@@ -2903,8 +2903,8 @@ cluster_heap_scan_fetch_full(HeapScanDesc scan)
 	volatile bool full = false;
 
 	if (!cluster_heap_read_needs_copy(scan->rs_base.rs_rd)
-		|| !(scan->rs_base.rs_flags & (SO_TYPE_SEQSCAN | SO_TYPE_TIDRANGESCAN)) || snapshot == NULL
-		|| snapshot->snapshot_type != SNAPSHOT_MVCC
+		|| !(scan->rs_base.rs_flags & (SO_TYPE_SEQSCAN | SO_TYPE_TIDRANGESCAN | SO_TYPE_BITMAPSCAN))
+		|| snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC
 		|| snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER)
 		return false;
 
@@ -5169,12 +5169,20 @@ heap_hot_r4_updated_xmin_needs_full(Page page, HeapTuple tuple,
 				   && scn_time_cmp(slot->write_scn, snapshot->read_scn) > 0));
 }
 
+/* Preserve HOT errors for index callers; bitmap owns its UNKNOWN counter
+ * and must retire the retained FULL before throwing. */
+static pg_attribute_noreturn() void heap_hot_r4_scan_unknown(HeapScanDesc scan, const char *reason)
+{
+	if (scan != NULL)
+		cluster_heap_scan_full_unknown(scan);
+	heap_hot_r4_unknown(reason);
+}
+
 /* Consume one immutable FULL page.  There is deliberately no Buffer input. */
 static bool
-heap_hot_r4_search_scratch(const BufferTag *tag,
-						   const ItemPointerData *logical_root,
-						   Relation relation, Snapshot snapshot,
-						   HeapHotSearchResult *result, bool scoped_full)
+heap_hot_r4_search_scratch_page(const BufferTag *tag, const ItemPointerData *logical_root,
+								Relation relation, Snapshot snapshot, HeapHotSearchResult *result,
+								bool scoped_full, HeapScanDesc preselected)
 {
 	ClusterR4HotScratchTestContext context;
 	Page		page = (Page) result->scratch_page;
@@ -5187,7 +5195,7 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 	int		depth = 0;
 
 	if (!heap_hot_r4_scratch_page_valid(page))
-		heap_hot_r4_unknown("malformed FULL page");
+		heap_hot_r4_scan_unknown(preselected, "malformed FULL page");
 
 	header = (PageHeader) page;
 	if (SCN_VALID(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn)
@@ -5198,11 +5206,11 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 			ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn);
 
 	if (!ItemPointerIsValid(logical_root))
-		heap_hot_r4_unknown("invalid logical HOT root");
+		heap_hot_r4_scan_unknown(preselected, "invalid logical HOT root");
 	blkno = ItemPointerGetBlockNumber(logical_root);
 	offnum = ItemPointerGetOffsetNumber(logical_root);
 	if (blkno != tag->blockNum)
-		heap_hot_r4_unknown("logical HOT root belongs to another block");
+		heap_hot_r4_scan_unknown(preselected, "logical HOT root belongs to another block");
 
 	memset(visited, 0, sizeof(visited));
 	memset(&context, 0, sizeof(context));
@@ -5232,12 +5240,12 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 				&& offnum > PageGetMaxOffsetNumber(page)
 				&& offnum <= MaxHeapTuplesPerPage)
 				return false;
-			heap_hot_r4_unknown("HOT offset is absent from the FULL page");
+			heap_hot_r4_scan_unknown(preselected, "HOT offset is absent from the FULL page");
 		}
 		if (offnum > MaxHeapTuplesPerPage || visited[offnum])
-			heap_hot_r4_unknown("HOT chain contains a cycle");
+			heap_hot_r4_scan_unknown(preselected, "HOT chain contains a cycle");
 		if (++depth > MaxHeapTuplesPerPage)
-			heap_hot_r4_unknown("HOT chain exceeds the bounded page depth");
+			heap_hot_r4_scan_unknown(preselected, "HOT chain exceeds the bounded page depth");
 		visited[offnum] = true;
 
 		lp = PageGetItemId(page, offnum);
@@ -5258,7 +5266,7 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 				at_chain_start = false;
 				continue;
 			}
-			heap_hot_r4_unknown("HOT root or member is unused or unprovable");
+			heap_hot_r4_scan_unknown(preselected, "HOT root or member is unused or unprovable");
 		}
 
 		item_offset = ItemIdGetOffset(lp);
@@ -5267,7 +5275,8 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 			|| item_offset < header->pd_upper
 			|| item_offset > header->pd_special
 			|| item_length > (Size) (header->pd_special - item_offset))
-			heap_hot_r4_unknown("HOT member lies outside the FULL page tuple area");
+			heap_hot_r4_scan_unknown(preselected,
+									 "HOT member lies outside the FULL page tuple area");
 
 		result->tuple.t_data = (HeapTupleHeader) ((char *) page + item_offset);
 		result->tuple.t_len = item_length;
@@ -5275,14 +5284,14 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 		ItemPointerSet(&result->tuple.t_self, blkno, offnum);
 		if (result->tuple.t_data->t_hoff < SizeofHeapTupleHeader
 			|| result->tuple.t_data->t_hoff > result->tuple.t_len)
-			heap_hot_r4_unknown("HOT member has a malformed tuple header");
+			heap_hot_r4_scan_unknown(preselected, "HOT member has a malformed tuple header");
 
 		if (at_chain_start && HeapTupleIsHeapOnly(&result->tuple))
-			heap_hot_r4_unknown("logical HOT root is heap-only");
+			heap_hot_r4_scan_unknown(preselected, "logical HOT root is heap-only");
 		if (TransactionIdIsValid(prev_xmax)
 			&& !TransactionIdEquals(
 				prev_xmax, HeapTupleHeaderGetXmin(result->tuple.t_data)))
-			heap_hot_r4_unknown("HOT predecessor identity does not match xmin");
+			heap_hot_r4_scan_unknown(preselected, "HOT predecessor identity does not match xmin");
 
 		/* This optional cache has no current authority for MultiXact I/O.
 		 * Return to the original visibility owner before evaluating this
@@ -5296,14 +5305,16 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 			return false;
 		}
 
-		if (HeapTupleSatisfiesMVCCScratch(&result->tuple, snapshot, &context))
+		/* Bitmap already proved every normal tuple in this same FULL. */
+		if (preselected != NULL ? cluster_heap_scan_r4_visible(preselected, offnum)
+								: HeapTupleSatisfiesMVCCScratch(&result->tuple, snapshot, &context))
 			return true;
 
 		if (!HeapTupleIsHotUpdated(&result->tuple))
 			return false;
 		if (!ItemPointerIsValid(&result->tuple.t_data->t_ctid)
 			|| ItemPointerGetBlockNumber(&result->tuple.t_data->t_ctid) != blkno)
-			heap_hot_r4_unknown("HOT chain crosses the reconstructed block");
+			heap_hot_r4_scan_unknown(preselected, "HOT chain crosses the reconstructed block");
 		if ((result->tuple.t_data->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
 		{
 			if (scoped_full)
@@ -5311,15 +5322,82 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 				result->cr_unsupported = true;
 				return false;
 			}
-			heap_hot_r4_unknown("scratch HOT predecessor requires MultiXact I/O");
+			heap_hot_r4_scan_unknown(preselected, "scratch HOT predecessor requires MultiXact I/O");
 		}
 
 		offnum = ItemPointerGetOffsetNumber(&result->tuple.t_data->t_ctid);
 		at_chain_start = false;
 		prev_xmax = HeapTupleHeaderGetRawXmax(result->tuple.t_data);
 		if (!TransactionIdIsNormal(prev_xmax))
-			heap_hot_r4_unknown("scratch HOT predecessor has no exact xid");
+			heap_hot_r4_scan_unknown(preselected, "scratch HOT predecessor has no exact xid");
 	}
+}
+
+/* Existing index callers retain the original per-tuple scratch evaluator. */
+static bool
+heap_hot_r4_search_scratch(const BufferTag *tag, const ItemPointerData *logical_root,
+						   Relation relation, Snapshot snapshot, HeapHotSearchResult *result,
+						   bool scoped_full)
+{
+	return heap_hot_r4_search_scratch_page(tag, logical_root, relation, snapshot, result,
+										   scoped_full, NULL);
+}
+
+/* A bitmap selection belongs to one immutable FULL observation. Exact inputs
+ * name index roots, so reuse bounded HOT traversal over the proved tuple set.
+ * No root starts another CR request or origin observation. */
+bool
+cluster_heap_scan_bitmap_full(HeapScanDesc scan, int ntuples, const OffsetNumber *offsets)
+{
+	HeapHotSearchResult result = { 0 };
+	OffsetNumber selected[MaxHeapTuplesPerPage];
+	volatile bool complete = false;
+	int count = 0;
+	BufferTag tag;
+
+	if (!cluster_heap_scan_fetch_full(scan))
+		return false;
+	PG_TRY();
+	{
+		if (ntuples < -1 || ntuples > MaxHeapTuplesPerPage || (ntuples > 0 && offsets == NULL))
+			cluster_heap_scan_full_unknown(scan);
+		if (ntuples >= 0) {
+			Page page = cluster_heap_scan_page(scan);
+
+			InitBufferTag(&tag, &scan->rs_base.rs_rd->rd_locator, MAIN_FORKNUM, scan->rs_cblock);
+			memcpy(result.scratch_page, page, BLCKSZ);
+			result.projection = scan->rs_projection;
+			for (int i = 0; i < ntuples; i++) {
+				ItemPointerData root;
+
+				if (offsets[i] < FirstOffsetNumber || offsets[i] > MaxHeapTuplesPerPage
+					|| (i > 0 && offsets[i] <= offsets[i - 1]))
+					cluster_heap_scan_full_unknown(scan);
+				ItemPointerSet(&root, scan->rs_cblock, offsets[i]);
+				if (heap_hot_r4_search_scratch_page(&tag, &root, scan->rs_base.rs_rd,
+													scan->rs_base.rs_snapshot, &result, true, scan))
+					selected[count++] = ItemPointerGetOffsetNumber(&result.tuple.t_self);
+				if (result.cr_unsupported)
+					cluster_heap_scan_full_unknown(scan);
+			}
+			/* Keep the sorted preselection intact until all roots are proved. */
+			(void)cluster_heap_scan_page(scan);
+			memcpy(scan->rs_vistuples, selected, count * sizeof(OffsetNumber));
+			scan->rs_ntuples = count;
+		}
+		if (scan->rs_ntuples == 0)
+			cluster_heap_scan_forget_owned(scan);
+		complete = true;
+	}
+	PG_FINALLY();
+	{
+		ClusterR4ProjectionForget(&result.projection);
+		memset(result.scratch_page, 0, BLCKSZ);
+		if (!complete)
+			cluster_heap_scan_forget_owned(scan);
+	}
+	PG_END_TRY();
+	return true;
 }
 
 static BufferTag

@@ -60,6 +60,10 @@ extern TM_Result cluster_heap_lock_tuple_owned(Relation relation, HeapTuple tupl
 extern void cluster_heap_rebind_locked_tuple(Relation relation, Buffer buffer,
 	HeapTuple tuple, TransactionId *creation_xmin);
 
+/* Private bitmap consumer; true means FULL handled, including an empty page. */
+extern bool cluster_heap_scan_bitmap_full(HeapScanDesc scan, int ntuples,
+										  const OffsetNumber *offsets);
+
 /* A pin protects the mapping, not tuple byte offsets across GCS installs. */
 static inline bool
 cluster_heap_read_needs_copy(Relation relation)

@@ -12157,8 +12157,9 @@ test_cluster_heap_cr_reuse_handler.inc: $(top_srcdir)/src/backend/access/heap/he
 
 
 test_cluster_heap_cr_reuse_scratch.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^(heap_hot_r4_scratch_page_valid|heap_hot_r4_search_scratch)\(/ { print "static bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	awk '/^(cluster_heap_scan_r4_visible|heap_hot_r4_scratch_page_valid|heap_hot_r4_search_scratch_page|heap_hot_r4_search_scratch)\(/ { print "static bool"; emit=1; found++ } \
+	     /^(static pg_attribute_noreturn\(\) void )?heap_hot_r4_scan_unknown\(/ { if ($$0 ~ /^heap_/) print "static pg_attribute_noreturn() void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real two-branch VACUUM scan and cutoff publication.
@@ -13179,16 +13180,39 @@ test_cluster_heap_epq_wait: test_cluster_heap_scan_r4.inc test_cluster_heap_main
 
 test_cluster_heap_scan_r4.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk 'BEGIN { print "static bool heap_hot_r4_scratch_page_valid(Page page);" } \
-	     /^(cluster_heap_scan_fetch_full|cluster_heap_scan_r4_visible|heap_hot_r4_scratch_page_valid)\(/ { print "static bool"; emit=1; found++ } \
+	     /^(cluster_heap_scan_fetch_full|cluster_heap_scan_r4_visible|heap_hot_r4_scratch_page_valid|heap_hot_r4_search_scratch_page)\(/ { print "static bool"; emit=1; found++ } \
 	     /^cluster_heap_scan_select_full\(/ { print "static void"; emit=1; found++ } \
 	     /^heap_endscan\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	     /^(heap_hot_r4_unknown|heap_hot_r4_snapshot_too_old)\(/ { print "static pg_attribute_noreturn() void"; emit=1; found++ } \
+	     /^(static pg_attribute_noreturn\(\) void )?heap_hot_r4_scan_unknown\(/ { if ($$0 ~ /^heap_/) print "static pg_attribute_noreturn() void"; emit=1; found++ } \
+	     /^cluster_heap_scan_bitmap_full\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 10) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_scan_full: test_cluster_heap_scan_full.c test_cluster_scratch_self.c \
         test_cluster_r4_scratch_resolver.c test_cluster_heap_scan_r4.inc \
         test_cluster_heap_scan_lifetime.inc test_cluster_heap_maintenance_policy.inc test_cluster_scratch_self \
         $(top_srcdir)/src/backend/access/heap/heapam_r4_private.h \
+        $(top_srcdir)/src/include/access/heapam.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+        $(CLUSTER_SAVEPOINT_READER_O) \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_heap_bitmap_full
+all: test_cluster_heap_bitmap_full
+
+test_cluster_heap_bitmap_callbacks.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_scan_bitmap_next_(block|tuple)\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_bitmap_full: test_cluster_heap_bitmap_full.c test_cluster_heap_scan_full.c \
+        test_cluster_scratch_self.c test_cluster_r4_scratch_resolver.c \
+        test_cluster_heap_bitmap_callbacks.inc test_cluster_heap_scan_r4.inc \
+        test_cluster_heap_scan_lifetime.inc test_cluster_heap_maintenance_policy.inc \
+        test_cluster_scratch_self $(top_srcdir)/src/backend/access/heap/heapam_r4_private.h \
         $(top_srcdir)/src/include/access/heapam.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \

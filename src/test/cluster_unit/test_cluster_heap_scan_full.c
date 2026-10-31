@@ -777,8 +777,11 @@ UT_TEST(serializable_dormant_scan_keeps_locked_native_conflicts)
 	}
 }
 
+#ifndef CLUSTER_SCAN_FULL_ENTRY
+#define CLUSTER_SCAN_FULL_ENTRY main
+#endif
 int
-main(void)
+CLUSTER_SCAN_FULL_ENTRY(void)
 {
 	UT_PLAN(15);
 	UT_RUN(page_mode_full_scan_preserves_private_rows_both_directions);

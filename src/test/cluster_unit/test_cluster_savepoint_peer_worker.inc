@@ -258,6 +258,8 @@ peer_worker_export_full_mode(FILE *stream, bool with_projection)
 	unsigned old_count = 0, supplied = 0;
 	int allocations = operation_worker_allocations;
 
+	if (with_projection && peer_projection_kind > 6)
+		return 1;
 	if (with_projection)
 		holder_mixed_init(&f, 2, 0, 0);
 	else {
@@ -293,15 +295,21 @@ peer_worker_export_full_mode(FILE *stream, bool with_projection)
 	if (with_projection && peer_projection_kind != 0) {
 		char old_root[60];
 		HeapTupleHeader root;
-		holder_mixed_modifier(&f,
-							  (peer_projection_kind & 1) ? UNDO_RECORD_UPDATE : UNDO_RECORD_DELETE,
-							  false, old_root);
+		bool hot = peer_projection_kind >= 5;
+		bool update = hot || (peer_projection_kind & 1) != 0;
+
+		holder_mixed_modifier(&f, update ? UNDO_RECORD_UPDATE : UNDO_RECORD_DELETE, hot, old_root);
 		root = (HeapTupleHeader)PageGetItem((Page)f.cr.source.data,
 											PageGetItemId((Page)f.cr.source.data, 1));
 		HeapTupleHeaderSetXminFrozen(root);
 		root->t_itl_slot_idx = 2;
-		if (peer_projection_kind >= 3)
-			peer_fixture_child_modifier(&f, (peer_projection_kind & 1) != 0);
+		if (peer_projection_kind == 3 || peer_projection_kind == 4 || peer_projection_kind == 6)
+			peer_fixture_child_modifier(&f, update);
+		if (hot) {
+			HeapTupleHeader newer = (HeapTupleHeader)PageGetItem(
+				(Page)f.cr.source.data, PageGetItemId((Page)f.cr.source.data, 12));
+			newer->t_infomask2 |= HEAP_ONLY_TUPLE;
+		}
 	}
 	cluster_node_id = with_projection ? 3 : 1;
 	for (unsigned tick = 0; tick < 80; tick++) {

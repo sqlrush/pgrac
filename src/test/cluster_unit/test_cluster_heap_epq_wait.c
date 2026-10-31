@@ -138,6 +138,13 @@ UT_TEST(test_exclusive_conflicting_locks_retain_exact_wait_dispatch)
 	check_lock_dispatch(LockTupleExclusive, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, false);
 }
 
+/* These native snapshot controls must never enter the FULL horizon branch. */
+int
+scn_time_cmp(SCN left, SCN right)
+{
+	abort();
+}
+
 bool
 ItemPointerEquals(ItemPointer a, ItemPointer b)
 {

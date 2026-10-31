@@ -2631,7 +2631,7 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	hscan->rs_cindex = 0;
 	hscan->rs_ntuples = 0;
 #ifdef USE_PGRAC_CLUSTER
-	hscan->rs_owned_kind = 0;
+	cluster_heap_scan_forget_owned(hscan);
 #endif
 
 	/*
@@ -2654,6 +2654,10 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 	hscan->rs_cblock = block;
 	buffer = hscan->rs_cbuf;
 	snapshot = scan->rs_snapshot;
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_heap_scan_bitmap_full(hscan, tbmres->ntuples, tbmres->offsets))
+		return hscan->rs_ntuples > 0;
+#endif
 
 	ntup = 0;
 
@@ -2752,8 +2756,13 @@ heapam_scan_bitmap_next_tuple(TableScanDesc scan,
 	/*
 	 * Out of range?  If so, nothing more to look at on this page
 	 */
-	if (hscan->rs_cindex < 0 || hscan->rs_cindex >= hscan->rs_ntuples)
+	if (hscan->rs_cindex < 0 || hscan->rs_cindex >= hscan->rs_ntuples) {
+#ifdef USE_PGRAC_CLUSTER
+		if (hscan->rs_owned_kind == 3)
+			cluster_heap_scan_forget_owned(hscan);
+#endif
 		return false;
+	}
 
 	targoffset = hscan->rs_vistuples[hscan->rs_cindex];
 #ifdef USE_PGRAC_CLUSTER
