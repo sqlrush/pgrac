@@ -34,6 +34,7 @@ execute_single_wal_chain(bool versioned)
 	RfPageProducerBatchV1 cluster_page_versions = { 0 };
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 	ClusterHeapVmMutationState cluster_vm_state = { 0 };
+	unsigned previous_publications = inserts + vm_clears;
 
 	multi_inserting = false;
 cluster_heap_insert_retry:
@@ -45,7 +46,7 @@ cluster_heap_insert_retry:
 	/* The original no-retry/receipt boundary is a controlled input. Only
 	 * acquisition, exact version capture and native publication execute. */
 	UT_ASSERT(multi_heap_locked && (!vm_locked || multi_vm_locked));
-	UT_ASSERT_EQ(inserts + vm_clears, 0);
+	UT_ASSERT_EQ(inserts + vm_clears, previous_publications);
 #include "test_cluster_heap_insert_version.inc"
 	if (vm_locked)
 		LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
