@@ -141,6 +141,15 @@ extern bool rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1
 														XLogRecPtr native_redo);
 extern bool rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 												   const RfSideXactOperationV1 *operation);
+/* Match the complete immutable native ABORT to its unique earlier exact TT
+ * terminal. V2 also requires the original FullXid; legacy never supplies it.
+ * target excludes retained history, identity may observe it. No output on refusal. */
+extern bool rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
+												 const RfSideOnlineOperationV1 *operation,
+												 ClusterUndoDecoded *out);
+extern bool rf_side_online_plan_abort_identity_v1(const RfSideOnlinePlanV1 *plan,
+												   const RfSideOnlineOperationV1 *operation,
+												   ClusterUndoDecoded *out);
 /* Only later native TRUNCATE in this exact sealed source can justify an
  * absent CREATE page. No visibility or mutation authority is returned. */
 extern bool rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *plan,
@@ -186,6 +195,12 @@ extern RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
 										   uint32 segment_id, const char *base,
 										   RfSideUndoHeaderImageV1 *out);
+/* Read the header through this exact source record only, including retained
+ * history inputs. Native ABORT retains target's stricter history boundary.
+ * Full source validation precedes the private prefix; no mutation or retirement. */
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_record_input_header_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 typedef struct RfSideSpaceContributionV1 {
 	ClusterSpaceIdentity result;

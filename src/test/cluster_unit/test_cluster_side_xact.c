@@ -5670,10 +5670,206 @@ UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_ga
 	}
 }
 
+/* TT40 native identity and immutable causal input use the original plan. */
+static XLogReaderState *
+tt40_side_native_abort(FakeXactRecord *fake, TransactionId xid)
+{
+	xl_xact_abort abort = { .xact_time = 123456 };
+	xl_xact_xinfo xinfo = { .xinfo = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SCN };
+	xl_xact_dbinfo dbinfo = { .dbId = 999 };
+	xl_xact_scn scn = { .scn = 12345 };
+	char *cursor;
+
+	memset(fake, 0, sizeof(*fake));
+	cursor = (char *)fake->data;
+	memcpy(cursor, &abort, sizeof(abort));
+	cursor += sizeof(abort);
+	memcpy(cursor, &xinfo, sizeof(xinfo));
+	cursor += sizeof(xinfo);
+	memcpy(cursor, &dbinfo, sizeof(dbinfo));
+	cursor += sizeof(dbinfo);
+	memcpy(cursor, &scn, sizeof(scn));
+	cursor += sizeof(scn);
+	fake->u.decoded.header.xl_rmid = RM_XACT_ID;
+	fake->u.decoded.header.xl_info = XLOG_XACT_ABORT | XLOG_XACT_HAS_INFO;
+	fake->u.decoded.header.xl_xid = xid;
+	fake->u.decoded.main_data = (char *)fake->data;
+	fake->u.decoded.main_data_len = (uint32)(cursor - (char *)fake->data);
+	fake->reader.record = &fake->u.decoded;
+	return &fake->reader;
+}
+
+
+static void
+tt40_side_exact(FakeXactRecord *fake, uint8 opcode, uint64 full, uint32 generation)
+{
+	xl_undo_tt_identity_v2 exact = { .segment_id = 513, .segment_generation = generation,
+		.xid = 802, .slot_offset = 4, .wrap = 7, .instance = 3,
+		.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION, .original_full_xid = full };
+
+	make_projection_record(fake, RM_CLUSTER_UNDO_ID, opcode, &exact, sizeof(exact));
+}
+
+static RfSideOnlinePlanV1 *
+tt40_side_plan(bool history, unsigned fault, bool init)
+{
+	unsigned records = 3 + (init ? 1 : 0) + (fault == 4 || fault == 5 ? 1 : 0);
+	XLogRecPtr end = 100 + records * 100;
+	RfSideOnlinePlanV1 *plan = space_online_plan_redo(end, history ? &end : NULL);
+	FakeXactRecord fake;
+	XLogRecPtr at = 100;
+	uint64 full = (UINT64_C(7) << 32) | 802;
+
+	if (init) {
+		struct {
+			xl_cluster_undo_segment_init record;
+			uint8 bytes[BLCKSZ];
+		} image = { 0 };
+
+		image.record.instance = 3;
+		image.record.segment_id = 513;
+		UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, (char *)image.bytes));
+		UT_ASSERT(cluster_undo_segment_header_seal((char *)image.bytes));
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT,
+			&image, sizeof(image));
+		undo_header_feed(plan, &fake, at);
+		at += 100;
+	}
+	if (fault == 2)
+		undo_header_bind(&fake, 0);
+	else
+		tt40_side_exact(&fake, XLOG_UNDO_TT_SLOT_BIND,
+			fault == 1 ? (UINT64_C(8) << 32) | 802 : full, fault == 3 ? 1 : 0);
+	undo_header_feed(plan, &fake, at);
+	at += 100;
+	tt40_side_exact(&fake, XLOG_UNDO_TT_SLOT_ABORT, full, 0);
+	undo_header_feed(plan, &fake, at);
+	at += 100;
+	if (fault == 4 || fault == 5) {
+		tt40_side_exact(&fake, fault == 4 ? XLOG_UNDO_TT_SLOT_ABORT : XLOG_UNDO_TT_SLOT_BIND,
+			full, 0);
+		undo_header_feed(plan, &fake, at);
+		at += 100;
+	}
+	tt40_side_native_abort(&fake, 802);
+	undo_header_feed(plan, &fake, at);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_tt40_native_abort_pair_preserves_exact_original_identity)
+{
+	for (unsigned history = 0; history < 2; history++) {
+		RfSideOnlinePlanV1 *plan = tt40_side_plan(history != 0, 0, false);
+		RfSideOnlineOperationV1 native;
+		ClusterUndoDecoded target, unchanged;
+
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 2, &native));
+		memset(&unchanged, 0x93, sizeof(unchanged));
+		target = unchanged;
+		UT_ASSERT_EQ(rf_side_online_plan_abort_target_v1(plan, &native, &target), history == 0);
+		if (history)
+			UT_ASSERT(memcmp(&target, &unchanged, sizeof(target)) == 0);
+		UT_ASSERT(rf_side_online_plan_abort_identity_v1(plan, &native, &target));
+		UT_ASSERT_EQ(target.kind, CLUSTER_UNDO_KIND_TT_ABORT);
+		UT_ASSERT_EQ(target.format_version, CLUSTER_UNDO_TT_IDENTITY_V2_VERSION);
+		UT_ASSERT_EQ(target.original_full_xid, (UINT64_C(7) << 32) | 802);
+		UT_ASSERT_EQ(target.instance, 3);
+		UT_ASSERT_EQ(target.segment_id, 513);
+		UT_ASSERT_EQ(target.expected_generation, 0);
+		UT_ASSERT_EQ(target.slot_offset, 4);
+		UT_ASSERT_EQ(target.wrap, 7);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 3);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_tt40_native_abort_pair_refuses_raw_reincarnation_and_carrier_drift)
+{
+	for (unsigned fault = 1; fault < 10; fault++) {
+		RfSideOnlinePlanV1 *plan = tt40_side_plan(false, fault, false);
+		RfSideOnlineOperationV1 native;
+		ClusterUndoDecoded target, unchanged;
+		uint32 count = rf_side_online_plan_operation_count_v1(plan);
+
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, count - 1, &native));
+		if (fault == 6) native.identity.record.origin_thread++;
+		if (fault == 7) native.identity.participant_index++;
+		if (fault == 8) native.xact.terminal_scn++;
+		if (fault == 9) native.history_only = true;
+		memset(&unchanged, 0x83, sizeof(unchanged));
+		target = unchanged;
+		UT_ASSERT(!rf_side_online_plan_abort_target_v1(plan, &native, &target));
+		UT_ASSERT(memcmp(&target, &unchanged, sizeof(target)) == 0);
+		UT_ASSERT(!rf_side_online_plan_abort_identity_v1(plan, &native, &target));
+		UT_ASSERT(memcmp(&target, &unchanged, sizeof(target)) == 0);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), count);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_tt40_causal_input_preserves_bind_before_later_abort)
+{
+	for (unsigned history = 0; history < 2; history++) {
+		RfSideOnlinePlanV1 *plan = tt40_side_plan(history != 0, 0, true);
+		RfSideOnlineOperationV1 operation;
+		RfSideUndoHeaderImageV1 image;
+		const TTSlotV2 *slot = &((const UndoSegmentHeaderDataV2 *)image.page.data)->tt_slots[4];
+		RfSideUndoHeaderImageV1 unchanged;
+
+		for (uint32 i = 1; i < 4; i++) {
+			bool accepted = !history || i != 3;
+			RfPageProofDetailV1 result;
+
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, i, &operation));
+			memset(&unchanged, 0x75, sizeof(unchanged));
+			image = unchanged;
+			result = rf_side_online_plan_prepare_undo_record_input_header_v1(plan, i,
+				&operation.identity, NULL, &image);
+			UT_ASSERT_EQ(result == RF_PAGE_PROOF_DETAIL_OK, accepted);
+			if (!accepted) {
+				UT_ASSERT(memcmp(&image, &unchanged, sizeof(image)) == 0);
+				continue;
+			}
+			UT_ASSERT_EQ(slot->status, i == 1 ? TT_SLOT_ACTIVE : TT_SLOT_ABORTED);
+			UT_ASSERT_EQ(slot->original_full_xid, (UINT64_C(7) << 32) | 802);
+			UT_ASSERT_EQ(slot->xid, 802);
+			UT_ASSERT_EQ(slot->wrap, 7);
+			UT_ASSERT_EQ(image.source_index, i == 1 ? 1 : 2);
+			UT_ASSERT_EQ(image.operation_count, i == 1 ? 2 : 3);
+			UT_ASSERT_EQ(((const UndoSegmentHeaderDataV2 *)image.page.data)->wrap_count, 0);
+			UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 4);
+		}
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+		operation.identity.reserved_zero = 1;
+		image = unchanged;
+		UT_ASSERT(rf_side_online_plan_prepare_undo_record_input_header_v1(plan, 1,
+			&operation.identity, NULL, &image) != RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(&image, &unchanged, sizeof(image)) == 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_tt40_causal_input_never_borrows_a_missing_predecessor)
+{
+	RfSideOnlinePlanV1 *plan = tt40_side_plan(false, 0, false);
+	RfSideOnlineOperationV1 operation;
+	RfSideUndoHeaderImageV1 image, unchanged;
+
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	memset(&unchanged, 0x65, sizeof(unchanged));
+	image = unchanged;
+	UT_ASSERT(rf_side_online_plan_prepare_undo_record_input_header_v1(plan, 0,
+		&operation.identity, NULL, &image) != RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(&image, &unchanged, sizeof(image)) == 0);
+	UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 3);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(82);
+	UT_PLAN(86);
 	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
 	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
@@ -5756,6 +5952,10 @@ main(void)
 	UT_RUN(test_space_commit_rejects_unowned_duplicate_or_malformed_drop_inputs);
 	UT_RUN(test_space_commit_retains_all_native_side_effects_and_refuses_tt_only_owner);
 	UT_RUN(test_multixact_retired_page_requires_exact_later_sealed_truncate);
+	UT_RUN(test_tt40_native_abort_pair_preserves_exact_original_identity);
+	UT_RUN(test_tt40_native_abort_pair_refuses_raw_reincarnation_and_carrier_drift);
+	UT_RUN(test_tt40_causal_input_preserves_bind_before_later_abort);
+	UT_RUN(test_tt40_causal_input_never_borrows_a_missing_predecessor);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
