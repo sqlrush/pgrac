@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
@@ -173,6 +174,8 @@ int cluster_lms_workers = 4;
 ClusterConf *ClusterConfShmem = NULL;
 bool cluster_smart_fusion = false;
 BackendId MyBackendId = 1;
+int MyProcPid = 1234;
+TimestampTz MyStartTimestamp = 1;
 BackendType MyBackendType = B_BACKEND;
 int cluster_gcs_reply_timeout_ms = 5000;
 int cluster_gcs_block_retransmit_max_retries = 4;
@@ -183,9 +186,52 @@ char *BufferBlocks = NULL;
 Block *LocalBufferBlockPointers = NULL;
 int NBuffers = 0;
 bool cluster_trace_tx_identity;
+bool cluster_trace_gcs_capacity;
 static ClusterWaitTrace retry_trace;
 static unsigned retry_trace_set, retry_trace_clear;
 static int retry_private_pins;
+/* This route fixture has no first-fill receipt or OS sleepers. The original
+ * first-fill and observation-ON owners run in their dedicated fixtures. */
+void
+cluster_content_trace_gcs_capacity(const ClusterContentTraceGcsCapacity *cut)
+{
+	(void) cut;
+	abort();
+}
+
+void
+cluster_block_io_trace_source(const ClusterPcmReadSource *source, const char *phase)
+{
+	(void) source;
+	(void) phase;
+	abort();
+}
+
+void
+cluster_block_io_trace_failed(BufferTag tag, const char *bytes, const char *source,
+							  uint32 expected, uint32 calculated)
+{
+	(void) tag;
+	UT_ASSERT_NOT_NULL(bytes);
+	UT_ASSERT_NOT_NULL(source);
+	UT_ASSERT_EQ(strcmp(source, "WIRE"), 0);
+	UT_ASSERT(expected != calculated);
+}
+
+void
+cluster_pcm_lock_check_shutdown_wait(void)
+{
+	/* No shutdown is in progress; original cancellation remains in the GCS
+	 * caller and the existing ProcessInterrupts/exit-callback fixture. */
+}
+
+bool
+cluster_lms_outbound_wait_capacity(int worker_id, uint64 epoch)
+{
+	(void) worker_id;
+	(void) epoch;
+	abort();
+}
 static bool retry_trace_throw;
 static bool retry_trace_header_busy;
 void cluster_content_trace_wait_set(ClusterContentTraceWait kind, const ClusterWaitTrace *wait)
@@ -536,6 +582,13 @@ cluster_membership_is_member(int32 node_id pg_attribute_unused())
 	return true;
 }
 
+ClusterMembershipState
+cluster_membership_get_state(int32 node_id)
+{
+	(void) node_id;
+	abort(); /* Only the separate first-fill path samples this provider. */
+}
+
 bool
 cluster_multixact_current_resolve_origin_member_proof(
 	TransactionId member_xid pg_attribute_unused(), uint8 member_status pg_attribute_unused(),
@@ -592,6 +645,21 @@ cluster_reconfig_get_observed_slot(int32 node_id pg_attribute_unused(), uint64 *
 	if (generation != NULL)
 		*generation = UINT64_C(1);
 	return true;
+}
+
+bool
+cluster_reconfig_get_observed_fresh_alive(int32 node_id)
+{
+	(void) node_id;
+	abort(); /* No first-fill source authentication is supplied by this test. */
+}
+
+bool
+cluster_sf_peer_pcm_x_connection_generation(int32 peer_id, uint32 *generation)
+{
+	(void) peer_id;
+	(void) generation;
+	abort();
 }
 
 bool
@@ -731,6 +799,7 @@ cluster_xid_origin_slot(TransactionId xid pg_attribute_unused())
 static int reply_lock_acquire_calls;
 static int reply_lock_release_calls;
 static int reply_cv_signal_calls;
+static int reply_cv_broadcast_calls;
 
 #define REQUESTER_REPLY_SCRIPT_CAPACITY 12
 
@@ -756,6 +825,13 @@ ConditionVariableSignal(ConditionVariable *cv pg_attribute_unused())
 	if (reply_cv_signal_calls < REQUESTER_REPLY_SCRIPT_CAPACITY)
 		reply_cv_signaled[reply_cv_signal_calls] = cv;
 	reply_cv_signal_calls++;
+}
+
+void
+ConditionVariableBroadcast(ConditionVariable *cv)
+{
+	UT_ASSERT_NOT_NULL(cv);
+	reply_cv_broadcast_calls++;
 }
 
 static int reply_cv_prepare_calls;
@@ -1142,6 +1218,14 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *retry_d
 	}
 	return cluster_gcs_send_block_request_and_wait(buf, PCM_TRANS_N_TO_S, UT_MASTER_NODE, false,
 												   retry_denied);
+}
+
+ClusterPcmReadSourceKind
+cluster_pcm_lock_acquire_buffer_source(BufferDesc *buf, ClusterPcmReadSource *source)
+{
+	(void) buf;
+	(void) source;
+	abort(); /* These legacy resident probes pass NULL; never fake a grant. */
 }
 
 /* The real bufmgr rearm and header snapshots below are generated verbatim.
@@ -4916,7 +5000,7 @@ UT_TEST(test_shared_acquire_error_retires_only_its_quiescent_n_reservation)
 		if (sigsetjmp(jump, 1) == 0) {
 			PG_exception_stack = &jump;
 			granted = cluster_bufmgr_pcm_acquire_shared_owned(&capacity_buffer, &base, token,
-															  &retry_denied);
+															  &retry_denied, NULL);
 		} else
 			caught = true;
 		PG_exception_stack = saved_stack;
