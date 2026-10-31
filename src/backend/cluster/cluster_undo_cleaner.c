@@ -688,10 +688,10 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		 * must not turn a different failure into caller cancellation. */
 		if (!completed && geterrcode() == ERRCODE_QUERY_CANCELED)
 			pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_cancelled, 1);
+		/* CV and bookkeeping LWLock waits clear their events on either exit. */
+		pgstat_report_wait_start(previous_wait_event);
 	}
 	PG_END_TRY();
-	/* CV and bookkeeping LWLock waits clear their events. Errors use PG cleanup. */
-	pgstat_report_wait_start(previous_wait_event);
 	return retry;
 }
 

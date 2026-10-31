@@ -61,6 +61,7 @@ static unsigned prepared, cancelled, slept, signalled, broadcasts;
 static uint32 test_wait_event, last_sleep_event;
 uint32 *my_wait_event_info = &test_wait_event;
 static bool subscribed, early_signal, test_cancel, test_pin_after_probe;
+static bool test_error_after_sleep;
 static int test_error_code = ERRCODE_QUERY_CANCELED;
 static bool test_lock_wait;
 static ClusterCtrcCapacityProbeResult test_proof;
@@ -683,6 +684,9 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long ti
 	if (test_cancel)
 		pg_re_throw();
 	pgstat_report_wait_end();
+	/* The real CV also checks interrupts after WaitLatch has cleared its event. */
+	if (test_error_after_sleep)
+		pg_re_throw();
 	return !early_signal; /* Both actual signal and timed repoll must retry allocation. */
 }
 
@@ -771,6 +775,7 @@ reset_wait_fixture(void)
 	cleaner_recovered_open = true;
 	cluster_undo_cleaner_enabled = cluster_undo_retention_horizon_enabled = true;
 	subscribed = early_signal = test_cancel = test_pin_after_probe = false;
+	test_error_after_sleep = false;
 	test_lock_wait = false;
 	prepared = cancelled = slept = signalled = broadcasts = 0;
 	test_wait_event = last_sleep_event = 0;
@@ -1157,6 +1162,122 @@ UT_TEST(test_capacity_sleep_restores_outer_event_on_normal_return)
 			UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
 			UT_ASSERT_EQ(slept, 1);
 			UT_ASSERT_EQ(test_wait_event, outer_events[i]);
+		}
+	}
+}
+
+static void
+capacity_probe_raise_error(void)
+{
+	pg_re_throw();
+}
+
+UT_TEST(test_capacity_error_restores_outer_event_before_rethrow)
+{
+	static const uint32 events[]
+		= { 0, WAIT_EVENT_CLIENT_READ, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP };
+	static const int codes[] = { ERRCODE_QUERY_CANCELED, ERRCODE_LOCK_NOT_AVAILABLE,
+		ERRCODE_T_R_DEADLOCK_DETECTED, ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS, ERRCODE_IO_ERROR };
+
+	for (unsigned route = 0; route < 3; route++) {
+		for (unsigned event = 0; event < lengthof(events); event++) {
+			for (unsigned error = 0; error < lengthof(codes); error++) {
+				for (unsigned stage = 0; stage < 4; stage++) {
+					ClusterCtrcTxnKeyV1 continuation = { 0 };
+					ClusterUndoCapacityStats out;
+					volatile bool caught = false;
+					volatile int caught_code = 0;
+
+					reset_wait_fixture();
+					test_lock_wait = true;
+					test_error_code = codes[error];
+					if (route != 0) {
+						test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+						test_pool_reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+						test_segment_owner = route == 2;
+					}
+					InterruptPending = stage == 0;
+					test_capacity_probe_hook = stage == 1 ? capacity_probe_raise_error : NULL;
+					test_cancel = stage == 2;
+					test_error_after_sleep = stage == 3;
+					pgstat_report_wait_start(events[event]);
+					PG_TRY();
+					{
+						(void)cluster_undo_cleaner_wait_for_capacity(1, &continuation);
+					}
+					PG_CATCH();
+					{
+						caught = true;
+						caught_code = geterrcode();
+					}
+					PG_END_TRY();
+					InterruptPending = false;
+					UT_ASSERT(caught);
+					UT_ASSERT_EQ(caught_code, codes[error]);
+					/* Observe cleanup before the snapshot's own LWLock can change the event. */
+					UT_ASSERT_EQ(test_wait_event, events[event]);
+					UT_ASSERT_EQ(prepared, 1);
+					UT_ASSERT_EQ(cancelled, 1);
+					UT_ASSERT(!subscribed);
+					UT_ASSERT_EQ(test_lock_depth, 0);
+					UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
+					UT_ASSERT_EQ(out.pool_wait_count, stage >= 2 ? 1 : 0);
+					UT_ASSERT_EQ(out.wakeup_recheck_count, 0);
+					UT_ASSERT_EQ(out.cancel_count, codes[error] == ERRCODE_QUERY_CANCELED ? 1 : 0);
+					UT_ASSERT_EQ(out.refused_context_count + out.refused_proof_count, 0);
+				}
+			}
+		}
+	}
+}
+
+UT_TEST(test_capacity_error_retirement_allows_a_fresh_wait_with_original_counts)
+{
+	static const int codes[] = { ERRCODE_QUERY_CANCELED, ERRCODE_IO_ERROR };
+
+	for (unsigned route = 0; route < 3; route++) {
+		for (unsigned error = 0; error < lengthof(codes); error++) {
+			ClusterCtrcTxnKeyV1 continuation = { 0 };
+			ClusterUndoCapacityStats out;
+			volatile bool caught = false;
+
+			reset_wait_fixture();
+			test_lock_wait = true;
+			test_error_code = codes[error];
+			test_error_after_sleep = true;
+			if (route != 0) {
+				test_proof = CLUSTER_CTRC_CAPACITY_REFUSE;
+				test_pool_reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+				test_segment_owner = route == 2;
+			}
+			pgstat_report_wait_start(WAIT_EVENT_CLIENT_READ);
+			PG_TRY();
+			{
+				(void)cluster_undo_cleaner_wait_for_capacity(1, &continuation);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(geterrcode(), codes[error]);
+			UT_ASSERT_EQ(test_wait_event, WAIT_EVENT_CLIENT_READ);
+			UT_ASSERT(!subscribed);
+			test_error_after_sleep = false;
+			MemSet(&continuation, 0, sizeof(continuation));
+			UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+			UT_ASSERT_EQ(test_wait_event, WAIT_EVENT_CLIENT_READ);
+			UT_ASSERT_EQ(prepared, 2);
+			UT_ASSERT_EQ(cancelled, 2);
+			UT_ASSERT_EQ(slept, 2);
+			UT_ASSERT(!subscribed);
+			UT_ASSERT_EQ(test_lock_depth, 0);
+			UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&out));
+			UT_ASSERT_EQ(out.pool_wait_count, 2);
+			UT_ASSERT_EQ(out.wakeup_recheck_count, 1);
+			UT_ASSERT_EQ(out.cancel_count, codes[error] == ERRCODE_QUERY_CANCELED ? 1 : 0);
+			UT_ASSERT_EQ(out.refused_context_count + out.refused_proof_count, 0);
 		}
 	}
 }
@@ -2476,7 +2597,7 @@ UT_TEST(test_capacity_retention_counts_known_bits_only_on_original_refusal)
 int
 main(void)
 {
-	UT_PLAN(56);
+	UT_PLAN(58);
 	UT_RUN(test_capacity_refusal_producer_and_legacy_reads_do_not_lock_or_truncate);
 	UT_RUN(test_capacity_retention_snapshot_preserves_zero_unsigned_and_unavailable);
 	UT_RUN(test_capacity_retention_counts_known_bits_only_on_original_refusal);
@@ -2509,6 +2630,8 @@ main(void)
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_sleep_reports_frontend_undo_event);
 	UT_RUN(test_capacity_sleep_restores_outer_event_on_normal_return);
+	UT_RUN(test_capacity_error_restores_outer_event_before_rethrow);
+	UT_RUN(test_capacity_error_retirement_allows_a_fresh_wait_with_original_counts);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
 	UT_RUN(test_capacity_cancellation_and_missing_supply_keep_original_outcome);
