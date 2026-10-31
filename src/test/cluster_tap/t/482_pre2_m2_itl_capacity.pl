@@ -170,6 +170,7 @@ sub wait_exit_cell {
     && ($judgement->{exit}->{sqlstate} // '') eq ($kind eq 'capacity_timeout' ? '53R70' : '57014')
     && ($judgement->{exit}->{wait_seq} // 0)==$selected->{wait_seq}
     && exists($judgement->{exit}->{authoritative}) && !$judgement->{exit}->{authoritative};
+  $exit->{retry_observation}=capture_wait_exit_retry($node,$exit,$judgement->{exit});
   $r->{stderr}='';
   $r->query_safe('ROLLBACK');
   die 'transaction-local capacity budget escaped rollback'
@@ -231,7 +232,7 @@ sub judge_requalification {
  my ($case,$option)=@_;
  my %keys=('--requalify-mutation'=>'mutation','--requalify'=>'requalified',
   '--cross-page-setup'=>'pair_setup','--cross-page-wait'=>'pair','--cross-page'=>'cross_page',
-  '--retry-observation'=>'retry_observation');
+  '--retry-observation'=>'retry_observation','--retry-exit'=>'retry_exit');
  die 'unknown requalification evaluator' unless exists($keys{$option});
  my ($input,$out,$err)=(encode_json($case),'','');
  my $ok=run([$ENV{PYTHON} // 'python3',"$FindBin::RealBin/../pre2/m2_itl_capacity.py",$option],
@@ -439,6 +440,30 @@ sub capture_cross_page_retry {
    qw(authoritative ready_known shared_retirement_known vm_reference_counts_known))
   && $json->encode($proof->{source_tag}) eq $json->encode($original->{source_tag})
   && $json->encode($proof->{destination_tag}) eq $json->encode($original->{start}->{tag});
+ return $proof;
+}
+
+sub capture_wait_exit_retry {
+ my ($node,$exit,$original)=@_;
+ # The original SQL has already failed. This observer neither waits on its
+ # transaction nor grants another statement/capacity deadline.
+ my $case={exit=>$exit,
+  trace=>decode_json($node->safe_psql('postgres','SELECT test_pgrac_native_itl_trace()'))};
+ my $kind=$exit->{kind};
+ save_json("b08-$kind-retry-observation",$case);
+ my ($proof,$error)=judge_requalification($case,'--retry-exit');
+ save_json("b08-$kind-retry-judge",{result=>$proof,error=>$error});
+ die "failed UPDATE retry evidence refused: $error" unless defined($proof)
+  && ($proof->{kind} // '') eq 'wait_retry_exit'
+  && ($proof->{scope} // '') eq 'local_projection_only'
+  && ($proof->{exit_kind} // '') eq $original->{kind}
+  && ($proof->{sqlstate} // '') eq $original->{sqlstate}
+  && ($proof->{waiter_pid} // 0)==$exit->{start}->{waiter_pid}
+  && ($proof->{wait_seq} // 0)==$original->{wait_seq}
+  && ($proof->{end_seq} // 0)==$original->{end_seq}
+  && ($proof->{last_phase} // 0)==2
+  && !(grep { !exists($proof->{$_}) || $proof->{$_} }
+   qw(authoritative ready_known shared_retirement_known vm_reference_counts_known abort_cleanup_known));
  return $proof;
 }
 

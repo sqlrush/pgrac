@@ -641,26 +641,19 @@ def _retry_projection(row):
     return values
 
 
-def validate_retry_observations(case):
-    """Observe one original UPDATE; no READY, pin-count or retirement verdict."""
-    finish = case['finish']
-    pair = validate_cross_page_finish(finish)
-    original = finish['cross_page']
-    start = original['start']
-    pid, node, xid = (number(start['waiter_pid']), number(start['waiter_node']),
-                      number(original['waiter_xid']))
-    events = _retry_trace(case['trace'])
+def _retry_waiter(events, pid, node, xid):
     active = [e for e in events if e.get('kind') == 2 and e.get('pid') == pid
-              and e.get('node') == node and e.get('key', {}).get('xid') == xid]
+              and e.get('node') == node and (xid is None or e.get('key', {}).get('xid') == xid)]
     if len(active) != 1 or active[0].get('key_known') is not True:
         raise ValueError('original waiter ACTIVE publication is missing or ambiguous')
     producer = active[0]
     actor = _retry_actor(producer)
     key = {k: number(producer['key'].get(k)) for k in KEY_FIELDS}
+    xid = key['xid']
     slot = producer['tt_slot']
     lsn = number(producer.get('bind_lsn'))
     if (key['format_version'] != 1 or key['owner_instance'] != node + 1
-            or key['origin_node_id'] != node or key['xid'] != xid
+            or key['origin_node_id'] != node or not 3 <= xid < 2**32
             or not 0 <= key['slot_wrap'] < 65535 or not lsn
             or any(not key[k] for k in ('segment_id', 'system_identifier', 'origin_boot_incarnation',
                                         'admission_record_generation', 'root_descriptor_incarnation',
@@ -672,9 +665,14 @@ def validate_retry_observations(case):
                         ('segment_id', 'segment_generation', 'xid', 'slot_offset', 'slot_wrap')}
     expected_binding.update(origin_instance=key['owner_instance'], publish_state=3,
                             reserved16=0, active_lsn=lsn)
+    return producer, actor, key, lsn, expected_binding
+
+
+def _retry_span(events, pid, node, xid=None, *, pending=False):
+    producer, actor, key, lsn, expected_binding = _retry_waiter(events, pid, node, xid)
     cuts = [e for e in events if e.get('kind') == 7 and e.get('pid') == pid and e.get('node') == node]
-    if not cuts or len(cuts) % 3:
-        raise ValueError('retry observation lacks a complete three-point span')
+    if not cuts or len(cuts) % 3 != (2 if pending else 0):
+        raise ValueError('retry observation does not match its completed or pending span')
     baseline, deadline, handle_slots, alias = None, 0, 0, False
     for offset in range(0, len(cuts), 3):
         group = cuts[offset:offset+3]
@@ -694,42 +692,91 @@ def validate_retry_observations(case):
             if phase == 1:
                 handle_slots = max(handle_slots, bool(old) + bool(new))
                 alias |= old != 0 and old == new
-        if projections[0] != projections[1] or projections[0] != projections[2]:
+        if any(p != projections[0] for p in projections[1:]):
             raise ValueError('local receipt projection changed across the capacity wait')
         projection = projections[0]
         if (projection['owner_instance'] != key['owner_instance']
                 or projection['segment_id'] != key['segment_id']
                 or projection['slot_offset'] != key['slot_offset']):
             raise ValueError('local reservation does not belong to the original waiter')
-        identity = {k: projection[k] for k in tuple(projection)[:9]}
+        identity = {k: projection[k] for k in
+                    ('magic', 'record_type', 'owner_instance', 'payload_capacity', 'segment_id',
+                     'slot_offset', 'actual_segment_id', 'reservation_sequence', 'prepare_deadline_us')}
         if baseline is not None and baseline != identity:
             raise ValueError('a later capacity cycle replaced the original local reservation')
         baseline = identity
-        if (stamps[0] != stamps[1] or not stamps[2]
-                or (stamps[0] and stamps[0] != stamps[2])
-                or (deadline and (stamps[0] != deadline or stamps[2] != deadline))):
+        if (stamps[0] != stamps[1] or (deadline and stamps[0] != deadline)
+                or (len(stamps) == 3 and (not stamps[2]
+                    or (stamps[0] and stamps[0] != stamps[2])
+                    or (deadline and stamps[2] != deadline)))):
             raise ValueError('original capacity deadline changed or was renewed')
-        deadline = stamps[2]
-    if not handle_slots:
+        deadline = stamps[2] if len(stamps) == 3 else stamps[0]
+    return dict(key=key, cuts=cuts, reservation_sequence=str(baseline['reservation_sequence']),
+                prepare_deadline_us=str(baseline['prepare_deadline_us']), wait_deadline_us=str(deadline),
+                vm_handle_slots_observed=handle_slots, aliased_handles_observed=alias)
+
+
+def _retry_wait_prefix(events, cuts, snapshot, pid, node, *, completed):
+    observed = _retry_trace(snapshot['trace'])
+    if events[:len(observed)] != observed:
+        raise ValueError('retry observation replaced an immutable wait prefix')
+    pending = [e for e in observed if e.get('kind') == 7
+               and e.get('pid') == pid and e.get('node') == node]
+    if len(pending) % 3 != 2 or cuts[:len(pending)] != pending:
+        raise ValueError('actual wait was not observed inside an open capacity span')
+    if completed:
+        if len(cuts) <= len(pending) or number(cuts[len(pending)]['sequence']) <= len(observed):
+            raise ValueError('retry was already qualified before the actual wait snapshot')
+    elif len(cuts) != len(pending):
+        raise ValueError('the failed wait was replaced by another capacity span')
+
+
+def validate_retry_observations(case):
+    """Observe one original UPDATE; no READY, pin-count or retirement verdict."""
+    finish = case['finish']
+    pair = validate_cross_page_finish(finish)
+    original = finish['cross_page']
+    start = original['start']
+    pid, node, xid = (number(start['waiter_pid']), number(start['waiter_node']),
+                      number(original['waiter_xid']))
+    events = _retry_trace(case['trace'])
+    span = _retry_span(events, pid, node, xid)
+    if not span['vm_handle_slots_observed']:
         raise ValueError('no owned VM handle was observed before the capacity wait')
     for snapshot in finish['waits']:
-        observed = _retry_trace(snapshot['trace'])
-        if events[:len(observed)] != observed:
-            raise ValueError('retry completion replaced an immutable wait observation')
-        pending = [e for e in observed if e.get('kind') == 7
-                   and e.get('pid') == pid and e.get('node') == node]
-        if len(pending) % 3 != 2 or cuts[:len(pending)] != pending:
-            raise ValueError('actual wait was not observed inside an open capacity span')
-        if number(cuts[len(pending)]['sequence']) <= len(observed):
-            raise ValueError('retry was already qualified before the actual wait snapshot')
-    return dict(kind='pair_retry', waiter_pid=pid, waiter_xid=xid, key=key,
+        _retry_wait_prefix(events, span['cuts'], snapshot, pid, node, completed=True)
+    return dict(kind='pair_retry', waiter_pid=pid, waiter_xid=xid, key=span['key'],
                 source_tag=pair['source_tag'], destination_tag=pair['destination_tag'],
-                cycles=len(cuts)//3, completed_waits=pair['completed_waits'],
-                reservation_sequence=str(baseline['reservation_sequence']),
-                prepare_deadline_us=str(baseline['prepare_deadline_us']), wait_deadline_us=str(deadline),
-                vm_handle_slots_observed=handle_slots, aliased_handles_observed=alias,
+                cycles=len(span['cuts'])//3, completed_waits=pair['completed_waits'],
+                **{k: span[k] for k in ('reservation_sequence', 'prepare_deadline_us', 'wait_deadline_us',
+                                       'vm_handle_slots_observed', 'aliased_handles_observed')},
                 scope='local_projection_only', authoritative=False, ready_known=False,
                 shared_retirement_known=False, vm_reference_counts_known=False)
+
+
+def validate_retry_exit_observations(case):
+    """An errored wait leaves no completed retry or receipt-cleanup authority."""
+    exited = case['exit']
+    original = validate_wait_exit(exited)
+    start = exited['start']
+    pid, node = number(start['waiter_pid']), number(start['waiter_node'])
+    xid = number(exited['settings']['waiter_xid']) if original['kind'] == 'capacity_timeout' else None
+    events = _retry_trace(case['trace'])
+    span = _retry_span(events, pid, node, pending=True)
+    if xid is not None and span['key']['xid'] != xid:
+        raise ValueError('capacity error and original waiter publication disagree')
+    _retry_wait_prefix(events, span['cuts'], start, pid, node, completed=False)
+    deadline = number(span['wait_deadline_us'])
+    if deadline and original['kind'] == 'capacity_timeout' and deadline != original['deadline_us']:
+        raise ValueError('capacity error and original observed deadline disagree')
+    return dict(kind='wait_retry_exit', exit_kind=original['kind'], sqlstate=original['sqlstate'],
+                waiter_pid=pid, waiter_key=span['key'], wait_seq=original['wait_seq'],
+                end_seq=original['end_seq'], completed_cycles=len(span['cuts'])//3, last_phase=2,
+                **{k: span[k] for k in ('reservation_sequence', 'prepare_deadline_us', 'wait_deadline_us',
+                                       'vm_handle_slots_observed', 'aliased_handles_observed')},
+                wait_deadline_known=bool(deadline), scope='local_projection_only',
+                authoritative=False, ready_known=False, shared_retirement_known=False,
+                vm_reference_counts_known=False, abort_cleanup_known=False)
 
 
 if __name__ == '__main__':
@@ -753,6 +800,8 @@ if __name__ == '__main__':
             print(json.dumps(dict(cross_page=validate_cross_page_finish(case))))
         elif sys.argv[1:] == ['--retry-observation']:
             print(json.dumps(dict(retry_observation=validate_retry_observations(case))))
+        elif sys.argv[1:] == ['--retry-exit']:
+            print(json.dumps(dict(retry_exit=validate_retry_exit_observations(case))))
         elif not sys.argv[1:]:
             print(json.dumps(dict(selected=select_blocker(case))))
         else:
