@@ -230,7 +230,8 @@ sub wait_exit_cell {
 sub judge_requalification {
  my ($case,$option)=@_;
  my %keys=('--requalify-mutation'=>'mutation','--requalify'=>'requalified',
-  '--cross-page-setup'=>'pair_setup','--cross-page-wait'=>'pair','--cross-page'=>'cross_page');
+  '--cross-page-setup'=>'pair_setup','--cross-page-wait'=>'pair','--cross-page'=>'cross_page',
+  '--retry-observation'=>'retry_observation');
  die 'unknown requalification evaluator' unless exists($keys{$option});
  my ($input,$out,$err)=(encode_json($case),'','');
  my $ok=run([$ENV{PYTHON} // 'python3',"$FindBin::RealBin/../pre2/m2_itl_capacity.py",$option],
@@ -414,6 +415,33 @@ sub check_cross_page_setup {
  return $proof;
 }
 
+sub capture_cross_page_retry {
+ my ($node,$finish,$pair,$until)=@_;
+ die 'retry observation exceeded the original deadline' unless clock_gettime(CLOCK_MONOTONIC)<$until;
+ my $case={finish=>$finish,
+  trace=>decode_json($node->safe_psql('postgres','SELECT test_pgrac_native_itl_trace()'))};
+ save_json('b06-pair-retry-observation',$case);
+ die 'retry observation exceeded the original deadline' unless clock_gettime(CLOCK_MONOTONIC)<$until;
+ my ($proof,$error)=judge_requalification($case,'--retry-observation');
+ save_json('b06-pair-retry-judge',{result=>$proof,error=>$error});
+ die 'retry observation exceeded the original deadline' unless clock_gettime(CLOCK_MONOTONIC)<$until;
+ my $original=$finish->{cross_page};
+ my $json=JSON::PP->new->canonical;
+ die "retry observation evidence refused: $error" unless defined($proof)
+  && ($proof->{kind} // '') eq 'pair_retry' && ($proof->{scope} // '') eq 'local_projection_only'
+  && ($proof->{waiter_pid} // 0)==$original->{start}->{waiter_pid}
+  && ($proof->{waiter_xid} // 0)==$original->{waiter_xid}
+  && ($proof->{key}->{xid} // 0)==$original->{waiter_xid}
+  && ($proof->{cycles} // 0)>0 && $proof->{cycles}<=1365
+  && ($proof->{completed_waits} // 0)==$pair->{completed_waits}
+  && ($proof->{vm_handle_slots_observed} // 0)>=1 && $proof->{vm_handle_slots_observed}<=2
+  && !(grep { !exists($proof->{$_}) || $proof->{$_} }
+   qw(authoritative ready_known shared_retirement_known vm_reference_counts_known))
+  && $json->encode($proof->{source_tag}) eq $json->encode($original->{source_tag})
+  && $json->encode($proof->{destination_tag}) eq $json->encode($original->{start}->{tag});
+ return $proof;
+}
+
 sub cross_page_cell {
  my ($node,$nodes)=@_;
  my $name='m2_b06_pair';
@@ -519,6 +547,7 @@ sub cross_page_cell {
    && $json->encode($result->{selected}) eq $json->encode($selected)
    && $json->encode($result->{source_tag}) eq $json->encode($source_tag)
    && $json->encode($result->{destination_tag}) eq $json->encode(\@tag);
+  $result->{retry_observation}=capture_cross_page_retry($node,$finish,$result,$until);
   $proof=$result;
   $by_pid{$_->{pid}}->query_safe('COMMIT') for @holders;
   die 'original two-page UPDATE connection was replaced' unless $r->query_safe('SELECT pg_backend_pid()') eq "$pid";
