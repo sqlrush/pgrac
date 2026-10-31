@@ -6829,7 +6829,9 @@ $(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		test_cluster_undo_pending_product.o: $(top_srcdir)/src/include/cluster/cluster_tx_resolve.h
 $(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_record.h
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
 # Execute the exact local current-MX consumer with the real runtime sampler.

@@ -315,6 +315,80 @@ cluster_vis_tt_block_positive_proof(const char *block, uint32 expected_segment_i
 	return proof;
 }
 
+/* Pure versioned observation shared by exact proof and held runtime readers. */
+bool
+cluster_vis_tt_block_slot_read(const char *block, uint32 expected_segment_id,
+							  uint8 expected_owner_instance,
+							  uint32 expected_segment_generation,
+							  uint16 expected_slot_offset, TTSlot *out_slot,
+							  FullTransactionId *out_original_full_xid)
+{
+	const UndoSegmentHeaderData *hdr;
+	const UndoSegmentHeaderDataV2 *v2;
+	const uint8 legacy_reserved[7] = { 0 };
+	TTSlot slot;
+	FullTransactionId original = InvalidFullTransactionId;
+	bool is_v2;
+
+	if (out_slot != NULL)
+		memset(out_slot, 0, sizeof(*out_slot));
+	if (out_original_full_xid != NULL)
+		*out_original_full_xid = InvalidFullTransactionId;
+	if (block == NULL || out_slot == NULL || expected_segment_id == 0
+		|| expected_segment_id > UINT16_MAX
+		|| expected_owner_instance == UNDO_OWNER_INSTANCE_INVALID
+		|| expected_owner_instance > UNDO_OWNER_INSTANCE_MAX
+		|| expected_segment_generation == UINT32_MAX
+		|| expected_slot_offset >= TT_SLOTS_PER_SEGMENT)
+		return false;
+
+	hdr = (const UndoSegmentHeaderData *)block;
+	v2 = (const UndoSegmentHeaderDataV2 *)block;
+	is_v2 = v2->tt_layout_version == CLUSTER_UNDO_TT_LAYOUT_V2;
+	if (is_v2) {
+		if (!cluster_vis_tt_v2_header_matches(block, expected_segment_id, expected_owner_instance)
+			|| v2->wrap_count != expected_segment_generation
+			|| !cluster_vis_tt_v2_slot_copy(&v2->tt_slots[expected_slot_offset], &slot))
+			return false;
+		original = FullTransactionIdFromU64(v2->tt_slots[expected_slot_offset].original_full_xid);
+	} else {
+		if (memcmp(hdr->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0)
+			return false;
+#ifdef USE_PGRAC_CLUSTER
+		if (!UndoSegmentHeader_identity_matches(block, expected_segment_id, expected_owner_instance))
+			return false;
+#else
+		/* Standalone policy builds retain the same page/identity refusal. */
+		{
+			const PageHeader ph = (PageHeader)block;
+			const UndoSegmentHeaderData *candidate = (const UndoSegmentHeaderData *)block;
+
+			if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0
+				|| PageGetPageSize((Page)block) != BLCKSZ
+				|| PageGetPageLayoutVersion((Page)block) != PG_PAGE_LAYOUT_VERSION
+				|| candidate->segment_id != expected_segment_id
+				|| candidate->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
+				|| candidate->owner_instance != expected_owner_instance
+				|| candidate->tt_slots_count != TT_SLOTS_PER_SEGMENT
+				|| (candidate->segment_state != SEGMENT_ALLOCATED
+					&& candidate->segment_state != SEGMENT_ACTIVE
+					&& candidate->segment_state != SEGMENT_COMMITTED
+					&& candidate->segment_state != SEGMENT_RECYCLABLE))
+				return false;
+		}
+#endif
+
+		if (hdr->wrap_count != expected_segment_generation)
+			return false;
+		slot = hdr->tt_slots[expected_slot_offset];
+	}
+
+	*out_slot = slot;
+	if (out_original_full_xid != NULL)
+		*out_original_full_xid = original;
+	return true;
+}
+
 /*
  * cluster_vis_tt_block_exact_fact
  *
@@ -333,67 +407,17 @@ cluster_vis_tt_block_exact_fact(const char *block, uint32 expected_segment_id,
 								 uint16 expected_wrap, SCN *out_commit_scn,
 								 FullTransactionId *out_original_full_xid)
 {
-	const UndoSegmentHeaderData *hdr;
-	const UndoSegmentHeaderDataV2 *v2;
-	const uint8 legacy_reserved[7] = { 0 };
 	TTSlot slot;
 	FullTransactionId original = InvalidFullTransactionId;
-	bool is_v2;
 
 	if (out_commit_scn != NULL)
 		*out_commit_scn = InvalidScn;
 	if (out_original_full_xid != NULL)
 		*out_original_full_xid = InvalidFullTransactionId;
-
-	/* These are the wire/ref domains.  Refuse widened or sentinel values. */
-	if (block == NULL || expected_segment_id == 0 || expected_segment_id > UINT16_MAX
-		|| expected_owner_instance == UNDO_OWNER_INSTANCE_INVALID
-		|| expected_owner_instance > UNDO_OWNER_INSTANCE_MAX
-		|| expected_segment_generation == UINT32_MAX
-		|| expected_slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| !TransactionIdIsNormal(expected_xid) || expected_wrap > TT_WRAP_MAX)
+	if (!TransactionIdIsNormal(expected_xid) || expected_wrap > TT_WRAP_MAX
+		|| !cluster_vis_tt_block_slot_read(block, expected_segment_id, expected_owner_instance,
+			 expected_segment_generation, expected_slot_offset, &slot, &original))
 		return CLUSTER_VIS_TT_PROOF_NONE;
-
-	hdr = (const UndoSegmentHeaderData *)block;
-	v2 = (const UndoSegmentHeaderDataV2 *)block;
-	is_v2 = v2->tt_layout_version == CLUSTER_UNDO_TT_LAYOUT_V2;
-	if (is_v2) {
-		if (!cluster_vis_tt_v2_header_matches(block, expected_segment_id, expected_owner_instance)
-			|| v2->wrap_count != expected_segment_generation
-			|| !cluster_vis_tt_v2_slot_copy(&v2->tt_slots[expected_slot_offset], &slot))
-			return CLUSTER_VIS_TT_PROOF_NONE;
-		original = FullTransactionIdFromU64(v2->tt_slots[expected_slot_offset].original_full_xid);
-	} else {
-		if (memcmp(hdr->_pad_57, legacy_reserved, sizeof(legacy_reserved)) != 0)
-			return CLUSTER_VIS_TT_PROOF_NONE;
-#ifdef USE_PGRAC_CLUSTER
-		if (!UndoSegmentHeader_identity_matches(block, expected_segment_id, expected_owner_instance))
-			return CLUSTER_VIS_TT_PROOF_NONE;
-#else
-		/* Standalone policy builds retain the same page/identity refusal. */
-		{
-			const PageHeader ph = (PageHeader)block;
-			const UndoSegmentHeaderData *candidate = (const UndoSegmentHeaderData *)block;
-
-			if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0
-				|| PageGetPageSize((Page)block) != BLCKSZ
-				|| PageGetPageLayoutVersion((Page)block) != PG_PAGE_LAYOUT_VERSION
-				|| candidate->segment_id != expected_segment_id
-				|| candidate->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
-				|| candidate->owner_instance != expected_owner_instance
-				|| candidate->tt_slots_count != TT_SLOTS_PER_SEGMENT
-				|| (candidate->segment_state != SEGMENT_ALLOCATED
-					&& candidate->segment_state != SEGMENT_ACTIVE
-					&& candidate->segment_state != SEGMENT_COMMITTED
-					&& candidate->segment_state != SEGMENT_RECYCLABLE))
-				return CLUSTER_VIS_TT_PROOF_NONE;
-		}
-#endif
-
-		if (hdr->wrap_count != expected_segment_generation)
-			return CLUSTER_VIS_TT_PROOF_NONE;
-		slot = hdr->tt_slots[expected_slot_offset];
-	}
 
 	if (slot.xid != expected_xid || slot.wrap != expected_wrap
 		|| (slot.flags & (uint8)~TT_SLOT_FLAGS_KNOWN) != 0

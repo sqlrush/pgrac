@@ -38,6 +38,7 @@
 #include "access/xlogdefs.h"
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_scn.h"	  /* SCN */
+#include "cluster/cluster_tt_slot.h" /* TTSlot observation */
 #include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -435,6 +436,16 @@ extern ClusterVisTtProof cluster_vis_tt_block_exact_proof(
 	const char *block, uint32 expected_segment_id, uint8 expected_owner_instance,
 	uint32 expected_segment_generation, uint16 expected_slot_offset,
 	TransactionId expected_xid, uint16 expected_wrap, SCN *out_commit_scn);
+
+/* Copy one slot only after explicit TT32/TT40 framing, owner and generation
+ * checks. TT40 additionally validates the stored original identity. This is
+ * an observation, not a transaction verdict or a live-origin grant; callers
+ * retain their exact xid/wrap, C1b and final current/ROOT/admission checks.
+ * TT32 leaves FullXid invalid. Refusal clears both outputs. */
+extern bool cluster_vis_tt_block_slot_read(
+	const char *block, uint32 expected_segment_id, uint8 expected_owner_instance,
+	uint32 expected_segment_generation, uint16 expected_slot_offset,
+	TTSlot *out_slot, FullTransactionId *out_original_full_xid);
 
 /* Same exact predicate, additionally copying the persisted TT40 FullXid.
  * TT32 leaves it invalid; no epoch is inferred. NONE clears both outputs.
