@@ -37,6 +37,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 
 #include <string.h>
 
@@ -446,10 +447,19 @@ cluster_undo_block0_current_prove_strict_empty_exclusive(
 	return g_current_empty_result;
 }
 
+static char g_canned_block[BLCKSZ];
+static bool g_capacity_apply_observe;
+static ClusterUndoCapacityChangeFence g_capacity_apply_fence;
+
 void
 cluster_undo_block0_unpin(ClusterUndoBlock0Pin *pin)
 {
 	if (pin != NULL && pin->slot >= 0) {
+		if (g_capacity_apply_observe) {
+			uint64 sequence;
+			UT_ASSERT(!cluster_undo_capacity_change_sample(&sequence));
+			UT_ASSERT_EQ(memcmp(g_current_resident, g_canned_block, BLCKSZ), 0);
+		}
 		g_current_unpin_calls++;
 		pin->slot = -1;
 	}
@@ -555,7 +565,7 @@ static bool g_read_hdr_second_enabled = false;
 static int g_read_hdr_calls = 0;
 static int g_read_hdr_fail_on_call = 0;
 
-static char g_canned_block[BLCKSZ];		  /* returned by read_block for segment 1 */
+/* g_canned_block is declared above the resident-pin callbacks. */
 static bool g_sealed_header_io;
 static uint32 g_canned_block_segment = 1; /* which segment_id the canned block answers */
 static bool g_read_block_ok = true;
@@ -947,6 +957,10 @@ cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent, uint
 									  uint32 len)
 {
 	UT_ASSERT_EQ(fd, 77);
+	if (g_capacity_apply_observe) {
+		uint64 sequence;
+		UT_ASSERT(!cluster_undo_capacity_change_sample(&sequence));
+	}
 	if (!XLogRecPtrIsInvalid(g_write_requires_flush) && g_flush_ptr < g_write_requires_flush)
 		g_write_before_flush = true;
 	return cluster_undo_smgr_write_header_bytes(intent, segment_id, owner_instance, offset, buf,
@@ -2335,7 +2349,16 @@ UT_TEST(test_commit_stage_then_apply_publishes_identical_durable_and_resident_su
 	owner = cluster_tt_slot_durable_commit_stage(1, 4, 7, 100, 5, scn_encode(1, 42), &admission,
 												 &successor);
 	UT_ASSERT(cluster_tt_slot_durable_commit_staged(1, 7, 100, 5));
+	cluster_undo_capacity_fence_init(&g_capacity_apply_fence);
+	cluster_undo_capacity_fence_attach(&g_capacity_apply_fence);
+	g_capacity_apply_observe = true;
 	apply_after_flush((XLogRecPtr)0x5000);
+	g_capacity_apply_observe = false;
+	{
+		uint64 sequence;
+		UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	}
+	cluster_undo_capacity_fence_attach(NULL);
 
 	UT_ASSERT_EQ(owner, 1);
 	UT_ASSERT(admission.entered);
@@ -2737,7 +2760,16 @@ UT_TEST(test_prepared_commit_stage_emits_and_writes_only_when_told)
 	UT_ASSERT_EQ(g_tt_wal_order[0], 'c');
 	UT_ASSERT_EQ(g_write_hdr_calls, 0);
 
+	cluster_undo_capacity_fence_init(&g_capacity_apply_fence);
+	cluster_undo_capacity_fence_attach(&g_capacity_apply_fence);
+	g_capacity_apply_observe = true;
 	cluster_tt_slot_durable_prepared_apply(&stage);
+	g_capacity_apply_observe = false;
+	{
+		uint64 sequence;
+		UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	}
+	cluster_undo_capacity_fence_attach(NULL);
 	UT_ASSERT_EQ(g_write_hdr_calls, 1);
 	UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_COMMITTED);
 	UT_ASSERT_EQ(g_last_written_slot.xid, 100);

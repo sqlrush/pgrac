@@ -35,6 +35,7 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/spin.h"
+#include "cluster/cluster_undo_capacity.h"
 #include "test_cluster_pgproc_active_types.inc"
 
 static int observe_busy_kind;
@@ -8017,6 +8018,182 @@ UT_TEST(test_oldest_age_requires_original_snapshot_clock_and_layout)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+static ClusterUndoCapacityChangeFence *capacity_test_fence;
+static unsigned capacity_test_wakeups;
+
+static void
+capacity_test_wakeup_observer(void)
+{
+	uint64 sequence;
+
+	UT_ASSERT_EQ(pg_atomic_read_u64(&capacity_test_fence->inflight_writers), 1);
+	UT_ASSERT(!cluster_undo_capacity_change_sample(&sequence));
+	capacity_test_wakeups++;
+}
+
+UT_TEST(test_capacity_fence_receipt_apply_cancel_and_reclaim_use_original_producers)
+{
+	ClusterUndoCapacityChangeFence fence;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcApplyToken token;
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult reply;
+	uint64 sequence, participant_index, receipt_index;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 81, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.change_sequence), sequence + 2);
+	target = handle.receipt->target;
+	target.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	target.itl_xid = origin->key.xid;
+	target.itl_class = 1;
+	target.itl_slot_wrap = 1;
+	target.uba[0] = 1;
+	target.planned_predecessor_sha256[0] = 1;
+	target.planned_successor_sha256[0] = 2;
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+				 CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.change_sequence), sequence + 2);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+				 CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&handle));
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	cluster_undo_capacity_fence_attach(NULL);
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 81, &handle), CLUSTER_CTRC_PREPARE_READY);
+	cluster_undo_capacity_fence_attach(&fence);
+	capacity_test_fence = &fence;
+	capacity_test_wakeups = 0;
+	wakeup_hook = capacity_test_wakeup_observer;
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&handle));
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(capacity_test_wakeups, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&handle));
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	wakeup_hook = NULL;
+	cluster_undo_capacity_fence_attach(NULL);
+
+	reset_fixture();
+	UT_ASSERT(seed_frozen_certificate(0, &dispatch, &participant_index, &receipt_index));
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &reply));
+	UT_ASSERT_EQ(reply, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.change_sequence), sequence + 2);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_entries()[participant_index],
+							  sizeof(ClusterCtrcParticipantEntry)));
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_receipt_entries()[receipt_index], sizeof(ClusterCtrcReceipt)));
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
+UT_TEST(test_capacity_fence_empty_selector_exception_retires_lazy_scope)
+{
+	ClusterUndoCapacityChangeFence fence;
+	ClusterCtrcTxnKeyV1 key;
+	uint64 sequence;
+	volatile bool caught = false;
+
+	reset_fixture();
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	InterruptPending = 1;
+	PG_TRY();
+	{
+		(void)cluster_ctrc_origin_next_open_shared(&key);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	InterruptPending = 0;
+	UT_ASSERT(caught);
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	UT_ASSERT_EQ(held_count, 0);
+	/* Attach asserts no leaked process-local scope after siglongjmp. */
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
+/* The production reservation/OPEN/CANCEL producers invalidate the same fence
+ * sampled by capacity readers. Empty selectors and private preflight copies
+ * must leave an otherwise current observation intact. */
+UT_TEST(test_capacity_fence_tracks_actual_origin_producers_only)
+{
+	ClusterUndoCapacityChangeFence fence;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcOriginEntry private_origin = { 0 };
+	uint64 sequence;
+	uint32 grant;
+
+	reset_fixture();
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(test_top_full));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	/* A raw private entry is never a shared producer, even nested inside an
+	 * actual outer writer's lazy scope. */
+	{
+		bool entered = cluster_undo_capacity_write_scope_begin();
+		UT_ASSERT_EQ(cluster_ctrc_origin_open_active(&private_origin, &key, 7),
+					 CLUSTER_CTRC_ORIGIN_OPENED);
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	cluster_undo_capacity_fence_attach(NULL);
+
+	reset_fixture();
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(!cluster_ctrc_origin_next_open_shared(&key));
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(test_top_full));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
 int
 main(void)
 {
@@ -8024,7 +8201,10 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(186);
+	UT_PLAN(189);
+	UT_RUN(test_capacity_fence_receipt_apply_cancel_and_reclaim_use_original_producers);
+	UT_RUN(test_capacity_fence_empty_selector_exception_retires_lazy_scope);
+	UT_RUN(test_capacity_fence_tracks_actual_origin_producers_only);
 	UT_RUN(test_bounded_pool_selectors_observe_work_after_intervening_unlock);
 	UT_RUN(test_empty_bounded_pool_scan_keeps_round_robin_position);
 	UT_RUN(test_empty_pool_selectors_cancel_without_retaining_shared_locks);

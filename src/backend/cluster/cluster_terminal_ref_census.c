@@ -29,6 +29,7 @@
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_capacity.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
@@ -1744,6 +1745,25 @@ typedef struct ClusterCtrcSharedHeader {
 	pg_atomic_uint64 real_completion_count;
 } ClusterCtrcSharedHeader;
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+static ClusterCtrcSharedHeader *CtrcShared;
+#endif
+
+static void
+ctrc_capacity_write_mark(const void *address)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	uintptr_t base = (uintptr_t)CtrcShared;
+	uintptr_t value = (uintptr_t)address;
+
+	/* Private preflight copies must not revoke a shared observation. */
+	if (CtrcShared != NULL && value >= base && value - base < CtrcShared->total_bytes)
+		cluster_undo_capacity_write_mark();
+#else
+	(void)address;
+#endif
+}
+
 static bool
 ctrc_size_add(Size left, Size right, Size *result)
 {
@@ -2488,15 +2508,18 @@ ctrc_origin_release_reclaim_locked(uint64 origin_index)
 														&checked))
 		return false;
 
+	ctrc_capacity_write_mark(CtrcShared);
 	MemSet(&ctrc_origin_ack_entries()[origin_index * nodes], 0,
 		   nodes * sizeof(ClusterCtrcLocalReleaseAckV1));
+	ctrc_capacity_write_mark(origin);
 	MemSet(origin, 0, sizeof(*origin));
 	pg_atomic_fetch_add_u64(&CtrcShared->real_completion_count, 1);
 	return true;
 }
 
 static bool
-ctrc_origin_next_certificate_snapshot_shared(ClusterCtrcOriginCertificateSnapshot *snapshot)
+ctrc_origin_next_certificate_snapshot_shared_capacity_internal(
+	ClusterCtrcOriginCertificateSnapshot *snapshot)
 {
 	uint64 visited;
 	uint64 limit;
@@ -2522,6 +2545,7 @@ ctrc_origin_next_certificate_snapshot_shared(ClusterCtrcOriginCertificateSnapsho
 			|| !ctrc_cleaner_owns_key(&origin->key))
 			continue;
 		if (!ctrc_origin_certificate_snapshot_index_locked(index, snapshot)) {
+			ctrc_capacity_write_mark(origin);
 			origin->state = CTRC_ORIGIN_BLOCKED;
 			continue;
 		}
@@ -2531,6 +2555,24 @@ ctrc_origin_next_certificate_snapshot_shared(ClusterCtrcOriginCertificateSnapsho
 	LWLockRelease(&CtrcShared->origin_lock);
 	ctrc_scan_charge(CTRC_SCAN_CERTIFICATE, visited + (found ? 1 : 0));
 	return found;
+}
+
+static bool
+ctrc_origin_next_certificate_snapshot_shared(ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = ctrc_origin_next_certificate_snapshot_shared_capacity_internal(snapshot);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 static bool
@@ -2550,7 +2592,8 @@ ctrc_origin_certificate_snapshot_matches_shared(
 }
 
 static bool
-ctrc_origin_certificate_commit_shared(const ClusterCtrcOriginCertificateSnapshot *snapshot)
+ctrc_origin_certificate_commit_shared_capacity_internal(
+	const ClusterCtrcOriginCertificateSnapshot *snapshot)
 {
 	ClusterCtrcOriginEntry *origin;
 	bool committed = false;
@@ -2565,6 +2608,24 @@ ctrc_origin_certificate_commit_shared(const ClusterCtrcOriginCertificateSnapshot
 		committed = ctrc_origin_release_reclaim_locked(snapshot->origin_index);
 	LWLockRelease(&CtrcShared->origin_lock);
 	return committed;
+}
+
+static bool
+ctrc_origin_certificate_commit_shared(const ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = ctrc_origin_certificate_commit_shared_capacity_internal(snapshot);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 static bool
@@ -3103,6 +3164,7 @@ ctrc_allocate_journal_sequence(uint64 *sequence_out)
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	if (CtrcShared->global_journal_generation != 0
 		&& CtrcShared->global_journal_generation != UINT64_MAX) {
+		ctrc_capacity_write_mark(CtrcShared);
 		*sequence_out = CtrcShared->global_journal_generation++;
 		allocated = true;
 	} else
@@ -3138,6 +3200,7 @@ cluster_ctrc_origin_reserve_entry(ClusterCtrcOriginEntry *origin, const ClusterC
 		result = CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN;
 		reservation->kind = CTRC_ORIGIN_RESERVATION_EXISTING_OPEN;
 	} else if (ctrc_bytes_zero(origin, sizeof(*origin))) {
+		ctrc_capacity_write_mark(origin);
 		origin->key = *key;
 		origin->reservation_generation = reservation_generation;
 		origin->diagnostic_born_us = ctrc_monotonic_us();
@@ -3154,7 +3217,10 @@ cluster_ctrc_origin_reserve_entry(ClusterCtrcOriginEntry *origin, const ClusterC
 		/* A second owner for the same physical origin slot is an invariant
 		 * conflict.  Retain it rather than allowing either claimant to reuse
 		 * the entry. */
-		origin->state = CTRC_ORIGIN_BLOCKED;
+		{
+			ctrc_capacity_write_mark(origin);
+			origin->state = CTRC_ORIGIN_BLOCKED;
+		}
 		return result;
 	}
 
@@ -3192,6 +3258,7 @@ cluster_ctrc_origin_cancel_pre_bind_entry(ClusterCtrcOriginEntry *origin, uint64
 		|| !ctrc_bytes_zero(origin->touched, sizeof(origin->touched))
 		|| !ctrc_bytes_zero(origin->close_request_id, sizeof(origin->close_request_id)))
 		return false;
+	ctrc_capacity_write_mark(origin);
 	MemSet(origin, 0, sizeof(*origin));
 	return true;
 }
@@ -3210,13 +3277,14 @@ cluster_ctrc_origin_block_post_bind_entry(ClusterCtrcOriginEntry *origin, uint64
 		|| origin->ack_bitmap != 0
 		|| !ctrc_bytes_zero(origin->close_request_id, sizeof(origin->close_request_id)))
 		return false;
+	ctrc_capacity_write_mark(origin);
 	origin->state = CTRC_ORIGIN_BLOCKED;
 	return true;
 }
 
-ClusterCtrcOriginReserveResult
-cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
-								   ClusterCtrcOriginReservation *reservation)
+static ClusterCtrcOriginReserveResult
+cluster_ctrc_origin_reserve_active_capacity_internal(const ClusterCtrcTxnKeyV1 *key,
+													 ClusterCtrcOriginReservation *reservation)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcOriginEntry *origin;
@@ -3267,17 +3335,20 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 	if (origin->state == CTRC_ORIGIN_OPEN)
 		reservation_generation = origin->reservation_generation;
 	else if (CtrcShared->global_reservation_generation != 0
-			 && CtrcShared->global_reservation_generation != UINT64_MAX)
+			 && CtrcShared->global_reservation_generation != UINT64_MAX) {
+		ctrc_capacity_write_mark(CtrcShared);
 		reservation_generation = CtrcShared->global_reservation_generation++;
-	else {
+	} else {
 		CtrcShared->full_refusal_count++;
 		LWLockRelease(&CtrcShared->origin_lock);
 		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 	}
 	result = cluster_ctrc_origin_reserve_entry(origin, key, index, reservation_generation,
 											   reservation);
-	if (result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING)
+	if (result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING) {
+		ctrc_capacity_write_mark(origin);
 		origin->original_full_xid = top_full;
+	}
 	if (result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING
 		|| result == CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN)
 		reservation->original_full_xid = top_full;
@@ -3291,6 +3362,25 @@ cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
 		MemSet(reservation, 0, sizeof(*reservation));
 	return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
 #endif
+}
+
+ClusterCtrcOriginReserveResult
+cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
+								   ClusterCtrcOriginReservation *reservation)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcOriginReserveResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_reserve_active_capacity_internal(key, reservation);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 /* A released predecessor can retain the one row for this physical TT slot
@@ -3321,8 +3411,9 @@ cluster_ctrc_origin_release_overlap_pending(const ClusterCtrcTxnKeyV1 *key)
 #endif
 }
 
-bool
-cluster_ctrc_origin_cancel_pre_bind(const ClusterCtrcOriginReservation *reservation)
+static bool
+cluster_ctrc_origin_cancel_pre_bind_capacity_internal(
+	const ClusterCtrcOriginReservation *reservation)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	uint64 index;
@@ -3343,7 +3434,26 @@ cluster_ctrc_origin_cancel_pre_bind(const ClusterCtrcOriginReservation *reservat
 }
 
 bool
-cluster_ctrc_origin_block_post_bind(const ClusterCtrcOriginReservation *reservation)
+cluster_ctrc_origin_cancel_pre_bind(const ClusterCtrcOriginReservation *reservation)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_cancel_pre_bind_capacity_internal(reservation);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
+static bool
+cluster_ctrc_origin_block_post_bind_capacity_internal(
+	const ClusterCtrcOriginReservation *reservation)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	uint64 index;
@@ -3364,8 +3474,26 @@ cluster_ctrc_origin_block_post_bind(const ClusterCtrcOriginReservation *reservat
 }
 
 bool
-cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservation,
-								  uint32 *grant_generation)
+cluster_ctrc_origin_block_post_bind(const ClusterCtrcOriginReservation *reservation)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_block_post_bind_capacity_internal(reservation);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
+static bool
+cluster_ctrc_origin_open_reserved_capacity_internal(const ClusterCtrcOriginReservation *reservation,
+													uint32 *grant_generation)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcOriginEntry *origin;
@@ -3404,6 +3532,7 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 			   && origin->grant_generation == 0
 			   && memcmp(&origin->key, &reservation->key, sizeof(reservation->key)) == 0
 			   && CtrcShared->global_grant_generation != UINT32_MAX) {
+		ctrc_capacity_write_mark(CtrcShared);
 		grant = CtrcShared->global_grant_generation++;
 		result = cluster_ctrc_origin_open_active(origin, &reservation->key, grant);
 		opened = result == CLUSTER_CTRC_ORIGIN_OPENED || result == CLUSTER_CTRC_ORIGIN_DUPLICATE;
@@ -3426,10 +3555,31 @@ cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservatio
 #endif
 }
 
-ClusterCtrcTouchResult
-cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
-								const ClusterCtrcParticipantIdentity *participant,
-								ClusterCtrcProofClass proof_class, uint32 *grant_out)
+bool
+cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservation,
+								  uint32 *grant_generation)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result
+			= cluster_ctrc_origin_open_reserved_capacity_internal(reservation, grant_generation);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
+static ClusterCtrcTouchResult
+cluster_ctrc_origin_touch_exact_capacity_internal(const ClusterCtrcTxnKeyV1 *key,
+												  const ClusterCtrcParticipantIdentity *participant,
+												  ClusterCtrcProofClass proof_class,
+												  uint32 *grant_out)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcTouchResult result;
@@ -3447,6 +3597,7 @@ cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	if (memcmp(&origin->key, key, sizeof(*key)) != 0) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		CtrcShared->full_refusal_count++;
 		result = CLUSTER_CTRC_TOUCH_REFUSED;
@@ -3464,6 +3615,27 @@ cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
 		*grant_out = 0;
 	return CLUSTER_CTRC_TOUCH_REFUSED;
 #endif
+}
+
+ClusterCtrcTouchResult
+cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
+								const ClusterCtrcParticipantIdentity *participant,
+								ClusterCtrcProofClass proof_class, uint32 *grant_out)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcTouchResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_touch_exact_capacity_internal(key, participant,
+																			proof_class, grant_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 /* Tasks 3-8 replace these fail-closed transition bodies in protocol order.
@@ -3487,12 +3659,16 @@ cluster_ctrc_origin_open_active(ClusterCtrcOriginEntry *origin, const ClusterCtr
 		|| origin->ack_bitmap != 0 || !ctrc_bytes_zero(origin->reserved8, sizeof(origin->reserved8))
 		|| !ctrc_bytes_zero(origin->touched, sizeof(origin->touched))
 		|| !ctrc_bytes_zero(origin->close_request_id, sizeof(origin->close_request_id))) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return CLUSTER_CTRC_ORIGIN_REFUSED;
 	}
 
-	if (ctrc_bytes_zero(origin, sizeof(*origin)))
+	if (ctrc_bytes_zero(origin, sizeof(*origin))) {
+		ctrc_capacity_write_mark(origin);
 		origin->diagnostic_born_us = ctrc_monotonic_us();
+	}
+	ctrc_capacity_write_mark(origin);
 	origin->key = *key;
 	origin->grant_generation = grant_generation;
 	origin->state = CTRC_ORIGIN_OPEN;
@@ -3522,14 +3698,17 @@ cluster_ctrc_origin_record_touched(ClusterCtrcOriginEntry *origin,
 			*grant_out = origin->grant_generation;
 			return CLUSTER_CTRC_TOUCH_DUPLICATE;
 		}
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return CLUSTER_CTRC_TOUCH_REFUSED;
 	}
 	if (origin->touched_count >= CLUSTER_CTRC_MAX_PARTICIPANTS) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return CLUSTER_CTRC_TOUCH_REFUSED;
 	}
 
+	ctrc_capacity_write_mark(origin);
 	origin->touched[participant->node_id] = *participant;
 	origin->touched_bitmap |= UINT32_C(1) << participant->node_id;
 	origin->touched_count++;
@@ -3626,9 +3805,11 @@ cluster_ctrc_origin_begin_seal_entry(ClusterCtrcOriginEntry *origin, uint64 seal
 		|| origin->close_confirmed_bitmap != 0 || origin->ack_bitmap != 0
 		|| !ctrc_bytes_zero(origin->close_request_id, sizeof(origin->close_request_id))
 		|| !ctrc_origin_frozen_touch_set_valid(origin)) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
+	ctrc_capacity_write_mark(origin);
 	origin->seal_generation = seal_generation;
 	origin->state = CTRC_ORIGIN_SEALING;
 	return true;
@@ -3650,15 +3831,19 @@ cluster_ctrc_origin_arm_close_entry(ClusterCtrcOriginEntry *origin, uint16 parti
 	if ((origin->close_dispatched_bitmap & bit) != 0) {
 		if (origin->close_request_id[participant_node_id] == request_id)
 			return true;
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
 	if (origin->close_request_id[participant_node_id] != 0) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
+	ctrc_capacity_write_mark(origin);
 	origin->close_request_id[participant_node_id] = request_id;
 	pg_write_barrier();
+	ctrc_capacity_write_mark(origin);
 	origin->close_dispatched_bitmap |= bit;
 	return true;
 }
@@ -3678,13 +3863,17 @@ cluster_ctrc_origin_note_close_reply_entry(ClusterCtrcOriginEntry *origin,
 		|| origin->close_request_id[participant_node_id] != request_id)
 		return false;
 	if (result != CTRC_SEAL_REPLY_PENDING_DRAIN && result != CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
+	ctrc_capacity_write_mark(origin);
 	origin->close_confirmed_bitmap |= bit;
 	if (origin->state == CTRC_ORIGIN_SEALING
-		&& origin->close_confirmed_bitmap == origin->touched_bitmap)
+		&& origin->close_confirmed_bitmap == origin->touched_bitmap) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_SEALED;
+	}
 	return true;
 }
 
@@ -3708,15 +3897,19 @@ cluster_ctrc_origin_arm_certificate_entry(ClusterCtrcOriginEntry *origin,
 	if ((origin->close_dispatched_bitmap & bit) != 0) {
 		if (origin->close_request_id[participant_node_id] == request_id)
 			return true;
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
 	if (origin->close_request_id[participant_node_id] != 0) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
+	ctrc_capacity_write_mark(origin);
 	origin->close_request_id[participant_node_id] = request_id;
 	pg_write_barrier();
+	ctrc_capacity_write_mark(origin);
 	origin->close_dispatched_bitmap |= bit;
 	return true;
 }
@@ -3736,6 +3929,7 @@ cluster_ctrc_origin_note_certificate_reply_entry(ClusterCtrcOriginEntry *origin,
 	if ((origin->touched_bitmap & bit) == 0 || (origin->close_dispatched_bitmap & bit) == 0
 		|| origin->close_request_id[participant_node_id] != request_id)
 		return false;
+	ctrc_capacity_write_mark(origin);
 	origin->close_confirmed_bitmap |= bit;
 	return true;
 }
@@ -3746,14 +3940,17 @@ cluster_ctrc_origin_begin_cleaning_entry(ClusterCtrcOriginEntry *origin)
 	if (origin == NULL || origin->seal_generation == 0)
 		return false;
 	if (origin->state == CTRC_ORIGIN_SEALING && origin->touched_bitmap == 0
-		&& origin->close_dispatched_bitmap == 0 && origin->close_confirmed_bitmap == 0)
+		&& origin->close_dispatched_bitmap == 0 && origin->close_confirmed_bitmap == 0) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_SEALED;
+	}
 	if (origin->state == CTRC_ORIGIN_CLEANING || origin->state == CTRC_ORIGIN_CERTIFYING)
 		return true;
 	if (origin->state != CTRC_ORIGIN_SEALED
 		|| origin->close_dispatched_bitmap != origin->touched_bitmap
 		|| origin->close_confirmed_bitmap != origin->touched_bitmap)
 		return false;
+	ctrc_capacity_write_mark(origin);
 	origin->state = CTRC_ORIGIN_CLEANING;
 	return true;
 }
@@ -4129,9 +4326,10 @@ ctrc_origin_batch_reply_trace(const char *event, const CtrcOriginBatchReplyTrace
 }
 #endif
 
-bool
-cluster_ctrc_origin_note_close_reply_shared(uint64 request_id, uint16 participant_node_id,
-											ClusterCtrcSealReplyResult result)
+static bool
+cluster_ctrc_origin_note_close_reply_shared_capacity_internal(uint64 request_id,
+															  uint16 participant_node_id,
+															  ClusterCtrcSealReplyResult result)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcOriginEntry *matched = NULL;
@@ -4194,6 +4392,26 @@ cluster_ctrc_origin_note_close_reply_shared(uint64 request_id, uint16 participan
 #endif
 }
 
+bool
+cluster_ctrc_origin_note_close_reply_shared(uint64 request_id, uint16 participant_node_id,
+											ClusterCtrcSealReplyResult result)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_note_close_reply_shared_capacity_internal(
+			request_id, participant_node_id, result);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
 #ifndef CLUSTER_CTRC_UNIT_TEST
 /* The scalar and bounded batch consumers share the exact terminal edge. The
  * origin lock is held from unique lookup until inbox/origin reclamation. */
@@ -4218,9 +4436,9 @@ ctrc_origin_note_certificate_match_locked(uint64 index, uint64 request_id,
 }
 #endif
 
-bool
-cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 participant_node_id,
-												  ClusterCtrcSealReplyResult result)
+static bool
+cluster_ctrc_origin_note_certificate_reply_shared_capacity_internal(
+	uint64 request_id, uint16 participant_node_id, ClusterCtrcSealReplyResult result)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcOriginEntry *matched = NULL;
@@ -4282,6 +4500,26 @@ cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 part
 	(void)result;
 	return false;
 #endif
+}
+
+bool
+cluster_ctrc_origin_note_certificate_reply_shared(uint64 request_id, uint16 participant_node_id,
+												  ClusterCtrcSealReplyResult result)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_note_certificate_reply_shared_capacity_internal(
+			request_id, participant_node_id, result);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
@@ -4380,10 +4618,10 @@ ctrc_origin_reply_lookup_locked(CtrcOriginReplyLookup *lookup,
  * A complete physical census still rejects duplicate request IDs in origins.
  * The bounded stack lookup is neither shared state nor a substitute authority.
  */
-bool
-cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDispatch *dispatches,
-														const ClusterCtrcSealReplyResult *results,
-														Size count)
+static bool
+cluster_ctrc_origin_note_local_certificate_batch_shared_capacity_internal(
+	const ClusterCtrcCloseDispatch *dispatches, const ClusterCtrcSealReplyResult *results,
+	Size count)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	CtrcOriginReplyLookup lookup;
@@ -4453,6 +4691,27 @@ cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDi
 #endif
 }
 
+bool
+cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDispatch *dispatches,
+														const ClusterCtrcSealReplyResult *results,
+														Size count)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_note_local_certificate_batch_shared_capacity_internal(
+			dispatches, results, count);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
 /*
  * cluster_ctrc_origin_note_local_close_batch_shared -- Consume local CLOSE replies.
  *
@@ -4463,11 +4722,10 @@ cluster_ctrc_origin_note_local_certificate_batch_shared(const ClusterCtrcCloseDi
  * one complete lookup remains valid while the original transitions run in
  * input order under origin X. ACKs keep their original exact-key lookup.
  */
-bool
-cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch *dispatches,
-												  const ClusterCtrcSealReplyResult *results,
-												  const ClusterCtrcLocalReleaseAckV1 *acks,
-												  Size count)
+static bool
+cluster_ctrc_origin_note_local_close_batch_shared_capacity_internal(
+	const ClusterCtrcCloseDispatch *dispatches, const ClusterCtrcSealReplyResult *results,
+	const ClusterCtrcLocalReleaseAckV1 *acks, Size count)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	CtrcOriginReplyLookup lookup;
@@ -4545,7 +4803,29 @@ cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch
 }
 
 bool
-cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
+cluster_ctrc_origin_note_local_close_batch_shared(const ClusterCtrcCloseDispatch *dispatches,
+												  const ClusterCtrcSealReplyResult *results,
+												  const ClusterCtrcLocalReleaseAckV1 *acks,
+												  Size count)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_note_local_close_batch_shared_capacity_internal(
+			dispatches, results, acks, count);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
+static bool
+cluster_ctrc_origin_next_open_shared_capacity_internal(ClusterCtrcTxnKeyV1 *key_out)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	static uint64 scan_cursor = 0;
@@ -4574,6 +4854,7 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 			continue;
 		if (!ctrc_txn_key_valid(&origin->key) || origin->grant_generation == 0
 			|| !ctrc_origin_frozen_touch_set_valid(origin)) {
+			ctrc_capacity_write_mark(origin);
 			origin->state = CTRC_ORIGIN_BLOCKED;
 			continue;
 		}
@@ -4592,7 +4873,25 @@ cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
 }
 
 bool
-cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
+cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_next_open_shared_capacity_internal(key_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
+static bool
+cluster_ctrc_origin_begin_seal_shared_capacity_internal(const ClusterCtrcTxnKeyV1 *key)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcOriginEntry *origin;
@@ -4606,6 +4905,7 @@ cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[index];
 	if (memcmp(&origin->key, key, sizeof(*key)) != 0) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		LWLockRelease(&CtrcShared->origin_lock);
 		return false;
@@ -4618,11 +4918,13 @@ cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
 	}
 	if (CtrcShared->global_seal_generation == 0
 		|| CtrcShared->global_seal_generation == UINT64_MAX) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		CtrcShared->full_refusal_count++;
 		LWLockRelease(&CtrcShared->origin_lock);
 		return false;
 	}
+	ctrc_capacity_write_mark(CtrcShared);
 	seal_generation = CtrcShared->global_seal_generation++;
 	sealed = cluster_ctrc_origin_begin_seal_entry(origin, seal_generation);
 	started = sealed;
@@ -4636,6 +4938,24 @@ cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
 	(void)key;
 	return false;
 #endif
+}
+
+bool
+cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_begin_seal_shared_capacity_internal(key);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
@@ -4652,8 +4972,10 @@ ctrc_origin_dispatchable_locked(ClusterCtrcOriginEntry *origin)
 	if (origin->state == CTRC_ORIGIN_SEALED
 		|| (origin->state == CTRC_ORIGIN_SEALING && origin->touched_bitmap == 0))
 		(void)cluster_ctrc_origin_begin_cleaning_entry(origin);
-	if (origin->state == CTRC_ORIGIN_CLEANING && origin->ack_bitmap == origin->touched_bitmap)
+	if (origin->state == CTRC_ORIGIN_CLEANING && origin->ack_bitmap == origin->touched_bitmap) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_CERTIFYING;
+	}
 	if (before != origin->state)
 		ctrc_semantic_progress(false);
 	if (origin->state == CTRC_ORIGIN_RELEASE_PROVEN)
@@ -4677,7 +4999,7 @@ ctrc_dispatch_batch_contains(uint64 index)
  * share. Only indices are retained; arm re-reads the real identity under its
  * original lock. No shared state, receipt or request is pre-reserved here. */
 static void
-ctrc_dispatch_batch_collect(void)
+ctrc_dispatch_batch_collect_capacity_internal(void)
 {
 	uint64 old_index[CTRC_CLEANER_OLD_BATCH];
 	uint64 old_seal[CTRC_CLEANER_OLD_BATCH];
@@ -4797,10 +5119,27 @@ ctrc_dispatch_batch_collect(void)
 		pg_atomic_write_u64(&row->observed_at_us, now);
 	}
 }
+
+static void
+ctrc_dispatch_batch_collect(void)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		ctrc_dispatch_batch_collect_capacity_internal();
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
 #endif
 
-bool
-cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatch_out)
+static bool
+cluster_ctrc_origin_next_close_dispatch_shared_capacity_internal(
+	ClusterCtrcCloseDispatch *dispatch_out)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	bool found = false;
@@ -4835,10 +5174,12 @@ cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatc
 			if (request_id == 0) {
 				if (CtrcShared->global_request_generation == 0
 					|| CtrcShared->global_request_generation == UINT64_MAX) {
+					ctrc_capacity_write_mark(origin);
 					origin->state = CTRC_ORIGIN_BLOCKED;
 					CtrcShared->full_refusal_count++;
 					break;
 				}
+				ctrc_capacity_write_mark(CtrcShared);
 				request_id = CtrcShared->global_request_generation++;
 			}
 			if (!(certificate_notification
@@ -4867,6 +5208,45 @@ cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatc
 	return false;
 #endif
 }
+
+bool
+cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatch_out)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result
+			= cluster_ctrc_origin_next_close_dispatch_shared_capacity_internal(dispatch_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
+#ifndef CLUSTER_CTRC_UNIT_TEST
+typedef struct CtrcCapacityHistoryContext {
+	ClusterCapacityHistoryPass *pass;
+	PGAlignedBlock current_page;
+	ClusterCapacitySegmentIdentityV1 sampled_identity;
+	unsigned current_gets;
+	unsigned pool_gets;
+	unsigned inventory_positions;
+	uint64 pool_sampled[4];
+	bool current_stage;
+	bool pool_stage;
+	bool current_captured;
+	bool inventory_enabled;
+	ClusterCapacityReasonV1 inventory_reason;
+} CtrcCapacityHistoryContext;
+
+static CtrcCapacityHistoryContext *CtrcCapacityHistory;
+static bool ctrc_capacity_history_inventory(unsigned budget, ClusterCapacityObservationV1 *out);
+#endif
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static bool
@@ -4937,6 +5317,14 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 			|| key->root_descriptor_incarnation != root.root_generation)
 			goto sample_done;
 
+		if (CtrcCapacityHistory != NULL && CtrcCapacityHistory->current_stage)
+			CtrcCapacityHistory->current_gets++;
+		if (CtrcCapacityHistory != NULL && CtrcCapacityHistory->pool_stage) {
+			unsigned position = (logical.segment_id - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
+
+			CtrcCapacityHistory->pool_gets++;
+			CtrcCapacityHistory->pool_sampled[position / 64] |= UINT64CONST(1) << (position % 64);
+		}
 		step = cluster_undo_block0_current_acquire_begin_admitted(
 			&logical, CLUSTER_UNDO_BLOCK0_SCUR, cluster_ges_request_timeout_ms, &admission, &guard,
 			&failure);
@@ -5031,6 +5419,20 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 		*released_out = slot.flags == TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
 	if (terminal && header_out != NULL)
 		memcpy(header_out, &page, sizeof(page));
+	if (terminal && CtrcCapacityHistory != NULL && CtrcCapacityHistory->current_stage
+		&& key->segment_id == CtrcCapacityHistory->pass->identity.current_segment) {
+		ClusterCapacitySegmentIdentityV1 *identity = &CtrcCapacityHistory->sampled_identity;
+
+		memcpy(&CtrcCapacityHistory->current_page, &page, sizeof(page));
+		*identity = CtrcCapacityHistory->pass->identity;
+		identity->segment_id = key->segment_id;
+		identity->segment_generation = key->segment_generation;
+		identity->formation_epoch = key->formation_epoch;
+		identity->admission_record_generation = key->admission_record_generation;
+		identity->root_id = key->root_id;
+		identity->root_generation = key->root_generation;
+		CtrcCapacityHistory->current_captured = true;
+	}
 	return terminal;
 }
 
@@ -5453,6 +5855,7 @@ ctrc_capacity_pool_gc_context(uint32 segment_id, uint32 *record_segment)
 
 typedef struct CtrcCapacitySegmentSample {
 	ClusterCapacitySegmentIdentityV1 identity;
+	bool physical_inventory;
 	uint32 retain_reasons;
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
@@ -5558,6 +5961,18 @@ ctrc_capacity_segment_read(CtrcCapacitySegmentSample *sample, SCN horizon)
 		|| header->wrap_count != sample->generation.value
 		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
 		return false;
+	/* A complete negative census needs native evidence even for retained
+	 * rows. This only returns the canonical image; it grants no reuse. */
+	if (sample->physical_inventory) {
+		if (!ctrc_capacity_segment_native(header) || !ctrc_capacity_segment_root_current(sample)
+			|| cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
+															 &final_generation)
+				   != CLUSTER_UNDO_BLOCK0_OK
+			|| !final_generation.known || final_generation.value != sample->generation.value)
+			return false;
+		sample->identity.segment_generation = sample->generation.value;
+		return true;
+	}
 	recyclable
 		= cluster_undo_segment_recyclable_for_mode_with_reasons(header, horizon, true, &reasons);
 	if ((recyclable && !ctrc_capacity_segment_native(header))
@@ -5596,6 +6011,12 @@ ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
 			|| sample->root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || sample->root.root_id == 0
 			|| sample->root.root_generation == 0)
 			goto segment_done;
+		if (CtrcCapacityHistory != NULL && CtrcCapacityHistory->pool_stage) {
+			unsigned position = (sample->logical.segment_id - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
+
+			CtrcCapacityHistory->pool_gets++;
+			CtrcCapacityHistory->pool_sampled[position / 64] |= UINT64CONST(1) << (position % 64);
+		}
 		step = cluster_undo_block0_current_acquire_begin_admitted(
 			&sample->logical, CLUSTER_UNDO_BLOCK0_SCUR, cluster_ges_request_timeout_ms,
 			&sample->admission, &sample->guard, &failure);
@@ -5652,6 +6073,196 @@ ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
 	}
 	cluster_semantic_activation_leave(&sample->admission);
 	return proven;
+}
+
+/* Identity-only revalidation across bounded immediate continuations. */
+static bool
+ctrc_capacity_history_identity_current(const ClusterCapacityHistoryPass *pass)
+{
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterUndoBlock0ResolvedRoot root = { 0 };
+	bool current;
+
+	if (!ctrc_capacity_segment_current(&pass->identity)
+		|| !cluster_undo_capacity_change_current(pass->change_sequence)
+		|| cluster_undo_record_active_segment_id() != pass->record_segment
+		|| pass->configured_cap
+			   != (cluster_undo_segments_max_per_instance < 16
+					   ? 16
+					   : Min((uint32)cluster_undo_segments_max_per_instance,
+							 CLUSTER_UNDO_SEGS_PER_INSTANCE))
+		|| !cluster_undo_cleaner_enabled || !cluster_undo_retention_horizon_enabled
+		|| cluster_normal_stop_maintenance_cut()
+		|| cluster_semantic_activation_enter_r4_terminal_census(&admission)
+			   != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	PG_TRY();
+	{
+		current = admission.formation_epoch == pass->identity.formation_epoch
+				  && admission.record_generation == pass->identity.admission_record_generation
+				  && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+					  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, pass->identity.owner_instance,
+					  pass->identity.current_segment, &root)
+				  && root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED
+				  && root.root_id == pass->identity.root_id
+				  && root.root_generation == pass->identity.root_generation
+				  && cluster_semantic_activation_recheck_r4_terminal_census(&admission);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return current && cluster_undo_capacity_change_current(pass->change_sequence);
+}
+
+/* CURRENT reuses slots rather than the whole segment's record lifecycle.
+ * FREE and terminal rows below the inclusive TT horizon expose real supply;
+ * only exact terminal rows above H can contribute to the negative proof. */
+static ClusterCapacityReasonV1
+ctrc_capacity_history_current(const ClusterTTSlotCurrentSnapshot *snapshot,
+							  const UndoSegmentHeaderData *header, SCN horizon)
+{
+	if (!ctrc_capacity_segment_native(header)
+		|| !cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET))
+		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const ClusterTTSlotCurrentOwner *owner = &snapshot->slots[i];
+		const TTSlot *slot = &header->tt_slots[i];
+
+		if (owner->status == CTS_FREE)
+			return CLUSTER_CAPACITY_SUPPLY_RECHECK;
+		if (owner->segment_id != header->segment_id || owner->slot_offset != i
+			|| !ctrc_bytes_zero(owner->reserved8, sizeof(owner->reserved8))
+			|| owner->status != CTS_COMMITTED || !TransactionIdIsNormal(owner->xid)
+			|| owner->wrap == TT_WRAP_INVALID || owner->wrap >= TT_WRAP_MAX
+			|| owner->xid != slot->xid || owner->wrap != slot->wrap
+			|| slot->status != TT_SLOT_COMMITTED || owner->commit_scn != slot->commit_scn
+			|| !SCN_VALID(slot->commit_scn) || !UBA_is_invalid(slot->first_undo_block)
+			|| slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN)
+			return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+		if (scn_time_cmp(slot->commit_scn, horizon) <= 0)
+			return CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	}
+	return CLUSTER_CAPACITY_PROTECTED_HISTORY;
+}
+
+/* Consume only the original reserved pool share, never a second scan. Exact
+ * absence is discovery; every existing image comes from the admitted SCUR. */
+static bool
+ctrc_capacity_history_inventory(unsigned budget, ClusterCapacityObservationV1 *out)
+{
+	ClusterCapacityHistoryPass *pass = CtrcCapacityHistory->pass;
+	uint32 first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+
+	for (unsigned visited = 0;
+		 visited < budget && pass->covered_positions < CLUSTER_UNDO_SEGS_PER_INSTANCE; visited++) {
+		uint32 position = pass->next_position;
+		uint32 segment = first + position;
+		ClusterUndoBlock0Result presence;
+		CtrcCapacitySegmentSample sample = { 0 };
+		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)sample.page.data;
+		uint32 reasons = 0;
+		bool recyclable;
+
+		CHECK_FOR_INTERRUPTS();
+		CtrcCapacitySegmentCursor = (position + 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		CtrcCapacityHistory->inventory_positions++;
+		presence = cluster_undo_segment_capacity_presence(pass->identity.owner_instance, segment);
+		if (presence == CLUSTER_UNDO_BLOCK0_NOT_FOUND) {
+			if (segment == pass->identity.current_segment || segment == pass->record_segment)
+				goto unknown;
+			pass->first_absent_position = Min(pass->first_absent_position, position);
+			if (position < pass->configured_cap)
+				goto supply;
+		} else if (presence == CLUSTER_UNDO_BLOCK0_OK) {
+			pass->allocated_count++;
+			if (segment != pass->identity.current_segment) {
+				if ((CtrcCapacityHistory->pool_sampled[position / 64]
+					 & (UINT64CONST(1) << (position % 64)))
+					!= 0)
+					goto unknown;
+				sample.identity = pass->identity;
+				sample.identity.segment_id = segment;
+				sample.logical.owner_instance = pass->identity.owner_instance;
+				sample.logical.segment_id = segment;
+				sample.physical_inventory = true;
+				if (!ctrc_capacity_segment_sample(&sample, pass->horizon)
+					|| sample.identity.formation_epoch != pass->identity.formation_epoch
+					|| sample.identity.admission_record_generation
+						   != pass->identity.admission_record_generation
+					|| sample.identity.root_id != pass->identity.root_id
+					|| sample.identity.root_generation != pass->identity.root_generation
+					|| !cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET))
+					goto unknown;
+				/* The exact live record cursor is excluded by the original
+				 * drain/GC contract. Its native bracket and handoff still hold. */
+				if (segment == pass->record_segment) {
+					if (header->segment_state != SEGMENT_ACTIVE)
+						goto unknown;
+					for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+						const TTSlot *slot = &header->tt_slots[i];
+
+						if ((slot->status == TT_SLOT_UNUSED || slot->status == TT_SLOT_RECYCLABLE)
+								? slot->flags != TT_FLAGS_RESERVED
+									  || !UBA_is_invalid(slot->first_undo_block)
+								: slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN
+									  || !UBA_is_invalid(slot->first_undo_block)
+									  || (slot->status == TT_SLOT_COMMITTED
+										  && !SCN_VALID(slot->commit_scn))
+									  || (slot->status == TT_SLOT_ABORTED
+										  && slot->commit_scn != InvalidScn))
+							goto unknown;
+					}
+				} else {
+					if (header->segment_state == SEGMENT_RECYCLABLE
+						|| (header->segment_state == SEGMENT_ALLOCATED && header->tail_block == 0
+							&& ctrc_bytes_zero(header->tt_slots, sizeof(header->tt_slots))))
+						goto supply;
+					recyclable = cluster_undo_segment_recyclable_for_mode_with_reasons(
+						header, pass->horizon, true, &reasons);
+					if (recyclable) {
+						uint64 coordinator, worker;
+						unsigned owner = (segment - 1) % CLUSTER_CTRC_CLEANER_WORKERS;
+
+						if (!cluster_undo_cleaner_capacity_owner_snapshot(owner, &coordinator,
+																		  &worker)
+							|| !ctrc_capacity_segment_origins_absent(segment))
+							goto unknown;
+						MemSet(&out->key, 0, sizeof(out->key));
+						out->segment = sample.identity;
+						out->scope = CLUSTER_CAPACITY_SCOPE_SEGMENT;
+						out->phase = CTRC_ORIGIN_EMPTY;
+						out->owner_worker = owner;
+						out->coordinator_generation = coordinator;
+						out->owner_generation = worker;
+						CtrcCapacityHistory->inventory_reason
+							= CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+						return true;
+					}
+					if (reasons != CLUSTER_UNDO_RETAIN_HISTORY_PIN)
+						goto unknown;
+					pass->saw_history = true;
+				}
+			}
+		} else
+			goto unknown;
+		pass->covered_positions++;
+		pass->next_position = (position + 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		pass->progress = true;
+		continue;
+	unknown:
+		pass->progress = false;
+		pass->incomplete = true;
+		CtrcCapacityHistory->inventory_enabled = false;
+		out->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
+		return false;
+	supply:
+		pass->progress = false;
+		CtrcCapacityHistory->inventory_reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
+		return false;
+	}
+	return false;
 }
 
 static bool
@@ -5723,6 +6334,14 @@ ctrc_capacity_unarmed_gc_probe(uint32 current_segment, SCN horizon, uint64 epoch
 	uint32 first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 	unsigned attempted = 0;
 
+	if (CtrcCapacityHistory != NULL && CtrcCapacityHistory->inventory_enabled) {
+		unsigned before = CtrcCapacityHistory->inventory_positions;
+
+		if (ctrc_capacity_history_inventory(budget, observation))
+			return true;
+		budget -= Min(budget, CtrcCapacityHistory->inventory_positions - before);
+	}
+
 	for (unsigned visited = 0; visited < CLUSTER_UNDO_SEGS_PER_INSTANCE && attempted < budget;
 		 visited++) {
 		uint32 segment_id = first + CtrcCapacitySegmentCursor % CLUSTER_UNDO_SEGS_PER_INSTANCE;
@@ -5731,6 +6350,11 @@ ctrc_capacity_unarmed_gc_probe(uint32 current_segment, SCN horizon, uint64 epoch
 		CtrcCapacitySegmentCursor
 			= (CtrcCapacitySegmentCursor + 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
 		CHECK_FOR_INTERRUPTS();
+		if (CtrcCapacityHistory != NULL
+			&& (CtrcCapacityHistory->pool_sampled[((segment_id - first) / 64)]
+				& (UINT64CONST(1) << ((segment_id - first) % 64)))
+				   != 0)
+			continue;
 		if (segment_id == current_segment || !ctrc_capacity_pool_gc_context(segment_id, &record)
 			|| !ctrc_capacity_segment_origins_absent(segment_id))
 			continue;
@@ -6006,6 +6630,219 @@ cluster_ctrc_capacity_probe_pool_v1(uint32 current_segment, SCN horizon, uint64 
 															observation);
 }
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* An unavailable negative fence cannot suppress original positive evidence. */
+static ClusterCapacityReasonV1
+ctrc_capacity_history_positive(uint32 current_segment, SCN horizon, uint64 epoch,
+							   const ClusterCtrcTxnKeyV1 *hint,
+							   ClusterCapacityObservationV1 *observation)
+{
+	ClusterCtrcTxnKeyV1 continuation = { 0 };
+	ClusterCtrcCapacityProbeResult current;
+
+	if (hint != NULL && hint->segment_id == current_segment)
+		continuation = *hint;
+	current = cluster_ctrc_capacity_probe_current(current_segment, horizon, epoch, &continuation);
+	if (current == CLUSTER_CTRC_CAPACITY_RETRY) {
+		observation->reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
+		return observation->reason;
+	}
+	if (current == CLUSTER_CTRC_CAPACITY_WAIT) {
+		unsigned worker = (current_segment - 1) % CLUSTER_CTRC_CLEANER_WORKERS;
+
+		if (cluster_undo_cleaner_capacity_owner_snapshot(
+				worker, &observation->coordinator_generation, &observation->owner_generation)) {
+			observation->key = continuation;
+			observation->scope = CLUSTER_CAPACITY_SCOPE_SLOT;
+			observation->owner_worker = worker;
+			observation->reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+			return observation->reason;
+		}
+	}
+	return ctrc_capacity_probe_pool(current_segment, horizon, epoch, hint, true, observation);
+}
+#endif
+
+ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_history_v1(uint32 current_segment, SCN horizon, uint64 epoch,
+									   const ClusterCtrcTxnKeyV1 *hint,
+									   ClusterCapacityHistoryPass *pass,
+									   ClusterCapacityObservationV1 *observation)
+{
+#ifndef CLUSTER_CTRC_UNIT_TEST
+	CtrcCapacityHistoryContext context = { 0 };
+	ClusterTTSlotCurrentSnapshot snapshot, final_snapshot;
+	ClusterCtrcTxnKeyV1 continuation = { 0 };
+	volatile ClusterCapacityReasonV1 reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	bool initialized;
+
+	if (pass == NULL || observation == NULL)
+		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	MemSet(observation, 0, sizeof(*observation));
+	observation->reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	pass->complete = pass->progress = pass->history_only = false;
+	pass->incomplete = true;
+	if (!SCN_VALID(horizon) || epoch == 0 || epoch != cluster_epoch_get_current()
+		|| !cluster_ctrc_shmem_ready() || !cluster_undo_cleaner_enabled
+		|| !cluster_undo_retention_horizon_enabled || cluster_normal_stop_maintenance_cut()
+		|| !cluster_tt_slot_current_snapshot(cluster_node_id, &snapshot)
+		|| snapshot.segment_id != current_segment || snapshot.reserved32 != 0
+		|| snapshot.binding_generation == 0 || snapshot.binding_generation == UINT64_MAX)
+		return ctrc_capacity_history_positive(current_segment, horizon, epoch, hint, observation);
+	initialized = pass->started;
+	if (initialized
+		&& (pass->horizon != horizon || pass->identity.current_segment != current_segment
+			|| pass->identity.current_binding_generation != snapshot.binding_generation
+			|| pass->identity.epoch != epoch || !ctrc_capacity_history_identity_current(pass))) {
+		/* Discard every old physical byte before observing the new cut.
+		 * This happens before the one bounded positive/physical pass. */
+		MemSet(pass, 0, sizeof(*pass));
+		pass->incomplete = true;
+		initialized = false;
+	}
+	if (!initialized) {
+		uint32 first;
+
+		if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS)
+			return ctrc_capacity_history_positive(current_segment, horizon, epoch, hint,
+												  observation);
+		first = (uint32)cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+		if (current_segment < first || current_segment - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE)
+			return ctrc_capacity_history_positive(current_segment, horizon, epoch, hint,
+												  observation);
+		MemSet(pass, 0, sizeof(*pass));
+		pass->incomplete = true;
+		pass->first_absent_position = CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		pass->next_position = CtrcCapacitySegmentCursor % CLUSTER_UNDO_SEGS_PER_INSTANCE;
+		pass->horizon = horizon;
+		pass->identity.owner_instance = cluster_node_id + 1;
+		pass->identity.current_segment = current_segment;
+		pass->identity.current_binding_generation = snapshot.binding_generation;
+		pass->identity.epoch = epoch;
+		pass->identity.system_identifier = GetSystemIdentifier();
+		pass->identity.origin_boot_incarnation = cluster_qvotec_get_self_incarnation();
+		pass->record_segment = cluster_undo_record_active_segment_id();
+		pass->configured_cap = cluster_undo_segments_max_per_instance < 16
+								   ? 16
+								   : Min((uint32)cluster_undo_segments_max_per_instance,
+										 CLUSTER_UNDO_SEGS_PER_INSTANCE);
+		if (pass->record_segment < first
+			|| pass->record_segment - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE
+			|| !cluster_undo_capacity_change_sample(&pass->change_sequence))
+			return ctrc_capacity_history_positive(current_segment, horizon, epoch, hint,
+												  observation);
+		pass->started = true;
+	}
+	context.pass = pass;
+	context.inventory_reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	Assert(CtrcCapacityHistory == NULL);
+	CtrcCapacityHistory = &context;
+	PG_TRY();
+	{
+		if (!pass->current_proven) {
+			ClusterCtrcCapacityProbeResult positive;
+
+			context.current_stage = true;
+			if (hint != NULL && hint->segment_id == current_segment)
+				continuation = *hint;
+			positive = cluster_ctrc_capacity_probe_current(current_segment, horizon, epoch,
+														   &continuation);
+			context.current_stage = false;
+			if (positive == CLUSTER_CTRC_CAPACITY_RETRY)
+				reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
+			else if (positive == CLUSTER_CTRC_CAPACITY_WAIT) {
+				unsigned worker = (current_segment - 1) % CLUSTER_CTRC_CLEANER_WORKERS;
+
+				if (cluster_undo_cleaner_capacity_owner_snapshot(
+						worker, &observation->coordinator_generation,
+						&observation->owner_generation)) {
+					observation->key = continuation;
+					observation->owner_worker = worker;
+					observation->scope = CLUSTER_CAPACITY_SCOPE_SLOT;
+					reason = CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+				}
+			} else {
+				if (!context.current_captured && context.current_gets < TT_SLOTS_PER_SEGMENT) {
+					CtrcCapacitySegmentSample sample = { 0 };
+
+					sample.identity = pass->identity;
+					sample.identity.segment_id = current_segment;
+					sample.logical.owner_instance = pass->identity.owner_instance;
+					sample.logical.segment_id = current_segment;
+					sample.physical_inventory = true;
+					if (ctrc_capacity_segment_sample(&sample, horizon)) {
+						context.current_page = sample.page;
+						context.sampled_identity = sample.identity;
+						context.current_captured = true;
+					}
+				}
+				if (context.current_captured) {
+					ClusterCapacityReasonV1 current_reason = ctrc_capacity_history_current(
+						&snapshot, (UndoSegmentHeaderData *)context.current_page.data, horizon);
+
+					if (current_reason == CLUSTER_CAPACITY_PROTECTED_HISTORY
+						&& cluster_tt_slot_current_snapshot(cluster_node_id, &final_snapshot)
+						&& memcmp(&snapshot, &final_snapshot, sizeof(snapshot)) == 0) {
+						pass->identity = context.sampled_identity;
+						pass->current_proven = true;
+						pass->saw_history = true;
+					} else if (current_reason == CLUSTER_CAPACITY_SUPPLY_RECHECK)
+						reason = current_reason;
+				}
+			}
+		}
+		if (reason == CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER) {
+			context.inventory_enabled = pass->current_proven;
+			context.pool_stage = true;
+			reason = ctrc_capacity_probe_pool(current_segment, horizon, epoch, hint, true,
+											  observation);
+			context.pool_stage = false;
+			if (reason == CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER
+				&& context.inventory_reason != CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER)
+				reason = context.inventory_reason;
+		}
+		if (reason == CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER && pass->current_proven
+			&& context.inventory_enabled && ctrc_capacity_history_identity_current(pass)) {
+			if (pass->covered_positions == CLUSTER_UNDO_SEGS_PER_INSTANCE) {
+				if (pass->first_absent_position < Max(pass->configured_cap, pass->allocated_count))
+					reason = CLUSTER_CAPACITY_SUPPLY_RECHECK;
+				else {
+					pass->complete = true;
+					pass->incomplete = false;
+					pass->history_only = pass->saw_history;
+				}
+			}
+		} else if (reason == CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER)
+			pass->progress = false;
+	}
+	PG_FINALLY();
+	{
+		CtrcCapacityHistory = NULL;
+	}
+	PG_END_TRY();
+	if (reason != CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER) {
+		pass->complete = pass->history_only = pass->progress = false;
+		pass->incomplete = true;
+	}
+	observation->reason = reason;
+	return reason;
+#else
+	(void)current_segment;
+	(void)horizon;
+	(void)epoch;
+	(void)hint;
+	if (pass != NULL) {
+		pass->complete = pass->history_only = pass->progress = false;
+		pass->incomplete = true;
+	}
+	if (observation != NULL) {
+		MemSet(observation, 0, sizeof(*observation));
+		observation->reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+	}
+	return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+#endif
+}
+
 /* The durable flag remains the sole release authority. This additional
  * local barrier prevents reuse while its publisher still owns CERTIFYING,
  * including ERROR after flush but before the shared handoff. Callers have
@@ -6231,7 +7068,8 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id, uint16 slot_offset
 
 #ifndef CLUSTER_CTRC_UNIT_TEST
 static bool
-ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *snapshot)
+ctrc_cleaner_publish_certificate_capacity_internal(
+	const ClusterCtrcOriginCertificateSnapshot *snapshot)
 {
 	ClusterCtrcCertificateInput input;
 	ClusterSemanticAdmissionToken admission;
@@ -6405,6 +7243,7 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 			certificate_lsn = cluster_undo_xlog_insert_tt_ctrc_release(&record);
 			if (XLogRecPtrIsInvalid(certificate_lsn))
 				goto certificate_done;
+			cluster_undo_capacity_write_mark();
 			cluster_undo_block0_flush_sync(&pin, successor_block.data, certificate_lsn, false);
 		}
 
@@ -6475,6 +7314,24 @@ ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *sna
 	} else
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_BLOCKED);
 	return committed;
+}
+
+static bool
+ctrc_cleaner_publish_certificate(const ClusterCtrcOriginCertificateSnapshot *snapshot)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = ctrc_cleaner_publish_certificate_capacity_internal(snapshot);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 #endif
 
@@ -6740,10 +7597,12 @@ cluster_ctrc_participant_open(ClusterCtrcParticipantEntry *participant,
 		&& memcmp(&participant->identity, identity, sizeof(*identity)) == 0)
 		return CLUSTER_CTRC_PARTICIPANT_DUPLICATE;
 	if (!ctrc_bytes_zero(participant, sizeof(*participant))) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_PARTICIPANT_REFUSED;
 	}
 
+	ctrc_capacity_write_mark(participant);
 	participant->key = *key;
 	participant->identity = *identity;
 	participant->grant_generation = grant_generation;
@@ -6776,6 +7635,7 @@ ctrc_receipt_prepare_with_sequence(ClusterCtrcParticipantEntry *participant,
 			&& stored_publication.journal_sequence != 0 && stored_publication.key_sequence != 0
 			&& stored_publication.journal_slot_generation != 0)
 			return CLUSTER_CTRC_PREPARE_DUPLICATE;
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_PREPARE_REFUSED;
 	}
@@ -6785,21 +7645,27 @@ ctrc_receipt_prepare_with_sequence(ClusterCtrcParticipantEntry *participant,
 		|| participant->next_key_sequence != participant->last_key_sequence + 1
 		|| (supplied_journal_sequence == 0 ? !ctrc_allocate_journal_sequence(&journal_sequence)
 										   : (journal_sequence = supplied_journal_sequence) == 0)) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_PREPARE_REFUSED;
 	}
 
 	key_sequence = participant->next_key_sequence;
+	ctrc_capacity_write_mark(receipt);
 	MemSet(receipt, 0, sizeof(*receipt));
 	receipt->key = participant->key;
 	receipt->publication = *publication;
 	receipt->publication.journal_sequence = journal_sequence;
 	receipt->publication.key_sequence = key_sequence;
 	/* Until Task 8 reclaims slots, each allocation has a unique generation. */
-	receipt->publication.journal_slot_generation = journal_sequence;
-	receipt->target = *target;
-	receipt->diagnostic_born_us = ctrc_monotonic_us();
+	{
+		ctrc_capacity_write_mark(receipt);
+		receipt->publication.journal_slot_generation = journal_sequence;
+		receipt->target = *target;
+		receipt->diagnostic_born_us = ctrc_monotonic_us();
+	}
 	pg_atomic_init_u32((pg_atomic_uint32 *)&receipt->state, CTRC_RECEIPT_PREPARED);
+	ctrc_capacity_write_mark(participant);
 	participant->next_key_sequence++;
 	participant->last_key_sequence = key_sequence;
 	participant->receipt_count++;
@@ -6874,6 +7740,7 @@ ctrc_receipt_prepare_table_observed(
 			*probe_count_out = probe + 1;
 		if (probe_state == CTRC_RECEIPT_PROBE_EMPTY) {
 			if (!ctrc_bytes_zero(receipt, sizeof(*receipt))) {
+				ctrc_capacity_write_mark(participant);
 				participant->state = CTRC_PARTICIPANT_BLOCKED;
 				if (path_out != NULL)
 					*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_EMPTY_BYTES;
@@ -6884,6 +7751,7 @@ ctrc_receipt_prepare_table_observed(
 		}
 		if (probe_state == CTRC_RECEIPT_PROBE_TOMBSTONE) {
 			if (!ctrc_bytes_zero(receipt, sizeof(*receipt))) {
+				ctrc_capacity_write_mark(participant);
 				participant->state = CTRC_PARTICIPANT_BLOCKED;
 				if (path_out != NULL)
 					*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_TOMBSTONE_BYTES;
@@ -6895,6 +7763,7 @@ ctrc_receipt_prepare_table_observed(
 		}
 		if (probe_state != CTRC_RECEIPT_PROBE_OCCUPIED || state == CTRC_RECEIPT_FREE
 			|| ctrc_bytes_zero(receipt, sizeof(*receipt))) {
+			ctrc_capacity_write_mark(participant);
 			participant->state = CTRC_PARTICIPANT_BLOCKED;
 			if (path_out != NULL)
 				*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_OCCUPIED;
@@ -6909,6 +7778,7 @@ ctrc_receipt_prepare_table_observed(
 				*receipt_index_out = index;
 				return CLUSTER_CTRC_PREPARE_DUPLICATE;
 			}
+			ctrc_capacity_write_mark(participant);
 			participant->state = CTRC_PARTICIPANT_BLOCKED;
 			if (path_out != NULL)
 				*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_DUPLICATE_CONFLICT;
@@ -6929,6 +7799,7 @@ ctrc_receipt_prepare_table_observed(
 			*path_out = CLUSTER_CTRC_PREPARE_PATH_TABLE_SLOT_PREPARE;
 		return CLUSTER_CTRC_PREPARE_REFUSED;
 	}
+	ctrc_capacity_write_mark(probe_states);
 	probe_states[selected_index] = CTRC_RECEIPT_PROBE_OCCUPIED;
 	*receipt_index_out = selected_index;
 	return CLUSTER_CTRC_PREPARE_READY;
@@ -7073,7 +7944,9 @@ cluster_ctrc_receipts_reclaim_batch_locked(ClusterCtrcReclaimWork *work, Size wo
 		j = ctrc_reclaim_work_find(work, work_count, &receipts[i].key);
 		if (j == work_count || !work[j].reclaimed)
 			continue;
+		ctrc_capacity_write_mark(receipts);
 		MemSet(&receipts[i], 0, sizeof(receipts[i]));
+		ctrc_capacity_write_mark(probe_states);
 		probe_states[i] = CTRC_RECEIPT_PROBE_TOMBSTONE;
 		reclaimed++;
 	}
@@ -7092,6 +7965,7 @@ cluster_ctrc_receipts_reclaim_batch_locked(ClusterCtrcReclaimWork *work, Size wo
 				cursor = cursor == 0 ? receipt_count - 1 : cursor - 1;
 				if (probe_states[cursor] != CTRC_RECEIPT_PROBE_TOMBSTONE)
 					break;
+				ctrc_capacity_write_mark(probe_states);
 				probe_states[cursor] = CTRC_RECEIPT_PROBE_EMPTY;
 			}
 		}
@@ -7113,6 +7987,7 @@ ctrc_receipt_collapse_deleted_probe(uint64 index)
 	for (uint64 visited = 0; visited < count; visited++) {
 		if (states[index] != CTRC_RECEIPT_PROBE_TOMBSTONE)
 			break;
+		ctrc_capacity_write_mark(states);
 		states[index] = CTRC_RECEIPT_PROBE_EMPTY;
 		index = index == 0 ? count - 1 : index - 1;
 	}
@@ -7166,11 +8041,13 @@ ctrc_receipts_reclaim_shared_locked(ClusterCtrcReclaimWork *work, Size count,
 			uint64 index = cursor - 1;
 
 			cursor = ctrc_receipt_links()[index].next_plus_one;
+			ctrc_capacity_write_mark(CtrcShared);
 			MemSet(&ctrc_receipt_entries()[index], 0, sizeof(ClusterCtrcReceipt));
 			ctrc_receipt_probe_states()[index] = CTRC_RECEIPT_PROBE_TOMBSTONE;
 			MemSet(&ctrc_receipt_links()[index], 0, sizeof(CtrcReceiptLink));
 			ctrc_receipt_collapse_deleted_probe(index);
 		}
+		ctrc_capacity_write_mark(CtrcShared);
 		ctrc_participant_receipt_heads()[participant_indices[i]] = 0;
 	}
 	/* A table that was entirely occupied may have no EMPTY successor. Only
@@ -7178,9 +8055,11 @@ ctrc_receipts_reclaim_shared_locked(ClusterCtrcReclaimWork *work, Size count,
 	for (uint64 i = 0; i < CtrcShared->receipt_entries; i++) {
 		if (ctrc_receipt_probe_states()[i] != CTRC_RECEIPT_PROBE_TOMBSTONE)
 			break;
-		if (i + 1 == CtrcShared->receipt_entries)
+		if (i + 1 == CtrcShared->receipt_entries) {
+			ctrc_capacity_write_mark(CtrcShared);
 			MemSet(ctrc_receipt_probe_states(), CTRC_RECEIPT_PROBE_EMPTY,
 				   CtrcShared->receipt_entries);
+		}
 	}
 }
 
@@ -7435,14 +8314,11 @@ ctrc_origin_protects_local_receipt_locked(const ClusterCtrcTxnKeyV1 *key,
 }
 
 static ClusterCtrcPrepareResult
-ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
-									 const ClusterCtrcParticipantIdentity *identity,
-									 uint32 grant_generation,
-									 const ClusterCtrcPublicationIdV1 *publication,
-									 const ClusterCtrcTargetV1 *target,
-									 ClusterCtrcReceiptHandle *handle,
-									 const ClusterKoPeerAdmissionV3 *continuation,
-									 ClusterCtrcPreparePath *path_out)
+ctrc_receipt_prepare_shared_internal_capacity_internal(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
+	uint32 grant_generation, const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCtrcTargetV1 *target, ClusterCtrcReceiptHandle *handle,
+	const ClusterKoPeerAdmissionV3 *continuation, ClusterCtrcPreparePath *path_out)
 {
 	ClusterCtrcParticipantEntry *participant;
 	ClusterCtrcReceipt *receipts;
@@ -7528,11 +8404,13 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	} else if (!ctrc_receipt_chain_exact_locked(participant_index, false)) {
 		if (path_out != NULL)
 			*path_out = CLUSTER_CTRC_PREPARE_PATH_CHAIN;
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
 	} else if (!ctrc_receipt_prepare_locators_valid_locked(key, publication)) {
 		if (path_out != NULL)
 			*path_out = CLUSTER_CTRC_PREPARE_PATH_LOCATOR;
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		result = CLUSTER_CTRC_PREPARE_REFUSED;
 	} else if (check_object
@@ -7558,9 +8436,14 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 
 			/* No throwing operation separates receipt placement, the locator
 			 * and handle publication. Duplicate requests never add a link. */
-			link->participant_plus_one = participant_index + 1;
-			link->next_plus_one = ctrc_participant_receipt_heads()[participant_index];
-			link->journal_generation = receipts[receipt_index].publication.journal_slot_generation;
+			{
+				ctrc_capacity_write_mark(link);
+				link->participant_plus_one = participant_index + 1;
+				link->next_plus_one = ctrc_participant_receipt_heads()[participant_index];
+				link->journal_generation
+					= receipts[receipt_index].publication.journal_slot_generation;
+			}
+			ctrc_capacity_write_mark(CtrcShared);
 			ctrc_participant_receipt_heads()[participant_index] = receipt_index + 1;
 		}
 	}
@@ -7574,8 +8457,10 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 		 * Keep that participant unqualified until its actual reclamation;
 		 * known matching receivers retain their identity through CLOSE/ACK. */
 		if (participant_was_empty && FullTransactionIdIsValid(original_full_xid)
-			&& !FullTransactionIdIsValid(participant->original_full_xid))
+			&& !FullTransactionIdIsValid(participant->original_full_xid)) {
+			ctrc_capacity_write_mark(participant);
 			participant->original_full_xid = original_full_xid;
+		}
 		ctrc_receipt_handle_fill(handle, participant, participant_index, &receipts[receipt_index],
 								 receipt_index);
 	}
@@ -7595,6 +8480,29 @@ ctrc_receipt_prepare_shared_internal(const ClusterCtrcTxnKeyV1 *key,
 	else if (result == CLUSTER_CTRC_PREPARE_REFUSED)
 		return ctrc_receipt_prepare_refused(false);
 	return result;
+}
+
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_shared_internal(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
+	uint32 grant_generation, const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCtrcTargetV1 *target, ClusterCtrcReceiptHandle *handle,
+	const ClusterKoPeerAdmissionV3 *continuation, ClusterCtrcPreparePath *path_out)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcPrepareResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = ctrc_receipt_prepare_shared_internal_capacity_internal(
+			key, identity, grant_generation, publication, target, handle, continuation, path_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 #endif
 
@@ -7681,6 +8589,7 @@ cluster_ctrc_receipt_apply_prepared(ClusterCtrcParticipantEntry *participant,
 	if (participant->state != CTRC_PARTICIPANT_OPEN || !target_finalizes)
 		return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
 
+	ctrc_capacity_write_mark(receipt);
 	receipt->target = *final_target;
 	pg_write_barrier();
 	expected = CTRC_RECEIPT_PREPARED;
@@ -7697,10 +8606,10 @@ cluster_ctrc_receipt_apply_prepared(ClusterCtrcParticipantEntry *participant,
 	return CLUSTER_CTRC_APPLY_APPLIED;
 }
 
-ClusterCtrcApplyResult
-cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
-								  const ClusterCtrcTargetV1 *final_target,
-								  ClusterCtrcApplyToken *token)
+static ClusterCtrcApplyResult
+cluster_ctrc_receipt_apply_shared_capacity_internal(const ClusterCtrcReceiptHandle *handle,
+													const ClusterCtrcTargetV1 *final_target,
+													ClusterCtrcApplyToken *token)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcApplyResult result;
@@ -7724,6 +8633,27 @@ cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
 		MemSet(token, 0, sizeof(*token));
 	return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
 #endif
+}
+
+ClusterCtrcApplyResult
+cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
+								  const ClusterCtrcTargetV1 *final_target,
+								  ClusterCtrcApplyToken *token)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcApplyResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result
+			= cluster_ctrc_receipt_apply_shared_capacity_internal(handle, final_target, token);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 static bool
@@ -7796,6 +8726,9 @@ cluster_ctrc_receipt_retarget_itl(ClusterCtrcParticipantEntry *participant,
 		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
 
 	expected = CTRC_RECEIPT_APPLIED;
+	/* RETARGETING may return to APPLIED concurrently; a pre-read cannot
+	 * condition registration for this reversible CAS edge. */
+	ctrc_capacity_write_mark(receipt);
 	if (!pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&receipt->state, &expected,
 										CTRC_RECEIPT_RETARGETING))
 		return expected == CTRC_RECEIPT_CLEANED || expected == CTRC_RECEIPT_CANCELLED
@@ -7814,6 +8747,7 @@ cluster_ctrc_receipt_retarget_itl(ClusterCtrcParticipantEntry *participant,
 														   : CLUSTER_CTRC_APPLY_FAIL_CLOSED;
 	}
 
+	ctrc_capacity_write_mark(receipt);
 	receipt->target = *final_target;
 	pg_write_barrier();
 	expected = CTRC_RECEIPT_RETARGETING;
@@ -7827,11 +8761,10 @@ cluster_ctrc_receipt_retarget_itl(ClusterCtrcParticipantEntry *participant,
 	return CLUSTER_CTRC_APPLY_APPLIED;
 }
 
-ClusterCtrcApplyResult
-cluster_ctrc_receipt_retarget_itl_shared(const ClusterCtrcReceiptHandle *handle,
-										 const ClusterCtrcTargetV1 *pending_target,
-										 const ClusterCtrcTargetV1 *final_target,
-										 ClusterCtrcApplyToken *token)
+static ClusterCtrcApplyResult
+cluster_ctrc_receipt_retarget_itl_shared_capacity_internal(
+	const ClusterCtrcReceiptHandle *handle, const ClusterCtrcTargetV1 *pending_target,
+	const ClusterCtrcTargetV1 *final_target, ClusterCtrcApplyToken *token)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	if (!ctrc_receipt_handle_exact(handle)) {
@@ -7849,6 +8782,28 @@ cluster_ctrc_receipt_retarget_itl_shared(const ClusterCtrcReceiptHandle *handle,
 		MemSet(token, 0, sizeof(*token));
 	return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
 #endif
+}
+
+ClusterCtrcApplyResult
+cluster_ctrc_receipt_retarget_itl_shared(const ClusterCtrcReceiptHandle *handle,
+										 const ClusterCtrcTargetV1 *pending_target,
+										 const ClusterCtrcTargetV1 *final_target,
+										 ClusterCtrcApplyToken *token)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcApplyResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_receipt_retarget_itl_shared_capacity_internal(
+			handle, pending_target, final_target, token);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 bool
@@ -7907,17 +8862,23 @@ cluster_ctrc_receipt_cancel_prepared(ClusterCtrcParticipantEntry *participant,
 		|| memcmp(&receipt->key, &participant->key, sizeof(receipt->key)) != 0
 		|| receipt->publication.grant_generation != participant->grant_generation
 		|| participant->state != CTRC_PARTICIPANT_OPEN
-		|| !pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&receipt->state, &expected,
-										   CTRC_RECEIPT_CANCELLED))
+		|| pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) != CTRC_RECEIPT_PREPARED)
+		return false;
+	/* PREPARED never reappears in this exact receipt incarnation. A failed
+	 * precheck is read-only; every attempted mutation registers before CAS. */
+	ctrc_capacity_write_mark(receipt);
+	if (!pg_atomic_compare_exchange_u32((pg_atomic_uint32 *)&receipt->state, &expected,
+										CTRC_RECEIPT_CANCELLED))
 		return false;
 	(void)pg_atomic_fetch_sub_u64((pg_atomic_uint64 *)&participant->prepared_count, 1);
 	(void)pg_atomic_fetch_add_u64((pg_atomic_uint64 *)&participant->cancelled_count, 1);
+	ctrc_capacity_write_mark(receipt);
 	receipt->disposition = CTRC_RELEASE_CANCELLED_PREMUTATION;
 	return true;
 }
 
-bool
-cluster_ctrc_receipt_cancel_shared(const ClusterCtrcReceiptHandle *handle)
+static bool
+cluster_ctrc_receipt_cancel_shared_capacity_internal(const ClusterCtrcReceiptHandle *handle)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	bool cancelled = ctrc_receipt_handle_exact(handle)
@@ -7932,6 +8893,24 @@ cluster_ctrc_receipt_cancel_shared(const ClusterCtrcReceiptHandle *handle)
 	(void)handle;
 	return false;
 #endif
+}
+
+bool
+cluster_ctrc_receipt_cancel_shared(const ClusterCtrcReceiptHandle *handle)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_receipt_cancel_shared_capacity_internal(handle);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 static bool
@@ -8016,6 +8995,7 @@ cluster_ctrc_receipt_discharge_itl(ClusterCtrcParticipantEntry *participant,
 											 durability->required_lsn, durability))
 		return CLUSTER_CTRC_DISCHARGE_RETAIN;
 
+	ctrc_capacity_write_mark(receipt);
 	receipt->highest_local_wal_lsn = durability->highest_local_lsn;
 	memcpy(receipt->required_lsn, durability->required_lsn, sizeof(receipt->required_lsn));
 	receipt->disposition = (uint8)disposition;
@@ -8031,11 +9011,10 @@ cluster_ctrc_receipt_discharge_itl(ClusterCtrcParticipantEntry *participant,
 	return CLUSTER_CTRC_DISCHARGE_CLEANED;
 }
 
-ClusterCtrcDischargeResult
-cluster_ctrc_receipt_discharge_itl_shared(const ClusterCtrcReceiptHandle *handle,
-										  const ClusterCtrcItlTargetIdentity *expected_target,
-										  ClusterCtrcItlProjection projection,
-										  const ClusterCtrcDurability *durability)
+static ClusterCtrcDischargeResult
+cluster_ctrc_receipt_discharge_itl_shared_capacity_internal(
+	const ClusterCtrcReceiptHandle *handle, const ClusterCtrcItlTargetIdentity *expected_target,
+	ClusterCtrcItlProjection projection, const ClusterCtrcDurability *durability)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcDischargeResult result;
@@ -8072,6 +9051,28 @@ cluster_ctrc_receipt_discharge_itl_shared(const ClusterCtrcReceiptHandle *handle
 	(void)durability;
 	return CLUSTER_CTRC_DISCHARGE_RETAIN;
 #endif
+}
+
+ClusterCtrcDischargeResult
+cluster_ctrc_receipt_discharge_itl_shared(const ClusterCtrcReceiptHandle *handle,
+										  const ClusterCtrcItlTargetIdentity *expected_target,
+										  ClusterCtrcItlProjection projection,
+										  const ClusterCtrcDurability *durability)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcDischargeResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_receipt_discharge_itl_shared_capacity_internal(
+			handle, expected_target, projection, durability);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 ClusterCtrcDischargeResult
@@ -8119,6 +9120,7 @@ cluster_ctrc_receipt_discharge_current_mx(ClusterCtrcParticipantEntry *participa
 											 durability->required_lsn, durability))
 		return CLUSTER_CTRC_DISCHARGE_RETAIN;
 
+	ctrc_capacity_write_mark(receipt);
 	receipt->highest_local_wal_lsn = durability->highest_local_lsn;
 	memcpy(receipt->required_lsn, durability->required_lsn, sizeof(receipt->required_lsn));
 	receipt->disposition = (uint8)disposition;
@@ -8134,11 +9136,10 @@ cluster_ctrc_receipt_discharge_current_mx(ClusterCtrcParticipantEntry *participa
 	return CLUSTER_CTRC_DISCHARGE_CLEANED;
 }
 
-ClusterCtrcDischargeResult
-cluster_ctrc_receipt_discharge_current_mx_shared(const ClusterCtrcReceiptHandle *handle,
-												 const ClusterCtrcTargetV1 *expected_target,
-												 ClusterCtrcCleanResult clean_result,
-												 const ClusterCtrcDurability *durability)
+static ClusterCtrcDischargeResult
+cluster_ctrc_receipt_discharge_current_mx_shared_capacity_internal(
+	const ClusterCtrcReceiptHandle *handle, const ClusterCtrcTargetV1 *expected_target,
+	ClusterCtrcCleanResult clean_result, const ClusterCtrcDurability *durability)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcDischargeResult result;
@@ -8176,6 +9177,28 @@ cluster_ctrc_receipt_discharge_current_mx_shared(const ClusterCtrcReceiptHandle 
 #endif
 }
 
+ClusterCtrcDischargeResult
+cluster_ctrc_receipt_discharge_current_mx_shared(const ClusterCtrcReceiptHandle *handle,
+												 const ClusterCtrcTargetV1 *expected_target,
+												 ClusterCtrcCleanResult clean_result,
+												 const ClusterCtrcDurability *durability)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcDischargeResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_receipt_discharge_current_mx_shared_capacity_internal(
+			handle, expected_target, clean_result, durability);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
 ClusterCtrcCloseResult
 cluster_ctrc_participant_close_or_tombstone(ClusterCtrcParticipantEntry *participant,
 											const ClusterCtrcTxnKeyV1 *key,
@@ -8196,6 +9219,7 @@ cluster_ctrc_participant_close_or_tombstone(ClusterCtrcParticipantEntry *partici
 	} else if (memcmp(&participant->key, key, sizeof(*key)) != 0
 			   || memcmp(&participant->identity, identity, sizeof(*identity)) != 0
 			   || participant->grant_generation != grant_generation) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN;
 	}
@@ -8263,6 +9287,7 @@ cluster_ctrc_origin_ack_land_entry(ClusterCtrcOriginEntry *origin, uint64 reques
 		|| ack->formation_epoch != origin->touched[node_id].formation_epoch
 		|| ack->admission_record_generation
 			   != origin->touched[node_id].admission_record_generation) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
@@ -8270,21 +9295,29 @@ cluster_ctrc_origin_ack_land_entry(ClusterCtrcOriginEntry *origin, uint64 reques
 	if ((origin->ack_bitmap & node_bit) != 0) {
 		if (memcmp(ack_slot, ack, sizeof(*ack)) == 0)
 			return true;
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
 	if (!ctrc_bytes_zero(ack_slot, sizeof(*ack_slot))) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_BLOCKED;
 		return false;
 	}
+	ctrc_capacity_write_mark(ack_slot);
 	*ack_slot = *ack;
+	ctrc_capacity_write_mark(origin);
 	origin->ack_bitmap |= node_bit;
 	origin->close_confirmed_bitmap |= node_bit;
 	if (origin->state == CTRC_ORIGIN_SEALING
-		&& origin->close_confirmed_bitmap == origin->touched_bitmap)
+		&& origin->close_confirmed_bitmap == origin->touched_bitmap) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_SEALED;
-	else if (origin->state == CTRC_ORIGIN_CLEANING && origin->ack_bitmap == origin->touched_bitmap)
+	} else if (origin->state == CTRC_ORIGIN_CLEANING
+			   && origin->ack_bitmap == origin->touched_bitmap) {
+		ctrc_capacity_write_mark(origin);
 		origin->state = CTRC_ORIGIN_CERTIFYING;
+	}
 	return true;
 }
 
@@ -8326,8 +9359,9 @@ ctrc_origin_ack_land_locked(uint64 request_id, const ClusterCtrcLocalReleaseAckV
 }
 #endif
 
-bool
-cluster_ctrc_origin_ack_land_shared(uint64 request_id, const ClusterCtrcLocalReleaseAckV1 *ack)
+static bool
+cluster_ctrc_origin_ack_land_shared_capacity_internal(uint64 request_id,
+													  const ClusterCtrcLocalReleaseAckV1 *ack)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	uint64 origin_index, ack_index;
@@ -8364,6 +9398,24 @@ cluster_ctrc_origin_ack_land_shared(uint64 request_id, const ClusterCtrcLocalRel
 #endif
 }
 
+bool
+cluster_ctrc_origin_ack_land_shared(uint64 request_id, const ClusterCtrcLocalReleaseAckV1 *ack)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_origin_ack_land_shared_capacity_internal(request_id, ack);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
 ClusterCtrcSealReplyResult
 cluster_ctrc_participant_request_apply(ClusterCtrcParticipantEntry *participant,
 									   ClusterCtrcLocalReleaseAckV1 *ack_summary,
@@ -8395,7 +9447,9 @@ cluster_ctrc_participant_request_apply(ClusterCtrcParticipantEntry *participant,
 			*first_reason = CTRC_SEAL_REASON_IDENTITY;
 			return CTRC_SEAL_REPLY_BLOCKED_RETAIN;
 		}
+		ctrc_capacity_write_mark(ack_summary);
 		MemSet(ack_summary, 0, sizeof(*ack_summary));
+		ctrc_capacity_write_mark(participant);
 		MemSet(participant, 0, sizeof(*participant));
 		*first_reason = 0;
 		return CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED;
@@ -8437,6 +9491,7 @@ cluster_ctrc_participant_request_apply(ClusterCtrcParticipantEntry *participant,
 		*first_reason = CTRC_SEAL_REASON_ACK_UNAVAILABLE;
 		return CTRC_SEAL_REPLY_BLOCKED_RETAIN;
 	}
+	ctrc_capacity_write_mark(ack_summary);
 	*ack_summary = *ack_out;
 	*first_reason = 0;
 	return CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK;
@@ -8447,12 +9502,11 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 												Size count, ClusterCtrcSealReplyResult *results,
 												uint16 *reasons);
 
-ClusterCtrcSealReplyResult
-cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
-										const ClusterCtrcParticipantIdentity *identity,
-										uint32 grant_generation, uint64 seal_generation,
-										ClusterCtrcSealSuboperation suboperation,
-										uint16 *first_reason, ClusterCtrcLocalReleaseAckV1 *ack_out)
+static ClusterCtrcSealReplyResult
+cluster_ctrc_participant_request_shared_capacity_internal(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
+	uint32 grant_generation, uint64 seal_generation, ClusterCtrcSealSuboperation suboperation,
+	uint16 *first_reason, ClusterCtrcLocalReleaseAckV1 *ack_out)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcParticipantEntry *participant;
@@ -8548,10 +9602,33 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 #endif
 }
 
+ClusterCtrcSealReplyResult
+cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
+										const ClusterCtrcParticipantIdentity *identity,
+										uint32 grant_generation, uint64 seal_generation,
+										ClusterCtrcSealSuboperation suboperation,
+										uint16 *first_reason, ClusterCtrcLocalReleaseAckV1 *ack_out)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcSealReplyResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = cluster_ctrc_participant_request_shared_capacity_internal(
+			key, identity, grant_generation, seal_generation, suboperation, first_reason, ack_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
+}
+
 static bool
-ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *dispatches,
-												Size count, ClusterCtrcSealReplyResult *results,
-												uint16 *reasons)
+ctrc_participant_certificate_batch_apply_shared_capacity_internal(
+	const ClusterCtrcCloseDispatch *dispatches, Size count, ClusterCtrcSealReplyResult *results,
+	uint16 *reasons)
 {
 #ifndef CLUSTER_CTRC_UNIT_TEST
 	ClusterCtrcReclaimWork work[CLUSTER_CTRC_RECLAIM_BATCH_MAX];
@@ -8628,6 +9705,7 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 				results[i] = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
 				continue;
 			}
+			ctrc_capacity_write_mark(CtrcShared);
 			MemSet(&ctrc_participant_entries()[indices[i]], 0, sizeof(ClusterCtrcParticipantEntry));
 			MemSet(&ctrc_participant_ack_entries()[indices[i]], 0,
 				   sizeof(ClusterCtrcLocalReleaseAckV1));
@@ -8635,6 +9713,7 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 	}
 	for (Size i = 0; i < count; i++)
 		if (block[i]) {
+			ctrc_capacity_write_mark(CtrcShared);
 			ctrc_participant_entries()[indices[i]].state = CTRC_PARTICIPANT_BLOCKED;
 			if (reasons != NULL)
 				reasons[i] = CTRC_SEAL_REASON_ACK_UNAVAILABLE;
@@ -8654,6 +9733,27 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 	(void)reasons;
 	return false;
 #endif
+}
+
+static bool
+ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *dispatches,
+												Size count, ClusterCtrcSealReplyResult *results,
+												uint16 *reasons)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result = ctrc_participant_certificate_batch_apply_shared_capacity_internal(
+			dispatches, count, results, reasons);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 bool
@@ -8680,21 +9780,25 @@ cluster_ctrc_participant_close(ClusterCtrcParticipantEntry *participant,
 		|| memcmp(&participant->identity, identity, sizeof(*identity)) != 0
 		|| participant->grant_generation != grant_generation
 		|| !ctrc_bytes_zero(participant->reserved8, sizeof(participant->reserved8))) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN;
 	}
 
 	if (participant->state == CTRC_PARTICIPANT_OPEN) {
 		if (participant->seal_generation != 0) {
+			ctrc_capacity_write_mark(participant);
 			participant->state = CTRC_PARTICIPANT_BLOCKED;
 			return CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN;
 		}
+		ctrc_capacity_write_mark(participant);
 		participant->seal_generation = seal_generation;
 		participant->state = CTRC_PARTICIPANT_CLOSED_DRAINING;
 	} else if ((participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
 				&& participant->state != CTRC_PARTICIPANT_ACK_READY
 				&& participant->state != CTRC_PARTICIPANT_ACK_FROZEN)
 			   || participant->seal_generation != seal_generation) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN;
 	}
@@ -8706,6 +9810,7 @@ cluster_ctrc_participant_close(ClusterCtrcParticipantEntry *participant,
 		|| participant->applied_count > participant->receipt_count
 		|| participant->cancelled_count > participant->receipt_count
 		|| participant->cleaned_count > participant->receipt_count) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN;
 	}
@@ -8715,11 +9820,14 @@ cluster_ctrc_participant_close(ClusterCtrcParticipantEntry *participant,
 	terminal_count = participant->cancelled_count + participant->cleaned_count;
 	if (terminal_count < participant->cancelled_count
 		|| terminal_count != participant->receipt_count) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
 		return CLUSTER_CTRC_CLOSE_BLOCKED_RETAIN;
 	}
-	if (participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING)
+	if (participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_ACK_READY;
+	}
 	return CLUSTER_CTRC_CLOSE_ACK_READY;
 }
 
@@ -8732,6 +9840,7 @@ cluster_ctrc_participant_note_owner_loss(ClusterCtrcParticipantEntry *participan
 
 	if (participant == NULL)
 		return CLUSTER_CTRC_LOSS_BLOCKED;
+	ctrc_capacity_write_mark(participant);
 	participant->state = CTRC_PARTICIPANT_BLOCKED;
 	if (receipt == NULL || memcmp(&receipt->key, &participant->key, sizeof(receipt->key)) != 0
 		|| receipt->publication.grant_generation != participant->grant_generation)
@@ -9902,9 +11011,9 @@ ctrc_cleaner_abort_history_unlock(void)
 
 /* Both original receipt locks are already held by the caller. */
 static ClusterCtrcDischargeResult
-ctrc_cleaner_companions_discharge_locked(const ClusterCtrcReceiptHandle *handle,
-										 const CtrcItlCompanionProof *proof,
-										 const ClusterCtrcDurability *durability)
+ctrc_cleaner_companions_discharge_locked_capacity_internal(const ClusterCtrcReceiptHandle *handle,
+														   const CtrcItlCompanionProof *proof,
+														   const ClusterCtrcDurability *durability)
 {
 	ClusterCtrcParticipantEntry *participant = handle->participant;
 
@@ -9928,6 +11037,27 @@ ctrc_cleaner_companions_discharge_locked(const ClusterCtrcReceiptHandle *handle,
 	}
 	return cluster_ctrc_receipt_discharge_itl(participant, handle->receipt, CTRC_ITL_TARGET_ABSENT,
 											  durability);
+}
+
+static ClusterCtrcDischargeResult
+ctrc_cleaner_companions_discharge_locked(const ClusterCtrcReceiptHandle *handle,
+										 const CtrcItlCompanionProof *proof,
+										 const ClusterCtrcDurability *durability)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile ClusterCtrcDischargeResult capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result
+			= ctrc_cleaner_companions_discharge_locked_capacity_internal(handle, proof, durability);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 static ClusterCtrcDischargeResult
@@ -11408,8 +12538,8 @@ ctrc_cleaner_clean_next_receipt(void)
 }
 
 static bool
-ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
-								uint64 *participant_index_out)
+ctrc_participant_find_ack_ready_capacity_internal(ClusterCtrcParticipantEntry *snapshot,
+												  uint64 *participant_index_out)
 {
 	static uint64 scan_cursor = 0;
 	uint64 visited;
@@ -11448,6 +12578,7 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 			continue;
 		if (!ctrc_bytes_zero(&ctrc_participant_ack_entries()[index],
 							 sizeof(ClusterCtrcLocalReleaseAckV1))) {
+			ctrc_capacity_write_mark(participant);
 			participant->state = CTRC_PARTICIPANT_BLOCKED;
 			continue;
 		}
@@ -11460,6 +12591,26 @@ ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
 	ctrc_participant_locks_release(lock_mask);
 	ctrc_scan_charge(CTRC_SCAN_ACK, visited + (found ? 1 : 0));
 	return found;
+}
+
+static bool
+ctrc_participant_find_ack_ready(ClusterCtrcParticipantEntry *snapshot,
+								uint64 *participant_index_out)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	volatile bool capacity_result;
+
+	PG_TRY();
+	{
+		capacity_result
+			= ctrc_participant_find_ack_ready_capacity_internal(snapshot, participant_index_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return capacity_result;
 }
 
 typedef struct CtrcAckWork {
@@ -11585,8 +12736,10 @@ ctrc_ack_block_if_same(const CtrcAckWork *work)
 	if (memcmp(&participant->key, &expected->key, sizeof(expected->key)) == 0
 		&& participant->grant_generation == expected->grant_generation
 		&& participant->seal_generation == expected->seal_generation
-		&& participant->state == CTRC_PARTICIPANT_ACK_READY)
+		&& participant->state == CTRC_PARTICIPANT_ACK_READY) {
+		ctrc_capacity_write_mark(participant);
 		participant->state = CTRC_PARTICIPANT_BLOCKED;
+	}
 }
 
 static Size
@@ -11600,7 +12753,7 @@ ctrc_ack_work_find(const CtrcAckWork *work, Size count, const ClusterCtrcTxnKeyV
 }
 
 static void
-ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count)
+ctrc_participant_copy_ack_batch_capacity_internal(CtrcAckWork *work, Size count)
 {
 	bool checked[CTRC_CLEANER_ACK_BATCH] = { false };
 	uint32 lock_mask = 0;
@@ -11639,7 +12792,23 @@ ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count)
 }
 
 static void
-ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
+ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		ctrc_participant_copy_ack_batch_capacity_internal(work, count);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+ctrc_participant_freeze_ack_batch_exact_capacity_internal(CtrcAckWork *work, Size count)
 {
 	bool checked[CTRC_CLEANER_ACK_BATCH] = { false };
 	bool any = false;
@@ -11688,8 +12857,10 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 		any |= work[i].eligible;
 	}
 	for (Size i = 0; i < count; i++)
-		if (work[i].eligible)
+		if (work[i].eligible) {
+			ctrc_capacity_write_mark(CtrcShared);
 			ctrc_participant_ack_entries()[work[i].participant_index] = work[i].second_ack;
+		}
 	for (Size i = 0; any && i < count; i++)
 		if (work[i].eligible) {
 			uint64 cursor = ctrc_participant_receipt_heads()[work[i].participant_index];
@@ -11707,13 +12878,31 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 			ClusterCtrcParticipantEntry *participant
 				= &ctrc_participant_entries()[work[i].participant_index];
 
+			ctrc_capacity_write_mark(participant);
 			participant->ack_frozen_count = work[i].receipt_count;
 			pg_write_barrier();
+			ctrc_capacity_write_mark(participant);
 			participant->state = CTRC_PARTICIPANT_ACK_FROZEN;
 			work[i].frozen = true;
 		}
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
+}
+
+static void
+ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		ctrc_participant_freeze_ack_batch_exact_capacity_internal(work, count);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
 }
 
 static bool
@@ -11849,6 +13038,7 @@ cluster_ctrc_participant_build_ack(ClusterCtrcParticipantEntry *participant,
 	if (cluster_ctrc_participant_ack_from_snapshot(participant, NULL, 0, durability, ack)
 		!= CLUSTER_CTRC_ACK_RELEASED)
 		return CLUSTER_CTRC_ACK_DENIED;
+	ctrc_capacity_write_mark(participant);
 	participant->state = CTRC_PARTICIPANT_ACK_FROZEN;
 	return CLUSTER_CTRC_ACK_RELEASED;
 }
@@ -12064,6 +13254,7 @@ cluster_ctrc_origin_certificate_commit_entry(ClusterCtrcOriginEntry *origin,
 		|| memcmp(&rebuilt, snapshot, sizeof(rebuilt)) != 0)
 		return false;
 
+	ctrc_capacity_write_mark(origin);
 	origin->state = CTRC_ORIGIN_RELEASE_PROVEN;
 	origin->close_dispatched_bitmap = 0;
 	origin->close_confirmed_bitmap = 0;

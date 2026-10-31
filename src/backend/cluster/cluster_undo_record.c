@@ -57,6 +57,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -687,8 +688,26 @@ cluster_undo_record_shmem_register(void)
  *	has filled it), so the drain always sees this entry.  Idempotent per
  *	top-xact via cluster_undo_write_registered.
  */
+static void cluster_undo_active_write_register_capacity_body(SCN first_undo_scn);
+
 static void
 cluster_undo_active_write_register(SCN first_undo_scn)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_undo_active_write_register_capacity_body(first_undo_scn);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_undo_active_write_register_capacity_body(SCN first_undo_scn)
 {
 	int idx;
 
@@ -704,6 +723,7 @@ cluster_undo_active_write_register(SCN first_undo_scn)
 		return; /* non-backend writer (e.g. startup redo) does not register */
 
 	LWLockAcquire(&UndoRecordShared->registry_lock.lock, LW_EXCLUSIVE);
+	cluster_undo_capacity_write_mark();
 	cluster_undo_write_registry[idx] = first_undo_scn;
 	LWLockRelease(&UndoRecordShared->registry_lock.lock);
 	cluster_undo_write_registered = true;
@@ -716,8 +736,26 @@ cluster_undo_active_write_register(SCN first_undo_scn)
  *	over retention after EndPrepare and before PostPrepare_ClusterTT unregisters
  *	the active writer, so the handoff has no gap.
  */
+static void cluster_undo_active_write_unregister_capacity_body(void);
+
 static void
 cluster_undo_active_write_unregister(void)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_undo_active_write_unregister_capacity_body();
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_undo_active_write_unregister_capacity_body(void)
 {
 	int idx;
 
@@ -732,6 +770,7 @@ cluster_undo_active_write_unregister(void)
 		return;
 
 	LWLockAcquire(&UndoRecordShared->registry_lock.lock, LW_EXCLUSIVE);
+	cluster_undo_capacity_write_mark();
 	cluster_undo_write_registry[idx] = InvalidScn;
 	LWLockRelease(&UndoRecordShared->registry_lock.lock);
 }
@@ -912,8 +951,30 @@ cluster_undo_any_unresolved_prepared(void)
  *	re-evaluates next pass.  Best-effort write (no ereport): a failed COMMITTED
  *	write just retains the segment for another pass.
  */
+static void cluster_undo_try_mark_record_segment_committed_owned_capacity_body(uint32 seg,
+																			   uint8 owner_instance,
+																			   SCN seal_scn);
+
 static void
 cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_instance, SCN seal_scn)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_undo_try_mark_record_segment_committed_owned_capacity_body(seg, owner_instance,
+																		   seal_scn);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_undo_try_mark_record_segment_committed_owned_capacity_body(uint32 seg, uint8 owner_instance,
+																   SCN seal_scn)
 {
 	PGAlignedBlock predecessor;
 	PGAlignedBlock successor;
@@ -1008,8 +1069,29 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_ins
 		pg_atomic_fetch_add_u64(&UndoRecordShared->record_segments_committed, 1);
 }
 
+static void cluster_undo_try_mark_record_segment_committed_capacity_body(uint32 seg,
+																		 uint8 owner_instance,
+																		 SCN seal_scn);
+
 void
 cluster_undo_try_mark_record_segment_committed(uint32 seg, uint8 owner_instance, SCN seal_scn)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_undo_try_mark_record_segment_committed_capacity_body(seg, owner_instance, seal_scn);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_undo_try_mark_record_segment_committed_capacity_body(uint32 seg, uint8 owner_instance,
+															 SCN seal_scn)
 {
 	if (UndoRecordShared == NULL || seg == 0)
 		return;
@@ -1349,9 +1431,34 @@ typedef enum UndoExtentClaimResult {
  *	whenever a segment becomes active (tail_block=1 is the conservative
  *	retention base, safe on restart resume).
  */
+static UndoExtentClaimResult claim_undo_extent_capacity_body(ClusterUndoExtent *ext,
+															 uint8 owner_instance,
+															 uint32 ensured_segment_id,
+															 SCN current_scn);
+
 static UndoExtentClaimResult
 claim_undo_extent(ClusterUndoExtent *ext, uint8 owner_instance, uint32 ensured_segment_id,
 				  SCN current_scn)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	UndoExtentClaimResult result;
+
+	PG_TRY();
+	{
+		result
+			= claim_undo_extent_capacity_body(ext, owner_instance, ensured_segment_id, current_scn);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static UndoExtentClaimResult
+claim_undo_extent_capacity_body(ClusterUndoExtent *ext, uint8 owner_instance,
+								uint32 ensured_segment_id, SCN current_scn)
 {
 	uint32 seg;
 	uint32 hw;
@@ -1549,11 +1656,13 @@ claim_retry_locked:
 		}
 		if (needs_activation) {
 			pg_atomic_fetch_add_u64(&UndoRecordShared->segment_claim_count, 1);
+			cluster_undo_capacity_write_mark();
 			UndoRecordShared->block_first_scn = current_scn;
 		}
 	}
 
 	/* Publish: advance high-water + active segment. */
+	cluster_undo_capacity_write_mark();
 	UndoRecordShared->next_extent_block = hw + n;
 	UndoRecordShared->active_segment_id = seg;
 	ext->segment_id = seg;
@@ -4435,9 +4544,33 @@ cluster_undo_autoextend_count(void)
  *	LWLockRelease on the allocator locks. Normal return paths still release
  *	their exact locks below.
  */
+static uint32 cluster_undo_tt_rollover_locked_capacity_body(int node_id, uint32 old_segment_id,
+															bool *out_at_hard_cap,
+															bool *out_no_side_effects);
+
 uint32
 cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at_hard_cap,
 								bool *out_no_side_effects)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	uint32 result;
+
+	PG_TRY();
+	{
+		result = cluster_undo_tt_rollover_locked_capacity_body(
+			node_id, old_segment_id, out_at_hard_cap, out_no_side_effects);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static uint32
+cluster_undo_tt_rollover_locked_capacity_body(int node_id, uint32 old_segment_id,
+											  bool *out_at_hard_cap, bool *out_no_side_effects)
 {
 	uint8 owner_instance = (uint8)(node_id + 1);
 	ClusterUndoBlock0LogicalKey logical;
@@ -4860,8 +4993,28 @@ cluster_undo_smgr_pwrite_count(void)
  *	Caller MUST be superuser (TAP test wraps with security definer
  *	function or runs as initdb superuser).  cursor_lock taken EXCLUSIVE.
  */
+static bool cluster_undo_test_force_segment_end_capacity_body(void);
+
 bool
 cluster_undo_test_force_segment_end(void)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = cluster_undo_test_force_segment_end_capacity_body();
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_undo_test_force_segment_end_capacity_body(void)
 {
 	if (UndoRecordShared == NULL)
 		return false;
@@ -4882,6 +5035,7 @@ cluster_undo_test_force_segment_end(void)
 		return false;
 	}
 
+	cluster_undo_capacity_write_mark();
 	UndoRecordShared->next_extent_block = UNDO_BLOCKS_PER_SEGMENT; /* claim -> 0 -> autoextend */
 	UndoRecordShared->current_block = UNDO_BLOCKS_PER_SEGMENT - 1;
 	UndoRecordShared->free_offset = BLCKSZ; /* triggers has_space() == false */

@@ -3973,10 +3973,65 @@ UT_TEST(test_readiness_denial_names_first_false_gate_without_side_effects)
 	reset_fixture();
 }
 
+UT_TEST(test_capacity_xcur_scope_cancel_error_and_scur)
+{
+	ClusterUndoCapacityChangeFence fence;
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0CurrentGuard other = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure;
+	uint64 before;
+	reset_fixture();
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_XCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	UT_ASSERT(cluster_undo_capacity_change_current(before));
+	cluster_undo_capacity_write_mark();
+	UT_ASSERT(!cluster_undo_capacity_change_sample(&before));
+	cluster_undo_block0_current_cancel(&guard);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	memset(&guard, 0, sizeof(guard));
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_XCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	cluster_undo_capacity_write_mark();
+	current_error_cleanup(0, PointerGetDatum(&guard));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	memset(&guard, 0, sizeof(guard));
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	cluster_undo_capacity_write_mark();
+	UT_ASSERT(cluster_undo_capacity_change_current(before));
+	cluster_undo_block0_current_cancel(&guard);
+	memset(&guard, 0, sizeof(guard));
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_XCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	key.segment_id++;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_XCUR, 1000,
+														   &other, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	cluster_undo_capacity_write_mark();
+	/* Retire the older scope first; the other original guard is still live. */
+	cluster_undo_block0_current_cancel(&guard);
+	UT_ASSERT(!cluster_undo_capacity_change_sample(&before));
+	current_backend_exit(0, (Datum)0);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	cluster_undo_block0_current_cancel(&other);
+	UT_ASSERT(cluster_undo_capacity_change_current(before));
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(95);
+	UT_PLAN(96);
 	UT_RUN(test_first_publication_deny_preserves_private_bytes_and_can_retry);
 	UT_RUN(test_first_publication_deny_does_not_intercept_existing_or_rejected_owners);
 	UT_RUN(test_first_publication_injected_error_uses_original_owner_cleanup);
@@ -4072,6 +4127,7 @@ main(void)
 	UT_RUN(test_live_owner_recycle_aborted_needs_release_not_scn_age);
 	UT_RUN(test_live_owner_recycle_rejects_invalid_horizon_before_authority_or_wal);
 	UT_RUN(test_live_owner_recycle_rejects_fold_epoch_drift_before_authority_or_wal);
+	UT_RUN(test_capacity_xcur_scope_cancel_error_and_scur);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -32,7 +32,7 @@ endif
 
 # The backend CRC dispatcher logs its hardware selection on some platforms.
 # Retain that real dispatcher; supply a fail-stop standalone logging boundary.
-CLUSTER_UNIT_PORT_LIBS = $(top_builddir)/src/port/libpgport_srv.a cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+CLUSTER_UNIT_PORT_LIBS = $(top_builddir)/src/port/libpgport_srv.a cluster_unit_port_stubs.o cluster_catalog_trace_test.o cluster_undo_capacity_unit.o
 CLUSTER_UNIT_CLANG ?= $(if $(strip $(CLANG)),$(CLANG),clang)
 
 # Analyze the same extracted product bodies that the standalone tests compile.
@@ -10171,9 +10171,12 @@ test_cluster_tt_checkpoint_apply.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     fields { print } /^} TTCommitStage;/ { fields=0 } \
 	     /^static TTCommitStage tt_commit_stage =/ { print; stages++ } \
 	     /^tt_commit_stage_clear\(/ { print "static void"; emit=1; functions++ } \
+	     /^tt_slot_install_resident\(/ { print "static void"; emit=1; functions++ } \
+	     /^static void cluster_tt_slot_durable_commit_apply_capacity_body\(/ { emit=1; functions++ } \
+	     /^cluster_tt_slot_durable_commit_apply_capacity_body\(/ { print "static void"; emit=1; functions++ } \
 	     /^cluster_tt_slot_durable_commit_apply\(/ { print "void"; emit=1; functions++ } \
-	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (functions != 3 || types != 1 || stages != 1 || emit || fields) exit 1 }' $< > $@.tmp
+	     emit { print } emit && /^\{/ { body=1 } emit && ((body && /^}/) || (!body && /;$$/)) { emit=0; body=0 } \
+	     END { if (functions != 6 || types != 1 || stages != 1 || emit || fields) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_tt_checkpoint_wait.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
@@ -10868,8 +10871,9 @@ test_cluster_undo_extent_types.inc: $(top_srcdir)/src/backend/cluster/cluster_un
 	mv $@.tmp $@
 
 test_cluster_undo_extent_claim.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_record.c Makefile
-	awk '/^claim_undo_extent\(/ { print "static UndoExtentClaimResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^static UndoExtentClaimResult claim_undo_extent_capacity_body\(/ { emit=1; count++ } \
+	     /^claim_undo_extent(_capacity_body)?\(/ { print "static UndoExtentClaimResult"; emit=1; count++ } \
+	     emit { print } emit && /^\{/ { body=1 } emit && ((body && /^}/) || (!body && /;$$/)) { emit=0; body=0 } END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_extent_claim: test_cluster_undo_extent_claim.c unit_test.h \
@@ -11047,9 +11051,10 @@ test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_u
 	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; found++ } \
-	     /^undo_cleaner_capacity_probe\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_(probe|history_probe)\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_(report_wait|real_protector|reports_advance)\(/ { print "static bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}$$/ { emit=0 } END { if (found != 6 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}$$/ { emit=0 } END { if (found != 10 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 clean distclean maintainer-clean: clean-ctrc-capacity-wait
@@ -14103,3 +14108,65 @@ test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Local read-only capacity invalidation uses the same core as the backend.
+# Only process-exit callback registration is outside standalone fixtures.
+TESTS += test_cluster_undo_capacity
+all: test_cluster_undo_capacity
+
+cluster_undo_capacity_unit.o: $(top_srcdir)/src/backend/cluster/cluster_undo_capacity.c $(top_srcdir)/src/include/cluster/cluster_undo_capacity.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_UNDO_CAPACITY_UNIT_TEST -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_undo_capacity: test_cluster_undo_capacity.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_capacity.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_srcdir)/src/backend/cluster/cluster_undo_capacity.c \
+		$(filter-out cluster_undo_capacity_unit.o,$(CLUSTER_UNIT_PORT_LIBS)) -o $@
+
+# Append after original recipes: preserve each original $< test input.
+$(TESTS): cluster_undo_capacity_unit.o
+
+# Capacity classification consumes the same two pure policy helpers over
+# observations made by the actual LMON/receiver in the horizon fixture.
+test_cluster_undo_capacity_history_policy.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^undo_cleaner_capacity_(real_protector|reports_advance)\(/ { print "static bool"; emit=1; n++ } emit { print } /^}$$/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_horizon: test_cluster_undo_capacity_history_policy.inc
+
+# Same actual local publisher, cohort and wait controller as the backend.
+TESTS += test_cluster_undo_capacity_history
+all: test_cluster_undo_capacity_history
+
+test_cluster_undo_capacity_history_lmon.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	awk '/^undo_horizon_publish_local_history\(/ { print "static void"; emit=1; n++ } \
+	     /^undo_horizon_capacity_local_sample\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; n++ } \
+	     /^cluster_undo_capacity_history_(observe|current)\(/ { print "ClusterHeapFreezeCohortStatus"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if (n != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_capacity_history: test_cluster_undo_capacity_history.c \
+		test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_capacity_wait.inc test_cluster_ctrc_horizon_sender.inc \
+		test_cluster_ctrc_horizon_cohort.inc test_cluster_undo_capacity_history_lmon.inc \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_worker_sample.inc \
+		test_cluster_ctrc_read_scope.inc test_cluster_ctrc_native_exit.inc \
+		test_cluster_ctrc_native_group_exit.inc test_cluster_ctrc_native_prepare.inc \
+		test_cluster_pgproc_active_types.inc unit_test.h cluster_undo_capacity_unit.o \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+clean distclean maintainer-clean: clean-undo-capacity-history
+.PHONY: clean-undo-capacity-history
+clean-undo-capacity-history:
+	rm -f test_cluster_undo_capacity_history_lmon.inc test_cluster_undo_capacity_history_lmon.inc.tmp \
+		test_cluster_undo_capacity_history_policy.inc test_cluster_undo_capacity_history_policy.inc.tmp \
+		cluster_undo_capacity_unit.o test_cluster_undo_capacity test_cluster_undo_capacity_history

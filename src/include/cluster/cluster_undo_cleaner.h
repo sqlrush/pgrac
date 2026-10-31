@@ -70,6 +70,7 @@
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "cluster/cluster_scn.h" /* SCN (pass-stats horizon plumbing) */
+#include "cluster/cluster_undo_capacity.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_xid_stripe_boot.h"
@@ -157,6 +158,7 @@ typedef struct UndoCleanerWorkerState {
 } UndoCleanerWorkerState;
 
 typedef struct UndoCleanerSharedState {
+	ClusterUndoCapacityChangeFence capacity_change;
 	LWLock lwlock;
 	bool shutdown_requested;
 	UndoCleanerWorkerState workers[CLUSTER_UNDO_CLEANER_WORKER_TYPES];
@@ -198,6 +200,9 @@ typedef struct UndoCleanerSharedState {
 	 */
 	uint32 scan_resume_seg;
 } UndoCleanerSharedState;
+
+StaticAssertDecl(offsetof(UndoCleanerSharedState, capacity_change) == 0,
+				 "capacity counters must retain shared-memory atomic alignment");
 
 /* Postmaster-owned PID inventory. Zero is an unoccupied slot, never a
  * reaped process identity. A normal reap frees exactly one respawn slot. */

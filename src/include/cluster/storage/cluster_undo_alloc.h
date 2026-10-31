@@ -268,6 +268,12 @@ extern uint32 cluster_undo_segment_scan_max_existing(uint8 owner_instance);
  */
 extern bool cluster_undo_segment_file_exists(uint8 owner_instance, uint32 segment_id);
 
+/* Discovery only. Absence is reported only for an original own-owner path's
+ * ENOENT; this probe grants no allocation, reuse or retention permission. */
+enum ClusterUndoBlock0Result;
+extern enum ClusterUndoBlock0Result cluster_undo_segment_capacity_presence(uint8 owner_instance,
+																		   uint32 segment_id);
+
 /*
  * spec-3.18 D3.2 (review finding 2):  restart resume must pick the live active
  * segment (SEGMENT_ACTIVE, FULL flag clear), not the highest-numbered file --

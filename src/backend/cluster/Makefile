@@ -318,7 +318,7 @@ OBJS = \
 	cluster_itl_cleanout.o \
 	cluster_itl_touch.o \
 	cluster_uba.o \
-	cluster_undo_cleaner.o \
+	cluster_undo_capacity.o cluster_undo_cleaner.o \
 	cluster_visibility_resolve.o \
 	cluster_visibility_verdict.o \
 	cluster_writer_chain.o \

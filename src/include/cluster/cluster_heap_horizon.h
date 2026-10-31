@@ -184,6 +184,10 @@ typedef struct ClusterHeapFreezeCohortObservation {
 	/* Same decoded reports as the H inputs; process-local diagnostics only. */
 	uint64 source_peer_report_sequence[CLUSTER_MAX_NODES];
 	uint64 source_local_sample_id;
+	/* Capacity observations use an actual LMON publication, independently
+	 * of F's completed sample id and the sender's last sequence. */
+	uint64 source_local_report_sequence;
+	uint64 source_local_reported_at_us;
 	uint64 source_started_at_us;
 	uint32 source_interval_ms;
 	ClusterHeapFreezeCohortPeerObservation source_peers[CLUSTER_MAX_NODES];
@@ -222,6 +226,11 @@ extern bool cluster_heap_freeze_observed_bounds_v1(
  * remains usable with fresh H; F itself has no age expiry. */
 extern ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out);
+extern ClusterHeapFreezeCohortStatus
+cluster_undo_capacity_history_observe(ClusterHeapFreezeCohortObservation *out,
+									  bool *producer_available);
+extern ClusterHeapFreezeCohortStatus
+cluster_undo_capacity_history_current(const ClusterHeapFreezeCohortObservation *expected);
 
 /* Keep the original observation unchanged. Recheck its completed local sample,
  * exact peer publications/connections and H age after local identity checks;

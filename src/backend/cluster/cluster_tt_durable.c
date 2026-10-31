@@ -32,6 +32,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 #include "cluster/cluster_native_itl_trace.h"
 #include "cluster/cluster_undo_recovery.h"
 
@@ -76,6 +77,7 @@ static void
 tt_slot_install_resident(UndoSegmentHeaderData *resident, uint16 slot_offset,
 						 const TTSlot *successor)
 {
+	cluster_undo_capacity_write_mark();
 	memcpy(&resident->tt_slots[slot_offset], successor, sizeof(*successor));
 	if (!cluster_undo_segment_header_seal(resident))
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -1052,9 +1054,28 @@ cluster_tt_slot_durable_prepared_emit(const ClusterTTPreparedStage *stage)
 
 /* Critical-section safe: write the staged successor; PANIC on failure (the
  * record is durable and redo restamps the slot). */
+static void cluster_tt_slot_durable_prepared_apply_capacity_body(ClusterTTPreparedStage *stage);
+
 void
 cluster_tt_slot_durable_prepared_apply(ClusterTTPreparedStage *stage)
 {
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_tt_slot_durable_prepared_apply_capacity_body(stage);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_tt_slot_durable_prepared_apply_capacity_body(ClusterTTPreparedStage *stage)
+{
+	cluster_undo_capacity_write_mark();
 	if (!cluster_undo_smgr_header_writer_write(
 			stage->fd, (ClusterUndoPathIntent)stage->intent, stage->segment_id, stage->owner,
 			tt_slot_file_offset(stage->slot_offset), (const char *)&stage->successor,
@@ -1403,8 +1424,26 @@ cluster_tt_slot_durable_commit_staged(uint32 segment_id, uint16 slot_offset, Tra
  * for that checkpoint's fsync.  Every failure is a PANIC; the commit record is
  * durable and redo restamps the slot.
  */
+static void cluster_tt_slot_durable_commit_apply_capacity_body(XLogRecPtr commit_end);
+
 void
 cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_tt_slot_durable_commit_apply_capacity_body(commit_end);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_tt_slot_durable_commit_apply_capacity_body(XLogRecPtr commit_end)
 {
 	TTCommitStage *stage = &tt_commit_stage;
 	UndoSegmentHeaderData *resident;
@@ -1441,6 +1480,7 @@ cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
 						errmsg("staged canonical TT predecessor of undo segment %u slot %u "
 							   "changed before its commit stamp",
 							   stage->segment_id, stage->slot_offset)));
+	cluster_undo_capacity_write_mark();
 	if (!cluster_undo_smgr_header_writer_write(stage->fd, stage->intent, stage->segment_id,
 											   stage->owner,
 											   tt_slot_file_offset(stage->slot_offset),

@@ -10,6 +10,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 
 #include "access/xact.h"
 #include "cluster/cluster_conf.h"
@@ -149,7 +150,8 @@ typedef struct ClusterUndoBlock0CurrentGuardData {
 	bool reservation_held;
 	bool request_dispatched;
 	bool grant_observed;
-	uint8 reserved[15];
+	bool capacity_scope;
+	uint8 reserved[14];
 	uint8 reply_wait_site_plus_one;
 	bool reply_wait_adapter_required;
 	bool reply_wait_repoll_pending;
@@ -379,6 +381,8 @@ current_active_unlink(ClusterUndoBlock0CurrentGuardData *data)
 	if (data != NULL && data->active_linked) {
 		dlist_delete_thoroughly(&data->active_node);
 		data->active_linked = false;
+		cluster_undo_capacity_write_scope_end(data->capacity_scope);
+		data->capacity_scope = false;
 	}
 }
 
@@ -398,6 +402,7 @@ cluster_undo_block0_current_startup_fenced_begin(ClusterUndoBlock0CurrentGuard *
 
 	current_ensure_exit_hook();
 	current_active_link(data);
+	data->capacity_scope = cluster_undo_capacity_write_scope_begin();
 	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR;
 	return true;
 }
@@ -808,6 +813,8 @@ current_promote_grant(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0
 	data->reservation_held = false; /* promote or the helper's failed revalidate consumed it */
 	if (result != CLUSTER_GRD_ENTRY_OK)
 		return current_fail(data, current_failure_from_grd(result), failure);
+	if (data->mode == CLUSTER_UNDO_BLOCK0_XCUR)
+		data->capacity_scope = cluster_undo_capacity_write_scope_begin();
 	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD;
 	return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 }

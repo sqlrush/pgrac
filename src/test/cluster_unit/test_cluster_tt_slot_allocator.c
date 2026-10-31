@@ -69,6 +69,7 @@
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_undo_capacity.h"
 #include "cluster/cluster_undo_cleaner.h" /* gc pass + stats (spec-3.13) */
 #include "storage/spin.h"				  /* slock_t (spec-3.15 map stub) */
 #include "cluster/cluster_undo_retention.h"
@@ -206,6 +207,9 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id, uint16 slot_offset
 
 
 /* ereport stub: longjmp out on ERROR so we can detect raises. */
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
 static sigjmp_buf ereport_recover_jmp;
 static int ereport_raised_count = 0;
 static int last_ereport_errcode = 0;
@@ -245,6 +249,16 @@ void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	siglongjmp(ereport_recover_jmp, 1);
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	siglongjmp(ereport_recover_jmp, 1);
 }
 
@@ -1609,9 +1623,49 @@ UT_TEST(test_stop_tt_last_invalid_is_not_hidden_by_first_active)
 	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
 }
 
+static ClusterUndoCapacityChangeFence capacity_test_fence;
+
+UT_TEST(test_capacity_real_tt_producers_and_noop)
+{
+	uint64 before, after;
+	uint16 slot, wrap;
+	reset_allocator();
+	cluster_undo_capacity_fence_init(&capacity_test_fence);
+	cluster_undo_capacity_fence_attach(&capacity_test_fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	slot = cluster_tt_slot_alloc(1, 9001);
+	wrap = cluster_tt_slot_get_wrap(1, slot);
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&after));
+	UT_ASSERT_EQ(cluster_tt_slot_alloc(1, 9001), slot);
+	UT_ASSERT(cluster_undo_capacity_change_current(after));
+	cluster_tt_slot_mark_committed(1, slot, 9002, wrap, (SCN)42);
+	UT_ASSERT(cluster_undo_capacity_change_current(after));
+	cluster_tt_slot_mark_committed(1, slot, 9001, wrap, (SCN)42);
+	UT_ASSERT(!cluster_undo_capacity_change_current(after));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	UT_ASSERT(cluster_tt_slot_protect(1, slot, wrap, 9001));
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	UT_ASSERT(cluster_tt_slot_protect(1, slot, wrap, 9001));
+	UT_ASSERT(cluster_undo_capacity_change_current(before));
+	UT_ASSERT_EQ(cluster_tt_slot_unprotect_xid(9001), 1);
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	cluster_tt_slot_free(1, slot);
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	cluster_tt_slot_rollover(0, 2, NULL);
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&after));
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
 int
 main(void)
 {
+	UT_PLAN(63);
+	UT_RUN(test_capacity_real_tt_producers_and_noop);
 	cluster_tt_slot_shmem_init(); /* one-time init for tests that
 										   don't call reset_allocator */
 

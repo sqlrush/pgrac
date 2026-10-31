@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_capacity.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "common/file_perm.h"
@@ -31,6 +32,18 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+static ClusterUndoCapacityChangeFence capacity_test_fence;
+static bool capacity_test_attached;
+
 
 int MyProcPid = 4321;
 pg_time_t MyStartTime = 0;
@@ -172,6 +185,10 @@ pg_fsync(int fd)
 static ssize_t
 test_product_pwrite(int fd, const void *buf, size_t nbytes, off_t offset)
 {
+	if (capacity_test_attached) {
+		uint64 sequence;
+		UT_ASSERT(!cluster_undo_capacity_change_sample(&sequence));
+	}
 	if (header_write_expected) {
 		UT_ASSERT(header_locked);
 		UT_ASSERT_EQ(nbytes, BLCKSZ);
@@ -1034,10 +1051,19 @@ UT_TEST(test_header_range_writer_preserves_other_slots_under_whole_page_lock)
 	expected = page;
 	((UndoSegmentHeaderData *)expected.data)->tt_slots[4] = terminal;
 	((PageHeader)expected.data)->pd_checksum = pg_checksum_page(expected.data, 0);
+	cluster_undo_capacity_fence_init(&capacity_test_fence);
+	cluster_undo_capacity_fence_attach(&capacity_test_fence);
+	capacity_test_attached = true;
 	header_write_expected = true;
 	header_writes = fsync_calls = 0;
 	UT_ASSERT(cluster_undo_smgr_header_writer_write(fd, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
 		1, 1, offsetof(UndoSegmentHeaderData, tt_slots[4]), (char *)&terminal, sizeof(terminal)));
+	{
+		uint64 sequence;
+		UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	}
+	capacity_test_attached = false;
+	cluster_undo_capacity_fence_attach(NULL);
 	UT_ASSERT_EQ(header_writes, 1);
 	UT_ASSERT_EQ(fsync_calls, 1);
 	UT_ASSERT(!header_locked);

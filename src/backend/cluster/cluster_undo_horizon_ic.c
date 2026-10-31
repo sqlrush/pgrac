@@ -118,12 +118,35 @@ typedef struct UndoHorizonMaintenanceIntent {
 	uint64 requested;
 } UndoHorizonMaintenanceIntent;
 
+typedef struct UndoHorizonLocalHistoryPublication {
+	uint64 report_sequence;
+	uint64 system_identifier;
+	uint64 cluster_epoch;
+	uint64 formation_epoch;
+	uint64 record_generation;
+	uint64 boot_incarnation;
+	uint64 admission_publication_seq;
+	uint64 membership_cut_generation;
+	uint64 horizon_scn;
+	uint64 sample_clock_scn;
+	uint64 contributor_token;
+	uint64 published_at_us;
+	uint32 contributor_kind;
+	uint32 reserved;
+} UndoHorizonLocalHistoryPublication;
+
+StaticAssertDecl(sizeof(UndoHorizonLocalHistoryPublication) == 104,
+				 "local history publication must retain its bounded payload");
+StaticAssertDecl(offsetof(UndoHorizonLocalHistoryPublication, contributor_kind) == 96,
+				 "local history publication must retain uint64 alignment");
+
 typedef struct ClusterUndoHorizonShmem {
 	ClusterUndoHorizonSlotShmem slots[CLUSTER_MAX_NODES];
 	ClusterHeapFreezeReportV2SlotShmem freeze_slots[CLUSTER_MAX_NODES];
 	uint64 report_sequence;			/* LMON only; survives a process restart; never wraps */
 	uint64 freeze_last_observed_us; /* LMON only; rate limit refusals as well */
 	slock_t maintenance_lock;
+	UndoHorizonLocalHistoryPublication local_history; /* same original short lock */
 	UndoHorizonMaintenanceIntent maintenance;
 	/* Latest READY fold, published only as an identity-bound candidate. */
 	pg_atomic_uint32 freeze_watermark_seq;
@@ -149,6 +172,9 @@ typedef struct ClusterUndoHorizonShmem {
 										   * admission at epoch 0 is distinct
 										   * from the never-admitted sentinel. */
 } ClusterUndoHorizonShmem;
+
+StaticAssertDecl(offsetof(ClusterUndoHorizonShmem, local_history) % sizeof(uint64) == 0,
+				 "local history publication must be aligned in shared memory");
 
 static ClusterUndoHorizonShmem *UndoHorizonShmem = NULL;
 
@@ -589,6 +615,58 @@ undo_horizon_local_source_current(const ClusterSemanticActiveSampleFence *fence,
 		&& cluster_undo_cleaner_active_sample_current(active);
 }
 
+/* Only the original LMON publishes. No peer or connection is manufactured
+ * for self; a local publication consumes its own real report sequence. */
+static void
+undo_horizon_publish_local_history(const ClusterUndoCleanerActiveSample *active,
+								   const ClusterUndoRetentionSample *history)
+{
+	const ClusterSemanticActiveSampleFence *fence = &active->admission_fence;
+	UndoHorizonLocalHistoryPublication publication = { 0 };
+	TimestampTz now = GetCurrentTimestamp();
+	uint64 epoch = cluster_epoch_get_current();
+
+	if (active->scan.status != CTRC_ACTIVE_SCAN_COMPLETE || active->sample_id == 0
+		|| active->scan.unqualified_entries != 0 || active->worker_pid <= 0
+		|| !FullTransactionIdIsValid(active->scan.future_full)
+		|| !FullTransactionIdIsValid(active->scan.min_full)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(active->scan.future_full))
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(active->scan.min_full))
+		|| U64FromFullTransactionId(active->scan.future_full) == UINT64_MAX
+		|| U64FromFullTransactionId(active->scan.min_full) == UINT64_MAX
+		|| FullTransactionIdFollows(active->scan.min_full, active->scan.future_full)
+		|| fence->local_node_id != cluster_node_id || fence->system_identifier == 0
+		|| fence->formation_epoch == 0 || fence->record_generation == 0
+		|| epoch != fence->formation_epoch || fence->admission_publication_seq == 0
+		|| fence->membership_cut_generation == 0 || fence->local_boot_incarnation == 0
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| fence->admitted_incarnation[cluster_node_id] != fence->local_boot_incarnation
+		|| !SCN_VALID(history->horizon_scn) || !SCN_VALID(history->clock_scn)
+		|| history->horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
+		|| scn_time_cmp(history->horizon_scn, history->clock_scn) > 0 || now <= 0
+		|| !undo_horizon_local_source_current(fence, active)
+		|| !cluster_semantic_activation_active_sample_current(fence))
+		return;
+	publication.system_identifier = fence->system_identifier;
+	publication.cluster_epoch = epoch;
+	publication.formation_epoch = fence->formation_epoch;
+	publication.record_generation = fence->record_generation;
+	publication.boot_incarnation = fence->local_boot_incarnation;
+	publication.admission_publication_seq = fence->admission_publication_seq;
+	publication.membership_cut_generation = fence->membership_cut_generation;
+	publication.horizon_scn = history->horizon_scn;
+	publication.sample_clock_scn = history->clock_scn;
+	publication.contributor_kind = history->contributor_kind;
+	publication.contributor_token = history->contributor_token;
+	publication.published_at_us = (uint64)now;
+	SpinLockAcquire(&UndoHorizonShmem->maintenance_lock);
+	if (UndoHorizonShmem->report_sequence < UINT64_MAX - 1) {
+		publication.report_sequence = ++UndoHorizonShmem->report_sequence;
+		UndoHorizonShmem->local_history = publication;
+	}
+	SpinLockRelease(&UndoHorizonShmem->maintenance_lock);
+}
+
 static void
 undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 					 const ClusterUndoRetentionSample *h)
@@ -750,6 +828,8 @@ cluster_undo_horizon_lmon_tick(void)
 	wire.epoch = cluster_epoch_get_current();
 	wire.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
 	have_active = cluster_undo_cleaner_active_sample(&active);
+	if (have_active)
+		undo_horizon_publish_local_history(&active, &sample);
 
 	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 		if (pi == cluster_node_id)
@@ -1265,6 +1345,120 @@ ClusterHeapFreezeCohortStatus
 cluster_heap_freeze_cohort_observe(ClusterHeapFreezeCohortObservation *out)
 {
 	return undo_horizon_v2_cohort_observe(out, NULL, NULL);
+}
+
+static ClusterHeapFreezeCohortStatus
+undo_horizon_capacity_local_sample(UndoHorizonLocalHistoryPublication *out)
+{
+	ClusterSemanticActiveSampleFence fence;
+	UndoHorizonLocalHistoryPublication publication;
+	UndoHorizonLocalHistoryPublication final;
+	TimestampTz now;
+	uint64 maximum_age;
+
+	if (!cluster_enabled || UndoHorizonShmem == NULL || out == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	SpinLockAcquire(&UndoHorizonShmem->maintenance_lock);
+	publication = UndoHorizonShmem->local_history;
+	SpinLockRelease(&UndoHorizonShmem->maintenance_lock);
+	if (publication.report_sequence == 0)
+		return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+	if (publication.report_sequence == UINT64_MAX || UndoHorizonShmem->report_sequence == UINT64_MAX
+		|| !cluster_semantic_activation_active_sample_capture(&fence)
+		|| !undo_horizon_v2_required(&fence, cluster_node_id)
+		|| publication.system_identifier != fence.system_identifier
+		|| publication.cluster_epoch != cluster_epoch_get_current()
+		|| publication.formation_epoch != fence.formation_epoch
+		|| publication.record_generation != fence.record_generation
+		|| publication.boot_incarnation != fence.local_boot_incarnation
+		|| publication.admission_publication_seq != fence.admission_publication_seq
+		|| publication.membership_cut_generation != fence.membership_cut_generation
+		|| fence.local_node_id != cluster_node_id
+		|| fence.admitted_incarnation[cluster_node_id] != publication.boot_incarnation
+		|| !cluster_semantic_activation_active_sample_current(&fence))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	now = GetCurrentTimestamp();
+	maximum_age = (uint64)CLUSTER_UNDO_HORIZON_FRESHNESS_FACTOR
+				  * Max(CLUSTER_UNDO_HORIZON_INTERVAL_MIN_MS,
+						Min(cluster_lmon_main_loop_interval, CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS))
+				  * 1000;
+	if (now <= 0 || publication.published_at_us == 0 || (uint64)now < publication.published_at_us
+		|| (uint64)now - publication.published_at_us > maximum_age)
+		return CLUSTER_HEAP_FREEZE_COHORT_H_STALE;
+	/* The end-clock observer can overlap retirement too. Close the original
+	 * identity cut after it, then reject replacement of this exact report. */
+	if (!cluster_semantic_activation_active_sample_current(&fence))
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	SpinLockAcquire(&UndoHorizonShmem->maintenance_lock);
+	final = UndoHorizonShmem->local_history;
+	SpinLockRelease(&UndoHorizonShmem->maintenance_lock);
+	if (memcmp(&publication, &final, sizeof(final)) != 0
+		|| UndoHorizonShmem->report_sequence == UINT64_MAX)
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	*out = publication;
+	return CLUSTER_HEAP_FREEZE_COHORT_READY;
+}
+
+ClusterHeapFreezeCohortStatus
+cluster_undo_capacity_history_observe(ClusterHeapFreezeCohortObservation *out,
+									  bool *producer_available)
+{
+	UndoHorizonLocalHistoryPublication publication, final;
+	ClusterUndoRetentionSample history;
+	ClusterHeapFreezeCohortObservation candidate;
+	ClusterHeapFreezeCohortStatus status;
+
+	if (producer_available != NULL)
+		*producer_available = false;
+	if (out == NULL)
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	MemSet(out, 0, sizeof(*out));
+	status = undo_horizon_capacity_local_sample(&publication);
+	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return status;
+	history.horizon_scn = publication.horizon_scn;
+	history.clock_scn = publication.sample_clock_scn;
+	history.contributor_kind = publication.contributor_kind;
+	history.contributor_token = publication.contributor_token;
+	status = undo_horizon_v2_cohort_observe(&candidate, &history, NULL);
+	if (undo_horizon_capacity_local_sample(&final) != CLUSTER_HEAP_FREEZE_COHORT_READY
+		|| memcmp(&publication, &final, sizeof(final)) != 0)
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	/* A fresh actual original publication proves the local report producer;
+	 * no PID or F sample id is promoted to such evidence. */
+	if (producer_available != NULL)
+		*producer_available = true;
+	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return status;
+	candidate.source_local_report_sequence = publication.report_sequence;
+	candidate.source_local_reported_at_us = publication.published_at_us;
+	*out = candidate;
+	return CLUSTER_HEAP_FREEZE_COHORT_READY;
+}
+
+ClusterHeapFreezeCohortStatus
+cluster_undo_capacity_history_current(const ClusterHeapFreezeCohortObservation *expected)
+{
+	UndoHorizonLocalHistoryPublication publication;
+	ClusterHeapFreezeCohortStatus status;
+
+	if (expected == NULL || expected->source_local_report_sequence == 0)
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+	status = cluster_heap_freeze_cohort_current(expected);
+	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return status;
+	status = undo_horizon_capacity_local_sample(&publication);
+	if (status != CLUSTER_HEAP_FREEZE_COHORT_READY)
+		return status;
+	if (publication.report_sequence != expected->source_local_report_sequence
+		|| publication.published_at_us != expected->source_local_reported_at_us
+		|| publication.horizon_scn != expected->source_local_horizon_scn
+		|| publication.sample_clock_scn != expected->source_local_history.sample_clock_scn
+		|| publication.contributor_kind != expected->source_local_history.contributor_kind
+		|| publication.contributor_token != expected->source_local_history.contributor_token)
+		return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
+	return CLUSTER_HEAP_FREEZE_COHORT_READY;
 }
 
 ClusterHeapFreezeCohortStatus

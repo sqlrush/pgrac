@@ -74,6 +74,43 @@ static bool test_clear_current_continuation;
 static unsigned test_continuation_calls;
 static ClusterCtrcTxnKeyV1 test_continuation_hint;
 static bool test_segment_owner;
+uint64
+cluster_epoch_get_current(void)
+{
+	return 7;
+}
+/* This lifecycle fixture models H as unavailable; real publication and
+ * complete physical classification are composed in their dedicated tests. */
+ClusterHeapFreezeCohortStatus
+cluster_undo_capacity_history_observe(ClusterHeapFreezeCohortObservation *out, bool *producer)
+{
+	MemSet(out, 0, sizeof(*out));
+	*producer = false;
+	return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
+}
+
+ClusterHeapFreezeCohortStatus
+cluster_undo_capacity_history_current(const ClusterHeapFreezeCohortObservation *expected)
+{
+	(void)expected;
+	abort();
+}
+
+ClusterCapacityReasonV1
+cluster_ctrc_capacity_probe_history_v1(uint32 segment, SCN horizon, uint64 epoch,
+									   const ClusterCtrcTxnKeyV1 *hint,
+									   ClusterCapacityHistoryPass *pass,
+									   ClusterCapacityObservationV1 *out)
+{
+	(void)segment;
+	(void)horizon;
+	(void)epoch;
+	(void)hint;
+	(void)pass;
+	(void)out;
+	abort();
+}
+
 static unsigned test_segment_fault;
 extern ClusterCapacityReasonV1
 cluster_ctrc_capacity_probe_pool_segment_v1(uint32 segment, SCN horizon, uint64 epoch,

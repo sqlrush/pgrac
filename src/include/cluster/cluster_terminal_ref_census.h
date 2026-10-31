@@ -1182,6 +1182,32 @@ cluster_ctrc_capacity_probe_pool_segment_v1(uint32 current_segment, SCN horizon,
 											const ClusterCtrcTxnKeyV1 *hint,
 											ClusterCapacityObservationV1 *observation);
 
+/* Caller-private coverage of a single unchanged horizon/identity cut. A legal
+ * bounded continuation sets incomplete+progress; unknown evidence sets only
+ * incomplete. This is never a release/reuse grant or a long-reader verdict. */
+#define CLUSTER_CTRC_CAPACITY_HISTORY_V1 1
+typedef struct ClusterCapacityHistoryPass {
+	ClusterCapacitySegmentIdentityV1 identity;
+	SCN horizon;
+	uint64 change_sequence;
+	uint32 next_position;
+	uint32 covered_positions;
+	uint32 allocated_count;
+	uint32 first_absent_position;
+	uint32 record_segment;
+	uint32 configured_cap;
+	bool started;
+	bool complete;
+	bool incomplete;
+	bool progress;
+	bool history_only;
+	bool current_proven;
+	bool saw_history;
+} ClusterCapacityHistoryPass;
+extern ClusterCapacityReasonV1 cluster_ctrc_capacity_probe_history_v1(
+	uint32 current_segment, SCN horizon, uint64 epoch, const ClusterCtrcTxnKeyV1 *hint,
+	ClusterCapacityHistoryPass *pass, ClusterCapacityObservationV1 *observation);
+
 /*
  * L11/L12 canonical release sampler for the current allocator GC.  The
  * caller holds no allocator/page/CTRC lock.  Success means one exact local

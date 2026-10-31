@@ -32,6 +32,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 #include "cluster/cluster_undo_recovery.h"
 
 #include <dirent.h>
@@ -359,11 +360,36 @@ cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance, uint32 
 	return ok;
 }
 
+static bool cluster_undo_smgr_recovery_materialize_v1_capacity_body(
+	uint32 segment, uint8 instance, const ClusterUndoSmgrRecoveryFileV1 *expected,
+	const char block0[BLCKSZ], const char final_header[BLCKSZ]);
+
 bool
 cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 										  const ClusterUndoSmgrRecoveryFileV1 *expected,
 										  const char block0[BLCKSZ],
 										  const char final_header[BLCKSZ])
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = cluster_undo_smgr_recovery_materialize_v1_capacity_body(
+			segment, instance, expected, block0, final_header);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_undo_smgr_recovery_materialize_v1_capacity_body(
+	uint32 segment, uint8 instance, const ClusterUndoSmgrRecoveryFileV1 *expected,
+	const char block0[BLCKSZ], const char final_header[BLCKSZ])
 {
 	ClusterUndoSmgrRecoveryFileV1 observed;
 	PGAlignedBlock page;
@@ -396,6 +422,8 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 			!= 0
 		|| strcmp(path, checked) != 0)
 		return false;
+	if (!expected->exists)
+		cluster_undo_capacity_write_mark();
 	fd = BasicOpenFile(path, flags);
 	if (fd < 0)
 		return false;
@@ -409,8 +437,10 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 									   checked, sizeof(checked))
 				 == 0
 			 && strcmp(path, checked) == 0;
-	if (ok)
+	if (ok) {
+		cluster_undo_capacity_write_mark();
 		ok = ftruncate(fd, UNDO_SEGMENT_SIZE_BYTES) == 0 && pg_fsync(fd) == 0;
+	}
 	if (close(fd) != 0)
 		ok = false;
 	/* Sync both the file name and the possibly newly created instance dir.
@@ -443,9 +473,35 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id, ui
 }
 
 
+static bool cluster_undo_smgr_write_block_capacity_body(ClusterUndoPathIntent intent,
+														uint32 segment_id, uint8 owner_instance,
+														uint32 block_no, const char *buf,
+														bool do_fsync);
+
 bool
 cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
 							  uint32 block_no, const char *buf, bool do_fsync)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = cluster_undo_smgr_write_block_capacity_body(intent, segment_id, owner_instance,
+															 block_no, buf, do_fsync);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_undo_smgr_write_block_capacity_body(ClusterUndoPathIntent intent, uint32 segment_id,
+											uint8 owner_instance, uint32 block_no, const char *buf,
+											bool do_fsync)
 {
 	int fd;
 	off_t offset;
@@ -467,6 +523,8 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, u
 		buf = header.data;
 	}
 	offset = (off_t)block_no * BLCKSZ;
+	if (block_no == 0)
+		cluster_undo_capacity_write_mark();
 	nwritten = pg_pwrite(fd, buf, BLCKSZ, offset);
 	cluster_undo_record_note_smgr_pwrite();
 	if (nwritten != BLCKSZ)
@@ -545,10 +603,37 @@ cluster_undo_smgr_header_writer_open(ClusterUndoPathIntent intent, uint32 segmen
 	return fd < 0 ? -1 : dup(fd);
 }
 
+static bool cluster_undo_smgr_header_writer_write_capacity_body(int fd,
+																ClusterUndoPathIntent intent,
+																uint32 segment_id,
+																uint8 owner_instance, uint32 offset,
+																const char *buf, uint32 len);
+
 bool
 cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent, uint32 segment_id,
 									  uint8 owner_instance, uint32 offset, const char *buf,
 									  uint32 len)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = cluster_undo_smgr_header_writer_write_capacity_body(
+			fd, intent, segment_id, owner_instance, offset, buf, len);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_undo_smgr_header_writer_write_capacity_body(int fd, ClusterUndoPathIntent intent,
+													uint32 segment_id, uint8 owner_instance,
+													uint32 offset, const char *buf, uint32 len)
 {
 	PGAlignedBlock page;
 	uint32 acquired;
@@ -568,6 +653,7 @@ cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent, uint
 	memcpy(page.data + offset, buf, len);
 	if (!cluster_undo_segment_header_seal(page.data))
 		goto done;
+	cluster_undo_capacity_write_mark();
 	ok = pg_pwrite(fd, page.data, BLCKSZ, 0) == BLCKSZ;
 	cluster_undo_record_note_smgr_pwrite();
 	if (ok)
@@ -783,8 +869,30 @@ cluster_undo_smgr_recovery_abort_prepare_tx_v1(ClusterWalInputsV1 *inputs,
 	return true;
 }
 
+static bool recovery_header_stamp_write_capacity_body(ClusterUndoSmgrRecoveryStampV1 stamp,
+													  RecoveryHeaderStampKind kind);
+
 static bool
 recovery_header_stamp_write(ClusterUndoSmgrRecoveryStampV1 stamp, RecoveryHeaderStampKind kind)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = recovery_header_stamp_write_capacity_body(stamp, kind);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+recovery_header_stamp_write_capacity_body(ClusterUndoSmgrRecoveryStampV1 stamp,
+										  RecoveryHeaderStampKind kind)
 {
 	RecoveryHeaderStamp *stage = &recovery_header_stamp;
 	PGAlignedBlock observed;
@@ -816,6 +924,7 @@ recovery_header_stamp_write(ClusterUndoSmgrRecoveryStampV1 stamp, RecoveryHeader
 		&& !cluster_wal_inputs_tx_abort_authorized_v1(stage->tx_inputs, &stage->record))
 		goto refused;
 	if (memcmp(stage->before.data, stage->after.data, BLCKSZ) != 0) {
+		cluster_undo_capacity_write_mark();
 		size = pg_pwrite(stage->fd, stage->after.data, BLCKSZ, 0);
 		cluster_undo_record_note_smgr_pwrite();
 		if (size != BLCKSZ)
@@ -1479,10 +1588,36 @@ provision_fsync_parent(const char *final_path)
 }
 
 
+static ClusterUndoSmgrPublishResult cluster_undo_smgr_provision_temp_publish_capacity_body(
+	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance, const char *temp_path,
+	const char block0[BLCKSZ]);
+
 ClusterUndoSmgrPublishResult
 cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 segment_id,
 										 uint8 owner_instance, const char *temp_path,
 										 const char block0[BLCKSZ])
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	ClusterUndoSmgrPublishResult result;
+
+	PG_TRY();
+	{
+		result = cluster_undo_smgr_provision_temp_publish_capacity_body(
+			intent, segment_id, owner_instance, temp_path, block0);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ClusterUndoSmgrPublishResult
+cluster_undo_smgr_provision_temp_publish_capacity_body(ClusterUndoPathIntent intent,
+													   uint32 segment_id, uint8 owner_instance,
+													   const char *temp_path,
+													   const char block0[BLCKSZ])
 {
 	char final_path[MAXPGPATH];
 	PGAlignedBlock observed, sealed;
@@ -1524,6 +1659,7 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 se
 		return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 	}
 
+	cluster_undo_capacity_write_mark();
 	if (link(temp_path, final_path) == 0) {
 		if (!provision_fsync_parent(final_path)) {
 			/*
