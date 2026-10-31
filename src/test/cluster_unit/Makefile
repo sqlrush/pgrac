@@ -9526,6 +9526,40 @@ clean-active-capacity-stats:
 test_cluster_tt_active_owner test_cluster_alter_early_bind test_cluster_analyze_preflight test_cluster_largeobject_preflight test_cluster_subscription_preflight test_cluster_drop_early_bind test_cluster_relmap_native_tt.o: \
 		test_cluster_active_capacity_stats.inc
 
+test_cluster_collation_import_preflight: test_cluster_active_capacity_stats.inc
+
+# Native import prefix through static checks, before any platform enumeration.
+test_cluster_collation_import_preflight.inc: $(top_srcdir)/src/backend/commands/collationcmds.c \
+		$(top_srcdir)/src/backend/tcop/utility.c Makefile
+	awk '/^PreflightClusterSharedCollationWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^pg_import_system_collations\(/ { print "Datum"; emit=1; entries++ } \
+	     emit && /^[ \t]*\/\* Load collations known to libc,/ \
+	     { print "(void)ncreated; import_enumeration_boundary(); }"; emit=0; cuts++; exit } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (helpers != 1 || entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
+	     { print "void"; emit=1; found++ } emit { print } \
+	     emit && /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' \
+		$(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_collation_import_preflight: test_cluster_collation_import_preflight.c \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
+		test_cluster_collation_import_preflight.inc test_cluster_tt_locator_stats.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c \
+		$(top_srcdir)/src/include/utils/syscache.h $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-collation-import-preflight
+.PHONY: clean-collation-import-preflight
+clean-collation-import-preflight:
+	rm -f test_cluster_collation_import_preflight test_cluster_collation_import_preflight.inc \
+		test_cluster_collation_import_preflight.inc.tmp
+
 test_cluster_tt_active_owner: test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \

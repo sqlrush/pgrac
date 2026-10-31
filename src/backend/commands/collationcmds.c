@@ -862,6 +862,10 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_UNDEFINED_SCHEMA),
 				 errmsg("schema with OID %u does not exist", nspid)));
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCollationWrite(true);
+#endif
+
 	/* Load collations known to libc, using "locale -a" to enumerate them */
 #ifdef READ_LOCALE_A_OUTPUT
 	{
