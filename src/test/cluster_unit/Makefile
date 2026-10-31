@@ -10974,3 +10974,4 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_tuple_graph.inc
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_hot_graph.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_coverage.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_redirect_graph.inc

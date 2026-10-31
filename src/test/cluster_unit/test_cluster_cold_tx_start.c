@@ -2514,6 +2514,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_tuple_graph.inc"
 #include "test_cluster_cold_ctrc_hot_graph.inc"
 #include "test_cluster_cold_ctrc_reference_coverage.inc"
+#include "test_cluster_cold_ctrc_redirect_graph.inc"
 #endif
 
 #include "test_cluster_cold_ctrc_page_raw.inc"
@@ -2521,6 +2522,15 @@ static void startup_local_empty_reset(void);
 int main(void)
 {
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (getenv("PGRAC_PRE2_TEST_REDIRECT_GRAPH") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_start_redirect_graph_keeps_actual_line_pointer_and_full_target_identity);
+		UT_RUN(test_start_redirect_graph_coverage_resolves_topology_without_erasing_free_slots);
+		UT_RUN(test_start_redirect_graph_missing_history_duplicate_and_changed_identity_stay_open);
+		UT_RUN(test_start_redirect_graph_late_change_wait_error_keep_whole_output_and_original_debt);
+		UT_RUN(test_start_redirect_graph_observation_and_pre_page_capacity_keep_original_contract);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_REFERENCE_COVERAGE") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
@@ -3105,7 +3115,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(440);
+	UT_PLAN(445);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3123,6 +3133,11 @@ int main(void)
 	UT_RUN(test_start_reference_coverage_missing_duplicate_history_and_changed_members_remain);
 	UT_RUN(test_start_reference_coverage_does_not_erase_redirect_history_or_tuple_duties);
 	UT_RUN(test_start_reference_coverage_late_change_wait_error_and_whole_budget_keep_debt);
+	UT_RUN(test_start_redirect_graph_keeps_actual_line_pointer_and_full_target_identity);
+	UT_RUN(test_start_redirect_graph_coverage_resolves_topology_without_erasing_free_slots);
+	UT_RUN(test_start_redirect_graph_missing_history_duplicate_and_changed_identity_stay_open);
+	UT_RUN(test_start_redirect_graph_late_change_wait_error_keep_whole_output_and_original_debt);
+	UT_RUN(test_start_redirect_graph_observation_and_pre_page_capacity_keep_original_contract);
 	UT_RUN(test_start_hot_graph_binds_complete_native_current_chains);
 	UT_RUN(test_start_hot_graph_missing_or_changed_member_keeps_entire_chain);
 	UT_RUN(test_start_hot_graph_late_change_wait_error_preserves_whole_debt);

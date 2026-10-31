@@ -408,7 +408,8 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
 	const uint8 *reference_key, *reference_evidence;
 	/* Zero in the observation API. Projected mode: kind4 for one proven
 	 * current ITL, kind2 for every tuple field referencing its original ITL.
-	 * Tuple keys/evidence live in contribution, not the singular fields above.
+ * Tuple/redirect keys and evidence live in contribution, not the singular
+ * fields above; a redirect references its proven same-page target xmin.
 	 * Count zero preserves the WHOLE unresolved original census entry. */
 	uint16 reference_edge_kind;
 	uint16 reference_field_count;
@@ -430,7 +431,9 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
  * unresolved. Current HOT pages require complete items/slots and original
  * whole-page projection/topology before connecting exact xmax -> xmin fields;
  * the pair must retain the same canonical T and actual DATA identity.
- * MX/history/no-storage references remain unresolved. Neither
+ * Current redirects preserve exact line-pointer keys and reference the same
+ * complete page's proven target xmin. Missing target identity, MX/history
+ * and other no-storage obligations remain unresolved. Neither
  * API supplies a complete graph, history/first/pin retirement or D0 verdict. */
 typedef struct RfPageCtrcOwnerGraphV1 {
 	RfPageProofDetailV1 detail;

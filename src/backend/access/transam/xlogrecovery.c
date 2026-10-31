@@ -3692,6 +3692,7 @@ cluster_recovery_cold_page_hot_projection(const ClusterRecoveryCensusReferenceV1
 		ItemId item = PageGetItemId(page, i);
 		Size offset = ItemIdGetOffset(item), length = ItemIdGetLength(item);
 		HeapTupleHeaderData h;
+		if (ItemIdIsRedirected(item)) { hot = true; continue; }
 		if (!ItemIdIsNormal(item)) continue;
 		if (offset < header->pd_upper || offset > header->pd_special
 			|| length < SizeofHeapTupleHeader || length > header->pd_special - offset) return false;
@@ -3702,8 +3703,9 @@ cluster_recovery_cold_page_hot_projection(const ClusterRecoveryCensusReferenceV1
 		const ClusterRecoveryCensusReferenceV1 *candidate = &references[i];
 		HeapTupleHeaderData h;
 		if (candidate->page_index != reference->page_index || candidate->version != 0
-			|| candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
-			|| candidate->entry.tuple_length < SizeofHeapTupleHeader) continue;
+			|| candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (ItemIdIsRedirected(&candidate->entry.item)) { hot = true; continue; }
+		if (candidate->entry.tuple_length < SizeofHeapTupleHeader) continue;
 		memcpy(&h, tuple_bytes + tuple_offsets[i], SizeofHeapTupleHeader);
 		if ((h.t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) != 0) hot = true;
 	}
@@ -4129,6 +4131,53 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 							entries[i].reference_edge_kind = 2; entries[i].reference_field_count = count;
 							unresolved_count--;
 						}
+					}
+					/* A native redirect names a line pointer, not another raw xid.
+					 * Its target tuple already required the complete original page
+					 * projection/topology above. Reuse ONLY that target's canonical
+					 * xmin and whole PAGE witness, keeping the redirect's own exact
+					 * physical offset/ordinal. No target xmin node means unresolved. */
+					for (uint32 i = 0; valid && i < reference_count; i++) {
+						const ClusterRecoveryCensusReferenceV1 *reference = &fixed_references[i];
+						const ClusterRecoveryHeapEntry *item = &reference->entry;
+						uint32 target = UINT32_MAX;
+						size_t to, n = contribution.node_count, r;
+						uint8 *key;
+						Size length;
+						if (reference->version != 0 || item->kind != CLUSTER_RECOVERY_HEAP_ITEM
+							|| !ItemIdIsRedirected(&item->item) || ItemIdHasStorage(&item->item)
+							|| item->tuple_length != 0 || item->tuple_bytes != NULL) continue;
+						for (uint32 j = 0; j < reference_count; j++) {
+							const ClusterRecoveryCensusReferenceV1 *next = &fixed_references[j];
+							if (next->version != 0 || next->page_index != reference->page_index
+								|| next->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+								|| next->entry.index != ItemIdGetRedirect(&item->item)) continue;
+							if (target != UINT32_MAX) { target = UINT32_MAX; break; }
+							target = j;
+						}
+						if (target == UINT32_MAX || (to = tuple_nodes[(Size)2 * target]) == SIZE_MAX) continue;
+						length = nodes[to].key.length;
+						valid = item->index >= FirstOffsetNumber && item->index <= MaxHeapTuplesPerPage
+							&& length >= 16 && length <= reference_capacity
+							&& contribution.node_count < (Size)2 * reference_count
+							&& contribution.edge_count < (Size)3 * reference_count
+							&& contribution.root_count < (Size)2 * reference_count;
+						if (!valid) break;
+						key = (uint8 *)entries + tuple_key_offset + (Size)2 * i * reference_capacity;
+						memcpy(key, nodes[to].key.data, length);
+						cluster_undo_tt_ctrc_put_u64_le(key + length - 16,
+							SizeOfPageHeaderData + (Size)(item->index - FirstOffsetNumber) * sizeof(ItemIdData));
+						cluster_undo_tt_ctrc_put_u64_le(key + length - 8, item->index);
+						nodes[n] = (ClusterRecoveryCTRCGraphNodeV2){1, {key, length}, nodes[to].evidence};
+						edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){2, n, to};
+						for (r = 0; r < contribution.root_count; r++) {
+							const ClusterRecoveryCTRCGraphBytesV2 *prior = &nodes[roots[r]].key;
+							if (prior->length == length && memcmp(prior->data, key, length) == 0) break;
+						}
+						if (r == contribution.root_count) roots[contribution.root_count++] = n;
+						contribution.node_count++;
+						entries[i].reference_edge_kind = 2; entries[i].reference_field_count = 1;
+						unresolved_count--;
 					}
 					/* Native HOT topology names the actual current tuple pair.
 					 * Retain its exact xmax -> xmin dependency only after BOTH
