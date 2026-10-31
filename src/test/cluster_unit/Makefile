@@ -14562,6 +14562,8 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_recovery_io_core.o: \
 		$(top_srcdir)/src/include/utils/relmapper.h
 
 # Original Startup declaration, sealed SIDE and dual-copy storage in one component.
+test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_early_retention.inc
+
 test_cluster_cold_startup_relmap_storage.o: test_cluster_cold_startup_relmap_storage.c \
 		test_cluster_cold_startup_relmap_storage.h test_cluster_cold_startup_relmap_storage_namespace.h \
 		test_cluster_relmap_v2_storage.c test_cluster_relmap_runtime_storage.inc \

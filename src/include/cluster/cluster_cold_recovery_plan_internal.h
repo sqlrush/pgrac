@@ -107,6 +107,7 @@ typedef struct ColdRelmapInput {
 	bool captured;
 	bool attempted;
 	bool applied;
+	/* Producer pin was armed before baseline I/O; explicit input has none. */
 	bool has_retention_snapshot;
 	ClusterRelmapRetentionSnapshot retention_snapshot;
 } ColdRelmapInput;

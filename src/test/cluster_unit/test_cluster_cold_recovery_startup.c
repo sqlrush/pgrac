@@ -3977,6 +3977,7 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 #include "test_cluster_cold_startup_relmap_replay.inc"
 #include "test_cluster_cold_startup_relmap_producer.inc"
 #include "test_cluster_cold_startup_relmap_pin_custody.inc"
+#include "test_cluster_cold_startup_relmap_early_retention.inc"
 
 int
 main(void)
@@ -4039,7 +4040,18 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(178);
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_EARLY_RETENTION") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_relmap_original_pin_cannot_cancel_at_first_baseline_read);
+		UT_RUN(test_relmap_entire_pin_batch_is_armed_before_any_baseline_io);
+		UT_RUN(test_relmap_later_preflight_refusal_does_not_arm_any_pin);
+		UT_RUN(test_relmap_partial_batch_arm_error_keeps_already_armed_pin);
+		UT_RUN(test_relmap_late_producer_refusal_or_error_keeps_armed_debt);
+		UT_RUN(test_relmap_early_pin_hold_survives_startup_replay_and_destruction);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(184);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4219,6 +4231,12 @@ main(void)
 	UT_RUN(test_relmap_pin_snapshot_refuses_drift_after_durable_pair_write);
 	UT_RUN(test_relmap_pin_snapshot_rechecks_receipt_and_duplicate_without_writes);
 	UT_RUN(test_relmap_pin_snapshot_allows_only_original_stage_transition);
+	UT_RUN(test_relmap_original_pin_cannot_cancel_at_first_baseline_read);
+	UT_RUN(test_relmap_entire_pin_batch_is_armed_before_any_baseline_io);
+	UT_RUN(test_relmap_later_preflight_refusal_does_not_arm_any_pin);
+	UT_RUN(test_relmap_partial_batch_arm_error_keeps_already_armed_pin);
+	UT_RUN(test_relmap_late_producer_refusal_or_error_keeps_armed_debt);
+	UT_RUN(test_relmap_early_pin_hold_survives_startup_replay_and_destruction);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -13,6 +13,7 @@
 #ifndef TEST_CLUSTER_COLD_STARTUP_RELMAP_STORAGE_H
 #define TEST_CLUSTER_COLD_STARTUP_RELMAP_STORAGE_H
 #include "cluster/cluster_cold_relmap.h"
+#include "cluster/cluster_relmap_retention.h"
 #include "storage/lwlock.h"
 
 typedef struct TestColdRelmapStorageStats {
@@ -21,6 +22,8 @@ typedef struct TestColdRelmapStorageStats {
 	bool pin_retained;
 	bool may_be_staged;
 	unsigned reads;
+	unsigned pins;
+	unsigned armed_pins;
 } TestColdRelmapStorageStats;
 
 extern void test_cold_relmap_storage_begin(ClusterColdRelmapInputV1 *input);
@@ -29,6 +32,9 @@ extern void test_cold_relmap_storage_fault(unsigned write, void (*hook)(bool));
 extern void test_cold_relmap_storage_read_hook(void (*hook)(unsigned));
 extern ssize_t test_cold_relmap_storage_read(int fd, void *bytes, size_t len);
 extern void test_cold_relmap_storage_pin_error(void);
+extern void test_cold_relmap_storage_pin_error_after(unsigned acquisitions);
+extern void test_cold_relmap_storage_add_namespace(const ClusterColdRelmapWalV1 *wal);
+extern ClusterRelmapRetentionResult test_cold_relmap_storage_cancel(const ClusterColdRelmapWalV1 *wal);
 extern void test_cold_relmap_storage_pin_drift(unsigned fault);
 extern bool test_cold_relmap_storage_acquire(LWLock *lock, LWLockMode mode);
 extern TestColdRelmapStorageStats test_cold_relmap_storage_stats(void);

@@ -56,7 +56,7 @@ UT_TEST(test_startup_relmap_produces_declaration_from_original_pin_and_wal)
 	UT_ASSERT_EQ(built->retention, wal.retention);
 	stats = test_cold_relmap_storage_stats();
 	UT_ASSERT(stats.reads > 0 && stats.writes == 0 && stats.pin_retained);
-	UT_ASSERT(!stats.may_be_staged);
+	UT_ASSERT(stats.may_be_staged);
 	cluster_cold_replay_window_enter_v1();
 	UT_ASSERT_EQ(startup_relmap_run(), CLUSTER_COLD_REPLAY_OK);
 	UT_ASSERT(cluster_cold_typed_relmap_ready_v1(startup_relmap_replay.typed,
@@ -145,7 +145,7 @@ UT_TEST(test_relmap_producer_late_record_or_pin_error_is_sticky)
 		UT_ASSERT_NULL(plan->relmap_inputs);
 		before = test_cold_relmap_storage_stats();
 		UT_ASSERT(before.reads > 0 && before.writes == 0 && before.pin_retained);
-		UT_ASSERT(!before.may_be_staged);
+		UT_ASSERT(before.may_be_staged);
 		UT_ASSERT_EQ(before.io_under_retention_lock, 0);
 		UT_ASSERT_EQ(cluster_cold_plan_relmap_from_wal_v1(plan,
 			&startup_relmap_replay.input.source, 1, &wal, 1), CLUSTER_COLD_STATE);
@@ -174,7 +174,7 @@ UT_TEST(test_startup_relmap_producer_rechecks_sources_before_pass_one)
 	UT_ASSERT(typed->plan->relmap_failed && typed->plan->phase == COLD_PHASE_FAILED);
 	UT_ASSERT_EQ(typed->scanned_records, 0);
 	stats = test_cold_relmap_storage_stats();
-	UT_ASSERT(stats.reads > 0 && stats.writes == 0 && stats.pin_retained && !stats.may_be_staged);
+	UT_ASSERT(stats.reads > 0 && stats.writes == 0 && stats.pin_retained && stats.may_be_staged);
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT_EQ(contexts_alive, 0);
 	startup_relmap_real_side = false;

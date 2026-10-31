@@ -55,7 +55,7 @@ UT_TEST(test_relmap_pin_snapshot_refuses_drift_during_baseline_read)
 		UT_ASSERT_EQ(plan->memory_used, used);
 		before = test_cold_relmap_storage_stats();
 		UT_ASSERT(before.reads > 0 && before.writes == 0 && before.pin_retained);
-		UT_ASSERT(!before.may_be_staged && before.io_under_retention_lock == 0);
+		UT_ASSERT(before.may_be_staged && before.io_under_retention_lock == 0);
 		UT_ASSERT_EQ(cluster_cold_plan_relmap_from_wal_v1(plan,
 			&startup_relmap_replay.input.source, 1, &wal, 1), CLUSTER_COLD_STATE);
 		after = test_cold_relmap_storage_stats();
@@ -99,7 +99,7 @@ UT_TEST(test_relmap_pin_snapshot_survives_startup_declaration_until_replay)
 		UT_ASSERT_EQ(startup_relmap_run(), CLUSTER_COLD_REPLAY_CALLBACK);
 		UT_ASSERT(startup_relmap_replay.typed->plan->relmap_failed);
 		stats = test_cold_relmap_storage_stats();
-		UT_ASSERT(stats.writes == 0 && stats.pin_retained && !stats.may_be_staged);
+		UT_ASSERT(stats.writes == 0 && stats.pin_retained && stats.may_be_staged);
 		UT_ASSERT(cluster_cold_plan_step_v1(startup_relmap_replay.typed->plan, 1, &step));
 		UT_ASSERT(!cluster_cold_typed_relmap_record_v1(startup_relmap_replay.typed,
 			(ClusterRecoveryFencePlan *)&fixture_context, &step, &startup_relmap_replay.reader));

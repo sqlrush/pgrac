@@ -50,8 +50,12 @@ typedef struct ClusterColdRelmapWalV1 {
 	struct XLogReaderState *reader;
 } ClusterColdRelmapWalV1;
 
-/* Explicit original-source adapter before pass-1. Whole-batch validation and
- * exact unstaged pins precede clean-pair I/O outside the retention lock.
+/* Explicit original-source adapter before pass-1. Whole-batch validation of
+ * exact unstaged pins precedes any mutation. Recheck and arm every original
+ * pin with the actual WAL end before the first clean-pair I/O, outside the
+ * retention lock. This conservatively prevents cancellation even when no
+ * physical pending was written. Partial arm, later failure and plan destruction
+ * retain those original pins/debt; no rollback or automatic retry follows.
  * Sources must be the original selected replay generations; the Startup
  * entry below brackets this call with original ROOT/fence revalidation.
  * Entered failure/ERROR poisons the plan, keeps all original pins/debt and

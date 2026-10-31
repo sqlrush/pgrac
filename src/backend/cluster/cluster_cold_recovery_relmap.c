@@ -65,8 +65,14 @@ relmap_side_matches(const ClusterColdTypedV1 *typed, const ClusterColdRelmapInpu
 		&& (reader == NULL || rf_side_online_plan_relmap_matches_v1(side, &input->source, reader));
 }
 
+typedef enum RelmapPinUse {
+	RELMAP_PIN_PREPARED,
+	RELMAP_PIN_ARM,
+	RELMAP_PIN_STAGED
+} RelmapPinUse;
+
 static bool
-relmap_pin(const ClusterColdRelmapInputV1 *input, bool staged,
+relmap_pin(const ClusterColdRelmapInputV1 *input, RelmapPinUse use,
 	const ClusterRelmapRetentionSnapshot *expected, ClusterRelmapRetentionSnapshot *capture)
 {
 	const ClusterRelmapV2Image *image = &input->staged;
@@ -74,6 +80,7 @@ relmap_pin(const ClusterColdRelmapInputV1 *input, bool staged,
 	ClusterRelmapRetentionKey key = {0};
 	volatile bool locked = false;
 	volatile bool ok = false;
+	bool staged = use == RELMAP_PIN_STAGED;
 
 	if (LWLockHeldByMe(input->retention_lock))
 		return false;
@@ -100,6 +107,13 @@ relmap_pin(const ClusterColdRelmapInputV1 *input, bool staged,
 				? cluster_relmap_retention_stage_check(input->retention, &key, owner->wal_end)
 				: cluster_relmap_retention_prepare_check(input->retention, &key))
 				== CLUSTER_RELMAP_RETENTION_OK;
+		/* Preserve the exact original pin before any baseline I/O can
+		 * expose it to cancellation. A partial batch or later failure keeps
+		 * this conservative debt; no declaration cleanup may cancel it. */
+		if (ok && use == RELMAP_PIN_ARM)
+			ok = expected != NULL && capture == NULL
+				&& cluster_relmap_retention_stage_start(input->retention, &key, owner->wal_end)
+					== CLUSTER_RELMAP_RETENTION_OK;
 		LWLockRelease(input->retention_lock);
 		locked = false;
 	}
@@ -117,7 +131,10 @@ relmap_pin(const ClusterColdRelmapInputV1 *input, bool staged,
 static bool
 relmap_entry_pin(const ColdRelmapInput *entry, bool staged)
 {
-	return relmap_pin(&entry->input, staged,
+	/* Producer snapshots already armed the original pin before pass-1.
+	 * Legacy explicit declarations retain their original stage transition. */
+	return relmap_pin(&entry->input, staged || entry->has_retention_snapshot
+		? RELMAP_PIN_STAGED : RELMAP_PIN_PREPARED,
 		entry->has_retention_snapshot ? &entry->retention_snapshot : NULL, NULL);
 }
 
@@ -228,12 +245,17 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 			ok = cold_relmap_inputs_valid(plan, inputs, count) == CLUSTER_COLD_OK;
 		/* Complete shape/source/namespace and all original pins first. */
 		for (uint32 i = 0; i < count && ok; ++i)
-			ok = relmap_pin(&inputs[i], false, NULL, &snapshots[i]);
+			ok = relmap_pin(&inputs[i], RELMAP_PIN_PREPARED, NULL, &snapshots[i]);
+		/* Every original pin was checked without mutation. Now arm the
+		 * entire batch, under its original short locks, before the first
+		 * file open/read. Never undo even a partially completed arm batch. */
+		for (uint32 i = 0; i < count && ok; ++i)
+			ok = relmap_pin(&inputs[i], RELMAP_PIN_ARM, &snapshots[i], NULL);
 		for (uint32 i = 0; i < count && ok; ++i) {
 			ClusterRelmapV2View base;
 			unsigned char encoded[CLUSTER_RELMAP_V2_FILE_SIZE];
 			ok = cluster_relmap_authority_x_held()
-				&& relmap_pin(&inputs[i], false, &snapshots[i], NULL)
+				&& relmap_pin(&inputs[i], RELMAP_PIN_STAGED, &snapshots[i], NULL)
 				&& cluster_relmap_authority_v2_read(&inputs[i].staged.identity, &base)
 					== CLUSTER_RELMAP_V2_PAIR_VALID
 				&& base.pending_complete && !base.has_pending
@@ -248,7 +270,7 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 		 * Recheck the complete original batch before publishing any output. */
 		for (uint32 i = 0; i < count && ok; ++i)
 			ok = cluster_relmap_authority_x_held()
-				&& relmap_pin(&inputs[i], false, &snapshots[i], NULL)
+				&& relmap_pin(&inputs[i], RELMAP_PIN_STAGED, &snapshots[i], NULL)
 				&& wal[i].reader != NULL
 				&& wal[i].reader->system_identifier == inputs[i].staged.identity.system_identifier
 				&& wal[i].reader->cluster_expected_thread_id == inputs[i].cut.thread_id

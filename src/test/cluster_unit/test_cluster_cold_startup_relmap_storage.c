@@ -18,6 +18,7 @@ int main(void);
 static unsigned producer_reads;
 static void (*producer_read_hook)(unsigned);
 static bool producer_pin_error;
+static unsigned producer_pin_error_after;
 
 /* The original Startup exception owner, outside the isolated fixture stack. */
 #undef PG_exception_stack
@@ -62,6 +63,7 @@ test_cold_relmap_storage_begin(ClusterColdRelmapInputV1 *input)
 	producer_reads = 0;
 	producer_read_hook = NULL;
 	producer_pin_error = false;
+	producer_pin_error_after = 0;
 }
 
 void
@@ -91,6 +93,61 @@ void
 test_cold_relmap_storage_pin_error(void)
 {
 	producer_pin_error = true;
+}
+
+void
+test_cold_relmap_storage_pin_error_after(unsigned acquisitions)
+{
+	producer_pin_error_after = acquisitions;
+}
+
+static ClusterRelmapRetentionKey
+producer_pin_key(const ClusterColdRelmapWalV1 *wal)
+{
+	ClusterRelmapRetentionKey key = {0};
+	key.identity = wal->identity;
+	key.generation = wal->generation;
+	key.origin = wal->owner.node;
+	key.top_full_xid = wal->owner.top_full_xid;
+	key.membership_epoch = wal->owner.membership_epoch;
+	key.admitted_incarnation = wal->owner.admitted_incarnation;
+	key.boot_incarnation = wal->owner.boot_incarnation;
+	return key;
+}
+
+void
+test_cold_relmap_storage_add_namespace(const ClusterColdRelmapWalV1 *wal)
+{
+	ClusterRelmapRetentionKey key = producer_pin_key(wal);
+	ClusterRelmapV2Image clean = {0};
+	unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+	char original[MAXPGPATH];
+	clean.identity = wal->identity;
+	clean.committed_generation = wal->generation - 1;
+	clean.committed = map_image(40000);
+	if (clean.identity.shared || clean.identity.dbid != 42
+		|| cluster_relmap_v2_encode(&clean, bytes, sizeof(bytes)) != CLUSTER_RELMAP_V2_VALID)
+		abort();
+	strcpy(original, directory);
+	snprintf(directory, sizeof(directory), "%s/base/42", root);
+	write_copy(0, bytes, sizeof(bytes));
+	write_copy(1, bytes, sizeof(bytes));
+	strcpy(directory, original);
+	LWLockAcquire(wal->retention_lock, LW_EXCLUSIVE);
+	if (cluster_relmap_retention_begin(wal->retention, &key) != CLUSTER_RELMAP_RETENTION_OK)
+		abort();
+	LWLockRelease(wal->retention_lock);
+}
+
+ClusterRelmapRetentionResult
+test_cold_relmap_storage_cancel(const ClusterColdRelmapWalV1 *wal)
+{
+	ClusterRelmapRetentionKey key = producer_pin_key(wal);
+	ClusterRelmapRetentionResult result;
+	LWLockAcquire(wal->retention_lock, LW_EXCLUSIVE);
+	result = cluster_relmap_retention_cancel_prepare(wal->retention, &key);
+	LWLockRelease(wal->retention_lock);
+	return result;
 }
 
 /* Preserve the exact original key while changing its retained context. */
@@ -134,7 +191,7 @@ test_cold_relmap_storage_pin_drift(unsigned fault)
 bool
 test_cold_relmap_storage_acquire(LWLock *lock, LWLockMode mode)
 {
-	if (producer_pin_error) {
+	if (producer_pin_error || (producer_pin_error_after != 0 && --producer_pin_error_after == 0)) {
 		producer_pin_error = false;
 		siglongjmp(*PG_exception_stack, 1);
 	}
@@ -152,7 +209,12 @@ TestColdRelmapStorageStats
 test_cold_relmap_storage_stats(void)
 {
 	TestColdRelmapStorageStats stats = {writes, io_under_retention_lock,
-		writer_retention.pins[0].occupied, writer_retention.pins[0].may_be_staged, producer_reads};
+		writer_retention.pins[0].occupied, writer_retention.pins[0].may_be_staged, producer_reads, 0, 0};
+	for (unsigned i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; ++i)
+		if (writer_retention.pins[i].occupied) {
+			++stats.pins;
+			stats.armed_pins += writer_retention.pins[i].may_be_staged;
+		}
 	return stats;
 }
 
