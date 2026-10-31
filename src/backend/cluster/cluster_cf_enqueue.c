@@ -40,7 +40,9 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_lock_owner.h"
 #include "miscadmin.h" /* AmStartupProcess / AmCheckpointerProcess */
+#include "portability/instr_time.h"
 #include "storage/fd.h"
+#include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
 #include "utils/timestamp.h"
@@ -60,9 +62,18 @@ typedef struct CfHoldState {
 	bool held;
 	bool coordinated;
 	bool release_pending;
+	bool release_started;
 	const void *caller;		/* Process-local task lifetime, never remote authority. */
 	ClusterLockOwner owner; /* Stable S5/reconstruction/S6 ownership. */
+	ClusterCfJobReceiptV1 *job_receipt; /* Borrowed until original retirement. */
+	uint64 job_generation;
+	ClusterControlRequestHandle job_handle;
+	uint64 job_creator;
 } CfHoldState;
+
+StaticAssertDecl(2 * (sizeof(CfHoldState) - offsetof(CfHoldState, job_receipt))
+					 <= CLUSTER_CF_JOB_BINDING_MAX_BYTES,
+				 "CF job bindings exceed their control-state budget");
 
 static CfHoldState cf_hold_x;
 static CfHoldState cf_hold_s;
@@ -194,13 +205,15 @@ cf_attempt_owner(const CfHoldState *slot)
  * cluster_cf_lock -- acquire the singleton CF lock in `mode` via GES.
  */
 static bool
-cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
+cf_lock(LOCKMODE mode, bool cooperative, const void *caller, uint64 deadline_ns)
 {
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
 	ClusterLockAcquireRequest *req = &slot->owner.request;
 	const ClusterGesTimeoutDetail *timeout;
 	bool resume;
+	int acquire_timeout_ms;
+	int cleanup_timeout_ms = 0;
 
 	cf_attempt_begin(mode, cooperative, caller);
 	cf_attempt_owner(slot);
@@ -259,6 +272,30 @@ cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 	if (resume)
 		goto acquire;
 	Assert(!slot->held);
+	cf_attempt_owner(slot);
+
+	/* Only the caller that owns an absolute deadline supplies it. Read the
+	 * remaining budget after old-slot cleanup, immediately before publishing
+	 * a new request. Cleanup retains its independent original timeout.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	acquire_timeout_ms = cluster_cf_enqueue_timeout_ms;
+	cleanup_timeout_ms = acquire_timeout_ms;
+	if (deadline_ns != 0) {
+		struct timespec now;
+		uint64 now_ns, remaining_ms;
+
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+			|| now.tv_nsec >= NS_PER_S
+			|| (uint64)now.tv_sec > (UINT64_MAX - (uint64)now.tv_nsec) / NS_PER_S)
+			return false;
+		now_ns = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+		if (now_ns >= deadline_ns || acquire_timeout_ms <= 0)
+			return false;
+		remaining_ms = (deadline_ns - now_ns) / NS_PER_MS;
+		if (remaining_ms == 0)
+			return false;
+		acquire_timeout_ms = (int)Min((uint64)acquire_timeout_ms, remaining_ms);
+	}
 
 	memset(req, 0, sizeof(*req));
 	cluster_cf_resid_encode(&req->resid);
@@ -271,7 +308,7 @@ cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 	req->sessionLock = false;
 	req->caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	/* spec-5.6 Dc4b: bound the CF acquire wait and label it ClusterCfEnqueueWait. */
-	req->timeout_ms = cluster_cf_enqueue_timeout_ms;
+	req->timeout_ms = acquire_timeout_ms;
 	req->wait_event = WAIT_EVENT_CLUSTER_CF_ENQUEUE;
 
 	/* Visible cleanup responsibility precedes every possible S3/S4 mutation;
@@ -286,12 +323,19 @@ acquire:
 	}
 	PG_CATCH();
 	{
+		if (deadline_ns != 0 && slot->owner.state != CLUSTER_LOCK_OWNER_EMPTY)
+			req->timeout_ms = cleanup_timeout_ms;
 		cf_attempt_owner(slot);
 		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
 			memset(slot, 0, sizeof(*slot));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	/* The cap belongs only to S1-S5. Every retained success, refusal or
+	 * ERROR keeps the original release budget, including its first bounded
+	 * confirmation. Identity and registry binding are unchanged. */
+	if (deadline_ns != 0 && slot->owner.state != CLUSTER_LOCK_OWNER_EMPTY)
+		req->timeout_ms = cleanup_timeout_ms;
 	/* Capture before EMPTY-slot cleanup erases the just-completed request. */
 	timeout = r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ? cluster_ges_timeout_detail_get() : NULL;
 	cf_attempt.result = r;
@@ -372,10 +416,10 @@ acquire:
 /* Copy original return facts, including requests cleared by EMPTY cleanup.
  * A grant record maps this exact tuple to its own PID, never a remote procno. */
 static bool
-cf_lock_observed(LOCKMODE mode, bool cooperative, const void *caller)
+cf_lock_observed(LOCKMODE mode, bool cooperative, const void *caller, uint64 deadline_ns)
 {
 	static TimestampTz last_refusal;
-	bool acquired = cf_lock(mode, cooperative, caller);
+	bool acquired = cf_lock(mode, cooperative, caller, deadline_ns);
 	TimestampTz now;
 	uint64 now_ms, age_ms = 0;
 	bool age_known, pid_matches;
@@ -422,7 +466,13 @@ cf_lock_observed(LOCKMODE mode, bool cooperative, const void *caller)
 bool
 cluster_cf_lock(LOCKMODE mode)
 {
-	return cf_lock_observed(mode, false, NULL);
+	return cf_lock_observed(mode, false, NULL, 0);
+}
+
+bool
+cluster_cf_lock_deadline_v1(LOCKMODE mode, uint64 deadline_ns)
+{
+	return cf_lock_observed(mode, false, NULL, deadline_ns);
 }
 
 bool
@@ -430,7 +480,7 @@ cluster_cf_lock_poll(LOCKMODE mode)
 {
 	if (!cluster_shared_config || (MyBackendType != B_LMON && MyBackendType != B_LMS))
 		return false;
-	return cf_lock_observed(mode, true, NULL);
+	return cf_lock_observed(mode, true, NULL, 0);
 }
 
 bool
@@ -448,7 +498,7 @@ cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller)
 	if (caller == NULL || !cluster_shared_config
 		|| (MyBackendType != B_LMON && MyBackendType != B_LMS))
 		return false;
-	return cf_lock_observed(mode, true, caller);
+	return cf_lock_observed(mode, true, caller, 0);
 }
 
 bool
@@ -540,15 +590,192 @@ cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller, ClusterCfRetir
 	return true;
 }
 
+/* The registry, not a copied dynamic state/cut, proves retirement. Only
+ * immutable registration identity is compared across its legal transitions. */
+static bool
+cf_job_snapshot(LOCKMODE mode, ClusterCfRetirementSnapshot *out)
+{
+	CfHoldState *slot = cf_slot(mode);
+	ClusterLockOwner *owner = &slot->owner;
+	ClusterLockAcquireRequest *request = &owner->request;
+	ClusterControlRequestView view;
+	ClusterResId resid;
+	uint64 epoch = cluster_epoch_get_current();
+	uint64 generation = cluster_grd_redeclare_generation();
+
+	cluster_cf_resid_encode(&resid);
+	if (!cluster_shared_config || MyProc == NULL || MyProcPid <= 0 || epoch == 0
+		|| generation == 0 || !slot->held || !slot->coordinated || !owner->shared
+		|| owner->generation == 0 || owner->acquire_poll_active
+		|| (owner->state != CLUSTER_LOCK_OWNER_HELD && owner->state != CLUSTER_LOCK_OWNER_RETIRING)
+		|| owner->conversion != CLUSTER_LOCK_OWNER_NO_CONVERSION
+		|| owner->secondary.generation != 0 || owner->attempt.generation == 0
+		|| request->control_owner_id == 0 || request->request_id == 0
+		|| request->holder.request_id != request->request_id
+		|| request->holder.node_id != (uint32)cluster_node_id
+		|| request->holder.procno != (uint32)MyProc->pgprocno
+		|| request->holder.cluster_epoch == 0 || request->holder.cluster_epoch > epoch
+		|| request->lockmode != mode
+		|| memcmp(&request->resid, &resid, sizeof(resid)) != 0
+		|| !cluster_control_request_snapshot(&owner->attempt, &view)
+		|| (view.state != CLUSTER_CONTROL_REQUEST_HELD
+			&& view.state != CLUSTER_CONTROL_REQUEST_ABANDONED
+			&& view.state != CLUSTER_CONTROL_REQUEST_TERMINAL)
+		|| view.owner_exited || view.owner.incarnation == 0 || view.owner.pid != MyProcPid
+		|| view.owner.procno != (uint32)MyProc->pgprocno || view.mode != mode
+		|| memcmp(&view.message.key.resid, &resid, sizeof(resid)) != 0
+		|| memcmp(&view.message.key.holder, &request->holder, sizeof(request->holder)) != 0
+		|| cluster_epoch_get_current() != epoch || cluster_grd_redeclare_generation() != generation)
+		return false;
+	out->cookie = request->control_owner_id;
+	out->registry = view;
+	return true;
+}
+
+static bool
+cf_job_binding_valid(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+	ClusterCfJobReceiptV1 *receipt = slot->job_receipt;
+	ClusterCfRetirementSnapshot current;
+	const ClusterControlRequestView *original;
+	const ClusterLockOwner *owner = &slot->owner;
+
+	if (receipt == NULL || receipt->job_generation == 0
+		|| receipt->job_generation != slot->job_generation || receipt->reserved != 0
+		|| receipt->state != CF_JOB_RECEIPT_RETIRING)
+		return false;
+	original = &receipt->original.registry;
+	if (original->handle.generation != slot->job_handle.generation
+		|| original->handle.slot != slot->job_handle.slot
+		|| original->owner.incarnation != slot->job_creator)
+		return false;
+	/* A normal private-owner census can already have consumed the exact
+	 * terminal ACK. The same embedded owner still retains the original
+	 * request/cookie until CF finishes it; an absent CF slot never suffices. */
+	if (owner->attempt.generation == 0) {
+		return cluster_shared_config && MyProc != NULL && MyProcPid > 0 && slot->held
+			&& slot->coordinated && slot->release_pending && slot->release_started
+			&& owner->shared && owner->state == CLUSTER_LOCK_OWNER_RETIRING
+			&& owner->conversion == CLUSTER_LOCK_OWNER_NO_CONVERSION
+			&& owner->secondary.generation == 0 && !owner->acquire_poll_active
+			&& owner->generation != 0 && cluster_grd_redeclare_generation() != 0
+			&& owner->request.holder.cluster_epoch != 0
+			&& owner->request.holder.cluster_epoch <= cluster_epoch_get_current()
+			&& receipt->original.cookie != 0
+			&& receipt->original.cookie == owner->request.control_owner_id
+			&& original->owner.pid == MyProcPid
+			&& original->owner.procno == (uint32)MyProc->pgprocno
+			&& original->mode == mode && owner->request.lockmode == mode
+			&& original->message.previous_request == 0 && original->message.previous_mode == NoLock
+			&& memcmp(&original->message.key.resid, &owner->request.resid,
+					  sizeof(owner->request.resid)) == 0
+			&& memcmp(&original->message.key.holder, &owner->request.holder,
+					  sizeof(owner->request.holder)) == 0;
+	}
+	if (!cf_job_snapshot(mode, &current))
+		return false;
+	return receipt->original.cookie == current.cookie
+		&& original->handle.generation == current.registry.handle.generation
+		&& original->handle.slot == current.registry.handle.slot
+		&& original->owner.incarnation == current.registry.owner.incarnation
+		&& original->owner.pid == current.registry.owner.pid
+		&& original->owner.procno == current.registry.owner.procno
+		&& original->mode == current.registry.mode
+		&& original->message.previous_request == current.registry.message.previous_request
+		&& original->message.previous_mode == current.registry.message.previous_mode
+		&& memcmp(&original->message.key.resid, &current.registry.message.key.resid,
+				  sizeof(current.registry.message.key.resid)) == 0
+		&& memcmp(&original->message.key.holder, &current.registry.message.key.holder,
+				  sizeof(current.registry.message.key.holder)) == 0;
+}
+
 static void
 cf_note_retired(LOCKMODE mode, uint64 cookie)
 {
+	CfHoldState *slot = cf_slot(mode);
+	ClusterCfJobReceiptV1 *receipt = slot->job_receipt;
+
 	if (cookie != 0) {
 		if (mode == ShareLock)
 			cf_retired_s = cookie;
 		else
 			cf_retired_x = cookie;
 	}
+	/* The caller validated this binding before the original owner consumed
+	 * its exact terminal ACK. Publish before clearing the borrowed slot. */
+	if (receipt != NULL && receipt->state == CF_JOB_RECEIPT_RETIRING
+		&& receipt->reserved == 0 && receipt->job_generation == slot->job_generation
+		&& receipt->original.cookie == cookie && receipt->original.registry.mode == mode) {
+		receipt->state = CF_JOB_RECEIPT_CONFIRMED;
+		if (MyLatch != NULL)
+			SetLatch(MyLatch);
+	}
+}
+
+ClusterCfJobResultV1
+cluster_cf_unlock_job_v1(LOCKMODE mode, const void *caller, ClusterCfJobReceiptV1 *receipt)
+{
+	CfHoldState *slot;
+	ClusterCfRetirementSnapshot original = { 0 }, empty = { 0 };
+	ClusterCfReleaseResult result;
+
+	if ((mode != ShareLock && mode != ExclusiveLock) || receipt == NULL
+		|| receipt->job_generation == 0 || receipt->reserved != 0)
+		return CF_JOB_INVALID;
+	slot = cf_slot(mode);
+	if (receipt->state == CF_JOB_RECEIPT_RETIRING) {
+		if (slot->caller != caller || slot->job_receipt != receipt)
+			return CF_JOB_INVALID;
+		return cluster_cf_job_retirement_poll_v1(receipt);
+	}
+	if (receipt->state != CF_JOB_RECEIPT_UNBOUND || slot->job_receipt != NULL
+		|| slot->caller != caller || memcmp(&receipt->original, &empty, sizeof(empty)) != 0
+		|| !cf_job_snapshot(mode, &original))
+		return CF_JOB_INVALID;
+
+	/* Bind before the original release can yield/throw or forget its handle. */
+	receipt->original = original;
+	receipt->state = CF_JOB_RECEIPT_RETIRING;
+	slot->job_receipt = receipt;
+	slot->job_generation = receipt->job_generation;
+	slot->job_handle = original.registry.handle;
+	slot->job_creator = original.registry.owner.incarnation;
+	if (slot->release_started)
+		return cluster_cf_job_retirement_poll_v1(receipt);
+	result = cf_unlock(mode, caller);
+	if (result == CLUSTER_CF_RELEASE_CONFIRMED)
+		return receipt->state == CF_JOB_RECEIPT_CONFIRMED ? CF_JOB_CONFIRMED : CF_JOB_INVALID;
+	return result == CLUSTER_CF_RELEASE_UNCONFIRMED ? CF_JOB_PENDING : CF_JOB_INVALID;
+}
+
+ClusterCfJobResultV1
+cluster_cf_job_retirement_poll_v1(ClusterCfJobReceiptV1 *receipt)
+{
+	CfHoldState *slot;
+	LOCKMODE mode;
+
+	if (receipt == NULL || receipt->job_generation == 0 || receipt->reserved != 0
+		|| receipt->original.cookie == 0 || MyProc == NULL || MyProcPid <= 0
+		|| receipt->original.registry.owner.pid != MyProcPid
+		|| receipt->original.registry.owner.procno != (uint32)MyProc->pgprocno
+		|| receipt->original.registry.owner.incarnation == 0)
+		return CF_JOB_INVALID;
+	mode = receipt->original.registry.mode;
+	if (mode != ShareLock && mode != ExclusiveLock)
+		return CF_JOB_INVALID;
+	/* Only the original terminalizer writes CONFIRMED. The original job
+	 * keeps this immutable receipt alive after the CF slot is reused. */
+	slot = cf_slot(mode);
+	if (receipt->state == CF_JOB_RECEIPT_CONFIRMED)
+		return slot->job_receipt != receipt ? CF_JOB_CONFIRMED : CF_JOB_INVALID;
+	if (slot->job_receipt != receipt || !slot->release_pending || !cf_job_binding_valid(mode))
+		return CF_JOB_INVALID;
+	if (!cluster_lock_owner_release_poll(&slot->owner))
+		return CF_JOB_PENDING;
+	cf_note_retired(mode, receipt->original.cookie);
+	memset(slot, 0, sizeof(*slot));
+	return receipt->state == CF_JOB_RECEIPT_CONFIRMED ? CF_JOB_CONFIRMED : CF_JOB_INVALID;
 }
 
 /*
@@ -592,7 +819,22 @@ cf_unlock(LOCKMODE mode, const void *caller)
 
 	if (!slot->held)
 		return CLUSTER_CF_RELEASE_NOT_HELD;
-	if (slot->caller != caller)
+	if (slot->caller != caller) {
+		if (CritSectionCount == 0)
+			ereport(LOG,
+				(errmsg("PGRAC_FAMILY=CF_RELEASE task=cf_unlock reason=caller_mismatch"
+						" node=%d pid=%d mode=%d caller_tagged=%d slot_caller_tagged=%d"
+						" control_owner=" UINT64_FORMAT " state=%d shared=%d"
+						" holder_node=%d holder_procno=%u holder_request=" UINT64_FORMAT
+						" epoch=" UINT64_FORMAT " confirmed=0",
+						cluster_node_id, MyProcPid, mode, caller != NULL, slot->caller != NULL,
+						cookie, (int)slot->owner.state, slot->owner.shared,
+						slot->owner.request.holder.node_id, slot->owner.request.holder.procno,
+						slot->owner.request.holder.request_id,
+						slot->owner.request.holder.cluster_epoch)));
+		return CLUSTER_CF_RELEASE_UNCONFIRMED;
+	}
+	if (slot->job_receipt != NULL && !cf_job_binding_valid(mode))
 		return CLUSTER_CF_RELEASE_UNCONFIRMED;
 	if (!slot->coordinated) {
 		memset(slot, 0, sizeof(*slot));
@@ -603,6 +845,7 @@ cf_unlock(LOCKMODE mode, const void *caller)
 	 * Neither case permits another read/write under this old request. Keep
 	 * the exact identity visible to retirement, lock-order and stop checks. */
 	slot->release_pending = true;
+	slot->release_started = true;
 	if (!cluster_lock_owner_release(&slot->owner))
 		return CLUSTER_CF_RELEASE_UNCONFIRMED;
 
@@ -629,6 +872,7 @@ cluster_cf_retirement_poll(void)
 
 		if (slot->held && slot->coordinated && slot->release_pending
 			&& slot->owner.state == CLUSTER_LOCK_OWNER_RETIRING
+			&& (slot->job_receipt == NULL || cf_job_binding_valid(i == 0 ? ShareLock : ExclusiveLock))
 			&& cluster_lock_owner_release_poll(&slot->owner)) {
 			cf_note_retired(i == 0 ? ShareLock : ExclusiveLock, cookie);
 			memset(slot, 0, sizeof(*slot));

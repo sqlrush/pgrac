@@ -13,7 +13,8 @@ static unsigned ir_cf_root_calls, ir_cf_acquires, ir_cf_releases;
 static unsigned ir_cf_held_at_root[8], ir_cf_failure_at;
 static bool ir_cf_confirm_release, ir_cf_release_active, ir_cf_wrong_ack;
 static int64 ir_cf_clock_ms, ir_cf_after_first_grant_ms;
-static int ir_cf_acquire_budgets[8];
+static int ir_cf_acquire_budgets[8], ir_cf_root_budgets[8], ir_cf_release_budgets[8];
+static uint64 ir_cf_after_root_ns;
 
 static unsigned
 ir_cf_held_count(void)
@@ -45,9 +46,29 @@ ir_cf_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
 				ClusterControlRootReadMode policy, ClusterControlRootSnapshot *snapshot,
 				ClusterControlRootReadToken *token)
 {
+	ClusterControlRootResult result;
+
 	if (!ir_cf_before_root())
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	return cluster_control_root_read_canonical(thread, expected, policy, snapshot, token);
+	result = cluster_control_root_read_canonical(thread, expected, policy, snapshot, token);
+	ir_cf_root_budgets[ir_cf_root_calls - 1] = g_last_timeout_ms;
+	set_cf_clock_ns += ir_cf_after_root_ns;
+	return result;
+}
+
+static ClusterControlRootResult
+ir_cf_canonical_deadline(uint16 thread, const ClusterControlRootIdentity *expected,
+						 ClusterControlRootSnapshot *snapshot, ClusterControlRootReadToken *token,
+						 uint64 deadline_ns)
+{
+	ClusterControlRootResult result;
+	if (!ir_cf_before_root())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_control_root_v3_read_canonical_deadline_v1(thread, expected, snapshot, token,
+																deadline_ns);
+	ir_cf_root_budgets[ir_cf_root_calls - 1] = g_last_timeout_ms;
+	set_cf_clock_ns += ir_cf_after_root_ns;
+	return result;
 }
 
 static ClusterControlRootResult
@@ -88,7 +109,8 @@ ir_cf_owner_release(const ClusterLockAcquireRequest *request)
 
 	UT_ASSERT_EQ(request->resid.type, CLUSTER_IR_RESID_TYPE);
 
-	++ir_cf_releases;
+	UT_ASSERT(ir_cf_releases < lengthof(ir_cf_release_budgets));
+	ir_cf_release_budgets[ir_cf_releases++] = request->timeout_ms;
 	ir_cf_release_active = true;
 	result = cluster_lock_owner_request_release(request);
 	ir_cf_release_active = false;
@@ -125,7 +147,9 @@ ir_cf_clock(void)
 #pragma push_macro("INSTR_TIME_SET_CURRENT")
 #undef INSTR_TIME_SET_CURRENT
 #define INSTR_TIME_SET_CURRENT(value) ((value) = ir_cf_clock())
+#define clock_gettime cf_budget_clock_gettime
 #define cluster_recovery_duty_key_compare_for_claim rejoin_key_compare_for_claim
+#define cluster_control_root_v3_read_canonical_deadline_v1 ir_cf_canonical_deadline
 #define cluster_control_root_read_canonical ir_cf_canonical
 #define cluster_control_root_read_recovery_subject ir_cf_recovery_subject
 #define cluster_formation_witness_revalidate_nowait failure_formation_current
@@ -146,7 +170,9 @@ ir_cf_clock(void)
 #undef cluster_formation_witness_revalidate_nowait
 #undef cluster_control_root_read_recovery_subject
 #undef cluster_control_root_read_canonical
+#undef cluster_control_root_v3_read_canonical_deadline_v1
 #undef cluster_recovery_duty_key_compare_for_claim
+#undef clock_gettime
 #pragma pop_macro("INSTR_TIME_SET_CURRENT")
 
 static unsigned
@@ -216,6 +242,10 @@ ir_cf_fixture(ClusterRecoverySerialMode mode, unsigned failure_at)
 	ir_cf_confirm_release = true;
 	ir_cf_release_active = ir_cf_wrong_ack = false;
 	ir_cf_clock_ms = ir_cf_after_first_grant_ms = 0;
+	ir_cf_after_root_ns = 0;
+	cf_budget_clock_fail = false;
+	memset(ir_cf_release_budgets, 0, sizeof(ir_cf_release_budgets));
+	memset(ir_cf_root_budgets, 0, sizeof(ir_cf_root_budgets));
 	memset(ir_cf_held_at_root, 0, sizeof(ir_cf_held_at_root));
 	memset(ir_cf_acquire_budgets, 0, sizeof(ir_cf_acquire_budgets));
 	memset(ir_cf_grants, 0, sizeof(ir_cf_grants));

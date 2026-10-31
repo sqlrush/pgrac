@@ -38,6 +38,9 @@
 #ifndef CLUSTER_CF_ENQUEUE_H
 #define CLUSTER_CF_ENQUEUE_H
 
+/* Both local S/X completion bindings, enforced against their actual type. */
+#define CLUSTER_CF_JOB_BINDING_MAX_BYTES 80
+
 #include "cluster/cluster_grd.h" /* ClusterResId */
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_sequence.h" /* CLUSTER_SQ_RESID_TYPE (collision check) */
@@ -83,6 +86,9 @@ extern void cluster_cf_resid_encode(ClusterResId *dst);
  *	Use cluster_cf_unlock_confirmed when the caller must consume the verdict.
  */
 extern bool cluster_cf_lock(LOCKMODE mode);
+/* Caller-local CLOCK_MONOTONIC deadline; zero keeps one ordinary attempt.
+ * Neither the configured acquire ceiling nor release cleanup is extended. */
+extern bool cluster_cf_lock_deadline_v1(LOCKMODE mode, uint64 deadline_ns);
 
 /* PGRAC: an observation of one process-local attempt, never lock authority.
  * Capture the sequence immediately around one synchronous consumer call.
@@ -122,6 +128,36 @@ typedef struct ClusterCfRetirementSnapshot {
 
 extern bool cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller,
 										   ClusterCfRetirementSnapshot *out);
+
+typedef enum ClusterCfJobResultV1 {
+	CF_JOB_INVALID = -1,
+	CF_JOB_PENDING = 0,
+	CF_JOB_CONFIRMED = 1
+} ClusterCfJobResultV1;
+
+typedef enum ClusterCfJobReceiptStateV1 {
+	CF_JOB_RECEIPT_UNBOUND = 0,
+	CF_JOB_RECEIPT_RETIRING = 1,
+	CF_JOB_RECEIPT_CONFIRMED = 2
+} ClusterCfJobReceiptStateV1;
+
+/* Caller-owned, process-local completion only; never CF permission.
+ * Initialize to zero with a nonzero, immutable job_generation before use.
+ * Keep its address/storage alive until CONFIRMED, including ERROR unwind.
+ * RETIRING receipts must not be copied, reset or rebound. After consuming
+ * CONFIRMED the original job may zero original/state for its next release. */
+typedef struct ClusterCfJobReceiptV1 {
+	ClusterCfRetirementSnapshot original;
+	uint64 job_generation;
+	uint32 state;
+	uint32 reserved;
+} ClusterCfJobReceiptV1;
+
+StaticAssertDecl(sizeof(ClusterCfJobReceiptV1) <= 184, "CF job receipt exceeds its byte limit");
+
+extern ClusterCfJobResultV1 cluster_cf_unlock_job_v1(LOCKMODE mode, const void *caller,
+													  ClusterCfJobReceiptV1 *receipt);
+extern ClusterCfJobResultV1 cluster_cf_job_retirement_poll_v1(ClusterCfJobReceiptV1 *receipt);
 
 typedef enum ClusterCfReleaseResult {
 	CLUSTER_CF_RELEASE_NOT_HELD = 0,

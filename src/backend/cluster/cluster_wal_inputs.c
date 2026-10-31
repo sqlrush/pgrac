@@ -33,6 +33,7 @@
 #include "cluster/storage/cluster_shared_fs.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
@@ -44,6 +45,8 @@
 
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
+#include "cluster_wal_inputs_job_payload_private.h"
+#include "cluster_wal_cut_job_private.h"
 
 typedef enum WalInputsPurpose {
 	WAL_INPUTS_ONLINE,
@@ -109,6 +112,9 @@ struct ClusterWalInputsV1 {
 	pid_t pid;
 	bool stale;
 	bool suspended;
+	/* Immutable copy of the original Startup plan budget in this read scope. */
+	bool prepare_deadline_set;
+	uint64 prepare_deadline_ns;
 	WalInputsPurpose purpose;
 	ClusterRecoveryTxIoScopeV1 tx;
 	ClusterRecoveryCtrcIoScopeV1 ctrc;
@@ -127,7 +133,140 @@ struct ClusterWalInputsV1 {
 	uint32 local_index;
 	ClusterWalWriterFlushV1 local_cut;
 	ClusterWalCutV1 *remote[CLUSTER_WAL_INPUTS_MAX];
+	ClusterWalInputsJobV1 *job; /* Cleanup backlink, never input authority. */
 };
+
+StaticAssertDecl(sizeof(ClusterWalInputsV1)
+				 <= CLUSTER_WAL_INPUT_JOB_SCOPE_BYTES,
+				 "WAL input scope exceeds its payload envelope");
+
+/* Only two consumer classes are valid for either original Aux role. Keep
+ * allocation witnesses outside borrowed scopes before dereferencing them. */
+static ClusterWalInputsV1 *inputs_job_scopes[CLUSTER_WAL_INPUT_JOB_COUNT / 2];
+StaticAssertDecl(2 * sizeof(inputs_job_scopes)
+				 <= sizeof(((ClusterWalInputsJobControlBudgetV1 *)0)->scope_locators),
+				 "WAL input scope locators exceed their control charge");
+
+bool
+cluster_wal_inputs_scope_job_binding_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsV1 *scope = job->inputs;
+	ClusterRecoveryTxIoScopeV1 tx;
+	ClusterRecoveryCtrcIoScopeV1 ctrc;
+
+	if (scope == NULL) {
+		for (unsigned i = 0; i < lengthof(inputs_job_scopes); ++i)
+			if (inputs_job_scopes[i] != NULL && inputs_job_scopes[i]->job == job)
+				return false;
+		return true;
+	}
+	if (job->consumer >= CLUSTER_WAL_INPUT_JOB_COUNT
+		|| inputs_job_scopes[job->consumer / 2] != scope)
+		return false;
+	memset(&tx, 0, sizeof(tx));
+	memset(&ctrc, 0, sizeof(ctrc));
+	ctrc.namespace_fd = -1;
+	if (scope->job != job || scope->owner != job->owner || scope->pid != job->owner_pid
+		|| scope->purpose != WAL_INPUTS_ONLINE
+		|| scope->thread_count > CLUSTER_WAL_RETENTION_MAX_THREADS || scope->count > CLUSTER_WAL_INPUTS_MAX
+		|| memcmp(&scope->tx, &tx, sizeof(tx)) != 0 || memcmp(&scope->ctrc, &ctrc, sizeof(ctrc)) != 0)
+		return false;
+	for (unsigned i = 0; i < lengthof(scope->remote); ++i)
+		if (scope->remote[i] != NULL && (i >= scope->count
+			|| !cluster_wal_cut_context_binding_v1(scope->remote[i], job->context,
+				job->owner, job->owner_pid, &scope->items[i].source)))
+			return false;
+	if ((job->state == WAL_INPUT_JOB_STATE_BUILDING || job->state == WAL_INPUT_JOB_STATE_USABLE
+		 || job->state == WAL_INPUT_JOB_STATE_SUSPENDED
+		 || job->pin != NULL) && scope->pin != job->pin)
+		return false;
+	if (job->state == WAL_INPUT_JOB_STATE_SUSPENDED && (!scope->suspended || scope->stale))
+		return false;
+	return job->state != WAL_INPUT_JOB_STATE_DONE || (scope->stale && scope->suspended && scope->pin == NULL);
+}
+
+bool
+cluster_wal_inputs_scope_job_suspended_v1(ClusterWalInputsJobV1 *job)
+{
+	return cluster_wal_inputs_scope_job_binding_v1(job) && job->inputs != NULL
+		&& job->inputs->suspended && !job->inputs->stale;
+}
+
+ClusterWalInputsV1 *
+cluster_wal_inputs_scope_job_allocate_v1(ClusterWalInputsJobV1 *job)
+{
+	MemoryContext context = cluster_wal_inputs_job_context_v1(job);
+	ClusterWalInputsV1 *scope;
+
+	if (context == NULL || job->state != WAL_INPUT_JOB_STATE_NEW || job->pin != NULL
+		|| job->inputs != NULL || inputs_job_scopes[job->consumer / 2] != NULL)
+		return NULL;
+	scope = MemoryContextAllocZero(context, sizeof(*scope));
+	scope->ctrc.namespace_fd = -1;
+	scope->pid = job->owner_pid;
+	scope->owner = job->owner;
+	scope->purpose = WAL_INPUTS_ONLINE;
+	scope->job = job;
+	inputs_job_scopes[job->consumer / 2] = scope;
+	return scope;
+}
+
+ClusterWalReadPinV1 **
+cluster_wal_inputs_scope_job_pin_slot_v1(ClusterWalInputsJobV1 *job)
+{
+	if (cluster_wal_inputs_job_context_v1(job) == NULL || job->state != WAL_INPUT_JOB_STATE_BUILDING
+		|| job->inputs == NULL || !cluster_wal_inputs_scope_job_binding_v1(job))
+		return NULL;
+	return &job->inputs->pin;
+}
+
+bool
+cluster_wal_inputs_scope_job_revoke_v1(ClusterWalInputsJobV1 *job)
+{
+	if (!cluster_wal_inputs_scope_job_binding_v1(job))
+		return false;
+	if (job->inputs != NULL) {
+		for (unsigned i = 0; i < lengthof(job->inputs->remote); ++i)
+			if (job->inputs->remote[i] != NULL
+				&& !cluster_wal_cut_cancel_in_context_v1(job->inputs->remote[i], job->context,
+					job->owner, job->owner_pid, &job->inputs->items[i].source))
+				return false;
+		job->inputs->stale = true;
+	}
+	return true;
+}
+
+bool
+cluster_wal_inputs_scope_job_drained_v1(ClusterWalInputsJobV1 *job)
+{
+	if (!cluster_wal_inputs_scope_job_binding_v1(job) || job->pin != NULL
+		|| job->cf.state == CF_JOB_RECEIPT_RETIRING || (job->flags & WAL_INPUT_JOB_FLAG_REVOKED) == 0)
+		return false;
+	if (job->inputs != NULL) {
+		for (unsigned i = 0; i < lengthof(job->inputs->remote); ++i)
+			if (job->inputs->remote[i] != NULL
+				&& !cluster_wal_cut_release_in_context_v1(&job->inputs->remote[i], job->context,
+					job->owner, job->owner_pid, &job->inputs->items[i].source))
+				return false;
+		job->inputs->pin = NULL;
+		job->inputs->stale = job->inputs->suspended = true;
+	}
+	return true;
+}
+
+bool
+cluster_wal_inputs_scope_job_forget_v1(ClusterWalInputsJobV1 *job)
+{
+	if (!cluster_wal_inputs_scope_job_binding_v1(job) || job->state != WAL_INPUT_JOB_STATE_DONE
+		|| job->pin != NULL || job->cf.state == CF_JOB_RECEIPT_RETIRING)
+		return false;
+	if (job->inputs != NULL) {
+		inputs_job_scopes[job->consumer / 2] = NULL;
+		job->inputs->job = NULL;
+		job->inputs = NULL;
+	}
+	return true;
+}
 
 /* A locator, not another owner or a grant. Keep the native incarnation outside
  * borrowed allocations so stale/forged views are rejected before dereference. */
@@ -181,6 +320,9 @@ inputs_scope_role(const ClusterWalInputsV1 *inputs)
 {
 	const ClusterColdTypedV1 *typed;
 	uint64 generation, serial;
+	/* Only the frozen job publication path may make this storage usable. */
+	if (inputs->job != NULL)
+		return cluster_wal_inputs_job_scope_matches_v1(inputs->job, inputs, false);
 	if (inputs->purpose == WAL_INPUTS_CTRC_CENSUS) {
 		ClusterRecoveryCheckpointOwnerV1 owner;
 
@@ -216,13 +358,59 @@ inputs_scope_role(const ClusterWalInputsV1 *inputs)
 		&& memcmp(inputs->tx.subject, &inputs->tx.version, sizeof(inputs->tx.version)) == 0;
 }
 
+static int
+inputs_prepare_budget(const ClusterWalInputsV1 *inputs, int ceiling)
+{
+	struct timespec now;
+	uint64 ns;
+	if (!inputs->prepare_deadline_set)
+		return ceiling;
+	if (inputs->prepare_deadline_ns == 0)
+		return 0;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return 0;
+	ns = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return ns < inputs->prepare_deadline_ns
+			   ? (int)Min((uint64)ceiling, (inputs->prepare_deadline_ns - ns) / NS_PER_MS)
+			   : 0;
+}
+static bool
+inputs_prepare_current(const ClusterWalInputsV1 *inputs)
+{
+	return !inputs->prepare_deadline_set || inputs->prepare_deadline_ns == 0
+		   || inputs_prepare_budget(inputs, 1) > 0;
+}
+
 static bool
 inputs_current(ClusterWalInputsV1 *inputs)
 {
 	return cluster_enabled && cluster_shared_config && inputs_owned(inputs)
-		   && inputs_scope_role(inputs) && !inputs->stale && inputs->thread_count > 0
-		   && !inputs->suspended && inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
+		   && inputs_scope_role(inputs) && !inputs->stale && inputs_prepare_current(inputs)
+		   && inputs->thread_count > 0 && !inputs->suspended
+		   && inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
 		   && cluster_wal_read_pin_covers_v1(inputs->pin, inputs->threads[0]);
+}
+
+/* Private selection/claim proof, never a public accessor's current test.
+ * Before publication the original pin protects I/O, not partial input use. */
+static bool
+inputs_build_current(ClusterWalInputsV1 *inputs)
+{
+	if (inputs->job == NULL)
+		return inputs_current(inputs);
+	return cluster_enabled && cluster_shared_config && inputs_owned(inputs)
+		&& cluster_wal_inputs_job_scope_matches_v1(inputs->job, inputs, true)
+		&& !inputs->stale && !inputs->suspended && inputs->thread_count > 0
+		&& inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
+		&& cluster_wal_read_pin_covers_v1(inputs->pin, inputs->threads[0]);
+}
+
+static ClusterControlRootResult
+inputs_revalidate(ClusterWalInputsV1 *inputs)
+{
+	return inputs != NULL && inputs->job != NULL
+		? cluster_wal_inputs_job_revalidate_v1(inputs->job) : cluster_wal_inputs_revalidate_v1(inputs);
 }
 
 static bool
@@ -373,7 +561,7 @@ cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
 		|| predecessor->claim.identity.origin_owner_incarnation == 0
 		|| predecessor->claim.identity.origin_owner_incarnation
 			   == writer->claim.identity.origin_owner_incarnation
-		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		|| inputs_revalidate(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return false;
 	for (uint32 i = 0; i < inputs->count; i++) {
 		const ClusterWalInputV1 *item = &inputs->items[i];
@@ -485,6 +673,8 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 		return;
 	if (!inputs_owned(*inputs))
 		elog(ERROR, "WAL input scope belongs to another resource owner");
+	if ((*inputs)->job != NULL)
+		elog(ERROR, "WAL input job scope requires its original job cleanup");
 	/* The cursor borrows this scope's namespace fd and complete holder set.
 	 * Retire its local ROOT/directories before ANY original protection. */
 	if ((*inputs)->relmap_census != NULL) {
@@ -621,11 +811,15 @@ inputs_cf_wait(const WalInputsCfWait *original, ClusterWalInputsV1 *inputs,
 	for (;;) {
 		ClusterCfRetirementSnapshot current;
 		bool held;
+		int wait_ms = inputs_prepare_budget(inputs, 20);
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		if (!inputs_cf_wait_current(original, inputs))
+			goto refuse;
+		reason = "ORIGINAL_PLAN_DEADLINE";
+		if (wait_ms <= 0)
 			goto refuse;
 		ResetLatch(MyLatch);
 		held = cluster_cf_held(ShareLock);
@@ -636,7 +830,7 @@ inputs_cf_wait(const WalInputsCfWait *original, ClusterWalInputsV1 *inputs,
 				if (empty_waited)
 					return;
 				empty_waited = true;
-				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 				continue;
 			}
@@ -656,9 +850,14 @@ inputs_cf_wait(const WalInputsCfWait *original, ClusterWalInputsV1 *inputs,
 			goto refuse;
 		cluster_lock_owners_service_poll();
 		cluster_cf_retirement_poll();
-		if (cluster_cf_held(ShareLock))
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+		if (cluster_cf_held(ShareLock)) {
+			wait_ms = inputs_prepare_budget(inputs, 20);
+			reason = "ORIGINAL_PLAN_DEADLINE";
+			if (wait_ms <= 0)
+				goto refuse;
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
 	}
 refuse:
 	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -685,8 +884,12 @@ inputs_root(ClusterWalInputsV1 *inputs, WalInputsWork *work, bool first)
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 
+		if (!inputs_prepare_current(inputs))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		work->cf_attempted = true;
-		if (cluster_cf_lock(ShareLock))
+		if (inputs->prepare_deadline_set
+				? cluster_cf_lock_deadline_v1(ShareLock, inputs->prepare_deadline_ns)
+				: cluster_cf_lock(ShareLock))
 			break;
 		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
@@ -703,6 +906,8 @@ inputs_root(ClusterWalInputsV1 *inputs, WalInputsWork *work, bool first)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = cluster_control_root_v3_read_control_locked(
 		inputs->storage_uuid, inputs->system_identifier, &work->root, &work->common, &token);
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (work->root.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
@@ -725,6 +930,8 @@ inputs_checkpoint(ClusterWalInputsV1 *inputs, const WalInputsWork *work,
 	ControlFileData native;
 	ClusterControlRootResult result;
 
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (inputs->count >= CLUSTER_WAL_INPUTS_MAX)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	item = &inputs->items[inputs->count];
@@ -744,6 +951,8 @@ inputs_checkpoint(ClusterWalInputsV1 *inputs, const WalInputsWork *work,
 	memcpy(anchor.claim_sha256, record->refs.claim_sha256, 32);
 	result = cluster_recovery_anchor_v3_read_native_window_locked(&anchor, &work->common, &native,
 																  item->native_window);
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_recovery_anchor_v2_thread_state(&anchor, &record->snapshot, &native);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -764,9 +973,13 @@ inputs_terminal(ClusterWalInputsV1 *inputs, WalInputsWork *work, uint32 node, ui
 	ClusterControlRootResult result;
 	bool hashed;
 
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (inputs->count >= CLUSTER_WAL_INPUTS_MAX)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	result = cluster_wal_terminal_read_locked(&work->root, node, index, &work->terminal);
+	if (!inputs_prepare_current(inputs))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	item = &inputs->items[inputs->count];
@@ -800,9 +1013,13 @@ inputs_collect(ClusterWalInputsV1 *inputs, WalInputsWork *work)
 	for (uint32 node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
 		if (!work->root.present[node])
 			continue;
+		if (!inputs_prepare_current(inputs))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		if (!cluster_wal_read_pin_covers_v1(inputs->pin, node + 1))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		result = cluster_wal_origin_inputs_read_locked(&work->root, node, &work->origin);
+		if (!inputs_prepare_current(inputs))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		if (work->origin.has_pending)
@@ -824,7 +1041,7 @@ inputs_collect(ClusterWalInputsV1 *inputs, WalInputsWork *work)
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
-	return inputs_current(inputs) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+	return inputs_build_current(inputs) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 								  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
@@ -905,14 +1122,14 @@ inputs_claims(ClusterWalInputsV1 *inputs)
 	for (uint32 i = 0; i < inputs->count; i++) {
 		ClusterWalThreadClaimV2 claim;
 		ClusterControlRootResult result;
-		if (!inputs_current(inputs))
+		if (!inputs_build_current(inputs))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &inputs->items[i].source.claim,
 										   &claim);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
-	return inputs_current(inputs) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+	return inputs_build_current(inputs) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 								  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
@@ -982,7 +1199,7 @@ cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	PG_TRY();
 	{
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT)
 				result = cluster_wal_retained_visit_v1(
@@ -1003,7 +1220,7 @@ cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
 				result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1100,7 +1317,7 @@ cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 inde
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	PG_TRY();
 	{
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			if (item->source.claim.identity.origin_node_id != cluster_node_id)
 				result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
@@ -1110,7 +1327,7 @@ cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 inde
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_writer_check(&native.writer);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1153,7 +1370,7 @@ cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_writer_check(&inputs->local_cut.writer);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1204,7 +1421,7 @@ inputs_ctrc_local_cut(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriter
 		|| CritSectionCount != 0 || ShutdownRequestPending
 		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	result = cluster_wal_writer_check(writer);
@@ -1243,7 +1460,7 @@ inputs_ctrc_local_cut(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriter
 	if (native.flushed_end < native.complete_end) {
 		/* Original Startup I/O only, without CF/content/critical locks.
 		 * Requalify before the native device call; never adopt a new writer. */
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_writer_check(writer);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1253,7 +1470,7 @@ inputs_ctrc_local_cut(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriter
 	}
 	result = cluster_wal_writer_check(writer);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (timeline != writer->ref.timeline)
@@ -1286,7 +1503,7 @@ inputs_ctrc_local_visit(ClusterWalInputsV1 *inputs, uint32 index,
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_wal_writer_check(&native.writer);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = observed;
 	return result;
@@ -1298,8 +1515,19 @@ inputs_remote_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterF
 	const ClusterWalInputV1 *item = &inputs->items[index];
 	ClusterControlRootResult result;
 	ClusterWalSourceRef selected;
+	MemoryContext context = NULL;
+	if (inputs->job != NULL) {
+		if (index >= inputs->count || item->source.claim.identity.origin_node_id == cluster_node_id
+			|| !cluster_wal_inputs_job_scope_matches_v1(inputs->job, inputs, false))
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		context = cluster_wal_inputs_job_context_v1(inputs->job);
+		if (context == NULL)
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
 	if (inputs->remote[index] == NULL) {
-		result = cluster_wal_cut_begin_v1(&item->source, &inputs->remote[index]);
+		result = context != NULL
+			? cluster_wal_cut_begin_in_context_v1(&item->source, context, &inputs->remote[index])
+			: cluster_wal_cut_begin_v1(&item->source, &inputs->remote[index]);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
@@ -1342,11 +1570,11 @@ cluster_wal_inputs_prepare_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
 		return cluster_wal_inputs_prepare_live_local_v1(inputs, index, out_complete_end);
 	PG_TRY();
 	{
-		result = cluster_wal_inputs_revalidate_v1(inputs);
+		result = inputs_revalidate(inputs);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = inputs_remote_sample(inputs, index, &native);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1399,7 +1627,7 @@ cluster_wal_inputs_visit_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
 			&& memcmp(&native, &after, sizeof(native)) != 0)
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 	}
 	PG_CATCH();
 	{
@@ -1431,7 +1659,7 @@ typedef struct WalContributionWork {
 static ClusterControlRootResult
 inputs_contribution_cuts(ClusterWalInputsV1 *inputs, WalContributionWork *work)
 {
-	ClusterControlRootResult result = cluster_wal_inputs_revalidate_v1(inputs);
+	ClusterControlRootResult result = inputs_revalidate(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	work->count = inputs->count;
@@ -1611,7 +1839,7 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		}
 	}
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (work->census == NULL) {
@@ -1619,7 +1847,7 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 		if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	}
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& inputs->local_cut.complete_end != InvalidXLogRecPtr)
 		result = cluster_wal_writer_check(&inputs->local_cut.writer);
@@ -1708,11 +1936,126 @@ cluster_wal_inputs_cold_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVi
 									 out_record_count, out_detail);
 }
 
+/* One original ROOT phase, with the same CF owner and job-owned receipt. */
+static ClusterControlRootResult
+inputs_job_root_phase(ClusterWalInputsV1 *inputs, WalInputsWork *work, bool first, bool collect)
+{
+	ClusterWalInputsJobV1 *job = inputs->job;
+	ClusterControlRootResult result;
+	ClusterCfJobResultV1 released;
+	ClusterCfAttemptObservation attempt;
+	uint64 before;
+
+	result = cluster_wal_inputs_job_cf_prepare_v1(job, &before);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	PG_TRY();
+	{
+		result = inputs_root(inputs, work, first);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && first) {
+			for (uint32 node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node)
+				if (work->root.present[node])
+					inputs->threads[inputs->thread_count++] = node + 1;
+			if (inputs->thread_count == 0)
+				result = CLUSTER_CONTROL_ROOT_ABSENT;
+		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && collect)
+			result = inputs_collect(inputs, work);
+	}
+	PG_CATCH();
+	{
+		/* Bind the original acquiring/retiring request before the job can
+		 * outlive work reset. INVALID is a contradiction, never no debt. */
+		if (work->cf_attempted
+			&& cluster_wal_inputs_job_cf_release_v1(job, before) == CF_JOB_INVALID)
+			elog(FATAL, "invalid original WAL input CF owner after begin error");
+		work->cf_attempted = false;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!work->cf_attempted)
+		return result;
+	released = cluster_wal_inputs_job_cf_release_v1(job, before);
+	work->cf_attempted = false;
+	if (released == CF_JOB_INVALID)
+		elog(FATAL, "invalid original WAL input CF owner after begin phase");
+	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+		&& cluster_cf_last_attempt_since(before, &attempt) && cluster_cf_attempt_wait_slice(&attempt))
+		result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	if (released == CF_JOB_PENDING)
+		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT : result;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_job_begin_v1(ClusterWalInputsJobV1 *job, const uint8 storage_uuid[16],
+	uint64 system_identifier, ClusterWalInputsV1 **usable)
+{
+	ClusterControlRootResult result;
+	ClusterWalInputsV1 *inputs;
+	WalInputsWork *volatile work = NULL;
+	ClusterWalPinResult pinned;
+
+	if (usable == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*usable = NULL;
+	if (storage_uuid == NULL || system_identifier == 0 || system_identifier != GetSystemIdentifier()
+		|| !cluster_enabled || !cluster_shared_config || !cluster_controlfile_shared_authority
+		|| CritSectionCount != 0)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_wal_inputs_job_begin_ready_v1(job);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	PG_TRY();
+	{
+		if (!cluster_wal_inputs_job_scope_create_v1(job))
+			elog(ERROR, "could not allocate original WAL input job scope");
+		inputs = job->inputs;
+		inputs->system_identifier = system_identifier;
+		memcpy(inputs->storage_uuid, storage_uuid, 16);
+		work = palloc0(sizeof(*work)); /* Original scratch, outside job context. */
+		result = inputs_job_root_phase(inputs, work, true, false);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			pinned = cluster_wal_read_pin_acquire_job_v1(inputs->threads, inputs->thread_count,
+				job, &inputs->pin);
+			if (pinned != CLUSTER_WAL_PIN_OK)
+				result = pinned == CLUSTER_WAL_PIN_RELEASE_UNCERTAIN
+					? CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_job_root_phase(inputs, work, false, true);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_claims(inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_job_root_phase(inputs, work, false, false);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !inputs_build_current(inputs))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	PG_CATCH();
+	{
+		if (!cluster_wal_inputs_job_begin_outcome_v1(job, UINT32_MAX, true))
+			elog(FATAL, "invalid original WAL input job after begin error");
+		if (work != NULL)
+			pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	pfree(work);
+	if (!cluster_wal_inputs_job_begin_outcome_v1(job, result, false))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*usable = job->inputs;
+	return result;
+}
+
 static ClusterControlRootResult
 inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPurpose purpose,
 			 const struct ClusterRecoveryStartV1 *start,
 			 const ClusterColdTopTxCensusEntryV1 *subject, const ClusterColdCtrcWorkV1 *ctrc_work,
-			 ClusterWalInputsV1 **out)
+			 ClusterWalInputsV1 **out, const uint64 *deadline)
 {
 	ClusterWalInputsV1 *inputs;
 	WalInputsWork *work;
@@ -1756,6 +2099,8 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 	inputs->pid = getpid();
 	inputs->owner = CurrentResourceOwner;
 	inputs->purpose = purpose;
+	inputs->prepare_deadline_set = deadline != NULL;
+	inputs->prepare_deadline_ns = deadline != NULL ? *deadline : 0;
 	if (purpose == WAL_INPUTS_CTRC_CENSUS) {
 		inputs->ctrc.start = start;
 		inputs->ctrc.inputs = typed;
@@ -1805,8 +2150,11 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 		}
 		inputs_unlock(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-			pinned = cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count,
-													 &inputs->pin);
+			pinned = deadline != NULL
+						 ? cluster_wal_read_pin_acquire_deadline_v1(
+							   inputs->threads, inputs->thread_count, &inputs->pin, *deadline)
+						 : cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count,
+														   &inputs->pin);
 			if (pinned != CLUSTER_WAL_PIN_OK)
 				result = pinned == CLUSTER_WAL_PIN_RELEASE_UNCERTAIN
 							 ? CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN
@@ -1848,15 +2196,28 @@ ClusterControlRootResult
 cluster_wal_inputs_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
 							ClusterWalInputsV1 **out)
 {
-	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_ONLINE, NULL, NULL, NULL, out);
+	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_ONLINE, NULL, NULL, NULL, out,
+						NULL);
 }
 
 ClusterControlRootResult
 cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
 								 ClusterWalInputsV1 **out)
 {
-	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_COLD_REPLAY, NULL, NULL, NULL, out);
+	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_COLD_REPLAY, NULL, NULL, NULL,
+						out, NULL);
 }
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_begin_deadline_v1(const uint8 storage_uuid[16], uint64 system_identifier,
+										  ClusterWalInputsV1 **out, uint64 deadline_ns)
+{
+	if (MyBackendType != B_STARTUP)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return inputs_begin(storage_uuid, system_identifier, WAL_INPUTS_COLD_REPLAY, NULL, NULL, NULL,
+						out, &deadline_ns);
+}
+
 
 ClusterControlRootResult
 cluster_wal_inputs_begin_tx_closure_v1(const struct ClusterRecoveryStartV1 *start,
@@ -1872,7 +2233,7 @@ cluster_wal_inputs_begin_tx_closure_v1(const struct ClusterRecoveryStartV1 *star
 	if (typed == NULL || typed->participant_count == 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
-		WAL_INPUTS_TX_CLOSURE, start, subject, NULL, out);
+						  WAL_INPUTS_TX_CLOSURE, start, subject, NULL, out, NULL);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!cluster_wal_read_pin_owner_v1((*out)->pin, &owner)) {
@@ -1903,7 +2264,7 @@ cluster_wal_inputs_begin_ctrc_census_v1(const struct ClusterRecoveryStartV1 *sta
 		|| (typed = ClusterColdRecoveryTxInputs(start)) == NULL || typed->participant_count == 0)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = inputs_begin(typed->sources[0].claim.identity.storage_uuid, typed->system_identifier,
-		WAL_INPUTS_CTRC_CENSUS, start, NULL, work, out);
+						  WAL_INPUTS_CTRC_CENSUS, start, NULL, work, out, NULL);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!cluster_wal_read_pin_owner_v1((*out)->pin, &owner)) {
@@ -2000,7 +2361,7 @@ cluster_wal_inputs_ctrc_namespace_v1(ClusterWalInputsV1 *inputs, int *root_fd)
 			inputs->stale = true;
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		} else if (!scope->namespace_verified) {
-			result = cluster_wal_inputs_revalidate_v1(inputs);
+			result = inputs_revalidate(inputs);
 			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				&& (!inputs_current(inputs) || !inputs_namespace_current(inputs))) {
 				inputs->stale = true;
@@ -2218,7 +2579,7 @@ cluster_wal_inputs_tx_serial_validate_v1(ClusterWalInputsV1 *inputs,
 
 	if (!cluster_wal_inputs_tx_serial_current_v1(inputs, request))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& !cluster_wal_inputs_tx_serial_current_v1(inputs, request))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -2588,7 +2949,7 @@ inputs_ctrc_replays_grant(ClusterWalInputsV1 *inputs)
 		plan->set_revoked = true;
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = inputs_revalidate(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || !inputs_ctrc_replays_current(inputs)) {
@@ -3661,7 +4022,7 @@ cluster_wal_inputs_tx_abort_path_v1(ClusterWalInputsV1 *inputs,
  * no WALR locks; retention belongs to the caller's original execution pin. */
 static ClusterControlRootResult
 inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
-							 const ClusterControlRootSnapshot *expected)
+							  const ClusterControlRootSnapshot *expected, bool readback)
 {
 	const ClusterWalHistoryRecord *selected = NULL;
 	uint32 node = expected->identity.origin_node_id;
@@ -3680,7 +4041,14 @@ inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
 												   : &work->origin.history.records[i];
 		if (!cluster_control_root_identity_equal(&record->snapshot.identity, &expected->identity))
 			continue;
-		if (selected != NULL || memcmp(&record->snapshot, expected, sizeof(*expected)) != 0)
+		if (selected != NULL
+			|| (readback ? (!cluster_wal_retention_root_source_equal_v1(&record->snapshot, expected)
+							|| (record->snapshot.lifecycle != expected->lifecycle
+								&& !(expected->lifecycle
+										 == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+									 && record->snapshot.lifecycle
+											== CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)))
+						 : memcmp(&record->snapshot, expected, sizeof(*expected)) != 0))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		selected = record;
 	}
@@ -3689,15 +4057,16 @@ inputs_cold_checkpoint_select(ClusterWalInputsV1 *scratch, WalInputsWork *work,
 	return inputs_checkpoint(scratch, work, selected, selected == &work->origin.current);
 }
 
-ClusterControlRootResult
-cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected,
-									const ClusterControlRootFileToken *root_token,
-									ClusterWalRecoveryCheckpointV1 *out)
+static ClusterControlRootResult
+inputs_cold_checkpoint(const ClusterControlRootSnapshot *expected,
+					   const ClusterControlRootFileToken *root_token,
+					   ClusterWalRecoveryCheckpointV1 *out, bool readback)
 {
 	ClusterWalInputsV1 *scratch;
 	WalInputsWork *work;
 	ClusterControlRootResult result;
 	ClusterControlRootSnapshot original;
+	ClusterWalInputV1 selected;
 
 	if (inputs_overlap(expected, sizeof(*expected), out, sizeof(*out))
 		|| inputs_overlap(root_token, sizeof(*root_token), out, sizeof(*out)))
@@ -3731,15 +4100,36 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 	{
 		ClusterWalThreadClaimV2 claim;
 
-		result = inputs_root(scratch, work, false);
+		result = inputs_root(scratch, work, readback);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = inputs_cold_checkpoint_select(scratch, work, &original);
+			result = inputs_cold_checkpoint_select(scratch, work, &original, readback);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && readback)
+			selected = scratch->items[0];
 		inputs_unlock(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_claim_v2_read(cluster_wal_threads_dir,
 											   &scratch->items[0].source.claim, &claim);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = inputs_root(scratch, work, false);
+			result = inputs_root(scratch, work, readback);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && readback) {
+			/* Another origin may advance only the file token while CF is
+			 * released. Rediscover this same source under the fresh cut,
+			 * rather than treating file-token drift as a semantic gap.
+			 * The original claim read is usable only for identical bytes. */
+			const ClusterWalInputV1 *current = &scratch->items[0];
+			scratch->count = 0;
+			result = inputs_cold_checkpoint_select(scratch, work, &original, true);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& (memcmp(&selected.source, &current->source, sizeof(selected.source)) != 0
+					|| selected.checkpoint_start != current->checkpoint_start
+					|| memcmp(&selected.native_checkpoint, &current->native_checkpoint,
+							  sizeof(selected.native_checkpoint))
+						   != 0
+					|| memcmp(selected.native_window, current->native_window,
+							  sizeof(selected.native_window))
+						   != 0))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
 		inputs_unlock(work);
 	}
 	PG_CATCH();
@@ -3759,6 +4149,26 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 	pfree(work);
 	pfree(scratch);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+									  const ClusterControlRootFileToken *root_token,
+									  ClusterWalRecoveryCheckpointV1 *out)
+{
+	return inputs_cold_checkpoint(expected, root_token, out, false);
+}
+
+/* Original Startup post-IR readback: refresh only the file cut, then bracket
+ * the same claim and native checkpoint with two exact reads. No new pin. */
+ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_readback_v1(const ClusterControlRootSnapshot *expected,
+											   const ClusterControlRootFileToken *root_token,
+											   ClusterWalRecoveryCheckpointV1 *out)
+{
+	if (MyBackendType != B_STARTUP || !AmStartupProcess())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return inputs_cold_checkpoint(expected, root_token, out, true);
 }
 
 ClusterControlRootResult
@@ -3797,11 +4207,143 @@ cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
 }
 
 ClusterControlRootResult
+cluster_wal_inputs_job_revalidate_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsV1 *inputs;
+	WalInputsWork *volatile work = NULL;
+	ClusterControlRootResult result;
+
+	result = cluster_wal_inputs_job_revalidate_prepare_v1(job, &inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	PG_TRY();
+	{
+		if (!inputs_build_current(inputs))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else {
+			work = palloc0(sizeof(*work));
+			result = inputs_job_root_phase(inputs, work, false, false);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !inputs_build_current(inputs))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+	}
+	PG_CATCH();
+	{
+		if (!cluster_wal_inputs_job_begin_outcome_v1(job, UINT32_MAX, true))
+			elog(FATAL, "invalid original WAL input job after revalidation error");
+		if (work != NULL)
+			pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (work != NULL)
+		pfree(work);
+	if (!cluster_wal_inputs_job_begin_outcome_v1(job, result, false))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_job_suspend_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterControlRootResult result;
+
+	result = cluster_wal_inputs_job_lifecycle_prepare_v1(job, &inputs, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || job->state == WAL_INPUT_JOB_STATE_SUSPENDED)
+		return result;
+	PG_TRY();
+	{
+		if (!inputs_build_current(inputs))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else {
+			ClusterWalrReleaseResult released;
+
+			/* Revoke public borrowing before the first original release.
+			 * Only a fully confirmed synchronous release is resumable. */
+			inputs->suspended = true;
+			released = cluster_wal_read_pin_suspend_job_v1(&inputs->pin, job);
+			result = released == CLUSTER_WALR_RELEASE_CONFIRMED ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				: released == CLUSTER_WALR_RELEASE_UNCONFIRMED ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+				: CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		}
+	}
+	PG_CATCH();
+	{
+		if (!cluster_wal_inputs_job_begin_outcome_v1(job, UINT32_MAX, true))
+			elog(FATAL, "invalid original WAL input job after suspend error");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		if (!cluster_wal_inputs_job_suspend_finish_v1(job))
+			elog(FATAL, "could not confirm original WAL input job suspension");
+	} else if (!cluster_wal_inputs_job_begin_outcome_v1(job, result, false))
+		elog(FATAL, "invalid original WAL input job after suspension");
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_job_resume_v1(ClusterWalInputsJobV1 *job, ClusterWalInputsV1 **usable)
+{
+	ClusterWalInputsV1 *inputs;
+	WalInputsWork *volatile work = NULL;
+	ClusterControlRootResult result;
+
+	if (usable == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*usable = NULL;
+	result = cluster_wal_inputs_job_lifecycle_prepare_v1(job, &inputs, true);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (job->state == WAL_INPUT_JOB_STATE_USABLE) {
+		result = cluster_wal_inputs_job_revalidate_v1(job);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			*usable = inputs;
+		return result;
+	}
+	PG_TRY();
+	{
+		ClusterWalPinResult pinned;
+
+		pinned = cluster_wal_read_pin_acquire_job_v1(inputs->threads, inputs->thread_count, job, &inputs->pin);
+		if (pinned != CLUSTER_WAL_PIN_OK)
+			result = pinned == CLUSTER_WAL_PIN_INVALID ? CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT
+				: CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		else {
+			inputs->suspended = false;
+			work = palloc0(sizeof(*work));
+			result = inputs_job_root_phase(inputs, work, false, false);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !inputs_build_current(inputs))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+	}
+	PG_CATCH();
+	{
+		if (!cluster_wal_inputs_job_begin_outcome_v1(job, UINT32_MAX, true))
+			elog(FATAL, "invalid original WAL input job after resume error");
+		if (work != NULL)
+			pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (work != NULL)
+		pfree(work);
+	if (!cluster_wal_inputs_job_begin_outcome_v1(job, result, false))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*usable = inputs;
+	return result;
+}
+
+ClusterControlRootResult
 cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 {
 	WalInputsWork *work;
 	ClusterControlRootResult result;
 
+	if (inputs != NULL && inputs->job != NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (!inputs_current(inputs))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
@@ -3829,9 +4371,64 @@ cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 	return result;
 }
 
+/* The failed business header outlives DONE, without input authority. A
+ * detection's own release stays in the same receipt until its exact ACK. */
+ClusterControlRootResult
+cluster_wal_inputs_job_failed_root_v1(ClusterWalInputsJobV1 *job)
+{
+	ClusterWalInputsV1 *inputs;
+	ClusterControlRootResult result;
+	ClusterCfJobResultV1 released = CF_JOB_CONFIRMED;
+	WalInputsWork *work;
+	uint64 before;
+
+	if (!cluster_wal_inputs_job_detect_next_v1(job, &inputs, &result))
+		return result;
+	result = cluster_wal_inputs_job_cf_prepare_v1(job, &before);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		job->detect_result = result;
+		(void)cluster_wal_inputs_job_detect_next_v1(job, &inputs, &result);
+		return result;
+	}
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		ClusterCfAttemptObservation attempt;
+
+		result = inputs_root(inputs, work, false);
+		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& cluster_cf_last_attempt_since(before, &attempt) && cluster_cf_attempt_wait_slice(&attempt))
+			result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		job->detect_result = result;
+		if (work->cf_attempted)
+			released = cluster_wal_inputs_job_cf_release_v1(job, before);
+		work->cf_attempted = false;
+		if (released == CF_JOB_INVALID)
+			elog(FATAL, "invalid original failed PI ROOT detection release");
+	}
+	PG_CATCH();
+	{
+		if (work->cf_attempted && cluster_wal_inputs_job_cf_release_v1(job, before) == CF_JOB_INVALID)
+			elog(FATAL, "invalid original failed PI ROOT detection after error");
+		if (!cluster_wal_inputs_job_owner_revoke_v1(job, WAL_INPUT_JOB_PI_REBUILD, true))
+			elog(FATAL, "invalid original failed PI ROOT detection owner");
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	pfree(work);
+	if (released == CF_JOB_PENDING)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	if (cluster_wal_inputs_job_detect_next_v1(job, &inputs, &result))
+		elog(FATAL, "failed PI ROOT detection lost its original verdict");
+	return result;
+}
+
 ClusterControlRootResult
 cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs)
 {
+	if (inputs != NULL && inputs->job != NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (!inputs_owned(inputs) || !inputs_scope_role(inputs) || inputs->stale)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
@@ -3852,6 +4449,8 @@ cluster_wal_inputs_wait_failed_v1(ClusterWalInputsV1 *inputs)
 {
 	WalInputsWork *work;
 	ClusterControlRootResult result;
+	if (inputs != NULL && inputs->job != NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (!inputs_owned(inputs) || !inputs_scope_role(inputs) || CritSectionCount != 0
 		|| !cluster_enabled || !cluster_shared_config)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -3889,6 +4488,8 @@ cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs)
 {
 	ClusterWalPinResult pinned;
 	ClusterControlRootResult result;
+	if (inputs != NULL && inputs->job != NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (!inputs_owned(inputs) || !inputs_scope_role(inputs) || inputs->stale)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!inputs->suspended)

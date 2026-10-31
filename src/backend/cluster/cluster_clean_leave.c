@@ -58,6 +58,8 @@
 
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_conf.h"
@@ -1847,7 +1849,8 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 {
 	static const char *const names[]
 		= { "ACTIVE_WRITE", "TT_SLOT", "UNDO_BLOCK0", "CTRC", "PCM",	  "GCS", "SF",
-			"GES_REPLY",	"GRD",	   "BUFMGR",	  "OID",  "SEQUENCE", "HW",	 "CF", "KO" };
+			"GES_REPLY",	"GRD",	   "BUFMGR",	  "OID",  "SEQUENCE", "HW",	 "CF", "KO",
+			"WAL_INPUT_JOB" };
 	ClusterNormalStopModuleObservation ignored;
 	ClusterPhase1FullStopPlan identity;
 	ClusterNormalStopPollResult result, aggregate = CLUSTER_NORMAL_STOP_READY;
@@ -1996,6 +1999,22 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 				? cluster_ko_shared_normal_stop_poll_v2(&current.reason)
 				: CLUSTER_NORMAL_STOP_READY;
 			strlcpy(current.object, "native-context-peer-send-directory", sizeof(current.object));
+			break;
+		case 15:
+			/* Process-local debt is observed by its original checkpointer.
+			 * LMON still uses the original shared CF/KO and BG quiescence cut. */
+			if (cluster_shared_config && AmCheckpointerProcess()) {
+				ClusterWalInputsJobResultV1 inputs = cluster_wal_inputs_jobs_stop_census_v1();
+
+				result = inputs == WAL_INPUT_JOB_DONE ? CLUSTER_NORMAL_STOP_READY
+					: inputs == WAL_INPUT_JOB_PENDING ? CLUSTER_NORMAL_STOP_PENDING
+					: CLUSTER_NORMAL_STOP_INVALID;
+				current.reason = inputs == WAL_INPUT_JOB_DONE ? "WAL_INPUT_JOBS_DRAINED"
+					: inputs == WAL_INPUT_JOB_PENDING ? "WAL_INPUT_JOB_CLEANUP_PENDING"
+					: "WAL_INPUT_JOB_IDENTITY_INVALID";
+			} else
+				result = CLUSTER_NORMAL_STOP_READY;
+			strlcpy(current.object, "original-aux-input-jobs", sizeof(current.object));
 			break;
 		default:
 			result = CLUSTER_NORMAL_STOP_INVALID;
@@ -3812,6 +3831,10 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 		cl_normal_stop_trace_peer_acks();
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
+		cluster_wal_inputs_jobs_service_poll_v1();
+		/* This original caller finishes the batch header only after ACK.
+		 * The passive census and the existing absolute deadline stay below. */
+		(void)cluster_pi_writeback_checkpointer_release_v1();
 		if (step == 0 && !after_checkpoint
 			&& pg_atomic_read_u32(&cl_normal_stop->phase) < CLUSTER_NORMAL_STOP_CHECKPOINT
 			&& pg_atomic_read_u32(&cl_normal_stop->service_seal) == 0

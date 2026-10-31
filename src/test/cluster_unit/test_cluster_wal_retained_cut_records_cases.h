@@ -400,15 +400,13 @@ UT_TEST(test_records_cold_terminal_counter_inputs)
 			for (int foreign = 0; foreign < 2; foreign++) {
 				ClusterColdDecodedV1 decoded = { 0 };
 
-				UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded), CLUSTER_COLD_OK);
-				UT_ASSERT(decoded.xid_input.complete);
-				UT_ASSERT_EQ(decoded.xid_input.record_xid, top);
-				UT_ASSERT_EQ(decoded.xid_input.payload_xid, wrap ? 4 : 803);
+				UT_ASSERT_EQ(rec_counter_decode(r, foreign, &decoded), CLUSTER_COLD_COMPONENT_INVALID);
+				UT_ASSERT(!decoded.xid_input.complete);
+				UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
+				UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
 				UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid, 0);
-				/* This unsorted child list fails the native terminal-tree
-				 * contract; valid counter evidence cannot supply that owner. */
-				UT_ASSERT_EQ(decoded.record.record_flags,
-							 foreign ? CLUSTER_COLD_RECORD_SIDE_UNOWNED : 0);
+				UT_ASSERT_EQ(decoded.record.record_flags, 0);
+				UT_ASSERT_EQ(decoded.effects.required, 0);
 				cluster_cold_decoded_release_v1(&decoded);
 			}
 		}
@@ -446,10 +444,22 @@ rec_check_cold_terminal_children(bool abort)
 			r->u.decoded.main_data_len += added;
 			memmove(r->data + 1, r->data, r->u.decoded.main_data_len);
 			r->u.decoded.main_data = (char *)r->data + 1;
-			UT_ASSERT_EQ(rec_counter_decode(r, true, &decoded), CLUSTER_COLD_OK);
-			UT_ASSERT(decoded.xid_input.complete);
-			UT_ASSERT_EQ(decoded.record.record_flags, invalid ? CLUSTER_COLD_RECORD_SIDE_UNOWNED
-															  : CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+			if (invalid) {
+				UT_ASSERT_EQ(rec_counter_decode(r, true, &decoded), CLUSTER_COLD_COMPONENT_INVALID);
+				UT_ASSERT(!decoded.xid_input.complete);
+				UT_ASSERT_EQ(decoded.xid_input.record_xid, InvalidTransactionId);
+				UT_ASSERT_EQ(decoded.xid_input.payload_xid, InvalidTransactionId);
+				UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid, 0);
+				UT_ASSERT_EQ(decoded.record.record_flags, 0);
+				UT_ASSERT_EQ(decoded.effects.required, 0);
+			} else {
+				UT_ASSERT_EQ(rec_counter_decode(r, true, &decoded), CLUSTER_COLD_OK);
+				UT_ASSERT(decoded.xid_input.complete);
+				UT_ASSERT_EQ(decoded.xid_input.record_xid, top);
+				UT_ASSERT_EQ(decoded.xid_input.payload_xid, wrap ? 4 : 803);
+				UT_ASSERT_EQ(decoded.xid_input.checkpoint_next_xid, 0);
+				UT_ASSERT_EQ(decoded.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_SIDE);
+			}
 			cluster_cold_decoded_release_v1(&decoded);
 		}
 }

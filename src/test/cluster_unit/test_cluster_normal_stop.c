@@ -36,6 +36,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "../../backend/cluster/cluster_clean_leave.c"
+#include "test_cluster_pi_empty_batch_fixture.h"
 #include "../../backend/cluster/cluster_service_observe.c"
 
 #undef printf
@@ -43,6 +44,7 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+#include "test_cluster_wal_inputs_empty_jobs_fixture.h"
 bool cluster_trace_cleanup;
 bool cluster_trace_normal_stop;
 static unsigned stop_trace_records, stop_trace_ko_calls;

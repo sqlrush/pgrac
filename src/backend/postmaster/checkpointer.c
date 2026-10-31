@@ -59,6 +59,7 @@
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_cut.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_shared_config.h" /* PGRAC: idle common-value retry */
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_ko.h"
@@ -561,6 +562,13 @@ CheckpointerMain(void)
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* Drain original input debt on its ACK wake, including a pending
+		 * shutdown interrupt, before entering checkpoint or PI work. */
+		cluster_cf_retirement_poll();
+		cluster_lock_owners_service_poll();
+		cluster_wal_inputs_jobs_service_poll_v1();
+#endif
 		/*
 		 * Process any requests or signals received recently.
 		 */
@@ -569,10 +577,6 @@ CheckpointerMain(void)
 
 #ifdef USE_PGRAC_CLUSTER
 		CheckpointerStartupSyncPoll();
-		/* PGRAC: a latch-only idle checkpoint loop must also advance owned
-		 * control cleanup. Author: SqlRush <sqlrush@gmail.com> */
-		cluster_cf_retirement_poll();
-		cluster_lock_owners_service_poll();
 		pi_pending = cluster_ko_shared_native_poll_v2();
 		AbsorbSyncRequests();
 		pi_pending = cluster_pi_writeback_checkpointer_tick_v1() || pi_pending;
@@ -615,7 +619,14 @@ CheckpointerMain(void)
 
 #ifdef USE_PGRAC_CLUSTER
 			/* Native checkpoint owns the next ROOT/WALR operation. */
-			cluster_pi_writeback_checkpointer_release_v1();
+			if (!cluster_pi_writeback_checkpointer_release_v1())
+			{
+				/* Reset preceded the original ACK poll at the loop head.
+				 * Do not consume checkpoint flags or enter ROOT/WAL yet. */
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
+								0, WAIT_EVENT_CHECKPOINTER_MAIN);
+				continue;
+			}
 			pi_pending = false;
 #endif
 
@@ -939,6 +950,7 @@ HandleCheckpointerInterrupts(void)
 					normal_stop_observation.reason = "NORMAL_STOP_ROOT_STOPPED_PENDING";
 					cluster_cf_retirement_poll();
 					cluster_lock_owners_service_poll();
+					cluster_wal_inputs_jobs_service_poll_v1();
 					if (cluster_cf_held_is_usable(ShareLock)
 						|| cluster_cf_held_is_usable(ExclusiveLock)) {
 						result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;

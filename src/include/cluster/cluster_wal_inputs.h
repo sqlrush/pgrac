@@ -31,6 +31,44 @@ typedef struct ClusterWalInputV1 {
 
 typedef struct ClusterWalInputsV1 ClusterWalInputsV1;
 
+/* Original auxiliary caller lifetime, not an input-use permission. The
+ * lifetime/CF/pin storage remains cleanup-only until the corresponding
+ * complete input publication interface is installed. */
+typedef enum ClusterWalInputsConsumerV1 {
+	WAL_INPUT_JOB_RETAINED_CUT = 0,
+	WAL_INPUT_JOB_PI_NOTICE = 1,
+	WAL_INPUT_JOB_PI_BATCH = 2,
+	WAL_INPUT_JOB_PI_REBUILD = 3
+} ClusterWalInputsConsumerV1;
+typedef struct ClusterWalInputsJobV1 ClusterWalInputsJobV1;
+typedef enum ClusterWalInputsJobResultV1 {
+	WAL_INPUT_JOB_INVALID = -1,
+	WAL_INPUT_JOB_PENDING = 0,
+	WAL_INPUT_JOB_DONE = 1
+} ClusterWalInputsJobResultV1;
+
+extern ClusterControlRootResult cluster_wal_inputs_job_open_v1(
+	ClusterWalInputsConsumerV1 consumer, MemoryContext caller_lifetime,
+	ClusterWalInputsJobV1 **job);
+extern MemoryContext cluster_wal_inputs_job_context_v1(ClusterWalInputsJobV1 *job);
+/* Only the complete original ROOT/pin/claim/final proof publishes usable.
+ * Refusal clears output while the original job retains cleanup ownership. */
+extern ClusterControlRootResult cluster_wal_inputs_job_begin_v1(ClusterWalInputsJobV1 *job,
+	const uint8 storage_uuid[16], uint64 system_identifier, ClusterWalInputsV1 **usable);
+extern ClusterControlRootResult cluster_wal_inputs_job_revalidate_v1(ClusterWalInputsJobV1 *job);
+extern ClusterControlRootResult cluster_wal_inputs_job_suspend_v1(ClusterWalInputsJobV1 *job);
+extern ClusterControlRootResult cluster_wal_inputs_job_resume_v1(ClusterWalInputsJobV1 *job,
+	ClusterWalInputsV1 **usable);
+/* Permanently revoke the scope and advance only its original cleanup. */
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_wait_failed_v1(ClusterWalInputsJobV1 *job);
+/* Original failed PI caller: read-only ROOT comparison after debt is DONE. */
+extern ClusterControlRootResult cluster_wal_inputs_job_failed_root_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_retire_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_poll_v1(ClusterWalInputsJobV1 *job);
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_finish_v1(ClusterWalInputsJobV1 **job);
+extern void cluster_wal_inputs_jobs_service_poll_v1(void);
+extern ClusterWalInputsJobResultV1 cluster_wal_inputs_jobs_stop_census_v1(void);
+
 /* Release every read pin while a background job waits for a peer. Suspended
  * scopes cannot expose inputs, read WAL or qualify use of an existing plan.
  * Resume reacquires the same sorted pin set and compares the complete original
@@ -70,6 +108,9 @@ extern ClusterControlRootResult cluster_wal_inputs_begin_v1(const uint8 storage_
  * metadata only while held. Release before acquiring an execution pin, then
  * revalidate the entire selected ROOT using that original execution owner
  * before IR; copied tokens alone confer no DATA/ROOT/PI/GC authority. */
+extern ClusterControlRootResult
+cluster_wal_inputs_cold_begin_deadline_v1(const uint8 storage_uuid[16], uint64 system_identifier,
+										  ClusterWalInputsV1 **out, uint64 deadline_ns);
 extern ClusterControlRootResult cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16],
 																 uint64 system_identifier,
 																 ClusterWalInputsV1 **out);
@@ -415,6 +456,13 @@ extern bool cluster_wal_inputs_tx_serial_current_v1(ClusterWalInputsV1 *inputs,
  * and recheck ROOT after claim I/O outside CF. Acquires no WALR scope or recovery
  * permission. The caller must revalidate its original execution owner before
  * and after the call; output is provisional metadata, never an endpoint proof. */
+/* Original Startup post-IR readback with WALR retained. The caller must
+ * compare the complete prepared source; this grants no authority. */
+extern ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_readback_v1(const ClusterControlRootSnapshot *expected,
+											   const ClusterControlRootFileToken *root_token,
+											   ClusterWalRecoveryCheckpointV1 *out);
+
 extern ClusterControlRootResult cluster_wal_inputs_cold_checkpoint_v1(
 	const ClusterControlRootSnapshot *expected, const ClusterControlRootFileToken *root_token,
 	ClusterWalRecoveryCheckpointV1 *out);

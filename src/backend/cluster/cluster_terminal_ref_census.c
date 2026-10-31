@@ -2131,6 +2131,13 @@ cluster_ctrc_participant_index_compute(uint64 origin_index, uint64 origin_entrie
 
 static ClusterCtrcSharedHeader *CtrcShared = NULL;
 
+static bool ctrc_cleaner_observation_guard(bool value, const char *predicate);
+static void ctrc_cleaner_observation_tt(const TTSlot *slot, bool commit_before,
+	bool abort_before, bool progress_before, bool commit_after, bool abort_after, bool progress_after);
+static ClusterSemanticAdmissionResult ctrc_cleaner_observation_admission(
+	ClusterSemanticAdmissionResult result, const ClusterSemanticAdmissionToken *token,
+	const char *source);
+
 /* Process-local scheduling hints, never part of an authority snapshot. Only
  * the existing UndoCleaner runs batches. A reused slot may inherit a cursor,
  * but every operation still samples and checks the current shared identity. */
@@ -5156,15 +5163,17 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 	MemSet(&final_root, 0, sizeof(final_root));
 	MemSet(&page, 0, sizeof(page));
 	MemSet(&slot, 0, sizeof(slot));
-	if (!ctrc_txn_key_valid(key) || cluster_node_id < 0
-		|| key->origin_node_id != (uint16)cluster_node_id
-		|| key->owner_instance != (uint8)(cluster_node_id + 1)
-		|| key->cluster_epoch != cluster_epoch_get_current()
-		|| key->system_identifier != GetSystemIdentifier()
-		|| key->origin_boot_incarnation != cluster_qvotec_get_self_incarnation())
+	if (!ctrc_cleaner_observation_guard(ctrc_txn_key_valid(key), "terminal.key_valid")
+		|| !ctrc_cleaner_observation_guard(cluster_node_id >= 0, "terminal.local_node")
+		|| !ctrc_cleaner_observation_guard(key->origin_node_id == (uint16)cluster_node_id, "terminal.origin")
+		|| !ctrc_cleaner_observation_guard(key->owner_instance == (uint8)(cluster_node_id + 1), "terminal.owner")
+		|| !ctrc_cleaner_observation_guard(key->cluster_epoch == cluster_epoch_get_current(), "terminal.epoch")
+		|| !ctrc_cleaner_observation_guard(key->system_identifier == GetSystemIdentifier(), "terminal.system_identifier")
+		|| !ctrc_cleaner_observation_guard(key->origin_boot_incarnation == cluster_qvotec_get_self_incarnation(), "terminal.boot"))
 		return false;
-	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
-		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+	if (!ctrc_cleaner_observation_guard(ctrc_cleaner_observation_admission(
+		cluster_semantic_activation_enter_r4_terminal_census(&admission), &admission,
+		"terminal.enter") == CLUSTER_SEMANTIC_ADMISSION_OK, "terminal.admission_enter"))
 		return false;
 	admission_entered = true;
 	logical.owner_instance = key->owner_instance;
@@ -5172,20 +5181,21 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 
 	PG_TRY();
 	{
-		if (admission.formation_epoch != key->formation_epoch
-			|| admission.record_generation != key->admission_record_generation
-			|| !cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+		if (!ctrc_cleaner_observation_guard(admission.formation_epoch == key->formation_epoch, "terminal.admission_formation")
+			|| !ctrc_cleaner_observation_guard(admission.record_generation == key->admission_record_generation, "terminal.admission_record")
+			|| !ctrc_cleaner_observation_guard(cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-				logical.segment_id, &root)
-			|| root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || root.root_id != key->root_id
-			|| root.root_generation != key->root_generation
-			|| key->root_descriptor_incarnation != root.root_generation)
+				logical.segment_id, &root), "terminal.resolve_root")
+			|| !ctrc_cleaner_observation_guard(root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED, "terminal.root_intent")
+			|| !ctrc_cleaner_observation_guard(root.root_id == key->root_id, "terminal.root_id")
+			|| !ctrc_cleaner_observation_guard(root.root_generation == key->root_generation, "terminal.root_generation")
+			|| !ctrc_cleaner_observation_guard(key->root_descriptor_incarnation == root.root_generation, "terminal.root_descriptor"))
 			goto sample_done;
 
 		step = cluster_undo_block0_current_acquire_begin_admitted(
 			&logical, CLUSTER_UNDO_BLOCK0_SCUR, cluster_ges_request_timeout_ms, &admission, &guard,
 			&failure);
-		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+		if (!ctrc_cleaner_observation_guard(step != CLUSTER_UNDO_BLOCK0_CURRENT_FAILED, "terminal.current_begin"))
 			goto sample_done;
 		current_active = true;
 		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
@@ -5196,50 +5206,56 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 					&guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_ACQUIRE))
 				pg_usleep(1000L);
 		}
-		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+		if (!ctrc_cleaner_observation_guard(step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD, "terminal.current_held"))
 			goto sample_done;
-		if (cluster_undo_block0_current_sample_generation(&guard, &root, &generation)
-				!= CLUSTER_UNDO_BLOCK0_OK
-			|| !generation.known || generation.value != key->segment_generation
-			|| cluster_undo_block0_current_copy_resident(&guard, &root, &generation, page.data)
-				   != CLUSTER_UNDO_BLOCK0_OK)
+		if (!ctrc_cleaner_observation_guard(cluster_undo_block0_current_sample_generation(&guard, &root, &generation) == CLUSTER_UNDO_BLOCK0_OK, "terminal.generation_sample")
+			|| !ctrc_cleaner_observation_guard(generation.known, "terminal.generation_known")
+			|| !ctrc_cleaner_observation_guard(generation.value == key->segment_generation, "terminal.generation_match")
+			|| !ctrc_cleaner_observation_guard(cluster_undo_block0_current_copy_resident(&guard, &root, &generation, page.data) == CLUSTER_UNDO_BLOCK0_OK, "terminal.resident_copy"))
 			goto sample_done;
 
 		native_commit_before = TransactionIdDidCommit(key->xid);
 		native_abort_before = TransactionIdDidAbort(key->xid);
 		native_progress_before = TransactionIdIsInProgress(key->xid);
 		header = (const UndoSegmentHeaderData *)page.data;
-		if (header->segment_id != key->segment_id || header->owner_instance != key->owner_instance
-			|| header->wrap_count != key->segment_generation
-			|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+		if (!ctrc_cleaner_observation_guard(header->segment_id == key->segment_id, "terminal.header_segment")
+			|| !ctrc_cleaner_observation_guard(header->owner_instance == key->owner_instance, "terminal.header_owner")
+			|| !ctrc_cleaner_observation_guard(header->wrap_count == key->segment_generation, "terminal.header_generation")
+			|| !ctrc_cleaner_observation_guard(header->tt_slots_count == TT_SLOTS_PER_SEGMENT, "terminal.header_slots"))
 			goto sample_done;
 		slot = header->tt_slots[key->slot_offset];
 		native_commit_after = TransactionIdDidCommit(key->xid);
 		native_abort_after = TransactionIdDidAbort(key->xid);
 		native_progress_after = TransactionIdIsInProgress(key->xid);
-		if (native_commit_before != native_commit_after || native_abort_before != native_abort_after
-			|| native_progress_before != native_progress_after || native_progress_after
-			|| slot.xid != key->xid || slot.wrap != key->slot_wrap
-			|| (slot.flags != TT_FLAGS_RESERVED
-				&& !(capacity_probe && slot.flags == TT_SLOT_FLAG_CTRC_RELEASE_PROVEN))
-			|| (capacity_probe && !UBA_is_invalid(slot.first_undo_block)))
+		ctrc_cleaner_observation_tt(&slot, native_commit_before, native_abort_before,
+			native_progress_before, native_commit_after, native_abort_after, native_progress_after);
+		if (!ctrc_cleaner_observation_guard(native_commit_before == native_commit_after, "terminal.native_commit_stable")
+			|| !ctrc_cleaner_observation_guard(native_abort_before == native_abort_after, "terminal.native_abort_stable")
+			|| !ctrc_cleaner_observation_guard(native_progress_before == native_progress_after, "terminal.native_progress_stable")
+			|| !ctrc_cleaner_observation_guard(!native_progress_after, "terminal.native_idle")
+			|| !ctrc_cleaner_observation_guard(slot.xid == key->xid, "terminal.slot_xid")
+			|| !ctrc_cleaner_observation_guard(slot.wrap == key->slot_wrap, "terminal.slot_wrap")
+			|| !ctrc_cleaner_observation_guard(slot.flags == TT_FLAGS_RESERVED
+				|| (capacity_probe && slot.flags == TT_SLOT_FLAG_CTRC_RELEASE_PROVEN), "terminal.slot_flags")
+			|| !ctrc_cleaner_observation_guard(!capacity_probe || UBA_is_invalid(slot.first_undo_block), "terminal.slot_undo"))
 			goto sample_done;
 
 		MemSet(&final_root, 0, sizeof(final_root));
-		if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+		if (!ctrc_cleaner_observation_guard(cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-				logical.segment_id, &final_root)
-			|| !cluster_undo_block0_root_matches(&root, &final_root)
-			|| !cluster_semantic_activation_recheck_r4_terminal_census(&admission)
-			|| cluster_undo_block0_current_sample_generation(&guard, &root, &final_generation)
-				   != CLUSTER_UNDO_BLOCK0_OK
-			|| !final_generation.known || final_generation.value != generation.value)
+				logical.segment_id, &final_root), "terminal.final_resolve_root")
+			|| !ctrc_cleaner_observation_guard(cluster_undo_block0_root_matches(&root, &final_root), "terminal.final_root_match")
+			|| !ctrc_cleaner_observation_guard(cluster_semantic_activation_recheck_r4_terminal_census(&admission), "terminal.final_admission_recheck")
+			|| !ctrc_cleaner_observation_guard(cluster_undo_block0_current_sample_generation(&guard, &root, &final_generation) == CLUSTER_UNDO_BLOCK0_OK, "terminal.final_generation_sample")
+			|| !ctrc_cleaner_observation_guard(final_generation.known, "terminal.final_generation_known")
+			|| !ctrc_cleaner_observation_guard(final_generation.value == generation.value, "terminal.final_generation_match"))
 			goto sample_done;
 
 		terminal = (slot.status == TT_SLOT_COMMITTED && SCN_VALID(slot.commit_scn)
 					&& native_commit_after && !native_abort_after)
 				   || (slot.status == TT_SLOT_ABORTED && slot.commit_scn == InvalidScn
 					   && native_abort_after && !native_commit_after);
+		(void)ctrc_cleaner_observation_guard(terminal, "terminal.status_coherent");
 
 	sample_done:
 		if (current_active) {
@@ -5253,7 +5269,7 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 					pg_usleep(1000L);
 			}
 			current_active = false;
-			if (step != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+			if (!ctrc_cleaner_observation_guard(step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED, "terminal.current_released"))
 				terminal = false;
 		}
 	}
@@ -8138,6 +8154,160 @@ ctrc_participant_certificate_batch_apply_shared(const ClusterCtrcCloseDispatch *
 												Size count, ClusterCtrcSealReplyResult *results,
 												uint16 *reasons);
 
+#ifndef CLUSTER_CTRC_UNIT_TEST
+/* Process-local, nonauthoritative copies. No shared/wire layout or protocol
+ * state is added. Capture only at an existing owner; output after unlocking. */
+#define CLUSTER_CTRC_PARTICIPANT_STOP_TRACE_PRESENT 1
+typedef struct CtrcParticipantStopTrace {
+	ClusterCtrcParticipantEntry before;
+	ClusterCtrcParticipantEntry after;
+	ClusterCtrcTxnKeyV1 expected_key;
+	ClusterCtrcParticipantIdentity expected_peer;
+	ClusterCtrcLocalReleaseAckV1 summary;
+	uint64 participant_index;
+	uint64 expected_seal;
+	uint32 expected_grant;
+	const char *phase;
+	const char *first_failed;
+	const char *first_failed_phase;
+	const char *capture_phase;
+	uint8 suboperation;
+	bool suboperation_known;
+	Size failed_found;
+	bool known;
+} CtrcParticipantStopTrace;
+
+static uint64 CtrcParticipantStopSequence;
+static uint64 CtrcParticipantStopSkipped;
+
+static void
+ctrc_participant_stop_capture(CtrcParticipantStopTrace *trace, uint64 index)
+{
+	if (!cluster_trace_normal_stop)
+		return;
+	if (!trace->known)
+		trace->before = ctrc_participant_entries()[index];
+	trace->after = ctrc_participant_entries()[index];
+	trace->summary = ctrc_participant_ack_entries()[index];
+	trace->participant_index = index;
+	trace->capture_phase = trace->phase;
+	trace->known = true;
+}
+
+static void
+ctrc_participant_stop_trace_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)context = true;
+}
+
+static void
+ctrc_participant_stop_trace(const char *event, const CtrcParticipantStopTrace *trace,
+						   unsigned result, uint16 first_reason, bool result_known,
+						   bool eligible, bool attempted, bool frozen, Size found, Size count)
+{
+	const ClusterCtrcParticipantEntry *before = &trace->before, *after = &trace->after;
+	const ClusterCtrcTxnKeyV1 *key = &after->key;
+	const ClusterCtrcParticipantIdentity *peer = &after->identity;
+	const ClusterCtrcLocalReleaseAckV1 *ack = &trace->summary;
+	bool held = false;
+	bool present;
+	bool matches;
+	bool mono_known = false;
+	struct timespec now;
+	uint64 mono_us = 0;
+
+	if (!cluster_trace_normal_stop || !trace->known)
+		return;
+	if (CritSectionCount == 0)
+		ForEachLWLockHeldByMe(ctrc_participant_stop_trace_lock, &held);
+	if (CritSectionCount != 0 || held) {
+		if (CtrcParticipantStopSkipped != UINT64_MAX)
+			CtrcParticipantStopSkipped++;
+		return;
+	}
+	/* These comparisons consume only private copies, never reload shared state.
+	 * Tuple equality is not the ACK digest/durability validation predicate. */
+	present = !ctrc_bytes_zero(ack, sizeof(*ack));
+	matches = present && memcmp(&ack->transaction_key, key, sizeof(*key)) == 0
+			  && ack->participant_node_id == peer->node_id
+			  && ack->participant_boot_incarnation == peer->boot_incarnation
+			  && ack->capability_record_generation == peer->capability_record_generation
+			  && ack->formation_epoch == peer->formation_epoch
+			  && ack->admission_record_generation == peer->admission_record_generation
+			  && ack->grant_generation == after->grant_generation
+			  && ack->seal_generation == after->seal_generation;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+		mono_us = (uint64)now.tv_sec * 1000000 + (uint64)now.tv_nsec / 1000;
+		mono_known = true;
+	}
+	if (CtrcParticipantStopSequence != UINT64_MAX)
+		CtrcParticipantStopSequence++;
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_PARTICIPANT_STOP event=%s event_seq=" UINT64_FORMAT
+		" sequence_scope=process node_id=%d pid=%d procno=%d backend_type=%d worker_id=%d worker_id_known=%d "
+		"emit_wall_us=" INT64_FORMAT " emit_monotonic_us=" UINT64_FORMAT
+		" emit_monotonic_known=%d capture_clock_known=0 process_incarnation_known=0 proc_generation_known=0 "
+		"request_id_known=0 authoritative=0 shared_atomic_graph=0 "
+		"durability_known=0 snapshot_subpredicate_known=0 sample_known=1 identity_source=participant_locked_after "
+		"participant_index=" UINT64_FORMAT " phase=%s capture_phase=%s first_failed=%s first_failed_phase=%s "
+		"suboperation_known=%d suboperation=%u original_full_xid_known=%d original_full_xid=" UINT64_FORMAT " "
+		"failed_found=%zu result_known=%d result=%u first_reason_known=%d first_reason=%u "
+		"ack_work_known=%d eligible=%d freeze_attempted=%d frozen=%d "
+		"receipt_found=%zu receipt_expected=%zu "
+		"system_identifier=" UINT64_FORMAT " key_format=%u owner_instance=%u origin_node=%u xid=%u "
+		"segment=%u segment_generation=%u slot=%u tt_wrap=%u cluster_epoch=%u "
+		"boot=" UINT64_FORMAT " formation=" UINT64_FORMAT " admission=" UINT64_FORMAT
+		" root_descriptor=" UINT64_FORMAT " root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+		" peer=%u peer_boot=" UINT64_FORMAT " peer_capability=%u peer_formation=" UINT64_FORMAT
+		" peer_admission=" UINT64_FORMAT " grant=%u seal=" UINT64_FORMAT
+		" before_key_matches_expected=%d after_key_matches_expected=%d "
+		"before_peer_matches_expected=%d after_peer_matches_expected=%d "
+		"expected_grant=%u expected_seal=" UINT64_FORMAT
+		" before_state=%u after_state=%u before_receipts=" UINT64_FORMAT " after_receipts=" UINT64_FORMAT
+		" before_prepared=" UINT64_FORMAT " before_applied=" UINT64_FORMAT
+		" before_cancelled=" UINT64_FORMAT " before_cleaned=" UINT64_FORMAT
+		" before_ack_frozen=" UINT64_FORMAT
+		" after_prepared=" UINT64_FORMAT " after_applied=" UINT64_FORMAT
+		" after_cancelled=" UINT64_FORMAT " after_cleaned=" UINT64_FORMAT " after_ack_frozen=" UINT64_FORMAT
+		" next_key_sequence=" UINT64_FORMAT " last_key_sequence=" UINT64_FORMAT
+		" summary_present=%d summary_tuple_matches=%d summary_crc=%u "
+		"summary_receipts=" UINT64_FORMAT " summary_cancelled=" UINT64_FORMAT
+		" summary_cleaned=" UINT64_FORMAT " summary_ack_frozen=" UINT64_FORMAT
+		" summary_proof_known=0 summary_tuple_known=%d summary_counts_known=%d unsafe_skipped=" UINT64_FORMAT
+		" partial_emit_possible=1 sequence_saturated=%d",
+		event, CtrcParticipantStopSequence, cluster_node_id, (int)getpid(),
+		MyProc != NULL ? MyProc->pgprocno : -1, MyBackendType, CtrcWorkerId, CtrcWorkerId >= 0,
+		GetCurrentTimestamp(), mono_us, mono_known,
+		trace->participant_index, trace->phase != NULL ? trace->phase : "unknown",
+		trace->capture_phase != NULL ? trace->capture_phase : "unknown",
+		trace->first_failed != NULL ? trace->first_failed : "none",
+		trace->first_failed_phase != NULL ? trace->first_failed_phase : "none",
+		trace->suboperation_known, trace->suboperation,
+		FullTransactionIdIsValid(after->original_full_xid), U64FromFullTransactionId(after->original_full_xid),
+		trace->failed_found,
+		result_known, result, result_known, first_reason, !result_known, eligible, attempted, frozen, found, count,
+		key->system_identifier, key->format_version, key->owner_instance, key->origin_node_id, key->xid,
+		key->segment_id, key->segment_generation, key->slot_offset, key->slot_wrap, key->cluster_epoch,
+		key->origin_boot_incarnation, key->formation_epoch, key->admission_record_generation,
+		key->root_descriptor_incarnation, key->root_id, key->root_generation,
+		peer->node_id, peer->boot_incarnation, peer->capability_record_generation,
+		peer->formation_epoch, peer->admission_record_generation, after->grant_generation,
+		after->seal_generation, memcmp(&before->key, &trace->expected_key, sizeof(*key)) == 0,
+		memcmp(key, &trace->expected_key, sizeof(*key)) == 0,
+		memcmp(&before->identity, &trace->expected_peer, sizeof(*peer)) == 0,
+		memcmp(peer, &trace->expected_peer, sizeof(*peer)) == 0,
+		trace->expected_grant, trace->expected_seal, before->state, after->state,
+		before->receipt_count, after->receipt_count, before->prepared_count, before->applied_count,
+		before->cancelled_count, before->cleaned_count, before->ack_frozen_count,
+		after->prepared_count, after->applied_count, after->cancelled_count, after->cleaned_count,
+		after->ack_frozen_count, after->next_key_sequence, after->last_key_sequence,
+		present, matches, ack->crc32c, ack->total_receipt_count, ack->cancelled_count,
+		ack->cleaned_count, ack->ack_frozen_count, present, present, CtrcParticipantStopSkipped,
+		CtrcParticipantStopSequence == UINT64_MAX)));
+}
+#endif
 ClusterCtrcSealReplyResult
 cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 										const ClusterCtrcParticipantIdentity *identity,
@@ -8153,6 +8323,8 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 	ClusterCtrcParticipantState state_before;
 	uint64 participant_index;
 	bool progressed;
+	bool trace_enabled = cluster_trace_normal_stop;
+	CtrcParticipantStopTrace trace;
 
 	if (first_reason != NULL)
 		*first_reason = CTRC_SEAL_REASON_MALFORMED;
@@ -8182,6 +8354,14 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 	ack_summary = &ctrc_participant_ack_entries()[participant_index];
 	participant_before = *participant;
 	state_before = (ClusterCtrcParticipantState)participant->state;
+	if (trace_enabled) {
+		MemSet(&trace, 0, sizeof(trace));
+		trace.expected_key = *key; trace.expected_peer = *identity;
+		trace.expected_grant = grant_generation; trace.expected_seal = seal_generation;
+		trace.phase = "request.apply";
+		trace.suboperation = (uint8)suboperation; trace.suboperation_known = true;
+		ctrc_participant_stop_capture(&trace, participant_index);
+	}
 	/* A CLOSE on an empty slot creates a new participant tombstone.  It is
 	 * not an exact completion of the participant previously reclaimed by a
 	 * certificate.  Local foreground/cleaner calls retain their native
@@ -8208,6 +8388,8 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 	}
 	progressed = result != CTRC_SEAL_REPLY_BLOCKED_RETAIN && result != CTRC_SEAL_REPLY_DENIED
 				 && memcmp(participant, &participant_before, sizeof(participant_before)) != 0;
+	if (trace_enabled)
+		ctrc_participant_stop_capture(&trace, participant_index);
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(ctrc_participant_lock_mask(participant_index));
 	if (progressed)
@@ -8224,6 +8406,18 @@ cluster_ctrc_participant_request_shared(const ClusterCtrcTxnKeyV1 *key,
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
 	} else if (result == CTRC_SEAL_REPLY_BLOCKED_RETAIN || result == CTRC_SEAL_REPLY_DENIED)
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_BLOCKED);
+	if (trace_enabled) {
+		if (result == CTRC_SEAL_REPLY_PENDING_DRAIN)
+			trace.first_failed = participant_before.prepared_count != 0 ? "prepared_drain"
+				: trace.after.applied_count != 0 ? "applied_drain"
+				: trace.after.receipt_count != 0 ? "ack_freeze_pending" : "pending_unknown";
+		else if (result == CTRC_SEAL_REPLY_BLOCKED_RETAIN || result == CTRC_SEAL_REPLY_DENIED)
+			trace.first_failed = *first_reason == CTRC_SEAL_REASON_ACK_UNAVAILABLE
+				? "ack_unavailable" : "participant_identity_or_input";
+		trace.first_failed_phase = trace.first_failed != NULL ? trace.phase : NULL;
+		ctrc_participant_stop_trace("request.reply", &trace, result, *first_reason, true,
+			false, false, false, 0, trace.after.receipt_count);
+	}
 	return result;
 #else
 	(void)key;
@@ -9051,6 +9245,453 @@ ctrc_page_version_capture(Page page, uint16 *origin_out, XLogRecPtr *lsn_out, SC
 	return true;
 }
 
+/* Private diagnostics only. Budgets belong to a complete key's residency in
+ * a bucket, never to the startup's first N records. A collision starts a new
+ * residency and is reported; missing samples cannot prove absence. */
+#define CLUSTER_CTRC_CLEANER_OBSERVATION_PRESENT 1
+#define CTRC_CLEANER_TRACE_BUCKETS 64
+#define CTRC_CLEANER_TRACE_SIGNATURES 16
+#define CTRC_CLEANER_TRACE_DETAILS 2
+typedef struct CtrcCleanerScanTrace {
+	uint64 start, limit, visited, remaining_before, remaining_after, cursor_after;
+	uint64 selected_index;
+	bool known, batch, selected;
+} CtrcCleanerScanTrace;
+
+typedef struct CtrcCleanerAttemptTrace {
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcReceipt receipt;
+	CtrcCleanerScanTrace scan;
+	ClusterItlSlotData slot;
+	TTSlot tt_slot;
+	ClusterSfDepVec first_dependencies, final_dependencies;
+	ClusterCtrcDurability durability;
+	uint64 participant_index, receipt_index, serial, guards;
+	XLogRecPtr page_lsn;
+	SCN page_scn, commit_scn, local_floor, cluster_floor;
+	uint64 floor_epoch;
+	uint64 admission_formation, admission_record;
+	int page_origin, durability_origin;
+	unsigned terminal, discharge, admission_result, fold_result;
+	const char *first_failed, *last_predicate, *retained_stage, *admission_source;
+	bool active, known, participant_known, selected, normal, scope_end_known, scope_ended;
+	bool terminal_known, page_known, admission_known, first_dependencies_known, final_dependencies_known;
+	bool durability_known, durability_origin_known, discharge_known;
+	bool tt_sample_known, native[6], fold_known, floor_known;
+} CtrcCleanerAttemptTrace;
+
+typedef struct CtrcCleanerTraceSignature {
+	uint64 receipt_index, generation;
+	const char *predicate;
+	unsigned details;
+	bool selected, cleaned, used;
+} CtrcCleanerTraceSignature;
+
+typedef struct CtrcCleanerTraceBucket {
+	ClusterCtrcTxnKeyV1 key;
+	CtrcCleanerTraceSignature signatures[CTRC_CLEANER_TRACE_SIGNATURES];
+	uint64 evictions, dropped, total_dropped;
+	bool used;
+} CtrcCleanerTraceBucket;
+
+static CtrcCleanerAttemptTrace CtrcCleanerObservation;
+static CtrcCleanerScanTrace CtrcCleanerScan;
+static CtrcCleanerTraceBucket CtrcCleanerBuckets[CTRC_CLEANER_TRACE_BUCKETS];
+static CtrcCleanerAttemptTrace CtrcCleanerCandidates[CTRC_CLEANER_TRACE_BUCKETS];
+static unsigned CtrcCleanerTouched[CTRC_CLEANER_TRACE_BUCKETS];
+static unsigned CtrcCleanerTouchedCount;
+static uint64 CtrcCleanerUnsafeDropped, CtrcCleanerErrorDropped, CtrcCleanerCaptureDropped;
+
+static void
+ctrc_cleaner_trace_increment(uint64 *counter)
+{
+	if (*counter != UINT64_MAX)
+		(*counter)++;
+}
+
+static unsigned
+ctrc_cleaner_trace_bucket(const ClusterCtrcTxnKeyV1 *key)
+{
+	const unsigned char *bytes = (const unsigned char *)key;
+	uint64 hash = UINT64_C(14695981039346656037);
+
+	for (Size i = 0; i < sizeof(*key); i++)
+		hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
+	return hash % CTRC_CLEANER_TRACE_BUCKETS;
+}
+
+/* Evaluated once, in the original short-circuit expression. Never a guard
+ * override, additional shared read, or diagnostic authorization. */
+static bool
+ctrc_cleaner_observation_guard(bool value, const char *predicate)
+{
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+		CtrcCleanerObservation.last_predicate = predicate;
+		ctrc_cleaner_trace_increment(&CtrcCleanerObservation.guards);
+		if (!value && CtrcCleanerObservation.first_failed == NULL)
+			CtrcCleanerObservation.first_failed = predicate;
+	}
+	return value;
+}
+
+static void
+ctrc_cleaner_observation_tt(const TTSlot *slot, bool commit_before, bool abort_before,
+							bool progress_before, bool commit_after, bool abort_after, bool progress_after)
+{
+	CtrcCleanerAttemptTrace *trace = &CtrcCleanerObservation;
+
+	if (!cluster_trace_normal_stop || !trace->active)
+		return;
+	trace->tt_sample_known = true;
+	trace->tt_slot = *slot;
+	trace->native[0] = commit_before;
+	trace->native[1] = abort_before;
+	trace->native[2] = progress_before;
+	trace->native[3] = commit_after;
+	trace->native[4] = abort_after;
+	trace->native[5] = progress_after;
+}
+
+static ClusterSemanticAdmissionResult
+ctrc_cleaner_observation_admission(ClusterSemanticAdmissionResult result,
+									 const ClusterSemanticAdmissionToken *token, const char *source)
+{
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+		CtrcCleanerObservation.admission_known = true;
+		CtrcCleanerObservation.admission_result = result;
+		CtrcCleanerObservation.admission_source = source;
+		CtrcCleanerObservation.admission_formation = token->formation_epoch;
+		CtrcCleanerObservation.admission_record = token->record_generation;
+	}
+	return result;
+}
+
+static ClusterUndoHorizonFoldStatus
+ctrc_cleaner_observation_floor(ClusterUndoHorizonFoldStatus result, SCN local,
+								const ClusterUndoHorizonFloor *floor)
+{
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+		CtrcCleanerObservation.fold_known = true;
+		CtrcCleanerObservation.fold_result = result;
+		CtrcCleanerObservation.local_floor = local;
+		if (result == CLUSTER_UNDO_HORIZON_FOLD_OK) {
+			CtrcCleanerObservation.floor_known = true;
+			CtrcCleanerObservation.cluster_floor = floor->scn;
+			CtrcCleanerObservation.floor_epoch = floor->epoch;
+		}
+	}
+	return result;
+}
+
+static void
+ctrc_cleaner_observation_begin(const ClusterCtrcParticipantEntry *participant,
+								 const ClusterCtrcReceipt *receipt, uint64 participant_index,
+								 uint64 receipt_index)
+{
+	if (!cluster_trace_normal_stop) {
+		CtrcCleanerObservation.active = CtrcCleanerObservation.known = false;
+		return;
+	}
+	if (CtrcCleanerObservation.active)
+		ctrc_cleaner_trace_increment(&CtrcCleanerErrorDropped);
+	MemSet(&CtrcCleanerObservation, 0, sizeof(CtrcCleanerObservation));
+	CtrcCleanerObservation.participant = *participant;
+	CtrcCleanerObservation.receipt = *receipt;
+	CtrcCleanerObservation.participant_index = participant_index;
+	CtrcCleanerObservation.receipt_index = receipt_index;
+	CtrcCleanerObservation.participant_known = true;
+	CtrcCleanerObservation.selected = true;
+	CtrcCleanerObservation.known = CtrcCleanerObservation.active = true;
+	if (CtrcCleanerScan.known && CtrcCleanerScan.selected
+		&& CtrcCleanerScan.selected_index == receipt_index)
+		CtrcCleanerObservation.scan = CtrcCleanerScan;
+}
+
+static void
+ctrc_cleaner_observation_leave(uint64 serial, bool ended, bool normal)
+{
+	if (!CtrcCleanerObservation.active)
+		return;
+	CtrcCleanerObservation.serial = serial;
+	CtrcCleanerObservation.scope_end_known = true;
+	CtrcCleanerObservation.scope_ended = ended;
+	CtrcCleanerObservation.normal = normal;
+	CtrcCleanerObservation.active = false;
+	if (!cluster_trace_normal_stop)
+		CtrcCleanerObservation.known = false;
+	if (!normal) {
+		ctrc_cleaner_trace_increment(&CtrcCleanerErrorDropped);
+		CtrcCleanerObservation.known = false;
+	}
+}
+
+static void
+ctrc_cleaner_observation_retained(const char *stage, const ClusterItlSlotData *slot,
+									XLogRecPtr lsn, SCN scn, int origin,
+									ClusterCtrcTerminalStatus terminal, SCN commit_scn)
+{
+	CtrcCleanerAttemptTrace *trace = &CtrcCleanerObservation;
+
+	if (!cluster_trace_normal_stop || !trace->active)
+		return;
+	trace->retained_stage = stage;
+	trace->terminal_known = true;
+	trace->terminal = terminal;
+	trace->commit_scn = commit_scn;
+	trace->page_known = slot != NULL;
+	if (slot != NULL) {
+		trace->slot = *slot;
+		trace->page_lsn = lsn;
+		trace->page_scn = scn;
+		trace->page_origin = origin;
+	}
+	if (trace->first_failed == NULL)
+		trace->first_failed = strcmp(stage, "SLOT_REVALIDATE") == 0
+			? "itl.cleanout_result" : stage;
+}
+
+static ClusterCtrcDischargeResult
+ctrc_cleaner_observation_discharge(ClusterCtrcDischargeResult result)
+{
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+		CtrcCleanerObservation.discharge_known = true;
+		CtrcCleanerObservation.discharge = result;
+	}
+	(void)ctrc_cleaner_observation_guard(result == CLUSTER_CTRC_DISCHARGE_CLEANED,
+									   "itl.discharge");
+	return result;
+}
+
+/* Serialize only private vectors after the original locks/scope have left. */
+static void
+ctrc_cleaner_trace_vector(char *out, Size size, const XLogRecPtr *values, bool known)
+{
+	Size used = 0;
+
+	out[0] = '\0';
+	if (!known) {
+		strlcpy(out, "unknown", size);
+		return;
+	}
+	for (unsigned i = 0; i < CLUSTER_SF_DEP_MAX_ORIGINS && used < size; i++) {
+		int n = snprintf(out + used, size - used, "%s%u:" UINT64_FORMAT,
+						 i == 0 ? "" : ",", i, values[i]);
+		if (n < 0 || (Size)n >= size - used)
+			break;
+		used += n;
+	}
+}
+
+static void
+ctrc_cleaner_observation_log(const CtrcCleanerAttemptTrace *trace, bool cleaned)
+{
+	const ClusterCtrcReceipt *receipt = &trace->receipt;
+	const ClusterCtrcTxnKeyV1 *key = &receipt->key;
+	const ClusterCtrcParticipantEntry *participant = &trace->participant;
+	const ClusterCtrcTargetV1 *target = &receipt->target;
+	const char *predicate = trace->first_failed != NULL ? trace->first_failed : "none";
+	unsigned bucket_index = ctrc_cleaner_trace_bucket(key);
+	CtrcCleanerTraceBucket *bucket = &CtrcCleanerBuckets[bucket_index];
+	CtrcCleanerTraceSignature *signature = NULL;
+	bool held = false, summary = false;
+	char first[CLUSTER_SF_DEP_MAX_ORIGINS * 32 + 1];
+	char final[CLUSTER_SF_DEP_MAX_ORIGINS * 32 + 1];
+	char durable[CLUSTER_SF_DEP_MAX_ORIGINS * 32 + 1];
+	UBA target_uba;
+
+	if (!cluster_trace_normal_stop || !trace->known)
+		return;
+	if (CritSectionCount == 0)
+		ForEachLWLockHeldByMe(ctrc_participant_stop_trace_lock, &held);
+	if (CritSectionCount != 0 || held) {
+		ctrc_cleaner_trace_increment(&CtrcCleanerUnsafeDropped);
+		return;
+	}
+	if (!bucket->used || memcmp(&bucket->key, key, sizeof(*key)) != 0) {
+		uint64 evictions = bucket->evictions;
+		uint64 total_dropped = bucket->total_dropped;
+		if (bucket->used)
+			ctrc_cleaner_trace_increment(&evictions);
+		MemSet(bucket, 0, sizeof(*bucket));
+		bucket->key = *key;
+		bucket->used = true;
+		bucket->evictions = evictions;
+		bucket->total_dropped = total_dropped;
+	}
+	for (unsigned i = 0; i < CTRC_CLEANER_TRACE_SIGNATURES; i++) {
+		CtrcCleanerTraceSignature *candidate = &bucket->signatures[i];
+		if (!candidate->used) {
+			candidate->used = true;
+			candidate->receipt_index = trace->receipt_index;
+			candidate->generation = receipt->publication.journal_slot_generation;
+			candidate->predicate = predicate;
+			candidate->selected = trace->selected;
+			candidate->cleaned = cleaned;
+			signature = candidate;
+			break;
+		}
+		if (candidate->receipt_index == trace->receipt_index
+			&& candidate->generation == receipt->publication.journal_slot_generation
+			&& candidate->selected == trace->selected && candidate->cleaned == cleaned
+			&& strcmp(candidate->predicate, predicate) == 0) {
+			signature = candidate;
+			break;
+		}
+	}
+	if (signature == NULL || signature->details >= CTRC_CLEANER_TRACE_DETAILS) {
+		uint64 before = bucket->dropped;
+		ctrc_cleaner_trace_increment(&bucket->dropped);
+		ctrc_cleaner_trace_increment(&bucket->total_dropped);
+		/* At most 65 summaries per key residency, including saturation. */
+		if (before == bucket->dropped
+			|| (bucket->dropped != UINT64_MAX && (bucket->dropped & (bucket->dropped - 1)) != 0))
+			return;
+		summary = true;
+	} else
+		signature->details++;
+	ctrc_cleaner_trace_vector(first, sizeof(first), trace->first_dependencies.required,
+							  trace->first_dependencies_known);
+	ctrc_cleaner_trace_vector(final, sizeof(final), trace->final_dependencies.required,
+							  trace->final_dependencies_known);
+	ctrc_cleaner_trace_vector(durable, sizeof(durable), trace->durability.durable_lsn,
+							  trace->durability_known);
+	memcpy(&target_uba, target->uba, sizeof(target_uba));
+	ereport(LOG, (errmsg_internal(
+		"PGRAC_FAMILY=CTRC_CLEANER_ATTEMPT authoritative=0 sample_kind=%s "
+		"node=%d pid=%d procno=%d backend_id=%d backend_type=%d worker=%d pass=" UINT64_FORMAT
+		" proc_generation_known=0 capture_clock_known=0 shared_atomic_graph=0 "
+		"request_id_known=0 identity_source=original_receipt_copy participant_known=%d selected=%d "
+		"first_failed=%s last_predicate=%s predicates_evaluated=" UINT64_FORMAT
+		" result_known=%d cleaned=%d normal_exit=%d scope_serial=" UINT64_FORMAT
+		" scope_end_known=%d scope_ended=%d scan_known=%d scan_start=" UINT64_FORMAT
+		" scan_limit=" UINT64_FORMAT " scan_visited=" UINT64_FORMAT " scan_cursor_after=" UINT64_FORMAT
+		" scan_batch=%d remaining_before=" UINT64_FORMAT " remaining_after=" UINT64_FORMAT
+		" system_identifier=" UINT64_FORMAT " key_format=%u owner_instance=%u origin_node=%u "
+		"segment=%u segment_generation=%u slot=%u tt_wrap=%u xid=%u cluster_epoch=%u "
+		"boot=" UINT64_FORMAT " formation=" UINT64_FORMAT " admission=" UINT64_FORMAT
+		" root_descriptor=" UINT64_FORMAT " root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+		" participant_index=" UINT64_FORMAT " receipt_index=" UINT64_FORMAT
+		" journal_generation=" UINT64_FORMAT " journal_sequence=" UINT64_FORMAT
+		" key_sequence=" UINT64_FORMAT " operation=" UINT64_FORMAT " reference_kind=%u "
+		"publication_target_kind=%u publication_grant=%u publication_requester_node=%u "
+		"publication_requester_boot=" UINT64_FORMAT " publication_capability=%u "
+		"publication_backend_id=%d publication_wire_request_id=" UINT64_FORMAT
+		" publication_attempt=%u publication_identity_copied=1 "
+		"receipt_state=%u peer=%u peer_boot=" UINT64_FORMAT " peer_capability=%u "
+		"peer_formation=" UINT64_FORMAT " peer_admission=" UINT64_FORMAT
+		" grant=%u seal=" UINT64_FORMAT " participant_state=%u applied=" UINT64_FORMAT
+		" cleaned_count=" UINT64_FORMAT " ack_frozen=" UINT64_FORMAT
+		" target_kind=%u tag=%u/%u/%u/%d/%u expected_slot=%u expected_xid=%u expected_wrap=%u "
+		"expected_class=%u expected_uba=" UINT64_FORMAT "/" UINT64_FORMAT
+		" predecessor_origin=%u predecessor_lsn=" UINT64_FORMAT " predecessor_scn=" UINT64_FORMAT
+		" terminal_known=%d terminal=%u commit_scn=" UINT64_FORMAT " retained_stage=%s "
+		"admission_known=%d admission_result=%u admission_source=%s admission_formation=" UINT64_FORMAT " admission_record=" UINT64_FORMAT " "
+		"tt_sample_known=%d tt_xid=%u sampled_tt_wrap=%u tt_status=%u tt_flags=%u tt_commit=" UINT64_FORMAT
+		" native_commit_before=%d native_abort_before=%d native_progress_before=%d "
+		"native_commit_after=%d native_abort_after=%d native_progress_after=%d "
+		"fold_known=%d fold_result=%u local_floor=" UINT64_FORMAT " floor_known=%d cluster_floor=" UINT64_FORMAT " floor_epoch=" UINT64_FORMAT " "
+		"page_known=%d page_origin=%d page_lsn=" UINT64_FORMAT " page_scn=" UINT64_FORMAT
+		" actual_xid=%u actual_wrap=%u actual_flags=%u actual_commit=" UINT64_FORMAT
+		" actual_write=" UINT64_FORMAT " actual_uba=" UINT64_FORMAT "/" UINT64_FORMAT
+		" first_dependencies_known=%d first_required=%s final_dependencies_known=%d final_required=%s "
+		"durability_known=%d durable=%s durability_origin_known=%d durability_origin=%d discharge_known=%d discharge=%u "
+		"bucket=%u bucket_evictions=" UINT64_FORMAT " key_budget_dropped=" UINT64_FORMAT
+		" bucket_total_dropped=" UINT64_FORMAT
+		" unsafe_dropped=" UINT64_FORMAT " error_dropped=" UINT64_FORMAT " capture_dropped=" UINT64_FORMAT
+		" budget_scope=key_residency detail_limit=%u signature_limit=%u partial_coverage=1",
+		summary ? "drop_summary" : "detail", cluster_node_id, MyProcPid,
+		MyProc != NULL ? MyProc->pgprocno : -1, MyBackendId, MyBackendType, CtrcWorkerId, CtrcLocalPasses,
+		trace->participant_known, trace->selected, predicate,
+		trace->last_predicate != NULL ? trace->last_predicate : "unknown", trace->guards,
+		trace->selected && trace->normal, cleaned, trace->normal, trace->serial,
+		trace->scope_end_known, trace->scope_ended, trace->scan.known, trace->scan.start,
+		trace->scan.limit, trace->scan.visited, trace->scan.cursor_after, trace->scan.batch,
+		trace->scan.remaining_before, trace->scan.remaining_after,
+		key->system_identifier, key->format_version, key->owner_instance, key->origin_node_id,
+		key->segment_id, key->segment_generation, key->slot_offset, key->slot_wrap, key->xid,
+		key->cluster_epoch, key->origin_boot_incarnation, key->formation_epoch,
+		key->admission_record_generation, key->root_descriptor_incarnation, key->root_id, key->root_generation,
+		trace->participant_index, trace->receipt_index, receipt->publication.journal_slot_generation,
+		receipt->publication.journal_sequence, receipt->publication.key_sequence,
+		receipt->publication.operation_id, receipt->publication.reference_kind,
+		receipt->publication.target_kind, receipt->publication.grant_generation,
+		receipt->publication.requester_node_id, receipt->publication.requester_boot_incarnation,
+		receipt->publication.capability_record_generation, receipt->publication.requester_backend_id,
+		receipt->publication.wire_request_id, receipt->publication.attempt_generation, receipt->state,
+		participant->identity.node_id, participant->identity.boot_incarnation,
+		participant->identity.capability_record_generation, participant->identity.formation_epoch,
+		participant->identity.admission_record_generation, participant->grant_generation,
+		participant->seal_generation, participant->state, participant->applied_count,
+		participant->cleaned_count, participant->ack_frozen_count,
+		target->kind, target->spc_oid, target->db_oid, target->rel_number, target->fork_number,
+		target->block_number, target->itl_slot_index, target->itl_xid, target->itl_slot_wrap,
+		target->itl_class, target_uba.raw[0], target_uba.raw[1],
+		target->predecessor_page_lsn_origin_node_id, target->predecessor_page_lsn, target->predecessor_page_scn,
+		trace->terminal_known, trace->terminal, (uint64)trace->commit_scn,
+		trace->retained_stage != NULL ? trace->retained_stage : "none",
+		trace->admission_known, trace->admission_result,
+		trace->admission_source != NULL ? trace->admission_source : "unknown",
+		trace->admission_formation, trace->admission_record,
+		trace->tt_sample_known, trace->tt_slot.xid, trace->tt_slot.wrap, trace->tt_slot.status,
+		trace->tt_slot.flags, (uint64)trace->tt_slot.commit_scn,
+		trace->native[0], trace->native[1], trace->native[2], trace->native[3], trace->native[4], trace->native[5],
+		trace->fold_known, trace->fold_result, (uint64)trace->local_floor, trace->floor_known,
+		(uint64)trace->cluster_floor, trace->floor_epoch,
+		trace->page_known, trace->page_origin, trace->page_lsn, (uint64)trace->page_scn,
+		trace->slot.xid, trace->slot.wrap, trace->slot.flags, (uint64)trace->slot.commit_scn,
+		(uint64)trace->slot.write_scn, trace->slot.undo_segment_head.raw[0], trace->slot.undo_segment_head.raw[1],
+		trace->first_dependencies_known, first, trace->final_dependencies_known, final,
+		trace->durability_known, durable, trace->durability_origin_known,
+		trace->durability_origin, trace->discharge_known, trace->discharge,
+		bucket_index, bucket->evictions, bucket->dropped, bucket->total_dropped, CtrcCleanerUnsafeDropped,
+		CtrcCleanerErrorDropped, CtrcCleanerCaptureDropped,
+		CTRC_CLEANER_TRACE_DETAILS, CTRC_CLEANER_TRACE_SIGNATURES)));
+}
+
+static void
+ctrc_cleaner_observation_emit(bool cleaned)
+{
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.known) {
+		/* Detach before LOG: an output error cannot leave an active owner. */
+		CtrcCleanerAttemptTrace snapshot = CtrcCleanerObservation;
+
+		CtrcCleanerObservation.known = false;
+		ctrc_cleaner_observation_log(&snapshot, cleaned);
+	}
+}
+
+static void
+ctrc_cleaner_observation_candidate(const ClusterCtrcReceipt *receipt, uint64 receipt_index,
+									 const ClusterCtrcParticipantEntry *participant,
+									 uint64 participant_index, const char *first_failed)
+{
+	unsigned bucket;
+	CtrcCleanerAttemptTrace *trace;
+
+	if (!cluster_trace_normal_stop)
+		return;
+	bucket = ctrc_cleaner_trace_bucket(&receipt->key);
+	trace = &CtrcCleanerCandidates[bucket];
+	if (!trace->known) {
+		if (CtrcCleanerTouchedCount >= CTRC_CLEANER_TRACE_BUCKETS) {
+			ctrc_cleaner_trace_increment(&CtrcCleanerCaptureDropped);
+			return;
+		}
+		CtrcCleanerTouched[CtrcCleanerTouchedCount++] = bucket;
+	} else
+		ctrc_cleaner_trace_increment(&CtrcCleanerCaptureDropped);
+	MemSet(trace, 0, sizeof(*trace));
+	trace->receipt = *receipt;
+	trace->receipt_index = receipt_index;
+	trace->participant_index = participant_index;
+	trace->first_failed = first_failed;
+	trace->known = true;
+	if (participant != NULL) {
+		trace->participant = *participant;
+		trace->participant_known = true;
+	}
+}
+
 static bool
 ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 								  ClusterCtrcReceipt *receipt_out, uint64 *participant_index_out,
@@ -9062,6 +9703,7 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 	bool found = false;
 	uint32 lock_mask = ctrc_participant_scan_lock_mask();
 
+	CtrcCleanerScan.known = false;
 	if (participant_out == NULL || receipt_out == NULL || participant_index_out == NULL
 		|| receipt_index_out == NULL || cluster_node_id < 0 || !cluster_ctrc_shmem_ready())
 		return false;
@@ -9070,6 +9712,18 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 	*participant_index_out = UINT64_MAX;
 	*receipt_index_out = UINT64_MAX;
 	limit = ctrc_scan_limit(CTRC_SCAN_RECEIPT, CtrcShared->receipt_entries);
+	if (cluster_trace_normal_stop) {
+		/* Reset only the previous finite diagnostic copies, not shared work. */
+		for (unsigned i = 0; i < CtrcCleanerTouchedCount; i++)
+			CtrcCleanerCandidates[CtrcCleanerTouched[i]].known = false;
+		CtrcCleanerTouchedCount = 0;
+		MemSet(&CtrcCleanerScan, 0, sizeof(CtrcCleanerScan));
+		CtrcCleanerScan.known = true;
+		CtrcCleanerScan.start = scan_cursor;
+		CtrcCleanerScan.limit = limit;
+		CtrcCleanerScan.batch = CtrcBatch.active;
+		CtrcCleanerScan.remaining_before = CtrcBatch.remaining[CTRC_SCAN_RECEIPT];
+	}
 	ctrc_participant_locks_acquire(lock_mask);
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
 	for (visited = 0; visited < limit; visited++) {
@@ -9083,19 +9737,42 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 		scan_cursor = (receipt_index + 1) % CtrcShared->receipt_entries;
 		receipt = &ctrc_receipt_entries()[receipt_index];
 
-		if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) != CTRC_RECEIPT_APPLIED
-			|| !ctrc_cleaner_owns_key(&receipt->key)
-			|| !ctrc_participant_index(&receipt->key, (uint16)cluster_node_id, &participant_index))
+		if (pg_atomic_read_u32((pg_atomic_uint32 *)&receipt->state) != CTRC_RECEIPT_APPLIED)
 			continue;
-		if ((ctrc_participant_lock_mask(participant_index) & lock_mask) == 0)
+		if (!ctrc_cleaner_owns_key(&receipt->key)) {
+			ctrc_cleaner_observation_candidate(receipt, receipt_index, NULL, UINT64_MAX,
+											 "selector.key_owner");
 			continue;
+		}
+		if (!ctrc_participant_index(&receipt->key, (uint16)cluster_node_id, &participant_index)) {
+			ctrc_cleaner_observation_candidate(receipt, receipt_index, NULL, UINT64_MAX,
+												 "selector.participant_index");
+			continue;
+		}
+		if ((ctrc_participant_lock_mask(participant_index) & lock_mask) == 0) {
+			ctrc_cleaner_observation_candidate(receipt, receipt_index, NULL, participant_index,
+											 "selector.participant_shard");
+			continue;
+		}
 		participant = &ctrc_participant_entries()[participant_index];
-		if (participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
-			|| participant->identity.node_id != (uint16)cluster_node_id
-			|| participant->applied_count == 0
-			|| memcmp(&participant->key, &receipt->key, sizeof(receipt->key)) != 0
-			|| participant->grant_generation != receipt->publication.grant_generation)
-			continue;
+		{
+			const char *failed = NULL;
+			if (participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING)
+				failed = "selector.participant_state";
+			else if (participant->identity.node_id != (uint16)cluster_node_id)
+				failed = "selector.participant_node";
+			else if (participant->applied_count == 0)
+				failed = "selector.applied_count";
+			else if (memcmp(&participant->key, &receipt->key, sizeof(receipt->key)) != 0)
+				failed = "selector.participant_key";
+			else if (participant->grant_generation != receipt->publication.grant_generation)
+				failed = "selector.grant";
+			if (failed != NULL) {
+				ctrc_cleaner_observation_candidate(receipt, receipt_index, participant,
+												 participant_index, failed);
+				continue;
+			}
+		}
 		*participant_out = *participant;
 		*receipt_out = *receipt;
 		*participant_index_out = participant_index;
@@ -9106,6 +9783,19 @@ ctrc_cleaner_next_applied_receipt(ClusterCtrcParticipantEntry *participant_out,
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
 	ctrc_scan_charge(CTRC_SCAN_RECEIPT, visited + (found ? 1 : 0));
+	if (cluster_trace_normal_stop) {
+		CtrcCleanerScan.visited = visited + (found ? 1 : 0);
+		CtrcCleanerScan.cursor_after = scan_cursor;
+		CtrcCleanerScan.remaining_after = CtrcBatch.remaining[CTRC_SCAN_RECEIPT];
+		CtrcCleanerScan.selected = found;
+		CtrcCleanerScan.selected_index = *receipt_index_out;
+		for (unsigned i = 0; i < CtrcCleanerTouchedCount; i++) {
+			CtrcCleanerAttemptTrace *trace = &CtrcCleanerCandidates[CtrcCleanerTouched[i]];
+			trace->scan = CtrcCleanerScan;
+			ctrc_cleaner_observation_log(trace, false);
+			trace->known = false;
+		}
+	}
 	return found;
 }
 
@@ -9120,27 +9810,33 @@ ctrc_cleaner_itl_page_exact(Buffer buffer, const ClusterCtrcTargetV1 *target, Pa
 	XLogRecPtr page_lsn;
 	SCN page_scn;
 
-	if (!BufferIsValid(buffer) || target == NULL || page_out == NULL)
+	if (!ctrc_cleaner_observation_guard(BufferIsValid(buffer), "page.buffer")
+		|| !ctrc_cleaner_observation_guard(target != NULL, "page.target_input")
+		|| !ctrc_cleaner_observation_guard(page_out != NULL, "page.output"))
 		return false;
 	BufferGetTag(buffer, &locator, &fork_number, &block_number);
-	if (locator.spcOid != target->spc_oid || locator.dbOid != target->db_oid
-		|| locator.relNumber != target->rel_number || fork_number != target->fork_number
-		|| block_number != target->block_number)
+	if (!ctrc_cleaner_observation_guard(locator.spcOid == target->spc_oid, "page.tag_tablespace")
+		|| !ctrc_cleaner_observation_guard(locator.dbOid == target->db_oid, "page.tag_database")
+		|| !ctrc_cleaner_observation_guard(locator.relNumber == target->rel_number, "page.tag_relation")
+		|| !ctrc_cleaner_observation_guard(fork_number == target->fork_number, "page.tag_fork")
+		|| !ctrc_cleaner_observation_guard(block_number == target->block_number, "page.tag_block"))
 		return false;
 	page = BufferGetPage(buffer);
-	if (PageIsNew(page) || !PageHasItl(page) || PageGetPageSize(page) != BLCKSZ
-		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
-		|| ((PageHeader)page)->pd_lower < SizeOfPageHeaderData
-		|| ((PageHeader)page)->pd_lower > ((PageHeader)page)->pd_upper
-		|| ((PageHeader)page)->pd_upper > ((PageHeader)page)->pd_special
-		|| ((PageHeader)page)->pd_special != BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE
-		|| (((PageHeader)page)->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
-		|| target->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
-		|| !ctrc_page_version_capture(page, &page_lsn_origin, &page_lsn, &page_scn)
-		|| cluster_ctrc_page_version_order(
+	if (!ctrc_cleaner_observation_guard(!PageIsNew(page), "page.initialized")
+		|| !ctrc_cleaner_observation_guard(PageHasItl(page), "page.has_itl")
+		|| !ctrc_cleaner_observation_guard(PageGetPageSize(page) == BLCKSZ, "page.size")
+		|| !ctrc_cleaner_observation_guard(PageGetPageLayoutVersion(page) == PG_PAGE_LAYOUT_VERSION, "page.layout")
+		|| !ctrc_cleaner_observation_guard(((PageHeader)page)->pd_lower >= SizeOfPageHeaderData, "page.lower")
+		|| !ctrc_cleaner_observation_guard(((PageHeader)page)->pd_lower <= ((PageHeader)page)->pd_upper, "page.lower_upper")
+		|| !ctrc_cleaner_observation_guard(((PageHeader)page)->pd_upper <= ((PageHeader)page)->pd_special, "page.upper_special")
+		|| !ctrc_cleaner_observation_guard(((PageHeader)page)->pd_special == BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE, "page.special")
+		|| !ctrc_cleaner_observation_guard((((PageHeader)page)->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) == 0, "page.line_geometry")
+		|| !ctrc_cleaner_observation_guard(target->itl_slot_index < CLUSTER_ITL_INITRANS_DEFAULT, "page.slot_index")
+		|| !ctrc_cleaner_observation_guard(ctrc_page_version_capture(page, &page_lsn_origin, &page_lsn, &page_scn), "page.version_capture")
+		|| !ctrc_cleaner_observation_guard(cluster_ctrc_page_version_order(
 			   target->predecessor_page_lsn_origin_node_id, target->predecessor_page_lsn,
 			   target->predecessor_page_scn, page_lsn_origin, page_lsn, page_scn)
-			   != CTRC_PAGE_VERSION_CURRENT)
+			   == CTRC_PAGE_VERSION_CURRENT, "page.version_order"))
 		return false;
 	*page_out = page;
 	return true;
@@ -9152,15 +9848,26 @@ ctrc_cleaner_dependencies_durable(const ClusterSfDepVec *dependencies,
 {
 	int origin;
 
-	if (dependencies == NULL || durability == NULL)
+	if (!ctrc_cleaner_observation_guard(dependencies != NULL, "durability.dependencies_input")
+		|| !ctrc_cleaner_observation_guard(durability != NULL, "durability.output"))
 		return false;
 	ctrc_participant_capture_durability(durability);
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+		CtrcCleanerObservation.durability = *durability;
+		CtrcCleanerObservation.durability_known = true;
+	}
 	for (origin = 0; origin < CLUSTER_SF_DEP_MAX_ORIGINS; origin++) {
 		durability->required_lsn[origin] = dependencies->required[origin];
 		if (!XLogRecPtrIsInvalid(dependencies->required[origin])
 			&& (XLogRecPtrIsInvalid(durability->durable_lsn[origin])
-				|| durability->durable_lsn[origin] < dependencies->required[origin]))
+				|| durability->durable_lsn[origin] < dependencies->required[origin])) {
+			if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+				CtrcCleanerObservation.durability_origin_known = true;
+				CtrcCleanerObservation.durability_origin = origin;
+			}
+			(void)ctrc_cleaner_observation_guard(false, "durability.origin_lsn");
 			return false;
+		}
 	}
 	return true;
 }
@@ -9674,30 +10381,34 @@ ctrc_cleaner_history_retirement_ready(const ClusterCtrcTxnKeyV1 *key,
 	int nviews;
 
 	if (status == CTRC_TERMINAL_ABORTED && !SCN_VALID(commit_scn)) {
-		if (!ctrc_cleaner_abort_history_lock(key))
+		if (!ctrc_cleaner_observation_guard(ctrc_cleaner_abort_history_lock(key), "history.abort_lock"))
 			return false;
 		ctrc_cleaner_abort_history_unlock();
 		return true;
 	}
-	if (key == NULL || status != CTRC_TERMINAL_COMMITTED || !SCN_VALID(commit_scn)
-		|| !cluster_undo_retention_horizon_enabled || !TransactionIdIsNormal(key->xid)
-		|| cluster_cr_native_prehistory_disabled()
-		|| cluster_xid_origin_slot(key->xid) != key->origin_node_id
-		|| cluster_epoch_get_current() != key->cluster_epoch)
+	if (!ctrc_cleaner_observation_guard(key != NULL, "history.key_input")
+		|| !ctrc_cleaner_observation_guard(status == CTRC_TERMINAL_COMMITTED, "history.status")
+		|| !ctrc_cleaner_observation_guard(SCN_VALID(commit_scn), "history.commit_scn")
+		|| !ctrc_cleaner_observation_guard(cluster_undo_retention_horizon_enabled, "history.enabled")
+		|| !ctrc_cleaner_observation_guard(TransactionIdIsNormal(key->xid), "history.xid_normal")
+		|| !ctrc_cleaner_observation_guard(!cluster_cr_native_prehistory_disabled(), "history.native_window")
+		|| !ctrc_cleaner_observation_guard(cluster_xid_origin_slot(key->xid) == key->origin_node_id, "history.xid_origin")
+		|| !ctrc_cleaner_observation_guard(cluster_epoch_get_current() == key->cluster_epoch, "history.epoch"))
 		return false;
 	local_floor = cluster_undo_retention_horizon();
 	nviews = cluster_undo_horizon_sample_views(views, CLUSTER_MAX_NODES);
-	return nviews == CLUSTER_MAX_NODES && cluster_undo_horizon_required_members(required, &epoch)
-		   && epoch == key->cluster_epoch
-		   && cluster_undo_horizon_cluster_floor(
+	return ctrc_cleaner_observation_guard(nviews == CLUSTER_MAX_NODES, "history.view_count")
+		   && ctrc_cleaner_observation_guard(cluster_undo_horizon_required_members(required, &epoch), "history.required_members")
+		   && ctrc_cleaner_observation_guard(epoch == key->cluster_epoch, "history.members_epoch")
+		   && ctrc_cleaner_observation_guard(ctrc_cleaner_observation_floor(cluster_undo_horizon_cluster_floor(
 				  local_floor, views, nviews, required, cluster_node_id, epoch,
 				  (uint64)GetCurrentTimestamp(), (uint32)cluster_lmon_main_loop_interval, &floor,
-				  &reason, &blame)
-				  == CLUSTER_UNDO_HORIZON_FOLD_OK
-		   && SCN_VALID(floor.scn) && floor.epoch == key->cluster_epoch
-		   && scn_time_cmp(commit_scn, floor.scn) < 0
-		   && !cluster_undo_horizon_epoch_fence_tripped(epoch)
-		   && !cluster_cr_native_prehistory_disabled();
+				  &reason, &blame), local_floor, &floor) == CLUSTER_UNDO_HORIZON_FOLD_OK, "history.floor_fold")
+		   && ctrc_cleaner_observation_guard(SCN_VALID(floor.scn), "history.floor_valid")
+		   && ctrc_cleaner_observation_guard(floor.epoch == key->cluster_epoch, "history.floor_epoch")
+		   && ctrc_cleaner_observation_guard(scn_time_cmp(commit_scn, floor.scn) < 0, "history.commit_before_floor")
+		   && ctrc_cleaner_observation_guard(!cluster_undo_horizon_epoch_fence_tripped(epoch), "history.epoch_fence")
+		   && ctrc_cleaner_observation_guard(!cluster_cr_native_prehistory_disabled(), "history.final_native_window");
 }
 
 /* Absence creates no local WAL. Its existing page WAL must be covered in the
@@ -10521,6 +11232,10 @@ ctrc_cleaner_note_itl_retained(const ClusterCtrcReceipt *receipt, const char *st
 	ClusterItlSlotData empty = { 0 };
 	bool sampled = slot != NULL;
 
+	/* Enabled attempts retain the same actual detail in their post-scope,
+	 * per-key record. Default-off legacy logging remains unchanged. */
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active)
+		return;
 	if (emitted >= 128)
 		return;
 	emitted++;
@@ -10565,6 +11280,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 							   uint64 receipt_index)
 {
 	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
 	ClusterCtrcTerminalStatus terminal_status;
 	ClusterCtrcItlCleanoutApplyResult apply_result;
 	ClusterCtrcItlProjection projection = CTRC_ITL_TERMINAL_INDEPENDENT;
@@ -10597,26 +11313,34 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	int observed_origin = -1;
 	bool observed_valid = false;
 
-	if (participant == NULL || receipt == NULL
-		|| participant_index >= CtrcShared->participant_key_entries
-		|| receipt_index >= CtrcShared->receipt_entries
-		|| receipt->publication.reference_kind != CTRC_REF_HEAP_ITL_UBA
-		|| receipt->state != CTRC_RECEIPT_APPLIED
-		|| receipt->key.origin_node_id != (uint16)cluster_node_id
-		|| !ctrc_target_exact_itl_valid(&receipt->key, &receipt->target)
-		|| (receipt->target.relation_persistence != RELPERSISTENCE_PERMANENT
-			&& receipt->target.relation_persistence != RELPERSISTENCE_UNLOGGED)
-		|| receipt->target.fork_number < 0 || receipt->target.fork_number > MAX_FORKNUM)
+	if (!ctrc_cleaner_observation_guard(participant != NULL, "itl.participant_input")
+		|| !ctrc_cleaner_observation_guard(receipt != NULL, "itl.receipt_input")
+		|| !ctrc_cleaner_observation_guard(participant_index < CtrcShared->participant_key_entries, "itl.participant_index")
+		|| !ctrc_cleaner_observation_guard(receipt_index < CtrcShared->receipt_entries, "itl.receipt_index")
+		|| !ctrc_cleaner_observation_guard(receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA, "itl.reference_kind")
+		|| !ctrc_cleaner_observation_guard(receipt->state == CTRC_RECEIPT_APPLIED, "itl.receipt_state")
+		|| !ctrc_cleaner_observation_guard(receipt->key.origin_node_id == (uint16)cluster_node_id, "itl.origin")
+		|| !ctrc_cleaner_observation_guard(ctrc_target_exact_itl_valid(&receipt->key, &receipt->target), "itl.target")
+		|| !ctrc_cleaner_observation_guard(receipt->target.relation_persistence == RELPERSISTENCE_PERMANENT
+			|| receipt->target.relation_persistence == RELPERSISTENCE_UNLOGGED, "itl.persistence")
+		|| !ctrc_cleaner_observation_guard(receipt->target.fork_number >= 0, "itl.fork_low")
+		|| !ctrc_cleaner_observation_guard(receipt->target.fork_number <= MAX_FORKNUM, "itl.fork_high"))
 		return false;
-	if (!ctrc_cleaner_terminal_sample_exact(&receipt->key, &terminal_status, &commit_scn))
+	if (!ctrc_cleaner_observation_guard(ctrc_cleaner_terminal_sample_exact(&receipt->key, &terminal_status, &commit_scn), "itl.terminal_sample"))
 		return false;
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+		CtrcCleanerObservation.terminal_known = true;
+		CtrcCleanerObservation.terminal = terminal_status;
+		CtrcCleanerObservation.commit_scn = commit_scn;
+	}
 
 	MemSet(&admission, 0, sizeof(admission));
-	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
-		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+	admission_result = ctrc_cleaner_observation_admission(
+		cluster_semantic_activation_enter_r4_terminal_census(&admission), &admission, "itl.enter");
+	if (!ctrc_cleaner_observation_guard(admission_result == CLUSTER_SEMANTIC_ADMISSION_OK, "itl.admission_enter"))
 		return false;
-	if (admission.formation_epoch != receipt->key.formation_epoch
-		|| admission.record_generation != receipt->key.admission_record_generation) {
+	if (!ctrc_cleaner_observation_guard(admission.formation_epoch == receipt->key.formation_epoch, "itl.admission_formation")
+		|| !ctrc_cleaner_observation_guard(admission.record_generation == receipt->key.admission_record_generation, "itl.admission_record")) {
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
@@ -10624,21 +11348,21 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	locator.dbOid = receipt->target.db_oid;
 	locator.relNumber = receipt->target.rel_number;
 	if (cluster_shared_config
-		&& !cluster_space_relation_read_maintenance_identity(locator, &space_identity)) {
+		&& !ctrc_cleaner_observation_guard(cluster_space_relation_read_maintenance_identity(locator, &space_identity), "itl.space_identity")) {
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
 	smgr = smgropen(locator, InvalidBackendId);
-	if (!smgrexists(smgr, (ForkNumber)receipt->target.fork_number)
-		|| smgrnblocks(smgr, (ForkNumber)receipt->target.fork_number)
-			   <= receipt->target.block_number) {
+	if (!ctrc_cleaner_observation_guard(smgrexists(smgr, (ForkNumber)receipt->target.fork_number), "itl.relation_exists")
+		|| !ctrc_cleaner_observation_guard(smgrnblocks(smgr, (ForkNumber)receipt->target.fork_number)
+			   > receipt->target.block_number, "itl.block_exists")) {
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
 	permanent = receipt->target.relation_persistence == RELPERSISTENCE_PERMANENT;
 	buffer = ReadBufferWithoutRelcache(locator, (ForkNumber)receipt->target.fork_number,
 									   receipt->target.block_number, RBM_NORMAL, NULL, permanent);
-	if (!BufferIsValid(buffer)) {
+	if (!ctrc_cleaner_observation_guard(BufferIsValid(buffer), "itl.read_buffer")) {
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
@@ -10646,14 +11370,14 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	/* First Resource-X round captures page dependencies, then releases every
 	 * page lock before sampling foreign durability. */
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
-	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+	if (!ctrc_cleaner_observation_guard(ClusterLockBufferExclusiveRetryAware(buffer), "itl.first_current")) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PAGE_REVALIDATE);
-	if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
-		|| !ctrc_cleaner_itl_page_exact(buffer, &receipt->target, &page))
+	if (!ctrc_cleaner_observation_guard(cluster_semantic_activation_recheck_r4_terminal_census(&admission), "itl.first_admission_recheck")
+		|| !ctrc_cleaner_observation_guard(ctrc_cleaner_itl_page_exact(buffer, &receipt->target, &page), "itl.first_page_exact"))
 		goto itl_retain_locked;
 	observed_slot = ClusterPageGetItlSlots(page)[receipt->target.itl_slot_index];
 	observed_lsn = PageGetLSN(page);
@@ -10662,6 +11386,10 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	observed_valid = true;
 	cluster_sf_dep_vec_reset(&first_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &first_dependencies);
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+		CtrcCleanerObservation.first_dependencies = first_dependencies;
+		CtrcCleanerObservation.first_dependencies_known = true;
+	}
 	absent = ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target);
 	/* Keep the original absence contract, including ABORTED and no-floor
 	 * cases. Only the distinct logical-history branch needs the floor. */
@@ -10676,17 +11404,19 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	}
 	abort_history = history_retired && terminal_status == CTRC_TERMINAL_ABORTED;
 	if ((absent || history_retired)
-		&& !ctrc_cleaner_absence_page_dependency(page, &receipt->target, &first_dependencies)) {
+		&& !ctrc_cleaner_observation_guard(ctrc_cleaner_absence_page_dependency(page, &receipt->target, &first_dependencies), "itl.first_absence_dependency")) {
 		retain_stage = "FIRST_ABSENCE_DEPENDENCY";
 		goto itl_retain_locked;
 	}
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	if ((absent || history_retired) && (first_carriers.mask != 0 || abort_history)) {
-		if (!ctrc_cleaner_companions_capture(participant, receipt, participant_index, receipt_index,
+		if (!ctrc_cleaner_observation_guard(ctrc_cleaner_companions_capture(participant, receipt, participant_index, receipt_index,
 											 &first_carriers, terminal_status, commit_scn,
-											 &companions, &first_dependencies)) {
+											 &companions, &first_dependencies), "itl.companion_proof")) {
 			ReleaseBuffer(buffer);
 			cluster_semantic_activation_leave(&admission);
+			ctrc_cleaner_observation_retained("COMPANION_PROOF", &observed_slot, observed_lsn,
+				observed_scn, observed_origin, terminal_status, commit_scn);
 			ctrc_cleaner_note_itl_retained(receipt, "COMPANION_PROOF", &observed_slot, observed_lsn,
 										   observed_scn, observed_origin, terminal_status,
 										   commit_scn);
@@ -10709,9 +11439,11 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 			PG_RE_THROW();
 		}
 		PG_END_TRY(history_proof);
-		if (!ready) {
+		if (!ctrc_cleaner_observation_guard(ready, "itl.history_floor")) {
 			ReleaseBuffer(buffer);
 			cluster_semantic_activation_leave(&admission);
+			ctrc_cleaner_observation_retained("HISTORY_FLOOR", &observed_slot, observed_lsn,
+				observed_scn, observed_origin, terminal_status, commit_scn);
 			ctrc_cleaner_note_itl_retained(receipt, "HISTORY_FLOOR", &observed_slot, observed_lsn,
 										   observed_scn, observed_origin, terminal_status,
 										   commit_scn);
@@ -10719,9 +11451,13 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 		}
 	}
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_WAL_DURABILITY);
-	if (!ctrc_cleaner_dependencies_durable(&first_dependencies, &durability)) {
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active)
+		CtrcCleanerObservation.first_dependencies = first_dependencies;
+	if (!ctrc_cleaner_observation_guard(ctrc_cleaner_dependencies_durable(&first_dependencies, &durability), "itl.dependencies_durable")) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
+		ctrc_cleaner_observation_retained("WAL_DURABILITY", &observed_slot, observed_lsn,
+			observed_scn, observed_origin, terminal_status, commit_scn);
 		ctrc_cleaner_note_itl_retained(receipt, "WAL_DURABILITY", &observed_slot, observed_lsn,
 									   observed_scn, observed_origin, terminal_status, commit_scn);
 		return false;
@@ -10730,7 +11466,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	/* Reacquire a fresh exact Resource-X/current page and require the
 	 * dependency vector to be unchanged before the WAL-protected rewrite. */
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
-	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+	if (!ctrc_cleaner_observation_guard(ClusterLockBufferExclusiveRetryAware(buffer), "itl.second_current")) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		return false;
@@ -10738,8 +11474,8 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PAGE_REVALIDATE);
 	retain_stage = "SECOND_PAGE_REVALIDATE";
 	observed_valid = false;
-	if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
-		|| !ctrc_cleaner_itl_page_exact(buffer, &receipt->target, &page))
+	if (!ctrc_cleaner_observation_guard(cluster_semantic_activation_recheck_r4_terminal_census(&admission), "itl.second_admission_recheck")
+		|| !ctrc_cleaner_observation_guard(ctrc_cleaner_itl_page_exact(buffer, &receipt->target, &page), "itl.second_page_exact"))
 		goto itl_retain_locked;
 	observed_slot = ClusterPageGetItlSlots(page)[receipt->target.itl_slot_index];
 	observed_lsn = PageGetLSN(page);
@@ -10749,27 +11485,31 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	observed_valid = true;
 	cluster_sf_dep_vec_reset(&final_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &final_dependencies);
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active) {
+		CtrcCleanerObservation.final_dependencies = final_dependencies;
+		CtrcCleanerObservation.final_dependencies_known = true;
+	}
 	if (absent
-		&& (!(has_companions ? cluster_ctrc_itl_retired_image_v1(page, &receipt->key, &receipt->target,
+		&& (!ctrc_cleaner_observation_guard(has_companions ? cluster_ctrc_itl_retired_image_v1(page, &receipt->key, &receipt->target,
 															 false, &final_carriers)
-							 : ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target))
-			|| !ctrc_cleaner_absence_page_dependency(page, &receipt->target,
-													 &final_dependencies))) {
+							 : ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target), "itl.second_absence_proof")
+			|| !ctrc_cleaner_observation_guard(ctrc_cleaner_absence_page_dependency(page, &receipt->target,
+												 &final_dependencies), "itl.second_absence_dependency"))) {
 		retain_stage = "SECOND_ABSENCE_DEPENDENCY";
 		goto itl_retain_locked;
 	}
 	if (history_retired
-		&& (!(has_companions
+		&& (!ctrc_cleaner_observation_guard(has_companions
 				  ? cluster_ctrc_itl_retired_image_v1(page, &receipt->key, &receipt->target, true,
 												  &final_carriers)
-				  : ctrc_cleaner_history_itl_retired(page, &receipt->key, &receipt->target))
-			|| !ctrc_cleaner_absence_page_dependency(page, &receipt->target,
-													 &final_dependencies))) {
+				  : ctrc_cleaner_history_itl_retired(page, &receipt->key, &receipt->target), "itl.second_history_proof")
+			|| !ctrc_cleaner_observation_guard(ctrc_cleaner_absence_page_dependency(page, &receipt->target,
+												 &final_dependencies), "itl.second_history_dependency"))) {
 		retain_stage = "HISTORY_RETIREMENT_RECHECK";
 		goto itl_retain_locked;
 	}
 	if (has_companions) {
-		if (!ctrc_cleaner_carriers_equal(&first_carriers, &final_carriers)) {
+		if (!ctrc_cleaner_observation_guard(ctrc_cleaner_carriers_equal(&first_carriers, &final_carriers), "itl.companion_page_recheck")) {
 			retain_stage = "COMPANION_PAGE_RECHECK";
 			goto itl_retain_locked;
 		}
@@ -10781,7 +11521,9 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 														companions.participant.identity.node_id,
 														&final_dependencies);
 	}
-	if (memcmp(&first_dependencies, &final_dependencies, sizeof(first_dependencies)) != 0) {
+	if (cluster_trace_normal_stop && CtrcCleanerObservation.active)
+		CtrcCleanerObservation.final_dependencies = final_dependencies;
+	if (!ctrc_cleaner_observation_guard(memcmp(&first_dependencies, &final_dependencies, sizeof(first_dependencies)) == 0, "itl.dependencies_equal")) {
 		retain_stage = "DEPENDENCY_CHANGED";
 		goto itl_retain_locked;
 	}
@@ -10793,7 +11535,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 		UnlockReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		if (history_retired && !abort_history
-			&& !ctrc_cleaner_history_retirement_ready(&receipt->key, terminal_status, commit_scn))
+			&& !ctrc_cleaner_observation_guard(ctrc_cleaner_history_retirement_ready(&receipt->key, terminal_status, commit_scn), "itl.final_history_floor"))
 			return false;
 		goto itl_discharge;
 	}
@@ -10812,7 +11554,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 
 	if (receipt->target.needs_wal) {
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_WAL_DURABILITY);
-		if (XLogRecPtrIsInvalid(cleanout_lsn))
+		if (!ctrc_cleaner_observation_guard(!XLogRecPtrIsInvalid(cleanout_lsn), "itl.cleanout_lsn"))
 			return false;
 		XLogFlush(cleanout_lsn);
 	}
@@ -10842,15 +11584,18 @@ itl_discharge:
 	expected_target.needs_wal = receipt->target.needs_wal;
 	memcpy(expected_target.uba, receipt->target.uba, sizeof(expected_target.uba));
 	if (has_companions)
-		return ctrc_cleaner_companions_discharge(&handle, &companions, &durability, abort_history)
+		return ctrc_cleaner_observation_discharge(ctrc_cleaner_companions_discharge(&handle, &companions, &durability, abort_history))
 			   == CLUSTER_CTRC_DISCHARGE_CLEANED;
-	return cluster_ctrc_receipt_discharge_itl_shared(&handle, &expected_target, projection,
-													 &durability)
+	return ctrc_cleaner_observation_discharge(cluster_ctrc_receipt_discharge_itl_shared(&handle, &expected_target, projection,
+													 &durability))
 		   == CLUSTER_CTRC_DISCHARGE_CLEANED;
 
 itl_retain_locked:
 	UnlockReleaseBuffer(buffer);
 	cluster_semantic_activation_leave(&admission);
+	ctrc_cleaner_observation_retained(retain_stage, observed_valid ? &observed_slot : NULL,
+		observed_valid ? observed_lsn : InvalidXLogRecPtr, observed_valid ? observed_scn : InvalidScn,
+		observed_valid ? observed_origin : -1, terminal_status, commit_scn);
 	ctrc_cleaner_note_itl_retained(receipt, retain_stage, observed_valid ? &observed_slot : NULL,
 								   observed_valid ? observed_lsn : InvalidXLogRecPtr,
 								   observed_valid ? observed_scn : InvalidScn,
@@ -10893,35 +11638,40 @@ ctrc_cleaner_read_scope_exact(const ClusterCtrcParticipantEntry *participant,
 	uint32 mask;
 	bool exact;
 
-	if (!ctrc_cleaner_read_scope_owner() || participant == NULL || receipt == NULL
-		|| !cluster_ctrc_shmem_ready() || !ctrc_txn_key_valid(&receipt->key)
-		|| !ctrc_cleaner_owns_key(&receipt->key)
-		|| !ctrc_participant_identity_valid(&receipt->key, &participant->identity)
-		|| participant->identity.node_id != cluster_node_id
-		|| participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
-		|| participant->seal_generation == 0 || participant->applied_count == 0
-		|| receipt->state != CTRC_RECEIPT_APPLIED
-		|| receipt->publication.grant_generation != participant->grant_generation
-		|| receipt->publication.journal_slot_generation == 0
-		|| memcmp(&receipt->key, &participant->key, sizeof(receipt->key)) != 0
-		|| receipt->target.fork_number < 0 || receipt->target.fork_number > MAX_FORKNUM
-		|| (receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
-				? !ctrc_target_exact_itl_valid(&receipt->key, &receipt->target)
-				: !ctrc_target_exact_tid_valid(&receipt->publication, &receipt->target))
-		|| !ctrc_participant_index(&receipt->key, participant->identity.node_id, &expected_index)
-		|| expected_index != participant_index || receipt_index >= CtrcShared->receipt_entries)
+	if (!ctrc_cleaner_observation_guard(ctrc_cleaner_read_scope_owner(), "scope.owner")
+		|| !ctrc_cleaner_observation_guard(participant != NULL, "scope.participant_input")
+		|| !ctrc_cleaner_observation_guard(receipt != NULL, "scope.receipt_input")
+		|| !ctrc_cleaner_observation_guard(cluster_ctrc_shmem_ready(), "scope.shmem")
+		|| !ctrc_cleaner_observation_guard(ctrc_txn_key_valid(&receipt->key), "scope.key_valid")
+		|| !ctrc_cleaner_observation_guard(ctrc_cleaner_owns_key(&receipt->key), "scope.key_owner")
+		|| !ctrc_cleaner_observation_guard(
+			ctrc_participant_identity_valid(&receipt->key, &participant->identity), "scope.peer_identity")
+		|| !ctrc_cleaner_observation_guard(participant->identity.node_id == cluster_node_id, "scope.node")
+		|| !ctrc_cleaner_observation_guard(participant->state == CTRC_PARTICIPANT_CLOSED_DRAINING, "scope.state")
+		|| !ctrc_cleaner_observation_guard(participant->seal_generation != 0, "scope.seal")
+		|| !ctrc_cleaner_observation_guard(participant->applied_count != 0, "scope.applied")
+		|| !ctrc_cleaner_observation_guard(receipt->state == CTRC_RECEIPT_APPLIED, "scope.receipt_state")
+		|| !ctrc_cleaner_observation_guard(receipt->publication.grant_generation == participant->grant_generation, "scope.grant")
+		|| !ctrc_cleaner_observation_guard(receipt->publication.journal_slot_generation != 0, "scope.journal_generation")
+		|| !ctrc_cleaner_observation_guard(memcmp(&receipt->key, &participant->key, sizeof(receipt->key)) == 0, "scope.key_match")
+		|| !ctrc_cleaner_observation_guard(receipt->target.fork_number >= 0, "scope.fork_low")
+		|| !ctrc_cleaner_observation_guard(receipt->target.fork_number <= MAX_FORKNUM, "scope.fork_high")
+		|| !ctrc_cleaner_observation_guard(receipt->publication.reference_kind == CTRC_REF_HEAP_ITL_UBA
+				? ctrc_target_exact_itl_valid(&receipt->key, &receipt->target)
+				: ctrc_target_exact_tid_valid(&receipt->publication, &receipt->target), "scope.target")
+		|| !ctrc_cleaner_observation_guard(ctrc_participant_index(&receipt->key, participant->identity.node_id, &expected_index), "scope.participant_index")
+		|| !ctrc_cleaner_observation_guard(expected_index == participant_index, "scope.participant_index_match")
+		|| !ctrc_cleaner_observation_guard(receipt_index < CtrcShared->receipt_entries, "scope.receipt_index"))
 		return false;
 	mask = ctrc_participant_lock_mask(participant_index);
 	ctrc_participant_locks_acquire(mask);
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
 	exact
-		= memcmp(&ctrc_participant_entries()[participant_index], participant, sizeof(*participant))
-			  == 0
-		  && memcmp(&ctrc_receipt_entries()[receipt_index], receipt, sizeof(*receipt)) == 0
-		  && ctrc_receipt_probe_states()[receipt_index] == CTRC_RECEIPT_PROBE_OCCUPIED
-		  && ctrc_receipt_links()[receipt_index].participant_plus_one == participant_index + 1
-		  && ctrc_receipt_links()[receipt_index].journal_generation
-				 == receipt->publication.journal_slot_generation;
+		= ctrc_cleaner_observation_guard(memcmp(&ctrc_participant_entries()[participant_index], participant, sizeof(*participant)) == 0, "scope.participant_snapshot")
+		  && ctrc_cleaner_observation_guard(memcmp(&ctrc_receipt_entries()[receipt_index], receipt, sizeof(*receipt)) == 0, "scope.receipt_snapshot")
+		  && ctrc_cleaner_observation_guard(ctrc_receipt_probe_states()[receipt_index] == CTRC_RECEIPT_PROBE_OCCUPIED, "scope.probe_state")
+		  && ctrc_cleaner_observation_guard(ctrc_receipt_links()[receipt_index].participant_plus_one == participant_index + 1, "scope.link_participant")
+		  && ctrc_cleaner_observation_guard(ctrc_receipt_links()[receipt_index].journal_generation == receipt->publication.journal_slot_generation, "scope.link_generation");
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(mask);
 	return exact;
@@ -10988,8 +11738,10 @@ ctrc_cleaner_read_scope_begin(const ClusterCtrcParticipantEntry *participant,
 	ClusterCtrcCleanerReadScopeV3 proof;
 	RelFileLocator locator;
 
-	if (serial == NULL || CtrcReadScope.active || CtrcReadSerial == UINT64_MAX
-		|| !ctrc_cleaner_read_scope_exact(participant, receipt, participant_index, receipt_index))
+	if (!ctrc_cleaner_observation_guard(serial != NULL, "scope.serial_output")
+		|| !ctrc_cleaner_observation_guard(!CtrcReadScope.active, "scope.inactive")
+		|| !ctrc_cleaner_observation_guard(CtrcReadSerial != UINT64_MAX, "scope.serial_available")
+		|| !ctrc_cleaner_observation_guard(ctrc_cleaner_read_scope_exact(participant, receipt, participant_index, receipt_index), "scope.exact"))
 		return false;
 	CtrcReadScope.participant = *participant;
 	CtrcReadScope.receipt = *receipt;
@@ -11005,7 +11757,7 @@ ctrc_cleaner_read_scope_begin(const ClusterCtrcParticipantEntry *participant,
 								receipt->target.rel_number };
 	/* Keep the finite attempt visible even if a concurrent original abort
 	 * cleanout discharges its receipt. No CTRC lock crosses this call. */
-	if (!cluster_ko_cleaner_enter_v3(locator, &proof)) {
+	if (!ctrc_cleaner_observation_guard(cluster_ko_cleaner_enter_v3(locator, &proof), "scope.ko_enter")) {
 		CtrcReadScope.active = false;
 		*serial = 0;
 		return false;
@@ -11071,11 +11823,13 @@ ctrc_cleaner_clean_next_receipt(void)
 	uint64 participant_index;
 	uint64 receipt_index;
 	volatile uint64 serial = 0;
+	volatile bool normal = false;
 	bool cleaned = false;
 
 	if (!ctrc_cleaner_next_applied_receipt(&participant, &receipt, &participant_index,
 										   &receipt_index))
 		return false;
+	ctrc_cleaner_observation_begin(&participant, &receipt, participant_index, receipt_index);
 	PG_TRY();
 	{
 		if (ctrc_cleaner_read_scope_begin(&participant, &receipt, participant_index, receipt_index,
@@ -11086,15 +11840,20 @@ ctrc_cleaner_clean_next_receipt(void)
 			else
 				cleaned = ctrc_cleaner_clean_current_mx_receipt(&participant, &receipt,
 																participant_index, receipt_index);
+			(void)ctrc_cleaner_observation_guard(cleaned, "physical.return");
 		}
+		normal = true;
 	}
 	PG_FINALLY();
 	{
-		(void)ctrc_cleaner_read_scope_end(serial);
+		bool ended = ctrc_cleaner_read_scope_end(serial);
+
+		ctrc_cleaner_observation_leave(serial, ended, normal);
 	}
 	PG_END_TRY();
 	if (cleaned)
 		cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_NONE);
+	ctrc_cleaner_observation_emit(cleaned);
 	return cleaned;
 }
 
@@ -11166,6 +11925,55 @@ typedef struct CtrcAckWork {
 	ClusterCtrcLocalReleaseAckV1 first_ack;
 	ClusterCtrcLocalReleaseAckV1 second_ack;
 } CtrcAckWork;
+
+/* Separate from CtrcAckWork: diagnostics must not change its allocation
+ * budget. One process-local observation owner; nested passes simply do not
+ * acquire it. The original PG_FINALLY releases it on every exit. */
+static CtrcAckWork *CtrcAckStopWork;
+static Size CtrcAckStopCount;
+static CtrcParticipantStopTrace CtrcAckStopSamples[CTRC_CLEANER_ACK_BATCH];
+
+static CtrcParticipantStopTrace *
+ctrc_ack_stop_sample(const CtrcAckWork *work)
+{
+	if (cluster_trace_normal_stop && CtrcAckStopWork != NULL)
+		for (Size i = 0; i < CtrcAckStopCount; i++)
+			if (&CtrcAckStopWork[i] == work)
+				return &CtrcAckStopSamples[i];
+	return NULL;
+}
+
+static void
+ctrc_ack_stop_phase(CtrcAckWork *work, const char *phase)
+{
+	CtrcParticipantStopTrace *trace = ctrc_ack_stop_sample(work);
+
+	if (trace != NULL)
+		trace->phase = phase;
+}
+
+static void
+ctrc_ack_stop_capture(CtrcAckWork *work)
+{
+	CtrcParticipantStopTrace *trace = ctrc_ack_stop_sample(work);
+
+	if (trace != NULL)
+		ctrc_participant_stop_capture(trace, work->participant_index);
+}
+
+/* Observe the actual original short-circuit operand, never evaluate it again. */
+static bool
+ctrc_ack_stop_predicate(CtrcAckWork *work, const char *predicate, bool value)
+{
+	CtrcParticipantStopTrace *trace = ctrc_ack_stop_sample(work);
+
+	if (trace != NULL && !value && trace->first_failed == NULL) {
+		trace->first_failed = predicate;
+		trace->first_failed_phase = trace->phase;
+		trace->failed_found = work->found;
+	}
+	return value;
+}
 
 static void ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count);
 static void ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count);
@@ -11307,9 +12115,13 @@ ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count)
 		uint64 cursor;
 
 		checked[i] = work[i].eligible;
-		if (work[i].eligible)
-			work[i].eligible = ctrc_ack_participant_exact(&work[i])
-							   && ctrc_receipt_chain_exact_locked(work[i].participant_index, false);
+		if (work[i].eligible) {
+			ctrc_ack_stop_capture(&work[i]);
+			work[i].eligible = ctrc_ack_stop_predicate(&work[i], "copy.participant_exact",
+														ctrc_ack_participant_exact(&work[i]))
+				&& ctrc_ack_stop_predicate(&work[i], "copy.receipt_chain_exact",
+					ctrc_receipt_chain_exact_locked(work[i].participant_index, false));
+		}
 		if (!work[i].eligible)
 			continue;
 		cursor = ctrc_participant_receipt_heads()[work[i].participant_index];
@@ -11321,9 +12133,12 @@ ctrc_participant_copy_ack_batch(CtrcAckWork *work, Size count)
 	}
 	for (Size i = 0; i < count; i++) {
 		if (work[i].eligible)
-			work[i].eligible = work[i].found == work[i].receipt_count;
+			work[i].eligible = ctrc_ack_stop_predicate(&work[i], "copy.receipt_count",
+				work[i].found == work[i].receipt_count);
 		if (checked[i] && !work[i].eligible)
 			ctrc_ack_block_if_same(&work[i]);
+		if (checked[i])
+			ctrc_ack_stop_capture(&work[i]);
 	}
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
@@ -11345,12 +12160,17 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 	LWLockAcquire(&CtrcShared->receipt_lock, LW_SHARED);
 	for (Size i = 0; i < count; i++) {
 		checked[i] = work[i].eligible;
-		if (work[i].eligible)
+		if (work[i].eligible) {
+			ctrc_ack_stop_capture(&work[i]);
 			work[i].eligible
-				= ctrc_ack_participant_exact(&work[i])
-				  && ctrc_receipt_chain_exact_locked(work[i].participant_index, false)
-				  && ctrc_bytes_zero(&ctrc_participant_ack_entries()[work[i].participant_index],
-									 sizeof(ClusterCtrcLocalReleaseAckV1));
+				= ctrc_ack_stop_predicate(&work[i], "freeze.participant_exact",
+					ctrc_ack_participant_exact(&work[i]))
+				  && ctrc_ack_stop_predicate(&work[i], "freeze.receipt_chain_exact",
+					ctrc_receipt_chain_exact_locked(work[i].participant_index, false))
+				  && ctrc_ack_stop_predicate(&work[i], "freeze.summary_empty",
+					ctrc_bytes_zero(&ctrc_participant_ack_entries()[work[i].participant_index],
+									 sizeof(ClusterCtrcLocalReleaseAckV1)));
+		}
 		any |= work[i].eligible;
 	}
 	for (uint64 i = 0; any && i < CtrcShared->receipt_entries; i++) {
@@ -11365,7 +12185,7 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 		key_sequence = receipt->publication.key_sequence;
 		if (key_sequence == 0 || key_sequence > work[j].receipt_count
 			|| memcmp(receipt, &work[j].sorted_receipts[key_sequence - 1], sizeof(*receipt)) != 0)
-			work[j].eligible = false;
+			work[j].eligible = ctrc_ack_stop_predicate(&work[j], "freeze.receipt_exact", false);
 		else
 			work[j].found++;
 	}
@@ -11373,7 +12193,8 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 	any = false;
 	for (Size i = 0; i < count; i++) {
 		if (work[i].eligible)
-			work[i].eligible = work[i].found == work[i].receipt_count;
+			work[i].eligible = ctrc_ack_stop_predicate(&work[i], "freeze.receipt_count",
+				work[i].found == work[i].receipt_count);
 		if (checked[i] && !work[i].eligible)
 			ctrc_ack_block_if_same(&work[i]);
 		any |= work[i].eligible;
@@ -11403,6 +12224,9 @@ ctrc_participant_freeze_ack_batch_exact(CtrcAckWork *work, Size count)
 			participant->state = CTRC_PARTICIPANT_ACK_FROZEN;
 			work[i].frozen = true;
 		}
+	for (Size i = 0; i < count; i++)
+		if (checked[i])
+			ctrc_ack_stop_capture(&work[i]);
 	LWLockRelease(&CtrcShared->receipt_lock);
 	ctrc_participant_locks_release(lock_mask);
 }
@@ -11418,6 +12242,7 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 {
 	CtrcAckWork *work;
 	volatile Size frozen = 0;
+	bool trace_owner;
 
 	if (maximum == 0 || maximum > CTRC_CLEANER_ACK_BATCH || !cluster_ctrc_shmem_ready())
 		return 0;
@@ -11428,6 +12253,12 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 	work = palloc_extended(maximum * sizeof(*work), MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
 	if (work == NULL)
 		return 0;
+	trace_owner = cluster_trace_normal_stop && CtrcAckStopWork == NULL;
+	if (trace_owner) {
+		MemSet(CtrcAckStopSamples, 0, sizeof(CtrcAckStopSamples));
+		CtrcAckStopCount = maximum;
+		CtrcAckStopWork = work;
+	}
 	PG_TRY();
 	{
 		Size count = 0;
@@ -11463,6 +12294,15 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 			allocated_bytes += bytes;
 			item->sorted_receipts = item->receipts;
 			item->eligible = true;
+			if (trace_owner) {
+				CtrcParticipantStopTrace *trace = ctrc_ack_stop_sample(item);
+
+				trace->expected_key = item->participant.key;
+				trace->expected_peer = item->participant.identity;
+				trace->expected_grant = item->participant.grant_generation;
+				trace->expected_seal = item->participant.seal_generation;
+				trace->phase = "first.copy";
+			}
 			count++;
 		}
 
@@ -11482,14 +12322,20 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 				XLogFlush(highest_local_lsn);
 			}
 			ctrc_participant_capture_durability(&durability);
-			item->eligible = cluster_ctrc_participant_ack_from_snapshot(
+			if (cluster_trace_normal_stop)
+				ctrc_ack_stop_phase(item, "first.snapshot");
+			item->eligible = ctrc_ack_stop_predicate(item, "first.snapshot_released",
+				cluster_ctrc_participant_ack_from_snapshot(
 								 &item->participant, item->receipts, item->receipt_count,
 								 &durability, &item->first_ack)
-							 == CLUSTER_CTRC_ACK_RELEASED;
+							 == CLUSTER_CTRC_ACK_RELEASED);
 		}
 
 		/* Independent second range and durability capture, never a reused
 		 * first proof. Sorting changes only each item's private allocation. */
+		if (cluster_trace_normal_stop)
+			for (Size i = 0; i < count; i++)
+				ctrc_ack_stop_phase(&work[i], "second.copy");
 		ctrc_participant_copy_ack_batch(work, count);
 		for (Size i = 0; i < count; i++) {
 			CtrcAckWork *item = &work[i];
@@ -11498,18 +12344,25 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 			if (!item->eligible)
 				continue;
 			ctrc_participant_capture_durability(&durability);
+			if (cluster_trace_normal_stop)
+				ctrc_ack_stop_phase(item, "second.snapshot");
 			item->eligible
-				= cluster_ctrc_participant_ack_from_snapshot(&item->participant, item->receipts,
+				= ctrc_ack_stop_predicate(item, "second.snapshot_released",
+					cluster_ctrc_participant_ack_from_snapshot(&item->participant, item->receipts,
 															 item->receipt_count, &durability,
 															 &item->second_ack)
-					  == CLUSTER_CTRC_ACK_RELEASED
-				  && memcmp(&item->first_ack, &item->second_ack, sizeof(item->first_ack)) == 0;
+					  == CLUSTER_CTRC_ACK_RELEASED)
+				  && ctrc_ack_stop_predicate(item, "second.ack_equal",
+					memcmp(&item->first_ack, &item->second_ack, sizeof(item->first_ack)) == 0);
 			if (item->eligible) {
 				cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PARTICIPANT_ACK);
 				cluster_ctrc_test_barrier_wait(CTRC_TEST_BARRIER_ACK_DURABLE);
 				item->freeze_attempted = true;
 			}
 		}
+		if (cluster_trace_normal_stop)
+			for (Size i = 0; i < count; i++)
+				ctrc_ack_stop_phase(&work[i], "freeze.exact");
 		ctrc_participant_freeze_ack_batch_exact(work, count);
 		for (Size i = 0; i < count; i++)
 			if (work[i].frozen) {
@@ -11519,9 +12372,21 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 				cluster_undo_cleaner_wakeup();
 			} else if (work[i].freeze_attempted)
 				cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_BLOCKED);
+		/* All original publication/statistics/wakeup work precedes output. A
+		 * captured row may predate a failed private snapshot; it is not a
+		 * post-failure atomic view or a new durability proof. */
+		if (trace_owner)
+			for (Size i = 0; i < count; i++)
+				ctrc_participant_stop_trace("ack.freeze", &CtrcAckStopSamples[i], 0, 0, false,
+					work[i].eligible, work[i].freeze_attempted, work[i].frozen,
+					work[i].found, work[i].receipt_count);
 	}
 	PG_FINALLY();
 	{
+		if (trace_owner) {
+			CtrcAckStopWork = NULL;
+			CtrcAckStopCount = 0;
+		}
 		for (Size i = 0; i < maximum; i++)
 			if (work[i].receipts != NULL)
 				pfree(work[i].receipts);

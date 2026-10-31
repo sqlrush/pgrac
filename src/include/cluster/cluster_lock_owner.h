@@ -65,6 +65,14 @@ typedef ClusterLockAcquireResult (*ClusterControlNativeFinish)(ClusterLockAcquir
 extern ClusterLockAcquireResult
 cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
 								   ClusterControlNativeFinish finish, void *argument);
+/* Local custody seam for an original job-bound caller. The request guard
+ * must outlive failed acquisition and ERROR cleanup. The caller must later
+ * consume exact retirement via request_release[_poll], including failures
+ * before publication. This grants no input permission and owns no native ref;
+ * the original non-job API retains its autonomous failed-acquire cleanup. */
+extern ClusterLockAcquireResult
+cluster_lock_owner_request_acquire_retained(ClusterLockAcquireRequest *request,
+											ClusterControlNativeFinish finish, void *argument);
 extern ClusterLockAcquireResult
 cluster_lock_owner_request_convert(ClusterLockAcquireRequest *request, uint64 preserve_request_id,
 								   ClusterControlNativeFinish finish, void *argument);
@@ -72,5 +80,10 @@ extern bool cluster_lock_owner_request_refresh(ClusterLockAcquireRequest *reques
 extern bool cluster_lock_owner_request_usable(const ClusterLockAcquireRequest *request);
 extern ClusterLockAcquireResult
 cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request);
+/* Same stable guard and retirement proof; no synchronous confirmation wait.
+ * The caller retains its local native ref until OK_GRANTED, and must record
+ * that result before consuming the guard. A missing owner is not success. */
+extern ClusterLockAcquireResult
+cluster_lock_owner_request_release_poll(const ClusterLockAcquireRequest *request);
 
 #endif

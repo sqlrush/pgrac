@@ -17,7 +17,27 @@ static ClusterMarkerPollResult rejoin_marker_poll;
 static uint32 rejoin_marker_result;
 static uint64 rejoin_proven_incarnation;
 static unsigned rejoin_reads, rejoin_imports, rejoin_publications;
-static unsigned rejoin_prepares, rejoin_publishes, rejoin_fences;
+static unsigned rejoin_prepares, rejoin_publishes, rejoin_fences, rejoin_polls;
+static unsigned rejoin_change_during_read;
+static bool rejoin_real_marker, rejoin_slot_valid, rejoin_lookup_uses_cf;
+static uint64 rejoin_slot_incarnation, rejoin_slot_generation;
+static ClusterJoinVerdict rejoin_vet_result;
+static ClusterStartupPhase rejoin_phase_state;
+static ClusterStartupPhase
+rejoin_phase(void)
+{
+	return rejoin_phase_state;
+}
+static pg_atomic_uint64 rejoin_completion;
+static pg_atomic_uint32 rejoin_result;
+static ClusterJoinCommitMarker rejoin_disk_marker;
+static ClusterRecoveryOwnerImportResult
+rejoin_select_marker(int32, const ClusterWalThreadClaim *, uint64, uint64,
+					 const ClusterRecoveryOwnerDiskSampleV1 *, int, const ClusterJoinCommitMarker *,
+					 uint64 *);
+static bool rejoin_checked(int32, uint64, const ClusterJoinCommitMarker *,
+						   const ClusterRecoveryDutyKey *, ClusterRecoveryDutyKey *, bool (*)(bool),
+						   ClusterControlRootResult *);
 static ClusterControlRootReadToken rejoin_seen_token;
 static ClusterControlRootPatch rejoin_seen_patch;
 
@@ -27,12 +47,24 @@ rejoin_lookup(int32 node, ClusterControlRootIdentity *identity,
 {
 	UT_ASSERT_EQ(node, 0);
 	++rejoin_reads;
+	if (rejoin_lookup_uses_cf) {
+		++g_next_request_id;
+		if (!cluster_cf_lock(ShareLock))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		UT_ASSERT(cluster_cf_held_is_clusterwide(ShareLock));
+	}
 	if (rejoin_lookup_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| rejoin_lookup_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 		*identity = rejoin_snapshot.identity;
 		*snapshot = rejoin_snapshot;
 		*token = generic_token;
+		if (rejoin_reads == 2 && rejoin_change_during_read == 1)
+			++rejoin_slot_generation;
+		else if (rejoin_reads == 2 && rejoin_change_during_read == 2)
+			owner_clock = rejoin_stage.async.deadline_us;
 	}
+	if (rejoin_lookup_uses_cf)
+		UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
 	return rejoin_lookup_result;
 }
 
@@ -51,15 +83,36 @@ rejoin_import(int32 node, const ClusterWalThreadClaim *claim, uint64 lo, uint64 
 	return rejoin_import_result;
 }
 
+/* Disk reads are a leaf; exact marker majority selection is original code. */
+static ClusterRecoveryOwnerImportResult
+rejoin_import_marker(int32 node, const ClusterWalThreadClaim *claim, uint64 lo, uint64 hi,
+					 const ClusterJoinCommitMarker *expected, uint64 *out)
+{
+	ClusterRecoveryOwnerDiskSampleV1 samples[3] = { 0 };
+	ClusterRecoveryOwnerImportResult result = rejoin_import(node, claim, lo, hi, out);
+
+	if (result != CLUSTER_RECOVERY_OWNER_IMPORT_JCMK)
+		return result;
+	for (unsigned i = 0; i < lengthof(samples); ++i) {
+		samples[i].join_io_state = CLUSTER_VOTING_DISK_IO_OK;
+		samples[i].join_marker = rejoin_disk_marker;
+	}
+	result = rejoin_select_marker(node, claim, lo, hi, samples, 3, expected, out);
+	if (rejoin_proven_incarnation != 77)
+		*out = rejoin_proven_incarnation;
+	return result;
+}
+
 static ClusterControlRootResult
 rejoin_compare(const ClusterControlRootReadToken *token, const ClusterControlRootPatch *patch,
 			   ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out,
-			   ClusterControlRootReadToken *out_token)
+			   ClusterControlRootReadToken *out_token, bool (*revalidate)(bool))
 {
 	++rejoin_publications;
 	rejoin_seen_token = *token;
 	rejoin_seen_patch = *patch;
-	return cluster_control_root_compare_and_publish(token, patch, reason, out, out_token);
+	return cluster_control_root_rejoin_compare_and_publish_checked(token, patch, reason, out,
+																   out_token, revalidate);
 }
 
 static bool
@@ -78,8 +131,11 @@ rejoin_submit(ClusterMarkerAsync *async, int32 node, const ClusterJoinCommitMark
 static ClusterMarkerPollResult
 rejoin_poll(ClusterMarkerAsync *async, TimestampTz now, uint32 *result, uint64 *elapsed)
 {
-	(void)now;
+	++rejoin_polls;
 	UT_ASSERT(async == &rejoin_stage.async);
+	if (rejoin_real_marker)
+		return cluster_marker_async_poll(async, &rejoin_completion, &rejoin_result, now, result,
+										 elapsed);
 	*result = rejoin_marker_result;
 	*elapsed = 10;
 	return rejoin_marker_poll;
@@ -90,25 +146,25 @@ rejoin_marker_note(ClusterMarkerAsyncKind kind, int32 node, uint64 elapsed)
 {
 	UT_ASSERT_EQ(kind, CLUSTER_MARKER_KIND_JOIN_COMMITTED);
 	UT_ASSERT_EQ(node, 0);
-	UT_ASSERT_EQ(elapsed, 10);
+	UT_ASSERT(rejoin_real_marker || elapsed == 10);
 }
 
 static bool
 rejoin_slot(int32 node, uint64 *incarnation, uint64 *generation)
 {
 	UT_ASSERT_EQ(node, 0);
-	*incarnation = 77;
-	*generation = 1;
-	return true;
+	*incarnation = rejoin_slot_incarnation;
+	*generation = rejoin_slot_generation;
+	return rejoin_slot_valid;
 }
 
 static ClusterJoinVerdict
 rejoin_vet(int32 node, uint64 incarnation, uint64 generation)
 {
 	UT_ASSERT_EQ(node, 0);
-	UT_ASSERT_EQ(incarnation, 77);
-	UT_ASSERT_EQ(generation, 1);
-	return CLUSTER_JOIN_ACCEPT;
+	UT_ASSERT_EQ(incarnation, rejoin_slot_incarnation);
+	UT_ASSERT_EQ(generation, rejoin_slot_generation);
+	return rejoin_vet_result;
 }
 
 static bool
@@ -118,6 +174,7 @@ rejoin_prepare(int32 node, uint64 incarnation, uint64 epoch)
 	UT_ASSERT_EQ(incarnation, 77);
 	UT_ASSERT_EQ(epoch, owner_epoch);
 	++rejoin_prepares;
+	rejoin_stage.fence_ready = true;
 	return true;
 }
 
@@ -158,9 +215,13 @@ rejoin_external_release(int32 node)
 #define cluster_recovery_duty_key_compare_for_claim rejoin_key_compare_for_claim
 #define cluster_recovery_duty_key_compare rejoin_key_compare
 #define cluster_recovery_owner_rejoin_v1 rejoin_owner
+#define cluster_recovery_owner_rejoin_checked_v1 rejoin_checked
+#define cluster_recovery_owner_import_read_marker_v1 rejoin_import_marker
+#define cluster_recovery_owner_import_select_marker_v1 rejoin_select_marker
 #define cluster_control_root_lookup_owner_by_node_runtime rejoin_lookup
 #define cluster_recovery_owner_import_read_v1 rejoin_import
-#define cluster_control_root_compare_and_publish rejoin_compare
+#define cluster_control_root_rejoin_compare_and_publish_checked rejoin_compare
+#define cluster_current_phase rejoin_phase
 #define join_commit_stage rejoin_stage
 #define ReconfigShmem (&rejoin_state)
 #define cluster_reconfig_submit_join_marker_async rejoin_submit
@@ -188,9 +249,13 @@ rejoin_external_release(int32 node)
 #undef cluster_reconfig_submit_join_marker_async
 #undef ReconfigShmem
 #undef join_commit_stage
-#undef cluster_control_root_compare_and_publish
+#undef cluster_current_phase
+#undef cluster_control_root_rejoin_compare_and_publish_checked
 #undef cluster_recovery_owner_import_read_v1
 #undef cluster_control_root_lookup_owner_by_node_runtime
+#undef cluster_recovery_owner_import_select_marker_v1
+#undef cluster_recovery_owner_import_read_marker_v1
+#undef cluster_recovery_owner_rejoin_checked_v1
 #undef cluster_recovery_owner_rejoin_v1
 #undef cluster_recovery_duty_key_compare
 #undef cluster_recovery_duty_key_compare_for_claim
@@ -202,6 +267,7 @@ rejoin_external_release(int32 node)
 static void
 rejoin_refresh_token(void)
 {
+	prepared_disk.present[0] = true;
 	prepared_disk.records[0] = rejoin_snapshot;
 	make_read_token(&prepared_disk, 1, CONTROL_ROOT_SOURCE_PRIMARY, &generic_token);
 }
@@ -217,6 +283,21 @@ rejoin_stage_reset(void)
 	rejoin_stage.submitted = true;
 	rejoin_stage.node_id = 0;
 	rejoin_stage.admitted_incarnation = 77;
+	rejoin_stage.async.deadline_us = (uint64)owner_clock + UINT64_C(10000000);
+	rejoin_stage.async.submitted_at = owner_clock;
+	rejoin_stage.marker.magic = CLUSTER_JCMK_MAGIC;
+	rejoin_stage.marker.version = CLUSTER_JCMK_VERSION;
+	rejoin_stage.marker.phase = CLUSTER_JCMK_PHASE_COMMITTED;
+	rejoin_stage.marker.node_id = 0;
+	rejoin_stage.marker.admitted_incarnation = 77;
+	rejoin_stage.marker.generation = 1;
+	rejoin_stage.marker.admitted_epoch = owner_epoch;
+	rejoin_stage.marker.commit_nonce = 19;
+	INIT_CRC32C(rejoin_stage.marker.crc32c);
+	COMP_CRC32C(rejoin_stage.marker.crc32c, &rejoin_stage.marker,
+				offsetof(ClusterJoinCommitMarker, crc32c));
+	FIN_CRC32C(rejoin_stage.marker.crc32c);
+	rejoin_disk_marker = rejoin_stage.marker;
 }
 
 static void
@@ -225,6 +306,7 @@ rejoin_fixture(uint32 lifecycle)
 	ClusterWalThreadClaim claim;
 	ClusterControlRootIdentity *identity;
 
+	UT_ASSERT(lock_owner_creator());
 	generic_fixture(lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 						? CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
 						: CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN);
@@ -252,7 +334,16 @@ rejoin_fixture(uint32 lifecycle)
 	rejoin_import_result = CLUSTER_RECOVERY_OWNER_IMPORT_JCMK;
 	rejoin_proven_incarnation = 77;
 	rejoin_reads = rejoin_imports = rejoin_publications = 0;
-	rejoin_prepares = rejoin_publishes = rejoin_fences = 0;
+	rejoin_prepares = rejoin_publishes = rejoin_fences = rejoin_polls = 0;
+	rejoin_real_marker = rejoin_lookup_uses_cf = false;
+	rejoin_change_during_read = 0;
+	rejoin_slot_valid = true;
+	rejoin_slot_incarnation = 77;
+	rejoin_slot_generation = 1;
+	rejoin_vet_result = CLUSTER_JOIN_ACCEPT;
+	rejoin_phase_state = CLUSTER_PHASE_3_RECOVERY;
+	pg_atomic_init_u64(&rejoin_completion, 11);
+	pg_atomic_init_u32(&rejoin_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
 	rejoin_marker_poll = CLUSTER_MARKER_POLL_ACKED;
 	rejoin_marker_result = CLUSTER_JOIN_MARKER_SUBMIT_ACK;
 	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
@@ -302,32 +393,13 @@ rejoin_retire(uint64 cookie)
 static void
 rejoin_finish(void)
 {
+	owner_ack_on_wakeup = false;
 	prepared_finish();
 	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
 }
 
-/* Desired continuity assertion: a CF wait is not a rejected admission. Keep
- * opt-in RED separate from the safety characterization until policy freezes. */
+/* Break caught: an exact marker ACK is lost or polled again after CF wait. */
 UT_TEST(rejoin_cf_wait_keeps_original_staged_publication)
-{
-	const uint32 lifecycles[] = { CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
-								  CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE };
-
-	for (unsigned i = 0; i < lengthof(lifecycles); i++) {
-		uint64 before;
-
-		rejoin_fixture(lifecycles[i]);
-		before = cluster_cf_attempt_sequence();
-		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
-		(void)rejoin_timeout_debt(before);
-		UT_ASSERT(rejoin_stage.async.has_staged_event);
-		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 0);
-		rejoin_finish();
-	}
-}
-
-/* Break caught: CF timeout leaks MEMBER/fence work or discards cleanup debt. */
-UT_TEST(rejoin_cf_slice_releases_stage_but_keeps_original_cleanup)
 {
 	const uint32 lifecycles[] = { CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
 								  CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE };
@@ -336,6 +408,54 @@ UT_TEST(rejoin_cf_slice_releases_stage_but_keeps_original_cleanup)
 		uint64 before, cookie;
 
 		rejoin_fixture(lifecycles[i]);
+		rejoin_real_marker = generic_rejoin_io = true;
+		before = cluster_cf_attempt_sequence();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		cookie = rejoin_timeout_debt(before);
+		UT_ASSERT_EQ(rejoin_stage.async.state, CLUSTER_MARKER_ASYNC_IDLE);
+		UT_ASSERT(rejoin_stage.async.has_staged_event);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 0);
+		UT_ASSERT_EQ(rejoin_prepares | prepared_writes, 0);
+		for (unsigned pending = 0; pending < 3; ++pending) {
+			UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+			UT_ASSERT(rejoin_stage.async.has_staged_event);
+			UT_ASSERT_EQ(rejoin_polls, 1);
+			UT_ASSERT_EQ(rejoin_reads, 1);
+			UT_ASSERT_EQ(rejoin_prepares | prepared_writes | entry_waits, 0);
+		}
+		rejoin_retire(cookie);
+		/* A new ROOT read token for the same full key is permitted. */
+		++rejoin_snapshot.root_publish_seq;
+		rejoin_refresh_token();
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		owner_ack_on_wakeup = true;
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT_EQ(rejoin_polls, 1);
+		UT_ASSERT_EQ(rejoin_reads, 2);
+		UT_ASSERT_EQ(rejoin_imports, 2);
+		UT_ASSERT_EQ(rejoin_prepares, 1);
+		UT_ASSERT_EQ(prepared_writes, 1);
+		UT_ASSERT_EQ(rejoin_seen_token.root_publish_seq, 8);
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT_EQ(rejoin_prepares, 1);
+		UT_ASSERT_EQ(prepared_writes, 1);
+		UT_ASSERT_EQ(rejoin_reads, 2);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 0);
+		rejoin_finish();
+	}
+}
+
+/* Break caught: CF timeout leaks MEMBER/fence work or discards cleanup debt. */
+UT_TEST(ordinary_rejoin_cf_slice_releases_stage_but_keeps_original_cleanup)
+{
+	const uint32 lifecycles[] = { CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
+								  CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE };
+
+	for (unsigned i = 0; i < lengthof(lifecycles); i++) {
+		uint64 before, cookie;
+
+		rejoin_fixture(lifecycles[i]);
+		rejoin_phase_state = CLUSTER_PHASE_RUNNING;
 		before = cluster_cf_attempt_sequence();
 		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
 		cookie = rejoin_timeout_debt(before);
@@ -458,4 +578,348 @@ UT_TEST(rejoin_open_exact_owner_still_requires_fresh_import)
 		UT_ASSERT_EQ(rejoin_snapshot.identity.root_lineage_seq, 5);
 		rejoin_finish();
 	}
+}
+
+/* Break caught: a foreign or missing exact cleanup receipt resumes binding. */
+UT_TEST(rejoin_retained_ack_requires_its_exact_cf_receipt)
+{
+	for (unsigned field = 0; field < 7; ++field) {
+		uint64 cookie, before;
+
+		rejoin_fixture(CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+		rejoin_real_marker = true;
+		before = cluster_cf_attempt_sequence();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		cookie = rejoin_timeout_debt(before);
+		if (field == 0)
+			++rejoin_stage.bind.cf.cookie;
+		else if (field == 1)
+			++rejoin_stage.bind.cf.registry.handle.slot;
+		else if (field == 2)
+			++rejoin_stage.bind.cf.registry.handle.generation;
+		else if (field == 3)
+			++rejoin_stage.bind.cf.registry.owner.incarnation;
+		else if (field == 4)
+			++rejoin_stage.bind.cf.registry.message.key.holder.request_id;
+		else if (field == 5)
+			++rejoin_stage.bind.cf.registry.message.key.resid.field1;
+		else {
+			rejoin_retire(cookie);
+			++rejoin_stage.bind.cf.cookie; /* Empty slot alone is insufficient. */
+		}
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT(!rejoin_stage.async.has_staged_event);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 1);
+		UT_ASSERT_EQ(rejoin_reads, 1);
+		UT_ASSERT_EQ(rejoin_polls, 1);
+		UT_ASSERT_EQ(rejoin_prepares | prepared_writes | entry_waits, 0);
+		if (field < 6)
+			rejoin_retire(cookie);
+		rejoin_finish();
+	}
+}
+
+/* Break caught: ACK survives a real context/member/slot change or deadline. */
+UT_TEST(rejoin_retained_ack_rechecks_context_and_original_deadline)
+{
+	for (unsigned field = 0; field < 14; ++field) {
+		uint64 before, cookie, epoch = owner_epoch, generation = owner_generation;
+		uint64 boot;
+		PGPROC *proc = MyProc;
+		Latch *latch = MyLatch;
+
+		rejoin_fixture(CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+		rejoin_real_marker = true;
+		boot = control_creator.incarnation;
+		before = cluster_cf_attempt_sequence();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		cookie = rejoin_timeout_debt(before);
+		rejoin_retire(cookie);
+		if (field == 0)
+			++owner_epoch;
+		else if (field == 1)
+			++owner_generation;
+		else if (field == 2)
+			++control_creator.incarnation;
+		else if (field == 3)
+			ShutdownRequestPending = true;
+		else if (field == 4)
+			MyProc = NULL;
+		else if (field == 5)
+			MyLatch = NULL;
+		else if (field == 6)
+			++rejoin_stage.async.inflight_seq;
+		else if (field == 7)
+			++rejoin_stage.marker.commit_nonce;
+		else if (field == 8)
+			++rejoin_slot_generation;
+		else if (field == 9)
+			++rejoin_slot_incarnation;
+		else if (field == 10)
+			rejoin_slot_valid = false;
+		else if (field == 11)
+			rejoin_vet_result = CLUSTER_JOIN_REJECT_NOT_READY;
+		else if (field == 12)
+			owner_clock = rejoin_stage.async.deadline_us;
+		else
+			entry_authority = false;
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT(!rejoin_stage.async.has_staged_event);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 1);
+		UT_ASSERT_EQ(rejoin_reads, 1);
+		UT_ASSERT_EQ(rejoin_polls, 1);
+		UT_ASSERT_EQ(rejoin_prepares | prepared_writes | entry_waits, 0);
+		owner_epoch = epoch;
+		owner_generation = generation;
+		control_creator.incarnation = boot;
+		MyProc = proc;
+		MyLatch = latch;
+		ShutdownRequestPending = false;
+		rejoin_finish();
+	}
+}
+
+/* Break caught: a fresh token for a different complete ROOT key is rebound. */
+UT_TEST(rejoin_retained_ack_rejects_changed_root_key_before_rebind)
+{
+	for (unsigned field = 0; field < 9; ++field) {
+		uint64 before, cookie;
+
+		rejoin_fixture(CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+		rejoin_real_marker = true;
+		before = cluster_cf_attempt_sequence();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		cookie = rejoin_timeout_debt(before);
+		rejoin_retire(cookie);
+		if (field == 0)
+			++rejoin_snapshot.identity.system_identifier;
+		else if (field == 1)
+			++rejoin_snapshot.identity.storage_uuid[2];
+		else if (field == 2)
+			++rejoin_snapshot.identity.authority_uuid[2];
+		else if (field == 3)
+			++rejoin_snapshot.identity.origin_thread_id;
+		else if (field == 4)
+			++rejoin_snapshot.identity.origin_node_id;
+		else if (field == 5)
+			++rejoin_snapshot.identity.thread_claim_created_at;
+		else if (field == 6)
+			++rejoin_snapshot.identity.thread_claim_crc32c;
+		else if (field == 7)
+			++rejoin_snapshot.identity.origin_owner_incarnation;
+		else
+			++rejoin_snapshot.identity.root_lineage_seq;
+		rejoin_refresh_token();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT(!rejoin_stage.async.has_staged_event);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 1);
+		UT_ASSERT_EQ(rejoin_reads, 2);
+		UT_ASSERT_EQ(rejoin_imports, 1);
+		UT_ASSERT_EQ(rejoin_publications, 1);
+		UT_ASSERT_EQ(rejoin_prepares | prepared_writes | entry_waits, 0);
+		rejoin_finish();
+	}
+}
+
+/* Break caught: a different majority marker with the same incarnation binds. */
+UT_TEST(rejoin_retained_ack_rechecks_exact_jcmk_completion)
+{
+	for (unsigned field = 0; field < 6; ++field) {
+		uint64 before, cookie;
+
+		rejoin_fixture(CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+		rejoin_real_marker = true;
+		before = cluster_cf_attempt_sequence();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		cookie = rejoin_timeout_debt(before);
+		rejoin_retire(cookie);
+		if (field == 0)
+			++rejoin_disk_marker.commit_nonce;
+		else if (field == 1)
+			++rejoin_disk_marker.generation;
+		else if (field == 2)
+			++rejoin_disk_marker.admitted_epoch;
+		else if (field == 3)
+			++rejoin_disk_marker.supersedes_leave_epoch;
+		else if (field == 4)
+			rejoin_import_result = CLUSTER_RECOVERY_OWNER_IMPORT_IO_FAILED;
+		else
+			memset(&rejoin_disk_marker, 0, sizeof(rejoin_disk_marker));
+		if (field < 4) {
+			INIT_CRC32C(rejoin_disk_marker.crc32c);
+			COMP_CRC32C(rejoin_disk_marker.crc32c, &rejoin_disk_marker,
+						offsetof(ClusterJoinCommitMarker, crc32c));
+			FIN_CRC32C(rejoin_disk_marker.crc32c);
+		}
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT(!rejoin_stage.async.has_staged_event);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 1);
+		UT_ASSERT_EQ(rejoin_reads, 2);
+		UT_ASSERT_EQ(rejoin_imports, 2);
+		UT_ASSERT_EQ(rejoin_publications, 1);
+		UT_ASSERT_EQ(rejoin_prepares | prepared_writes | entry_waits, 0);
+		rejoin_finish();
+	}
+}
+
+/* Break caught: untyped/hard refusal or someone else's cleanup starts a wait. */
+UT_TEST(rejoin_retained_ack_does_not_retry_hard_or_preexisting_cf)
+{
+	for (unsigned fault = 0; fault < 4; ++fault) {
+		uint64 existing = 0;
+
+		rejoin_fixture(CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+		rejoin_real_marker = true;
+		if (fault == 0)
+			g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		else if (fault == 1)
+			g_timeout_detail.source = CLUSTER_GES_TSRC_NONE;
+		else if (fault == 2)
+			existing = entry_timeout(ExclusiveLock);
+		else
+			existing = entry_timeout(ShareLock);
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT(!rejoin_stage.async.has_staged_event);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 1);
+		UT_ASSERT_EQ(rejoin_prepares | prepared_writes | entry_waits, 0);
+		if (fault >= 2) {
+			UT_ASSERT_EQ(cluster_cf_owner_cookie(fault == 2 ? ExclusiveLock : ShareLock), existing);
+			if (fault == 3) {
+				UT_ASSERT(acknowledge_retirements());
+				cluster_cf_retirement_poll();
+				UT_ASSERT(cluster_cf_release_completed(ShareLock, existing));
+			}
+		}
+		rejoin_finish();
+	}
+}
+
+/* Break caught: a slot change/deadline during fresh I/O binds the old ACK. */
+UT_TEST(rejoin_retained_ack_requalifies_after_fresh_reads_before_bind)
+{
+	for (unsigned field = 1; field <= 2; ++field) {
+		uint64 before, cookie;
+
+		rejoin_fixture(CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+		rejoin_real_marker = generic_rejoin_io = true;
+		before = cluster_cf_attempt_sequence();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		cookie = rejoin_timeout_debt(before);
+		rejoin_retire(cookie);
+		g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		owner_ack_on_wakeup = true;
+		rejoin_change_during_read = field;
+		before = cluster_cf_attempt_sequence();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT(!rejoin_stage.async.has_staged_event);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 1);
+		UT_ASSERT_EQ(rejoin_reads, 2);
+		UT_ASSERT_EQ(rejoin_publications, 1);
+		UT_ASSERT_EQ(cluster_cf_attempt_sequence(), before);
+		UT_ASSERT_EQ(rejoin_prepares | prepared_writes | entry_waits, 0);
+		rejoin_finish();
+	}
+}
+
+/* Break caught: an ACK is discarded when the first ROOT CF-S read must wait. */
+UT_TEST(rejoin_retained_ack_can_learn_its_root_after_exact_read_retirement)
+{
+	uint64 before, cookie;
+	ClusterCfAttemptObservation attempt;
+
+	rejoin_fixture(CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+	rejoin_real_marker = generic_rejoin_io = rejoin_lookup_uses_cf = true;
+	before = cluster_cf_attempt_sequence();
+	UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+	UT_ASSERT(cluster_cf_last_attempt_since(before, &attempt));
+	UT_ASSERT(cluster_cf_attempt_wait_slice(&attempt));
+	UT_ASSERT_EQ(attempt.mode, ShareLock);
+	cookie = cluster_cf_owner_cookie(ShareLock);
+	UT_ASSERT(cookie != 0);
+	UT_ASSERT(rejoin_stage.async.has_staged_event);
+	UT_ASSERT(!rejoin_stage.bind.root_key_valid);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 0);
+	UT_ASSERT_EQ(rejoin_imports | rejoin_publications | rejoin_prepares | prepared_writes, 0);
+	UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+	UT_ASSERT_EQ(rejoin_polls, 1);
+	UT_ASSERT_EQ(rejoin_reads, 1);
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(cluster_cf_release_completed(ShareLock, cookie));
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	owner_ack_on_wakeup = true;
+	UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+	UT_ASSERT_EQ(rejoin_polls, 1);
+	UT_ASSERT_EQ(rejoin_reads, 2);
+	UT_ASSERT_EQ(rejoin_imports, 1);
+	UT_ASSERT_EQ(rejoin_prepares, 1);
+	UT_ASSERT_EQ(prepared_writes, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 0);
+	rejoin_finish();
+}
+
+/* Break caught: a final WALR cleanup debt is mistaken for a CF-only wait. */
+UT_TEST(rejoin_unconfirmed_walr_is_not_a_cf_wait)
+{
+	const uint32 lifecycles[] = { CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
+								  CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE };
+
+	for (unsigned i = 0; i < lengthof(lifecycles); ++i) {
+		uint64 before, cookie;
+
+		rejoin_fixture(lifecycles[i]);
+		rejoin_real_marker = true;
+		generic_pin_confirmed = false;
+		before = cluster_cf_attempt_sequence();
+		UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+		cookie = rejoin_timeout_debt(before);
+		UT_ASSERT(!rejoin_stage.async.has_staged_event);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 1);
+		UT_ASSERT(generic_pin_active && !root_publish_authority.active);
+		UT_ASSERT_EQ(generic_pin_begins, 1);
+		UT_ASSERT_EQ(generic_pin_ends, 1);
+		rejoin_retire(cookie);
+		UT_ASSERT(!cluster_reconfig_poll_join_commit_stage());
+		UT_ASSERT_EQ(rejoin_reads, 1);
+		UT_ASSERT_EQ(rejoin_prepares | prepared_writes, 0);
+		/* Explicit teardown of the leaf pin debt, never a runtime receipt. */
+		generic_pin_active = false;
+		rejoin_finish();
+	}
+}
+
+static unsigned rejoin_write_drift;
+static void
+rejoin_drift_after_cf_read(void)
+{
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	if (rejoin_write_drift == 0)
+		owner_clock = rejoin_stage.async.deadline_us;
+	else
+		++rejoin_slot_generation;
+}
+
+/* Break caught: CF acquisition/read crosses the cutoff or changes the slot. */
+UT_TEST(rejoin_requalifies_at_actual_write_boundary)
+{
+	const uint32 lifecycles[] = { CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
+								  CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE };
+
+	for (unsigned i = 0; i < lengthof(lifecycles); ++i)
+		for (rejoin_write_drift = 0; rejoin_write_drift < 2; ++rejoin_write_drift) {
+			rejoin_fixture(lifecycles[i]);
+			rejoin_real_marker = generic_rejoin_io = true;
+			g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+			owner_ack_on_wakeup = true;
+			generic_after_cf_read = rejoin_drift_after_cf_read;
+			UT_ASSERT(cluster_reconfig_poll_join_commit_stage());
+			UT_ASSERT(!rejoin_stage.async.has_staged_event);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&rejoin_state.join_reject_count), 1);
+			UT_ASSERT_EQ(rejoin_polls, 1);
+			UT_ASSERT_EQ(rejoin_publications, 1);
+			UT_ASSERT_EQ(rejoin_prepares | prepared_writes, 0);
+			UT_ASSERT(!generic_pin_active && !root_publish_authority.active);
+			UT_ASSERT(!cluster_cf_held(ExclusiveLock));
+			rejoin_finish();
+		}
 }

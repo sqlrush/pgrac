@@ -49,6 +49,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_tier1.h"
@@ -78,6 +79,12 @@ static ConditionVariable *ut_space_wait;
 static unsigned ut_space_sleeps, ut_space_broadcasts;
 static int ut_space_action;
 static bool ut_space_cancel;
+static bool ut_tt_diag_enabled, ut_tt_diag_fail;
+static unsigned ut_tt_diag_n, ut_tt_diag_total;
+static unsigned ut_tt_diag_broadcasts;
+static char ut_tt_diag_message[2048], ut_tt_diag_log[65536];
+static GcsBlockForwardPayload ut_tt_diag_sent;
+static bool ut_tt_diag_unlocked(void);
 
 void
 pg_re_throw(void)
@@ -122,15 +129,35 @@ ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
 }
 
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return false;
+	return ut_tt_diag_enabled && elevel == LOG;
 }
 
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{}
+{
+	UT_ASSERT(ut_tt_diag_unlocked());
+	UT_ASSERT(ut_space_broadcasts > ut_tt_diag_broadcasts);
+	ut_tt_diag_n++;
+	ut_tt_diag_total++;
+	if (ut_tt_diag_fail)
+		pg_re_throw();
+	strncat(ut_tt_diag_log, ut_tt_diag_message,
+			sizeof(ut_tt_diag_log) - strlen(ut_tt_diag_log) - 2);
+	strncat(ut_tt_diag_log, "\n", sizeof(ut_tt_diag_log) - strlen(ut_tt_diag_log) - 1);
+}
+
+int
+errmsg_internal(const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(ut_tt_diag_message, sizeof(ut_tt_diag_message), fmt, args);
+	va_end(args);
+	return 0;
+}
 
 int
 errmsg(const char *fmt pg_attribute_unused(), ...)
@@ -727,6 +754,12 @@ static LWLockPadded ut_locks[CLUSTER_LMS_MAX_WORKERS];
 static LWLock *ut_held_lock;
 static LWLock *ut_lock_stack[CLUSTER_LMS_MAX_WORKERS];
 static unsigned ut_lock_depth;
+
+static bool
+ut_tt_diag_unlocked(void)
+{
+	return ut_lock_depth == 0;
+}
 static int ut_lock_reads;
 extern void cluster_lms_outbound_test_geometry(int worker, uint32 head, uint32 tail, uint32 count);
 
@@ -903,6 +936,9 @@ ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
 						 uint32 payload_len)
 {
+	if (ut_tt_diag_enabled && msg_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+		&& payload_len == sizeof(ut_tt_diag_sent))
+		memcpy(&ut_tt_diag_sent, payload, sizeof(ut_tt_diag_sent));
 	if (ut_sent_n < (int)lengthof(ut_sent_log)) {
 		ut_sent_log[ut_sent_n].msg_type = msg_type;
 		ut_sent_log[ut_sent_n].dest = dest_node_id;
@@ -2810,10 +2846,236 @@ UT_TEST(test_capacity_wait_membership_and_cancel_remove_subscription)
 	}
 }
 
+/* Same original enqueue/drain object; no diagnostic emitter is called directly. */
+static GcsBlockForwardPayload
+ut_tt_diag_fixture(void)
+{
+	GcsBlockForwardPayload request = { 0 };
+
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_tt_diag_enabled = true;
+	ut_tt_diag_fail = false;
+	ut_tt_diag_n = 0;
+	ut_tt_diag_log[0] = '\0';
+	ut_tt_diag_broadcasts = ut_space_broadcasts;
+	memset(&ut_tt_diag_sent, 0, sizeof(ut_tt_diag_sent));
+	request.request_id = UINT64CONST(2199023309737);
+	request.epoch = 7;
+	request.tag = GcsBlockUndoFetchTagMake(3073, 6);
+	request.original_requester_node = 0;
+	request.requester_backend_id = 17;
+	request.master_node = 0;
+	request.transition_id = PCM_TRANS_N_TO_S;
+	GcsBlockForwardPayloadSetUndoVerdictRequest(&request, false);
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&request, 6264227);
+	return request;
+}
+
+static void
+ut_tt_diag_identity(const GcsBlockForwardPayload *request)
+{
+	char key[256];
+
+	snprintf(key, sizeof(key),
+			 "node=0 worker=1 destination=3 requester=0 backend=17 request=" UINT64_FORMAT
+			 " xid=" UINT64_FORMAT " epoch=7",
+			 request->request_id, (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(request));
+	UT_ASSERT(strstr(ut_tt_diag_log, key) != NULL);
+	snprintf(key, sizeof(key), "tag=%u/%u/%u/%u/%u", request->tag.spcOid, request->tag.dbOid,
+			 request->tag.relNumber, request->tag.forkNum, request->tag.blockNum);
+	UT_ASSERT(strstr(ut_tt_diag_log, key) != NULL);
+	UT_ASSERT(strstr(ut_tt_diag_log, "frame_epoch=7 membership=2 stream=11") != NULL);
+	UT_ASSERT(ut_tt_diag_unlocked());
+}
+
+UT_TEST(test_ordinary_tt_not_admitted_keeps_exact_frame_and_later_handoff)
+{
+	GcsBlockForwardPayload request = ut_tt_diag_fixture();
+	int failures = ut_not_admitted_count;
+
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &request,
+										   sizeof(request)));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
+	UT_ASSERT_EQ(ut_not_admitted_count, failures + 1);
+	UT_ASSERT_EQ(ut_tt_diag_n, 1);
+	ut_tt_diag_identity(&request);
+	UT_ASSERT(strstr(ut_tt_diag_log, "phase=SEND_RESULT send_result=3") != NULL);
+	UT_ASSERT_EQ(memcmp(&ut_tt_diag_sent, &request, sizeof(request)), 0);
+	ut_tt_diag_n = 0;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+	UT_ASSERT_EQ(ut_tt_diag_n, 0);
+	UT_ASSERT_EQ(memcmp(&ut_tt_diag_sent, &request, sizeof(request)), 0);
+}
+
+UT_TEST(test_ordinary_tt_hard_error_keeps_original_drop_and_send_result)
+{
+	GcsBlockForwardPayload request = ut_tt_diag_fixture();
+
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &request,
+										   sizeof(request)));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_tt_diag_n, 1);
+	ut_tt_diag_identity(&request);
+	UT_ASSERT(strstr(ut_tt_diag_log, "phase=SEND_RESULT send_result=2") != NULL);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+}
+
+UT_TEST(test_ordinary_tt_stale_frame_reports_copied_qualification_without_send)
+{
+	for (int drift = 0; drift < 4; drift++) {
+		GcsBlockForwardPayload request = ut_tt_diag_fixture();
+
+		UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X,
+											   &request, sizeof(request)));
+		if (drift == 0)
+			ut_request_epoch++;
+		else if (drift == 1)
+			ut_member_cut += 2;
+		else
+			ut_data_stream[UT_PEER_X] = drift == 2 ? 0 : 12;
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+		UT_ASSERT_EQ(ut_sent_n, 0);
+		UT_ASSERT_EQ(ut_tt_diag_n, 1);
+		ut_tt_diag_identity(&request);
+		UT_ASSERT(strstr(ut_tt_diag_log, "phase=FRAME_STALE send_result=-1") != NULL);
+	}
+}
+
+UT_TEST(test_ordinary_tt_blocked_peer_preserves_fifo_and_other_peer_flow)
+{
+	GcsBlockForwardPayload request = ut_tt_diag_fixture(), second = request;
+
+	second.request_id++;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &request,
+										   sizeof(request)));
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &second,
+										   sizeof(second)));
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_Y, 0x82));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 2);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+	UT_ASSERT_EQ(ut_tt_diag_n, 2);
+	ut_tt_diag_identity(&second);
+	UT_ASSERT(strstr(ut_tt_diag_log, "phase=PEER_BLOCKED send_result=-1") != NULL);
+	ut_tt_diag_n = 0;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 2);
+	UT_ASSERT_EQ(ut_sent_n, 4);
+	UT_ASSERT_EQ(ut_sent_log[2].marker, ((const uint8 *)&request)[0]);
+	UT_ASSERT_EQ(ut_sent_log[3].marker, ((const uint8 *)&second)[0]);
+	UT_ASSERT_EQ(ut_tt_diag_n, 0);
+}
+
+UT_TEST(test_ordinary_tt_diagnostic_excludes_other_shapes_and_admitted_sends)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		GcsBlockForwardPayload request = ut_tt_diag_fixture();
+		uint8 bytes[sizeof(request) + 1];
+		uint8 type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+		uint16 size = sizeof(request);
+
+		ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
+		if (variant == 0)
+			GcsBlockForwardPayloadSetUndoVerdictRequest(&request, true);
+		else if (variant == 1)
+			GcsBlockForwardPayloadSetUndoFreshRefC1bPairRequest(&request);
+		else if (variant == 2)
+			GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(&request);
+		else if (variant == 3)
+			type = UT_MSG_TYPE;
+		else if (variant == 4)
+			size--;
+		else if (variant == 5)
+			size++;
+		else
+			ut_peer_rc[UT_PEER_X]
+				= variant == 6 ? CLUSTER_IC_SEND_DONE : CLUSTER_IC_SEND_WOULD_BLOCK;
+		memset(bytes, 0, sizeof(bytes));
+		memcpy(bytes, &request, sizeof(request));
+		UT_ASSERT(cluster_lms_outbound_enqueue(1, type, UT_PEER_X, bytes, size));
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), variant >= 6 ? 1 : 0);
+		UT_ASSERT_EQ(ut_tt_diag_n, 0);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+		UT_ASSERT_EQ(ut_sent_n, 1);
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+		UT_ASSERT_EQ(ut_sent_n, 1);
+	}
+}
+
+UT_TEST(test_ordinary_tt_log_exception_follows_original_batch_cleanup)
+{
+	GcsBlockForwardPayload request = ut_tt_diag_fixture();
+	volatile bool caught = false;
+
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &request,
+										   sizeof(request)));
+	ut_tt_diag_fail = true;
+	PG_TRY();
+	{
+		(void)cluster_lms_outbound_drain_send(1);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(ut_tt_diag_unlocked());
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
+	UT_ASSERT_EQ(ut_space_broadcasts, 1);
+	ut_tt_diag_fail = false;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+}
+
+UT_TEST(test_ordinary_tt_full_batch_and_output_bound_preserve_all_frames)
+{
+	GcsBlockForwardPayload request = ut_tt_diag_fixture();
+	int failures = ut_not_admitted_count, drops = ut_requeue_drop_count;
+
+	/* Last: the original production logger owns a process-local detail budget. */
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	for (int i = 0; i < 70; i++) {
+		request.request_id++;
+		UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X,
+											   &request, sizeof(request)));
+	}
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 70);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_not_admitted_count, failures + 1);
+	UT_ASSERT_EQ(ut_requeue_drop_count, drops);
+	UT_ASSERT_EQ(ut_tt_diag_total, 64);
+	UT_ASSERT(strstr(ut_tt_diag_log, "detail_budget_exhausted=1") != NULL);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 64);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 6);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 6);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 71);
+	UT_ASSERT_EQ(ut_tt_diag_total, 64);
+	UT_ASSERT_EQ(ut_not_admitted_count, failures + 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(68);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2876,6 +3138,13 @@ main(void)
 	UT_RUN(test_plain_frame_old_head_does_not_block_new_cut_frame);
 	UT_RUN(test_foreground_capacity_wait_resumes_after_native_drain);
 	UT_RUN(test_capacity_wait_membership_and_cancel_remove_subscription);
+	UT_RUN(test_ordinary_tt_not_admitted_keeps_exact_frame_and_later_handoff);
+	UT_RUN(test_ordinary_tt_hard_error_keeps_original_drop_and_send_result);
+	UT_RUN(test_ordinary_tt_stale_frame_reports_copied_qualification_without_send);
+	UT_RUN(test_ordinary_tt_blocked_peer_preserves_fifo_and_other_peer_flow);
+	UT_RUN(test_ordinary_tt_diagnostic_excludes_other_shapes_and_admitted_sends);
+	UT_RUN(test_ordinary_tt_log_exception_follows_original_batch_cleanup);
+	UT_RUN(test_ordinary_tt_full_batch_and_output_bound_preserve_all_frames);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

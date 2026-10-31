@@ -99,6 +99,7 @@
 #include "cluster/cluster_wal_retained_cut.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster_wal_retained_cut_internal.h"
+#include "cluster_wal_inputs_job_private.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
@@ -111,6 +112,7 @@ static uint64 retained_structure_pins;
 static ClusterControlRootResult retained_logged_result;
 static RfPageProofDetailV1 retained_logged_detail;
 static ClusterWalRetainedPinV1 retained_logged_pin;
+static ClusterWalInputsJobV1 *retained_inputs_job;
 
 /*
  * Hash of one page or SPACE block.  BufferTag has no padding and the
@@ -468,6 +470,9 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 									  retained_space, work, &owners);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return work->detail = retained_native_record(work, record, detail);
+	if (XLogRecGetRmid(record) == RM_XACT_ID
+		&& (owners.owners & RF_SIDE_CONTRIBUTION_NATIVE_STRUCTURE) != 0)
+		retained_structure(work);
 	retained_side_record(work, record, source, cut, owners.owners);
 	for (uint32 i = 0; i < plan.component_count; i++) {
 		const RfDetachedComponentPlanV1 *component = &plan.components[i];
@@ -669,7 +674,7 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 		return result;
 	}
 	retained_fold(work);
-	result = cluster_wal_inputs_revalidate_v1(inputs);
+	result = cluster_wal_inputs_job_revalidate_v1(retained_inputs_job);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_wal_inputs_root_token_v1(inputs, &out->root_token);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -708,7 +713,7 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 }
 
 static void
-retained_work_release(RetainedCutWork *work, ClusterWalInputsV1 **inputs)
+retained_work_release(RetainedCutWork *work)
 {
 	if (work->spool != NULL) {
 		BufFileClose(work->spool);
@@ -718,7 +723,22 @@ retained_work_release(RetainedCutWork *work, ClusterWalInputsV1 **inputs)
 		pfree(work->sketch);
 		work->sketch = NULL;
 	}
-	cluster_wal_inputs_release_v1(inputs);
+}
+
+static ClusterWalInputsJobResultV1
+retained_job_release(bool first)
+{
+	ClusterWalInputsJobResultV1 result;
+
+	if (retained_inputs_job == NULL)
+		return WAL_INPUT_JOB_DONE;
+	result = first ? cluster_wal_inputs_job_retire_v1(retained_inputs_job)
+		: cluster_wal_inputs_job_poll_v1(retained_inputs_job);
+	if (result == WAL_INPUT_JOB_DONE)
+		result = cluster_wal_inputs_job_finish_v1(&retained_inputs_job);
+	if (result == WAL_INPUT_JOB_INVALID)
+		elog(FATAL, "invalid original retained-cut input cleanup");
+	return result;
 }
 
 /* The pre-sync snapshot of this checkpoint (checkpointer-local). */
@@ -769,6 +789,7 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 	ClusterWalInputsV1 *inputs = NULL;
 	RetainedCutWork *work;
 	ClusterControlRootResult result;
+	ClusterWalInputsJobResultV1 released;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -779,6 +800,10 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 	if (self == NULL || out == NULL || detail == NULL
 		|| !cluster_wal_claim_v2_ref_valid(&self->claim))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* Old debt owns this caller slot. Do not resample dirty state or ROOT
+	 * until the original ACKs and native releases have all been observed. */
+	if (retained_job_release(false) == WAL_INPUT_JOB_PENDING)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	work = palloc0(sizeof(*work));
 	/* Before selecting the input: the directory scan waits on entry locks.
 	 * Buffers first, then the directory (see the file header). */
@@ -788,15 +813,18 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	}
 	retained_dirty_merge_presync(&work->dirty);
-	result = cluster_wal_inputs_begin_v1(self->claim.identity.storage_uuid,
-										 self->claim.identity.system_identifier, &inputs);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-		pfree(work);
-		return result;
-	}
 	PG_TRY();
 	{
-		result = retained_census(work, inputs, self, out, detail);
+		result = cluster_wal_inputs_job_open_aux_v1(WAL_INPUT_JOB_RETAINED_CUT, &retained_inputs_job);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_job_begin_v1(retained_inputs_job,
+				self->claim.identity.storage_uuid, self->claim.identity.system_identifier, &inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			/* A throwing business scan has no completed business verdict. */
+			retained_inputs_job->original_result = UINT32_MAX;
+			result = retained_census(work, inputs, self, out, detail);
+			retained_inputs_job->original_result = result;
+		}
 		if (diagnostics != NULL)
 			diagnostics->native_effects_incomplete = work->native_effects_incomplete;
 	}
@@ -804,13 +832,34 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 	{
 		if (diagnostics != NULL)
 			diagnostics->native_effects_incomplete = work->native_effects_incomplete;
-		retained_work_release(work, &inputs);
+		memset(out, 0, sizeof(*out));
+		if (retained_inputs_job != NULL
+			&& !cluster_wal_inputs_job_revoke_v1(retained_inputs_job, true))
+			elog(FATAL, "invalid original retained-cut input after error");
+		retained_work_release(work);
 		pfree(work);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	retained_work_release(work, &inputs);
-	pfree(work);
+	PG_TRY();
+	{
+		retained_work_release(work);
+		pfree(work);
+		released = retained_job_release(true);
+		if (released == WAL_INPUT_JOB_PENDING && result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	}
+	PG_CATCH();
+	{
+		/* Original Aux cleanup owns any throwing spool/scratch release.
+		 * Do not reclose it here or discard the independent input job. */
+		memset(out, 0, sizeof(*out));
+		if (retained_inputs_job != NULL
+			&& !cluster_wal_inputs_job_revoke_v1(retained_inputs_job, true))
+			elog(FATAL, "invalid original retained-cut input during release");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		memset(out, 0, sizeof(*out));
 	return result;

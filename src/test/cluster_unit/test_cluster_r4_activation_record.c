@@ -16,6 +16,7 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "port/pg_crc32c.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 
 #include "cluster_r4_activation_test_stubs.h"
@@ -24,10 +25,50 @@
 int cluster_node_id = 0;
 bool cluster_enabled = true;
 
+/* Explicit clock input for the now-connected bounded CONTROL duty. No
+ * OPEN/rebind baseline exists in this codec/ordinary-activation fixture. */
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return INT64CONST(1000000);
+}
+
 /* This codec fixture has no postmaster, formation, or ROOT serving owner.
  * Linux retains the whole LMON call graph; reaching one of these is a bug. */
 bool IsUnderPostmaster = false;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
+PGPROC *MyProc = NULL;
+int cluster_interconnect_heartbeat_interval_ms = 1000;
+
+/* The live handler/tick also retain CONTROL rebind dependencies. This
+ * fixture has no stream, dispatch frame, stop owner, or successful OPEN
+ * baseline. Crossing any of those boundaries must fail the fixture. */
+bool
+cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env pg_attribute_unused(),
+								   ClusterICControlIngress *out pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_ic_tier1_stream_capture(int32 peer pg_attribute_unused(),
+							   ClusterICTier1Stream *out pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_normal_stop_service_control_sealed(void)
+{
+	abort();
+}
+
 /* The sample-request tests tick LMON with no recovery result owner. */
 bool
 cluster_recovery_tx_result_accept_v1(void)
@@ -1541,7 +1582,8 @@ UT_TEST(test_64_shmem_size_includes_exact_ack_table)
 					+ MAXALIGN(sizeof(ClusterR4Bit22SourceCloseShmem))
 					+ MAXALIGN(sizeof(pg_atomic_uint32)) /* local clean-start observation */
 					+ MAXALIGN(sizeof(ClusterNormalStartCompletion))
-					+ MAXALIGN(sizeof(SemanticServingCompletion));
+					+ MAXALIGN(sizeof(SemanticServingCompletion))
+					+ MAXALIGN(sizeof(SemanticControlRebindShmem));
 
 	UT_ASSERT_EQ(cluster_semantic_activation_shmem_size(), expected);
 }

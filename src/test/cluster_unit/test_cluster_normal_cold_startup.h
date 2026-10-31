@@ -353,3 +353,22 @@ UT_TEST(test_normal_actual_finish_preserves_unconfigured_native_startup)
 		test_gate_reset();
 	}
 }
+
+UT_TEST(test_normal_actual_cold_guards_require_the_original_owner)
+{
+	uint64 foreign_input = 0;
+	const struct ClusterRecoveryStartV1 *foreign = (const void *)&foreign_input;
+	Size budget = (Size)CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB * 1024 / 4;
+
+	/* Actual entry guards, with the native empty owner state. Any attempt to
+	 * enter retained-cold service crosses an abort-only fixture boundary. */
+	UT_ASSERT_EQ(cluster_cold_recovery_plan_memory, CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB);
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(NULL, budget));
+	UT_ASSERT(ClusterColdRecoveryCtrcObserve(NULL, 0));
+	UT_ASSERT(cluster_recovery_ctrc_result_wait_v1(NULL));
+	UT_ASSERT(!ClusterColdRecoveryCtrcObserve(foreign, budget));
+	UT_ASSERT(!cluster_recovery_ctrc_result_wait_v1(foreign));
+	cluster_recovery_merge_claim_release_if_held();
+	cluster_recovery_merge_claim_release_if_held();
+	UT_ASSERT_EQ(foreign_input, 0);
+}

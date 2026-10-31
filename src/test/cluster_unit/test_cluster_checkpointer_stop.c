@@ -28,6 +28,7 @@
 #undef fprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+#include "test_cluster_wal_inputs_empty_jobs_fixture.h"
 
 static jmp_buf exit_boundary;
 static int exit_code, checkpoint_calls, stopped_calls, complete_calls, prepare_calls;
@@ -142,12 +143,13 @@ record(char c)
 	trace[trace_pos++] = c;
 	trace[trace_pos] = 0;
 }
-void
+bool
 cluster_pi_writeback_checkpointer_release_v1(void)
 {
 	pi_scope_retained = false;
 	pi_scope_releases++;
 	record('R');
+	return true;
 }
 static void
 UpdateSharedMemoryConfig(void)

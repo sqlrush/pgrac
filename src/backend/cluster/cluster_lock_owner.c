@@ -276,9 +276,9 @@ lock_owner_reap(void)
 	}
 }
 
-ClusterLockAcquireResult
-cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
-								   ClusterControlNativeFinish finish, void *argument)
+static ClusterLockAcquireResult
+lock_owner_request_acquire(ClusterLockAcquireRequest *request,
+						   ClusterControlNativeFinish finish, void *argument, bool retain_guard)
 {
 	ClusterLockOwner *owner;
 	ClusterLockAcquireResult result;
@@ -316,20 +316,37 @@ cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
 				|| result == CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
 				result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 			lock_owner_abandon(owner);
-			owner->auto_reap = true;
+			owner->auto_reap = !retain_guard;
 		}
 		*request = owner->request;
 	}
 	PG_CATCH();
 	{
 		lock_owner_abandon(owner);
-		owner->auto_reap = true;
+		owner->auto_reap = !retain_guard;
 		*request = owner->request;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	lock_owner_reap();
 	return result;
+}
+
+ClusterLockAcquireResult
+cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
+								   ClusterControlNativeFinish finish, void *argument)
+{
+	return lock_owner_request_acquire(request, finish, argument, false);
+}
+
+ClusterLockAcquireResult
+cluster_lock_owner_request_acquire_retained(ClusterLockAcquireRequest *request,
+											ClusterControlNativeFinish finish, void *argument)
+{
+	/* The original caller owns this stable guard even if acquisition fails
+	 * or throws. Census may prove terminal retirement, but only that caller
+	 * consumes the guard before releasing its associated local resources. */
+	return lock_owner_request_acquire(request, finish, argument, true);
 }
 
 static ClusterLockOwner *
@@ -542,6 +559,17 @@ cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request)
 	return lock_owner_release_wait(owner, request->timeout_ms, request->wait_event)
 			   ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
 			   : CLUSTER_LOCK_ACQUIRE_PENDING;
+}
+
+ClusterLockAcquireResult
+cluster_lock_owner_request_release_poll(const ClusterLockAcquireRequest *request)
+{
+	ClusterLockOwner *owner = lock_owner_from_guard(request);
+
+	if (owner == NULL)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	return cluster_lock_owner_release_poll(owner) ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+													: CLUSTER_LOCK_ACQUIRE_PENDING;
 }
 
 static ClusterLockAcquireResult lock_owner_install_result(ClusterLockOwner *owner);
@@ -1001,6 +1029,39 @@ lock_owner_trace_walr_release(const ClusterLockOwner *owner, bool enabled,
 					(uint64)INSTR_TIME_GET_MICROSEC(elapsed))));
 }
 
+/* Permanent CF refusal diagnostics; no owner may be inspected after success.
+ * Do not read clocks or drive retirement from an observation. */
+static void
+lock_owner_cf_release_refused(const ClusterLockOwner *owner, const char *reason,
+							  int timeout_ms, int effective_ms)
+{
+	const ClusterLockAcquireRequest *request;
+
+	if (owner == NULL || CritSectionCount != 0
+		|| owner->request.resid.type != CLUSTER_CF_RESID_TYPE)
+		return;
+	request = &owner->request;
+	ereport(LOG,
+		(errmsg("PGRAC_FAMILY=CF_RELEASE task=owner_wait reason=%s owner_release=0"
+				" node=%d pid=%d role=%d proc_exit=%d proc_present=%d latch_present=%d"
+				" resource_type=%u mode=%d request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+				" holder_node=%d holder_procno=%u holder_request=" UINT64_FORMAT
+				" control_owner=" UINT64_FORMAT " state=%d shared=%d"
+				" conversion=%d reconstructable=%d secondary_retiring=%d"
+				" owner_generation=" UINT64_FORMAT
+				" attempt_slot=%u attempt_generation=" UINT64_FORMAT
+				" secondary_slot=%u secondary_generation=" UINT64_FORMAT
+				" timeout_ms=%d effective_ms=%d confirmed=0",
+				reason, cluster_node_id, MyProcPid, (int)MyBackendType, proc_exit_inprogress,
+				MyProc != NULL, MyLatch != NULL, (unsigned)request->resid.type,
+				request->lockmode, request->request_id, request->holder.cluster_epoch,
+				request->holder.node_id, request->holder.procno, request->holder.request_id,
+				request->control_owner_id, (int)owner->state, owner->shared,
+				(int)owner->conversion, owner->reconstructable, owner->secondary_retiring,
+				owner->generation, owner->attempt.slot, owner->attempt.generation,
+				owner->secondary.slot, owner->secondary.generation, timeout_ms, effective_ms)));
+}
+
 /* Preserve the caller's existing release budget, not a retirement deadline.
  * Expiry leaves the exact shared obligation owned and unusable. CONTROL
  * services never sleep on work they themselves must dispatch. */
@@ -1021,6 +1082,7 @@ lock_owner_release_wait(ClusterLockOwner *owner, int timeout_ms, uint32 event)
 		|| MyBackendType == B_LMON || MyBackendType == B_LMS || MyLatch == NULL
 		|| proc_exit_inprogress) {
 		lock_owner_trace_walr_release(owner, trace, &started, "wait_gate", timeout_ms, effective);
+		lock_owner_cf_release_refused(owner, "wait_gate", timeout_ms, effective);
 		return false;
 	}
 	if (effective == 0)
@@ -1036,6 +1098,7 @@ lock_owner_release_wait(ClusterLockOwner *owner, int timeout_ms, uint32 event)
 		now = GetCurrentTimestamp();
 		if (deadline != 0 && now >= deadline) {
 			lock_owner_trace_walr_release(owner, trace, &started, "deadline", timeout_ms, effective);
+			lock_owner_cf_release_refused(owner, "deadline", timeout_ms, effective);
 			return false;
 		}
 		if (deadline != 0)

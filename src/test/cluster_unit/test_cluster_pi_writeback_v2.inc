@@ -1834,7 +1834,9 @@ UT_TEST(writeback_v2_structure_scheduler_yields_or_cancels_without_clearing_ko)
 			ClusterPiWritebackJobV1 *job = wb_active;
 			wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
 			cluster_pi_writeback_release_v1(&job);
-			pfree(abandoned);
+			UT_ASSERT(wb_batch == abandoned);
+			UT_ASSERT(cluster_wal_inputs_job_context_v1(wb_batch->inputs_job) == NULL);
+			UT_ASSERT(cluster_pi_writeback_checkpointer_release_v1());
 		} else {
 			wb_now += 1000000;
 			UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
@@ -2084,12 +2086,14 @@ UT_TEST(writeback_v2_checkpointer_owner_error_preserves_original_offer)
 		goto done;
 	UT_ASSERT(!wb_inputs_pinned[2]);
 	wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(wb_batch == abandoned && wb_active == NULL);
+	UT_ASSERT(cluster_wal_inputs_job_context_v1(wb_batch->inputs_job) == NULL);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_release_v1());
 	UT_ASSERT(wb_batch == NULL && wb_active == NULL && wb_shared->outbound_pid == 0);
 	UT_ASSERT(wb_offer_present && wb_offer_accepted == 0 && !wb_inputs_pinned[2]);
-	/* The backend's native resource/memory owners reclaim these on ERROR.
-	 * This single-process boundary releases only its abandoned allocations. */
+	/* The original callback has cancelled this separate physical job.
+	 * The input job now owns and frees its retained batch header. */
 	cluster_pi_writeback_release_v1(&job);
-	pfree(abandoned);
 done:
 	wb_select(2, B_CHECKPOINTER);
 	cluster_pi_writeback_checkpointer_release_v1();

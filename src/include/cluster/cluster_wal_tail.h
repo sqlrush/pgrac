@@ -79,6 +79,10 @@ extern ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
 										const ClusterControlRootReadToken *token,
 										ClusterWalSourceRef *out, XLogRecPtr *native_redo);
+/* The merge caller owns rollback and any CF retry, including zero mode. */
+extern ClusterControlRootResult cluster_control_root_recovery_source_deadline_v1(
+	const ClusterControlRootSnapshot *expected, const ClusterControlRootReadToken *token,
+	ClusterWalSourceRef *out, XLogRecPtr *native_redo, uint64 deadline_ns);
 
 /* Exact selected origin checkpoint, not the common allocator projection.
  * This is provisional input only: its nextXid is not proof of a TT slot's
@@ -94,6 +98,14 @@ extern ClusterControlRootResult
 cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
 											const ClusterControlRootReadToken *token,
 											ClusterWalRecoveryCheckpointV1 *out);
+
+/* Original typed prepare deadline; provisional source, never authority. */
+extern ClusterControlRootResult cluster_control_root_recovery_checkpoint_deadline_v1(
+	const ClusterControlRootSnapshot *expected, const ClusterControlRootReadToken *token,
+	ClusterWalRecoveryCheckpointV1 *out, uint64 deadline_ns);
+extern ClusterControlRootResult cluster_control_root_recovery_visit_deadline_v1(
+	const ClusterControlRootSnapshot *expected, const ClusterControlRootReadToken *token,
+	ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out, uint64 deadline_ns);
 
 /* Startup-only physical input, never a close/recovery/serving permission.
  * Zero maxima mean no PARAMETER_CHANGE record was observed; the caller must

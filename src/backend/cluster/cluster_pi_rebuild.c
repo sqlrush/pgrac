@@ -15,6 +15,7 @@
 #include "storage/buffile.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "cluster_wal_inputs_job_payload_private.h"
 
 #define PI_REBUILD_BATCH 64
 
@@ -31,6 +32,7 @@ typedef struct PiRebuildJob {
 	ClusterWalSourceRef local;
 	ClusterWalSourceRef source;
 	ClusterWalInputsV1 *inputs;
+	ClusterWalInputsJobV1 *inputs_job;
 	BufFile *spool;
 	PiRebuildContribution batch[PI_REBUILD_BATCH];
 	PiRebuildContribution pending;
@@ -49,6 +51,10 @@ typedef struct PiRebuildJob {
 	TimestampTz started;
 } PiRebuildJob;
 
+StaticAssertDecl(sizeof(PiRebuildJob)
+				 <= CLUSTER_WAL_INPUT_JOB_REBUILD_BYTES,
+				 "WAL input rebuild exceeds its payload envelope");
+
 static PiRebuildJob *pi_rebuild_job;
 static bool pi_rebuild_callback_registered;
 static bool pi_rebuild_logged;
@@ -58,27 +64,62 @@ static ClusterGrdPiRebuildCutV1 pi_rebuild_apply_logged_cut;
 static bool pi_rebuild_plan_logged;
 static ClusterGrdPiRebuildCutV1 pi_rebuild_plan_logged_cut;
 
-static void
+static bool
 pi_rebuild_release(void)
 {
+	ClusterWalInputsJobV1 *job;
+	ClusterWalInputsJobResultV1 result;
 	if (pi_rebuild_job == NULL)
-		return;
-	if (pi_rebuild_job->spool != NULL)
+		return true;
+	job = pi_rebuild_job->inputs_job;
+	if (pi_rebuild_job->owner != CurrentResourceOwner
+		|| !cluster_wal_inputs_job_consumer_matches_v1(job, WAL_INPUT_JOB_PI_REBUILD))
+		elog(FATAL, "invalid original PI rebuild release identity");
+	if (pi_rebuild_job->spool != NULL) {
 		BufFileClose(pi_rebuild_job->spool);
-	cluster_wal_inputs_release_v1(&pi_rebuild_job->inputs);
-	pfree(pi_rebuild_job);
+		pi_rebuild_job->spool = NULL;
+	}
+	result = cluster_wal_inputs_job_retire_v1(job);
+	if (result == WAL_INPUT_JOB_INVALID)
+		elog(FATAL, "invalid original PI rebuild retirement");
+	if (result != WAL_INPUT_JOB_DONE)
+		return false;
 	pi_rebuild_job = NULL;
+	if (cluster_wal_inputs_job_finish_v1(&job) != WAL_INPUT_JOB_DONE)
+		elog(FATAL, "invalid original PI rebuild completion");
+	return true;
+}
+
+/* Failure waiting belongs to this original business header, not input
+ * authority. DONE retains it until the immutable ROOT baseline changes. */
+static bool
+pi_rebuild_failed_wait(void)
+{
+	ClusterWalInputsJobResultV1 retired = cluster_wal_inputs_job_wait_failed_v1(pi_rebuild_job->inputs_job);
+	ClusterControlRootResult result;
+
+	if (retired == WAL_INPUT_JOB_INVALID)
+		elog(FATAL, "invalid failed PI rebuild input cleanup");
+	if (retired == WAL_INPUT_JOB_PENDING)
+		return true;
+	result = cluster_wal_inputs_job_failed_root_v1(pi_rebuild_job->inputs_job);
+	return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY || result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+		|| result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 }
 
 static void
 pi_rebuild_owner_release(ResourceReleasePhase phase, bool is_commit pg_attribute_unused(),
 						 bool is_top_level pg_attribute_unused(), void *arg pg_attribute_unused())
 {
-	/* Native file/input owners release resources before this memory context
-	 * is reset. No retry may retain any pointer from a failed owner. */
 	if (phase == RESOURCE_RELEASE_BEFORE_LOCKS && pi_rebuild_job != NULL
-		&& pi_rebuild_job->owner == CurrentResourceOwner)
-		pi_rebuild_job = NULL;
+		&& pi_rebuild_job->owner == CurrentResourceOwner) {
+		if (!cluster_wal_inputs_job_owner_revoke_v1(pi_rebuild_job->inputs_job,
+				WAL_INPUT_JOB_PI_REBUILD, !is_commit))
+			elog(FATAL, "invalid original PI rebuild input cleanup");
+		/* Native file cleanup/reset owns this borrow. Never close it again. */
+		pi_rebuild_job->spool = NULL;
+		pi_rebuild_job->inputs = NULL;
+	}
 }
 
 static void
@@ -218,6 +259,14 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 	ClusterPiRebuildProgressV1 progress = CLUSTER_PI_REBUILD_WAIT;
 	int state;
 
+	if (pi_rebuild_job != NULL
+		&& !cluster_wal_inputs_job_consumer_matches_v1(pi_rebuild_job->inputs_job, WAL_INPUT_JOB_PI_REBUILD))
+		elog(FATAL, "invalid original PI rebuild caller binding");
+	if (pi_rebuild_job != NULL
+		&& cluster_wal_inputs_job_context_v1(pi_rebuild_job->inputs_job) == NULL
+		&& (!pi_rebuild_job->plan_blocked
+			|| (pi_rebuild_job->inputs_job->flags & (WAL_INPUT_JOB_FLAG_ERROR | WAL_INPUT_JOB_FLAG_CANCELLED)) != 0))
+		return pi_rebuild_release() ? CLUSTER_PI_REBUILD_IDLE : CLUSTER_PI_REBUILD_WAIT;
 	if (MyBackendType != B_BG_WRITER || !cluster_enabled || !cluster_shared_config
 		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
 		return CLUSTER_PI_REBUILD_IDLE;
@@ -239,9 +288,24 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		&& (pi_rebuild_job->owner != CurrentResourceOwner
 			|| memcmp(&pi_rebuild_job->cut, &cut, sizeof(cut)) != 0
 			|| memcmp(&pi_rebuild_job->local, &local, sizeof(local)) != 0))
-		pi_rebuild_release();
+		if (!pi_rebuild_release())
+			return CLUSTER_PI_REBUILD_WAIT;
 	if (pi_rebuild_job == NULL) {
-		PiRebuildJob *job = palloc0(sizeof(*job));
+		ClusterWalInputsJobV1 *inputs_job = NULL;
+		PiRebuildJob *job;
+		result = cluster_wal_inputs_job_open_aux_v1(WAL_INPUT_JOB_PI_REBUILD, &inputs_job);
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT && inputs_job != NULL) {
+			ClusterWalInputsJobResultV1 retired = cluster_wal_inputs_job_retire_v1(inputs_job);
+			if (retired == WAL_INPUT_JOB_INVALID
+				|| (retired == WAL_INPUT_JOB_DONE
+					&& cluster_wal_inputs_job_finish_v1(&inputs_job) != WAL_INPUT_JOB_DONE))
+				elog(FATAL, "invalid unbound PI rebuild cleanup");
+			return CLUSTER_PI_REBUILD_WAIT;
+		}
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			elog(FATAL, "invalid original PI rebuild auxiliary caller");
+		job = MemoryContextAllocZero(cluster_wal_inputs_job_context_v1(inputs_job), sizeof(*job));
+		job->inputs_job = inputs_job;
 		job->owner = CurrentResourceOwner;
 		job->started = GetCurrentTimestamp();
 		job->cut = cut;
@@ -250,8 +314,9 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 	}
 	if (pi_rebuild_job->plan_blocked)
 		goto failed;
-	if (pi_rebuild_job->inputs == NULL) {
-		result = cluster_wal_inputs_begin_v1(local.claim.identity.storage_uuid,
+	if (pi_rebuild_job->inputs_job->state == WAL_INPUT_JOB_STATE_NEW) {
+		result = cluster_wal_inputs_job_begin_v1(pi_rebuild_job->inputs_job,
+											   local.claim.identity.storage_uuid,
 											 local.claim.identity.system_identifier,
 											 &pi_rebuild_job->inputs);
 		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
@@ -262,7 +327,7 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 			goto done;
 		}
 	}
-	result = cluster_wal_inputs_resume_v1(pi_rebuild_job->inputs);
+	result = cluster_wal_inputs_job_resume_v1(pi_rebuild_job->inputs_job, &pi_rebuild_job->inputs);
 	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 		goto wait;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
@@ -279,6 +344,7 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 			if (detail == RF_PAGE_PROOF_DETAIL_OK)
 				goto done;
 			pi_rebuild_job->plan_blocked = true;
+			pi_rebuild_job->inputs_job->original_result = result;
 			goto failed;
 		}
 		/* A failed physical suffix has made no directory additions. Spill
@@ -292,7 +358,7 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		pi_rebuild_job->scanned = true;
 	}
 	if (!cluster_grd_pi_rebuild_current_v1(&cut)
-		|| cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs)
+		|| cluster_wal_inputs_job_revalidate_v1(pi_rebuild_job->inputs_job)
 			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	for (; budget > 0 && pi_rebuild_job->cursor < pi_rebuild_job->total; budget--) {
@@ -316,7 +382,7 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		progress = CLUSTER_PI_REBUILD_MORE;
 		goto wait;
 	}
-	if (cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+	if (cluster_wal_inputs_job_revalidate_v1(pi_rebuild_job->inputs_job) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& cluster_grd_pi_rebuild_complete_v1(&cut)) {
 		/* The fault-cut reading: census and registration of this cut. */
 		ereport(DEBUG1,
@@ -333,21 +399,18 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		cluster_lmon_wakeup();
 	}
 done:
-	pi_rebuild_release();
-	return CLUSTER_PI_REBUILD_IDLE;
+	return pi_rebuild_release() ? CLUSTER_PI_REBUILD_IDLE : CLUSTER_PI_REBUILD_WAIT;
 failed:
-	result = cluster_wal_inputs_wait_failed_v1(pi_rebuild_job->inputs);
-	if (result == CLUSTER_CONTROL_ROOT_STALE_TOKEN
-		|| result == CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT)
-		goto done;
-	return CLUSTER_PI_REBUILD_WAIT;
+	if (pi_rebuild_failed_wait())
+		return CLUSTER_PI_REBUILD_WAIT;
+	goto done;
 blocked:
 	if (!cluster_grd_pi_rebuild_current_v1(&cut)
-		|| cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs)
+		|| cluster_wal_inputs_job_revalidate_v1(pi_rebuild_job->inputs_job)
 			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 wait:
-	if (cluster_wal_inputs_suspend_v1(pi_rebuild_job->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (cluster_wal_inputs_job_suspend_v1(pi_rebuild_job->inputs_job) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	return progress;
 }

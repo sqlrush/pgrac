@@ -52,6 +52,7 @@ char *cluster_wal_threads_dir = "/fixture/wal";
 char *cluster_shared_data_dir = "/fixture/data";
 int cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS;
 int cluster_external_fence_acquire_timeout_ms = 5000;
+int cluster_recovery_merge_wait_timeout = 10000;
 int cluster_cssd_heartbeat_interval_ms = 1000;
 int cluster_cssd_dead_deadband_factor = 3;
 int cluster_node_id = 0;
@@ -67,6 +68,66 @@ static uint64 fence_owner_boot;
 uint64 cluster_qvotec_get_self_incarnation(void) { return fence_owner_boot; }
 uint64 cluster_cf_owner_cookie(LOCKMODE mode pg_attribute_unused()) { return 0; }
 
+
+/* These metadata-only TUs never model a pending CF owner. The actual
+ * projection continuation is linked to CF/owner/CONTROL in Startup tests. */
+bool cluster_enabled = true;
+bool cluster_controlfile_shared_authority = true;
+bool InRecovery;
+volatile sig_atomic_t ShutdownRequestPending;
+BackendType MyBackendType = B_INVALID;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+PGPROC *MyProc;
+LWLockPadded *MainLWLockArray;
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	(void)lock;
+	abort();
+}
+bool
+cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out)
+{
+	(void)before;
+	(void)out;
+	abort();
+}
+bool
+cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *attempt)
+{
+	(void)attempt;
+	abort();
+}
+bool
+cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller, ClusterCfRetirementSnapshot *out)
+{
+	(void)mode;
+	(void)caller;
+	(void)out;
+	abort();
+}
+bool
+cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
+{
+	(void)mode;
+	(void)cookie;
+	abort();
+}
+void
+cluster_cf_retirement_poll(void)
+{
+	abort();
+}
+void
+cluster_lock_owners_service_poll(void)
+{
+	abort();
+}
+bool
+cluster_recovery_transport_components_current(void)
+{
+	abort();
+}
 
 /* ---- fixture state ---- */
 static ClusterRecoveryPlan census;
@@ -122,6 +183,10 @@ static char formation_obj[NODES + 1];
 static char needs_obj[NODES + 1];
 static char admissions_obj[NODES + 1];
 static char pin_obj;
+static bool deadline_serial_leaf;
+static int deadline_formation_budget[NODES + 1];
+static int deadline_admission_budget[NODES + 1];
+static int deadline_ir_budget, deadline_ir_release_budget;
 
 /* ---- ereport capture ---- */
 static jmp_buf fatal_jump;
@@ -303,6 +368,11 @@ ClusterFormationWitnessResult cluster_authority_startup_refresh_recovery(int tim
 { UT_ASSERT(!cold_cf_held); UT_ASSERT(timeout_ms > 0); return CLUSTER_FORMATION_WITNESS_READY; }
 bool cluster_cf_lock(LOCKMODE mode)
 { UT_ASSERT_EQ(mode, ShareLock); UT_ASSERT(!cold_cf_held); cold_cf_held = true; return true; }
+bool
+cluster_cf_lock_deadline_v1(LOCKMODE mode, uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_cf_lock(mode);
+}
 bool cluster_cf_held(LOCKMODE mode)
 { return mode == ShareLock && cold_cf_held; }
 bool cluster_cf_held_is_clusterwide(LOCKMODE mode)
@@ -436,6 +506,27 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* Budget propagation is exercised with actual ROOT/CF in the Startup test.
+ * These legacy tests keep their original metadata and deadline boundaries. */
+ClusterControlRootResult
+cluster_control_root_lookup_owner_deadline_v1(int32 node, ClusterControlRootIdentity *identity,
+											  ClusterControlRootSnapshot *snapshot,
+											  ClusterControlRootReadToken *token,
+											  uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_control_root_lookup_owner_by_node_runtime(node, identity, snapshot, token);
+}
+ClusterControlRootResult
+cluster_control_root_v3_read_canonical_deadline_v1(uint16 thread,
+												   const ClusterControlRootIdentity *expected,
+												   ClusterControlRootSnapshot *snapshot,
+												   ClusterControlRootReadToken *token,
+												   uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_control_root_read_canonical(thread, expected, CLUSTER_CONTROL_ROOT_READ_STRONG,
+											   snapshot, token);
+}
+
 /* The source proof needs a sealed, tail-validated generation. */
 ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
@@ -445,6 +536,10 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 	uint16 tid = expected->identity.origin_thread_id;
 
 	UT_ASSERT(tid > 1 && tid <= NODES);
+#ifdef TEST_MERGE_DEADLINE
+	if (deadline_source_hook != NULL)
+		deadline_source_hook();
+#endif
 	source_calls[tid]++;
 	memset(out, 0, sizeof(*out));
 	*native_redo = InvalidXLogRecPtr;
@@ -457,6 +552,14 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 	out->timeline = expected->checkpoint_tli;
 	*native_redo = redo[tid];
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+ClusterControlRootResult
+cluster_control_root_recovery_source_deadline_v1(const ClusterControlRootSnapshot *expected,
+												 const ClusterControlRootReadToken *token,
+												 ClusterWalSourceRef *out, XLogRecPtr *native_redo,
+												 uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_control_root_recovery_source_v1(expected, token, out, native_redo);
 }
 
 static uint16
@@ -557,6 +660,27 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* Physical metadata leaves for the explicit cold caller. No pending CF is
+ * modeled here; the Startup fixture links that path to actual CF/owner. */
+ClusterControlRootResult
+cluster_control_root_v3_failure_open_deadline_v1(const ClusterRecoverySerialRequest *request,
+												 ClusterControlRootSnapshot *out,
+												 ClusterControlRootReadToken *token,
+												 uint64 deadline_ns)
+{
+	(void)deadline_ns;
+	return cluster_control_root_v3_failure_open_publish(request, out, token);
+}
+ClusterControlRootResult
+cluster_control_root_v3_failure_tail_deadline_v1(const ClusterRecoverySerialRequest *request,
+												 ClusterControlRootSnapshot *out,
+												 ClusterControlRootReadToken *token,
+												 uint64 deadline_ns)
+{
+	(void)deadline_ns;
+	return cluster_control_root_v3_failure_tail_publish(request, out, token);
+}
+
 /* ---- external write exclusion ---- */
 static PgracExternalFenceNeedSetResult cold_need_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 static const char *cold_need_predicate = "NONE";
@@ -587,6 +711,7 @@ cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread,
 													ClusterFormationWitnessV1 **out)
 {
 	UT_ASSERT(cluster_shared_config);
+	deadline_formation_budget[origin_thread] = timeout_ms;
 	UT_ASSERT(origin_thread > 1 && origin_thread <= NODES);
 	cold_formations_built++;
 	formations_built++;
@@ -670,6 +795,7 @@ cluster_external_fence_admit_set_wait(const PgracExternalFenceNeedSetV1 *needs,
 
 	UT_ASSERT_EQ(fence_thread(formation, formation_obj), tid);
 	event("admit:%u;", (unsigned)tid);
+	deadline_admission_budget[tid] = timeout_ms;
 	*out = (PgracExternalFenceAdmissionSetV1 *)&admissions_obj[tid];
 	return PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED;
 }
@@ -767,6 +893,13 @@ cluster_thread_recovery_root_complete_patch_build_v1(
 	return true;
 }
 
+bool
+cluster_wal_retention_pin_sealed_current_v1(ClusterWalRetentionPin *pin)
+{
+	return pin == (ClusterWalRetentionPin *)&pin_obj && pin_sealed
+		   && ir_release_result == CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED;
+}
+
 ClusterWalPinResult
 cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin)
 {
@@ -844,7 +977,31 @@ cluster_recovery_serial_acquire_set(
 	ClusterRecoverySerialGuardSet *set pg_attribute_unused(),
 	uint16 *failed_index pg_attribute_unused())
 {
+	if (deadline_serial_leaf) {
+		deadline_ir_budget = overall_acquire_timeout_ms;
+		deadline_ir_release_budget = requests[0].release_timeout_ms;
+		memset(set, 0, sizeof(*set));
+		set->count = count;
+		set->release_timeout_ms = requests[0].release_timeout_ms;
+		for (uint16 i = 0; i < count; i++) {
+			UT_ASSERT_EQ(requests[i].acquire_timeout_ms, overall_acquire_timeout_ms);
+			set->guards[i].held = true;
+		}
+		*failed_index = CLUSTER_RECOVERY_SERIAL_SET_FAILED_NONE;
+		return CLUSTER_RECOVERY_SERIAL_GRANTED;
+	}
 	UNREACHED();
+}
+
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire_set_deadline_v1(const ClusterRecoverySerialRequest *requests,
+												uint16 count, int overall_acquire_timeout_ms,
+												ClusterRecoverySerialGuardSet *set,
+												uint16 *failed_index,
+												uint64 deadline_ns pg_attribute_unused())
+{
+	return cluster_recovery_serial_acquire_set(requests, count, overall_acquire_timeout_ms, set,
+											   failed_index);
 }
 
 bool
@@ -858,6 +1015,8 @@ cluster_thread_recovery_pin_request_build_v1(
 	ClusterWalRetentionInterval *interval pg_attribute_unused(),
 	ClusterWalRetentionPinThreadRequest *out pg_attribute_unused())
 {
+	if (deadline_serial_leaf)
+		return true;
 	UNREACHED();
 }
 
@@ -866,6 +1025,10 @@ cluster_wal_retention_pin_acquire(
 	const ClusterWalRetentionPinThreadRequest *requests pg_attribute_unused(),
 	uint16 nthreads pg_attribute_unused(), ClusterWalRetentionPin **out_pin pg_attribute_unused())
 {
+	if (deadline_serial_leaf) {
+		*out_pin = (ClusterWalRetentionPin *)&pin_obj;
+		return CLUSTER_WAL_PIN_OK;
+	}
 	UNREACHED();
 }
 
@@ -874,6 +1037,24 @@ cluster_wal_retention_pin_acquire_inputs_v1(
 	const ClusterWalRetentionPinThreadRequest *requests pg_attribute_unused(),
 	uint16 nthreads pg_attribute_unused(), const uint16 *input_threads pg_attribute_unused(),
 	uint16 ninput_threads pg_attribute_unused(), ClusterWalRetentionPin **out_pin pg_attribute_unused())
+{
+	UNREACHED();
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_acquire_deadline_v1(const ClusterWalRetentionPinThreadRequest *requests,
+											  uint16 count, const uint16 *threads, uint16 nthreads,
+											  ClusterWalRetentionPin **out,
+											  uint64 deadline_ns pg_attribute_unused())
+{
+	return nthreads ? cluster_wal_retention_pin_acquire_inputs_v1(requests, count, threads,
+																  nthreads, out)
+					: cluster_wal_retention_pin_acquire(requests, count, out);
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_preflight_deadline_v1(ClusterWalRetentionPin *pin pg_attribute_unused(),
+												uint64 deadline_ns pg_attribute_unused())
 {
 	UNREACHED();
 }
@@ -889,6 +1070,8 @@ ClusterWalPinResult
 cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin pg_attribute_unused(),
 								   ClusterRecoverySerialGuardSet *held_set pg_attribute_unused())
 {
+	if (deadline_serial_leaf)
+		return CLUSTER_WAL_PIN_OK;
 	UNREACHED();
 }
 

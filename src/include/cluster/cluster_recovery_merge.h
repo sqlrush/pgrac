@@ -475,6 +475,10 @@ cluster_merge_claim_classify(const void *buf, size_t len, uint64 expected_sysid)
 /* Backend engine (cluster_recovery_merge.c). */
 typedef struct ClusterRecoveryMergeState ClusterRecoveryMergeState;
 typedef struct ClusterRecoveryFencePlan ClusterRecoveryFencePlan;
+/* Copy this caller's original cold Startup deadline for readonly pass 1.
+ * Zero is one complete attempt; false supplies no budget or authority. */
+extern bool cluster_recovery_merge_fence_plan_deadline_v1(const ClusterRecoveryFencePlan *plan,
+														  uint64 *deadline_ns);
 
 /* Engage decision (spec-4.5 §3.1).  Computed at the top of
  * PerformWalRecovery before the redo loop.  ENGAGE means: merged
@@ -518,6 +522,11 @@ extern bool cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFenc
 extern bool cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
 	ClusterRecoveryFencePlan *plan, const uint16 *input_threads, uint16 ninput_threads);
 extern bool cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan);
+/* Startup's original input union. A typed CF slice surrenders the old IR/pin,
+ * waits only without IR, and reacquires before the unchanged commit proof. */
+extern bool cluster_recovery_merge_commit_plan_inputs_v1(ClusterRecoveryFencePlan *plan,
+														 const uint16 *input_threads,
+														 uint16 ninput_threads);
 /* Borrowed diagnostic only, valid until plan destruction. Empty before the
  * first refusal; copied before cleanup by the original Startup FATAL. */
 extern const char *
@@ -572,8 +581,16 @@ typedef enum ClusterRecoveryFenceCompleteV1 {
 	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_SEAL = 4,
 	CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE = 5, /* release not confirmed */
 	CLUSTER_RECOVERY_FENCE_COMPLETE_FINALIZE = 6,
-	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE = 7
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE = 7,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_SOURCE = 8
 } ClusterRecoveryFenceCompleteV1;
+
+typedef bool (*ClusterRecoveryPostIrCheckV1)(void *arg, ClusterRecoveryFencePlan *plan);
+extern bool cluster_recovery_merge_fence_plan_publish_current_v1(ClusterRecoveryFencePlan *plan);
+extern ClusterRecoveryFenceCompleteV1
+cluster_recovery_merge_fence_plan_complete_checked_v1(ClusterRecoveryFencePlan *plan,
+													  ClusterRecoveryPostIrCheckV1 check, void *arg,
+													  uint16 *failed_thread, int *failed_detail);
 
 extern ClusterRecoveryFenceCompleteV1
 cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, uint16 *failed_thread,

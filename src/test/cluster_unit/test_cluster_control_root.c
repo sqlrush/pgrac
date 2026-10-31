@@ -5,6 +5,10 @@
  *
  *-------------------------------------------------------------------------
  */
+#ifdef PGRAC_CONTROL_ROOT_RENAME_WRAP
+/* GNU ld must retain both the real common helpers and this fault boundary. */
+#define durable_rename __wrap_durable_rename
+#endif
 #include "postgres.h"
 #include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster/cluster_wal_writer.h"
@@ -65,6 +69,36 @@
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "../../backend/cluster/cluster_recovery_anchor_private.h"
+#include "../../backend/cluster/cluster_wal_inputs_job_private.h"
+#include "../../backend/cluster/cluster_wal_cut_job_private.h"
+
+/* This immutable-file fixture creates only legacy, non-job scopes. Actual
+ * original job ownership is exercised by the separate job-body fixtures. */
+bool
+cluster_wal_inputs_job_scope_matches_v1(ClusterWalInputsJobV1 *job,
+	const ClusterWalInputsV1 *scope, bool building)
+{
+	(void)job; (void)scope; (void)building;
+	abort(); /* Entering this unsupported boundary cannot manufacture proof. */
+}
+/* Preserve this legacy-only file fixture: job admission and remote ownership
+ * are exercised with actual bodies in the separate job lifecycle fixture. */
+MemoryContext cluster_wal_inputs_job_context_v1(ClusterWalInputsJobV1 *job)
+{ (void)job; abort(); }
+ClusterControlRootResult cluster_wal_inputs_job_revalidate_prepare_v1(
+	ClusterWalInputsJobV1 *job, ClusterWalInputsV1 **scope)
+{ (void)job; (void)scope; abort(); }
+ClusterControlRootResult cluster_wal_inputs_job_cf_prepare_v1(ClusterWalInputsJobV1 *job, uint64 *before)
+{ (void)job; (void)before; abort(); }
+ClusterCfJobResultV1 cluster_wal_inputs_job_cf_release_v1(ClusterWalInputsJobV1 *job, uint64 before)
+{ (void)job; (void)before; abort(); }
+bool cluster_wal_inputs_job_begin_outcome_v1(ClusterWalInputsJobV1 *job, uint32 result, bool error)
+{ (void)job; (void)result; (void)error; abort(); }
+bool cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *observation)
+{ (void)observation; abort(); }
+ClusterControlRootResult cluster_wal_cut_begin_in_context_v1(const ClusterWalSourceRef *source,
+	MemoryContext context, ClusterWalCutV1 **out)
+{ (void)source; (void)context; (void)out; abort(); }
 
 #undef printf
 #undef fprintf

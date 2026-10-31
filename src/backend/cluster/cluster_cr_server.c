@@ -3228,7 +3228,8 @@ lms_ordinary_verdict_refusal(const ClusterLmsCrSlot *slot, const char *predicate
 		 " predicate=%s sqlerrcode=%d scan_sampled=%d scan=%d matched_segment=%u "
 		 "matched_slot=%u matched_wrap=%u resolved=" UINT64_FORMAT
 		 " commit_sampled=%d did_commit=%d abort_sampled=%d did_abort=%d "
-		 "horizon=" UINT64_FORMAT " authority_scn=" UINT64_FORMAT " detail_budget_exhausted=%d",
+		 "horizon=" UINT64_FORMAT " authority_scn=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u detail_budget_exhausted=%d",
 		 cluster_node_id, slot->requester_node, slot->requester_backend, slot->request_id,
 		 slot->undo_xid, slot->undo_segment_id, slot->undo_block_no, slot->epoch, predicate,
 		 sqlerrcode, d != NULL, d == NULL ? -1 : (int)d->resolve,
@@ -3236,7 +3237,8 @@ lms_ordinary_verdict_refusal(const ClusterLmsCrSlot *slot, const char *predicate
 		 d == NULL ? 0 : d->matched_wrap, (uint64)(d == NULL ? 0 : d->resolved_scn),
 		 d != NULL && d->commit_sampled, d != NULL && d->did_commit, d != NULL && d->abort_sampled,
 		 d != NULL && d->did_abort, (uint64)(d == NULL ? 0 : d->horizon_scn),
-		 (uint64)slot->undo_auth.authority_scn, emitted == 64);
+		 (uint64)slot->undo_auth.authority_scn, slot->tag.spcOid, slot->tag.dbOid,
+		 slot->tag.relNumber, (unsigned)slot->tag.forkNum, slot->tag.blockNum, emitted == 64);
 }
 
 static bool
@@ -3838,6 +3840,80 @@ cr_serve_slot_impl(ClusterLmsCrSlot *slot)
 	}
 }
 
+/* Stack copies only, never a slot owner or transaction proof. Queued callers
+ * copy before FREE, then emit after the entire original ship loop; inline
+ * callers emit after scratch reset. A throwing LOG cannot retain those slots
+ * or scratch bytes. No R4 slot generation is attributed to this legacy family. */
+typedef struct LmsOrdinaryReplyObservation {
+	bool ordinary;
+	BufferTag tag;
+	uint64 request_id;
+	uint64 epoch;
+	int32 requester_node;
+	int32 requester_backend;
+	int32 reply_master_node;
+	TransactionId xid;
+	uint32 segment;
+	uint32 block;
+	uint8 transition_id;
+	uint8 result_status;
+	ClusterICSendResult send_result;
+} LmsOrdinaryReplyObservation;
+
+static void
+cr_ordinary_reply_capture(LmsOrdinaryReplyObservation *d, const ClusterLmsCrSlot *slot)
+{
+	d->ordinary = slot->req_kind == CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT && !slot->undo_authoritative
+				  && slot->undo_owner < 0 && !SCN_VALID(slot->read_scn);
+	if (!d->ordinary)
+		return;
+	d->tag = slot->tag;
+	d->request_id = slot->request_id;
+	d->epoch = slot->epoch;
+	d->requester_node = slot->requester_node;
+	d->requester_backend = slot->requester_backend;
+	d->reply_master_node = slot->reply_master_node;
+	d->xid = slot->undo_xid;
+	d->segment = slot->undo_segment_id;
+	d->block = slot->undo_block_no;
+	d->transition_id = slot->transition_id;
+	d->result_status = slot->result_status;
+}
+
+static void
+cr_ordinary_reply_emit(const LmsOrdinaryReplyObservation *d, const char *path)
+{
+	static uint32 emitted;
+
+	if (!d->ordinary
+		|| (d->result_status == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
+			&& (d->send_result == CLUSTER_IC_SEND_DONE
+				|| d->send_result == CLUSTER_IC_SEND_WOULD_BLOCK))
+		|| emitted >= 64)
+		return;
+	emitted++; /* Output attempts, including a throwing LOG; not a failure count. */
+	elog(LOG,
+		 "PGRAC ordinary TT reply: path=%s node=%d requester=%d backend=%d request=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u xid=%u decoded_xid_valid=%d request_segment=%u request_block=%u"
+		 " request_epoch=" UINT64_FORMAT " master=%d transition=%u reply_status=%u send_result=%d"
+		 " detail_budget_exhausted=%d",
+		 path, cluster_node_id, d->requester_node, d->requester_backend, d->request_id,
+		 d->tag.spcOid, d->tag.dbOid, d->tag.relNumber, (unsigned)d->tag.forkNum, d->tag.blockNum,
+		 d->xid, TransactionIdIsNormal(d->xid), d->segment, d->block, d->epoch,
+		 d->reply_master_node, (unsigned)d->transition_id, (unsigned)d->result_status,
+		 (int)d->send_result, emitted == 64);
+}
+
+static void
+cr_ordinary_reply_note(const ClusterLmsCrSlot *slot, const char *path, ClusterICSendResult result)
+{
+	LmsOrdinaryReplyObservation observation = { 0 };
+
+	cr_ordinary_reply_capture(&observation, slot);
+	observation.send_result = result;
+	cr_ordinary_reply_emit(&observation, path);
+}
+
 /*
  * cr_build_and_send_reply — build the standard GCS_BLOCK_REPLY (header +
  * BLCKSZ page, + ClusterGcsUndoAuthTrailer for served undo kinds) with the
@@ -3846,13 +3922,14 @@ cr_serve_slot_impl(ClusterLmsCrSlot *slot)
  * checksum (the requester never consumes DENIED bytes).  Shared by the
  * CONTROL-plane LMON ship and the D6 DATA-plane inline serve.
  */
-static void
+static ClusterICSendResult
 cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 {
 	uint32 header_len = (uint32)sizeof(GcsBlockReplyHeader);
 	uint32 total = header_len + GCS_BLOCK_DATA_SIZE;
 	char *buf;
 	GcsBlockReplyHeader *hdr;
+	ClusterICSendResult result;
 
 	/* spec-6.12i: a served undo-TT fetch / undo verdict appends the authority
 	 * trailer (tt_generation); DENIED undo replies stay v1-sized. */
@@ -3894,10 +3971,11 @@ cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 	/* GCS serve-stall round-5: share the block-family send admission
 	 * accounting (an admitted reply is queued;  a refused one is the
 	 * capacity red flag the S3 gate watches). */
-	cluster_gcs_block_note_send_outcome(
-		GCS_BLOCK_SEND_FAMILY_REPLY,
-		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node, buf, total));
+	result
+		= cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node, buf, total);
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, result);
 	pfree(buf);
+	return result;
 }
 
 /* Sample only the existing deferral, at geometrically spaced observations.
@@ -4035,6 +4113,8 @@ cluster_lms_cr_drain(void)
 void
 cluster_lms_cr_ship_ready(void)
 {
+	LmsOrdinaryReplyObservation observations[CLUSTER_LMS_CR_SLOTS] = { 0 };
+
 	if (CrServerShared == NULL)
 		return;
 
@@ -4045,10 +4125,13 @@ cluster_lms_cr_ship_ready(void)
 			continue;
 		pg_read_barrier();
 
-		cr_build_and_send_reply(slot);
+		cr_ordinary_reply_capture(&observations[i], slot);
+		observations[i].send_result = cr_build_and_send_reply(slot);
 
 		pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_FREE);
 	}
+	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++)
+		cr_ordinary_reply_emit(&observations[i], "QUEUED");
 }
 
 /*
@@ -4421,9 +4504,15 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	SCN pair_scn = InvalidScn;
 	bool inject_refuse;
 	TimestampTz serve_started_at;
+	ClusterICSendResult reply_result;
+	bool ordinary_reply;
 
 	if (fwd == NULL)
 		return;
+	/* Slot defaults do not identify a family before the fence/decode. Keep
+	 * only the original payload discriminator, never an authority decision. */
+	ordinary_reply = GcsBlockForwardPayloadIsUndoVerdictRequest(fwd)
+					 && !GcsBlockForwardPayloadIsUndoVerdictAuthoritative(fwd);
 
 	/*
 	 * PGRAC: spec-7.3 D5 (review P2-1) — per-worker shard routing guard,
@@ -4502,10 +4591,12 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	if ((cluster_write_fence_enforcing() && !cluster_write_fence_allowed()) || inject_refuse) {
 		cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_FENCE_REFUSED);
 		old = MemoryContextSwitchTo(cr_serve_scratch_context());
-		cr_build_and_send_reply(&slot); /* slot.result_status == DENIED */
+		reply_result = cr_build_and_send_reply(&slot); /* slot.result_status == DENIED */
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(CrServeScratchCtx);
 		cluster_lms_obs_note_direct_reply(); /* spec-7.3 D8 */
+		if (ordinary_reply)
+			cr_ordinary_reply_note(&slot, "INLINE_FENCE", reply_result);
 		return;
 	}
 
@@ -4614,10 +4705,12 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 		cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_FENCE_REFUSED);
 	}
 inline_deny_no_serve:
-	cr_build_and_send_reply(&slot);
+	reply_result = cr_build_and_send_reply(&slot);
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(CrServeScratchCtx);
 	cluster_lms_obs_note_direct_reply(); /* spec-7.3 D8 */
+	if (ordinary_reply)
+		cr_ordinary_reply_note(&slot, "INLINE", reply_result);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

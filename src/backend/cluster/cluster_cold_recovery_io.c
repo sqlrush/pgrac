@@ -557,11 +557,11 @@ cold_scan_checkpoint_valid(const ClusterControlRootSnapshot *root,
 		   && checkpoint->checkpoint.ThisTimeLineID == root->checkpoint_tli;
 }
 
-ClusterColdDetailV1
-cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
-						  const ClusterControlRootSnapshot *root,
-						  const ClusterControlRootReadToken *token, bool space_active, bool foreign,
-						  struct RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
+static ClusterColdDetailV1
+cold_scan_root(ClusterColdPlanV1 *plan, uint32 participant, const ClusterControlRootSnapshot *root,
+			   const ClusterControlRootReadToken *token, bool space_active, bool foreign,
+			   struct RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result,
+			   const uint64 *deadline)
 {
 	ColdScanWork *work;
 	ClusterWalTailObservation observed;
@@ -573,7 +573,10 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	memset(result, 0, sizeof(*result));
 	if (plan == NULL || root == NULL || token == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
-	visit = cluster_control_root_recovery_checkpoint_v1(root, token, &checkpoint);
+	visit = deadline != NULL
+				? cluster_control_root_recovery_checkpoint_deadline_v1(root, token, &checkpoint,
+																	   *deadline)
+				: cluster_control_root_recovery_checkpoint_v1(root, token, &checkpoint);
 	result->root_result = (int)visit;
 	if (visit != CLUSTER_CONTROL_ROOT_OK_PRIMARY || !cold_scan_checkpoint_valid(root, &checkpoint))
 		return CLUSTER_COLD_SOURCE_GAP;
@@ -584,8 +587,32 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	work->source_thread = root->identity.origin_thread_id;
 	work->timeline = root->checkpoint_tli;
 	memset(&observed, 0, sizeof(observed));
-	visit = cluster_control_root_recovery_visit(root, token, cold_scan_visit, work, &observed);
+	visit
+		= deadline != NULL
+			  ? cluster_control_root_recovery_visit_deadline_v1(root, token, cold_scan_visit, work,
+																&observed, *deadline)
+			  : cluster_control_root_recovery_visit(root, token, cold_scan_visit, work, &observed);
 	return cold_scan_finish(work, visit, &observed, root->validated_tail_lsn_exclusive);
+}
+
+ClusterColdDetailV1
+cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
+						  const ClusterControlRootSnapshot *root,
+						  const ClusterControlRootReadToken *token, bool space_active, bool foreign,
+						  struct RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result)
+{
+	return cold_scan_root(plan, participant, root, token, space_active, foreign, side_plan, result,
+						  NULL);
+}
+ClusterColdDetailV1
+cluster_cold_scan_root_deadline_v1(ClusterColdPlanV1 *plan, uint32 participant,
+								   const ClusterControlRootSnapshot *root,
+								   const ClusterControlRootReadToken *token, bool space_active,
+								   bool foreign, struct RfSideOnlinePlanV1 *side_plan,
+								   ClusterColdScanResultV1 *result, uint64 deadline_ns)
+{
+	return cold_scan_root(plan, participant, root, token, space_active, foreign, side_plan, result,
+						  &deadline_ns);
 }
 
 ClusterColdDetailV1

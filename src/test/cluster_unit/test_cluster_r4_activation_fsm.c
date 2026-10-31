@@ -10,6 +10,9 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_relmap_arb.h"
+#include "storage/proc.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cr_server.h"
@@ -20,10 +23,12 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_control_root.h" /* bit22 (G3 accessor test) */
+#include "cluster/cluster_control_root_prepared.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -100,7 +105,8 @@ static TestSemanticUtilityMailboxStorage test_semantic_utility_mailbox;
 static TestSemanticAckTableStorage test_semantic_ack_table;
 static TestSemanticPgrdSnapshotStorage test_semantic_pgrd_snapshot;
 static TestSemanticBit22LatchStorage test_semantic_bit22_latch;
-typedef struct TestSemanticSourceCloseStorage {
+typedef union TestSemanticSourceCloseStorage {
+	pg_atomic_uint64 align;
 	uint8 bytes[TEST_SEMANTIC_BIT22_SOURCE_CLOSE_BYTES];
 } TestSemanticSourceCloseStorage;
 static TestSemanticSourceCloseStorage test_semantic_source_close;
@@ -112,6 +118,26 @@ static union {
 } test_normal_start_completion;
 static TestSemanticShmemStorage test_serving_completion;
 static bool test_serving_found;
+static union {
+	pg_atomic_uint64 align;
+	uint8 bytes[CLUSTER_SEMANTIC_CONTROL_REBIND_STATE_BUDGET];
+} test_rebind_shmem;
+static bool test_rebind_found;
+static PGPROC test_rebind_procs[8];
+#define test_rebind_proc test_rebind_procs[7]
+PGPROC *MyProc = &test_rebind_proc;
+static PROC_HDR test_open_proof_proc_header = {
+	.allProcs = test_rebind_procs,
+	.allProcCount = 8
+};
+PROC_HDR *ProcGlobal = &test_open_proof_proc_header;
+static bool test_open_proof_caps_busy;
+static unsigned test_open_proof_caps_samples, test_open_proof_caps_busy_at;
+int cluster_interconnect_heartbeat_interval_ms = 1000;
+static uint64 test_rebind_stream_serial[4];
+static const ClusterICEnvelope *test_rebind_dispatch_envelope;
+static ClusterICControlIngress test_rebind_dispatch_ingress;
+
 static bool test_serving_formation_valid;
 static uint64 test_serving_formation;
 static ClusterControlRootResult test_serving_result;
@@ -191,6 +217,39 @@ static unsigned test_recovery_ctrc_accept_calls;
 static bool test_recovered_checkpoint_fail_after_first;
 static int test_first_live_checks;
 static ClusterControlRootResult test_first_live_result;
+
+bool
+cluster_ic_dispatch_control_ingress(const ClusterICEnvelope *env, ClusterICControlIngress *out)
+{
+	if (env != test_rebind_dispatch_envelope || out == NULL)
+		return false;
+	*out = test_rebind_dispatch_ingress;
+	return true;
+}
+
+bool
+cluster_ic_tier1_stream_capture(int32 peer, ClusterICTier1Stream *out)
+{
+	if (peer < 0 || peer >= 4 || out == NULL || test_rebind_stream_serial[peer] == 0)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->serial = test_rebind_stream_serial[peer];
+	out->epoch = test_current_epoch;
+	out->owner_pid = MyProcPid;
+	out->peer = peer;
+	out->plane = CLUSTER_IC_PLANE_CONTROL;
+	out->channel = -1;
+	return true;
+}
+
+bool
+cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream)
+{
+	ClusterICTier1Stream current;
+	return stream != NULL && cluster_ic_tier1_stream_capture(stream->peer, &current)
+		   && memcmp(stream, &current, sizeof(current)) == 0;
+}
+
 
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
@@ -430,6 +489,12 @@ cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(bool thawed,
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
+	if (strcmp(name, "pgrac CONTROL rebind proof") == 0) {
+		if (size > sizeof(test_rebind_shmem))
+			abort();
+		*foundPtr = test_rebind_found;
+		return test_rebind_shmem.bytes;
+	}
 	if (strcmp(name, "pgrac semantic ROOT serving completion") == 0) {
 		if (size > sizeof(test_serving_completion))
 			abort();
@@ -568,11 +633,14 @@ superuser(void)
 	return true;
 }
 
+static unsigned ut_root_image_calls;
+
 ClusterControlRootResult
 cluster_control_root_build_migration_image(const ClusterControlRootMigrationRoundV1 *round
 											   pg_attribute_unused(),
 										   ClusterControlRootMigrationImage *out)
 {
+	++ut_root_image_calls;
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -755,6 +823,24 @@ cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
 				 && (test_capability_missing_bitmap & (UINT64_C(1) << peer_id)) == 0;
 	out->bits = test_peer_capability_word;
 	out->generation = test_peer_capability_generation;
+	return true;
+}
+
+/* Same external cap inputs as the blocking accessor, with explicit original
+ * conditional-lock backpressure; it does not produce a semantic verdict. */
+bool
+cluster_sf_peer_capability_table_try_snapshot(ClusterSfPeerCap *out, uint32 capacity, bool *busy)
+{
+	bool contended = test_open_proof_caps_busy
+		|| ++test_open_proof_caps_samples == test_open_proof_caps_busy_at;
+
+	if (busy != NULL)
+		*busy = contended;
+	if (out == NULL || capacity != CLUSTER_MAX_NODES || contended)
+		return false;
+	for (unsigned node = 0; node < capacity; node++)
+		if (!cluster_sf_peer_capability_record_snapshot(node, &out[node]))
+			return false;
 	return true;
 }
 
@@ -960,10 +1046,23 @@ cluster_reconfig_join_in_progress(void)
 {
 	return test_terminal_join;
 }
+static bool test_rebind_control_sealed;
+/* External clock input for the real bounded LMON/retry body. */
+static TimestampTz test_rebind_now = INT64CONST(1000000);
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return test_rebind_now;
+}
 bool
 cluster_normal_stop_requested(void)
 {
 	return test_terminal_stop;
+}
+bool
+cluster_normal_stop_service_control_sealed(void)
+{
+	return test_terminal_stop && test_rebind_control_sealed;
 }
 static bool test_clean_admitted = true;
 
@@ -1236,6 +1335,40 @@ errstart(int elevel, const char *domain pg_attribute_unused())
 	return (test_capture_activation_log || test_capture_stop_log) && elevel == LOG;
 }
 
+/* This fixture does not run the active-sample publisher or shared header
+ * writer. Linux retains their link dependencies; crossing one must fail,
+ * never invent a membership cut, join verdict, or content-lock owner. */
+bool
+cluster_normal_stop_maintenance_cut(void)
+{
+	abort();
+}
+
+ClusterJoinGateVerdict
+cluster_reconfig_self_join_gate_verdict(void)
+{
+	abort();
+}
+
+bool
+cluster_reconfig_lmon_snapshot_r4_membership(
+	ClusterR4MembershipSnapshot *out pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockHeldByMe(LWLock *lock pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	abort();
+}
+
 void
 ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
 {
@@ -1350,9 +1483,12 @@ test_gate_inflight(ClusterSemanticAdmissionSide side, int feature_index)
 						 + ((Size)side * 64 + (Size)feature_index) * sizeof(pg_atomic_uint32));
 }
 
+static void ut_prepared_job_reset(void);
+
 static void
 test_gate_reset(void)
 {
+	ut_prepared_job_reset();
 	cluster_shared_config = false;
 	cluster_trace_normal_stop = false;
 	test_capture_stop_log = test_stop_diag_held_lock = test_stop_diag_unsafe_log = false;
@@ -1376,6 +1512,20 @@ test_gate_reset(void)
 	test_recovered_checkpoint_fail_after_first = false;
 	memset(&test_recovered_checkpoint, 0, sizeof(test_recovered_checkpoint));
 	test_serving_found = false;
+	test_rebind_found = false;
+	memset(&test_rebind_shmem, 0, sizeof(test_rebind_shmem));
+	memset(&test_rebind_proc, 0, sizeof(test_rebind_proc));
+	test_rebind_proc.cluster_grd_generation = 41;
+	test_rebind_proc.pgprocno = 7;
+	test_rebind_proc.pid = 101;
+	test_open_proof_caps_busy = false;
+	test_open_proof_caps_samples = test_open_proof_caps_busy_at = 0;
+	ProcGlobal = &test_open_proof_proc_header;
+	MyProc = &test_rebind_proc;
+	test_rebind_dispatch_envelope = NULL;
+	memset(&test_rebind_dispatch_ingress, 0, sizeof(test_rebind_dispatch_ingress));
+	for (unsigned node = 0; node < 4; node++)
+		test_rebind_stream_serial[node] = 100 + node;
 	test_serving_formation_valid = false;
 	test_serving_formation = 2;
 	test_serving_result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
@@ -1505,6 +1655,7 @@ test_gate_reset(void)
 	test_stop_storage_quorum = true;
 	test_terminal_membership_cut = 2;
 	test_terminal_fenced = test_terminal_prebump = test_terminal_join = test_terminal_stop = false;
+	test_rebind_control_sealed = false;
 	test_terminal_sessions_ok = true;
 	test_terminal_qv_status = CLUSTER_QVOTEC_READY;
 	test_terminal_nonmember = -1;
@@ -5747,6 +5898,7 @@ UT_TEST(test_99_shared_gate_layout_and_bootstrap_are_fail_closed)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SEAM_BYTES)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SOURCE_CLOSE_BYTES)
 					 + MAXALIGN(sizeof(SemanticServingCompletion))
+					 + MAXALIGN(sizeof(SemanticControlRebindShmem))
 					 + MAXALIGN(sizeof(pg_atomic_uint32)) + MAXALIGN(1568));
 	UT_ASSERT(!cluster_r4_bit22_cutover_active());
 	UT_ASSERT(SemanticActivationAckTable
@@ -12418,10 +12570,26 @@ UT_TEST(test_prepared_round_fixture_cannot_accept_unmodelled_cold_handoff)
 	cluster_recovery_merge_claim_release_if_held();
 }
 
+#include "test_cluster_prepared_round.h"
+
 int
 main(void)
 {
-	UT_PLAN(422);
+	UT_PLAN(437);
+	UT_RUN(test_prepared_round_published_result_waits_for_original_release_without_replay);
+	UT_RUN(test_prepared_round_completed_result_survives_table_observation_gap);
+	UT_RUN(test_prepared_round_identity_loss_retires_original_debt_without_delivery);
+	UT_RUN(test_prepared_round_activate_seam_identity_loss_keeps_original_cleanup);
+	UT_RUN(test_prepared_round_failed_published_result_waits_then_refuses);
+	UT_RUN(test_prepared_round_missing_receipt_proof_never_replays_or_completes);
+	UT_RUN(test_prepared_round_error_keeps_work_at_original_address_for_next_tick);
+	UT_RUN(test_prepared_round_cleanup_precedes_original_lmon_early_return);
+	UT_RUN(test_prepared_round_stop_census_keeps_debt_until_exact_cleanup);
+	UT_RUN(test_prepared_round_confirmed_operation_failure_terminates_original_round);
+	UT_RUN(test_prepared_round_error_before_binding_keeps_original_refusal_semantics);
+	UT_RUN(test_prepared_round_synchronous_success_rechecks_round_before_stage);
+	UT_RUN(test_prepared_round_cached_success_rejects_later_producer_identity_loss);
+	UT_RUN(test_prepared_round_old_cleanup_cannot_invalidate_replacement_round);
 	UT_RUN(test_prepared_round_cf_refusal_retries_without_advancing_or_resubmitting);
 	UT_RUN(test_prepared_round_cf_retry_requalifies_current_authority);
 	UT_RUN(test_prepared_round_activate_retry_requires_its_original_staged_seam);
@@ -12485,6 +12653,7 @@ main(void)
 	UT_RUN(test_normal_actual_postjobs_exclude_shared_legacy_page_rollback);
 	UT_RUN(test_normal_actual_finish_requires_cf_and_hw_and_keeps_disk_history);
 	UT_RUN(test_normal_actual_finish_failure_is_fatal_not_ready);
+	UT_RUN(test_normal_actual_cold_guards_require_the_original_owner);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);

@@ -1571,7 +1571,8 @@ UT_TEST(test_actual_peer_observation_gap_keeps_delivery_and_ingress_owned)
 		= { CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_AUTHORITY_UNAVAILABLE,
 			CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_NOT_READY,
 			CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN,
-			CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING };
+			CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING,
+			CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_REBIND_PENDING };
 
 	for (int reason = 0; reason < lengthof(pending); reason++) {
 		for (int leg = 0; leg < 4; leg++) {
@@ -1946,6 +1947,8 @@ UT_TEST(test_actual_foreground_retained_and_predecessor_wait_reobserve_without_f
 	scenario = 0;
 }
 
+static bool dispatch_changed_connection;
+
 static ResourceXApplyResult
 run_actual_dispatch_observation(ResourceXBootstrapRoundAction action, bool join_only)
 {
@@ -1989,6 +1992,8 @@ run_actual_dispatch_observation(ResourceXBootstrapRoundAction action, bool join_
 	saved_witness = *caller_witness;
 	dispatch.common.assertion_sequence = 41;
 	gate.formation = 17;
+	if (dispatch_changed_connection)
+		master_ingress_connection_generation = 60;
 	for (iteration = 0; iteration < 4; iteration++) {
 		if (delivery_retries != 0 || assert_sends != 0) {
 			UT_ASSERT_EQ(memcmp(caller_witness, &saved_witness, sizeof(*caller_witness)), 0);
@@ -2031,6 +2036,60 @@ UT_TEST(test_actual_dispatch_reobserves_request_assert_and_follower)
 	}
 	pause_clears_gap = session_gap = false;
 	scenario = 0;
+}
+
+static ResourceXApplyResult
+run_actual_preflight_peer(unsigned *waits)
+{
+	ClusterSemanticAdmissionToken admission = {
+		.entered = true,
+		.feature_bit = CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		.record_generation = 77,
+		.formation_epoch = 2,
+		.side = CLUSTER_SEMANTIC_TARGET_SIDE
+	};
+	int32 master_node = master;
+	uint32 master_ingress_connection_generation = 61;
+	bool requester_ready = true, master_ready = true, preflight_current = false;
+	ClusterSemanticResourceXPeerOpenResult peer_open_result;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_BAD_STATE;
+
+	*waits = 0;
+	for (unsigned sample = 0; sample < 2; sample++) {
+#include "test_cluster_resource_x_preflight_peer.inc"
+		(*waits)++;
+		/* Supply the next independent peer sample, never a grant. */
+		peer_observation_gap = CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_NOT_CHECKED;
+	}
+	return preflight_current ? RESOURCE_X_APPLY_APPLIED : result;
+}
+
+UT_TEST(test_actual_preflight_and_rebind_wait_only_for_typed_pending)
+{
+	for (unsigned pending = 0; pending < 2; pending++) {
+		unsigned waits;
+		reset_delivery_fixture();
+		peer_observation_gap = pending
+			? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_REBIND_PENDING
+			: CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
+		UT_ASSERT_EQ(run_actual_preflight_peer(&waits),
+			pending ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(waits, pending ? 1 : 0);
+		UT_ASSERT_EQ(kind9_requests + ack_sends + assert_sends + installs + publishes, 0);
+
+		reset_delivery_fixture();
+		peer_observation_gap = pending
+			? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_REBIND_PENDING
+			: CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
+		dispatch_changed_connection = true;
+		terminal_pause_calls = 0;
+		UT_ASSERT_EQ(run_actual_dispatch_observation(RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST,
+			false), pending ? RESOURCE_X_APPLY_INVALID : RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(terminal_pause_calls, pending ? 4 : 0);
+		UT_ASSERT_EQ(kind9_requests + ack_sends + assert_sends + installs + publishes, 0);
+		dispatch_changed_connection = false;
+	}
+	reset_delivery_fixture();
 }
 
 UT_TEST(test_actual_context_check_preserves_typed_observation_and_terminal_cover)
@@ -2613,7 +2672,7 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(31);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2631,6 +2690,7 @@ main(void)
 	UT_RUN(test_actual_source_before_mutation_waits_without_exporting_session);
 	UT_RUN(test_actual_foreground_retained_and_predecessor_wait_reobserve_without_fuse);
 	UT_RUN(test_actual_dispatch_reobserves_request_assert_and_follower);
+	UT_RUN(test_actual_preflight_and_rebind_wait_only_for_typed_pending);
 	UT_RUN(test_actual_context_check_preserves_typed_observation_and_terminal_cover);
 	UT_RUN(test_actual_peer_observation_gap_keeps_delivery_and_ingress_owned);
 	UT_RUN(test_actual_type17_and_assert_admission_keep_unproven_work_pending);

@@ -61,6 +61,9 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_wal_cut.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_lock_owner.h"
+#include "cluster/cluster_wal_inputs.h"
 #endif
 
 /*
@@ -240,6 +243,13 @@ BackgroundWriterMain(void)
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* Original ACK/retirement wakes also run during the stop cut. Reset
+		 * first so a continuation wake cannot be consumed before waiting. */
+		cluster_cf_retirement_poll();
+		cluster_lock_owners_service_poll();
+		cluster_wal_inputs_jobs_service_poll_v1();
+#endif
 		HandleMainLoopInterrupts();
 
 		/*

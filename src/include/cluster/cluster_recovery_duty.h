@@ -175,6 +175,21 @@ extern ClusterRecoveryOwnerImportResult
 cluster_recovery_owner_import_read_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
 									  uint64 frozen_admitted_bitmap_low,
 									  uint64 frozen_admitted_bitmap_high, uint64 *out_incarnation);
+/* Local retained-ACK continuation only; no token or authority is retained. */
+extern ClusterRecoveryOwnerImportResult cluster_recovery_owner_import_select_marker_v1(
+	int32 node_id, const ClusterWalThreadClaim *immutable_claim, uint64 frozen_admitted_bitmap_low,
+	uint64 frozen_admitted_bitmap_high, const ClusterRecoveryOwnerDiskSampleV1 *samples,
+	int total_disk_count, const ClusterJoinCommitMarker *expected_marker, uint64 *out_incarnation);
+extern ClusterRecoveryOwnerImportResult cluster_recovery_owner_import_read_marker_v1(
+	int32 node_id, const ClusterWalThreadClaim *immutable_claim, uint64 frozen_admitted_bitmap_low,
+	uint64 frozen_admitted_bitmap_high, const ClusterJoinCommitMarker *expected_marker,
+	uint64 *out_incarnation);
+extern bool cluster_recovery_owner_rejoin_checked_v1(int32 node_id, uint64 admitted_incarnation,
+													 const ClusterJoinCommitMarker *expected_marker,
+													 const ClusterRecoveryDutyKey *expected_key,
+													 ClusterRecoveryDutyKey *observed_key,
+													 bool (*revalidate)(bool publishing),
+													 ClusterControlRootResult *out_result);
 extern bool cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation);
 extern bool cluster_control_root_thread_clean_close_publish(void); /* RF-ROOT P6 */
 extern bool

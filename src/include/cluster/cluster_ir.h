@@ -162,6 +162,12 @@ typedef struct ClusterRecoverySerialGuardSet {
 extern ClusterRecoverySerialAcquireResult
 cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 								ClusterRecoverySerialGuard *guard);
+/* Explicit cold INPUT_SEAL attempt; no internal CF retry or cleanup deadline
+ * renewal. Zero preserves the complete single attempt. */
+extern ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_input_acquire_deadline_v1(const ClusterRecoverySerialRequest *request,
+												  ClusterRecoverySerialGuard *guard,
+												  uint64 deadline_ns);
 extern ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialRevalidateResult
@@ -176,6 +182,11 @@ extern ClusterRecoverySerialAcquireResult
 cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests, uint16 count,
 									int overall_acquire_timeout_ms,
 									ClusterRecoverySerialGuardSet *set, uint16 *failed_index);
+/* Cold Startup only: bound preflight and acquisition by its original monotonic
+ * deadline; zero retains one complete attempt. Release deadlines are separate. */
+extern ClusterRecoverySerialAcquireResult cluster_recovery_serial_acquire_set_deadline_v1(
+	const ClusterRecoverySerialRequest *requests, uint16 count, int overall_acquire_timeout_ms,
+	ClusterRecoverySerialGuardSet *set, uint16 *failed_index, uint64 deadline_ns);
 extern ClusterRecoverySerialReleaseResult
 cluster_recovery_serial_release_set(ClusterRecoverySerialGuardSet *set);
 

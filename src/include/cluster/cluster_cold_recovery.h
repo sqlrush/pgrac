@@ -833,6 +833,10 @@ typedef struct ClusterColdScanResultV1 {
 
 struct RfSideOnlinePlanV1;
 
+extern ClusterColdDetailV1 cluster_cold_scan_root_deadline_v1(
+	ClusterColdPlanV1 *plan, uint32 participant, const struct ClusterControlRootSnapshot *root,
+	const struct ClusterControlRootReadToken *token, bool space_active, bool foreign,
+	struct RfSideOnlinePlanV1 *side_plan, ClusterColdScanResultV1 *result, uint64 deadline_ns);
 extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 													 const ClusterControlRootSnapshot *root,
 													 const ClusterControlRootReadToken *token,
@@ -1007,6 +1011,10 @@ extern bool cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed);
  * This does not qualify history durability, final freshness or endpoints. */
 extern bool cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed,
 												 struct ClusterRecoveryFencePlan *fence);
+/* Commit using the same sealed physical input union. No census or pass-1
+ * replay occurs while IR is held or when its original CF wait resumes. */
+extern bool cluster_cold_typed_commit_serial_v1(ClusterColdTypedV1 *typed,
+												struct ClusterRecoveryFencePlan *fence);
 
 /* Original native checkpoint and its exact window for any selected generation,
  * including history. Legacy zero windows remain zero. Copies only sealed input;
@@ -1173,6 +1181,10 @@ extern bool cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * history inside the caller's still-held pass-2 fence/serial set. No refresh
  * or authority acquisition: failure invalidates this attempt's cached input.
  * This is not a post-EOR recovery-writer grant. */
+/* Original merge caller's post-IR, retained-WALR source check. */
+extern bool cluster_cold_typed_sources_readback_v1(void *typed,
+												   struct ClusterRecoveryFencePlan *fence);
+
 extern bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
 												  struct ClusterRecoveryFencePlan *fence);
 

@@ -55,17 +55,23 @@ bool InRecovery, cluster_enabled, cluster_controlfile_shared_authority;
 uint64
 GetSystemIdentifier(void)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 9;
 }
 uint64
 cluster_grd_redeclare_generation(void)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 1;
 }
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 1;
 }
 void
 HandleStartupProcInterrupts(void)
@@ -96,12 +102,16 @@ WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
 int
 errdetail(const char *format pg_attribute_unused(), ...)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 0;
 }
 uint64
 cluster_cf_attempt_sequence(void)
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return 0;
 }
 bool
 cluster_cf_last_attempt_since(uint64 before pg_attribute_unused(),
@@ -146,7 +156,9 @@ bool
 cluster_reconfig_capture_formation_snapshot_v1(
 	uint16 thread pg_attribute_unused(), ClusterFormationSnapshotV1 *out pg_attribute_unused())
 {
-	abort();
+	if (!prepare_probe_active)
+		abort();
+	return false; /* No wait in this driver-only source boundary. */
 }
 bool
 cluster_formation_snapshot_matches_v1(
@@ -202,7 +214,10 @@ MemoryContextDelete(MemoryContext context)
 void *
 palloc0(Size size)
 {
-	return calloc(1, size);
+	void *result = calloc(1, size);
+	if (prepare_probe_active && size == sizeof(ClusterColdTypedV1) && prepare_probe_typed == NULL)
+		prepare_probe_typed = result;
+	return result;
 }
 
 /* Backend common helpers use the same local allocation boundary. */
@@ -260,6 +275,7 @@ cluster_control_native_commit_ts_profile_v1(const char *shared_root, uint32 node
 {
 	if (shared_root == NULL || strcmp(shared_root, cluster_shared_data_dir) != 0 || node >= NROOTS)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	prepare_probe_leaf(PREPARE_PROFILE);
 	commit_ts_profile_calls[node]++;
 	return commit_ts_profile_calls[node] > commit_ts_profile_fail_after[node]
 			   ? commit_ts_profile_result[node]
@@ -275,6 +291,11 @@ static bool scan_space_drop;
 static bool scan_space;					/* thread 2 extends relation 300 before its page record */
 static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
 static bool restart_ref_present;
+char *cluster_wal_threads_dir = "cold-fixture";
+int wal_segment_size = 16777216;
+static int pass2_root_reads;
+static unsigned pass2_forbidden_reads;
+static bool test_post_ir;
 static int source_sync_calls;
 static uint16 source_sync_order[NROOTS];
 static uint16 source_sync_fail_thread;
@@ -417,12 +438,29 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 node, ClusterControlRoot
 }
 
 ClusterControlRootResult
+cluster_control_root_lookup_owner_deadline_v1(int32 node, ClusterControlRootIdentity *identity,
+											  ClusterControlRootSnapshot *snapshot,
+											  ClusterControlRootReadToken *token,
+											  uint64 deadline_ns)
+{
+	/* This whole-driver leaf never waits; the CF-linked suite exercises the
+	 * actual bounded ROOT consumer and original plan deadline. */
+	UT_ASSERT_EQ(deadline_ns, prepare_probe_active ? prepare_probe_deadline : 0);
+	return cluster_control_root_lookup_owner_by_node_runtime(node, identity, snapshot, token);
+}
+
+ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 										const ClusterControlRootReadToken *token,
 										ClusterWalSourceRef *source, XLogRecPtr *redo)
 {
 	uint16 thread = root->identity.origin_thread_id;
 
+	pass2_root_reads++;
+	if (cluster_cold_replay_window_active_v1() && !test_post_ir) {
+		++pass2_forbidden_reads;
+		UT_ASSERT(false); /* Applies to every execution caller in this suite. */
+	}
 	memset(source, 0, sizeof(*source));
 	if (memcmp(token, &tokens[thread], sizeof(*token)) != 0
 		|| memcmp(root, &roots[thread], sizeof(*root)) != 0)
@@ -443,6 +481,12 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ro
 											ClusterWalRecoveryCheckpointV1 *out)
 {
 	ClusterControlRootResult result;
+	if (prepare_probe_active && !prepare_probe_census_read) {
+		++prepare_probe_checkpoints;
+		prepare_probe_leaf(prepare_probe_checkpoints <= NROOTS		 ? PREPARE_CHECKPOINT
+						   : prepare_probe_checkpoints <= 2 * NROOTS ? PREPARE_BEFORE_SEAL
+																	 : PREPARE_AFTER_SEAL);
+	}
 	*out = native_checkpoint[root->identity.origin_thread_id];
 	result
 		= cluster_control_root_recovery_source_v1(root, token, &out->source, &out->checkpoint.redo);
@@ -534,6 +578,15 @@ cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *p
 {
 	(void)plan;
 	return fence_count;
+}
+
+bool
+cluster_recovery_merge_fence_plan_deadline_v1(const ClusterRecoveryFencePlan *plan,
+											  uint64 *deadline_ns)
+{
+	(void)plan;
+	*deadline_ns = prepare_probe_active ? prepare_probe_deadline : 0;
+	return true;
 }
 
 bool
@@ -672,6 +725,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	(void)token;
 
 	(void)space_active;
+	prepare_probe_leaf(PREPARE_SCAN);
 	scan_foreign[thread] = foreign;
 	memset(result, 0, sizeof(*result));
 	if (scan_result[thread] != CLUSTER_COLD_OK) {
@@ -860,6 +914,8 @@ static uint16 history_sync_threads[MAX_HISTORY];
 static unsigned serial_input_calls;
 static uint16 serial_input_count, serial_input_threads[128];
 static bool serial_input_ok;
+static unsigned commit_input_calls;
+static bool commit_input_ok;
 
 bool
 cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
@@ -875,12 +931,27 @@ cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1(
 	return serial_input_ok;
 }
 
+bool
+cluster_recovery_merge_commit_plan_inputs_v1(ClusterRecoveryFencePlan *plan, const uint16 *threads,
+											 uint16 count)
+{
+	UT_ASSERT_NOT_NULL(plan);
+	UT_ASSERT_EQ(serial_input_calls, 1);
+	UT_ASSERT_EQ(census_begins, census_releases);
+	UT_ASSERT_EQ(count, serial_input_count);
+	UT_ASSERT_EQ(memcmp(threads, serial_input_threads, count * sizeof(*threads)), 0);
+	UT_ASSERT(!cluster_cold_replay_window_active_v1());
+	++commit_input_calls;
+	return commit_input_ok;
+}
+
 static int history_scans;
 static uint32 history_scan_index;
 
 static void
 census_refresh_inputs(void)
 {
+	prepare_probe_census_read = true;
 	memset(census_inputs, 0, sizeof(census_inputs));
 	for (uint32 i = 1; i <= NROOTS; i++) {
 		ClusterWalRecoveryCheckpointV1 selected;
@@ -950,6 +1021,7 @@ census_refresh_inputs(void)
 			break;
 		}
 	}
+	prepare_probe_census_read = false;
 }
 
 static void
@@ -969,6 +1041,11 @@ cluster_wal_inputs_cold_checkpoint_v1(const ClusterControlRootSnapshot *expected
 	UT_ASSERT(cluster_cold_replay_window_active_v1());
 	UT_ASSERT_EQ(census_begins, census_releases);
 	history_checkpoint_reads++;
+	pass2_root_reads++;
+	if (cluster_cold_replay_window_active_v1() && !test_post_ir) {
+		++pass2_forbidden_reads;
+		UT_ASSERT(false); /* Applies to every execution caller in this suite. */
+	}
 	memset(out, 0, sizeof(*out));
 	if (memcmp(root_token, &census_token, sizeof(*root_token)) != 0)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -1045,11 +1122,94 @@ cluster_wal_inputs_cold_sync_v1(const ClusterControlRootSnapshot *expected,
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* Physical-only tail fsync leaf: no ROOT selection or token reads. */
+ClusterControlRootResult
+cluster_wal_tail_sync_sealed_v1(const char *path, const ClusterWalSourceRef *source,
+								int segment_size, const ClusterControlRootSnapshot *root,
+								XLogRecPtr checkpoint, ClusterWalTailObservation *out)
+{
+	uint16 thread = root->identity.origin_thread_id;
+	unsigned call;
+	if (root->identity.origin_owner_incarnation == roots[thread].identity.origin_owner_incarnation)
+		return cluster_control_root_recovery_sync_v1(root, &tokens[thread], out);
+	call = history_sync_calls++;
+	UT_ASSERT(call < MAX_HISTORY);
+	if (call < MAX_HISTORY) {
+		history_sync_incarnations[call] = root->identity.origin_owner_incarnation;
+		history_sync_threads[call] = thread;
+	}
+	memset(out, 0, sizeof(*out));
+	out->complete_end = root->validated_tail_lsn_exclusive;
+	out->last_record_start = root->tail_last_record_lsn;
+	out->last_record_crc = root->tail_last_record_crc32c;
+	out->database_incarnation = source->claim.database_incarnation;
+	if (call + 1 == history_sync_fail_at) {
+		if (history_sync_fault == 1)
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (history_sync_fault == 2)
+			out->complete_end++;
+		if (history_sync_fault == 3)
+			out->last_record_start++;
+		if (history_sync_fault == 4)
+			out->last_record_crc++;
+		if (history_sync_fault == 5)
+			out->database_incarnation++;
+		if (history_sync_fault == 6)
+			census_token.file_txn_seq++;
+		if (history_sync_fault == 7)
+			census_input_fault = 7;
+		if (history_sync_fault == 8)
+			fence_current = false;
+		if (history_sync_fault == 9)
+			siglongjmp(*PG_exception_stack, 1);
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_recovery_merge_fence_plan_publish_current_v1(ClusterRecoveryFencePlan *plan)
+{
+	return plan != NULL && fence_current && test_post_ir;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_checkpoint_readback_v1(const ClusterControlRootSnapshot *root,
+											   const ClusterControlRootFileToken *token,
+											   ClusterWalRecoveryCheckpointV1 *out)
+{
+	uint16 thread = root->identity.origin_thread_id;
+	UT_ASSERT(test_post_ir);
+	if (root->identity.origin_owner_incarnation == roots[thread].identity.origin_owner_incarnation)
+		return cluster_control_root_recovery_checkpoint_v1(root, &tokens[thread], out);
+	return cluster_wal_inputs_cold_checkpoint_v1(root, &census_token, out);
+}
+
+/* Existing negative assertions about physical ROOT drift move to this
+ * explicit post-release phase. Execution-owner failures still refuse in IR. */
+static bool
+test_sources_readback(ClusterColdTypedV1 *typed)
+{
+	bool result;
+	test_post_ir = true;
+	result = cluster_cold_typed_sources_readback_v1(typed,
+													(ClusterRecoveryFencePlan *)&fixture_context);
+	test_post_ir = false;
+	return result;
+}
+
+static bool
+test_sync_and_readback(ClusterColdTypedV1 *typed)
+{
+	return cluster_cold_typed_sync_sources_v1(typed, (ClusterRecoveryFencePlan *)&fixture_context)
+		   && test_sources_readback(typed);
+}
+
 ClusterControlRootResult
 cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
 								 ClusterWalInputsV1 **out)
 {
 	census_begins++;
+	prepare_probe_leaf(PREPARE_CENSUS);
 	UT_ASSERT_EQ(system_identifier, 9);
 	UT_ASSERT_EQ(storage_uuid[0], 1);
 	census_refresh_inputs();
@@ -1517,6 +1677,8 @@ fixture(void)
 	retention_invalidations = retention_root_reads = 0;
 	serial_input_calls = serial_input_count = 0;
 	serial_input_ok = true;
+	commit_input_calls = 0;
+	commit_input_ok = true;
 	memset(serial_input_threads, 0, sizeof(serial_input_threads));
 	tt_base_captures = tt_base_rechecks = tt_base_destroys = 0;
 	tt_base_participants = 0;
@@ -1589,6 +1751,7 @@ fixture(void)
 	restart_ref.timeline = 1;
 	restart_ref_present = true;
 	source_sync_calls = source_sync_fail_thread = source_sync_fault = 0;
+	test_post_ir = false;
 	memset(source_sync_order, 0, sizeof(source_sync_order));
 	fence_current = true;
 	scan_space_offset = 0;
@@ -1626,6 +1789,40 @@ prepare(XLogRecPtr own_redo)
 	retention_root_reads = 0; /* Count input reads in this attempt. */
 	return cluster_cold_typed_prepare_v1((struct ClusterRecoveryFencePlan *)&fixture_context, 1,
 										 own_redo);
+}
+
+
+/* Deadline wrappers check forwarding only. Actual CF waits live in the
+ * companion CF/CONTROL suite, not this orchestration boundary. */
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_deadline_v1(const ClusterControlRootSnapshot *root,
+													 const ClusterControlRootReadToken *token,
+													 ClusterWalRecoveryCheckpointV1 *out,
+													 uint64 deadline_ns)
+{
+	UT_ASSERT(prepare_probe_active);
+	UT_ASSERT_EQ(deadline_ns, prepare_probe_deadline);
+	return cluster_control_root_recovery_checkpoint_v1(root, token, out);
+}
+ClusterControlRootResult
+cluster_wal_inputs_cold_begin_deadline_v1(const uint8 storage_uuid[16], uint64 system_identifier,
+										  ClusterWalInputsV1 **out, uint64 deadline_ns)
+{
+	UT_ASSERT(prepare_probe_active);
+	UT_ASSERT_EQ(deadline_ns, prepare_probe_deadline);
+	return cluster_wal_inputs_cold_begin_v1(storage_uuid, system_identifier, out);
+}
+ClusterColdDetailV1
+cluster_cold_scan_root_deadline_v1(ClusterColdPlanV1 *plan, uint32 participant,
+								   const ClusterControlRootSnapshot *root,
+								   const ClusterControlRootReadToken *token, bool space_active,
+								   bool foreign, struct RfSideOnlinePlanV1 *side_plan,
+								   ClusterColdScanResultV1 *result, uint64 deadline_ns)
+{
+	UT_ASSERT(prepare_probe_active);
+	UT_ASSERT_EQ(deadline_ns, prepare_probe_deadline);
+	return cluster_cold_scan_root_v1(plan, participant, root, token, space_active, foreign,
+									 side_plan, result);
 }
 
 #endif /* TEST_CLUSTER_COLD_RECOVERY_STARTUP_BOUNDARY_H */

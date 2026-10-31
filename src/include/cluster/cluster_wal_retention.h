@@ -359,8 +359,23 @@ extern bool cluster_wal_retention_resid_encode(uint16 thread_id, ClusterResId *o
  * This scope conveys no recovery, DATA or publication authority. */
 extern ClusterWalPinResult cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads,
 														   ClusterWalReadPinV1 **out);
+extern ClusterWalPinResult cluster_wal_read_pin_acquire_deadline_v1(const uint16 *threads,
+																	uint16 nthreads,
+																	ClusterWalReadPinV1 **out,
+																	uint64 deadline_ns);
 extern bool cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread);
 extern ClusterWalrReleaseResult cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin);
+struct ClusterWalInputsJobV1;
+/* Original Aux caller only. Even failed/throwing acquisition retains the
+ * original allocation and stable guards; an output is never input authority. */
+extern ClusterWalPinResult cluster_wal_read_pin_acquire_job_v1(const uint16 *threads,
+	uint16 nthreads, struct ClusterWalInputsJobV1 *job, ClusterWalReadPinV1 **out);
+/* Called by the original job after CF confirmation. Reentry never restarts
+ * the first confirmation budget; poll processes at most one original member. */
+extern ClusterWalrReleaseResult cluster_wal_read_pin_release_job_v1(
+	ClusterWalReadPinV1 **pin, struct ClusterWalInputsJobV1 *job);
+extern ClusterWalrReleaseResult cluster_wal_read_pin_release_job_poll_v1(
+	ClusterWalReadPinV1 **pin, struct ClusterWalInputsJobV1 *job);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
 								  uint16 nthreads, ClusterWalRetentionPin **out_pin);
@@ -371,6 +386,14 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 extern ClusterWalPinResult cluster_wal_retention_pin_acquire_inputs_v1(
 	const ClusterWalRetentionPinThreadRequest *requests, uint16 nthreads,
 	const uint16 *input_threads, uint16 ninput_threads, ClusterWalRetentionPin **out_pin);
+/* Non-initializer cold Startup union. Its original absolute deadline bounds
+ * WALR/ROOT acquisition and CF waiting; zero permits one complete attempt.
+ * No deadline changes the pin identity or its independent cleanup budget. */
+extern ClusterWalPinResult
+cluster_wal_retention_pin_acquire_deadline_v1(const ClusterWalRetentionPinThreadRequest *requests,
+											  uint16 nthreads, const uint16 *input_threads,
+											  uint16 ninput_threads,
+											  ClusterWalRetentionPin **out_pin, uint64 deadline_ns);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
 								   ClusterRecoverySerialGuard *held_serial);
@@ -379,6 +402,8 @@ cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
 								   ClusterRecoverySerialGuardSet *held_set);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_preflight_revalidate_wait_v1(ClusterWalRetentionPin *pin);
+extern ClusterWalPinResult
+cluster_wal_retention_pin_preflight_deadline_v1(ClusterWalRetentionPin *pin, uint64 deadline_ns);
 extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin);
 /* Borrow the current ResourceOwner's complete bound COLD_FORMED set. This
  * neither acquires nor transfers ownership and cannot qualify DATA by itself.
@@ -391,6 +416,26 @@ cluster_wal_retention_pin_borrow_cold_v1(ClusterWalRetentionPin **out_pin,
 										 uint16 *out_count);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin);
+/* The original sealed-pin source tuple. Equality alone grants no authority. */
+static inline bool
+cluster_wal_retention_root_source_equal_v1(const ClusterControlRootSnapshot *left,
+										   const ClusterControlRootSnapshot *right)
+{
+	return memcmp(&left->identity, &right->identity, sizeof(left->identity)) == 0
+		   && left->checkpoint_tli == right->checkpoint_tli
+		   && left->checkpoint_source_kind == right->checkpoint_source_kind
+		   && left->checkpoint_lower_lsn == right->checkpoint_lower_lsn
+		   && left->checkpoint_record_crc32c == right->checkpoint_record_crc32c
+		   && left->tail_tli == right->tail_tli
+		   && left->tail_validation_kind == right->tail_validation_kind
+		   && left->validated_tail_lsn_exclusive == right->validated_tail_lsn_exclusive
+		   && left->tail_last_record_lsn == right->tail_last_record_lsn
+		   && left->tail_last_record_crc32c == right->tail_last_record_crc32c;
+}
+
+/* Zero IO, using only original sealed WALR and confirmed IR release. */
+extern bool cluster_wal_retention_pin_sealed_current_v1(ClusterWalRetentionPin *pin);
+
 extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(
 	ClusterWalRetentionPin *pin, const ClusterControlRootSnapshot *expected_snapshot,
 	const ClusterControlRootReadToken *expected_token,
@@ -405,6 +450,11 @@ extern ClusterWalPinResult
 cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
 											   bool require_sealed_pin,
 											   ClusterWalRootPublishGuard **out_guard);
+/* Fresh ordinary WALR custody for cold input sealing before plan pin/IR.
+ * No borrowed pin, conversion, or change to the independent end contract. */
+extern ClusterWalPinResult cluster_wal_retention_root_publish_begin_deadline_v1(
+	const ClusterControlRootReadToken *expected_root, ClusterWalRootPublishGuard **out_guard,
+	uint64 deadline_ns);
 /* PGRAC: one original sealed cold-input owner protects an entire sorted
  * COMPLETE/CLOSED ROOT cut through CF/CAS/readback. COMPLETE members convert
  * their original S holders only after every IR release; CLOSED inputs retain

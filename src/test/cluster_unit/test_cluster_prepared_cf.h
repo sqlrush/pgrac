@@ -3,6 +3,7 @@
  * are leaves. This does not assert a native LMON or storage proof.
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_control_root_prepared.h"
 #include "common/cryptohash.h"
 
 static ControlRootImage prepared_disk;
@@ -15,6 +16,7 @@ static unsigned prepared_acquires, prepared_reads, prepared_wal_reads, prepared_
 static uint64 prepared_cookie;
 static ClusterControlRequestView prepared_request;
 static ClusterControlRootResult prepared_storage_result, prepared_read_result;
+static void (*prepared_on_published_read)(void);
 
 static bool
 prepared_image_valid(const ClusterControlRootMigrationImage *image,
@@ -37,7 +39,7 @@ static void
 prepared_encode_record(uint8 *dst, const ClusterControlRootSnapshot *record, uint64 incarnation,
 					   uint32 node, ClusterControlRootPublishReason reason)
 {
-	UT_ASSERT_EQ(incarnation, 17);
+	UT_ASSERT_EQ(incarnation, prepared_round.coordinator_incarnation);
 	UT_ASSERT_EQ(node, 0);
 	UT_ASSERT_EQ(reason, CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT);
 	memcpy(dst, record, Min(sizeof(*record), CLUSTER_CONTROL_ROOT_RECORD_BYTES));
@@ -56,7 +58,7 @@ prepared_wal(const ClusterControlRootSnapshot *records, const uint8 *expected, u
 {
 	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
 	UT_ASSERT_EQ(records[0].identity.system_identifier, 1234);
-	UT_ASSERT_EQ(round->coordinator_incarnation, 17);
+	UT_ASSERT_EQ(round->coordinator_incarnation, prepared_round.coordinator_incarnation);
 	++prepared_wal_reads;
 	memset(out, 0x55, 32);
 	if (expected != NULL && memcmp(expected, out, 32) != 0)
@@ -92,6 +94,8 @@ prepared_read_pair(ControlRootImage *primary, ControlRootImage *bak)
 {
 	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
 	++prepared_reads;
+	if (prepared_writes != 0 && prepared_on_published_read != NULL)
+		prepared_on_published_read();
 	*primary = *bak = prepared_disk;
 	return prepared_read_result;
 }
@@ -111,6 +115,8 @@ prepared_read_one(const char *path, const uint8 uuid[16], uint64 sysid, ControlR
 	UT_ASSERT_EQ(uuid[0], 31);
 	UT_ASSERT_EQ(sysid, 1234);
 	++prepared_reads;
+	if (prepared_writes != 0 && prepared_on_published_read != NULL)
+		prepared_on_published_read();
 	*out = prepared_disk;
 	return prepared_read_result;
 }
@@ -220,6 +226,7 @@ prepared_fixture(bool activate)
 	MyAuxProcType = LmonProcess;
 	prepared_activate = activate;
 	prepared_cookie = 0;
+	prepared_on_published_read = NULL;
 	prepared_ack_complete = true;
 	prepared_acquires = prepared_reads = prepared_wal_reads = prepared_writes = 0;
 	g_s5_result = g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;

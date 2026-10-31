@@ -643,4 +643,25 @@ XLogRecGetBlockTagExtended(XLogReaderState *record, uint8 block_id, RelFileLocat
 	return true;
 }
 
+
+/* Legacy scan cases keep their original source boundary. */
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_deadline_v1(const ClusterControlRootSnapshot *expected,
+													 const ClusterControlRootReadToken *token,
+													 ClusterWalRecoveryCheckpointV1 *out,
+													 uint64 deadline_ns)
+{
+	(void)deadline_ns;
+	return cluster_control_root_recovery_checkpoint_v1(expected, token, out);
+}
+ClusterControlRootResult
+cluster_control_root_recovery_visit_deadline_v1(const ClusterControlRootSnapshot *expected,
+												const ClusterControlRootReadToken *token,
+												ClusterWalRecordVisitor visitor, void *arg,
+												ClusterWalTailObservation *out, uint64 deadline_ns)
+{
+	(void)deadline_ns;
+	return cluster_control_root_recovery_visit(expected, token, visitor, arg, out);
+}
+
 #endif /* TEST_CLUSTER_COLD_RECOVERY_IO_BOUNDARY_H */

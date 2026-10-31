@@ -30,6 +30,12 @@ else
 R4_RUNTIME_VIS_TEST_DEAD_STRIP = -Wl,--gc-sections
 endif
 
+ifeq ($(PORTNAME), linux)
+# Keep the ROOT fixture's rename fault boundary separate from libpgcommon.
+CONTROL_ROOT_TEST_CPPFLAGS = -DPGRAC_CONTROL_ROOT_RENAME_WRAP
+CONTROL_ROOT_TEST_LDFLAGS = -Wl,--wrap=durable_rename
+endif
+
 # The backend CRC dispatcher logs its hardware selection on some platforms.
 # Retain that real dispatcher; supply a fail-stop standalone logging boundary.
 CLUSTER_UNIT_PORT_LIBS = $(top_builddir)/src/port/libpgport_srv.a cluster_unit_port_stubs.o cluster_catalog_trace_test.o
@@ -53,7 +59,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_r4_tx_rpc_slots test_cluster_gcs_read_image_trace \
+TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_r4_tx_rpc_slots test_cluster_ordinary_tt_diagnostic test_cluster_gcs_read_image_trace \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -135,6 +141,16 @@ TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_rea
 		test_cluster_control_retire \
 		test_cluster_control_retire_master \
 		test_cluster_control_cf_poll \
+		test_cluster_cf_job_retirement \
+		test_cluster_control_owner_poll \
+		test_cluster_control_owner_custody \
+		test_cluster_wal_inputs_job \
+		test_cluster_wal_inputs_job_pi test_cluster_wal_inputs_job_pin \
+		test_cluster_wal_inputs_job_scope \
+		test_cluster_wal_inputs_job_cf \
+		test_cluster_wal_inputs_job_begin \
+		test_cluster_wal_inputs_job_revalidate \
+		test_cluster_wal_inputs_job_lifecycle test_cluster_wal_inputs_job_service test_cluster_wal_inputs_job_retained \
 		test_cluster_control_walr \
 		test_cluster_control_ir \
 		test_cluster_recovery_cold_cut test_cluster_typed_redo \
@@ -502,6 +518,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_cold_recovery_eor,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap_maintenance_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_cf_job_retirement test_cluster_control_owner_custody test_cluster_control_owner_poll test_cluster_wal_inputs_job test_cluster_wal_inputs_job_begin test_cluster_wal_inputs_job_cf test_cluster_wal_inputs_job_lifecycle test_cluster_wal_inputs_job_pi test_cluster_wal_inputs_job_pin test_cluster_wal_inputs_job_retained test_cluster_wal_inputs_job_revalidate test_cluster_wal_inputs_job_scope test_cluster_wal_inputs_job_service,$(SIMPLE_TESTS))
 TESTS += test_cluster_space_extend
 SIMPLE_TESTS := $(filter-out test_cluster_btree_leaf_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_btree_structure_version
@@ -559,7 +576,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_side_xact test_cluster_pi_contribution
 SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner test_cluster_remote_xact_writer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tx_exit_dispatch,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_rpc_slots,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_rpc_slots test_cluster_ordinary_tt_diagnostic,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
@@ -1289,7 +1306,16 @@ $(CLUSTER_CR_SERVER_C0_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_cr_ser
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
 		-c $< -o $@
 
-test_cluster_cr_server_policy: test_cluster_cr_server_policy.c unit_test.h $(CLUSTER_VERSION_O) \
+# Keep the complete original serve envelope and its diagnostics; service
+# leaves bind to the existing C0 product seam in the test translation unit.
+test_cluster_cr_server_envelope.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_server.c Makefile
+	awk '/^typedef struct (LmsFreshrefPairDiagnostic|LmsOrdinaryVerdictDiagnostic) / { emit=1; types++ } \
+	     /^(lms_freshref_pair_detail_admit|lms_freshref_pair_log_refusal|lms_ordinary_verdict_refusal|cr_serve_slot|cr_serve_slot_impl)\(/ \
+	     { print previous; emit=1; count++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (count != 5 || types != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cr_server_policy: test_cluster_cr_server_policy.c test_cluster_cr_server_envelope.inc unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_CR_SERVER_C0_TEST_O) \
 		$(top_builddir)/src/backend/cluster/cluster_undo_retention.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -1558,13 +1584,25 @@ test_cluster_startup_cf_callsite.inc: $(top_srcdir)/src/backend/access/transam/x
 	     END { if (calls != 1 || complete != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c \
-		test_cluster_prepared_cf.h test_cluster_prepared_cf.inc \
+test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_enqueue.c test_cluster_cf_deadline.h test_cluster_ir_pin_deadline.h test_cluster_seal_deadline.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		test_cluster_classification_cf.h test_cluster_classification_cf.inc \
+		test_cluster_typed_root_budget.h test_cluster_typed_root_budget.inc \
+		test_cluster_typed_prepare_budget.h test_cluster_typed_prepare_budget.inc \
+        test_cluster_typed_pass2.h test_cluster_typed_pass2.inc test_cluster_typed_pass2_select.inc \
+		test_cluster_prepared_cf.h test_cluster_prepared_job.h test_cluster_prepared_cf.inc \
+		$(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_generic_cf.h test_cluster_generic_cf.inc \
 		test_cluster_rejoin_cf.h test_cluster_rejoin_cf.inc test_cluster_rejoin_cf_types.inc \
 		test_cluster_cold_own_root_cf.h test_cluster_cold_own_root_cf.inc \
 		test_cluster_wal_pin_cf.h test_cluster_wal_pin_cf.inc test_cluster_wal_pin_cf_types.inc \
 		test_cluster_ir_preflight_cf.h \
+		test_cluster_cold_input_deadline.h \
+		test_cluster_merge_ir_cf.h test_cluster_merge_ir_cf.inc test_cluster_merge_ir_cf_types.inc \
+		test_cluster_merge_project_cf.h test_cluster_merge_project_cf.inc \
+		test_cluster_pre_ir_project_cf.h test_cluster_pre_ir_project_cf.inc \
+		test_cluster_merge_commit_cf.h test_cluster_merge_commit_cf.inc \
+		test_cluster_commit_owner_cf.h test_cluster_commit_owner_cf.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_ir.c \
 		$(top_srcdir)/src/backend/cluster/cluster_ir_lock.c \
 		test_cluster_startup_cf_entry.inc test_cluster_startup_cf_callsite.inc \
@@ -1573,7 +1611,7 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		test_cluster_inputs_cf.inc test_cluster_inputs_cf_checkpoint.inc \
 		test_cluster_retention_cf_types.inc test_cluster_retention_cf.inc \
 		test_cluster_recovery_wal_cf.inc test_cluster_self_seal_cf.inc \
-		test_cluster_failure_input_cf.inc \
+		test_cluster_failure_input_cf.inc test_cluster_seal_publish_cf.inc \
 		test_cluster_recovery_complete_cf.inc test_cluster_complete_authority.inc \
 		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_census.h \
@@ -1583,6 +1621,83 @@ test_cluster_startup_cf_entry: test_cluster_startup_cf_entry.c test_cluster_cf_e
 		$(CLUSTER_UNIT_CRYPTOHASH_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+# Actual merge caller, including original IR acquire-set rollback before CF wait.
+test_cluster_merge_ir_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^#define CLUSTER_RECOVERY_FENCE_PLAN_MAGIC/ { print; magic++ } \
+	     /^typedef struct (ClusterRecoveryFenceOrigin|RecoveryFenceCfContext)/ || /^struct ClusterRecoveryFencePlan/ || /^typedef enum RecoveryFenceSealStep/ { emit=1; n++ } \
+	     emit { print } /^};/ || /^} (ClusterRecoveryFenceOrigin|RecoveryFenceCfContext|RecoveryFenceSealStep);/ { emit=0 } \
+	     END { if (magic != 1 || n != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_merge_ir_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^(recovery_fence_plan_valid|recovery_fence_monotonic_ns|recovery_fence_deadline_current|recovery_fence_refused_detail|recovery_fence_refused|recovery_fence_cf_context_current|recovery_fence_wait_own_cf|recovery_fence_plan_acquire_serial_inputs)\(/ { print "static bool"; emit=1; n++ } \
+	     /^recovery_fence_acquire_budget\(/ { print "static int"; emit=1; n++ } \
+	     /^(cluster_recovery_merge_fence_plan_acquire_serial|cluster_recovery_merge_fence_plan_acquire_serial_inputs_v1)\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 11 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original positive canonical projection; its caller phases stay distinct.
+test_cluster_merge_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^(cluster_recovery_merge_project_readonly|recovery_merge_project_attempt)\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pre_ir_project_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^recovery_fence_origin_unsealed\(/ { print "static bool"; emit=1; n++ } \
+	     /^(recovery_fence_deadline_require|recovery_fence_plan_seal_inputs)\(/ { print "static void"; emit=1; n++ } \
+	     /^(recovery_fence_read_context_current|recovery_fence_project_context_current)\(/ { print "static bool"; emit=1; n++ } \
+	     /^recovery_fence_project_wait\(/ { print "static ClusterMergeEngage"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Actual typed root collection, linked to ROOT, CF and the original plan.
+test_cluster_typed_root_budget.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c \
+		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	awk 'FNR == NR && /^cluster_recovery_merge_fence_plan_origin\(/ { print "bool"; emit=1; getters++ } \
+	     FNR == NR && /^cluster_recovery_merge_fence_plan_deadline_v1\(/ { print "bool"; emit=1; getters++ } \
+	     FNR == NR && /^cluster_recovery_merge_fence_plan_origin_count\(/ { print "uint16"; emit=1; getters++ } \
+	     FNR != NR && /^cold_collect_roots\(/ { print "static bool"; emit=1; callers++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (getters != 3 || callers != 1 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+# Actual cold preflight classification, linked to ROOT and CF.
+test_cluster_classification_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^(recovery_fence_deadline_begin|recovery_fence_classify_origins)\(/ { print "static void"; emit=1; n++ } \
+	     /^recovery_fence_origin_input_acceptable\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_recovery_merge_preflight_readonly\(/ { print "ClusterMergeEngage"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Actual cold seal caller, linked to the failure-input publisher and CF.
+test_cluster_seal_publish_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^recovery_fence_acquire_budget_required\(/ { print "static int"; emit=1; n++ } \
+	     /^recovery_fence_origin_seal\(/ { print "static void"; emit=1; n++ } \
+	     /^recovery_fence_seal_publish_wait\(/ { signature=$$0; candidate=1; next } \
+	     candidate { signature=signature "\n" $$0; if (/;$$/) { candidate=0; next } if (/^{$$/) { print "static ClusterControlRootResult"; print signature; emit=1; n++; candidate=0 } next } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 3 || candidate || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_merge_commit_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^recovery_fence_plan_find_origin\(/ { print "static int"; emit=1; n++ } \
+	     /^(recovery_fence_changed|recovery_fence_commit_attempt)\(/ { print "static bool"; emit=1; n++ } \
+	     /^(cluster_recovery_merge_commit_plan_nowait|cluster_recovery_merge_fence_plan_revalidate_nowait)\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_commit_owner_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^(recovery_fence_cf_context_current|recovery_fence_wait_own_cf|recovery_fence_plan_acquire_serial_inputs|recovery_fence_commit_context_current)\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_recovery_merge_commit_plan_inputs_v1\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (n != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 # Join both original prepared ROOT consumers and authority checks to CF/CONTROL.
 # Physical ROOT I/O and the all-member ACK observation remain explicit leaves.
@@ -1594,8 +1709,13 @@ test_cluster_prepared_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_
 	     /^release_cf\(/ { print "static ClusterControlRootResult"; emit=1; releases++ } \
 	     /^(cluster_control_root_create_authority_current_v1|cluster_control_root_activate_authority_current_v1)\(/ { print "bool"; emit=1; authorities++ } \
 	     /^(cluster_control_root_create_prepared|cluster_control_root_activate_prepared)\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
+	     /^(cluster_control_root_create_prepared_job_v1|cluster_control_root_activate_prepared_job_v1|cluster_control_root_prepared_job_poll_v1)\(/ { print "ClusterControlRootResult"; emit=1; jobs++ } \
+	     /^(prepared_work_ready|prepared_work_current)\(/ { print "static bool"; emit=1; workchecks++ } \
+	     /^cluster_control_root_prepared_job_identity_current_v1\(/ { print "bool"; emit=1; identities++ } \
+	     /^prepared_work_bind\(/ { print "static void"; emit=1; workbinds++ } \
+	     /^(prepared_work_consume|prepared_work_release|control_root_create_prepared|control_root_activate_prepared)\(/ { print "static ClusterControlRootResult"; emit=1; worksteps++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || emit) exit 1 }' \
+	     END { if (codecs != 4 || predicates != 5 || acquires != 1 || releases != 1 || authorities != 2 || consumers != 2 || jobs != 3 || workchecks != 2 || identities != 1 || workbinds != 1 || worksteps != 4 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
@@ -1605,27 +1725,30 @@ test_cluster_generic_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_r
 	     /^reason_mask\(/ { print "static uint64"; emit=1; masks++ } \
 	     /^patch_shape_valid\(/ { print "static bool"; emit=1; shapes++ } \
 	     /^root_publish_requires_walr\(/ { print "static bool"; emit=1; selectors++ } \
-	     /^cluster_control_root_compare_and_publish\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
+	     /^(cluster_control_root_compare_and_publish|cluster_control_root_rejoin_compare_and_publish_checked)\(/ { print "ClusterControlRootResult"; emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (reserved != 1 || masks != 1 || shapes != 1 || selectors != 1 || consumers != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (reserved != 1 || masks != 1 || shapes != 1 || selectors != 1 || consumers != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original retained coordinator stage layout.
 test_cluster_rejoin_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
-	awk '/^typedef struct ClusterReconfigJoinCommitStage \{/ { emit=1; types++ } \
-	     emit { print } /^} ClusterReconfigJoinCommitStage;/ { emit=0 } \
-	     END { if (types != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^typedef struct ClusterReconfigJoin(BindContinuation|CommitStage) \{/ { emit=1; types++ } \
+	     emit { print } /^} ClusterReconfigJoin(BindContinuation|CommitStage);/ { emit=0 } \
+	     END { if (types != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Join the original coordinator stage to its ROOT publisher and CF refusal.
 test_cluster_rejoin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c \
 		$(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
-	awk 'FNR == NR && /^(cluster_recovery_duty_key_encode_for_claim|cluster_recovery_owner_rejoin_v1)\(/ { print "static bool"; emit=1; publishers++ } \
+	awk 'FNR == NR && /^(cluster_recovery_duty_key_encode_for_claim|cluster_recovery_owner_rejoin_v1|cluster_recovery_owner_rejoin_checked_v1|owner_marker_absent|owner_marker_committed_valid)\(/ { print "static bool"; emit=1; publishers++ } \
 	     FNR == NR && /^(cluster_recovery_duty_key_compare_for_claim|cluster_recovery_duty_key_compare)\(/ { print "static ClusterRecoveryDutyCompare"; emit=1; compares++ } \
+	     FNR == NR && /^cluster_recovery_owner_import_select_marker_v1\(/ { print "static ClusterRecoveryOwnerImportResult"; emit=1; selects++ } \
+	     FNR != NR && /^(cluster_reconfig_join_bind_current|cluster_reconfig_join_bind_context_current)\(/ { print "static bool"; emit=1; revalidates++ } \
+	     FNR != NR && /^cluster_reconfig_join_bind_cf_poll\(/ { print "static int"; emit=1; waits++ } \
 	     FNR != NR && /^cluster_reconfig_release_join_commit_stage\(/ { print "static void"; emit=1; releases++ } \
 	     FNR != NR && /^cluster_reconfig_poll_join_commit_stage\(/ { print "static bool"; emit=1; polls++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (publishers != 2 || compares != 2 || releases != 1 || polls != 1 || emit) exit 1 }' \
+	     END { if (publishers != 5 || compares != 2 || selects != 1 || waits != 1 || revalidates != 2 || releases != 1 || polls != 1 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
@@ -1638,10 +1761,12 @@ test_cluster_cold_own_root_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_col
 	     FNR == NR && /^(cold_refuse|cold_own_key_refuse|cold_identity_uuid_hex|cold_own_identity_refuse)\(/ { print "static void"; emit=1; diagnostics++ } \
 	     FNR == NR && /^cold_own_root_cf_(capture|wait)\(/ { print "static void"; emit=1; helpers++ } \
 	     FNR == NR && /^cold_own_root_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     FNR == NR && /^cold_own_root_(monotonic_ns|deadline_current)\(/ { print "static bool"; emit=1; budgets++ } \
+	     FNR == NR && /^cold_own_root_cf_budget\(/ { print "static int"; emit=1; budgets++ } \
 	     FNR == NR && /^cold_own_root\(/ { print "static bool"; emit=1; callers++ } \
-	     FNR != NR && /^cluster_control_root_lookup_owner_by_node_runtime\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
+	     FNR != NR && /^(cluster_control_root_lookup_owner_by_node_runtime|cluster_control_root_lookup_owner_deadline_v1)\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (flags != 1 || declarations < 1 || declarations > 2 || diagnostics != 4 || helpers > 2 || checks > 1 || callers != 1 || readers != 1 || emit || types) exit 1 }' \
+	     END { if (flags != 1 || declarations < 1 || declarations > 2 || diagnostics != 4 || helpers > 2 || checks > 1 || budgets != 3 || callers != 1 || readers != 2 || emit || types) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
@@ -1655,17 +1780,19 @@ test_cluster_wal_pin_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal
 test_cluster_wal_pin_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
 	awk 'FNR == NR && /^(control_root_read_ready|pin_valid|walr_request_current|pin_readers_current|pin_thread_walr_current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     FNR == NR && /^walr_deadline_budget\(/ { print "static int"; emit=1; budgets++ } \
+	     FNR == NR && /^(walr_request_acquire|walr_request_acquire_actual)\(/ { print "static ClusterLockAcquireResult"; emit=1; acquisitions++ } \
 	     FNR == NR && /^pin_free\(/ { print "static void"; emit=1; frees++ } \
 	     FNR == NR && /^pin_walr_for_thread\(/ { print "static ClusterWalPinLock *"; emit=1; selectors++ } \
 	     FNR == NR && /^root_publish_member\(/ { print "static const ClusterWalRootPublishGuard *"; emit=1; selectors++ } \
 	     FNR == NR && /^pin_release_locks\(/ { print "static ClusterWalrReleaseResult"; emit=1; releases++ } \
-	     FNR == NR && /^(pin_fail_after_locks|pin_current_after_grants|pin_acquire_inputs)\(/ { print "static ClusterWalPinResult"; emit=1; callers++ } \
-	     FNR == NR && /^(cluster_wal_retention_pin_acquire|cluster_wal_retention_pin_preflight_revalidate_wait_v1)\(/ { print "ClusterWalPinResult"; emit=1; callers++ } \
+	     FNR == NR && /^(pin_fail_after_locks|pin_current_after_grants|pin_acquire_inputs|root_publish_begin_exact)\(/ { print "static ClusterWalPinResult"; emit=1; callers++ } \
+	     FNR == NR && /^(cluster_wal_retention_pin_acquire|cluster_wal_retention_pin_acquire_deadline_v1|cluster_wal_retention_pin_preflight_deadline_v1|cluster_wal_retention_pin_preflight_revalidate_wait_v1|cluster_wal_retention_root_publish_begin_exact|cluster_wal_retention_root_publish_begin_deadline_v1)\(/ { print "ClusterWalPinResult"; emit=1; callers++ } \
 	     FNR == NR && /^pin_startup_cf_(capture|free)\(/ { print "static void"; emit=1; helpers++ } \
 	     FNR == NR && /^pin_startup_cf_(current|wait)\(/ { print "static bool"; emit=1; helpers++ } \
 	     FNR != NR && /^(cluster_control_root_read_canonical|cluster_control_root_read_recovery_subject|cluster_control_root_revalidate)\(/ { print "ClusterControlRootResult"; emit=1; readers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (predicates != 5 || frees != 1 || selectors != 2 || releases != 1 || callers != 5 || helpers > 4 || readers != 3 || emit) exit 1 }' \
+	     END { if (predicates != 5 || frees != 1 || selectors != 2 || releases != 1 || callers != 10 || budgets != 1 || acquisitions != 2 || helpers > 4 || readers != 3 || emit) exit 1 }' \
 	     $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
@@ -1699,18 +1826,20 @@ test_cluster_inputs_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs
 	     /^inputs_(io_role|owned|scope_role|current)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^inputs_unlock\(/ { print "static void"; emit=1; cleanup++ } \
 	     /^inputs_root\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
-	     /^inputs_cf_wait_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^(inputs_cf_wait_current|inputs_prepare_current)\(/ { print "static bool"; emit=1; checks++ } \
+	     /^inputs_prepare_budget\(/ { print "static int"; emit=1; budgets++ } \
 	     /^inputs_cf_wait(_capture)?\(/ { print "static void"; emit=1; waiters++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (declarations != 7 || helpers > 1 || checks > 1 || waiters > 2 || predicates != 4 || cleanup != 1 || consumers != 1 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (declarations != 7 || helpers > 1 || checks != 2 || budgets != 1 || waiters > 2 || predicates != 4 || cleanup != 1 || consumers != 1 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # The actual no-pin checkpoint caller, including its original cleanup paths.
 test_cluster_inputs_cf_checkpoint.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
 	awk '/^inputs_overlap\(/ { print "static bool"; emit=1; overlaps++ } \
-	     /^cluster_wal_inputs_cold_checkpoint_v1\(/ { print "ClusterControlRootResult"; emit=1; callers++ } \
+	     /^inputs_cold_checkpoint\(/ { print "static ClusterControlRootResult"; emit=1; common++ } \
+	     /^cluster_wal_inputs_cold_checkpoint(_readback)?_v1\(/ { print "ClusterControlRootResult"; emit=1; callers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (overlaps != 1 || callers != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (overlaps != 1 || common != 1 || callers != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original retention consumers and their shared canonical observation, joined
@@ -1725,12 +1854,12 @@ test_cluster_retention_cf_types.inc: $(top_srcdir)/src/backend/cluster/cluster_c
 
 test_cluster_retention_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
 	awk '/^(cluster_control_root_identity_equal|read_token_equal|canonical_aux_actor|canonical_aux_capture_cut|canonical_aux_finish)\(/ { print ($$0 ~ /^cluster_control_root_identity_equal/ ? "bool" : "static bool"); emit=1; predicates++ } \
-	     /^(runtime_v2_owner_check|release_cf|read_retention_version|read_canonical_version|cluster_control_root_v3_read_canonical|cluster_control_root_v3_terminal_history_blocked)\(/ { print ($$0 ~ /^cluster_control_root_v3_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
+	     /^(runtime_v2_owner_check|release_cf|read_retention_version|read_canonical_version|cluster_control_root_v3_read_canonical|cluster_control_root_v3_read_canonical_deadline_v1|cluster_control_root_v3_terminal_history_blocked)\(/ { print ($$0 ~ /^cluster_control_root_v3_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
 	     /^make_read_token\(/ { print "static void"; emit=1; tokens++ } \
 	     /^retention_startup_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     /^retention_startup_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (predicates != 5 || consumers != 6 || tokens != 1 || checks > 1 || waiters > 2 || emit) exit 1 }' $< > $@.tmp
+	     END { if (predicates != 5 || consumers != 7 || tokens != 1 || checks > 1 || waiters > 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Exact recovery WAL consumers and their original CF/alias boundaries.
@@ -1739,11 +1868,12 @@ test_cluster_recovery_wal_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_cont
 	     /^typedef struct RecoveryWalCfWait / { types=1; helpers++ } \
 	     types { print; if (/^}/) types=0; next } \
 	     /^(history_ranges_overlap|acquire_clusterwide_cf)\(/ { print "static bool"; emit=1; predicates++ } \
-	     /^recovery_wal_cf_current\(/ { print "static bool"; emit=1; checks++ } \
+	     /^(recovery_wal_cf_current|recovery_wal_prepare_current)\(/ { print "static bool"; emit=1; checks++ } \
+	     /^recovery_wal_prepare_budget\(/ { print "static int"; emit=1; budgets++ } \
 	     /^recovery_wal_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
-	     /^(recovery_wal_visit_root|recovery_wal_visit|cluster_control_root_recovery_(source_v1|checkpoint_v1|visit|sync_v1))\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
+	     /^(recovery_wal_source|recovery_wal_visit_root|recovery_wal_visit|recovery_wal_checkpoint|cluster_control_root_recovery_(source_v1|source_deadline_v1|checkpoint_v1|checkpoint_deadline_v1|visit|visit_deadline_v1|sync_v1))\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (work != 1 || helpers > 1 || predicates != 2 || checks > 1 || waiters > 2 || consumers != 6 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (work != 1 || helpers > 1 || predicates != 2 || checks != 2 || budgets != 1 || waiters > 2 || consumers != 11 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original Startup self-seal authorization and S/X consumer/caller/cleanup.
@@ -1752,12 +1882,12 @@ test_cluster_self_seal_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_control
 	awk '/^typedef struct FailureInputV2Work / { types=1; work++ } \
 	     /^typedef struct (FailureSelfCfWait|FailureInputCfWait) / { types=1; helpers++ } \
 	     types { print; if (/^}/) types=0; next } \
-	     /^(self_predecessor_authorized|failure_v2_authorized|failure_v2_current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     /^(failure_input_deadline_current|self_predecessor_authorized|failure_v2_authorized|failure_v2_current)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^failure_self_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     /^failure_self_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
 	     /^(failure_v2_cleanup|failure_v2_self_open_read|failure_v2_self_seal_work)\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (work != 1 || helpers > 2 || predicates != 3 || checks > 1 || waiters > 2 || consumers != 3 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (work != 1 || helpers > 2 || predicates != 4 || checks > 1 || waiters > 2 || consumers != 3 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Failure input keeps its original fenced or self authority and IR purpose.
@@ -1766,9 +1896,9 @@ test_cluster_failure_input_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_con
 	awk '/^(failure_v2_authorized|failure_v2_current)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^failure_input_cf_current\(/ { print "static bool"; emit=1; checks++ } \
 	     /^failure_input_cf_(capture|wait)\(/ { print "static void"; emit=1; waiters++ } \
-	     /^(failure_v2_cleanup|failure_v2_tail_read|failure_v2_tail_commit|failure_v2_tail_work|failure_v2_open_work)\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
+	     /^(failure_v2_cleanup|failure_v2_tail_read|failure_v2_tail_commit|failure_v2_tail_work|failure_v2_open_work|failure_v2_publish|cluster_control_root_v3_failure_(open|tail)_deadline_v1)\(/ { print ($$0 ~ /^cluster_control_root_/ ? "ClusterControlRootResult" : "static ClusterControlRootResult"); emit=1; consumers++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (predicates != 2 || checks > 1 || waiters > 2 || consumers != 5 || emit) exit 1 }' $< > $@.tmp
+	     END { if (predicates != 2 || checks > 1 || waiters > 2 || consumers != 8 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Post-IR completion stays within the original one-shot publication call.
@@ -3195,14 +3325,15 @@ test_cluster_heap_ctrc_g_required_ack_body.inc: $(top_srcdir)/src/backend/cluste
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
-	@awk 'BEGIN { pattern = "^(ctrc_tlv_bytes|ctrc_tlv_u8|ctrc_tlv_u16|ctrc_tlv_u32|ctrc_tlv_u64|ctrc_publication_id_encode|ctrc_target_encode|ctrc_cleaner_owns_key|ctrc_scan_limit|ctrc_scan_charge|ctrc_participant_scan_lock_mask|ctrc_receipt_snapshot_valid|ctrc_receipt_row_encode|ctrc_receipt_key_sequence_cmp|ctrc_receipt_durability_covered|cluster_ctrc_participant_ack_from_snapshot|ctrc_participant_find_ack_ready|ctrc_participant_capture_durability|ctrc_ack_batch_inputs|ctrc_ack_participant_exact|ctrc_ack_block_if_same|ctrc_ack_work_find|ctrc_participant_copy_ack_batch|ctrc_participant_freeze_ack_batch_exact|ctrc_participant_freeze_ack_batch_shared)\\(" } \
+	@awk 'BEGIN { pattern = "^(ctrc_tlv_bytes|ctrc_tlv_u8|ctrc_tlv_u16|ctrc_tlv_u32|ctrc_tlv_u64|ctrc_publication_id_encode|ctrc_target_encode|ctrc_cleaner_owns_key|ctrc_scan_limit|ctrc_scan_charge|ctrc_participant_scan_lock_mask|ctrc_receipt_snapshot_valid|ctrc_receipt_row_encode|ctrc_receipt_key_sequence_cmp|ctrc_receipt_durability_covered|cluster_ctrc_participant_ack_from_snapshot|ctrc_participant_find_ack_ready|ctrc_participant_capture_durability|ctrc_participant_stop_capture|ctrc_participant_stop_trace_lock|ctrc_participant_stop_trace|ctrc_ack_stop_sample|ctrc_ack_stop_phase|ctrc_ack_stop_capture|ctrc_ack_stop_predicate|ctrc_ack_batch_inputs|ctrc_ack_participant_exact|ctrc_ack_block_if_same|ctrc_ack_work_find|ctrc_participant_copy_ack_batch|ctrc_participant_freeze_ack_batch_exact|ctrc_participant_freeze_ack_batch_shared)\\(" } \
 	     /^#define (CTRC_CLEANER_ACK_BATCH|CTRC_PARTICIPANT_ALL_SHARDS) / { print; constants++ } \
-	     /^typedef struct CtrcAckWork \{/ { structure=1; structures++ } \
-	     structure { print; if (/^} CtrcAckWork;/) structure=0; next } \
+	     /^typedef struct (CtrcAckWork|CtrcParticipantStopTrace) \{/ { structure=1; structures++ } \
+	     structure { print; if (/^} (CtrcAckWork|CtrcParticipantStopTrace);/) structure=0; next } \
+	     /^static (uint64 CtrcParticipantStop(Sequence|Skipped);|CtrcAckWork \*CtrcAckStopWork;|Size CtrcAckStopCount;|CtrcParticipantStopTrace CtrcAckStopSamples\[)/ { print; globals++ } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
 	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
 	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
-	     END { if (found != 25 || done != 25 || candidate || structure || structures != 1 || constants != 2) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	     END { if (found != 32 || done != 32 || candidate || structure || structures != 2 || constants != 2 || globals != 5) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original volatile origin/inbox terminal edge; canonical block0 publisher is separate.
@@ -3791,7 +3922,15 @@ test_cluster_abort_writer_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 test_cluster_pi_drop_storage: test_cluster_pi_drop_storage.c test_cluster_page_data.c
 test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
 test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: $(CLUSTER_KO_O)
-test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
+test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O) cluster_pi_inject_test.o cluster_pi_io_trace_test.o
+# Keep inherited FlushBuffer diagnostics bound to their real implementations.
+test_cluster_pi_writeback: PI_WRITEBACK_DIAGNOSTIC_OBJS = cluster_pi_inject_test.o cluster_pi_io_trace_test.o
+cluster_pi_inject_test.o: $(top_srcdir)/src/backend/cluster/cluster_inject.c \
+		$(top_srcdir)/src/include/cluster/cluster_inject.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+cluster_pi_io_trace_test.o: $(top_srcdir)/src/backend/cluster/cluster_block_io_trace.c \
+		$(top_srcdir)/src/include/cluster/cluster_block_io_trace.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
@@ -3812,8 +3951,8 @@ test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cl
 		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
-		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter test_cluster_pi_writeback,$@),-ffunction-sections -fdata-sections) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
+		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) $(PI_WRITEBACK_DIAGNOSTIC_OBJS) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
@@ -4928,7 +5067,7 @@ test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal
 		$(top_srcdir)/src/include/cluster/storage/cluster_shared_fs.h \
 		$(top_srcdir)/src/include/access/xlogrecovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read -c $< -o $@
 
 test_cluster_catalog_origin_io.o: $(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
@@ -5248,6 +5387,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		test_cluster_page_stable_ctrc.o \
 		cluster_page_authority_ctrc_test.o cluster_page_install_ctrc_test.o $(CLUSTER_PAGE_GUARD_O) \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
 		test_cluster_wal_inputs_product.o \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
@@ -5261,7 +5401,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
 		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter test_cluster_control_root,$@),$(CONTROL_ROOT_TEST_CPPFLAGS)) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_native_census_product.o test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_pending.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_startup.o test_cluster_cold_recovery_io_core.o $(top_builddir)/src/backend/cluster/cluster_wal_restart_read.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_retained_owner.o) \
@@ -5296,7 +5436,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(if $(filter test_cluster_control_root,$@),$(CONTROL_ROOT_TEST_LDFLAGS)) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) $(if $(filter test_cluster_ctrc_native_fpi,$@),-lcrypto -lssl) -o $@
 
 # PGRAC: perturb only syscall timing/failure; all read/decoder/selection code is
@@ -5365,6 +5505,8 @@ test_cluster_wal_retained_cut_records: test_cluster_wal_retained_cut_records.c u
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_retention: test_cluster_wal_retention.c unit_test.h \
 		test_cluster_wal_retention_startup_boundary.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(CLUSTER_WAL_RETENTION_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_RETENTION_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
@@ -5847,20 +5989,227 @@ test_cluster_cf_blocker_trace.inc: $(top_srcdir)/src/backend/cluster/cluster_ges
 
 test_cluster_cf_enqueue test_cluster_control_walr test_cluster_control_ir: test_cluster_cf_blocker_trace.inc
 
-test_cluster_cf_enqueue: test_cluster_cf_enqueue.c unit_test.h \
+test_cluster_cf_inputs_unlock.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^typedef struct WalInputsWork \{/ { emit=1; types++ } \
+	     /^inputs_unlock\(/ { print "static void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || functions != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cf_enqueue: test_cluster_cf_enqueue.c unit_test.h test_cluster_cf_inputs_unlock.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(top_builddir)/src/backend/cluster/cluster_control_request.o \
 		$(CLUSTER_LMD_WAIT_STATE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(top_builddir)/src/backend/cluster/cluster_control_request.o \
 		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# PGRAC: original CF owner/registry/ACK with local completion storage.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_cf_job_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_control_retire.c Makefile
+	awk '/^(cluster_control_retire_cut|control_cut_current|control_receive_ack)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cf_job_retirement: test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_cf_blocker_trace.inc \
+		test_cluster_startup_interrupt.inc test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) \
+		$(CLUSTER_CONTROL_REQUEST_O) $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # PGRAC: test the actual WALR caller through the stable control owner.
 # Author: SqlRush <sqlrush@gmail.com>
-test_cluster_control_walr.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
-	awk '/^#define CLUSTER_WALR_NATIVE_TAG_MAGIC/ { print } \
-	     /^(walr_native_locktag_init|walr_request_has_native_lock|walr_native_lock_release_or_fatal|walr_request_finish_native|walr_request_acquire_actual|walr_convert_finish_native|walr_request_convert_actual|walr_request_release_actual)\(/ { print prev; emit=1; count++ } \
+test_cluster_control_owner_poll: test_cluster_control_owner_poll.c test_cluster_control_walr.c \
+		test_cluster_cf_enqueue.c unit_test.h test_cluster_cf_job_ack.inc \
+		test_cluster_control_walr.inc test_cluster_cf_blocker_trace.inc \
+		test_cluster_startup_interrupt.inc test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/include/cluster/cluster_lock_owner.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) \
+		$(CLUSTER_CONTROL_REQUEST_O) $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_control_owner_custody: test_cluster_control_owner_custody.c test_cluster_control_walr.c \
+		test_cluster_cf_enqueue.c unit_test.h test_cluster_cf_job_ack.inc \
+		test_cluster_control_walr.inc test_cluster_cf_blocker_trace.inc \
+		test_cluster_startup_interrupt.inc test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/include/cluster/cluster_lock_owner.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) \
+		$(CLUSTER_CONTROL_REQUEST_O) $(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_wal_inputs_job: test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c \
+		test_cluster_cf_enqueue.c unit_test.h test_cluster_cf_job_ack.inc \
+		test_cluster_wal_inputs_job_callback.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_wal_inputs_job test_cluster_wal_inputs_job_pin test_cluster_wal_inputs_job_scope test_cluster_wal_inputs_job_cf test_cluster_wal_inputs_job_begin test_cluster_wal_inputs_job_revalidate test_cluster_wal_inputs_job_lifecycle: \
+		test_cluster_wal_inputs_job_pin_fixture.h test_cluster_wal_inputs_job_pin_types.inc \
+		test_cluster_wal_inputs_job_pin_bodies.inc test_cluster_control_walr.inc \
+		test_cluster_wal_inputs_job_scope_fixture.h test_cluster_wal_inputs_job_scope_types.inc \
+		test_cluster_wal_inputs_job_scope_bodies.inc \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_cut_job_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h
+
+test_cluster_wal_inputs_job_begin: test_cluster_wal_inputs_job_begin.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		test_cluster_wal_inputs_job_begin_fixture.h test_cluster_wal_inputs_job_begin_types.inc \
+		test_cluster_wal_inputs_job_begin_bodies.inc \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+test_cluster_wal_inputs_job_revalidate: test_cluster_wal_inputs_job_revalidate.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		test_cluster_wal_inputs_job_begin_fixture.h test_cluster_wal_inputs_job_begin_types.inc \
+		test_cluster_wal_inputs_job_begin_bodies.inc \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+test_cluster_wal_inputs_job_lifecycle: test_cluster_wal_inputs_job_lifecycle.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		test_cluster_wal_inputs_job_begin_fixture.h test_cluster_wal_inputs_job_begin_types.inc \
+		test_cluster_wal_inputs_job_begin_bodies.inc \
+		test_cluster_wal_inputs_job_cut_fixture.h test_cluster_wal_inputs_job_cut_types.inc \
+		test_cluster_wal_inputs_job_cut_bodies.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_cut_job_private.h \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o $(top_builddir)/src/common/libpgcommon.a \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter -lcrypto,$(LIBS)) -lm -o $@
+
+test_cluster_wal_inputs_job_begin_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^typedef struct (WalInputsWork|WalInputsCfWait)/ { emit=1; count++ } \
+	     emit { print } /^} (WalInputsWork|WalInputsCfWait);/ { emit=0 } \
+	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_begin_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^(inputs_cf_wait_capture|inputs_cf_wait_current|inputs_cf_wait|inputs_build_current|inputs_revalidate|inputs_unlock|inputs_root|inputs_checkpoint|inputs_terminal|inputs_collect|inputs_claims|inputs_remote_sample|cluster_wal_inputs_prepare_live_v1|inputs_job_root_phase|cluster_wal_inputs_job_begin_v1|cluster_wal_inputs_job_failed_root_v1|cluster_wal_inputs_job_revalidate_v1|cluster_wal_inputs_job_suspend_v1|cluster_wal_inputs_job_resume_v1|cluster_wal_inputs_revalidate_v1|cluster_wal_inputs_suspend_v1|cluster_wal_inputs_wait_failed_v1|cluster_wal_inputs_resume_v1|cluster_wal_inputs_root_token_v1|cluster_wal_inputs_at_v1)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 8) exit 1 }' $< > $@.tmp
+	     END { if (count != 25 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_cf: test_cluster_wal_inputs_job_cf.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_wal_inputs_job_scope: test_cluster_wal_inputs_job_scope.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_wal_inputs_job_scope_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^typedef enum WalInputsPurpose/ || /^typedef struct ClusterRecoveryTxIoScopeV1/ || /^typedef struct ClusterRecoveryCtrcReplayOwnerV1/ || /^typedef struct ClusterRecoveryCtrcSourcePlanV1/ || /^typedef struct ClusterRecoveryCtrcIoScopeV1/ || /^struct ClusterWalInputsV1/ { emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     /^static ClusterWalInputsV1 \*inputs_job_scopes/ || /^static ClusterRecoveryTxRetentionV1 active_(tx|ctrc)_retention;/ { print; globals++ } \
+	     END { if (count != 6 || globals != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_scope_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^(inputs_prepare_budget|inputs_prepare_current|cluster_wal_inputs_scope_job_binding_v1|cluster_wal_inputs_scope_job_suspended_v1|cluster_wal_inputs_scope_job_allocate_v1|cluster_wal_inputs_scope_job_pin_slot_v1|cluster_wal_inputs_scope_job_revoke_v1|cluster_wal_inputs_scope_job_drained_v1|cluster_wal_inputs_scope_job_forget_v1|inputs_io_role|inputs_owned|inputs_scope_role|inputs_current|cluster_wal_inputs_release_v1|cluster_wal_inputs_count_v1)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 15 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_pin: test_cluster_wal_inputs_job_pin.c test_cluster_wal_inputs_job.c \
+		test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c unit_test.h \
+		test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_wal_inputs_job_pin_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
+	awk '/^#define CLUSTER_WAL_READ_PIN_MAGIC/ { print; constants++ } \
+	     /^typedef struct ClusterWalPinLock \{/ || /^struct ClusterWalReadPinV1 \{/ || /^struct ClusterWalRootPublishGuard \{/ { emit=1; types++ } \
+	     emit { print } /^};/ || /^} ClusterWalPinLock;/ { emit=0 } \
+	     /^static .* (read_pin_generation);/ || /^static .*\*(active_pin|active_read_pin|active_root_publish_guard|active_reuse_guard|active_e1_context|active_action_context);/ { print; globals++ } \
+	     END { if (constants != 1 || types != 3 || globals != 7 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_pin_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
+	awk '/^(read_pin_acquire|cluster_wal_read_pin_owner_v1|cluster_wal_read_pin_owner_current_v1|cluster_wal_retention_resid_encode|walr_request_current|walr_share_request_init|read_pin_valid|cluster_wal_read_pin_job_binding_v1|cluster_wal_read_pin_covers_v1|cluster_wal_read_pin_release_v1|cluster_wal_read_pin_acquire_v1|read_pin_job_finish_native|cluster_wal_read_pin_acquire_job_v1|read_pin_job_release|cluster_wal_read_pin_release_job_v1|cluster_wal_read_pin_suspend_job_v1|cluster_wal_read_pin_release_job_poll_v1|read_pin_job_owner_cleanup)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 18 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_callback.inc: $(top_srcdir)/src/backend/utils/resowner/resowner.c Makefile
+	awk '/^typedef struct ResourceReleaseCallbackItem/ { emit=1; count++ } \
+	     emit { print } /^} ResourceReleaseCallbackItem;/ { emit=0; ends++ } \
+	     END { if (count != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_control_walr.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
+	awk '/^#include <time.h>/ || /^#include "portability\/instr_time.h"/ || /^#define CLUSTER_WALR_NATIVE_TAG_MAGIC/ { print } \
+	     /^(walr_deadline_budget|walr_request_acquire|walr_native_locktag_init|walr_request_has_native_lock|walr_native_lock_release_or_fatal|walr_request_finish_native|walr_request_acquire_actual|walr_convert_finish_native|walr_request_convert_actual|walr_request_release_actual)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 10) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: actual copyable IR callers use production ownership/registry objects.
@@ -6904,6 +7253,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_recovery_episode_clog.o test_cluster_recovery_episode_side_owner.o test_cluster_recovery_consumed_inputs.o test_cluster_recovery_scope_native_census_product.o test_cluster_recovery_episode_allocator.o test_cluster_recovery_scope_startup.o
 	rm -f test_cluster_startup_native_ctrc.o test_cluster_startup_native_ctrc_owner.inc test_cluster_startup_native_ctrc_owner.inc.tmp
 	rm -f test_cluster_side_native_clog.o
+	rm -f test_cluster_cr_server_envelope.inc test_cluster_cr_server_envelope.inc.tmp
 	rm -f test_cluster_tx_exit_dispatch.inc test_cluster_tx_exit_dispatch.inc.tmp \
 		test_cluster_tx_exit_registration.inc test_cluster_tx_exit_registration.inc.tmp
 	rm -f test_cluster_external_fence_duty.inc
@@ -7113,6 +7463,7 @@ clean distclean maintainer-clean:
 		test_cluster_resource_x_retained_wait_gate.inc \
 		test_cluster_resource_x_predecessor_wait_gate.inc \
 		test_cluster_resource_x_dispatch_observation.inc \
+		test_cluster_resource_x_preflight_peer.inc \
 		test_cluster_pcm_source_finish_tick.inc \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_resource_x_eviction_owner.inc \
@@ -8518,12 +8869,14 @@ test_cluster_r4_lms_controls: test_cluster_r4_lms_controls.c unit_test.h \
 # function-sectioned CR-server object and source-check all four legacy callers.
 CLUSTER_R4_SLOT_RESERVATION_TEST_O = test_cluster_r4_slot_reservation_product.o
 
-# Execute the exact inline entry, with constructor/I/O/reply and memory-context
-# boundaries supplied by the test. No copied policy or product test branch.
+# Execute the exact inline entry and reply construction/shipping. The test
+# supplies the constructor, transport and memory-context boundaries.
 test_cluster_cr_inline_stop.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_server.c Makefile
-	awk '/^cluster_gcs_block_forward_serve_inline\(/ { print "void"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } \
-	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^typedef struct (ClusterCrServerShared|LmsOrdinaryReplyObservation) / { emit=1; types++ } \
+	     /^static ClusterCrServerShared \*CrServerShared/ { print; globals++ } \
+	     /^(cr_ordinary_reply_capture|cr_ordinary_reply_emit|cr_ordinary_reply_note|cr_build_and_send_reply|cluster_lms_cr_ship_ready|cluster_gcs_block_forward_serve_inline)\(/ \
+	     { print previous; emit=1; count++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (count != 6 || types != 2 || globals != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_cr_inline_stop: test_cluster_cr_inline_stop.c test_cluster_cr_inline_stop.inc unit_test.h
@@ -8789,7 +9142,7 @@ test_cluster_checkpoint_pi_order.inc: $(top_srcdir)/src/backend/access/transam/x
 		fn && /^}/ { exit } \
 		function at(name) { if (!(name in line)) line[name] = NR } \
 		fn && /CheckPointBuffers\(flags\);/ { at("buffers") } \
-		fn && /cluster_pi_writeback_checkpointer_release_v1\(\);/ { at("release") } \
+		fn && /ClusterCheckpointReleasePiInputs\(flags\);/ { at("release") } \
 		fn && /cluster_undo_buf_flush_all\(/ { at("undo") } \
 		fn && /ProcessSyncRequests\(\);/ { at("sync") } \
 		END { n = split("buffers release undo sync", k, " "); \
@@ -9216,6 +9569,13 @@ test_cluster_resource_x_dispatch_observation.inc: $(top_srcdir)/src/backend/clus
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_resource_x_preflight_peer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/if \(requester_ready && master_ready\)/ { emit=1; begin++ } \
+	     emit && /preflight_membership_wait:/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingress.c \
 		unit_test.h test_cluster_resource_x_terminal_owner.inc \
 		test_cluster_resource_x_eviction_owner.inc \
@@ -9231,6 +9591,7 @@ test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingre
 		test_cluster_resource_x_retained_wait_gate.inc \
 		test_cluster_resource_x_predecessor_wait_gate.inc \
 		test_cluster_resource_x_dispatch_observation.inc \
+		test_cluster_resource_x_preflight_peer.inc \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
 		$(top_srcdir)/src/include/cluster/cluster_ic.h \
@@ -10129,11 +10490,11 @@ test_cluster_r4_activation_record: test_cluster_r4_activation_record.c unit_test
 		cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
-		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O)
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(top_builddir)/src/common/sha2_srv.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
-		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/common/sha2_srv.o $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 
 CLUSTER_R4_OPEN_ROUTE_TEST_O = test_cluster_r4_open_route_product.o
@@ -10159,6 +10520,60 @@ test_cluster_normal_cold_postjobs.inc: $(top_srcdir)/src/backend/access/transam/
 	@awk '/^StartupXLOG\(/ { fn=1 } fn && /PGRAC MODIFICATIONS \(spec-4.8 D1\): resolve crash-left/ { print "/*"; emit=1; starts++ } \
 		emit && /^#endif/ { done=1; exit } emit { print } END { if (!done || starts != 1) exit 1 }' $< > $@
 
+# Preserve the native absent-input/owner guards, then abort at the unmodelled
+# retained-cold boundary. Count every source anchor so source drift fails build.
+test_cluster_normal_cold_memory.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	@awk '/^int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;/ { print; count++ } \
+		END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_normal_cold_observe_guard.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	@awk '/^static struct ClusterRecoveryStartV1 \*cluster_recovery_cold_start;/ { print; owners++ } \
+		/^ClusterColdRecoveryCtrcObserve\(/ { print previous; emit=1; starts++ } \
+		emit && /^\tstate = cluster_recovery_cold_start;/ { emit=0; stops++ } \
+		emit { print } { previous=$$0 } \
+		END { if (owners != 1 || starts != 1 || stops != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_normal_cold_wait_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c Makefile
+	@awk '/^static ClusterRecoveryPlanShmem \*cluster_recovery_plan_shmem = NULL;/ { print; shared++ } \
+		/^static const struct ClusterRecoveryStartV1 \*checkpoint_registered_start;/ { print; owners++ } \
+		/^typedef struct RecoveryCtrcHandoffV1 \{/ { type=1; types++ } \
+		/^cluster_recovery_ctrc_result_wait_v1\(/ { print previous; emit=1; starts++ } \
+		emit && /^\tfixed.start = start;/ { emit=0; stops++ } \
+		type || emit { print } /^} RecoveryCtrcHandoffV1;/ { type=0 } { previous=$$0 } \
+		END { if (shared != 1 || owners != 1 || types != 1 || starts != 1 || stops != 1 || type || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_normal_cold_claim_guard.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	@awk '/^static bool merge_claim_held = false;/ { print; held++ } \
+		/^typedef struct MergeClaimCustody \{/ { type=1; types++ } \
+		/^static MergeClaimCustody merge_claim_custody = / { print; owners++ } \
+		/^cluster_recovery_merge_claim_release_if_held\(/ { print previous; emit=1; starts++ } \
+		emit && /^\tcookie = merge_claim_cf_enter\(\);/ { emit=0; stops++ } \
+		type || emit { print } /^} MergeClaimCustody;/ { type=0 } { previous=$$0 } \
+		END { if (held != 1 || types != 1 || owners != 1 || starts != 1 || stops != 1 || type || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+CLUSTER_NORMAL_COLD_GUARDS_O = test_cluster_normal_cold_guards.o
+$(CLUSTER_NORMAL_COLD_GUARDS_O): test_cluster_normal_cold_guards.c \
+		test_cluster_normal_cold_memory.inc test_cluster_normal_cold_observe_guard.inc \
+		test_cluster_normal_cold_wait_guard.inc test_cluster_normal_cold_claim_guard.inc \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+		$(top_srcdir)/src/include/utils/resowner.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+.PHONY: clean-normal-cold-guards
+clean-normal-cold-guards:
+	rm -f $(CLUSTER_NORMAL_COLD_GUARDS_O) test_cluster_normal_cold_*guard.inc \
+		test_cluster_normal_cold_*guard.inc.tmp test_cluster_normal_cold_memory.inc \
+		test_cluster_normal_cold_memory.inc.tmp
+clean distclean maintainer-clean: clean-normal-cold-guards
+
 # PGRAC: compile the actual observation predicate behind the semantic caller;
 # fixture values are external inputs, never a hand-copied liveness decision.
 test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
@@ -10167,12 +10582,15 @@ test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
 test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h test_cluster_clean_restart_formation.h test_cluster_commit_carrier.h test_cluster_normal_cold_scn.inc \
+		test_cluster_prepared_round.h $(top_srcdir)/src/include/cluster/cluster_control_root_prepared.h \
 		test_cluster_terminal_peer.inc \
 		test_cluster_stop_membership_observation.inc \
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \
 		test_cluster_normal_cold_prepare.inc test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
+		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		cluster_r4_open_route_test_stubs.h $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
@@ -10183,9 +10601,41 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
+		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
+
+TESTS += test_cluster_control_rebind
+all: test_cluster_control_rebind
+
+test_cluster_r4_activation_record: $(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc
+
+test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activation_fsm.c \
+		test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h \
+		test_cluster_clean_restart_formation.h test_cluster_commit_carrier.h unit_test.h \
+		test_cluster_normal_cold_scn.inc test_cluster_terminal_peer.inc \
+		test_cluster_stop_membership_observation.inc test_cluster_normal_cold_startup.h \
+		test_cluster_normal_cold_capture.inc test_cluster_normal_cold_prepare.inc \
+		test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
+		test_cluster_normal_cold_runtime.h cluster_r4_open_route_test_stubs.h \
+		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc \
+		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
+		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
+		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
+		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
+		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 
 # Stage 8 R4 D6 lifecycle/store RED tranche: link the real heap HOT lifecycle,
 # index-handler ownership switch, executor buffer-slot implementation and heap
@@ -11196,13 +11646,15 @@ test_cluster_wal_state_rmw: test_cluster_wal_state_rmw.c unit_test.h \
 # Header-only; scn_recovery_cmp stubbed in-test (cluster_scn.o not
 # linked).  Header deps explicit per L229.
 test_cluster_recovery_cold_cut.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
-	awk '/^cluster_recovery_merge_project_readonly\(/ { print prev; emit=1; count++ } \
+	awk '/^(cluster_recovery_merge_project_readonly|recovery_merge_project_attempt)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_recovery_cold_cut: test_cluster_recovery_cold_cut.c unit_test.h \
 		test_cluster_recovery_cold_cut.inc \
+		test_cluster_recovery_duty_compare.inc \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
 		$(top_srcdir)/src/include/cluster/cluster_control_root.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_source.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
@@ -11399,6 +11851,7 @@ test_cluster_pi_data: test_cluster_pi_data.c unit_test.h \
 test_cluster_wal_cut: test_cluster_wal_cut.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_cut.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_cut.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_cut_job_private.h \
 		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o
@@ -12588,7 +13041,7 @@ COLD_NATIVE_SIDE_OBJS = test_cluster_cold_native_side.o $(CLUSTER_SIDE_XACT_O) \
 	test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) \
 	$(CLUSTER_RF_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
 
-test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_test.h $(CLUSTER_COLD_STARTUP_O) \
+test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c test_cluster_typed_prepare_phases.h unit_test.h $(CLUSTER_COLD_STARTUP_O) \
 		$(COLD_NATIVE_SIDE_OBJS) $(CLUSTER_UNIT_CRYPTOHASH_O) test_cluster_cold_native_side.h \
 		test_cluster_cold_native_storage.inc test_cluster_recovery_episode_clog.o \
 		test_cluster_recovery_episode_clog.h \
@@ -12726,7 +13179,7 @@ test_cluster_cold_recovery_io test_cluster_cold_recovery_complete: %: %.c unit_t
 		$(CLUSTER_COLD_IO_PUBLISHER_O) \
 		test_cluster_cold_recovery_xid_core.o \
 		$(CLUSTER_COLD_PLAN_O) $(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o \
-		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lcrypto -o $@
 
 test_cluster_recovery_duty_compare.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c Makefile
 	awk '/^write_u(16|32|64)_le\(/ { print "static void"; emit=1; n++ } \
@@ -12753,6 +13206,7 @@ test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c un
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		test_cluster_recovery_duty_compare.inc \
 		test_cluster_recovery_merge_seal_boundary.h test_cluster_recovery_merge_cold_fixture.h \
+		test_cluster_recovery_merge_deadline.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_worker.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c \
@@ -14050,6 +14504,31 @@ test_cluster_r4_tx_rpc_slots: test_cluster_r4_tx_rpc_slots.c \
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		$< $(top_builddir)/src/port/libpgport_srv.a -o $@
 
+# Ordinary TT requester diagnostics: original private types and exchange bodies.
+test_cluster_ordinary_tt_types.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c $(srcdir)/Makefile
+	awk '/^typedef struct (GcsFirstFillReceipt|ClusterGcsBlockOutstandingSlot|ClusterGcsBlockBackendBlock|GcsFreshrefPairExchangeDiagnostic) / { emit=1; types++ } \
+	     emit { print } emit && /^} (GcsFirstFillReceipt|ClusterGcsBlockOutstandingSlot|ClusterGcsBlockBackendBlock|GcsFreshrefPairExchangeDiagnostic);$$/ { emit=0 } \
+	     END { if (types != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ordinary_tt_diagnostic.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c $(srcdir)/Makefile
+	awk '/^gcs_block_slot_clear_current_mx_expectation\(/ { print "static void"; emit=1; mx++ } \
+	     /^gcs_block_reserve_slot\(/ { print "static ClusterGcsBlockOutstandingSlot *"; emit=1; reserves++ } \
+	     /^gcs_block_clear_slot_locked\(/ { print "static void"; emit=1; clears++ } \
+	     /^gcs_block_release_slot\(/ { print "static void"; emit=1; releases++ } \
+	     /^gcs_block_compute_checksum\(/ { print "static uint32"; emit=1; checksums++ } \
+	     /^gcs_ordinary_verdict_refusal\(/ { print "static void"; emit=1; ordinary++ } \
+	     /^gcs_freshref_pair_log_refusal\(/ { print "static void"; emit=1; freshrefs++ } \
+	     /^gcs_block_undo_verdict_wire_exchange_trace_impl\(/ { print "static bool"; emit=1; exchanges++ } \
+	     emit { print } emit && /^}$$/ { emit=0 } \
+	     END { if (mx != 1 || reserves != 1 || clears != 1 || releases != 1 || checksums != 1 || ordinary != 1 || freshrefs != 1 || exchanges != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ordinary_tt_diagnostic: test_cluster_ordinary_tt_diagnostic.c unit_test.h \
+		test_cluster_ordinary_tt_types.inc test_cluster_ordinary_tt_diagnostic.inc \
+		$(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a -o $@
+
 # Exact original HOT FULL-cycle/validated readers; same fixture also builds parent.
 test_cluster_heap_hot_full_trace.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^typedef enum HeapHotR4CycleOutcome/ { emit=1; enums++ } \
@@ -14564,3 +15043,229 @@ clean: clean-clog-native-callback
 .PHONY: clean-clog-native-callback
 clean-clog-native-callback:
 	rm -f test_cluster_clog_native_callback.inc test_cluster_clog_native_callback.inc.tmp
+
+# Real original collector/cancel bodies for the job lifetime fixture.
+test_cluster_wal_inputs_job_cut_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_cut.c Makefile
+	awk '/^typedef enum WalCutSourceState/ { emit=1; starts++ } /^static uint64 sent_revision;/ { emit=0; ends++ } \
+	     emit { print } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_cut_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_cut.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c Makefile
+	awk '/^(claim_zero|claim_identity_valid|cluster_wal_claim_v2_ref_valid)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 3 || emit) exit 1 }' $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c > $@.tmp
+	awk '/^(cut_message_valid|cut_current|cut_collector_current|cut_same_request|cut_cancel|cut_resource_release|cut_child_exit|cut_register_cleanup|cut_background|cut_collector_procno|cut_begin|cluster_wal_cut_begin_v1|cluster_wal_cut_begin_in_context_v1|cluster_wal_cut_context_binding_v1|cluster_wal_cut_cancel_in_context_v1|cluster_wal_cut_release_in_context_v1|cluster_wal_cut_poll_v1|cluster_wal_cut_release_v1)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 18 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+
+# Actual original Aux latch-reset/service prefixes; no copied polling loop.
+test_cluster_wal_inputs_job_bgwriter.inc: $(top_srcdir)/src/backend/postmaster/bgwriter.c Makefile
+	awk '/Clear any already-pending wakeups/ { emit=1; blocks++ } \
+	     emit && /HandleMainLoopInterrupts\(\);/ { print; emit=0; next } \
+	     emit { print } END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_checkpointer.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	awk '/Clear any already-pending wakeups/ { emit=1; blocks++ } \
+	     emit && /pi_pending = cluster_ko_shared_native_poll_v2\(\);/ { print "#endif"; emit=0; next } \
+	     emit { print } END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_service.c \
+		test_cluster_wal_inputs_job_pin.c test_cluster_wal_inputs_job.c \
+		test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c unit_test.h \
+		test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_wal_inputs_job_bgwriter.inc test_cluster_wal_inputs_job_checkpointer.inc \
+		test_cluster_wal_inputs_job_pin_fixture.h test_cluster_wal_inputs_job_pin_types.inc \
+		test_cluster_wal_inputs_job_pin_bodies.inc test_cluster_control_walr.inc \
+		test_cluster_wal_inputs_job_scope_fixture.h test_cluster_wal_inputs_job_scope_types.inc \
+		test_cluster_wal_inputs_job_scope_bodies.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_cut_job_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_wal_inputs_job_stop.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c Makefile
+	awk '/^cl_normal_stop_checkpoint_run\(/ { owner=1 } \
+	     owner && /ResetLatch\(MyLatch\);/ { emit=1; blocks++ } \
+	     emit && /if \(step == 0 && !after_checkpoint/ { emit=0; owner=0; next } \
+	     emit { print } END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_quiesce.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
+	awk '/^typedef struct WritebackShared/ { emit=1; types++ } \
+	     /^cluster_pi_writeback_bgwriter_quiesced_v1\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || functions != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_stop.inc test_cluster_wal_inputs_job_quiesce.inc
+
+test_cluster_wal_inputs_job_stop_module.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c Makefile
+	awk '/^cl_normal_stop_modules_poll\(/ { owner=1 } \
+	     owner && /^[ \t]*case 15:/ { emit=1; cases++ } \
+	     emit { print } emit && /^[ \t]*break;/ { emit=0; owner=0 } \
+	     END { if (cases != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_stop_module.inc
+
+# These existing fixtures exercise only the actual empty original job table.
+test_cluster_wal_inputs_empty_jobs.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c Makefile
+	awk '/^inputs_job_empty\(/ { print "static bool"; emit=1; functions++ } \
+	     /^cluster_wal_inputs_jobs_stop_census_v1\(/ { print "ClusterWalInputsJobResultV1"; emit=1; functions++ } \
+	     /^cluster_wal_inputs_jobs_service_poll_v1\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (functions != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpointer_stop test_cluster_checkpoint_error test_cluster_normal_stop test_cluster_pi_writeback: \
+		test_cluster_wal_inputs_empty_jobs_fixture.h test_cluster_wal_inputs_empty_jobs.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+
+test_cluster_wal_inputs_job_stopped.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	awk '/ClusterCfAttemptObservation waiting =/ { owner=1 } \
+	     owner && /ResetLatch\(MyLatch\);/ { emit=1; blocks++ } \
+	     emit && /if \(cluster_cf_held_is_usable/ { emit=0; owner=0; next } \
+	     emit { print } END { if (blocks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_stopped.inc
+
+test_cluster_wal_inputs_job_retained: test_cluster_wal_inputs_job_retained.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		test_cluster_wal_inputs_job_begin_fixture.h test_cluster_wal_inputs_job_begin_types.inc \
+		test_cluster_wal_inputs_job_begin_bodies.inc \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+test_cluster_wal_inputs_job_retained: test_cluster_wal_inputs_job_pin_fixture.h test_cluster_wal_inputs_job_pin_types.inc test_cluster_wal_inputs_job_pin_bodies.inc test_cluster_wal_inputs_job_scope_fixture.h test_cluster_wal_inputs_job_scope_types.inc test_cluster_wal_inputs_job_scope_bodies.inc $(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h
+
+test_cluster_wal_inputs_retained_claim.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c Makefile
+	awk '/^(claim_zero|claim_identity_valid|cluster_wal_claim_v2_ref_valid)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_retained_caller.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut.c Makefile
+	awk '/^retained_work_release\(/ { print "static void"; emit=1; count++ } \
+	     /^retained_job_release\(/ { print "static ClusterWalInputsJobResultV1"; emit=1; count++ } \
+	     /^cluster_wal_retained_cut_compute_v1\(/ { print "ClusterControlRootResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count < 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_retained: test_cluster_wal_inputs_retained_claim.inc test_cluster_wal_inputs_retained_caller.inc $(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut_internal.h
+
+test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records: test_cluster_wal_retained_job_boundary.h $(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h
+
+# Real input/ACK bodies combined with the original PI caller lifecycle.
+test_cluster_wal_inputs_job_pi: test_cluster_wal_inputs_job_pi.c test_cluster_wal_inputs_job_pin.c \
+		test_cluster_wal_inputs_job.c test_cluster_cf_job_retirement.c test_cluster_cf_enqueue.c \
+		test_cluster_wal_inputs_job_begin_fixture.h test_cluster_wal_inputs_job_begin_types.inc \
+		test_cluster_wal_inputs_job_begin_bodies.inc \
+		unit_test.h test_cluster_cf_job_ack.inc test_cluster_wal_inputs_job_callback.inc \
+		test_cluster_cf_blocker_trace.inc test_cluster_startup_interrupt.inc \
+		test_cluster_startup_interrupt_fixture.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/backend/cluster $< \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) \
+		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter -lcrypto,$(LIBS)) -o $@
+
+test_cluster_wal_inputs_job_pi: test_cluster_wal_inputs_job_pin_fixture.h test_cluster_wal_inputs_job_pin_types.inc test_cluster_wal_inputs_job_pin_bodies.inc test_cluster_wal_inputs_job_scope_fixture.h test_cluster_wal_inputs_job_scope_types.inc test_cluster_wal_inputs_job_scope_bodies.inc $(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_private.h
+
+test_cluster_wal_inputs_job_pi: test_cluster_wal_inputs_pi_types.inc test_cluster_wal_inputs_pi_callbacks.inc \
+		test_cluster_pi_checkpoint_wait.inc test_cluster_pi_checkpoint_release.inc \
+		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h \
+		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_inputs_job_payload_private.h
+
+test_cluster_wal_inputs_pi_types.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c $(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c Makefile
+	awk '/^enum { WB_EMPTY/ { emit=1; starts++ } \
+	     emit && /^wb_local_advance_locked\(/ { emit=0; ends++ } \
+	     emit { if (line != "") print line; line=$$0 } \
+	     END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^#define PI_REBUILD_BATCH / { emit=1; starts++ } \
+	     emit && /^pi_rebuild_release\(/ { emit=0; ends++ } \
+	     emit { if (line != "") print line; line=$$0 } \
+	     END { if (starts != 1 || ends != 1 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_pi_callbacks.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c $(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c Makefile
+	awk '/^(wb_forget_batch|wb_cancel|wb_forget_server|wb_notice_revoke|wb_batch_revoke|wb_resource_release|wb_inputs_retire|wb_inputs_open|wb_server_finish|wb_batch_release|wb_batch_allocate|cluster_pi_writeback_checkpointer_release_v1)\(/ { print prev; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (functions != 12 || emit) exit 1 }' $< > $@.tmp
+	awk '/^(pi_rebuild_owner_release|pi_rebuild_release|pi_rebuild_failed_wait)\(/ { print prev; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (functions != 3 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pi_checkpoint_wait.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^(ClusterCheckpointYieldForShutdown|ClusterCheckpointReleasePiInputs)\(/ { print prev; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (functions != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pi_checkpoint_release.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/CheckPointBuffers\(flags\);/ { phase=1 } \
+	     phase && /if \(MyBackendType == B_CHECKPOINTER\)/ { print; emit=1; blocks++; next } \
+	     emit { print; emit=0; phase=0; ends++ } \
+	     END { if (blocks != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pi_writeback: test_cluster_pi_inputs_boundary.h
+
+test_cluster_pi_empty_batch_release.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
+	awk '/^cluster_pi_writeback_checkpointer_release_v1\(/ { print prev; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (functions != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_inputs_job_service test_cluster_normal_stop: test_cluster_pi_empty_batch_fixture.h test_cluster_pi_empty_batch_release.inc $(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
+
+# Actual pre-write typed checkpoint caller.
+test_cluster_typed_prepare_budget.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	awk '/^cold_prepare_deadline_check\(/ { print "static void"; emit=1; checks++ } \
+	     /^cold_participant\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 1 || checks != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Exact committed matcher: the same product bodies, no test retry policy.
+test_cluster_typed_pass2.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile
+	awk '/^(cold_captured_sources_match|cold_replay_sources_current)\(/ { print "static bool"; emit=1; checks++ } \
+	     /^cold_execution_inputs_failed\(/ { print "static void"; emit=1; cleanup++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (checks != 2 || cleanup != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_typed_pass2_select.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
+	awk '/^inputs_cold_checkpoint_select\(/ { print "static ClusterControlRootResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@

@@ -384,6 +384,7 @@ OBJS = \
 	cluster_views.o \
 	cluster_wal_claim.o \
 	cluster_wal_inputs.o \
+	cluster_wal_inputs_job.o \
 	cluster_pi_contribution_stream.o \
 	cluster_wal_cut.o \
 	cluster_pi_data.o \
@@ -466,6 +467,20 @@ cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 cluster_wal_inputs.o: $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 	$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 	$(srcdir)/cluster_control_root_private.h $(srcdir)/cluster_recovery_anchor_private.h
+cluster_wal_inputs_job.o cluster_semantic_activation.o: \
+	$(srcdir)/cluster_wal_inputs_job_private.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+	$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h
+cluster_wal_inputs_job.o: $(top_srcdir)/src/include/cluster/cluster_wal_retention.h
+# These actual-type payload assertions must run after a budget/header edit,
+# including builds without compiler-generated dependency files.
+cluster_wal_inputs.o cluster_wal_retention.o cluster_wal_cut.o \
+cluster_pi_writeback.o cluster_pi_rebuild.o: \
+	$(srcdir)/cluster_wal_inputs_job_payload_private.h \
+	$(srcdir)/cluster_wal_inputs_job_private.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
+	$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h
 cluster_wal_writer.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 cluster_stats.o: $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 cluster_recovery_namespace.o: $(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h
@@ -532,3 +547,5 @@ cluster_grd.o: $(top_srcdir)/src/include/cluster/cluster_grd.h
 
 # Rebuild the sole route table when its opcode manifest changes.
 cluster_rf_route.o: $(top_srcdir)/src/include/cluster/cluster_rf_route_manifest.def
+
+cluster_semantic_activation.o: $(srcdir)/cluster_control_rebind.inc

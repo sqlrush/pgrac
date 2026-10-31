@@ -25,6 +25,7 @@
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_control_root_prepared.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_external_fence.h"
@@ -55,6 +56,7 @@
 #include "common/sha2.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
+#include "portability/instr_time.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
 #include "storage/lwlock.h"
@@ -3395,7 +3397,7 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 					   ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
 					   uint64 admitted_incarnation, ClusterControlRootStopObservation *stop,
 					   uint16 version, ClusterControlRecoverySubject *recovery,
-					   const RootRetentionCfWait *retention)
+					   const RootRetentionCfWait *retention, uint64 deadline_ns)
 {
 	ControlRootImage *root;
 	ControlRootImage *peer_root;
@@ -3453,7 +3455,9 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 	result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	PG_TRY();
 	{
-		if (auxiliary ? cluster_cf_lock_poll(ShareLock) : cluster_cf_lock(ShareLock)) {
+		if (auxiliary		   ? cluster_cf_lock_poll(ShareLock)
+			: deadline_ns != 0 ? cluster_cf_lock_deadline_v1(ShareLock, deadline_ns)
+							   : cluster_cf_lock(ShareLock)) {
 			held = true;
 			if (retention != NULL && !retention_startup_cf_current(retention))
 				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -3631,7 +3635,7 @@ read_canonical_v2(uint16 thread, const ClusterControlRootIdentity *expected,
 				  uint64 admitted_incarnation, ClusterControlRootStopObservation *stop)
 {
 	return read_canonical_version(thread, expected, out, token, admitted_incarnation, stop,
-								  CONTROL_ROOT_HEADER_VERSION_V2, NULL, NULL);
+								  CONTROL_ROOT_HEADER_VERSION_V2, NULL, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -3683,7 +3687,20 @@ cluster_control_root_v3_read_canonical(uint16 thread, const ClusterControlRootId
 									   ClusterControlRootReadToken *token)
 {
 	return read_canonical_version(thread, expected, out, token, 0, NULL,
-								  CONTROL_ROOT_HEADER_VERSION_V3, NULL, NULL);
+								  CONTROL_ROOT_HEADER_VERSION_V3, NULL, NULL, 0);
+}
+
+/* One canonical attempt under the merge owner's existing absolute deadline.
+ * This never starts a retry or transfers cleanup ownership. */
+ClusterControlRootResult
+cluster_control_root_v3_read_canonical_deadline_v1(uint16 thread,
+												   const ClusterControlRootIdentity *expected,
+												   ClusterControlRootSnapshot *out,
+												   ClusterControlRootReadToken *token,
+												   uint64 deadline_ns)
+{
+	return read_canonical_version(thread, expected, out, token, 0, NULL,
+								  CONTROL_ROOT_HEADER_VERSION_V3, NULL, NULL, deadline_ns);
 }
 
 ClusterControlRootResult
@@ -3693,7 +3710,7 @@ cluster_control_root_v3_stop_phase_read(uint16 thread, uint64 admitted_incarnati
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	return read_canonical_version(thread, NULL, NULL, NULL, admitted_incarnation, out,
-								  CONTROL_ROOT_HEADER_VERSION_V3, NULL, NULL);
+								  CONTROL_ROOT_HEADER_VERSION_V3, NULL, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -3704,7 +3721,7 @@ cluster_control_root_read_recovery_subject(uint16 origin_thread,
 	if (out == NULL || history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	return read_canonical_version(origin_thread, expected, NULL, NULL, 0, NULL,
-								  CONTROL_ROOT_HEADER_VERSION_V3, out, NULL);
+								  CONTROL_ROOT_HEADER_VERSION_V3, out, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -3882,10 +3899,11 @@ cluster_control_root_read_canonical_dead_origin(uint16 origin_thread_id,
 }
 
 ClusterControlRootResult
-cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
-												  ClusterControlRootIdentity *out_identity,
-												  ClusterControlRootSnapshot *out_snapshot,
-												  ClusterControlRootReadToken *out_token)
+cluster_control_root_lookup_owner_deadline_v1(int32 old_node_id,
+											  ClusterControlRootIdentity *out_identity,
+											  ClusterControlRootSnapshot *out_snapshot,
+											  ClusterControlRootReadToken *out_token,
+											  uint64 deadline_ns)
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -3905,7 +3923,8 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	thread_id = (uint16)(old_node_id + 1);
 	if (cluster_shared_config) {
-		result = cluster_control_root_v3_read_canonical(thread_id, NULL, &snapshot, &token);
+		result = cluster_control_root_v3_read_canonical_deadline_v1(thread_id, NULL, &snapshot,
+																	&token, deadline_ns);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 			if (snapshot.identity.origin_node_id != old_node_id)
@@ -3919,6 +3938,8 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
 		}
 		return result;
 	}
+	if (deadline_ns != 0)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = storage_contract_check(NULL, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -3951,6 +3972,16 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
 			*out_token = token;
 	}
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
+												  ClusterControlRootIdentity *out_identity,
+												  ClusterControlRootSnapshot *out_snapshot,
+												  ClusterControlRootReadToken *out_token)
+{
+	return cluster_control_root_lookup_owner_deadline_v1(old_node_id, out_identity, out_snapshot,
+														 out_token, 0);
 }
 
 /* PRE2: the external-fence rejoin consumer must authenticate a typed
@@ -4141,7 +4172,7 @@ cluster_control_root_v3_terminal_history_blocked(
 
 		result = read_canonical_version(expected.origin_thread_id, &expected, &snapshot, &token, 0,
 										NULL, CONTROL_ROOT_HEADER_VERSION_V3, NULL,
-										waited ? &original : NULL);
+										waited ? &original : NULL, 0);
 		if (result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE || !startup
 			|| !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
@@ -9113,7 +9144,25 @@ typedef struct FailureInputV2Work {
 	ClusterWalSourceRef self_restart;
 	FailureSelfCfWait self_cf_wait;
 	FailureInputCfWait input_cf_wait;
+	/* Process-local cold caller parameters; never a request/ROOT identity. */
+	bool caller_owns_cf_retry;
+	uint64 deadline_ns;
 } FailureInputV2Work;
+
+static bool
+failure_input_deadline_current(const FailureInputV2Work *work)
+{
+	struct timespec now;
+	uint64 ns;
+
+	if (!work->caller_owns_cf_retry || work->deadline_ns == 0)
+		return true;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return false;
+	ns = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return ns < work->deadline_ns;
+}
 
 /*
  * PGRAC (S9P2-05, PU-D-5): after every instance failed, the founder seals
@@ -9168,6 +9217,8 @@ failure_v2_authorized(const ClusterRecoverySerialRequest *request, const Failure
 	uint32 count;
 	bool original_owner = false;
 
+	if (!failure_input_deadline_current(work))
+		return false;
 	if (work->self)
 		return self_predecessor_authorized(request, work);
 	if (cluster_node_id != work->publisher_node
@@ -9219,7 +9270,8 @@ failure_v2_cleanup(FailureInputV2Work *work, ClusterControlRootResult result)
 	if (result == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
 		ereport(
 			FATAL,
-			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			(errcode(work->caller_owns_cf_retry ? ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT
+												: ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 			 errmsg("failed-thread input publisher could not confirm lock release"),
 			 errhint("Keep the failed thread closed until recovery ownership is re-established.")));
 	return result;
@@ -10158,9 +10210,11 @@ failure_v2_tail_read(const ClusterRecoverySerialRequest *request, FailureInputV2
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 
-		if (cluster_cf_lock(mode))
+		if (work->caller_owns_cf_retry ? cluster_cf_lock_deadline_v1(mode, work->deadline_ns)
+									   : cluster_cf_lock(mode))
 			break;
-		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+		if (work->caller_owns_cf_retry || !startup
+			|| !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != mode)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		failure_input_cf_wait(request, work, true, &attempt);
@@ -10169,6 +10223,8 @@ failure_v2_tail_read(const ClusterRecoverySerialRequest *request, FailureInputV2
 	work->cf_mode = mode;
 	if (!cluster_cf_held_is_clusterwide(mode))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!failure_input_deadline_current(work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (work->input_cf_wait.waited && !failure_input_cf_current(request, work, true))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
@@ -10266,14 +10322,20 @@ failure_v2_tail_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	const ClusterControlRootSnapshot *record;
 	int index = request->duty.origin_thread_id - 1;
 
-	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
-															  &work->walr);
+	retained = work->caller_owns_cf_retry
+				   ? cluster_wal_retention_root_publish_begin_deadline_v1(
+						 &request->expected_root_token, &work->walr, work->deadline_ns)
+				   : cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token,
+																	false, &work->walr);
 	if (retained != CLUSTER_WAL_PIN_OK)
 		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	/* PGRAC: a self-seal holds no IR; the root CAS and WALR still apply. */
 	if (!work->self) {
-		acquired = cluster_recovery_serial_acquire(request, &work->serial);
+		acquired = work->caller_owns_cf_retry
+					   ? cluster_recovery_serial_input_acquire_deadline_v1(request, &work->serial,
+																		   work->deadline_ns)
+					   : cluster_recovery_serial_acquire(request, &work->serial);
 		if (acquired != CLUSTER_RECOVERY_SERIAL_GRANTED)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	}
@@ -10314,8 +10376,11 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	int index = request->duty.origin_thread_id - 1;
 	bool startup = MyBackendType == B_STARTUP;
 
-	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
-															  &work->walr);
+	retained = work->caller_owns_cf_retry
+				   ? cluster_wal_retention_root_publish_begin_deadline_v1(
+						 &request->expected_root_token, &work->walr, work->deadline_ns)
+				   : cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token,
+																	false, &work->walr);
 	if (retained != CLUSTER_WAL_PIN_OK)
 		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -10327,9 +10392,12 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 
-		if (cluster_cf_lock(ExclusiveLock))
+		if (work->caller_owns_cf_retry
+				? cluster_cf_lock_deadline_v1(ExclusiveLock, work->deadline_ns)
+				: cluster_cf_lock(ExclusiveLock))
 			break;
-		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+		if (work->caller_owns_cf_retry || !startup
+			|| !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ExclusiveLock)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		failure_input_cf_wait(request, work, false, &attempt);
@@ -10338,6 +10406,8 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	work->cf_mode = ExclusiveLock;
 	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!failure_input_deadline_current(work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (work->input_cf_wait.waited && !failure_input_cf_current(request, work, false))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
@@ -10707,7 +10777,8 @@ failure_v2_self_seal_work(const ClusterRecoverySerialRequest *request, FailureIn
 static ClusterControlRootResult
 failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
 				   ClusterControlRootReadToken *out_token, bool seal_tail, uint16 version,
-				   const ClusterWalSourceRef *self_restart, uint64 self_min_dead_us)
+				   const ClusterWalSourceRef *self_restart, uint64 self_min_dead_us,
+				   const uint64 *deadline_ns)
 {
 	FailureInputV2Work *work;
 	ClusterControlRootResult result;
@@ -10728,6 +10799,9 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 		|| request->mode != CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
 		|| !cluster_recovery_duty_key_valid_for_claim(&request->duty, true)
 		|| request->duty.system_identifier != GetSystemIdentifier()
+		|| (deadline_ns != NULL
+			&& (MyBackendType != B_STARTUP || !AmStartupProcess() || self_restart != NULL
+				|| version != CONTROL_ROOT_HEADER_VERSION_V3))
 		|| (self_restart == NULL
 			&& (request->formation == NULL || request->fence_need_set == NULL
 				|| request->fence_admission_set == NULL)))
@@ -10738,6 +10812,8 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 	work->format_version = version;
 	work->publisher_node = cluster_node_id;
 	work->publisher_incarnation = cluster_qvotec_get_self_incarnation();
+	work->caller_owns_cf_retry = deadline_ns != NULL;
+	work->deadline_ns = deadline_ns != NULL ? *deadline_ns : 0;
 	if (self_restart != NULL) {
 		work->self = true;
 		work->self_min_dead_us = self_min_dead_us;
@@ -10773,7 +10849,7 @@ cluster_control_root_v2_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false, 2, NULL, 0);
+	return failure_v2_publish(request, out, out_token, false, 2, NULL, 0, NULL);
 }
 
 ClusterControlRootResult
@@ -10781,7 +10857,7 @@ cluster_control_root_v2_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true, 2, NULL, 0);
+	return failure_v2_publish(request, out, out_token, true, 2, NULL, 0, NULL);
 }
 
 ClusterControlRootResult
@@ -10789,7 +10865,7 @@ cluster_control_root_v3_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false, 3, NULL, 0);
+	return failure_v2_publish(request, out, out_token, false, 3, NULL, 0, NULL);
 }
 
 ClusterControlRootResult
@@ -10797,7 +10873,25 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true, 3, NULL, 0);
+	return failure_v2_publish(request, out, out_token, true, 3, NULL, 0, NULL);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_failure_open_deadline_v1(const ClusterRecoverySerialRequest *request,
+												 ClusterControlRootSnapshot *out,
+												 ClusterControlRootReadToken *out_token,
+												 uint64 deadline_ns)
+{
+	return failure_v2_publish(request, out, out_token, false, 3, NULL, 0, &deadline_ns);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_failure_tail_deadline_v1(const ClusterRecoverySerialRequest *request,
+												 ClusterControlRootSnapshot *out,
+												 ClusterControlRootReadToken *out_token,
+												 uint64 deadline_ns)
+{
+	return failure_v2_publish(request, out, out_token, true, 3, NULL, 0, &deadline_ns);
 }
 
 /*
@@ -10841,14 +10935,16 @@ cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 
 	request.duty = restart->claim.identity;
 	request.expected_root_token = token;
 	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
-		result = failure_v2_publish(&request, &snapshot, &token, false, 3, restart, min_dead_us);
+		result
+			= failure_v2_publish(&request, &snapshot, &token, false, 3, restart, min_dead_us, NULL);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		request.expected_root_token = token;
 	}
 	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 		&& (snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0) {
-		result = failure_v2_publish(&request, &snapshot, &token, true, 3, restart, min_dead_us);
+		result
+			= failure_v2_publish(&request, &snapshot, &token, true, 3, restart, min_dead_us, NULL);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
@@ -11854,10 +11950,100 @@ cluster_control_root_build_migration_image(const ClusterControlRootMigrationRoun
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
-ClusterControlRootResult
-cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *image,
-									 const ClusterControlRootMigrationRoundV1 *round,
-									 ClusterControlRootFileToken *out_token)
+static bool
+prepared_work_ready(const ClusterControlRootPreparedWorkV1 *work,
+					const ClusterControlRootMigrationRoundV1 *round)
+{
+	ClusterControlRootPreparedWorkV1 empty;
+
+	if (work == NULL || round == NULL || work->release.job_generation == 0)
+		return false;
+	memset(&empty, 0, sizeof(empty));
+	empty.release.job_generation = work->release.job_generation;
+	return memcmp(work, &empty, sizeof(empty)) == 0 && MyProc != NULL && MyProcPid > 0
+		   && CurrentResourceOwner != NULL && cluster_node_id >= 0
+		   && round->coordinator_node_id == (uint32)cluster_node_id
+		   && round->coordinator_incarnation != 0
+		   && round->coordinator_incarnation == cluster_qvotec_get_self_incarnation()
+		   && round->transition_epoch != 0 && round->transition_epoch == cluster_epoch_get_current()
+		   && cluster_grd_redeclare_generation() != 0;
+}
+
+static void
+prepared_work_bind(ClusterControlRootPreparedWorkV1 *work,
+				   const ClusterControlRootMigrationRoundV1 *round)
+{
+	work->address = work;
+	work->proc = MyProc;
+	work->resource_owner = CurrentResourceOwner;
+	work->pid = MyProcPid;
+	work->procno = MyProc->pgprocno;
+	work->generation = work->release.job_generation;
+	work->owner_generation = cluster_grd_redeclare_generation();
+	work->cf_cookie = cluster_cf_owner_cookie(ExclusiveLock);
+	work->round = *round;
+	work->result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	work->phase = CONTROL_ROOT_PREPARED_WORK_WRITING;
+}
+
+static bool
+prepared_work_current(const ClusterControlRootPreparedWorkV1 *work)
+{
+	return CurrentResourceOwner == work->resource_owner && cluster_node_id >= 0
+		   && (uint32)cluster_node_id == work->round.coordinator_node_id
+		   && cluster_qvotec_get_self_incarnation() == work->round.coordinator_incarnation
+		   && cluster_epoch_get_current() == work->round.transition_epoch
+		   && cluster_grd_redeclare_generation() == work->owner_generation;
+}
+
+bool
+cluster_control_root_prepared_job_identity_current_v1(const ClusterControlRootPreparedWorkV1 *work)
+{
+	return work != NULL && work->address == work && work->proc != NULL && MyProc == work->proc
+		   && MyProcPid == work->pid && MyProc->pgprocno == work->procno && work->generation != 0
+		   && work->release.job_generation == work->generation && !work->rejected
+		   && (work->phase == CONTROL_ROOT_PREPARED_WORK_RETIRING
+			   || work->phase == CONTROL_ROOT_PREPARED_WORK_CONSUMED)
+		   && prepared_work_current(work);
+}
+
+static ClusterControlRootResult
+prepared_work_consume(ClusterControlRootPreparedWorkV1 *work, ClusterCfJobResultV1 release,
+					  ClusterControlRootFileToken *out_token)
+{
+	ClusterControlRootResult result;
+
+	if (!prepared_work_current(work))
+		work->rejected = true;
+	if (release == CF_JOB_PENDING)
+		return CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	if (release != CF_JOB_CONFIRMED)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = work->rejected ? CLUSTER_CONTROL_ROOT_STALE_TOKEN : work->result;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && out_token != NULL)
+		*out_token = work->token;
+	memset(&work->token, 0, sizeof(work->token));
+	work->phase = CONTROL_ROOT_PREPARED_WORK_CONSUMED;
+	return result;
+}
+
+static ClusterControlRootResult
+prepared_work_release(ClusterControlRootPreparedWorkV1 *work, ClusterControlRootResult result,
+					  const ClusterControlRootFileToken *token,
+					  ClusterControlRootFileToken *out_token)
+{
+	work->result = result;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		work->token = *token;
+	work->phase = CONTROL_ROOT_PREPARED_WORK_RETIRING;
+	return cluster_control_root_prepared_job_poll_v1(work, out_token);
+}
+
+static ClusterControlRootResult
+control_root_create_prepared(const ClusterControlRootMigrationImage *image,
+							 const ClusterControlRootMigrationRoundV1 *round,
+							 ClusterControlRootPreparedWorkV1 *work,
+							 ClusterControlRootFileToken *out_token)
 {
 	ControlRootImage *root;
 	ControlRootImage *primary;
@@ -11884,6 +12070,8 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (work != NULL)
+		prepared_work_bind(work, round);
 
 	root = palloc(sizeof(*root));
 	memset(root, 0, sizeof(*root));
@@ -11938,17 +12126,20 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 		pfree(primary);
 	}
 	pfree(root);
+	if (work != NULL)
+		return prepared_work_release(work, result, &token, out_token);
 	result = release_cf(ExclusiveLock, result);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && out_token != NULL)
 		*out_token = token;
 	return result;
 }
 
-ClusterControlRootResult
-cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expected_token,
-									   const uint8 expected_round_sha256[32],
-									   const ClusterControlRootMigrationRoundV1 *round,
-									   ClusterControlRootFileToken *out_token)
+static ClusterControlRootResult
+control_root_activate_prepared(const ClusterControlRootFileToken *expected_token,
+							   const uint8 expected_round_sha256[32],
+							   const ClusterControlRootMigrationRoundV1 *round,
+							   ClusterControlRootPreparedWorkV1 *work,
+							   ClusterControlRootFileToken *out_token)
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -11978,6 +12169,8 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 		return result;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (work != NULL)
+		prepared_work_bind(work, round);
 	primary = palloc(sizeof(*primary));
 	bak = palloc(sizeof(*bak));
 	updated = palloc(sizeof(*updated));
@@ -12030,10 +12223,113 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 	pfree(updated);
 	pfree(bak);
 	pfree(primary);
+	if (work != NULL)
+		return prepared_work_release(work, result, &token, out_token);
 	result = release_cf(ExclusiveLock, result);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && out_token != NULL)
 		*out_token = token;
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *image,
+									 const ClusterControlRootMigrationRoundV1 *round,
+									 ClusterControlRootFileToken *out_token)
+{
+	return control_root_create_prepared(image, round, NULL, out_token);
+}
+
+ClusterControlRootResult
+cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expected_token,
+									   const uint8 expected_round_sha256[32],
+									   const ClusterControlRootMigrationRoundV1 *round,
+									   ClusterControlRootFileToken *out_token)
+{
+	return control_root_activate_prepared(expected_token, expected_round_sha256, round, NULL,
+										  out_token);
+}
+
+ClusterControlRootResult
+cluster_control_root_create_prepared_job_v1(const ClusterControlRootMigrationImage *image,
+											const ClusterControlRootMigrationRoundV1 *round,
+											ClusterControlRootPreparedWorkV1 *work,
+											ClusterControlRootFileToken *out_token)
+{
+	ClusterControlRootResult result;
+
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (!prepared_work_ready(work, round))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	PG_TRY();
+	{
+		result = control_root_create_prepared(image, round, work, out_token);
+	}
+	PG_CATCH();
+	{
+		if (work->phase == CONTROL_ROOT_PREPARED_WORK_WRITING)
+			work->phase = CONTROL_ROOT_PREPARED_WORK_RETIRING;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_activate_prepared_job_v1(const ClusterControlRootFileToken *expected_token,
+											  const uint8 expected_round_sha256[32],
+											  const ClusterControlRootMigrationRoundV1 *round,
+											  ClusterControlRootPreparedWorkV1 *work,
+											  ClusterControlRootFileToken *out_token)
+{
+	ClusterControlRootResult result;
+
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (!prepared_work_ready(work, round))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	PG_TRY();
+	{
+		result = control_root_activate_prepared(expected_token, expected_round_sha256, round, work,
+												out_token);
+	}
+	PG_CATCH();
+	{
+		if (work->phase == CONTROL_ROOT_PREPARED_WORK_WRITING)
+			work->phase = CONTROL_ROOT_PREPARED_WORK_RETIRING;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_prepared_job_poll_v1(ClusterControlRootPreparedWorkV1 *work,
+										  ClusterControlRootFileToken *out_token)
+{
+	ClusterCfJobResultV1 release;
+
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (work == NULL || work->address != work || work->proc == NULL || MyProc != work->proc
+		|| MyProcPid != work->pid || MyProc->pgprocno != work->procno || work->generation == 0
+		|| work->release.job_generation != work->generation
+		|| work->phase != CONTROL_ROOT_PREPARED_WORK_RETIRING)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!prepared_work_current(work))
+		work->rejected = true;
+	/* ERROR before the first release leaves the original hold to start here.
+	 * A cookie mismatch only refuses binding; it never proves completion.
+	 * The original receipt, once bound, is always polled at its first address. */
+	if (work->cf_cookie == 0
+		|| (work->release.state == CF_JOB_RECEIPT_UNBOUND
+				? cluster_cf_owner_cookie(ExclusiveLock) != work->cf_cookie
+				: work->release.original.cookie != work->cf_cookie))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	release = work->release.state == CF_JOB_RECEIPT_UNBOUND
+				  ? cluster_cf_unlock_job_v1(ExclusiveLock, NULL, &work->release)
+				  : cluster_cf_job_retirement_poll_v1(&work->release);
+	return prepared_work_consume(work, release, out_token);
 }
 
 static uint64
@@ -12585,11 +12881,10 @@ recovery_complete_v3_publish(const ClusterControlRootReadToken *expected,
 }
 
 ClusterControlRootResult
-cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
-										 const ClusterControlRootPatch *patch,
-										 ClusterControlRootPublishReason reason,
-										 ClusterControlRootSnapshot *out_snapshot,
-										 ClusterControlRootReadToken *out_token)
+cluster_control_root_rejoin_compare_and_publish_checked(
+	const ClusterControlRootReadToken *expected_token, const ClusterControlRootPatch *patch,
+	ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token, bool (*revalidate)(bool publishing))
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -12618,7 +12913,10 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
-	if (alias || expected_token == NULL || expected_token->source != CONTROL_ROOT_SOURCE_PRIMARY
+	if ((revalidate != NULL
+		 && (reason != CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
+			 && reason != CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN))
+		|| alias || expected_token == NULL || expected_token->source != CONTROL_ROOT_SOURCE_PRIMARY
 		|| expected_token->origin_thread_id == 0
 		|| expected_token->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| expected_token->reserved20 != 0 || expected_token->reserved32 != 0
@@ -12700,7 +12998,10 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 			updated->header.file_txn_seq++;
 			updated->header.published_at_usec = snapshot.published_at_usec;
 			encode_header(updated);
-			if (!publish_updated_image(primary, updated))
+			/* A CF wait and canonical read must not outlive the owning stage. */
+			if (revalidate != NULL && !revalidate(true))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			else if (!publish_updated_image(primary, updated))
 				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 			else {
 				ControlRootImage *readback = palloc(sizeof(*readback));
@@ -12744,6 +13045,17 @@ release_walr:
 	return result;
 }
 
+ClusterControlRootResult
+cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
+										 const ClusterControlRootPatch *patch,
+										 ClusterControlRootPublishReason reason,
+										 ClusterControlRootSnapshot *out_snapshot,
+										 ClusterControlRootReadToken *out_token)
+{
+	return cluster_control_root_rejoin_compare_and_publish_checked(expected_token, patch, reason,
+																   out_snapshot, out_token, NULL);
+}
+
 /* PGRAC: keep the exact shared recovery source inside one owned read scope.
  * No raw reader/FD escapes to a caller and no provisional record is authority.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -12769,6 +13081,9 @@ typedef struct RecoveryWalVisitWork {
 	bool native_checkpoint;
 	uint8 native_window[160];
 	RecoveryWalCfWait cf_wait;
+	bool caller_owns_cf_retry;
+	uint64 cf_deadline_ns;
+	const uint64 *prepare_deadline;
 } RecoveryWalVisitWork;
 
 /* Keep this input-only operation's original owner across both ROOT intervals.
@@ -12820,6 +13135,31 @@ recovery_wal_cf_current(const RecoveryWalVisitWork *work)
 		   && work->native_checkpoint == original->native_checkpoint;
 }
 
+/* Same pre-write plan deadline, never a new duration or cleanup budget. */
+static int
+recovery_wal_prepare_budget(const RecoveryWalVisitWork *work, int ceiling)
+{
+	struct timespec now;
+	uint64 ns;
+	if (work->prepare_deadline == NULL)
+		return ceiling;
+	if (*work->prepare_deadline == 0)
+		return 0;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return 0;
+	ns = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return ns < *work->prepare_deadline
+			   ? (int)Min((uint64)ceiling, (*work->prepare_deadline - ns) / NS_PER_MS)
+			   : 0;
+}
+static bool
+recovery_wal_prepare_current(const RecoveryWalVisitWork *work)
+{
+	return work->prepare_deadline == NULL || *work->prepare_deadline == 0
+		   || recovery_wal_prepare_budget(work, 1) > 0;
+}
+
 static void
 recovery_wal_cf_wait(const RecoveryWalVisitWork *work, const ClusterCfAttemptObservation *attempt)
 {
@@ -12840,11 +13180,15 @@ recovery_wal_cf_wait(const RecoveryWalVisitWork *work, const ClusterCfAttemptObs
 	for (;;) {
 		ClusterCfRetirementSnapshot current;
 		bool held;
+		int wait_ms = recovery_wal_prepare_budget(work, 20);
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		if (!recovery_wal_cf_current(work))
+			goto refuse;
+		reason = "ORIGINAL_PLAN_DEADLINE";
+		if (wait_ms <= 0)
 			goto refuse;
 		ResetLatch(MyLatch);
 		held = cluster_cf_held(ShareLock);
@@ -12855,7 +13199,7 @@ recovery_wal_cf_wait(const RecoveryWalVisitWork *work, const ClusterCfAttemptObs
 				if (empty_waited)
 					return;
 				empty_waited = true;
-				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 				continue;
 			}
@@ -12875,9 +13219,14 @@ recovery_wal_cf_wait(const RecoveryWalVisitWork *work, const ClusterCfAttemptObs
 			goto refuse;
 		cluster_lock_owners_service_poll();
 		cluster_cf_retirement_poll();
-		if (cluster_cf_held(ShareLock))
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+		if (cluster_cf_held(ShareLock)) {
+			wait_ms = recovery_wal_prepare_budget(work, 20);
+			reason = "ORIGINAL_PLAN_DEADLINE";
+			if (wait_ms <= 0)
+				goto refuse;
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
 	}
 refuse:
 	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -12903,10 +13252,26 @@ recovery_wal_visit_root(RecoveryWalVisitWork *work)
 	for (;;) {
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
+		bool acquired;
 
-		if (acquire_clusterwide_cf(ShareLock))
+		if (!recovery_wal_prepare_current(work))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		if (work->caller_owns_cf_retry || work->prepare_deadline != NULL) {
+			acquired = cluster_cf_lock_deadline_v1(ShareLock, work->prepare_deadline != NULL
+																  ? *work->prepare_deadline
+																  : work->cf_deadline_ns);
+			if (acquired && !cluster_cf_held_is_clusterwide(ShareLock)) {
+				(void)cluster_cf_unlock_confirmed(ShareLock);
+				return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+			}
+		} else
+			acquired = acquire_clusterwide_cf(ShareLock);
+		if (acquired)
 			break;
-		if (!startup || !cluster_cf_last_attempt_since(before, &attempt)
+		/* The set owner must release every IR before waiting. Even zero
+		 * mode returns the original typed failure without a nested retry. */
+		if (work->caller_owns_cf_retry || !startup
+			|| !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		recovery_wal_cf_wait(work, &attempt);
@@ -12937,13 +13302,16 @@ recovery_wal_visit_root(RecoveryWalVisitWork *work)
 		}
 	}
 	work->cf_mode = NoLock;
-	return release_cf(ShareLock, result);
+	result = release_cf(ShareLock, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !recovery_wal_prepare_current(work))
+		result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	return result;
 }
 
-ClusterControlRootResult
-cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
-										const ClusterControlRootReadToken *token,
-										ClusterWalSourceRef *out, XLogRecPtr *native_redo)
+static ClusterControlRootResult
+recovery_wal_source(const ClusterControlRootSnapshot *expected,
+					const ClusterControlRootReadToken *token, ClusterWalSourceRef *out,
+					XLogRecPtr *native_redo, bool caller_owns_cf_retry, uint64 deadline_ns)
 {
 	RecoveryWalVisitWork *work;
 	ClusterControlRootResult result;
@@ -12975,6 +13343,8 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 	work = palloc0(sizeof(*work));
 	work->expected = *expected;
 	work->token = *token;
+	work->caller_owns_cf_retry = caller_owns_cf_retry;
+	work->cf_deadline_ns = deadline_ns;
 	PG_TRY();
 	{
 		result = recovery_wal_visit_root(work);
@@ -12996,9 +13366,26 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 }
 
 ClusterControlRootResult
-cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
-											const ClusterControlRootReadToken *token,
-											ClusterWalRecoveryCheckpointV1 *out)
+cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
+										const ClusterControlRootReadToken *token,
+										ClusterWalSourceRef *out, XLogRecPtr *native_redo)
+{
+	return recovery_wal_source(expected, token, out, native_redo, false, 0);
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_source_deadline_v1(const ClusterControlRootSnapshot *expected,
+												 const ClusterControlRootReadToken *token,
+												 ClusterWalSourceRef *out, XLogRecPtr *native_redo,
+												 uint64 deadline_ns)
+{
+	return recovery_wal_source(expected, token, out, native_redo, true, deadline_ns);
+}
+
+static ClusterControlRootResult
+recovery_wal_checkpoint(const ClusterControlRootSnapshot *expected,
+						const ClusterControlRootReadToken *token,
+						ClusterWalRecoveryCheckpointV1 *out, const uint64 *deadline)
 {
 	RecoveryWalVisitWork *work;
 	ClusterControlRootResult result;
@@ -13025,6 +13412,7 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ex
 	work->expected = *expected;
 	work->token = *token;
 	work->native_checkpoint = true;
+	work->prepare_deadline = deadline;
 	PG_TRY();
 	{
 		result = recovery_wal_visit_root(work);
@@ -13049,10 +13437,29 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ex
 	return result;
 }
 
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *expected,
+											const ClusterControlRootReadToken *token,
+											ClusterWalRecoveryCheckpointV1 *out)
+{
+	return recovery_wal_checkpoint(expected, token, out, NULL);
+}
+ClusterControlRootResult
+cluster_control_root_recovery_checkpoint_deadline_v1(const ClusterControlRootSnapshot *expected,
+													 const ClusterControlRootReadToken *token,
+													 ClusterWalRecoveryCheckpointV1 *out,
+													 uint64 deadline_ns)
+{
+	if (MyBackendType != B_STARTUP)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return recovery_wal_checkpoint(expected, token, out, &deadline_ns);
+}
+
 static ClusterControlRootResult
 recovery_wal_visit(const ClusterControlRootSnapshot *expected,
 				   const ClusterControlRootReadToken *token, ClusterWalRecordVisitor visitor,
-				   void *arg, ClusterWalTailObservation *out, bool sync_inputs)
+				   void *arg, ClusterWalTailObservation *out, bool sync_inputs,
+				   const uint64 *deadline)
 {
 	RecoveryWalVisitWork *work;
 	ClusterControlRootResult result;
@@ -13077,6 +13484,7 @@ recovery_wal_visit(const ClusterControlRootSnapshot *expected,
 	work = palloc0(sizeof(*work));
 	work->expected = *expected;
 	work->token = *token;
+	work->prepare_deadline = deadline;
 	PG_TRY();
 	{
 		result = recovery_wal_visit_root(work);
@@ -13113,7 +13521,7 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
 									ClusterWalRecordVisitor visitor, void *arg,
 									ClusterWalTailObservation *out)
 {
-	return recovery_wal_visit(expected, token, visitor, arg, out, false);
+	return recovery_wal_visit(expected, token, visitor, arg, out, false, NULL);
 }
 
 ClusterControlRootResult
@@ -13121,7 +13529,18 @@ cluster_control_root_recovery_sync_v1(const ClusterControlRootSnapshot *expected
 									  const ClusterControlRootReadToken *token,
 									  ClusterWalTailObservation *out)
 {
-	return recovery_wal_visit(expected, token, NULL, NULL, out, true);
+	return recovery_wal_visit(expected, token, NULL, NULL, out, true, NULL);
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_visit_deadline_v1(const ClusterControlRootSnapshot *expected,
+												const ClusterControlRootReadToken *token,
+												ClusterWalRecordVisitor visitor, void *arg,
+												ClusterWalTailObservation *out, uint64 deadline_ns)
+{
+	if (MyBackendType != B_STARTUP)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return recovery_wal_visit(expected, token, visitor, arg, out, false, &deadline_ns);
 }
 
 ClusterControlRootResult

@@ -73,6 +73,7 @@
 #include "storage/checksum.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
+#include "portability/instr_time.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
@@ -91,6 +92,7 @@ int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
 typedef struct ClusterColdReplayRootV1 {
 	ClusterControlRootSnapshot root;
 	ClusterControlRootReadToken token;
+	ClusterWalSourceRef source;
 	XLogRecPtr checkpoint_start;
 	CheckPoint native_checkpoint;
 	uint8 native_window[160];
@@ -347,10 +349,48 @@ cold_own_root_cf_current(const ColdOwnRootCfWait *original)
 		   && memcmp(&original->restart, &restart, sizeof(restart)) == 0;
 }
 
+static bool
+cold_own_root_monotonic_ns(uint64 *out)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0
+		|| now.tv_nsec >= NS_PER_S || (uint64)now.tv_sec > (UINT64_MAX - NS_PER_S) / NS_PER_S)
+		return false;
+	*out = (uint64)now.tv_sec * NS_PER_S + (uint64)now.tv_nsec;
+	return true;
+}
+
+static bool
+cold_own_root_deadline_current(const uint64 *deadline_ns)
+{
+	uint64 now;
+
+	return deadline_ns == NULL || *deadline_ns == 0
+		   || (cold_own_root_monotonic_ns(&now) && now < *deadline_ns);
+}
+
+/* NULL preserves the ordinary caller policy; zero permits no added wait.
+ * The Startup deadline was created by the original merge plan, not here. */
+static int
+cold_own_root_cf_budget(const uint64 *deadline_ns)
+{
+	uint64 now;
+	uint64 remaining_ms;
+
+	if (deadline_ns == NULL)
+		return 20;
+	if (*deadline_ns == 0 || !cold_own_root_monotonic_ns(&now) || now >= *deadline_ns)
+		return 0;
+	remaining_ms = (*deadline_ns - now) / NS_PER_MS;
+	return (int)Min(remaining_ms, UINT64_C(100));
+}
+
 /* No serial set is held in pass 1. Retire only this lookup's failed request;
  * neither its cleanup receipt nor the read below supplies replay authority. */
 static void
-cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptObservation *attempt)
+cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptObservation *attempt,
+					  const uint64 *deadline_ns)
 {
 	ClusterCfRetirementSnapshot retiring;
 	bool empty = attempt->owner_state_at_return == CLUSTER_LOCK_OWNER_EMPTY;
@@ -369,11 +409,16 @@ cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptO
 	for (;;) {
 		ClusterCfRetirementSnapshot current;
 		bool held;
+		int wait_ms;
 
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		reason = "CONTEXT_CHANGED_AFTER_WAIT_SLICE";
 		if (!cold_own_root_cf_current(original))
+			goto refuse;
+		reason = "MERGE_DEADLINE_OR_ZERO_ATTEMPT";
+		if (deadline_ns != NULL
+			&& (*deadline_ns == 0 || !cold_own_root_deadline_current(deadline_ns)))
 			goto refuse;
 		ResetLatch(MyLatch);
 		held = cluster_cf_held(ShareLock);
@@ -384,7 +429,10 @@ cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptO
 				if (empty_waited)
 					return;
 				empty_waited = true;
-				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+				wait_ms = cold_own_root_cf_budget(deadline_ns);
+				if (wait_ms <= 0)
+					goto refuse;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 								WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 				continue;
 			}
@@ -404,9 +452,14 @@ cold_own_root_cf_wait(const ColdOwnRootCfWait *original, const ClusterCfAttemptO
 			goto refuse;
 		cluster_lock_owners_service_poll();
 		cluster_cf_retirement_poll();
-		if (cluster_cf_held(ShareLock))
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+		if (cluster_cf_held(ShareLock)) {
+			reason = "MERGE_DEADLINE_OR_ZERO_ATTEMPT";
+			wait_ms = cold_own_root_cf_budget(deadline_ns);
+			if (wait_ms <= 0)
+				goto refuse;
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 							WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		}
 	}
 refuse:
 	ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
@@ -418,7 +471,8 @@ refuse:
 
 /* The founder's previous generation must be sealed like every peer. */
 static bool
-cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
+cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out,
+			  const uint64 *deadline_ns)
 {
 	ClusterControlRootIdentity identity;
 	ClusterControlRootResult result;
@@ -433,8 +487,22 @@ cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 		ClusterCfAttemptObservation attempt;
 		uint64 before = startup ? cluster_cf_attempt_sequence() : 0;
 
-		result = cluster_control_root_lookup_owner_by_node_runtime((int32)own_thread - 1, &identity,
-																   &out->root, &out->token);
+		if (!cold_own_root_deadline_current(deadline_ns))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("cold own-root lookup exceeded its original merge deadline"),
+							errdetail("stage=merge_deadline before=own_root_read")));
+		result = deadline_ns != NULL
+					 ? cluster_control_root_lookup_owner_deadline_v1(
+						   (int32)own_thread - 1, &identity, &out->root, &out->token, *deadline_ns)
+					 : cluster_control_root_lookup_owner_by_node_runtime(
+						   (int32)own_thread - 1, &identity, &out->root, &out->token);
+		if (!cold_own_root_deadline_current(deadline_ns)) {
+			memset(&out->root, 0, sizeof(out->root));
+			memset(&out->token, 0, sizeof(out->token));
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+							errmsg("cold own-root lookup exceeded its original merge deadline"),
+							errdetail("stage=merge_deadline after=own_root_read")));
+		}
 		/* The acquire can yield. Reject a fresh read from a changed context
 		 * before its provisional outputs reach any original admission gate. */
 		if (waited && !cold_own_root_cf_current(&original)) {
@@ -450,7 +518,7 @@ cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 			|| !cluster_cf_last_attempt_since(before, &attempt)
 			|| !cluster_cf_attempt_wait_slice(&attempt) || attempt.mode != ShareLock)
 			break;
-		cold_own_root_cf_wait(&original, &attempt);
+		cold_own_root_cf_wait(&original, &attempt, deadline_ns);
 		waited = true;
 	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -500,14 +568,28 @@ cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
 
 /* Exact source, complete native checkpoint and cut from the original token.
  * This binds input only, not a TT slot's era or a winner/loser decision. */
+static void
+cold_prepare_deadline_check(const uint64 *deadline)
+{
+	if (!cold_own_root_deadline_current(deadline))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("cold preparation exceeded its original merge deadline")));
+}
+
 static bool
-cold_participant(ClusterColdTypedV1 *typed, ColdRoot *root, uint32 index)
+cold_participant(ClusterColdTypedV1 *typed, ColdRoot *root, uint32 index, const uint64 *deadline)
 {
 	ClusterColdParticipantV1 *participant = &typed->participants[index];
 	ClusterControlRootResult result;
 	ClusterWalRecoveryCheckpointV1 selected;
 
-	result = cluster_control_root_recovery_checkpoint_v1(&root->root, &root->token, &selected);
+	cold_prepare_deadline_check(deadline);
+	result
+		= deadline != NULL
+			  ? cluster_control_root_recovery_checkpoint_deadline_v1(&root->root, &root->token,
+																	 &selected, *deadline)
+			  : cluster_control_root_recovery_checkpoint_v1(&root->root, &root->token, &selected);
+	cold_prepare_deadline_check(deadline);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| selected.checkpoint.redo < root->root.checkpoint_lower_lsn
 		|| selected.checkpoint.redo > root->root.validated_tail_lsn_exclusive) {
@@ -517,6 +599,7 @@ cold_participant(ClusterColdTypedV1 *typed, ColdRoot *root, uint32 index)
 		return false;
 	}
 	typed->sources[index] = selected.source;
+	root->source = selected.source;
 	root->checkpoint_start = selected.checkpoint_start;
 	memcpy(&root->native_checkpoint, &selected.checkpoint, sizeof(root->native_checkpoint));
 	memcpy(root->native_window, selected.native_window, sizeof(root->native_window));
@@ -567,13 +650,23 @@ cold_collect_roots(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, u
 {
 	uint16 count = cluster_recovery_merge_fence_plan_origin_count(fence);
 	uint16 i;
+	uint64 deadline_ns;
+	const uint64 *deadline = NULL;
 
 	if (count == 0 || (uint32)count + 1 > CLUSTER_COLD_MAX_PARTICIPANTS) {
 		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID, "fence plan names %u origins",
 					(unsigned)count);
 		return false;
 	}
-	if (!cold_own_root(typed, own_thread, &roots[0]))
+	if (cluster_shared_config && MyBackendType == B_STARTUP && AmStartupProcess()) {
+		if (!cluster_recovery_merge_fence_plan_deadline_v1(fence, &deadline_ns)) {
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+						"stage=merge_deadline reason=ORIGINAL_PLAN_INVALID");
+			return false;
+		}
+		deadline = &deadline_ns;
+	}
+	if (!cold_own_root(typed, own_thread, &roots[0], deadline))
 		return false;
 	for (i = 0; i < count; i++) {
 		uint16 thread = 0;
@@ -586,6 +679,9 @@ cold_collect_roots(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, u
 			return false;
 		}
 	}
+	if (!cold_own_root_deadline_current(deadline))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						errmsg("cold root collection exceeded its original merge deadline")));
 	typed->participant_count = (uint32)count + 1;
 	typed->own_participant = 0;
 	return true;
@@ -743,6 +839,7 @@ cold_census_take(ClusterColdTypedV1 *typed, ColdRoot *roots, const ClusterWalInp
 		typed->sources[typed->participant_count] = entry->source;
 		typed->input_index[typed->participant_count] = entry->input_index;
 		roots[typed->participant_count].root = input->checkpoint;
+		roots[typed->participant_count].source = input->source;
 		roots[typed->participant_count].checkpoint_start = input->checkpoint_start;
 		memcpy(&roots[typed->participant_count].native_checkpoint, &input->native_checkpoint,
 			   sizeof(input->native_checkpoint));
@@ -757,7 +854,7 @@ cold_census_take(ClusterColdTypedV1 *typed, ColdRoot *roots, const ClusterWalInp
 /* Complete participant census: every generation with retained WAL under one
  * cold read scope, held until pass 1 has scanned the history-only ones. */
 static bool
-cold_census(ClusterColdTypedV1 *typed, ColdRoot *roots)
+cold_census(ClusterColdTypedV1 *typed, ColdRoot *roots, const uint64 *deadline)
 {
 	const ClusterControlRootIdentity *own = &roots[0].root.identity;
 	const ClusterWalInputV1 **inputs;
@@ -773,8 +870,13 @@ cold_census(ClusterColdTypedV1 *typed, ColdRoot *roots)
 	bool taken = false;
 
 	typed->replay_count = typed->participant_count;
-	result = cluster_wal_inputs_cold_begin_v1(own->storage_uuid, own->system_identifier,
-											  &typed->inputs);
+	cold_prepare_deadline_check(deadline);
+	result = deadline != NULL
+				 ? cluster_wal_inputs_cold_begin_deadline_v1(
+					   own->storage_uuid, own->system_identifier, &typed->inputs, *deadline)
+				 : cluster_wal_inputs_cold_begin_v1(own->storage_uuid, own->system_identifier,
+													&typed->inputs);
+	cold_prepare_deadline_check(deadline);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
 					"participant census unavailable (root result %d)", (int)result);
@@ -802,6 +904,7 @@ cold_census(ClusterColdTypedV1 *typed, ColdRoot *roots)
 	pfree(crashed);
 	pfree(entries);
 	pfree(inputs);
+	cold_prepare_deadline_check(deadline);
 	return taken;
 }
 
@@ -1012,22 +1115,25 @@ cluster_cold_typed_recheck_inputs_v1(ClusterColdTypedV1 *typed)
 	return true;
 }
 
-bool
-cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+/* Copies the same physical union for initial retention and commit retry.
+ * This reads only the original local plan; it never opens a census under IR. */
+static bool
+cold_execution_input_threads(ClusterColdTypedV1 *typed, uint16 *threads, uint16 *count)
 {
 	bool selected[CLUSTER_WAL_RETENTION_MAX_THREADS + 1] = { false };
-	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
-	uint16 count = 0;
-	bool acquired = false;
 
+	*count = 0;
 	if (typed == NULL)
 		return false;
-	if (fence == NULL) {
-		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input retention refused: stage=fence");
-		goto refused;
+	if (typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	if (!typed->census_root_captured || typed->inputs != NULL || typed->replay_roots == NULL
+		|| typed->participant_count == 0 || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| cluster_cold_replay_window_active_v1()) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"execution input retention refused: stage=input_state");
+		return false;
 	}
-	if (!cluster_cold_typed_recheck_inputs_v1(typed))
-		goto refused;
 	for (uint32 i = 0; i < typed->participant_count; i++) {
 		uint16 thread = typed->participants[i].thread_id;
 
@@ -1039,14 +1145,34 @@ cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryF
 						"thread=%u root_thread=%u source_thread=%u",
 						i, thread, typed->replay_roots[i].root.identity.origin_thread_id,
 						typed->sources[i].claim.identity.origin_thread_id);
-			goto refused;
+			return false;
 		}
 		selected[thread] = true;
 	}
 	for (uint16 thread = 1; thread <= CLUSTER_WAL_RETENTION_MAX_THREADS; thread++) {
 		if (selected[thread])
-			threads[count++] = thread;
+			threads[(*count)++] = thread;
 	}
+	return *count != 0;
+}
+
+bool
+cluster_cold_typed_acquire_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
+	uint16 count;
+	bool acquired = false;
+
+	if (typed == NULL)
+		return false;
+	if (fence == NULL) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"execution input retention refused: stage=fence");
+		goto refused;
+	}
+	if (!cluster_cold_typed_recheck_inputs_v1(typed)
+		|| !cold_execution_input_threads(typed, threads, &count))
+		goto refused;
 	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input retention is incomplete");
 	PG_TRY();
 	{
@@ -1074,7 +1200,50 @@ refused:
 	return false;
 }
 
-static bool cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence);
+bool
+cluster_cold_typed_commit_serial_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+{
+	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
+	uint16 count;
+	bool committed = false;
+
+	if (typed == NULL)
+		return false;
+	if (fence == NULL) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input commit refused: stage=fence");
+		goto refused;
+	}
+	if (!cold_execution_input_threads(typed, threads, &count))
+		goto refused;
+	cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "execution input commit is incomplete");
+	PG_TRY();
+	{
+		committed = cluster_recovery_merge_commit_plan_inputs_v1(fence, threads, count);
+	}
+	PG_CATCH();
+	{
+		memset(&typed->history_xid, 0, sizeof(typed->history_xid));
+		typed->census_root_captured = false;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!committed) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"execution input commit refused: stage=commit_inputs input_threads=%u", count);
+		goto refused;
+	}
+	typed->refusal = CLUSTER_COLD_OK;
+	typed->refusal_detail[0] = '\0';
+	return true;
+
+refused:
+	memset(&typed->history_xid, 0, sizeof(typed->history_xid));
+	typed->census_root_captured = false;
+	return false;
+}
+
+static bool cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+							   const uint64 *deadline);
 
 /* PAGE, SIDE and original TT inputs share the existing plan budget. */
 static Size
@@ -1173,20 +1342,26 @@ cold_native_profiles_match(const ClusterColdTypedV1 *typed)
 
 static bool
 cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
-				   ClusterRecoveryFencePlan *fence)
+				   ClusterRecoveryFencePlan *fence, const uint64 *deadline)
 {
 	ClusterColdDiagV1 diag;
 	ClusterColdDetailV1 detail;
 	uint32 i;
+	bool profiles_current;
 
-	if (!cold_native_profiles_match(typed)) {
+	cold_prepare_deadline_check(deadline);
+	profiles_current = cold_native_profiles_match(typed);
+	cold_prepare_deadline_check(deadline);
+	if (!profiles_current) {
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
 					"original commit_ts physical profile is unsupported or unavailable");
 		return false;
 	}
+	cold_prepare_deadline_check(deadline);
 	if (!cold_space_namespace(typed))
 		return false;
 	detail = cluster_cold_tt_base_capture_v1(typed, cold_tt_budget());
+	cold_prepare_deadline_check(deadline);
 	if (detail != CLUSTER_COLD_OK) {
 		cold_refuse(typed, detail, "original TT base capture refused: %s",
 					cold_detail_name(detail));
@@ -1204,9 +1379,15 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 	for (i = 0; i < typed->replay_count; i++) {
 		ClusterColdScanResultV1 scan;
 
-		detail
-			= cluster_cold_scan_root_v1(typed->plan, i, &roots[i].root, &roots[i].token, false,
-										i != typed->own_participant, typed->side_plans[i], &scan);
+		cold_prepare_deadline_check(deadline);
+		detail = deadline != NULL
+					 ? cluster_cold_scan_root_deadline_v1(
+						   typed->plan, i, &roots[i].root, &roots[i].token, false,
+						   i != typed->own_participant, typed->side_plans[i], &scan, *deadline)
+					 : cluster_cold_scan_root_v1(typed->plan, i, &roots[i].root, &roots[i].token,
+												 false, i != typed->own_participant,
+												 typed->side_plans[i], &scan);
+		cold_prepare_deadline_check(deadline);
 		typed->scanned_records += scan.records;
 		if (detail == CLUSTER_COLD_OK
 			&& memcmp(scan.native_window, roots[i].native_window, sizeof(scan.native_window)) != 0)
@@ -1229,16 +1410,20 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 			rf_side_online_plan_destroy_v1(&typed->side_plans[i]);
 		}
 	}
-	if (!cold_scan_history(typed))
+	if (!cold_scan_history(typed)) {
+		cold_prepare_deadline_check(deadline);
 		return false;
+	}
+	cold_prepare_deadline_check(deadline);
 	detail = cluster_cold_plan_seal_v1(typed->plan, cluster_cold_observe_data_v1, &typed->observer,
 									   &diag);
+	cold_prepare_deadline_check(deadline);
 	if (detail != CLUSTER_COLD_OK) {
 		cold_refuse_diag(typed, detail, "plan seal", &diag);
 		return false;
 	}
 	/* No provisional payload plan survives a later source or ROOT failure. */
-	if (!cold_sources_match(typed, fence)) {
+	if (!cold_sources_match(typed, fence, deadline)) {
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "SIDE capture source changed before seal");
 		return false;
 	}
@@ -1251,6 +1436,7 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 			side_detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 		else
 			side_detail = rf_side_online_plan_seal_v1(typed->side_plans[i]);
+		cold_prepare_deadline_check(deadline);
 		if (side_detail == RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
 			|| side_detail == RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED) {
 			/* Original native/history coverage can exceed this execution
@@ -1264,10 +1450,11 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 			return false;
 		}
 	}
-	if (!cold_sources_match(typed, fence)) {
+	if (!cold_sources_match(typed, fence, deadline)) {
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "SIDE capture source changed after seal");
 		return false;
 	}
+	cold_prepare_deadline_check(deadline);
 	return true;
 }
 
@@ -1280,6 +1467,8 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 	ClusterColdTypedV1 *typed;
 	ColdRoot *roots;
 	ClusterColdDetailV1 detail;
+	uint64 deadline_ns;
+	const uint64 *deadline = NULL;
 
 	context = AllocSetContextCreate(TopMemoryContext, "cluster cold replay plan",
 									ALLOCSET_DEFAULT_SIZES);
@@ -1288,6 +1477,15 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 	typed->context = context;
 	roots = (ColdRoot *)palloc0(sizeof(ColdRoot) * CLUSTER_COLD_MAX_PARTICIPANTS);
 	typed->replay_roots = roots;
+	if (cluster_shared_config && MyBackendType == B_STARTUP && AmStartupProcess()) {
+		if (!cluster_recovery_merge_fence_plan_deadline_v1(fence, &deadline_ns)) {
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+						"original prepare plan is invalid");
+			goto done;
+		}
+		deadline = &deadline_ns;
+		cold_prepare_deadline_check(deadline);
+	}
 	if (!cluster_relmap_retention_runtime_recovery_invalidate_v2()) {
 		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "shared relmap retention invalidation refused");
 		goto done;
@@ -1296,9 +1494,9 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 		goto done;
 	typed->replay_root_count = typed->participant_count;
 	for (uint32 i = 0; i < typed->participant_count; i++)
-		if (!cold_participant(typed, &roots[i], i))
+		if (!cold_participant(typed, &roots[i], i, deadline))
 			goto done;
-	if (!cold_own_restart(typed, own_thread, own_redo) || !cold_census(typed, roots))
+	if (!cold_own_restart(typed, own_thread, own_redo) || !cold_census(typed, roots, deadline))
 		goto done;
 	typed->system_identifier = roots[0].root.identity.system_identifier;
 	detail = cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
@@ -1325,7 +1523,7 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 			}
 		}
 	}
-	if (cold_scan_and_seal(typed, roots, fence))
+	if (cold_scan_and_seal(typed, roots, fence, deadline))
 		typed->refusal = CLUSTER_COLD_OK;
 
 done:
@@ -1411,8 +1609,10 @@ cluster_cold_typed_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 partici
 
 /* Re-select through each original ROOT token, never through a newer root. */
 static bool
-cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
+cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+				   const uint64 *deadline)
 {
+	bool profiles_current;
 	if (fence == NULL
 		|| (uint32)cluster_recovery_merge_fence_plan_origin_count(fence) + 1 != typed->replay_count)
 		return false;
@@ -1421,6 +1621,7 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 		const ClusterWalSourceRef *expected = &typed->sources[i];
 		const ClusterColdParticipantV1 *participant = &typed->participants[i];
 		ClusterWalRecoveryCheckpointV1 observed;
+		ClusterControlRootResult result;
 		const ClusterWalSourceRef *source = &observed.source;
 
 		if (i != typed->own_participant) {
@@ -1435,9 +1636,13 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 				|| memcmp(&origin.token, &selected->token, sizeof(origin.token)) != 0)
 				return false;
 		}
-		if (cluster_control_root_recovery_checkpoint_v1(&selected->root, &selected->token,
-														&observed)
-				!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		cold_prepare_deadline_check(deadline);
+		result = deadline != NULL ? cluster_control_root_recovery_checkpoint_deadline_v1(
+										&selected->root, &selected->token, &observed, *deadline)
+								  : cluster_control_root_recovery_checkpoint_v1(
+										&selected->root, &selected->token, &observed);
+		cold_prepare_deadline_check(deadline);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| !cluster_control_root_identity_equal(&source->claim.identity,
 													&expected->claim.identity)
 			|| source->claim.database_incarnation != expected->claim.database_incarnation
@@ -1455,10 +1660,13 @@ cold_sources_match(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 					  sizeof(observed.checkpoint))
 				   != 0
 			|| memcmp(selected->native_window, observed.native_window,
-					  sizeof(observed.native_window)) != 0)
+					  sizeof(observed.native_window))
+				   != 0)
 			return false;
 	}
-	return cold_native_profiles_match(typed);
+	profiles_current = cold_native_profiles_match(typed);
+	cold_prepare_deadline_check(deadline);
+	return profiles_current;
 }
 
 /* A retained history participant has no native redo to apply.  Its sealed
@@ -1506,34 +1714,49 @@ cold_history_side_effects_match(const ClusterColdTypedV1 *typed, uint32 particip
 	return true;
 }
 
-/* Re-read history metadata using the caller's original execution retention
- * owner. Do not acquire a census read set from inside the execution IR set. */
+/* Independent prepared copies, checked only under the original owners.
+ * Physical source drift is checked after exact IR release, never here. */
 static bool
-cold_history_sources_match(ClusterColdTypedV1 *typed)
+cold_captured_sources_match(const ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 {
-	if (!typed->census_root_captured || typed->inputs != NULL)
+	if (fence == NULL || typed->replay_roots == NULL || typed->own_participant != 0
+		|| typed->replay_count == 0 || typed->replay_count > typed->participant_count
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->replay_root_count != typed->replay_count || !typed->census_root_captured
+		|| typed->inputs != NULL || typed->plan == NULL
+		|| cluster_cold_plan_participant_count_v1(typed->plan) != typed->participant_count
+		|| typed->replay_count != (uint32)cluster_recovery_merge_fence_plan_origin_count(fence) + 1)
 		return false;
-	for (uint32 i = typed->replay_count; i < typed->participant_count; i++) {
+	for (uint32 i = 0; i < typed->participant_count; ++i) {
 		const ColdRoot *selected = &typed->replay_roots[i];
 		const ClusterColdParticipantV1 *participant = &typed->participants[i];
-		ClusterWalRecoveryCheckpointV1 observed;
-
 		if (!selected->checkpoint_captured
+			|| memcmp(&selected->source, &typed->sources[i], sizeof(selected->source)) != 0
+			|| !cluster_control_root_identity_equal(&selected->source.claim.identity,
+													&selected->root.identity)
+			|| selected->source.timeline != selected->root.checkpoint_tli
 			|| participant->thread_id != selected->root.identity.origin_thread_id
 			|| participant->owner_incarnation != selected->root.identity.origin_owner_incarnation
 			|| participant->timeline != selected->root.checkpoint_tli
 			|| participant->physical_lower != selected->root.checkpoint_lower_lsn
 			|| participant->tail_end != selected->root.validated_tail_lsn_exclusive
-			|| participant->native_redo != participant->tail_end
-			|| cluster_wal_inputs_cold_checkpoint_v1(&selected->root, &typed->census_root, &observed)
-				   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			|| memcmp(&observed.source, &typed->sources[i], sizeof(observed.source)) != 0
-			|| observed.checkpoint_start != selected->checkpoint_start
-			|| memcmp(&observed.checkpoint, &selected->native_checkpoint,
-						  sizeof(observed.checkpoint)) != 0
-			|| memcmp(observed.native_window, selected->native_window,
-					  sizeof(observed.native_window)) != 0
-			|| !cold_history_side_effects_match(typed, i))
+			|| (i < typed->replay_count
+				&& participant->native_redo != selected->native_checkpoint.redo)
+			|| !cluster_cold_plan_participant_matches_v1(typed->plan, i, participant))
+			return false;
+		if (i > 0 && i < typed->replay_count) {
+			ClusterControlRootSnapshot root;
+			ClusterControlRootReadToken token;
+			uint16 thread;
+			if (!cluster_recovery_merge_fence_plan_origin(fence, i - 1, &thread, &root, &token)
+				|| thread != participant->thread_id
+				|| memcmp(&root, &selected->root, sizeof(root)) != 0
+				|| memcmp(&token, &selected->token, sizeof(token)) != 0)
+				return false;
+		}
+		if (i >= typed->replay_count
+			&& (participant->native_redo != participant->tail_end
+				|| !cold_history_side_effects_match(typed, i)))
 			return false;
 	}
 	return true;
@@ -1563,7 +1786,7 @@ cold_replay_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan 
 	PG_TRY();
 	{
 		matched = cluster_recovery_merge_fence_plan_revalidate_nowait(fence)
-				  && cold_sources_match(typed, fence) && cold_history_sources_match(typed)
+				  && cold_captured_sources_match(typed, fence) && cold_native_profiles_match(typed)
 				  && cluster_recovery_merge_fence_plan_revalidate_nowait(fence);
 	}
 	PG_CATCH();
@@ -1594,6 +1817,50 @@ cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed, ClusterRecovery
 		return false;
 	}
 	return cold_replay_sources_current(typed, fence);
+}
+
+/* Original merge caller, after exact IR release and before publication.
+ * Waits use original Startup/CF ownership, without any replay retry/budget. */
+bool
+cluster_cold_typed_sources_readback_v1(void *arg, ClusterRecoveryFencePlan *fence)
+{
+	ClusterColdTypedV1 *typed = arg;
+	bool matched = false;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	PG_TRY();
+	{
+		matched = cluster_recovery_merge_fence_plan_publish_current_v1(fence)
+				  && cold_captured_sources_match(typed, fence);
+		for (uint32 i = 0; matched && i < typed->participant_count; ++i) {
+			const ColdRoot *selected = &typed->replay_roots[i];
+			ClusterWalRecoveryCheckpointV1 observed;
+			matched = cluster_wal_inputs_cold_checkpoint_readback_v1(&selected->root,
+																	 &typed->census_root, &observed)
+						  == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					  && memcmp(&observed.source, &selected->source, sizeof(observed.source)) == 0
+					  && observed.checkpoint_start == selected->checkpoint_start
+					  && memcmp(&observed.checkpoint, &selected->native_checkpoint,
+								sizeof(observed.checkpoint))
+							 == 0
+					  && memcmp(observed.native_window, selected->native_window,
+								sizeof(observed.native_window))
+							 == 0
+					  && cluster_recovery_merge_fence_plan_publish_current_v1(fence);
+		}
+		matched = matched && cold_captured_sources_match(typed, fence)
+				  && cold_native_profiles_match(typed)
+				  && cluster_recovery_merge_fence_plan_publish_current_v1(fence);
+	}
+	PG_CATCH();
+	{
+		cold_execution_inputs_failed(typed);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!matched)
+		cold_execution_inputs_failed(typed);
+	return matched;
 }
 
 bool
@@ -1629,12 +1896,9 @@ cluster_cold_typed_sync_sources_v1(ClusterColdTypedV1 *typed, ClusterRecoveryFen
 			ClusterWalTailObservation observed;
 			ClusterControlRootResult result;
 
-			if (i < typed->replay_count)
-				result = cluster_control_root_recovery_sync_v1(&selected->root, &selected->token,
-															   &observed);
-			else
-				result = cluster_wal_inputs_cold_sync_v1(&selected->root, &typed->census_root,
-														 &observed);
+			result = cluster_wal_tail_sync_sealed_v1(cluster_wal_threads_dir, &selected->source,
+													 wal_segment_size, &selected->root,
+													 selected->checkpoint_start, &observed);
 			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				|| observed.complete_end != selected->root.validated_tail_lsn_exclusive
 				|| observed.last_record_start != selected->root.tail_last_record_lsn
