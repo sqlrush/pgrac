@@ -14,6 +14,8 @@ static void
 skip_delay(void)
 {
 	UT_ASSERT(!ios_locked && ios_evaluators == 0);
+	if (ios_pin_watch)
+		UT_ASSERT_EQ(ios_live_pins, 0);
 	skip_delays++;
 	if (skip_delay_error)
 		elog(ERROR, "controlled cancellation at vacuum delay point");
@@ -86,7 +88,7 @@ UT_TEST(qualified_af_range_is_skipped_in_both_vacuum_modes)
 		UT_ASSERT_EQ(skip_delays, 33);
 		UT_ASSERT_EQ(ios_grants, 34);
 		UT_ASSERT_EQ(ios_unlocks, 34);
-		UT_ASSERT_EQ(ios_reads, 1);
+		UT_ASSERT_EQ(ios_reads, 34);
 		UT_ASSERT_EQ(skip_raw_reads, 0);
 	}
 }
@@ -289,16 +291,76 @@ UT_TEST(no_page_in_the_requested_range_cannot_claim_shared_visibility)
 	}
 }
 
+UT_TEST(shared_range_unpins_before_every_delay_and_final_heap_work)
+{
+	LVRelState state = skip_reset(VISIBILITYMAP_VALID_BITS);
+	bool all_visible = false, range = false;
+	ios_pin_watch = true;
+	UT_ASSERT_EQ(skip_run(&state, &all_visible, &range), 33);
+	UT_ASSERT(all_visible && range && !state.skippedallvis);
+	UT_ASSERT_EQ(ios_live_pins, 0);
+	UT_ASSERT_EQ(ios_reads, 34);
+	UT_ASSERT_EQ(ios_releases, 34);
+}
+
+UT_TEST(shared_no_skip_refusals_release_a_preexisting_vm_pin)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		LVRelState state = skip_reset(VISIBILITYMAP_VALID_BITS);
+		Buffer buffer = 2;
+		bool all_visible = false, skipsallvis = false;
+		ios_pin_watch = true; ios_live_pins = 1;
+		switch (fault) {
+		case 0: state.skipwithvm = false; break;
+		case 1: *PageGetContents(ios_current.data) = 0; break;
+		case 2: ios_grant = false; break;
+		case 3: ios_drift = 4; break;
+		case 4: skip_active = false; break;
+		}
+		UT_ASSERT(!lazy_scan_skip_shared_page(&state, &buffer, 0, &all_visible, &skipsallvis));
+		UT_ASSERT_EQ(buffer, InvalidBuffer);
+		UT_ASSERT_EQ(ios_live_pins, 0);
+		UT_ASSERT_EQ(ios_releases, 1);
+	}
+}
+
+UT_TEST(shared_range_errors_retire_pin_before_propagation)
+{
+	for (int error = 0; error < 2; error++) {
+		LVRelState state = skip_reset(VISIBILITYMAP_VALID_BITS);
+		bool all_visible = false, range = false;
+		volatile bool caught = false;
+		ios_pin_watch = true;
+		ios_error = error == 0; skip_delay_error = error == 1;
+		expecting_error = true;
+		PG_TRY();
+		{
+			(void)skip_run(&state, &all_visible, &range);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(!ios_locked && ios_evaluators == 0);
+		UT_ASSERT_EQ(ios_live_pins, 0);
+		UT_ASSERT_EQ(ios_releases, 1);
+	}
+}
+
 int
 main(void)
 {
 	if (PGRAC_VM_QUALIFIED_CATALOG_VERSION == 0) {
-		UT_PLAN(3);
+		UT_PLAN(4);
 		UT_RUN(zero_catalog_threshold_never_admits_even_the_largest_loaded_version);
 		UT_RUN(unavailable_or_unproven_vm_source_never_makes_a_range);
 		UT_RUN(no_page_in_the_requested_range_cannot_claim_shared_visibility);
+		UT_RUN(shared_no_skip_refusals_release_a_preexisting_vm_pin);
 	} else {
-		UT_PLAN(13);
+		UT_PLAN(16);
 		UT_RUN(qualified_af_range_is_skipped_in_both_vacuum_modes);
 		UT_RUN(av_only_range_sets_skippedallvis_only_at_the_original_threshold);
 		UT_RUN(aggressive_vacuum_does_not_skip_av_only_pages);
@@ -312,6 +374,9 @@ main(void)
 		UT_RUN(delay_cancel_and_read_recheck_error_leave_no_vm_scope);
 		UT_RUN(native_range_selection_and_prior_skippedallvis_are_preserved);
 		UT_RUN(no_page_in_the_requested_range_cannot_claim_shared_visibility);
+		UT_RUN(shared_range_unpins_before_every_delay_and_final_heap_work);
+		UT_RUN(shared_no_skip_refusals_release_a_preexisting_vm_pin);
+		UT_RUN(shared_range_errors_retire_pin_before_propagation);
 	}
 	UT_DONE();
 	return ut_failed_count != 0;

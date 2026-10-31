@@ -2695,6 +2695,13 @@ lazy_scan_skip_shared_page(LVRelState *vacrel, Buffer *vmbuffer, BlockNumber blo
 	PG_FINALLY();
 	{
 		visibilitymap_read_end(&scope);
+		/* VM/FSM DROP cannot finish with this passive predecessor pin.
+		 * Leave delay points and subsequent heap work without it. */
+		if (BufferIsValid(*vmbuffer))
+		{
+			ReleaseBuffer(*vmbuffer);
+			*vmbuffer = InvalidBuffer;
+		}
 	}
 	PG_END_TRY();
 	return skip;

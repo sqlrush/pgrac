@@ -46,6 +46,9 @@ static int ios_drift, ios_error;
 static unsigned ios_reads, ios_grants, ios_unlocks, ios_releases, ios_fetches;
 static unsigned ios_indexes, ios_copies, ios_evaluators, ios_enters, ios_exits;
 static unsigned ios_quals;
+/* Opt-in pin ledger for consumer boundaries, not ResourceOwner simulation. */
+static bool ios_pin_watch;
+static unsigned ios_live_pins;
 static uint64 ios_space_generation, ios_admission_generation;
 static CommandId ios_expected_cid;
 static ItemPointerData ios_tid;
@@ -55,6 +58,8 @@ ios_vm_readbuf(Relation rel, BlockNumber block, bool extend)
 {
 	UT_ASSERT(rel == &relation && block == 0 && !extend && !ios_locked);
 	ios_reads++;
+	if (ios_pin_watch && !ios_missing)
+		ios_live_pins++;
 	return ios_missing ? InvalidBuffer : 2;
 }
 
@@ -62,6 +67,8 @@ static uint8
 ios_raw_status(Relation rel, BlockNumber block, Buffer *buffer)
 {
 	UT_ASSERT(rel == &relation && block == 0 && !ios_locked);
+	if (ios_pin_watch && !BufferIsValid(*buffer))
+		ios_live_pins++;
 	*buffer = 2;
 	return (uint8)*PageGetContents(pages[1].data) & VISIBILITYMAP_VALID_BITS;
 }
@@ -79,6 +86,11 @@ ios_release(Buffer buffer)
 {
 	UT_ASSERT(buffer == 2 && !ios_locked);
 	ios_releases++;
+	if (ios_pin_watch) {
+		UT_ASSERT_EQ(ios_live_pins, 1);
+		if (ios_live_pins > 0)
+			ios_live_pins--;
+	}
 }
 
 static bool
@@ -199,6 +211,8 @@ ios_index_next(IndexScanDesc scan, ScanDirection direction)
 {
 	UT_ASSERT(scan->heapRelation == &relation && direction == ForwardScanDirection);
 	UT_ASSERT(!ios_locked && ios_evaluators == 0);
+	if (ios_pin_watch && ios_indexes > 0 && cluster_heap_maintenance_restricted(&relation))
+		UT_ASSERT_EQ(ios_live_pins, 0);
 	return ios_indexes++ == 0 ? &ios_tid : NULL;
 }
 
@@ -207,6 +221,8 @@ ios_fetch(IndexScanDesc scan, TupleTableSlot *slot)
 {
 	UT_ASSERT(scan->heapRelation == &relation && slot != NULL);
 	UT_ASSERT(!ios_locked && ios_evaluators == 0);
+	if (ios_pin_watch && cluster_heap_maintenance_restricted(&relation))
+		UT_ASSERT_EQ(ios_live_pins, 0);
 	UT_ASSERT_EQ(ios_snapshot.curcid, ios_expected_cid);
 	ios_fetches++;
 	return ios_heap_visible;
@@ -228,6 +244,8 @@ static bool
 ios_qual(void)
 {
 	UT_ASSERT(!ios_locked && ios_evaluators == 0);
+	if (ios_pin_watch && cluster_heap_maintenance_restricted(&relation))
+		UT_ASSERT_EQ(ios_live_pins, 0);
 	ios_quals++;
 	return ios_qual_result;
 }
@@ -272,6 +290,8 @@ ios_reset(bool publish)
 	ios_reads = ios_grants = ios_unlocks = ios_releases = ios_fetches = 0;
 	ios_indexes = ios_copies = ios_evaluators = ios_enters = ios_exits = 0;
 	ios_quals = 0;
+	ios_pin_watch = false;
+	ios_live_pins = 0;
 	ios_space_generation = ios_admission_generation = 1;
 	memset(&ios_snapshot, 0, sizeof(ios_snapshot));
 	ios_snapshot.snapshot_type = SNAPSHOT_MVCC;
@@ -307,6 +327,8 @@ ios_run(Buffer *cached, bool heap_index)
 	node.ioss_TableSlot = &heap_slot;
 	node.ioss_ScanDesc = &scan;
 	node.ioss_VMBuffer = *cached;
+	if (ios_pin_watch)
+		ios_live_pins = BufferIsValid(*cached) ? 1 : 0;
 	scan.heapRelation = &relation;
 	scan.xs_recheck = ios_lossy;
 	if (heap_index) {
@@ -356,7 +378,7 @@ UT_TEST(old_or_unknown_catalog_does_not_consult_a_positive_vm)
 		UT_ASSERT(!ios_run(&buffer, false));
 		UT_ASSERT_EQ(ios_fetches, 1);
 		UT_ASSERT_EQ(ios_grants + ios_reads + ios_enters, 0);
-		UT_ASSERT_EQ(buffer, 2);
+		UT_ASSERT_EQ(buffer, InvalidBuffer);
 	}
 }
 
@@ -385,7 +407,7 @@ UT_TEST(reused_vm_pin_must_obtain_current_s_for_every_tid)
 	UT_ASSERT_EQ(ios_grants, 2);
 	UT_ASSERT_EQ(ios_unlocks, 2);
 	UT_ASSERT_EQ(ios_fetches, 1);
-	UT_ASSERT_EQ(ios_reads, 1);
+	UT_ASSERT_EQ(ios_reads, 2);
 }
 
 UT_TEST(space_membership_snapshot_cid_or_target_change_cannot_grant)
@@ -520,6 +542,82 @@ UT_TEST(retry_setter_without_publication_proof_is_a_silent_noop)
 	UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
 }
 
+UT_TEST(shared_ios_unpins_before_quals_next_tid_and_return)
+{
+	for (int kind = 0; kind < 2; kind++)
+		for (int lossy = 0; lossy < 2; lossy++)
+			for (int accepted = 0; accepted < 2; accepted++) {
+				Buffer buffer = InvalidBuffer;
+				ios_reset(true); ios_pin_watch = true;
+				ios_lossy = lossy; ios_qual_result = accepted;
+				UT_ASSERT_EQ(ios_run(&buffer, kind), !lossy || accepted);
+				UT_ASSERT_EQ(ios_fetches, 0);
+				UT_ASSERT_EQ(buffer, InvalidBuffer);
+				UT_ASSERT_EQ(ios_live_pins, 0);
+				UT_ASSERT_EQ(ios_releases, 1);
+			}
+}
+
+UT_TEST(shared_ios_fallback_unpins_before_heap_fetch)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		Buffer buffer = 2;
+		ios_reset(true); ios_pin_watch = true; ios_heap_visible = true;
+		switch (fault) {
+		case 0: *PageGetContents(ios_current.data) = 0; break;
+		case 1: ios_grant = false; break;
+		case 2: ios_missing = true; buffer = InvalidBuffer; break;
+		case 3: ios_space = false; break;
+		case 4: ios_admission = false; break;
+		case 5: ios_pcm = false; break;
+		case 6: ios_drift = 4; break;
+		}
+		UT_ASSERT(ios_run(&buffer, false));
+		UT_ASSERT_EQ(ios_fetches, 1);
+		UT_ASSERT_EQ(buffer, InvalidBuffer);
+		UT_ASSERT_EQ(ios_live_pins, 0);
+		UT_ASSERT_EQ(ios_releases, fault == 2 ? 0 : 1);
+	}
+}
+
+UT_TEST(shared_ios_old_format_unpins_its_preexisting_cache)
+{
+	Buffer buffer = 2;
+	ios_reset(true); ios_pin_watch = true;
+	control.catalog_version_no = 0;
+	UT_ASSERT(!ios_run(&buffer, false));
+	UT_ASSERT_EQ(ios_grants + ios_reads + ios_enters, 0);
+	UT_ASSERT_EQ(ios_fetches, 1);
+	UT_ASSERT_EQ(buffer, InvalidBuffer);
+	UT_ASSERT_EQ(ios_live_pins, 0);
+	UT_ASSERT_EQ(ios_releases, 1);
+}
+
+UT_TEST(shared_ios_cancel_and_copy_error_retire_the_caller_pin)
+{
+	for (int error = 0; error < 2; error++) {
+		Buffer buffer = InvalidBuffer;
+		volatile bool caught = false;
+		ios_reset(true); ios_pin_watch = true;
+		ios_error = error == 0; ios_copy_error = error == 1;
+		expecting_error = true;
+		PG_TRY();
+		{
+			(void)ios_run(&buffer, false);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(!ios_locked && ios_evaluators == 0);
+		UT_ASSERT_EQ(ios_live_pins, 0);
+		UT_ASSERT_EQ(ios_releases, 1);
+	}
+}
+
 #ifndef VM_QUALIFIED_IOS_MAIN
 #define VM_QUALIFIED_IOS_MAIN main
 #endif
@@ -528,12 +626,13 @@ VM_QUALIFIED_IOS_MAIN(void)
 {
 	if (PGRAC_VM_QUALIFIED_CATALOG_VERSION == 0)
 	{
-		UT_PLAN(1);
+		UT_PLAN(2);
 		UT_RUN(unassigned_catalog_never_grants_even_with_a_new_loaded_catalog);
+		UT_RUN(shared_ios_old_format_unpins_its_preexisting_cache);
 	}
 	else
 	{
-		UT_PLAN(12);
+		UT_PLAN(16);
 		UT_RUN(loaded_control_catalog_is_not_the_compiled_catalog);
 		UT_RUN(empty_native_publication_reaches_ios_without_heap_fetch);
 		UT_RUN(old_or_unknown_catalog_does_not_consult_a_positive_vm);
@@ -546,6 +645,10 @@ VM_QUALIFIED_IOS_MAIN(void)
 		UT_RUN(nonshared_keeps_the_native_raw_shortcut);
 		UT_RUN(lossy_qual_and_next_tid_run_after_vm_scope_release);
 		UT_RUN(retry_setter_without_publication_proof_is_a_silent_noop);
+		UT_RUN(shared_ios_unpins_before_quals_next_tid_and_return);
+		UT_RUN(shared_ios_fallback_unpins_before_heap_fetch);
+		UT_RUN(shared_ios_old_format_unpins_its_preexisting_cache);
+		UT_RUN(shared_ios_cancel_and_copy_error_retire_the_caller_pin);
 	}
 	UT_DONE();
 	return ut_failed_count != 0;

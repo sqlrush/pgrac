@@ -181,6 +181,14 @@ IndexOnlyNext(IndexOnlyScanState *node)
 								&node->ioss_VMBuffer))
 			{
 				visibilitymap_read_end(&vm_scope);
+				/* A passive shared VM pin can prevent the original holder's
+				 * DROP. Retire it before fetching another block. */
+				if (cluster_heap_maintenance_restricted(scandesc->heapRelation)
+					&& BufferIsValid(node->ioss_VMBuffer))
+				{
+					ReleaseBuffer(node->ioss_VMBuffer);
+					node->ioss_VMBuffer = InvalidBuffer;
+				}
 				/*
 				 * Rats, we have to visit the heap to check visibility.
 				 */
@@ -239,6 +247,14 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		PG_FINALLY();
 		{
 			visibilitymap_read_end(&vm_scope);
+			/* The index value has been consumed. User quals, the next TID
+			 * and caller waits must not retain this shared VM pin. */
+			if (cluster_heap_maintenance_restricted(scandesc->heapRelation)
+				&& BufferIsValid(node->ioss_VMBuffer))
+			{
+				ReleaseBuffer(node->ioss_VMBuffer);
+				node->ioss_VMBuffer = InvalidBuffer;
+			}
 		}
 		PG_END_TRY();
 		if (skip_tuple)
