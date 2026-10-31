@@ -31,6 +31,7 @@
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_savepoint_reader.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_format.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -222,6 +223,121 @@ unknown:
 	memset(proof, 0, sizeof(*proof));
 	proof->state = CCM_UNKNOWN;
 	return false;
+}
+
+bool
+cluster_multixact_current_resolve_operation_member_proof(const ClusterCurrentMxMemberDesc *member,
+														 uint16 ordinal,
+														 const ClusterTTStatusKey *top_key,
+														 const ClusterTTStatusResult *top_result,
+														 const ClusterSavepointEffectProof *effect,
+														 ClusterCurrentMemberOperationProof *out)
+{
+	ClusterCurrentMemberOperationProof proof = { 0 };
+	static const ClusterTTStatusKey no_parent;
+	const ClusterSavepointReaderIdentity *identity;
+	uint16 origin;
+
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+		out->base.state = CCM_UNKNOWN;
+		out->format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
+	}
+	if (out == NULL || member == NULL || top_key == NULL || top_result == NULL
+		|| !cluster_savepoint_reader_mx_effect_valid(effect) || !TransactionIdIsNormal(member->xid)
+		|| member->member_status > MaxMultiXactStatus || member->reserved8[0] != 0
+		|| member->reserved8[1] != 0 || member->reserved8[2] != 0
+		|| ordinal >= CLUSTER_CURRENT_MX_MAX_MEMBERS
+		|| member->xid != XidFromFullTransactionId(effect->key.operation_fxid))
+		return false;
+	identity = &effect->identity;
+	origin = (uint16)((identity->canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	if (!tt_key_valid(top_key, identity->canonical.xid, effect->cluster_epoch, origin)
+		|| top_key->undo_segment_id != identity->canonical.segment_id
+		|| top_key->tt_slot_id != cluster_tt_slot_offset_to_id(identity->canonical.slot_offset)
+		|| !top_result->authoritative || top_result->status_epoch != effect->cluster_epoch
+		|| top_result->has_parent_key
+		|| memcmp(&top_result->parent_key, &no_parent, sizeof(no_parent)) != 0
+		|| top_result->commit_scn != effect->top_commit_scn)
+		return false;
+	switch (top_result->status) {
+	case CLUSTER_TT_STATUS_IN_PROGRESS:
+		if (effect->top_outcome != CLUSTER_TX_IN_PROGRESS)
+			return false;
+		/* SELF is a requester-local projection, never an origin TT state. */
+		proof.base.state = CCM_ACTIVE;
+		break;
+	case CLUSTER_TT_STATUS_COMMITTED:
+	case CLUSTER_TT_STATUS_CLEANED_OUT:
+		if (effect->top_outcome != CLUSTER_TX_COMMITTED)
+			return false;
+		proof.base.state = CCM_COMMITTED;
+		proof.base.commit_scn = effect->top_commit_scn;
+		break;
+	case CLUSTER_TT_STATUS_ABORTED:
+		if (effect->top_outcome != CLUSTER_TX_ABORTED)
+			return false;
+		proof.base.state = CCM_ABORTED;
+		break;
+	default:
+		return false;
+	}
+	proof_key_set_unbound(&proof.base.key, top_key);
+	ClusterCurrentMemberProofSetCtrcBinding(&proof.base, identity->canonical_generation,
+											identity->canonical.wrap);
+	proof.base.member_xid = member->xid;
+	proof.base.member_ordinal = ordinal;
+	proof.base.member_status = member->member_status;
+	proof.operation_uba = effect->key.locator.uba;
+	proof.top_fxid = effect->key.top_fxid;
+	proof.operation_fxid = effect->key.operation_fxid;
+	proof.effect_state = effect->effect_state;
+	proof.format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
+	proof.flags = CLUSTER_CURRENT_OPERATION_PROOF_EXACT;
+	*out = proof;
+	return true;
+}
+
+bool
+cluster_multixact_current_operation_member_proof_bind_ctrc(
+	ClusterCurrentMemberOperationProof *proof, const ClusterCtrcTxnKeyV1 *ctrc_key)
+{
+	uint32 segment, block;
+	uint16 tt_offset, row;
+	ClusterTTStatusKey key;
+	uint32 generation;
+	uint16 wrap;
+
+	if (proof == NULL || ctrc_key == NULL
+		|| proof->format_version != CLUSTER_CURRENT_OPERATION_PROOF_VERSION
+		|| proof->flags != CLUSTER_CURRENT_OPERATION_PROOF_EXACT || proof->reserved != 0
+		|| (proof->effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+			&& proof->effect_state != CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
+		|| proof->base.commit_scn != InvalidScn
+		|| proof->base.member_ordinal >= CLUSTER_CURRENT_MX_MAX_MEMBERS
+		|| proof->base.member_status > MaxMultiXactStatus
+		|| !TransactionIdIsNormal(proof->base.member_xid)
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(proof->top_fxid))
+		|| U64FromFullTransactionId(proof->top_fxid) == UINT64_MAX
+		|| U64FromFullTransactionId(proof->operation_fxid) == UINT64_MAX
+		|| U64FromFullTransactionId(proof->operation_fxid)
+			   <= U64FromFullTransactionId(proof->top_fxid)
+		|| XidFromFullTransactionId(proof->top_fxid) != proof->base.key.local_xid
+		|| XidFromFullTransactionId(proof->operation_fxid) != proof->base.member_xid
+		|| !ClusterCurrentMemberProofGetStatusKey(&proof->base, &key, &generation, &wrap)
+		|| !tt_key_valid(&key, proof->base.key.local_xid, ctrc_key->cluster_epoch,
+						 ctrc_key->origin_node_id)
+		|| proof->base.key.undo_segment_id == 0
+		|| (proof->base.key.undo_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+			   != proof->base.key.origin_node_id
+		|| !uba_decode_record(proof->operation_uba, &segment, &block, &tt_offset, &row)
+		|| uba_origin_node_id(proof->operation_uba) != proof->base.key.origin_node_id
+		|| cluster_tt_slot_offset_to_id(tt_offset) != proof->base.key.tt_slot_id
+		/* The old binder assigns these fields. It must not replace the
+		 * independent current-DATA proof with a different CTRC incarnation. */
+		|| generation != ctrc_key->segment_generation || wrap != ctrc_key->slot_wrap)
+		return false;
+	return cluster_multixact_current_member_proof_bind_ctrc(&proof->base, ctrc_key);
 }
 
 

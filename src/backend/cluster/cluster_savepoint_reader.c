@@ -284,6 +284,128 @@ cluster_savepoint_reader_extract_identity(const ClusterSavepointReaderIdentity *
 	return true;
 }
 
+static bool
+savepoint_mx_target_valid(const ClusterUndoRecordTarget *target)
+{
+	return target->_pad == 0 && RelFileNumberIsValid(target->locator.relNumber)
+		   && target->forknum == MAIN_FORKNUM && target->blockno != InvalidBlockNumber
+		   && OffsetNumberIsValid(target->offnum);
+}
+
+static bool
+savepoint_mx_outcome_valid(ClusterTxOutcome outcome, SCN commit_scn)
+{
+	return outcome == CLUSTER_TX_COMMITTED
+			   ? SCN_VALID(commit_scn)
+			   : ((outcome == CLUSTER_TX_IN_PROGRESS || outcome == CLUSTER_TX_ABORTED)
+				  && commit_scn == InvalidScn);
+}
+
+bool
+cluster_savepoint_reader_mx_effect_valid(const ClusterSavepointEffectProof *effect)
+{
+	uint32 segment, block;
+	uint16 tt_offset, row;
+	const ClusterSavepointOperationKey *key;
+	const ClusterSavepointReaderIdentity *identity;
+
+	if (effect == NULL)
+		return false;
+	key = &effect->key;
+	identity = &effect->identity;
+	return effect->reserved16 == 0 && savepoint_mx_target_valid(&key->target)
+		   && identity->canonical.reserved32 == 0
+		   && savepoint_reader_identity_valid(identity, &key->locator)
+		   && identity->operation_sequence != 0
+		   && U64FromFullTransactionId(key->top_fxid) != UINT64_MAX
+		   && U64FromFullTransactionId(key->operation_fxid) != UINT64_MAX
+		   && FullTransactionIdEquals(key->top_fxid, identity->top_fxid)
+		   && FullTransactionIdEquals(key->operation_fxid, identity->operation_fxid)
+		   && key->locator.itl_slot_index < CLUSTER_ITL_INITRANS_DEFAULT
+		   && ((key->locator.itl_kind >= ITL_FLAG_ACTIVE
+				&& key->locator.itl_kind <= ITL_FLAG_NEEDS_CLEANOUT)
+			   || ITL_FLAG_IS_LOCK_ONLY(key->locator.itl_kind))
+		   && uba_decode_record(key->locator.uba, &segment, &block, &tt_offset, &row)
+		   && tt_offset == identity->canonical.slot_offset
+		   && uba_origin_node_id(key->locator.uba)
+				  == (identity->canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+		   && (effect->effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE
+			   || effect->effect_state == CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
+		   && savepoint_mx_outcome_valid(effect->top_outcome, effect->top_commit_scn);
+}
+
+/* Payload has already passed the original body/history decoder. Match either
+ * explicit UPDATE side, never another row merely sharing the child xid. */
+static bool
+savepoint_mx_target_matches(const ClusterUndoRecordTarget *target, const UndoRecordHeader *record,
+							const char *body)
+{
+	UndoUpdatePayload update;
+
+	if (target->locator.spcOid != record->target_locator.spcOid
+		|| target->locator.dbOid != record->target_locator.dbOid
+		|| target->locator.relNumber != record->target_locator.relNumber
+		|| target->forknum != record->target_fork)
+		return false;
+	if (target->blockno == record->target_block && target->offnum == record->target_offset)
+		return true;
+	if (record->record_type != UNDO_RECORD_UPDATE)
+		return false;
+	memcpy(&update, body, sizeof(update));
+	return target->blockno == update.new_block && target->offnum == update.new_offset;
+}
+
+bool
+cluster_savepoint_reader_mx_effect(const ClusterSavepointOperationKey *key,
+								   const ClusterTxResolution *top, const char page[BLCKSZ],
+								   ClusterSavepointEffectProof *out)
+{
+	ClusterSavepointEffectProof effect = { 0 };
+	ClusterSavepointReaderRecord decoded;
+	UndoRecordHeader record;
+	UndoSlotDirEntry slot;
+	const char *body;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || key == NULL || top == NULL || page == NULL
+		|| !savepoint_mx_target_valid(&key->target)
+		|| top->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+		|| !savepoint_mx_outcome_valid(top->outcome, top->commit_scn) || !top->local_canonical_valid
+		|| top->local_canonical.reserved32 != 0
+		|| !FullTransactionIdEquals(top->local_original_full_xid, key->top_fxid)
+		|| top->top_xid != XidFromFullTransactionId(key->top_fxid)
+		|| top->authority.origin_epoch > UINT32_MAX || !SCN_VALID(top->authority.authority_scn)
+		|| !cluster_tx_locator_reply_matches(&key->locator, &top->locator_echo)
+		|| !savepoint_reader_record(&key->locator, page, &record, &slot))
+		return false;
+	body = page + slot.record_offset + sizeof(record);
+	if (!cluster_undo_record_decode_operation_payload(&record, body, record.payload_length,
+													  &decoded.body_length, &decoded.history,
+													  &decoded.operation))
+		return false;
+	effect.key = *key;
+	effect.identity.canonical = top->local_canonical;
+	effect.identity.canonical_generation = top->local_canonical_generation;
+	effect.identity.top_fxid = key->top_fxid;
+	effect.identity.operation_fxid = key->operation_fxid;
+	effect.identity.operation_sequence = decoded.operation.operation_sequence;
+	effect.identity.command_id = decoded.operation.command_id;
+	effect.identity.subid = decoded.operation.subid;
+	effect.cluster_epoch = (uint32)top->authority.origin_epoch;
+	effect.top_outcome = top->outcome;
+	effect.top_commit_scn = top->commit_scn;
+	effect.effect_state = decoded.operation.effect_state;
+	if (!cluster_savepoint_reader_mx_effect_valid(&effect)
+		|| !cluster_savepoint_reader_decode_identity(&effect.identity, &key->locator,
+													 key->locator.uba, &record, body,
+													 record.payload_length, &decoded)
+		|| !savepoint_mx_target_matches(&key->target, &record, body))
+		return false;
+	*out = effect;
+	return true;
+}
+
 bool
 cluster_savepoint_reader_decode(const ClusterSavepointOperation *expected,
 								const ClusterTxLocator *locator, UBA current_uba,

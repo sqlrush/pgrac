@@ -99,6 +99,22 @@ typedef struct ClusterCurrentMemberProof {
 	uint8 reserved8[4];
 } ClusterCurrentMemberProof;
 
+#define CLUSTER_CURRENT_OPERATION_PROOF_VERSION UINT8_C(2)
+#define CLUSTER_CURRENT_OPERATION_PROOF_EXACT UINT16_C(1)
+
+/* Exact-operation format; not accepted by the existing wire-5 family.
+ * Canonical top state and operation disposition remain independent. */
+typedef struct ClusterCurrentMemberOperationProof {
+	ClusterCurrentMemberProof base;
+	ClusterUndoByteAddress operation_uba;
+	FullTransactionId top_fxid;
+	FullTransactionId operation_fxid;
+	uint8 effect_state;
+	uint8 format_version;
+	uint16 flags;
+	uint32 reserved;
+} ClusterCurrentMemberOperationProof;
+
 
 static inline void
 ClusterCurrentMemberProofSetCtrcBinding(ClusterCurrentMemberProof *proof, uint32 segment_generation,
@@ -380,6 +396,16 @@ StaticAssertDecl(sizeof(ClusterCurrentMemberProofKey) == 24,
 				 "ClusterCurrentMemberProofKey must remain 24 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 48,
 				 "ClusterCurrentMemberProof must remain 48 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMemberOperationProof) == 88,
+				 "ClusterCurrentMemberOperationProof must remain 88 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMemberOperationProof, operation_uba) == 48
+					 && offsetof(ClusterCurrentMemberOperationProof, top_fxid) == 64
+					 && offsetof(ClusterCurrentMemberOperationProof, operation_fxid) == 72
+					 && offsetof(ClusterCurrentMemberOperationProof, effect_state) == 80
+					 && offsetof(ClusterCurrentMemberOperationProof, format_version) == 81
+					 && offsetof(ClusterCurrentMemberOperationProof, flags) == 82
+					 && offsetof(ClusterCurrentMemberOperationProof, reserved) == 84,
+				 "Exact operation proof offsets must remain fixed");
 StaticAssertDecl(sizeof(ClusterCurrentMxSuccessorAlias) == 24,
 				 "ClusterCurrentMxSuccessorAlias must remain 24 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentUpdaterProof) == 72,
@@ -408,6 +434,13 @@ extern bool cluster_multixact_current_resolve_origin_member_proof(
 extern bool
 cluster_multixact_current_member_proof_bind_ctrc(ClusterCurrentMemberProof *proof,
 												 const struct ClusterCtrcTxnKeyV1 *ctrc_key);
+struct ClusterSavepointEffectProof;
+extern bool cluster_multixact_current_resolve_operation_member_proof(
+	const ClusterCurrentMxMemberDesc *member, uint16 ordinal, const ClusterTTStatusKey *top_key,
+	const ClusterTTStatusResult *top_result, const struct ClusterSavepointEffectProof *effect,
+	ClusterCurrentMemberOperationProof *out);
+extern bool cluster_multixact_current_operation_member_proof_bind_ctrc(
+	ClusterCurrentMemberOperationProof *proof, const struct ClusterCtrcTxnKeyV1 *ctrc_key);
 extern ClusterUpdaterCandidateVerdict cluster_multixact_current_updater_candidate_verdict(
 	const ClusterTTStatusKey *candidate, TransactionId updater_xid, uint16 updater_origin_node,
 	uint32 current_epoch, ClusterTTStatusKey *current_binding,

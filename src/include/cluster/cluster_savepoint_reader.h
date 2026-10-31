@@ -23,6 +23,7 @@
 #include "cluster/cluster_undo_record.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_undo_record_api.h"
 #include "storage/buf_internals.h"
 
 #define CLUSTER_SAVEPOINT_READER_PRESENT 1
@@ -45,6 +46,35 @@ typedef struct ClusterSavepointReaderIdentity {
 	CommandId command_id;
 	SubTransactionId subid;
 } ClusterSavepointReaderIdentity;
+
+/* Exact compare input discovered from this protected tuple/MX history. */
+typedef struct ClusterSavepointOperationKey {
+	ClusterTxLocator locator;
+	ClusterUndoRecordTarget target;
+	FullTransactionId top_fxid;
+	FullTransactionId operation_fxid;
+} ClusterSavepointOperationKey;
+
+/* Local typed decode result, never a peer proof, cached outcome or authority. */
+typedef struct ClusterSavepointEffectProof {
+	ClusterSavepointOperationKey key;
+	ClusterSavepointReaderIdentity identity;
+	SCN top_commit_scn;
+	uint32 cluster_epoch;
+	uint8 top_outcome;
+	uint8 effect_state;
+	uint16 reserved16;
+} ClusterSavepointEffectProof;
+
+/* The original origin reader owns retention/admission and samples canonical
+ * TT before acquiring this fresh current DATA. No acquisition or ordering
+ * authority is created here. Missing original top FullXid fails closed.
+ * false clears out. The semantic validator grants no additional authority. */
+extern bool cluster_savepoint_reader_mx_effect(const ClusterSavepointOperationKey *key,
+											   const ClusterTxResolution *top,
+											   const char page[BLCKSZ],
+											   ClusterSavepointEffectProof *out);
+extern bool cluster_savepoint_reader_mx_effect_valid(const ClusterSavepointEffectProof *effect);
 
 extern bool
 cluster_savepoint_reader_identity_from_operation(const ClusterSavepointOperation *expected,

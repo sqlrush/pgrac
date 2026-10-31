@@ -13263,3 +13263,24 @@ test_cluster_heap_sample_full: test_cluster_heap_sample_full.c test_cluster_heap
         $(CLUSTER_SAVEPOINT_READER_O) \
         $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_mx_operation_core
+all: test_cluster_mx_operation_core
+
+$(CLUSTER_SAVEPOINT_READER_O): $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
+$(CLUSTER_MULTIXACT_CURRENT_O): $(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
+        $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
+$(CLUSTER_MULTIXACT_CURRENT_WIRE_O): $(top_srcdir)/src/include/cluster/cluster_multixact_current.h
+
+test_cluster_mx_operation_core: test_cluster_mx_operation_core.c test_cluster_savepoint_reader.c \
+        unit_test.h $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
+        $(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
+        $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+        $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_SAVEPOINT_READER_O) \
+        $(CLUSTER_MULTIXACT_CURRENT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+        $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_SAVEPOINT_READER_O) \
+        $(CLUSTER_MULTIXACT_CURRENT_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
