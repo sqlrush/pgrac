@@ -10,7 +10,8 @@
  *    src/test/cluster_unit/test_cluster_multixact_limits_io.c
  * NOTES
  *    PGRAC test; only shmem, locks, original authority and fault delivery are
- *    fixtures. Native SLRU lookup, read, write, delete and replay bodies execute.
+ *    fixtures. Native creation, cache, member readback, SLRU and redo execute;
+ *    backend memory contexts and WAL transport remain fixture boundaries.
  *    This is not a cluster fencing or native startup qualification.
  *-------------------------------------------------------------------------
  */
@@ -19,6 +20,9 @@
 #include "postmaster/checkpointer.h"
 #include <dirent.h>
 #include <sys/wait.h>
+#ifdef USE_CLUSTER_UNIT
+#error "This fixture requires the native MultiXact persistence body"
+#endif
 #ifdef MULTIXACT_TEST_SOURCE
 #include MULTIXACT_TEST_SOURCE
 #else
@@ -41,6 +45,15 @@ bool InRecovery;
 bool cluster_enabled = true;
 bool cluster_xid_striping = true;
 int autovacuum_multixact_freeze_max_age = 400000000;
+int MaxBackends = 1;
+int max_prepared_xacts = 0;
+BackendId MyBackendId = 1;
+static MultiXactId local_oldest_member[2], local_oldest_visible[2];
+static ClusterConf local_topology;
+ClusterConf *ClusterConfShmem = &local_topology;
+static char context_marker;
+MemoryContext TopTransactionContext = (MemoryContext)&context_marker;
+static void *transaction_allocations[64];
 static LWLockPadded local_locks[128];
 LWLockPadded *MainLWLockArray = local_locks;
 static MultiXactStateData local_state;
@@ -232,6 +245,53 @@ TransactionIdFollowsOrEquals(TransactionId a, TransactionId b)
 	return (int32)(a - b) >= 0;
 }
 
+/* Only allocation/context lifetime is doubled; native cache lookup, insertion,
+ * sorting and AtEOXact reset still run. Unexpected allocation scope fails. */
+void *
+palloc(Size size)
+{
+	for (unsigned i = 0; i < lengthof(transaction_allocations); i++) {
+		if (transaction_allocations[i] == NULL) {
+			void *pointer = malloc(size);
+			if (pointer == NULL)
+				abort();
+			transaction_allocations[i] = pointer;
+			return pointer;
+		}
+	}
+	abort();
+}
+void
+pfree(void *pointer)
+{
+	if (pointer == NULL)
+		abort();
+	for (unsigned i = 0; i < lengthof(transaction_allocations); i++) {
+		if (transaction_allocations[i] == pointer) {
+			free(pointer);
+			transaction_allocations[i] = NULL;
+			return;
+		}
+	}
+	abort();
+}
+void *
+MemoryContextAlloc(MemoryContext context, Size size)
+{
+	if (context != TopTransactionContext)
+		abort();
+	return palloc(size);
+}
+MemoryContext
+AllocSetContextCreateInternal(MemoryContext parent, const char *name pg_attribute_unused(),
+							  Size minimum pg_attribute_unused(), Size initial pg_attribute_unused(),
+							  Size maximum pg_attribute_unused())
+{
+	if (parent != TopTransactionContext)
+		abort();
+	return parent;
+}
+
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *found)
 {
@@ -352,6 +412,8 @@ XLogInsert(RmgrId id, uint8 info)
 {
 	UT_ASSERT_EQ(id, RM_MULTIXACT_ID);
 	if (capture_allocation) {
+		if (info == XLOG_MULTIXACT_CREATE_ID)
+			UT_ASSERT(CritSectionCount > 0);
 		UT_ASSERT(wal_records < lengthof(allocation_wal));
 		UT_ASSERT(insert_length <= sizeof(allocation_wal[0].data));
 		if (wal_records < lengthof(allocation_wal)
@@ -440,6 +502,20 @@ local_reset(void)
 {
 	char path[MAXPGPATH];
 
+	if (MyBackendId < 1 || MyBackendId >= lengthof(local_oldest_member)
+		|| MaxOldestSlot >= lengthof(local_oldest_member))
+		abort();
+	OldestMemberMXactId = local_oldest_member;
+	OldestVisibleMXactId = local_oldest_visible;
+	AtEOXact_MultiXact();
+	for (unsigned i = 0; i < lengthof(transaction_allocations); i++) {
+		free(transaction_allocations[i]);
+		transaction_allocations[i] = NULL;
+	}
+	memset(local_oldest_member, 0, sizeof(local_oldest_member));
+	memset(local_oldest_visible, 0, sizeof(local_oldest_visible));
+	memset(&local_topology, 0, sizeof(local_topology));
+	local_topology.node_count = 2;
 	empty_input = false;
 	for (int family = 0; family < 2; family++) {
 		SlruCtl ctl = family ? MultiXactMemberCtl : MultiXactOffsetCtl;
@@ -521,27 +597,17 @@ local_segment_exists(SlruCtl ctl, int segno)
 	return access(path, F_OK) == 0;
 }
 
-/* Native allocation/recording execute; CREATE WAL below is a layout fixture,
- * not a claim that MultiXactIdCreateFromMembers or WAL durability executed. */
+/* No USE_CLUSTER_UNIT materializer: the original local-current constructor
+ * produces CREATE WAL and records members in its original critical section.
+ * This is the persistence tail, not heap/CTRC publication or WAL durability. */
 static bool
 local_allocate_and_record(MultiXactId *id, MultiXactMember *members)
 {
-	MultiXactOffset offset = 0;
 	bool refused = false;
 	expect_error = true;
 	PG_TRY();
 	{
-		xl_multixact_create create;
-		*id = GetNewMultiXactId(2, &offset);
-		RecordNewMultiXact(*id, offset, 2, members);
-		END_CRIT_SECTION();
-		create.mid = *id;
-		create.moff = offset;
-		create.nmembers = 2;
-		XLogBeginInsert();
-		XLogRegisterData((char *)&create, SizeOfMultiXactCreate);
-		XLogRegisterData((char *)members, 2 * sizeof(*members));
-		(void)XLogInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID);
+		*id = MultiXactIdCreateLocalCurrentMembers(2, members);
 	}
 	PG_CATCH();
 	{
@@ -552,13 +618,44 @@ local_allocate_and_record(MultiXactId *id, MultiXactMember *members)
 	return !refused;
 }
 
+static void
+local_check_members(MultiXactId id, MultiXactOffset offset, TransactionId first,
+					TransactionId second)
+{
+	MultiXactMember *members = NULL;
+	MultiXactOffset observed_offset = 0;
+	int count;
+
+	/* This API must read native pages even while the backend cache is warm. */
+	count = GetMultiXactIdMembersWithOffset(id, &members, false, false, &observed_offset);
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(observed_offset, offset);
+	UT_ASSERT(members != NULL);
+	if (members != NULL && count == 2) {
+		UT_ASSERT_EQ(members[0].xid, first);
+		UT_ASSERT_EQ(members[0].status, MultiXactStatusForKeyShare);
+		UT_ASSERT_EQ(members[1].xid, second);
+		UT_ASSERT_EQ(members[1].status, MultiXactStatusForShare);
+	}
+	if (members != NULL)
+		pfree(members);
+}
+
 UT_TEST(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members)
 {
-	MultiXactMember members[2]
-		= {{100, MultiXactStatusForKeyShare}, {116, MultiXactStatusForShare}};
-	for (int wrap = 0; wrap < 2; wrap++) {
+	static const struct {
+		int slot;
+		bool wrap;
+		MultiXactId first, second, third;
+	} cases[] = {{0, false, 262160, 262176, 262192},
+				 {1, false, 262145, 262161, 262177},
+				 {0, true, 32, 48, 64}, {1, true, 17, 33, 49}};
+	for (unsigned c = 0; c < lengthof(cases); c++) {
+		MultiXactMember members[2]
+			= {{116, MultiXactStatusForShare}, {100, MultiXactStatusForKeyShare}};
 		PGAlignedBlock old_page, member_page = {0}, expected_offsets, expected_members;
 		MultiXactId id = 0;
+		bool wrap = cases[c].wrap;
 		int old_pageno = wrap ? MultiXactIdToOffsetPage(MaxMultiXactId) : 0;
 		int new_pageno = wrap ? 0 : 128;
 		int slot;
@@ -569,7 +666,8 @@ UT_TEST(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members)
 		local_state.nextOffset = 500;
 		local_state.multiVacLimit = local_state.oldestMultiXactId + 1000;
 		local_state.multiWarnLimit = local_state.oldestMultiXactId + 2000;
-		cluster_mxid_stripe_latch_runtime(true, 0, wrap ? UINT32_MAX - 63 : 32);
+		cluster_node_id = cases[c].slot;
+		cluster_mxid_stripe_latch_runtime(true, cases[c].slot, wrap ? UINT32_MAX - 63 : 32);
 		memset(old_page.data, 0x72, BLCKSZ);
 		local_page(MultiXactOffsetCtl, old_pageno, old_page.data, BLCKSZ);
 		local_page(MultiXactMemberCtl, 0, member_page.data, BLCKSZ);
@@ -578,16 +676,26 @@ UT_TEST(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members)
 			UT_ASSERT(false);
 			continue;
 		}
-		UT_ASSERT_EQ(id, wrap ? 32 : 262160);
-		UT_ASSERT_EQ(wal_records, 2); /* actual ZERO then fixture CREATE */
+		UT_ASSERT_EQ(id, cases[c].first);
+		UT_ASSERT_EQ(wal_records, 2); /* actual ZERO then actual CREATE */
+		UT_ASSERT_EQ(CritSectionCount, 0);
 		UT_ASSERT_EQ(allocation_wal[0].info, XLOG_MULTIXACT_ZERO_OFF_PAGE);
 		{
 			int zero_page;
 			memcpy(&zero_page, allocation_wal[0].data, sizeof(zero_page));
 			UT_ASSERT_EQ(zero_page, new_pageno);
 		}
+		/* Identical members hit the real native cache; a distinct set below
+		 * must allocate again, so this shortcut cannot hide the gap path. */
 		UT_ASSERT(local_allocate_and_record(&id, members));
-		UT_ASSERT_EQ(id, wrap ? 48 : 262176);
+		UT_ASSERT_EQ(id, cases[c].first);
+		UT_ASSERT_EQ(wal_records, 2);
+		UT_ASSERT_EQ(local_state.nextMXact, cases[c].first + 1);
+		UT_ASSERT_EQ(local_state.nextOffset, 502);
+		members[0].xid = 200;
+		members[1].xid = 216;
+		UT_ASSERT(local_allocate_and_record(&id, members));
+		UT_ASSERT_EQ(id, cases[c].second);
 		UT_ASSERT_EQ(wal_records, 3); /* no second ZERO of occupied page */
 		SimpleLruWriteAll(MultiXactOffsetCtl, true);
 		SimpleLruWriteAll(MultiXactMemberCtl, true);
@@ -597,16 +705,20 @@ UT_TEST(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members)
 		LWLockRelease(MultiXactOffsetSLRULock);
 		slot = SimpleLruReadPage_ReadOnly(MultiXactOffsetCtl, new_pageno, 0);
 		memcpy(expected_offsets.data, MultiXactOffsetCtl->shared->page_buffer[slot], BLCKSZ);
-		UT_ASSERT_EQ(((MultiXactOffset *)expected_offsets.data)[wrap ? 32 : 16], 500);
-		UT_ASSERT_EQ(((MultiXactOffset *)expected_offsets.data)[wrap ? 48 : 32], 502);
+		UT_ASSERT_EQ(((MultiXactOffset *)expected_offsets.data)[MultiXactIdToOffsetEntry(cases[c].first)], 500);
+		UT_ASSERT_EQ(((MultiXactOffset *)expected_offsets.data)[MultiXactIdToOffsetEntry(cases[c].second)], 502);
 		LWLockRelease(MultiXactOffsetSLRULock);
 		slot = SimpleLruReadPage_ReadOnly(MultiXactMemberCtl, 0, 0);
 		memcpy(expected_members.data, MultiXactMemberCtl->shared->page_buffer[slot], BLCKSZ);
 		UT_ASSERT_EQ(*(TransactionId *)(expected_members.data + MXOffsetToMemberOffset(500)), 100);
 		UT_ASSERT_EQ(*(TransactionId *)(expected_members.data + MXOffsetToMemberOffset(501)), 116);
-		UT_ASSERT_EQ(*(TransactionId *)(expected_members.data + MXOffsetToMemberOffset(502)), 100);
-		UT_ASSERT_EQ(*(TransactionId *)(expected_members.data + MXOffsetToMemberOffset(503)), 116);
+		UT_ASSERT_EQ(*(TransactionId *)(expected_members.data + MXOffsetToMemberOffset(502)), 200);
+		UT_ASSERT_EQ(*(TransactionId *)(expected_members.data + MXOffsetToMemberOffset(503)), 216);
 		LWLockRelease(MultiXactMemberSLRULock);
+		local_check_members(cases[c].first, 500, 100, 116);
+		local_check_members(cases[c].second, 502, 200, 216);
+		UT_ASSERT(!local_limit_refuses(false));
+		UT_ASSERT_EQ(local_state.oldestOffset, 500);
 		if (!wrap)
 			for (int page = 1; page < 4; page++)
 				UT_ASSERT(!SimpleLruDoesPhysicalPageExist(MultiXactOffsetCtl, page));
@@ -618,6 +730,9 @@ UT_TEST(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members)
 		local_page(MultiXactOffsetCtl, new_pageno, member_page.data, BLCKSZ);
 		local_page(MultiXactMemberCtl, 0, member_page.data, BLCKSZ);
 		local_discard_cache();
+		/* Restore only fixture cursors, not a claim of checkpoint startup. */
+		local_state.nextMXact = wrap ? UINT32_MAX - 31 : 33;
+		local_state.nextOffset = 500;
 		InRecovery = true;
 		for (unsigned i = 0; i < saved_count; i++) {
 			DecodedXLogRecord decoded = {0};
@@ -641,7 +756,21 @@ UT_TEST(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members)
 		slot = SimpleLruReadPage_ReadOnly(MultiXactOffsetCtl, old_pageno, 0);
 		UT_ASSERT_EQ(memcmp(old_page.data, MultiXactOffsetCtl->shared->page_buffer[slot], BLCKSZ), 0);
 		LWLockRelease(MultiXactOffsetSLRULock);
-		UT_ASSERT_EQ(advanced_xid, 116);
+		UT_ASSERT_EQ(local_state.nextMXact, cases[c].second + 1);
+		UT_ASSERT_EQ(local_state.nextOffset, 504);
+		local_check_members(cases[c].first, 500, 100, 116);
+		local_check_members(cases[c].second, 502, 200, 216);
+		UT_ASSERT_EQ(advanced_xid, 216);
+		InRecovery = false;
+		members[0].xid = 300;
+		members[1].xid = 316;
+		UT_ASSERT(local_allocate_and_record(&id, members));
+		UT_ASSERT_EQ(id, cases[c].third);
+		UT_ASSERT_EQ(wal_records, 4);
+		UT_ASSERT_EQ(local_state.nextOffset, 506);
+		local_check_members(cases[c].first, 500, 100, 116);
+		local_check_members(cases[c].second, 502, 200, 216);
+		local_check_members(cases[c].third, 504, 300, 316);
 		UT_ASSERT_EQ(transient_fds, 0);
 		UT_ASSERT_EQ(CritSectionCount, 0);
 	}
