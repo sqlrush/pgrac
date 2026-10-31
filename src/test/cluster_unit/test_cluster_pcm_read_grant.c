@@ -215,6 +215,7 @@ static uint64 read_epoch;
 static ClusterMembershipState read_requester_state, read_holder_state;
 static char read_reply_frame[sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
 static GcsBlockDonePayload read_notice;
+static GcsBlockInvalidatePayload read_invalidate;
 static unsigned read_notices, read_revokes, read_cleanup_lookups;
 static bool read_cleanup_capacity = true;
 static TimestampTz read_master_time;
@@ -272,6 +273,7 @@ gcs_block_send_envelope_or_loopback(uint8 type, int32 dest, const void *payload,
 	}
 	if (type == PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE) {
 		UT_ASSERT_EQ(bytes, sizeof(GcsBlockInvalidatePayload));
+		read_invalidate = *(const GcsBlockInvalidatePayload *)payload;
 		read_revokes++;
 		return CLUSTER_IC_SEND_DONE;
 	}
@@ -410,6 +412,7 @@ read_wire_setup(BufferTag tag)
 	GcsBlockDedupKey key = {0};
 	read_forwards = read_replies = read_local_forwards = 0;
 	read_notices = read_revokes = read_cleanup_lookups = 0;
+	memset(&read_invalidate, 0, sizeof(read_invalidate));
 	read_cleanup_capacity = true;
 	read_notice_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	read_disk_result = CLUSTER_IC_SEND_DONE;
@@ -451,6 +454,193 @@ read_confirm_original_service(void)
 	UT_ASSERT(cluster_pcm_lock_read_grant_done(&grant.key, read_request.sender_node, true));
 	read_master_time += 10000;
 	gcs_first_fill_master_tick(1);
+}
+
+UT_TEST(test_vm_confirmation_rechecks_original_writer_blockers)
+{
+	for (int source = 0; source < 3; source++) {
+		BufferTag tag = make_tag(0);
+		GcsBlockDedupKey key;
+		GcsBlockDonePayload done = {0};
+		ClusterICEnvelope env = {0};
+		ResourceXDecodedFrame writer;
+		ResourceXMasterSnapshot queued;
+		PcmAuthoritySnapshot authority;
+		const uint32 expected_holders[] = {2, 6, 6};
+
+		tag.forkNum = VISIBILITYMAP_FORKNUM;
+		reset_fake_pcm_runtime(4);
+		key = read_wire_setup(tag);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+			RESOURCE_X_APPLY_APPLIED);
+		if (source != 0)
+			UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag,
+				source == 1 ? PCM_TRANS_N_TO_S : PCM_TRANS_N_TO_X, 2));
+		gcs_block_first_fill_request(&read_request, &key, 1, true);
+		writer = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 3, 3);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&writer, 3, &queued),
+			RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(queued.is_head);
+		UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_QUEUED);
+		UT_ASSERT_EQ(queued.incompatible_holders_bitmap, 0);
+
+		/* An old live read is still a liability, not an abandoned grant. */
+		read_master_time = INT64CONST(120000001);
+		cluster_gcs_block_pending_s_tick();
+		UT_ASSERT_EQ(read_revokes, 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+			&writer.common.logical_assertion, &queued), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_QUEUED);
+
+		done.tag = tag;
+		done.request_id = 71;
+		done.epoch = 1;
+		done.sender_node = 1;
+		done.requester_backend_id = 13;
+		done.transition_id = PCM_TRANS_N_TO_S;
+		done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_CONFIRM;
+		done.reserved_0[1] = 1;
+		env.source_node_id = 1;
+		env.dest_node_id = cluster_node_id;
+		env.payload_length = sizeof(done);
+		read_done_session = true;
+		for (int bad = 0; bad < 4; bad++) {
+			GcsBlockDonePayload wrong = done;
+			ClusterICEnvelope wrong_env = env;
+
+			if (bad == 0) wrong.requester_backend_id++;
+			else if (bad == 1) wrong.epoch++;
+			else if (bad == 2) wrong_env.source_node_id = 2;
+			else read_done_session = false;
+			cluster_gcs_handle_block_done_envelope(&wrong_env, &wrong);
+			read_done_session = true;
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+				&writer.common.logical_assertion, &queued), RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_QUEUED);
+		}
+		cluster_gcs_handle_block_done_envelope(&env, &done);
+		UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &authority));
+		UT_ASSERT_EQ(authority.state, PCM_STATE_S);
+		UT_ASSERT_EQ(authority.s_holders_bitmap, expected_holders[source]);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+			&writer.common.logical_assertion, &queued), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+		UT_ASSERT_EQ(queued.incompatible_holders_bitmap, expected_holders[source]);
+	}
+}
+
+UT_TEST(test_vm_cancel_keeps_writer_queued_until_retirement_notice_takeover)
+{
+	for (int source = 0; source < 3; source++) {
+		for (int variant = 0; variant < (source == 0 ? 2 : 4); variant++) {
+			BufferTag tag = make_tag(0);
+			GcsBlockDedupKey key;
+			GcsBlockDonePayload done = {0};
+			GcsBlockInvalidateAckPayload ack = {0};
+			ClusterICEnvelope env = {0};
+			ClusterPcmReadGrant grant, other = {0};
+			ClusterPcmReadGrantKey decoded, wrong;
+			ResourceXDecodedFrame writer;
+			ResourceXMasterSnapshot queued;
+			PcmAuthoritySnapshot authority;
+			const uint32 expected_blockers[][2] = {{0, 1}, {4, 5}, {4, 5}};
+			const uint32 expected_shared[][2] = {{0, 1}, {4, 5}, {0, 5}};
+			/* An unconfirmed disk grantee cannot supply the second read. */
+			bool second_reader = source != 0 && (variant & 1) != 0;
+			bool buffered = source == 0 ? variant != 0 : (variant & 2) != 0;
+
+			tag.forkNum = VISIBILITYMAP_FORKNUM;
+			reset_fake_pcm_runtime(4);
+			key = read_wire_setup(tag);
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				RESOURCE_X_APPLY_APPLIED);
+			if (source != 0)
+				UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag,
+					source == 1 ? PCM_TRANS_N_TO_S : PCM_TRANS_N_TO_X, 2));
+			gcs_block_first_fill_request(&read_request, &key, 1, true);
+			UT_ASSERT_EQ(cluster_pcm_lock_read_grant_begin(tag, 1, 13, 71, 1,
+				10000, false, &grant), PCM_GCS_TRANSITION_APPLIED);
+			if (second_reader)
+				other = begin_read(tag, 0, 14, 72);
+			writer = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 3, 3);
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&writer, 3, &queued),
+				RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_QUEUED);
+
+			done.tag = tag;
+			done.request_id = 71;
+			done.epoch = 1;
+			done.sender_node = 1;
+			done.requester_backend_id = 13;
+			done.transition_id = PCM_TRANS_N_TO_S;
+			done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_NACK;
+			done.reserved_0[1] = 1;
+			env.source_node_id = 1;
+			env.dest_node_id = cluster_node_id;
+			env.payload_length = sizeof(done);
+			read_done_session = true;
+			cluster_gcs_handle_block_done_envelope(&env, &done);
+			read_master_time = INT64CONST(120000001);
+			cluster_gcs_block_pending_s_tick();
+			UT_ASSERT_EQ(read_revokes, 1);
+			UT_ASSERT_EQ(read_invalidate.tag.forkNum, VISIBILITYMAP_FORKNUM);
+			UT_ASSERT_EQ(read_invalidate.tag.blockNum, 0);
+			UT_ASSERT_EQ(read_invalidate.request_id, 71);
+			UT_ASSERT_EQ(GcsBlockInvalidatePayloadPendingSBackend(&read_invalidate), 13);
+			UT_ASSERT_EQ(GcsBlockInvalidatePayloadPendingSEpoch(&read_invalidate), 1);
+			ack.tag = read_invalidate.tag;
+			ack.request_id = read_invalidate.request_id;
+			ack.sender_node = 1;
+			GcsBlockInvalidateAckPayloadEchoPendingS(&ack, &read_invalidate);
+			UT_ASSERT(GcsBlockInvalidateAckPayloadPendingSKey(&ack, &decoded));
+			UT_ASSERT_EQ(memcmp(&decoded, &grant.key, sizeof(decoded)), 0);
+			wrong = decoded;
+			wrong.request_id++;
+			UT_ASSERT(!cluster_pcm_lock_read_grant_revoke_ack(&wrong));
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+				&writer.common.logical_assertion, &queued), RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_QUEUED);
+			UT_ASSERT(cluster_pcm_lock_read_grant_revoke_ack(&decoded));
+			/* Another pending reader may confirm while this cancelled read
+			 * still owes its notice. Re-evaluating the head must keep both
+			 * liabilities separate. */
+			if (second_reader)
+				UT_ASSERT(cluster_pcm_lock_read_grant_done(&other.key, 0, true));
+
+			/* No backend retry is needed to drive the retained notice. The
+			 * writer remains queued even after the actual revoke ACK. */
+			for (int retry = 0; retry < 3; retry++) {
+				read_master_time += INT64CONST(10000000);
+				cluster_gcs_block_pending_s_tick();
+				UT_ASSERT_EQ(read_notices, retry + 1);
+				UT_ASSERT_EQ(read_notice.reserved_0[0], GCS_BLOCK_DONE_PENDING_S_RETIRED);
+				UT_ASSERT_EQ(read_notice.request_id, 71);
+				UT_ASSERT(BufferTagsEqual(&read_notice.tag, &tag));
+				UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+					&writer.common.logical_assertion, &queued), RESOURCE_X_APPLY_APPLIED);
+				UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_QUEUED);
+				UT_ASSERT(cluster_pcm_lock_read_grant_blocker_snapshot(tag, 1, &grant));
+				UT_ASSERT(grant.ack_consumed);
+				UT_ASSERT(!cluster_pcm_lock_read_grant_retire_notice_admitted(&wrong));
+			}
+			read_notice_result = buffered ? CLUSTER_IC_SEND_WOULD_BLOCK : CLUSTER_IC_SEND_DONE;
+			read_master_time += 10000;
+			cluster_gcs_block_pending_s_tick();
+			UT_ASSERT(!cluster_pcm_lock_read_grant_blocker_snapshot(tag, 1, &grant));
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+				&writer.common.logical_assertion, &queued), RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(queued.phase, source == 0 && !second_reader ? RESOURCE_X_MASTER_WAIT_PROOF
+				: RESOURCE_X_MASTER_WAIT_BLOCKERS);
+			UT_ASSERT_EQ(queued.incompatible_holders_bitmap, expected_blockers[source][second_reader]);
+			/* A late success cannot resurrect the cancelled VM copy. */
+			done.reserved_0[0] = GCS_BLOCK_DONE_PENDING_S_CONFIRM;
+			cluster_gcs_handle_block_done_envelope(&env, &done);
+			UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &authority));
+			UT_ASSERT_EQ(authority.s_holders_bitmap, expected_shared[source][second_reader]);
+			gcs_first_fill_master_tick(1);
+			UT_ASSERT(!gcs_first_fill_master_parks[0].in_use);
+		}
+	}
 }
 
 UT_TEST(test_native_master_keeps_original_service_behind_later_x)
@@ -1681,7 +1871,7 @@ UT_TEST(master_handed_off_service_ends_only_on_proved_holder_death_or_new_incarn
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(50);
 	UT_RUN(master_handed_off_service_ends_only_on_proved_holder_death_or_new_incarnation);
 	UT_RUN(return_from_a_different_holder_incarnation_cannot_reset_service);
 	UT_RUN(returned_service_observes_a_native_release_and_reacquire_of_same_holder);
@@ -1730,6 +1920,8 @@ main(void)
 	UT_RUN(test_native_master_retains_refused_forward_until_transport_takeover);
 	UT_RUN(test_native_master_holder_loopback_uses_existing_data_ring);
 	UT_RUN(test_pending_done_and_revoke_echo_are_exact_and_reject_unknown_fields);
+	UT_RUN(test_vm_confirmation_rechecks_original_writer_blockers);
+	UT_RUN(test_vm_cancel_keeps_writer_queued_until_retirement_notice_takeover);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
