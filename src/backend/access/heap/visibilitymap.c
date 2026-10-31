@@ -1140,10 +1140,15 @@ visibilitymap_read_qualified_begin(Relation rel, BlockNumber heapBlk,
 void
 visibilitymap_read_end(volatile VisibilityMapReadScope *scope)
 {
+	Buffer buffer;
+
 	if (scope == NULL || !BufferIsValid(scope->locked_buffer))
 		return;
-	LockBuffer(scope->locked_buffer, BUFFER_LOCK_UNLOCK);
+	buffer = scope->locked_buffer;
+	/* Generic unlock can report a PCM release error after dropping local S.
+	 * An enclosing FINALLY must not try to unlock that same scope again. */
 	scope->locked_buffer = InvalidBuffer;
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 }
 
 /* Observation-only compatibility entry: no read lock survives the return. */

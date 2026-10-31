@@ -41,9 +41,11 @@ static PGAlignedBlock ios_current;
 static SnapshotData ios_snapshot;
 static bool ios_locked, ios_pcm, ios_grant, ios_space, ios_admission;
 static bool ios_heap_visible, ios_missing, ios_copy_error, ios_snapshot_live;
+static bool ios_unlock_error;
 static bool ios_lossy, ios_qual_result;
 static int ios_drift, ios_error;
 static unsigned ios_reads, ios_grants, ios_unlocks, ios_releases, ios_fetches;
+static unsigned ios_unlock_attempts, ios_unlock_errors;
 static unsigned ios_indexes, ios_copies, ios_evaluators, ios_enters, ios_exits;
 static unsigned ios_quals;
 /* Opt-in pin ledger for consumer boundaries, not ResourceOwner simulation. */
@@ -76,9 +78,16 @@ ios_raw_status(Relation rel, BlockNumber block, Buffer *buffer)
 static void
 ios_unlock(Buffer buffer, int mode)
 {
+	ios_unlock_attempts++;
 	UT_ASSERT(buffer == 2 && mode == BUFFER_LOCK_UNLOCK && ios_locked);
 	ios_locked = false;
 	ios_unlocks++;
+	/* Generic unlock releases local S before a cache-off PCM release can
+	 * raise ERROR. Keep that ordering without simulating the transport. */
+	if (ios_unlock_error) {
+		ios_unlock_errors++;
+		elog(ERROR, "controlled PCM release failure after local VM unlock");
+	}
 }
 
 static void
@@ -282,12 +291,14 @@ ios_reset(bool publish)
 	ControlFile = &control;
 	control.catalog_version_no = PGRAC_VM_QUALIFIED_CATALOG_VERSION;
 	ios_locked = ios_missing = ios_copy_error = false;
+	ios_unlock_error = false;
 	ios_lossy = false;
 	ios_qual_result = true;
 	ios_pcm = ios_grant = ios_space = ios_admission = ios_snapshot_live = true;
 	ios_heap_visible = false;
 	ios_drift = ios_error = 0;
 	ios_reads = ios_grants = ios_unlocks = ios_releases = ios_fetches = 0;
+	ios_unlock_attempts = ios_unlock_errors = 0;
 	ios_indexes = ios_copies = ios_evaluators = ios_enters = ios_exits = 0;
 	ios_quals = 0;
 	ios_pin_watch = false;
@@ -618,6 +629,79 @@ UT_TEST(shared_ios_cancel_and_copy_error_retire_the_caller_pin)
 	}
 }
 
+UT_TEST(vm_read_end_error_consumes_only_its_lock_scope)
+{
+	Buffer buffer = InvalidBuffer;
+	volatile VisibilityMapReadScope scope = {0};
+	volatile bool caught = false;
+	uint8 status = 0;
+
+	ios_reset(true); ios_pin_watch = true;
+	UT_ASSERT(visibilitymap_read_qualified_begin(&relation, 0, &ios_snapshot,
+		&buffer, &scope, &status));
+	UT_ASSERT_EQ(status, VISIBILITYMAP_VALID_BITS);
+	UT_ASSERT_EQ(scope.locked_buffer, buffer);
+	ios_unlock_error = expecting_error = true;
+	PG_TRY();
+	{
+		visibilitymap_read_end(&scope);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expecting_error = ios_unlock_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+	UT_ASSERT(!ios_locked && ios_evaluators == 0);
+	UT_ASSERT_EQ(ios_live_pins, 1);
+	UT_ASSERT_EQ(buffer, 2);
+	UT_ASSERT_EQ(ios_releases, 0);
+	visibilitymap_read_end(&scope);
+	visibilitymap_read_end(NULL);
+	UT_ASSERT_EQ(ios_unlock_attempts, 1);
+	UT_ASSERT_EQ(ios_unlocks, 1);
+	UT_ASSERT_EQ(ios_unlock_errors, 1);
+	ReleaseBuffer(buffer);
+	UT_ASSERT_EQ(ios_live_pins, 0);
+	UT_ASSERT_EQ(ios_releases, 1);
+}
+
+UT_TEST(ios_fallback_unlock_error_does_not_unlock_twice)
+{
+	for (int failure = 0; failure < 3; failure++) {
+		Buffer buffer = InvalidBuffer;
+		volatile bool caught = false;
+
+		ios_reset(true); ios_pin_watch = true;
+		if (failure == 0)
+			*PageGetContents(ios_current.data) = 0;
+		else
+			ios_drift = failure == 1 ? 1 : 4;
+		ios_unlock_error = expecting_error = true;
+		PG_TRY();
+		{
+			(void)ios_run(&buffer, false);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = ios_unlock_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(!ios_locked && ios_evaluators == 0);
+		UT_ASSERT_EQ(ios_enters, ios_exits);
+		UT_ASSERT_EQ(ios_unlock_attempts, 1);
+		UT_ASSERT_EQ(ios_unlocks, 1);
+		UT_ASSERT_EQ(ios_unlock_errors, 1);
+		UT_ASSERT_EQ(ios_live_pins, 0);
+		UT_ASSERT_EQ(ios_releases, 1);
+		UT_ASSERT_EQ(ios_fetches + ios_copies, 0);
+	}
+}
+
 #ifndef VM_QUALIFIED_IOS_MAIN
 #define VM_QUALIFIED_IOS_MAIN main
 #endif
@@ -632,7 +716,7 @@ VM_QUALIFIED_IOS_MAIN(void)
 	}
 	else
 	{
-		UT_PLAN(16);
+		UT_PLAN(18);
 		UT_RUN(loaded_control_catalog_is_not_the_compiled_catalog);
 		UT_RUN(empty_native_publication_reaches_ios_without_heap_fetch);
 		UT_RUN(old_or_unknown_catalog_does_not_consult_a_positive_vm);
@@ -649,6 +733,8 @@ VM_QUALIFIED_IOS_MAIN(void)
 		UT_RUN(shared_ios_fallback_unpins_before_heap_fetch);
 		UT_RUN(shared_ios_old_format_unpins_its_preexisting_cache);
 		UT_RUN(shared_ios_cancel_and_copy_error_retire_the_caller_pin);
+		UT_RUN(vm_read_end_error_consumes_only_its_lock_scope);
+		UT_RUN(ios_fallback_unlock_error_does_not_unlock_twice);
 	}
 	UT_DONE();
 	return ut_failed_count != 0;
