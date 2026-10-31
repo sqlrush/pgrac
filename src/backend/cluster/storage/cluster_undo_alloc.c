@@ -395,6 +395,60 @@ read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *bloc
 	return true;
 }
 
+/* Only the metadata prefix through byte 111 is shared by both layouts.
+ * Keep whole-segment reuse/supply callers on their original V1 contract. */
+typedef struct ClusterUndoLifecycleHeaderView {
+	UndoSegmentHeaderData *prefix;
+	Size bitmap_offset;
+	uint32 generation;
+} ClusterUndoLifecycleHeaderView;
+
+static bool
+read_lifecycle_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *blockbuf,
+							   ClusterUndoLifecycleHeaderView *out)
+{
+	UndoSegmentHeaderData *prefix;
+	ClusterUndoLifecycleHeaderView candidate;
+
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf, &prefix))
+		return false;
+	if ((uint8)blockbuf[57] == CLUSTER_UNDO_TT_LAYOUT_V2) {
+		const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)blockbuf;
+
+		if (!UndoSegmentHeaderV2_identity_matches(blockbuf, BLCKSZ, segment_id, owner_instance))
+			return false;
+		/* Preserve the entire canonical identity, including an unrelated last
+		 * slot. Raw xid equality must never qualify a partial TT40 image. */
+		for (uint16 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			const TTSlotV2 *slot = &header->tt_slots[i];
+
+			if (slot->status > TT_SLOT_RECYCLABLE || (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+				|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
+				return false;
+			if (slot->status == TT_SLOT_UNUSED) {
+				if (slot->original_full_xid != 0)
+					return false;
+			} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+					   || (TransactionId)slot->original_full_xid != slot->xid)
+				return false;
+			if (slot->status == TT_SLOT_ABORTED && SCN_VALID(slot->commit_scn))
+				return false;
+		}
+		candidate.bitmap_offset = offsetof(UndoSegmentHeaderDataV2, free_block_bitmap);
+		candidate.generation = header->wrap_count;
+	} else {
+		/* This also rejects unknown framing; V1's seven reserved bytes must
+		 * remain zero. Do not try the old generation offset on an unknown page. */
+		if (!cluster_undo_segment_header_identity_ok(blockbuf, segment_id, owner_instance))
+			return false;
+		candidate.bitmap_offset = offsetof(UndoSegmentHeaderData, free_block_bitmap);
+		candidate.generation = prefix->wrap_count;
+	}
+	candidate.prefix = prefix;
+	*out = candidate;
+	return true;
+}
+
 
 typedef enum ClusterUndoLifecycleMutationKind {
 	CLUSTER_UNDO_LIFECYCLE_MARK_ACTIVE = 1,
@@ -415,19 +469,24 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(uint32 segment_id, uint8 
 {
 	PGAlignedBlock predecessor;
 	PGAlignedBlock successor;
+	ClusterUndoLifecycleHeaderView header;
 	UndoSegmentHeaderData *before;
 	UndoSegmentHeaderData *after;
+	const uint8 *before_bitmap;
+	uint8 *after_bitmap;
 	ClusterUndoBlock0LogicalKey key;
 	ClusterUndoBlock0Generation expected;
 	uint64 last;
 	uint32 block;
 
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, predecessor.data, &before)
-		|| !cluster_undo_segment_header_identity_ok(predecessor.data, segment_id, owner_instance)
-		|| before->wrap_count == UINT32_MAX)
+	if (!read_lifecycle_header_via_smgr(segment_id, owner_instance, predecessor.data, &header)
+		|| header.generation == UINT32_MAX)
 		return false;
+	before = header.prefix;
 	memcpy(successor.data, predecessor.data, BLCKSZ);
 	after = (UndoSegmentHeaderData *)successor.data;
+	before_bitmap = (const uint8 *)predecessor.data + header.bitmap_offset;
+	after_bitmap = (uint8 *)successor.data + header.bitmap_offset;
 
 	switch (kind) {
 	case CLUSTER_UNDO_LIFECYCLE_MARK_ACTIVE:
@@ -454,7 +513,7 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(uint32 segment_id, uint8 
 	case CLUSTER_UNDO_LIFECYCLE_MARK_BLOCK:
 		if (before->segment_state != SEGMENT_ACTIVE || arg1 >= UNDO_BLOCKS_PER_SEGMENT)
 			return false;
-		(void)UndoSegmentBitmap_mark_used(after->free_block_bitmap, arg1);
+		(void)UndoSegmentBitmap_mark_used(after_bitmap, arg1);
 		break;
 	case CLUSTER_UNDO_LIFECYCLE_CLAIM_RANGE:
 		last = (uint64)arg1 + arg2;
@@ -467,10 +526,10 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(uint32 segment_id, uint8 
 			uint32 byte_idx = block / 8;
 			uint8 bit_mask = (uint8)(1u << (block % 8));
 
-			if ((before->free_block_bitmap[byte_idx] & bit_mask) != 0)
+			if ((before_bitmap[byte_idx] & bit_mask) != 0)
 				return false;
 		}
-		if (!UndoSegmentBitmap_mark_range_used(after->free_block_bitmap, arg1, arg2,
+		if (!UndoSegmentBitmap_mark_range_used(after_bitmap, arg1, arg2,
 											   UNDO_BLOCKS_PER_SEGMENT))
 			return false;
 		break;
@@ -481,7 +540,7 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(uint32 segment_id, uint8 
 	key.segment_id = segment_id;
 	key.owner_instance = owner_instance;
 	expected.known = true;
-	expected.value = before->wrap_count;
+	expected.value = header.generation;
 	if (cluster_undo_block0_current_live_owner_ensure_resident(&key, 10000)
 		!= CLUSTER_UNDO_BLOCK0_OK)
 		return false;
@@ -625,13 +684,11 @@ uint32
 cluster_undo_segment_generation(uint32 segment_id, uint8 owner_instance)
 {
 	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
+	ClusterUndoLifecycleHeaderView header;
 
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
+	if (!read_lifecycle_header_via_smgr(segment_id, owner_instance, blockbuf.data, &header))
 		return 0;
-	if (!cluster_undo_segment_header_identity_ok(blockbuf.data, segment_id, owner_instance))
-		return 0;
-	return hdr->wrap_count;
+	return header.generation;
 }
 
 
@@ -717,12 +774,13 @@ uint32
 cluster_undo_segment_first_free_block(uint32 segment_id, uint8 owner_instance)
 {
 	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
+	ClusterUndoLifecycleHeaderView header;
 
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
+	if (!read_lifecycle_header_via_smgr(segment_id, owner_instance, blockbuf.data, &header))
 		return 0;
 
-	return UndoSegmentBitmap_first_free_block(hdr->free_block_bitmap, UNDO_BLOCKS_PER_SEGMENT);
+	return UndoSegmentBitmap_first_free_block((const uint8 *)blockbuf.data + header.bitmap_offset,
+											 UNDO_BLOCKS_PER_SEGMENT);
 }
 
 
@@ -730,13 +788,14 @@ bool
 cluster_undo_segment_is_full(uint32 segment_id, uint8 owner_instance)
 {
 	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
+	ClusterUndoLifecycleHeaderView header;
 
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
+	if (!read_lifecycle_header_via_smgr(segment_id, owner_instance, blockbuf.data, &header))
 		return false;
 
 	/* Pure-kernel decision (covered by cluster_unit T15). */
-	return UndoSegmentBitmap_is_full(hdr->free_block_bitmap, UNDO_FREE_BITMAP_BYTES);
+	return UndoSegmentBitmap_is_full((const uint8 *)blockbuf.data + header.bitmap_offset,
+									UNDO_FREE_BITMAP_BYTES);
 }
 
 
@@ -753,12 +812,12 @@ uint8
 cluster_undo_segment_read_state(uint32 segment_id, uint8 owner_instance)
 {
 	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
+	ClusterUndoLifecycleHeaderView header;
 
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
+	if (!read_lifecycle_header_via_smgr(segment_id, owner_instance, blockbuf.data, &header))
 		return (uint8)SEGMENT_INVALID;
 
-	return hdr->segment_state;
+	return header.prefix->segment_state;
 }
 
 

@@ -8320,8 +8320,9 @@ test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 test_cluster_undo_block0_current: test_cluster_undo_block0_current.c unit_test.h \
 		$(CLUSTER_UNDO_BLOCK0_CURRENT_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(CLUSTER_GES_REPLY_WAIT_O) $(CLUSTER_GES_O) \
-		test_cluster_undo_segment_init_backend.o
+		test_cluster_undo_segment_init_backend.o $(CLUSTER_UNDO_ALLOC_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_undo_segment_init_backend.o \
+		$(CLUSTER_UNDO_ALLOC_TEST_O) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 

@@ -14,6 +14,7 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 
 extern ClusterUndoBlock0Result cluster_undo_block0_current_pin_exclusive(
@@ -4167,10 +4168,286 @@ UT_TEST(test_lifecycle_v2_rejects_legacy_generation_alias_and_unqualified_reuse)
 	UT_ASSERT(!current_reuse_page_identity(before.data, &key, 7, SEGMENT_ACTIVE));
 }
 
+/* Exercise the original allocator entry points through the real current
+ * owner above. Only the existing storage/admission boundaries are modeled. */
+static void
+alloc_lifecycle_images(PGAlignedBlock *before, bool v2, uint32 generation)
+{
+	PGAlignedBlock unused;
+	UndoSegmentHeaderData *prefix = (UndoSegmentHeaderData *)before->data;
+
+	lifecycle_v2_images(before, &unused, generation);
+	if (!v2) {
+		cluster_undo_segment_make_header_bytes(1, 1, before->data);
+		prefix->segment_state = SEGMENT_ACTIVE;
+		prefix->wrap_count = generation;
+		prefix->tt_slots[47] = (TTSlot){ .xid = 700, .wrap = 4, .status = TT_SLOT_ACTIVE };
+		memcpy(fake_disk_page, before->data, BLCKSZ);
+		memcpy(fake_pin_page, before->data, BLCKSZ);
+	}
+}
+
+static bool
+alloc_lifecycle_call(unsigned change)
+{
+	switch (change) {
+	case 0: return cluster_undo_segment_mark_active(1, 1);
+	case 1: return cluster_undo_segment_mark_committed(1, 1);
+	case 2: return cluster_undo_segment_mark_full(1, 1);
+	case 3: return cluster_undo_segment_tail_block_init(1, 1, 1);
+	case 4: return cluster_undo_segment_mark_block_used(1, 1, 8191);
+	case 5: return cluster_undo_segment_mark_block_range_used(1, 1, 8, 8);
+	default: abort();
+	}
+}
+
+UT_TEST(test_alloc_lifecycle_v1_v2_public_mutations_use_real_current_owner)
+{
+	for (int v2 = 0; v2 < 2; v2++) {
+		for (int source = 0; source < 2; source++) {
+			for (unsigned change = 0; change < 6; change++) {
+				PGAlignedBlock before, want;
+				UndoSegmentHeaderData *pre = (UndoSegmentHeaderData *)before.data;
+				UndoSegmentHeaderData *post = (UndoSegmentHeaderData *)want.data;
+				uint8 *bitmap = v2 ? ((UndoSegmentHeaderDataV2 *)want.data)->free_block_bitmap
+								   : post->free_block_bitmap;
+
+				alloc_lifecycle_images(&before, v2, change == 0 ? 0 : 7);
+				fake_modifier_side = source ? CLUSTER_SEMANTIC_SOURCE_SIDE : CLUSTER_SEMANTIC_TARGET_SIDE;
+				if (change == 0) pre->segment_state = SEGMENT_ALLOCATED;
+				memcpy(want.data, before.data, BLCKSZ);
+				switch (change) {
+				case 0: post->segment_state = SEGMENT_ACTIVE; break;
+				case 1: post->segment_state = SEGMENT_COMMITTED; break;
+				case 2: post->segment_flags = UNDO_SEGMENT_FLAG_FULL; break;
+				case 3: post->tail_block = 1; break;
+				case 4: bitmap[1023] = 0x80; break;
+				case 5: bitmap[1] = 0xff; break;
+				}
+				memcpy(fake_disk_page, before.data, BLCKSZ);
+				memcpy(fake_pin_page, before.data, BLCKSZ);
+				UT_ASSERT(alloc_lifecycle_call(change));
+				UT_ASSERT_EQ(memcmp(fake_disk_page, want.data, BLCKSZ), 0);
+				UT_ASSERT_EQ(memcmp(fake_pin_page, want.data, BLCKSZ), 0);
+				UT_ASSERT_EQ(semantic_enter_calls, 2);
+				UT_ASSERT_EQ(semantic_leave_calls, 2);
+				UT_ASSERT_EQ(flush_sync_calls, 1);
+				UT_ASSERT_EQ(unpin_calls, 1);
+				UT_ASSERT_EQ(init_wal_calls + reuse_wal_calls + recycle_wal_calls, 0);
+				UT_ASSERT(!cluster_undo_block0_current_backend_has_guards());
+			}
+		}
+	}
+}
+
+UT_TEST(test_alloc_lifecycle_getters_dispatch_actual_bitmap_and_generation)
+{
+	const uint32 generations[] = { 0, 7, UINT32_MAX };
+
+	for (int v2 = 0; v2 < 2; v2++) {
+		for (unsigned i = 0; i < lengthof(generations); i++) {
+			PGAlignedBlock before;
+			uint8 *bitmap;
+
+			alloc_lifecycle_images(&before, v2, generations[i]);
+			bitmap = v2 ? ((UndoSegmentHeaderDataV2 *)fake_disk_page)->free_block_bitmap
+						: ((UndoSegmentHeaderData *)fake_disk_page)->free_block_bitmap;
+			bitmap[0] = 0xfe;
+			bitmap[1] = 0x07;
+			UT_ASSERT_EQ(cluster_undo_segment_generation(1, 1), generations[i]);
+			UT_ASSERT_EQ(cluster_undo_segment_read_state(1, 1), SEGMENT_ACTIVE);
+			UT_ASSERT_EQ(cluster_undo_segment_first_free_block(1, 1), 11);
+			UT_ASSERT(!cluster_undo_segment_is_full(1, 1));
+			memset(bitmap, 0xff, UNDO_FREE_BITMAP_BYTES);
+			bitmap[1023] = 0x7f;
+			UT_ASSERT(cluster_undo_segment_is_full(1, 1));
+			UT_ASSERT_EQ(cluster_undo_segment_first_free_block(1, 1), 8191);
+			UT_ASSERT_EQ(semantic_enter_calls, 0);
+			UT_ASSERT_EQ(flush_sync_calls, 0);
+		}
+	}
+}
+
+UT_TEST(test_alloc_lifecycle_rejects_malformed_whole_tt40_before_owner)
+{
+	for (unsigned fault = 0; fault < 17; fault++) {
+		PGAlignedBlock before, disk;
+		UndoSegmentHeaderDataV2 *h = (UndoSegmentHeaderDataV2 *)fake_disk_page;
+
+		alloc_lifecycle_images(&before, true, 7);
+		switch (fault) {
+		case 0: h->tt_layout_version = 3; break;
+		case 1: h->tt_slot_bytes = 32; break;
+		case 2: h->tt_layout_reserved = 1; break;
+		case 3: h->owner_instance = 2; break;
+		case 4: h->segment_id = 2; break;
+		case 5: h->tt_slots_count = 47; break;
+		case 6: h->tt_next_free_slot = 49; break;
+		case 7: h->tt_active_count = 49; break;
+		case 8: h->tt_slots[47].status = TT_SLOT_INVALID; break;
+		case 9: h->tt_slots[47].flags = 0x80; break;
+		case 10: h->tt_slots[47].wrap = TT_WRAP_INVALID; break;
+		case 11: h->tt_slots[47].xid = FrozenTransactionId; break;
+		case 12: h->tt_slots[47].original_full_xid = 0; break;
+		case 13: h->tt_slots[47].original_full_xid = UINT64_MAX; break;
+		case 14: h->tt_slots[47].original_full_xid++; break;
+		case 15: h->tt_slots[47].status = TT_SLOT_ABORTED; h->tt_slots[47].commit_scn = 50; break;
+		case 16: h->tt_slots[46].original_full_xid = UINT64_C(0x700000064); break;
+		}
+		memcpy(disk.data, fake_disk_page, BLCKSZ);
+		UT_ASSERT_EQ(cluster_undo_segment_generation(1, 1), 0);
+		UT_ASSERT_EQ(cluster_undo_segment_read_state(1, 1), SEGMENT_INVALID);
+		UT_ASSERT_EQ(cluster_undo_segment_first_free_block(1, 1), 0);
+		UT_ASSERT(!cluster_undo_segment_is_full(1, 1));
+		for (unsigned change = 0; change < 6; change++) UT_ASSERT(!alloc_lifecycle_call(change));
+		UT_ASSERT_EQ(semantic_enter_calls, 0);
+		lifecycle_expect_no_write(&disk);
+	}
+}
+
+UT_TEST(test_alloc_lifecycle_preserves_existing_preflight_refusals)
+{
+	for (int v2 = 0; v2 < 2; v2++) {
+		PGAlignedBlock before, disk;
+		UndoSegmentHeaderData *h = (UndoSegmentHeaderData *)fake_disk_page;
+		alloc_lifecycle_images(&before, v2, 7);
+		UT_ASSERT(!cluster_undo_segment_tail_block_init(1, 1, 2));
+		UT_ASSERT(!cluster_undo_segment_mark_block_used(1, 1, 8192));
+		UT_ASSERT(!cluster_undo_segment_mark_block_range_used(1, 1, 0, 8));
+		UT_ASSERT(!cluster_undo_segment_mark_block_range_used(1, 1, 8, 0));
+		UT_ASSERT(!cluster_undo_segment_mark_block_range_used(1, 1, UINT32_MAX, 2));
+		UT_ASSERT(!cluster_undo_segment_mark_block_range_used(1, 1, 8191, 2));
+		if (v2) ((UndoSegmentHeaderDataV2 *)fake_disk_page)->free_block_bitmap[1] = 0x08;
+		else h->free_block_bitmap[1] = 0x08;
+		UT_ASSERT(!cluster_undo_segment_mark_block_range_used(1, 1, 8, 8));
+		h->segment_state = SEGMENT_COMMITTED;
+		UT_ASSERT(!cluster_undo_segment_mark_active(1, 1));
+		h->segment_state = SEGMENT_ALLOCATED;
+		UT_ASSERT(!cluster_undo_segment_mark_committed(1, 1));
+		h->segment_state = SEGMENT_RECYCLABLE;
+		UT_ASSERT(!cluster_undo_segment_mark_full(1, 1));
+		h->segment_state = SEGMENT_ACTIVE;
+		if (v2) ((UndoSegmentHeaderDataV2 *)fake_disk_page)->wrap_count = UINT32_MAX;
+		else h->wrap_count = UINT32_MAX;
+		UT_ASSERT(!cluster_undo_segment_mark_full(1, 1));
+		memcpy(disk.data, fake_disk_page, BLCKSZ);
+		UT_ASSERT_EQ(semantic_enter_calls, 0);
+		lifecycle_expect_no_write(&disk);
+	}
+}
+
+static unsigned alloc_lifecycle_reads;
+static bool alloc_lifecycle_error;
+static void
+alloc_lifecycle_invalidate_after_predecessor(void)
+{
+	if (++alloc_lifecycle_reads == 2) {
+		if (alloc_lifecycle_error) siglongjmp(*PG_exception_stack, 1);
+		fake_admission_recheck = false;
+	}
+}
+
+UT_TEST(test_alloc_lifecycle_real_owner_refusals_keep_original_cleanup)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		PGAlignedBlock before, disk;
+		volatile bool caught = false;
+		volatile bool result = true;
+
+		alloc_lifecycle_images(&before, true, 7);
+		if (fault == 0) fake_admission_result = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		if (fault == 1) fake_sample_generation.value = 8;
+		if (fault == 2) fake_pin_invalidates_authority = true;
+		if (fault == 3) fake_pin_page[BLCKSZ - 1] ^= 1;
+		if (fault == 4) fake_smgr_read_ok = false;
+		if (fault >= 5) {
+			alloc_lifecycle_reads = 0;
+			alloc_lifecycle_error = fault == 6;
+			fake_lifecycle_read_hook = alloc_lifecycle_invalidate_after_predecessor;
+		}
+		memcpy(disk.data, fake_disk_page, BLCKSZ);
+		PG_TRY();
+		{ result = cluster_undo_segment_mark_full(1, 1); }
+		PG_CATCH();
+		{ caught = true; }
+		PG_END_TRY();
+		UT_ASSERT(caught || !result);
+		UT_ASSERT_EQ(caught, fault == 6);
+		UT_ASSERT_EQ(semantic_enter_calls, fault == 4 ? 0 : fault == 0 ? 1 : 2);
+		UT_ASSERT_EQ(semantic_leave_calls, fault == 4 || fault == 0 ? 0 : 2);
+		UT_ASSERT_EQ(unpin_calls, fault == 2 || fault == 3 || fault >= 5 ? 1 : 0);
+		lifecycle_expect_no_write(&disk);
+	}
+}
+
+static int alloc_lifecycle_publish_fault;
+static void
+alloc_lifecycle_publish_canonical_after_read(void)
+{
+	UndoSegmentHeaderDataV2 *h = (UndoSegmentHeaderDataV2 *)fake_disk_page;
+
+	fake_lifecycle_read_hook = NULL;
+	for (int i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
+		h->tt_slots[i] = (TTSlotV2){ .xid = 2000 + i, .wrap = 5, .status = TT_SLOT_COMMITTED,
+			.commit_scn = 80, .original_full_xid = UINT64_C(0x900000000) | (2000 + i) };
+	if (alloc_lifecycle_publish_fault == 1) h->tt_slots[47].original_full_xid++;
+	if (alloc_lifecycle_publish_fault == 2) h->tt_layout_version = 0;
+	memcpy(fake_pin_page, fake_disk_page, BLCKSZ);
+}
+
+UT_TEST(test_alloc_lifecycle_preserves_real_canonical_tt40_rebase)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		PGAlignedBlock before, want;
+		UndoSegmentHeaderDataV2 *h = (UndoSegmentHeaderDataV2 *)want.data;
+
+		alloc_lifecycle_images(&before, true, 7);
+		alloc_lifecycle_publish_fault = fault;
+		fake_lifecycle_read_hook = alloc_lifecycle_publish_canonical_after_read;
+		UT_ASSERT_EQ(cluster_undo_segment_mark_block_range_used(1, 1, 8, 8), fault == 0);
+		memcpy(want.data, fake_disk_page, BLCKSZ);
+		UT_ASSERT_EQ(semantic_enter_calls, 2);
+		UT_ASSERT_EQ(semantic_leave_calls, 2);
+		UT_ASSERT_EQ(unpin_calls, 1);
+		UT_ASSERT_EQ(flush_sync_calls, fault == 0 ? 1 : 0);
+		if (fault == 0) {
+			UT_ASSERT_EQ(h->tt_slots[47].original_full_xid, UINT64_C(0x9000007ff));
+			UT_ASSERT_EQ(h->free_block_bitmap[1], 0xff);
+			memcpy(want.data, before.data, BLCKSZ);
+			for (int i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
+				h->tt_slots[i] = (TTSlotV2){ .xid = 2000 + i, .wrap = 5, .status = TT_SLOT_COMMITTED,
+					.commit_scn = 80, .original_full_xid = UINT64_C(0x900000000) | (2000 + i) };
+			h->free_block_bitmap[1] = 0xff;
+			UT_ASSERT_EQ(memcmp(fake_disk_page, want.data, BLCKSZ), 0);
+		} else {
+			UT_ASSERT_EQ(h->free_block_bitmap[1], 0);
+			lifecycle_expect_no_write(&want);
+		}
+		UT_ASSERT(!cluster_undo_block0_current_backend_has_guards());
+	}
+}
+
+UT_TEST(test_alloc_lifecycle_ignores_legacy_generation_bitmap_alias)
+{
+	PGAlignedBlock before, want;
+	uint32 legacy_alias = 9;
+
+	alloc_lifecycle_images(&before, true, 7);
+	memcpy(before.data + offsetof(UndoSegmentHeaderData, wrap_count), &legacy_alias, 4);
+	memcpy(fake_disk_page, before.data, BLCKSZ);
+	memcpy(fake_pin_page, before.data, BLCKSZ);
+	UT_ASSERT_EQ(cluster_undo_segment_generation(1, 1), 7);
+	UT_ASSERT(cluster_undo_segment_mark_full(1, 1));
+	memcpy(want.data, before.data, BLCKSZ);
+	((UndoSegmentHeaderDataV2 *)want.data)->segment_flags = UNDO_SEGMENT_FLAG_FULL;
+	UT_ASSERT_EQ(memcmp(fake_disk_page, want.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(flush_sync_calls, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(99);
+	UT_PLAN(106);
 	UT_RUN(test_first_publication_deny_preserves_private_bytes_and_can_retry);
 	UT_RUN(test_first_publication_deny_does_not_intercept_existing_or_rejected_owners);
 	UT_RUN(test_first_publication_injected_error_uses_original_owner_cleanup);
@@ -4270,6 +4547,13 @@ main(void)
 	UT_RUN(test_lifecycle_v2_preserves_final_authority_and_error_cleanup);
 	UT_RUN(test_lifecycle_v2_keeps_original_monotone_seal_drain_rules);
 	UT_RUN(test_lifecycle_v2_rejects_legacy_generation_alias_and_unqualified_reuse);
+	UT_RUN(test_alloc_lifecycle_v1_v2_public_mutations_use_real_current_owner);
+	UT_RUN(test_alloc_lifecycle_getters_dispatch_actual_bitmap_and_generation);
+	UT_RUN(test_alloc_lifecycle_rejects_malformed_whole_tt40_before_owner);
+	UT_RUN(test_alloc_lifecycle_preserves_existing_preflight_refusals);
+	UT_RUN(test_alloc_lifecycle_real_owner_refusals_keep_original_cleanup);
+	UT_RUN(test_alloc_lifecycle_preserves_real_canonical_tt40_rebase);
+	UT_RUN(test_alloc_lifecycle_ignores_legacy_generation_bitmap_alias);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
