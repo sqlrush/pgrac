@@ -396,7 +396,7 @@ read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *bloc
 }
 
 /* Only the metadata prefix through byte 111 is shared by both layouts.
- * Keep whole-segment reuse/supply callers on their original V1 contract. */
+ * Supply selection retains its separate contract. */
 typedef struct ClusterUndoLifecycleHeaderView {
 	UndoSegmentHeaderData *prefix;
 	Size bitmap_offset;
@@ -638,7 +638,7 @@ uint32
 cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance, uint32 old_generation)
 {
 	PGAlignedBlock page;
-	UndoSegmentHeaderData *hdr;
+	ClusterUndoLifecycleHeaderView view;
 	ClusterUndoBlock0LogicalKey key;
 	ClusterUndoBlock0Generation expected;
 	ClusterUndoBlock0Result result;
@@ -647,9 +647,20 @@ cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance, uin
 		|| owner_instance > UNDO_OWNER_INSTANCE_MAX)
 		return 0;
 
-	cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page.data);
-	hdr = (UndoSegmentHeaderData *)page.data;
-	hdr->wrap_count = old_generation + 1;
+	/* Sample framing before constructing the private fresh image. The original
+	 * current owner rechecks generation, exact predecessor and the same layout
+	 * under XCUR; this read grants no reuse or conversion authority. */
+	if (!read_lifecycle_header_via_smgr(segment_id, owner_instance, page.data, &view)
+		|| view.generation != old_generation)
+		return 0;
+	if ((uint8)page.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2) {
+		if (!cluster_undo_segment_make_header_v2_bytes(segment_id, owner_instance, page.data))
+			return 0;
+		((UndoSegmentHeaderDataV2 *)page.data)->wrap_count = old_generation + 1;
+	} else {
+		cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page.data);
+		((UndoSegmentHeaderData *)page.data)->wrap_count = old_generation + 1;
+	}
 	key.owner_instance = owner_instance;
 	key.segment_id = segment_id;
 	expected.known = true;

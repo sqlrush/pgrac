@@ -105,6 +105,59 @@ cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
 }
 
 
+/* Retention consumes the original slot prefix, after checking the complete
+ * explicit TT40 image. FullXid is identity only: it adds no release, horizon
+ * or historical-record lifetime permission to the policy below. */
+static bool
+retention_tt_layout_valid(const UndoSegmentHeaderData *header, bool *is_v2)
+{
+	const uint8 legacy_reserved[7] = { 0 };
+
+	*is_v2 = false;
+	if ((uint8)((const char *)header)[57] == 0)
+		return memcmp(header->_pad_57, legacy_reserved, sizeof(legacy_reserved)) == 0;
+#ifdef USE_PGRAC_CLUSTER
+	{
+		const UndoSegmentHeaderDataV2 *v2 = (const UndoSegmentHeaderDataV2 *)header;
+
+		if (!UndoSegmentHeaderV2_identity_matches((const char *)header, BLCKSZ,
+				header->segment_id, header->owner_instance))
+			return false;
+		for (uint16 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			const TTSlotV2 *slot = &v2->tt_slots[i];
+
+			if (slot->status > TT_SLOT_RECYCLABLE || (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+				|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
+				return false;
+			if (slot->status == TT_SLOT_UNUSED) {
+				if (slot->original_full_xid != 0)
+					return false;
+			} else if (!TransactionIdIsNormal(slot->xid)
+					   || slot->original_full_xid == UINT64_MAX
+					   || (TransactionId)slot->original_full_xid != slot->xid)
+				return false;
+			if (slot->status == TT_SLOT_ABORTED && SCN_VALID(slot->commit_scn))
+				return false;
+		}
+	}
+	*is_v2 = true;
+	return true;
+#else
+	return false;
+#endif
+}
+
+static const TTSlot *
+retention_tt_slot(const UndoSegmentHeaderData *header, bool is_v2, uint16 index,
+				  TTSlot *projected)
+{
+	if (!is_v2)
+		return &header->tt_slots[index];
+	memcpy(projected, &((const UndoSegmentHeaderDataV2 *)header)->tt_slots[index],
+		   sizeof(*projected));
+	return projected;
+}
+
 /*
  * cluster_undo_segment_recyclable_for_mode
  *
@@ -124,6 +177,7 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 {
 	SCN watermark = InvalidScn;
 	bool saw_unresolved_committed = false;
+	bool is_v2;
 	int i;
 
 	if (hdr == NULL)
@@ -136,6 +190,8 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 	 * not a recycle candidate.
 	 */
 	if (hdr->segment_state != SEGMENT_COMMITTED)
+		return false;
+	if (!retention_tt_layout_valid(hdr, &is_v2))
 		return false;
 
 	/* A record-only segment may have an empty or wholly ABORTED TT array.
@@ -154,7 +210,8 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 	 * In particular, ACTIVE precedes its first undo write and must retain the
 	 * segment even when record seal/drain and the other slots permit reuse. */
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		const TTSlot *s = &hdr->tt_slots[i];
+		TTSlot projected;
+		const TTSlot *s = retention_tt_slot(hdr, is_v2, i, &projected);
 
 		switch (s->status) {
 		case TT_SLOT_COMMITTED:
@@ -173,7 +230,8 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 
 	if (peer_mode) {
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *s = &hdr->tt_slots[i];
+			TTSlot projected;
+			const TTSlot *s = retention_tt_slot(hdr, is_v2, i, &projected);
 
 			switch (s->status) {
 			case TT_SLOT_COMMITTED:
@@ -203,7 +261,8 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 	}
 
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		const TTSlot *s = &hdr->tt_slots[i];
+		TTSlot projected;
+		const TTSlot *s = retention_tt_slot(hdr, is_v2, i, &projected);
 
 		if (s->status != TT_SLOT_COMMITTED)
 			continue;

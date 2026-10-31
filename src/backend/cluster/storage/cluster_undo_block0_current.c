@@ -1904,17 +1904,17 @@ cluster_undo_block0_current_live_owner_ensure_resident(const ClusterUndoBlock0Lo
 	return cluster_undo_block0_current_live_owner_ensure_resident_exact(key, timeout_ms, NULL);
 }
 
+static bool current_lifecycle_page_valid(const char page[BLCKSZ],
+	const ClusterUndoBlock0LogicalKey *key, uint32 generation, bool *is_v2);
+
 static bool
 current_reuse_page_identity(const char page[BLCKSZ], const ClusterUndoBlock0LogicalKey *key,
 							uint32 generation, uint8 expected_state)
 {
 	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)page;
+	bool is_v2;
 
-	/* The reuse/recycle producer chain below still consumes V1 TT/bitmap
-	 * offsets. Never authenticate V2 using the old generation offset. */
-	return page != NULL && key != NULL
-		   && UndoSegmentHeader_identity_matches(page, key->segment_id, key->owner_instance)
-		   && header->wrap_count == generation
+	return current_lifecycle_page_valid(page, key, generation, &is_v2)
 		   && header->segment_state == expected_state;
 }
 
@@ -1923,6 +1923,7 @@ current_reuse_predecessor_exact(const char disk_page[BLCKSZ], const char residen
 								const ClusterUndoBlock0LogicalKey *key, uint32 generation)
 {
 	const UndoSegmentHeaderData *disk = (const UndoSegmentHeaderData *)disk_page;
+	const UndoSegmentHeaderDataV2 *v2 = (const UndoSegmentHeaderDataV2 *)disk_page;
 	uint32 i;
 
 	if (!current_reuse_page_identity(disk_page, key, generation, SEGMENT_RECYCLABLE)
@@ -1930,8 +1931,10 @@ current_reuse_predecessor_exact(const char disk_page[BLCKSZ], const char residen
 		|| memcmp(disk_page, resident_page, BLCKSZ) != 0)
 		return false;
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		if (disk->tt_slots[i].status == TT_SLOT_ACTIVE
-			|| disk->tt_slots[i].status == TT_SLOT_INVALID)
+		uint8 status = (uint8)disk_page[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+						   ? v2->tt_slots[i].status : disk->tt_slots[i].status;
+
+		if (status == TT_SLOT_ACTIVE || status == TT_SLOT_INVALID)
 			return false;
 	}
 	return true;
@@ -1946,8 +1949,15 @@ current_reuse_successor_exact(const char successor_page[BLCKSZ],
 
 	if (successor_page == NULL || key == NULL)
 		return false;
-	cluster_undo_segment_make_header_bytes(key->segment_id, key->owner_instance, fresh.data);
-	fresh_header->wrap_count = successor_generation;
+	if ((uint8)successor_page[57] == CLUSTER_UNDO_TT_LAYOUT_V2) {
+		if (!cluster_undo_segment_make_header_v2_bytes(key->segment_id, key->owner_instance,
+													fresh.data))
+			return false;
+		((UndoSegmentHeaderDataV2 *)fresh.data)->wrap_count = successor_generation;
+	} else {
+		cluster_undo_segment_make_header_bytes(key->segment_id, key->owner_instance, fresh.data);
+		fresh_header->wrap_count = successor_generation;
+	}
 	return memcmp(successor_page, fresh.data, BLCKSZ) == 0;
 }
 
@@ -1964,7 +1974,8 @@ current_lifecycle_page_valid(const char page[BLCKSZ], const ClusterUndoBlock0Log
 	if (page == NULL || key == NULL)
 		return false;
 	if ((uint8)page[57] != CLUSTER_UNDO_TT_LAYOUT_V2)
-		return current_reuse_page_identity(page, key, generation, header->segment_state);
+		return UndoSegmentHeader_identity_matches(page, key->segment_id, key->owner_instance)
+			   && ((const UndoSegmentHeaderData *)page)->wrap_count == generation;
 	if (!UndoSegmentHeaderV2_identity_matches(page, BLCKSZ, key->segment_id, key->owner_instance)
 		|| header->wrap_count != generation)
 		return false;
@@ -2176,8 +2187,18 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 			result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 			goto mutate_done;
 		}
-		if (memcmp(disk_block.data, successor_page, BLCKSZ) == 0
-			&& memcmp(resident_page, successor_page, BLCKSZ) == 0) {
+		/* The caller freezes the original checksum with its byte-exact
+		 * request. Only this owner seals the private TT40 publication image;
+		 * the resident flush writes and mirrors exactly these same bytes. */
+		if ((uint8)successor_page[57] == CLUSTER_UNDO_TT_LAYOUT_V2) {
+			memcpy(rebased_block.data, successor_page, BLCKSZ);
+			if (!cluster_undo_segment_header_seal(rebased_block.data)) {
+				result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+				goto mutate_done;
+			}
+			publish_page = rebased_block.data;
+		}
+		if (memcmp(disk_block.data, publish_page, BLCKSZ) == 0) {
 			result = CLUSTER_UNDO_BLOCK0_OK;
 			goto mutate_done;
 		}
@@ -2199,8 +2220,26 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 			memcpy(rebased_block.data, successor_page, BLCKSZ);
 			memcpy(rebased_block.data + offsetof(UndoSegmentHeaderData, tt_slots),
 				   disk_block.data + offsetof(UndoSegmentHeaderData, tt_slots), slots_bytes);
+			if (disk_v2) {
+				/* A real canonical TT40 publisher also updates the checksum.
+				 * Permit that derived drift only after checking the complete
+				 * current image, then validate every other original byte. */
+				if (((PageHeader)disk_block.data)->pd_checksum
+						!= ((const PageHeaderData *)predecessor_page)->pd_checksum
+					&& cluster_undo_segment_header_integrity(disk_block.data)
+						   != CLUSTER_UNDO_HEADER_VALID) {
+					result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+					goto mutate_done;
+				}
+				((PageHeader)rebased_block.data)->pd_checksum
+					= ((PageHeader)disk_block.data)->pd_checksum;
+			}
 			if (!current_lifecycle_successor_exact(disk_block.data, rebased_block.data, key,
 												   expected->value)) {
+				result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+				goto mutate_done;
+			}
+			if (disk_v2 && !cluster_undo_segment_header_seal(rebased_block.data)) {
 				result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 				goto mutate_done;
 			}
@@ -2266,6 +2305,7 @@ cluster_undo_block0_current_live_owner_reuse_exact(const ClusterUndoBlock0Logica
 	ClusterUndoBlock0Generation observed = { false, 0 };
 	ClusterUndoBlock0Generation successor_generation = { false, 0 };
 	PGAlignedBlock disk_block;
+	const char *publish_page = successor_page;
 	char *resident_page = NULL;
 	volatile ClusterUndoBlock0LiveOwnerCleanup cleanup;
 	ClusterUndoBlock0CurrentStep step;
@@ -2274,6 +2314,7 @@ cluster_undo_block0_current_live_owner_reuse_exact(const ClusterUndoBlock0Logica
 	ClusterSemanticAdmissionResult admission_result;
 	XLogRecPtr reuse_lsn;
 	bool root_ok;
+	bool resident_v2;
 
 	if (key == NULL || expected == NULL || !expected->known || expected->value == UINT32_MAX
 		|| successor_page == NULL || timeout_ms <= 0 || cluster_node_id < 0
@@ -2355,12 +2396,13 @@ cluster_undo_block0_current_live_owner_reuse_exact(const ClusterUndoBlock0Logica
 			goto reuse_done;
 		}
 		if (!current_reuse_page_identity(disk_block.data, key, expected->value, SEGMENT_RECYCLABLE)
-			|| ((UndoSegmentHeaderData *)resident_page)->wrap_count != expected->value) {
+			|| !current_lifecycle_page_valid(resident_page, key, expected->value, &resident_v2)) {
 			result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
 			goto reuse_done;
 		}
 		if (!current_reuse_predecessor_exact(disk_block.data, resident_page, key,
-											 expected->value)) {
+											 expected->value)
+			|| disk_block.data[57] != successor_page[57]) {
 			result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 			goto reuse_done;
 		}
@@ -2382,14 +2424,25 @@ cluster_undo_block0_current_live_owner_reuse_exact(const ClusterUndoBlock0Logica
 			goto reuse_done;
 		}
 
+		/* The exact fresh template has no checksum. Seal a private copy
+		 * after the original authority checks, then WAL and flush the same
+		 * immutable bytes. The predecessor buffer is no longer needed. */
+		if (resident_v2) {
+			memcpy(disk_block.data, successor_page, BLCKSZ);
+			if (!cluster_undo_segment_header_seal(disk_block.data)) {
+				result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+				goto reuse_done;
+			}
+			publish_page = disk_block.data;
+		}
 		reuse_lsn
 			= cluster_undo_emit_segment_reuse(key->owner_instance, key->segment_id, expected->value,
-											  successor_generation.value, successor_page);
+											  successor_generation.value, publish_page);
 		if (XLogRecPtrIsInvalid(reuse_lsn)) {
 			result = CLUSTER_UNDO_BLOCK0_IO_ERROR;
 			goto reuse_done;
 		}
-		cluster_undo_block0_flush_sync(&pin, successor_page, reuse_lsn, false);
+		cluster_undo_block0_flush_sync(&pin, publish_page, reuse_lsn, false);
 		result = CLUSTER_UNDO_BLOCK0_OK;
 
 	reuse_done:
@@ -2445,6 +2498,8 @@ cluster_undo_block0_current_live_owner_recycle_exact(const ClusterUndoBlock0Logi
 	ClusterUndoBlock0RecycleResult recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED;
 	XLogRecPtr recycle_lsn;
 	bool root_ok;
+	bool disk_v2;
+	bool resident_v2;
 
 	if (key == NULL || !SCN_VALID(horizon)
 		|| (expected_epoch == 0 && cluster_conf_node_count() != 4)
@@ -2516,9 +2571,13 @@ cluster_undo_block0_current_live_owner_recycle_exact(const ClusterUndoBlock0Logi
 		if (!cluster_undo_smgr_read_block(root.intent, key->segment_id, key->owner_instance, 0,
 										  disk_block.data))
 			goto recycle_done;
-		if (!current_recycle_resident_identity(resident_page, key, observed.value)
+		if (!current_lifecycle_page_valid(disk_block.data, key, observed.value, &disk_v2)
+			|| !current_lifecycle_page_valid(resident_page, key, observed.value, &resident_v2)
+			|| disk_v2 != resident_v2
+			|| !current_recycle_resident_identity(resident_page, key, observed.value)
 			|| memcmp(disk->tt_slots, ((UndoSegmentHeaderData *)resident_page)->tt_slots,
-					  sizeof(disk->tt_slots))
+					  disk_v2 ? sizeof(((UndoSegmentHeaderDataV2 *)0)->tt_slots)
+							  : sizeof(disk->tt_slots))
 				   != 0)
 			goto recycle_done;
 
@@ -2561,6 +2620,8 @@ cluster_undo_block0_current_live_owner_recycle_exact(const ClusterUndoBlock0Logi
 			|| !cluster_semantic_activation_modifier_recheck(&admission, true)
 			|| cluster_epoch_get_current() != expected_epoch
 			|| cluster_undo_block0_current_recheck_exclusive(&guard) != CLUSTER_UNDO_BLOCK0_OK)
+			goto recycle_done;
+		if (disk_v2 && !cluster_undo_segment_header_seal(successor_block.data))
 			goto recycle_done;
 
 		recycle_lsn = cluster_undo_emit_segment_recycle(key->owner_instance, key->segment_id,
