@@ -455,8 +455,11 @@ UT_TEST(nonshared_owners_keep_implicit_vm_and_native_wal_shape)
 	}
 }
 
+#ifndef DML_VM_WAL_MAIN
+#define DML_VM_WAL_MAIN main
+#endif
 int
-main(void)
+DML_VM_WAL_MAIN(void)
 {
 	UT_PLAN(10);
 	UT_RUN(delete_acquires_then_captures_and_logs_exact_heap_vm);

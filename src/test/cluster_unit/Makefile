@@ -3476,6 +3476,35 @@ clean: clean-dml-vm-wal-chain
 clean-dml-vm-wal-chain:
 	rm -f test_cluster_heap_delete_capture.inc test_cluster_heap_delete_capture.inc.tmp
 
+# Complete ordinary UPDATE executor through VM WAL, indexes and AFTER/RETURNING.
+TESTS += test_cluster_heap_update_index test_cluster_heap_update_index_noassert
+all: test_cluster_heap_update_index test_cluster_heap_update_index_noassert
+
+test_cluster_heap_update_context.inc: extract_update_index_fixture.py $(top_srcdir)/src/backend/executor/nodeModifyTable.c
+	python3 $(srcdir)/extract_update_index_fixture.py $(top_srcdir)/src/backend/executor/nodeModifyTable.c --types > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_am.inc: extract_update_index_fixture.py extract_vacuum_mx_fixture.py $(top_srcdir)/src/backend/access/heap/heapam_handler.c
+	python3 $(srcdir)/extract_update_index_fixture.py $(top_srcdir)/src/backend/access/heap/heapam_handler.c --am > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_executor.inc: extract_update_index_fixture.py extract_vacuum_mx_fixture.py $(top_srcdir)/src/backend/executor/nodeModifyTable.c
+	python3 $(srcdir)/extract_update_index_fixture.py $(top_srcdir)/src/backend/executor/nodeModifyTable.c --executor > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_index test_cluster_heap_update_index_noassert: test_cluster_heap_update_index.c test_cluster_heap_dml_vm_wal_chain.c test_cluster_heap_dml_vm_wal_chain test_cluster_heap_update_context.inc test_cluster_heap_update_am.inc test_cluster_heap_update_executor.inc $(top_srcdir)/src/include/access/tableam.h $(top_srcdir)/src/include/commands/trigger.h $(top_srcdir)/src/include/foreign/fdwapi.h $(top_srcdir)/src/include/cluster/cluster_xnode_profile.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+clean: clean-update-index
+.PHONY: clean-update-index
+clean-update-index:
+	rm -f test_cluster_heap_update_context.inc test_cluster_heap_update_context.inc.tmp \
+		test_cluster_heap_update_am.inc test_cluster_heap_update_am.inc.tmp \
+		test_cluster_heap_update_executor.inc test_cluster_heap_update_executor.inc.tmp
+
 # Direct repair must not bypass shared heap/VM publication obligations.
 TESTS += test_cluster_heap_surgery_admission test_cluster_heap_surgery_admission_noassert
 all: test_cluster_heap_surgery_admission test_cluster_heap_surgery_admission_noassert
