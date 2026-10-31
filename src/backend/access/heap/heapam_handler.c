@@ -457,10 +457,17 @@ heapam_fetch_row_version(Relation relation,
 		{
 			HeapTupleData tuple = bslot->base.tupdata;
 
-			ExecForceStoreHeapTuple(&tuple, slot, false);
-			slot->tts_tid = tuple.t_self;
-			slot->tts_tableOid = tuple.t_tableOid;
-			ReleaseBuffer(buffer);
+			PG_TRY();
+			{
+				ExecForceStoreHeapTuple(&tuple, slot, false);
+				slot->tts_tid = tuple.t_self;
+				slot->tts_tableOid = tuple.t_tableOid;
+			}
+			PG_FINALLY();
+			{
+				ReleaseBuffer(buffer);
+			}
+			PG_END_TRY();
 			return true;
 		}
 #endif

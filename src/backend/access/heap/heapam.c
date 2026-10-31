@@ -2903,7 +2903,8 @@ cluster_heap_scan_fetch_full(HeapScanDesc scan)
 	volatile bool full = false;
 
 	if (!cluster_heap_read_needs_copy(scan->rs_base.rs_rd)
-		|| !(scan->rs_base.rs_flags & (SO_TYPE_SEQSCAN | SO_TYPE_TIDRANGESCAN | SO_TYPE_BITMAPSCAN))
+		|| !(scan->rs_base.rs_flags
+			 & (SO_TYPE_SEQSCAN | SO_TYPE_TIDRANGESCAN | SO_TYPE_BITMAPSCAN | SO_TYPE_TIDSCAN))
 		|| snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC
 		|| snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER)
 		return false;
@@ -4011,6 +4012,76 @@ heap_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
 	return true;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Exact point reads reuse the scan FULL owner only for this call. A mapping
+ * pin cannot own private tuple bytes; the existing owned API supplies storage. */
+static bool
+cluster_heap_fetch_full(Relation relation, Snapshot snapshot, HeapTuple tuple, Buffer buffer,
+						Buffer *userbuf, bool keep_buf, char *storage, bool *visible)
+{
+	HeapScanDescData scan;
+	volatile bool handled = false;
+	volatile bool completed = false;
+
+	if (!cluster_heap_read_needs_copy(relation) || snapshot == NULL
+		|| snapshot->snapshot_type != SNAPSHOT_MVCC
+		|| snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER)
+		return false;
+
+	memset(&scan, 0, sizeof(scan));
+	scan.rs_base.rs_rd = relation;
+	scan.rs_base.rs_snapshot = snapshot;
+	scan.rs_base.rs_flags = SO_TYPE_TIDSCAN;
+	scan.rs_cblock = ItemPointerGetBlockNumber(&tuple->t_self);
+	scan.rs_cbuf = buffer;
+	tuple->t_data = NULL;
+	*userbuf = InvalidBuffer;
+	PG_TRY();
+	{
+		if (cluster_heap_scan_fetch_full(&scan)) {
+			Page page = cluster_heap_scan_page(&scan);
+			OffsetNumber off = ItemPointerGetOffsetNumber(&tuple->t_self);
+			ItemId item = NULL;
+
+			handled = true;
+			*visible = false;
+			if (off >= FirstOffsetNumber && off <= PageGetMaxOffsetNumber(page))
+				item = PageGetItemId(page, off);
+			if (item != NULL && ItemIdIsNormal(item)) {
+				*visible = cluster_heap_scan_r4_visible(&scan, off);
+				if (*visible || keep_buf) {
+					if (storage == NULL)
+						cluster_heap_scan_full_unknown(&scan);
+					tuple->t_data = (HeapTupleHeader)PageGetItem(page, item);
+					tuple->t_len = ItemIdGetLength(item);
+					tuple->t_tableOid = RelationGetRelid(relation);
+					cluster_heap_copy_read_tuple(storage, tuple);
+					tuple->t_data = (HeapTupleHeader)storage;
+				}
+			}
+			if (tuple->t_data != NULL)
+				*userbuf = buffer;
+			else
+				ReleaseBuffer(buffer);
+		}
+		completed = true;
+	}
+	PG_FINALLY();
+	{
+		/* Retire the entire automatic owner without inspecting fields that
+		 * may have changed across longjmp. Nothing in it escapes this call. */
+		memset(&scan, 0, sizeof(scan));
+		if (!completed) {
+			tuple->t_data = NULL;
+			*userbuf = InvalidBuffer;
+			ReleaseBuffer(buffer);
+		}
+	}
+	PG_END_TRY();
+	return handled;
+}
+#endif
+
 /*
  *	heap_fetch		- retrieve tuple with given tid
  *
@@ -4034,6 +4105,8 @@ heap_getnextslot_tidrange(TableScanDesc sscan, ScanDirection direction,
  *
  * heap_fetch does not follow HOT chains: only the exact TID requested will
  * be fetched.
+ * Cluster MVCC FULL tuples require the owned entrypoint's caller storage;
+ * buffer-only entrypoints fail closed rather than return private page pointers.
  *
  * It is somewhat inconsistent that we ereport() on invalid block number but
  * return false on invalid item number.  There are a couple of reasons though.
@@ -4072,6 +4145,13 @@ heap_fetch_internal(Relation relation, Snapshot snapshot, HeapTuple tuple, Buffe
 	 * Fetch and pin the appropriate page of the relation.
 	 */
 	buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
+
+#ifdef USE_PGRAC_CLUSTER
+	/* FULL fetch and visibility run outside the live page's content lock. */
+	if (cluster_heap_fetch_full(relation, snapshot, tuple, buffer, userbuf, keep_buf, owned_storage,
+								&valid))
+		return valid;
+#endif
 
 	/*
 	 * Need share lock on buffer to examine tuple commit status.

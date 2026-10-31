@@ -9423,9 +9423,10 @@ test_cluster_heap_epq_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	mv $@.tmp $@
 
 test_cluster_heap_fetch_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^heap_fetch_internal\(/ { print "static bool"; emit=1; found++ } \
+	awk 'BEGIN { print "static bool cluster_heap_scan_fetch_full(HeapScanDesc scan);"; print "static bool cluster_heap_scan_r4_visible(HeapScanDesc scan, OffsetNumber offset);" } \
+	     /^(cluster_heap_fetch_full|heap_fetch_internal)\(/ { print "static bool"; emit=1; found++ } \
 	     /^(heap_fetch|cluster_heap_fetch_waitable|cluster_heap_fetch_owned)\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_lock_dispatch.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -13213,6 +13214,27 @@ test_cluster_heap_bitmap_full: test_cluster_heap_bitmap_full.c test_cluster_heap
         test_cluster_heap_bitmap_callbacks.inc test_cluster_heap_scan_r4.inc \
         test_cluster_heap_scan_lifetime.inc test_cluster_heap_maintenance_policy.inc \
         test_cluster_scratch_self $(top_srcdir)/src/backend/access/heap/heapam_r4_private.h \
+        $(top_srcdir)/src/include/access/heapam.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+        $(CLUSTER_SAVEPOINT_READER_O) \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_heap_point_full
+all: test_cluster_heap_point_full
+
+test_cluster_heap_point_callback.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_fetch_row_version\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_point_full: test_cluster_heap_point_full.c test_cluster_heap_scan_full.c \
+        test_cluster_scratch_self.c test_cluster_r4_scratch_resolver.c \
+        test_cluster_heap_point_callback.inc test_cluster_heap_fetch_consumer.inc \
+        test_cluster_heap_scan_r4.inc test_cluster_heap_scan_lifetime.inc \
+        test_cluster_heap_maintenance_policy.inc test_cluster_scratch_self \
+        $(top_srcdir)/src/backend/access/heap/heapam_r4_private.h \
         $(top_srcdir)/src/include/access/heapam.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
