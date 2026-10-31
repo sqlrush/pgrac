@@ -687,6 +687,11 @@ cluster_undo_block0_current_live_owner_ensure_resident(const ClusterUndoBlock0Lo
 }
 
 static unsigned undo_test_lifecycle_mutate_calls;
+static bool undo_test_record_v2_capture;
+static uint32 undo_test_record_v2_generation;
+static PGAlignedBlock undo_test_record_v2_predecessor;
+static PGAlignedBlock undo_test_record_v2_successor;
+static ClusterUndoBlock0Result undo_test_record_v2_result;
 
 ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0LogicalKey *key,
@@ -701,6 +706,18 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 	const UndoSegmentHeaderData *requested = (const UndoSegmentHeaderData *)successor_page;
 
 	undo_test_lifecycle_mutate_calls++;
+	/* New tests inspect the real record owner's exact request. The original
+	 * current owner is covered by its own real-owner unit, not imitated here. */
+	if (undo_test_record_v2_capture) {
+		if (key == NULL || expected == NULL || !expected->known || predecessor_page == NULL
+			|| successor_page == NULL || timeout_ms != 10000 || key->segment_id != 2
+			|| key->owner_instance != 1)
+			return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+		undo_test_record_v2_generation = expected->value;
+		memcpy(undo_test_record_v2_predecessor.data, predecessor_page, BLCKSZ);
+		memcpy(undo_test_record_v2_successor.data, successor_page, BLCKSZ);
+		return undo_test_record_v2_result;
+	}
 
 	if (key == NULL || expected == NULL || !expected->known || predecessor_page == NULL
 		|| successor_page == NULL || timeout_ms <= 0 || key->segment_id != current->segment_id
@@ -4196,10 +4213,153 @@ UT_TEST(test_tt40_restart_rejects_present_bad_header_after_an_earlier_candidate)
 	undo_test_fixture_end();
 }
 
+UT_TEST(test_public_segment_identity_accepts_explicit_complete_tt40_without_mutation)
+{
+	PGAlignedBlock page;
+	PGAlignedBlock before;
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)page.data;
+	const uint8 states[] = { TT_SLOT_ACTIVE, TT_SLOT_COMMITTED, TT_SLOT_ABORTED,
+							TT_SLOT_RECYCLABLE };
+
+	undo_test_make_header(2, 1, SEGMENT_ACTIVE, page.data);
+	UT_ASSERT(cluster_undo_segment_header_identity_ok(page.data, 2, 1));
+	undo_test_make_supply_v2(2, SEGMENT_ACTIVE, 7, page.data);
+	for (unsigned i = 0; i < lengthof(states); i++) {
+		TTSlotV2 *slot = &header->tt_slots[i == 3 ? 47 : i];
+
+		slot->status = states[i];
+		slot->xid = 700 + i;
+		slot->wrap = 4;
+		slot->original_full_xid = i == 0 ? 700 : (UINT64CONST(2) << 32) | (700 + i);
+		if (slot->status == TT_SLOT_COMMITTED)
+			slot->commit_scn = 70;
+	}
+	memcpy(before.data, page.data, BLCKSZ);
+	UT_ASSERT(cluster_undo_segment_header_identity_ok(page.data, 2, 1));
+	UT_ASSERT(!cluster_undo_segment_header_identity_ok(page.data, 3, 1));
+	UT_ASSERT(!cluster_undo_segment_header_identity_ok(page.data, 2, 2));
+	UT_ASSERT(!cluster_undo_segment_header_identity_ok(NULL, 2, 1));
+	header->tt_slots[47].original_full_xid ^= 1;
+	UT_ASSERT(!cluster_undo_segment_header_identity_ok(page.data, 2, 1));
+	header->tt_slots[47].original_full_xid ^= 1;
+	UT_ASSERT_EQ(memcmp(before.data, page.data, BLCKSZ), 0);
+}
+
+static void
+undo_test_record_v2_fixture(void)
+{
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)undo_test_lifecycle_disk.data;
+
+	undo_test_reset_record_shmem();
+	undo_test_make_supply_v2(2, SEGMENT_ACTIVE, 7, undo_test_lifecycle_disk.data);
+	((UndoSegmentHeaderData *)header)->wrap_count = UINT32_MAX;
+	header->tt_slots[0].status = TT_SLOT_ACTIVE;
+	header->tt_slots[0].xid = 700;
+	header->tt_slots[0].wrap = 3;
+	header->tt_slots[0].original_full_xid = (UINT64CONST(2) << 32) | 700;
+	header->tt_slots[47].status = TT_SLOT_COMMITTED;
+	header->tt_slots[47].xid = 701;
+	header->tt_slots[47].wrap = 4;
+	header->tt_slots[47].commit_scn = 70;
+	header->tt_slots[47].original_full_xid = (UINT64CONST(2) << 32) | 701;
+	undo_test_record_v2_capture = true;
+	undo_test_record_v2_generation = UINT32_MAX;
+	undo_test_record_v2_result = CLUSTER_UNDO_BLOCK0_OK;
+	undo_test_lifecycle_mutate_calls = 0;
+	undo_test_publish_tt_after_block0_read = false;
+	undo_test_drain_allowed = false;
+}
+
+UT_TEST(test_tt40_record_seal_uses_actual_generation_and_retains_every_full_slot)
+{
+	PGAlignedBlock before;
+	PGAlignedBlock expected;
+
+	undo_test_record_v2_fixture();
+	memcpy(before.data, undo_test_lifecycle_disk.data, BLCKSZ);
+	memcpy(expected.data, before.data, BLCKSZ);
+	UndoSegmentHeader_set_record_seal_upper_scn((UndoSegmentHeaderData *)expected.data, 42);
+	cluster_undo_try_mark_record_segment_committed(2, 1, 42);
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, 1);
+	UT_ASSERT_EQ(undo_test_record_v2_generation, 7);
+	UT_ASSERT_EQ(memcmp(undo_test_record_v2_predecessor.data, before.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(undo_test_record_v2_successor.data, expected.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(cluster_undo_record_segments_committed_count(), 0);
+	/* Model the existing owner's completed publication, then prove the
+	 * original seal is not replaced by a later clock. */
+	memcpy(undo_test_lifecycle_disk.data, expected.data, BLCKSZ);
+	cluster_undo_try_mark_record_segment_committed(2, 1, 200);
+	UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, 1);
+	UT_ASSERT_EQ(memcmp(undo_test_lifecycle_disk.data, expected.data, BLCKSZ), 0);
+	undo_test_record_v2_capture = false;
+}
+
+UT_TEST(test_tt40_record_drain_keeps_original_gate_current_result_and_counters)
+{
+	for (unsigned variant = 0; variant < 2; variant++) {
+		PGAlignedBlock before;
+		PGAlignedBlock expected;
+		UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
+
+		undo_test_record_v2_fixture();
+		UndoSegmentHeader_set_record_seal_upper_scn(disk, 42);
+		memcpy(before.data, disk, BLCKSZ);
+		memcpy(expected.data, before.data, BLCKSZ);
+		UndoSegmentHeader_set_record_drain_upper_scn((UndoSegmentHeaderData *)expected.data, 1000);
+		((UndoSegmentHeaderData *)expected.data)->segment_state = SEGMENT_COMMITTED;
+		cluster_undo_try_mark_record_segment_committed(2, 1, InvalidScn);
+		UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, 0);
+		undo_test_drain_allowed = true;
+		if (variant == 0)
+			undo_test_record_v2_result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+		cluster_undo_try_mark_record_segment_committed(2, 1, InvalidScn);
+		UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, 1);
+		UT_ASSERT_EQ(undo_test_record_v2_generation, 7);
+		UT_ASSERT_EQ(memcmp(undo_test_record_v2_predecessor.data, before.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(memcmp(undo_test_record_v2_successor.data, expected.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(cluster_undo_record_segments_committed_count(), variant);
+		/* This test captures a request only; the real current owner remains
+		 * the sole checksum/rebase/publication authority. */
+		UT_ASSERT_EQ(memcmp(undo_test_lifecycle_disk.data, before.data, BLCKSZ), 0);
+		undo_test_drain_allowed = false;
+		undo_test_record_v2_capture = false;
+	}
+}
+
+UT_TEST(test_tt40_record_refuses_bad_identity_actual_generation_or_nonactive_state)
+{
+	for (unsigned variant = 0; variant < 7; variant++) {
+		PGAlignedBlock before;
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)undo_test_lifecycle_disk.data;
+
+		undo_test_record_v2_fixture();
+		switch (variant) {
+		case 0: header->tt_layout_version = 3; break;
+		case 1: header->tt_slot_bytes = 32; break;
+		case 2: header->tt_slots[47].original_full_xid ^= 1; break;
+		case 3: header->tt_slots[47].status = UINT8_MAX; break;
+		case 4:
+			header->wrap_count = UINT32_MAX;
+			((UndoSegmentHeaderData *)header)->wrap_count = 0;
+			break;
+		case 5: header->segment_state = SEGMENT_COMMITTED; break;
+		case 6: header->segment_state = SEGMENT_ALLOCATED; break;
+		}
+		memcpy(before.data, header, BLCKSZ);
+		undo_test_drain_allowed = true;
+		cluster_undo_try_mark_record_segment_committed(2, 1, 42);
+		UT_ASSERT_EQ(undo_test_lifecycle_mutate_calls, 0);
+		UT_ASSERT_EQ(memcmp(undo_test_lifecycle_disk.data, before.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(cluster_undo_record_segments_committed_count(), 0);
+		undo_test_drain_allowed = false;
+		undo_test_record_v2_capture = false;
+	}
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(85);
+	UT_PLAN(89);
 	UT_RUN(test_itl_prepare_requires_original_fullxid_before_receiver_publication);
 	UT_RUN(test_itl_prepare_passes_exact_original_envelope_to_receiver);
 	UT_RUN(test_abort_prepared_after_lock_release_is_idempotent);
@@ -4286,6 +4446,10 @@ main(int argc, char **argv)
 	UT_RUN(test_tt40_complete_pool_observation_counts_mixed_layouts_across_gaps);
 	UT_RUN(test_tt40_restart_selects_unique_writable_active_with_original_gap_rule);
 	UT_RUN(test_tt40_restart_rejects_present_bad_header_after_an_earlier_candidate);
+	UT_RUN(test_public_segment_identity_accepts_explicit_complete_tt40_without_mutation);
+	UT_RUN(test_tt40_record_seal_uses_actual_generation_and_retains_every_full_slot);
+	UT_RUN(test_tt40_record_drain_keeps_original_gate_current_result_and_counters);
+	UT_RUN(test_tt40_record_refuses_bad_identity_actual_generation_or_nonactive_state);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

@@ -917,6 +917,7 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_ins
 	UndoSegmentHeaderData *next;
 	ClusterUndoBlock0LogicalKey key;
 	ClusterUndoBlock0Generation generation;
+	uint32 header_generation;
 	bool dirty = false;
 	bool advanced = false;
 	ClusterUndoBlock0Result result;
@@ -936,7 +937,12 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_ins
 		return; /* L212: identity, not template bytes -> retain */
 	}
 	hdr = (UndoSegmentHeaderData *)predecessor.data;
-	if (hdr->wrap_count == UINT32_MAX) {
+	/* Identity validation has selected the complete layout. In TT40 the
+	 * legacy generation offset belongs to the block bitmap. */
+	header_generation = (uint8)predecessor.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+							? ((const UndoSegmentHeaderDataV2 *)predecessor.data)->wrap_count
+							: hdr->wrap_count;
+	if (header_generation == UINT32_MAX) {
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		return;
 	}
@@ -997,7 +1003,7 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_ins
 	key.segment_id = seg;
 	key.owner_instance = owner_instance;
 	generation.known = true;
-	generation.value = hdr->wrap_count;
+	generation.value = header_generation;
 	result = cluster_undo_block0_current_live_owner_mutate_exact(
 		&key, &generation, predecessor.data, successor.data, 10000);
 	if (advanced && result == CLUSTER_UNDO_BLOCK0_OK)

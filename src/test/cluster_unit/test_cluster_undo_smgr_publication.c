@@ -184,14 +184,6 @@ cluster_undo_path_resolve(ClusterUndoPathIntent intent pg_attribute_unused(), ui
 	return ret < 0 || (size_t)ret >= buf_size ? -1 : 0;
 }
 
-bool
-cluster_undo_segment_header_identity_ok(const char *blockbuf,
-										uint32 segment_id pg_attribute_unused(),
-										uint8 owner_instance pg_attribute_unused())
-{
-	return blockbuf != NULL && (unsigned char)blockbuf[0] == 0xa5;
-}
-
 #undef pg_pwrite
 #define pg_pwrite test_product_pwrite
 #undef pg_pread
@@ -240,9 +232,24 @@ write_empty_file(const char *path)
 static void
 make_page(char page[BLCKSZ], unsigned char marker)
 {
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)page;
+
 	memset(page, 0, BLCKSZ);
 	page[0] = (char)marker;
 	page[BLCKSZ - 1] = (char)(marker ^ 0xff);
+	/* Preserve the old marker cases, but supply a real V1 identity to the
+	 * original allocator predicate instead of a marker-only success stub. */
+	if (marker == 0xa5) {
+		header->pd_flags = PD_UNDO_SEG_HEADER;
+		header->pd_lower = SizeOfPageHeaderData;
+		header->pd_upper = header->pd_special = BLCKSZ;
+		header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+		header->segment_id = 1;
+		header->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+		header->segment_state = SEGMENT_ALLOCATED;
+		header->owner_instance = 1;
+		header->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	}
 }
 
 static void
@@ -947,6 +954,123 @@ UT_TEST(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes)
 	}
 }
 
+static void
+make_tt40_publication_page(char page[BLCKSZ])
+{
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)page;
+
+	make_page(page, 0xa5);
+	header->tt_layout_version = 2;
+	header->tt_slot_bytes = 40;
+	header->wrap_count = 7;
+	((UndoSegmentHeaderData *)page)->wrap_count = 91; /* V2 bitmap, not generation */
+	header->tt_slots[0].status = TT_SLOT_ACTIVE;
+	header->tt_slots[0].xid = 700;
+	header->tt_slots[0].wrap = 3;
+	header->tt_slots[0].original_full_xid = (UINT64CONST(2) << 32) | 700;
+	header->tt_slots[47].status = TT_SLOT_COMMITTED;
+	header->tt_slots[47].xid = 701;
+	header->tt_slots[47].wrap = 4;
+	header->tt_slots[47].commit_scn = 70;
+	header->tt_slots[47].original_full_xid = (UINT64CONST(2) << 32) | 701;
+}
+
+UT_TEST(test_tt40_publish_probe_preserves_complete_identity_and_original_barriers)
+{
+	PGAlignedBlock page;
+	PGAlignedBlock observed;
+	char final[MAXPGPATH];
+	char temp[MAXPGPATH];
+
+	resolve_final(final);
+	make_tt40_publication_page(page.data);
+	UT_ASSERT(cluster_undo_smgr_provision_temp_create(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, temp));
+	fsync_calls = 0;
+	UT_ASSERT_EQ(cluster_undo_smgr_provision_temp_publish(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
+														  temp, page.data), CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED);
+	UT_ASSERT_EQ(fsync_calls, 2);
+	UT_ASSERT_EQ(cluster_undo_smgr_probe_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
+												  observed.data), CLUSTER_UNDO_SMGR_FINAL_EXACT);
+	UT_ASSERT_EQ(fsync_calls, 3);
+	UT_ASSERT_EQ(memcmp(page.data, observed.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)observed.data)->wrap_count, 7);
+	UT_ASSERT(access(temp, F_OK) != 0 && errno == ENOENT);
+	/* Cleanup is fixture-owned even when the original parent refuses V2. */
+	remove_if_present(temp);
+	remove_if_present(final);
+}
+
+UT_TEST(test_tt40_eexist_keeps_original_winner_including_last_fullxid)
+{
+	PGAlignedBlock winner;
+	PGAlignedBlock loser;
+	PGAlignedBlock observed;
+	char final[MAXPGPATH];
+	char temp[MAXPGPATH];
+
+	resolve_final(final);
+	make_tt40_publication_page(winner.data);
+	memcpy(loser.data, winner.data, BLCKSZ);
+	((UndoSegmentHeaderDataV2 *)loser.data)->tt_slots[47].original_full_xid
+		= (UINT64CONST(3) << 32) | 701;
+	write_segment_file(final, winner.data, UNDO_SEGMENT_SIZE_BYTES);
+	UT_ASSERT(cluster_undo_smgr_provision_temp_create(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, temp));
+	UT_ASSERT_EQ(cluster_undo_smgr_provision_temp_publish(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
+														  temp, loser.data), CLUSTER_UNDO_SMGR_PUBLISH_EXISTS);
+	UT_ASSERT_EQ(cluster_undo_smgr_probe_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
+													  observed.data), CLUSTER_UNDO_SMGR_FINAL_EXACT);
+	UT_ASSERT_EQ(memcmp(winner.data, observed.data, BLCKSZ), 0);
+	UT_ASSERT(access(temp, F_OK) != 0 && errno == ENOENT);
+	remove_if_present(temp);
+	remove_if_present(final);
+}
+
+UT_TEST(test_tt40_unknown_or_fullxid_conflict_never_publishes_or_repairs_a_winner)
+{
+	PGAlignedBlock good;
+	PGAlignedBlock bad;
+	PGAlignedBlock observed;
+	PGAlignedBlock sentinel;
+	char final[MAXPGPATH];
+	char temp[MAXPGPATH];
+	int fd;
+
+	resolve_final(final);
+	make_tt40_publication_page(good.data);
+	for (unsigned variant = 0; variant < 2; variant++) {
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)bad.data;
+
+		memcpy(bad.data, good.data, BLCKSZ);
+		if (variant == 0)
+			header->tt_layout_version = 3;
+		else
+			header->tt_slots[47].original_full_xid ^= 1;
+		UT_ASSERT(cluster_undo_smgr_provision_temp_create(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, temp));
+		fsync_calls = 0;
+		UT_ASSERT_EQ(cluster_undo_smgr_provision_temp_publish(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
+															  temp, bad.data), CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR);
+		UT_ASSERT_EQ(fsync_calls, 0);
+		UT_ASSERT(access(final, F_OK) != 0 && errno == ENOENT);
+		remove_if_present(temp);
+		write_segment_file(final, bad.data, UNDO_SEGMENT_SIZE_BYTES);
+		memset(sentinel.data, 0x6d, BLCKSZ);
+		memcpy(observed.data, sentinel.data, BLCKSZ);
+		UT_ASSERT_EQ(cluster_undo_smgr_probe_segment(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
+														  observed.data), CLUSTER_UNDO_SMGR_FINAL_INVALID);
+		UT_ASSERT_EQ(memcmp(observed.data, sentinel.data, BLCKSZ), 0);
+		UT_ASSERT(cluster_undo_smgr_provision_temp_create(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, temp));
+		UT_ASSERT_EQ(cluster_undo_smgr_provision_temp_publish(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
+															  temp, good.data), CLUSTER_UNDO_SMGR_PUBLISH_INVALID);
+		fd = open(final, O_RDONLY);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(pread(fd, observed.data, BLCKSZ, 0), BLCKSZ);
+		UT_ASSERT_EQ(close(fd), 0);
+		UT_ASSERT_EQ(memcmp(observed.data, bad.data, BLCKSZ), 0);
+		remove_if_present(temp);
+		remove_if_present(final);
+	}
+}
+
 int
 main(void)
 {
@@ -954,7 +1078,7 @@ main(void)
 
 	UT_ASSERT_NOT_NULL(mkdtemp(template));
 	strlcpy(publication_dir, template, sizeof(publication_dir));
-	UT_PLAN(29);
+	UT_PLAN(32);
 	UT_RUN(test_recovery_file_materializes_absent_without_publishing_header);
 	UT_RUN(test_recovery_file_short_tail_and_errors_are_distinct);
 	UT_RUN(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes);
@@ -984,6 +1108,9 @@ main(void)
 	UT_RUN(test_root_descriptor_mirror_probe_rejects_short_and_symlink);
 	UT_RUN(test_root_descriptor_mirror_probe_rejects_lstat_open_symlink_swap);
 	UT_RUN(test_root_descriptor_mirror_write_failure_cleans_owned_temp);
+	UT_RUN(test_tt40_publish_probe_preserves_complete_identity_and_original_barriers);
+	UT_RUN(test_tt40_eexist_keeps_original_winner_including_last_fullxid);
+	UT_RUN(test_tt40_unknown_or_fullxid_conflict_never_publishes_or_repairs_a_winner);
 	UT_ASSERT_EQ(rmdir(publication_dir), 0);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

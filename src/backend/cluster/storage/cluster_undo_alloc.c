@@ -214,20 +214,6 @@ ensure_instance_subdir(uint8 owner_instance)
 }
 
 /*
- * Existing undo segment files are mutable: lifecycle state, block bitmap, and
- * durable TT slots all live in block 0 after allocation.  Idempotence therefore
- * means "the header identity is valid", not "the whole block still equals the
- * freshly allocated zero template".
- */
-bool
-cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
-										uint8 owner_instance)
-{
-	return UndoSegmentHeader_identity_matches(blockbuf, segment_id, owner_instance);
-}
-
-
-/*
  * cluster_undo_segment_allocate
  *
  *   Validate the local owner and enter the current-authorized publisher.
@@ -436,7 +422,7 @@ lifecycle_header_view(uint32 segment_id, uint8 owner_instance, char *blockbuf,
 	} else {
 		/* This also rejects unknown framing; V1's seven reserved bytes must
 		 * remain zero. Do not try the old generation offset on an unknown page. */
-		if (!cluster_undo_segment_header_identity_ok(blockbuf, segment_id, owner_instance))
+		if (!UndoSegmentHeader_identity_matches(blockbuf, segment_id, owner_instance))
 			return false;
 		candidate.bitmap_offset = offsetof(UndoSegmentHeaderData, free_block_bitmap);
 		candidate.generation = prefix->wrap_count;
@@ -444,6 +430,19 @@ lifecycle_header_view(uint32 segment_id, uint8 owner_instance, char *blockbuf,
 	candidate.prefix = prefix;
 	*out = candidate;
 	return true;
+}
+
+/* Existing files are mutable. Validate their explicit complete layout and
+ * identity, not equality to a fresh template. The view only reads blockbuf;
+ * original checksum/current/recovery gates remain the caller's responsibility. */
+bool
+cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
+										uint8 owner_instance)
+{
+	ClusterUndoLifecycleHeaderView view;
+
+	return blockbuf != NULL
+		   && lifecycle_header_view(segment_id, owner_instance, (char *)blockbuf, &view);
 }
 
 static bool

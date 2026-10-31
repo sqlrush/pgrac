@@ -8345,10 +8345,18 @@ test_cluster_undo_header_durability: test_cluster_undo_header_durability.c unit_
 
 # Spec 8.4A P3 first publication: the fixture includes the real smgr source
 # and runs typed final-path/no-replace behavior against a private temp dir.
+test_cluster_undo_publication_alloc_product.o: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_undo_path_resolve=undo_publication_unused_path_resolve \
+		-c $< -o $@
+
 test_cluster_undo_smgr_publication: test_cluster_undo_smgr_publication.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
-		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
+		test_cluster_undo_publication_alloc_product.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		test_cluster_undo_publication_alloc_product.o \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@

@@ -308,7 +308,8 @@ extern uint32 cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner
 /* spec-3.13 D4: durable segment generation (== header wrap_count; 0 = unknown). */
 extern uint32 cluster_undo_segment_generation(uint32 segment_id, uint8 owner_instance);
 
-/* spec-3.13: identity check exported for redo + reuse peek (L212 surface). */
+/* Complete aligned BLCKSZ input: explicit TT32/TT40 mutable identity, including
+ * all TT40 slot identities. No checksum/current/recovery authority is granted. */
 extern bool cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
 													uint8 owner_instance);
 
