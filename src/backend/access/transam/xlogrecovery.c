@@ -3555,6 +3555,48 @@ cluster_recovery_cold_page_owner_scopes_current(const struct ClusterRecoveryStar
 		start->ctrc_page_sources, source_count);
 }
 
+/* The original forest member is authoritative only while its complete ITL
+ * is still present at that same field in the actual owner after-image.
+ * Reuse that image's DATA atom: inverse ordinals are not file generations,
+ * and a different before-image must not borrow this after-image witness.
+ * Missing/moved/changed fields remain explicit unresolved entries. */
+static void
+cluster_recovery_cold_page_reference_key(const ClusterRecoveryCensusReferenceV1 *reference,
+	const RfPageCtrcOwnerEvidenceV1 *proof, uint8 *key, RfPageCtrcOwnerGraphEntryV1 *entry)
+{
+	const PageHeaderData *header = (const PageHeaderData *)proof->completed.owner.image.data;
+	const uint8 *id = proof->evidence + 26;
+	Size id_length, field;
+
+	if (reference->version != 0 || reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITL
+		|| reference->entry.itl.flags == ITL_FLAG_FREE
+		|| reference->entry.itl.flags > ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
+		|| reference->entry.index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| PageGetPageSize((Page)header) != BLCKSZ
+		|| PageGetPageLayoutVersion((Page)header) != PG_PAGE_LAYOUT_VERSION
+		|| !PageHasItl((Page)header) || (header->pd_flags & ~PD_VALID_FLAG_BITS) != 0
+		|| (header->pd_flags & (PD_UNDO_SEG_HEADER | PD_SPACE_METADATA)) != 0
+		|| header->pd_special != BLCKSZ - MAXALIGN(CLUSTER_ITL_SPECIAL_SIZE)
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
+		return;
+	field = header->pd_special + (Size)reference->entry.index * sizeof(ClusterItlSlotData);
+	if (memcmp((const uint8 *)header + field, &reference->entry.itl, sizeof(reference->entry.itl)) != 0)
+		return;
+	/* Both envelopes were produced by the original owner codecs above; T34
+	 * comes from the full original forest/effect scope, never from raw xid. */
+	id_length = cluster_undo_tt_ctrc_get_u64_le(proof->evidence + 18) - 16;
+	memcpy(key, entry->key + 10, 34);
+	cluster_undo_tt_ctrc_put_u16_le(key + 34, 1);
+	cluster_undo_tt_ctrc_put_u64_le(key + 36, id_length);
+	memcpy(key + 44, id, id_length);
+	cluster_undo_tt_ctrc_put_u64_le(key + 44 + id_length, field + offsetof(ClusterItlSlotData, xid));
+	cluster_undo_tt_ctrc_put_u64_le(key + 52 + id_length, reference->entry.index);
+	entry->reference_key = key; entry->reference_key_length = 60 + id_length;
+	entry->reference_evidence = proof->evidence; entry->reference_evidence_length = proof->evidence_length;
+}
+
 RfPageCtrcOwnerGraphV1
 ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
 {
@@ -3570,6 +3612,7 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 	ClusterWalInputsV1 *scope;
 	Size bytes = 0, entry_offset, owner_offset, source_offset, observed_offset, reference_offset;
 	Size edge_offset, effect_offset, indexes_offset, data_offset, key_capacity, stride, scratch;
+	const Size reference_capacity = MAXPGPATH + 105;
 	uint32 reference_count, owner_count, source_count, wal_count, edge_count = 0, max_edges = 0;
 	bool ready = false;
 
@@ -3602,12 +3645,12 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 		|| max_edges > (MaxAllocSize - 60 - 4 * source_count) / 62) return out;
 	key_capacity = 60 + (Size)4 * source_count + (Size)62 * max_edges;
 	if (key_capacity > (MaxAllocSize - sizeof(((RfPageCtrcOwnerEvidenceV1 *)0)->evidence)
-		- sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) - 26) / 2) return out;
+		- sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) - 26 - reference_capacity) / 2) return out;
 	stride = 2 * key_capacity + sizeof(((RfPageCtrcOwnerEvidenceV1 *)0)->evidence)
-		+ sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) + 26;
+		+ sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) + 26 + reference_capacity;
 	scratch = key_capacity + sizeof(out) + sizeof(related) + sizeof(ClusterRecoveryCTRCOwnerScopeV2)
 		+ sizeof(ClusterRecoveryPageWalV1) + sizeof(ClusterRecoveryCTRCOwnerEffectV2)
-		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryWalSourceObservationV1);
+		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryWalSourceObservationV1) + 128;
 	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(reference_count, 1), sizeof(*entries), &entry_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count, sizeof(*owners), &owner_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, source_count, sizeof(*sources), &source_offset)
@@ -3707,6 +3750,8 @@ ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start
 					memcpy(atom + 18 + entry->key_length, proof->completed.completion, proof->completed.length);
 					entry->key = key; entry->evidence = evidence;
 					entry->evidence_length = proof->evidence_length + 26 + entry->key_length + proof->completed.length;
+					cluster_recovery_cold_page_reference_key(&fixed_references[i], proof,
+						key + stride - reference_capacity, entry);
 				}
 				ready = valid && cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
 					sources, observed, source_count, wal_count, references, fixed_references, reference_count);

@@ -401,11 +401,21 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
 	uint32 reference_index, owner_index;
 	Size key_length, evidence_length;
 	const uint8 *key, *evidence;
+	/* Optional current ITL kind1 key and complete actual after-image atom2.
+	 * NULL/zero retains an unresolved field, never a zero-reference proof. */
+	Size reference_key_length, reference_evidence_length;
+	const uint8 *reference_key, *reference_evidence;
 } RfPageCtrcOwnerGraphEntryV1;
 
 /* Complete reference order, with canonical PAGE owner contributions only for
  * matched current non-FREE ITLs. Unmatched entries have no key/evidence.
- * This is not a complete transaction graph or a discharge verdict. */
+ * A byte-exact current ITL also exposes its canonical DATA field key, with
+ * full T from the twice-checked original forest member and the SAME owner's
+ * complete after-image witness. Evidence borrows related.owners.entries;
+ * keys belong to entries. Keep both original result allocations alive.
+ * Changed/moved/invalid fields and historical/FREE/tuple references retain
+ * NULL reference fields, including when a PAGE owner key is available.
+ * This creates no discharged_by edge, complete graph or discharge verdict. */
 typedef struct RfPageCtrcOwnerGraphV1 {
 	RfPageProofDetailV1 detail;
 	RfPageCtrcOwnerReferencesV1 related;

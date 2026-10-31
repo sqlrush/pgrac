@@ -10955,3 +10955,6 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_images.inc
 
 # The relation wrapper owns the complete expanded reference output.
 $(top_builddir)/src/backend/cluster/cluster_recovery_relation_census.o: 	$(top_srcdir)/src/include/cluster/cluster_recovery_page_census.h
+
+# Exact current ITL references use the original owner graph fixture.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_graph.inc
