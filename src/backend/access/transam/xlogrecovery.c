@@ -205,6 +205,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_page_install_ctrc.h"
@@ -6598,6 +6599,13 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 
 	switch (action)
 	{
+		case CLUSTER_COLD_RELMAP_STEP:
+			if (!cluster_cold_typed_relmap_record_v1(typed, *rep->fence_plan, step, r))
+				cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+					"a declared relmap participant did not consume its complete image");
+			if (is_own)
+				AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
+			break;
 		case CLUSTER_COLD_SPACE_STEP:
 			cluster_typed_replay_space_step(rep, participant, step, r);
 			break;
@@ -6811,6 +6819,9 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 		cluster_typed_replay_unpublished(
 			thread, "Native durability, PAGE readback or source counter endpoints are incomplete",
 			(int)rep->typed->refusal);
+	if (!cluster_cold_typed_relmap_ready_v1(rep->typed, plan))
+		cluster_typed_replay_unpublished(thread,
+			"Declared relmap receipts or their original protection are incomplete", 0);
 	/* Retain read-only ACTIVE inputs before the original pass-2 authority
 	 * is released. Unproven tops stay explicit; C0 requires its own later
 	 * TX_CLOSURE source/isolation and writer authority after native EOR. */

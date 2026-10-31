@@ -1154,6 +1154,11 @@ main(int argc, char **argv)
 	test_program_path = argv[0];
 	setup_fixture();
 #ifdef RECOVERY_SCOPE_NATIVE_CENSUS
+	if (getenv("PGRAC_PRE2_TEST_SCOPE_HANDOFF_PLAN") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_scope_handoff_original_plan_refuses_missing_relmap_declaration);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_SCOPE_HANDOFF") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_scope_handoff_reuses_native_receipt_without_replaying_after_eor);
@@ -1177,7 +1182,7 @@ main(int argc, char **argv)
 		UT_RUN(test_scope_replayed_census_retains_joint_completion_boundary);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(22);
+	UT_PLAN(23);
 	UT_RUN(test_scope_native_census_uses_original_episode_and_retires_before_holders);
 	UT_RUN(test_scope_native_census_missing_corrupt_pending_pairs_keep_original_debt);
 	UT_RUN(test_scope_native_census_late_source_loss_and_error_do_not_replace_custody);
@@ -1200,6 +1205,7 @@ main(int argc, char **argv)
 	UT_RUN(test_scope_handoff_reuses_native_receipt_without_replaying_after_eor);
 	UT_RUN(test_scope_handoff_native_failure_cannot_publish_or_retry);
 	UT_RUN(test_scope_handoff_late_census_failures_keep_receipts_and_held_pages);
+	UT_RUN(test_scope_handoff_original_plan_refuses_missing_relmap_declaration);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
 	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_PAGES") != NULL) {

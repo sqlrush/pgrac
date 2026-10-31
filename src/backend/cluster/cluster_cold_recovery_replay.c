@@ -65,7 +65,7 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 {
 	const ClusterColdRecordV1 *record;
 	const ClusterColdEffectRoutesV1 *e;
-	uint32 routes[4];
+	uint32 routes[5];
 	uint32 seen = 0;
 	uint32 no_effect_mask = CLUSTER_COLD_EFFECT_RECORD;
 	const uint32 page_mask
@@ -84,7 +84,8 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 	if (!(e->required & CLUSTER_COLD_EFFECT_RECORD)
 		|| (e->required & ~((CLUSTER_COLD_EFFECT_SCN << 1) - 1U)) != 0 || e->refused != 0
 		|| (record->record_flags
-			& ~(CLUSTER_COLD_RECORD_FOREIGN_CONTROL | CLUSTER_COLD_RECORD_FOREIGN_SIDE))
+			& ~(CLUSTER_COLD_RECORD_FOREIGN_CONTROL | CLUSTER_COLD_RECORD_FOREIGN_SIDE
+				| (e->participant_apply ? CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED : 0)))
 			   != 0
 		|| record->component_count > CLUSTER_COLD_MAX_COMPONENTS
 		|| (record->component_count != 0 && record->components == NULL)
@@ -95,12 +96,14 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 			& (CLUSTER_COLD_EFFECT_PAGE | CLUSTER_COLD_EFFECT_FSM | CLUSTER_COLD_EFFECT_SPACE))
 			   != 0
 		|| (e->page_apply & ~page_mask) != 0 || (e->space_apply & ~space_mask) != 0
-		|| (e->no_effect & ~no_effect_mask) != 0)
+		|| (e->no_effect & ~no_effect_mask) != 0
+		|| (e->participant_apply & ~CLUSTER_COLD_EFFECT_RECORD) != 0)
 		return false;
 	routes[0] = e->native_apply;
 	routes[1] = e->page_apply;
 	routes[2] = e->space_apply;
 	routes[3] = e->no_effect;
+	routes[4] = e->participant_apply;
 	for (uint32 i = 0; i < lengthof(routes); i++) {
 		if ((seen & routes[i]) != 0)
 			return false;
@@ -135,7 +138,15 @@ cluster_cold_replay_effects_v1(const ClusterColdDecodedV1 *decoded, const Cluste
 		}
 		return false;
 	}
-	if ((record->record_flags != 0
+	if (step->step_kind == CLUSTER_COLD_STEP_RELMAP)
+		return record->rmid == RM_RELMAP_ID && record->relmap_image != NULL
+			&& (record->record_flags == CLUSTER_COLD_RECORD_STRUCTURAL
+				|| record->record_flags == (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED))
+			&& record->component_count == 0 && record->space_count == 0
+			&& record->read_rec_ptr == step->read_rec_ptr && record->end_rec_ptr == step->end_rec_ptr
+			&& record->record_crc == step->record_crc && record->info == step->info
+			&& record->rmid == step->rmid && e->participant_apply == e->required;
+	if (e->participant_apply != 0 || (record->record_flags != 0
 		 && !(!own && record->record_flags == CLUSTER_COLD_RECORD_FOREIGN_SIDE))
 		|| record->read_rec_ptr != step->read_rec_ptr || record->end_rec_ptr != step->end_rec_ptr
 		|| record->record_crc != step->record_crc || record->rmid != step->rmid
@@ -186,7 +197,7 @@ cluster_cold_effects_proof_record_v1(ClusterColdEffectsProofV1 *proof, uint32 pa
 		return false;
 	}
 	routed = decoded->effects.native_apply | decoded->effects.page_apply
-			  | decoded->effects.space_apply | decoded->effects.no_effect;
+			  | decoded->effects.space_apply | decoded->effects.no_effect | decoded->effects.participant_apply;
 	proof->records_seen[participant]++;
 	proof->records_routed++;
 	proof->required_union |= decoded->effects.required;
@@ -344,6 +355,8 @@ cluster_cold_typed_xid_maximum_v1(const ClusterColdTypedV1 *typed, uint64 *next_
 ClusterColdPageActionV1
 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
 {
+	if (step != NULL && step->step_kind == CLUSTER_COLD_STEP_RELMAP)
+		return CLUSTER_COLD_RELMAP_STEP;
 	if (step != NULL && step->step_kind == CLUSTER_COLD_STEP_SPACE)
 		return CLUSTER_COLD_SPACE_STEP;
 	if (step == NULL || !step->all_skip)

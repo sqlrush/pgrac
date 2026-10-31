@@ -608,6 +608,9 @@ cluster_cold_plan_seal_v1(ClusterColdPlanV1 *plan, ClusterColdObserveV1 observe,
 		return CLUSTER_COLD_STATE;
 	memset(&work, 0, sizeof(work));
 	detail = seal_inputs_complete(plan, diag);
+	for (uint32 i = 0; i < plan->relmap_count && detail == CLUSTER_COLD_OK; ++i)
+		if (!plan->relmap_inputs[i].captured)
+			detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 	if (detail == CLUSTER_COLD_OK)
 		detail = cold_plan_space_seal(plan, diag);
 	if (detail == CLUSTER_COLD_OK)

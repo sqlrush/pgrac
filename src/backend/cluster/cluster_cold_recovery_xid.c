@@ -108,8 +108,10 @@ cluster_cold_xid_record_v1(ClusterColdXidProgressV1 *progress,
 		|| record->prev_rec_ptr >= record->read_rec_ptr
 		|| (progress->records != 0 && record->prev_rec_ptr != progress->last_read)
 		|| record->reserved_zero != 0 || (record->record_flags & ~CLUSTER_COLD_RECORD_KNOWN_FLAGS) != 0
-		|| (record->record_flags & (CLUSTER_COLD_RECORD_UNSUPPORTED | CLUSTER_COLD_RECORD_STRUCTURAL))
-			   != 0
+		|| (record->record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED) != 0
+		|| ((record->record_flags & CLUSTER_COLD_RECORD_STRUCTURAL) != 0
+			&& !(record->rmid == RM_RELMAP_ID && record->relmap_image != NULL
+				&& record->component_count == 0 && record->space_count == 0))
 		|| (input->payload_xid != InvalidTransactionId
 			&& !TransactionIdIsNormal(input->payload_xid))
 		|| (input->checkpoint_next_xid != 0

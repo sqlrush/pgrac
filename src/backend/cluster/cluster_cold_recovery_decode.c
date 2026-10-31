@@ -38,6 +38,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "utils/relmapper.h"
+
 #include "access/heapam_xlog.h"
 #include "access/clog.h"
 #include "access/multixact.h"
@@ -71,6 +73,47 @@
 		 : repalloc_extended((pointer_), (size_), MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM))
 #define cold_ops_free(pointer_) pfree(pointer_)
 #endif
+
+/* Native bytes are copied before reading aligned fields. The complete image,
+ * including inactive slots, is retained for the declared pass-1 owner. */
+static bool
+cold_relmap_image(XLogReaderState *reader, ClusterColdDecodedV1 *out)
+{
+	xl_relmap_update header;
+	RelMapFile *map = &out->relmap_image;
+	pg_crc32c crc;
+
+	if (XLogRecGetInfo(reader) != XLOG_RELMAP_UPDATE || XLogRecHasAnyBlockRefs(reader)
+		|| reader->record->has_page_version_edge || XLogRecGetOrigin(reader) != InvalidRepOriginId
+		|| XLogRecGetData(reader) == NULL
+		|| XLogRecGetDataLen(reader) != MinSizeOfRelmapUpdate + sizeof(*map))
+		return false;
+	memcpy(&header, XLogRecGetData(reader), MinSizeOfRelmapUpdate);
+	if (header.nbytes != sizeof(*map)
+		|| (header.dbid == InvalidOid ? header.tsid != GLOBALTABLESPACE_OID
+			: header.tsid != DEFAULTTABLESPACE_OID))
+		return false;
+	memcpy(map, XLogRecGetData(reader) + MinSizeOfRelmapUpdate, sizeof(*map));
+	if (map->magic != RELMAPPER_FILEMAGIC || map->num_mappings < 0 || map->num_mappings > MAX_MAPPINGS)
+		return false;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, map, offsetof(RelMapFile, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, map->crc))
+		return false;
+	for (int i = 0; i < map->num_mappings; ++i) {
+		if (!OidIsValid(map->mappings[i].mapoid) || !OidIsValid(map->mappings[i].mapfilenumber))
+			return false;
+		for (int k = 0; k < i; ++k)
+			if (map->mappings[k].mapoid == map->mappings[i].mapoid)
+				return false;
+	}
+	out->record.relmap_dbid = header.dbid;
+	out->record.relmap_tsid = header.tsid;
+	out->record.relmap_image = map;
+	return true;
+}
+
 
 static RfPageProofDetailV1
 cold_preflight_side_record(void *arg, const RfOpcodeRouteV1 *route,
@@ -602,10 +645,12 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 		return CLUSTER_COLD_OK;
 	case RM_DBASE_ID:
 	case RM_TBLSPC_ID:
-	case RM_RELMAP_ID:
 	case RM_REPLORIGIN_ID:
 		*flags = CLUSTER_COLD_RECORD_STRUCTURAL;
 		return CLUSTER_COLD_OK;
+	case RM_RELMAP_ID:
+		*flags = CLUSTER_COLD_RECORD_STRUCTURAL;
+		return cold_relmap_image(reader, out) ? CLUSTER_COLD_OK : CLUSTER_COLD_COMPONENT_INVALID;
 	case RM_CLUSTER_XID_STRIPE_ID:
 		if (info == XLOG_CLUSTER_XID_STRIPE_JOIN) {
 			/* JOINs commute only within one activation. The readonly plan
@@ -826,6 +871,15 @@ cold_effect_routes(const RfDetachedRecordPlanV1 *plan, uint32 required, ClusterC
 	if (out->record.space_count > 0)
 		required |= CLUSTER_COLD_EFFECT_SPACE;
 	routes->required = required;
+	if (out->record.rmid == RM_RELMAP_ID && out->record.relmap_image != NULL
+		&& (flags == CLUSTER_COLD_RECORD_STRUCTURAL
+			|| flags == (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED))
+		&& required == CLUSTER_COLD_EFFECT_RECORD) {
+		/* This is a conditional route. Only an exact declared, scheduled
+		 * relmap step can discharge it; unscheduled structural records refuse. */
+		routes->participant_apply = required;
+		return;
+	}
 	if (flags & (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_UNSUPPORTED)) {
 		routes->refused = required;
 		return;
@@ -879,8 +933,9 @@ cold_xid_input(XLogReaderState *reader, ClusterColdDecodedV1 *out)
 	uint8 rmid = XLogRecGetRmid(reader);
 	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
-	if (out->record.record_flags
-		& (CLUSTER_COLD_RECORD_UNSUPPORTED | CLUSTER_COLD_RECORD_STRUCTURAL))
+	if ((out->record.record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED)
+		|| ((out->record.record_flags & CLUSTER_COLD_RECORD_STRUCTURAL)
+			&& !(rmid == RM_RELMAP_ID && out->record.relmap_image != NULL)))
 		return;
 	input.record_xid = XLogRecGetXid(reader);
 	if (rmid == RM_XACT_ID && (info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT) {

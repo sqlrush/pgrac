@@ -30,6 +30,7 @@
 #define CLUSTER_COLD_RECOVERY_PLAN_INTERNAL_H
 
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_relmap.h"
 
 #ifdef USE_CLUSTER_UNIT
 #define cold_alloc0(size_) calloc(1, (size_))
@@ -98,6 +99,14 @@ typedef struct ColdInputFrameRef {
 
 #define COLD_RECORD_HISTORY 0x01
 #define COLD_RECORD_SCHEDULED 0x02
+#define COLD_RECORD_RELMAP 0x10
+
+typedef struct ColdRelmapInput {
+	ClusterColdRelmapInputV1 input;
+	bool captured;
+	bool attempted;
+	bool applied;
+} ColdRelmapInput;
 #define COLD_RECORD_SPACE 0x04		/* first_component is its first SPACE effect */
 #define COLD_RECORD_SPACE_STEP 0x08 /* CREATE, TRUNCATE or drop after a native redo start */
 
@@ -243,7 +252,28 @@ struct ClusterColdPlanV1 {
 	Size space_scratch_bytes;
 	uint32 *schedule;
 	uint32 schedule_count;
+	ColdRelmapInput *relmap_inputs;
+	uint32 relmap_count;
+	bool relmap_failed;
 };
+
+static inline bool
+cold_relmap_cut_equal(const ClusterColdParticipantV1 *a, const ClusterColdParticipantV1 *b)
+{
+	return a->thread_id == b->thread_id && a->reserved_zero == b->reserved_zero
+		&& a->timeline == b->timeline && a->owner_incarnation == b->owner_incarnation
+		&& a->physical_lower == b->physical_lower && a->native_redo == b->native_redo
+		&& a->tail_end == b->tail_end;
+}
+
+static inline bool
+cold_relmap_frame_equal(const ClusterColdRecordFrameV1 *a, const ClusterColdRecordV1 *b)
+{
+	return a->read_rec_ptr == b->read_rec_ptr && a->end_rec_ptr == b->end_rec_ptr
+		&& a->record_crc == b->record_crc && a->rmid == b->rmid && a->info == b->info
+		&& a->source_xid == b->source_xid && a->source_top_xid == b->source_top_xid
+		&& a->page_components == b->component_count && a->space_effects == b->space_count;
+}
 
 static inline ColdRecord *
 cold_record(const ClusterColdPlanV1 *plan, uint32 index)

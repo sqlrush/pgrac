@@ -7,7 +7,8 @@
  * IDENTIFICATION
  *     src/test/cluster_unit/test_cluster_recovery_scope_startup.c
  * NOTES
- *     Installed Startup/fence and pass-1 plan construction remain fixtures.
+ *     Installed Startup/fence remain fixtures. The opt-in handoff builds
+ *     and seals its original plan from complete original ROOT scans.
  *     No scope, authority or completion state is acquired by this bridge.
  *-------------------------------------------------------------------------
  */
@@ -22,12 +23,12 @@ static uint32 scope_startup_count;
 bool
 test_scope_startup_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
 {
-	/* The native record owner uses this exact ROOT/checkpoint/fence bracket.
-	 * The general SIDE sequencer's installed plan is still a fixture here. */
 	return typed != NULL && typed->refusal == CLUSTER_COLD_OK
 		&& typed->replay_roots == scope_startup_roots && scope_startup_count == 2
 		&& typed->replay_root_count == scope_startup_count
-		&& cluster_cold_replay_window_active_v1() && cold_replay_sources_current(typed, fence);
+		&& (typed->plan == (ClusterColdPlanV1 *)typed
+			? cluster_cold_replay_window_active_v1() && cold_replay_sources_current(typed, fence)
+			: cluster_cold_typed_sources_current_v1(typed, fence));
 }
 
 bool
@@ -61,6 +62,38 @@ test_scope_startup_attach_cold(ClusterColdTypedV1 *typed, const ClusterWalInputV
 	scope_startup_count = typed->participant_count;
 	cluster_cold_replay_window_enter_v1();
 	return true;
+}
+
+ClusterColdDetailV1
+test_scope_startup_prepare_plan(ClusterColdTypedV1 *typed,
+	const ClusterWalInputV1 *sources, Size budget)
+{
+	ClusterColdDetailV1 detail;
+	ClusterColdDiagV1 diag;
+
+	if (typed == NULL || typed->plan != NULL || scope_startup_count != 0)
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	detail = cluster_cold_plan_create_v1(typed->participants,
+		typed->participant_count, budget, &typed->plan);
+	if (detail == CLUSTER_COLD_OK && !test_scope_startup_attach_cold(typed, sources))
+		detail = CLUSTER_COLD_SOURCE_GAP;
+	for (uint32 i = 0; detail == CLUSTER_COLD_OK && i < typed->participant_count; ++i) {
+		const ColdRoot *root = &scope_startup_roots[i];
+		ClusterColdScanResultV1 scan;
+
+		detail = cluster_cold_scan_root_v1(typed->plan, i, &root->root, &root->token,
+			false, i != typed->own_participant, NULL, &scan);
+		typed->scanned_records += scan.records;
+		if (detail == CLUSTER_COLD_OK
+			&& memcmp(scan.native_window, root->native_window, sizeof(scan.native_window)) != 0)
+			detail = CLUSTER_COLD_SOURCE_GAP;
+	}
+	if (detail == CLUSTER_COLD_OK)
+		detail = cluster_cold_plan_seal_v1(typed->plan, cluster_cold_observe_data_v1,
+			&typed->observer, &diag);
+	if (detail != CLUSTER_COLD_OK)
+		cold_refuse(typed, detail, "scope fixture original plan refused");
+	return detail;
 }
 
 bool
