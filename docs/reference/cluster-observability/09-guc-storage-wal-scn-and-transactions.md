@@ -741,11 +741,11 @@ SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WH
 | 单位 | — |
 | 内置短说明（与 `pg_settings.short_desc` 对应） | Hard cap of per-instance undo segment pool size. |
 
-工作原理与调节影响：限定 undo / `segments` / 上限 / 每 / `instance` 的容量或并发。调大可减少容量型拒绝但增加共享内存/进程/队列占用；调小节省资源但更容易触发回退或 fail-closed。
+工作原理与调节影响：限制本实例 undo 段池的增长上限。调大允许按需创建更多段，会增加潜在磁盘占用；不会直接增加后台进程数，也不会解除活动事务或保留历史的保护。reload 值低于已分配段数时会给出 WARNING，并以现有池大小为有效下限，不缩池或删除现有段。
 
-依赖与保护：无额外配置钩子；组合约束仍可能在启动或运行入口检查。
+依赖与保护：段池到顶时，尚未占槽的新共享事务在原安全执行上下文和清偿进展可证明时可以进入容量等待；其他分配路径或无法证明这些条件时仍可能返回原容量错误。到顶不保证立即报 `53R9E`，也不保证所有调用者都能等待。单段事务槽等待另受当前活动事务限制，增大段池上限不能保证消除此类等待。shared 配置必须保持 `cluster.undo_cleaner_enabled=on`，但开启 cleaner 不表示容量已经可复用。
 
-观察入口：`pg_cluster_state 的 undo/scn/xid_stripe/tt_* 分类`。
+观察入口：`pg_cluster_state` 的 `undo_cleaner` 容量诊断及 `pg_stat_activity` 的当前等待，见[容量等待采样](12-operations-and-query-cost.md#8-undo-容量等待采样)。
 
 ```sql
 SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WHERE name = 'cluster.undo_segments_max_per_instance';

@@ -3829,13 +3829,10 @@ cluster_init_guc(void)
 	DefineCustomIntVariable(
 		"cluster.undo_segments_max_per_instance",
 		gettext_noop("Hard cap of per-instance undo segment pool size."),
-		gettext_noop("Spec-3.8 D9. Default 256 = CLUSTER_UNDO_SEGS_PER_INSTANCE "
-					 "encoding limit (F2 codex review). Range 16..256; "
-					 "超过 256 需要 future ABI/segment-id encoding spec. "
-					 "SIGHUP reload allowed but configured value lower than current "
-					 "pool size results in WARNING + effective floor at current pool "
-					 "(no retro-shrink). Hard cap reached → SQLSTATE 53R9E "
-					 "(cluster_undo_segments_hard_cap_reached)."),
+		gettext_noop("Range 16..256. Reloading a lower limit does not shrink an existing pool. "
+					 "New shared transactions may wait at the cap when a safe execution context "
+					 "and reclamation progress can be established. Other allocation paths "
+					 "retain their existing capacity errors."),
 		&cluster_undo_segments_max_per_instance, 256, 16, 256, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(

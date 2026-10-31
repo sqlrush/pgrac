@@ -239,7 +239,24 @@
 | `undo_cleaner_last_liveness_tick_at` | 时间戳文本或 `(unset)` | undo / `cleaner` / 最近 / `liveness` / `tick`的时间戳。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `undo_cleaner_main_loop_iters` | 十进制整数文本 | undo / `cleaner` / `main` / `loop` / `iters`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 
-容量诊断的 `tt_capacity_stats_available` 表示本实例统计快照是否可用。为 `false` 时不输出下面的原因计数；为 `true` 时，`tt_capacity_origin_node_id` 标识来源，计数以无符号十进制文本输出。计数在 postmaster 重启后归零，cleaner worker 重启不清零。
+容量诊断的 `tt_capacity_stats_available` 表示本实例统计快照是否可用。为 `false` 时不输出下面的来源与计数，不能当作零；为 `true` 时，`tt_capacity_origin_node_id` 标识来源，计数以无符号十进制文本输出。计数在 postmaster 重启后归零，cleaner worker 重启不清零。
+
+| key | 含义 |
+|---|---|
+| `tt_capacity_stats_available` | `true` / `false`；本实例容量统计是否可读。 |
+| `tt_capacity_origin_node_id` | 统计的本实例来源节点号；只在统计可用时输出。 |
+| `tt_slot_active_full_wait_count` | 事务槽 native 等待路径的进入次数；包含 owner 已结束、无需实际睡眠的尝试。 |
+| `tt_capacity_pool_wait_count` | 容量 CV 等待路径的进入次数；不表示实际睡眠或成功获得容量。 |
+| `tt_capacity_wakeup_recheck_count` | 容量 CV 正常返回后的重查次数，加上 native 事务槽等待正常返回后的重查次数；ERROR 和等待前的身份漂移不计为 native 正常返回。 |
+| `tt_capacity_cancel_count` | 原容量等待路径因 `57014` 退出的次数，含已开始的 native 槽等待；`55P03`、`40P01`、`53R60` 等其他错误不计为取消。 |
+| `tt_capacity_refuse_by_reason.context` | 原安全执行上下文检查不通过的次数。 |
+| `tt_capacity_refuse_by_reason.proof` | 原等待所需证据或 owner 无法确认的拒绝次数。 |
+| `capacity_wait_entered` | 原名称；与 `tt_capacity_pool_wait_count` 同值。 |
+| `capacity_wait_repolled` | 原名称；只计容量 CV 正常返回后的重查，不含 native 槽等待返回。 |
+| `capacity_wait_refused_context` | 原名称；与 `tt_capacity_refuse_by_reason.context` 同值。 |
+| `capacity_wait_refused_proof` | 原名称；与 `tt_capacity_refuse_by_reason.proof` 同值。 |
+
+这些计数分别采样，不要求并发读取时等待、重查、取消和拒绝构成相等的总数；一次事务也可能多次进入原重查路径。重查增加不表示槽已分配或清偿已完成。查询示例见[容量等待采样](12-operations-and-query-cost.md#8-undo-容量等待采样)。
 
 | key | 含义 |
 |---|---|
