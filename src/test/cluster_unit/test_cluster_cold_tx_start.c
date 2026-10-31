@@ -66,6 +66,10 @@ static ClusterPageWalDirtyFloorV1 startup_first_floor;
 static unsigned startup_first_calls;
 static bool startup_first_available = true;
 static void (*startup_first_step)(void);
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
+#include "test_cluster_startup_first_wal.h"
+static bool startup_first_use_native;
+#endif
 
 bool
 cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source,
@@ -74,6 +78,9 @@ cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source,
 	UT_ASSERT(source != NULL && out != NULL);
 	startup_first_calls++;
 	if (startup_first_step != NULL) startup_first_step();
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
+	if (startup_first_use_native) return test_startup_first_native_scan(source, out);
+#endif
 	*out = startup_first_floor;
 	return startup_first_available;
 }
@@ -2378,9 +2385,22 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_untouched_pages.inc"
 #include "test_cluster_cold_ctrc_post_service.inc"
 #include "test_cluster_cold_ctrc_final_namespace.inc"
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
+#include "test_cluster_cold_ctrc_native_first.inc"
+#endif
 
 int main(void)
 {
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
+	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_FIRST") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_native_first_exact_clean_write_releases_only_first_reference);
+		UT_RUN(test_startup_native_first_failed_write_keeps_debt_and_cannot_revive_start);
+		UT_RUN(test_startup_native_first_foreign_and_unattributed_records_remain_obligations);
+		UT_RUN(test_startup_native_first_late_native_capture_revokes_without_reopening_fds);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+#endif
 	if (getenv("PGRAC_PRE2_TEST_FINAL_NAMESPACE") != NULL) {
 		UT_PLAN(5);
 	UT_RUN(test_startup_final_namespace_covers_completed_and_zero_page_sets);
@@ -2714,13 +2734,23 @@ int main(void)
 		return ut_failed_count == 0 ? 0 : 1;
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
+	UT_PLAN(310);
+#else
 	UT_PLAN(306);
+#endif
 	UT_RUN(test_startup_native_directory_empty_preserves_fpi_unchanged_and_zero_page);
 	UT_RUN(test_startup_native_directory_partial_lock_wait_repeats_same_fd_readback);
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
 	UT_PLAN(302);
+#endif
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
+	UT_RUN(test_startup_native_first_exact_clean_write_releases_only_first_reference);
+	UT_RUN(test_startup_native_first_failed_write_keeps_debt_and_cannot_revive_start);
+	UT_RUN(test_startup_native_first_foreign_and_unattributed_records_remain_obligations);
+	UT_RUN(test_startup_native_first_late_native_capture_revokes_without_reopening_fds);
 #endif
 	UT_RUN(test_startup_final_namespace_covers_completed_and_zero_page_sets);
 	UT_RUN(test_startup_final_namespace_refusal_keeps_same_fd_and_original_scope);

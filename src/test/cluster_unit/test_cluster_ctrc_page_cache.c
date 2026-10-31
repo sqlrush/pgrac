@@ -12,6 +12,7 @@
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "unit_test.h"
+#include "test_cluster_startup_first_wal.h"
 
 UT_DEFINE_GLOBALS();
 bool cluster_enabled = true, cluster_shared_config = true, IsUnderPostmaster = true;
@@ -21,6 +22,8 @@ volatile uint32 CritSectionCount, InterruptHoldoffCount, QueryCancelHoldoffCount
 volatile sig_atomic_t ShutdownRequestPending;
 static bool recovering, current, scope_current, page_current, mapping, locked, refuse_lock;
 static bool retire_success, drift_after_release;
+static bool native_retirement;
+static unsigned native_freelist;
 static unsigned current_calls, evictions, first_observations, mapping_calls;
 static int mapping_id;
 static ClusterPageWalFirstResultV1 first_result;
@@ -40,6 +43,13 @@ static const struct ClusterRecoveryStartV1 *const start = (const void *)256;
 static const struct ClusterColdCtrcWorkV1 *const work = (const void *)512;
 static const RfPageCtrcAuthorityV1 *const authority = (const void *)768;
 static struct ClusterWalInputsV1 *const scope = (void *)1024;
+
+int
+s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
+{
+	(void)lock; (void)file; (void)line; (void)func;
+	abort(); /* Same single-thread source-pool boundary as original Startup. */
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -116,8 +126,37 @@ ClusterPageWalFirstResultV1
 cluster_page_wal_first_observe_locked_v1(BufferDesc *buf, ClusterPageWalRefV1 *out)
 {
 	UT_ASSERT(locked && (pg_atomic_read_u32(&buf->state) & BM_LOCKED));
-	first_observations++; memset(out, 0, sizeof(*out)); return first_result;
+	first_observations++;
+	if (native_retirement) return test_startup_first_native_observe(buf, out);
+	memset(out, 0, sizeof(*out)); return first_result;
 }
+
+void
+cluster_page_wal_reset_reuse_locked(BufferDesc *buf)
+{
+	UT_ASSERT(native_retirement && locked);
+	test_startup_first_native_reuse(buf);
+}
+
+void
+BufTableDelete(BufferTag *tag, uint32 hash)
+{
+	UT_ASSERT(native_retirement && locked && mapping && hash == 7 && tag->blockNum == 7);
+	mapping = false;
+}
+
+void
+StrategyFreeBuffer(BufferDesc *buf)
+{
+	UT_ASSERT(native_retirement && !locked && !mapping);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 0);
+	UT_ASSERT_EQ(test_startup_first_native_references(), 0);
+	native_freelist++;
+}
+
+/* Exact original native tail; PCM saved-tag release is never entered by N. */
+#include "test_cluster_ctrc_cache_native_tail.inc"
+
 static bool
 InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *tag, uint32 hash,
 	LWLock *partition, uint32 state)
@@ -128,6 +167,10 @@ InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *tag, uint32 hash,
 	UT_ASSERT_EQ(first_result, CLUSTER_PAGE_WAL_FIRST_ABSENT);
 	UT_ASSERT(buf->buffer_type == BUF_TYPE_CURRENT && own.pcm_state == PCM_STATE_N);
 	evictions++;
+	if (native_retirement && retire_success) {
+		InvalidateBufferCommitTailLocked(buf, tag, hash, partition, state, 0, false);
+		return true;
+	}
 	if (retire_success) { mapping = false; ClearBufferTag(&buf->tag); state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK); }
 	UnlockBufHdr(buf, state); LWLockRelease(partition); return retire_success;
 }
@@ -141,6 +184,7 @@ fixture(void)
 {
 	BufferDesc *buf = &descriptors[0].bufferdesc;
 	memset(descriptors, 0, sizeof(descriptors)); memset(&space, 0, sizeof(space));
+	BufferDescriptors = descriptors; native_retirement = false; native_freelist = 0;
 	memset(&before, 0, sizeof(before)); memset(&own, 0, sizeof(own));
 	cluster_enabled = cluster_shared_config = IsUnderPostmaster = true;
 	MyBackendType = B_STARTUP; MyProcPid = 111;
@@ -173,7 +217,7 @@ probe(const char *expected)
 	ClusterCtrcPageCacheResultV1 result = cluster_bufmgr_ctrc_page_cache_v1(
 		start, work, authority, &space, 7, &before, expected);
 	UT_ASSERT(!locked); UT_ASSERT_EQ(InterruptHoldoffCount, 0);
-	UT_ASSERT(!(pg_atomic_read_u32(&descriptors[0].bufferdesc.state) & BM_LOCKED));
+	UT_ASSERT(!(pg_atomic_read_u32(&BufferDescriptors[0].bufferdesc.state) & BM_LOCKED));
 	return result;
 }
 UT_TEST(test_ctrc_cache_absence_observation_never_evicts)
@@ -278,10 +322,20 @@ UT_TEST(test_ctrc_cache_failed_native_eviction_does_not_claim_absence)
 	UT_ASSERT_EQ(probe(image.data), CLUSTER_CTRC_PAGE_CACHE_WAIT);
 	UT_ASSERT(mapping); UT_ASSERT_EQ(evictions, 1);
 }
+#include "test_cluster_ctrc_cache_native_retirement.inc"
+
 int
-main(void)
+main(int argc, char **argv)
 {
-	UT_PLAN(7);
+	if (argc == 2 && strcmp(argv[1], "--native-retirement") == 0) {
+		UT_PLAN(4);
+		UT_RUN(test_ctrc_native_pin_blocks_latest_source_retirement);
+		UT_RUN(test_ctrc_native_first_must_clear_before_residency_can_retire);
+		UT_RUN(test_ctrc_native_refused_image_or_owner_preserves_source);
+		UT_RUN(test_ctrc_native_late_owner_refusal_cannot_restore_retired_source);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(11);
 	UT_RUN(test_ctrc_cache_absence_observation_never_evicts);
 	UT_RUN(test_ctrc_cache_exact_clean_native_predecessor_uses_original_eviction);
 	UT_RUN(test_ctrc_cache_busy_pin_dirty_io_or_first_never_retires);
@@ -289,5 +343,9 @@ main(void)
 	UT_RUN(test_ctrc_cache_wrong_bytes_version_source_or_mapping_refuse);
 	UT_RUN(test_ctrc_cache_original_current_before_and_after_native_locks);
 	UT_RUN(test_ctrc_cache_failed_native_eviction_does_not_claim_absence);
+	UT_RUN(test_ctrc_native_pin_blocks_latest_source_retirement);
+	UT_RUN(test_ctrc_native_first_must_clear_before_residency_can_retire);
+	UT_RUN(test_ctrc_native_refused_image_or_owner_preserves_source);
+	UT_RUN(test_ctrc_native_late_owner_refusal_cannot_restore_retired_source);
 	UT_DONE(); return ut_failed_count != 0;
 }
