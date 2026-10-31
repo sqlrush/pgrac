@@ -13236,6 +13236,19 @@ test_cluster_vm_read_visibility: test_cluster_vm_read_visibility.c unit_test.h t
 		$(top_srcdir)/src/include/access/visibilitymap.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+TESTS += test_cluster_vm_report_pin test_cluster_vm_report_pin_noassert
+all: test_cluster_vm_report_pin test_cluster_vm_report_pin_noassert
+
+test_cluster_vm_report_pin.inc: $(top_srcdir)/contrib/pg_visibility/pg_visibility.c \
+		$(srcdir)/extract_vm_report_fixture.py $(srcdir)/extract_vacuum_mx_fixture.py
+	python3 $(srcdir)/extract_vm_report_fixture.py $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_report_pin test_cluster_vm_report_pin_noassert: test_cluster_vm_report_pin.c \
+		test_cluster_vm_read_visibility.c unit_test.h test_cluster_vm_report_pin.inc \
+		test_cluster_vm_read_visibility.inc $(top_srcdir)/src/include/access/visibilitymap.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # PGRAC: reuse the actual pure relation policy in existing native fixtures.
 test_cluster_heap_maintenance_policy.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
 	awk '/^cluster_heap_maintenance_restricted\(/ { print "bool"; emit=1; found++ } \

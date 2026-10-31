@@ -59,6 +59,23 @@ static bool tuple_all_visible(HeapTuple tup, TransactionId OldestXmin,
 							  Buffer buffer);
 static void check_relation_relkind(Relation rel);
 
+/* Copy diagnostic bits without holding up a shared VM holder during heap I/O. */
+static int32
+visibilitymap_get_status_for_report(Relation rel, BlockNumber blkno,
+									Buffer *vmbuffer)
+{
+	int32		mapbits = (int32) visibilitymap_get_status(rel, blkno, vmbuffer);
+
+	if (cluster_heap_maintenance_restricted(rel) && BufferIsValid(*vmbuffer))
+	{
+		Buffer		buffer = *vmbuffer;
+
+		*vmbuffer = InvalidBuffer;
+		ReleaseBuffer(buffer);
+	}
+	return mapbits;
+}
+
 /*
  * Visibility map information for a single block of a relation.
  *
@@ -90,7 +107,7 @@ pg_visibility_map(PG_FUNCTION_ARGS)
 
 	tupdesc = pg_visibility_tupdesc(false, false);
 
-	mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+	mapbits = visibilitymap_get_status_for_report(rel, blkno, &vmbuffer);
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 	values[0] = BoolGetDatum((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0);
@@ -131,7 +148,7 @@ pg_visibility(PG_FUNCTION_ARGS)
 
 	tupdesc = pg_visibility_tupdesc(false, true);
 
-	mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+	mapbits = visibilitymap_get_status_for_report(rel, blkno, &vmbuffer);
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 	values[0] = BoolGetDatum((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0);
@@ -280,7 +297,7 @@ pg_visibility_map_summary(PG_FUNCTION_ARGS)
 		CHECK_FOR_INTERRUPTS();
 
 		/* Get map info. */
-		mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+		mapbits = visibilitymap_get_status_for_report(rel, blkno, &vmbuffer);
 		if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
 			++all_visible;
 		if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
@@ -513,7 +530,7 @@ collect_visibility_data(Oid relid, bool include_pd)
 		CHECK_FOR_INTERRUPTS();
 
 		/* Get map info. */
-		mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+		mapbits = visibilitymap_get_status_for_report(rel, blkno, &vmbuffer);
 		if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
 			info->bits[blkno] |= (1 << 0);
 		if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
