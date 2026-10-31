@@ -28,6 +28,9 @@
 #define TEST_CLUSTER_COLD_RECOVERY_IO_BOUNDARY_H
 
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_cold_relmap.h"
+#include "catalog/pg_tablespace_d.h"
+#include "utils/relmapper.h"
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
@@ -36,6 +39,16 @@
 #include "postmaster/bgwriter.h"
 
 /* ---- process and memory boundaries ---- */
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
 volatile sig_atomic_t InterruptPending = false;
 static uint32 wait_event_slot;
 uint32 *my_wait_event_info = &wait_event_slot;
@@ -336,6 +349,10 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ex
 
 
 static int side_capture_token, side_capture_calls, side_capture_fail_at;
+static int relmap_capture_calls;
+static bool relmap_capture_throw;
+static const ClusterColdRelmapInputV1 *decode_relmap;
+static ClusterColdRelmapInputV1 captured_relmap;
 static RfPageOnlineRecordIdentityV1 captured_identity[4];
 static RfPageProofDetailV1 side_capture_refusal;
 
@@ -351,6 +368,21 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan, const RfDetachedRec
 	captured_identity[side_capture_calls++] = *identity;
 	return side_capture_calls == side_capture_fail_at ? side_capture_refusal
 													  : RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_feed_relmap_v1(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record,
+	const RfPageOnlineRecordIdentityV1 *identity, const ClusterColdRelmapInputV1 *input)
+{
+	UT_ASSERT(input != NULL);
+	++relmap_capture_calls;
+	captured_relmap = *input;
+	{
+		RfPageProofDetailV1 result = rf_side_online_plan_feed_record_v1(plan, record, identity);
+		if (relmap_capture_throw)
+			siglongjmp(*PG_exception_stack, 1);
+		return result;
+	}
 }
 
 ClusterControlRootResult
@@ -413,6 +445,14 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	out->record.info = 0x10;
 	out->record.record_crc = 0x9876;
 	out->record.record_flags = decode_record_flags[i];
+	if (decode_relmap != NULL && reader->ReadRecPtr == decode_relmap->frame.read_rec_ptr) {
+		out->record.rmid = RM_RELMAP_ID;
+		out->record.info = XLOG_RELMAP_UPDATE;
+		out->record.source_xid = decode_relmap->frame.source_xid;
+		out->record.relmap_image = &decode_relmap->staged.pending;
+		out->record.relmap_dbid = decode_relmap->staged.identity.dbid;
+		out->record.relmap_tsid = GLOBALTABLESPACE_OID;
+	}
 	out->xid_input = decode_xid_input[i];
 	out->detached.source_record = reader;
 	out->detached.preflight_complete = true;

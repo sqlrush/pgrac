@@ -142,6 +142,22 @@ extern RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
 								   const RfPageOnlineRecordIdentityV1 *identity);
+/* Explicit externally owned cold relmap input, after the original cold plan
+ * captured its declaration. Retains full native header/MAIN within this plan's
+ * budget. The ordinary feed keeps refusing relmap. This is not a SIDE no-op:
+ * original merged replay owns its execution and final receipt. Whole-source
+ * SIDE apply refuses while these external obligations exist; selected SIDE
+ * records retain their original preflights and never publish completion. */
+struct ClusterColdRelmapInputV1;
+extern RfPageProofDetailV1 rf_side_online_plan_feed_relmap_v1(RfSideOnlinePlanV1 *plan,
+	const RfDetachedRecordPlanV1 *record_plan, const RfPageOnlineRecordIdentityV1 *identity,
+	const struct ClusterColdRelmapInputV1 *input);
+/* Sealed bound RECOVERY input only; UINT32_MAX on unavailable source/plan.
+ * No I/O, execution, FullXid-era, physical lifetime or completion authority. */
+extern uint32 rf_side_online_plan_relmap_count_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source);
+extern bool rf_side_online_plan_relmap_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader);
 /* Exact same-source native MAIN CREATE / typed CREATE pair. This is an
  * immutable dependency lookup, never an execution or file-existence proof. */
 extern bool rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,

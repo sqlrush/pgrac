@@ -38,6 +38,17 @@ typedef struct ClusterColdRelmapInputV1 {
 extern ClusterColdDetailV1 cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
 	const ClusterColdRelmapInputV1 *inputs, uint32 count);
 
+/* Original source obligation, including declarations not reached yet.
+ * Failure invalidation is sticky and cannot grant capture or execution. */
+extern bool cluster_cold_plan_relmap_required_v1(const ClusterColdPlanV1 *plan,
+	uint32 participant);
+extern void cluster_cold_plan_relmap_invalidate_v1(ClusterColdPlanV1 *plan);
+
+/* Borrowed read-only declaration only after this exact pass-1 record was
+ * captured. Valid until plan destruction; no pin, execution or lifetime grant. */
+extern const ClusterColdRelmapInputV1 *cluster_cold_plan_relmap_captured_v1(
+	const ClusterColdPlanV1 *plan, uint32 participant, const ClusterColdRecordV1 *record);
+
 /* Explicit original-owner input before pass-1. The ordinary prepare entry
  * supplies no declaration and retains the original structural refusal. */
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_relmap_v1(
