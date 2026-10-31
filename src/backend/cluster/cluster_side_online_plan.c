@@ -1957,10 +1957,10 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 
 /* Reconstruct only the selected record's causal prefix. The sealed source and
  * all retained ownership remain unchanged; this returns no replay authority. */
-RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_record_input_header_v1(
-	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
-	const char *base, RfSideUndoHeaderImageV1 *out)
+static RfPageProofDetailV1
+side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
+	const RfPageOnlineRecordIdentityV1 *identity, const char *base, bool header_only,
+	bool allow_history, RfSideUndoHeaderImageV1 *out)
 {
 	const RfSideOnlineOperationV1 *operation;
 	RfSideOnlinePlanV1 prefix;
@@ -1972,20 +1972,29 @@ rf_side_online_plan_prepare_undo_record_input_header_v1(
 		|| index >= plan->operation_count)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	operation = &plan->operations[index];
-	if (operation->purpose != RF_SIDE_PLAN_RECOVERY || identity->reserved_zero != 0
+	if ((operation->history_only && !allow_history) || operation->purpose != RF_SIDE_PLAN_RECOVERY
+		|| identity->reserved_zero != 0
 		|| identity->participant_index != operation->identity.participant_index
 		|| memcmp(&identity->record, &operation->identity.record, sizeof(identity->record)) != 0
 		|| rf_side_online_plan_origin_operation_count_v1(plan, identity->record.origin_thread)
 			   == UINT32_MAX)
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	/* Bound only a private view, after validating the complete original source. */
+	prefix = *plan;
+	prefix.operation_count = index + 1;
 	if (operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO) {
 		instance = operation->undo.instance;
 		segment = operation->undo.segment_id;
+		if (!header_only
+			&& (operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				|| operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI))
+			return rf_side_online_plan_prepare_undo_block_v1(&prefix, instance, segment,
+				operation->undo.block_no, out);
 	} else if (operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
 			   && operation->xact.kind == RF_SIDE_XACT_COMMIT && operation->xact.has_tt_delta) {
 		instance = operation->xact.tt_delta.instance;
 		segment = operation->xact.tt_delta.segment_id;
-	} else if (operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
+	} else if (header_only && operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
 			   && operation->xact.kind == RF_SIDE_XACT_ABORT) {
 		RfSideOnlineOperationV1 exported;
 		ClusterUndoDecoded target;
@@ -1997,11 +2006,61 @@ rf_side_online_plan_prepare_undo_record_input_header_v1(
 		segment = target.segment_id;
 	} else
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-	/* Validate the complete original source above before bounding reconstruction.
-	 * Neither a later full image nor a terminal can supply this prefix's base. */
-	prefix = *plan;
-	prefix.operation_count = index + 1;
+	/* A later full image or terminal cannot supply this prefix's base. */
 	return rf_side_online_plan_prepare_undo_header_v1(&prefix, instance, segment, base, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+	const RfPageOnlineRecordIdentityV1 *identity, const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, false, false, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+	const RfPageOnlineRecordIdentityV1 *identity, const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, true, false, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_record_input_header_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	return side_plan_prepare_undo_record(plan, index, identity, base, true, true, out);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+	const RfPageOnlineRecordIdentityV1 *identity, RfSideUndoBlockImageV1 *out)
+{
+	const RfSideOnlineOperationV1 *op;
+	RfSideOnlinePlanV1 prefix;
+	uint32 segment, block;
+	uint16 slot, row;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || plan->failed
+		|| plan->purpose != RF_SIDE_PLAN_RECOVERY || index >= plan->operation_count
+		|| identity == NULL || out == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	op = &plan->operations[index];
+	if (op->history_only || op->purpose != RF_SIDE_PLAN_RECOVERY
+		|| op->kind != RF_SIDE_ONLINE_OPERATION_UNDO
+		|| op->undo.kind != CLUSTER_UNDO_KIND_TT_SET_HEAD || identity->reserved_zero != 0
+		|| identity->participant_index != op->identity.participant_index
+		|| memcmp(&identity->record, &op->identity.record, sizeof(identity->record)) != 0
+		|| rf_side_online_plan_origin_operation_count_v1(plan, identity->record.origin_thread)
+			   == UINT32_MAX
+		|| !(op->undo.format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+				 ? cluster_undo_preflight_tt_v2(&op->undo) : cluster_undo_preflight(&op->undo))
+		|| !uba_decode_record(op->undo.first_undo_block, &segment, &block, &slot, &row))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	/* Only DATA before the selected head can prove that head's predecessor. */
+	prefix = *plan;
+	prefix.operation_count = index;
+	return rf_side_online_plan_prepare_undo_block_v1(&prefix, op->undo.instance, segment, block, out);
 }
 
 typedef struct SideSpaceSourceInput {

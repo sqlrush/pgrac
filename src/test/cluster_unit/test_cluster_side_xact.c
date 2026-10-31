@@ -5866,10 +5866,153 @@ UT_TEST(test_tt40_causal_input_never_borrows_a_missing_predecessor)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+/* Selected TT40 records use only the original immutable causal prefix. */
+static RfSideOnlinePlanV1 *
+tt40_record_head_plan(bool future_only, bool history)
+{
+	XLogRecPtr end = 600;
+	RfSideOnlinePlanV1 *plan = space_online_plan_redo(end, history ? &end : NULL);
+	FakeXactRecord fake;
+	struct {
+		xl_undo_block_write record;
+		uint8 bytes[BLCKSZ];
+	} image = { 0 };
+	xl_undo_tt_slot_set_head_v2 head = { .identity = { .segment_id = 513,
+		.segment_generation = 0, .xid = 802, .slot_offset = 4, .wrap = 7,
+		.instance = 3, .format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION,
+		.original_full_xid = (UINT64_C(7) << 32) | 802 },
+		.first_undo_block = { .raw = { UINT64_C(513) | (UINT64_C(9) << 32), 4 } } };
+
+	tt40_side_exact(&fake, XLOG_UNDO_TT_SLOT_BIND, head.identity.original_full_xid, 0);
+	undo_header_feed(plan, &fake, 100);
+	tt40_side_exact(&fake, XLOG_UNDO_TT_SLOT_ABORT, head.identity.original_full_xid, 0);
+	undo_header_feed(plan, &fake, 200);
+	image.record.instance = 3;
+	image.record.segment_id = 513;
+	image.record.block_no = 9;
+	image.record.has_fpi = 1;
+	memset(image.bytes, 0x31, BLCKSZ);
+	if (future_only)
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD,
+			&head, sizeof(head));
+	else
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
+			&image, sizeof(image));
+	undo_header_feed(plan, &fake, 300);
+	if (future_only)
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
+			&image, sizeof(image));
+	else
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD,
+			&head, sizeof(head));
+	undo_header_feed(plan, &fake, 400);
+	memset(image.bytes, 0x52, BLCKSZ);
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
+		&image, sizeof(image));
+	undo_header_feed(plan, &fake, 500);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_tt40_selected_record_keeps_causal_header_and_history_boundary)
+{
+	for (unsigned history = 0; history < 2; history++) {
+		RfSideOnlinePlanV1 *plan = tt40_side_plan(history != 0, 0, true);
+		RfSideOnlineOperationV1 operation;
+		RfSideUndoHeaderImageV1 image, saved;
+
+		memset(&saved, 0x79, sizeof(saved));
+		for (uint32 i = 1; i < 4; i++) {
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, i, &operation));
+			image = saved;
+			UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_header_v1(plan, i,
+				&operation.identity, NULL, &image) == RF_PAGE_PROOF_DETAIL_OK, history == 0);
+			if (history)
+				UT_ASSERT(memcmp(&image, &saved, sizeof(image)) == 0);
+			else {
+				const TTSlotV2 *slot = &((const UndoSegmentHeaderDataV2 *)image.page.data)->tt_slots[4];
+
+				UT_ASSERT_EQ(slot->status, i == 1 ? TT_SLOT_ACTIVE : TT_SLOT_ABORTED);
+				UT_ASSERT_EQ(slot->original_full_xid, (UINT64_C(7) << 32) | 802);
+				UT_ASSERT_EQ(image.source_index, i == 1 ? 1 : 2);
+			}
+			image = saved;
+			UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, i,
+				&operation.identity, NULL, &image) == RF_PAGE_PROOF_DETAIL_OK,
+				history == 0 && i != 3);
+			if (history || i == 3)
+				UT_ASSERT(memcmp(&image, &saved, sizeof(image)) == 0);
+		}
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 4);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_tt40_selected_head_reads_only_preceding_exact_data)
+{
+	RfSideOnlinePlanV1 *plan = tt40_record_head_plan(false, false);
+	RfSideOnlineOperationV1 operation;
+	RfSideUndoBlockImageV1 before, selected, whole;
+	RfSideUndoHeaderImageV1 header;
+	PGAlignedBlock base;
+
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(513, 3, base.data));
+	UT_ASSERT(cluster_undo_segment_header_seal(base.data));
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 3, &operation));
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_head_block_v1(plan, 3,
+		&operation.identity, &before), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(before.source_index, 2);
+	UT_ASSERT_EQ(before.operation_count, 1);
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, 2,
+		/* The DATA record carries its own complete original identity. */
+		&(RfPageOnlineRecordIdentityV1){ 0 }, NULL, &selected),
+		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 2, &operation));
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, 2,
+		&operation.identity, NULL, &selected), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(before.page.data, selected.page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_block_v1(plan, 3, 513, 9, &whole),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(whole.source_index, 4);
+	UT_ASSERT(memcmp(before.page.data, whole.page.data, BLCKSZ) != 0);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 3, &operation));
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, 3,
+		&operation.identity, base.data, &header), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)header.page.data)->tt_slots[4].status,
+		TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)header.page.data)->tt_slots[4].original_full_xid,
+		(UINT64_C(7) << 32) | 802);
+	UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 5);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_tt40_selected_head_refuses_history_future_and_changed_identity)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		RfSideOnlinePlanV1 *plan = tt40_record_head_plan(fault == 0, fault == 1);
+		uint32 index = fault == 0 ? 2 : 3;
+		RfSideOnlineOperationV1 operation;
+		RfSideUndoBlockImageV1 image, saved;
+
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, index, &operation));
+		if (fault == 2) operation.identity.record.record_crc++;
+		if (fault == 3) operation.identity.record.origin_thread++;
+		if (fault == 4) operation.identity.participant_index++;
+		if (fault == 5) operation.identity.reserved_zero = 1;
+		memset(&saved, 0x69, sizeof(saved));
+		image = saved;
+		UT_ASSERT_NE(rf_side_online_plan_prepare_undo_head_block_v1(plan, index,
+			&operation.identity, &image), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(&image, &saved, sizeof(image)) == 0);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 5);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(86);
+	UT_PLAN(89);
 	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
 	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
@@ -5956,6 +6099,9 @@ main(void)
 	UT_RUN(test_tt40_native_abort_pair_refuses_raw_reincarnation_and_carrier_drift);
 	UT_RUN(test_tt40_causal_input_preserves_bind_before_later_abort);
 	UT_RUN(test_tt40_causal_input_never_borrows_a_missing_predecessor);
+	UT_RUN(test_tt40_selected_record_keeps_causal_header_and_history_boundary);
+	UT_RUN(test_tt40_selected_head_reads_only_preceding_exact_data);
+	UT_RUN(test_tt40_selected_head_refuses_history_future_and_changed_identity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

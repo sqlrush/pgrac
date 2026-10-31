@@ -201,6 +201,18 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8
 extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_record_input_header_v1(
 	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
 	const char *base, RfSideUndoHeaderImageV1 *out);
+/* Selected replay excludes history. Header-only reads may cover a native
+ * ABORT, but DATA and head reads stay within its exact retained prefix.
+ * The original owner retains authority, installation and durability. */
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_record_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out);
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_record_header_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out);
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_head_block_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	RfSideUndoBlockImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 typedef struct RfSideSpaceContributionV1 {
 	ClusterSpaceIdentity result;
