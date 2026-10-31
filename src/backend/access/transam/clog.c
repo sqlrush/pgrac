@@ -867,6 +867,32 @@ clog_recovery_cache_discard_page(SlruCtl ctl, int page)
 	LWLockRelease(shared->ControlLock);
 }
 
+/* A successful terminal read/write consumed its targets from disk. Only
+ * untouched clean FULL slots retain their actual native initialization input;
+ * cache residency does not certify era or continuous physical lifetime.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+clog_recovery_cache_discard_unknown(SlruCtl ctl)
+{
+	SlruShared shared = ctl->shared;
+
+	if (!LWLockHeldByMe(shared->ControlLock))
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	for (int slot = 0; slot < shared->num_slots; slot++) {
+		if (shared->page_status[slot] == SLRU_PAGE_VALID
+			&& !shared->page_dirty[slot] && shared->page_initial_full_xid[slot] != 0)
+			continue;
+		if ((shared->page_status[slot] == SLRU_PAGE_READ_IN_PROGRESS
+			 || shared->page_status[slot] == SLRU_PAGE_WRITE_IN_PROGRESS)
+			&& LWLockHeldByMe(&shared->buffer_locks[slot].lock))
+			LWLockRelease(&shared->buffer_locks[slot].lock);
+		shared->page_status[slot] = SLRU_PAGE_EMPTY;
+		shared->page_initial_full_xid[slot] = 0;
+		shared->page_dirty[slot] = false;
+	}
+	LWLockRelease(shared->ControlLock);
+}
+
 static bool
 clog_native_directory_ready(int origin)
 {
@@ -1884,7 +1910,7 @@ clog_recovery_page(int origin, int page, TransactionId top, int count,
 	int slot;
 	bool ok;
 
-	clog_recovery_cache_discard(ctl);
+	clog_recovery_cache_discard_page(ctl, page);
 	if (!clog_recovery_terminal_directory_ready(origin, top, count, status)
 		|| !clog_recovery_page_identity(ctl, page, &before))
 		return false;
@@ -1972,6 +1998,7 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 {
 	volatile bool locked = false;
 	volatile bool ok = false;
+	volatile bool finished = false;
 	LWLock *lock;
 	TransactionId previous = xid;
 
@@ -1996,15 +2023,33 @@ clog_recovery_access(int origin, TransactionId xid, int nsubxids, const Transact
 		else {
 			LWLockAcquire(lock, LW_EXCLUSIVE);
 			locked = true;
-			clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
 			if (clog_recovery_terminal_directory_ready(origin, xid, nsubxids, status))
 				ok = clog_recovery_tree(origin, xid, nsubxids, subxids, status, verify);
 		}
+		finished = true;
 	}
 	PG_FINALLY();
 	{
 		if (locked) {
-			clog_recovery_cache_discard(&ClogRecoveryCtl[origin]);
+			SlruCtl ctl = &ClogRecoveryCtl[origin];
+
+			if (finished && ok)
+				clog_recovery_cache_discard_unknown(ctl);
+			else {
+				/* ERROR clears holdoffs for locks still owned by native I/O. */
+				if (!finished) {
+					if (LWLockHeldByMe(ctl->shared->ControlLock))
+						HOLD_INTERRUPTS();
+					for (int slot = 0; slot < ctl->shared->num_slots; slot++)
+						if ((ctl->shared->page_status[slot] == SLRU_PAGE_READ_IN_PROGRESS
+							 || ctl->shared->page_status[slot] == SLRU_PAGE_WRITE_IN_PROGRESS)
+							&& LWLockHeldByMe(&ctl->shared->buffer_locks[slot].lock))
+							HOLD_INTERRUPTS();
+				}
+				clog_recovery_cache_discard(ctl);
+			}
+			if (!finished)
+				HOLD_INTERRUPTS();
 			LWLockRelease(lock);
 		}
 		if (!verify)
