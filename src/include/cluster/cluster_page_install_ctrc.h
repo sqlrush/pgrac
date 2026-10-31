@@ -427,7 +427,10 @@ typedef struct RfPageCtrcOwnerGraphEntryV1 {
  * for that current ITL. Current tuple xmin/xmax/plain-lock fields require ALL
  * same-page/version ITLs with original full T and a byte-exact native whole
  * projection. Every field is selected together or the WHOLE tuple remains
- * unresolved. MX/HOT/history/no-storage references remain unresolved. Neither
+ * unresolved. Current HOT pages require complete items/slots and original
+ * whole-page projection/topology before connecting exact xmax -> xmin fields;
+ * the pair must retain the same canonical T and actual DATA identity.
+ * MX/history/no-storage references remain unresolved. Neither
  * API supplies a complete graph, history/first/pin retirement or D0 verdict. */
 typedef struct RfPageCtrcOwnerGraphV1 {
 	RfPageProofDetailV1 detail;

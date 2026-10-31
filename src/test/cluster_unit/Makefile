@@ -10971,3 +10971,5 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_projected_graph.inc test_clus
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_graph_contribution.inc
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_tuple_graph.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_hot_graph.inc

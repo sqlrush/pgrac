@@ -336,7 +336,11 @@ extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageOwnerGraph(
  * owner. Current tuple xmin/xmax/plain-lock fields use the complete same-page
  * original ITL set's full identities, exact item/payload snapshot and original
  * whole native projector; kind2 references those proven ITLs. All fields of a
- * tuple contribute together. Historical/FREE/MX/HOT/unmatched references remain
+ * tuple contribute together. Current HOT pages additionally require EVERY
+ * original item and all eight slots to reproduce the actual whole after-image
+ * under the original native topology; exact same-page xmax -> xmin links use
+ * the same full canonical T. A missing/changed member leaves its page's tuple
+ * contributions unresolved. Historical/FREE/MX/unmatched references remain
  * unresolved. Complete tuple bytes and all output arrays are budgeted before
  * the first PAGE and rechecked with original source/terminal identity at return.
  * Return canonical nodes/edges and unique current-reference roots in the

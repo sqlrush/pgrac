@@ -2512,6 +2512,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_graph_contribution.inc"
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #include "test_cluster_cold_ctrc_tuple_graph.inc"
+#include "test_cluster_cold_ctrc_hot_graph.inc"
 #endif
 
 #include "test_cluster_cold_ctrc_page_raw.inc"
@@ -2519,6 +2520,14 @@ static void startup_local_empty_reset(void);
 int main(void)
 {
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (getenv("PGRAC_PRE2_TEST_HOT_GRAPH") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_start_hot_graph_binds_complete_native_current_chains);
+		UT_RUN(test_start_hot_graph_missing_or_changed_member_keeps_entire_chain);
+		UT_RUN(test_start_hot_graph_late_change_wait_error_preserves_whole_debt);
+		UT_RUN(test_start_hot_graph_budget_observation_and_history_keep_original_gates);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_TUPLE_GRAPH") != NULL) {
 		UT_PLAN(6);
 		UT_RUN(test_start_tuple_graph_uses_complete_native_tuple_and_original_itl_identity);
@@ -3086,7 +3095,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(431);
+	UT_PLAN(435);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3097,8 +3106,12 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(414);
+	UT_PLAN(418);
 #endif
+	UT_RUN(test_start_hot_graph_binds_complete_native_current_chains);
+	UT_RUN(test_start_hot_graph_missing_or_changed_member_keeps_entire_chain);
+	UT_RUN(test_start_hot_graph_late_change_wait_error_preserves_whole_debt);
+	UT_RUN(test_start_hot_graph_budget_observation_and_history_keep_original_gates);
 	UT_RUN(test_start_tuple_graph_uses_complete_native_tuple_and_original_itl_identity);
 	UT_RUN(test_start_tuple_graph_missing_ambiguous_and_unproved_itls_keep_whole_item);
 	UT_RUN(test_start_tuple_graph_rejects_changed_bytes_layout_and_unsupported_fields);

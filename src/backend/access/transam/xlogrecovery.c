@@ -3666,20 +3666,98 @@ cluster_recovery_cold_page_tuple_bytes_current(const ClusterRecoveryCensusRefere
 	return true;
 }
 
+/* A HOT page is one complete native topology. Restore EVERY original item
+ * and all eight slots before projection; one tuple mixed into an after-image
+ * cannot prove its neighbours. The complete actual after-image remains the
+ * DATA witness, never this private scratch. Ordinary non-HOT inputs retain
+ * their existing per-tuple contract. */
+static bool
+cluster_recovery_cold_page_hot_projection(const ClusterRecoveryCensusReferenceV1 *references,
+	uint32 count, uint32 index, const Size *tuple_offsets, const char *tuple_bytes,
+	const ClusterItlSlotData *slots, const RfPageCtrcOwnerEvidenceV1 *proof,
+	const ClusterColdTtSlotInputV1 *terminals, uint32 terminal_count, PGAlignedBlock *scratch)
+{
+	const ClusterRecoveryCensusReferenceV1 *reference = &references[index];
+	Page page = (Page)proof->completed.owner.image.data;
+	PageHeader header = (PageHeader)page;
+	uint8 seen[MaxHeapTuplesPerPage] = {0};
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	bool hot = false;
+	ClusterCtrcItlCleanoutApplyResult result;
+
+	/* Missing references cannot erase topology in the actual owner image.
+	 * Inspect that complete PAGE as well as the supplied current members. */
+	if (maxoff > MaxHeapTuplesPerPage) return false;
+	for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++) {
+		ItemId item = PageGetItemId(page, i);
+		Size offset = ItemIdGetOffset(item), length = ItemIdGetLength(item);
+		HeapTupleHeaderData h;
+		if (!ItemIdIsNormal(item)) continue;
+		if (offset < header->pd_upper || offset > header->pd_special
+			|| length < SizeofHeapTupleHeader || length > header->pd_special - offset) return false;
+		memcpy(&h, page + offset, SizeofHeapTupleHeader);
+		if ((h.t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) != 0) hot = true;
+	}
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *candidate = &references[i];
+		HeapTupleHeaderData h;
+		if (candidate->page_index != reference->page_index || candidate->version != 0
+			|| candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+			|| candidate->entry.tuple_length < SizeofHeapTupleHeader) continue;
+		memcpy(&h, tuple_bytes + tuple_offsets[i], SizeofHeapTupleHeader);
+		if ((h.t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) != 0) hot = true;
+	}
+	if (!hot) return true;
+	*scratch = proof->completed.owner.image;
+	memcpy(scratch->data + header->pd_special, slots,
+		CLUSTER_ITL_INITRANS_DEFAULT * sizeof(*slots));
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *candidate = &references[i];
+		const ClusterRecoveryHeapEntry *entry = &candidate->entry;
+		Size offset;
+		if (candidate->page_index != reference->page_index || candidate->version != 0
+			|| entry->kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (entry->index < FirstOffsetNumber || entry->index > maxoff
+			|| seen[entry->index - 1] != 0
+			|| memcmp(&entry->item, PageGetItemId(page, entry->index), sizeof(entry->item)) != 0)
+			return false;
+		seen[entry->index - 1] = 1;
+		if (!ItemIdHasStorage(&entry->item)) {
+			if (entry->tuple_length != 0 || entry->tuple_bytes != NULL) return false;
+			continue;
+		}
+		offset = ItemIdGetOffset(&entry->item);
+		if (!ItemIdIsNormal(&entry->item) || offset < header->pd_upper || offset > header->pd_special
+			|| entry->tuple_length != ItemIdGetLength(&entry->item)
+			|| entry->tuple_length > header->pd_special - offset
+			|| !cluster_ctrc_recovery_heap_tuple_itl_references_v1(slots,
+				tuple_bytes + tuple_offsets[i], entry->tuple_length)) return false;
+		memcpy(scratch->data + offset, tuple_bytes + tuple_offsets[i], entry->tuple_length);
+	}
+	for (OffsetNumber i = 0; i < maxoff; i++) if (seen[i] == 0) return false;
+	result = cluster_ctrc_recovery_itl_page_image_v1(terminals, terminal_count,
+		scratch->data, scratch->data);
+	return (result == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN || result == CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL)
+		&& memcmp(scratch->data, proof->completed.owner.image.data, BLCKSZ) == 0
+		&& cluster_ctrc_recovery_heap_hot_references_v1(scratch->data, proof->completed.owner.blockno);
+}
+
 /* A current tuple has no independent canonical T in the census. Resolve its
  * fields ONLY through the complete original same-page/version ITLs, each
  * already joined to a full forest T and actual PAGE owner above. Replaying
  * all those original slots and this complete tuple into private scratch must
  * reproduce the WHOLE actual after-image. Scratch is never DATA/base evidence.
- * Select every field before publishing any; history/MX/HOT remain unresolved. */
+ * Select every field before publishing any; history/MX remain unresolved. */
 static uint16
 cluster_recovery_cold_page_tuple_fields(const ClusterRecoveryCensusReferenceV1 *references,
-	uint32 reference_count, uint32 index, const char *bytes, const RfPageCtrcOwnerGraphEntryV1 *entries,
+	uint32 reference_count, uint32 index, const Size *tuple_offsets, const char *tuple_bytes,
+	const RfPageCtrcOwnerGraphEntryV1 *entries,
 	const volatile RfPageCtrcOwnerReferencesV1 *related, const ClusterColdTtSlotInputV1 *terminals,
 	uint32 terminal_count, uint32 fields[2], Size offsets[2])
 {
 	const ClusterRecoveryCensusReferenceV1 *reference = &references[index];
 	const ClusterRecoveryHeapEntry *entry = &reference->entry;
+	const char *bytes = tuple_bytes + tuple_offsets[index];
 	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
 	uint32 indexes[CLUSTER_ITL_INITRANS_DEFAULT], seen = 0, owner = UINT32_MAX;
 	HeapTupleHeaderData header;
@@ -3712,8 +3790,7 @@ cluster_recovery_cold_page_tuple_fields(const ClusterRecoveryCensusReferenceV1 *
 	if (seen != (UINT32_C(1) << CLUSTER_ITL_INITRANS_DEFAULT) - 1 || owner == UINT32_MAX
 		|| !cluster_ctrc_recovery_heap_tuple_itl_references_v1(slots, bytes, entry->tuple_length)) return 0;
 	memcpy(&header, bytes, SizeofHeapTupleHeader);
-	if ((tuple->t_infomask & HEAP_MOVED) != 0
-		|| (tuple->t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) != 0) return 0;
+	if ((tuple->t_infomask & HEAP_MOVED) != 0) return 0;
 	if (!HeapTupleHeaderXminFrozen(tuple) && HeapTupleHeaderGetRawXmin(tuple) != BootstrapTransactionId
 		&& HeapTupleHeaderGetRawXmin(tuple) != FrozenTransactionId) {
 		uint32 selected = UINT32_MAX;
@@ -3741,6 +3818,8 @@ cluster_recovery_cold_page_tuple_fields(const ClusterRecoveryCensusReferenceV1 *
 	}
 	if (count == 0) return 0;
 	proof = &related->owners.entries[owner]; page = (const PageHeaderData *)proof->completed.owner.image.data;
+	if (!cluster_recovery_cold_page_hot_projection(references, reference_count, index,
+		tuple_offsets, tuple_bytes, slots, proof, terminals, terminal_count, &scratch)) return 0;
 	offset = ItemIdGetOffset(&entry->item);
 	if (entry->index > PageGetMaxOffsetNumber((Page)page)
 		|| memcmp(&entry->item, PageGetItemId((Page)page, entry->index), sizeof(entry->item)) != 0
@@ -3769,7 +3848,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	ClusterColdTtSlotInputV1 *terminals;
 	ClusterRecoveryCTRCGraphNodeV2 *nodes;
 	ClusterRecoveryCTRCGraphEdgeV2 *edges;
-	size_t *roots, *reference_nodes;
+	size_t *roots, *reference_nodes, *tuple_nodes;
 	Size *tuple_offsets;
 	char *tuple_bytes;
 	ClusterRecoveryCTRCGraphV2 contribution = {0};
@@ -3781,6 +3860,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	Size edge_offset, effect_offset, indexes_offset, data_offset, terminal_offset, key_capacity, stride, scratch;
 	Size graph_node_offset = 0, graph_edge_offset = 0, graph_root_offset = 0;
 	Size tuple_offsets_offset = 0, tuple_bytes_offset = 0, tuple_key_offset = 0, reference_node_offset = 0;
+	Size tuple_node_offset = 0;
 	Size tuple_length = 0;
 	const Size reference_capacity = MAXPGPATH + 105;
 	uint32 reference_count, owner_count, source_count, wal_count, terminal_count, edge_count = 0, max_edges = 0;
@@ -3800,7 +3880,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	terminal_count = projected ? work->counts.subject_count : 0;
 	out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	if (owner_count == 0 || source_count == 0 || source_count > RF_PAGE_STABLE_MAX_PARTICIPANTS) goto refused;
-	if (projected && reference_count > UINT32_MAX / 2) {
+	if (projected && reference_count > UINT32_MAX / 3) {
 		out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
 	}
 	if (projected) {
@@ -3839,7 +3919,8 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 		+ sizeof(ClusterRecoveryPageWalV1) + sizeof(ClusterRecoveryCTRCOwnerEffectV2)
 		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryWalSourceObservationV1) + 128
 		+ sizeof(accepted) + (projected ? 5 * BLCKSZ + sizeof(ClusterRecoveryCensusReferenceV1)
-			+ sizeof(HeapTupleHeaderData) + CLUSTER_ITL_INITRANS_DEFAULT * (sizeof(ClusterItlSlotData) + sizeof(uint32)) : 0);
+			+ 2 * sizeof(HeapTupleHeaderData) + MaxHeapTuplesPerPage
+			+ CLUSTER_ITL_INITRANS_DEFAULT * (sizeof(ClusterItlSlotData) + sizeof(uint32)) : 0);
 	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(reference_count, 1), sizeof(*entries), &entry_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count, sizeof(*owners), &owner_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, source_count, sizeof(*sources), &source_offset)
@@ -3851,9 +3932,10 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, stride, &data_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, terminal_count, sizeof(*terminals), &terminal_offset)
 		|| (projected && (!cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*nodes), &graph_node_offset)
-			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*edges), &graph_edge_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 3 * reference_count, sizeof(*edges), &graph_edge_offset)
 			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*roots), &graph_root_offset)
 			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*reference_nodes), &reference_node_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*tuple_nodes), &tuple_node_offset)
 			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*tuple_offsets), &tuple_offsets_offset)
 			|| !cluster_recovery_cold_page_reference_reserve(&bytes, tuple_length, 1, &tuple_bytes_offset)
 			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, reference_capacity, &tuple_key_offset)))
@@ -3983,6 +4065,8 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 					edges = (ClusterRecoveryCTRCGraphEdgeV2 *)((char *)entries + graph_edge_offset);
 					roots = (size_t *)((char *)entries + graph_root_offset);
 					reference_nodes = (size_t *)((char *)entries + reference_node_offset);
+					tuple_nodes = (size_t *)((char *)entries + tuple_node_offset);
+					for (Size i = 0; i < (Size)2 * reference_count; i++) tuple_nodes[i] = SIZE_MAX;
 					for (uint32 i = 0; valid && i < reference_count; i++) {
 						const RfPageCtrcOwnerGraphEntryV1 *entry = &entries[i];
 						size_t n = contribution.node_count, r;
@@ -4015,7 +4099,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 						const ClusterRecoveryCensusReferenceV1 *reference = &fixed_references[i];
 						if (reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
 						count = cluster_recovery_cold_page_tuple_fields(fixed_references, reference_count, i,
-							tuple_bytes + tuple_offsets[i], entries, &related, terminals, terminal_count, fields, offsets);
+							tuple_offsets, tuple_bytes, entries, &related, terminals, terminal_count, fields, offsets);
 						if (count == 0) continue;
 						valid = contribution.node_count <= (Size)2 * reference_count - count
 							&& contribution.edge_count <= (Size)2 * reference_count - count
@@ -4031,6 +4115,8 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 							cluster_undo_tt_ctrc_put_u64_le(key + length - 8, reference->entry.index);
 							nodes[n] = (ClusterRecoveryCTRCGraphNodeV2){1, {key, length},
 								{itl->reference_evidence, itl->reference_evidence_length}};
+							tuple_nodes[(Size)2 * i + (offsets[f] - ItemIdGetOffset(&reference->entry.item)
+								== offsetof(HeapTupleHeaderData, t_choice.t_heap.t_xmax))] = n;
 							edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){2, n, reference_nodes[fields[f]]};
 							for (r = 0; r < contribution.root_count; r++) {
 								const ClusterRecoveryCTRCGraphBytesV2 *prior = &nodes[roots[r]].key;
@@ -4043,6 +4129,29 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 							entries[i].reference_edge_kind = 2; entries[i].reference_field_count = count;
 							unresolved_count--;
 						}
+					}
+					/* Native HOT topology names the actual current tuple pair.
+					 * Retain its exact xmax -> xmin dependency only after BOTH
+					 * whole-page field contributions and full canonical T agree. */
+					for (uint32 i = 0; valid && i < reference_count; i++) {
+						const ClusterRecoveryCensusReferenceV1 *reference = &fixed_references[i];
+						HeapTupleHeaderData h; size_t from = tuple_nodes[(Size)2 * i + 1], to = SIZE_MAX;
+						if (reference->version != 0 || reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+							|| reference->entry.tuple_length < SizeofHeapTupleHeader || from == SIZE_MAX) continue;
+						memcpy(&h, tuple_bytes + tuple_offsets[i], SizeofHeapTupleHeader);
+						if (!HeapTupleHeaderIsHotUpdated(&h)) continue;
+						for (uint32 j = 0; j < reference_count; j++) {
+							const ClusterRecoveryCensusReferenceV1 *next = &fixed_references[j];
+							if (next->version != 0 || next->page_index != reference->page_index
+								|| next->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+								|| next->entry.index != ItemPointerGetOffsetNumberNoCheck(&h.t_ctid)) continue;
+							if (to != SIZE_MAX) { valid = false; break; }
+							to = tuple_nodes[(Size)2 * j];
+						}
+						valid = valid && to != SIZE_MAX && nodes[from].key.length == nodes[to].key.length
+							&& memcmp(nodes[from].key.data, nodes[to].key.data, nodes[from].key.length - 16) == 0
+							&& contribution.edge_count < (Size)3 * reference_count;
+						if (valid) edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){2, from, to};
 					}
 					if (contribution.node_count != 0) {
 						contribution.nodes = nodes; contribution.edges = edges; contribution.roots = roots;
