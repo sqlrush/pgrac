@@ -60,7 +60,17 @@ void ResourceOwnerForgetBuffer(ResourceOwner owner, Buffer b)
 { UT_ASSERT(owner == CurrentResourceOwner); UT_ASSERT(b > 0 && pin_remembered > 0); --pin_remembered; }
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf pg_attribute_unused()) { abort(); }
 uint32 LockBufHdr(BufferDesc *buf pg_attribute_unused()) { abort(); }
-bool LWLockHeldByMe(LWLock *lock pg_attribute_unused()) { abort(); }
+/* Full-cassert UnpinBuffer queries these original content locks. This host
+ * owns none; unknown lock addresses or the existing held-lock fault still abort. */
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	if (backend_return_lock_held) abort();
+	for (unsigned i = 0; i < lengthof(pin_descriptors); ++i)
+		if (lock == BufferDescriptorGetContentLock(GetBufferDescriptor(i)))
+			return false;
+	abort();
+}
 bool LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused()) { abort(); }
 void ProcSendSignal(int pgprocno pg_attribute_unused()) { abort(); }
 uint32 BufTableHashCode(BufferTag *tag pg_attribute_unused()) { abort(); }
