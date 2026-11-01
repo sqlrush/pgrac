@@ -250,14 +250,17 @@ native_init(void)
 		NativeFileBank *next = palloc0(sizeof(*next));
 		PG_TRY();
 		{
+			unsigned relmaps = 4;
+			if ((creation->cohort[0] || creation->cohort[1]) && creation->cohort_origin != 0)
+				relmaps = 0;
 			next->info.mode = CLUSTER_NATIVE_FILES_CREATION_V2;
 			next->info.startup_generation = creation->creator_pid;
 			next->info.creation = *creation;
 			next->info.registry_byte_budget = CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2;
-			next->info.count = 6;
-			if (!pgrac_initdb_recovery_relmaps_v2(creation, next->files)
-				|| !pgrac_initdb_recovery_boot_v2(creation, next->files + 4)
-				|| !native_canonical(next) || native_install(next, NULL, creation) != 0)
+			next->info.count = relmaps + creation->boot_file_count;
+			if ((relmaps && !pgrac_initdb_recovery_relmaps_v2(creation, next->files)) ||
+				!pgrac_initdb_recovery_boot_v2(creation, next->files + relmaps) ||
+				!native_canonical(next) || native_install(next, NULL, creation) != 0)
 				ereport(FATAL, (errmsg("cannot install original native creation file identities")));
 		}
 		PG_FINALLY();

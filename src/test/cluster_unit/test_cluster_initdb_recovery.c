@@ -623,11 +623,74 @@ UT_TEST(relay_rejects_nonrecipient_and_incomplete_sets)
 	cleanup();
 }
 
+UT_TEST(cohort_peer_has_independent_clog_and_no_published_local_seed)
+{
+	PgracInitdbRecoveryContext ctx;
+	ClusterRecoveryFileIdentityV2 clog, boot[2];
+	uint64 cohort[2] = {3, UINT64CONST(1) << 63};
+	setup_request();
+	clog = first;
+	clog.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+	clog.database_oid = clog.tablespace_oid = 0;
+	clog.origin = 127;
+	clog.creation_generation = 132;
+	UT_ASSERT(pgrac_initdb_recovery_prepare_cohort_v2(&first, &clog, cohort, 127, &config,
+													  source_fd, shared_fd, &ctx));
+	UT_ASSERT_EQ(ctx.boot_file_count, 1);
+	UT_ASSERT(pgrac_initdb_recovery_boot_v2(&ctx, boot));
+	UT_ASSERT_EQ(boot[0].origin, 127);
+	UT_ASSERT_EQ(boot[0].creation_generation, 132);
+	UT_ASSERT_EQ(boot[0].kind, CLUSTER_RECOVERY_FILE_CLOG_V2);
+	UT_ASSERT_EQ(boot[1].kind, CLUSTER_RECOVERY_FILE_UNKNOWN_V2);
+	UT_ASSERT_EQ(child_read(&ctx, 0, false), 0);
+ {
+  int fd=-1;
+  ctx.boot_file_count=0;memset(ctx.boot_files,0,sizeof(ctx.boot_files));
+  UT_ASSERT(!pgrac_initdb_recovery_pipe_v2(&ctx,&fd));
+  if(fd>=0) close(fd);
+ }
+	cleanup();
+}
+UT_TEST(cohort_wrong_origin_missing_member_and_local_undo_refuse)
+{
+	PgracInitdbRecoveryContext ctx, saved;
+	ClusterRecoveryFileIdentityV2 clog;
+	uint64 cohort[2] = {3, 0};
+	setup_request();
+	memset(&ctx, 0xa5, sizeof(ctx));
+	saved = ctx;
+	for (unsigned fault = 0; fault < 5; fault++)
+	{
+		uint64 members[2] = {cohort[0], 0};
+		clog = first;
+		clog.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+		clog.database_oid = clog.tablespace_oid = 0;
+		clog.origin = 1;
+		clog.creation_generation = 6;
+		if (fault == 0)
+			clog.origin = 0;
+		if (fault == 1)
+			members[0] = 1;
+		if (fault == 2)
+			members[0] = 2;
+		if (fault == 3)
+			clog.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+		if (fault == 4)
+			clog.creation_generation = 4;
+		UT_ASSERT(!pgrac_initdb_recovery_prepare_cohort_v2(&first, &clog, members, 1, &config,
+														   source_fd, shared_fd, &ctx));
+		UT_ASSERT(!memcmp(&ctx, &saved, sizeof(ctx)));
+	}
+	cleanup();
+}
+
 int
 main(int argc, char **argv)
 {
 	pg_logging_init(argv[0]);
-	UT_PLAN(17);
+	UT_PLAN(19);
+	UT_RUN(cohort_peer_has_independent_clog_and_no_published_local_seed);
+	UT_RUN(cohort_wrong_origin_missing_member_and_local_undo_refuse);
 	UT_RUN(original_creator_pipe_to_complete_managed_pairs);
 	UT_RUN(stale_binding_refuses_before_any_pair_creation);
 	UT_RUN(preregistration_rejects_bad_birth_and_alias_without_io);

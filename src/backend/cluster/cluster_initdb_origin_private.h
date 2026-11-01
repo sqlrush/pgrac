@@ -32,6 +32,11 @@ extern bool cluster_initdb_object_recheck(int directory, const char *name, const
 /* Original new-cohort owner only, before launching the founder. Reserve all
  * four births from its exact config/first redo branch, without reading any
  * existing authority file. No ROOT selection or format activation. */
+extern bool cluster_initdb_cohort_prepare_v2(const ClusterSharedConfigRef *,
+											 const PgracInitdbConfigContext *,
+											 const uint8 redo_branch_uuid[16], uint16 origin,
+											 int data_fd, int shared_fd,
+											 PgracInitdbRecoveryContext *out);
 extern bool cluster_initdb_cohort_relmap_prepare_v2(const ClusterSharedConfigRef *,
 	const PgracInitdbConfigContext *, const uint8 redo_branch_uuid[16],
 	int data_fd, int shared_fd, PgracInitdbRecoveryContext *out);

@@ -20,8 +20,17 @@ typedef struct PgracInitdbRecoveryContext {
 	 * Zero count is the older explicit relmap-only request, never full BOOT. */
 	uint64 boot_file_count;
 	ClusterRecoveryFileIdentityV2 boot_files[PGRAC_INITDB_BOOT_FILES_V2];
+	/* Explicit complete creation cohort; zero preserves the older isolated
+	 * relmap request. Only this selected origin's CLOG0 is a BOOT file; the
+	 * local undo seed is unpublished material, never a table/registry entry. */
+	uint64 cohort[2];
+	uint64 cohort_origin;
 } PgracInitdbRecoveryContext;
 
+extern bool pgrac_initdb_recovery_prepare_cohort_v2(
+	const ClusterRecoveryFileIdentityV2 *first_relmap, const ClusterRecoveryFileIdentityV2 *clog,
+	const uint64 cohort[2], uint16 origin, const PgracInitdbConfigContext *, int data_fd,
+	int shared_fd, PgracInitdbRecoveryContext *out);
 extern bool pgrac_initdb_recovery_prepare_files_v2(
 	const ClusterRecoveryFileIdentityV2 *first,
 	const ClusterRecoveryFileIdentityV2 boot[PGRAC_INITDB_BOOT_FILES_V2],

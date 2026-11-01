@@ -543,10 +543,52 @@ UT_TEST(address_unpublished_creation_is_not_ordinary_available)
 	cf_held = true;
 	selection_end();
 }
+UT_TEST(cohort_creation_table_excludes_every_local_undo_seed)
+{
+	for (unsigned origin = 0; origin < 2; origin++)
+	{
+		ClusterControlNativeTableInfoV2 info;
+		ClusterControlNativeFileBorrowV2 b = {0};
+		ClusterControlFileKeyV2 k = key(0);
+		table_reset();
+		native_inventory(1);
+		memset(&creator_batch, 0, sizeof(creator_batch));
+		creator_batch.magic = PGRAC_INITDB_RECOVERY_MAGIC;
+		creator_batch.version = 2;
+		creator_batch.creator_pid = getpid();
+		creator_batch.config.fd = 3;
+		creator_batch.config.bytes = 1;
+		creator_batch.config.sha256[0] = 1;
+		creator_batch.first = inventory[0].identity;
+		creator_batch.first.object_id = 0;
+		creator_batch.first.creation_generation = 1;
+		creator_batch.cohort[0] = 3;
+		creator_batch.cohort_origin = origin;
+		creator_batch.boot_file_count = 1;
+		creator_batch.boot_files[0] = creator_batch.first;
+		creator_batch.boot_files[0].kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+		creator_batch.boot_files[0].database_oid = creator_batch.boot_files[0].tablespace_oid = 0;
+		creator_batch.boot_files[0].origin = origin;
+		creator_batch.boot_files[0].creation_generation = 5 + origin;
+		creation = &creator_batch;
+		cf_held = false;
+		registered->init_fn();
+		UT_ASSERT(cluster_control_native_files_info_v2(&info));
+		UT_ASSERT_EQ(info.count, origin ? 1 : 5);
+		k.origin = origin;
+		UT_ASSERT(cluster_control_native_file_acquire_v2(&k, &b));
+		UT_ASSERT(cluster_control_native_file_release_v2(&b));
+		k.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+		UT_ASSERT(!cluster_control_native_file_acquire_v2(&k, &b));
+		creation = NULL;
+		cf_held = true;
+		selection_end();
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(test_original_codec_v4_extent_and_exact_reference);
 	UT_RUN(test_v4_refuses_forged_reference_and_record);
 	UT_RUN(test_selected_root_registry_real_files_and_late_change);
@@ -572,6 +614,7 @@ main(void)
 	UT_RUN(preregistration_requires_complete_persistent_set_and_no_half_publish);
 	UT_RUN(addition_waits_for_borrow_and_reidentity_always_refuses);
 	UT_RUN(shared_borrow_blocks_parent_publication_and_aliases_refuse);
+	UT_RUN(cohort_creation_table_excludes_every_local_undo_seed);
 	UT_RUN(original_creation_batch_selects_six_exact_keys_without_root);
 	UT_RUN(late_error_releases_only_local_publish_latch_and_keeps_old_table);
 	UT_RUN(capacity_wrap_and_full_gap_never_truncate);

@@ -16356,3 +16356,28 @@ test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/include/cluster/clu
 
 cluster_registry_common_test.o test_cluster_recovery_registry test_cluster_recovery_reservations: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h $(top_srcdir)/src/include/common/cluster_recovery_registry.h
 cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h
+
+# Original Main dispatch and complete cohort registration; family leaves controlled.
+TESTS += test_cluster_initdb_main
+all: test_cluster_initdb_main
+test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc: test_cluster_initdb_main.stamp
+	@test -f $@
+test_cluster_initdb_main.stamp: $(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c $(srcdir)/extract_cluster_initdb_main.py
+	python3 $(srcdir)/extract_cluster_initdb_main.py $< test_cluster_initdb_main
+	touch $@
+test_cluster_initdb_main: test_cluster_initdb_main.c test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc unit_test.h \
+ $(top_srcdir)/src/include/common/pgrac_initdb_recovery.h $(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+ $(top_srcdir)/src/common/cluster_recovery_file_identity.c $(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+ $(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+ $(top_srcdir)/src/backend/cluster/cluster_initdb_common_private.h $(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
+ $(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
+ $(top_srcdir)/src/include/common/cluster_recovery_registry.h cluster_registry_common_test.o \
+ $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -I$(top_srcdir)/src/backend/cluster -I$(top_srcdir)/src/bin/initdb -ffunction-sections -fdata-sections $< \
+ $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+ cluster_registry_common_test.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+ $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-main
+.PHONY: clean-initdb-main
+clean-initdb-main:
+	rm -f test_cluster_initdb_main test_cluster_initdb_main.d test_cluster_initdb_main.stamp test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc

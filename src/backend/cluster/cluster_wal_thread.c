@@ -177,19 +177,25 @@ initdb_boot_recovery_accept(PgracInitdbWalContext *context)
 	ClusterRecoveryFileIdentityV2 boot[2];
 	int data_fd;
 	bool valid;
-	if (!context || (context->phase != PGRAC_INITDB_WAL_BOOTSTRAP &&
-		context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP) || context->thread_id != 1
-		|| context->recovery_fd < 3 || context->base_fd < 3 || context->config.fd < 3
-		|| context->recovery_fd == context->base_fd || context->recovery_fd == context->config.fd
-		|| context->base_fd == context->config.fd || initdb_recovery_present)
+	if (!context ||
+		(context->phase != PGRAC_INITDB_WAL_BOOTSTRAP &&
+		 context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP) ||
+		context->thread_id < 1 || context->thread_id > 128 || context->recovery_fd < 3 ||
+		context->base_fd < 3 || context->config.fd < 3 ||
+		context->recovery_fd == context->base_fd || context->recovery_fd == context->config.fd ||
+		context->base_fd == context->config.fd || initdb_recovery_present)
 		return false;
 	data_fd = open(".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-	valid = data_fd >= 0
-			&& pgrac_initdb_recovery_read_v2(context->recovery_fd, &context->config,
-											 context->system_identifier,
-											 context->database_incarnation, context->storage_uuid,
-											 data_fd, context->base_fd, &recovery)
-			&& pgrac_initdb_recovery_boot_v2(&recovery, boot);
+	valid = data_fd >= 0 &&
+			pgrac_initdb_recovery_read_v2(context->recovery_fd, &context->config,
+										  context->system_identifier, context->database_incarnation,
+										  context->storage_uuid, data_fd, context->base_fd,
+										  &recovery) &&
+			pgrac_initdb_recovery_boot_v2(&recovery, boot) &&
+			((recovery.cohort[0] || recovery.cohort[1])
+				 ? recovery.cohort_origin == context->thread_id - 1 &&
+					   boot[0].origin == recovery.cohort_origin
+				 : context->thread_id == 1);
 	if (data_fd >= 0 && close(data_fd))
 		valid = false;
 	if (!valid)
@@ -197,7 +203,8 @@ initdb_boot_recovery_accept(PgracInitdbWalContext *context)
 	/* The BOOT descriptor is only input proof. The later SQL child already
 	 * owns the original independent post-bootstrap DATA publication grant;
 	 * consuming the same creator batch must not erase that original duty. */
-	if (context->phase == PGRAC_INITDB_WAL_BOOTSTRAP) {
+	if (context->phase == PGRAC_INITDB_WAL_BOOTSTRAP || context->thread_id != 1)
+	{
 		if (close(context->base_fd))
 			return false;
 		context->base_fd = 0;
@@ -332,22 +339,22 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 		uint8 any = 0;
 		for (int i = 0; i < sizeof(context.storage_uuid); ++i)
 			any |= context.storage_uuid[i];
-		if (context.recovery_fd < 0
-			|| (context.recovery_fd != 0
-				&& (context.thread_id != 1 || context.recovery_fd < 3
-					|| context.recovery_fd == context.base_fd
-					|| context.recovery_fd == context.config.fd))
-			|| (context.base_fd == 0
-					? (context.database_incarnation != 0 || context.base_device != 0
-					   || context.base_inode != 0 || any != 0)
-					: ((bootstrap && context.recovery_fd == 0) || context.thread_id != 1
-					   || context.base_fd < 3 || context.database_incarnation == 0 || any == 0
-					   || fstat(context.base_fd, &base_st) != 0 || !S_ISDIR(base_st.st_mode)
-					   || base_st.st_uid != geteuid() || (base_st.st_mode & 0022) != 0
-					   || (uint64)base_st.st_dev != context.base_device
-					   || (uint64)base_st.st_ino != context.base_inode
-					   || (base_st.st_dev == data_st.st_dev && base_st.st_ino == data_st.st_ino)
-					   || (base_st.st_dev == wal_st.st_dev && base_st.st_ino == wal_st.st_ino))))
+		if (context.recovery_fd < 0 ||
+			(context.recovery_fd != 0 &&
+			 (context.recovery_fd < 3 || context.recovery_fd == context.base_fd ||
+			  context.recovery_fd == context.config.fd)) ||
+			(context.base_fd == 0
+				 ? (context.database_incarnation != 0 || context.base_device != 0 ||
+					context.base_inode != 0 || any != 0)
+				 : ((bootstrap && context.recovery_fd == 0) ||
+					(context.thread_id != 1 && context.recovery_fd == 0) || context.base_fd < 3 ||
+					context.database_incarnation == 0 || any == 0 ||
+					fstat(context.base_fd, &base_st) != 0 || !S_ISDIR(base_st.st_mode) ||
+					base_st.st_uid != geteuid() || (base_st.st_mode & 0022) != 0 ||
+					(uint64)base_st.st_dev != context.base_device ||
+					(uint64)base_st.st_ino != context.base_inode ||
+					(base_st.st_dev == data_st.st_dev && base_st.st_ino == data_st.st_ino) ||
+					(base_st.st_dev == wal_st.st_dev && base_st.st_ino == wal_st.st_ino))))
 			ereport(FATAL, (errmsg("INITDB_BASE_CONTEXT: invalid original founder target")));
 		if (context.base_fd != 0 && fcntl(context.base_fd, F_SETFD, FD_CLOEXEC) != 0)
 			ereport(FATAL,
