@@ -100,6 +100,10 @@ typedef struct SlruSharedData
 
 typedef SlruSharedData *SlruShared;
 
+#ifdef USE_PGRAC_CLUSTER
+typedef struct ClusterControlNativeFileBorrowV2 ClusterControlNativeFileBorrowV2;
+#endif
+
 /*
  * SlruCtlData is an unshared structure that points to the active information
  * in shared memory.
@@ -107,6 +111,19 @@ typedef SlruSharedData *SlruShared;
 typedef struct SlruCtlData
 {
 	SlruShared	shared;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Original CLOG owner adapters. The table borrow is address-bound and
+	 * remains on the native call's stack through slot/FD/I/O cleanup. These
+	 * process-local callbacks confer neither file authority nor CF custody.
+	 * Other SLRUs leave them NULL and retain their original implementation. */
+	bool (*clog_native_required) (void);
+	bool (*clog_native_acquire) (int pageno, ClusterControlNativeFileBorrowV2 *);
+	bool (*clog_native_current) (const ClusterControlNativeFileBorrowV2 *);
+	bool (*clog_native_release) (ClusterControlNativeFileBorrowV2 *);
+	int (*clog_native_read) (struct SlruCtlData *, int pageno, bool write_ok);
+	void (*clog_native_write) (struct SlruCtlData *, int slotno, bool checkpoint);
+#endif
 
 	/*
 	 * Which sync handler function to use when handing sync requests over to
@@ -135,6 +152,12 @@ typedef struct SlruCtlData
 
 typedef SlruCtlData *SlruCtl;
 
+#ifdef USE_PGRAC_CLUSTER
+/* Installed only by the original CLOG owner. Other SLRUs do not link a CLOG
+ * writer/reader merely by using the common raw cache implementation. */
+extern int SimpleLruNativeClogReadV2(SlruCtl ctl, int pageno, bool write_ok);
+extern void SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint);
+#endif
 
 extern Size SimpleLruShmemSize(int nslots, int nlsns);
 extern void SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,

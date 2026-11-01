@@ -53,6 +53,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_control_native_files.h"
 #endif
 
 /*
@@ -124,6 +125,54 @@ static void TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 											   TransactionId *subxids, XidStatus status,
 											   XLogRecPtr lsn, int pageno);
 
+
+#ifdef USE_PGRAC_CLUSTER
+/* Disabled-cluster PostgreSQL remains raw. A managed or creation selection
+ * also applies before serving; UNKNOWN on an enabled cluster must refuse. */
+static bool
+CLOGNativeIORequired(void)
+{
+	return cluster_enabled || cluster_control_native_files_mode_v2() !=
+		CLUSTER_NATIVE_FILES_UNKNOWN_V2;
+}
+
+static bool
+CLOGNativeFileAcquire(int pageno, ClusterControlNativeFileBorrowV2 *borrow)
+{
+	ClusterControlFileKeyV2 key = {0};
+
+	if (pageno < 0 || pageno >= 131072 || cluster_node_id < 0 ||
+		cluster_node_id > PG_UINT16_MAX ||
+		cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_UNKNOWN_V2)
+		return false;
+	key.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+	key.origin = (uint16) cluster_node_id;
+	key.object_id = (uint64) pageno / SLRU_PAGES_PER_SEGMENT;
+	return cluster_control_native_file_acquire_v2(&key, borrow);
+}
+
+static void
+CLOGConfigureManagedIO(SlruCtl ctl)
+{
+	ctl->clog_native_required = CLOGNativeIORequired;
+	ctl->clog_native_acquire = CLOGNativeFileAcquire;
+	ctl->clog_native_current = cluster_control_native_file_current_v2;
+	ctl->clog_native_release = cluster_control_native_file_release_v2;
+	ctl->clog_native_read = SimpleLruNativeClogReadV2;
+	ctl->clog_native_write = SimpleLruNativeClogWriteV2;
+}
+
+/* These lifecycle callers still need their original complete selected-range
+ * owner. A raw record, cutoff or segno-only request cannot supply it. */
+static void
+CLOGRequireLegacyLifecycle(void)
+{
+	if (CLOGNativeIORequired())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("managed CLOG lifecycle requires its selected control owner")));
+}
+#endif
 
 /*
  * TransactionIdSetTreeStatus
@@ -763,6 +812,9 @@ void
 CLOGShmemInit(void)
 {
 	XactCtl->PagePrecedes = CLOGPagePrecedes;
+#ifdef USE_PGRAC_CLUSTER
+	CLOGConfigureManagedIO(XactCtl);
+#endif
 	SimpleLruInit(XactCtl, "Xact", CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE,
 				  XactSLRULock, "pg_xact", LWTRANCHE_XACT_BUFFER,
 				  SYNC_HANDLER_CLOG);
@@ -1067,6 +1119,9 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 {
 	int			cutoffPage;
 
+#ifdef USE_PGRAC_CLUSTER
+	CLOGRequireLegacyLifecycle();
+#endif
 	/*
 	 * The cutoff point is the start of the segment containing oldestXact. We
 	 * pass the *page* containing oldestXact to SimpleLruTruncate.
@@ -1174,6 +1229,9 @@ clog_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
+#ifdef USE_PGRAC_CLUSTER
+	CLOGRequireLegacyLifecycle();
+#endif
 	/* Backup blocks are not used in clog records */
 	Assert(!XLogRecHasAnyBlockRefs(record));
 
@@ -1212,5 +1270,15 @@ clog_redo(XLogReaderState *record)
 int
 clogsyncfiletag(const FileTag *ftag, char *path)
 {
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired())
+	{
+		/* Preserve an observable failed sync request; never open a replacement
+		 * generation using an old raw segment-only tag. */
+		snprintf(path, MAXPGPATH, "%s/%04X", XactCtl->Dir, ftag->segno);
+		errno = ESTALE;
+		return -1;
+	}
+#endif
 	return SlruSyncFileTag(XactCtl, ftag, path);
 }

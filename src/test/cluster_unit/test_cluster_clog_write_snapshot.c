@@ -34,6 +34,8 @@ bool IsUnderPostmaster;
 static void *allocated_shared;
 static Size allocated_size;
 static bool control_held, io_held, inject_update, fail_write, short_write, fail_sync;
+static bool fixture_io_wait_mode;
+static void (*fixture_io_wait) (void);
 static bool queue_full;
 static unsigned writes, flushes, closes, syncs, queues, stats_writes;
 static FileTag queued_tag;
@@ -84,13 +86,18 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	UT_ASSERT(mode == LW_EXCLUSIVE || (lock == &control && mode == LW_SHARED));
+	UT_ASSERT(mode == LW_EXCLUSIVE || mode == LW_SHARED);
 	if (lock == &control) {
 		UT_ASSERT(!control_held);
 		control_held = true;
 	} else {
 		UT_ASSERT(lock == &locks[0].lock);
-		UT_ASSERT(control_held && !io_held);
+		if (mode == LW_SHARED) {
+			UT_ASSERT(!control_held && !io_held && fixture_io_wait != NULL);
+			if (fixture_io_wait == NULL) abort();
+			fixture_io_wait();
+			fixture_io_wait_mode = true;
+		} else UT_ASSERT(control_held && !io_held);
 		io_held = true;
 	}
 	return true;
@@ -102,7 +109,7 @@ LWLockRelease(LWLock *lock)
 	if (lock == &control) {
 		UT_ASSERT(control_held);
 		control_held = false;
-		if (inject_update) {
+		if (inject_update && io_held) {
 			/* One other updater owns the original control lock in this gap. */
 			inject_update = false;
 			UT_ASSERT(io_held);
@@ -117,7 +124,8 @@ LWLockRelease(LWLock *lock)
 		}
 	} else {
 		UT_ASSERT(lock == &locks[0].lock);
-		UT_ASSERT(control_held && io_held);
+		UT_ASSERT(io_held && (fixture_io_wait_mode ? !control_held : control_held));
+		fixture_io_wait_mode = false;
 		io_held = false;
 	}
 }
@@ -144,8 +152,11 @@ XLogFlush(XLogRecPtr lsn)
 	record_event('F');
 }
 
+#ifndef SLRU_FIXTURE_OPEN
+#define SLRU_FIXTURE_OPEN OpenTransientFile
+#endif
 int
-OpenTransientFile(const char *path, int flags)
+SLRU_FIXTURE_OPEN(const char *path, int flags)
 {
 	UT_ASSERT(!control_held && io_held);
 	record_event('O');
@@ -254,6 +265,7 @@ reset(SyncRequestHandler handler)
 	strlcpy(ctl.Dir, directory, sizeof(ctl.Dir));
 	control_held = true;
 	io_held = inject_update = fail_write = short_write = fail_sync = queue_full = false;
+	fixture_io_wait_mode = false; fixture_io_wait = NULL;
 	writes = flushes = closes = syncs = queues = stats_writes = event_count = 0;
 	written_offset = -1;
 	written_length = 0;

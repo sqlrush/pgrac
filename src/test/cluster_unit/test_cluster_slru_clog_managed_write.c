@@ -519,7 +519,10 @@ UT_TEST(inflight_managed_read_keeps_raw_zero_out_of_its_reserved_slot)
 	close(borrowed);
 }
 
-int main(void)
+#ifndef CLOG_MANAGED_MAIN
+#define CLOG_MANAGED_MAIN main
+#endif
+int CLOG_MANAGED_MAIN(void)
 {
 	strlcpy(directory, "/tmp/pgrac-slru-managed-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
