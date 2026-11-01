@@ -84,6 +84,7 @@ static bool managed_cache_test;
 static bool managed_checkpoint_test;
 static int managed_checkpoint_sync(int fd);
 static unsigned managed_cache_fault;
+static unsigned managed_cache_release_calls;
 static void managed_cache_after_read(void);
 static bool managed_cache_fatal_probe, managed_cache_fatal_inherited;
 static void managed_cache_fatal_observe(void);
@@ -262,6 +263,9 @@ void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
 {
+	/* Match native errfinish(ERROR), including a second cleanup ERROR. */
+	if (managed_cache_test && error_level == ERROR)
+		InterruptHoldoffCount = 0;
 	if ((v2_postcommit_error_stack || managed_writer_test) && error_level == ERROR
 		&& PG_exception_stack)
 		siglongjmp(*PG_exception_stack, 1);
@@ -364,6 +368,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 			  && (mode == LW_EXCLUSIVE || (managed_writer_test && mode == LW_SHARED)));
 	UT_ASSERT((managed_cache_test || managed_checkpoint_test || authority_held)
 		&& !local_held && CritSectionCount == 0);
+	if (managed_cache_test) HOLD_INTERRUPTS();
 	local_held = true;
 	local_acquires++;
 	lock_order = ++sequence;
@@ -384,6 +389,7 @@ LWLockRelease(LWLock *lock)
 	local_held = false;
 	if (managed_cache_test && managed_cache_fault == 4)
 		ereport(ERROR, (errmsg("controlled cache lock release ERROR")));
+	if (managed_cache_test) RESUME_INTERRUPTS();
 }
 
 bool
@@ -1185,7 +1191,7 @@ main(void)
 		return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_RELMAP_NATIVE_CACHE_FOCUS")) {
-		UT_PLAN(9);
+		UT_PLAN(10);
 		UT_RUN(native_cache_registered_address_under_original_mapping_lock);
 		UT_RUN(native_cache_uses_committed_image_while_writer_pending);
 		UT_RUN(native_cache_unknown_missing_and_ambiguous_never_fall_back);
@@ -1195,6 +1201,7 @@ main(void)
 		UT_RUN(native_cache_refuses_inconsistent_caller_locks);
 		UT_RUN(native_cache_borrow_capacity_refuses_before_file_io);
 		UT_RUN(native_cache_fatal_refusal_retires_local_borrow_before_exit);
+		UT_RUN(native_cache_cleanup_release_error_preserves_original_duties);
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
@@ -1221,7 +1228,7 @@ main(void)
 		return ut_failed_count != 0;
 	}
 
-	UT_PLAN(focus ? 4 : 127);
+	UT_PLAN(focus ? 4 : 128);
 	UT_RUN(retained_stage_uses_native_writer_identity_before_mapping_and_wal);
 	UT_RUN(retained_stage_missing_writer_never_assigns_or_stages);
 	UT_RUN(retained_stage_allocator_error_preserves_outputs_and_pins);
@@ -1349,6 +1356,7 @@ main(void)
 	if (!focus) UT_RUN(native_cache_refuses_inconsistent_caller_locks);
 	if (!focus) UT_RUN(native_cache_borrow_capacity_refuses_before_file_io);
 	if (!focus) UT_RUN(native_cache_fatal_refusal_retires_local_borrow_before_exit);
+	if (!focus) UT_RUN(native_cache_cleanup_release_error_preserves_original_duties);
 
 	if (!focus) UT_RUN(native_checkpoint_pending_pair_and_old_cache);
 	if (!focus) UT_RUN(native_checkpoint_commit_abort_and_fresh_receipt);

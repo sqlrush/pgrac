@@ -1058,12 +1058,17 @@ cluster_read_relmap_from_native(RelMapFile *out, bool lock_held, Oid dbid, Oid t
 			{
 				if (owned_mapping) {
 					owned_mapping = false;
+					/* ERROR reset the acquisition holdoff. Replace the one
+					 * consumed by release, as LWLockReleaseAll does. */
+					HOLD_INTERRUPTS();
 					LWLockRelease(RelationMappingLock);
 				}
 			}
 			PG_FINALLY();
 			{
-				RESUME_INTERRUPTS();
+				/* Borrow or lock cleanup can itself ERROR and reset it. */
+				if (InterruptHoldoffCount > 0)
+					RESUME_INTERRUPTS();
 			}
 			PG_END_TRY();
 		}

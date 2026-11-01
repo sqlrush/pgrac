@@ -45,7 +45,8 @@ cache_setup(void)
 	managed_setup_files();
 	managed_cache_test = true;
 	managed_cache_fault = 0;
-	InterruptHoldoffCount = 0; /* test isolation after an intentionally failing cleanup */
+	InterruptHoldoffCount = 0;
+	managed_cache_release_calls = 0;
 	authority_held = false;
 }
 static void
@@ -60,7 +61,7 @@ managed_cache_after_read(void)
 {
 	UT_ASSERT(local_held);
 	UT_ASSERT_EQ(borrowed_count(), cluster_relmap_v2_arms[0].armed ? 3 : 1);
-	if (managed_cache_fault == 2 || managed_cache_fault == 4)
+	if (managed_cache_fault == 2 || managed_cache_fault == 4 || managed_cache_fault == 7)
 		ereport(ERROR, (errmsg("controlled cache read ERROR")));
 	if (managed_cache_fault == 3)
 		MyProcPid++;
@@ -258,4 +259,53 @@ UT_TEST(native_cache_fatal_refusal_retires_local_borrow_before_exit)
 			UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 		}
 	}
+}
+
+/* The original cache must not consume a caller's MappingLock or retry an
+ * uncertain release when its ERROR cleanup is itself interrupted. */
+UT_TEST(native_cache_cleanup_release_error_preserves_original_duties)
+{
+	for (unsigned fault = 5; fault <= 7; fault++)
+		for (unsigned inherited = 0; inherited < 2; inherited++) {
+			pid_t child;
+			int status;
+			fflush(NULL);
+			child = fork();
+			UT_ASSERT(child >= 0);
+			if (child == 0) {
+				RelMapFile out, before;
+				unsigned reads;
+				cache_setup();
+				managed_cache_fault = fault;
+				memset(&out, 0x72, sizeof(out));
+				before = out;
+				if (inherited) LWLockAcquire(RelationMappingLock, LW_SHARED);
+				UT_ASSERT(cache_error(&out, inherited != 0, 0, GLOBALTABLESPACE_OID));
+				UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+				UT_ASSERT_EQ(local_held, inherited != 0);
+				UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+				UT_ASSERT_EQ(managed_cache_release_calls, 1);
+				UT_ASSERT_EQ(borrowed_count(), fault == 6 ? 0 : 1);
+				UT_ASSERT(!managed_cf && !authority_held);
+				reads = managed_reads;
+				if (fault != 6) {
+					managed_cache_fault = 0;
+					UT_ASSERT(cache_error(&out, inherited != 0, 0, GLOBALTABLESPACE_OID));
+					UT_ASSERT_EQ(managed_reads, reads);
+					UT_ASSERT_EQ(managed_cache_release_calls, 1);
+					UT_ASSERT_EQ(borrowed_count(), 1);
+					UT_ASSERT_EQ(local_held, inherited != 0);
+					UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+				}
+				/* Test-process shutdown only, never a production duty release. */
+				local_held = false;
+				cache_cleanup();
+				fflush(NULL);
+				_exit(ut_current_failed ? 1 : 0);
+			}
+			if (child > 0) {
+				UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+				UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+			}
+		}
 }

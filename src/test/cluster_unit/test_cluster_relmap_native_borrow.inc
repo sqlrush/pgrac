@@ -71,7 +71,26 @@ borrow_region_init(const char *name, Size size, bool *found)
 }
 #define cluster_shmem_register_region borrow_region_register
 #define ShmemInitStruct borrow_region_init
+/* Keep the original table implementation; inject ERROR only at the original
+ * cache release boundary, before or after its real accounting. */
+static bool cache_original_native_release(ClusterControlNativeFileBorrowV2 *);
+#define cluster_control_native_file_release_v2 cache_original_native_release
 #include "../../backend/cluster/cluster_control_native_files.c"
+#undef cluster_control_native_file_release_v2
+bool
+cluster_control_native_file_release_v2(ClusterControlNativeFileBorrowV2 *b)
+{
+	bool ok;
+	if (managed_cache_test) {
+		managed_cache_release_calls++;
+		if (managed_cache_fault == 5 || managed_cache_fault == 7)
+			ereport(ERROR, (errmsg("controlled cache borrow release ERROR")));
+	}
+	ok = cache_original_native_release(b);
+	if (managed_cache_test && managed_cache_fault == 6)
+		ereport(ERROR, (errmsg("controlled cache released borrow ERROR")));
+	return ok;
+}
 #undef ShmemInitStruct
 #undef cluster_shmem_register_region
 static ClusterControlNativeResultV2
