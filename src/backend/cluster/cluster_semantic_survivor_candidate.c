@@ -10,6 +10,7 @@
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_semantic_survivor_candidate.h"
 #include "cluster/cluster_semantic_survivor_producer.h"
 #include "../../common/sha2_int.h"
@@ -52,8 +53,89 @@ candidate_owner(void)
 		&& cluster_enabled && cluster_shared_config
 		&& MyProc != NULL && MyProcPid > 0 && MyProc->pid == MyProcPid
 		&& MyProc->pgprocno >= 0 && MyProc->backendId == InvalidBackendId
+		&& MyBackendId == InvalidBackendId
 		&& MyProc->cluster_grd_generation != 0
 		&& MyProc->cluster_grd_generation != UINT64_MAX;
+}
+/* Stack-only scope fences, not an admission or producer-closure proof. */
+typedef struct CandidateLocalView {
+	PGPROC *proc;
+	int pid;
+	int pgprocno;
+	uint64 proc_generation;
+	ClusterSemanticWaitGraphSnapshot gate;
+} CandidateLocalView;
+StaticAssertDecl(sizeof(CandidateLocalView) <= 128, "candidate scope stack bound");
+
+static bool
+candidate_open_scope(const uint8 *pgsa, uint64 generation, uint64 native_epoch,
+	uint64 source_features, uint64 target_features, ClusterSurvivorProducerScope *scope)
+{
+	ClusterSemanticActivationRecord open;
+
+	if (!cluster_semantic_activation_record_decode(pgsa, &open, NULL)
+		|| open.phase != CLUSTER_SEMANTIC_PHASE_OPEN
+		|| open.record_generation == 0 || open.record_generation == UINT64_MAX
+		|| open.record_generation != generation
+		|| open.transition_epoch == 0 || open.transition_epoch == UINT64_MAX
+		|| open.transition_epoch > native_epoch
+		|| open.target_feature_bitmap != target_features
+		|| open.target_feature_bitmap != source_features)
+		return false;
+	scope->native_epoch = native_epoch; scope->gate_epoch = open.transition_epoch;
+	scope->record_generation = generation;
+	return true;
+}
+static bool
+candidate_same_owner(const CandidateLocalView *view)
+{
+	return candidate_owner() && MyProc == view->proc && MyProcPid == view->pid
+		&& MyProc->pgprocno == view->pgprocno
+		&& MyProc->cluster_grd_generation == view->proc_generation;
+}
+static ClusterSemanticAdmissionObservationResult
+candidate_local_view(ClusterSurvivorProducerScope scope, CandidateLocalView *view)
+{
+	uint64 epoch_before, epoch_after;
+	bool known;
+
+	memset(view, 0, sizeof(*view));
+	if (!candidate_owner()) return CANDIDATE_REFUSED;
+	view->proc = MyProc; view->pid = MyProcPid; view->pgprocno = MyProc->pgprocno;
+	view->proc_generation = MyProc->cluster_grd_generation;
+	epoch_before = cluster_epoch_get_current();
+	known = cluster_semantic_activation_wait_graph_snapshot(&view->gate);
+	epoch_after = cluster_epoch_get_current();
+	if (!candidate_same_owner(view)) return CANDIDATE_REFUSED;
+	if (epoch_before != scope.native_epoch || epoch_after != scope.native_epoch)
+		return CANDIDATE_STALE;
+	if (!known || !view->gate.known || view->gate.seq == 0 || (view->gate.seq & 1))
+		return CANDIDATE_PENDING;
+	if (view->gate.formation_epoch != scope.gate_epoch
+		|| view->gate.record_generation != scope.record_generation)
+		return CANDIDATE_STALE;
+	/* CURRENT is internal metadata only; every public candidate stays unconfirmed. */
+	return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT;
+}
+static ClusterSemanticAdmissionObservationResult
+candidate_local_recheck(ClusterSurvivorProducerScope scope, const CandidateLocalView *before)
+{
+	CandidateLocalView after;
+	ClusterSemanticAdmissionObservationResult result = candidate_local_view(scope, &after);
+
+	if (!candidate_same_owner(before)) return CANDIDATE_REFUSED;
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT) return result;
+	if (before->gate.seq != after.gate.seq || before->gate.active_bits != after.gate.active_bits
+		|| before->gate.transition_closed != after.gate.transition_closed)
+		return CANDIDATE_PENDING;
+	return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT;
+}
+static void
+candidate_mark_invalid(ClusterSurvivorControl *c)
+{
+	/* Called inside the existing write bracket; original responsibility is retained. */
+	c->header.flags = CANDIDATE_INVALID;
+	c->header.staged_chunk[0] = c->header.staged_chunk[1] = 0;
 }
 static bool
 candidate_live(const ClusterSurvivorControl *c)
@@ -136,6 +218,9 @@ cluster_semantic_survivor_candidate_begin(ClusterSurvivorControl *c,
 {
 	ClusterSurvivorMessageV4 m;
 	ClusterSurvivorTableHeader *t;
+	ClusterSurvivorProducerScope scope;
+	CandidateLocalView view;
+	ClusterSemanticAdmissionObservationResult result;
 	const uint8 *row;
 
 	if (!candidate_owner() || c == NULL)
@@ -149,6 +234,12 @@ cluster_semantic_survivor_candidate_begin(ClusterSurvivorControl *c,
 	/* A failed/new episode cannot erase original callbacks, jobs or rows. */
 	if (!candidate_zero(c, sizeof(*c)))
 		return candidate_result(CANDIDATE_PENDING, reason, "candidate_previous_object_retained");
+	if (!candidate_open_scope(m.body, candidate_read(m.body + 1160, 8), m.epoch,
+		m.features, m.features, &scope))
+		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_open_baseline_invalid");
+	result = candidate_local_view(scope, &view);
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT)
+		return candidate_result(result, reason, "candidate_local_scope_unconfirmed");
 	c->header.seq = 1;
 	candidate_basis(&c->basis, m.body);
 	c->header.nonce = m.nonce; c->header.epoch = m.epoch;
@@ -169,8 +260,11 @@ cluster_semantic_survivor_candidate_begin(ClusterSurvivorControl *c,
 		candidate_identity(&c->tables[0].expected[node], row); row += 48;
 	}
 	/* No EXPECTED_VALID/observed/COMPLETE bit, capability sample or permission. */
+	result = candidate_local_recheck(scope, &view);
+	if (result == CANDIDATE_STALE || result == CANDIDATE_REFUSED) candidate_mark_invalid(c);
 	pg_write_barrier(); t->seq = c->header.seq = 2;
-	return candidate_result(CANDIDATE_PENDING, reason, "candidate_unconfirmed");
+	return candidate_result(result == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT
+		? CANDIDATE_PENDING : result, reason, "candidate_unconfirmed");
 }
 
 ClusterSemanticAdmissionObservationResult
@@ -182,6 +276,9 @@ cluster_semantic_survivor_candidate_stage(ClusterSurvivorControl *c,
 	ClusterSurvivorObserved row;
 	ClusterSurvivorIngress ingress;
 	ClusterSurvivorTable *t;
+	ClusterSurvivorProducerScope scope;
+	CandidateLocalView view;
+	ClusterSemanticAdmissionObservationResult result;
 	uint8 basis[32];
 	uint64 bit;
 
@@ -207,6 +304,18 @@ cluster_semantic_survivor_candidate_stage(ClusterSurvivorControl *c,
 		|| transport_generation == 0 || transport_generation == UINT64_MAX
 		|| transport_generation != row.identity.control_generation)
 		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_identity_changed");
+	if (!candidate_open_scope(c->basis.pgsa, c->basis.open_generation, c->header.epoch,
+		t->header.source_features, t->header.target_features, &scope))
+		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_open_baseline_invalid");
+	result = candidate_local_view(scope, &view);
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT) {
+		if (result == CANDIDATE_STALE) {
+			/* Only a proved local drift invalidates; a foreign frame never can. */
+			if (cluster_semantic_survivor_candidate_invalidate(c, NULL) != CANDIDATE_STALE)
+				result = CANDIDATE_REFUSED;
+		}
+		return candidate_result(result, reason, "candidate_local_scope_unconfirmed");
+	}
 	memset(&ingress, 0, sizeof(ingress));
 	ingress.node = m.sender; ingress.kind = m.kind; ingress.length = length;
 	ingress.transport_generation = transport_generation; ingress.round_generation = m.round_generation;
@@ -222,8 +331,12 @@ cluster_semantic_survivor_candidate_stage(ClusterSurvivorControl *c,
 	candidate_change_begin(c);
 	t->observed[m.sender] = row; c->ingress[m.sender] = ingress;
 	c->header.staged_chunk[m.sender / 64] |= bit;
+	result = candidate_local_recheck(scope, &view);
+	if (result == CANDIDATE_STALE || result == CANDIDATE_REFUSED) candidate_mark_invalid(c);
 	candidate_change_end(c);
-	return candidate_result(CANDIDATE_PENDING, reason, "candidate_row_unconfirmed");
+	/* Unknown publication after a write retains raw syntax, never confirmed state. */
+	return candidate_result(result == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT
+		? CANDIDATE_PENDING : result, reason, "candidate_row_unconfirmed");
 }
 
 ClusterSemanticAdmissionObservationResult
@@ -236,8 +349,7 @@ cluster_semantic_survivor_candidate_invalidate(ClusterSurvivorControl *c, const 
 	if (!candidate_live(c) || !candidate_writable(c))
 		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_invalidation_invalid");
 	candidate_change_begin(c);
-	c->header.flags = CANDIDATE_INVALID;
-	c->header.staged_chunk[0] = c->header.staged_chunk[1] = 0;
+	candidate_mark_invalid(c);
 	candidate_change_end(c);
 	return candidate_result(CANDIDATE_STALE, reason, "candidate_invalidated");
 }
@@ -247,27 +359,17 @@ cluster_semantic_survivor_candidate_probe(ClusterSurvivorControl *c,
 	ClusterServiceProducerCollection *out, const char **reason)
 {
 	ClusterSemanticAdmissionObservationResult result;
-	ClusterSemanticActivationRecord open;
 	ClusterSurvivorProducerObservation observation;
 	ClusterSurvivorProducerScope scope;
+	if (out != NULL) memset(out, 0, sizeof(*out));
 	if (!candidate_owner() || out == NULL || c == NULL)
 		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_owner_invalid");
 	if (!candidate_live(c))
 		return candidate_result(CANDIDATE_STALE, reason, "candidate_not_live");
-	memset(out, 0, sizeof(*out));
-	/* Decode the original baseline, not offsets from an untrusted PGSA blob.
-	 * This only binds the collection scope; no durable/current proof is implied. */
-	if (!cluster_semantic_activation_record_decode(c->basis.pgsa, &open, NULL)
-		|| open.phase != CLUSTER_SEMANTIC_PHASE_OPEN
-		|| open.record_generation == UINT64_MAX
-		|| open.record_generation != c->basis.open_generation
-		|| open.transition_epoch == 0 || open.transition_epoch == UINT64_MAX
-		|| open.transition_epoch > c->header.epoch
-		|| open.target_feature_bitmap != c->tables[0].header.target_features
-		|| open.target_feature_bitmap != c->tables[0].header.source_features)
+	/* Original PGSA decode binds scope, never durable/current proof. */
+	if (!candidate_open_scope(c->basis.pgsa, c->basis.open_generation, c->header.epoch,
+		c->tables[0].header.source_features, c->tables[0].header.target_features, &scope))
 		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_open_baseline_invalid");
-	scope.native_epoch = c->header.epoch; scope.gate_epoch = open.transition_epoch;
-	scope.record_generation = c->basis.open_generation;
 	result = cluster_semantic_survivor_producer_poll(CLUSTER_SURVIVOR_PRODUCER_NATIVE,
 		scope, &observation);
 	if (result == CANDIDATE_PENDING)

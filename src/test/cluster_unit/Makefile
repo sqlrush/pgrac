@@ -17597,3 +17597,6 @@ clean: clean-relmap-control
 .PHONY: clean-relmap-control
 clean-relmap-control:
 	rm -f test_cluster_relmap_control test_cluster_relmap_control.d test_cluster_relmap_control_authority.o test_cluster_relmap_control_authority.d test_cluster_relmap_control_entries.inc test_cluster_relmap_control_entries.inc.tmp
+
+# Original pending collection rejects local epoch/gate drift.
+test_cluster_survivor_candidate: test_cluster_survivor_candidate_invalidation.inc test_cluster_backend_return_gate.inc

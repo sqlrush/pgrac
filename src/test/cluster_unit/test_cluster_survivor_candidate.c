@@ -6,6 +6,7 @@ int survivor_candidate_original_lmon_main(void);
 #define main survivor_candidate_original_lmon_main
 #include "test_cluster_lmon.c"
 #undef main
+#include "test_cluster_backend_return_gate.inc"
 #include "cluster/cluster_semantic_survivor_candidate.h"
 #include "../../common/sha2_int.h"
 #include "port/pg_crc32c.h"
@@ -471,9 +472,10 @@ UT_TEST(return_collection_rechecks_original_identity_and_late_work) { run_candid
 UT_TEST(return_collection_preserves_refusal_and_pending_priorities) { run_candidate(14); }
 UT_TEST(original_open_historical_source_does_not_replace_current_target) { run_candidate(15); }
 UT_TEST(survivor_native_dispatch_uses_actual_roles_at_original_lmon_return) { run_candidate(16); }
+#include "test_cluster_survivor_candidate_invalidation.inc"
 int main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(34);
 	UT_RUN(candidate_does_not_turn_an_idle_owner_point_into_quiescence);
 	UT_RUN(all_128_untrusted_rows_remain_unconfirmed);
 	UT_RUN(exact_duplicates_are_idempotent_conflicts_preserve_first);
@@ -491,5 +493,22 @@ int main(void)
 	UT_RUN(return_collection_preserves_refusal_and_pending_priorities);
 	UT_RUN(original_open_historical_source_does_not_replace_current_target);
 	UT_RUN(survivor_native_dispatch_uses_actual_roles_at_original_lmon_return);
+	UT_RUN(candidate_late_row_rechecks_actual_native_epoch_at_original_return);
+	UT_RUN(candidate_late_row_rechecks_original_gate_generation);
+	UT_RUN(candidate_late_row_rechecks_original_gate_epoch);
+	UT_RUN(candidate_missing_gate_defers_without_mutation);
+	UT_RUN(candidate_odd_gate_defers_without_mutation);
+	UT_RUN(candidate_duplicate_rechecks_local_epoch);
+	UT_RUN(candidate_foreign_scope_cannot_invalidate_local_candidate);
+	UT_RUN(candidate_stale_native_request_cannot_begin);
+	UT_RUN(candidate_stale_gate_request_cannot_begin);
+	UT_RUN(candidate_unknown_gate_request_cannot_begin);
+	UT_RUN(candidate_epoch_drift_during_write_retains_unconfirmed_rows);
+	UT_RUN(candidate_gate_drift_during_write_retains_unconfirmed_rows);
+	UT_RUN(candidate_owner_drift_during_write_revokes_candidate);
+	UT_RUN(candidate_gate_drift_during_begin_retains_original_basis);
+	UT_RUN(candidate_unknown_cut_during_write_never_confirms);
+	UT_RUN(candidate_probe_clears_all_early_rejections);
+	UT_RUN(candidate_invalidation_uses_one_bounded_generation_change);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }

@@ -140,10 +140,14 @@ cluster_qvotec_get_self_incarnation(void)
 {
 	return 17;
 }
+/* Original epoch read with explicit host publication scheduling. */
+static uint64 test_native_epoch = 3;
+static void (*test_native_epoch_read_hook)(void);
 uint64
 cluster_epoch_get_current(void)
 {
-	return 3;
+	if (test_native_epoch_read_hook != NULL) test_native_epoch_read_hook();
+	return test_native_epoch;
 }
 
 static TimestampTz test_stop_now;
