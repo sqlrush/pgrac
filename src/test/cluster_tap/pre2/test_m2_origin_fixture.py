@@ -198,6 +198,7 @@ my %sessions;
 my (@closed,@queries);
 {package FixtureNode; sub background_psql {return bless {id=>++$_[0]->{id}},'FixtureSession';}}
 {package FixtureSession; sub query_safe {push @queries,[$_[0]->{id},$_[1]];}
+ sub set_query_timer_restart {return 1;}
  sub quit {push @closed,$_[0]->{id};}}
 ''' + helpers + r'''
 my $node=bless {},'FixtureNode';
