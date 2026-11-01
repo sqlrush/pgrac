@@ -11992,3 +11992,85 @@ clean-source-coverage:
 test_cluster_source_coverage_replace.inc: test_cluster_resource_x_pi_replace.c Makefile
 	awk '/^int$$/ { n++; exit } { print } END { if (n != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# Eight cached reader scopes, native output IO and one original conversion.
+TESTS += test_cluster_native_hot_block
+all: test_cluster_native_hot_block
+test_cluster_native_hot_block_drain.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile
+	awk '/^typedef struct ClusterLmsZeroBlockReplyWire / { emit=1; types++ } \
+	     /^(lms_outbound_resource_x_intent_identity_equal|lms_outbound_r4_refusal_header_valid|lms_outbound_frame_current|lms_outbound_block_request_current|cluster_lms_outbound_drain_send)\(/ { print previous; emit=1; found++ } \
+	     emit { print } /^}/ && emit { emit=0 } { previous=$$0 } \
+	     END { if (found != 5 || types != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_writer.inc: test_cluster_native_resident_x.c Makefile
+	awk '/^UT_TEST/ { stop=1; exit } \
+	     /if \(\+\+wc_waits > 8 \|\| rx_cancel_wait\) pg_re_throw\(\);/ { print; print "\thb_wait_event();"; waits++; next } \
+	     /^#include "test_cluster_native_resident_x_driver.inc"/ { \
+	       print "#define cluster_bufmgr_first_fill_error hb_error"; \
+	       print "#define LWLockConditionalAcquire hb_conditional"; \
+	       print "#define cluster_pcm_own_revoke_to_grant_handoff_exact hb_handoff"; \
+	       print; print "#undef cluster_pcm_own_revoke_to_grant_handoff_exact"; \
+	       print "#undef LWLockConditionalAcquire"; \
+	       print "#undef cluster_bufmgr_first_fill_error"; drivers++; next } \
+	     { print } END { if (stop != 1 || waits != 1 || drivers != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_master.inc: test_cluster_native_master.c Makefile
+	awk '/^#include "test_cluster_resource_x_master_done_ingress.inc"/ { emit=1; starts++ } \
+	     /^UT_TEST/ { stop=1; exit } emit { print } \
+	     END { if (starts != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_reserve.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_begin_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; begin++ } \
+	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; abort++ } \
+	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; wait++ } \
+	     emit { print } /^}/ { emit=0 } END { if (begin != 1 || abort != 1 || wait != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_reader.inc: test_cluster_native_resident_lock.c Makefile
+	awk '/^#include "test_cluster_native_resident_fill_fixture.inc"/ { includes++; next } \
+	     /^#include "test_cluster_native_resident_lock_reserve.inc"/ { \
+	       print "#include \"test_cluster_native_hot_block_reserve.inc\""; reserves++; next } \
+	     /^UT_TEST/ { stop=1; exit } { print } \
+	     END { if (includes != 1 || reserves != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block: test_cluster_native_hot_block.c test_cluster_native_hot_block_writer.inc \
+        test_cluster_native_hot_block_master.inc test_cluster_native_hot_block_reader.inc \
+        test_cluster_native_hot_block_reserve.inc test_cluster_native_hot_block_drain.inc \
+        test_cluster_native_hot_block_io.inc \
+        test_cluster_native_hot_block_owner.inc \
+        test_cluster_native_resident_x test_cluster_native_master test_cluster_native_resident_lock \
+        test_cluster_native_holder_writeback
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-native-hot-block
+.PHONY: clean-native-hot-block
+clean-native-hot-block:
+	rm -f test_cluster_native_hot_block $(addprefix test_cluster_native_hot_block_, \
+        writer.inc writer.inc.tmp master.inc master.inc.tmp reader.inc reader.inc.tmp \
+        reserve.inc reserve.inc.tmp drain.inc drain.inc.tmp io.inc io.inc.tmp \
+        owner.inc owner.inc.tmp)
+
+test_cluster_native_hot_block_io.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^StartBufferIO\(/ { print "static bool"; emit=1; starts++ } \
+         /^TerminateBufferIO\(/ { print "static void"; emit=1; ends++ } \
+         emit { print } /^}/ && emit { emit=0 } \
+         END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_owner.inc: $(top_srcdir)/src/backend/utils/resowner/resowner.c Makefile
+	awk '/^ResourceArrayFree\(/ { print "static void"; emit=1; arrays++ } \
+         /^ResourceOwner(Delete|NewParent)\(/ { print "void"; emit=1; owners++ } \
+         emit { print } /^}/ && emit { emit=0 } \
+         END { if (arrays != 1 || owners != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
