@@ -402,6 +402,7 @@ mx_history_lock_window_open(Relation rel, Buffer buffer, HeapTuple tuple,
 			requested->wait_for_conflict, requested->follow_updates,
 			&receipt_result, &window_scope.operation);
 		cluster_current_mx_lock_scope_require(&window_scope);
+		cluster_current_mx_bind_writer_scope(&window_scope, &receipt_result);
 	}
 	PG_CATCH();
 	{
@@ -445,6 +446,13 @@ void mx_history_lock_window_close(void)
 }
 
 static ClusterCurrentMxLockScope *recursive_scope;
+bool
+mx_history_writer_matches(Buffer buffer, HeapTuple tuple,
+	const ClusterHeapSuccessorProof *proof, bool scoped)
+{
+	return cluster_current_mx_successor_matches(buffer, tuple, proof,
+		scoped ? recursive_scope : NULL);
+}
 static bool recursive_edge_consumed;
 static ClusterCurrentMxOperationState recursive_operation;
 void

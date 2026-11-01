@@ -13509,6 +13509,8 @@ test_cluster_mx_operation_consumer: test_cluster_mx_operation_consumer.c \
 
 TESTS += test_cluster_mx_history_writer_decision
 all: test_cluster_mx_history_writer_decision
+TESTS += test_cluster_mx_history_writer_bridge
+all: test_cluster_mx_history_writer_bridge
 
 # Collector results consumed through the actual dormant codecs and operation core.
 TESTS += test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot test_cluster_mx_history_caller test_cluster_mx_history_hot_caller
@@ -13517,7 +13519,7 @@ all: test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cl
 TESTS += test_cluster_mx_history_native_walk test_cluster_mx_history_full_companion test_cluster_mx_history_lock_handoff test_cluster_mx_history_lock_scope test_cluster_mx_history_recursive_lock
 all: test_cluster_mx_history_native_walk test_cluster_mx_history_full_companion test_cluster_mx_history_lock_handoff test_cluster_mx_history_lock_scope test_cluster_mx_history_recursive_lock
 
-test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot test_cluster_mx_history_caller test_cluster_mx_history_hot_caller test_cluster_mx_history_native_walk test_cluster_mx_history_full_companion test_cluster_mx_history_lock_handoff test_cluster_mx_history_lock_scope test_cluster_mx_history_recursive_lock test_cluster_mx_history_writer_decision: %: %.c \
+test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot test_cluster_mx_history_caller test_cluster_mx_history_hot_caller test_cluster_mx_history_native_walk test_cluster_mx_history_full_companion test_cluster_mx_history_lock_handoff test_cluster_mx_history_lock_scope test_cluster_mx_history_recursive_lock test_cluster_mx_history_writer_decision test_cluster_mx_history_writer_bridge: %: %.c \
 		test_cluster_mx_history_typed_hot.inc test_cluster_mx_history_native_walk.c test_cluster_mx_history_hot_caller.c test_cluster_mx_history_hot.c test_cluster_mx_history_authorize.c test_cluster_mx_history_roundtrip.c test_cluster_mx_history_heap_bridge.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_visibility_verdict.c \
 		$(top_srcdir)/src/backend/utils/time/combocid.c $(top_srcdir)/src/include/utils/combocid.h \
@@ -13576,7 +13578,8 @@ TESTS += test_cluster_mx_operation_receipt test_cluster_mx_receipt_publication
 all: test_cluster_mx_operation_receipt test_cluster_mx_receipt_publication
 
 test_cluster_mx_operation_receipt_product.o: test_cluster_mx_operation_receipt_product.c \
-		test_cluster_mx_operation_receipt.h $(top_srcdir)/src/backend/access/heap/heapam.c
+		test_cluster_mx_operation_receipt.h $(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/include/access/heapam.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_mx_operation_receipt test_cluster_mx_receipt_publication: %: %.c \

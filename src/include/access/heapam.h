@@ -40,6 +40,8 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_r4_projection.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_savepoint_reader.h"
+#include "cluster/cluster_multixact_current.h"
 #endif
 
 
@@ -68,8 +70,8 @@ extern bool cluster_heap_preflight_write(Relation relation, const char *operatio
  */
 /* Read-only typed-history variant, private to this content-lock bracket.
  * Exact page/tuple/roots plus fresh read qualification replace no raw gate:
- * legacy proofs retain their original ITL equality; mutation rejects this
- * variant until its separate operation-aware receipt path is connected. */
+ * legacy proofs retain their original ITL equality. Mutation rejects this
+ * variant; the separate writer delivery below owns its exact scope/grant. */
 typedef struct ClusterHeapSuccessorHistory
 {
 	ClusterPcmOwnSnapshot pcm;
@@ -81,6 +83,18 @@ typedef struct ClusterHeapSuccessorHistory
 	FullTransactionId top_fxid, operation_fxid;
 	uint32 canonical_generation;
 } ClusterHeapSuccessorHistory;
+
+/* Independent writer delivery; never inferred from a read-only handoff. */
+typedef struct ClusterHeapSuccessorWriter
+{
+	ClusterSavepointOperationKey key;
+	ClusterCurrentMemberOperationProof member;
+	ClusterCurrentMxKey mxkey;
+	ClusterCurrentMxMemberDesc descriptor;
+	uint32 capability_generation;
+	uint64 snapshot_identity, read_epoch, admission_generation, scope_generation;
+	SCN read_scn;
+} ClusterHeapSuccessorWriter;
 
 typedef struct ClusterHeapSuccessorProof
 {
@@ -95,6 +109,8 @@ typedef struct ClusterHeapSuccessorProof
 	uint8		locator_itl_kind;
 	uint8		locator_itl_slot_index;
 	ClusterHeapSuccessorHistory history;
+	ClusterHeapSuccessorWriter writer;
+	bool		writer_valid;
 	bool		history_valid;
 	bool		valid;
 } ClusterHeapSuccessorProof;

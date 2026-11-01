@@ -110,4 +110,6 @@ extern bool mx_history_recursive_next(HeapTuple tuple, ClusterHeapSuccessorProof
 extern void mx_history_recursive_missing(const ClusterHeapSuccessorProof *expected);
 extern bool mx_history_recursive_header(HeapTuple tuple, TransactionId xmax,
 	uint16 infomask, uint16 infomask2, uint8 output[SizeofHeapTupleHeader]);
+extern bool mx_history_writer_matches(Buffer buffer, HeapTuple tuple,
+	const ClusterHeapSuccessorProof *proof, bool scoped);
 #endif

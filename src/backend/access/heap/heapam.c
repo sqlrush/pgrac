@@ -8301,6 +8301,7 @@ cluster_writer_chain_probe_new_version(Relation relation, Buffer oldbuf,
  * page-ITL, and PCM ownership fingerprint closes each unlocked window.
  */
 static uint64 cluster_current_mx_next_operation_id;
+static uint64 cluster_current_mx_next_scope_id;
 static bool cluster_current_mx_capture_equal(
 	const ClusterCurrentMxHeapFingerprint *left,
 	const ClusterCurrentMxHeapFingerprint *right);
@@ -8333,6 +8334,7 @@ typedef struct ClusterCurrentMxLockScope
 	Snapshot actual;
 	ResourceOwner owner;
 	uint64 identity;
+	uint64 binding_id;
 	SCN read_scn;
 	uint64 read_epoch;
 	ClusterSemanticAdmissionToken admission;
@@ -8340,6 +8342,8 @@ typedef struct ClusterCurrentMxLockScope
 	bool evaluation_entered;
 	ClusterCurrentMxOperationState operation;
 } ClusterCurrentMxLockScope;
+
+static void cluster_current_mx_lock_scope_require(ClusterCurrentMxLockScope *scope);
 
 typedef enum ClusterCurrentMxStampKind
 {
@@ -8790,7 +8794,7 @@ cluster_current_mx_set_successor_proof(
  * The caller owns the original relocked tuple and retained Snapshot; these
  * are the consume-once keys/A/B/capabilities from that same attempt. */
 static ClusterCurrentMxDecision pg_attribute_unused()
-cluster_current_mx_result_consume_operations(
+cluster_current_mx_result_consume_operations_mode(
 	ClusterCurrentMxHeapResult *heap_result,
 	const ClusterCurrentMxMemberDesc *members,
 	const ClusterSavepointOperationKey *keys,
@@ -8802,7 +8806,8 @@ cluster_current_mx_result_consume_operations(
 	const ClusterCurrentUpdaterProof *updater,
 	const ItemPointerData *successor_tid,
 	const ClusterCurrentMxOperationState *operation,
-	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace,
+	const ClusterUndoRecordTarget *target, const ClusterMxHistorySuccessorProof *successor)
 {
 	ClusterCurrentMxDecision decision;
 	int updater_ordinal = -1;
@@ -8826,8 +8831,15 @@ cluster_current_mx_result_consume_operations(
 
 	/* Only this typed decision may project exact canonical ownership to
 	 * SELF. Never pass base proofs to the legacy SQL decision compositor. */
-	decision = cluster_multixact_current_decide_operations(members, keys, proofs,
-		nmembers, ctx, owner, challenge, updater, wait_key, trace);
+	if (successor != NULL) {
+		if (successor->requester_capability_generation == 0)
+			goto invalid;
+		decision = cluster_multixact_current_decide_operations_with_successor(members, keys,
+			proofs, nmembers, ctx, owner, target, &successor->key, &successor->member,
+			wait_key, trace);
+	} else
+		decision = cluster_multixact_current_decide_operations(members, keys, proofs,
+			nmembers, ctx, owner, challenge, updater, wait_key, trace);
 	if (decision == CMDL_UNKNOWN)
 		goto unknown;
 	for (i = 0; i < nmembers; i++)
@@ -8850,7 +8862,7 @@ cluster_current_mx_result_consume_operations(
 	 * does not require chain following; do not manufacture B from A/echo.
 	 * The original qualified landing proves its source; this is its final
 	 * binding comparison against the freshly relocked successor challenge. */
-	if (ctx->tuple_shape == CCM_SHAPE_UPDATED)
+	if (ctx->tuple_shape == CCM_SHAPE_UPDATED && successor == NULL)
 	{
 		if (updater_ordinal < 0 || challenge == NULL || updater == NULL
 			|| successor_tid == NULL || !ItemPointerIsValid(successor_tid)
@@ -8878,7 +8890,7 @@ cluster_current_mx_result_consume_operations(
 				&updater->candidate_next_xmin_locator))
 			goto invalid;
 	}
-	else if (challenge != NULL)
+	else if (ctx->tuple_shape != CCM_SHAPE_UPDATED && (challenge != NULL || successor != NULL))
 		goto invalid;
 
 	switch (decision)
@@ -8917,8 +8929,8 @@ cluster_current_mx_result_consume_operations(
 		case CMDL_UNKNOWN:
 			goto unknown;
 	}
-	if (decision == CMDL_UPDATED || decision == CMDL_FOLLOW_UPDATED
-		|| (decision == CMDL_SELF_MODIFIED && ctx->tuple_shape == CCM_SHAPE_UPDATED))
+	if (successor == NULL && (decision == CMDL_UPDATED || decision == CMDL_FOLLOW_UPDATED
+		|| (decision == CMDL_SELF_MODIFIED && ctx->tuple_shape == CCM_SHAPE_UPDATED)))
 		cluster_current_mx_set_successor_proof(&heap_result->successor_proof,
 			successor_tid, heap_result->authoritative_updater,
 			&challenge->candidate_next_xmin_alias,
@@ -8938,6 +8950,22 @@ unknown:
 	return CMDL_UNKNOWN;
 }
 
+/* Original V1/raw consumer keeps its proof gate and receipt behavior. */
+static ClusterCurrentMxDecision pg_attribute_unused()
+cluster_current_mx_result_consume_operations(
+	ClusterCurrentMxHeapResult *heap_result, const ClusterCurrentMxMemberDesc *members,
+	const ClusterSavepointOperationKey *keys, const ClusterCurrentMemberOperationProof *proofs,
+	const uint32 *capabilities, uint16 nmembers, const ClusterCurrentMxRequestContext *ctx,
+	const ClusterR4CrOwnerChallenge *owner, const ClusterCurrentUpdaterChallenge *challenge,
+	const ClusterCurrentUpdaterProof *updater, const ItemPointerData *successor_tid,
+	const ClusterCurrentMxOperationState *operation, ClusterTTStatusKey *wait_key,
+	ClusterCurrentMxDecisionTrace *trace)
+{
+	return cluster_current_mx_result_consume_operations_mode(heap_result, members, keys, proofs,
+		capabilities, nmembers, ctx, owner, challenge, updater, successor_tid, operation,
+		wait_key, trace, NULL, NULL);
+}
+
 /*
  * Compare an authority-proven successor under a held content lock.  Raw xmin
  * equality is insufficient: the live tuple must still carry the exact
@@ -8951,6 +8979,8 @@ cluster_current_mx_successor_key_matches(
 	ClusterTxLocator locator;
 	ClusterTxLocator canonical_locator;
 
+	if (proof != NULL && proof->writer_valid)
+		return false;
 	if (proof != NULL && proof->valid && proof->history_valid)
 		return proof->cluster_epoch == cluster_epoch_get_current()
 			&& cluster_current_mx_history_successor_matches(buffer, tuple, &proof->tid,
@@ -8984,12 +9014,85 @@ cluster_current_mx_successor_key_matches(
 		&& cluster_tx_locator_reply_matches(&locator, &canonical_locator);
 }
 
+/* Exact writer image, not a read proof promotion. Any intervening page or
+ * root write requalifies the original attempt; never rebase a saved proof. */
+static bool
+cluster_current_mx_writer_successor_matches(Buffer buffer, HeapTuple tuple,
+	const ClusterHeapSuccessorProof *proof, ClusterCurrentMxLockScope *scope)
+{
+	const ClusterHeapSuccessorWriter *w = &proof->writer;
+	const ClusterCurrentMemberProofKey *key = &w->member.base.key;
+	ClusterCurrentMemberOperationProof single = w->member;
+	ClusterCurrentMxHeapFingerprint live;
+	HeapTupleData candidate;
+	ClusterCtrcTxnKeyV1 ctrc;
+	ClusterCtrcParticipantIdentity participant;
+	BufferTag *tag;
+
+	if (!proof->valid || !proof->writer_valid || proof->history_valid || scope == NULL
+		|| buffer <= 0 || buffer > NBuffers || !BufferIsPinnedByMe(buffer)
+		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
+			LW_EXCLUSIVE))
+		return false;
+	cluster_current_mx_lock_scope_require(scope);
+	tag = &GetBufferDescriptor(buffer - 1)->tag;
+	single.base.member_ordinal = 0;
+	if (w->scope_generation == 0 || w->scope_generation != scope->binding_id
+		|| w->snapshot_identity != scope->identity || w->read_scn != scope->read_scn
+		|| w->read_epoch != scope->read_epoch
+		|| w->admission_generation != scope->admission.record_generation
+		|| proof->cluster_epoch != cluster_epoch_get_current()
+		|| w->capability_generation == 0 || w->member.flags != CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+		|| w->member.effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+		|| (w->member.base.state != CCM_ACTIVE && w->member.base.state != CCM_COMMITTED)
+		|| cluster_multixact_current_validate_operation_proof_set(&w->mxkey, &w->descriptor,
+			&w->key, &single, 1) != CMX_RESOLVE_OK
+		|| proof->updater_xid != w->descriptor.xid || proof->origin_node_id != key->origin_node_id
+		|| proof->undo_record_segment_id != key->undo_segment_id || proof->tt_slot_id != key->tt_slot_id
+		|| proof->cluster_epoch != key->cluster_epoch
+		|| proof->locator_uba_raw[0] != w->key.locator.uba.raw[0]
+		|| proof->locator_uba_raw[1] != w->key.locator.uba.raw[1]
+		|| proof->locator_tt_wrap != w->key.locator.tt_wrap
+		|| proof->locator_itl_kind != w->key.locator.itl_kind
+		|| proof->locator_itl_slot_index != w->key.locator.itl_slot_index
+		|| proof->history.canonical_generation != key->segment_generation
+		|| !FullTransactionIdEquals(proof->history.top_fxid, w->member.top_fxid)
+		|| !FullTransactionIdEquals(proof->history.operation_fxid, w->member.operation_fxid)
+		|| w->key.target.locator.spcOid != tag->spcOid
+		|| w->key.target.locator.dbOid != tag->dbOid
+		|| w->key.target.locator.relNumber != tag->relNumber || w->key.target.forknum != tag->forkNum
+		|| w->key.target.blockno != tag->blockNum
+		|| w->key.target.blockno != ItemPointerGetBlockNumber(&proof->tid)
+		|| w->key.target.offnum != ItemPointerGetOffsetNumber(&proof->tid)
+		|| tuple == NULL || tuple->t_data == NULL
+		|| !ItemPointerEquals(&tuple->t_self, (ItemPointer)&proof->tid)
+		|| !cluster_current_mx_history_candidate(buffer, &proof->tid, tuple->t_tableOid, &candidate)
+		|| candidate.t_data != tuple->t_data || candidate.t_len != tuple->t_len
+		|| HeapTupleHeaderGetRawXmin(tuple->t_data) != proof->updater_xid
+		|| !cluster_current_mx_capture(buffer, tuple, &live)
+		|| !cluster_pcm_x_activation_fence_open(live.pcm.writer_activation_token,
+			live.pcm.resource_x_activation_generation)
+		|| !cluster_heap_pcm_authority_equal(&proof->history.pcm, &live.pcm)
+		|| proof->history.page_lsn != live.page_lsn || proof->history.tuple_len != live.tuple_len
+		|| memcmp(&proof->history.line_pointer, &live.line_pointer, sizeof(live.line_pointer)) != 0
+		|| memcmp(proof->history.tuple_header, live.tuple_header, sizeof(live.tuple_header)) != 0
+		|| memcmp(proof->history.roots, live.itl_slots, sizeof(live.itl_slots)) != 0)
+		return false;
+	return w->member.base.state != CCM_ACTIVE
+		|| cluster_runtime_visibility_active_proof_ctrc_identity_exact(key,
+			ClusterCurrentMemberProofGetCtrcGrant(&w->member.base), w->capability_generation,
+			&ctrc, &participant);
+}
+
 static bool
 cluster_current_mx_successor_matches(
-	Buffer buffer, HeapTuple tuple, const ClusterHeapSuccessorProof *proof)
+	Buffer buffer, HeapTuple tuple, const ClusterHeapSuccessorProof *proof,
+	ClusterCurrentMxLockScope *scope)
 {
 	ClusterPcmOwnSnapshot pcm;
 
+	if (proof != NULL && proof->writer_valid)
+		return cluster_current_mx_writer_successor_matches(buffer, tuple, proof, scope);
 	return proof != NULL && !proof->history_valid
 		&& cluster_current_mx_successor_key_matches(buffer, tuple, proof)
 		&& cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1),
@@ -9126,7 +9229,7 @@ cluster_current_mx_build_hot_challenge(
 static bool
 cluster_current_mx_build_history_challenge(Relation relation, Buffer buffer, HeapTuple root,
 	TransactionId updater, uint16 ordinal, ClusterMxHistorySuccessorChallenge *challenge,
-	ClusterCurrentMxHeapFingerprint *capture)
+	ClusterCurrentMxHeapFingerprint *capture, bool read_only)
 {
 	HeapTupleData candidate;
 	BufferTag *tag = &GetBufferDescriptor(buffer - 1)->tag;
@@ -9135,7 +9238,7 @@ cluster_current_mx_build_history_challenge(Relation relation, Buffer buffer, Hea
 		|| !cluster_current_mx_history_candidate(buffer, &root->t_data->t_ctid,
 			RelationGetRelid(relation), &candidate)
 		|| HeapTupleHeaderGetRawXmin(candidate.t_data) != updater
-		|| !cluster_current_mx_read_capture(buffer, &candidate, capture))
+		|| !cluster_current_mx_capture_mode(buffer, &candidate, capture, read_only))
 		return false;
 	memset(challenge, 0, sizeof(*challenge));
 	challenge->target.locator = BufTagGetRelFileLocator(tag);
@@ -9180,6 +9283,38 @@ cluster_current_mx_set_history_successor(ClusterHeapSuccessorProof *out,
 	out->history.operation_fxid = b->member.operation_fxid;
 	out->history.canonical_generation = key->segment_generation;
 	out->history_valid = out->valid = true;
+	return true;
+}
+
+static bool
+cluster_current_mx_set_writer_successor(ClusterHeapSuccessorProof *out,
+	Buffer buffer, Relation relation, const ItemPointerData *tid, TransactionId updater,
+	const ClusterMxHistoryCapture *capture, const ClusterMxHistorySuccessorProof *b)
+{
+	HeapTupleData candidate;
+	ClusterCurrentMxHeapFingerprint fresh;
+	ClusterHeapSuccessorWriter *w;
+	uint16 ordinal = b->member.base.member_ordinal;
+
+	/* The read builder supplies only bytes here; writer qualification is
+	 * independently required from this exact EXCLUSIVE collector attempt. */
+	if (capture->read_only || ordinal >= capture->nmembers
+		|| !cluster_current_mx_history_candidate(buffer, tid, RelationGetRelid(relation), &candidate)
+		|| !cluster_current_mx_capture(buffer, &candidate, &fresh)
+		|| !cluster_current_mx_set_history_successor(out, buffer, relation, tid, updater, b))
+		return false;
+	out->history_valid = false;
+	w = &out->writer;
+	w->key = b->key;
+	w->member = b->member;
+	w->mxkey = capture->mxkey;
+	w->descriptor = capture->members[ordinal];
+	w->capability_generation = b->requester_capability_generation;
+	w->snapshot_identity = capture->snapshot_identity;
+	w->read_epoch = capture->read_epoch;
+	w->read_scn = capture->read_scn;
+	w->admission_generation = capture->admission.record_generation;
+	out->writer_valid = true;
 	return true;
 }
 
@@ -9303,31 +9438,23 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 			if (read_only && !have_challenge)
 				break;
 			batch->successor = tuple->t_data->t_ctid;
-			if (read_only) {
+			if (have_challenge) {
 				ClusterCurrentMxHeapFingerprint legacy_capture;
 				if (!cluster_current_mx_build_history_challenge(relation, buffer, tuple,
-					members[updater].xid, (uint16)updater, &batch->target_challenge, &batch->candidate))
+					members[updater].xid, (uint16)updater, &batch->target_challenge,
+					&batch->candidate, read_only))
 					break;
 				/* Only V1 may consume this optional original raw challenge. */
 				batch->legacy_challenge = cluster_current_mx_build_hot_challenge(relation,
 					buffer, tuple, members[updater].xid, (uint16)updater, &batch->challenge,
-					&legacy_capture, true);
+					&legacy_capture, read_only);
 				if (!cluster_mx_history_capture_begin_with_successor(relation, buffer, tuple,
 					actual, key, members, nmembers, admission, &batch->target_challenge,
 					batch->legacy_challenge ? &batch->challenge : NULL, &batch->collector))
 					break;
-			} else {
-				if (have_challenge && !cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
-					members[updater].xid, (uint16)updater, &batch->challenge, &batch->candidate, false))
-					break;
-				if (have_challenge) {
-					if (!cluster_mx_history_capture_begin_with_updater(relation, buffer, tuple, actual,
-						key, members, nmembers, admission, &batch->challenge, &batch->collector))
-						break;
-				} else if (!cluster_mx_history_capture_begin(relation, buffer, tuple, actual,
-					key, members, nmembers, admission, &batch->collector))
-					break;
-			}
+			} else if (!cluster_mx_history_capture_begin(relation, buffer, tuple, actual,
+				key, members, nmembers, admission, &batch->collector))
+				break;
 			if (!cluster_mx_history_capture_read(batch->collector, &batch->capture))
 				break;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -9341,10 +9468,10 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 				ClusterCurrentMxHeapFingerprint fresh;
 				bool exact = cluster_current_mx_hot_capture_still_exact(buffer, relation,
 					&batch->successor, &batch->candidate, read_only);
-				if (exact && read_only)
+				if (exact)
 					exact = cluster_current_mx_build_history_challenge(relation, buffer, tuple,
-						members[updater].xid, (uint16)updater, &batch->fresh_target, &fresh);
-				if (exact && (!read_only || batch->legacy_challenge))
+						members[updater].xid, (uint16)updater, &batch->fresh_target, &fresh, read_only);
+				if (exact && batch->legacy_challenge)
 					exact = cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
 						members[updater].xid, (uint16)updater, &batch->fresh_challenge, &fresh, read_only);
 				if (!exact) {
@@ -9352,7 +9479,7 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 					break;
 				}
 			}
-			if (read_only)
+			if (have_challenge)
 				collected = cluster_mx_history_recheck_and_finish_with_successor(batch->collector,
 					relation, buffer, tuple, key, members, nmembers, batch->keys, batch->proofs,
 					batch->capabilities, nmembers, &batch->fresh_target,
@@ -9408,6 +9535,15 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 			/* A complete typed probe with neutral precheck can report SELF_MODIFIED
 			 * only for an exact owned live updater. Do not decode any raw/foreign
 			 * combo ID, or use native GetCmax's raw MultiXact assertion lookup. */
+			if (batch->typed_successor.member.flags == CLUSTER_CURRENT_OPERATION_PROOF_EXACT) {
+				if (!cluster_mx_history_validate_successor(&batch->capture, batch->keys,
+					batch->proofs, &batch->fresh_target, &batch->typed_successor))
+					break;
+				probe = cluster_multixact_current_decide_operations_with_successor(members,
+					batch->keys, batch->proofs, nmembers, &batch->ctx, &batch->capture.requester_owner,
+					&batch->fresh_target.target, &batch->typed_successor.key,
+					&batch->typed_successor.member, &probe_wait, trace);
+			} else
 			probe = cluster_multixact_current_decide_operations(members, batch->keys, batch->proofs,
 				nmembers, &batch->ctx, &batch->capture.requester_owner,
 				have_challenge ? &batch->fresh_challenge : NULL, &batch->updater, &probe_wait, trace);
@@ -9421,12 +9557,23 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 				}
 				break;
 			}
-			*decision = cluster_current_mx_result_consume_operations(heap_result, members,
+			*decision = cluster_current_mx_result_consume_operations_mode(heap_result, members,
 				batch->keys, batch->proofs, batch->capabilities, nmembers, &batch->ctx,
 				&batch->capture.requester_owner, have_challenge ? &batch->fresh_challenge : NULL,
-				&batch->updater, have_challenge ? &batch->successor : NULL, operation, wait_key, trace);
-			if (*decision != CMDL_UNKNOWN)
-				step = CMXH_COMPLETE;
+				&batch->updater, have_challenge ? &batch->successor : NULL, operation, wait_key, trace,
+				&batch->fresh_target.target,
+				batch->typed_successor.member.flags == CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+					? &batch->typed_successor : NULL);
+			if (*decision == CMDL_UNKNOWN)
+				break;
+			if (batch->typed_successor.member.flags == CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+				&& (*decision == CMDL_UPDATED || *decision == CMDL_FOLLOW_UPDATED
+					|| *decision == CMDL_SELF_MODIFIED)
+				&& !cluster_current_mx_set_writer_successor(&heap_result->successor_proof,
+					buffer, relation, &batch->successor, members[updater].xid,
+					&batch->capture, &batch->typed_successor))
+				break;
+			step = CMXH_COMPLETE;
 		} while (false);
 	}
 	PG_FINALLY();
@@ -9434,6 +9581,12 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 		/* The last typed/receipt consumer runs while the native lease is held. */
 		cluster_mx_history_cancel(batch->collector);
 		pfree(batch);
+		if (step != CMXH_COMPLETE) {
+			memset(heap_result, 0, sizeof(*heap_result));
+			heap_result->result = TM_BeingModified;
+			*decision = CMDL_UNKNOWN;
+			memset(wait_key, 0, sizeof(*wait_key));
+		}
 	}
 	PG_END_TRY();
 	return step;
@@ -10543,6 +10696,10 @@ cluster_current_mx_lock_scope_begin(ClusterCurrentMxLockScope *scope, Snapshot a
 		|| !cluster_current_mx_caller_snapshot(actual, &scope->identity))
 		cluster_current_mx_failclosed(&scope->operation, CCMH_FAIL_MEMBER_PROOF,
 			"the tuple-lock caller has no exact retained statement Snapshot");
+	if (cluster_current_mx_next_scope_id == UINT64_MAX)
+		cluster_current_mx_failclosed(&scope->operation, CCMH_FAIL_MEMBER_PROOF,
+			"the tuple-lock scope identity is exhausted");
+	scope->binding_id = ++cluster_current_mx_next_scope_id;
 	scope->actual = actual;
 	scope->owner = CurrentResourceOwner;
 	scope->read_scn = actual->read_scn;
@@ -10563,7 +10720,7 @@ cluster_current_mx_lock_scope_require(ClusterCurrentMxLockScope *scope)
 	if (scope == NULL)
 		return;
 	/* Membership/retention is checked before dereferencing actual. */
-	if (!scope->evaluation_entered || CurrentResourceOwner != scope->owner
+	if (scope->binding_id == 0 || !scope->evaluation_entered || CurrentResourceOwner != scope->owner
 		|| !cluster_semantic_activation_recheck(&scope->admission)
 		|| !cluster_snapshot_cr_identity_v1(scope->actual, &identity)
 		|| identity != scope->identity || scope->actual->read_scn != scope->read_scn
@@ -10572,10 +10729,31 @@ cluster_current_mx_lock_scope_require(ClusterCurrentMxLockScope *scope)
 			"the tuple-lock statement scope changed before consumption");
 }
 
+/* Only the actual long-lived native scope may bind a delivered writer edge.
+ * A collector or transient caller cannot invent a new follow lifetime. */
+static void
+cluster_current_mx_bind_writer_scope(ClusterCurrentMxLockScope *scope,
+	ClusterCurrentMxHeapResult *current)
+{
+	ClusterHeapSuccessorWriter *w = &current->successor_proof.writer;
+
+	if (!current->successor_proof.writer_valid)
+		return;
+	cluster_current_mx_lock_scope_require(scope);
+	if (scope == NULL || w->snapshot_identity != scope->identity
+		|| w->read_scn != scope->read_scn || w->read_epoch != scope->read_epoch
+		|| w->admission_generation != scope->admission.record_generation
+		|| (w->scope_generation != 0 && w->scope_generation != scope->binding_id))
+		cluster_current_mx_failclosed(scope != NULL ? &scope->operation : NULL,
+			CCMH_FAIL_HOT_PROOF, "the writer successor belongs to a different native scope");
+	w->scope_generation = scope->binding_id;
+}
+
 static void
 cluster_current_mx_lock_scope_end(ClusterCurrentMxLockScope *scope)
 {
 	cluster_current_mx_operation_finish(&scope->operation);
+	scope->binding_id = 0;
 	if (scope->evaluation_entered) {
 		cluster_snapshot_read_exit_v1(&scope->evaluation);
 		scope->evaluation_entered = false;
@@ -10662,6 +10840,7 @@ cluster_current_mx_chain_authorize(ClusterCurrentMxLockScope *scope,
 			scope->actual, &scope->admission, requester, CCM_ACTION_LOCK, mode,
 			false, LockWaitBlock, true, true, current, operation);
 		cluster_current_mx_lock_scope_require(scope);
+		cluster_current_mx_bind_writer_scope(scope, current);
 		return disposition;
 	}
 	if (cluster_peer_mode_enabled()
@@ -17896,7 +18075,7 @@ l3:
 	if (expected_successor != NULL && expected_successor->valid)
 	{
 		if (!cluster_current_mx_successor_matches(
-				*buffer, tuple, expected_successor))
+				*buffer, tuple, expected_successor, history_scope))
 			cluster_current_mx_failclosed(
 				operation,
 				CCMH_FAIL_ABA_FENCE,
@@ -17963,12 +18142,14 @@ l3:
 		{
 			ClusterCurrentMxHeapDisposition current_mx_disposition;
 
-			if (history_scope != NULL)
+			if (history_scope != NULL) {
 				current_mx_disposition = cluster_current_mx_history_authorize(
 					relation, *buffer, tuple, history_scope->actual,
 					&history_scope->admission, GetCurrentTransactionId(),
 					CCM_ACTION_LOCK, mode, false, wait_policy, true,
 					follow_updates, &cluster_current_mx, operation);
+				cluster_current_mx_bind_writer_scope(history_scope, &cluster_current_mx);
+			}
 			else
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, *buffer, tuple, GetCurrentTransactionId(),
@@ -20251,7 +20432,7 @@ l4:
 #ifdef USE_PGRAC_CLUSTER
 		if (expected_successor.valid
 			&& !cluster_current_mx_successor_matches(
-				buf, &mytup, &expected_successor))
+				buf, &mytup, &expected_successor, history_scope))
 			cluster_current_mx_failclosed(
 				NULL,
 				CCMH_FAIL_ABA_FENCE,
