@@ -13,6 +13,8 @@
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_cold_relmap.h"
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_guc.h"
@@ -223,6 +225,7 @@ static void (*ctrc_interrupt_step)(void);
 static unsigned ctrc_driver_acquires, ctrc_driver_authorizations, ctrc_driver_waits;
 static unsigned ctrc_driver_busy_until, ctrc_driver_lwlocks;
 static bool ctrc_driver_waiting, ctrc_driver_false_authorization, ctrc_driver_error;
+static void start_native_table_reset(void);
 static ClusterControlRootResult ctrc_driver_result;
 static void (*ctrc_driver_acquire_step)(void), (*ctrc_driver_authorize_step)(void);
 static void (*ctrc_driver_wait_step)(void);
@@ -734,6 +737,7 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 
 static void reset(void)
 {
+	start_native_table_reset();
 	history_fixture_reset();
 	relmap_owner_check_step = NULL;
 	relmap_observe_checks = relmap_observe_fault_at = 0;
@@ -2578,8 +2582,15 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_tx_relmap_handoff.inc"
 #include "test_cluster_cold_ctrc_relmap_gate.inc"
 
+#include "test_cluster_cold_start_native_table.inc"
+
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_TABLE") != NULL) {
+		UT_PLAN(5);
+		start_native_table_tests();
+		UT_DONE(); return ut_failed_count != 0;
+	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 	if (getenv("PGRAC_PRE2_TEST_RELMAP_CONSUMER") != NULL) {
 		UT_PLAN(4);
@@ -3206,7 +3217,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(460);
+	UT_PLAN(465);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3217,7 +3228,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(449);
+	UT_PLAN(454);
 #endif
 	UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
 	UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
@@ -3249,7 +3260,7 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(421);
+	UT_PLAN(426);
 #endif
 	UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
 	UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
@@ -3692,6 +3703,7 @@ int main(void)
 	UT_RUN(test_start_images_preconditions_never_enter_or_start_a_replacement);
 	UT_RUN(test_start_images_missing_or_rebound_collection_revokes_same_observation);
 	UT_RUN(test_start_images_error_or_late_owner_drift_preserve_original_cleanup);
+	start_native_table_tests();
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

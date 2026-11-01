@@ -5296,6 +5296,11 @@ test_cluster_cold_relmap_terminal_start: test_cluster_cold_relmap_terminal.c \
 test_cluster_cold_tx_start test_cluster_relmap_original_start.o: \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
 
+test_cluster_cold_tx_start test_cluster_relmap_original_start.o: \
+		test_cluster_cold_start_native_table.inc \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h
+
 test_cluster_relmap_original_start.o: test_cluster_relmap_original_start.c \
 		test_cluster_relmap_original_start.h \
 		test_cluster_relmap_original_start_namespace.h \

@@ -207,6 +207,8 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_cold_relmap.h"
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_terminal_ref_census.h"
@@ -5823,6 +5825,60 @@ ClusterColdRecoveryTxC0Reserve(const struct ClusterRecoveryStartV1 *start,
 	return true;
 }
 
+/* One narrow original CF interval, before any post-replay read scope or new
+ * target IR. The table is control input only; it carries no file lifetime,
+ * native recovery, checkpoint or joint completion permission. */
+static bool
+cluster_recovery_cold_native_files_publish(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterControlRelmapFormatV2 before, after;
+	volatile bool attempted = false, selected = false;
+
+	if (!cluster_recovery_cold_ctrc_replays_actor()
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	PG_TRY();
+	{
+		attempted = true; /* Preserve exact CF cleanup even if acquire throws. */
+		if (cluster_cf_lock(ExclusiveLock)
+			&& cluster_cf_held_is_clusterwide(ExclusiveLock)
+			&& ClusterColdRecoveryTxCurrent(start)
+			&& cluster_control_root_relmap_format_locked_v2(
+				CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &before) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& before.config.identity.system_identifier == start->writer.ref.claim.identity.system_identifier
+			&& before.config.identity.database_incarnation == start->writer.ref.claim.database_incarnation
+			&& before.config.identity.generation >= start->writer.ref.claim.max_config_generation
+			&& !memcmp(before.config.identity.storage_uuid, start->writer.ref.claim.identity.storage_uuid, 16)
+			&& !memcmp(before.config.identity.authority_uuid, start->writer.ref.claim.identity.authority_uuid, 16)
+			&& ClusterColdRecoveryTxCurrent(start)) {
+			/* An explicit ROOTv3 keeps its original path. Unknown never
+			 * falls back; ROOTv4 must install the complete selected table. */
+			selected = before.root_version == 3
+				|| (before.root_version == 4
+					&& cluster_control_native_files_publish_locked_v2(&before.config,
+						CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, start->owner_boot)
+						== CLUSTER_NATIVE_FILES_OK_V2);
+			selected = selected && ClusterColdRecoveryTxCurrent(start)
+				&& cluster_control_root_relmap_format_locked_v2(
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &after) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !memcmp(&before, &after, sizeof(before))
+				&& ClusterColdRecoveryTxCurrent(start);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (attempted) {
+			ClusterCfReleaseResult released = cluster_cf_unlock_confirmed(ExclusiveLock);
+			if (released != CLUSTER_CF_RELEASE_CONFIRMED)
+				selected = false; /* Unconfirmed CF remains original cleanup debt. */
+		}
+	}
+	PG_END_TRY();
+	/* No CF is carried into the original WAL/namespace/census entries. */
+	return selected && ClusterColdRecoveryTxCurrent(start);
+}
+
 bool
 ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 {
@@ -5842,6 +5898,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		|| cluster_recovery_cold_start != NULL || info->cluster_tx_start != NULL
 		|| cluster_recovery_cold_inputs->inputs != NULL
 		|| cluster_recovery_cold_inputs->plan == NULL
+		|| cluster_recovery_cold_inputs->refusal != CLUSTER_COLD_OK
 		|| cluster_recovery_cold_inputs->participant_count == 0
 		|| cluster_recovery_cold_inputs->top_tx_census == NULL
 		|| cluster_recovery_cold_inputs->top_tx_census->plan != cluster_recovery_cold_inputs->plan
@@ -5884,6 +5941,29 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	start->writer = writer;
 	memcpy(start->operation_uuid, operation_uuid, 16);
 	cluster_recovery_cold_start = start;
+	{
+		volatile bool published = false;
+		PG_TRY();
+		{
+			published = cluster_recovery_cold_native_files_publish(start);
+		}
+		PG_CATCH();
+		{
+			cluster_recovery_cold_inputs->refusal = CLUSTER_COLD_SOURCE_GAP;
+			cluster_recovery_checkpoint_revoke_v1(start);
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (!published) {
+			cluster_recovery_cold_inputs->refusal = CLUSTER_COLD_SOURCE_GAP;
+			cluster_recovery_checkpoint_revoke_v1(start);
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			return false;
+		}
+	}
 	if (relmap_count == 0) {
 		if (!ClusterColdRecoveryTxCurrent(start)
 			|| !cluster_recovery_checkpoint_register_v1(start)) {
