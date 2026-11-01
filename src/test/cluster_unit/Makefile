@@ -11518,15 +11518,15 @@ test_cluster_native_holder_bufmgr.inc: $(top_srcdir)/src/backend/storage/buffer/
 	awk '/^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
 	     /^typedef enum ClusterPcmOwnSSourceHardFailureReason/ { emit=1; types++ } \
 	     /^} ClusterPcmOwnSSourceHardFailureReason;/ { print; emit=0; next } \
-	     /^cluster_bufmgr_pcm_own_(snapshot_by_tag|begin_s_revoke|abort_s_revoke|begin_x_revoke|abort_x_revoke|prepare_x_source_image|finish_x_source|prepare_s_source_image|finish_s_source)\(/ { print "ClusterPcmOwnResult"; emit=1; pub++ } \
-	     /^cluster_bufmgr_pcm_own_(finish_x_to_s_downgrade|capture_x_source_locked|prepare_x_source_image_internal|prepare_s_source_image_internal|copy_source_image_exact)\(/ { print "static ClusterPcmOwnResult"; emit=1; priv++ } \
-	     /^cluster_bufmgr_downgrade_record_pi\(/ { print "static bool"; emit=1; pi++ } \
-	     emit { print } /^}/ { emit=0 } END { if (shape != 1 || types != 1 || pi != 1 || pub != 9 || priv != 5) exit 1 }' $< > $@.tmp
+	     /^cluster_bufmgr_pcm_own_(snapshot_by_tag|begin_s_revoke|abort_s_revoke|begin_x_revoke|abort_x_revoke|prepare_x_source_image|finish_x_source|prepare_s_source_image|finish_s_source|finish_revoke_retain|finish_s_holder_revoke|release_pi_carrier_exact)\(/ { print "ClusterPcmOwnResult"; emit=1; pub++ } \
+	     /^cluster_bufmgr_pcm_own_(finish_x_to_s_downgrade|capture_x_source_locked|prepare_x_source_image_internal|prepare_s_source_image_internal|copy_source_image_exact|finish_revoke_drop_unpinned|finish_revoke_retain_internal)\(/ { print "static ClusterPcmOwnResult"; emit=1; priv++ } \
+	     /^cluster_bufmgr_(downgrade_record_pi|revoke_wal_retained_locked|gcs_copy_defer_data)\(/ { print "static bool"; emit=1; pi++ } \
+	     emit { print } /^}/ { emit=0 } END { if (shape != 1 || types != 1 || pi != 3 || pub != 12 || priv != 7) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_native_holder_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_resource_x_acquire_s_read_finish_owned\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
+	awk '/^gcs_block_resource_x_acquire_s_(read_finish_owned|native_handoff_owned|source_finish_owned)\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
 	     /^gcs_block_resource_x_acquire_s_source_capture_owned\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
-	     emit { print } /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 clean distclean maintainer-clean: clean-native-holder
 .PHONY: clean-native-holder
