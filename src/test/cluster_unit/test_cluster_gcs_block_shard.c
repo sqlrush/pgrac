@@ -54,6 +54,7 @@
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_mx_history_wire.h"
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_multixact_operation_wire.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "storage/buf_internals.h"
@@ -1029,10 +1030,46 @@ UT_TEST(test_history424_exact_codec_routes_to_original_data0)
 		-1);
 }
 
+UT_TEST(test_current_mx_operation768_routes_by_identity_without_legacy_alias)
+{
+	ClusterCurrentMxOperationForwardV6 frame = { 0 };
+	BufferTag tag;
+	uint8 unaligned[sizeof(frame) + 1];
+	int expected;
+
+	frame.prefix.request_id = 12345;
+	frame.prefix.epoch = 9;
+	frame.prefix.original_requester_node = 2;
+	frame.prefix.requester_backend_id = 19;
+	frame.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	frame.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	frame.version = CLUSTER_CURRENT_MX_OPERATION_WIRE_VERSION;
+	tag = GcsBlockCurrentMxRouteTagMake(12345, 9, 2, 19);
+	expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+	for (int fault = 0; fault <= 9; ++fault) {
+		ClusterCurrentMxOperationForwardV6 candidate = frame;
+		uint16 length = sizeof(frame);
+		switch (fault) {
+		case 1: candidate.magic ^= 1; break;
+		case 2: candidate.version = 5; break;
+		case 3: candidate.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS; break;
+		case 4: candidate.reserved16 = 1; break;
+		case 5: candidate.prefix.requester_backend_id = 0; break;
+		case 6: candidate.prefix.request_id = 0; break;
+		case 7: candidate.prefix.original_requester_node = CLUSTER_MAX_NODES; break;
+		case 8: candidate.prefix.flags = 1; break;
+		case 9: length--; break;
+		}
+		memcpy(unaligned + 1, &candidate, sizeof(candidate));
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+			unaligned + 1, length, CLUSTER_LMS_MAX_WORKERS), fault == 0 ? expected : -1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
 	UT_RUN(test_first_fill_service_wire_routes_only_canonical_extension);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
@@ -1052,6 +1089,7 @@ main(void)
 	UT_RUN(test_resource_x_reused_types_route_only_after_strict_domain_decode);
 	UT_RUN(test_resource_x_length_collisions_preserve_legacy_domains);
 	UT_RUN(test_history424_exact_codec_routes_to_original_data0);
+	UT_RUN(test_current_mx_operation768_routes_by_identity_without_legacy_alias);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

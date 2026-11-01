@@ -936,6 +936,59 @@ cluster_multixact_operation_wire_get_ask(const ClusterCurrentMxOperationForwardV
 	return operation_wire_read_ask(&checked, index, cluster_xid_origin_slot(xid), out);
 }
 
+bool
+cluster_multixact_operation_wire_upgrade_top_request(
+	const ClusterCurrentMxProofForwardV2 *request, int32 source, int32 origin, uint64 epoch,
+	ClusterCurrentMxOperationForwardV6 *out)
+{
+	ClusterCurrentMxProofForwardV2 checked;
+	ClusterCurrentMxOperationForwardV6 next = { 0 };
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_multixact_current_wire_validate_proof_forward(
+		request, sizeof(*request), source, origin, epoch, &checked))
+		return false;
+	next.prefix = checked.prefix;
+	next.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	next.version = CLUSTER_CURRENT_MX_OPERATION_WIRE_VERSION;
+	if (checked.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
+		const ClusterCurrentMxUpdaterChallengeWire *up = &checked.trailer.body.updater.challenge;
+		ClusterCurrentMxProofAskWire ask = { up->updater_xid, up->member_ordinal,
+			up->member_status, 0 };
+		memcpy(next.body, up, sizeof(*up));
+		operation_wire_write_ask(next.body + 56, &ask, NULL);
+	} else
+		for (uint16 i = 0; i < checked.prefix.entry_count; ++i)
+			operation_wire_write_ask(next.body + i * 96, &checked.trailer.body.asks[i], NULL);
+	return cluster_multixact_operation_wire_validate_forward(&next, sizeof(next), source,
+		origin, epoch, out);
+}
+
+bool
+cluster_multixact_operation_wire_project_request(
+	const ClusterCurrentMxOperationForwardV6 *request, int32 source, int32 origin, uint64 epoch,
+	ClusterCurrentMxProofForwardV2 *out)
+{
+	ClusterCurrentMxOperationForwardV6 checked;
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_multixact_operation_wire_validate_forward(request,
+		sizeof(*request), source, origin, epoch, &checked)) return false;
+	out->prefix = checked.prefix;
+	out->trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	out->trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	if (checked.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
+		memcpy(&out->trailer.body.updater.challenge, checked.body,
+			sizeof(out->trailer.body.updater.challenge));
+	else
+		for (uint16 i = 0; i < checked.prefix.entry_count; ++i) {
+			ClusterCurrentMxOperationAsk ask;
+			if (!cluster_multixact_operation_wire_get_ask(&checked, i, &ask)) {
+				memset(out, 0, sizeof(*out)); return false;
+			}
+			out->trailer.body.asks[i] = ask.member;
+		}
+	return true;
+}
+
 static void
 operation_wire_proof_fields(uint8 *bytes, ClusterCurrentMemberOperationProof *p, bool encode)
 {

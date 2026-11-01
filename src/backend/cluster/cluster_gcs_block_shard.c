@@ -33,6 +33,7 @@
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_mx_history_wire.h"
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_multixact_operation_wire.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "storage/buf_internals.h"
@@ -194,6 +195,26 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		 * explicit format before considering the independent CR shape. */
 		if (payload_len == CLUSTER_CTRC_SEAL_REQUEST_BYTES
 			&& cluster_ctrc_payload_route_tag(payload, payload_len, &route_tag)) {
+			tag = &route_tag;
+			break;
+		}
+		if (payload_len == sizeof(ClusterCurrentMxOperationForwardV6)) {
+			ClusterCurrentMxOperationForwardV6 frame = { 0 };
+
+			/* Routing is not proof validation. The origin validates every
+			 * entry before admitting its immutable continuation. */
+			memcpy(&frame, payload, offsetof(ClusterCurrentMxOperationForwardV6, body));
+			if (frame.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+				|| frame.version != CLUSTER_CURRENT_MX_OPERATION_WIRE_VERSION
+				|| frame.reserved16 != 0 || frame.prefix.flags != 0
+				|| frame.prefix.kind != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF
+				|| frame.prefix.request_id == 0 || frame.prefix.epoch == 0
+				|| frame.prefix.original_requester_node < 0
+				|| frame.prefix.original_requester_node >= CLUSTER_MAX_NODES
+				|| frame.prefix.requester_backend_id <= 0)
+				return -1;
+			route_tag = GcsBlockCurrentMxRouteTagMake(frame.prefix.request_id, frame.prefix.epoch,
+				frame.prefix.original_requester_node, frame.prefix.requester_backend_id);
 			tag = &route_tag;
 			break;
 		}

@@ -850,10 +850,55 @@ UT_TEST(discarded_active_cannot_carry_live_grant)
 	UT_ASSERT(ow_zero(&page, sizeof(page)));
 }
 
+UT_TEST(top_request_bridge_preserves_members_and_updater)
+{
+	for (int updater = 0; updater < 2; ++updater) {
+		OperationWireFixture f;
+		ClusterCurrentUpdaterChallenge challenge;
+		ClusterCurrentMxProofForwardV2 base;
+		ClusterCurrentMxOperationForwardV6 copied;
+
+		ow_init(&f, 1);
+		memset(f.operations, 0, sizeof(f.operations));
+		if (updater) {
+			f.members[0].member_status = MultiXactStatusNoKeyUpdate;
+			test_updater_challenge(&challenge, f.origins[0], 100, 20);
+		}
+		UT_ASSERT(ow_build(&f, 1, updater ? &challenge : NULL));
+		UT_ASSERT(cluster_multixact_operation_wire_project_request(&f.plans[0].request,
+			3, f.origins[0], 9, &base));
+		UT_ASSERT(cluster_multixact_operation_wire_upgrade_top_request(&base,
+			3, f.origins[0], 9, &copied));
+		UT_ASSERT_EQ(memcmp(&copied, &f.plans[0].request, sizeof(copied)), 0);
+	}
+}
+
+UT_TEST(request_bridge_failure_clears_complete_outputs)
+{
+	OperationWireFixture f;
+	ClusterCurrentMxProofForwardV2 base;
+	ClusterCurrentMxOperationForwardV6 copied;
+
+	ow_init(&f, 1);
+	UT_ASSERT(ow_build(&f, 1, NULL));
+	/* Projection is compare input; exact identity remains in the V6 owner. */
+	UT_ASSERT(cluster_multixact_operation_wire_project_request(&f.plans[0].request,
+		3, f.origins[0], 9, &base));
+	f.plans[0].request.body[7] = 2;
+	memset(&base, 0xa5, sizeof(base));
+	UT_ASSERT(!cluster_multixact_operation_wire_project_request(&f.plans[0].request,
+		3, f.origins[0], 9, &base));
+	UT_ASSERT(ow_zero(&base, sizeof(base)));
+	memset(&copied, 0xa5, sizeof(copied));
+	UT_ASSERT(!cluster_multixact_operation_wire_upgrade_top_request(&base,
+		3, f.origins[0], 9, &copied));
+	UT_ASSERT(ow_zero(&copied, sizeof(copied)));
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(27);
 	UT_RUN(request_exact_literal_layout);
 	UT_RUN(request_top_only_has_zero_context);
 	UT_RUN(updater_request_carries_challenge_and_exact_entry);
@@ -879,6 +924,8 @@ main(void)
 	UT_RUN(top_only_extra_context_and_invalid_wrap_are_refused);
 	UT_RUN(discarded_active_has_no_live_grant);
 	UT_RUN(discarded_active_cannot_carry_live_grant);
+	UT_RUN(top_request_bridge_preserves_members_and_updater);
+	UT_RUN(request_bridge_failure_clears_complete_outputs);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

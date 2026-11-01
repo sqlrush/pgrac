@@ -73,6 +73,7 @@
 #include "cluster/cluster_lms.h"	   /* PGRAC: spec-7.3 D8 per-worker serve counters */
 #include "cluster/cluster_lms_shard.h" /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_multixact_operation_wire.h"
 #include "cluster/cluster_mxid_stripe.h" /* cluster_mxid_is_mine (spec-7.1 D3-b) */
 #include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_semantic_activation.h"
@@ -4370,6 +4371,25 @@ cluster_cr_server_current_mx_build_proof_page(
 	page->header.wire_length = (uint16)wire_length;
 	page->header.result = (uint8)CMX_RESOLVE_OK;
 	return CMX_RESOLVE_OK;
+}
+
+ClusterMxResolveResult
+cluster_cr_server_current_mx_build_operation_proof_page(
+	uint16 source, const ClusterCurrentMxOperationForwardV6 *request,
+	ClusterMxResolveResult result, uint32 capability,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 count,
+	const ClusterCurrentUpdaterProof *updater, ClusterCurrentMxOperationReplyPageV6 *page)
+{
+	const ClusterCurrentUpdaterProof *published_updater = NULL;
+
+	if (result == CMX_RESOLVE_OK && request != NULL
+		&& request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
+		published_updater = updater;
+	if (!cluster_multixact_operation_wire_encode_reply(request, source,
+			request != NULL ? request->prefix.epoch : 0, result, proofs, count,
+			published_updater, capability, page))
+		return CMX_RESOLVE_UNKNOWN;
+	return result;
 }
 
 #ifdef USE_CLUSTER_UNIT

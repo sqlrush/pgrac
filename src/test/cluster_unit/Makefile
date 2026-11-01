@@ -7674,9 +7674,9 @@ test_cluster_gcs_read_rearm_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	mv $@.tmp $@
 
 test_cluster_current_mx_reply_builder.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_server.c Makefile
-	awk '/^cluster_cr_server_current_mx_build_proof_page\(/ { print "static ClusterMxResolveResult"; emit=1; found++ } \
+	awk '/^cluster_cr_server_current_mx_build_(operation_)?proof_page\(/ { print "static ClusterMxResolveResult"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
@@ -13540,3 +13540,9 @@ test_cluster_mx_history_roundtrip: test_cluster_mx_history_roundtrip.c test_clus
 
 $(top_builddir)/src/backend/storage/lmgr/lock.o:
 	$(MAKE) -C $(top_builddir)/src/backend/storage/lmgr lock.o
+
+# V6 tests execute the real codecs alongside the legacy controlled validators.
+test_cluster_r4_route_policy test_cluster_mx_history_backend \
+        test_cluster_mx_history_gcs test_cluster_mx_history_graph test_cluster_mx_history_members: \
+        $(top_srcdir)/src/backend/cluster/cluster_multixact_current_wire.c \
+        $(top_srcdir)/src/include/cluster/cluster_multixact_operation_wire.h

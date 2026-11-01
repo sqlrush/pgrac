@@ -70,6 +70,16 @@ cluster_multixact_operation_wire_validate_forward(const void *payload, uint32 le
 extern bool
 cluster_multixact_operation_wire_get_ask(const ClusterCurrentMxOperationForwardV6 *request,
 										 uint16 index, ClusterCurrentMxOperationAsk *out);
+/* Internal top-only callers retain their semantic request type. Only the
+ * complete V6 frame travels; this conversion never invents an exact key. */
+extern bool cluster_multixact_operation_wire_upgrade_top_request(
+	const ClusterCurrentMxProofForwardV2 *request, int32 source, int32 origin, uint64 epoch,
+	ClusterCurrentMxOperationForwardV6 *out);
+/* Validated V6 compare inputs projected for the original top/updater sampler.
+ * Exact contexts remain separately owned by the same origin continuation. */
+extern bool cluster_multixact_operation_wire_project_request(
+	const ClusterCurrentMxOperationForwardV6 *request, int32 source, int32 origin, uint64 epoch,
+	ClusterCurrentMxProofForwardV2 *out);
 extern bool cluster_multixact_operation_wire_encode_reply(
 	const ClusterCurrentMxOperationForwardV6 *request, int32 source, uint64 epoch,
 	ClusterMxResolveResult result, const ClusterCurrentMemberOperationProof *proofs, uint16 count,

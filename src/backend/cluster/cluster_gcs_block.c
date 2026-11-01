@@ -224,6 +224,7 @@ typedef struct GcsBlockR4TxOriginContext {
 		bool history_stopping;
 	};
 	bool final_released, request_conflict;
+	bool current_mx_operation_wire;
 	ClusterR4OperationContextWire operation_context;
 	ClusterR4PeerOperationProof peer_operation;
 	GcsBlockR4TxOriginDomain domain;
@@ -271,7 +272,10 @@ typedef struct GcsBlockR4TxOriginContext {
 	ClusterTxResolution resolution;
 	ClusterTxOutcome outcome;
 	ClusterTxResolveReason reason;
-	ClusterMxHistoryRequestWire history_request;
+	union {
+		ClusterMxHistoryRequestWire history_request;
+		ClusterCurrentMxOperationForwardV6 current_mx_operation_request;
+	};
 	uint8 reply_frame[CLUSTER_MX_HISTORY_REPLY_BYTES];
 } GcsBlockR4TxOriginContext;
 
@@ -375,6 +379,7 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	bool expected_current_mx_key_valid;
 	ClusterCurrentMxKey expected_current_mx_key;
 	bool expected_current_mx_proof_valid;
+	bool expected_current_mx_operation_valid;
 	ClusterCurrentMxProofForwardV2 expected_current_mx_proof;
 	bool stale;
 	uint32 direct_generation;
@@ -397,7 +402,10 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 		uint64 r4_activation_generation;
 		uint64 history_stream_generation;
 	};
-	ClusterR4ProjectionScratch r4_projection;
+	union {
+		ClusterR4ProjectionScratch r4_projection;
+		ClusterCurrentMxOperationForwardV6 expected_current_mx_operation;
+	};
 	GcsMxHistorySlot history;
 } ClusterGcsBlockOutstandingSlot;
 
@@ -428,6 +436,9 @@ gcs_block_slot_clear_current_mx_expectation(ClusterGcsBlockOutstandingSlot *slot
 	slot->expected_reply_status = 0;
 	slot->expected_current_mx_key_valid = false;
 	memset(&slot->expected_current_mx_key, 0, sizeof(slot->expected_current_mx_key));
+	if (slot->expected_current_mx_operation_valid)
+		memset(&slot->expected_current_mx_operation, 0, sizeof(slot->expected_current_mx_operation));
+	slot->expected_current_mx_operation_valid = false;
 	slot->expected_current_mx_proof_valid = false;
 	memset(&slot->expected_current_mx_proof, 0, sizeof(slot->expected_current_mx_proof));
 }
@@ -6795,6 +6806,169 @@ cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterC
 }
 
 ClusterMxResolveResult
+cluster_gcs_current_mx_operation_proof_fetch_and_wait(
+	int32 origin_node, ClusterCurrentMxOperationForwardV6 *request, ClusterCurrentMemberOperationProof *proofs,
+	uint16 proofs_cap, uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *requester_capability_generation_out, TimestampTz deadline)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterCurrentMxOperationForwardV6 decoded;
+	ClusterCurrentMxOperationReplyPageV6 reply_page;
+	GcsBlockReplyHeader reply_header;
+	BufferTag route_tag;
+	uint64 request_id = 0;
+	uint64 request_epoch;
+	uint32 capability_generation = 0;
+	int worker_id;
+	bool got_reply = false;
+	bool stale = false;
+	ClusterMxResolveResult result = CMX_RESOLVE_UNKNOWN;
+	uint16 i;
+
+	if (proofs_cap > CLUSTER_CURRENT_MX_MAX_MEMBERS)
+		return CMX_RESOLVE_SUPPORTED_LIMIT;
+
+	if (proofs != NULL) {
+		memset(proofs, 0, sizeof(*proofs) * proofs_cap);
+		for (i = 0; i < proofs_cap; i++) {
+			proofs[i].base.state = CCM_UNKNOWN;
+			proofs[i].format_version = 2;
+		}
+	}
+	if (proof_count != NULL)
+		*proof_count = 0;
+	if (updater_proof != NULL) {
+		memset(updater_proof, 0, sizeof(*updater_proof));
+		updater_proof->verdict = CUCP_UNKNOWN;
+	}
+	if (requester_capability_generation_out != NULL)
+		*requester_capability_generation_out = 0;
+	request_epoch = cluster_epoch_get_current();
+	if (request == NULL || proofs == NULL || proof_count == NULL || updater_proof == NULL
+		|| requester_capability_generation_out == NULL || origin_node < 0
+		|| origin_node == cluster_node_id || origin_node >= CLUSTER_MAX_NODES
+		|| !cluster_gcs_block_family_on_data_plane())
+		return CMX_RESOLVE_UNKNOWN;
+	if (deadline != 0 && GetCurrentTimestamp() >= deadline)
+		return CMX_RESOLVE_TIMEOUT;
+	request->prefix.epoch = request_epoch;
+	request->prefix.original_requester_node = cluster_node_id;
+	request->prefix.requester_backend_id = (int32)MyBackendId;
+	if (!cluster_multixact_operation_wire_validate_forward(
+			request, sizeof(*request), cluster_node_id, origin_node, request_epoch, &decoded)
+		|| !cluster_sf_peer_multixact_current_capability_generation(origin_node,
+																	&capability_generation))
+		return CMX_RESOLVE_UNKNOWN;
+
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_try_reserve_current_mx_slot(
+		&request->prefix.mxkey, request_epoch, origin_node,
+		(uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT, &request_id);
+	if (slot == NULL)
+		return CMX_RESOLVE_UNKNOWN;
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+
+		request->prefix.request_id = request_id;
+		if (!cluster_multixact_operation_wire_validate_forward(
+				request, sizeof(*request), cluster_node_id, origin_node, request_epoch, &decoded))
+			goto proof_done;
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		if (!slot->in_use || slot->request_id != request_id) {
+			LWLockRelease(&blk->lock.lock);
+			goto proof_done;
+		}
+		slot->expected_current_mx_proof_valid = true;
+		slot->expected_current_mx_operation_valid = true;
+		slot->expected_current_mx_operation = *request;
+		LWLockRelease(&blk->lock.lock);
+
+		route_tag = GcsBlockCurrentMxRouteTagMake(request_id, request_epoch, cluster_node_id,
+												  (int32)MyBackendId);
+		worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
+		if (worker_id < 0
+			|| !cluster_lms_outbound_enqueue_cap_bound(
+				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, request,
+				sizeof(*request), PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1, capability_generation))
+			goto proof_done;
+
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			stale = slot->in_use && slot->stale;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			if (stale)
+				break;
+			now = GetCurrentTimestamp();
+			if (deadline != 0 && now >= deadline)
+				break;
+			if (deadline == 0)
+			{
+				/* An unbounded proof wait is event-driven; do not poll on a
+				 * fixed one-second tick while the reply slot is unchanged. */
+				ConditionVariableSleep(&slot->reply_cv, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			}
+			else
+			{
+				timeout_ms = (long)((deadline - now) / 1000);
+				timeout_ms = Max(timeout_ms, 1L);
+				(void) ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+												  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			}
+		}
+		ConditionVariableCancelSleep();
+		if (!got_reply) {
+			result = stale ? CMX_RESOLVE_UNKNOWN : CMX_RESOLVE_TIMEOUT;
+			goto proof_done;
+		}
+
+		reply_header = slot->reply_header;
+		memcpy(&reply_page, slot->reply_block_data, sizeof(reply_page));
+		if (reply_header.status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+			|| reply_header.sender_node != origin_node || reply_header.request_id != request_id
+			|| reply_header.epoch != request_epoch
+			|| reply_header.requester_backend_id != (int32)MyBackendId
+			|| reply_header.transition_id != 0 || reply_header.page_lsn != 0
+			|| GcsBlockReplyHeaderGetForwardingMasterNode(&reply_header)
+				   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+			|| reply_header.checksum
+				   != cluster_gcs_block_compute_checksum((const char *)&reply_page)
+			|| cluster_epoch_get_current() != request_epoch)
+			goto proof_done;
+		if (!cluster_multixact_operation_wire_validate_reply(
+				&reply_page, sizeof(reply_page), origin_node, request_epoch, request, &result,
+				proofs, proofs_cap, proof_count, updater_proof,
+				requester_capability_generation_out))
+			result = CMX_RESOLVE_UNKNOWN;
+		if (result == CMX_RESOLVE_OK)
+			gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+
+	proof_done:;
+	}
+	PG_CATCH();
+	{
+		ConditionVariableCancelSleep();
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+	return result;
+}
+
+ClusterMxResolveResult
 cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	int32 origin_node, ClusterCurrentMxProofForwardV2 *request, ClusterCurrentMemberProof *proofs,
 	uint16 proofs_cap, uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof,
@@ -10164,6 +10338,9 @@ static bool
 gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterCurrentMxProofForwardV2 request;
+	ClusterCurrentMxOperationForwardV6 operation_request;
+	bool operation_wire = env != NULL && env->payload_length == sizeof(operation_request);
+	bool has_exact = false;
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
 	ClusterUndoBlock0LogicalKey logical;
@@ -10184,12 +10361,27 @@ gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env, const void 
 	memset(&admission, 0, sizeof(admission));
 	memset(&logical, 0, sizeof(logical));
 	memset(&root, 0, sizeof(root));
-	if (env == NULL || payload == NULL || env->dest_node_id != (uint32)cluster_node_id
+	if (env == NULL || payload == NULL || env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+		|| env->dest_node_id != (uint32)cluster_node_id
 		|| !cluster_gcs_block_family_on_data_plane()
-		|| !cluster_multixact_current_wire_validate_proof_forward(
-			payload, env->payload_length, (int32)env->source_node_id, cluster_node_id,
-			cluster_epoch_get_current(), &request))
+		|| (operation_wire
+			? (!cluster_multixact_operation_wire_validate_forward(payload, env->payload_length,
+				(int32)env->source_node_id, cluster_node_id, cluster_epoch_get_current(),
+				&operation_request)
+			   || !cluster_multixact_operation_wire_project_request(&operation_request,
+				(int32)env->source_node_id, cluster_node_id, cluster_epoch_get_current(), &request))
+			: !cluster_multixact_current_wire_validate_proof_forward(
+				payload, env->payload_length, (int32)env->source_node_id, cluster_node_id,
+				cluster_epoch_get_current(), &request)))
 		return false;
+	if (operation_wire) {
+		for (i = 0; i < request.prefix.entry_count; ++i) {
+			ClusterCurrentMxOperationAsk ask;
+			if (!cluster_multixact_operation_wire_get_ask(&operation_request, i, &ask))
+				return false;
+			has_exact |= ask.exact;
+		}
+	}
 	route_tag = GcsBlockCurrentMxRouteTagMake(request.prefix.request_id, request.prefix.epoch,
 											  request.prefix.original_requester_node,
 											  request.prefix.requester_backend_id);
@@ -10221,8 +10413,16 @@ gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env, const void 
 			&& context->current_mx_request.prefix.requester_backend_id
 				   == request.prefix.requester_backend_id
 			&& context->current_mx_request.prefix.request_id == request.prefix.request_id
-			&& context->current_mx_request.prefix.epoch == request.prefix.epoch)
+			&& context->current_mx_request.prefix.epoch == request.prefix.epoch) {
+			if (context->current_mx_operation_wire != operation_wire
+				|| (operation_wire && memcmp(&context->current_mx_operation_request,
+					&operation_request, sizeof(operation_request)) != 0)) {
+				context->request_conflict = true;
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+				context->current_mx_proof_count = 0;
+			}
 			return true;
+		}
 	}
 	if (free_context == NULL) {
 		if (!gcs_block_current_mx_origin_first_unknown_logged) {
@@ -10270,6 +10470,9 @@ gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env, const void 
 			  : 0;
 	free_context->requester_capability_generation = capability_generation;
 	free_context->current_mx_request = request;
+	free_context->current_mx_operation_wire = operation_wire;
+	if (operation_wire)
+		free_context->current_mx_operation_request = operation_request;
 	free_context->current_mx_result = CMX_RESOLVE_UNKNOWN;
 	free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_NONE;
 	free_context->current_mx_updater_proof.verdict = CUCP_UNKNOWN;
@@ -10283,6 +10486,12 @@ gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env, const void 
 	free_context->outcome = CLUSTER_TX_UNKNOWN;
 	free_context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 
+	/* Exact contexts must never reach the legacy raw/top sampler. Their
+	 * effect and successor strategies are connected before activation. */
+	if (has_exact) {
+		free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SAMPLE;
+		return true;
+	}
 	if (request.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
 		const ClusterCurrentMxUpdaterChallengeWire *challenge
 			= &request.trailer.body.updater.challenge;
@@ -10610,6 +10819,10 @@ gcs_block_current_mx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 	uint32 requester_capability_generation = 0;
 	uint16 i;
 
+	if (context->request_conflict) {
+		context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+		context->current_mx_proof_count = 0;
+	}
 	if (context->current_mx_result == CMX_RESOLVE_OK
 		&& !gcs_block_current_mx_requester_identity_current(context)) {
 		context->current_mx_result = CMX_RESOLVE_RETRY;
@@ -10643,17 +10856,38 @@ gcs_block_current_mx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 	if (context->current_mx_result == CMX_RESOLVE_OK)
 		requester_capability_generation
 			= context->current_mx_requester_identity.capability_record_generation;
-	built = cluster_cr_server_current_mx_build_proof_page(
-		(uint16)cluster_node_id, &context->current_mx_request, context->current_mx_result,
-		requester_capability_generation, context->current_mx_proofs,
-		context->current_mx_proof_count, &context->current_mx_updater_proof, page);
-	if (built != context->current_mx_result) {
-		context->current_mx_result = CMX_RESOLVE_UNKNOWN;
-		context->current_mx_proof_count = 0;
-		(void)cluster_cr_server_current_mx_build_proof_page(
-			(uint16)cluster_node_id, &context->current_mx_request, CMX_RESOLVE_UNKNOWN, 0, NULL, 0,
-			NULL, page);
+	if (context->current_mx_operation_wire) {
+		ClusterCurrentMemberOperationProof proofs[7] = { 0 };
+		ClusterCurrentMxOperationReplyPageV6 *operation_page = (void *)page;
+		for (i = 0; i < context->current_mx_proof_count; ++i) {
+			proofs[i].base = context->current_mx_proofs[i];
+			proofs[i].format_version = 2;
+		}
+		built = cluster_cr_server_current_mx_build_operation_proof_page(
+			(uint16)cluster_node_id, &context->current_mx_operation_request,
+			context->current_mx_result, requester_capability_generation, proofs,
+			context->current_mx_proof_count, &context->current_mx_updater_proof, operation_page);
+		if (built != context->current_mx_result) {
+			context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+			context->current_mx_proof_count = 0;
+			(void)cluster_cr_server_current_mx_build_operation_proof_page(
+				(uint16)cluster_node_id, &context->current_mx_operation_request,
+				CMX_RESOLVE_UNKNOWN, 0, NULL, 0, NULL, operation_page);
+		}
+	} else {
+		built = cluster_cr_server_current_mx_build_proof_page(
+			(uint16)cluster_node_id, &context->current_mx_request, context->current_mx_result,
+			requester_capability_generation, context->current_mx_proofs,
+			context->current_mx_proof_count, &context->current_mx_updater_proof, page);
+		if (built != context->current_mx_result) {
+			context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+			context->current_mx_proof_count = 0;
+			(void)cluster_cr_server_current_mx_build_proof_page(
+				(uint16)cluster_node_id, &context->current_mx_request, CMX_RESOLVE_UNKNOWN, 0, NULL, 0,
+				NULL, page);
+		}
 	}
+
 	header->request_id = context->current_mx_request.prefix.request_id;
 	header->epoch = context->current_mx_request.prefix.epoch;
 	header->sender_node = cluster_node_id;
@@ -23236,12 +23470,21 @@ gcs_block_try_land_current_mx_reply(const ClusterICEnvelope *env, const void *pa
 					scratch_members, lengthof(scratch_members), &scratch_count, &scratch_total);
 				typed_valid = typed_result != CMX_DESC_UNKNOWN && typed_result != CMX_DESC_TIMEOUT;
 			} else if (hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
-					   && slot->expected_current_mx_proof_valid)
-				typed_valid = cluster_multixact_current_wire_validate_proof_reply_frame(
-					block_data, GCS_BLOCK_DATA_SIZE, slot->expected_master_node,
-					slot->request_epoch, &slot->expected_current_mx_proof, &proof_result,
-					scratch_proofs, lengthof(scratch_proofs), &scratch_count, &scratch_updater,
-					&scratch_capability_generation);
+					   && slot->expected_current_mx_proof_valid) {
+				if (slot->expected_current_mx_operation_valid) {
+					ClusterCurrentMemberOperationProof operation_proofs[7];
+					typed_valid = cluster_multixact_operation_wire_validate_reply(
+						block_data, GCS_BLOCK_DATA_SIZE, slot->expected_master_node,
+						slot->request_epoch, &slot->expected_current_mx_operation, &proof_result,
+						operation_proofs, lengthof(operation_proofs), &scratch_count, &scratch_updater,
+						&scratch_capability_generation);
+				} else
+					typed_valid = cluster_multixact_current_wire_validate_proof_reply_frame(
+						block_data, GCS_BLOCK_DATA_SIZE, slot->expected_master_node,
+						slot->request_epoch, &slot->expected_current_mx_proof, &proof_result,
+						scratch_proofs, lengthof(scratch_proofs), &scratch_count, &scratch_updater,
+						&scratch_capability_generation);
+			}
 		}
 		if (!typed_valid) {
 			const ClusterCurrentMxDescribeReplyPage *describe_page
@@ -23886,16 +24129,21 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 	return true;
 }
 
-/* Exact 128-byte Current-MX demultiplexing precedes every legacy BufferTag
- * interpretation.  Kind 8 remains reserved/dormant and is consumed here. */
+/* Exact Current-MX lengths precede every legacy BufferTag interpretation.
+ * Kind 8 remains reserved/dormant and is consumed here. */
 static bool
 gcs_block_try_current_mx_forward128(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsBlockForwardPayload *routing;
 
 	if (env == NULL || payload == NULL
-		|| env->payload_length != CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE)
+		|| (env->payload_length != CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE
+			&& env->payload_length != sizeof(ClusterCurrentMxOperationForwardV6)))
 		return false;
+	if (env->payload_length == sizeof(ClusterCurrentMxOperationForwardV6)) {
+		(void)gcs_block_current_mx_origin_try_accept(env, payload);
+		return true;
+	}
 	routing = (const GcsBlockForwardPayload *)payload;
 	if (GcsBlockForwardPayloadIsCurrentMxDescribe(routing))
 		cluster_gcs_current_mx_describe_serve_inline(env, payload);

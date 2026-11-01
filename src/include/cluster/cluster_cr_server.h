@@ -572,6 +572,20 @@ extern ClusterMxDescribeResult cluster_cr_server_test_current_mx_build_describe_
 	const MultiXactMember *native_members, int native_count,
 	struct ClusterCurrentMxDescribeReplyPage *page);
 #endif
+struct ClusterCurrentMxOperationForwardV6;
+struct ClusterCurrentMxOperationReplyPageV6;
+extern ClusterMxResolveResult cluster_cr_server_current_mx_build_operation_proof_page(
+	uint16 source, const struct ClusterCurrentMxOperationForwardV6 *request,
+	ClusterMxResolveResult result, uint32 capability,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 count,
+	const ClusterCurrentUpdaterProof *updater, struct ClusterCurrentMxOperationReplyPageV6 *page);
+/* Dormant explicit carriage. Legacy callers switch only with the complete
+ * operation producer/origin/consumer activation. */
+extern ClusterMxResolveResult cluster_gcs_current_mx_operation_proof_fetch_and_wait(
+	int32 origin_node, struct ClusterCurrentMxOperationForwardV6 *request,
+	ClusterCurrentMemberOperationProof *proofs, uint16 capacity, uint16 *count,
+	ClusterCurrentUpdaterProof *updater, uint32 *requester_capability_generation,
+	TimestampTz deadline);
 extern ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	int32 origin_node, struct ClusterCurrentMxProofForwardV2 *request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
