@@ -12,6 +12,8 @@ bool IsPostmasterEnvironment;
 int MaxBackends=100;
 #ifdef SURVIVOR_LOCAL_BACKEND_ROUTE
 #include "test_cluster_survivor_backend_route_native.h"
+#elif defined(SURVIVOR_LOCAL_INPUT_ROUTE)
+#include "test_cluster_survivor_input_route_native.h"
 #else
 /* Owner-only fixtures never issue LMON queries. Reaching its scope API is
  * a test error, never a replacement positive scope or receipt. */
@@ -26,7 +28,12 @@ void SetLatch(Latch *latch) { (void)latch;abort(); }
 #endif
 #pragma push_macro("proc")
 #undef proc
+#pragma push_macro("SetLatch")
+#ifdef SURVIVOR_LOCAL_INPUT_ROUTE
+#define SetLatch input_route_set_latch
+#endif
 #include "../../backend/cluster/cluster_semantic_survivor_local.c"
+#pragma pop_macro("SetLatch")
 #pragma pop_macro("proc")
 static uint64 survivor_local_scalar(const uint8 *p,unsigned n)
 { uint64 x=0;for(unsigned i=0;i<n;i++)x|=(uint64)p[i]<<(8*i);return x; }

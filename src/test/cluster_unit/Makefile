@@ -13831,3 +13831,15 @@ test_cluster_snapshot_admission: test_cluster_survivor_backend_census_fixture.h 
  test_cluster_survivor_generation.inc \
  $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_targets.h \
  $(top_srcdir)/src/include/cluster/cluster_grd.h
+
+# Input owner query/census with original CF/WALR service-loop prefixes.
+test_cluster_wal_inputs_job_service: test_cluster_survivor_input_route_native.h \
+ test_cluster_survivor_input_route_fixture.h test_cluster_shared_admission_observe.inc \
+ test_cluster_backend_return_gate.inc test_cluster_survivor_pgsa.inc \
+ test_cluster_survivor_status_identity.inc test_cluster_survivor_generation.inc \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_targets.c \
+ $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_targets.h \
+ $(top_builddir)/src/common/libpgcommon_srv.a
+test_cluster_wal_inputs_job_service: CLUSTER_UNIT_PORT_LIBS += $(top_builddir)/src/common/libpgcommon_srv.a
