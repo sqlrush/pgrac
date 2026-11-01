@@ -439,7 +439,12 @@ _classify_owners(
 _classify_owners(
     "CTRC_RELATION_GATE",
     "src/backend/cluster/cluster_ko_lock.c",
-    ("cluster_ko_drain_inbound_and_apply", "ko_flush_and_wait_ack"),
+    (
+        "cluster_ko_drain_inbound_and_apply",
+        "ko_flush_and_wait_ack",
+        "ko_native_origin_checkpoint",
+        "ko_peer_fence_physical_tick_v3",
+    ),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_RELATION_TARGETS",

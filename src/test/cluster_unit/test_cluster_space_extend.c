@@ -96,8 +96,11 @@ cluster_ko_extend_end_v3(uint64 serial)
 	return owner_end_ok;
 }
 static void
-cluster_bufmgr_ko_read_wait(void)
+cluster_bufmgr_ko_read_wait(RelFileLocator locator pg_attribute_unused(),
+	ForkNumber fork pg_attribute_unused(), BlockNumber block, uint64 revision)
 {
+	UT_ASSERT_EQ(block, InvalidBlockNumber);
+	UT_ASSERT_EQ(revision, 0);
 	UT_ASSERT(!owner_live);
 	owner_waits++;
 	if (owner_invalid_admission)
