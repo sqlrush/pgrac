@@ -125,15 +125,43 @@ sub remote_pause {
  return $receipt;
 }
 
+sub trace_preflight {
+ my ($nodes)=@_;
+ die 'trace preflight requires four original members' unless @$nodes == 4;
+ for my $i (0..$#$nodes) {
+  my $node=$nodes->[$i];
+  my $raw=$node->safe_psql('postgres',q{SELECT json_build_object(
+   'node',current_setting('cluster.node_id')::integer,
+   'trace_normal_stop',current_setting('cluster.trace_normal_stop'),
+   'trace_cleanup',current_setting('cluster.trace_cleanup'),
+   'trace_tx_identity',current_setting('cluster.trace_tx_identity'),
+   'trace_control_config',current_setting('cluster.trace_control_config'))});
+  my $settings=eval {decode_json($raw)};
+  my $log=$node->logfile;
+  save_json("trace-settings-$i",{settings=>$settings,raw=>$raw,logfile=>$log,
+   authoritative=>JSON::PP::false,diagnostic_branches=>'not induced by preflight'});
+  die "trace preflight node identity unavailable at $i"
+   unless ref($settings) eq 'HASH' && defined($settings->{node}) &&
+    $settings->{node} =~ /\A[0-3]\z/ && $settings->{node} == $i;
+  for my $name (qw(trace_normal_stop trace_cleanup trace_tx_identity trace_control_config)) {
+   die "trace preflight $name is not on at $i"
+    unless defined($settings->{$name}) && $settings->{$name} eq 'on';
+  }
+  die "trace preflight server log missing at $i" unless -f $log && -s $log;
+ }
+}
+
 $cluster=PostgreSQL::Test::ClusterPRE2->new_cluster('m2_a08',nodes=>4,blackbox=>1,
  required_operations=>[],extra_conf=>['shared_buffers=512MB','autovacuum=off','cluster.trace_tx_identity=on',
-  'cluster.trace_control_config=on','log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
+  'cluster.trace_control_config=on','cluster.trace_normal_stop=on','cluster.trace_cleanup=on',
+  'log_error_verbosity=verbose','log_line_prefix=\'%m [%p] \'']);
 my @nodes=$cluster->nodes;
 # Preload is local postmaster setup after the original native creation;
 # it is not a supported shared bootstrap-profile parameter.
 $_->append_conf('postgresql.conf',"shared_preload_libraries='test_pgrac_shared_config'\n") for @nodes;
 $cluster->start_cluster;
 is(scalar(@nodes),4,'original PRE2 formation admits four normal members');
+trace_preflight(\@nodes);
 my ($a,$b)=@nodes;
 my @active=($a,$b);
 save_json('formation',{

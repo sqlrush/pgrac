@@ -1,5 +1,7 @@
 """Run the remote-locator fixture without a database or VM."""
 import json
+import re
+import tempfile
 from pathlib import Path
 import subprocess
 import unittest
@@ -241,10 +243,64 @@ print encode_json(\@events);
         settings = result[0]['options']['extra_conf']
         self.assertFalse(any('shared_preload_libraries' in line for line in settings))
         self.assertIn('shared_buffers=512MB', settings)
+        self.assertIn('cluster.trace_normal_stop=on', settings)
+        self.assertIn('cluster.trace_cleanup=on', settings)
         self.assertEqual(result[0]['options']['nodes'], 4)
         for node, row in enumerate(result[1:-1]):
             self.assertEqual(row, dict(op='append', node=node, file='postgresql.conf',
                                       text="shared_preload_libraries='test_pgrac_shared_config'\n"))
+
+    def trace_preflight(self, *, change=None, missing_log=False):
+        source = (HERE.parent / 't/480_pre2_m2_canonical_interleave.pl').read_text()
+        bodies = re.findall(r'(^sub trace_preflight \{.*?^\})', source, re.M | re.S)
+        self.assertEqual(len(bodies), 1, 'actual four-node trace preflight is missing')
+        rows = [dict(node=i, trace_normal_stop='on', trace_cleanup='on',
+                     trace_tx_identity='on', trace_control_config='on') for i in range(4)]
+        if change:
+            rows[change[0]].update(change[1])
+        with tempfile.TemporaryDirectory() as directory:
+            logs = [Path(directory) / f'node-{i}.log' for i in range(4)]
+            for log in logs:
+                log.write_text('original server log, no induced failure\n')
+            if missing_log:
+                logs[1].unlink()
+            return perl(r'''my $v=decode_json(do {local $/; <STDIN>});
+my (@queries,@saved);
+{package TraceNode;
+ sub safe_psql {push @queries,{node=>$_[0]->{reply}->{node},sql=>$_[2]};
+                return JSON::PP::encode_json($_[0]->{reply});}
+ sub logfile {return $_[0]->{log};}
+}
+sub save_json {push @saved,{name=>$_[0],value=>$_[1]};}
+''' + bodies[0] + r'''
+my @nodes=map {bless {reply=>$v->{rows}->[$_],log=>$v->{logs}->[$_]},'TraceNode'} 0..3;
+my $started=0;
+my $error='';
+eval {trace_preflight(\@nodes); $started++; 1;} or $error=$@;
+print encode_json({error=>$error,started=>$started,queries=>\@queries,saved=>\@saved});
+''', dict(rows=rows, logs=[str(p) for p in logs]))
+
+    def test_trace_preflight_reads_and_saves_all_four_actual_nodes_before_cells(self):
+        result = self.trace_preflight()
+        self.assertEqual(result['error'], '')
+        self.assertEqual(result['started'], 1)
+        self.assertEqual(len(result['queries']), 4)
+        self.assertEqual([r['value']['settings']['node'] for r in result['saved']], list(range(4)))
+        for row in result['queries']:
+            self.assertTrue(row['sql'].lstrip().startswith('SELECT '))
+            self.assertNotIn('cluster_dump_state', row['sql'])
+            self.assertNotIn('SET ', row['sql'])
+
+    def test_trace_preflight_refuses_off_unknown_identity_or_missing_log_before_cells(self):
+        for change, missing in [((2, dict(trace_cleanup='off')), False),
+                                ((1, dict(trace_normal_stop=None)), False),
+                                ((2, dict(node=3)), False), (None, True)]:
+            with self.subTest(change=change, missing_log=missing):
+                result = self.trace_preflight(change=change, missing_log=missing)
+                self.assertEqual(result['started'], 0)
+                self.assertIn('trace preflight', result['error'])
+                self.assertLessEqual(len(result['queries']), 4)
+                self.assertTrue(result['saved'])
 
 
 if __name__ == '__main__':
