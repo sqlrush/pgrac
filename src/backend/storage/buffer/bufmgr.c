@@ -3197,6 +3197,61 @@ cluster_bufmgr_pcm_own_acquire_intent_exact(
 	return CLUSTER_PCM_OWN_OK;
 }
 
+/* Preserve an old N/PI before REQUEST, while its original GP still owns
+ * the descriptor. Content/header capture never overlaps the entry owner.
+ * Conditional content acquisition keeps ordinary capacity wait local. */
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_preserve_resident_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	ResourceXDecodedAcquireIntent checked;
+	ClusterPcmLocalPiSnapshotV1 pi;
+	ClusterPcmOwnSnapshot native, expected;
+	ClusterPcmOwnResult own;
+	PGIOAlignedBlock page;
+	LWLock *content;
+	uint64 write_generation;
+	volatile bool captured = false;
+
+	if (buf == NULL || base == NULL || episode == NULL || admission == NULL
+		|| episode->path != RESOURCE_X_ACQUIRE_RESIDENT || base->pcm_state != PCM_STATE_N)
+		return RESOURCE_X_APPLY_INVALID;
+	content = BufferDescriptorGetContentLock(buf);
+	if (LWLockHeldByMe(content)) return RESOURCE_X_APPLY_BAD_STATE;
+	own = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, episode->reservation_token,
+		episode->path, admission, episode, &checked);
+	if (own != CLUSTER_PCM_OWN_OK)
+		return own == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_APPLY_LOCAL_WAIT : RESOURCE_X_APPLY_STALE;
+	/* Avoid a page copy for the ordinary no-PI case. The original entry
+	 * preflight still rechecks capacity atomically with round preparation. */
+	if (!cluster_pcm_local_pi_snapshot_v1(base->tag, &pi)) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (pi.first.record_start == 0) return RESOURCE_X_APPLY_APPLIED;
+	write_generation = pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation);
+	if ((write_generation & 1) != 0 || write_generation >= UINT64_MAX-1)
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	if (!LWLockConditionalAcquire(content, LW_EXCLUSIVE)) return RESOURCE_X_APPLY_LOCAL_WAIT;
+	expected = *base; expected.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	expected.reservation_token = episode->reservation_token;
+	PG_TRY();
+	{
+		uint32 state = LockBufHdr(buf);
+		cluster_pcm_own_snapshot_locked(buf, &native);
+		captured = cluster_pcm_own_snapshot_equal_exact(&native, &expected)
+			&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0
+			&& pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) == write_generation;
+		UnlockBufHdr(buf, state);
+		if (captured) memcpy(page.data, BufferGetBlock(BufferDescriptorGetBuffer(buf)), BLCKSZ);
+	}
+	PG_FINALLY(); { LWLockRelease(content); } PG_END_TRY();
+	if (!captured) return RESOURCE_X_APPLY_STALE;
+	own = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, episode->reservation_token,
+		episode->path, admission, episode, &checked);
+	if (own != CLUSTER_PCM_OWN_OK)
+		return own == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_APPLY_LOCAL_WAIT : RESOURCE_X_APPLY_STALE;
+	return cluster_pcm_lock_resource_x_resident_image_preserved_exact(base, page.data);
+}
+
 ResourceXApplyResult
 cluster_bufmgr_pcm_own_acquire_input_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,

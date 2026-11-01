@@ -10706,6 +10706,17 @@ cluster_gcs_block_acquire_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *ba
 		}
 		if (result != RESOURCE_X_APPLY_APPLIED)
 			return result;
+		/* Seal old local PI before this E can occupy master priority.
+		 * No requester retry or new authority is produced by local wait. */
+		if (path == RESOURCE_X_ACQUIRE_RESIDENT && base->pcm_state == PCM_STATE_N) {
+			result = cluster_bufmgr_pcm_own_acquire_preserve_resident_exact(buf,
+				base, &fill->episode, &fill->admission);
+			if (result == RESOURCE_X_APPLY_LOCAL_WAIT) {
+				gcs_block_resource_x_observation_pause();
+				continue;
+			}
+			if (result != RESOURCE_X_APPLY_APPLIED) return result;
+		}
 		now = gcs_block_pcm_x_monotonic_us();
 		slice = (uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1) * UINT64_C(1000);
 		diagnostic_budget = gcs_block_pcm_x_retry_timeout_us();

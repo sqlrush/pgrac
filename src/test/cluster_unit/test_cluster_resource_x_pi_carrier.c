@@ -904,10 +904,136 @@ UT_TEST(test_resident_PI_local_master_uses_retired_full_receipt_after_DONE)
 	pi_end();
 }
 
+/* No source pair or A exists for this original local PI. Native bytes and
+ * the existing typed DATA receipt remain explicit fixture inputs. */
+static bool
+pi_bodyless_start(PiFixture *f, ClusterPcmOwnSnapshot *base)
+{
+	BufferTag tag = make_tag(850);
+	memset(f, 0, sizeof(*f)); memset(base, 0, sizeof(*base));
+	f->last = local_pi_setup(tag); f->first = f->last;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17), RESOURCE_X_APPLY_APPLIED);
+	f->first.record_start = 80; f->first.record_end = 90;
+	f->first.version.mutation_token = 70;
+	if (!cluster_pcm_local_pi_record_first_v1(tag, &f->first, &f->last)
+		|| !cluster_pcm_local_pi_snapshot_v1(tag, &f->local)) return false;
+	base->tag = tag; base->generation = 901; base->reservation_token = 77;
+	base->pcm_state = PCM_STATE_N; base->buffer_type = BUF_TYPE_PI;
+	base->semantic_buf_state = BM_TAG_VALID | BM_VALID;
+	((PageHeader)f->source.page.data)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)f->source.page.data)->pd_upper = BLCKSZ;
+	((PageHeader)f->source.page.data)->pd_special = BLCKSZ;
+	((PageHeader)f->source.page.data)->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	PageXLogRecPtrSet(((PageHeader)f->source.page.data)->pd_lsn, f->last.record_end);
+	if (!PageSetLSNOrigin(f->source.page.data, 0)) return false;
+	((PageHeader)f->source.page.data)->pd_block_scn = f->last.version.mutation_token;
+	return true;
+}
+UT_TEST(test_local_PI_without_A_seals_before_resident_overwrite)
+{
+	PiFixture f; ClusterPcmOwnSnapshot base; ClusterPcmLocalPiSnapshotV1 after;
+	UT_ASSERT(pi_bodyless_start(&f, &base));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+		f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(base.tag, &after));
+	UT_ASSERT(memcmp(&f.local, &after, sizeof(after)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+		f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	pi_end();
+}
+UT_TEST(test_local_PI_cannot_be_sent_as_an_authorized_holder_image)
+{
+	PiFixture f; ClusterPcmOwnSnapshot base; ResourceXAssertion assertion;
+	ResourceXDecodedFrame out = {0}, before = out;
+	UT_ASSERT(pi_bodyless_start(&f, &base));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+		f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&base.tag, 1, &assertion));
+	UT_ASSERT(cluster_pcm_lock_resource_x_holder_image_exact(&assertion, &out) != RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&before, &out, sizeof(out)) == 0);
+	pi_end();
+}
+UT_TEST(test_local_PI_late_native_or_bytes_cannot_replace_original_body)
+{
+	for (unsigned cut = 0; cut < 5; cut++) {
+		PiFixture f; ClusterPcmOwnSnapshot base, wrong; PGIOAlignedBlock page;
+		UT_ASSERT(pi_bodyless_start(&f, &base));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+		wrong = base; memcpy(page.data, f.source.page.data, BLCKSZ);
+		if (cut == 0) wrong.generation++;
+		else if (cut == 1) wrong.reservation_token++;
+		else if (cut == 2) page.data[BLCKSZ-1] ^= 1;
+		else if (cut == 3) wrong.tag.blockNum++;
+		else wrong.writer_activation_token = 1;
+		UT_ASSERT(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&wrong,
+			page.data) != RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+		pi_end();
+	}
+}
+UT_TEST(test_local_PI_requires_original_page_WAL_before_sealing)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		PiFixture f; ClusterPcmOwnSnapshot base; PGIOAlignedBlock page;
+		UT_ASSERT(pi_bodyless_start(&f, &base)); memcpy(page.data, f.source.page.data, BLCKSZ);
+		if (cut == 0) ((PageHeader)page.data)->pd_block_scn++;
+		else if (cut == 1) PageXLogRecPtrSet(((PageHeader)page.data)->pd_lsn, f.last.record_end+1);
+		else UT_ASSERT(PageSetLSNOrigin(page.data, 1));
+		UT_ASSERT(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			page.data) != RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+		pi_end();
+	}
+}
+UT_TEST(test_local_PI_only_typed_DATA_can_retire_the_sealed_body)
+{
+	for (unsigned structural = 0; structural < 2; structural++) {
+		PiFixture f; ClusterPcmOwnSnapshot base;
+		UT_ASSERT(pi_bodyless_start(&f, &base));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(!pi_retire(&f, structural != 0));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+		local_pi_covered = true; UT_ASSERT(pi_retire(&f, structural != 0));
+		base.generation++; base.reservation_token++;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+			f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+		pi_end();
+	}
+}
+UT_TEST(test_local_PI_membership_freeze_preserves_the_original_debt)
+{
+	PiFixture f; ClusterPcmOwnSnapshot base; ResourceXGateSnapshot gate;
+	UT_ASSERT(pi_bodyless_start(&f, &base));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+		f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_gate_snapshot(&gate));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_fail_closed_exact(&gate), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+		f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	local_pi_covered = true; UT_ASSERT(pi_retire(&f, false));
+	pi_end();
+}
+UT_TEST(test_local_PI_stop_census_keeps_valid_recovery_debt)
+{
+	PiFixture f; ClusterPcmOwnSnapshot base; PcmGrdProtocolDebtStats debt;
+	UT_ASSERT(pi_bodyless_start(&f, &base));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+		f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_grd_protocol_debt_snapshot(&debt);
+	UT_ASSERT_EQ(debt.invalid_entry_count, 0);
+	UT_ASSERT(debt.retained_entry_count != 0);
+	pi_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(31);
 	UT_RUN(test_pi_master_arms_settlement_without_retiring_pi);
 	UT_RUN(test_pi_transport_settlement_keeps_original_body_and_wal_scope);
 	UT_RUN(test_pi_retirement_after_transport_releases_body_with_ack_still_owned);
@@ -932,6 +1058,13 @@ main(void)
 	UT_RUN(test_resident_PI_pre_request_scope_native_and_receipt_guards);
 	UT_RUN(test_resident_PI_ACK_wait_keeps_exact_master_session);
 	UT_RUN(test_resident_PI_local_master_uses_retired_full_receipt_after_DONE);
+	UT_RUN(test_local_PI_without_A_seals_before_resident_overwrite);
+	UT_RUN(test_local_PI_cannot_be_sent_as_an_authorized_holder_image);
+	UT_RUN(test_local_PI_late_native_or_bytes_cannot_replace_original_body);
+	UT_RUN(test_local_PI_requires_original_page_WAL_before_sealing);
+	UT_RUN(test_local_PI_only_typed_DATA_can_retire_the_sealed_body);
+	UT_RUN(test_local_PI_membership_freeze_preserves_the_original_debt);
+	UT_RUN(test_local_PI_stop_census_keeps_valid_recovery_debt);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

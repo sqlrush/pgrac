@@ -3008,8 +3008,9 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_read_source_sett
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_source_done_snapshot_exact(
 	const ResourceXBootstrapWork *work, ResourceXDecodedFrame *notice_out);
 
-/* Evidence only. Native GP/delivery and the unchanged bytes must be
- * continuously protected and rechecked by the resident refill adapter. */
+/* Preserve an exact original local PI in the existing holder-body quota if
+ * that body is empty; existing E/A/fence evidence is never replaced. This
+ * grants no access. The caller protects/rechecks native GP and page bytes. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_resident_image_preserved_exact(
 	const struct ClusterPcmOwnSnapshot *base, const char *page);
 

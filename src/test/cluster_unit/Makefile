@@ -11065,6 +11065,7 @@ clean-native-wait-cancel:
 TESTS += test_cluster_native_first_fill
 all: test_cluster_native_first_fill
 test_cluster_native_first_fill: test_cluster_native_first_fill.c test_cluster_native_wait_cancel \
+		test_cluster_native_resident_preserve.inc \
 		test_cluster_native_wait_fixture.inc test_cluster_native_disk_guard.inc \
 		test_cluster_native_disk_episode.inc test_cluster_native_image_episode.inc \
 		test_cluster_native_first_fill_gcs.inc test_cluster_native_first_fill_native.inc \
@@ -11085,6 +11086,14 @@ test_cluster_native_first_fill_gcs.inc: $(top_srcdir)/src/backend/cluster/cluste
 	     /^\/\* End ordinary first-fill request driver/ { emit=0; stop=1 } \
 	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_native_resident_preserve.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_own_acquire_preserve_resident_exact\(/ { print "ResourceXApplyResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-resident-preserve
+.PHONY: clean-native-resident-preserve
+clean-native-resident-preserve:
+	rm -f test_cluster_native_resident_preserve.inc test_cluster_native_resident_preserve.inc.tmp
 test_cluster_native_first_fill_native.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^\/\* Ordinary first-fill owns one native reservation/ { emit=1; found++ } \
 	     /^\/\* End ordinary first-fill native driver/ { emit=0; stop=1 } \

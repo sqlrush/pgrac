@@ -146,6 +146,9 @@ ordinary_send(int32 master, const ResourceXDecodedFrame *frame, BufferDesc *buf,
 	if (result == CLUSTER_LMS_ENQUEUE_ADMITTED) fake_cv_prepare_hook = ordinary_deliver;
 	return result;
 }
+#define LockBufHdr stage_header_lock
+#include "test_cluster_native_resident_preserve.inc"
+#undef LockBufHdr
 #define gcs_block_resource_x_gate_session_snapshot_result ordinary_session
 #define gcs_block_resource_x_gate_session_recheck_result ordinary_current
 #define gcs_block_pcm_x_resource_x_peer_ready_exact ordinary_peer

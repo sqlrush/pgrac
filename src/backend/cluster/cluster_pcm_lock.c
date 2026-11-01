@@ -703,6 +703,8 @@ typedef struct ClusterPcmResourceXBlockIntent {
 #define RESOURCE_X_HOLDER_PAIR_PENDING UINT8_C(1)
 #define RESOURCE_X_HOLDER_PAIR_PUBLISHED UINT8_C(2)
 #define RESOURCE_X_HOLDER_SOURCE_FORWARD UINT8_C(3)
+/* Local recovery evidence, never a wire image or an authority decision. */
+#define RESOURCE_X_HOLDER_LOCAL_PI UINT8_C(4)
 
 typedef struct ClusterPcmResourceXHolderStatus {
 	ResourceXIntentBodyHandle body;
@@ -743,6 +745,20 @@ typedef struct ClusterPcmResourceXPiCarrier {
 	uint8 reserved[2];
 } ClusterPcmResourceXPiCarrier;
 StaticAssertDecl(sizeof(ClusterPcmResourceXPiCarrier) == 184, "bounded PI body references");
+
+/* Fits inside the original holder image payload. No assertion or A is
+ * invented for a PI that predates that transport producer. */
+typedef struct ClusterPcmResourceXLocalPiBody {
+	ClusterPcmOwnSnapshot native;
+	uint64 binding_generation;
+	uint64 pi_revision;
+	ClusterPageWalBindingV1 first, last;
+	uint32 version;
+	uint32 crc;
+	char page[BLCKSZ];
+} ClusterPcmResourceXLocalPiBody;
+StaticAssertDecl(sizeof(ClusterPcmResourceXLocalPiBody) <= RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES,
+	"local PI must use the original holder body quota");
 
 typedef struct ClusterPcmResourceXRequesterJoin {
 	uint64 t_image_us;
@@ -1149,6 +1165,8 @@ static bool pcm_local_pi_snapshot_locked(struct GrdEntry *entry,
 										ClusterPcmLocalPiSnapshotV1 *out);
 static bool pcm_local_pi_source_equal(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b);
 static bool pcm_resource_x_pi_carrier_decode_locked(const struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state, ClusterPcmLocalPiSnapshotV1 *scope);
+static bool pcm_resource_x_local_pi_body_decode(const struct GrdEntry *entry,
 	const ClusterPcmResourceXMasterState *state, ClusterPcmLocalPiSnapshotV1 *scope);
 static bool pcm_resource_x_pi_carrier_observe(BufferTag tag,
 	ClusterPcmResourceXPiCarrier *observation, ClusterPcmLocalPiSnapshotV1 *scope);
@@ -3195,7 +3213,14 @@ pcm_resource_x_reconfig_proof_slot_locked(struct GrdEntry *entry,
 	if (state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		&& state->holder_status.valid == 0)
 		return false;
-	if (state->holder_image.valid != 0) {
+	if (state->holder_image.valid == RESOURCE_X_HOLDER_LOCAL_PI) {
+		if (!pcm_resource_x_local_pi_body_decode(entry, state, NULL)) return false;
+		/* Local recovery duty is never a successor grant or an old-frame
+		 * tombstone. Keep it in the original recovery owner across R8. */
+		*old_residual_out = true;
+		for (Size n = 0; n < sizeof(state->holder_image); n++)
+			digest = pcm_resource_x_proof_digest_u64(digest, ((const uint8 *)&state->holder_image)[n]);
+	} else if (state->holder_image.valid != 0) {
 		if ((state->holder_image.valid != RESOURCE_X_HOLDER_PAIR_PENDING
 			 && state->holder_image.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED)
 			|| (state->holder_image.resource_formation != token->old_formation
@@ -4067,7 +4092,14 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 		 * R8 retirement rule. */
 		holder_pair_present = master_state->holder_image.valid != 0;
 		holder_pair_old_unsettled = false;
-		if (!pcm_resource_x_s_source_empty(master_state)) {
+		if (master_state->holder_image.valid == RESOURCE_X_HOLDER_LOCAL_PI) {
+			if (!pcm_resource_x_local_pi_body_decode(entry, master_state, NULL)) {
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_resource_x_reconfig_block();
+				return pcm_resource_x_reconfig_return_release(&entry_ref, RESOURCE_X_RECONFIG_CORRUPT);
+			}
+			holder_pair_old_unsettled = true;
+		} else if (!pcm_resource_x_s_source_empty(master_state)) {
 			/* This source may have a remote master and no local canonical
 			 * head. Recognize its complete retained evidence here as well as
 			 * in the proof pass. Legacy DRAIN history cannot retire it. */
@@ -10442,7 +10474,8 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 			retained = true;
 		if ((state->holder_status.valid > RESOURCE_X_HOLDER_PAIR_PUBLISHED
 			 && !pcm_resource_x_s_source_forward_valid(entry, state, NULL))
-			|| (state->holder_image.valid > RESOURCE_X_HOLDER_PAIR_PUBLISHED)
+			|| (state->holder_image.valid > RESOURCE_X_HOLDER_PAIR_PUBLISHED
+				&& state->holder_image.valid != RESOURCE_X_HOLDER_LOCAL_PI)
 			|| state->holder_status_intent.slot.state > RESOURCE_X_INTENT_SLOT_STAGED
 			|| state->holder_image_intent.state > RESOURCE_X_INTENT_SLOT_STAGED
 			|| state->grant_intent.slot.state > RESOURCE_X_INTENT_SLOT_STAGED
@@ -26238,6 +26271,67 @@ pcm_resource_x_pi_prior_settlement_locked(struct GrdEntry *entry,
 		&& prior->common.authority_generation < next->common.authority_generation;
 }
 
+/* A local PI body is deliberately outside both old wire decoders. Its
+ * native receipt and WAL refs name the original version, not a replacement
+ * descriptor. Frozen membership cannot erase this local recovery duty. */
+static bool
+pcm_resource_x_local_pi_body_decode(const struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state, ClusterPcmLocalPiSnapshotV1 *scope)
+{
+	static const ClusterPcmResourceXHolderStatus empty_status;
+	static const ResourceXIntentBodyHandle empty_body;
+	static const ClusterPcmOwnSnapshot empty_native;
+	static const uint8 zero_tail[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
+	const ClusterPcmResourceXHolderImage *image = &state->holder_image;
+	const ClusterPcmResourceXPiCarrier *carrier = &state->pi_carrier;
+	ClusterPcmResourceXLocalPiBody body;
+	ClusterPcmLocalPiSnapshotV1 value = {0};
+	pg_crc32c crc;
+	uint32 stored;
+
+	if (image->valid != RESOURCE_X_HOLDER_LOCAL_PI || image->kind != 0
+		|| image->payload_bytes != sizeof(body) || image->logical_generation != 0
+		|| image->authority_generation != 0 || image->resource_formation != 0
+		|| image->destination_node != 0 || memcmp(&image->body, &empty_body, sizeof(empty_body)) != 0
+		|| memcmp(&state->holder_status, &empty_status, sizeof(empty_status)) != 0
+		|| memcmp(&state->holder_acquire_s_native, &empty_native, sizeof(empty_native)) != 0
+		|| state->holder_acquire_s_buffer_id != 0 || state->holder_acquire_s_forward_connection != 0
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_status_intent.slot)
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_image_intent)
+		|| carrier->transport_refs != 0 || carrier->pi_refs != 1
+		|| carrier->reserved[0] != 0 || carrier->reserved[1] != 0
+		|| carrier->binding_generation != entry->binding_generation
+		|| carrier->pi_revision == 0 || carrier->pi_revision == UINT64_MAX
+		|| memcmp(image->payload + sizeof(body), zero_tail, sizeof(image->payload)-sizeof(body)) != 0)
+		return false;
+	memcpy(&body, image->payload, sizeof(body));
+	stored = body.crc; body.crc = 0;
+	INIT_CRC32C(crc); COMP_CRC32C(crc, &body, sizeof(body)); FIN_CRC32C(crc);
+	if (body.version != 1 || stored != (uint32)crc || carrier->image_crc != stored
+		|| body.binding_generation != carrier->binding_generation || body.pi_revision != carrier->pi_revision
+		|| !cluster_pcm_own_snapshot_equal_exact(&body.native, &carrier->completed)
+		|| !BufferTagsEqual(&body.native.tag, &entry->tag)
+		|| body.native.generation == 0 || body.native.generation >= UINT64_MAX-1
+		|| body.native.reservation_token == 0 || body.native.reservation_token >= UINT64_MAX-1
+		|| body.native.flags != 0 || body.native.writer_activation_token != 0
+		|| body.native.resource_x_activation_generation != 0 || body.native.pcm_state != PCM_STATE_N
+		|| (body.native.buffer_type != BUF_TYPE_PI && body.native.buffer_type != BUF_TYPE_CURRENT)
+		|| body.native.semantic_buf_state != (BM_TAG_VALID | BM_VALID)
+		|| !cluster_page_wal_ref_read_v1(&carrier->first, BufTagGetRelFileLocator(&entry->tag),
+			entry->tag.forkNum, entry->tag.blockNum, &value.first)
+		|| !cluster_page_wal_ref_read_v1(&carrier->last, BufTagGetRelFileLocator(&entry->tag),
+			entry->tag.forkNum, entry->tag.blockNum, &value.last)
+		|| !cluster_page_wal_same_mutation_v1(&body.first, &value.first)
+		|| !cluster_page_wal_same_mutation_v1(&body.last, &value.last)
+		|| !cluster_page_wal_binding_matches_v1(&value.last, BufTagGetRelFileLocator(&entry->tag),
+			entry->tag.forkNum, entry->tag.blockNum, body.page))
+		return false;
+	value.resource = entry->tag; value.binding_generation = carrier->binding_generation;
+	value.revision = carrier->pi_revision;
+	if (scope != NULL) *scope = value;
+	return true;
+}
+
 /* Independent PI-reference decoder. It validates the unchanged original
  * body and native publication receipt, without treating a later descriptor
  * or the source-settlement ACK slot as that body's transport producer. */
@@ -26254,6 +26348,8 @@ pcm_resource_x_pi_carrier_decode_locked(const struct GrdEntry *entry,
 	const ResourceXDecodedImageEnvelope *body = &image.body.acquire_image.original_image;
 
 	if (scope != NULL) memset(scope, 0, sizeof(*scope));
+	if (state->holder_image.valid == RESOURCE_X_HOLDER_LOCAL_PI)
+		return pcm_resource_x_local_pi_body_decode(entry, state, scope);
 	if (carrier->transport_refs == 0 && carrier->pi_refs == 0)
 		return memcmp(carrier, &empty, sizeof(empty)) == 0;
 	/* A non-source S holder retains a control receipt, not an image/PI
@@ -26468,6 +26564,15 @@ pcm_resource_x_resident_preserved_locked(struct GrdEntry *entry,
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	else if (local.first.record_start == 0 && !state->pi_carrier.pi_refs)
 		result = RESOURCE_X_APPLY_APPLIED;
+	else if (state->holder_image.valid == RESOURCE_X_HOLDER_LOCAL_PI) {
+		ClusterPcmResourceXLocalPiBody body;
+		memcpy(&body, state->holder_image.payload, sizeof(body));
+		if (cluster_pcm_own_snapshot_equal_exact(base, &state->pi_carrier.completed)
+			&& cluster_page_wal_same_mutation_v1(&local.first, &covered.first)
+			&& cluster_page_wal_same_mutation_v1(&local.last, &covered.last)
+			&& (page == NULL || memcmp(page, body.page, BLCKSZ) == 0))
+			result = RESOURCE_X_APPLY_APPLIED;
+	}
 	else if (state->pi_carrier.pi_refs == 1
 		&& state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PUBLISHED
 		&& cluster_pcm_own_snapshot_equal_exact(base, &state->pi_carrier.completed)
@@ -26479,9 +26584,65 @@ pcm_resource_x_resident_preserved_locked(struct GrdEntry *entry,
 	return result;
 }
 
-/* A resident refill may overwrite old bytes only when any local PI duty
- * has an independently retained, byte-exact body and WAL scope. This is
- * evidence only: the caller must retain and recheck its native GP/hold. */
+static ResourceXApplyResult
+pcm_resource_x_local_pi_seal_locked(struct GrdEntry *entry,
+	const ClusterPcmOwnSnapshot *base, const char *page)
+{
+	static const ClusterPcmResourceXHolderStatus empty_status;
+	static const ClusterPcmResourceXHolderImage empty_image;
+	ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
+	ClusterPcmResourceXLocalPiBody body = {0};
+	ClusterPcmResourceXPiCarrier carrier = {0};
+	ClusterPcmLocalPiSnapshotV1 local;
+	pg_crc32c crc;
+
+	if (base->semantic_buf_state != (BM_TAG_VALID | BM_VALID)
+		|| state == NULL || !pcm_local_pi_snapshot_locked(entry, &local)
+		|| local.first.record_start == 0 || local.revision == 0 || local.revision == UINT64_MAX
+		|| !pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!pcm_resource_x_s_source_empty(state)
+		|| memcmp(&state->holder_status, &empty_status, sizeof(empty_status)) != 0
+		|| memcmp(&state->holder_image, &empty_image, sizeof(empty_image)) != 0
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_status_intent.slot)
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_image_intent)
+		|| state->holder_pi_first.source_flags != 0 || state->pi_carrier.pi_refs || state->pi_carrier.transport_refs
+		|| entry->resource_x_source_drain.r4_record_generation != 0
+		|| state->holder_coverage_forward.valid != 0)
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	memcpy(body.page, page, BLCKSZ);
+	if (!cluster_page_wal_binding_matches_v1(&local.last, BufTagGetRelFileLocator(&entry->tag),
+		entry->tag.forkNum, entry->tag.blockNum, body.page))
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	body.native = *base; body.binding_generation = local.binding_generation;
+	body.pi_revision = local.revision; body.first = local.first; body.last = local.last; body.version = 1;
+	INIT_CRC32C(crc); COMP_CRC32C(crc, &body, sizeof(body)); FIN_CRC32C(crc); body.crc = (uint32)crc;
+	if (!cluster_page_wal_ref_retain_v1(&local.first, &carrier.first))
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	if (!cluster_page_wal_ref_retain_v1(&local.last, &carrier.last)) {
+		if (!cluster_page_wal_ref_release_v1(&carrier.first))
+			elog(PANIC, "local PI lost its prepared WAL reference");
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	}
+	if (!pcm_resource_x_intent_mark_dirty()) {
+		if (!cluster_page_wal_ref_release_v1(&carrier.first)
+			|| !cluster_page_wal_ref_release_v1(&carrier.last))
+			elog(PANIC, "local PI lost its unpublished WAL references");
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	carrier.completed = *base; carrier.binding_generation = local.binding_generation;
+	carrier.pi_revision = local.revision; carrier.image_crc = body.crc; carrier.pi_refs = 1;
+	state->holder_image.valid = RESOURCE_X_HOLDER_LOCAL_PI;
+	state->holder_image.payload_bytes = sizeof(body);
+	memcpy(state->holder_image.payload, &body, sizeof(body));
+	state->pi_carrier = carrier;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+/* A resident refill may overwrite old bytes only after its original PI
+ * owns a byte-exact body and WAL scope. Seal a missing local-only body in
+ * that same quota; never downgrade an existing E/A/fence. This grants no
+ * access: the caller must retain and recheck its native GP/hold. */
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_resident_image_preserved_exact(
 	const ClusterPcmOwnSnapshot *base, const char *page)
@@ -26490,15 +26651,19 @@ cluster_pcm_lock_resource_x_resident_image_preserved_exact(
 	PcmEntryAcquireResult acquired;
 	ResourceXApplyResult result;
 
-	if (base == NULL || page == NULL || base->pcm_state != PCM_STATE_N
+	if (base == NULL || page == NULL || base->generation == 0 || base->generation >= UINT64_MAX-1
+		|| base->reservation_token == 0 || base->reservation_token >= UINT64_MAX-1
+		|| base->pcm_state != PCM_STATE_N
 		|| (base->buffer_type != BUF_TYPE_CURRENT && base->buffer_type != BUF_TYPE_PI)
 		|| base->flags != 0 || base->writer_activation_token != 0
 		|| base->resource_x_activation_generation != 0)
 		return RESOURCE_X_APPLY_INVALID;
 	if (!pcm_entry_ref_acquire(&base->tag, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;
-	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_EXCLUSIVE);
 	result = pcm_resource_x_resident_preserved_locked(ref.entry, base, page);
+	if (result == RESOURCE_X_APPLY_LOCAL_WAIT)
+		result = pcm_resource_x_local_pi_seal_locked(ref.entry, base, page);
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;
@@ -26639,6 +26804,11 @@ pcm_resource_x_acquire_predecessor_locked(struct GrdEntry *entry,
 			? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	/* Local PI owns old bytes/WAL only. It has no source authority or
+	 * transport predecessor; the completed ACK check above still applies. */
+	if (state->holder_image.valid == RESOURCE_X_HOLDER_LOCAL_PI)
+		return pcm_resource_x_local_pi_body_decode(entry, state, NULL)
+			? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	if (pcm_resource_x_s_source_empty(state))
 		return pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(entry, master, session, formation, 0);
 	if (state->holder_status.valid == RESOURCE_X_HOLDER_SOURCE_FORWARD) {
