@@ -12115,3 +12115,77 @@ clean distclean maintainer-clean: clean-native-hot-cycle
 clean-native-hot-cycle:
 	rm -f test_cluster_native_hot_cycle $(addprefix test_cluster_native_hot_cycle_, \
         roles.inc roles.inc.tmp remote.inc remote.inc.tmp successor.inc successor.inc.tmp)
+
+
+# Read-only normal-stop cuts in original remote-cycle and cancellation bodies.
+TESTS += test_cluster_native_stop_cycle test_cluster_native_stop_cancel
+all: test_cluster_native_stop_cycle test_cluster_native_stop_cancel
+test_cluster_native_stop_observer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_stop_held_lock\(/ { print "static void"; emit=1; held++ } \
+	     /^cluster_bufmgr_stop_poll\(/ { print "static ClusterNormalStopPollResult"; emit=1; scan++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (held != 1 || scan != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_roles.inc: test_cluster_native_three_role.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /NM_REQUIRE\(nm_master_admit\(&f, &request\)\);/ { print; print "\tns_cut(0);"; live++; next } \
+	     /NM_REQUIRE\(!holder_probe\(&next\)\); holder_content_busy = false;/ { \
+	       print "\t\tNM_REQUIRE(!holder_probe(&next)); ns_cut(1); hc_release_readers(); holder_content_busy = false;"; parks++; next } \
+	     /NM_REQUIRE\(nc_stage\(&state->holder_status_intent.slot, &proof_send\)\);/ { print "\tns_cut(2);"; acks++ } \
+	     { print } /NM_REQUIRE\(nc_callback\(&proof_send\)\);/ { print "\tns_cut(3);"; sent++ } \
+	     END { if (stop != 1 || live != 1 || parks != 1 || acks != 1 || sent != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_remote.inc: test_cluster_native_remote_x.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_three_role_fixture.inc"/ { \
+	       print "#include \"test_cluster_native_stop_roles.inc\""; includes++; next } \
+	     { print } END { if (stop != 1 || includes != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_successor.inc: test_cluster_native_s_read_successor.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_remote_x_fixture.inc"/ { \
+	       print "#include \"test_cluster_native_stop_remote.inc\""; includes++; next } \
+	     /nt_seed_holder = second \? ss_holder_kept : nm_parent_as;/ { \
+	       print "\tnt_seed_holder = second ? ss_holder_kept : hc_seed_eight;"; seeds++; next } \
+	     { print } END { if (stop != 1 || includes != 1 || seeds != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_cycle.inc: test_cluster_native_hot_cycle.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_hot_cycle_successor.inc"/ { \
+	       print "#include \"test_cluster_native_stop_successor.inc\""; includes++; next } \
+	     { print } END { if (stop != 1 || includes != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_cancel.inc: test_cluster_native_cancel_master.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /disk_on_enter = disk_on_read = disk_on_end = NULL;/ { print "\tns_cancel_io();"; io++ } \
+	     { print } /NM_REQUIRE\(!ordinary_run\(&read\)\);/ { print "\tns_cancel_aborted();"; aborted++ } \
+	     END { if (stop != 1 || io != 1 || aborted != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_cycle: test_cluster_native_stop_cycle.c test_cluster_native_stop_census.h \
+        test_cluster_native_stop_cycle.inc test_cluster_native_stop_roles.inc \
+        test_cluster_native_stop_remote.inc test_cluster_native_stop_successor.inc \
+        test_cluster_native_stop_observer.inc test_cluster_native_hot_cycle
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_stop_cancel: test_cluster_native_stop_cancel.c test_cluster_native_stop_census.h \
+        test_cluster_native_stop_cancel.inc test_cluster_native_stop_observer.inc test_cluster_native_cancel_master
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-stop-census
+.PHONY: clean-native-stop-census
+clean-native-stop-census:
+	rm -f test_cluster_native_stop_cycle test_cluster_native_stop_cancel \
+        $(addprefix test_cluster_native_stop_, observer.inc observer.inc.tmp roles.inc roles.inc.tmp \
+        remote.inc remote.inc.tmp successor.inc successor.inc.tmp cycle.inc cycle.inc.tmp cancel.inc cancel.inc.tmp)
