@@ -119,6 +119,7 @@ sub wait_exit_cell {
    $by_pid{$pid}=$s;
   }
   $r=session($node);
+  $r->query_safe('\\set ON_ERROR_STOP 0');
   $r->query_safe('\\set VERBOSITY verbose');
   my $pid=0+$r->query_safe('SELECT pg_backend_pid()');
   save_json("b08-$name-setup",{tag=>\@tag,ctids=>\@tids,holders=>\@holders,pid=>$pid,
@@ -678,6 +679,7 @@ sub deadlock_cell {
   my $page=deadlock_page($node,$pages[1],$offset);
   my ($second,$why)=select_blocker($page,'--page-owner');
   die "second page has no exact observed owner: $why" unless defined($second);
+  $by_pid{$second->{pid}}->query_safe('\\set ON_ERROR_STOP 0');
   my $first_sql="UPDATE $pages[0]->{name} SET v=1 WHERE id=9;";
   my $until=clock_gettime(CLOCK_MONOTONIC)+10;
   $by_pid{$second->{pid}}->query_until(qr/B08_DEADLOCK_FORWARD/,
@@ -691,6 +693,7 @@ sub deadlock_cell {
   my $second_sql="UPDATE $pages[1]->{name} SET v=1 WHERE id=9;";
   @clients=({%$second,session=>$by_pid{$second->{pid}},sql=>$first_sql,target=>$pages[0]->{name}},
             {%$first,session=>$by_pid{$first->{pid}},sql=>$second_sql,target=>$pages[1]->{name}});
+  $by_pid{$first->{pid}}->query_safe('\\set ON_ERROR_STOP 0');
   save_json('b08-deadlock-start',{forward=>$forward,reverse=>$reverse,selected=>[$first,$second]});
   $by_pid{$first->{pid}}->query_until(qr/B08_DEADLOCK_REVERSE/,
    "\\echo B08_DEADLOCK_REVERSE\n$second_sql\n");
