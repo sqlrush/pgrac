@@ -130,7 +130,12 @@ extern bool cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 insta
 													 const ClusterUndoSmgrRecoveryFileV1 *expected,
 													 char out[BLCKSZ]);
 /* Only a source-proved INIT/REUSE owner may call materialize. It preserves all
- * existing bytes through the target size and does not publish a new header. */
+ * existing bytes through the target size and does not publish a new header.
+ * Managed preparation requires an existing, fully selected TT40 observation;
+ * one matching identity/generation borrow spans original-inode/base checks,
+ * extension, file/directory sync and cleanup. Both images must match that
+ * identity. Absence is not creation permission. Late failure preserves any
+ * completed extension; the original recovery owner retains its duties. */
 extern bool cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 													  const ClusterUndoSmgrRecoveryFileV1 *expected,
 													  const char block0[BLCKSZ],

@@ -392,6 +392,105 @@ undo_native_recovery_read(uint32 segment, uint8 instance, uint32 block,
 	}
 	return ok;
 }
+
+/* Size preparation of an existing recovery file does not publish block zero.
+ * The full-image owner retains source/cut/path and writer authority. Keep its
+ * original observation, both TT40 images and all I/O on one selected identity;
+ * absence requires a separate qualified creation path, never O_CREAT here. */
+static bool
+undo_native_recovery_materialize(uint32 segment, uint8 instance,
+	const ClusterUndoSmgrRecoveryFileV1 *expected, const char block0[BLCKSZ],
+	const char final_header[BLCKSZ])
+{
+	ClusterControlFileKeyV2 key = { 0 };
+	ClusterControlNativeFileBorrowV2 borrow = { 0 };
+	ClusterUndoSmgrRecoveryFileV1 observed;
+	PGAlignedBlock page;
+	char path[MAXPGPATH], checked[MAXPGPATH];
+	volatile int fd = -1;
+	volatile bool ok = false;
+
+	if (expected == NULL || !expected->native_selected || !expected->exists
+		|| expected->native_table_generation == 0 || expected->native_startup_generation == 0
+		|| block0 == NULL || final_header == NULL || instance == 0
+		|| instance > UNDO_OWNER_INSTANCE_MAX || segment == 0 || segment > UINT16_MAX
+		|| (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != instance)
+		return false;
+	key.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+	key.origin = instance - 1;
+	key.object_id = segment;
+	if (!cluster_control_native_file_acquire_v2(&key, &borrow))
+		return false;
+	PG_TRY();
+	{
+		do {
+			int owned_fd;
+			bool directories_synced = true;
+
+			if (!cluster_control_native_file_current_v2(&borrow)
+				|| expected->native_table_generation != borrow.table_generation
+				|| expected->native_startup_generation != borrow.startup_generation
+				|| !cluster_recovery_file_identity_matches_v2(expected->native_file_reference,
+					sizeof(expected->native_file_reference), &borrow.expected)
+				|| !cluster_undo_segment_header_identity_ok(block0, segment, instance)
+				|| !cluster_tt_file_reference_matches_v2(block0, BLCKSZ, &borrow.expected)
+				|| cluster_undo_segment_header_integrity(block0) != CLUSTER_UNDO_HEADER_VALID
+				|| !cluster_undo_segment_header_identity_ok(final_header, segment, instance)
+				|| !cluster_tt_file_reference_matches_v2(final_header, BLCKSZ, &borrow.expected)
+				|| cluster_undo_segment_header_integrity(final_header) != CLUSTER_UNDO_HEADER_VALID
+				|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment,
+					path, sizeof(path)) != 0)
+				break;
+			fd_cache_close();
+			fd = BasicOpenFile(path, O_RDWR | PG_BINARY | O_NOFOLLOW);
+			if (fd < 0 || !cluster_control_native_file_current_v2(&borrow)
+				|| !undo_recovery_file_stat(fd, &observed)
+				|| observed.size < BLCKSZ || observed.size > UNDO_SEGMENT_SIZE_BYTES
+				|| !undo_recovery_file_same(expected, &observed)
+				|| !undo_recovery_read(fd, observed.size, 0, page.data)
+				|| memcmp(page.data, block0, BLCKSZ) != 0
+				|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment,
+					checked, sizeof(checked)) != 0 || strcmp(path, checked) != 0
+				|| !cluster_control_native_file_current_v2(&borrow))
+				break;
+			if (ftruncate(fd, UNDO_SEGMENT_SIZE_BYTES) != 0
+				|| !cluster_control_native_file_current_v2(&borrow) || pg_fsync(fd) != 0
+				|| !cluster_control_native_file_current_v2(&borrow))
+				break;
+			owned_fd = fd; fd = -1;
+			if (close(owned_fd) != 0 || !cluster_control_native_file_current_v2(&borrow))
+				break;
+			/* Preserve both original directory syncs, but keep any owned
+			 * directory FD in the same ERROR cleanup as the file FD. */
+			for (unsigned depth = 0; depth < 2; depth++) {
+				get_parent_directory(checked);
+				fd = BasicOpenFile(checked, O_RDONLY | PG_BINARY);
+				if (fd < 0 || pg_fsync(fd) != 0) {
+					directories_synced = false;
+					break;
+				}
+				owned_fd = fd; fd = -1;
+				if (close(owned_fd) != 0 || !cluster_control_native_file_current_v2(&borrow)) {
+					directories_synced = false;
+					break;
+				}
+			}
+			if (!directories_synced)
+				break;
+			ok = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (fd >= 0 && close(fd) != 0)
+			ok = false;
+		if (!cluster_control_native_file_release_v2(&borrow))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not release recovery TT size-preparation borrow")));
+	}
+	PG_END_TRY();
+	return ok;
+}
 #endif
 
 bool
@@ -494,6 +593,13 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 	int flags = O_RDWR | PG_BINARY;
 	int fd;
 	bool ok;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2
+		|| (expected != NULL && expected->native_selected))
+		return undo_native_recovery_materialize(segment, instance, expected, block0, final_header);
+#endif
 
 	if (expected == NULL || block0 == NULL || final_header == NULL
 		|| !((uint8)final_header[57] == CLUSTER_UNDO_TT_LAYOUT_V2
