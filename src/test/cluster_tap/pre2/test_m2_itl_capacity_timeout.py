@@ -23,6 +23,19 @@ def capacity_timeout_fixture():
 
 
 class CapacityTimeoutEvidence(unittest.TestCase):
+    def test_psql_stdin_location_keeps_the_original_capacity_diagnostic(self):
+        case = capacity_timeout_fixture()
+        case['stderr'] = 'psql:<stdin>:47: ' + case['stderr']
+        before = copy.deepcopy(case)
+        try:
+            result = validate_wait_exit(case)
+        except ValueError as exc:
+            self.fail('complete native psql capacity error refused: ' + str(exc))
+        self.assertEqual(result['sqlstate'], '53R70')
+        self.assertEqual(result['deadline_us'], 5000000)
+        self.assertFalse(result['authoritative'])
+        self.assertEqual(case, before)
+
     def test_original_capacity_budget_has_its_own_error_and_exact_cleanup(self):
         case = capacity_timeout_fixture()
         before = copy.deepcopy(case)
