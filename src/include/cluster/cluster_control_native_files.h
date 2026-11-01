@@ -160,6 +160,22 @@ cluster_control_native_files_reserve_clog_range_locked_v2(uint16 origin, uint64 
 														  uint64 last_segment,
 														  ClusterControlNativeClogRangeV2 **fresh);
 extern void cluster_control_native_clog_range_destroy_v2(ClusterControlNativeClogRangeV2 **);
+/* Original creator's one CLOG file, SAME original CF-X and complete selection.
+ * The file owner supplies independent expected/batch and its actual complete
+ * sync/readback receipt under continuing file/I/O custody. Release native
+ * borrows before this call, without releasing that original protection.
+ * startup/table must match the published MANAGED snapshot selected for this
+ * attempt. No family lock/critical section. The selection is consumed ONCE on
+ * success, refusal or ERROR; destroy it before leaving the original CF.
+ * Only this exact RESERVED file becomes AVAILABLE; same-batch successors and
+ * their original creation duty remain RESERVED. Generic whole-batch COMPLETE
+ * and coverage validation are unchanged. No file permission, drain, coverage
+ * qualification, era/lifetime, OPEN or activation is granted. Persistent/late
+ * failure returns REGISTRATION_DEBT (or ERROR): no cancel, rollback or retry. */
+extern ClusterControlNativeResultV2 cluster_control_native_files_complete_clog_file_locked_v2(
+	ClusterControlRelmapSelectionV2 *, uint64 startup_generation, uint64 table_generation,
+	const uint8 batch_uuid[16], const ClusterRecoveryFileIdentityV2 *expected,
+	const ClusterRecoveryCheckpointFileV2 *receipt);
 /* Pure storage predicate for the control producer's output; no table read,
  * borrow, I/O or authority. */
 extern bool cluster_control_native_files_output_distinct_v2(const void *, Size);
