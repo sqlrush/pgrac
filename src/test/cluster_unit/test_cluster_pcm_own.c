@@ -10043,8 +10043,11 @@ UT_TEST(test_queue_s_source_dirty_flush_makes_progress_and_reports_exact_refusal
 			"BM_IO_IN_PROGRESS",
 			"CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_IO_IN_PROGRESS",
 			"cluster_bufmgr_pcm_own_begin_s_revoke",
-			"smgrread",
-			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)" };
+			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
+			"local_page = (Page)BufHdrGetBlock(buf)",
+			"if (!local_covers)",
+			"CLUSTER_PCM_S_SOURCE_HARD_NO_COVER",
+			"buf, &live, local_page, false, out_revoking" };
 	char *source = read_bufmgr_source();
 
 	/* A clean checkpoint can be dirtied again by a SELECT's commit hint before

@@ -33,6 +33,13 @@ static void holder_pin(BufferDesc *buf, uint32 state)
 	UT_ASSERT(buf == &request_buf); UT_ASSERT_EQ(fake_lwlock_depth, 1);
 	holder_pins++; UnlockBufHdr(buf, state + BUF_REFCOUNT_ONE);
 }
+static void holder_header_pin(BufferDesc *buf)
+{
+	uint32 state = pg_atomic_read_u32(&buf->state);
+	UT_ASSERT(buf == &request_buf); UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT((state & BM_LOCKED) != 0);
+	holder_pins++; UnlockBufHdr(buf, (state & ~BM_LOCKED) + BUF_REFCOUNT_ONE);
+}
 static void holder_unpin(BufferDesc *buf)
 {
 	UT_ASSERT(buf == &request_buf); UT_ASSERT(holder_pins > 0);
@@ -144,7 +151,7 @@ void XLogFlush(XLogRecPtr lsn) { (void)lsn; holder_unexpected_write(); }
 #define cluster_injection_is_armed(name) ((void)(name), false)
 #define cluster_pcm_x_retain_flush_error_target_matches(spc, db, rel, fork, block) \
 	((void)(spc), (void)(db), (void)(rel), (void)(fork), (void)(block), false)
-#define PinBuffer_Locked(buf) holder_pin(buf, pg_atomic_read_u32(&(buf)->state) & ~BM_LOCKED)
+#define PinBuffer_Locked(buf) holder_header_pin(buf)
 #define UnpinBuffer(buf) holder_unpin(buf)
 #define ReservePrivateRefCountEntry() ((void)0)
 #define ResourceOwnerEnlargeBuffers(owner) ((void)(owner))
@@ -448,25 +455,116 @@ UT_TEST(test_holder_storage_write_ERROR_before_shared_handoff_releases_native_fe
 	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_ACQUIRE_S_SOURCE_FORWARD);
 	holder_no_debt();
 }
-UT_TEST(test_holder_compatible_S_captures_verified_storage_and_preserves_native_generation)
+UT_TEST(test_holder_compatible_S_captures_resident_current_without_disk_read)
 {
 	HolderFixture f; bool ok = holder_start_mode(&f, PCM_STATE_S); UT_ASSERT(ok); if (!ok) return;
+	PGIOAlignedBlock before;
+	ResourceXDecodedFrame image; ResourceXAcquireSSourceState phase;
+	ClusterPcmOwnSnapshot native; int32 id;
+	memcpy(before.data, disk_shared.data, BLCKSZ);
+	disk_bytes.data[BLCKSZ - 1] ^= 0x5a;
+	((PageHeader)disk_bytes.data)->pd_checksum = pg_checksum_page(disk_bytes.data, request_buf.tag.blockNum);
+	disk_store();
 	HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(disk_reads, 1); UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(disk_opens, 0);
+	UT_ASSERT(memcmp(before.data, disk_shared.data, BLCKSZ) == 0);
+	HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(&f.block, 0,
+		&id, &native, &image, &phase), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(before.data, image.body.acquire_image.original_image.page_bytes, BLCKSZ) == 0);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
 	HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S); UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 901);
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	UT_ASSERT_EQ(holder_slot(&f, true)->state, RESOURCE_X_INTENT_SLOT_ARMED); holder_no_debt();
 }
-UT_TEST(test_holder_S_storage_read_ERROR_unwinds_native_but_retains_original_service)
+
+UT_TEST(test_holder_S_current_checksum_is_not_a_disk_checksum)
+{
+	HolderFixture f; PGIOAlignedBlock before;
+	ResourceXDecodedFrame image; ResourceXAcquireSSourceState phase;
+	ClusterPcmOwnSnapshot native; int32 id;
+	bool ok = holder_start_mode(&f, PCM_STATE_S); UT_ASSERT(ok); if (!ok) return;
+	((PageHeader)disk_shared.data)->pd_checksum ^= 1;
+	UT_ASSERT(!PageIsVerifiedExtended(disk_shared.data, request_buf.tag.blockNum, 0));
+	memcpy(before.data, disk_shared.data, BLCKSZ);
+	HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(disk_reads, 0);
+	HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(&f.block, 0,
+		&id, &native, &image, &phase), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(before.data, image.body.acquire_image.original_image.page_bytes, BLCKSZ) == 0);
+	HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED); holder_no_debt();
+}
+
+UT_TEST(test_holder_S_missing_current_floor_cannot_refresh_from_newer_disk)
+{
+	HolderFixture f; PGIOAlignedBlock before, output;
+	ClusterPcmOwnSnapshot prepared; ClusterPcmOwnSourcePrepareRefusal refusal;
+	ClusterPageWalBindingV1 wal; XLogRecPtr lsn; uint64 scn;
+	bool ok = holder_start_mode(&f, PCM_STATE_S); UT_ASSERT(ok); if (!ok) return;
+	memcpy(before.data, disk_shared.data, BLCKSZ);
+	((PageHeader)disk_bytes.data)->pd_block_scn = 100;
+	((PageHeader)disk_bytes.data)->pd_checksum = pg_checksum_page(disk_bytes.data, request_buf.tag.blockNum);
+	disk_store();
+	HOLDER_EQ(cluster_bufmgr_pcm_own_prepare_s_source_image(&request_buf, &request_base,
+		94, &prepared, output.data, &lsn, &scn, &refusal, &wal), CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(disk_opens, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); UT_ASSERT_EQ(prepared.reservation_token, 0);
+	UT_ASSERT_EQ(lsn, InvalidXLogRecPtr); UT_ASSERT_EQ(scn, 0);
+	UT_ASSERT(memcmp(before.data, disk_shared.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(f.master.state->holder_image.valid, 0);
+	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_ACQUIRE_S_SOURCE_FORWARD);
+	holder_no_debt();
+}
+
+UT_TEST(test_holder_S_current_keeps_exact_identity_shape_and_IO_refusals)
+{
+	for (unsigned cut = 0; cut < 5; cut++) {
+		HolderFixture f; PGIOAlignedBlock before, output;
+		ClusterPcmOwnSnapshot expected, prepared; ClusterPcmOwnSourcePrepareRefusal refusal;
+		ClusterPageWalBindingV1 wal; XLogRecPtr lsn; uint64 scn;
+		bool ok = holder_start_mode(&f, PCM_STATE_S); UT_ASSERT(ok); if (!ok) return;
+		expected = request_base; memcpy(before.data, disk_shared.data, BLCKSZ);
+		if (cut == 0) expected.generation++;
+		if (cut == 1) expected.reservation_token++;
+		if (cut == 2) request_buf.buffer_type = BUF_TYPE_PI;
+		if (cut == 3) pg_atomic_fetch_or_u32(&request_buf.state, BM_IO_ERROR);
+		if (cut == 4) pg_atomic_fetch_or_u32(&request_buf.state, BM_IO_IN_PROGRESS);
+		HOLDER_EQ(cluster_bufmgr_pcm_own_prepare_s_source_image(&request_buf, &expected,
+			0, &prepared, output.data, &lsn, &scn, &refusal, &wal),
+			cut < 2 ? CLUSTER_PCM_OWN_STALE : cut < 4 ? CLUSTER_PCM_OWN_CORRUPT : CLUSTER_PCM_OWN_BUSY);
+		UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+		UT_ASSERT(memcmp(before.data, disk_shared.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(f.master.state->holder_image.valid, 0); holder_no_debt();
+	}
+}
+
+UT_TEST(test_holder_S_content_busy_waits_same_service_without_reading_disk)
+{
+	HolderFixture f; ResourceXSourceDrainWork next;
+	bool ok = holder_start_mode(&f, PCM_STATE_S); UT_ASSERT(ok); if (!ok) return;
+	holder_content_busy = true;
+	HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(disk_reads, 0);
+	HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work,
+		RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!holder_probe(&next)); holder_content_busy = false;
+	cluster_pcm_lock_resource_x_source_drain_content_released();
+	ok = holder_probe(&next); UT_ASSERT(ok); if (!ok) return;
+	UT_ASSERT(memcmp(&next.request, &f.work.request, sizeof(next.request)) == 0); f.work = next;
+	HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(disk_reads, 0);
+	HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED); holder_no_debt();
+}
+UT_TEST(test_holder_S_storage_unavailable_does_not_replace_resident_current)
 {
 	HolderFixture f; volatile bool caught = false;
 	bool ok = holder_start_mode(&f, PCM_STATE_S); UT_ASSERT(ok); if (!ok) return;
 	disk_read_error = true;
 	PG_TRY(); { (void)holder_capture(&f); } PG_CATCH(); { caught = true; } PG_END_TRY();
-	UT_ASSERT(caught); UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
-	UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_ACQUIRE_S_SOURCE_FORWARD);
-	UT_ASSERT_EQ(holder_slot(&f, true)->state, RESOURCE_X_INTENT_SLOT_EMPTY); holder_no_debt();
+	UT_ASSERT(!caught); UT_ASSERT_EQ(disk_reads, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+	HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(holder_slot(&f, true)->state, RESOURCE_X_INTENT_SLOT_ARMED); holder_no_debt();
 }
 UT_TEST(test_holder_native_itl_active_slot_defers_same_current_before_revoke)
 {
@@ -1034,12 +1132,10 @@ UT_TEST(test_holder_all_roles_storage_ERROR_keeps_shared_service)
 		bool ok = holder_lifecycle_start(&f, role, "storage-ERROR", 0);
 		UT_ASSERT(ok && shared != NULL); if (!ok || shared == NULL) { free(shared); return; }
 		memcpy(shared, f.master.state, sizeof(*shared)); memcpy(page.data, disk_shared.data, BLCKSZ);
-		if (role == 0 || role == 2) {
-			holder_write_error = true; pg_atomic_fetch_or_u32(&request_buf.state, BM_DIRTY);
-		} else disk_read_error = true;
+		holder_write_error = true; pg_atomic_fetch_or_u32(&request_buf.state, BM_DIRTY);
 		PG_TRY(); { (void)holder_capture(&f); } PG_CATCH(); { caught = true; } PG_END_TRY();
 		UT_ASSERT(caught); holder_lifecycle_unhanded(&f, &page, shared); free(shared);
-		if (role == 0 || role == 2) UT_ASSERT((pg_atomic_read_u32(&request_buf.state) & BM_DIRTY) != 0);
+		UT_ASSERT((pg_atomic_read_u32(&request_buf.state) & BM_DIRTY) != 0);
 	}
 }
 UT_TEST(test_holder_all_roles_interrupted_native_publish_rejoins_once)
@@ -1135,7 +1231,7 @@ int holder_clean_fixture_main(void)
 int main(void)
 #endif
 {
-	UT_PLAN(40);
+	UT_PLAN(44);
 	UT_RUN(test_holder_capture_native_downgrade_and_original_pair);
 	UT_RUN(test_holder_real_busy_before_capture_keeps_one_work_until_release);
 	UT_RUN(test_holder_real_busy_after_capture_preserves_exact_native_fence_and_image);
@@ -1144,8 +1240,12 @@ int main(void)
 	UT_RUN(test_holder_changed_native_token_cannot_publish_or_clear_successor);
 	UT_RUN(test_holder_peer_loss_after_native_prepare_aborts_only_unhanded_fence);
 	UT_RUN(test_holder_storage_write_ERROR_before_shared_handoff_releases_native_fence_and_pins);
-	UT_RUN(test_holder_compatible_S_captures_verified_storage_and_preserves_native_generation);
-	UT_RUN(test_holder_S_storage_read_ERROR_unwinds_native_but_retains_original_service);
+	UT_RUN(test_holder_compatible_S_captures_resident_current_without_disk_read);
+	UT_RUN(test_holder_S_storage_unavailable_does_not_replace_resident_current);
+	UT_RUN(test_holder_S_current_checksum_is_not_a_disk_checksum);
+	UT_RUN(test_holder_S_missing_current_floor_cannot_refresh_from_newer_disk);
+	UT_RUN(test_holder_S_current_keeps_exact_identity_shape_and_IO_refusals);
+	UT_RUN(test_holder_S_content_busy_waits_same_service_without_reading_disk);
 	UT_RUN(test_holder_native_itl_active_slot_defers_same_current_before_revoke);
 	UT_RUN(test_holder_real_full_ring_keeps_immutable_pair_and_both_send_owners);
 	UT_RUN(test_holder_real_transport_failure_rearms_same_payload_and_success_keeps_semantic_debt);

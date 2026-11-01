@@ -24435,7 +24435,7 @@ typedef enum ClusterPcmOwnSSourceHardFailureReason
 	CLUSTER_PCM_S_SOURCE_HARD_INITIAL_CURRENT_IMAGE,
 	CLUSTER_PCM_S_SOURCE_HARD_INITIAL_IO_ERROR,
 	CLUSTER_PCM_S_SOURCE_HARD_BEGIN_REVOKE_CORRUPT,
-	CLUSTER_PCM_S_SOURCE_HARD_STORAGE_READ_ERROR,
+	CLUSTER_PCM_S_SOURCE_HARD_CAPTURE_ERROR,
 	CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY,
 	CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_CURRENT_IMAGE,
 	CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_IO_ERROR,
@@ -24477,8 +24477,8 @@ cluster_bufmgr_pcm_own_s_source_hard_failure_reason_name(
 			return "initial-io-error";
 		case CLUSTER_PCM_S_SOURCE_HARD_BEGIN_REVOKE_CORRUPT:
 			return "begin-revoke-corrupt";
-		case CLUSTER_PCM_S_SOURCE_HARD_STORAGE_READ_ERROR:
-			return "storage-read-error";
+		case CLUSTER_PCM_S_SOURCE_HARD_CAPTURE_ERROR:
+			return "capture-error";
 		case CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY:
 			return "storage-verify";
 		case CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_CURRENT_IMAGE:
@@ -24568,10 +24568,10 @@ cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 		 (unsigned int)obs.buffer_type);
 }
 
-/* Freeze an exact S source and materialize the newest safe image visible in
- * either its clean resident page or shared storage.  REVOKING prevents local
- * data writes/reuse while the conditional content-lock hold binds the final
- * comparison and optional storage refresh to the same ownership tuple. */
+/* Freeze an exact S current source and copy its protected resident image.
+ * REVOKING and content EXCLUSIVE bind the copy to the same native tuple.
+ * This holder has no disk-source grant: a missing current/floor proof must
+ * fail closed rather than substitute bytes from shared storage. */
 static ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
@@ -24579,23 +24579,16 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
 	ClusterPageWalBindingV1 *out_wal)
 {
-	PGIOAlignedBlock scratch;
 	ClusterPcmOwnResult abort_result;
 	ClusterPcmOwnResult result;
 	ClusterPcmOwnSnapshot live;
-	SMgrRelation reln;
 	LWLock *content_lock;
-	Page local_page;
-	Page selected_page = NULL;
-	Page storage_page;
+	Page local_page = NULL;
 	SCN local_scn;
-	SCN storage_scn;
 	uint32 buf_state;
 	uint32 observed_buf_state = 0;
 	uint8 observed_buffer_type = 0;
 	bool local_covers;
-	bool replace_resident = false;
-	bool storage_covers;
 	ClusterPageWalBindingV1 wal = { 0 };
 	volatile bool content_locked = false;
 	volatile bool private_pinned = false;
@@ -24704,22 +24697,11 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 		return result;
 	}
 	content_lock = BufferDescriptorGetContentLock(buf);
-	storage_page = (Page)scratch.data;
 	local_scn = InvalidScn;
-	storage_scn = InvalidScn;
 
 	PG_TRY();
 	{
-		reln = smgropen(BufTagGetRelFileLocator(&expected_s->tag), InvalidBackendId);
-		smgrread(reln, BufTagGetForkNum(&expected_s->tag), expected_s->tag.blockNum,
-				 scratch.data);
-		if (!PageIsVerifiedForFork(storage_page, BufTagGetForkNum(&expected_s->tag), expected_s->tag.blockNum,
-								PIV_LOG_WARNING | PIV_REPORT_STAT)) {
-			hard_failure_reason = CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY;
-			result = CLUSTER_PCM_OWN_CORRUPT;
-		}
-		if (result == CLUSTER_PCM_OWN_OK
-			&& LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+		if (LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
 			content_locked = true;
 			buf_state = LockBufHdr(buf);
 			observed_buf_state = buf_state;
@@ -24747,36 +24729,21 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 			else {
 				local_page = (Page)BufHdrGetBlock(buf);
 				local_scn = ((PageHeader)local_page)->pd_block_scn;
-				storage_scn = ((PageHeader)storage_page)->pd_block_scn;
 				local_covers
 					= !SCN_VALID(required_page_scn)
 					  || (SCN_VALID(local_scn)
 						  && scn_local(local_scn) >= scn_local(required_page_scn));
-				storage_covers
-					= !SCN_VALID(required_page_scn)
-					  || (SCN_VALID(storage_scn)
-						  && scn_local(storage_scn) >= scn_local(required_page_scn));
-				/* Every S grant is storage-consistent before publication.  Once an
-				 * exact non-source ACK has published a higher floor, neither copy
-				 * covering it is durable lost-write evidence, not retryable lag. */
-				if (!local_covers && !storage_covers) {
+				/* Only the master-selected protected current can satisfy the
+				 * witness floor. Disk freshness cannot establish this grant. */
+				if (!local_covers) {
 					hard_failure_reason = CLUSTER_PCM_S_SOURCE_HARD_NO_COVER;
 					result = CLUSTER_PCM_OWN_CORRUPT;
-				}
-				else if (local_covers
-						 && (!storage_covers || !SCN_VALID(storage_scn)
-							 || (SCN_VALID(local_scn)
-								 && scn_local(local_scn) >= scn_local(storage_scn)))) {
-					selected_page = local_page;
-				} else {
-					selected_page = storage_page;
-					replace_resident = true;
 				}
 			}
 			UnlockBufHdr(buf, buf_state);
 			if (result == CLUSTER_PCM_OWN_OK)
 				result = cluster_bufmgr_pcm_own_copy_source_image_exact(
-					buf, &live, selected_page, replace_resident, out_revoking,
+					buf, &live, local_page, false, out_revoking,
 					block_data, out_page_lsn, out_page_scn);
 			if (result == CLUSTER_PCM_OWN_OK && cluster_shared_config && out_wal != NULL)
 				(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal);
@@ -24806,11 +24773,11 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 		if (abort_result != CLUSTER_PCM_OWN_OK) {
 			cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 				CLUSTER_PCM_S_SOURCE_HARD_ABORT_FAILURE,
-				CLUSTER_PCM_S_SOURCE_HARD_STORAGE_READ_ERROR, buf, &live,
-				required_page_scn, local_scn, storage_scn, observed_buf_state,
+				CLUSTER_PCM_S_SOURCE_HARD_CAPTURE_ERROR, buf, &live,
+				required_page_scn, local_scn, InvalidScn, observed_buf_state,
 				observed_buffer_type, CLUSTER_PCM_OWN_CORRUPT, abort_result);
 			elog(LOG,
-				 "could not abort exact PCM-X S-source reservation after storage read error: "
+				 "could not abort exact PCM-X S-source reservation after source capture error: "
 				 "buffer=%d generation=%llu token=%llu result=%d; evidence retained",
 				 buf->buf_id, (unsigned long long)live.generation,
 				 (unsigned long long)live.reservation_token, (int)abort_result);
@@ -24828,14 +24795,14 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 	if (abort_result != CLUSTER_PCM_OWN_OK) {
 		cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 			CLUSTER_PCM_S_SOURCE_HARD_ABORT_FAILURE, hard_failure_reason, buf, &live,
-			required_page_scn, local_scn, storage_scn, observed_buf_state,
+			required_page_scn, local_scn, InvalidScn, observed_buf_state,
 			observed_buffer_type, result, abort_result);
 		return CLUSTER_PCM_OWN_CORRUPT;
 	}
 	if (result == CLUSTER_PCM_OWN_CORRUPT)
 		cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 			hard_failure_reason, CLUSTER_PCM_S_SOURCE_HARD_NONE, buf, &live,
-			required_page_scn, local_scn, storage_scn, observed_buf_state,
+			required_page_scn, local_scn, InvalidScn, observed_buf_state,
 			observed_buffer_type, result, abort_result);
 	memset(out_revoking, 0, sizeof(*out_revoking));
 	memset(block_data, 0, BLCKSZ);
