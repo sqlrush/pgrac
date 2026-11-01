@@ -585,10 +585,171 @@ UT_TEST(cohort_creation_table_excludes_every_local_undo_seed)
 		selection_end();
 	}
 }
+UT_TEST(inventory_snapshot_refuses_unknown_alias_and_nonfresh_output)
+{
+	ClusterControlNativeInventoryV2 *v = NULL;
+	ClusterControlNativeInventoryV2 *sentinel = (void *)1;
+	table_reset();
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), CLUSTER_NATIVE_FILES_REFUSED_V2);
+	UT_ASSERT(v == NULL);
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &sentinel), CLUSTER_NATIVE_FILES_REFUSED_V2);
+	UT_ASSERT(sentinel == (void *)1);
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, (void *)native_files), CLUSTER_NATIVE_FILES_REFUSED_V2);
+}
+UT_TEST(inventory_snapshot_copies_every_available_row_above64_without_cf)
+{
+	ClusterControlNativeInventoryV2 *v = NULL;
+	uint64 started;
+	table_reset();
+	native_inventory(80);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	cf_held = false;
+	started = nanos();
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), 0);
+	UT_ASSERT(v != NULL);
+	if (v) {
+		printf("# inventory snapshot rows=%llu bytes=%zu ns=%llu\n",
+			(unsigned long long)v->info.count, v->private_bytes,
+			(unsigned long long)(nanos() - started));
+		UT_ASSERT_EQ(v->info.count, 81);
+		UT_ASSERT_EQ(v->info.reservation_count, 0);
+		for (unsigned i = 0; i < 82; i++) {
+			bool found = false;
+			for (uint64 j = 0; j < v->info.count; j++)
+				if (identity_same(&v->files[j], &inventory[i].identity))
+					found = true;
+			UT_ASSERT(found);
+		}
+		UT_ASSERT(cluster_control_native_files_inventory_current_v2(v));
+		UT_ASSERT(!cf_held);
+	}
+	cluster_control_native_inventory_destroy_v2(&v);
+	UT_ASSERT(v == NULL);
+	cf_held = true;
+	selection_end();
+}
+UT_TEST(inventory_snapshot_preserves_complete_reserved_values_without_admission)
+{
+	ClusterControlNativeInventoryV2 *v = NULL;
+	ClusterControlNativeFileBorrowV2 borrow = {0};
+	NativeFileBank *bank;
+	table_reset();
+	native_inventory(2);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	bank = &native_files->banks[native_files->active];
+	for (unsigned i = 0; i < 2; i++) {
+		bank->reservations[i].expected = inventory[2].identity;
+		bank->reservations[i].expected.object_id = 100 + i;
+		bank->reservations[i].batch_uuid[0] = 7;
+		bank->reservations[i].owner_generation = 9;
+		bank->reservations[i].state = CLUSTER_RECOVERY_FILE_RESERVED_V1;
+	}
+	bank->info.reservation_count = 2;
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), 0);
+	if (v) {
+		UT_ASSERT_EQ(v->info.reservation_count, 2);
+		UT_ASSERT(!memcmp(v->reservations, bank->reservations, 2 * sizeof(*v->reservations)));
+		UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 100, &borrow),
+			CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2);
+		UT_ASSERT(cluster_control_native_files_inventory_current_v2(v));
+	}
+	cluster_control_native_inventory_destroy_v2(&v);
+	UT_ASSERT_EQ(bank->info.reservation_count, 2);
+	selection_end();
+}
+UT_TEST(inventory_snapshot_budget_and_invalid_counts_never_return_a_prefix)
+{
+	ClusterControlNativeInventoryV2 *v = NULL;
+	Size exact;
+	table_reset();
+	native_inventory(80);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), 0);
+	exact = v ? v->private_bytes : 0;
+	cluster_control_native_inventory_destroy_v2(&v);
+	UT_ASSERT(exact > sizeof(*v));
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(exact - 1, &v), CLUSTER_NATIVE_FILES_CAPACITY_EXCEEDED_V2);
+	UT_ASSERT(v == NULL);
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(exact, &v), 0);
+	cluster_control_native_inventory_destroy_v2(&v);
+	native_files->banks[native_files->active].info.count = CLUSTER_NATIVE_FILES_CAPACITY_V2 + 1;
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), CLUSTER_NATIVE_FILES_CAPACITY_EXCEEDED_V2);
+	UT_ASSERT(v == NULL);
+	selection_end();
+}
+UT_TEST(inventory_snapshot_current_refuses_saved_value_and_address_drift)
+{
+	ClusterControlNativeInventoryV2 *v = NULL, copied, *copy;
+	table_reset();
+	native_inventory(2);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), 0);
+	if (v) {
+		copied = *v;
+		copy = &copied;
+		UT_ASSERT(!cluster_control_native_files_inventory_current_v2(copy));
+		cluster_control_native_inventory_destroy_v2(&copy);
+		UT_ASSERT(copy == &copied);
+		((ClusterRecoveryFileIdentityV2 *)v->files)[0].creation_generation++;
+		UT_ASSERT(!cluster_control_native_files_inventory_current_v2(v));
+		((ClusterRecoveryFileIdentityV2 *)v->files)[0].creation_generation--;
+		UT_ASSERT(cluster_control_native_files_inventory_current_v2(v));
+		MyProcPid++;
+		UT_ASSERT(!cluster_control_native_files_inventory_current_v2(v));
+		MyProcPid--;
+	}
+	cluster_control_native_inventory_destroy_v2(&v);
+	selection_end();
+}
+UT_TEST(inventory_snapshot_publication_revokes_current_but_destroy_keeps_borrow)
+{
+	ClusterControlNativeInventoryV2 *v = NULL;
+	ClusterControlNativeFileBorrowV2 borrow = {0};
+	ClusterControlFileKeyV2 k = key(0);
+	table_reset();
+	native_inventory(2);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), 0);
+	native_files->publishing = true;
+	UT_ASSERT(!cluster_control_native_files_inventory_current_v2(v));
+	native_files->publishing = false;
+	native_inventory(3);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	UT_ASSERT(!cluster_control_native_files_inventory_current_v2(v));
+	UT_ASSERT(cluster_control_native_file_acquire_v2(&k, &borrow));
+	cluster_control_native_inventory_destroy_v2(&v);
+	UT_ASSERT(cluster_control_native_file_current_v2(&borrow));
+	UT_ASSERT(cluster_control_native_file_release_v2(&borrow));
+	selection_end();
+}
+UT_TEST(inventory_snapshot_inflight_publication_and_forged_extent_refuse)
+{
+	ClusterControlNativeInventoryV2 *v = NULL;
+	table_reset();
+	native_inventory(2);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	native_files->publishing = true;
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), CLUSTER_NATIVE_FILES_BUSY_V2);
+	UT_ASSERT(v == NULL);
+	native_files->publishing = false;
+	UT_ASSERT_EQ(cluster_control_native_files_inventory_v2(65536, &v), 0);
+	if (v) {
+		v->private_bytes--;
+		UT_ASSERT(!cluster_control_native_files_inventory_current_v2(v));
+		v->private_bytes++;
+		v->files++;
+		UT_ASSERT(!cluster_control_native_files_inventory_current_v2(v));
+		v->files--;
+		UT_ASSERT(cluster_control_native_files_inventory_current_v2(v));
+	}
+	cluster_control_native_inventory_destroy_v2(&v);
+	selection_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(41);
 	UT_RUN(test_original_codec_v4_extent_and_exact_reference);
 	UT_RUN(test_v4_refuses_forged_reference_and_record);
 	UT_RUN(test_selected_root_registry_real_files_and_late_change);
@@ -624,6 +785,13 @@ main(void)
 	UT_RUN(address_missing_and_invalid_outputs_keep_original_duty);
 	UT_RUN(address_full_inventory_borrow_blocks_changed_publication);
 	UT_RUN(address_unpublished_creation_is_not_ordinary_available);
+	UT_RUN(inventory_snapshot_refuses_unknown_alias_and_nonfresh_output);
+	UT_RUN(inventory_snapshot_copies_every_available_row_above64_without_cf);
+	UT_RUN(inventory_snapshot_preserves_complete_reserved_values_without_admission);
+	UT_RUN(inventory_snapshot_budget_and_invalid_counts_never_return_a_prefix);
+	UT_RUN(inventory_snapshot_current_refuses_saved_value_and_address_drift);
+	UT_RUN(inventory_snapshot_publication_revokes_current_but_destroy_keeps_borrow);
+	UT_RUN(inventory_snapshot_inflight_publication_and_forged_extent_refuse);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

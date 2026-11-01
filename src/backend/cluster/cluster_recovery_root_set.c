@@ -22,6 +22,7 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "common/cryptohash.h"
 #include "common/relmap.h"
+#include "common/cluster_relmap_create.h"
 #include "utils/relmapper.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -764,6 +765,62 @@ roots_add_relmap(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffec
 	return CLUSTER_RECOVERY_ROOTS_MORE;
 }
 
+/* Creation candidates retain missing/partial files too. Decoding the complete
+ * original payload is not independent control registration or replay permission.
+ * Keep the batch/file identity in the native scan, rather than inventing a
+ * logical identity from these physical ROOT path entries. */
+static ClusterRecoveryRootsResult
+roots_add_relmap_create(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffect *effect)
+{
+	const ClusterRecoveryNativeRecord *record = effect->record;
+	const ForkNumber forks[] = { MAIN_FORKNUM, FSM_FORKNUM, VISIBILITYMAP_FORKNUM, SPACE_FORKNUM };
+	const char *names[] = { "pgrac_relmap_authority", "pgrac_relmap_authority.bak" };
+	const ClusterRecoveryFileKind kinds[] = { CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY,
+		CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP };
+	ClusterRelmapCreateWalV1 creation;
+	RelFileLocator locator;
+
+	if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
+		|| record->header.xl_rmid != RM_RELMAP_ID
+		|| (record->header.xl_info & ~XLR_INFO_MASK) != CLUSTER_RELMAP_CREATE_WAL_INFO_V1
+		|| record->payload == NULL || effect->bytes != record->payload
+		|| effect->ordinal != 0 || effect->length != record->payload_length
+		|| record->mappings_offset != 0
+		|| !cluster_relmap_create_decode_v1(record->payload, record->payload_length, &creation)
+		|| creation.identity.system_identifier != record->source.claim.identity.system_identifier
+		|| creation.identity.database_incarnation != record->source.claim.database_incarnation
+		|| memcmp(creation.identity.storage_uuid, record->source.claim.identity.storage_uuid, 16) != 0
+		|| record->database != creation.identity.database_oid
+		|| record->tablespace != creation.identity.tablespace_oid
+		|| record->nmappings != (uint32)creation.committed.num_mappings
+		/* The original physical namespace has no user-tablespace route. */
+		|| creation.identity.tablespace_oid != DEFAULTTABLESPACE_OID)
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	locator = (RelFileLocator){ creation.identity.tablespace_oid, creation.identity.database_oid, 0 };
+	for (unsigned i = 0; i < lengthof(names); ++i) {
+		char path[MAXPGPATH];
+		uint32 index;
+		ClusterRecoveryRootEntry *entry;
+		snprintf(path, sizeof(path), "base/%u/%s", locator.dbOid, names[i]);
+		if (!roots_lookup(roots, path, true, &index))
+			return roots->status;
+		entry = &roots->entries[index];
+		entry->file.kind = kinds[i];
+		entry->file.locator = locator;
+		entry->file.forknum = InvalidForkNumber;
+		entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
+	}
+	for (int m = 0; m < creation.committed.num_mappings; ++m) {
+		locator.relNumber = creation.committed.mappings[m].mapfilenumber;
+		for (unsigned f = 0; f < lengthof(forks); ++f) {
+			ClusterRecoveryRootsResult result = roots_add_relation(roots, &locator, forks[f], 0);
+			if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+				return result;
+		}
+	}
+	return CLUSTER_RECOVERY_ROOTS_MORE;
+}
+
 ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 									 const ClusterRecoveryNativeEffect *effect)
@@ -783,6 +840,8 @@ cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 		|| memcmp(record->source.claim.identity.storage_uuid, roots->storage_uuid, 16) != 0)
 		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
 	opcode = record->header.xl_info & ~XLR_INFO_MASK;
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_RELMAP_CREATE)
+		return roots_add_relmap_create(roots, effect);
 	if (effect->kind == CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE
 		|| effect->kind == CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY)
 		return roots_add_relmap(roots, effect);

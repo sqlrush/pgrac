@@ -305,6 +305,112 @@ cluster_control_native_files_info_v2(ClusterControlNativeTableInfoV2 *out)
 	return true;
 }
 static bool
+native_inventory_size(const ClusterControlNativeTableInfoV2 *info, Size *bytes, Size *offset)
+{
+	Size prefix = MAXALIGN(sizeof(ClusterControlNativeInventoryV2));
+	if (info->count > CLUSTER_NATIVE_FILES_CAPACITY_V2
+		|| info->reservation_count > CLUSTER_NATIVE_RESERVATIONS_CAPACITY_V2)
+		return false;
+	*offset = prefix + MAXALIGN(info->count * sizeof(ClusterRecoveryFileIdentityV2));
+	*bytes = *offset + info->reservation_count * sizeof(ClusterRecoveryFileReservationV1);
+	return *bytes <= CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2;
+}
+/* Caller holds the original short table lock, not CF or a family I/O lock. */
+static bool
+native_inventory_info_same(const ClusterControlNativeTableInfoV2 *saved)
+{
+	ClusterControlNativeTableInfoV2 current
+		= native_files->banks[native_files->active].info;
+	current.borrowed = native_files->borrowed;
+	return !native_files->publishing && !memcmp(saved, &current, sizeof(current));
+}
+ClusterControlNativeResultV2
+cluster_control_native_files_inventory_v2(Size budget, ClusterControlNativeInventoryV2 **out)
+{
+	ClusterControlNativeTableInfoV2 info;
+	ClusterControlNativeInventoryV2 *value;
+	ClusterControlNativeResultV2 result = CLUSTER_NATIVE_FILES_REFUSED_V2;
+	Size bytes, offset;
+	if (!native_files || !native_distinct(out, sizeof(*out)) || *out)
+		return result;
+	SpinLockAcquire(&native_files->lock);
+	if (native_files->publishing) {
+		SpinLockRelease(&native_files->lock);
+		return CLUSTER_NATIVE_FILES_BUSY_V2;
+	}
+	info = native_files->banks[native_files->active].info;
+	info.borrowed = native_files->borrowed;
+	SpinLockRelease(&native_files->lock);
+	if (info.mode != CLUSTER_NATIVE_FILES_MANAGED_V2 || !info.table_generation
+		|| info.table_generation == UINT64_MAX || !info.startup_generation
+		|| info.startup_generation == UINT64_MAX)
+		return result;
+	if (!native_inventory_size(&info, &bytes, &offset) || bytes > budget
+		|| budget > CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2)
+		return CLUSTER_NATIVE_FILES_CAPACITY_EXCEEDED_V2;
+	/* No allocation while holding the shared lock. Publication between these
+	 * two observations refuses; it does not restart against the new table. */
+	value = palloc0(bytes);
+	value->info = info;
+	value->private_bytes = bytes;
+	value->private_self = (uintptr_t)value;
+	value->private_pid = MyProcPid;
+	value->files = (void *)((char *)value + MAXALIGN(sizeof(*value)));
+	value->reservations = (void *)((char *)value + offset);
+	SpinLockAcquire(&native_files->lock);
+	if (native_inventory_info_same(&info)) {
+		NativeFileBank *bank = &native_files->banks[native_files->active];
+		memcpy((void *)value->files, bank->files, info.count * sizeof(*value->files));
+		memcpy((void *)value->reservations, bank->reservations,
+			   info.reservation_count * sizeof(*value->reservations));
+		result = CLUSTER_NATIVE_FILES_OK_V2;
+	}
+	SpinLockRelease(&native_files->lock);
+	if (result == CLUSTER_NATIVE_FILES_OK_V2)
+		*out = value;
+	else
+		pfree(value);
+	return result;
+}
+bool
+cluster_control_native_files_inventory_current_v2(const ClusterControlNativeInventoryV2 *value)
+{
+	Size bytes, offset;
+	bool current = false;
+	if (!native_files || !native_distinct(value, sizeof(*value))
+		|| value->private_self != (uintptr_t)value || value->private_pid != MyProcPid
+		|| value->info.mode != CLUSTER_NATIVE_FILES_MANAGED_V2
+		|| !native_inventory_size(&value->info, &bytes, &offset)
+		|| value->private_bytes != bytes || (uintptr_t)value > UINTPTR_MAX - bytes
+		|| value->files != (void *)((char *)value + MAXALIGN(sizeof(*value)))
+		|| value->reservations != (void *)((char *)value + offset))
+		return false;
+	SpinLockAcquire(&native_files->lock);
+	if (native_inventory_info_same(&value->info)) {
+		NativeFileBank *bank = &native_files->banks[native_files->active];
+		current = !memcmp(value->files, bank->files, value->info.count * sizeof(*value->files))
+			&& !memcmp(value->reservations, bank->reservations,
+					   value->info.reservation_count * sizeof(*value->reservations));
+	}
+	SpinLockRelease(&native_files->lock);
+	return current;
+}
+void
+cluster_control_native_inventory_destroy_v2(ClusterControlNativeInventoryV2 **out)
+{
+	ClusterControlNativeInventoryV2 *value;
+	if (!native_distinct(out, sizeof(*out)) || !(value = *out)
+		|| !native_distinct(value, sizeof(*value)) || value->private_self != (uintptr_t)value
+		|| value->private_pid != MyProcPid || value->private_bytes < sizeof(*value)
+		|| value->private_bytes > CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2
+		|| (uintptr_t)value > UINTPTR_MAX - value->private_bytes
+		|| ((uintptr_t)out < (uintptr_t)value + value->private_bytes
+			&& (uintptr_t)value < (uintptr_t)out + sizeof(*out)))
+		return;
+	*out = NULL;
+	pfree(value);
+}
+static bool
 native_borrow_valid(const ClusterControlNativeFileBorrowV2 *b)
 {
 	NativeFileBank *bank = &native_files->banks[native_files->active];

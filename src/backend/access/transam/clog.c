@@ -76,6 +76,7 @@
 #include "storage/shmem.h"
 #include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_wal_thread.h"
 #endif
 
 /*
@@ -3382,8 +3383,31 @@ CLOGTrimNative(FullTransactionId next)
 	TransactionId xid = XidFromFullTransactionId(next);
 	int pageno = TransactionIdToPage(xid);
 	volatile bool body_complete = false;
+	const PgracInitdbRecoveryContext *creator = NULL;
+	ClusterControlNativeTableInfoV2 creation = {0};
+	bool creating = false;
 
-	if (!(MyBackendType == B_STARTUP
+	/* Only the authenticated original child may consume its unpublished
+	 * creation table. Processing mode or a table row alone grants nothing. */
+	if (cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2)
+	{
+		creator = cluster_wal_thread_initdb_recovery_context();
+		creating = creator != NULL && MyBackendType == B_STANDALONE_BACKEND
+			&& !IsUnderPostmaster && !IsPostmasterEnvironment
+			&& (IsBootstrapProcessingMode() || IsInitProcessingMode())
+			&& cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2
+			&& cluster_control_native_files_info_v2(&creation)
+			&& creation.mode == CLUSTER_NATIVE_FILES_CREATION_V2
+			&& creation.table_generation != 0 && creator->creator_pid != 0
+			&& creation.startup_generation == creator->creator_pid
+			&& memcmp(&creation.creation, creator, sizeof(*creator)) == 0;
+		if (!creating)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("native CLOG trim requires the original creation context")));
+	}
+
+	if (!(creating || MyBackendType == B_STARTUP
 		  || (!cluster_shared_config && !IsUnderPostmaster && !IsPostmasterEnvironment
 			  && MyBackendType == B_STANDALONE_BACKEND && IsInitProcessingMode()))
 		|| InRecovery || !enableFsync
@@ -3410,6 +3434,20 @@ CLOGTrimNative(FullTransactionId next)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("native CLOG startup cut changed before trim")));
+		if (creating)
+		{
+			ClusterControlNativeTableInfoV2 current;
+
+			if (creator != cluster_wal_thread_initdb_recovery_context()
+				|| !cluster_control_native_files_info_v2(&current)
+				|| current.mode != creation.mode
+				|| current.table_generation != creation.table_generation
+				|| current.startup_generation != creation.startup_generation
+				|| memcmp(&current.creation, &creation.creation, sizeof(current.creation)) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("native CLOG creation context changed before trim")));
+		}
 		page = &XactCtl->shared->clog_page_identity[slotno];
 		birth = XidFromFullTransactionId(page->identity.birth_full_xid);
 		if (!page->identity.birth_observed || page->identity.logical_page != (uint64)pageno
@@ -3421,7 +3459,9 @@ CLOGTrimNative(FullTransactionId next)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("native CLOG page birth does not match the startup FullXid cut")));
-		if (cluster_shared_config) {
+		/* An unpublished BOOT child verifies its original image; it cannot
+		 * erase status or manufacture normal WAL in bootstrap mode. */
+		if (cluster_shared_config || creating) {
 			if (!cluster_native_clog_suffix_unused(XactCtl->shared->page_buffer[slotno], xid))
 				ereport(FATAL,
 						(errcode(ERRCODE_DATA_CORRUPTED),
@@ -3872,13 +3912,18 @@ clog_redo(XLogReaderState *record)
 	{
 		/* This original rmgr call owns Startup's retained source/cut. WAL
 		 * supplies neither a selected file registration nor foreign authority. */
-		if (info != CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2 ||
+		if ((info != CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2 &&
+			 info != CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2) ||
 			XLogRecHasAnyBlockRefs(record) ||
 			record->ReadRecPtr == InvalidXLogRecPtr ||
 			record->EndRecPtr == PG_UINT64_MAX || record->EndRecPtr <= record->ReadRecPtr)
 			CLOGRequireLegacyLifecycle();
-		SimpleLruNativeClogReplayV2(XactCtl, XLogRecGetData(record),
-								  XLogRecGetDataLen(record), record->EndRecPtr);
+		if (info == CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2)
+			SimpleLruNativeClogSegmentReplayV2(XactCtl, XLogRecGetData(record),
+											 XLogRecGetDataLen(record), record->EndRecPtr);
+		else
+			SimpleLruNativeClogReplayV2(XactCtl, XLogRecGetData(record),
+									  XLogRecGetDataLen(record), record->EndRecPtr);
 		return;
 	}
 #endif

@@ -14300,7 +14300,22 @@ test_cluster_recovery_native_scan: $(top_srcdir)/src/include/access/twophase_rmg
 
 test_cluster_recovery_native_scan: test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_effects.inc
 
-test_cluster_recovery_native_scan: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_effects.inc
+test_cluster_recovery_native_scan: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_effects.inc test_cluster_recovery_relmap_create_fixture.h test_cluster_recovery_relmap_create_effects.inc
+
+# Native creation and ROOT fixtures reuse the canonical RMC1 codec. Keep the
+# archive before its original port dependencies; no duplicated decoder/stub.
+RECOVERY_RELMAP_CODEC_TESTS = test_cluster_recovery_native_scan \
+		test_cluster_recovery_root_set test_cluster_recovery_slru_scan \
+		test_cluster_recovery_relmap_scan test_cluster_recovery_relation_scan \
+		test_cluster_recovery_undo_store test_cluster_recovery_native_roots \
+		test_cluster_recovery_wal_targets test_cluster_recovery_final_namespace \
+		test_cluster_recovery_managed_relmap_scan test_cluster_relmap_retention_census \
+		test_cluster_relmap_census_side
+test_cluster_recovery_native_scan test_cluster_recovery_root_set test_cluster_recovery_slru_scan \
+		test_cluster_recovery_native_roots test_cluster_recovery_final_namespace: CLUSTER_UNIT_PORT_LIBS := $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+$(RECOVERY_RELMAP_CODEC_TESTS): $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
 
 test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c test_cluster_recovery_undo_effects.inc test_cluster_recovery_multixact_effects.inc test_cluster_recovery_slru_effects.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_scan.c \
@@ -14331,7 +14346,7 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-test_cluster_recovery_wal_targets: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_targets.inc
+test_cluster_recovery_wal_targets: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_targets.inc test_cluster_recovery_relmap_create_fixture.h test_cluster_recovery_relmap_create_targets.inc
 
 test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
 		test_cluster_recovery_undo_targets.inc test_cluster_recovery_multixact_targets.inc \
@@ -17195,7 +17210,8 @@ test_cluster_clog_native_trim: test_cluster_clog_native_trim.c \
 		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_clog_wal.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_srcdir)/src/include/access/clog.h $(top_srcdir)/src/include/access/slru.h \
-		$(top_srcdir)/src/include/cluster/cluster_native_startup.h $(CLUSTER_UNIT_PORT_LIBS)
+		$(top_srcdir)/src/include/cluster/cluster_native_startup.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_thread.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_clog_wal.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
@@ -17205,3 +17221,30 @@ clean: clean-clog-native-trim
 clean-clog-native-trim:
 	rm -f test_cluster_clog_native_trim test_cluster_clog_native_trim.d \
 		test_cluster_clog_native_trim.inc test_cluster_clog_native_trim.inc.tmp
+
+test_cluster_relmap_create_copy: test_cluster_relmap_recovery_create.inc \
+        $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
+
+# Relmap diagnostics use the same frontend codecs as pg_waldump.
+TESTS += test_cluster_relmap_wal_desc
+all: test_cluster_relmap_wal_desc
+test_cluster_relmap_wal_desc: test_cluster_relmap_wal_desc.c unit_test.h \
+		$(top_srcdir)/src/backend/access/rmgrdesc/relmapdesc.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/backend/access/rmgrdesc/relmapdesc.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-relmap-wal-desc
+.PHONY: clean-relmap-wal-desc
+clean-relmap-wal-desc:
+	rm -f test_cluster_relmap_wal_desc test_cluster_relmap_wal_desc.d

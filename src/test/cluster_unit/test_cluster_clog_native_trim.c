@@ -18,6 +18,8 @@ int trim_managed_fixture_main(void);
 #include "test_cluster_slru_clog_managed_write.c"
 #include "access/clog.h"
 #include "cluster/cluster_native_startup.h"
+#include "common/pgrac_initdb_recovery.h"
+#include "cluster/cluster_wal_thread.h"
 #define XactCtl (&ctl)
 #ifdef NATIVE_CLOG_TRIM_PRODUCT
 #include NATIVE_CLOG_TRIM_PRODUCT
@@ -33,6 +35,20 @@ BackendType MyBackendType;
 static ClusterControlNativeModeV2 trim_mode;
 static unsigned trim_borrows, trim_releases, trim_currents, trim_change_next, trim_throw_at;
 static bool trim_available;
+static PgracInitdbRecoveryContext trim_creator;
+static ClusterControlNativeTableInfoV2 trim_creation;
+static bool trim_has_creator, trim_has_table, trim_creation_drift;
+static unsigned trim_info_reads;
+const PgracInitdbRecoveryContext *cluster_wal_thread_initdb_recovery_context(void)
+{ return trim_has_creator ? &trim_creator : NULL; }
+bool cluster_control_native_files_info_v2(ClusterControlNativeTableInfoV2 *out)
+{
+	trim_info_reads++;
+	if (!trim_has_table) return false;
+	*out = trim_creation;
+	if (trim_creation_drift && trim_info_reads > 1) out->table_generation++;
+	return true;
+}
 static LWLock *trim_control_lock(void) { return &control; }
 static void trim_error_reset(void) { if (trim_count_holds) InterruptHoldoffCount = 0; }
 int OpenTransientFile(const char *path, int flags)
@@ -60,7 +76,7 @@ static bool trim_current(const ClusterControlNativeFileBorrowV2 *borrow)
 		variables.nextXid = FullTransactionIdFromU64(U64FromFullTransactionId(variables.nextXid) + 4);
 	if (trim_throw_at == trim_currents)
 		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("injected selected trim failure")));
-	return trim_mode == CLUSTER_NATIVE_FILES_MANAGED_V2;
+	return trim_mode == CLUSTER_NATIVE_FILES_MANAGED_V2 || trim_mode == CLUSTER_NATIVE_FILES_CREATION_V2;
 }
 static bool trim_release(ClusterControlNativeFileBorrowV2 *borrow)
 {
@@ -83,6 +99,10 @@ static void trim_reset(bool is_shared, uint32 epoch, TransactionId next)
 	trim_borrows = trim_releases = trim_currents = trim_change_next = trim_throw_at = 0;
 	trim_available = true;
 	trim_open_error = IsPostmasterEnvironment = false;
+	trim_has_creator = trim_has_table = trim_creation_drift = false;
+	trim_info_reads = 0;
+	memset(&trim_creator, 0, sizeof(trim_creator));
+	memset(&trim_creation, 0, sizeof(trim_creation));
 	states[0] = SLRU_PAGE_EMPTY; dirty[0] = false;
 	control_held = false; InterruptHoldoffCount = 3;
 	trim_count_holds = true;
@@ -243,12 +263,83 @@ UT_TEST(actual_error_zero_holdoff_releases_only_the_new_family_lock)
 		UT_ASSERT_EQ(inserts + writes, 0); trim_finish();
 	}
 }
+static void trim_creation_reset(bool shared, bool bootstrap)
+{
+	uint8 payload[BLCKSZ] = {1};
+	trim_reset(shared, 0, 5);
+	MyBackendType = B_STANDALONE_BACKEND;
+	Mode = bootstrap ? BootstrapProcessing : InitProcessing;
+	trim_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
+	trim_has_creator = trim_has_table = true;
+	trim_creator.magic = PGRAC_INITDB_RECOVERY_MAGIC; trim_creator.version = 2;
+	trim_creator.creator_pid = 91;
+	trim_creator.first = binding.identity;
+	trim_creator.boot_file_count = 1; trim_creator.boot_files[0] = binding.identity;
+	trim_creation.mode = trim_mode; trim_creation.table_generation = 41;
+	trim_creation.startup_generation = trim_creator.creator_pid;
+	trim_creation.creation = trim_creator;
+	trim_disk(FullTransactionIdFromEpochAndXid(0, FirstNormalTransactionId), payload);
+}
+UT_TEST(original_creation_child_verifies_boot_suffix_without_mutation_or_wal)
+{
+	for (unsigned shared = 0; shared < 2; shared++) {
+		for (unsigned bootstrap = 0; bootstrap < 2; bootstrap++) {
+			uint8 before[8256], after[8256];
+			trim_creation_reset(shared, bootstrap);
+			UT_ASSERT_EQ(pread(borrowed, before, sizeof(before), 8192), sizeof(before));
+			UT_ASSERT(trim_run()); UT_ASSERT(!control_held && !io_held && !dirty[0]);
+			UT_ASSERT_EQ((uint8)page.data[0], 1); UT_ASSERT_EQ((uint8)page.data[1], 0);
+			UT_ASSERT_EQ(inserts + flushes + writes + syncs + queues, 0);
+			UT_ASSERT_EQ(pread(borrowed, after, sizeof(after), 8192), sizeof(after));
+			UT_ASSERT_EQ(memcmp(before, after, sizeof(before)), 0);
+			UT_ASSERT_EQ(trim_borrows, trim_releases); UT_ASSERT_EQ(InterruptHoldoffCount, 3);
+			trim_finish();
+		}
+	}
+}
+UT_TEST(creation_mode_requires_original_private_request_and_exact_table)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		trim_creation_reset(true, true);
+		if (fault == 0) trim_has_creator = false;
+		if (fault == 1) trim_has_table = false;
+		if (fault == 2) trim_mode = CLUSTER_NATIVE_FILES_MANAGED_V2;
+		if (fault == 3) trim_creation.mode = CLUSTER_NATIVE_FILES_MANAGED_V2;
+		if (fault == 4) trim_creation.table_generation = 0;
+		if (fault == 5) trim_creation.startup_generation++;
+		if (fault == 6) trim_creation.creation.first.creation_generation++;
+		if (fault == 7) Mode = NormalProcessing;
+		if (fault == 8) MyBackendType = B_BACKEND;
+		if (fault == 9) IsUnderPostmaster = true;
+		if (fault == 10) IsPostmasterEnvironment = true;
+		if (fault == 11) InRecovery = true;
+		UT_ASSERT(!trim_run()); UT_ASSERT(!dirty[0] && !control_held && !io_held);
+		UT_ASSERT_EQ(trim_borrows + reads + inserts + writes, 0);
+		trim_finish(); IsUnderPostmaster = false;
+	}
+}
+UT_TEST(creation_rechecks_table_and_refuses_nonzero_suffix_without_erasing_it)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		uint8 payload[BLCKSZ] = {1};
+		trim_creation_reset(fault != 2, true);
+		if (fault == 0) trim_creation_drift = true;
+		else {
+			payload[1] = 4;
+			trim_disk(FullTransactionIdFromEpochAndXid(0, FirstNormalTransactionId), payload);
+		}
+		UT_ASSERT(!trim_run()); UT_ASSERT(!dirty[0] && !control_held && !io_held);
+		UT_ASSERT_EQ(memcmp(page.data, payload, BLCKSZ), 0);
+		UT_ASSERT_EQ(inserts + writes, 0); UT_ASSERT_EQ(trim_borrows, trim_releases);
+		trim_finish();
+	}
+}
 int main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-trim-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(nonshared_exact_full_cut_preserves_prefix_and_writes_native_frame);
 	UT_RUN(shared_exact_cut_is_readonly_and_nonzero_suffix_stays_closed);
 	UT_RUN(equal_raw_page_from_other_epoch_never_trims_or_certifies_unused);
@@ -257,5 +348,8 @@ int main(void)
 	UT_RUN(native_startup_owner_and_finite_cut_precede_any_io);
 	UT_RUN(page_boundary_has_no_io_and_page_zero_preserves_special_xids);
 	UT_RUN(actual_error_zero_holdoff_releases_only_the_new_family_lock);
+	UT_RUN(original_creation_child_verifies_boot_suffix_without_mutation_or_wal);
+	UT_RUN(creation_mode_requires_original_private_request_and_exact_table);
+	UT_RUN(creation_rechecks_table_and_refuses_nonzero_suffix_without_erasing_it);
 	rmdir(directory); UT_DONE(); return ut_failed_count != 0;
 }

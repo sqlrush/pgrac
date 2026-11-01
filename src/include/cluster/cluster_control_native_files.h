@@ -55,6 +55,30 @@ extern void cluster_control_native_files_shmem_register(void);
  * allocation or family-lock acquisition on the following local read path. */
 extern ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void);
 extern bool cluster_control_native_files_info_v2(ClusterControlNativeTableInfoV2 *out);
+/* Complete local observation for the original checkpoint/file owner. Both
+ * vectors are copied by value from one published MANAGED table; no 64-row
+ * prefix, CF/I/O, native borrow, file permission, coverage or drain is added.
+ * Caller retains the original source-cut/file/old-writer protections and must
+ * recheck them independently. current compares every saved value and the same
+ * original table/startup/control generation; refusal never reselects.
+ * Fresh *out is NULL, with an explicit whole-allocation byte budget. No wait or
+ * retry during publication/drift. Address/PID-bound, do not copy or mutate.
+ * borrowed is a point observation, never a stop/drain certificate. Destroy
+ * frees only this local copy, including after failed current; original
+ * reservations, borrows, files and debt remain untouched. */
+typedef struct ClusterControlNativeInventoryV2 {
+	ClusterControlNativeTableInfoV2 info;
+	const ClusterRecoveryFileIdentityV2 *files;
+	const ClusterRecoveryFileReservationV1 *reservations;
+	Size private_bytes;
+	uintptr_t private_self;
+	int private_pid;
+} ClusterControlNativeInventoryV2;
+extern ClusterControlNativeResultV2 cluster_control_native_files_inventory_v2(
+	Size memory_budget, ClusterControlNativeInventoryV2 **fresh);
+extern bool cluster_control_native_files_inventory_current_v2(
+	const ClusterControlNativeInventoryV2 *);
+extern void cluster_control_native_inventory_destroy_v2(ClusterControlNativeInventoryV2 **);
 extern bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *,
 												   ClusterControlNativeFileBorrowV2 *fresh);
 /* Resolve an address without guessing its creation origin. Exactly one
@@ -136,6 +160,22 @@ cluster_control_native_files_reserve_clog_range_locked_v2(uint16 origin, uint64 
 														  uint64 last_segment,
 														  ClusterControlNativeClogRangeV2 **fresh);
 extern void cluster_control_native_clog_range_destroy_v2(ClusterControlNativeClogRangeV2 **);
+/* Original creator's one CLOG file, SAME original CF-X and complete selection.
+ * The file owner supplies independent expected/batch and its actual complete
+ * sync/readback receipt under continuing file/I/O custody. Release native
+ * borrows before this call, without releasing that original protection.
+ * startup/table must match the published MANAGED snapshot selected for this
+ * attempt. No family lock/critical section. The selection is consumed ONCE on
+ * success, refusal or ERROR; destroy it before leaving the original CF.
+ * Only this exact RESERVED file becomes AVAILABLE; same-batch successors and
+ * their original creation duty remain RESERVED. Generic whole-batch COMPLETE
+ * and coverage validation are unchanged. No file permission, drain, coverage
+ * qualification, era/lifetime, OPEN or activation is granted. Persistent/late
+ * failure returns REGISTRATION_DEBT (or ERROR): no cancel, rollback or retry. */
+extern ClusterControlNativeResultV2 cluster_control_native_files_complete_clog_file_locked_v2(
+	ClusterControlRelmapSelectionV2 *, uint64 startup_generation, uint64 table_generation,
+	const uint8 batch_uuid[16], const ClusterRecoveryFileIdentityV2 *expected,
+	const ClusterRecoveryCheckpointFileV2 *receipt);
 /* Pure storage predicate for the control producer's output; no table read,
  * borrow, I/O or authority. */
 extern bool cluster_control_native_files_output_distinct_v2(const void *, Size);
