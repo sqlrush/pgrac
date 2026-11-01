@@ -39,6 +39,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_relmap.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
 #include "utils/relmapper.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_xid_stripe_xlog.h"
@@ -3982,9 +3983,17 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 #include "test_cluster_cold_startup_relmap_recheck.inc"
 #include "test_cluster_cold_startup_relmap_recovery.inc"
 
+#include "test_cluster_cold_terminal_episode.inc"
+
 int
 main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_TERMINAL_EPISODE") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
+		UT_RUN(test_terminal_original_episode_refuses_changed_whole_source_or_owner);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_CARRIER") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_recovery_carrier_stages_without_publishing_ordinary_directory);
@@ -4081,7 +4090,9 @@ main(void)
 		UT_RUN(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(199);
+	UT_PLAN(201);
+	UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
+	UT_RUN(test_terminal_original_episode_refuses_changed_whole_source_or_owner);
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);

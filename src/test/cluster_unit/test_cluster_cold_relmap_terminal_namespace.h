@@ -17,3 +17,6 @@
 #define cluster_cold_typed_checkpoint_v1 terminal_checkpoint
 
 #define cluster_recovery_plan_output_distinct_v1 terminal_output_distinct
+
+#define cluster_cold_typed_terminal_authority_v1 terminal_episode_authority
+#define cluster_cold_typed_terminal_visit_v1 terminal_episode_visit

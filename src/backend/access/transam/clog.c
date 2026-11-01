@@ -1155,10 +1155,30 @@ struct ClusterClogNativeBaseHandleV1 {
 static bool clog_relmap_mutation_snapshot(int origin, uint64 *generation);
 static bool clog_relmap_mutation_matches(int origin, uint64 generation);
 
+/* This participant adapter borrows the still-held original episode. It
+ * only performs in-memory identity checks under native locks. Full source
+ * revalidation remains outside this function, before and after native I/O. */
+static bool
+clog_episode_permitted(int origin, const ClusterRelmapTerminalEpisodeV1 *episode)
+{
+	return episode == NULL ? clog_recovery_permitted(origin)
+		: (RecoveryInProgress() && MyBackendType == B_STARTUP && CritSectionCount == 0
+			&& clog_recovery_initialized(origin) && episode->serial != 0
+			&& episode->permitted != NULL && episode->permitted(episode->arg, origin));
+}
+
+static bool
+clog_episode_directory_ready(int origin, const ClusterRelmapTerminalEpisodeV1 *episode)
+{
+	return episode == NULL ? clog_recovery_directory_ready(origin)
+		: (clog_episode_permitted(origin, episode) && clog_native_directory_ready(origin)
+			&& clog_episode_permitted(origin, episode));
+}
+
 /* The raw and held variants share the original native lock/I/O checks. */
 static bool
 clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *out,
-					   ClusterClogNativeBaseHandleV1 **custody)
+					   ClusterClogNativeBaseHandleV1 **custody, const ClusterRelmapTerminalEpisodeV1 *episode)
 {
 	ClusterClogNativeBaseV1 result = { 0 };
 	ClusterClogNativeBaseHandleV1 *held = custody != NULL ? *custody : NULL;
@@ -1187,7 +1207,7 @@ clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *
 	}
 	if (!enableFsync || CritSectionCount != 0 || !TransactionIdIsNormal(xid)
 		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactTruncationLock)
-		|| LWLockHeldByMe(XactSLRULock) || !clog_recovery_permitted(origin))
+		|| LWLockHeldByMe(XactSLRULock) || !clog_episode_permitted(origin, episode))
 		return false;
 	ctl = &ClogRecoveryCtl[origin];
 	lock = &ClogRecoveryLocks[origin * 2 + 1].lock;
@@ -1212,7 +1232,7 @@ clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *
 	{
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 		locked = true;
-		if (clog_recovery_directory_ready(origin)
+		if (clog_episode_directory_ready(origin, episode)
 			&& clog_recovery_page_identity(ctl, page, &before)) {
 			fd = existing ? held->fd
 						  : OpenTransientFile(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC | PG_BINARY);
@@ -1247,7 +1267,7 @@ clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *
 			}
 		}
 		if (ok && custody != NULL)
-			ok = clog_recovery_directory_ready(origin)
+			ok = clog_episode_directory_ready(origin, episode)
 				&& (!held->mutation_observed
 					|| clog_relmap_mutation_matches(origin, held->mutation_generation));
 		if (fd >= 0 && !existing && (custody == NULL || !ok)) {
@@ -1257,7 +1277,7 @@ clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *
 				ok = false;
 		}
 		if (ok && custody == NULL)
-			ok = clog_recovery_directory_ready(origin);
+			ok = clog_episode_directory_ready(origin, episode);
 		LWLockRelease(lock);
 		locked = false;
 	}
@@ -1306,7 +1326,7 @@ bool
 cluster_clog_native_recovery_base_read_v1(int origin, TransactionId xid,
 										  ClusterClogNativeBaseV1 *out)
 {
-	return clog_recovery_base_read(origin, xid, out, NULL);
+	return clog_recovery_base_read(origin, xid, out, NULL, NULL);
 }
 
 bool
@@ -1315,7 +1335,16 @@ cluster_clog_native_recovery_base_read_held_v1(int origin, TransactionId xid,
 {
 	if (held == NULL)
 		return false;
-	return clog_recovery_base_read(origin, xid, out, held);
+	return clog_recovery_base_read(origin, xid, out, held, NULL);
+}
+
+bool
+cluster_clog_native_episode_read_v1(int origin, TransactionId xid, ClusterClogNativeBaseV1 *out,
+	ClusterClogNativeBaseHandleV1 **held, const ClusterRelmapTerminalEpisodeV1 *episode)
+{
+	if (episode == NULL || held == NULL)
+		return false;
+	return clog_recovery_base_read(origin, xid, out, held, episode);
 }
 
 void
@@ -1500,6 +1529,21 @@ cluster_clog_native_terminal_seal_v1(ClusterClogNativeBaseHandleV1 *held)
 	held->failed = true;
 	if (!clog_recovery_permitted(held->origin)
 		|| !held->mutation_observed)
+		return false;
+	held->terminal_sealed = true;
+	held->failed = false;
+	return cluster_clog_native_terminal_current_v1(held);
+}
+
+bool
+cluster_clog_native_episode_seal_v1(ClusterClogNativeBaseHandleV1 *held,
+	const ClusterRelmapTerminalEpisodeV1 *episode)
+{
+	if (episode == NULL || held == NULL || held->pid != getpid()
+		|| held->failed || held->terminal_sealed)
+		return false;
+	held->failed = true;
+	if (!clog_episode_permitted(held->origin, episode) || !held->mutation_observed)
 		return false;
 	held->terminal_sealed = true;
 	held->failed = false;

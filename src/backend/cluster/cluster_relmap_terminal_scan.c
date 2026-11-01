@@ -17,6 +17,7 @@
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_side_xact.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "miscadmin.h"
@@ -34,6 +35,7 @@ struct ClusterRelmapTerminalScanV1 {
 	bool checkpoint_seen, terminal_seen, failed, prefix_only, native_base_retained;
 	bool pending_required, pending_seen, execution_owner;
 	uint64 pending_scope_serial;
+	const ClusterRelmapTerminalEpisodeV1 *episode;
 	uint32 native_terminals, expected_native_terminals;
 	ClusterRelmapV2Image pending;
 };
@@ -104,9 +106,11 @@ terminal_scan_xact(ClusterRelmapTerminalScanV1 *scan, XLogReaderState *reader)
 		return false;
 	if (scan->pending_required
 		&& (scan->native_terminals == UINT32_MAX - 1
-			|| !cluster_undo_recovery_cold_terminal_matches_v1(
-				&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo,
-				scan->pending_scope_serial, reader)))
+			|| !(scan->episode != NULL
+				? rf_side_online_plan_terminal_matches_v1(scan->episode->side, &scan->selected.source, reader)
+				: cluster_undo_recovery_cold_terminal_matches_v1(
+					&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo,
+					scan->pending_scope_serial, reader))))
 		return false;
 	if (scan->pending_required)
 		scan->native_terminals++;
@@ -252,9 +256,10 @@ terminal_scan_begin(ClusterRelmapTerminalScanV1 *scan)
 	scan->hash = pg_cryptohash_create(PG_SHA256);
 	return scan->hash != NULL
 		   && (!scan->pending_required
-			   || ((scan->expected_native_terminals = cluster_undo_recovery_cold_terminal_count_v1(
-						&input->source, &input->checkpoint, input->native_redo,
-						scan->pending_scope_serial))
+			   || ((scan->expected_native_terminals = (scan->episode != NULL
+				? rf_side_online_plan_native_terminal_count_v1(scan->episode->side, &input->source)
+				: cluster_undo_recovery_cold_terminal_count_v1(
+					&input->source, &input->checkpoint, input->native_redo, scan->pending_scope_serial)))
 					   != UINT32_MAX
 				   && scan->expected_native_terminals != 0))
 		   && pg_cryptohash_init(scan->hash) == 0
@@ -271,9 +276,10 @@ terminal_scan_fold_complete(ClusterRelmapTerminalScanV1 *scan)
 	return scan->checkpoint_seen && scan->terminal_seen
 		   && (!scan->pending_required
 			   || (scan->native_terminals == scan->expected_native_terminals
-				   && cluster_undo_recovery_cold_terminal_count_v1(
-						  &scan->selected.source, &scan->selected.checkpoint,
-						  scan->selected.native_redo, scan->pending_scope_serial)
+				   && (scan->episode != NULL
+				? rf_side_online_plan_native_terminal_count_v1(scan->episode->side, &scan->selected.source)
+				: cluster_undo_recovery_cold_terminal_count_v1(
+					&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo, scan->pending_scope_serial))
 						  == scan->expected_native_terminals
 				   && scan->pending_seen && scan->native_base_retained
 				   && scan->pending.pending_owner.wal_end <= scan->observation.terminal_start
@@ -390,6 +396,9 @@ static bool
 terminal_scan_current(ClusterRelmapTerminalScanV1 *scan)
 {
 	const ClusterWalInputV1 *current;
+	if (scan->episode != NULL)
+		return scan->episode->serial == scan->pending_scope_serial
+			&& scan->episode->current(scan->episode->arg, &scan->selected);
 	if (scan->execution_owner)
 		return cluster_undo_recovery_cold_single_source_v1(
 			&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo,
@@ -435,9 +444,11 @@ terminal_prefix_base_read(ClusterRelmapTerminalScanV1 *scan,
 		TransactionId xid = (TransactionId)scan->observation.requested_top_full_xid;
 		int origin = scan->observation.window.origin;
 		if (terminal_scan_current(scan)
-			&& cluster_undo_recovery_cold_source_matches_v1(
-				&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo)
-			&& (held != NULL
+			&& (scan->episode != NULL || cluster_undo_recovery_cold_source_matches_v1(
+				&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo))
+			&& (scan->episode != NULL
+				? cluster_clog_native_episode_read_v1(origin, xid, &result.native_base, held, scan->episode)
+				: held != NULL
 					? cluster_clog_native_recovery_base_read_held_v1(
 						  origin, xid, &result.native_base, held)
 					: cluster_clog_native_recovery_base_read_v1(origin, xid, &result.native_base))
@@ -462,8 +473,8 @@ terminal_prefix_base_read(ClusterRelmapTerminalScanV1 *scan,
 				&& pg_cryptohash_update(hash, result.native_base.image, BLCKSZ) == 0
 				&& pg_cryptohash_final(hash, result.fingerprint, 32) == 0
 				&& terminal_scan_current(scan)
-				&& cluster_undo_recovery_cold_source_matches_v1(
-					&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo))
+				&& (scan->episode != NULL || cluster_undo_recovery_cold_source_matches_v1(
+					&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo)))
 				accepted = true;
 		}
 	}
@@ -1064,20 +1075,24 @@ terminal_execution_visit(const ClusterWalRecoveryCheckpointV1 *checkpoint,
 }
 
 static bool
-terminal_scan_cold(const ClusterRelmapV2Image *pending, ClusterRelmapTerminalScanV1 **out)
+terminal_scan_cold(const ClusterRelmapV2Image *pending,
+	const ClusterRelmapTerminalEpisodeV1 *episode, ClusterRelmapTerminalScanV1 **out)
 {
 	ClusterRelmapTerminalScanV1 *scan = palloc0(sizeof(*scan));
 	bool accepted = false;
 
 	scan->pid = getpid();
+	scan->episode = episode;
 	scan->execution_owner = scan->prefix_only = scan->native_base_retained = true;
 	scan->pending_required = true;
 	scan->pending = *pending;
 	scan->observation.requested_top_full_xid = pending->pending_owner.top_full_xid;
 	PG_TRY();
 	{
-		accepted = cluster_undo_recovery_cold_checkpoint_visit_v1(pending->pending_owner.node,
-																  terminal_execution_visit, scan)
+		accepted = (episode != NULL
+			? episode->visit(episode->arg, terminal_execution_visit, scan)
+			: cluster_undo_recovery_cold_checkpoint_visit_v1(pending->pending_owner.node,
+				terminal_execution_visit, scan))
 				   && scan->observation.records != 0 && terminal_scan_current(scan)
 				   && terminal_scan_fold_complete(scan) && scan->last_end == scan->observation.cut
 				   && MyBackendType == B_STARTUP && RecoveryInProgress() && CritSectionCount == 0
@@ -1135,9 +1150,9 @@ recovery_handle_current(ClusterRelmapRecoveryHandle *handle)
 {
 	ClusterRelmapTerminalScanV1 *scan = handle->scan;
 	return terminal_scan_current(scan)
-		   && cluster_undo_recovery_cold_scope_id_v1(
-				  &scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo)
-				  == handle->scope_serial
+		   && (scan->episode != NULL ? scan->episode->serial == handle->scope_serial
+			: cluster_undo_recovery_cold_scope_id_v1(
+				&scan->selected.source, &scan->selected.checkpoint, scan->selected.native_redo) == handle->scope_serial)
 		   && terminal_scan_current(scan);
 }
 
@@ -1229,10 +1244,10 @@ cluster_relmap_recovery_prepare_v1(ClusterWalInputsV1 *inputs,
 	return true;
 }
 
-bool
-cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity,
+static bool
+recovery_prepare_cold(const ClusterRelmapV2Namespace *identity,
 										const ClusterRelmapV2View *pending,
-										ClusterRelmapRecoveryHandle **out)
+	const ClusterRelmapTerminalEpisodeV1 *episode, ClusterRelmapRecoveryHandle **out)
 {
 	ClusterRelmapV2Image image;
 	uint8 pending_wire[CLUSTER_RELMAP_V2_FILE_SIZE], committed_wire[CLUSTER_RELMAP_V2_FILE_SIZE];
@@ -1252,7 +1267,7 @@ cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity
 	memcpy(handle->committed_wire, committed_wire, sizeof(committed_wire));
 	PG_TRY();
 	{
-		if (terminal_scan_cold(&image, &handle->scan)) {
+		if (terminal_scan_cold(&image, episode, &handle->scan)) {
 			handle->scope_serial = handle->scan->pending_scope_serial;
 			accepted = recovery_handle_base_fingerprint(handle, handle->native_base_fingerprint,
 													 &handle->native_base_file);
@@ -1274,6 +1289,25 @@ cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity
 	}
 	*out = handle;
 	return true;
+}
+
+bool
+cluster_relmap_recovery_prepare_cold_v1(const ClusterRelmapV2Namespace *identity,
+	const ClusterRelmapV2View *pending, ClusterRelmapRecoveryHandle **out)
+{
+	return recovery_prepare_cold(identity, pending, NULL, out);
+}
+
+bool
+cluster_relmap_recovery_prepare_episode_v1(const ClusterRelmapV2Namespace *identity,
+	const ClusterRelmapV2View *pending, const ClusterRelmapTerminalEpisodeV1 *episode,
+	ClusterRelmapRecoveryHandle **out)
+{
+	if (episode == NULL || recovery_overlap(out, sizeof(*out), episode, sizeof(*episode))
+		|| episode->serial == 0 || episode->side == NULL
+		|| episode->current == NULL || episode->permitted == NULL || episode->visit == NULL)
+		return false;
+	return recovery_prepare_cold(identity, pending, episode, out);
 }
 
 bool
@@ -1434,7 +1468,9 @@ cluster_relmap_recovery_terminal_detach_v1(ClusterRelmapRecoveryHandle *handle,
 		return false;
 	handle->failed = true;
 	if (!recovery_handle_current(handle)
-		|| !cluster_clog_native_terminal_seal_v1(handle->native_base)
+		|| !(handle->scan->episode != NULL
+			? cluster_clog_native_episode_seal_v1(handle->native_base, handle->scan->episode)
+			: cluster_clog_native_terminal_seal_v1(handle->native_base))
 		|| !recovery_handle_current(handle))
 		return false;
 	out->selected = handle->scan->selected;
@@ -1443,7 +1479,8 @@ cluster_relmap_recovery_terminal_detach_v1(ClusterRelmapRecoveryHandle *handle,
 	out->file = handle->native_base_file;
 	out->held = handle->native_base;
 	handle->native_base = NULL;
-	/* The old scanner is now release-only, still before scope leave. */
+	/* The scanner is now release-only. Its borrowed episode adapter is not
+	 * part of the detached terminal custody. */
 	return true;
 }
 

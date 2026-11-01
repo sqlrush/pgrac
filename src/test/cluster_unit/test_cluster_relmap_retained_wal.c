@@ -3661,3 +3661,16 @@ main(int argc, char **argv)
 #ifdef TEST_RELMAP_RETAINED_MAIN
 #undef main
 #endif
+
+#include "cluster/cluster_relmap_terminal_internal.h"
+#ifndef TEST_TERMINAL_CLEANUP
+bool cluster_clog_native_episode_read_v1(int origin, TransactionId xid, ClusterClogNativeBaseV1 *out,
+	ClusterClogNativeBaseHandleV1 **held, const ClusterRelmapTerminalEpisodeV1 *episode)
+{
+	(void)origin; (void)xid; (void)out; (void)held; (void)episode;
+	UT_ASSERT(false); return false;
+}
+bool cluster_clog_native_episode_seal_v1(ClusterClogNativeBaseHandleV1 *held,
+	const ClusterRelmapTerminalEpisodeV1 *episode)
+{ (void)held; (void)episode; UT_ASSERT(false); return false; }
+#endif
