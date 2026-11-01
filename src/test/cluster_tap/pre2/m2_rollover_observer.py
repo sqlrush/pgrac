@@ -122,7 +122,7 @@ class RolloverObserver:
                     executable_device=installed.st_dev, executable_inode=installed.st_ino,
                     binary_sha256=self.identity["binary_sha256"])
 
-    def _command(self, pid):
+    def _command(self, pid, *, reads=READS):
         tools = self.base / "debug-tools/root"
         command = [str(tools / "usr/bin/gdb"), "-q", "-nx", "--batch",
                    "--data-directory=" + str(tools / "usr/share/gdb")]
@@ -135,20 +135,20 @@ class RolloverObserver:
             command += ["-iex", "set print " + setting]
         command += ["-p", str(pid), "-ex",
                     'printf "M2_ROLL_PID=%d NODE=%d XID=%u\\n", MyProcPid, cluster_node_id, MyProc->xid']
-        for name, expression in READS:
+        for name, expression in reads:
             command += ["-ex", "echo M2_ROLL_FIELD=" + name + "\\n", "-ex", "p " + expression]
         command += ["-ex", "echo M2_ROLL_FIELD=stack\\n", "-ex", "thread apply all bt full",
                     "-ex", "detach"]
         return command
 
     @staticmethod
-    def _complete_raw(raw, context):
+    def _complete_raw(raw, context, *, reads=READS):
         text = raw.decode(errors="replace")
         native = re.findall(r"^M2_ROLL_PID=(\d+) NODE=(\d+) XID=(\d+)$", text, re.M)
         if native != [(str(context["producer_pid"]), "0", str(context["xid"] & 0xffffffff))]:
             return False
         fields = re.findall(r"^M2_ROLL_FIELD=(\w+)$", text, re.M)
-        if fields != [name for name, _ in READS] + ["stack"]:
+        if fields != [name for name, _ in reads] + ["stack"]:
             return False
         query = text.split("M2_ROLL_FIELD=query\n", 1)[1].split("M2_ROLL_FIELD=", 1)[0]
         return ("UPDATE m2_roll SET v=v+1" in query and re.search(r"^#0\s", text, re.M)
