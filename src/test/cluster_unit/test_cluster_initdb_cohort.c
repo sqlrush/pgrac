@@ -485,9 +485,70 @@ reused_link_inode_does_not_restore_original_link(void)
 	side_route_case(14, 3);
 }
 
+static void
+managed_child_cannot_select_the_legacy_root_publisher(void)
+{
+	InitdbOrigin *origins = calloc(CLUSTER_CONTROL_ROOT_RECORD_COUNT, sizeof(*origins));
+	UT_ASSERT(origins != NULL);
+	creation_legacy_format_current(origins);
+	for (unsigned slot = 0; slot < 128; slot += 127) {
+		origins[slot].managed_relmap = true;
+		expecting = true;
+		if (setjmp(refused) == 0) {
+			creation_legacy_format_current(origins);
+			UT_ASSERT(false);
+		}
+		expecting = false;
+		origins[slot].managed_relmap = false;
+	}
+	free(origins);
+}
+
+static void
+original_registered_child_receives_only_its_creator(void)
+{
+	char temp[] = "/tmp/pgrac-creation-child-XXXXXX";
+	char a[MAXPGPATH], b[MAXPGPATH], ad[24], bd[24];
+	char *args[] = {executable, "registered-child", ad, bd, NULL};
+	ClusterSharedConfigRef config = {0};
+	PgracInitdbConfigContext request = {0};
+	PgracInitdbRecoveryContext ctx;
+	uint8 branch[16] = {2};
+	int data, shared;
+	UT_ASSERT(mkdtemp(temp) != NULL);
+	snprintf(a, sizeof(a), "%s/a", temp); snprintf(b, sizeof(b), "%s/b", temp);
+	UT_ASSERT(mkdir(a, 0700) == 0 && mkdir(b, 0700) == 0);
+	data = open(a, O_RDONLY | O_DIRECTORY); shared = open(b, O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(data >= 0 && shared >= 0);
+	config.identity.system_identifier = 91; config.identity.database_incarnation = 27;
+	config.identity.generation = 1; config.identity.storage_uuid[0] = 1;
+	config.identity.authority_uuid[0] = 3; config.identity.configured[0] = 1;
+	config.sha256[0] = 10;
+	request.fd = 3; request.device = 7; request.inode = 8; request.bytes = 9;
+	request.sha256[0] = 10;
+	UT_ASSERT(cluster_initdb_cohort_relmap_prepare_v2(&config, &request, branch, data, shared, &ctx));
+	snprintf(ad, sizeof(ad), "%d", data); snprintf(bd, sizeof(bd), "%d", shared);
+	run_child_registered(args, getppid(), &ctx);
+	UT_ASSERT(getenv(PGRAC_INITDB_RECOVERY_ENV) == NULL);
+	UT_ASSERT(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
+	UT_ASSERT(close(data) == 0 && close(shared) == 0);
+	UT_ASSERT(rmdir(a) == 0 && rmdir(b) == 0 && rmdir(temp) == 0);
+}
+
 int
 main(int argc, char **argv)
 {
+	if (argc == 4 && strcmp(argv[1], "registered-child") == 0)
+	{
+		PgracInitdbConfigContext config = {0};
+		PgracInitdbRecoveryContext ctx;
+		uint8 storage[16] = {1};
+		const char *value = getenv(PGRAC_INITDB_RECOVERY_ENV);
+		config.fd = 3; config.device = 7; config.inode = 8; config.bytes = 9;
+		config.sha256[0] = 10;
+		return value && pgrac_initdb_recovery_read_v2(atoi(value), &config, 91, 27,
+			storage, atoi(argv[2]), atoi(argv[3]), &ctx) ? 0 : 17;
+	}
 	if (argc >= 3 && strcmp(argv[1], "child") == 0) {
 		pid_t self = getpid(), descendant;
 		int fd;
@@ -535,7 +596,9 @@ main(int argc, char **argv)
 			pause();
 	}
 	strlcpy(executable, argv[0], sizeof(executable));
-	UT_PLAN(10);
+	UT_PLAN(12);
+	UT_RUN(managed_child_cannot_select_the_legacy_root_publisher);
+	UT_RUN(original_registered_child_receives_only_its_creator);
 	UT_RUN(storage_contract_is_original_unverified_and_rechecked);
 	UT_RUN(side_routes_retain_actual_original_directories);
 	UT_RUN(side_routes_reject_unqualified_inputs_before_moving);

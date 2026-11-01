@@ -78,6 +78,8 @@
 #include "common/cluster_hw_snapshot_codec.h"
 #include "common/pgrac_initdb_wal.h"
 #include "common/pgrac_initdb_cohort.h"
+#include "common/pgrac_initdb_recovery.h"
+#include <limits.h>
 #include "common/cryptohash.h"
 #include "datatype/timestamp.h"
 #endif
@@ -209,6 +211,9 @@ static int pgrac_native_base_child_fd = -1;
 static char *pgrac_native_config_path;
 static PgracInitdbConfigContext pgrac_native_config;
 static int pgrac_native_config_child_fd = -1;
+static bool pgrac_native_recovery_requested;
+static PgracInitdbRecoveryContext pgrac_native_recovery;
+static ClusterRecoveryFileIdentityV2 pgrac_native_relmap_identities[4];
 static void pgrac_native_bind_creation(void);
 static int pgrac_native_child_begin(bool bootstrap);
 static void pgrac_native_child_started(int context_fd);
@@ -3583,6 +3588,9 @@ pgrac_native_validate_options(void)
 	if (getenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != NULL
 		|| getenv(PGRAC_INITDB_COHORT_ENV) != NULL)
 		pg_fatal("INITDB_WAL_CONTEXT: initdb cannot inherit a child context");
+	if (getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL
+		&& (pgrac_native_cohort || pgrac_native_thread != 1 || pgrac_native_base_path == NULL))
+		pg_fatal("INITDB_RECOVERY_CONTEXT: only the original founder may receive registration");
 	if (pgrac_native_cohort)
 	{
 		if (pgrac_native_config_path == NULL || !do_sync || sync_only || !data_checksums
@@ -3880,6 +3888,27 @@ pgrac_native_bind_creation(void)
 			pg_fatal("INITDB_BASE_PATH: cannot pin original shared base: %m");
 	}
 	pgrac_native_check_directories(&data_st, &wal_st);
+	{
+		const char *value = getenv(PGRAC_INITDB_RECOVERY_ENV);
+		if (value != NULL) {
+			char *end;
+			long descriptor;
+			errno = 0;
+			descriptor = strtol(value, &end, 10);
+			if (*value == '\0' || strspn(value, "0123456789") != strlen(value)
+				|| errno != 0 || *end != '\0' || descriptor < 3 || descriptor > INT_MAX
+				|| !pgrac_initdb_recovery_read_v2(descriptor, &pgrac_native_config,
+					pgrac_native_sysid, pgrac_native_database_incarnation,
+					pgrac_native_storage_bytes, pgrac_native_data_fd, pgrac_native_base_fd,
+					&pgrac_native_recovery)
+				|| !pgrac_initdb_recovery_relmaps_v2(&pgrac_native_recovery,
+												   pgrac_native_relmap_identities)
+				|| unsetenv(PGRAC_INITDB_RECOVERY_ENV) != 0)
+				pg_fatal("INITDB_RECOVERY_CONTEXT: original precreation registration refused");
+			pgrac_native_recovery_requested = true;
+			pgrac_native_config_check(false);
+		}
+	}
 }
 
 static ControlFileData *
@@ -3988,6 +4017,19 @@ pgrac_native_child_started(int context_fd)
 	}
 }
 
+/* Original post-bootstrap owner only; no fallback after a managed refusal. */
+static bool
+pgrac_native_create_relmaps(const ControlFileData *control)
+{
+	if (pgrac_native_recovery_requested)
+		return control != NULL
+			&& control->system_identifier == pgrac_native_recovery.first.system_identifier
+			&& control->checkPointCopy.ThisTimeLineID == pgrac_native_recovery.first.redo_timeline
+			&& pgrac_initdb_relmap_managed_create(pgrac_native_data_fd,
+				pgrac_native_base_fd, pgrac_native_relmap_identities);
+	return pgrac_initdb_relmap_create(pgrac_native_data_fd, pgrac_native_base_fd);
+}
+
 static void
 pgrac_native_sync(void)
 {
@@ -4031,8 +4073,8 @@ pgrac_native_sync(void)
 		if (control->track_commit_timestamp
 			|| !pgrac_initdb_side_create(pgrac_native_data_fd, pgrac_native_base_fd))
 			pg_fatal("INITDB_SIDE_CREATE: original native SIDE creation failed");
-		if (!pgrac_initdb_relmap_create(pgrac_native_data_fd, pgrac_native_base_fd))
-			pg_fatal("INITDB_RELMAP_CREATE: original relmap authority creation failed");
+		if (!pgrac_native_create_relmaps(control))
+			pg_fatal("INITDB_RELMAP_CREATE: original authority creation failed");
 		pgrac_native_check_directories(&data_st, &wal_st);
 		after = pgrac_native_control();
 		if (memcmp(control, after, sizeof(*control)) != 0)

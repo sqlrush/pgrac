@@ -10,6 +10,7 @@ common_sources = files(
   'cluster_catalog_verify.c',
   'cluster_hw_snapshot_codec.c',
   'cluster_recovery_file_identity.c',
+  'cluster_recovery_registry.c',
   'cluster_relmap_file.c',
   'cluster_relmap_file_io.c',
   'cluster_relmap_init.c',
@@ -30,6 +31,7 @@ common_sources = files(
   'link-canary.c',
   'md5_common.c',
   'percentrepl.c',
+  'pgrac_initdb_recovery.c',
   'pgrac_control_binding.c',
   'pgrac_external_fence_protocol.c',
   'pgrac_fence_map.c',
@@ -42,6 +44,7 @@ common_sources = files(
   'relpath.c',
   'rmtree.c',
   'saslprep.c',
+  'sha2.c',
   'scram-common.c',
   'string.c',
   'stringinfo.c',
@@ -63,7 +66,6 @@ else
     'hmac.c',
     'md5.c',
     'sha1.c',
-    'sha2.c',
   )
 endif
 

@@ -66,6 +66,7 @@ OBJS = \
 	cluster_config_members.o \
 	cluster_service_observe.o \
 	cluster_control_root.o \
+	cluster_control_root_registry.o \
 	cluster_control_observe.o \
 	cluster_wal_history.o \
 	cluster_wal_tail.o \
@@ -298,6 +299,7 @@ OBJS = \
 	cluster_oid_lease_shmem.o \
 	cluster_relmap_arb.o \
 	cluster_relmap_authority.o \
+	cluster_relmap_control.o \
 	cluster_relmap_lock.o \
 	cluster_relmap_owner.o \
 	cluster_relmap_recovery.o \
@@ -552,3 +554,11 @@ cluster_grd.o: $(top_srcdir)/src/include/cluster/cluster_grd.h
 cluster_rf_route.o: $(top_srcdir)/src/include/cluster/cluster_rf_route_manifest.def
 
 cluster_semantic_activation.o: $(srcdir)/cluster_control_rebind.inc
+
+cluster_control_root_registry.o: $(srcdir)/cluster_control_root_registry_private.h \
+	$(srcdir)/cluster_control_root_private.h \
+	$(top_srcdir)/src/include/common/cluster_recovery_registry.h
+
+cluster_control_bootstrap.o cluster_control_bootstrap_read.o: \
+	$(srcdir)/cluster_control_root_registry_private.h \
+	$(top_srcdir)/src/include/common/cluster_recovery_registry.h

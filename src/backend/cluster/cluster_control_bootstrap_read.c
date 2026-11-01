@@ -23,6 +23,8 @@
 #include "storage/fd.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
+#include "cluster_control_root_registry_private.h"
+#include "utils/memutils.h"
 #include "cluster_recovery_anchor_private.h"
 
 #if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
@@ -31,8 +33,11 @@
 typedef struct BootstrapReadWork {
 	ControlRootImage before;
 	ControlRootImage after;
-	uint8 root_before[CLUSTER_CONTROL_ROOT_FILE_BYTES + 1];
-	uint8 root_after[CLUSTER_CONTROL_ROOT_FILE_BYTES + 1];
+	uint8 root_before[66560 + 1];
+	uint8 root_after[66560 + 1];
+	size_t root_len;
+	ClusterRecoveryRegistryDecodedV2 *registry;
+	uint64 registry_sources_seen;
 	uint8 common[PG_CONTROL_FILE_SIZE + 1];
 	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES + 1];
 	uint8 anchor[CLUSTER_RECOVERY_ANCHOR_SIZE + 1];
@@ -1244,8 +1249,20 @@ read_again(BootstrapReadWork *work, const char *shared_root, const char *wal_roo
 		result = read_object(global, parts, lengthof(parts), name, CLUSTER_WAL_TERMINAL_BYTES,
 							 CLUSTER_WAL_TERMINAL_BYTES, work->terminal, &length);
 	} else
-		result = read_bytes(global, "pgrac_control_root", CLUSTER_CONTROL_ROOT_FILE_BYTES,
-							CLUSTER_CONTROL_ROOT_FILE_BYTES, work->root_after, &length);
+		result = read_bytes(global, "pgrac_control_root", work->root_len,
+							work->root_len, work->root_after, &length);
+	if (result == 0 && kind == BOOTSTRAP_FINAL_ROOT && work->registry) {
+		ClusterRecoveryRegistryDecodedV2 *later = NULL;
+		if (!cluster_recovery_registry_load_selected_v2(global, work->root_before + 512,
+			MaxAllocSize, &later) || !cluster_control_root_registry_matches_v4(
+			work->root_before, work->root_len, cluster_recovery_registry_view_v2(later)))
+			result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		cluster_recovery_registry_destroy_v2(&later);
+		/* Registry I/O is inside the final whole-ROOT bracket as well. */
+		if (result == 0)
+			result = read_bytes(global, "pgrac_control_root", work->root_len,
+				work->root_len, work->root_after, &length);
+	}
 	if (result == 0)
 		result = read_same_dir(AT_FDCWD, shared_root, shared);
 	if (result == 0)
@@ -1292,6 +1309,25 @@ read_source_capacity(BootstrapReadWork *work, const char *shared_root, const cha
 											   &anchor_ref, &anchor);
 	if (result != 0)
 		return result;
+	if (work->registry) {
+		const ClusterRecoveryRegistryV2 *r = cluster_recovery_registry_view_v2(work->registry);
+		bool found = false;
+		for (uint64 i = 0; i < r->coverage.source_count; i++) {
+			const ClusterRecoveryCheckpointSourceV2 *c = &r->coverage.sources[i];
+			if (memcmp(&c->source.claim.identity, &source->identity, sizeof(source->identity)))
+				continue;
+			if (found || c->source.claim.database_incarnation != header->v2.database_incarnation ||
+				c->source.claim.max_config_generation != header->v2.config_generation ||
+				memcmp(c->source.claim.claim_sha256, refs->claim_sha256, 32) ||
+				c->source.timeline != source->checkpoint_tli ||
+				c->checkpoint_start != anchor.checkpoint ||
+				memcmp(&c->checkpoint, &anchor.checkpoint_copy, sizeof(c->checkpoint)))
+				return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			found = true;
+		}
+		if (!found || ++work->registry_sources_seen > r->coverage.source_count)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	}
 	/* Applies to current, retained and pending origins, not just this node. */
 	if (anchor.track_commit_timestamp
 		|| TransactionIdIsValid(anchor.checkpoint_copy.oldestCommitTsXid)
@@ -1444,6 +1480,10 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 	const ControlRootImage *root = &work->before;
 	ClusterControlRootResult result;
 
+	/* v4 retains these exact v3 object formats. Only private metadata is
+	 * adapted for their original validators; raw ROOT bytes/hash stay v4. */
+	if (work->registry)
+		work->before.header.format_version = 3;
 	memset(required, 0, sizeof(*required));
 	for (uint32 node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
 		if (!root->present[node])
@@ -1494,6 +1534,8 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 				work->startup, CLUSTER_WAL_STARTUP_BYTES, root, node, &work->pending);
 			if (result != 0)
 				return result;
+			if (work->registry && work->pending.phase != CLUSTER_WAL_STARTUP_DURABLE)
+				return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
 			if (work->pending.phase != CLUSTER_WAL_STARTUP_RESERVED) {
 				result = read_startup_ref(work->startup, &work->pending, &pending);
 				if (result != 0)
@@ -1523,6 +1565,9 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 			required->pending_sources++;
 		}
 	}
+	if (work->registry && work->registry_sources_seen !=
+		cluster_recovery_registry_view_v2(work->registry)->coverage.source_count)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 #endif
@@ -1569,8 +1614,9 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 		return result;
 	if (binding.node_id != node_id)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
-	/* Every fallible allocation precedes raw FDs. Root codecs are memory-only. */
-	work = palloc(sizeof(*work));
+	/* Backend ERROR-capable allocations precede raw FDs. Memory-only codecs
+	 * and the common registry loader use checked malloc with ordinary refusal. */
+	work = palloc0(sizeof(*work));
 	config = palloc(CLUSTER_SHARED_CONFIG_MAX_BYTES + 1);
 	result = read_dir(-1, shared_root, &shared);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1579,7 +1625,8 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
 	result = read_bytes(global, "pgrac_control_root", CLUSTER_CONTROL_ROOT_FILE_BYTES,
-						CLUSTER_CONTROL_ROOT_FILE_BYTES, work->root_before, &length);
+						66560, work->root_before, &length);
+	work->root_len = length;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
 	result = cluster_control_bootstrap_root_decode(work->root_before, length, binding.storage_uuid,
@@ -1589,12 +1636,20 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 	result = cluster_control_bootstrap_root_bound(&binding, &work->before);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
+	if (work->before.header.format_version == 4 &&
+		(!cluster_recovery_registry_load_selected_v2(global, work->root_before + 512,
+			MaxAllocSize, &work->registry) ||
+		 !cluster_control_root_registry_matches_v4(work->root_before, work->root_len,
+			cluster_recovery_registry_view_v2(work->registry)))) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto close_dirs;
+	}
 	objects = read_dir(-1, wal_root, &wal);
 	if (objects == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		objects = read_selected(work, global, wal, node_id, (uint8 *)config, &config_len);
 	/* Reobserve even after a missing object: a publisher/GC may have advanced. */
-	result = read_bytes(global, "pgrac_control_root", CLUSTER_CONTROL_ROOT_FILE_BYTES,
-						CLUSTER_CONTROL_ROOT_FILE_BYTES, work->root_after, &length);
+	result = read_bytes(global, "pgrac_control_root", work->root_len,
+						work->root_len, work->root_after, &length);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
 	result = cluster_control_bootstrap_root_decode(work->root_after, length, binding.storage_uuid,
@@ -1604,7 +1659,7 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 	result = cluster_control_bootstrap_root_bound(&binding, &work->after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
-	if (memcmp(work->root_before, work->root_after, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0) {
+	if (memcmp(work->root_before, work->root_after, work->root_len) != 0) {
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		goto close_dirs;
 	}
@@ -1639,14 +1694,16 @@ close_dirs:
 	input.field.data = ptr;                                                                        \
 	input.field.len = size
 	READ_INPUT(binding, binding_bytes, sizeof(binding_bytes));
-	READ_INPUT(root_before, work->root_before, CLUSTER_CONTROL_ROOT_FILE_BYTES);
-	READ_INPUT(root_after, work->root_after, CLUSTER_CONTROL_ROOT_FILE_BYTES);
+	READ_INPUT(root_before, work->root_before, work->root_len);
+	READ_INPUT(root_after, work->root_after, work->root_len);
 	READ_INPUT(common, work->common, PG_CONTROL_FILE_SIZE);
 	READ_INPUT(config, (const uint8 *)config, config_len);
 	READ_INPUT(claim, work->claim, CLUSTER_WAL_CLAIM_V2_BYTES);
 	READ_INPUT(anchor, work->anchor, CLUSTER_RECOVERY_ANCHOR_SIZE);
 #undef READ_INPUT
-	result = cluster_control_bootstrap_decode(&input, &snapshot);
+	result = work->registry ? cluster_control_bootstrap_decode_v4(&input,
+		cluster_recovery_registry_view_v2(work->registry), &snapshot)
+		: cluster_control_bootstrap_decode(&input, &snapshot);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	objects = read_capacities(work, shared_root, wal_root, &required, &snapshot);
@@ -1656,14 +1713,14 @@ close_dirs:
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	result = cluster_control_bootstrap_root_decode(
-		work->root_after, CLUSTER_CONTROL_ROOT_FILE_BYTES, binding.storage_uuid,
+		work->root_after, work->root_len, binding.storage_uuid,
 		binding.system_identifier, &work->after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	result = cluster_control_bootstrap_root_bound(&binding, &work->after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	if (memcmp(work->root_before, work->root_after, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0) {
+	if (memcmp(work->root_before, work->root_after, work->root_len) != 0) {
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		goto done;
 	}
@@ -1684,6 +1741,7 @@ close_dirs:
 		config = NULL;
 	}
 done:
+	cluster_recovery_registry_destroy_v2(&work->registry);
 	if (config != NULL)
 		pfree(config);
 	pfree(work);

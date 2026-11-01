@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include "cluster/cluster_shared_config.h"
 #include "cluster_control_root_private.h"
+#include "common/pgrac_initdb_recovery.h"
 
 /* Caller owns the new cohort, has reaped all native initializers, synced
  * their files and holds both freshly created directories. Recheck their
@@ -27,5 +28,12 @@ extern bool cluster_initdb_object_write_observed(int directory, const char *name
 												 const uint8 *bytes, Size length, struct stat *out);
 extern bool cluster_initdb_object_recheck(int directory, const char *name, const uint8 *bytes,
 										  Size length, const struct stat *expected);
+
+/* Original new-cohort owner only, before launching the founder. Reserve all
+ * four births from its exact config/first redo branch, without reading any
+ * existing authority file. No ROOT selection or format activation. */
+extern bool cluster_initdb_cohort_relmap_prepare_v2(const ClusterSharedConfigRef *,
+	const PgracInitdbConfigContext *, const uint8 redo_branch_uuid[16],
+	int data_fd, int shared_fd, PgracInitdbRecoveryContext *out);
 
 #endif

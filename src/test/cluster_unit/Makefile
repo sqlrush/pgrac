@@ -6293,6 +6293,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		$(if $(filter test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_consumed_inputs.o,test_cluster_wal_inputs_product.o) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
+		$(top_builddir)/src/backend/cluster/cluster_control_root_registry.o $(top_builddir)/src/common/cluster_recovery_registry.o \
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_catalog_read.o \
 		$(top_builddir)/src/backend/cluster/cluster_initdb_catalog.o \
@@ -14575,12 +14576,17 @@ test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c un
 
 # The same fork/exec/wait path as original native creation, with real children.
 test_cluster_initdb_cohort: test_cluster_initdb_cohort.c unit_test.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/common/file_perm.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
@@ -17365,3 +17371,229 @@ test_cluster_wal_inputs_job_service test_cluster_snapshot_admission test_cluster
  test_cluster_survivor_producer_fixture.h \
  $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_producer.c \
  $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_producer.h
+TESTS += test_cluster_recovery_registry
+all: test_cluster_recovery_registry
+test_cluster_recovery_registry: test_cluster_recovery_registry.c unit_test.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c test_cluster_registry_io.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
+		$(srcdir)/test_cluster_registry_io.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-recovery-registry
+.PHONY: clean-recovery-registry
+clean-recovery-registry:
+	rm -f test_cluster_recovery_registry test_cluster_recovery_registry.d
+
+TESTS += test_cluster_control_registry
+all: test_cluster_control_registry
+cluster_control_registry_original.o: $(top_srcdir)/src/backend/cluster/cluster_control_root.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+test_cluster_control_registry: test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-registry
+.PHONY: clean-control-registry
+clean-control-registry:
+	rm -f test_cluster_control_registry test_cluster_control_registry.d cluster_control_registry_original.o cluster_control_registry_original.d cluster_registry_common_test.o cluster_registry_common_test.d
+
+cluster_registry_common_test.o: test_cluster_registry_io.c $(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
+
+# Same creator pipe into the original managed relmap file producer.
+TESTS += test_cluster_initdb_recovery
+all: test_cluster_initdb_recovery
+test_cluster_initdb_recovery_fixture.inc: test_cluster_initdb_relmap.c
+	awk '/^UT_TEST/ { found=1; exit } { print } END { if (!found) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_initdb_recovery_dispatch.inc: $(top_srcdir)/src/bin/initdb/initdb.c
+	awk '/^pgrac_native_create_relmaps\(const ControlFileData \*control\)/ { print "static bool"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_initdb_recovery_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c $(srcdir)/extract_cluster_initdb_recovery.py
+	python3 $(srcdir)/extract_cluster_initdb_recovery.py $< $@
+test_cluster_initdb_recovery: test_cluster_initdb_recovery.c test_cluster_initdb_recovery_owner.inc test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_dispatch.inc unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_contract_private.h \
+		$(top_srcdir)/src/bin/initdb/pgrac_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_shared_config.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -DFRONTEND $< $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-recovery
+.PHONY: clean-initdb-recovery
+clean-initdb-recovery:
+	rm -f test_cluster_initdb_recovery_owner.inc test_cluster_initdb_recovery_owner.inc.tmp test_cluster_initdb_recovery test_cluster_initdb_recovery.d test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_fixture.inc.tmp test_cluster_initdb_recovery_dispatch.inc test_cluster_initdb_recovery_dispatch.inc.tmp
+
+TESTS += test_cluster_control_file_selection
+all: test_cluster_control_file_selection
+test_cluster_control_file_selection: test_cluster_control_file_selection.c test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-file-selection
+.PHONY: clean-control-file-selection
+clean-control-file-selection:
+	rm -f test_cluster_control_file_selection test_cluster_control_file_selection.d
+
+# Original creator's last publication, with real immutable registry/object I/O.
+TESTS += test_cluster_initdb_registry_publish
+all: test_cluster_initdb_registry_publish
+test_cluster_initdb_registry_publish.inc: $(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c $(srcdir)/extract_cluster_initdb_registry_publish.py Makefile
+	python3 $(srcdir)/extract_cluster_initdb_registry_publish.py $< $@
+test_cluster_initdb_registry_publish: test_cluster_initdb_registry_publish.c test_cluster_initdb_registry_publish.inc \
+		test_cluster_control_registry.c test_cluster_recovery_registry.c unit_test.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/file_perm.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/common/file_perm.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_registry_common_test.o cluster_control_registry_original.o \
+		$(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-registry-publish
+.PHONY: clean-initdb-registry-publish
+clean-initdb-registry-publish:
+	rm -f test_cluster_initdb_registry_publish test_cluster_initdb_registry_publish.d test_cluster_initdb_registry_publish.inc test_cluster_initdb_registry_publish.inc.tmp
+
+# Complete original control-selected relmap inventory; no live activation.
+TESTS += test_cluster_control_relmap_selection
+all: test_cluster_control_relmap_selection
+test_cluster_control_relmap_selection: test_cluster_control_relmap_selection.c test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-relmap-selection
+.PHONY: clean-control-relmap-selection
+clean-control-relmap-selection:
+	rm -f test_cluster_control_relmap_selection test_cluster_control_relmap_selection.d
+
+# Explicit ROOTv4 bootstrap reads use the selected complete registry.
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start test_cluster_ctrc_native_fpi: test_cluster_control_bootstrap_v4.inc $(top_builddir)/src/backend/cluster/cluster_control_root_registry.o $(top_builddir)/src/common/cluster_recovery_registry.o
+cluster_control_bootstrap_read_test.o: $(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h $(top_srcdir)/src/include/common/cluster_recovery_registry.h
+
+# Managed cache/checkpoint companions use the complete original control selector.
+TESTS += test_cluster_relmap_control
+all: test_cluster_relmap_control
+test_cluster_relmap_control_entries.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
+	awk '/^(RelationMapReadManagedV2|CheckPointRelationMapManagedV2|CheckPointRelationMapControlV2)\(/ { print "bool"; emit=1; n++ } /^CheckPointRelationMap\(/ { print "void"; emit=1; n++ } /^cluster_read_relmap_from_control\(/ { print "static void"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if (n != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_relmap_control_authority.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_relmap_authority_managed_read_v2=control_original_read \
+		-Dcluster_relmap_authority_managed_checkpoint_v2=control_original_checkpoint -c $< -o $@
+test_cluster_relmap_control: test_cluster_relmap_control.c test_cluster_control_relmap_selection.c \
+		test_cluster_control_file_selection.c test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		test_cluster_relmap_control_entries.inc test_cluster_relmap_control_authority.o \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_control.h \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c unit_test.h Makefile \
+		cluster_control_registry_original.o cluster_registry_common_test.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c \
+		test_cluster_relmap_control_authority.o cluster_control_registry_original.o cluster_registry_common_test.o \
+		$(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-relmap-control
+.PHONY: clean-relmap-control
+clean-relmap-control:
+	rm -f test_cluster_relmap_control test_cluster_relmap_control.d test_cluster_relmap_control_authority.o test_cluster_relmap_control_authority.d test_cluster_relmap_control_entries.inc test_cluster_relmap_control_entries.inc.tmp

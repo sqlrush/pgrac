@@ -137,13 +137,13 @@ sub mkvcbuild
 	}
 
 	our @pgcommonallfiles = qw(
-	  archive.c base64.c checksum_helper.c cluster_catalog_init.c cluster_catalog_manifest.c cluster_catalog_verify.c cluster_hw_snapshot_codec.c cluster_recovery_file_identity.c cluster_relmap_file.c cluster_relmap_file_io.c cluster_relmap_init.c cluster_relmap_v2.c cluster_space_identity.c cluster_space_reservation.c compression.c
+	  archive.c base64.c checksum_helper.c cluster_catalog_init.c cluster_catalog_manifest.c cluster_catalog_verify.c cluster_hw_snapshot_codec.c cluster_recovery_file_identity.c cluster_recovery_registry.c cluster_relmap_file.c cluster_relmap_file_io.c cluster_relmap_init.c cluster_relmap_v2.c cluster_space_identity.c cluster_space_reservation.c compression.c
 	  config_info.c controldata_utils.c d2s.c encnames.c exec.c
 	  f2s.c file_perm.c file_utils.c hashfn.c ip.c jsonapi.c
 	  keywords.c kwlookup.c link-canary.c md5_common.c percentrepl.c
-	  pgrac_control_binding.c pgrac_external_fence_protocol.c pgrac_fence_map.c pgrac_protected_set.c
+	  pgrac_initdb_recovery.c pgrac_control_binding.c pgrac_external_fence_protocol.c pgrac_fence_map.c pgrac_protected_set.c
 	  pg_get_line.c pg_lzcompress.c pg_prng.c pgfnames.c psprintf.c relpath.c
-	  rmtree.c saslprep.c scram-common.c string.c stringinfo.c unicode_norm.c
+	  rmtree.c sha2.c saslprep.c scram-common.c string.c stringinfo.c unicode_norm.c
 	  username.c wait_error.c wchar.c);
 
 	if ($solution->{options}->{openssl})
@@ -158,7 +158,6 @@ sub mkvcbuild
 		push(@pgcommonallfiles, 'hmac.c');
 		push(@pgcommonallfiles, 'md5.c');
 		push(@pgcommonallfiles, 'sha1.c');
-		push(@pgcommonallfiles, 'sha2.c');
 	}
 
 	our @pgcommonfrontendfiles = (

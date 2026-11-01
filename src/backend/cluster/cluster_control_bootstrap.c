@@ -9,8 +9,10 @@
 #include "cluster/cluster_wal_claim.h"
 #include "common/cryptohash.h"
 #include "port/pg_crc32c.h"
+#include "utils/memutils.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
+#include "cluster_control_root_registry_private.h"
 #include "cluster_recovery_anchor_private.h"
 
 static bool
@@ -53,8 +55,9 @@ bootstrap_input_valid(const ClusterControlBootstrapInput *input)
 			return false;
 	return input->node_id < PGRAC_CONTROL_BINDING_MAX_NODES
 		   && input->binding.len == PGRAC_CONTROL_BINDING_BYTES
-		   && input->root_before.len == CLUSTER_CONTROL_ROOT_FILE_BYTES
-		   && input->root_after.len == CLUSTER_CONTROL_ROOT_FILE_BYTES
+		   && (input->root_before.len == CLUSTER_CONTROL_ROOT_FILE_BYTES
+			   || input->root_before.len == 66560)
+		   && input->root_after.len == input->root_before.len
 		   && input->common.len == PG_CONTROL_FILE_SIZE && input->config.len > 0
 		   && input->config.len <= CLUSTER_SHARED_CONFIG_MAX_BYTES
 		   && input->claim.len == CLUSTER_WAL_CLAIM_V2_BYTES
@@ -81,6 +84,10 @@ cluster_control_bootstrap_root_decode(const uint8 *bytes, size_t len, const uint
 {
 	/* Only dispatch on the little-endian version tag; do not retry a failed
 	 * decoder under a different version or reinterpret any reserved byte. */
+	if (bytes != NULL && len >= 6 && bytes[4] == 4 && bytes[5] == 0)
+		return cluster_control_root_registry_decode_v4(bytes, len, storage_uuid,
+			system_identifier, out) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			: CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (bytes != NULL && len >= 6 && bytes[4] == 3 && bytes[5] == 0)
 		return cluster_control_root_v3_decode(bytes, len, storage_uuid, system_identifier, out);
 	return cluster_control_root_v2_decode(bytes, len, storage_uuid, system_identifier, out);
@@ -159,9 +166,9 @@ bootstrap_common(const ClusterControlBootstrapBytes *bytes, const ControlRootIma
 	return result;
 }
 
-ClusterControlRootResult
-cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
-								 ClusterControlBootstrapSnapshot *out)
+static ClusterControlRootResult
+bootstrap_decode(const ClusterControlBootstrapInput *input,
+	const ClusterRecoveryRegistryV2 *registry, ClusterControlBootstrapSnapshot *out)
 {
 	ClusterControlBootstrapSnapshot snapshot;
 	ControlRootImage *before, *after;
@@ -202,8 +209,16 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 	result = cluster_control_bootstrap_root_bound(&snapshot.binding, after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	if (memcmp(before->bytes, after->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0) {
+	if (memcmp(input->root_before.data, input->root_after.data, input->root_before.len) != 0) {
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+
+	if ((before->header.format_version == 4 && (!registry ||
+		!cluster_control_root_registry_matches_v4(input->root_before.data,
+			input->root_before.len, registry))) ||
+		(before->header.format_version != 4 && registry)) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 		goto done;
 	}
 
@@ -267,7 +282,7 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 		goto done;
 	snapshot.wal.claim = claim_ref;
 	snapshot.wal.timeline = snapshot.control.checkPointCopy.ThisTimeLineID;
-	if (!bootstrap_hash(before->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, snapshot.root_sha256)) {
+	if (!bootstrap_hash(input->root_before.data, input->root_before.len, snapshot.root_sha256)) {
 		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 		goto done;
 	}
@@ -282,4 +297,32 @@ done:
 	pfree(after);
 	pfree(before);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
+	ClusterControlBootstrapSnapshot *out)
+{
+	return bootstrap_decode(input, NULL, out);
+}
+
+ClusterControlRootResult
+cluster_control_bootstrap_decode_v4(const ClusterControlBootstrapInput *input,
+	const ClusterRecoveryRegistryV2 *registry, ClusterControlBootstrapSnapshot *out)
+{
+	/* Check all borrowed storage before the original composer clears output. */
+	Size n;
+	if (!registry || !cluster_recovery_registry_size_v2(registry, MaxAllocSize, &n) ||
+		bootstrap_overlap(registry, sizeof(*registry), out, sizeof(*out)) ||
+		bootstrap_overlap(registry->coverage.sources,
+			registry->coverage.source_count * sizeof(*registry->coverage.sources), out, sizeof(*out)) ||
+		bootstrap_overlap(registry->coverage.files,
+			registry->coverage.file_count * sizeof(*registry->coverage.files), out, sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	for (uint64 i = 0; i < registry->coverage.file_count; i++)
+		if (bootstrap_overlap(registry->coverage.files[i].sources,
+			registry->coverage.files[i].source_count * sizeof(*registry->coverage.files[i].sources),
+			out, sizeof(*out)))
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return bootstrap_decode(input, registry, out);
 }

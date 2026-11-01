@@ -135,6 +135,8 @@
 #include "cluster/cluster_inject.h"	  /* crash-window test levers (D5) */
 #include "cluster/cluster_mode.h"		  /* cluster_peer_mode_enabled (D5) */
 #include "cluster/cluster_relmap_authority.h" /* shared relmap authority (D5) */
+#include "cluster/cluster_relmap_control.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_relmap_lock.h"  /* singleton relmap X lock (D5) */
 #include "cluster/cluster_relmap_owner.h" /* immutable producer identity */
 #include "cluster/cluster_relmap_retention_runtime.h"
@@ -207,7 +209,7 @@ static void merge_map_updates(RelMapFile *map, const RelMapFile *updates,
 							  bool add_okay);
 static void load_relmap_file(bool shared, bool lock_held);
 static void read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held,
-							 int elevel);
+							 int elevel, Oid dbid, Oid tsid);
 static void write_relmap_file(RelMapFile *newmap, bool write_wal,
 							  bool send_sinval, bool preserve_files,
 							  Oid dbid, Oid tsid, const char *dbpath);
@@ -328,13 +330,13 @@ RelationMapFilenumberToOid(RelFileNumber filenumber, bool shared)
  * path instead of using the one for the current database.
  */
 RelFileNumber
-RelationMapOidToFilenumberForDatabase(char *dbpath, Oid relationId)
+RelationMapOidToFilenumberForDatabase(char *dbpath, Oid relationId, Oid dbid, Oid tsid)
 {
 	RelMapFile	map;
 	int			i;
 
 	/* Read the relmap file from the source database. */
-	read_relmap_file(&map, dbpath, false, ERROR);
+	read_relmap_file(&map, dbpath, false, ERROR, dbid, tsid);
 
 	/* Iterate over the relmap entries to find the input relation OID. */
 	for (i = 0; i < map.num_mappings; i++)
@@ -355,14 +357,15 @@ RelationMapOidToFilenumberForDatabase(char *dbpath, Oid relationId)
  * relmap file.
  */
 void
-RelationMapCopy(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath)
+RelationMapCopy(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath,
+				Oid srcdbid, Oid srctsid)
 {
 	RelMapFile	map;
 
 	/*
 	 * Read the relmap file from the source database.
 	 */
-	read_relmap_file(&map, srcdbpath, false, ERROR);
+	read_relmap_file(&map, srcdbpath, false, ERROR, srcdbid, srctsid);
 
 	/*
 	 * Write the same data into the destination database's relmap file.
@@ -834,6 +837,26 @@ RestoreRelationMap(char *startAddress)
 	active_local_updates = relmaps->active_local_updates;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Explicit control-selected companions. The original control owner chooses
+ * this format and holds CF before entry; managed refusal has no legacy route. */
+bool
+RelationMapReadManagedV2(const ClusterSharedConfigRef *expected, Size registry_budget,
+	Oid database_oid, Oid tablespace_oid, RelMapFile *out)
+{
+	return cluster_relmap_control_read_v2(expected, registry_budget,
+	database_oid, tablespace_oid, out);
+}
+
+bool
+CheckPointRelationMapManagedV2(const ClusterSharedConfigRef *expected,
+	Size registry_budget, Size receipt_budget,
+	ClusterRelmapCheckpointReceiptV2 **fresh)
+{
+	return cluster_relmap_control_checkpoint_v2(expected, registry_budget, receipt_budget, fresh);
+}
+#endif
+
 /*
  * load_relmap_file -- load the shared or local map file
  *
@@ -846,9 +869,9 @@ static void
 load_relmap_file(bool shared, bool lock_held)
 {
 	if (shared)
-		read_relmap_file(&shared_map, "global", lock_held, FATAL);
+		read_relmap_file(&shared_map, "global", lock_held, FATAL, InvalidOid, GLOBALTABLESPACE_OID);
 	else
-		read_relmap_file(&local_map, DatabasePath, lock_held, FATAL);
+		read_relmap_file(&local_map, DatabasePath, lock_held, FATAL, MyDatabaseId, MyDatabaseTableSpace);
 }
 
 #ifdef USE_PGRAC_CLUSTER
@@ -948,6 +971,99 @@ cluster_read_relmap_from_authority(RelMapFile *map, const char *dbpath,
 }
 #endif							/* USE_PGRAC_CLUSTER */
 
+#ifdef USE_PGRAC_CLUSTER
+/* Same original CF across format selection, mapping I/O and control recheck.
+ * Copy only after confirmed release; inherited CF stays with its original owner. */
+static void
+cluster_read_relmap_from_control(RelMapFile *out, const char *path, Oid dbid, Oid tsid, int elevel)
+{
+	ClusterControlRelmapFormatV2 before, after;
+	RelMapFile map;
+	volatile bool owned = false;
+	if (CritSectionCount || LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(RelationMappingLock))
+		ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+			errmsg("relation map control read requires CF before MappingLock")));
+	if (!cluster_cf_held_is_clusterwide(ShareLock) && !cluster_cf_held_is_clusterwide(ExclusiveLock)) {
+		if (!cluster_cf_lock(ShareLock))
+			ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				errmsg("could not acquire relation map control input")));
+		owned = true;
+	}
+	PG_TRY();
+	{
+		if (cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &before) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				errmsg("relation map format is not selected by complete control inputs")));
+		if (before.root_version == 4) {
+			if (!RelationMapReadManagedV2(&before.config, MaxAllocSize, dbid, tsid, &map))
+				ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+					errmsg("managed relation map read failed")));
+		} else
+			cluster_read_relmap_from_authority(&map, path, false, elevel);
+		if (cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &after) != CLUSTER_CONTROL_ROOT_OK_PRIMARY ||
+			memcmp(&before, &after, sizeof(before)))
+			ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				errmsg("relation map control input changed during read")));
+		if (owned) {
+			owned = false;
+			if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+				ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+					errmsg("relation map control release is unconfirmed")));
+		}
+	}
+	PG_CATCH();
+	{
+		HOLD_INTERRUPTS();
+		if (owned) (void)cluster_cf_unlock_confirmed(ShareLock);
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*out = map;
+}
+
+bool
+CheckPointRelationMapControlV2(ClusterRelmapCheckpointReceiptV2 **out)
+{
+	ClusterControlRelmapFormatV2 before, after;
+	ClusterRelmapCheckpointReceiptV2 *volatile receipt = NULL;
+	volatile bool owned = false;
+	volatile bool ok = false;
+	if (!out || *out || CritSectionCount || LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(RelationMappingLock))
+		return false;
+	if (!cluster_cf_held_is_clusterwide(ShareLock) && !cluster_cf_held_is_clusterwide(ExclusiveLock)) {
+		if (!cluster_cf_lock(ShareLock)) return false;
+		owned = true;
+	}
+	PG_TRY();
+	{
+		ok = cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &before) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		if (ok && before.root_version == 4)
+			ok = CheckPointRelationMapManagedV2(&before.config, MaxAllocSize, MaxAllocSize,
+				(ClusterRelmapCheckpointReceiptV2 **)&receipt);
+		else if (ok) CheckPointRelationMap();
+		if (ok) ok = cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &after) == CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+			!memcmp(&before, &after, sizeof(before));
+		if (owned) {
+			owned = false;
+			if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED) ok = false;
+		}
+	}
+	PG_CATCH();
+	{
+		HOLD_INTERRUPTS();
+		cluster_relmap_checkpoint_destroy_v2((ClusterRelmapCheckpointReceiptV2 **)&receipt);
+		if (owned) (void)cluster_cf_unlock_confirmed(ShareLock);
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ok) *out = receipt;
+	else cluster_relmap_checkpoint_destroy_v2((ClusterRelmapCheckpointReceiptV2 **)&receipt);
+	return ok;
+}
+#endif
+
 /*
  * read_relmap_file -- load data from any relation mapper file
  *
@@ -959,7 +1075,7 @@ cluster_read_relmap_from_authority(RelMapFile *map, const char *dbpath,
  * ERROR.
  */
 static void
-read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
+read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel, Oid dbid, Oid tsid)
 {
 	char		mapfilename[MAXPGPATH];
 	pg_crc32c	crc;
@@ -972,7 +1088,12 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
 	/* PGRAC: on-mode reads adopt the shared relmap authority (spec-6.14 D5). */
 	if (cluster_shared_catalog && !IsBootstrapProcessingMode())
 	{
-		cluster_read_relmap_from_authority(map, dbpath, lock_held, elevel);
+		if (cluster_shared_config && !lock_held)
+			cluster_read_relmap_from_control(map, dbpath, dbid, tsid, elevel);
+		else
+			/* Strict legacy writer reader; managed files cannot satisfy it.
+			 * Never acquire CF below an inherited MappingLock. */
+			cluster_read_relmap_from_authority(map, dbpath, lock_held, elevel);
 		return;
 	}
 #endif

@@ -21,6 +21,8 @@
 #include "common/file_perm.h"
 #include "common/cryptohash.h"
 #include "common/pgrac_initdb_cohort.h"
+#include "cluster/cluster_recovery_format.h"
+#include "catalog/pg_tablespace_d.h"
 #include "miscadmin.h"
 #include "libpq/pqsignal.h"
 #include "utils/guc.h"
@@ -30,6 +32,7 @@
 #include "cluster_initdb_common_private.h"
 #include "cluster_initdb_catalog_private.h"
 #include "cluster_initdb_tree_private.h"
+#include "cluster_control_root_registry_private.h"
 #include "cluster_cf_contract_private.h"
 #include "../../bin/initdb/pgrac_wal.h"
 #include "../../bin/initdb/pgrac_side.h"
@@ -56,6 +59,9 @@ typedef struct InitdbOrigin {
 	ClusterCfContractRecord storage_contract;
 	struct stat storage_contract_identity, storage_contract_directory;
 	bool side_routed;
+	bool managed_relmap;
+	PgracInitdbRecoveryContext relmap_registration;
+	ClusterRecoveryCheckpointFileV2 relmap_observations[8];
 	struct stat side_archive;
 	struct stat side_sources[4], side_targets[4], side_links[4];
 	int side_link_fds[4];
@@ -419,20 +425,64 @@ control_read(InitdbOrigin *origin, uint16 thread, uint64 system_identifier, bool
 	directory_current(&origin->wal);
 }
 
+bool
+cluster_initdb_cohort_relmap_prepare_v2(const ClusterSharedConfigRef *config,
+	const PgracInitdbConfigContext *request, const uint8 branch[16],
+	int data_fd, int shared_fd, PgracInitdbRecoveryContext *out)
+{
+	ClusterRecoveryFileIdentityV2 first = {0};
+	uintptr_t output = (uintptr_t)out;
+	uintptr_t inputs[3] = {(uintptr_t)config, (uintptr_t)request, (uintptr_t)branch};
+	size_t lengths[3] = {sizeof(*config), sizeof(*request), 16};
+	for (unsigned i = 0; out != NULL && i < 3; ++i)
+		if (output <= inputs[i] ? inputs[i] - output < sizeof(*out)
+							   : output - inputs[i] < lengths[i]) return false;
+	if (!config || !request || !branch || !out || config->identity.generation != 1
+		|| !(config->identity.configured[0] & 1)
+		|| memcmp(config->sha256, request->sha256, 32) != 0) return false;
+	first.kind = CLUSTER_RECOVERY_FILE_RELMAP_V2;
+	first.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+	first.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+	first.system_identifier = config->identity.system_identifier;
+	first.database_incarnation = config->identity.database_incarnation;
+	memcpy(first.storage_uuid, config->identity.storage_uuid, 16);
+	memcpy(first.redo_branch_uuid, branch, 16);
+	first.redo_branch_generation = 1;
+	first.redo_timeline = 1; /* original native initdb birth; final control rechecks it */
+	first.tablespace_oid = GLOBALTABLESPACE_OID;
+	first.creation_generation = 1;
+	first.registration_generation = 1;
+	return pgrac_initdb_recovery_prepare_v2(&first, request, data_fd, shared_fd, out);
+}
+
 static void
-run_child(char *const *args, uint64 creator_pid)
+run_child_registered(char *const *args, uint64 creator_pid,
+					 const PgracInitdbRecoveryContext *registration)
 {
 	int status;
+	int recovery_fd = -1;
 	pid_t child, waited;
 	bool cancelled = false;
 	if (creation_cancelled || getppid() != creator_pid)
 		refuse("original creation was cancelled");
+	if (getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL
+		|| (registration != NULL
+			&& !pgrac_initdb_recovery_pipe_v2(registration, &recovery_fd)))
+		refuse("cannot bind original managed creation request");
 	fflush(NULL);
 	child = fork();
-	if (child < 0)
+	if (child < 0) {
+		if (recovery_fd >= 0) (void)close(recovery_fd);
 		refuse("cannot start an original native initializer");
+	}
 	if (child == 0) {
 		sigset_t empty;
+		char descriptor[32];
+		if (recovery_fd >= 0) {
+			snprintf(descriptor, sizeof(descriptor), "%d", recovery_fd);
+			if (fcntl(recovery_fd, F_SETFD, 0) != 0
+				|| setenv(PGRAC_INITDB_RECOVERY_ENV, descriptor, 1) != 0) _exit(127);
+		}
 		if (setpgid(0, 0) != 0)
 			_exit(127);
 		pqsignal(SIGINT, SIG_DFL);
@@ -449,7 +499,13 @@ run_child(char *const *args, uint64 creator_pid)
 		do {
 			waited = waitpid(child, &status, 0);
 		} while (waited < 0 && errno == EINTR);
+		if (recovery_fd >= 0) (void)close(recovery_fd);
 		refuse("cannot bind the original native child group");
+	}
+	if (recovery_fd >= 0 && close(recovery_fd) != 0) {
+		(void)kill(-child, SIGKILL);
+		do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+		refuse("cannot close original managed creation request");
 	}
 	for (;;) {
 		if (creation_cancelled || getppid() != creator_pid) {
@@ -474,9 +530,16 @@ run_child(char *const *args, uint64 creator_pid)
 }
 
 static void
-run_origin(const char *initdb, const PgracInitdbCohortContext *request,
-		   const ClusterSharedConfigRef *config, const char *shared, InitdbOrigin *origin, int node)
+run_child(char *const *args, uint64 creator_pid)
 {
+	run_child_registered(args, creator_pid, NULL);
+}
+
+static void
+run_origin(const char *initdb, const PgracInitdbCohortContext *request,
+					   const ClusterSharedConfigRef *config, const char *shared,
+					   InitdbOrigin *origin, int node,
+					   const PgracInitdbRecoveryContext *registration) {
 	char thread[64], system[96], storage[96], incarnation[96], base[MAXPGPATH + 64];
 	char configuration[MAXPGPATH + 64], local[96], host[96], segment[64], uuid[33];
 	char *args[24];
@@ -493,14 +556,16 @@ run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 	snprintf(system, sizeof(system), "--pgrac-initdb-system-identifier=" UINT64_FORMAT,
 			 config->identity.system_identifier);
 	snprintf(storage, sizeof(storage), "--pgrac-initdb-storage-uuid=%s", uuid);
-	snprintf(incarnation, sizeof(incarnation), "--pgrac-initdb-database-incarnation=" UINT64_FORMAT,
+	snprintf(incarnation, sizeof(incarnation),
+			 "--pgrac-initdb-database-incarnation=" UINT64_FORMAT,
 			 config->identity.database_incarnation);
 	snprintf(base, sizeof(base), "--pgrac-initdb-shared-base=%s", shared);
 	snprintf(configuration, sizeof(configuration), "--pgrac-initdb-shared-config=%s",
 			 request->config_path);
 	snprintf(local, sizeof(local), "--auth-local=%s", request->auth_local);
 	snprintf(host, sizeof(host), "--auth-host=%s", request->auth_host);
-	snprintf(segment, sizeof(segment), "--wal-segsize=%u", request->segment_size / (1024 * 1024));
+	snprintf(segment, sizeof(segment), "--wal-segsize=%u",
+			 request->segment_size / (1024 * 1024));
 	args[count++] = (char *)initdb;
 	args[count++] = "-D";
 	args[count++] = origin->data.path;
@@ -527,9 +592,34 @@ run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 	}
 	args[count] = NULL;
 	Assert(count < lengthof(args));
-	run_child(args, request->creator_pid);
+	if (registration != NULL) {
+		ClusterRecoveryFileIdentityV2 identities[4];
+		if (node != 0 || registration->creator_pid != (uint64)getpid() ||
+			registration->first.system_identifier != config->identity.system_identifier ||
+			registration->first.database_incarnation != config->identity.database_incarnation ||
+			memcmp(registration->first.storage_uuid, config->identity.storage_uuid, 16) != 0 ||
+			memcmp(registration->config.sha256, config->sha256, 32) != 0 ||
+			!pgrac_initdb_recovery_relmaps_v2(registration, identities))
+			refuse("managed founder registration differs from original cohort");
+		memcpy(&origin->relmap_registration, registration, sizeof(*registration));
+		run_child_registered(args, request->creator_pid, &origin->relmap_registration);
+	} else
+		run_child(args, request->creator_pid);
 	request_current(request, config);
 	control_read(origin, node + 1, config->identity.system_identifier, true);
+	if (registration != NULL) {
+		int fd = open(shared, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		bool ok =
+			fd >= 0 &&
+			memcmp(registration, &origin->relmap_registration, sizeof(*registration)) == 0 &&
+			pgrac_initdb_recovery_relmap_observe_v2(
+				&origin->relmap_registration, origin->data.fd, fd, origin->relmap_observations);
+		if (fd >= 0 && close(fd))
+			ok = false;
+		if (!ok)
+			refuse("original managed relmap creation cannot be captured completely");
+		origin->managed_relmap = true;
+	}
 }
 
 static void
@@ -971,10 +1061,10 @@ creation_storage_current(InitdbOrigin *origin)
 
 static void
 creation_sources_current(const PgracInitdbCohortContext *request,
-						 const ClusterSharedConfigRef *config, InitdbDirectory roots[4],
-						 InitdbOrigin *origins, const ClusterInitdbTree *data,
-						 const ClusterInitdbTree *undo, bool derived)
-{
+									 const ClusterSharedConfigRef *config,
+									 InitdbDirectory roots[4], InitdbOrigin *origins,
+									 const ClusterInitdbTree *data,
+									 const ClusterInitdbTree *undo, bool derived) {
 	request_current(request, config);
 	for (unsigned i = 0; i < 4; i++)
 		directory_current(&roots[i]);
@@ -985,6 +1075,11 @@ creation_sources_current(const PgracInitdbCohortContext *request,
 		creation_side_current(&roots[1], &origins[node], node);
 		creation_tree_recheck(origins[node].wal.fd, false, &origins[node].wal_observed);
 		creation_storage_current(&origins[node]);
+		if (origins[node].managed_relmap &&
+			!pgrac_initdb_recovery_relmap_current_v2(&origins[node].relmap_registration,
+													 origins[node].data.fd, roots[1].fd,
+													 origins[node].relmap_observations))
+			refuse("original managed relmap creation changed before ROOT publication");
 	}
 	creation_tree_recheck(roots[1].fd, derived, data);
 	creation_tree_recheck(roots[3].fd, false, undo);
@@ -1020,10 +1115,272 @@ creation_derived_current(const InitdbDirectory *global, const InitdbDirectory *s
 		refuse("original backup ROOT changed before primary publication");
 }
 
+/* The default v3 publisher cannot select even one managed-format child. */
+static void
+creation_legacy_format_current(const InitdbOrigin *origins)
+{
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node)
+		if (origins[node].managed_relmap)
+			refuse("managed creation requires complete ROOTv4 file registration");
+}
+
+/* The managed child retains all four preallocated identities and eight actual
+ * file observations. Other file families still require their original owners. */
+static bool
+creation_relmap_registry_valid(const InitdbOrigin *origins,
+										   const ClusterRecoveryRegistryV2 *r) {
+	const InitdbOrigin *o = &origins[0];
+	ClusterRecoveryFileIdentityV2 identities[4];
+	uint8 encoded[128];
+	unsigned found = 0;
+	for (unsigned node = 1; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node)
+		if (origins[node].managed_relmap)
+			return false;
+	if (!o->managed_relmap)
+		return true;
+	if (!pgrac_initdb_recovery_relmaps_v2(&o->relmap_registration, identities))
+		return false;
+	for (unsigned j = 0; j < 8; ++j) {
+		const ClusterRecoveryCheckpointFileV2 *captured = &o->relmap_observations[j];
+		if (!cluster_recovery_file_identity_encode_v2(&identities[j / 2], encoded,
+													  sizeof(encoded)) ||
+			!cluster_recovery_file_identity_matches_v2(encoded, sizeof(encoded),
+													   &captured->identity) ||
+			captured->copy_index != j % 2 || captured->copy_count != 2 ||
+			captured->synced_bytes != 2304 || captured->first_page != 0 ||
+			captured->page_count != 1 || captured->source_count != 0 ||
+			captured->sources != NULL)
+			return false;
+	}
+	for (uint64 i = 0; i < r->coverage.file_count; ++i) {
+		const ClusterRecoveryCheckpointFileV2 *f = &r->coverage.files[i];
+		bool matched = false;
+		if (f->identity.kind != CLUSTER_RECOVERY_FILE_RELMAP_V2)
+			continue;
+		if (!cluster_recovery_file_identity_encode_v2(&f->identity, encoded, sizeof(encoded)))
+			return false;
+		for (unsigned j = 0; j < 8; ++j) {
+			const ClusterRecoveryCheckpointFileV2 *captured = &o->relmap_observations[j];
+			if (f->copy_index != captured->copy_index ||
+				!cluster_recovery_file_identity_matches_v2(encoded, sizeof(encoded),
+														   &captured->identity))
+				continue;
+			if ((found & (1U << j)) || f->copy_count != captured->copy_count ||
+				f->synced_bytes != captured->synced_bytes ||
+				f->first_page != captured->first_page ||
+				f->page_count != captured->page_count ||
+				memcmp(f->image_digest, captured->image_digest, 32))
+				return false;
+			matched = true;
+			found |= 1U << j;
+			break;
+		}
+		if (!matched)
+			return false;
+	}
+	return found == 255;
+}
+/* First registration only, from the original complete creation cohort. File
+ * observations must already be supplied by that creator's managed producers;
+ * neither this predicate nor the registry codec supplies their custody. Bounds
+ * unavailable from this native shutdown checkpoint remain explicitly unknown. */
+static bool
+creation_registry_valid(const ClusterSharedConfigRef *config, const InitdbOrigin *origins,
+						const ControlRootImage *root, const ClusterRecoveryRegistryV2 *r,
+						Size budget)
+{
+	Size n;
+	uint64 at = 0;
+	if (!config || !origins || !root || !r || !cluster_recovery_registry_size_v2(r, budget, &n)
+		|| config->identity.generation != 1 || root->header.file_txn_seq != 1
+		|| root->header.lineage_kind != PGRAC_CONTROL_LINEAGE_CREATION_V1
+		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+		|| r->system_identifier != config->identity.system_identifier
+		|| r->system_identifier != root->header.system_identifier
+		|| r->database_incarnation != config->identity.database_incarnation
+		|| r->database_incarnation != root->header.v2.database_incarnation
+		|| memcmp(r->storage_uuid, config->identity.storage_uuid, 16)
+		|| memcmp(r->storage_uuid, root->header.storage_uuid, 16)
+		|| memcmp(root->header.authority_uuid, config->identity.authority_uuid, 16)
+		|| memcmp(root->header.v2.configured, config->identity.configured, 16)
+		|| root->header.v2.config_generation != 1
+		|| memcmp(root->header.v2.config_sha256, config->sha256, 32)
+		|| r->redo_branch_generation != 1 || r->coverage.control_generation != 1
+		|| r->coverage.registration_generation != 1 || r->coverage.checkpoint_generation != 1
+		|| r->coverage.commit_generation != 1 || !creation_relmap_registry_valid(origins, r))
+		return false;
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node) {
+		const InitdbOrigin *o = &origins[node];
+		const ClusterRecoveryCheckpointSourceV2 *source;
+		const CheckPoint *actual = &o->control.checkPointCopy, *captured;
+		bool selected
+			= (config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64))) != 0;
+		if (root->present[node] != selected)
+			return false;
+		if (!selected)
+			continue;
+		if (at >= r->coverage.source_count)
+			return false;
+		source = &r->coverage.sources[at++];
+		captured = &source->checkpoint;
+		if (!cluster_control_root_identity_equal(&source->source.claim.identity,
+												 &o->input.snapshot.identity)
+			|| !cluster_control_root_identity_equal(&root->records[node].identity,
+													&o->input.snapshot.identity)
+			|| source->source.claim.identity.origin_node_id != node
+			|| source->source.claim.database_incarnation != r->database_incarnation
+			|| source->source.claim.max_config_generation != 1
+			|| memcmp(source->source.claim.claim_sha256, o->input.refs.claim_sha256, 32)
+			|| memcmp(root->refs[node].claim_sha256, o->input.refs.claim_sha256, 32)
+			|| o->control.system_identifier != r->system_identifier
+			|| o->control.state != DB_SHUTDOWNED
+			|| source->source.timeline != actual->ThisTimeLineID
+			|| source->checkpoint_start != o->control.checkPoint
+			|| source->checkpoint_start != o->checkpoint.checkpoint_start
+			|| source->checkpoint_end != o->checkpoint.checkpoint_end
+			|| source->redo_start != actual->redo
+			|| source->replay_end != o->checkpoint.checkpoint_end
+			|| U64FromFullTransactionId(source->native_floor)
+			|| U64FromFullTransactionId(source->post_flush_issued) || source->local_bounds_observed
+			|| U64FromFullTransactionId(source->next_full_xid) || source->oldest_clog_xid)
+			return false;
+		/* Compare all serialized fields, never native struct padding. */
+#define CREATION_CHECKPOINT_SAME(field)                                                            \
+	if (captured->field != actual->field)                                                          \
+	return false
+		CREATION_CHECKPOINT_SAME(redo);
+		CREATION_CHECKPOINT_SAME(ThisTimeLineID);
+		CREATION_CHECKPOINT_SAME(PrevTimeLineID);
+		CREATION_CHECKPOINT_SAME(fullPageWrites);
+		if (U64FromFullTransactionId(captured->nextXid)
+			!= U64FromFullTransactionId(actual->nextXid))
+			return false;
+		CREATION_CHECKPOINT_SAME(nextOid);
+		CREATION_CHECKPOINT_SAME(nextMulti);
+		CREATION_CHECKPOINT_SAME(nextMultiOffset);
+		CREATION_CHECKPOINT_SAME(oldestXid);
+		CREATION_CHECKPOINT_SAME(oldestXidDB);
+		CREATION_CHECKPOINT_SAME(oldestMulti);
+		CREATION_CHECKPOINT_SAME(oldestMultiDB);
+		CREATION_CHECKPOINT_SAME(time);
+		CREATION_CHECKPOINT_SAME(oldestCommitTsXid);
+		CREATION_CHECKPOINT_SAME(newestCommitTsXid);
+		CREATION_CHECKPOINT_SAME(oldestActiveXid);
+#undef CREATION_CHECKPOINT_SAME
+	}
+	if (at != r->coverage.source_count)
+		return false;
+	for (uint64 i = 0; i < r->coverage.file_count; ++i) {
+		const ClusterRecoveryCheckpointFileV2 *f = &r->coverage.files[i];
+		unsigned origin = f->identity.origin;
+		if (origin >= 128 || !root->present[origin] || f->identity.registration_generation != 1
+			|| f->identity.redo_timeline != origins[origin].control.checkPointCopy.ThisTimeLineID
+			|| f->source_count != at)
+			return false;
+		for (uint64 j = 0; j < f->source_count; ++j) {
+			const ClusterRecoveryCheckpointFileSourceV2 *v = &f->sources[j];
+			const ClusterRecoveryCheckpointSourceV2 *source = &r->coverage.sources[v->source_index];
+			if (v->redo_start != source->redo_start || v->replay_end != source->replay_end)
+				return false;
+		}
+	}
+	return true;
+}
+
+static void
+creation_registry_current(const InitdbDirectory *global, const ClusterSharedConfigRef *config,
+						  const InitdbOrigin *origins, const ControlRootImage *root,
+						  const ClusterRecoveryRegistryV2 *r, Size budget, const uint8 *captured,
+						  Size length, const uint8 reference[128])
+{
+	if (!creation_registry_valid(config, origins, root, r, budget)
+		|| !cluster_recovery_registry_matches_v2(captured, length, r, reference)
+		|| !cluster_recovery_registry_read_v2(global->fd, r, reference, budget)
+		|| !cluster_recovery_registry_matches_v2(captured, length, r, reference))
+		refuse("original complete creation registration changed before ROOT publication");
+}
+
+/* Same creator, same source/derived revalidation and exclusive object writes.
+ * The optional complete managed registration is dormant until all original
+ * family producers supply it. Main continues to pass NULL, retaining its v3
+ * refusal for a managed child. No startup/admission/coverage authority escapes.
+ * FATAL terminates this dedicated creator; uncertain objects are never erased. */
+static void
+creation_root_publish(const PgracInitdbCohortContext *request, const ClusterSharedConfigRef *config,
+					  InitdbDirectory roots[4], InitdbOrigin *origins,
+					  const ClusterInitdbTree *data, const ClusterInitdbTree *undo,
+					  const InitdbDirectory *global, const InitdbDirectory *startups,
+					  const InitdbStartupObject objects[128], const ControlRootImage *root,
+					  const uint8 inputs[128][CLUSTER_WAL_STARTUP_BYTES],
+					  const ClusterRecoveryRegistryV2 *registration, Size registry_budget)
+{
+	const uint8 *selected = root->bytes;
+	Size selected_length = sizeof(root->bytes), registry_length = 0;
+	uint8 *registry_bytes = NULL, *managed_root = NULL;
+	uint8 reference[128], persisted[128];
+	struct stat backup;
+
+	if (registration) {
+		if (!creation_registry_valid(config, origins, root, registration, registry_budget)
+			|| !cluster_recovery_registry_size_v2(registration, registry_budget, &registry_length))
+			refuse("incomplete original creation registration");
+		registry_bytes = palloc(registry_length);
+		managed_root = palloc(66560);
+		if (!cluster_recovery_registry_encode_v2(registration, registry_bytes, registry_length,
+												 reference)
+			|| !cluster_control_root_registry_encode_v4(root, registration, reference, managed_root,
+														66560))
+			refuse("cannot encode original registered creation ROOT");
+		selected = managed_root;
+		selected_length = 66560;
+	} else
+		creation_legacy_format_current(origins);
+
+	creation_sources_current(request, config, roots, origins, data, undo, true);
+	creation_derived_current(global, startups, objects, root, inputs, NULL);
+	if (registration) {
+		if (!cluster_recovery_registry_create_v2(global->fd, registration, registry_budget,
+												 persisted)
+			|| memcmp(reference, persisted, sizeof(reference)))
+			refuse("cannot persist original complete creation registration");
+		creation_sources_current(request, config, roots, origins, data, undo, true);
+		creation_derived_current(global, startups, objects, root, inputs, NULL);
+		creation_registry_current(global, config, origins, root, registration, registry_budget,
+								  registry_bytes, registry_length, reference);
+	}
+	if (!cluster_initdb_object_write_observed(global->fd, "pgrac_control_root.bak", selected,
+											  selected_length, &backup))
+		refuse("cannot persist original backup ROOT");
+	creation_sources_current(request, config, roots, origins, data, undo, true);
+	creation_derived_current(global, startups, objects, root, inputs, NULL);
+	if (registration) {
+		creation_registry_current(global, config, origins, root, registration, registry_budget,
+								  registry_bytes, registry_length, reference);
+		/* Registry I/O cannot substitute for a final native-source check. */
+		creation_sources_current(request, config, roots, origins, data, undo, true);
+		creation_derived_current(global, startups, objects, root, inputs, NULL);
+		if (!creation_registry_valid(config, origins, root, registration, registry_budget)
+			|| !cluster_recovery_registry_matches_v2(registry_bytes, registry_length, registration,
+													 reference))
+			refuse("original creation input changed after registration readback");
+	}
+	if (!cluster_initdb_object_recheck(global->fd, "pgrac_control_root.bak", selected,
+									   selected_length, &backup))
+		refuse("original backup ROOT changed before primary publication");
+	if (!cluster_initdb_object_write_new(global->fd, "pgrac_control_root", selected,
+										 selected_length))
+		refuse("cannot persist original primary ROOT");
+	if (managed_root)
+		pfree(managed_root);
+	if (registry_bytes)
+		pfree(registry_bytes);
+}
+
 static void
 create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roots[4],
 					InitdbOrigin *origins, const ClusterSharedConfigRef *config,
-					const ClusterInitdbCommon *common, uint64 incarnation)
+					const ClusterInitdbCommon *common, uint64 incarnation,
+					const ClusterRecoveryRegistryV2 *registration, Size registry_budget)
 {
 	static const char origins_domain[] = "PGRAC-CREATION-ORIGINS-V1";
 	static const char cohort_domain[] = "PGRAC-CREATION-COHORT-V1";
@@ -1036,10 +1393,11 @@ create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roo
 	ControlRootCommonV2 *shared = &header->v2;
 	InitdbDirectory global, startups;
 	InitdbStartupObject *objects = palloc0(128 * sizeof(*objects));
-	struct stat backup;
 	pg_cryptohash_ctx *hash;
 	char name[112], hex[65];
 
+	if (registration == NULL)
+		creation_legacy_format_current(origins);
 	header->file_txn_seq = 1;
 	header->format_version = 3;
 	header->system_identifier = config->identity.system_identifier;
@@ -1156,16 +1514,8 @@ create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roo
 	}
 	if (fsync(startups.fd) != 0 || fsync(global.fd) != 0)
 		refuse("cannot persist original startup namespace");
-	creation_sources_current(request, config, roots, origins, &data, &undo, true);
-	creation_derived_current(&global, &startups, objects, root, inputs, NULL);
-	if (!cluster_initdb_object_write_observed(global.fd, "pgrac_control_root.bak", root->bytes,
-											  sizeof(root->bytes), &backup))
-		refuse("cannot persist original backup ROOT");
-	creation_sources_current(request, config, roots, origins, &data, &undo, true);
-	creation_derived_current(&global, &startups, objects, root, inputs, &backup);
-	if (!cluster_initdb_object_write_new(global.fd, "pgrac_control_root", root->bytes,
-										 sizeof(root->bytes)))
-		refuse("cannot persist original primary ROOT");
+	creation_root_publish(request, config, roots, origins, &data, &undo, &global, &startups,
+						  objects, root, inputs, registration, registry_budget);
 	directory_current(&global);
 	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
 		if (root->present[node] && close(objects[node].directory.fd) != 0)
@@ -1253,7 +1603,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
 		if (!(ref->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64))))
 			continue;
-		run_origin(initdb, &request, ref, roots[1].path, &origins[node], node);
+		run_origin(initdb, &request, ref, roots[1].path, &origins[node], node, NULL);
 		for (int i = 0; i < 4; i++)
 			directory_current(&roots[i]);
 	}
@@ -1280,7 +1630,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 			refuse("cannot persist original cohort directory entries");
 	}
 	request_current(&request, ref);
-	create_root_objects(&request, roots, origins, ref, &common, incarnation);
+	create_root_objects(&request, roots, origins, ref, &common, incarnation, NULL, 0);
 	printf("Shared cohort created; shared startup remains closed.\n");
 	exit(0);
 }
