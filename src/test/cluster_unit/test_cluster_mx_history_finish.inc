@@ -10,6 +10,7 @@ static bool finish_pending, finish_distinct_capabilities;
 static TransactionId finish_top;
 static ClusterTxOutcome finish_outcome;
 static bool finish_all_discarded, finish_successor_in_graph, finish_successor_fxid_drift;
+static bool finish_same_page_successor, finish_native_top_records;
 
 static uint32
 finish_crc(const void *data, size_t n)
@@ -90,8 +91,10 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	h.target_fork = r.target_fork;
 	h.target_block = r.target_block;
 	h.target_offset = r.target_offset;
-	if (index == 2)
+	if (index == 2 && !finish_same_page_successor)
 		h.target_block++; /* B may create a successor on another heap page. */
+	if (index == 2 && finish_same_page_successor)
+		h.target_offset++; /* Same-page B creates the captured successor. */
 	history.magic = UNDO_ITL_HISTORY_MAGIC;
 	history.version = UNDO_ITL_HISTORY_VERSION;
 	history.count = 1;
@@ -99,6 +102,8 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 												.slot_index = index,
 												.after_kind = ITL_FLAG_ACTIVE,
 												.after_write_scn = h.write_scn };
+	if (finish_native_top_records && index == 2)
+		history.entries[0].prior.wrap = 1;
 	op.version = UNDO_OPERATION_TRAILER_VERSION;
 	op.length = sizeof(op);
 	op.effect_state = index || finish_all_discarded ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED
@@ -111,11 +116,18 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 		op.operation_fxid += UINT64CONST(1) << 32;
 	op.command_id = 4;
 	op.subid = 3;
+	if (finish_native_top_records && index != 1) {
+		h.flags &= ~UNDO_REC_FLAG_HAS_OPERATION;
+		op.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+		op.operation_sequence = 0;
+	}
 	body = (char *)out->data + sizeof(bh) + sizeof(h);
 	memcpy(body, &insert, sizeof(insert));
 	memcpy(body + sizeof(insert), &history, sizeof(history));
 	memcpy(body + sizeof(insert) + sizeof(history), &op, sizeof(op));
 	h.payload_length = sizeof(insert) + sizeof(history) + sizeof(op);
+	if (!(h.flags & UNDO_REC_FLAG_HAS_OPERATION))
+		h.payload_length -= sizeof(op);
 	dir.record_offset = sizeof(bh);
 	dir.record_length = sizeof(h) + h.payload_length;
 	dir.record_type = h.record_type;
@@ -126,6 +138,8 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	memcpy(out->data + BLCKSZ - sizeof(dir), &dir, sizeof(dir));
 	peer.flags = CLUSTER_MX_HISTORY_ORDERED;
 	peer.record_class = CMXH_OPERATION;
+	if (!(h.flags & UNDO_REC_FLAG_HAS_OPERATION))
+		peer.record_class = CMXH_V1_TOP;
 	peer.outcome = finish_outcome;
 	peer.effect = op.effect_state;
 	peer.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
@@ -179,6 +193,7 @@ finish_sources(void)
 	finish_outcome = CLUSTER_TX_COMMITTED;
 	finish_all_discarded = false;
 	finish_successor_in_graph = finish_successor_fxid_drift = false;
+	finish_same_page_successor = finish_native_top_records = false;
 	memset(finish_keys, 0xa5, sizeof(finish_keys));
 	memset(finish_proofs, 0xa5, sizeof(finish_proofs));
 }

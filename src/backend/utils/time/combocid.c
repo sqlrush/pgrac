@@ -90,6 +90,31 @@ static CommandId GetComboCommandId(CommandId cmin, CommandId cmax);
 static CommandId GetRealCmin(CommandId combocid);
 static CommandId GetRealCmax(CommandId combocid);
 
+#ifdef USE_PGRAC_CLUSTER
+bool
+cluster_combo_cmax_local(HeapTupleHeader tuple, CommandId *cmax)
+{
+	CommandId cid;
+
+	if (cmax == NULL)
+		return false;
+	*cmax = InvalidCommandId;
+	if (tuple == NULL || (tuple->t_infomask & HEAP_MOVED))
+		return false;
+	cid = HeapTupleHeaderGetRawCommandId(tuple);
+	if (tuple->t_infomask & HEAP_COMBOCID) {
+		if (comboCids == NULL || usedComboCids <= 0 || sizeComboCids < usedComboCids
+			|| cid >= (CommandId)usedComboCids)
+			return false;
+		cid = comboCids[cid].cmax;
+	}
+	if (cid == InvalidCommandId)
+		return false;
+	*cmax = cid;
+	return true;
+}
+#endif
+
 
 /**** External API ****/
 

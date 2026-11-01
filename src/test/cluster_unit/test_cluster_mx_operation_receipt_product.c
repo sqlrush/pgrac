@@ -3,6 +3,37 @@
 #include "../../backend/access/heap/heapam.c"
 #include "test_cluster_mx_operation_receipt.h"
 static ClusterCurrentMxHeapResult receipt_result;
+ClusterMxHistoryStep
+mx_history_collect(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	const ClusterSemanticAdmissionToken *admission, const ClusterCurrentMxKey *key,
+	const ClusterCurrentMxMemberDesc *members, uint16 count,
+	const ClusterCurrentMxRequestContext *requested, ClusterCurrentMxDecision *decision,
+	MxHeapReadout *out)
+{
+	ClusterCurrentMxOperationState operation = { 0 };
+	ClusterMxHistoryStep step;
+	operation.operation_id = 900;
+	operation.restarts = 4;
+	memset(out, 0, sizeof(*out));
+	memset(&receipt_result, 0xa5, sizeof(receipt_result));
+	memset(&out->wait_key, 0xa5, sizeof(out->wait_key));
+	step = cluster_current_mx_history_decide(rel, buffer, tuple, actual, admission,
+		key, members, count, requested, &operation, &receipt_result, decision,
+		&out->wait_key, &out->trace);
+	memcpy(out->retained.normalized, receipt_result.normalized, sizeof(out->retained.normalized));
+	memcpy(out->retained.proofs, receipt_result.proofs, sizeof(out->retained.proofs));
+	memcpy(out->retained.capabilities, receipt_result.proof_capability_generations,
+		sizeof(out->retained.capabilities));
+	out->retained.normalized_count = receipt_result.normalized_count;
+	out->retained.proof_count = receipt_result.proof_count;
+	out->retained.operation_id = receipt_result.operation_id;
+	out->retained.attempt_generation = receipt_result.attempt_generation;
+	out->result = receipt_result.result;
+	out->authoritative_updater = receipt_result.authoritative_updater;
+	out->follow_updated_chain = receipt_result.follow_updated_chain;
+	out->successor = receipt_result.successor_proof;
+	return step;
+}
 ClusterCurrentMxDecision
 mx_receipt_decide(const ClusterCurrentMxMemberDesc *members,
 	const ClusterSavepointOperationKey *keys, const ClusterCurrentMemberOperationProof *proofs,

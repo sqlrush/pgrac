@@ -20,8 +20,15 @@ typedef struct MxHeapReadout {
 	bool follow_updated_chain;
 	ClusterHeapSuccessorProof successor;
 	ClusterTTStatusKey wait_key;
+	ClusterCurrentMxDecisionTrace trace;
 } MxHeapReadout;
 struct ClusterR4CrOwnerChallenge;
+#include "cluster/cluster_mx_history.h"
+ClusterMxHistoryStep mx_history_collect(Relation rel, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, const ClusterSemanticAdmissionToken *admission,
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 count,
+	const ClusterCurrentMxRequestContext *requested, ClusterCurrentMxDecision *decision,
+	MxHeapReadout *out);
 ClusterCurrentMxDecision mx_receipt_decide(
 	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,
 	const ClusterCurrentMemberOperationProof *proofs, const uint32 *capabilities, uint16 count,

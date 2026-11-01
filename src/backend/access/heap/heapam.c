@@ -80,8 +80,10 @@
 #include "storage/spin.h"
 #include "storage/standby.h"
 #include "utils/datum.h"
+#include "utils/combocid.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/spccache.h"
@@ -102,6 +104,7 @@
 #include "cluster/cluster_gcs_block.h" /* ACTIVE local writer ledger */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
 #include "cluster/cluster_multixact_current.h" /* current-DML authority */
+#include "cluster/cluster_mx_history.h"
 #include "cluster/cluster_multixact_current_stats.h" /* authority counters */
 #include "cluster/cluster_mxid_stripe.h" /* derived-own guard for local pg_multixact decode */
 #include "cluster/cluster_pcm_x_bufmgr.h" /* tuple/PCM ABA fingerprint */
@@ -8961,6 +8964,173 @@ cluster_current_mx_hot_capture_still_exact(
 		&& (read_only
 			? cluster_current_mx_read_capture_equal(expected, &live)
 			: cluster_current_mx_capture_equal(expected, &live));
+}
+
+/* Private staging only; the complete requester family selects this bridge
+ * together. Fixed batch storage is allocated outside critical sections. */
+typedef struct ClusterCurrentMxHistoryBatch
+{
+	ClusterMxHistoryCollector *collector;
+	ClusterMxHistoryCapture capture;
+	ClusterSavepointOperationKey *keys;
+	ClusterCurrentMemberOperationProof *proofs;
+	uint32 *capabilities;
+	ClusterCurrentUpdaterChallenge challenge;
+	ClusterCurrentUpdaterChallenge fresh_challenge;
+	ClusterCurrentUpdaterProof updater;
+	ClusterCurrentMxHeapFingerprint candidate;
+	ClusterCurrentMxRequestContext ctx;
+	ItemPointerData successor;
+} ClusterCurrentMxHistoryBatch;
+
+/* Complete capture -> unlock -> wait -> relock -> typed consume bracket.
+ * Caller passes its actual live Snapshot, immutable descriptor and native
+ * request options. Its input top/CID/shape values supply no authority. Normal
+ * returns preserve the original EXCLUSIVE lock; ERROR uses native cleanup.
+ * Deployed callers remain unchanged until whole-family activation. */
+static ClusterMxHistoryStep pg_attribute_unused()
+cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, const ClusterSemanticAdmissionToken *admission,
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *requested, const ClusterCurrentMxOperationState *operation,
+	ClusterCurrentMxHeapResult *heap_result, ClusterCurrentMxDecision *decision,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+{
+	ClusterCurrentMxHistoryBatch *batch;
+	volatile ClusterMxHistoryStep step = CMXH_UNKNOWN;
+	Size batch_bytes, key_bytes, proof_bytes;
+	int updater = -1;
+	bool have_challenge;
+
+	if (decision != NULL)
+		*decision = CMDL_UNKNOWN;
+	if (wait_key != NULL)
+		memset(wait_key, 0, sizeof(*wait_key));
+	if (trace != NULL) {
+		trace->unknown_reason = CMX_UNKNOWN_PROOF_ENTRY;
+		trace->member_ordinal = -1;
+	}
+	if (heap_result == NULL)
+		return CMXH_UNKNOWN;
+	memset(heap_result, 0, sizeof(*heap_result));
+	heap_result->result = TM_BeingModified;
+	if (CritSectionCount != 0 || relation == NULL || tuple == NULL || tuple->t_data == NULL
+		|| actual == NULL || key == NULL || members == NULL || nmembers == 0
+		|| nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS || requested == NULL
+		|| operation == NULL || operation->operation_id == 0 || operation->restarts == UINT32_MAX
+		|| decision == NULL || wait_key == NULL || buffer <= 0 || buffer > NBuffers
+		|| !BufferIsPinnedByMe(buffer) || TopTransactionContext == NULL
+		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
+			LW_EXCLUSIVE))
+		return CMXH_UNKNOWN;
+	for (uint16 i = 0; i < nmembers; i++) {
+		if (ISUPDATE_from_mxstatus(members[i].member_status)) {
+			if (updater >= 0)
+				return CMXH_UNKNOWN;
+			updater = i;
+		}
+	}
+	key_bytes = MAXALIGN(nmembers * sizeof(*batch->keys));
+	proof_bytes = MAXALIGN(nmembers * sizeof(*batch->proofs));
+	batch_bytes = MAXALIGN(sizeof(*batch)) + key_bytes + proof_bytes
+		+ nmembers * sizeof(*batch->capabilities);
+	batch = MemoryContextAllocExtended(TopTransactionContext, batch_bytes, MCXT_ALLOC_NO_OOM);
+	if (batch == NULL)
+		return CMXH_UNKNOWN;
+	memset(batch, 0, batch_bytes);
+	batch->keys = (ClusterSavepointOperationKey *)((char *)batch + MAXALIGN(sizeof(*batch)));
+	batch->proofs = (ClusterCurrentMemberOperationProof *)((char *)batch->keys + key_bytes);
+	batch->capabilities = (uint32 *)((char *)batch->proofs + proof_bytes);
+	PG_TRY();
+	{
+		do {
+			ClusterMxHistoryStep collected;
+			ClusterCurrentMxDecision probe;
+			ClusterTTStatusKey probe_wait;
+
+			have_challenge = updater >= 0
+				&& !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask)
+				&& !ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid);
+			batch->successor = tuple->t_data->t_ctid;
+			if (have_challenge && !cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
+					members[updater].xid, (uint16)updater, &batch->challenge, &batch->candidate, false))
+				break;
+			if (have_challenge) {
+				if (!cluster_mx_history_capture_begin_with_updater(relation, buffer, tuple, actual,
+						key, members, nmembers, admission, &batch->challenge, &batch->collector))
+					break;
+			} else if (!cluster_mx_history_capture_begin(relation, buffer, tuple, actual,
+					key, members, nmembers, admission, &batch->collector))
+				break;
+			if (!cluster_mx_history_capture_read(batch->collector, &batch->capture))
+				break;
+			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			collected = cluster_mx_history_wait(batch->collector);
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			if (collected != CMXH_COMPLETE) {
+				step = collected == CMXH_REQUALIFY ? CMXH_REQUALIFY : CMXH_UNKNOWN;
+				break;
+			}
+			if (have_challenge) {
+				ClusterCurrentMxHeapFingerprint fresh;
+				if (!cluster_current_mx_hot_capture_still_exact(buffer, relation,
+						&batch->successor, &batch->candidate, false)
+					|| !cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
+						members[updater].xid, (uint16)updater, &batch->fresh_challenge, &fresh, false)) {
+					step = CMXH_REQUALIFY;
+					break;
+				}
+			}
+			collected = cluster_mx_history_recheck_and_finish_for_receipts(batch->collector,
+				relation, buffer, tuple, key, members, nmembers, batch->keys, batch->proofs,
+				batch->capabilities, nmembers, have_challenge ? &batch->fresh_challenge : NULL,
+				&batch->updater);
+			if (collected != CMXH_COMPLETE) {
+				step = collected == CMXH_REQUALIFY ? CMXH_REQUALIFY : CMXH_UNKNOWN;
+				break;
+			}
+			batch->ctx = *requested;
+			batch->ctx.mxkey = *key;
+			batch->ctx.top_xid = XidFromFullTransactionId(GetTopFullTransactionIdIfAny());
+			batch->ctx.curcid = GetCurrentCommandId(false);
+			batch->ctx.tuple_cmax = InvalidCommandId;
+			batch->ctx.precheck_result = TM_BeingModified;
+			batch->ctx.tuple_shape = HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask)
+				? CCM_SHAPE_LOCK_ONLY : have_challenge ? CCM_SHAPE_UPDATED : CCM_SHAPE_DELETED;
+			batch->ctx.updater_origin_node_id = updater < 0 ? -1
+				: cluster_xid_origin_slot(members[updater].xid);
+			/* A complete typed probe with neutral precheck can report SELF_MODIFIED
+			 * only for an exact owned live updater. Do not decode any raw/foreign
+			 * combo ID, or use native GetCmax's raw MultiXact assertion lookup. */
+			probe = cluster_multixact_current_decide_operations(members, batch->keys, batch->proofs,
+				nmembers, &batch->ctx, &batch->capture.requester_owner,
+				have_challenge ? &batch->fresh_challenge : NULL, &batch->updater, &probe_wait, trace);
+			if (probe == CMDL_UNKNOWN)
+				break;
+			if (probe == CMDL_SELF_MODIFIED
+				&& !cluster_combo_cmax_local(tuple->t_data, &batch->ctx.tuple_cmax)) {
+				if (trace != NULL) {
+					trace->unknown_reason = CMX_UNKNOWN_REQUEST_CONTEXT;
+					trace->member_ordinal = updater;
+				}
+				break;
+			}
+			*decision = cluster_current_mx_result_consume_operations(heap_result, members,
+				batch->keys, batch->proofs, batch->capabilities, nmembers, &batch->ctx,
+				&batch->capture.requester_owner, have_challenge ? &batch->fresh_challenge : NULL,
+				&batch->updater, have_challenge ? &batch->successor : NULL, operation, wait_key, trace);
+			if (*decision != CMDL_UNKNOWN)
+				step = CMXH_COMPLETE;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		/* The last typed/receipt consumer runs while the native lease is held. */
+		cluster_mx_history_cancel(batch->collector);
+		pfree(batch);
+	}
+	PG_END_TRY();
+	return step;
 }
 
 /*

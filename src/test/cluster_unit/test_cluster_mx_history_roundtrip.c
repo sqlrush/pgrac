@@ -425,11 +425,13 @@ UT_TEST(collector_independent_B_reaches_heap_follow_and_updated_decisions)
 		}
 }
 
+#include "test_cluster_mx_history_heap_bridge.inc"
+
 int
 main(void)
 {
 	history_fixture_init();
-	UT_PLAN(12);
+	UT_PLAN(20);
 	UT_RUN(collector_wire_and_consumers_preserve_disposition);
 	UT_RUN(late_grant_corruption_rejects_whole_collector_batch);
 	UT_RUN(original_relock_gate_prevents_wire_publication);
@@ -443,6 +445,14 @@ main(void)
 	UT_RUN(collector_batch_drives_heap_decision_and_original_capability_retention);
 	UT_RUN(collector_independent_B_reaches_heap_follow_and_updated_decisions);
 	free(procArray);
+	UT_RUN(heap_bridge_native_capture_wait_relock_receipts);
+	UT_RUN(heap_bridge_native_conflict_policy_and_wait_key);
+	UT_RUN(heap_bridge_relock_drift_scrubs_whole_attempt);
+	UT_RUN(heap_bridge_invalid_scope_never_acquires_history);
+	UT_RUN(heap_bridge_wait_ERROR_releases_snapshot);
+	UT_RUN(heap_bridge_exact_owner_before_local_combo_decode);
+	UT_RUN(heap_bridge_checked_combo_bounds_and_plain_cmax);
+	UT_RUN(heap_bridge_native_successor_recheck);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
