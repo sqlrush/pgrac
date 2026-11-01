@@ -330,10 +330,58 @@ sub run_full_preflight_cancellations
 	}
 }
 
+sub wait_preflight_retirement
+{
+	my ($name, $entry, $offset) = @_;
+	my $deadline = clock_gettime(CLOCK_MONOTONIC) + 30;
+	my $sample;
+	my $first = 1;
+	while (clock_gettime(CLOCK_MONOTONIC) < $deadline)
+	{
+		$sample = empty_observation($entry);
+		save_json("$name-retirement-first", $sample) if $first;
+		$first = 0;
+		if ($sample->{snapshot}{available})
+		{
+			my @slots = grep { $_->{offset} == $offset } @{$sample->{snapshot}{slots}};
+			return $sample if @slots == 1 && $slots[0]{status} == 0;
+		}
+		sleep(0.03);
+	}
+	save_json("$name-retirement-last", $sample);
+	die "NOT_REACHED $name: original waiter slot cleanup did not finish\n";
+}
+
+sub resume_full_preflight
+{
+	my ($name, $mode, $owners, $chosen, $waiter, $blocked, $case) = @_;
+	my ($original) = grep { $_->{pid} == $chosen->{pid} } @{$blocked->{before}{bindings}};
+	die 'selected owner has no original binding' unless defined($original);
+	end_owner($chosen, $mode eq 'commit' ? 'COMMIT' : 'ROLLBACK');
+	push @expected, "$chosen->{table}|$chosen->{trial}" if $mode eq 'commit';
+	my $trigger = $case->[0] eq 'statement_trigger_error';
+	my $first = empty_statement("$name-first", $waiter, undef, $trigger);
+	my $repeated = $trigger ? undef : empty_statement("$name-repeated", $waiter, $case->[1], 0);
+	end_owner($waiter, $trigger || $mode eq 'abort' ? 'ROLLBACK' : 'COMMIT');
+	my $after = wait_preflight_retirement($name, $waiter, $original->{slot_offset});
+	my $data_sql = q{SELECT 'data',id,value FROM g_empty_undo }
+	  . q{UNION ALL SELECT 'trigger',id,value FROM g_empty_trigger ORDER BY 1,2};
+	my $sample = {kind => $case->[0], mode => $mode, blocked => $blocked,
+		first => $first, repeated => $repeated, after => $after,
+		remaining => [map { binding($_) } grep { $_->{pid} != $chosen->{pid} } @$owners],
+		data => [map { $_->safe_psql('postgres', $data_sql, timeout => 30) } @nodes]};
+	save_json("$name-resume-input", $sample);
+	my $result = evaluate_sample($sample, 'full_preflight_resume.py');
+	save_json("$name-resume-result", $result);
+	die "NOT_REACHED $name: $result->{reason}\n" unless $result->{passed};
+	pass("$name: full-slot caller resumes and retires the exact original slot");
+}
+
 sub run_case
 {
-	my ($mode, $trial) = @_;
+	my ($mode, $trial, $case) = @_;
 	my $name = "$trial-$mode";
+	$name .= "-$case->[0]" if defined($case);
 	# Existing cleaner GC must finish before owners can pin the old horizon.
 	my $idle = wait_idle($name);
 	my @owners;
@@ -355,6 +403,8 @@ sub run_case
 	die 'the selected slot has no actual owner session' unless defined($chosen);
 	my $old_counters = counters();
 	my $waiter = open_session("g_slot_${mode}_waiter");
+	$waiter->{client}->query_safe("\\set VERBOSITY verbose\nSET client_min_messages=notice")
+	  if defined($case);
 	if ($mode eq 'cancel')
 	{
 		# Reuse this cohort and backend; every cancelled preflight keeps all48 owners.
@@ -365,7 +415,9 @@ sub run_case
 	$waiter->{transaction} = 1;
 	$waiter->{xid} = 0 + $waiter->{client}->query_safe('BEGIN; SELECT pg_current_xact_id()::text');
 	$waiter->{pending} = 1;
-	my $sent = $waiter->{client}->query_until(qr/G_SLOT_SENT\r?\n/,
+	my $sent = defined($case) ? $waiter->{client}->query_until(qr/G_SLOT_SENT\r?\n/,
+		"\\echo G_SLOT_SENT\n$case->[1]\n\\echo G_EMPTY_SQLSTATE :SQLSTATE\n")
+	  : $waiter->{client}->query_until(qr/G_SLOT_SENT\r?\n/,
 		"\\echo G_SLOT_SENT\nINSERT INTO g_slot_heap_48 VALUES($trial);\n\\echo G_SLOT_SQLSTATE :SQLSTATE\n");
 	save_json("$name-sent", {output => $sent, pid => $waiter->{pid}, xid => $waiter->{xid}});
 	my $wait_activity = wait_witness($name, $waiter);
@@ -374,7 +426,11 @@ sub run_case
 		waiter_pid => $waiter->{pid}, waiter_xid => $waiter->{xid}, activity => $wait_activity,
 		locks => lock_rows($waiter->{pid}, $chosen->{pid})};
 	judge("$name-blocked", $blocked);
-	if ($mode eq 'cancel')
+	if (defined($case))
+	{
+		resume_full_preflight($name, $mode, \@owners, $chosen, $waiter, $blocked, $case);
+	}
+	elsif ($mode eq 'cancel')
 	{
 		cancel_waiter($name, \@owners, $waiter, $before, $old_counters);
 	}
@@ -403,7 +459,8 @@ sub empty_statement
 {
 	my ($name, $entry, $sql, $trigger) = @_;
 	my ($out, $error) = $entry->{client}->query(
-		"$sql\n\\echo G_EMPTY_SQLSTATE :SQLSTATE\n");
+		defined($sql) ? "$sql\n\\echo G_EMPTY_SQLSTATE :SQLSTATE\n" : '');
+	$entry->{pending} = 0 unless defined($sql);
 	my $stderr = $entry->{client}{stderr};
 	save_json("$name-statement", {output => $out, error => $error, stderr => $stderr});
 	my @states = $out =~ /^G_EMPTY_SQLSTATE ([A-Z0-9]{5})\r?$/mg;
@@ -500,6 +557,24 @@ SQL
 	run_empty_case('explain_only', 'commit', 'EXPLAIN UPDATE g_empty_undo SET value=999 WHERE false;');
 }
 
+sub run_full_preflight_resumes
+{
+	my @cases = (
+		['zero_update', 'UPDATE g_empty_undo SET value=999 WHERE false;'],
+		['empty_copy', "COPY g_empty_undo FROM STDIN;\n\\.\n"],
+		['conflict_nothing', 'INSERT INTO g_empty_undo VALUES(1,999) ON CONFLICT(id) DO NOTHING;'],
+		['zero_row_lock', 'SELECT * FROM g_empty_undo WHERE false FOR UPDATE;'],
+		['statement_trigger_error', 'UPDATE g_empty_trigger SET value=999 WHERE false;']);
+	my $trial = 100;
+	for my $case (@cases)
+	{
+		for my $mode (qw(commit abort))
+		{
+			run_case($mode, $trial++, $case);
+		}
+	}
+}
+
 my $execution = eval {
 	$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('undo_active_slots', nodes => 4,
 		blackbox => 1, required_operations => [], extra_conf => ['autovacuum=off',
@@ -523,6 +598,7 @@ my $execution = eval {
 	run_case('commit', 1);
 	run_case('abort', 2);
 	run_case('cancel', 3);
+	run_full_preflight_resumes();
 	1;
 };
 my $first_error = $execution ? '' : $@;
