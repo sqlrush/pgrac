@@ -215,6 +215,8 @@ static void write_relmap_file(RelMapFile *newmap, bool write_wal,
 							  Oid dbid, Oid tsid, const char *dbpath);
 static void perform_relmap_update(bool shared, const RelMapFile *updates);
 #ifdef USE_PGRAC_CLUSTER
+static void cluster_copy_relmap_from_control(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath,
+											 Oid srcdbid, Oid srctsid);
 static bool relmap_control_update_batch_v2(bool is_parallel_worker);
 #endif
 
@@ -364,6 +366,15 @@ RelationMapCopy(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath,
 				Oid srcdbid, Oid srctsid)
 {
 	RelMapFile	map;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* A managed source cannot be copied into a legacy target. Select the
+	 * format before even reading the source, under X -> CF -> MappingLock. */
+	if (cluster_shared_config && !IsBootstrapProcessingMode()) {
+		cluster_copy_relmap_from_control(dbid, tsid, srcdbpath, dstdbpath, srcdbid, srctsid);
+		return;
+	}
+#endif
 
 	/*
 	 * Read the relmap file from the source database.
@@ -1795,6 +1806,83 @@ relmap_writer_cf_enter_v2(bool *owned)
 		*owned = true;
 	}
 	return true;
+}
+
+/* PGRAC: keep the original creation operation under one selected control
+ * format. Managed targets require the original owner's independent creation
+ * batch; without that input, refuse before source I/O or a legacy target effect.
+ * Spec: 2026-11-01-pre2-e1-format-closure-v1.2-path-c.md */
+static void
+cluster_copy_relmap_from_control(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath, Oid srcdbid,
+								 Oid srctsid)
+{
+	ClusterControlRelmapFormatV2 before, after;
+	RelMapFile map;
+	volatile bool owned_cf = false;
+	volatile bool local_operation = false;
+	bool owned_x = !cluster_relmap_authority_x_held();
+
+	PG_TRY();
+	{
+		if (!relmap_writer_cf_enter_v2((bool *)&owned_cf))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+							errmsg("relation map copy requires X then CF before MappingLock")));
+		if (cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &before)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+							errmsg("relation map copy has no complete control-selected format")));
+		if (before.root_version != 3)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+					 errmsg("relation map copy requires the registered target creation batch")));
+
+		/* Exact legacy ROOT only; the unchanged reader borrows this CF.
+		 * Never release/reselect control between source and target. */
+		local_operation = true;
+		read_relmap_file(&map, srcdbpath, false, ERROR, srcdbid, srctsid);
+		LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+		write_relmap_file(&map, true, false, false, dbid, tsid, dstdbpath);
+		LWLockRelease(RelationMappingLock);
+		if (cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &after)
+				!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| memcmp(&before, &after, sizeof(before)))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+							errmsg("relation map control input changed during copy")));
+		if (owned_cf) {
+			/* Latch before the fallible release: an unconfirmed S6 is not
+			 * retried from ERROR cleanup. Original X/creation debt remains. */
+			owned_cf = false;
+			if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+								errmsg("relation map copy control release is unconfirmed")));
+		}
+		if (owned_x)
+			cluster_relmap_authority_x_unlock();
+	}
+	PG_CATCH();
+	{
+		/* Entry forbids an inherited MappingLock. The original reader or
+		 * writer can leave ours held on ERROR; release it before CF. Keep
+		 * singleton X for the original abort/creation owner, never cancel
+		 * registration or release another owner's inherited CF. */
+		HOLD_INTERRUPTS();
+		PG_TRY();
+		{
+			if (local_operation && LWLockHeldByMe(RelationMappingLock))
+				LWLockRelease(RelationMappingLock);
+			if (owned_cf) {
+				owned_cf = false;
+				(void)cluster_cf_unlock_confirmed(ShareLock);
+			}
+		}
+		PG_FINALLY();
+		{
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static bool

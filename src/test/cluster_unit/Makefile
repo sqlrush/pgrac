@@ -15979,6 +15979,31 @@ clean-relmap-writer:
 clean: clean-relmap-writer
 .PHONY: clean-relmap-writer
 
+# The original cross-database entry must not emit legacy files from managed maps.
+TESTS += test_cluster_relmap_copy_control
+all: test_cluster_relmap_copy_control
+test_cluster_relmap_copy_control_entries.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
+	awk '/^RelationMapCopy\(/ { print "void"; emit=1; n++ } /^relmap_writer_cf_enter_v2\(/ { print "static bool"; emit=1; n++ } /^cluster_copy_relmap_from_control\(/ { print "static void"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_relmap_copy_control: test_cluster_relmap_copy_control.c unit_test.h \
+		test_cluster_relmap_copy_control_entries.inc \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_control.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_guc.h \
+		$(top_srcdir)/src/include/storage/lwlock.h \
+		$(top_srcdir)/src/include/miscadmin.h \
+		$(top_srcdir)/src/include/utils/memutils.h \
+		$(top_srcdir)/src/include/utils/relmapper.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean: clean-relmap-copy-control
+.PHONY: clean-relmap-copy-control
+clean-relmap-copy-control:
+	rm -f test_cluster_relmap_copy_control test_cluster_relmap_copy_control.d \
+		test_cluster_relmap_copy_control_entries.inc test_cluster_relmap_copy_control_entries.inc.tmp
+
 # The native/ROOT observation family consumes the shared managed WAL codec.
 RELMAP_WAL_OBSERVER_TESTS = test_cluster_recovery_final_namespace \
         test_cluster_recovery_native_roots test_cluster_recovery_native_scan \
