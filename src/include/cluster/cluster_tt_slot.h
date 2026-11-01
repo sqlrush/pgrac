@@ -425,6 +425,13 @@ extern bool cluster_tt_slot_origin_identity_retain(
 	const struct ClusterCtrcOriginReservation *reservation);
 extern bool cluster_tt_slot_origin_identity_read(const struct ClusterCtrcTxnKeyV1 *key,
 											   FullTransactionId *out);
+/* Read-only terminal candidate from the original CURRENT slot provenance.
+ * Outputs are zeroed when unavailable. No terminal/release/reuse authority. */
+#define CLUSTER_TT_SLOT_CURRENT_ORIGIN_SNAPSHOT_V1 1
+extern bool cluster_tt_slot_current_origin_snapshot(uint32 segment_id, uint16 slot_offset,
+													struct ClusterCtrcTxnKeyV1 *key,
+													ClusterTTSlotCurrentOwner *owner,
+													uint64 *binding_generation);
 extern void cluster_tt_slot_rollover(int node_id, uint32 new_segment_id, bool *out_old_had_active);
 
 
