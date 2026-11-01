@@ -21,6 +21,9 @@ typedef struct RangeOwned {
 	ResourceOwner owner;
 	ClusterMxCompositionReceive *op;
 	ClusterKoDirectoryIoV3 io;
+	ClusterCurrentMxKey key;
+	uint64 system_identifier;
+	uint32 loaded_catalog, peer_generation;
 } RangeOwned;
 
 typedef struct RangeServiceCheck {
@@ -80,6 +83,17 @@ range_owned_begin(void)
 	owned->next = range_owned;
 	range_owned = owned;
 	return owned;
+}
+
+static bool
+range_owned_current(const RangeOwned *owned)
+{
+	return owned->key.cluster_epoch == cluster_epoch_get_current()
+		&& owned->system_identifier == GetSystemIdentifier()
+		&& owned->loaded_catalog == GetControlFileCatalogVersion()
+		&& cluster_sf_peer_foreign_mx_capability_matches_v1(owned->key.origin_node_id,
+			CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1,
+			owned->loaded_catalog, owned->peer_generation);
 }
 
 static bool
@@ -232,7 +246,16 @@ cluster_multixact_current_proofs_accept(ClusterMxCompositionReceive **op,
 	}
 	PG_TRY();
 	{
-		result = cluster_mx_composition_accept_proofs(&owned->op, status, reply);
+		/* Preserve the original acquisition through every provisional proof
+		 * window, including allocation and the last append. These local
+		 * checks do not replace member grants or the caller's tuple fence. */
+		if (!range_owned_current(owned))
+			result = cluster_mx_composition_accept_proofs(&owned->op, MXCOMP_READ_RETRY, NULL);
+		else {
+			result = cluster_mx_composition_accept_proofs(&owned->op, status, reply);
+			if (result != MXCOMP_UNKNOWN && !range_owned_current(owned))
+				result = cluster_mx_composition_accept_proofs(&owned->op, MXCOMP_READ_RETRY, NULL);
+		}
 	}
 	PG_CATCH();
 	{
@@ -278,6 +301,10 @@ cluster_multixact_current_describe_full(const ClusterCurrentMxKey *key,
 	request.route.requester_backend = MyBackendId;
 	PG_TRY();
 	{
+		owned->key = *key;
+		owned->system_identifier = GetSystemIdentifier();
+		owned->loaded_catalog = GetControlFileCatalogVersion();
+		owned->peer_generation = generation;
 		for (;;) {
 			ClusterMxRangeRoute route;
 			BufferTag tag;

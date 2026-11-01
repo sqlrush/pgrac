@@ -4,12 +4,18 @@ int k_service_component_main(void);
 #define main k_service_component_main
 #define LWLockAcquire k_native_lock_acquire
 #define LWLockRelease k_native_lock_release
+#define MemoryContextAllocZero k_proof_original_alloc_zero
+#define GetControlFileCatalogVersion k_proof_original_catalog
 #define cluster_gcs_current_mx_range_fetch_and_wait k_controlled_range_transport
 #include "test_k_mx_g5_service.c"
 #undef cluster_gcs_current_mx_range_fetch_and_wait
 #undef LWLockAcquire
 #undef LWLockRelease
+#undef MemoryContextAllocZero
+#undef GetControlFileCatalogVersion
 #undef main
+void *MemoryContextAllocZero(MemoryContext context, Size size);
+uint32 GetControlFileCatalogVersion(void);
 bool LWLockAcquire(LWLock *lock, LWLockMode mode);
 void LWLockRelease(LWLock *lock);
 bool cluster_gcs_current_mx_range_fetch_and_wait(ClusterMxRangeRequest *request,
@@ -31,6 +37,46 @@ static unsigned late_fault, late_at;
 static bool late_fired;
 static uint32 first_history[8];
 static uint64 request_history[8];
+static unsigned proof_allocation_fault;
+static bool proof_allocation_fired, proof_catalog_error;
+static uint32 proof_catalog_delta;
+
+static void
+proof_drift(unsigned kind)
+{
+	switch (kind) {
+	case 1: native_epoch++; break;
+	case 2: service_system++; break;
+	case 3: connection_generation++; break;
+	case 4: capability_ok = false; break;
+	case 5: proof_catalog_delta++; break;
+	case 6: proof_catalog_error = true; break;
+	default: abort();
+	}
+}
+
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	void *result = k_proof_original_alloc_zero(context, size);
+	/* Keep the real G2 allocation/append path. Only its slow allocator leaf
+	 * schedules a change after allocation and before the owner returns. */
+	if (proof_allocation_fault && size == sizeof(ClusterMxCompositionProofPage)) {
+		unsigned kind = proof_allocation_fault;
+		proof_allocation_fault = 0;
+		proof_allocation_fired = true;
+		proof_drift(kind);
+	}
+	return result;
+}
+
+uint32
+GetControlFileCatalogVersion(void)
+{
+	if (proof_catalog_error)
+		pg_re_throw();
+	return k_proof_original_catalog() + proof_catalog_delta;
+}
 
 void *ShmemInitStruct(const char *name,Size size,bool *found)
 {
@@ -147,6 +193,8 @@ static void chain_seed(uint32 count,uint32 start)
 	gcs_locks=requests_sent=replies_sent=wakes=fault=0;previous_request_id=0;
 	late_fault=late_at=0;late_fired=false;memset(first_history,0,sizeof(first_history));
 	memset(request_history,0,sizeof(request_history));
+	proof_allocation_fault = proof_catalog_delta = 0;
+	proof_allocation_fired = proof_catalog_error = false;
 	cluster_multixact_current_stats_shmem_init();
 }
 static void chain_clean(void)
@@ -395,11 +443,144 @@ caller_proof_windows_keep_original_owner(void)
 	}
 }
 
+static ClusterMxProofReply
+proof_window(uint32 total, uint32 first, ClusterMxFullMemberProof *entries)
+{
+	ClusterMxProofReply reply = { 0 };
+	uint32 count = Min(total - first, 7);
+	reply.source = &proof_source;
+	reply.source_bytes = sizeof(proof_source);
+	reply.total = total; reply.first = first; reply.count = count;
+	reply.next = first + count; reply.last = reply.next == total;
+	reply.proofs = entries; reply.proof_bytes = count * sizeof(*entries);
+	reply.frame_bytes = 208 + reply.proof_bytes;
+	for (uint32 i = 0; i < count; i++) {
+		memset(&entries[i], 0, sizeof(entries[i]));
+		entries[i].member_ordinal = first + i;
+		entries[i].proof.member_xid = 100 + first + i;
+		entries[i].proof.member_status = MultiXactStatusForShare;
+		entries[i].proof.member_ordinal = i;
+		entries[i].proof.state = CCM_COMMITTED;
+		entries[i].proof.commit_scn = 1000 + first + i;
+	}
+	return reply;
+}
+
+static void
+proof_scope_drift(bool during, bool error)
+{
+	static ClusterMxCompositionReceive *op;
+	static ClusterMxCompositionReceiveStats stats;
+	const uint32 sizes[] = { 2, 257 };
+	for (unsigned s = 0; s < lengthof(sizes); s++)
+		for (unsigned tail = 0; tail < 2; tail++)
+			for (unsigned kind = error ? 6 : 1; kind <= (error ? 6 : 5); kind++) {
+				ClusterCurrentMxKey key = { 0 };
+				uint32 total = sizes[s];
+				uint64 accepted = 0;
+				unsigned network;
+				bool caught = false;
+				chain_seed(total, 1); op = NULL; memset(&stats, 0, sizeof(stats));
+				key.multixact_id = 1000; key.cluster_epoch = 7;
+				UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag,
+					&request_snapshot, &op, &stats));
+				network = requests_sent;
+				for (uint32 first = 0; first < total;) {
+					ClusterMxFullMemberProof entries[7];
+					ClusterMxProofReply reply = proof_window(total, first, entries);
+					bool inject_now = tail ? reply.last : first == 0;
+					ClusterMxCompositionReceiveResult result = MXCOMP_UNKNOWN;
+					if (inject_now) {
+						if (during) proof_allocation_fault = kind;
+						else proof_drift(kind);
+					}
+					PG_TRY();
+					{
+						result = cluster_multixact_current_proofs_accept(&op, MXCOMP_READ_OK, &reply);
+					}
+					PG_CATCH();
+					{
+						caught = true;
+					}
+					PG_END_TRY();
+					if (inject_now) {
+						UT_ASSERT_EQ(caught, error);
+						UT_ASSERT_EQ(result, MXCOMP_UNKNOWN);
+						UT_ASSERT_NULL(op);
+						UT_ASSERT_EQ(proof_allocation_fired, during);
+						if (!error) {
+							UT_ASSERT_EQ(stats.accepted_proof_frames, accepted + (during ? 1 : 0));
+							UT_ASSERT_EQ(stats.unknown_results, 1);
+							UT_ASSERT_EQ(stats.restart_requests, 1);
+						}
+						break;
+					}
+					UT_ASSERT(!caught); UT_ASSERT_EQ(result, MXCOMP_PARTIAL);
+					accepted++; first = reply.next;
+				}
+				proof_catalog_error = false;
+				UT_ASSERT_EQ(requests_sent, network);
+				cluster_multixact_current_describe_finish(&op);
+				range_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, range_release_arg);
+				chain_clean();
+			}
+}
+
+static void caller_proof_scope_drift_before_window(void) { proof_scope_drift(false, false); }
+static void caller_proof_scope_drift_after_window(void) { proof_scope_drift(true, false); }
+static void caller_proof_scope_provider_error_cleanup(void)
+{
+	proof_scope_drift(false, true);
+	proof_scope_drift(true, true);
+}
+
+static void
+caller_proof_scope_stable_and_explicit_retry(void)
+{
+	const uint32 sizes[] = { 2, 257 };
+	for (unsigned s = 0; s < lengthof(sizes); s++) {
+		ClusterCurrentMxKey key = { 0 };
+		ClusterMxCompositionReceive *op = NULL;
+		ClusterMxCompositionReceiveStats stats = { 0 };
+		uint32 total = sizes[s], n = 0, seen = 0;
+		const ClusterMxCompositionProofPage *page;
+		chain_seed(total, 1); key.multixact_id = 1000; key.cluster_epoch = 7;
+		UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag,
+			&request_snapshot, &op, &stats));
+		connection_generation++;
+		{
+			ClusterMxFullMemberProof entries[7];
+			ClusterMxProofReply reply = proof_window(total, 0, entries);
+			UT_ASSERT_EQ(cluster_multixact_current_proofs_accept(&op, MXCOMP_READ_OK, &reply), MXCOMP_UNKNOWN);
+			UT_ASSERT_NULL(op);
+		}
+		UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag,
+			&request_snapshot, &op, &stats));
+		UT_ASSERT_EQ(first_history[0], 0);
+		UT_ASSERT_EQ(first_history[total > 256 ? 2 : 1], 0);
+		UT_ASSERT_EQ(requests_sent, total > 256 ? 4 : 2);
+		for (uint32 first = 0; first < total;) {
+			ClusterMxFullMemberProof entries[7];
+			ClusterMxProofReply reply = proof_window(total, first, entries);
+			UT_ASSERT_EQ(cluster_multixact_current_proofs_accept(&op, MXCOMP_READ_OK, &reply),
+				reply.last ? MXCOMP_COMPLETE : MXCOMP_PARTIAL);
+			first = reply.next;
+		}
+		page = cluster_mx_composition_proofs(op, &n); UT_ASSERT_EQ(n, total);
+		for (; page != NULL; page = page->next)
+			for (uint32 j = 0; j < page->count; j++, seen++)
+				UT_ASSERT_EQ(page->proofs[j].member_ordinal, seen);
+		UT_ASSERT_EQ(seen, total);
+		UT_ASSERT_EQ(stats.unknown_results, 1); UT_ASSERT_EQ(stats.restart_requests, 1);
+		cluster_multixact_current_describe_finish(&op); chain_clean();
+	}
+}
+
 int main(void)
 {
 	TopMemoryContext=AllocSetContextCreate(CurrentMemoryContext,"native caller",ALLOCSET_DEFAULT_SIZES);
 	CurrentMemoryContext=TopMemoryContext;
-	UT_PLAN(9);
+	UT_PLAN(13);
 	UT_RUN(caller_native_transport_sizes);
 	UT_RUN(caller_native_transport_failure_cleanup);
 	UT_RUN(scoped_outcomes_in_original_snapshot);UT_RUN(scoped_cancel_has_no_returned_outcome);
@@ -407,6 +588,10 @@ int main(void)
 	UT_RUN(scoped_last_reply_refusal_has_one_outcome);
 	UT_RUN(caller_fresh_retry_starts_at_zero);
 	UT_RUN(caller_proof_windows_keep_original_owner);
+	UT_RUN(caller_proof_scope_drift_before_window);
+	UT_RUN(caller_proof_scope_drift_after_window);
+	UT_RUN(caller_proof_scope_provider_error_cleanup);
+	UT_RUN(caller_proof_scope_stable_and_explicit_retry);
 	UT_DONE();
 	return ut_failed_count==0?0:1;
 }

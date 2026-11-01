@@ -78,7 +78,9 @@ extern bool cluster_multixact_current_describe_full(const ClusterCurrentMxKey *k
 	ClusterMxCompositionReceive **op, ClusterMxCompositionReceiveStats *stats);
 extern void cluster_multixact_current_describe_finish(ClusterMxCompositionReceive **op);
 /* Keep the original ResourceOwner/directory borrow in sync on proof failure
- * and ERROR. Registered operations must not use the raw G2 accept entry. */
+ * and ERROR, rechecking requester epoch/storage/CONTROL before and after each
+ * provisional window. This does not validate member grants or tuple fences.
+ * Registered operations must not use the raw G2 accept entry. */
 extern ClusterMxCompositionReceiveResult
 cluster_multixact_current_proofs_accept(ClusterMxCompositionReceive **op,
 										ClusterMxCompositionReadStatus status,
