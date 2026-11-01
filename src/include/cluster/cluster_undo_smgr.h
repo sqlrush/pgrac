@@ -139,6 +139,9 @@ extern bool cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 inst
  *	block-zero content lock or inside a DELAY_CHKPT_START window.  offset+len
  *	must be within BLCKSZ.  Returns true on success, false on bad args / I/O
  *	error / short transfer.  NOT critical-section safe.
+ *	Managed TT40 reads validate a complete page before copying the range;
+ *	writes require offset 0 / BLCKSZ with the original content-X owner's sealed
+ *	page. The file identity stays borrowed through I/O/checkpoint bookkeeping.
  */
 extern bool cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
 												uint8 owner_instance, uint32 offset, char *buf,
@@ -170,7 +173,9 @@ extern void cluster_undo_smgr_header_writer_close(int fd);
 extern bool cluster_undo_smgr_header_unchanged_durable(ClusterUndoPathIntent intent,
 													   uint32 segment_id, uint8 owner_instance);
 
-/* Checkpoint: fsync one segment file through the intent its header used. */
+/* Checkpoint: fsync one segment file through the intent its header used.
+ * Managed TT40 validates the complete selected block zero and holds its file
+ * identity through the same-FD fsync; this alone grants no coverage authority. */
 extern bool cluster_undo_smgr_fsync_header(ClusterUndoPathIntent intent, uint32 segment_id,
 										   uint8 owner_instance);
 

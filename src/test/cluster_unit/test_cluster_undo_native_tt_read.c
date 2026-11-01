@@ -32,6 +32,14 @@ void pg_re_throw(void)
 void before_shmem_exit(pg_on_exit_callback function, Datum arg)
 { (void) function; (void) arg; }
 
+#ifndef UNDO_NATIVE_TT_HEADER_RECORDER_TEST
+/* These original physical-I/O cases have no resident checkpoint region.
+ * If a header call is added, it must take the actual same-FD fsync fallback. */
+bool cluster_undo_block0_note_unsynced_header(uint32 segment, uint8 owner,
+	ClusterUndoPathIntent intent)
+{ (void) segment; (void) owner; (void) intent; return false; }
+#endif
+
 ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void)
 { return selected_mode; }
 bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,

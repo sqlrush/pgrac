@@ -186,7 +186,10 @@ UT_TEST(native_tt_write_arguments_data_and_legacy_are_separate)
 	UT_ASSERT_EQ(selected_acquires, 0); assert_disk(path, &next); finish_selected(path);
 }
 
-int main(void)
+#ifndef UNDO_NATIVE_TT_WRITE_MAIN
+#define UNDO_NATIVE_TT_WRITE_MAIN main
+#endif
+int UNDO_NATIVE_TT_WRITE_MAIN(void)
 {
 	char path[] = "/tmp/pgrac-native-tt-write-XXXXXX";
 

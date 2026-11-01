@@ -8491,6 +8491,31 @@ clean-undo-native-tt-write:
 clean: clean-undo-native-tt-write
 .PHONY: clean-undo-native-tt-write
 
+# Noncritical header range I/O and original checkpoint/fsync dispatch share
+# the physical TT providers; control/recorder outcomes are explicitly finite.
+test_cluster_undo_native_tt_header_io: test_cluster_undo_native_tt_header_io.c \
+		test_cluster_undo_native_tt_write.c test_cluster_undo_native_tt_read.c \
+		test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_header_io
+all: test_cluster_undo_native_tt_header_io
+clean-undo-native-tt-header-io:
+	rm -f test_cluster_undo_native_tt_header_io test_cluster_undo_native_tt_header_io.d
+clean: clean-undo-native-tt-header-io
+.PHONY: clean-undo-native-tt-header-io
+
 # spec-8.4 D13: these activation policy targets include the real
 # dependency-light product source so static codec/FSM/lock-policy helpers are
 # exercised without exporting a test hook.  Their only linked prerequisite
