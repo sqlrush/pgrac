@@ -33,6 +33,7 @@ static bool nc_holder_start(HolderFixture *f, const ResourceXDecodedFrame *reque
 	/* Co-located M/H uses this cohort's actual shared peer identity, rather
 	 * than the unrelated 83-generation leaf in isolated holder cases. */
 	holder_requester_connection = 61;
+	holder_requester_node = request->common.logical_assertion.requester_node;
 	request_buf.tag = request->common.logical_assertion.resource;
 	provenance_grant_for(0, request_buf.tag);
 	if (mode == PCM_STATE_S) service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
@@ -125,7 +126,7 @@ static bool nc_master(int fd, int mode)
 	NM_REQUIRE(nm_send(fd, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &consumed));
 	NM_REQUIRE(nm_master_callback(&f.master.state->grant_intent.slot, true));
 	UT_ASSERT_EQ(f.master.state->deferred_settlement.present, 0);
-	UT_ASSERT_EQ(f.master.state->requests[1].phase, RESOURCE_X_MASTER_NONE);
+	UT_ASSERT_EQ(f.master.state->requests[request.common.logical_assertion.requester_node].phase, RESOURCE_X_MASTER_NONE);
 	UT_ASSERT_EQ(f.master.state->holder_image.valid, 0); UT_ASSERT_EQ(f.master.state->holder_status.valid, 0);
 	UT_ASSERT_EQ(f.master.state->settlement_retry.pending, 0);
 	UT_ASSERT_EQ(f.master.state->pi_carrier.transport_refs, 0);
@@ -142,7 +143,7 @@ static void nc_deliver(void)
 	if (!nm_receive(nc_image_fd, RESOURCE_X_MSG_IMAGE_OR_GRANT, &nc_image)) { UT_ASSERT(false); pg_re_throw(); }
 	UT_ASSERT_EQ(nc_image.kind, RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	prepared_episode = nc_request.body.acquire_intent;
-	env.msg_type = RESOURCE_X_MSG_IMAGE_OR_GRANT; env.source_node_id = nc_source_node; env.dest_node_id = 1;
+	env.msg_type = RESOURCE_X_MSG_IMAGE_OR_GRANT; env.source_node_id = nc_source_node; env.dest_node_id = cluster_node_id;
 	env.epoch = 17; env.payload_length = nc_image.payload_bytes; auth_peer_boot = nc_source_boot;
 	ResourceXApplyResult result = gcs_block_resource_x_requester_join_ingress(&env, &nc_image, 61, &joined);
 	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED); if (result != RESOURCE_X_APPLY_APPLIED) pg_re_throw();
@@ -176,12 +177,12 @@ static void nc_auth_peer(int32 node, unsigned sample)
 	UT_ASSERT(node == 0 || node == nc_source_node);
 	auth_peer_boot = node == 0 ? 31 : nc_source_boot;
 }
-static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint64 source_boot)
+static bool nc_parent_role(int fd, int image_fd, int mode, int source_node, uint64 source_boot, int requester)
 {
 	ClusterBufmgrFirstFill read; ClusterPcmResourceXMasterState *state = NULL;
 	ResourceXDecodedFrame done, consumed; ResourceXIntentSlot staged;
 	ClusterICEnvelope env = {0}; ResourceXRequesterJoinSnapshot joined;
-	ordinary_start(&read, 2); nc_fd = fd; nc_image_fd = image_fd; nc_mode = mode;
+	ordinary_start(&read, 2); cluster_node_id = requester; nc_fd = fd; nc_image_fd = image_fd; nc_mode = mode;
 	nc_source_node = source_node; nc_source_boot = source_boot;
 	auth_observation_hook = nc_auth_peer;
 	ordinary_delivery_transport = nc_deliver;
@@ -200,7 +201,7 @@ static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint
 	NM_REQUIRE(nc_stage(&state->requester_settlement_intent.slot, &staged)); NM_REQUIRE(nc_callback(&staged));
 	NM_REQUIRE(nm_send(fd, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &done));
 	NM_REQUIRE(nm_receive(fd, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &consumed));
-	env.msg_type = RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE; env.source_node_id = 0; env.dest_node_id = 1;
+	env.msg_type = RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE; env.source_node_id = 0; env.dest_node_id = cluster_node_id;
 	env.epoch = 17; env.payload_length = consumed.payload_bytes; auth_peer_boot = 31;
 	NM_REQUIRE(gcs_block_resource_x_requester_join_ingress(&env, &consumed, 61, &joined) == RESOURCE_X_APPLY_APPLIED);
 	if (mode == 3) NM_REQUIRE(gcs_block_resource_x_requester_join_ingress(&env, &consumed, 61, &joined) == RESOURCE_X_APPLY_DUPLICATE);
@@ -211,6 +212,8 @@ static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint
 	UT_ASSERT_EQ(complete_commits, 1); UT_ASSERT_EQ(ordinary_sends, 1);
 	complete_idle(); return true;
 }
+static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint64 source_boot)
+{ return nc_parent_role(fd, image_fd, mode, source_node, source_boot, 1); }
 static bool nc_parent(int fd, int mode) { return nc_parent_from(fd, fd, mode, 0, 31); }
 UT_TEST(test_native_current_S_to_S_full_episode) { nm_run_roles(0, nc_master, nc_parent); }
 UT_TEST(test_native_current_X_to_S_full_episode) { nm_run_roles(1, nc_master, nc_parent); }

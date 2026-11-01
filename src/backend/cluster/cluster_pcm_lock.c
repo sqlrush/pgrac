@@ -25588,13 +25588,26 @@ pcm_resource_x_s_source_forward_record(const ResourceXDecodedFrame *block, int32
 		&& status->payload_bytes == RESOURCE_X_DECISION_V4_BYTES;
 }
 
+/* A completed holder send keeps only its physical episode floor. Treating
+ * that legal EMPTY as all-zero would strand the next retained FORWARD. */
+static bool
+pcm_resource_x_s_source_intent_empty(const ResourceXIntentSlot *slot)
+{
+	static const ResourceXIntentSlot empty;
+	ResourceXIntentSlot quiet = *slot;
+
+	if (quiet.first_armed_us >= UINT64_MAX - 1)
+		return false;
+	quiet.first_armed_us = 0;
+	return memcmp(&quiet, &empty, sizeof(quiet)) == 0;
+}
+
 static bool
 pcm_resource_x_s_source_forward_valid(const struct GrdEntry *entry,
 	const ClusterPcmResourceXMasterState *state, ResourceXDecodedFrame *block)
 {
 	static const ClusterPcmOwnSnapshot empty_native;
 	static const ClusterPcmResourceXHolderImage empty_image;
-	static const ResourceXIntentSlot empty_intent;
 	static const ClusterPageWalRefV1 empty_first;
 	ClusterPcmResourceXHolderStatus expected;
 	ResourceXDecodedFrame frame, canonical;
@@ -25611,8 +25624,8 @@ pcm_resource_x_s_source_forward_valid(const struct GrdEntry *entry,
 		|| memcmp(&state->holder_acquire_s_native, &empty_native, sizeof(empty_native)) != 0
 		|| state->holder_acquire_s_buffer_id != 0 || state->holder_acquire_s_forward_connection != 0
 		|| memcmp(&state->holder_image, &empty_image, sizeof(empty_image)) != 0
-		|| memcmp(&state->holder_status_intent.slot, &empty_intent, sizeof(empty_intent)) != 0
-		|| memcmp(&state->holder_image_intent, &empty_intent, sizeof(empty_intent)) != 0
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_status_intent.slot)
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_image_intent)
 		|| memcmp(&state->holder_pi_first, &empty_first, sizeof(empty_first)) != 0
 		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, state->holder_status.payload,
 			state->holder_status.payload_bytes, &frame, &reject)
@@ -25710,8 +25723,8 @@ cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(const ResourceXDecode
 		goto done;
 	}
 	if (state->holder_status.valid != 0 || state->holder_image.valid != 0
-		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
-		|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_status_intent.slot)
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_image_intent)
 		|| state->holder_pi_first.source_flags != 0 || ref.entry->resource_x_source_drain.r4_record_generation != 0) {
 		result = RESOURCE_X_APPLY_BAD_STATE; goto done;
 	}

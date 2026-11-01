@@ -3,7 +3,11 @@
  * does not qualify multi-process contention or the complete H matrix.
  * Author: SqlRush <sqlrush@gmail.com> */
 #define cluster_test_pcm_clock_gettime cluster_publish_fixture_clock_gettime
+#ifdef NATIVE_HOLDER_X_REQUESTER_COMPOSITION
+#include "test_cluster_native_resident_x_fixture.inc"
+#else
 #include "test_cluster_native_first_fill_fixture.inc"
+#endif
 #undef cluster_test_pcm_clock_gettime
 #define ereport(level, rest) ordinary_report(level)
 #define gcs_block_resource_x_payload_candidate holder_payload_candidate
@@ -20,6 +24,7 @@ static unsigned holder_pins, holder_fuses;
 static unsigned holder_interrupt_repairs, holder_interrupt_releases;
 static bool holder_peer_current = true;
 static uint32 holder_requester_connection = 83;
+static int32 holder_requester_node = 1;
 static void (*holder_after_prepare)(void);
 static void holder_pin(BufferDesc *buf, uint32 state)
 {
@@ -145,7 +150,20 @@ void XLogFlush(XLogRecPtr lsn) { (void)lsn; holder_unexpected_write(); }
 	((void)(reason), (void)(cause), (void)(buf), (void)(native), (void)(required), \
 	 (void)(local), (void)(storage), (void)(state), (void)(type), (void)(result), (void)(abort_result))
 #define cluster_bufmgr_resource_x_fail_closed_current() (holder_fuses++)
+#ifdef NATIVE_HOLDER_X_REQUESTER_COMPOSITION
+/* Same original bodies, distinct test lock leaves for the two roles. */
+static ClusterPcmOwnResult holder_begin_s_revoke(BufferDesc *, const ClusterPcmOwnSnapshot *, ClusterPcmOwnSnapshot *);
+static ClusterPcmOwnResult holder_abort_s_revoke(BufferDesc *, const ClusterPcmOwnSnapshot *);
+#define cluster_bufmgr_pcm_current_image_locked holder_current_image_locked
+#define cluster_bufmgr_pcm_own_begin_s_revoke holder_begin_s_revoke
+#define cluster_bufmgr_pcm_own_abort_s_revoke holder_abort_s_revoke
+#endif
 #include "test_cluster_native_holder_bufmgr.inc"
+#ifdef NATIVE_HOLDER_X_REQUESTER_COMPOSITION
+#undef cluster_bufmgr_pcm_current_image_locked
+#undef cluster_bufmgr_pcm_own_begin_s_revoke
+#undef cluster_bufmgr_pcm_own_abort_s_revoke
+#endif
 #undef cluster_bufmgr_resource_x_fail_closed_current
 #undef cluster_bufmgr_pcm_own_observe_s_source_hard_failure
 #undef ResourceOwnerEnlargeBuffers
@@ -188,7 +206,7 @@ static bool holder_master_peer(int32 node, uint32 *connection)
 static ResourceXApplyResult holder_peer_result(const ClusterSemanticAdmissionToken *admission,
 	int32 node, uint32 connection)
 {
-	return holder_peer_current && admission->entered && ((node == 0 && connection == 61) || (node == 1 && connection == holder_requester_connection))
+	return holder_peer_current && admission->entered && ((node == 0 && connection == 61) || (node == holder_requester_node && connection == holder_requester_connection))
 		? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE;
 }
 static bool holder_peer_sample(int32 node, uint64 required, uint64 *caps, uint32 *connection)
@@ -253,7 +271,7 @@ static void holder_native_start(PcmState mode)
 	holder_after_prepare = NULL; holder_peer_current = true; holder_write_error = false;
 	holder_io_enters = holder_io_ends = 0;
 	holder_interrupt_repairs = holder_interrupt_releases = 0;
-	holder_requester_connection = 83;
+	holder_requester_connection = 83; holder_requester_node = 1;
 }
 static bool holder_start_role(HolderFixture *f, PcmState mode, PcmState target, int32 holder)
 {
