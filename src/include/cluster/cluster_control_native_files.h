@@ -55,6 +55,30 @@ extern void cluster_control_native_files_shmem_register(void);
  * allocation or family-lock acquisition on the following local read path. */
 extern ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void);
 extern bool cluster_control_native_files_info_v2(ClusterControlNativeTableInfoV2 *out);
+/* Complete local observation for the original checkpoint/file owner. Both
+ * vectors are copied by value from one published MANAGED table; no 64-row
+ * prefix, CF/I/O, native borrow, file permission, coverage or drain is added.
+ * Caller retains the original source-cut/file/old-writer protections and must
+ * recheck them independently. current compares every saved value and the same
+ * original table/startup/control generation; refusal never reselects.
+ * Fresh *out is NULL, with an explicit whole-allocation byte budget. No wait or
+ * retry during publication/drift. Address/PID-bound, do not copy or mutate.
+ * borrowed is a point observation, never a stop/drain certificate. Destroy
+ * frees only this local copy, including after failed current; original
+ * reservations, borrows, files and debt remain untouched. */
+typedef struct ClusterControlNativeInventoryV2 {
+	ClusterControlNativeTableInfoV2 info;
+	const ClusterRecoveryFileIdentityV2 *files;
+	const ClusterRecoveryFileReservationV1 *reservations;
+	Size private_bytes;
+	uintptr_t private_self;
+	int private_pid;
+} ClusterControlNativeInventoryV2;
+extern ClusterControlNativeResultV2 cluster_control_native_files_inventory_v2(
+	Size memory_budget, ClusterControlNativeInventoryV2 **fresh);
+extern bool cluster_control_native_files_inventory_current_v2(
+	const ClusterControlNativeInventoryV2 *);
+extern void cluster_control_native_inventory_destroy_v2(ClusterControlNativeInventoryV2 **);
 extern bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *,
 												   ClusterControlNativeFileBorrowV2 *fresh);
 /* Resolve an address without guessing its creation origin. Exactly one
