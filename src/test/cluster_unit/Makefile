@@ -19009,3 +19009,6 @@ clean-l1b-tail-bounds:
 	rm -f test_cluster_l1b_tail_bounds.inc test_cluster_l1b_tail_bounds.inc.tmp \
 		test_cluster_l1b_tail_bounds
 clean distclean maintainer-clean: clean-l1b-tail-bounds
+
+# The native maintenance link consumes this shared test support object.
+test_cluster_vacuum_native_window test_cluster_subtrans_watermark: cluster_catalog_trace_test.o
