@@ -509,6 +509,19 @@ extern ClusterCurrentMxDecision cluster_multixact_current_decide_operations(
 	const ClusterCurrentMxRequestContext *ctx, const struct ClusterR4CrOwnerChallenge *owner,
 	const ClusterCurrentUpdaterChallenge *challenge, const ClusterCurrentUpdaterProof *updater,
 	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace);
+/* Independent typed creation B for an actual, freshly relocked target.
+ * Pure decision only: the caller retains capture/source/retention, original
+ * request capabilities, mutation receipts and before-mutation checks. The
+ * target is a compare input, never canonical identity. No raw B coercion. */
+struct ClusterUndoRecordTarget;
+extern ClusterCurrentMxDecision cluster_multixact_current_decide_operations_with_successor(
+	const ClusterCurrentMxMemberDesc *members, const struct ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *ctx, const struct ClusterR4CrOwnerChallenge *owner,
+	const struct ClusterUndoRecordTarget *target,
+	const struct ClusterSavepointOperationKey *successor_key,
+	const ClusterCurrentMemberOperationProof *successor,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace);
 extern ClusterMxRecomposeResult cluster_multixact_current_recompose_operations(
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
 	const struct ClusterSavepointOperationKey *keys,

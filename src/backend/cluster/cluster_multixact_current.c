@@ -1077,7 +1077,8 @@ current_mx_decide_internal(const ClusterCurrentMxMemberDesc *members,
 						   const ClusterCurrentUpdaterChallenge *challenge,
 						   const ClusterCurrentUpdaterProof *updater_proof,
 						   ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace,
-						   const uint8 *effects)
+						   const uint8 *effects,
+						   const ClusterCurrentMemberOperationProof *successor)
 {
 	ClusterTTStatusKey selected_wait_key;
 	ClusterCurrentMxDecision self_result = CMDL_CONTINUE;
@@ -1194,9 +1195,11 @@ current_mx_decide_internal(const ClusterCurrentMxMemberDesc *members,
 		if (ctx->tuple_shape != CCM_SHAPE_UPDATED)
 			return current_mx_unknown(trace, CMX_UNKNOWN_COMMITTED_UPDATER_SHAPE,
 									  committed_updater);
-		if (!validate_updater_proof_state(&ctx->mxkey, members, proofs, nmembers, challenge,
-										  updater_proof, (uint16)ctx->updater_origin_node_id,
-										  CCM_COMMITTED, effects))
+		if (successor != NULL
+			? successor->base.state != CCM_COMMITTED
+				|| successor->base.member_ordinal != (uint16)committed_updater
+			: !validate_updater_proof_state(&ctx->mxkey, members, proofs, nmembers, challenge,
+				updater_proof, (uint16)ctx->updater_origin_node_id, CCM_COMMITTED, effects))
 			return current_mx_unknown(trace, CMX_UNKNOWN_COMMITTED_UPDATER_PROOF,
 									  committed_updater);
 		return CMDL_UPDATED;
@@ -1214,9 +1217,11 @@ current_mx_decide_internal(const ClusterCurrentMxMemberDesc *members,
 		&& ctx->follow_updates) {
 		if (ctx->tuple_shape != CCM_SHAPE_UPDATED)
 			return current_mx_unknown(trace, CMX_UNKNOWN_ACTIVE_UPDATER_SHAPE, active_updater);
-		if (!validate_updater_proof_state(&ctx->mxkey, members, proofs, nmembers, challenge,
-										  updater_proof, (uint16)ctx->updater_origin_node_id,
-										  CCM_ACTIVE, effects))
+		if (successor != NULL
+			? successor->base.state != CCM_ACTIVE
+				|| successor->base.member_ordinal != (uint16)active_updater
+			: !validate_updater_proof_state(&ctx->mxkey, members, proofs, nmembers, challenge,
+				updater_proof, (uint16)ctx->updater_origin_node_id, CCM_ACTIVE, effects))
 			return current_mx_unknown(trace, CMX_UNKNOWN_ACTIVE_UPDATER_PROOF, active_updater);
 		return CMDL_FOLLOW_UPDATED;
 	}
@@ -1238,7 +1243,7 @@ cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *memb
 										  ClusterCurrentMxDecisionTrace *trace)
 {
 	return current_mx_decide_internal(members, proofs, nmembers, ctx, challenge, updater_proof,
-									  wait_key, trace, NULL);
+									  wait_key, trace, NULL, NULL);
 }
 
 
@@ -1998,13 +2003,56 @@ cluster_multixact_current_validate_operation_updater(
 		updater_origin_node_id, CCM_COMMITTED, effects);
 }
 
-ClusterCurrentMxDecision
-cluster_multixact_current_decide_operations(
+/* A complete independently qualified creation B, never a synthesized raw
+ * challenge. The actual relock target is only a compare input. Source role,
+ * current grants, capture and mutation authority remain caller obligations. */
+static bool
+operation_successor_valid(const ClusterCurrentMxMemberDesc *members,
+	const ClusterSavepointOperationKey *keys, const ClusterCurrentMemberOperationProof *proofs,
+	uint16 nmembers, const ClusterCurrentMxRequestContext *ctx,
+	const ClusterUndoRecordTarget *target, const ClusterSavepointOperationKey *key,
+	const ClusterCurrentMemberOperationProof *b)
+{
+	const ClusterCurrentMemberOperationProof *a;
+	const ClusterUndoRecordTarget *root;
+	int ordinal = -1;
+	if (target == NULL || key == NULL || b == NULL || ctx->tuple_shape != CCM_SHAPE_UPDATED
+		|| memcmp(target, &key->target, sizeof(*target)) != 0)
+		return false;
+	for (uint16 i = 0; i < nmembers; ++i) {
+		if (!ISUPDATE_from_mxstatus(members[i].member_status))
+			continue;
+		if (ordinal >= 0) return false;
+		ordinal = i;
+	}
+	if (ordinal < 0) return false;
+	a = &proofs[ordinal];
+	root = &keys[ordinal].target;
+	return a->flags == CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+		&& a->effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE
+		&& b->flags == CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+		&& b->effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE
+		&& ctx->updater_origin_node_id == a->base.key.origin_node_id
+		&& operation_proof_entry_valid(&members[ordinal], key, b, ordinal, ctx->mxkey.cluster_epoch)
+		&& memcmp(&b->base.key, &a->base.key, sizeof(a->base.key)) == 0
+		&& FullTransactionIdEquals(a->top_fxid, b->top_fxid)
+		&& FullTransactionIdEquals(a->operation_fxid, b->operation_fxid)
+		&& a->base.state == b->base.state && a->base.commit_scn == b->base.commit_scn
+		&& RelFileLocatorEquals(root->locator, target->locator)
+		&& root->forknum == target->forknum
+		&& (root->blockno != target->blockno || root->offnum != target->offnum);
+}
+
+static ClusterCurrentMxDecision
+current_mx_decide_operations(
 	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,
 	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,
 	const ClusterCurrentMxRequestContext *ctx, const ClusterR4CrOwnerChallenge *owner,
 	const ClusterCurrentUpdaterChallenge *challenge, const ClusterCurrentUpdaterProof *updater,
-	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace,
+	bool typed_successor, const ClusterUndoRecordTarget *target,
+	const ClusterSavepointOperationKey *successor_key,
+	const ClusterCurrentMemberOperationProof *successor)
 {
 	ClusterCurrentMemberProof base[CLUSTER_CURRENT_MX_MAX_MEMBERS];
 	uint8 effects[CLUSTER_CURRENT_MX_MAX_MEMBERS];
@@ -2020,6 +2068,9 @@ cluster_multixact_current_decide_operations(
 																  proofs, nmembers)
 			   != CMX_RESOLVE_OK)
 		return CMDL_UNKNOWN;
+	if (typed_successor && !operation_successor_valid(members, keys, proofs, nmembers,
+		ctx, target, successor_key, successor))
+		return current_mx_unknown(trace, CMX_UNKNOWN_PROOF_ENTRY, -1);
 	for (uint16 i = 0; i < nmembers; ++i) {
 		const ClusterCurrentMemberOperationProof *p = &proofs[i];
 		const ClusterCurrentMemberProofKey *b = &p->base.key;
@@ -2040,7 +2091,33 @@ cluster_multixact_current_decide_operations(
 		}
 	}
 	return current_mx_decide_internal(members, base, nmembers, ctx, challenge, updater, wait_key,
-									  trace, effects);
+									  trace, effects, typed_successor ? successor : NULL);
+}
+
+/* Original V1/raw entry: its proof gate and behavior remain unchanged. */
+ClusterCurrentMxDecision
+cluster_multixact_current_decide_operations(
+	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *ctx, const ClusterR4CrOwnerChallenge *owner,
+	const ClusterCurrentUpdaterChallenge *challenge, const ClusterCurrentUpdaterProof *updater,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+{
+	return current_mx_decide_operations(members, keys, proofs, nmembers, ctx, owner, challenge,
+		updater, wait_key, trace, false, NULL, NULL, NULL);
+}
+
+ClusterCurrentMxDecision
+cluster_multixact_current_decide_operations_with_successor(
+	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *ctx, const ClusterR4CrOwnerChallenge *owner,
+	const ClusterUndoRecordTarget *target, const ClusterSavepointOperationKey *successor_key,
+	const ClusterCurrentMemberOperationProof *successor,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+{
+	return current_mx_decide_operations(members, keys, proofs, nmembers, ctx, owner, NULL,
+		NULL, wait_key, trace, true, target, successor_key, successor);
 }
 
 ClusterMxRecomposeResult
