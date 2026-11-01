@@ -172,6 +172,33 @@ mx_history_hot(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
 	return result;
 }
 bool
+mx_history_hot_caller(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	bool full, MxHotReadout *out)
+{
+	volatile bool result = false;
+	memset(out, 0xa5, sizeof(*out));
+	PG_TRY();
+	{
+		if (full)
+			result = heap_hot_current_mx_history_resolve_updater_caller(rel, buffer, tuple, actual,
+				&out->updater, &out->restart, &hot_full_proof, &authorize_operation);
+		else
+			result = cluster_current_mx_history_hot_updater_for_chain_caller(rel, buffer, tuple, actual,
+				&out->updater, &out->restart, &hot_native_proof, &authorize_operation);
+	}
+	PG_FINALLY();
+	{
+		memset(&out->successor, 0, sizeof(out->successor));
+		if (full && hot_full_proof.valid)
+			cluster_current_mx_set_successor_proof(&out->successor, &hot_full_proof.tid,
+				hot_full_proof.updater_xid, &hot_full_proof.alias, &hot_full_proof.locator);
+		else if (!full)
+			out->successor = hot_native_proof;
+	}
+	PG_END_TRY();
+	return result;
+}
+bool
 mx_history_hot_matches(Buffer buffer, HeapTuple candidate, bool full)
 {
 	return full ? heap_hot_current_mx_successor_matches(buffer, candidate, &hot_full_proof)

@@ -9463,6 +9463,27 @@ cluster_current_mx_history_hot_updater_for_chain(Relation relation, Buffer buffe
 	return result;
 }
 
+/* Project an already verified successor without another history request. */
+static void
+cluster_current_mx_hot_successor_project(const ClusterHeapSuccessorProof *proof,
+	HeapHotCurrentMxSuccessorProof *successor)
+{
+	successor->tid = proof->tid;
+	successor->updater_xid = proof->updater_xid;
+	successor->alias.origin_node_id = proof->origin_node_id;
+	successor->alias.undo_record_segment_id = proof->undo_record_segment_id;
+	successor->alias.tt_slot_id = proof->tt_slot_id;
+	successor->alias.cluster_epoch = proof->cluster_epoch;
+	successor->alias.local_xid = proof->updater_xid;
+	successor->locator.uba.raw[0] = proof->locator_uba_raw[0];
+	successor->locator.uba.raw[1] = proof->locator_uba_raw[1];
+	successor->locator.xid = proof->updater_xid;
+	successor->locator.tt_wrap = proof->locator_tt_wrap;
+	successor->locator.itl_kind = proof->locator_itl_kind;
+	successor->locator.itl_slot_index = proof->locator_itl_slot_index;
+	successor->valid = true;
+}
+
 /* The existing FULL HOT evaluator uses a separate native proof shape.
  * Translate only the already verified successor; do not rerun history. */
 static bool pg_attribute_unused()
@@ -9477,20 +9498,7 @@ heap_hot_current_mx_history_resolve_updater(Relation relation, Buffer buffer,
 	if (!cluster_current_mx_history_hot_updater_for_chain(relation, buffer, tuple, actual,
 			admission, updater_xid, restart, &proof, operation))
 		return false;
-	successor->tid = proof.tid;
-	successor->updater_xid = proof.updater_xid;
-	successor->alias.origin_node_id = proof.origin_node_id;
-	successor->alias.undo_record_segment_id = proof.undo_record_segment_id;
-	successor->alias.tt_slot_id = proof.tt_slot_id;
-	successor->alias.cluster_epoch = proof.cluster_epoch;
-	successor->alias.local_xid = proof.updater_xid;
-	successor->locator.uba.raw[0] = proof.locator_uba_raw[0];
-	successor->locator.uba.raw[1] = proof.locator_uba_raw[1];
-	successor->locator.xid = proof.updater_xid;
-	successor->locator.tt_wrap = proof.locator_tt_wrap;
-	successor->locator.itl_kind = proof.locator_itl_kind;
-	successor->locator.itl_slot_index = proof.locator_itl_slot_index;
-	successor->valid = true;
+	cluster_current_mx_hot_successor_project(&proof, successor);
 	return true;
 }
 
@@ -10299,6 +10307,84 @@ cluster_current_mx_history_authorize_caller(Relation relation, Buffer buffer, He
 	}
 	PG_END_TRY();
 	return result;
+}
+
+/* Dormant native read front door. The explicit statement Snapshot or current
+ * ActiveSnapshot remains owned by the caller. Both HOT representations use
+ * this same bracket; only a complete typed result can leave it. */
+static bool pg_attribute_unused()
+cluster_current_mx_history_hot_updater_for_chain_caller(Relation relation, Buffer buffer,
+	HeapTuple tuple, Snapshot actual, TransactionId *updater, bool *restart,
+	ClusterHeapSuccessorProof *successor, ClusterCurrentMxOperationState *operation)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSnapshotReadScopeV1 scope;
+	uint64 identity = 0;
+	volatile bool result = false;
+	volatile bool completed = false;
+
+	*updater = InvalidTransactionId;
+	*restart = false;
+	if (successor != NULL)
+		memset(successor, 0, sizeof(*successor));
+	if (actual == NULL && ActiveSnapshotSet())
+		actual = GetActiveSnapshot();
+	if (CritSectionCount != 0 || CurrentResourceOwner == NULL
+		|| !cluster_current_mx_caller_snapshot(actual, &identity)) {
+		cluster_current_mx_failclosed(operation, CCMH_FAIL_HOT_PROOF,
+			"the HOT caller has no exact retained statement Snapshot");
+		return false;
+	}
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+			CLUSTER_SEMANTIC_TARGET_SIDE, &admission) != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		cluster_current_mx_failclosed(operation, CCMH_FAIL_HOT_PROOF,
+			"the HOT caller history admission is closed");
+		return false;
+	}
+	/* Initialize before setjmp, and restore both obligations even on ERROR. */
+	cluster_snapshot_read_enter_v1(&scope, actual);
+	PG_TRY();
+	{
+		uint64 live_identity = 0;
+
+		result = cluster_current_mx_history_hot_updater_for_chain(relation, buffer, tuple,
+			actual, &admission, updater, restart, successor, operation);
+		if (!cluster_semantic_activation_recheck(&admission)
+			|| !cluster_snapshot_cr_identity_v1(actual, &live_identity)
+			|| live_identity != identity)
+			cluster_current_mx_failclosed(operation, CCMH_FAIL_HOT_PROOF,
+				"the HOT caller read scope changed before history consumption");
+		completed = true;
+	}
+	PG_FINALLY();
+	{
+		if (!completed) {
+			cluster_current_mx_operation_finish(operation);
+			*updater = InvalidTransactionId;
+			*restart = false;
+			if (successor != NULL)
+				memset(successor, 0, sizeof(*successor));
+		}
+		cluster_snapshot_read_exit_v1(&scope);
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool pg_attribute_unused()
+heap_hot_current_mx_history_resolve_updater_caller(Relation relation, Buffer buffer,
+	HeapTuple tuple, Snapshot actual, TransactionId *updater, bool *restart,
+	HeapHotCurrentMxSuccessorProof *successor, ClusterCurrentMxOperationState *operation)
+{
+	ClusterHeapSuccessorProof proof;
+
+	memset(successor, 0, sizeof(*successor));
+	if (!cluster_current_mx_history_hot_updater_for_chain_caller(relation, buffer, tuple,
+			actual, updater, restart, &proof, operation))
+		return false;
+	cluster_current_mx_hot_successor_project(&proof, successor);
+	return true;
 }
 
 #ifdef USE_CLUSTER_UNIT

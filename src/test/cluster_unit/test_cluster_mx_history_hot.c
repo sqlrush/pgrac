@@ -243,6 +243,10 @@ UT_TEST(hot_invalid_root_and_descriptor_fail_closed)
 			UT_ASSERT_EQ(hot_promotions, 0); auth_clean(s);
 		}
 }
+#ifdef HISTORY_HOT_CALLER_FIXTURE
+int history_hot_caller_unused_hot_main(void);
+#define main history_hot_caller_unused_hot_main
+#endif
 int main(void)
 {
 	history_fixture_init(); UT_PLAN(8);

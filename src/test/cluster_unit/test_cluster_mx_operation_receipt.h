@@ -56,6 +56,8 @@ typedef struct MxHotReadout {
 } MxHotReadout;
 bool mx_history_hot(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
 	const ClusterSemanticAdmissionToken *admission, bool full, MxHotReadout *out);
+bool mx_history_hot_caller(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	bool full, MxHotReadout *out);
 bool mx_history_hot_matches(Buffer buffer, HeapTuple candidate, bool full);
 ClusterMxHistoryStep mx_history_collect(Relation rel, Buffer buffer, HeapTuple tuple,
 	Snapshot actual, const ClusterSemanticAdmissionToken *admission,
