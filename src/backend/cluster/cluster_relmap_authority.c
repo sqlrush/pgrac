@@ -987,3 +987,54 @@ cluster_relmap_authority_v2_discard_pending(const ClusterRelmapV2Image *staged)
 {
 	return relmap_v2_finish(staged, false);
 }
+
+/* Managed readers share the original authority path and serialization lock.
+ * Registration belongs to the original control owner, not this file layer. */
+static bool
+relmap_managed_observe(const ClusterRecoveryFileIdentityV2 *identity,
+					   ClusterRelmapFilePairV2 *output, bool checkpoint)
+{
+	RelmapV2Directory dirs;
+	ClusterRelmapV2Namespace ns;
+	ClusterRelmapFilePairV2 pair;
+	ClusterRelmapV2Image checked;
+	ClusterRecoveryFileIdentityV2 bound;
+	uintptr_t a = (uintptr_t) identity, b = (uintptr_t) output;
+	bool ok = false;
+
+	if (identity == NULL || output == NULL
+		|| (a <= b ? b - a < sizeof(*identity) : a - b < sizeof(*output))
+		|| !LWLockHeldByMe(RelationMappingLock)
+		|| (checkpoint && !enableFsync))
+		return false;
+	memcpy(&bound, identity, sizeof(bound));
+	ns = (ClusterRelmapV2Namespace) {bound.system_identifier,
+		bound.database_incarnation, bound.database_oid, bound.database_oid == InvalidOid};
+	if (relmap_v2_open_dirs(&ns, &dirs))
+		ok = (checkpoint ? cluster_relmap_file_pair_checkpoint_v2(dirs.map, &bound, &pair)
+						 : cluster_relmap_file_pair_read_v2(dirs.map, &bound, &pair))
+			&& relmap_v2_dirs_current(&dirs) && LWLockHeldByMe(RelationMappingLock)
+			&& cluster_relmap_file_decode_v2(pair.bytes[0], sizeof(pair.bytes[0]), identity, &checked);
+	if (!relmap_v2_close_dirs(&dirs))
+		ok = false;
+	if (ok)
+		ok = LWLockHeldByMe(RelationMappingLock) && (!checkpoint || enableFsync)
+			&& cluster_relmap_file_decode_v2(pair.bytes[0], sizeof(pair.bytes[0]), identity, &checked);
+	if (ok)
+		*output = pair;
+	return ok;
+}
+
+bool
+cluster_relmap_authority_managed_read_v2(const ClusterRecoveryFileIdentityV2 *identity,
+									  ClusterRelmapFilePairV2 *output)
+{
+	return relmap_managed_observe(identity, output, false);
+}
+
+bool
+cluster_relmap_authority_managed_checkpoint_v2(const ClusterRecoveryFileIdentityV2 *identity,
+										ClusterRelmapFilePairV2 *output)
+{
+	return relmap_managed_observe(identity, output, true);
+}

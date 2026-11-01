@@ -50,6 +50,7 @@
 #include "c.h"
 
 #include "common/cluster_relmap_v2.h"
+#include "common/cluster_relmap_file.h"
 #include "port/pg_crc32c.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_relmap_pending.h"
@@ -351,5 +352,14 @@ extern ClusterRelmapV2ClearResult
 cluster_relmap_authority_v2_publish(const ClusterRelmapV2Image *staged);
 extern ClusterRelmapV2ClearResult
 cluster_relmap_authority_v2_discard_pending(const ClusterRelmapV2Image *staged);
+
+/* Registered-file facades for the original cache/checkpoint owner. The caller
+ * holds RelationMappingLock throughout; no registration is inferred from the
+ * current file. A successful pair is an observation, not whole-set coverage.
+ * Output stays unchanged on failure; original pins and debts are untouched. */
+extern bool cluster_relmap_authority_managed_read_v2(
+	const ClusterRecoveryFileIdentityV2 *identity, ClusterRelmapFilePairV2 *output);
+extern bool cluster_relmap_authority_managed_checkpoint_v2(
+	const ClusterRecoveryFileIdentityV2 *identity, ClusterRelmapFilePairV2 *output);
 
 #endif /* CLUSTER_RELMAP_AUTHORITY_H */

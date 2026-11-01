@@ -577,13 +577,13 @@ TESTS += test_cluster_relmap_arb
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_arb,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_v2
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2,$(SIMPLE_TESTS))
-TESTS += test_cluster_relmap_v2_storage
+TESTS += test_cluster_relmap_v2_storage test_cluster_relmap_managed_storage test_cluster_relmap_file
 TESTS += test_cluster_cold_relmap test_cluster_cold_relmap_side
 SIMPLE_TESTS := $(filter-out test_cluster_cold_relmap test_cluster_cold_relmap_side,$(SIMPLE_TESTS))
 all: test_cluster_cold_relmap test_cluster_cold_relmap_side
 TESTS += test_cluster_relmap_publish_native
 TESTS += test_cluster_relmap_publish_clog
-SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_v2_storage test_cluster_relmap_managed_storage test_cluster_relmap_file,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_publish_native,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_publish_clog,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_retention
@@ -829,7 +829,7 @@ test_cluster_relmap_publish_clog_bridge.o: test_cluster_relmap_publish_clog_brid
 test_cluster_relmap_publish_clog: test_cluster_relmap_publish_clog_bridge.o \
 		test_cluster_relmap_publish_clog.h
 
-test_cluster_relmap_v2_storage test_cluster_relmap_publish_native test_cluster_relmap_publish_clog: %: %.c unit_test.h \
+test_cluster_relmap_v2_storage test_cluster_relmap_managed_storage test_cluster_relmap_publish_native test_cluster_relmap_publish_clog: %: %.c unit_test.h \
 		test_cluster_relmap_v2_storage.c test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_staged_observation.inc \
 		test_cluster_relmap_runtime_storage.inc \
@@ -7038,7 +7038,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
-	rm -f test_cluster_relmap_v2_storage_product.o
+	rm -f test_cluster_relmap_v2_storage_product.o test_cluster_relmap_managed_storage test_cluster_relmap_file
 	rm -f test_cluster_relmap_publish_clog_bridge.o
 	rm -f test_cluster_relmap_retained_owner.o
 	rm -f $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_DECODE_O) $(CLUSTER_COLD_STARTUP_O) test_cluster_cold_recovery_io_core.o
@@ -14822,3 +14822,19 @@ test_cluster_relmap_retained_wal: $(top_srcdir)/src/include/cluster/cluster_relm
 
 test_cluster_cold_recovery_startup: test_cluster_cold_terminal_episode.inc \
  $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
+
+# Managed envelope: real pair I/O, while control registration remains external.
+test_cluster_relmap_file: test_cluster_relmap_file.c unit_test.h \
+		$(top_srcdir)/src/common/cluster_relmap_file_io.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_initdb_relmap test_cluster_relmap_managed_storage test_cluster_relmap_v2_storage_product.o: \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
