@@ -13,6 +13,10 @@
 static const ClusterShmemRegion *registered;
 static void *native_test_region;
 static PgracInitdbRecoveryContext *creation;
+bool IsUnderPostmaster;
+bool IsPostmasterEnvironment;
+ProcessingMode Mode = InitProcessing;
+int cluster_node_id;
 int MyProcPid;
 static uint32 local_wait_event;
 uint32 *my_wait_event_info = &local_wait_event;
@@ -746,6 +750,124 @@ UT_TEST(inventory_snapshot_inflight_publication_and_forged_extent_refuse)
 	selection_end();
 }
 
+static void
+creation_child_fixture(unsigned origin)
+{
+	table_reset();
+	native_inventory(1);
+	memset(&creator_batch, 0, sizeof(creator_batch));
+	creator_batch.magic = PGRAC_INITDB_RECOVERY_MAGIC;
+	creator_batch.version = 2;
+	creator_batch.creator_pid = getpid();
+	creator_batch.config.fd = 3;
+	creator_batch.config.bytes = 1;
+	creator_batch.config.sha256[0] = 1;
+	creator_batch.first = inventory[0].identity;
+	creator_batch.first.object_id = 0;
+	creator_batch.first.creation_generation = 1;
+	creator_batch.cohort[0] = 15;
+	creator_batch.cohort_origin = origin;
+	creator_batch.boot_file_count = 1;
+	creator_batch.boot_files[0] = creator_batch.first;
+	creator_batch.boot_files[0].kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+	creator_batch.boot_files[0].database_oid = creator_batch.boot_files[0].tablespace_oid = 0;
+	creator_batch.boot_files[0].origin = origin;
+	creator_batch.boot_files[0].creation_generation = 5 + origin;
+	creation = &creator_batch;
+	IsUnderPostmaster = IsPostmasterEnvironment = false;
+	MyBackendType = B_STANDALONE_BACKEND;
+	Mode = BootstrapProcessing;
+	cluster_node_id = -1;
+	cf_held = false;
+}
+static void
+creation_child_cleanup(void)
+{
+	creation = NULL;
+	IsUnderPostmaster = IsPostmasterEnvironment = false;
+	MyBackendType = B_INVALID;
+	Mode = InitProcessing;
+	cluster_node_id = 0;
+	cf_held = true;
+	selection_end();
+}
+UT_TEST(creation_shmem_missing_request_keeps_original_table_unknown)
+{
+	ClusterControlNativeTableInfoV2 info;
+	table_reset();
+	UT_ASSERT_EQ(cluster_control_native_files_creation_shmem_size_v2(), 0);
+	cluster_control_native_files_creation_shmem_init_v2();
+	UT_ASSERT(cluster_control_native_files_info_v2(&info));
+	UT_ASSERT_EQ(info.mode, CLUSTER_NATIVE_FILES_UNKNOWN_V2);
+	UT_ASSERT_EQ(info.table_generation, 0);
+}
+UT_TEST(creation_shmem_original_cohort_child_installs_only_its_exact_batch)
+{
+	for (unsigned origin = 0; origin < 4; origin++) {
+		ClusterControlNativeTableInfoV2 info;
+		ClusterControlNativeFileBorrowV2 b = {0};
+		ClusterControlFileKeyV2 k = key(0);
+		Size reserved;
+		creation_child_fixture(origin);
+		/* Reproduce the original child before any table-region initializer. */
+		munmap(native_files, registered->size_fn());
+		native_files = native_test_region = NULL;
+		registered = NULL;
+		if (origin & 1)
+			Mode = InitProcessing;
+		reserved = cluster_control_native_files_creation_shmem_size_v2();
+		UT_ASSERT(reserved > 100000); /* Cannot use PG's original 100K slop. */
+		UT_ASSERT_EQ(cluster_control_native_files_mode_v2(), CLUSTER_NATIVE_FILES_UNKNOWN_V2);
+		cluster_control_native_files_creation_shmem_init_v2();
+		UT_ASSERT(registered == NULL); /* No full-cluster registry activation. */
+		UT_ASSERT(cluster_control_native_files_info_v2(&info));
+		UT_ASSERT_EQ(info.shared_bytes, reserved);
+		UT_ASSERT_EQ(info.mode, CLUSTER_NATIVE_FILES_CREATION_V2);
+		UT_ASSERT_EQ(info.count, origin ? 1 : 5);
+		UT_ASSERT_EQ(info.startup_generation, creator_batch.creator_pid);
+		UT_ASSERT(!memcmp(&info.creation, &creator_batch, sizeof(creator_batch)));
+		UT_ASSERT_EQ(cluster_node_id, -1);
+		k.origin = origin;
+		UT_ASSERT(cluster_control_native_file_acquire_v2(&k, &b));
+		UT_ASSERT(identity_same(&b.expected, &creator_batch.boot_files[0]));
+		UT_ASSERT(cluster_control_native_file_release_v2(&b));
+		k.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+		UT_ASSERT(!cluster_control_native_file_acquire_v2(&k, &b));
+		printf("# original creation table bytes=%zu origin=%u\n", reserved, origin);
+		/* Let the original fixture cleanup own the existing native region. */
+		cluster_control_native_files_shmem_register();
+		creation_child_cleanup();
+	}
+}
+UT_TEST(creation_shmem_rejects_online_or_changed_original_child_context)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		creation_child_fixture(0);
+		if (fault == 0) IsUnderPostmaster = true;
+		if (fault == 1) IsPostmasterEnvironment = true;
+		if (fault == 2) MyBackendType = B_BACKEND;
+		if (fault == 3) Mode = NormalProcessing;
+		if (fault == 4) cluster_node_id = 0;
+		for (unsigned action = 0; action < 2; action++) {
+			volatile bool caught = false;
+			PG_TRY();
+			{
+				if (action == 0)
+					(void)cluster_control_native_files_creation_shmem_size_v2();
+				else
+					cluster_control_native_files_creation_shmem_init_v2();
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(cluster_control_native_files_mode_v2(), CLUSTER_NATIVE_FILES_UNKNOWN_V2);
+		}
+		creation_child_cleanup();
+	}
+}
 int
 main(void)
 {
@@ -792,6 +914,9 @@ main(void)
 	UT_RUN(inventory_snapshot_current_refuses_saved_value_and_address_drift);
 	UT_RUN(inventory_snapshot_publication_revokes_current_but_destroy_keeps_borrow);
 	UT_RUN(inventory_snapshot_inflight_publication_and_forged_extent_refuse);
+	UT_RUN(creation_shmem_missing_request_keeps_original_table_unknown);
+	UT_RUN(creation_shmem_original_cohort_child_installs_only_its_exact_batch);
+	UT_RUN(creation_shmem_rejects_online_or_changed_original_child_context);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

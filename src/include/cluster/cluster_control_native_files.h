@@ -51,6 +51,13 @@ typedef struct ClusterControlNativeTableInfoV2 {
 	PgracInitdbRecoveryContext creation;
 } ClusterControlNativeTableInfoV2;
 extern void cluster_control_native_files_shmem_register(void);
+/* Only PG's original shared-memory size/init phase of an authenticated initdb
+ * child (standalone bootstrap/init, node still disabled). Uses the SAME native
+ * table/creator batch without registering online cluster regions. No request
+ * returns zero/no-op; a request in another execution context refuses. Does not
+ * publish ROOT, grant file/CF authority, qualify coverage, or change a role. */
+extern Size cluster_control_native_files_creation_shmem_size_v2(void);
+extern void cluster_control_native_files_creation_shmem_init_v2(void);
 /* Unknown is refusal, never permission to select a legacy file. No CF, I/O,
  * allocation or family-lock acquisition on the following local read path. */
 extern ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void);
