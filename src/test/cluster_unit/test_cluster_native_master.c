@@ -206,6 +206,9 @@ static bool nm_requester_notice(ClusterPcmResourceXMasterState **state)
 	NM_REQUIRE(matches == 1);
 	return true;
 }
+/* Optional read-only observation of the actual retired transport/receipt.
+ * Compositions use it to replay old bytes against a real successor. */
+static void (*nm_settled_observer)(const ResourceXIntentSlot *, const ResourceXDecodedFrame *);
 static bool nm_parent_as(int fd, int mode, int requester)
 {
 	ClusterBufmgrFirstFill read;
@@ -241,6 +244,7 @@ static bool nm_parent_as(int fd, int mode, int requester)
 	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.send.pending, 0);
 	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation + 1);
 	UT_ASSERT_EQ(complete_commits, 1); UT_ASSERT_EQ(ordinary_sends, 1);
+	if (nm_settled_observer != NULL) nm_settled_observer(&staged, &notice);
 	complete_idle(); return true;
 }
 static bool nm_parent(int fd, int mode) { return nm_parent_as(fd, mode, 1); }

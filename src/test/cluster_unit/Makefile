@@ -11748,3 +11748,28 @@ clean distclean maintainer-clean: clean-native-remote-cancel
 .PHONY: clean-native-remote-cancel
 clean-native-remote-cancel:
 	rm -f test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel
+
+# Real prior S, ordinary S-to-X ERROR cleanup and independent master.
+TESTS += test_cluster_native_s_x_cancel_master
+all: test_cluster_native_s_x_cancel_master
+test_cluster_native_s_x_cancel_master: test_cluster_native_s_x_cancel_master.c \
+		test_cluster_native_master test_cluster_native_resident_x \
+		test_cluster_native_master_fixture.inc test_cluster_native_resident_x_fixture.inc \
+		test_cluster_native_s_release.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-s-x-cancel-master
+.PHONY: clean-native-s-x-cancel-master
+test_cluster_native_s_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_(bump_failure|bump_locked)\(/ { print "static inline ClusterPcmOwnResult"; emit=1; helpers++ } \
+	     /^cluster_bufmgr_pcm_own_finish_s_release_to_n\(/ { print "ClusterPcmOwnResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (helpers != 2 || found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean-native-s-x-cancel-master:
+	rm -f test_cluster_native_s_x_cancel_master test_cluster_native_s_release.inc test_cluster_native_s_release.inc.tmp

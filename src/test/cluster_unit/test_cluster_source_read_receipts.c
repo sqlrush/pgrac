@@ -42,6 +42,9 @@ sr_start(EvidenceFixture *f, int profile)
 	Size offset = offsetof(ClusterPcmResourceXMasterState, requester_join.grant_payload), matches = 0;
 	const ResourceXDecodedImageEnvelope *image;
 	if (!disk_start(f, profile)) return false;
+	/* The original REQUEST callback precedes normal receipt settlement. */
+	if (!cluster_pcm_lock_resource_x_requester_send_complete_exact(
+		&f->ticket, true, ++fake_pcm_clock_us)) return false;
 	/* The next input comes from M, not the source peer used above. */
 	auth_peer_boot = 31;
 	BufferBlocks = disk_shared.data;
@@ -313,7 +316,7 @@ UT_TEST(test_source_read_actual_LMS_accepts_all_requester_receipt_shapes)
 		UT_ASSERT(!lms_outbound_resource_x_intent_payload_valid(&slot, bytes));
 	}
 }
-UT_TEST(test_source_read_LMS_preserves_master_disk_only_and_reverse_direction)
+UT_TEST(test_source_read_LMS_preserves_master_disk_and_source_reverse_direction)
 {
 	for (int kind = 0; kind < 3; kind++) {
 		EvidenceFixture f; ResourceXDecodedFrame frame; ResourceXIntentSlot slot;
@@ -334,6 +337,8 @@ UT_TEST(test_source_read_LMS_preserves_master_disk_only_and_reverse_direction)
 		UT_ASSERT(lms_outbound_resource_x_intent_valid(&slot));
 		UT_ASSERT(lms_outbound_resource_x_intent_payload_valid(&slot, bytes));
 		slot.payload_bytes = RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
+		UT_ASSERT(lms_outbound_resource_x_intent_valid(&slot));
+		slot.payload_bytes--;
 		UT_ASSERT(!lms_outbound_resource_x_intent_valid(&slot)); cluster_node_id = 1;
 	}
 }
@@ -372,7 +377,7 @@ UT_TEST(test_source_read_snapshot_capacity_is_exact_and_no_other_owner_grows)
 		bytes, sizeof(bytes)), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(memcmp(bytes, sr_state->requester_settlement_intent.payload, sizeof(bytes)) == 0);
 	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXControlIntent), 408);
-	UT_ASSERT_EQ(sizeof(sr_state->deferred_settlement.payload), RESOURCE_X_COMPLETE_V5_BYTES);
+	UT_ASSERT_EQ(sizeof(sr_state->deferred_settlement.payload), RESOURCE_X_SOURCE_COMPLETE_V11_BYTES);
 }
 
 UT_TEST(test_source_read_global_probe_and_real_LMS_handoff_keep_full_receipt)
@@ -416,7 +421,7 @@ main(void)
 	UT_RUN(test_source_read_verified_quiet_waits_for_exact_ACK_and_callback);
 	UT_RUN(test_source_read_unarmed_quiet_never_claims_image_or_native_C);
 	UT_RUN(test_source_read_actual_LMS_accepts_all_requester_receipt_shapes);
-	UT_RUN(test_source_read_LMS_preserves_master_disk_only_and_reverse_direction);
+	UT_RUN(test_source_read_LMS_preserves_master_disk_and_source_reverse_direction);
 	UT_RUN(test_source_read_ACK_domain_changes_leave_exact_debt);
 	UT_RUN(test_source_read_snapshot_capacity_is_exact_and_no_other_owner_grows);
 	UT_RUN(test_source_read_global_probe_and_real_LMS_handoff_keep_full_receipt);

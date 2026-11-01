@@ -10666,10 +10666,10 @@ cluster_gcs_block_acquire_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *ba
 			|| now >= UINT64_MAX - diagnostic_budget)
 			return RESOURCE_X_APPLY_INVALID;
 		fill->preparing = true;
-		action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(&assertion,
+		action = cluster_pcm_lock_resource_x_acquire_round_step_exact(&assertion,
 			fill->master_node, fill->gate.formation, fill->master_session,
 			fill->admission.record_generation, fill->requester_connection, fill->master_connection,
-			now + diagnostic_budget, diagnostic_budget, now, slice, false, 0, &fill->prepared, &unused);
+			now + diagnostic_budget, diagnostic_budget, now, slice, base, &fill->episode, &fill->prepared, &unused);
 		if (action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST)
 			fill->round_prepared = true;
 		fill->preparing = false;

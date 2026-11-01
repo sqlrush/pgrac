@@ -2889,6 +2889,14 @@ extern void cluster_pcm_lock_pi_holder_note(BufferTag tag, int32 holder_node);
 extern bool cluster_pcm_lock_pi_discard_collect(BufferTag tag, SCN written_scn,
 												uint32 *holders_out);
 
+/* Ordinary native reservations alone can consume a settled resident S
+ * authorization. Generic/bootstrap callers retain their original WAIT. */
+extern ResourceXBootstrapRoundAction cluster_pcm_lock_resource_x_acquire_round_step_exact(
+	const ResourceXAssertion *assertion, int32 master, uint64 formation, uint64 session, uint64 r4,
+	uint32 sender, uint32 ingress, uint64 deadline, uint64 budget, uint64 now, uint64 slice,
+	const struct ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDecodedFrame *dispatch, ResourceXAcquisitionRef *terminal);
+
 /* Original full-E preparation only. Generic delivery claims reject PREPARED.
  * Revert requires bufmgr's exact unpublished/zero-hold native observation;
  * neither operation grants physical IO, image installation or native C. */
