@@ -14225,6 +14225,50 @@ clean-pending-ack-ingress:
 	rm -f test_cluster_pcm_pending_ack_ingress.inc test_cluster_pcm_pending_ack_ingress.inc.tmp
 	rm -f test_cluster_pcm_vm_revoke.inc test_cluster_pcm_vm_revoke.inc.tmp
 
+# Complete local writer constructors through the original VM continuation.
+TESTS += test_cluster_vm_writer_activation test_cluster_vm_writer_activation_noassert
+all: test_cluster_vm_writer_activation test_cluster_vm_writer_activation_noassert
+
+test_cluster_vm_writer_activation.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_x_writer_prepare_target\(/ { print "static ClusterPcmXWriterLedgerEntry *"; emit=1; prepare++ } \
+	     /^cluster_bufmgr_pcm_x_writer_activate\(/ { print "static bool"; emit=1; activate++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (prepare != 1 || activate != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_writer_clear.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^#define (MAPSIZE|HEAPBLOCKS_PER_BYTE|HEAPBLOCKS_PER_PAGE|HEAPBLK_TO_MAPBLOCK|HEAPBLK_TO_MAPBYTE|HEAPBLK_TO_OFFSET)[ (]/ { print; constants++ } \
+	     /^vm_buffer_matches\(/ || /^vm_redo_page_valid\(/ { print "static bool"; emit=1; validate++ } \
+	     /^visibilitymap_clear_locked\(/ { print "bool"; emit=1; clear++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (constants != 6 || validate != 2 || clear != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_writer_activation_noassert: CPPFLAGS += -DFIXTURE_NO_ASSERTS
+test_cluster_vm_writer_activation test_cluster_vm_writer_activation_noassert: \
+		test_cluster_vm_writer_activation.c unit_test.h test_cluster_vm_writer_activation.inc \
+		test_cluster_vm_writer_clear.inc test_cluster_freeze_writer_context.inc \
+		test_cluster_heap_insert_vm_authority.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/cluster/cluster_content_trace.h \
+		$(top_srcdir)/src/include/storage/bufmgr.h \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_own.h \
+		$(top_srcdir)/src/include/cluster/cluster_ko.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_smgr.h \
+		$(top_srcdir)/src/include/access/visibilitymap.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean: clean-vm-writer-activation
+.PHONY: clean-vm-writer-activation
+clean-vm-writer-activation:
+	rm -f test_cluster_vm_writer_activation.inc test_cluster_vm_writer_activation.inc.tmp \
+		test_cluster_vm_writer_clear.inc test_cluster_vm_writer_clear.inc.tmp
+
 TESTS += test_cluster_first_fill_wait
 all: test_cluster_first_fill_wait
 test_cluster_first_fill_bufmgr.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
