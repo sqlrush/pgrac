@@ -16373,3 +16373,38 @@ clean: clean-relmap-wal-desc
 .PHONY: clean-relmap-wal-desc
 clean-relmap-wal-desc:
 	rm -f test_cluster_relmap_wal_desc test_cluster_relmap_wal_desc.d
+
+# Complete RMC1 observations keep the original cold structural refusal.
+TESTS += test_cluster_relmap_cold_create
+all: test_cluster_relmap_cold_create
+test_cluster_relmap_cold_create: test_cluster_relmap_cold_create.c test_cluster_cold_recovery_effects.c unit_test.h test_cluster_cold_dependency.inc \
+		test_cluster_cold_abort_replay.inc test_cluster_cold_effects_consumer.h \
+		test_cluster_cold_effects_consumer.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o \
+		$(CLUSTER_COLD_PLAN_SPLIT_O) \
+		$(CLUSTER_COLD_DECODE_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
+		test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o \
+		$(CLUSTER_COLD_PLAN_SPLIT_O) \
+		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_SIDE_XACT_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) \
+		$(SIDE_XACT_XACTDESC_O) $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -o $@
+
+$(CLUSTER_COLD_DECODE_O) test_cluster_relmap_cold_create: \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+.PHONY: clean-relmap-cold-create
+clean: clean-relmap-cold-create
+clean-relmap-cold-create:
+	rm -f test_cluster_relmap_cold_create test_cluster_relmap_cold_create.d

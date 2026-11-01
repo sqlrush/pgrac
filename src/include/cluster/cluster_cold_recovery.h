@@ -49,6 +49,7 @@
 #define CLUSTER_COLD_RECOVERY_H
 
 #include "common/relmap.h"
+#include "common/cluster_relmap_create.h"
 
 #include "access/xlogrecord.h"
 #include "cluster/cluster_page_stable_base.h"
@@ -193,6 +194,9 @@ typedef struct ClusterColdRecordV1 {
 	Oid relmap_dbid;
 	Oid relmap_tsid;
 	const RelMapFile *relmap_image;
+	/* Independent clean creation observation. Never a pending pin/image,
+	 * execution grant or substitute for original RESERVED/batch authority. */
+	const ClusterRelmapCreateWalV1 *relmap_create;
 } ClusterColdRecordV1;
 
 /* Original record frame metadata, not an ownership or effects proof. */
@@ -674,6 +678,7 @@ typedef struct ClusterColdDecodedV1 {
 	ClusterColdSpaceOpV1 *space_ops;
 	uint32 space_capacity;
 	RelMapFile relmap_image;
+	ClusterRelmapCreateWalV1 relmap_create;
 } ClusterColdDecodedV1;
 
 /* Classify one decoded record of the exact source namespace. Reserved raw/top

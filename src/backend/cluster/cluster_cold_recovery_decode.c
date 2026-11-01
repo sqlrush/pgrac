@@ -115,6 +115,34 @@ cold_relmap_image(XLogReaderState *reader, ClusterColdDecodedV1 *out)
 }
 
 
+/* Independent creation bytes are observations only. The old pending-image
+ * declaration cannot supply original RESERVED/batch authority. Keep this
+ * carrier separate so neither the legacy participant route nor the native
+ * counter/no-op route can consume it before the original owner is wired. */
+static bool
+cold_relmap_create(XLogReaderState *reader, uint64 system_identifier,
+	const uint8 storage_uuid[16], ClusterColdDecodedV1 *out)
+{
+	ClusterRelmapCreateWalV1 *creation = &out->relmap_create;
+
+	if (XLogRecGetInfo(reader) != CLUSTER_RELMAP_CREATE_WAL_INFO_V1
+		|| XLogRecHasAnyBlockRefs(reader) || reader->record->has_page_version_edge
+		|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+		|| reader->ReadRecPtr == InvalidXLogRecPtr || reader->ReadRecPtr >= reader->EndRecPtr
+		|| !cluster_relmap_create_decode_v1(XLogRecGetData(reader), XLogRecGetDataLen(reader), creation)
+		|| creation->identity.system_identifier != system_identifier
+		|| memcmp(creation->identity.storage_uuid, storage_uuid, 16) != 0)
+		return false;
+	/* The full target origin/branch/incarnations/batch remain by value.
+	 * Target origin need not equal the original WAL writer's thread. The
+	 * decoder has no independent creation registration to qualify them. */
+	out->record.relmap_dbid = creation->identity.database_oid;
+	out->record.relmap_tsid = creation->identity.tablespace_oid;
+	out->record.relmap_create = creation;
+	return true;
+}
+
+
 static RfPageProofDetailV1
 cold_preflight_side_record(void *arg, const RfOpcodeRouteV1 *route,
 						   const RfPageVersionEdgeEntryV1 *edge, const DecodedBkpBlock *block)
@@ -650,6 +678,9 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 		return CLUSTER_COLD_OK;
 	case RM_RELMAP_ID:
 		*flags = CLUSTER_COLD_RECORD_STRUCTURAL;
+		if (XLogRecGetInfo(reader) == CLUSTER_RELMAP_CREATE_WAL_INFO_V1)
+			return cold_relmap_create(reader, system_identifier, storage_uuid, out)
+				? CLUSTER_COLD_OK : CLUSTER_COLD_COMPONENT_INVALID;
 		return cold_relmap_image(reader, out) ? CLUSTER_COLD_OK : CLUSTER_COLD_COMPONENT_INVALID;
 	case RM_CLUSTER_XID_STRIPE_ID:
 		if (info == XLOG_CLUSTER_XID_STRIPE_JOIN) {
