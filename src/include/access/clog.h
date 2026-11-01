@@ -11,6 +11,7 @@
 #ifndef CLOG_H
 #define CLOG_H
 
+#include "access/transam.h"
 #include "access/xlogreader.h"
 #include "storage/sync.h"
 #include "lib/stringinfo.h"

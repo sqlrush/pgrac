@@ -11432,6 +11432,28 @@ clean: clean-clog-storage-initialize
 clean-clog-storage-initialize:
 	rm -f test_cluster_clog_initialize test_cluster_clog_initialize.d
 
+# Native full-image reconstruction preserves earlier same-birth terminal redo.
+TESTS += test_cluster_clog_image_restore
+all: test_cluster_clog_image_restore
+test_cluster_clog_image_restore: test_cluster_clog_image_restore.c unit_test.h \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-image-restore
+.PHONY: clean-clog-image-restore
+clean-clog-image-restore:
+	rm -f test_cluster_clog_image_restore test_cluster_clog_image_restore.d
+
 # Original issuer/CLOG birth and cache provenance lifecycle.
 TESTS += test_cluster_clog_birth
 all: test_cluster_clog_birth
