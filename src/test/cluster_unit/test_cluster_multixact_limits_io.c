@@ -88,6 +88,10 @@ static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
 static char fixture_root[MAXPGPATH];
 static bool expect_error, fail_open, fail_sync, fail_dirsync;
+static void (*warning_unlock_hook)(void);
+static MultiXactId warning_next, warning_lower;
+static bool warning_known, warning_member_stop;
+static unsigned warning_unlocks, warning_writes, warning_wal;
 static int transient_fds;
 static unsigned writes, syncs, dirsyncs, reads;
 static struct {
@@ -333,6 +337,12 @@ LWLockRelease(LWLock *lock)
 	unsigned i = fixture_lock_index(lock);
 	UT_ASSERT(fixture_locks[i].held);
 	fixture_locks[i].held = false;
+	if (lock == MultiXactGenLock && warning_unlock_hook != NULL) {
+		void (*hook)(void) = warning_unlock_hook;
+
+		warning_unlock_hook = NULL;
+		hook();
+	}
 }
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -504,6 +514,8 @@ local_reset(void)
 {
 	char path[MAXPGPATH];
 
+	warning_unlock_hook = NULL;
+	warning_unlocks = 0;
 	if (MyBackendId < 1 || MyBackendId >= lengthof(local_oldest_member)
 		|| MaxOldestSlot >= lengthof(local_oldest_member))
 		abort();
@@ -993,6 +1005,143 @@ UT_TEST(physical_checkpoint_startup_refuses_contradiction_before_mutation)
 	}
 }
 
+/* Only the scheduling boundary is simulated. The opaque prepared-page bytes
+ * are preservation markers, not issued IDs or authority to read old members. */
+static void
+local_publish_warning_window(void)
+{
+	UT_ASSERT(!LWLockHeldByMe(MultiXactGenLock));
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(writes, warning_writes);
+	UT_ASSERT_EQ(wal_records, warning_wal);
+	warning_unlocks++;
+	local_state.nextMXact = warning_next;
+	local_state.oldestMultiXactId = warning_lower;
+	local_state.nextOffset = local_state.oldestOffset = 502;
+	local_state.oldestOffsetKnown = warning_known;
+	if (warning_member_stop)
+		local_state.offsetStopLimit = 503;
+}
+
+static void
+local_prepare_warning_window(bool wrap, int origin, PGAlignedBlock *old,
+							 PGAlignedBlock *offsets, PGAlignedBlock *members)
+{
+	int old_page = wrap ? MultiXactIdToOffsetPage(MaxMultiXactId) : 0;
+	int next_page = wrap ? 0 : 128;
+
+	local_reset();
+	local_state.nextMXact = wrap ? UINT32_MAX - 31 : 33;
+	local_state.oldestMultiXactId = local_state.multiVacLimit = wrap ? UINT32_MAX - 63 : 32;
+	local_state.nextOffset = local_state.oldestOffset = 500;
+	local_state.multiWarnLimit = local_state.multiVacLimit + 1000;
+	cluster_node_id = origin;
+	cluster_mxid_stripe_latch_runtime(true, origin, wrap ? UINT32_MAX - 63 : 32);
+	memset(old->data, 0, BLCKSZ);
+	old->data[BLCKSZ - 1] = 0x72;
+	memset(offsets->data, 0, BLCKSZ);
+	memset(members->data, 0, BLCKSZ);
+	((MultiXactOffset *)offsets->data)[2] = 887;
+	((MultiXactOffset *)offsets->data)[MULTIXACT_OFFSETS_PER_PAGE - 1] = 771;
+	members->data[BLCKSZ - 1] = 0x6b;
+	local_page(MultiXactOffsetCtl, old_page, old->data, BLCKSZ);
+	local_page(MultiXactOffsetCtl, next_page, offsets->data, BLCKSZ);
+	local_page(MultiXactMemberCtl, 0, members->data, BLCKSZ);
+	warning_next = wrap ? 17 : 262145;
+	warning_lower = wrap ? 33 : 262161;
+	warning_known = true;
+	warning_member_stop = false;
+	warning_writes = writes;
+	warning_wal = wal_records;
+	capture_allocation = true;
+	warning_unlock_hook = local_publish_warning_window;
+}
+
+UT_TEST(physical_warning_recheck_preserves_prepared_page_and_records_final_candidate)
+{
+	static const struct {
+		int origin;
+		bool wrap;
+		MultiXactId expected;
+	} cases[] = {{0, false, 262176}, {1, false, 262161},
+				 {0, true, 48}, {1, true, 33}};
+
+	for (unsigned c = 0; c < lengthof(cases); c++) {
+		MultiXactMember members[2]
+			= {{116, MultiXactStatusForShare}, {100, MultiXactStatusForKeyShare}};
+		PGAlignedBlock old, offsets, retained_members, expected, after;
+		MultiXactId id = 0;
+		int old_page = cases[c].wrap ? MultiXactIdToOffsetPage(MaxMultiXactId) : 0;
+		int next_page = cases[c].wrap ? 0 : 128;
+		bool allocated;
+
+		local_prepare_warning_window(cases[c].wrap, cases[c].origin,
+								 &old, &offsets, &retained_members);
+		allocated = local_allocate_and_record(&id, members);
+		UT_ASSERT(allocated);
+		UT_ASSERT_EQ(warning_unlocks, 1);
+		UT_ASSERT_EQ(id, cases[c].expected);
+		if (!allocated || warning_unlocks != 1 || id != cases[c].expected)
+			continue;
+		UT_ASSERT(warning_unlock_hook == NULL);
+		UT_ASSERT_EQ(local_state.nextMXact, id + 1);
+		UT_ASSERT_EQ(local_state.nextOffset, 504);
+		UT_ASSERT_EQ(wal_records, 1);
+		UT_ASSERT_EQ(allocation_wal[0].info, XLOG_MULTIXACT_CREATE_ID);
+		expected = offsets;
+		((MultiXactOffset *)expected.data)[MultiXactIdToOffsetEntry(id)] = 502;
+		((MultiXactOffset *)expected.data)[MultiXactIdToOffsetEntry(id + 1)] = 504;
+		CheckPointMultiXact();
+		local_discard_cache();
+		local_read_page(MultiXactOffsetCtl, next_page, after.data);
+		UT_ASSERT_EQ(memcmp(expected.data, after.data, BLCKSZ), 0);
+		local_read_page(MultiXactOffsetCtl, old_page, after.data);
+		UT_ASSERT_EQ(memcmp(old.data, after.data, BLCKSZ), 0);
+		local_read_page(MultiXactMemberCtl, 0, after.data);
+		UT_ASSERT_EQ(after.data[BLCKSZ - 1], retained_members.data[BLCKSZ - 1]);
+		local_check_members(id, 502, 100, 116);
+		UT_ASSERT_EQ(transient_fds, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT(!LWLockHeldByMe(MultiXactGenLock));
+	}
+}
+
+UT_TEST(physical_warning_recheck_refuses_changed_member_limits_before_writes)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		MultiXactMember members[2]
+			= {{116, MultiXactStatusForShare}, {100, MultiXactStatusForKeyShare}};
+		PGAlignedBlock old, offsets, retained_members, after;
+		MultiXactId id = 0;
+
+		local_prepare_warning_window(false, 0, &old, &offsets, &retained_members);
+		warning_known = fault != 0;
+		warning_member_stop = fault == 1;
+		UT_ASSERT(!local_allocate_and_record(&id, members));
+		UT_ASSERT_EQ(warning_unlocks, 1);
+		UT_ASSERT_EQ(error_level, ERROR);
+		UT_ASSERT_EQ(id, 0);
+		if (warning_unlocks != 1)
+			continue;
+		UT_ASSERT_EQ(local_state.nextMXact, warning_next);
+		UT_ASSERT_EQ(local_state.oldestMultiXactId, warning_lower);
+		UT_ASSERT_EQ(local_state.nextOffset, 502);
+		UT_ASSERT_EQ(wal_records, warning_wal);
+		CheckPointMultiXact();
+		UT_ASSERT_EQ(writes, warning_writes);
+		local_discard_cache();
+		local_read_page(MultiXactOffsetCtl, 128, after.data);
+		UT_ASSERT_EQ(memcmp(offsets.data, after.data, BLCKSZ), 0);
+		local_read_page(MultiXactOffsetCtl, 0, after.data);
+		UT_ASSERT_EQ(memcmp(old.data, after.data, BLCKSZ), 0);
+		local_read_page(MultiXactMemberCtl, 0, after.data);
+		UT_ASSERT_EQ(memcmp(retained_members.data, after.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(transient_fds, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT(!LWLockHeldByMe(MultiXactGenLock));
+	}
+}
+
 UT_TEST(physical_exact_page_missing_short_and_zero_keep_original_refusal)
 {
 	for (int fault = 0; fault < 3; fault++) {
@@ -1247,7 +1396,7 @@ main(void)
 		SimpleLruInit(ctl, family ? "members" : "offsets", 4, 0, lock, path,
 					  LWTRANCHE_MULTIXACTOFFSET_BUFFER, SYNC_HANDLER_NONE);
 	}
-	UT_PLAN(9);
+	UT_PLAN(11);
 	UT_RUN(native_empty_boot_reads_real_authority_and_original_backup);
 	UT_RUN(physical_exact_page_missing_short_and_zero_keep_original_refusal);
 	UT_RUN(physical_runtime_limit_preserves_live_member_page);
@@ -1257,6 +1406,8 @@ main(void)
 	UT_RUN(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members);
 	UT_RUN(physical_checkpoint_startup_preserves_retained_bytes_and_continues);
 	UT_RUN(physical_checkpoint_startup_refuses_contradiction_before_mutation);
+	UT_RUN(physical_warning_recheck_preserves_prepared_page_and_records_final_candidate);
+	UT_RUN(physical_warning_recheck_refuses_changed_member_limits_before_writes);
 	local_reset();
 	UT_ASSERT_EQ(rmdir(MultiXactOffsetCtl->Dir), 0);
 	UT_ASSERT_EQ(rmdir(MultiXactMemberCtl->Dir), 0);
