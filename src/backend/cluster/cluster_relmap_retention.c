@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_relmap_retention.h"
+#include "cluster/cluster_relmap_recovery_internal.h"
 #include "cluster/cluster_tt_slot.h"
 
 /* Strictly less than half of the raw-XID space, using full-width identities. */
@@ -597,4 +598,115 @@ cluster_relmap_retention_allocation_observe(ClusterRelmapRetentionDirectory *dir
 	if (result == CLUSTER_RELMAP_RETENTION_OK)
 		directory->last_issued = candidate;
 	return result;
+}
+
+/* Recovery custody is deliberately independent of the ordinary directory FSM.
+ * The original coordinator authenticates source/cut/full batch, not this core. */
+bool
+cluster_relmap_recovery_check(const ClusterRelmapRecoveryPins *pins,
+	const ClusterRelmapV2Image *image)
+{
+	unsigned found = 0;
+	if (pins == NULL || image == NULL || pins->state != CLUSTER_RELMAP_RETENTION_BUILDING
+		|| !pins->restored || pins->transferred || pins->expected == 0
+		|| pins->expected > CLUSTER_RELMAP_RETENTION_CAPACITY || pins->count != pins->expected)
+		return false;
+	for (uint32 i = 0; i < pins->count; ++i)
+		if (memcmp(&pins->images[i], image, sizeof(*image)) == 0)
+			++found;
+	return found == 1;
+}
+
+bool
+cluster_relmap_recovery_stage_start(ClusterRelmapRecoveryPins *pins,
+	const ClusterRelmapV2Image *image)
+{
+	if (!cluster_relmap_recovery_check(pins, image)) return false;
+	for (uint32 i = 0; i < pins->count; ++i)
+		if (memcmp(&pins->images[i], image, sizeof(*image)) == 0) {
+			if (pins->attempted[i]) return false;
+			pins->attempted[i] = true; /* Before the first fallible file call. */
+			return true;
+		}
+	return false;
+}
+
+bool
+cluster_relmap_recovery_stage_finish(ClusterRelmapRecoveryPins *pins,
+	const ClusterRelmapV2Image *image)
+{
+	if (!cluster_relmap_recovery_check(pins, image)) return false;
+	for (uint32 i = 0; i < pins->count; ++i)
+		if (memcmp(&pins->images[i], image, sizeof(*image)) == 0) {
+			if (!pins->attempted[i] || pins->staged[i]) return false;
+			pins->staged[i] = true; /* Only after pair readback AND close. */
+			return true;
+		}
+	return false;
+}
+
+bool
+cluster_relmap_recovery_transfer(ClusterRelmapRecoveryPins *pins,
+	ClusterRelmapRetentionDirectory *const *targets, uint32 count)
+{
+	unsigned slots[CLUSTER_RELMAP_RETENTION_CAPACITY];
+	ClusterRelmapRetentionKey keys[CLUSTER_RELMAP_RETENTION_CAPACITY];
+	if (pins == NULL || targets == NULL || count == 0 || count != pins->count
+		|| count > CLUSTER_RELMAP_RETENTION_CAPACITY
+		|| snapshot_overlaps(pins, sizeof(*pins), targets, (Size)count * sizeof(*targets)))
+		return false;
+	for (uint32 i = 0; i < count; ++i) {
+		const ClusterRelmapV2Image *image = &pins->images[i];
+		const ClusterRelmapV2Owner *owner = &image->pending_owner;
+		ClusterRelmapRetentionDirectory *dir = targets[i];
+		unsigned chosen = CLUSTER_RELMAP_RETENTION_CAPACITY;
+		unsigned matches = 0;
+		keys[i] = (ClusterRelmapRetentionKey){image->identity, image->pending_generation,
+			owner->node, owner->top_full_xid, owner->membership_epoch,
+			owner->admitted_incarnation, owner->boot_incarnation};
+		if (!cluster_relmap_recovery_check(pins, image) || !pins->attempted[i] || !pins->staged[i]
+			|| dir == NULL
+			|| snapshot_overlaps(pins, sizeof(*pins), dir, sizeof(*dir))
+			|| snapshot_overlaps(targets, (Size)count * sizeof(*targets), dir, sizeof(*dir))
+			|| dir->state != CLUSTER_RELMAP_RETENTION_COMPLETE
+			|| check_key(dir, &keys[i]) != CLUSTER_RELMAP_RETENTION_OK)
+			return false;
+		for (uint32 k = 0; k < i; ++k)
+			if (targets[k] != dir && snapshot_overlaps(targets[k], sizeof(*dir), dir, sizeof(*dir)))
+				return false;
+		for (unsigned j = 0; j < CLUSTER_RELMAP_RETENTION_CAPACITY; ++j) {
+			const ClusterRelmapRetentionPin *pin = &dir->pins[j];
+			if (pin->occupied && same_namespace(&pin->key.identity, &keys[i].identity)) {
+				if (!same_key(&pin->key, &keys[i]) || !pin->may_be_staged
+					|| pin->wal_end != owner->wal_end || ++matches != 1)
+					return false;
+				chosen = j;
+			}
+		}
+		if (matches == 0) {
+			for (unsigned j = 0; j < CLUSTER_RELMAP_RETENTION_CAPACITY; ++j) {
+				bool reserved = false;
+				for (uint32 k = 0; k < i; ++k)
+					if (targets[k] == dir && slots[k] == j) reserved = true;
+				if (!dir->pins[j].occupied && !reserved) { chosen = j; break; }
+			}
+		}
+		if (chosen == CLUSTER_RELMAP_RETENTION_CAPACITY)
+			return false;
+		slots[i] = chosen;
+	}
+	/* No failure, callbacks or ERROR are possible after the first copy.
+	 * Preserve an already qualified original TT binding on an exact pin. */
+	for (uint32 i = 0; i < count; ++i) {
+		ClusterRelmapRetentionPin *pin = &targets[i]->pins[slots[i]];
+		if (!pin->occupied) {
+			memset(pin, 0, sizeof(*pin));
+			pin->key = keys[i];
+			pin->wal_end = pins->images[i].pending_owner.wal_end;
+			pin->may_be_staged = true;
+			pin->occupied = true;
+		}
+	}
+	pins->transferred = true;
+	return true;
 }

@@ -40,6 +40,7 @@
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_retention.h"
+#include "cluster/cluster_relmap_recovery_internal.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
@@ -890,6 +891,35 @@ done:
 	if (!relmap_v2_close_dirs(&dirs))
 		ok = false;
 	return ok;
+}
+
+bool
+cluster_relmap_authority_v2_write_recovery_pending(const ClusterRelmapV2Image *image,
+	ClusterRelmapRecoveryPins *pins)
+{
+	RelmapV2Directory dirs;
+	RelmapV2Copy copies[2];
+	ClusterRelmapV2View view;
+	unsigned char bytes[CLUSTER_RELMAP_V2_FILE_SIZE];
+	bool ok = false;
+	if (!enableFsync || !cluster_relmap_authority_x_held()
+		|| !cluster_relmap_recovery_stage_start(pins, image))
+		return false;
+	if (!relmap_v2_open_dirs(&image->identity, &dirs)) goto done;
+	if (relmap_v2_load(&dirs, &image->identity, copies, &view) != CLUSTER_RELMAP_V2_PAIR_VALID
+		|| view.has_pending || view.committed_generation != image->committed_generation
+		|| memcmp(&view.committed, &image->committed, sizeof(view.committed)) != 0
+		|| cluster_relmap_v2_encode(image, bytes, sizeof(bytes)) != CLUSTER_RELMAP_V2_VALID
+		|| !cluster_relmap_authority_x_held() || !cluster_relmap_recovery_check(pins, image))
+		goto done;
+	/* Custody was latched for the complete original batch before pass-1.
+	 * Recheck immediately before the SAME real pair writer; never call the
+	 * ordinary COMPLETE stage_start or convert BUILDING into a directory. */
+	ok = relmap_v2_store_pair(&dirs, &image->identity, bytes, copies)
+		&& cluster_relmap_recovery_check(pins, image);
+done:
+	if (!relmap_v2_close_dirs(&dirs)) ok = false;
+	return ok && cluster_relmap_recovery_stage_finish(pins, image);
 }
 
 static ClusterRelmapV2ClearResult
