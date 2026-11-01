@@ -11893,7 +11893,6 @@ test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activ
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
-		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 
@@ -12743,11 +12742,11 @@ test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity t
 		test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: \
 		$(top_srcdir)/src/include/storage/proc.h
 
-test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h test_cluster_undo_link_scn.o test_cluster_undo_link_xid_stripe.o \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
-		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< test_cluster_undo_link_scn.o \
+		test_cluster_undo_link_xid_stripe.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
@@ -13944,7 +13943,7 @@ test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(CLUSTER_UNDO_RETENTION_O) \
-		test_cluster_subtrans_watermark.inc $(CLUSTER_XID_STRIPE_O) \
+		test_cluster_subtrans_watermark.inc test_cluster_undo_link_xid_stripe.o \
 		$(top_srcdir)/src/include/access/slru.h $(top_srcdir)/src/include/access/subtrans.h \
 		$(top_srcdir)/src/include/cluster/cluster_mode.h $(top_srcdir)/src/include/storage/lwlock.h \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
@@ -13959,11 +13958,11 @@ test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
-		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) $(CLUSTER_XID_STRIPE_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) test_cluster_undo_link_xid_stripe.o \
 		$(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -lm -o $@
 
 # spec-5.22b D2-1/D2-3: test_cluster_undo_gcs — owner-as-master routing layer
 # (D2-1: cluster_undo_block_lookup_master / _master_is_self) + the pure reader
@@ -14293,7 +14292,7 @@ test_cluster_cold_tt_base: test_cluster_cold_tt_base.c unit_test.h test_cluster_
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
-test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
+test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c Makefile \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_checkpoint.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
@@ -14304,7 +14303,7 @@ test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/clu
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_cold_recovery_startup_plan_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
@@ -17086,10 +17085,10 @@ test_cluster_undo_capacity_history: test_cluster_undo_capacity_history.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
-		$(CLUSTER_UNDO_RETENTION_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
+		$(CLUSTER_UNDO_RETENTION_O) test_cluster_undo_link_xid_stripe.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_UNDO_RETENTION_O) $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
-		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		test_cluster_undo_link_xid_stripe.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
@@ -17218,3 +17217,16 @@ clean distclean maintainer-clean: clean-ctrc-allocator-gc
 .PHONY: clean-ctrc-allocator-gc
 clean-ctrc-allocator-gc:
 	rm -f test_cluster_ctrc_allocator_gc
+
+# Standalone GNU ld needs sections in each complete linked product object,
+# matching the existing Darwin dead-strip boundary without backend stubs.
+test_cluster_undo_link_scn.o: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_undo_link_xid_stripe.o: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+.PHONY: clean-undo-link-products
+clean-undo-link-products:
+	rm -f test_cluster_undo_link_scn.o test_cluster_undo_link_xid_stripe.o
+clean distclean maintainer-clean: clean-undo-link-products
