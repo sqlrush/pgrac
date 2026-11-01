@@ -71,6 +71,35 @@ class DeadlockEvidence(unittest.TestCase):
             self.assertFalse(result['authoritative'])
             self.assertEqual(case, before)
 
+    def test_psql_stdin_location_keeps_the_actual_deadlock_victim(self):
+        for pid in (100, 200):
+            with self.subTest(pid=pid):
+                case = deadlock_fixture(pid)
+                case['stderr'] = 'psql:<stdin>:28: ' + case['stderr']
+                before = copy.deepcopy(case)
+                try:
+                    result = self.validate(case)
+                except ValueError as exc:
+                    self.fail('complete native psql deadlock error refused: ' + str(exc))
+                self.assertEqual(result['sqlstate'], '40P01')
+                self.assertEqual(result['victim_pid'], pid)
+                self.assertEqual(result['cycle'], 71)
+                self.assertFalse(result['authoritative'])
+                self.assertEqual(case, before)
+
+    def test_duplicate_or_unrecognized_deadlock_errors_are_rejected(self):
+        error = deadlock_fixture()['stderr']
+        for stderr in (
+                'psql:/tmp/case.sql:28: ' + error,
+                'psql:<stdin>:0: ' + error,
+                error + 'psql:<stdin>:28: ' + error,
+                error + 'psql:<stdin>:bad: ' + error,
+                error + 'FATAL:  57P01: terminating connection\n',
+                error + 'psql:<stdin>:28: PANIC:  XX000: invalid state\n'):
+            with self.subTest(stderr=stderr):
+                case = deadlock_fixture(); case['stderr'] = stderr
+                with self.assertRaises(ValueError): self.validate(case)
+
     def test_page_selection_requires_the_existing_full_canonical_join(self):
         selector = getattr(evidence, 'select_page_owner', None)
         self.assertTrue(callable(selector), 'observed page owner selector is missing')

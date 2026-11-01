@@ -128,6 +128,20 @@ def select_blocker(case):
     return dict(selected, wait_seq=number(wait['wait_seq']))
 
 
+def _native_errors(stderr):
+    """Read exact verbose errors from psql stdin without changing raw evidence."""
+    errors = []
+    for line in stderr.splitlines():
+        if not re.search(r'\b(?:ERROR|FATAL|PANIC):', line):
+            continue
+        error = re.fullmatch(r'(?:psql:<stdin>:[1-9][0-9]*: )?'
+                             r'ERROR:\s+([0-9A-Z]{5}): (.*)', line)
+        if error is None:
+            raise ValueError('unrecognized native client error record')
+        errors.append(error.groups())
+    return errors
+
+
 def validate_wait_exit(case):
     """Require the original wait to end without releasing any test owner."""
     selected = select_blocker(case['start'])
@@ -139,7 +153,7 @@ def validate_wait_exit(case):
     kind = case['kind']
     if kind not in causes or case['cancel_sent'] is not (kind == 'cancel'):
         raise ValueError('unexpected cancellation boundary or signal')
-    errors = re.findall(r'^ERROR:\s+([0-9A-Z]{5}): (.*)$', case['stderr'], re.MULTILINE)
+    errors = _native_errors(case['stderr'])
     sqlstate, message = causes[kind]
     if (case['client_had_error'] is not True or case['stdout'].strip() != 'B08_SQLSTATE ' + sqlstate
             or errors != [(sqlstate, message)]):
@@ -348,7 +362,7 @@ def validate_deadlock(case):
             raise ValueError('original wait did not return native DEADLOCK or RESOLVED')
         if waiter['pid'] == victim and len(raw) != 2:
             raise ValueError('victim registered another wait before rollback')
-    errors = re.findall(r'^ERROR:\s+([0-9A-Z]{5}): (.*)$', case['stderr'], re.MULTILINE)
+    errors = _native_errors(case['stderr'])
     if (case['client_had_error'] is not True or case['stdout'].strip() != 'B08_SQLSTATE 40P01'
             or errors != [('40P01', 'deadlock detected while waiting for heap update ITL '
                            'capacity (INITRANS=8)')]):
