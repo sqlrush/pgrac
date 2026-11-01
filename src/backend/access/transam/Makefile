@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
 OBJS = \
 	clog.o \
 	clog_storage.o \
+	clog_write.o \
 	commit_ts.o \
 	generic_xlog.o \
 	multixact.o \
