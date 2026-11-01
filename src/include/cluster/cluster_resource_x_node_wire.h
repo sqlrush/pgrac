@@ -13,6 +13,7 @@
 #define CLUSTER_RESOURCE_X_NODE_WIRE_H
 
 #include "cluster/cluster_buffer_desc.h"
+#include "cluster/cluster_ctrc_origin_fullxid.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_page_wal.h"
@@ -24,12 +25,46 @@
 #define RESOURCE_X_PROOF_V1_BYTES 312
 #define RESOURCE_X_IMAGE_V2_BYTES 8752
 #define RESOURCE_X_IMAGE_WIRE_VERSION 2
+/* V3 appends an explicit CTRC delegation bundle; V2 bytes stay unchanged.
+ * The wire codec checks framing only. Receiver custody is independent. */
+#define RESOURCE_X_IMAGE_CTRC_WIRE_VERSION 3
+#define RESOURCE_X_CTRC_BUNDLE_VERSION 1
+#define RESOURCE_X_CTRC_BUNDLE_V2_VERSION 2
+#define RESOURCE_X_CTRC_RECORD_VERSION 1
+#define RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES 8
+#define RESOURCE_X_CTRC_RECORD_BASE_BYTES 152
+#define RESOURCE_X_CTRC_DELEGATION_HOP_BYTES 72
+#define RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES 4096
+#define RESOURCE_X_CTRC_BUNDLE_V2_MAX_RECORDS 8
+#define RESOURCE_X_CTRC_BUNDLE_MAX_BYTES \
+	(RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES \
+	 + RESOURCE_X_CTRC_BUNDLE_V2_MAX_RECORDS * CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES)
+/* Preserve V1's complete bounded framing domain (up to eighteen records).
+ * Actual ordinary pages independently require one record per occupied slot. */
+#define RESOURCE_X_CTRC_BUNDLE_LAYOUT_MAX_RECORDS \
+	((RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES - RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES) \
+	 / CLUSTER_CTRC_DELEGATION_V1_BYTES)
+#define RESOURCE_X_IMAGE_V3_MIN_BYTES \
+	(RESOURCE_X_IMAGE_V2_BYTES + RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES \
+	 + RESOURCE_X_CTRC_RECORD_BASE_BYTES + RESOURCE_X_CTRC_DELEGATION_HOP_BYTES)
+#define RESOURCE_X_IMAGE_V3_MAX_BYTES \
+	(RESOURCE_X_IMAGE_V2_BYTES + RESOURCE_X_CTRC_BUNDLE_MAX_BYTES)
 #define RESOURCE_X_IMAGE_HAS_WAL UINT16_C(1)
 #define RESOURCE_X_PAGE_BYTES 8192
 #define RESOURCE_X_DEPENDENCY_MAX 16
 #define RESOURCE_X_DEPENDENCY_VECTOR_BYTES 128
 #define RESOURCE_X_SOURCE_FENCE_BYTES 34
 #define RESOURCE_X_REQUEST_TAIL_BYTES 20
+
+/* Storage/transport bounds only: the complete codec still validates framing,
+ * and original CTRC custody must be established before an image is visible. */
+static inline bool
+resource_x_image_payload_length_valid(Size payload_bytes)
+{
+	return payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
+		|| (payload_bytes >= RESOURCE_X_IMAGE_V3_MIN_BYTES
+			&& payload_bytes <= RESOURCE_X_IMAGE_V3_MAX_BYTES);
+}
 
 #define RESOURCE_X_MSG_ASSERT_X PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 #define RESOURCE_X_MSG_IMAGE_OR_GRANT PGRAC_IC_MSG_GCS_BLOCK_REPLY
@@ -310,7 +345,19 @@ typedef struct ResourceXDecodedImageEnvelope {
 	uint16 image_flags;
 	uint8 page_bytes[RESOURCE_X_PAGE_BYTES];
 	ClusterPageWalBindingV1 page_wal;
+	/* Untrusted, versioned bytes: never a receiver-retention certificate. */
+	uint16 ctrc_delegation_bytes;
+	uint8 ctrc_delegation[RESOURCE_X_CTRC_BUNDLE_MAX_BYTES];
 } ResourceXDecodedImageEnvelope;
+
+/* Pure validated byte slices, never participant or transport authority.
+ * Output is all-zero on refusal; version/count are zero for an empty bundle. */
+typedef struct ResourceXCtrcBundleLayout {
+	uint16 version;
+	uint16 count;
+	uint16 offsets[RESOURCE_X_CTRC_BUNDLE_LAYOUT_MAX_RECORDS];
+	uint16 lengths[RESOURCE_X_CTRC_BUNDLE_LAYOUT_MAX_RECORDS];
+} ResourceXCtrcBundleLayout;
 
 typedef struct ResourceXDecodedInstallSettlement {
 	uint64 conversion_base_generation;
@@ -373,6 +420,9 @@ StaticAssertDecl(sizeof(ResourceXInstallSettlementV1) == RESOURCE_X_SHORT_V1_BYT
 StaticAssertDecl(offsetof(ResourceXInstallSettlementV1, conversion_base_generation) == 96
 					 && offsetof(ResourceXInstallSettlementV1, settlement_flags) == 148,
 				 "Resource-X install-settlement V1 offsets changed");
+
+extern bool cluster_resource_x_ctrc_bundle_layout(const ResourceXDecodedImageEnvelope *body,
+												 ResourceXCtrcBundleLayout *out);
 
 extern bool cluster_resource_x_wire_encode(uint8 msg_type, const ResourceXDecodedFrame *frame,
 										   void *payload, uint16 payload_capacity,

@@ -50,6 +50,9 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "common/cluster_recovery_bootstrap.h"
+#include "storage/fd.h"
+#include <sys/stat.h>
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
@@ -71,6 +74,8 @@
 #include "cluster/cluster_undo_recovery.h"
 #include "storage/fd.h"
 #include "storage/shmem.h"
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_cf_enqueue.h"
 #endif
 
 /*
@@ -158,6 +163,238 @@ static void TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 											   TransactionId *subxids, XidStatus status,
 											   XLogRecPtr lsn, int pageno);
 
+
+#ifdef USE_PGRAC_CLUSTER
+/* Disabled-cluster PostgreSQL remains raw. A managed or creation selection
+ * also applies before serving; UNKNOWN on an enabled cluster must refuse. */
+static bool
+CLOGNativeIORequired(void)
+{
+	return cluster_enabled || cluster_control_native_files_mode_v2() !=
+		CLUSTER_NATIVE_FILES_UNKNOWN_V2;
+}
+
+static bool
+CLOGNativeFileAcquire(int pageno, ClusterControlNativeFileBorrowV2 *borrow)
+{
+	ClusterControlFileKeyV2 key = {0};
+
+	if (pageno < 0 || pageno >= 131072 || cluster_node_id < 0 ||
+		cluster_node_id > PG_UINT16_MAX ||
+		cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_UNKNOWN_V2)
+		return false;
+	key.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+	key.origin = (uint16) cluster_node_id;
+	key.object_id = (uint64) pageno / SLRU_PAGES_PER_SEGMENT;
+	return cluster_control_native_file_acquire_v2(&key, borrow);
+}
+
+static void
+CLOGConfigureManagedIO(SlruCtl ctl)
+{
+	ctl->clog_native_required = CLOGNativeIORequired;
+	ctl->clog_native_acquire = CLOGNativeFileAcquire;
+	ctl->clog_native_current = cluster_control_native_file_current_v2;
+	ctl->clog_native_release = cluster_control_native_file_release_v2;
+	ctl->clog_native_read = SimpleLruNativeClogReadV2;
+	ctl->clog_native_write = SimpleLruNativeClogWriteV2;
+}
+
+/* These lifecycle callers still need their original complete selected-range
+ * owner. A raw record, cutoff or segno-only request cannot supply it. */
+static void
+CLOGRequireLegacyLifecycle(void)
+{
+	if (CLOGNativeIORequired())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("managed CLOG lifecycle requires its selected control owner")));
+}
+
+/* Actual gap files are protected through issuer completion. The two successor
+ * identities are presence only; neither their metadata nor this borrow grants
+ * page birth or access to RESERVED through the ordinary SLRU I/O path. */
+struct ClusterClogAllocationV2 {
+	uint64 first, count;
+	ClusterControlNativeFileBorrowV2 files[FLEXIBLE_ARRAY_MEMBER];
+};
+
+static bool
+CLOGAllocationSegments(FullTransactionId first, FullTransactionId last,
+					   uint64 *begin, uint64 *gap, uint64 *total)
+{
+	uint64 a = U64FromFullTransactionId(first), b = U64FromFullTransactionId(last);
+	uint64 per = (uint64) CLOG_XACTS_PER_PAGE * SLRU_PAGES_PER_SEGMENT;
+
+	if (!FullTransactionIdIsNormal(first) || !FullTransactionIdIsNormal(last)
+		|| a == UINT64_MAX || b == UINT64_MAX || b < a || b - a > PG_INT32_MAX)
+		return false;
+	*begin = (a / per) % 4096;
+	*gap = b / per - a / per + 1;
+	*total = Min(*gap + 2, UINT64CONST(4096));
+	return true;
+}
+
+static bool
+CLOGAllocationPresence(uint64 begin, uint64 count)
+{
+	uint64 tail = Min(count, 4096 - begin);
+
+	return cluster_node_id >= 0 && cluster_node_id < 128
+		&& cluster_control_native_files_clog_range_v2(cluster_node_id, begin, begin + tail - 1)
+			== CLUSTER_NATIVE_FILES_OK_V2
+		&& (count == tail || cluster_control_native_files_clog_range_v2(
+			cluster_node_id, 0, count - tail - 1) == CLUSTER_NATIVE_FILES_OK_V2);
+}
+
+void
+CLOGFinishAllocation(ClusterClogAllocationV2 **state)
+{
+	ClusterClogAllocationV2 *value = *state;
+
+	if (!value)
+		return;
+	for (uint64 i = 0; i < value->count; i++)
+		if (value->files[i].private_self
+			&& !cluster_control_native_file_release_v2(&value->files[i]))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not return CLOG allocation file identity")));
+	*state = NULL;
+	pfree(value);
+}
+
+bool
+CLOGAllocationRequired(void)
+{
+	return CLOGNativeIORequired();
+}
+
+bool
+CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last,
+						 ClusterClogAllocationV2 **state)
+{
+	uint64 begin, gap, total;
+	ClusterClogAllocationV2 *value;
+
+	if (!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE)
+		|| !CLOGAllocationSegments(first, last, &begin, &gap, &total)
+		|| !CLOGAllocationPresence(begin, total))
+		return false;
+	value = *state;
+	if (!value) {
+		value = palloc0(offsetof(ClusterClogAllocationV2, files) + gap * sizeof(value->files[0]));
+		value->first = begin;
+		value->count = gap;
+		*state = value;
+		for (uint64 i = 0; i < gap; i++) {
+			ClusterControlFileKeyV2 key = {0};
+
+			key.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+			key.origin = cluster_node_id;
+			key.object_id = (begin + i) % 4096;
+			if (!cluster_control_native_file_acquire_v2(&key, &value->files[i])) {
+				CLOGFinishAllocation(state);
+				return false;
+			}
+		}
+	}
+	for (uint64 i = 0; i < gap; i++) {
+		uint64 at = ((begin + i) % 4096 + 4096 - value->first) % 4096;
+
+		if (at >= value->count || !cluster_control_native_file_current_v2(&value->files[at]))
+			return false;
+	}
+	return true;
+}
+
+void
+CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last,
+						ClusterClogAllocationV2 **state)
+{
+	struct CLOGPrepareWork {
+		ClusterControlNativeClogRangeV2 *ranges[2];
+		bool attempted;
+	} *work;
+	uint64 begin, gap, total, tail;
+
+	if (CritSectionCount || LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactSLRULock)
+		|| LWLockHeldByMe(XactTruncationLock) || LWLockHeldByMe(ControlFileLock)
+		|| LWLockHeldByMe(RelationMappingLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock) || cluster_node_id < 0 || cluster_node_id >= 128
+		|| !CLOGAllocationSegments(first, last, &begin, &gap, &total))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("CLOG allocation preparation requires the original unlocked issuer")));
+	CLOGFinishAllocation(state);
+	tail = Min(total, 4096 - begin);
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		work->attempted = true;
+		if (!cluster_cf_lock(ExclusiveLock))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("CLOG allocation control owner is unavailable")));
+		/* Publish both physical halves before borrowing either: publication
+		 * cannot replace a table with live borrows. No full-XID epoch is inferred. */
+		for (unsigned half = 0; half < (total == tail ? 1 : 2); half++) {
+			uint64 lo = half ? 0 : begin, hi = half ? total - tail - 1 : begin + tail - 1;
+			ClusterControlNativeResultV2 result
+				= cluster_control_native_files_reserve_clog_range_locked_v2(
+					cluster_node_id, lo, hi, &work->ranges[half]);
+
+			if (result != CLUSTER_NATIVE_FILES_OK_V2 || !work->ranges[half]
+				|| work->ranges[half]->first_segment != lo
+				|| work->ranges[half]->last_segment != hi
+				|| work->ranges[half]->count != hi - lo + 1)
+				ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+								errmsg("could not prepare the complete CLOG allocation range")));
+		}
+		*state = palloc0(offsetof(ClusterClogAllocationV2, files)
+						+ gap * sizeof((*state)->files[0]));
+		(*state)->first = begin;
+		(*state)->count = gap;
+		for (uint64 i = 0; i < gap; i++) {
+			uint64 segment = (begin + i) % 4096;
+			ClusterControlNativeClogRangeV2 *range = work->ranges[segment < begin ? 1 : 0];
+			ClusterControlNativeClogEntryV2 *entry = &range->entries[segment - range->first_segment];
+			ClusterControlNativeFileBorrowV2 *borrow = &(*state)->files[i];
+			ClusterControlFileKeyV2 key = {0};
+			uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+			key.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+			key.origin = cluster_node_id;
+			key.object_id = segment;
+			if ((entry->reserved
+				 ? cluster_control_native_file_reserved_acquire_locked_v2(&range->config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, range->startup_generation,
+					entry->batch_uuid, &entry->expected, borrow) != CLUSTER_NATIVE_FILES_OK_V2
+				 : !cluster_control_native_file_acquire_v2(&key, borrow))
+				|| borrow->expected.kind != key.kind || borrow->expected.origin != key.origin
+				|| borrow->expected.object_id != segment
+				|| !cluster_recovery_file_identity_encode_v2(&entry->expected, reference, sizeof(reference))
+				|| !cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &borrow->expected)
+				|| borrow->startup_generation != range->startup_generation
+				|| borrow->table_generation != work->ranges[total == tail ? 0 : 1]->table_generation
+				|| !cluster_control_native_file_current_v2(borrow))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("CLOG allocation lost its selected creator identity")));
+		}
+		if (!CLOGAllocationPresence(begin, total))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("CLOG allocation range changed during preparation")));
+	}
+	PG_FINALLY();
+	{
+		for (unsigned half = 0; half < 2; half++)
+			cluster_control_native_clog_range_destroy_v2(&work->ranges[half]);
+		if (work->attempted && cluster_cf_held(ExclusiveLock)
+			&& cluster_cf_unlock_confirmed(ExclusiveLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not return CLOG allocation control owner")));
+		pfree(work);
+	}
+	PG_END_TRY();
+}
+#endif
 
 /*
  * TransactionIdSetTreeStatus
@@ -2898,6 +3135,9 @@ void
 CLOGShmemInit(void)
 {
 	XactCtl->PagePrecedes = CLOGPagePrecedes;
+#ifdef USE_PGRAC_CLUSTER
+	CLOGConfigureManagedIO(XactCtl);
+#endif
 	SimpleLruInit(XactCtl, "Xact", CLOGShmemBuffers(), CLOG_LSNS_PER_PAGE,
 				  XactSLRULock, "pg_xact", LWTRANCHE_XACT_BUFFER,
 				  SYNC_HANDLER_CLOG);
@@ -2931,6 +3171,72 @@ BootStrapCLOG(void)
 	Assert(!XactCtl->shared->page_dirty[slotno]);
 
 	LWLockRelease(XactSLRULock);
+}
+
+/* The original BootStrapXLOG caller supplies its independently allocated
+ * complete identity and actual initial nextXid. The creator, not these bytes,
+ * owns the unpublished directory and closed-writer context. No bootstrap WAL.
+ * Leave the cache empty: its later managed read must acquire file provenance. */
+bool
+BootStrapCLOGManagedV2(const ClusterRecoveryFileIdentityV2 *expected,
+					 FullTransactionId actual_initial_next, ClusterRecoveryBootFileV2 *out)
+{
+#if defined(USE_PGRAC_CLUSTER) && !defined(WIN32)
+	char path[MAXPGPATH];
+	uint8 reference[CLUSTER_RECOVERY_IDENTITY_REFERENCE_V2_BYTES];
+	ClusterRecoveryFileIdentityV2 captured;
+	ClusterRecoveryBootFileV2 observed;
+	volatile int fd = -1;
+	volatile bool ok = false;
+	uintptr_t a = (uintptr_t)expected;
+	uintptr_t b = (uintptr_t)out;
+
+	if (!IsBootstrapProcessingMode() || IsUnderPostmaster || InRecovery || !enableFsync
+		|| expected == NULL || out == NULL
+		|| (a <= b ? b - a < sizeof(*expected) : a - b < sizeof(*out))
+		|| expected->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 || expected->object_id != 0
+		|| expected->database_oid != 0 || expected->tablespace_oid != 0
+		|| expected->system_identifier != GetSystemIdentifier()
+		|| U64FromFullTransactionId(actual_initial_next) != FirstNormalTransactionId
+		|| !cluster_recovery_file_identity_encode_v2(expected, reference, sizeof(reference))
+		|| XactCtl->Dir[0] == '\0'
+		|| strnlen(XactCtl->Dir, sizeof(XactCtl->Dir)) == sizeof(XactCtl->Dir))
+		return false;
+	captured = *expected;
+	if (snprintf(path, sizeof(path), "%s/0000", XactCtl->Dir) >= sizeof(path))
+		return false;
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY | O_NOFOLLOW);
+		if (fd >= 0) {
+			struct stat before, named;
+
+			ok = cluster_clog_bootstrap_v2(fd, &captured, actual_initial_next, &observed)
+				&& fstat(fd, &before) == 0;
+			if (ok) {
+				/* The whole file was synchronized and read back before the name
+				 * is made durable. Original owner excludes directory replacement. */
+				fsync_fname(XactCtl->Dir, true);
+				ok = lstat(path, &named) == 0 && S_ISREG(named.st_mode)
+					&& before.st_dev == named.st_dev && before.st_ino == named.st_ino
+					&& before.st_size == named.st_size;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (fd >= 0 && CloseTransientFile(fd) != 0)
+			ok = false;
+	}
+	PG_END_TRY();
+	if (!ok)
+		return false;
+	*out = observed;
+	return true;
+#else
+	(void)expected; (void)actual_initial_next; (void)out;
+	return false;
+#endif
 }
 
 /*
@@ -3078,10 +3384,11 @@ CheckPointCLOG(void)
  * unless we're forced to write out a dirty clog or xlog page to make room
  * in shared memory.
  */
-void
-ExtendCLOG(TransactionId newestXact)
+static void
+ExtendCLOGInternal(TransactionId newestXact, FullTransactionId birth)
 {
 	int			pageno;
+	int			slotno;
 
 	/*
 	 * No work except at first XID of a page.  But beware: just after
@@ -3094,9 +3401,41 @@ ExtendCLOG(TransactionId newestXact)
 	pageno = TransactionIdToPage(newestXact);
 
 	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired())
+	{
+		volatile bool body_complete = false;
 
-	/* Zero the page and make an XLOG entry about it */
-	ZeroCLOGPage(pageno, true);
+		PG_TRY();
+		{
+			(void) SimpleLruNativeClogZeroV2(XactCtl, birth);
+			body_complete = true;
+		}
+		PG_FINALLY();
+		{
+			/* ERROR has reset the holdoff for this still-held family lock. */
+			if (!body_complete)
+				HOLD_INTERRUPTS();
+			LWLockRelease(XactSLRULock);
+		}
+		PG_END_TRY();
+		return;
+	}
+#endif
+
+	/* Zero the page and make an XLOG entry about it. Raw-only callers leave
+	 * birth unknown; only the original allocator supplies a complete identity. */
+	slotno = ZeroCLOGPage(pageno, true);
+	if (FullTransactionIdIsValid(birth))
+	{
+		ClusterClogPageIdentityV2 *page = &XactCtl->shared->clog_page_identity[slotno];
+
+		page->identity.logical_page = pageno;
+		page->identity.page_generation = U64FromFullTransactionId(birth);
+		page->identity.birth_observed = true;
+		page->identity.birth_full_xid = birth;
+		XactCtl->shared->page_initial_full_xid[slotno] = U64FromFullTransactionId(birth);
+	}
 
 	LWLockRelease(XactSLRULock);
 }
@@ -3117,37 +3456,24 @@ clog_full_birth_valid(const xl_clog_zeropage_full *birth)
 }
 
 void
+ExtendCLOG(TransactionId newestXact)
+{
+	ExtendCLOGInternal(newestXact, InvalidFullTransactionId);
+}
+
+void
 ExtendCLOGFull(FullTransactionId newestXact)
 {
-	TransactionId raw = XidFromFullTransactionId(newestXact);
-	xl_clog_zeropage_full birth = {0};
-#ifdef USE_PGRAC_CLUSTER
-	int slot;
-#endif
+	if (!FullTransactionIdIsValid(newestXact) ||
+		!TransactionIdIsNormal(XidFromFullTransactionId(newestXact)) ||
+		U64FromFullTransactionId(newestXact) == PG_UINT64_MAX ||
+		!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE) ||
+		XactCtl->shared == NULL || XactCtl->shared->clog_page_identity == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CLOG page birth requires the original allocator identity")));
 
-	/* This is a production guard, including release builds. The original
-	 * caller supplies its actual candidate, not an inferred raw-xid era. */
-	if (!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE) || !TransactionIdIsNormal(raw))
-		elog(ERROR, "full CLOG page birth requires the original native issuer");
-	if (TransactionIdToPgIndex(raw) != 0 && raw != FirstNormalTransactionId)
-		return;
-	birth.pageno = TransactionIdToPage(raw);
-	birth.first_full_xid = U64FromFullTransactionId(newestXact);
-
-	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
-#ifdef USE_PGRAC_CLUSTER
-	slot = ZeroCLOGPage(birth.pageno, false);
-#else
-	ZeroCLOGPage(birth.pageno, false);
-#endif
-	XLogBeginInsert();
-	XLogRegisterData((char *)&birth, sizeof(birth));
-	(void)XLogInsert(RM_CLOG_ID, CLOG_ZEROPAGE_FULL);
-#ifdef USE_PGRAC_CLUSTER
-	/* Failed insertion leaves the original dirty page with unknown birth. */
-	XactCtl->shared->page_initial_full_xid[slot] = birth.first_full_xid;
-#endif
-	LWLockRelease(XactSLRULock);
+	ExtendCLOGInternal(XidFromFullTransactionId(newestXact), newestXact);
 }
 
 
@@ -3171,6 +3497,9 @@ TruncateCLOGInternal(TransactionId oldestXact, Oid oldestxid_datoid, uint64 full
 {
 	int			cutoffPage;
 
+#ifdef USE_PGRAC_CLUSTER
+	CLOGRequireLegacyLifecycle();
+#endif
 	/*
 	 * The cutoff point is the start of the segment containing oldestXact. We
 	 * pass the *page* containing oldestXact to SimpleLruTruncate.
@@ -3373,6 +3702,9 @@ clog_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
+#ifdef USE_PGRAC_CLUSTER
+	CLOGRequireLegacyLifecycle();
+#endif
 	/* Backup blocks are not used in clog records */
 	Assert(info == CLOG_ZEROPAGE_FULL || info == CLOG_TRUNCATE_FULL
 		|| !XLogRecHasAnyBlockRefs(record));
@@ -3460,5 +3792,15 @@ clog_redo(XLogReaderState *record)
 int
 clogsyncfiletag(const FileTag *ftag, char *path)
 {
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired())
+	{
+		/* Preserve an observable failed sync request; never open a replacement
+		 * generation using an old raw segment-only tag. */
+		snprintf(path, MAXPGPATH, "%s/%04X", XactCtl->Dir, ftag->segno);
+		errno = ESTALE;
+		return -1;
+	}
+#endif
 	return SlruSyncFileTag(XactCtl, ftag, path);
 }

@@ -20,6 +20,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_segment_init.h"
 
 #include "access/xlog.h"
 #include "miscadmin.h"
@@ -37,6 +38,10 @@
 #include "storage/shmem.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+
+#ifndef UNDO_RESIDENT_NATIVE_TEST
+#include "cluster_unit_no_native_files.h"
+#endif
 
 #undef printf
 #undef fprintf
@@ -484,6 +489,9 @@ make_valid_block0(uint32 segment_id, uint8 owner_instance, uint32 generation, ui
 	hdr->segment_state = SEGMENT_ACTIVE;
 	hdr->owner_instance = owner_instance;
 	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	/* The legacy page constructor reserves these bytes as zero; the marker
+	 * is payload data and must not masquerade as an unknown layout. */
+	memset(hdr->_pad_57, 0, sizeof(hdr->_pad_57));
 	hdr->wrap_count = generation;
 }
 
@@ -2703,6 +2711,11 @@ main(void)
 	UT_RUN(test_stop_block0_durability_and_undo_anchor_are_not_cleared_by_poll);
 	UT_RUN(test_stop_block0_invalid_late_slot_overrides_active_and_root_drift);
 	UT_RUN(test_stop_block0_two_actual_segment_roots_share_one_pgrd_not_one_file_id);
+	UT_RUN(test_block0_v2_reads_original_generation_before_current_pin);
+	UT_RUN(test_block0_v2_bad_framing_never_publishes_resident_generation);
+	UT_RUN(test_stop_block0_v2_checks_every_slot_and_preserves_original_identity);
+	UT_RUN(test_stop_block0_v2_retains_last_slot_undo_and_checkpoint_debt);
+	UT_RUN(test_stop_block0_v2_late_corruption_overrides_earlier_pending_without_mutation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

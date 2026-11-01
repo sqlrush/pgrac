@@ -32,6 +32,8 @@
 #include "storage/fd.h"
 #include "utils/memutils.h"
 
+#include "cluster_cold_recovery_tt_internal.h"
+
 #define COLD_TT_MAX_ORIGINS UNDO_OWNER_INSTANCE_MAX
 
 typedef struct ColdTtInputV1 {
@@ -69,6 +71,13 @@ static const ColdTtBlockV1 *cold_tt_undo_block(const ClusterColdTypedV1 *typed, 
 											   uint32 segment, uint32 blockno, bool fresh);
 
 typedef enum ColdTtReadV1 { COLD_TT_ABSENT, COLD_TT_PRESENT, COLD_TT_UNREADABLE } ColdTtReadV1;
+
+static bool
+cold_tt_header_identity_matches(const UndoSegmentHeaderData *header, uint8 owner, uint32 segment)
+{
+	return UndoSegmentHeader_identity_matches((const char *)header, segment, owner)
+		|| UndoSegmentHeaderV2_identity_matches((const char *)header, BLCKSZ, segment, owner);
+}
 
 static bool
 cold_tt_owners(const ClusterColdTypedV1 *typed, bool *owners)
@@ -124,7 +133,8 @@ cold_tt_read(uint8 owner, uint32 segment, ColdTtInputV1 *input)
 	 * cannot supply a TT identity or DATA ancestry; sealed INIT/REUSE redo
 	 * must reconstruct the entire header before any such fact is exported. */
 	if (cluster_undo_segment_header_integrity(input->block.data) != CLUSTER_UNDO_HEADER_CORRUPT
-		&& !UndoSegmentHeader_identity_matches(input->block.data, segment, owner))
+		&& !cold_tt_header_identity_matches((const UndoSegmentHeaderData *)input->block.data,
+										   owner, segment))
 		goto done;
 	if (fstat(fd, &after) != 0 || lstat(path, &named) != 0 || !cold_tt_same_file(&before, &after)
 		|| !cold_tt_same_file(&after, &named))
@@ -153,7 +163,8 @@ cold_tt_read_data(const ColdTtInputV1 *input, uint32 block, char *bytes)
 	int fd;
 	bool result = false;
 
-	if (cluster_undo_segment_header_integrity(input->block.data) == CLUSTER_UNDO_HEADER_CORRUPT)
+	if (!cold_tt_header_readable((const UndoSegmentHeaderData *)input->block.data,
+								input->owner, input->segment))
 		return false;
 #ifdef O_NOFOLLOW
 	flags |= O_NOFOLLOW;
@@ -725,13 +736,15 @@ cold_tt_after_redo_graph_read(void *arg, const ClusterRecoveryTxnKey *key, UBA a
 			&& block->block == blockno)
 			break;
 	if (block == NULL
+		|| !cold_tt_header_readable((const UndoSegmentHeaderData *)block->file->block.data,
+									block->file->owner, block->file->segment)
 		|| cluster_recovery_undo_record_read(block->bytes.data, BLCKSZ, segment, blockno,
 											 block->file->owner, address, record)
 			   != CLUSTER_RECOVERY_UNDO_ENTRY)
 		return CLUSTER_RECOVERY_GRAPH_CORRUPT;
 	/* A spill segment has its own physical generation. The original graph
 	 * separately validates every record against the canonical TT key. */
-	*generation = ((const UndoSegmentHeaderData *)block->file->block.data)->wrap_count;
+	*generation = cold_tt_header_generation((const UndoSegmentHeaderData *)block->file->block.data);
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 }
 
@@ -741,6 +754,7 @@ cluster_cold_tt_after_redo_undo_chain_matches_v1(const ClusterColdTypedV1 *typed
 {
 	const UndoSegmentHeaderData *header;
 	const TTSlot *slot;
+	ClusterColdTtSlotInputV1 captured;
 	ColdTtAfterRedoGraphInputV1 input = { typed };
 	ClusterRecoveryTxnKey transaction;
 	ClusterRecoveryReferenceGraph *graph = NULL;
@@ -756,11 +770,12 @@ cluster_cold_tt_after_redo_undo_chain_matches_v1(const ClusterColdTypedV1 *typed
 		|| (header = cluster_cold_tt_header_find_v1(typed, true, key->owner_instance,
 													key->segment_id, NULL))
 			   == NULL
-		|| cluster_undo_segment_header_integrity(header) == CLUSTER_UNDO_HEADER_CORRUPT
+		|| !cold_tt_header_readable(header, key->owner_instance, key->segment_id)
 		|| typed->system_identifier == 0 || typed->observer.database_incarnation == 0)
 		return false;
-	slot = &header->tt_slots[key->slot_offset];
-	if (header->wrap_count != key->segment_generation || slot->status != TT_SLOT_ACTIVE
+	cold_tt_slot_copy(header, key->owner_instance, key->segment_id, key->slot_offset, &captured);
+	slot = &captured.slot;
+	if (captured.key.segment_generation != key->segment_generation || slot->status != TT_SLOT_ACTIVE
 		|| slot->xid != key->xid || slot->wrap != key->slot_wrap)
 		return false;
 	/* Empty is neutral here. It cannot qualify transaction effects or an old
@@ -843,26 +858,12 @@ cluster_cold_tt_after_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 ind
 	return (const UndoSegmentHeaderData *)input->block.data;
 }
 
-static void
-cold_tt_slot_copy(const ColdTtInputV1 *input, uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
-{
-	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
-	const TTSlot *slot = &header->tt_slots[slot_offset];
-
-	out->key.owner_instance = input->owner;
-	out->key.segment_id = input->segment;
-	out->key.segment_generation = header->wrap_count;
-	out->key.slot_offset = slot_offset;
-	out->key.xid = slot->xid;
-	out->key.slot_wrap = slot->wrap;
-	out->slot = *slot;
-}
-
 static bool
 cold_tt_slot(const ClusterColdTtBaseV1 *base, uint32 count, uint32 segment_index,
 			 uint32 slot_offset, ClusterColdTtSlotInputV1 *out)
 {
 	const ColdTtInputV1 *input;
+	const UndoSegmentHeaderData *header;
 
 	if (out == NULL)
 		return false;
@@ -872,9 +873,10 @@ cold_tt_slot(const ClusterColdTtBaseV1 *base, uint32 count, uint32 segment_index
 	input = base->first;
 	while (segment_index-- > 0)
 		input = input->next;
-	if (cluster_undo_segment_header_integrity(input->block.data) == CLUSTER_UNDO_HEADER_CORRUPT)
+	header = (const UndoSegmentHeaderData *)input->block.data;
+	if (!cold_tt_header_readable(header, input->owner, input->segment))
 		return false;
-	cold_tt_slot_copy(input, slot_offset, out);
+	cold_tt_slot_copy(header, input->owner, input->segment, slot_offset, out);
 	return true;
 }
 
@@ -1012,12 +1014,18 @@ cluster_cold_typed_top_tx_census_v1(ClusterColdTypedV1 *typed,
 	for (const ColdTtInputV1 *input = after->first; input != NULL; input = input->next) {
 		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
 
-		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++)
-			if (header->tt_slots[slot].status == TT_SLOT_ACTIVE) {
+		if (!cold_tt_header_readable(header, input->owner, input->segment))
+			return false;
+		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+			ClusterColdTtSlotInputV1 observed;
+
+			cold_tt_slot_copy(header, input->owner, input->segment, slot, &observed);
+			if (observed.slot.status == TT_SLOT_ACTIVE) {
 				if (count == UINT32_MAX)
 					return false;
 				count++;
 			}
+		}
 	}
 	census = cold_tt_census_allocate(typed, count, &bytes);
 	if (census == NULL)
@@ -1027,15 +1035,21 @@ cluster_cold_typed_top_tx_census_v1(ClusterColdTypedV1 *typed,
 	for (const ColdTtInputV1 *input = after->first; input != NULL; input = input->next) {
 		const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)input->block.data;
 
+		if (!cold_tt_header_readable(header, input->owner, input->segment))
+			goto refused;
 		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
+			ClusterColdTtSlotInputV1 observed;
 			ClusterColdTopTxCensusEntryV1 *entry;
 			ClusterColdTopTxProofV1 proof = { 0 };
 			ClusterColdTopTxLoserProducerResultV1 loser;
 
-			if (header->tt_slots[slot].status != TT_SLOT_ACTIVE)
+			cold_tt_slot_copy(header, input->owner, input->segment, slot, &observed);
+			if (observed.slot.status != TT_SLOT_ACTIVE)
 				continue;
+			if (next >= count)
+				goto refused;
 			entry = &census->entries[next++];
-			cold_tt_slot_copy(input, slot, &entry->input);
+			entry->input = observed;
 			proof.key = entry->input.key;
 			/* No aggregate effects count supplies a per-top effects flag.
 			 * History/unknown origins remain explicit unproven inputs. */
@@ -1056,7 +1070,7 @@ cluster_cold_typed_top_tx_census_v1(ClusterColdTypedV1 *typed,
 	}
 	/* Bracket the entire census, including entries whose proof is absent.
 	 * No partial list can survive a failed physical/source recheck. */
-	if (cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
+	if (next != count || cluster_cold_tt_after_redo_recheck_v1(typed) != CLUSTER_COLD_OK
 		|| !cluster_cold_typed_sources_current_v1(typed, fence))
 		goto refused;
 	typed->top_tx_census = census;
@@ -1090,18 +1104,18 @@ cluster_cold_tt_base_match_v1(const ClusterColdTypedV1 *typed,
 		return false;
 	for (input = typed->tt_base->first; input != NULL; input = input->next) {
 		const UndoSegmentHeaderData *header;
-		const TTSlot *slot;
+		ClusterColdTtSlotInputV1 observed;
 
 		if (input->owner != key.owner_instance || input->segment != key.segment_id)
 			continue;
 		header = (const UndoSegmentHeaderData *)input->block.data;
-		if (cluster_undo_segment_header_integrity(header) == CLUSTER_UNDO_HEADER_CORRUPT)
+		if (!cold_tt_header_readable(header, input->owner, input->segment))
 			return false;
-		slot = &header->tt_slots[key.slot_offset];
-		if (header->wrap_count != key.segment_generation || slot->xid != key.xid
-			|| slot->wrap != key.slot_wrap)
+		cold_tt_slot_copy(header, input->owner, input->segment, key.slot_offset, &observed);
+		if (observed.key.segment_generation != key.segment_generation || observed.key.xid != key.xid
+			|| observed.key.slot_wrap != key.slot_wrap)
 			return false;
-		cold_tt_slot_copy(input, key.slot_offset, out);
+		*out = observed;
 		return true;
 	}
 	return false;
@@ -1130,7 +1144,9 @@ cold_tt_undo_block(const ClusterColdTypedV1 *typed, bool after_redo, uint32 segm
 	for (file = base->first; file != NULL; file = file->next)
 		if (file->segment == segment)
 			break;
-	if (file == NULL)
+	if (file == NULL
+		|| !cold_tt_header_readable((const UndoSegmentHeaderData *)file->block.data,
+									file->owner, file->segment))
 		return NULL;
 	for (block = base->blocks; block != NULL; block = block->next)
 		if (block->file == file && block->block == blockno)
@@ -1198,7 +1214,7 @@ cluster_cold_tt_base_block_v1(ClusterColdTypedV1 *typed, uint32 segment_index, u
 	if (out == NULL || generation == NULL
 		|| (header = cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment))
 			   == NULL
-		|| cluster_undo_segment_header_integrity(header) == CLUSTER_UNDO_HEADER_CORRUPT)
+		|| !cold_tt_header_readable(header, owner, segment))
 		return false;
 	if (typed->system_identifier != typed->tt_base->system_identifier
 		|| typed->observer.database_incarnation != typed->tt_base->database_incarnation) {
@@ -1209,7 +1225,7 @@ cluster_cold_tt_base_block_v1(ClusterColdTypedV1 *typed, uint32 segment_index, u
 	if (block == NULL)
 		return false;
 	*out = block->bytes;
-	*generation = header->wrap_count;
+	*generation = cold_tt_header_generation(header);
 	return true;
 }
 
@@ -1243,7 +1259,7 @@ cold_tt_undo_record(ClusterColdTypedV1 *typed, UBA address, ClusterRecoveryUndoR
 		return false;
 	}
 	*out = record;
-	*generation = ((const UndoSegmentHeaderData *)block->file->block.data)->wrap_count;
+	*generation = cold_tt_header_generation((const UndoSegmentHeaderData *)block->file->block.data);
 	return true;
 }
 

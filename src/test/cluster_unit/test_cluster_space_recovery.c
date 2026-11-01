@@ -46,7 +46,6 @@
 #include "storage/smgr.h"
 #include "storage/md.h"
 #include "storage/checksum.h"
-#include "storage/checksum_impl.h"
 #include "utils/resowner.h"
 #include "unit_test.h"
 
@@ -323,6 +322,15 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment, uint16 slot, Transacti
 										  uint16 wrap, TTSlot *out)
 {
 	abort();
+}
+
+/* This fixture supplies only the original V1 slot model. V2 rejection is
+ * covered with the actual SIDE and durable readers in the durable test. */
+bool
+cluster_tt_slot_durable_read_exact_legacy_stable(uint32 segment_id, uint16 slot_offset,
+												 TransactionId xid, uint16 wrap, TTSlot *out)
+{
+	return cluster_tt_slot_durable_read_exact_stable(segment_id, slot_offset, xid, wrap, out);
 }
 TwoPhaseRecoveryPendingResult
 TwoPhaseRecoveryPendingReadExact(TransactionId xid, Oid database, const char *gid, void **out,

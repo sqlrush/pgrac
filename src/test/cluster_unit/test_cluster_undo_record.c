@@ -137,6 +137,8 @@ static int undo_test_stop_lock_depth;
 static uint32 undo_test_wait_event_info;
 static PGAlignedBlock undo_test_lifecycle_disk;
 static bool undo_test_publish_tt_after_block0_read;
+static bool undo_test_supply_reads_files;
+static void undo_test_segment_path(uint32 segment_id, char *path, size_t path_size);
 static TimestampTz receipt_clock_us;
 static TimestampTz receipt_clock_after_unref;
 static bool receipt_log_enabled;
@@ -159,6 +161,10 @@ static bool receipt_block0_conditional_available;
 static bool receipt_buffer_available;
 static bool receipt_buffer_locked;
 static int receipt_prepare_calls;
+static int receipt_origin_capture_calls;
+static int receipt_origin_prepare_calls;
+static bool receipt_origin_capture_available;
+static uint8 receipt_origin_capture[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 static int receipt_apply_calls;
 static int receipt_cancel_calls;
 static int receipt_cancel_fail_at;
@@ -780,6 +786,25 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 {
 	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)undo_test_lifecycle_disk.data;
 
+	/* Only the new restart-selection tests read their own temporary pool.
+	 * The original lifecycle provider below remains the default. */
+	if (undo_test_supply_reads_files) {
+		char path[MAXPGPATH];
+		ssize_t nread;
+		int fd;
+
+		if (owner_instance != 1 || segment_id < 1
+			|| segment_id > CLUSTER_UNDO_SEGS_PER_INSTANCE || block_no != 0 || buf == NULL)
+			return false;
+		undo_test_segment_path(segment_id, path, sizeof(path));
+		fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+		if (fd < 0)
+			return false;
+		nread = pg_pread(fd, buf, BLCKSZ, 0);
+		close(fd);
+		return nread == BLCKSZ;
+	}
+
 	if (segment_id != disk->segment_id || owner_instance != disk->owner_instance || block_no != 0
 		|| buf == NULL)
 		return false;
@@ -839,6 +864,11 @@ cluster_undo_block0_current_live_owner_ensure_resident(const ClusterUndoBlock0Lo
 }
 
 static unsigned undo_test_lifecycle_mutate_calls;
+static bool undo_test_record_v2_capture;
+static uint32 undo_test_record_v2_generation;
+static PGAlignedBlock undo_test_record_v2_predecessor;
+static PGAlignedBlock undo_test_record_v2_successor;
+static ClusterUndoBlock0Result undo_test_record_v2_result;
 
 ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0LogicalKey *key,
@@ -853,6 +883,18 @@ cluster_undo_block0_current_live_owner_mutate_exact(const ClusterUndoBlock0Logic
 	const UndoSegmentHeaderData *requested = (const UndoSegmentHeaderData *)successor_page;
 
 	undo_test_lifecycle_mutate_calls++;
+	/* New tests inspect the real record owner's exact request. The original
+	 * current owner is covered by its own real-owner unit, not imitated here. */
+	if (undo_test_record_v2_capture) {
+		if (key == NULL || expected == NULL || !expected->known || predecessor_page == NULL
+			|| successor_page == NULL || timeout_ms != 10000 || key->segment_id != 2
+			|| key->owner_instance != 1)
+			return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+		undo_test_record_v2_generation = expected->value;
+		memcpy(undo_test_record_v2_predecessor.data, predecessor_page, BLCKSZ);
+		memcpy(undo_test_record_v2_successor.data, successor_page, BLCKSZ);
+		return undo_test_record_v2_result;
+	}
 
 	if (key == NULL || expected == NULL || !expected->known || predecessor_page == NULL
 		|| successor_page == NULL || timeout_ms <= 0 || key->segment_id != current->segment_id
@@ -2871,6 +2913,9 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_buffer_available = true;
 	receipt_buffer_locked = false;
 	receipt_prepare_calls = receipt_apply_calls = receipt_cancel_calls = 0;
+	receipt_origin_capture_calls = receipt_origin_prepare_calls = 0;
+	receipt_origin_capture_available = true;
+	memset(receipt_origin_capture, 0xa6, sizeof(receipt_origin_capture));
 	receipt_cancel_fail_at = 0;
 	receipt_child_attempt = 0;
 	receipt_leave_calls = receipt_unref_calls = receipt_install_calls = 0;
@@ -2903,6 +2948,44 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	header->magic = PGRAC_UNDO_BLOCK_MAGIC;
 	header->block_version = UNDO_BLOCK_VERSION_1;
 	header->free_offset = sizeof(UndoBlockHeader);
+}
+
+UT_TEST(test_itl_prepare_requires_original_fullxid_before_receiver_publication)
+{
+	ClusterUndoRecordPrepareReceipt receipt, saved;
+
+	receipt_fixture_ready(UNDO_RECORD_UPDATE, &receipt);
+	receipt.ctrc_pending_mask = 1;
+	receipt.ctrc_pending_targets[0].block_number = 37;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	saved = receipt;
+	receipt_origin_capture_available = false;
+	UT_ASSERT(!cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_origin_capture_calls, 1);
+	UT_ASSERT_EQ(receipt_prepare_calls + receipt_origin_prepare_calls, 0);
+	UT_ASSERT(memcmp(&receipt, &saved, sizeof(receipt)) == 0);
+	UT_ASSERT(memcmp(&cluster_undo_record_reservation.receipt, &saved, sizeof(receipt)) == 0);
+	UT_ASSERT_EQ(receipt_apply_calls + receipt_cancel_calls + receipt_install_calls
+		+ receipt_leave_calls + receipt_unref_calls, 0);
+	UT_ASSERT_EQ(strcmp(cluster_undo_record_receipt_last_reason(), "CTRC_ORIGINAL_FULL_XID_REQUIRED"), 0);
+}
+
+UT_TEST(test_itl_prepare_passes_exact_original_envelope_to_receiver)
+{
+	ClusterUndoRecordPrepareReceipt receipt;
+
+	receipt_fixture_ready(UNDO_RECORD_INSERT, &receipt);
+	receipt.ctrc_pending_mask = 1;
+	receipt.ctrc_pending_targets[0].block_number = 37;
+	UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+	UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+	UT_ASSERT_EQ(receipt_origin_capture_calls, 1);
+	UT_ASSERT_EQ(receipt_origin_prepare_calls, 1);
+	UT_ASSERT_EQ(receipt_prepare_calls, 1);
+	UT_ASSERT(receipt.ctrc_handles[0].valid);
+	UT_ASSERT_EQ(receipt.ctrc_prepared_mask, 1);
+	UT_ASSERT_EQ(receipt_apply_calls + receipt_cancel_calls + receipt_install_calls
+		+ receipt_leave_calls + receipt_unref_calls, 0);
 }
 
 /* PGRAC: the baseline build selects the original caller's exact cleanup. */

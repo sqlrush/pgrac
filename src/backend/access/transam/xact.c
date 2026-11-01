@@ -1698,7 +1698,7 @@ RecordTransactionCommit(
 		bool		replorigin;
 		SCN			commit_scn = InvalidScn;	/* PGRAC: spec-1.18 */
 		bool		has_tt_fold = false;		/* PGRAC: spec-3.18 D4.1 */
-		xl_xact_tt_commit tt_fold;				/* PGRAC: spec-3.18 D4.1 (valid iff has_tt_fold) */
+		xl_xact_tt_commit_v2 tt_fold;				/* PGRAC: spec-3.18 D4.1 (valid iff has_tt_fold) */
 
 		/*
 		 * Are we using the replication origins feature?  Or, in other words,
@@ -6790,7 +6790,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 					int xactflags, TransactionId twophase_xid,
 					const char *twophase_gid,
 					SCN commit_scn,		/* PGRAC: spec-1.18 */
-					const xl_xact_tt_commit *tt_commit,
+					const xl_xact_tt_commit_v2 *tt_commit,
 					const char *space_drop_data, uint32 space_drop_len)
 {
 	xl_xact_commit xlrec;
@@ -6803,7 +6803,8 @@ XactLogCommitRecord(TimestampTz commit_time,
 	xl_xact_twophase xl_twophase;
 	xl_xact_origin xl_origin;
 	xl_xact_scn xl_scn;			/* PGRAC: spec-1.18 */
-	xl_xact_tt_commit xl_tt;	/* PGRAC: spec-3.18 D4.1 */
+	xl_xact_tt_commit_v2 xl_tt;	/* PGRAC: spec-3.18 D4.1 */
+	Size tt_bytes = 0;
 	uint8		info;
 
 	Assert(CritSectionCount > 0);
@@ -6917,8 +6918,20 @@ XactLogCommitRecord(TimestampTz commit_time,
 	 */
 	if (tt_commit != NULL)
 	{
+		/* A typed carrier must not discard an original identity by relabeling
+		 * its prefix as V1. Legacy producers explicitly supply zero here. */
+		if (tt_commit->delta.format_version == CLUSTER_XACT_TT_COMMIT_VERSION
+			&& tt_commit->original_full_xid != 0)
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("canonical TT V1 commit cannot discard an original FullXid")));
+		tt_bytes = tt_commit->delta.format_version == CLUSTER_XACT_TT_COMMIT_VERSION
+			? sizeof(xl_xact_tt_commit) : sizeof(xl_xact_tt_commit_v2);
+		if (cluster_xact_tt_commit_read(tt_commit, tt_bytes, &xl_tt) != tt_bytes
+			|| (xl_tt.delta.format_version == CLUSTER_XACT_TT_COMMIT_V2_VERSION
+				&& xl_tt.delta.commit_scn != commit_scn))
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid canonical TT commit identity before WAL insertion")));
 		xl_xinfo.xinfo |= XACT_XINFO_HAS_TT_COMMIT;
-		xl_tt = *tt_commit;
 	}
 	if (space_drop_len != 0)
 	{
@@ -6997,7 +7010,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	 * the read order in ParseCommitRecord (origin -> scn -> tt_commit).
 	 */
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_TT_COMMIT)
-		XLogRegisterData((char *) (&xl_tt), sizeof(xl_xact_tt_commit));
+		XLogRegisterData((char *) (&xl_tt), tt_bytes);
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_SPACE_DROP)
 		XLogRegisterData(unconstify(char *, space_drop_data), space_drop_len);
 
@@ -7211,6 +7224,17 @@ xact_redo_commit(XLogReaderState *record, xl_xact_parsed_commit *parsed,
 	Assert(TransactionIdIsValid(xid));
 
 #ifdef USE_PGRAC_CLUSTER
+	if (parsed->has_tt_commit) {
+		xl_xact_tt_commit_v2 carrier, validated;
+
+		carrier.delta = parsed->tt_commit;
+		carrier.original_full_xid = parsed->tt_original_full_xid;
+		if (cluster_xact_tt_commit_read(&carrier, sizeof(carrier), &validated) == 0
+			|| (carrier.delta.format_version == CLUSTER_XACT_TT_COMMIT_VERSION
+				&& carrier.original_full_xid != 0))
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid folded TT commit identity before native replay")));
+	}
 	if (cluster_shared_config && (parsed->nrels != 0 || parsed->nspace_drops != 0)
 		&& !cluster_space_drop_replay_commit(record, xid))
 		elog(PANIC, "xact_redo: exact SPACE deletion commit refused");
@@ -7243,13 +7267,7 @@ xact_redo_commit(XLogReaderState *record, xl_xact_parsed_commit *parsed,
 	 * ordering violation, same contract as the 0x30 redo).
 	 */
 	if (parsed->has_tt_commit)
-		cluster_tt_durable_redo_stamp_slot_exact(parsed->tt_commit.instance,
-										   parsed->tt_commit.segment_id,
-										   parsed->tt_commit.segment_generation,
-										   parsed->tt_commit.slot_offset,
-										   parsed->tt_commit.wrap,
-										   parsed->tt_commit.xid,
-										   parsed->tt_commit.commit_scn);
+		cluster_tt_durable_redo_xact_commit(&parsed->tt_commit, parsed->tt_original_full_xid);
 #endif
 
 	max_xid = TransactionIdLatest(xid, parsed->nsubxacts, parsed->subxacts);

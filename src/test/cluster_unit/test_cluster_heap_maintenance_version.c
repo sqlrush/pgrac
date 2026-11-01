@@ -43,8 +43,11 @@
 #include "utils/resowner.h"
 #include "utils/memdebug.h"
 #include "utils/hsearch.h"
+#include "common/hashfn.h"
+#include "storage/lock.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_ko.h"
@@ -63,11 +66,13 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "commands/vacuum.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/standby.h"
 #include "storage/proc.h"
+#include "utils/wait_event.h"
 #include "storage/proclist.h"
 #include "storage/s_lock.h"
 #include "utils/rel.h"
@@ -142,6 +147,15 @@ static bool recent_pin_allowed, recent_pin_error;
 static bool recent_caller_local_x, recent_caller_writer, recent_caller_share;
 static bool recent_pin_held;
 static bool phase_pin_released;
+static bool phase_use_original_resident;
+static bool phase_use_original_recent_pin;
+static bool phase_use_original_cleanout;
+static unsigned phase_optional_hint_begins, phase_optional_hint_finishes;
+/* Retain earlier resident observations when the same owner enters native apply. */
+static unsigned phase_prior_lock_activity, phase_prior_authority_activity;
+static unsigned phase_prior_writer_checks, phase_prior_route_checks, phase_prior_authority_checks;
+static bool phase_resident_completed;
+static unsigned phase_resident_expected_resumes;
 static int32 recent_caller_pins;
 
 /* The original path owns one pin. The recent entry temporarily adds exactly
@@ -268,12 +282,17 @@ GetPrivateRefCount(Buffer buffer)
 	return backend_pin_count;
 }
 #include "test_cluster_heap_borrowed_pin.inc"
-/* Resident I/O is a leaf double; the complete native continuation and its
- * writer cleanup are extracted production bodies. No page fetch is modeled. */
+static bool phase_original_recent_pin(RelFileLocator locator, ForkNumber fork,
+									 BlockNumber block, Buffer recent_buffer);
+static void phase_original_recent_release(Buffer buffer);
+/* Legacy tests retain their pin leaf; the opt-in resident chain below uses
+ * the original recent lookup, private refs and ResourceOwner operations. */
 bool
 ReadRecentBuffer(RelFileLocator locator, ForkNumber fork, BlockNumber block,
 				 Buffer recent_buffer)
 {
+	if (phase_use_original_recent_pin)
+		return phase_original_recent_pin(locator, fork, block, recent_buffer);
 	recent_pin_calls++;
 	UT_ASSERT(RelFileLocatorEquals(locator, relation_data.rd_locator));
 	UT_ASSERT_EQ(fork, MAIN_FORKNUM); UT_ASSERT_EQ(block, 7);
@@ -291,6 +310,10 @@ ReadRecentBuffer(RelFileLocator locator, ForkNumber fork, BlockNumber block,
 void
 ReleaseBuffer(Buffer buffer)
 {
+	if (phase_use_original_recent_pin) {
+		phase_original_recent_release(buffer);
+		return;
+	}
 	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(recent_pin_held);
 	UT_ASSERT_EQ(backend_pin_count, recent_caller_pins + 1);
 	UT_ASSERT_EQ(local_x, recent_caller_local_x);
@@ -470,7 +493,7 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 	if (!local_x) {
 		census_preflight_checks++;
 		UT_ASSERT(token != NULL && token->entered && backend_pin_count == fixture_expected_backend_pins());
-		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 		return admission_current && fixture_native_admission_current(token, 2);
 	}
 	if (space_observation_checks != 0) {
@@ -617,7 +640,7 @@ cluster_xid_stripe_sample_fence_current(const ClusterXidStripeSampleFence *fence
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 	UT_ASSERT_EQ(policy_current_checks, 1);
 	UT_ASSERT_EQ(cohort_current_checks + census_preflight_checks, 0);
 	if (expected_current_policy != NULL)
@@ -633,7 +656,7 @@ cluster_heap_freeze_policy_sample_current_v1(const ClusterHeapFreezePolicySample
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 	UT_ASSERT_EQ(inserts + dirties + flushes + wal_clock_reads, 0);
 	UT_ASSERT_EQ(target_preflight_checks, 1);
 	UT_ASSERT_EQ(census_preflight_checks, 0);
@@ -657,7 +680,7 @@ cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out)
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 	UT_ASSERT_EQ(cohort_current_checks, 1);
 	cohort_sample_reads++;
 	if (cohort_sample_error) elog(ERROR, "injected worker publication read ERROR");
@@ -1112,9 +1135,18 @@ sampler_stripe_future(FullTransactionId reference, FullTransactionId *future,
 
 
 /* Execute the original native exit on the same PGPROC used by origin reserve.
- * Only lock scheduling is controlled: this fixture takes the normal exclusive
- * path and fails if the untested group-clear/secondary-acquire path is entered. */
+ * Legacy cases take the direct exclusive path. Opt-in cases force its first
+ * conditional miss and execute the original group leader. A second queued
+ * member is an explicit scheduling leaf; semaphore waiters remain outside. */
 static bool source_exit_lock_held;
+static bool source_exit_group_requested;
+static bool source_exit_history_requested;
+static unsigned source_exit_history_samples;
+static ClusterUndoRetentionSample source_exit_history_report;
+static bool source_exit_member_requested;
+static unsigned source_exit_member_wakeups;
+static FullTransactionId source_exit_member_wait_minimum, source_exit_member_wake_minimum;
+static FullTransactionId source_exit_member_census_minimum;
 static unsigned source_exit_locks, source_exit_unlocks;
 static XidCacheStatus source_exit_subxids[3];
 static uint8 source_exit_status[3];
@@ -1126,6 +1158,8 @@ static bool source_exit_precedes(TransactionId, TransactionId);
 static bool source_exit_precedes_or_equals(TransactionId, TransactionId);
 static bool source_exit_follows_or_equals(TransactionId, TransactionId);
 static void source_exit_assert_xid_range(TransactionId);
+static void source_exit_group(PGPROC *, TransactionId);
+static void source_exit_member_wakeup(PGSemaphore);
 
 static bool
 source_exit_try_lock(LWLock *lock, LWLockMode mode)
@@ -1133,6 +1167,7 @@ source_exit_try_lock(LWLock *lock, LWLockMode mode)
 	worker_pass_assert_unlocked();
 	UT_ASSERT(lock == sampler_proc_lock && mode == LW_EXCLUSIVE);
 	UT_ASSERT(!source_exit_lock_held && !sampler_lock_held && !census_step_lock_held);
+	if (source_exit_group_requested) return false;
 	source_exit_lock_held = true; source_exit_locks++;
 	return true;
 }
@@ -1156,16 +1191,41 @@ source_exit_unlock(LWLock *lock)
 }
 
 static void
-source_exit_unexpected_acquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+source_exit_group_acquire(LWLock *lock, LWLockMode mode)
 {
-	UT_ASSERT(false); abort();
+	if (!source_exit_group_requested) { UT_ASSERT(false); abort(); }
+	worker_pass_assert_unlocked();
+	UT_ASSERT(lock == sampler_proc_lock && mode == LW_EXCLUSIVE);
+	UT_ASSERT(!source_exit_lock_held && !sampler_lock_held && !census_step_lock_held);
+	UT_ASSERT(sampler_slots[0].procArrayGroupMember);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&sampler_procs.procArrayGroupFirst), 0);
+	if (source_exit_member_requested)
+	{
+		PGPROC *member = &sampler_slots[1];
+		FullTransactionId reference, future;
+		ClusterXidStripeSampleFence fence;
+		uint32 first = 0;
+
+		/* Queue placement is a controlled interleaving. The original leader
+		 * must perform both internal clears and the real post-unlock tail. */
+		UT_ASSERT(!member->procArrayGroupMember && TransactionIdIsValid(member->xid));
+		member->procArrayGroupMember = true;
+		member->procArrayGroupMemberXid = member->xid + 2;
+		pg_atomic_write_u32(&member->procArrayGroupNext, 0);
+		UT_ASSERT(pg_atomic_compare_exchange_u32(&sampler_procs.procArrayGroupFirst, &first, 1));
+		UT_ASSERT(original_native_fullxid_sample(&reference, &future, &source_exit_member_wait_minimum, &fence));
+		UT_ASSERT(FullTransactionIdEquals(source_exit_member_wait_minimum,
+			FullTransactionIdFromU64(pg_atomic_read_u64(&sampler_slots[0].cluster_top_full_xid_atomic))));
+	}
+	source_exit_lock_held = true; source_exit_locks++;
 }
 
-static void
-source_exit_unexpected_group(PGPROC *proc pg_attribute_unused(), TransactionId xid pg_attribute_unused())
-{
-	UT_ASSERT(false); abort();
-}
+static void source_exit_unexpected_semaphore(PGSemaphore sema pg_attribute_unused())
+{ UT_ASSERT(false); abort(); }
+static void source_exit_unexpected_wait_start(uint32 event pg_attribute_unused())
+{ UT_ASSERT(false); abort(); }
+static void source_exit_unexpected_wait_end(void)
+{ UT_ASSERT(false); abort(); }
 
 #define ShmemVariableCache sampler_cache
 #define ProcGlobal sampler_proc_global
@@ -1173,7 +1233,7 @@ source_exit_unexpected_group(PGPROC *proc pg_attribute_unused(), TransactionId x
 #define Mode source_exit_mode
 #define RecoveryInProgress sampler_recovery_in_progress
 #define LWLockConditionalAcquire source_exit_try_lock
-#define LWLockAcquire source_exit_unexpected_acquire
+#define LWLockAcquire source_exit_group_acquire
 #define LWLockRelease source_exit_unlock
 #define LWLockHeldByMe source_exit_owned
 #define LWLockHeldByMeInMode source_exit_owned_mode
@@ -1186,8 +1246,21 @@ source_exit_unexpected_group(PGPROC *proc pg_attribute_unused(), TransactionId x
 #define MaintainLatestCompletedXid source_exit_maintain_latest
 #define ProcArrayEndTransactionInternal source_exit_internal
 #define ProcArrayEndTransaction source_exit_end_transaction
-#define ProcArrayGroupClearXid source_exit_unexpected_group
+#define ProcArrayGroupClearXid source_exit_group
 #include "test_cluster_heap_freeze_pgproc_exit.inc"
+#define allProcs (sampler_procs.allProcs)
+#define MyProc (&sampler_slots[0])
+#define PGSemaphoreLock source_exit_unexpected_semaphore
+#define PGSemaphoreUnlock source_exit_member_wakeup
+#define pgstat_report_wait_start source_exit_unexpected_wait_start
+#define pgstat_report_wait_end source_exit_unexpected_wait_end
+#include "test_cluster_ctrc_native_group_exit.inc"
+#undef pgstat_report_wait_end
+#undef pgstat_report_wait_start
+#undef PGSemaphoreUnlock
+#undef PGSemaphoreLock
+#undef MyProc
+#undef allProcs
 #undef ProcArrayGroupClearXid
 #undef ProcArrayEndTransaction
 #undef ProcArrayEndTransactionInternal
@@ -1414,7 +1487,72 @@ census_step_unlock(LWLock *lock)
 #define cluster_xid_widen original_census_xid_widen
 #define ctrc_active_scan_step original_census_step_internal
 #define cluster_ctrc_active_scan_step_source original_census_step_source
+/* Original later-defined helpers used by the current census/reclaim bodies. */
+static bool
+ctrc_delegated_certificate_retired_exact_locked(uint64 index);
+static bool
+ctrc_origin_root_metadata_valid(const ClusterCtrcOriginEntry *origin);
+static bool
+ctrc_participant_successor_exact_locked(uint64 index,
+	const ClusterCtrcParticipantEntry *successor);
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_successor_locked(uint64 index, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	FullTransactionId original, const uint8 *original_v2,
+	const ClusterCtrcDelegationCustodyV1 *parent, const ClusterCtrcDelegationPathV2 *path,
+	uint64 journal_sequence, uint64 *receipt_index, ClusterCtrcPreparePath *path_out);
+static bool
+ctrc_root_ack_bytes_exact(const ClusterCtrcRootSubtreeAckV1 *ack);
+static bool
+ctrc_root_ack_encode_body(const ClusterCtrcRootSubtreeAckV1 *ack,
+	uint8 bytes[CLUSTER_CTRC_ROOT_ACK_BYTES]);
+static bool
+ctrc_root_ack_shape_valid(const ClusterCtrcRootSubtreeAckV1 *ack);
+static bool
+ctrc_root_certificate_notice_locked(uint64 index, const ClusterCtrcCloseDispatch *dispatch,
+	bool *progressed);
+static bool
+ctrc_root_local_ack_exact_locked(uint64 index, const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant, uint64 seal);
+static bool
+original_participant_participant_index(const ClusterCtrcTxnKeyV1 *key, uint16 participant_node_id,
+					   uint64 *index_out);
+static bool pg_attribute_unused()
+original_ack_delegated_local_ack_summary_exact(const ClusterCtrcParticipantEntry *participant,
+	const ClusterCtrcLocalReleaseAckV1 *summary);
+static ClusterCtrcLocalReleaseAckV1 *
+original_certificate_participant_ack_entries(void);
+static uint64 *
+original_participant_participant_receipt_heads(void);
+static bool
+original_participant_participant_identity_valid(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity);
+static bool
+original_participant_origin_fullxid_match_v2(const uint8 *bytes, Size length,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *identity,
+	uint32 grant, FullTransactionId *original);
+static bool
+original_certificate_delegation_path_valid(const ClusterCtrcDelegationPathV2 *path,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcDelegationCustodyV1 *parent, const uint8 *origin_v2,
+	uint32 grant, FullTransactionId full);
+#define ctrc_participant_identity_valid original_participant_participant_identity_valid
+#define cluster_ctrc_origin_fullxid_match_v2 original_participant_origin_fullxid_match_v2
+#define ctrc_delegation_path_valid original_certificate_delegation_path_valid
+#define ctrc_participant_index original_participant_participant_index
+#define ctrc_delegated_local_ack_summary_exact original_ack_delegated_local_ack_summary_exact
+#define ctrc_participant_ack_entries original_certificate_participant_ack_entries
+#define ctrc_participant_receipt_heads original_participant_participant_receipt_heads
 #include "test_cluster_heap_ctrc_step.inc"
+#undef ctrc_delegation_path_valid
+#undef cluster_ctrc_origin_fullxid_match_v2
+#undef ctrc_participant_identity_valid
+#undef ctrc_participant_index
+#undef ctrc_delegated_local_ack_summary_exact
+#undef ctrc_participant_ack_entries
+#undef ctrc_participant_receipt_heads
+
 #undef cluster_ctrc_active_scan_step_source
 #undef ctrc_active_scan_step
 #undef cluster_xid_widen
@@ -1527,11 +1665,22 @@ static bool
 cohort_peer_generation_current(int32 peer, uint32 capability, uint32 generation)
 {
 	UT_ASSERT(peer >= 0 && peer < CLUSTER_MAX_NODES);
-	UT_ASSERT_EQ(capability, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
+	UT_ASSERT_EQ(capability, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK);
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	cohort_peer_current_checks++;
 	if (cohort_peer_revoke_worker) cohort_worker_live = false;
 	return generation == cohort_live_generation[peer];
+}
+
+/* Retain this native-writer fixture's existing controlled history boundary.
+ * The actual per-boot covers accessor and sampler are composed separately
+ * by test_cluster_retention_sample and test_cluster_undo_horizon. */
+bool
+cluster_undo_retention_horizon_covers(SCN horizon)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return SCN_VALID(horizon) && horizon != (SCN)UINT64_MAX;
 }
 
 static TimestampTz
@@ -1591,7 +1740,7 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *coh
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
 	UT_ASSERT_EQ(inserts + dirties + flushes + wal_clock_reads, 0);
 	UT_ASSERT_EQ(policy_current_checks, 1);
 	UT_ASSERT_EQ(census_preflight_checks, 0);
@@ -1611,8 +1760,8 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 		target_preflight_checks++;
 		UT_ASSERT(token != NULL && token->entered && backend_pin_count == fixture_expected_backend_pins());
 		UT_ASSERT_EQ(CritSectionCount, 0);
-		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
-		UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + admission_checks, 0);
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, phase_prior_lock_activity);
+		UT_ASSERT_EQ(writer_checks + route_checks + authority_checks + admission_checks, phase_prior_authority_activity);
 		UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
 		if (preflight_target_error) elog(ERROR, "injected unlocked TARGET preflight error");
 		if (preflight_revoke_census) admission_current = false;
@@ -1646,9 +1795,9 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	UT_ASSERT(local_x && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	/* Native final authority + real capture; a resumed scope checked once more. */
-	UT_ASSERT_EQ(writer_checks, resumed_writer ? 3 : 2);
-	UT_ASSERT_EQ(route_checks, 1);
-	UT_ASSERT_EQ(authority_checks, 1);
+	UT_ASSERT_EQ(writer_checks, phase_prior_writer_checks + (resumed_writer ? 3 : 2));
+	UT_ASSERT_EQ(route_checks, phase_prior_route_checks + 1);
+	UT_ASSERT_EQ(authority_checks, phase_prior_authority_checks + 1);
 	UT_ASSERT_EQ(admission_checks, 0);
 	UT_ASSERT_EQ(wal_clock_reads + inserts + dirties + edges + flushes, 0);
 	if (target_recheck_error) elog(ERROR, "injected full TARGET recheck error");
@@ -1903,6 +2052,55 @@ static void page_verify_redirects(Page page);
 #include "test_cluster_heap_freeze_helpers.inc"
 
 /* Plans here are fixture-qualified, not shared FullXid/provenance evidence. */
+static bool heap_freeze_retained_sources_current(
+	const ClusterHeapFreezePageInputV1 *, const ClusterHeapFreezeProofBatchV1 *,
+	const ClusterSemanticAdmissionToken *, bool);
+
+/* Native consumer source/registry inputs are controlled here. The real
+ * issuer's registry binding and CLOSE lifetime run in ctrc_cleaner. */
+static unsigned native_foreign_source_checks, native_foreign_guard_checks;
+static bool native_foreign_source_refused, native_foreign_source_error;
+static unsigned native_foreign_guard_refuse_at;
+
+static bool
+native_foreign_guard_matches(const ClusterCtrcItlReadGuardV1 *guard,
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterCtrcItlTargetIdentity *target, uint16 node,
+	uint64 formation, uint64 generation)
+{
+	UBA expected = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 1, 0, 128);
+
+	native_foreign_guard_checks++;
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return native_foreign_guard_refuse_at != native_foreign_guard_checks
+		&& guard->serial == 315 && guard->slot == 0 && guard->pid == 2901
+		&& key->origin_node_id == 1 && node == 0 && formation == 21 && generation == 13
+		&& FullTransactionIdEquals(original, FullTransactionIdFromEpochAndXid(1, 77))
+		&& target->spc_oid == relation_data.rd_locator.spcOid
+		&& target->db_oid == relation_data.rd_locator.dbOid
+		&& target->rel_number == relation_data.rd_locator.relNumber
+		&& target->fork_number == MAIN_FORKNUM && target->block_number == 7
+		&& target->itl_xid == 77 && target->itl_slot_index == 0
+		&& target->itl_slot_wrap == 2 && target->itl_class == ITL_FLAG_ACTIVE
+		&& target->needs_wal && memcmp(target->uba, &expected, sizeof(expected)) == 0;
+}
+
+static bool
+native_foreign_source_current(const ClusterTxResolution *resolution,
+	const ClusterCtrcItlTargetIdentity *target, const ClusterSemanticAdmissionToken *admission,
+	const ClusterCtrcItlReadGuardV1 *guard)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(ClusterR4TxCompanionIsValid(resolution) && admission->entered);
+	UT_ASSERT(target->block_number == 7 && guard->serial == 315);
+	native_foreign_source_checks++;
+	if (native_foreign_source_error) elog(ERROR, "injected retained foreign source ERROR");
+	return !native_foreign_source_refused;
+}
+
+#define cluster_ctrc_itl_read_guard_matches_admission_v1 native_foreign_guard_matches
+#define cluster_runtime_visibility_foreign_companion_target_guard_current_admitted native_foreign_source_current
 static bool
 heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   TransactionId snapshotConflictHorizon,
@@ -1910,11 +2108,14 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   const ClusterSpaceIdentity *identity, bool conditional,
 						   const ClusterHeapFreezePageInputV1 *freeze_input,
 						   const ClusterSemanticAdmissionToken *freeze_admission,
+						   const ClusterHeapFreezeProofBatchV1 *freeze_proofs,
 						   const ClusterHeapFreezeObservedBoundsV1 *expected_bounds,
 						   FullTransactionId expected_legal_next)
 #include "test_cluster_heap_freeze_apply.inc"
 
 #include "test_cluster_heap_freeze_xmin_apply.inc"
+#undef cluster_runtime_visibility_foreign_companion_target_guard_current_admitted
+#undef cluster_ctrc_itl_read_guard_matches_admission_v1
 
 /* Execute the full native freeze body with the planned pre-lock identity. */
 static void
@@ -2158,6 +2359,12 @@ reset(uint8 opcode, bool shared)
 	recent_pin_allowed = true; recent_pin_error = false; recent_pin_admission = NULL;
 	recent_caller_local_x = recent_caller_writer = recent_caller_share = recent_pin_held = false;
 	recent_caller_pins = 0; phase_pin_released = false;
+	phase_use_original_resident = false;
+	phase_use_original_recent_pin = false;
+	phase_use_original_cleanout = false;
+	phase_optional_hint_begins = phase_optional_hint_finishes = 0;
+	phase_prior_lock_activity = phase_prior_authority_activity = 0;
+	phase_prior_writer_checks = phase_prior_route_checks = phase_prior_authority_checks = 0;
 	writer_state = PCM_STATE_X;
 	route_holder = 11;
 	route_master = 12;
@@ -2293,7 +2500,7 @@ UT_TEST(test_qualified_freeze_kernel_changes_only_planned_headers)
 		tuples[i].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
 		tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 	}
-	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+	heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 2, &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 	check_publication(true);
 	UT_ASSERT_EQ(tx_checks, 0);
 	UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -2398,7 +2605,7 @@ UT_TEST(test_exact_xmin_plan_preserves_xmax_through_native_wal_and_redo)
 		if (!prepared)
 			continue;
 		tx_committed = false;
-		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+		heap_freeze_apply_prepared(&relation_data, 1, 70, &plan, 1, &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 		check_publication(true);
 		UT_ASSERT_EQ(tx_checks, 0);
 		UT_ASSERT_EQ(freeze_data_calls, 2);
@@ -3181,7 +3388,7 @@ UT_TEST(test_freeze_native_wal_dedup_and_redo)
 			tuples[i].checkflags = HEAP_FREEZE_CHECK_XMIN_COMMITTED;
 		}
 		if (shared)
-			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+			heap_freeze_apply_prepared(&relation_data, 1, 70, tuples, 3, &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 		else
 			run_freeze(&relation_data, 1, 70, tuples, 3, NULL);
 		check_publication(shared);
@@ -3253,7 +3460,7 @@ UT_TEST(test_freeze_kernel_rejects_invalid_space_before_write)
 		expecting_error = true;
 		if (setjmp(error_jump) == 0) {
 			heap_freeze_apply_prepared(&relation_data, 1, 70, &tuple, 1,
-									 bad == 4 ? NULL : &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+									 bad == 4 ? NULL : &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 			UT_ASSERT(false);
 		}
 		expecting_error = false;
@@ -4012,7 +4219,7 @@ UT_TEST(test_xmin_locked_kernel_refuses_foreign_proof_before_native_wal)
 		expecting_error = true;
 		if (setjmp(error_jump) == 0) {
 			UT_ASSERT(!cluster_heap_freeze_apply_xmin_batch_locked_v1(&relation_data,
-				1, &f.input, &f.page, &f.fence, &f.authority, &f.admission,
+				1, &f.input, &f.page, &f.proofs, &f.fence, &f.authority, &f.admission,
 				&target, 1, &plan, conflict_horizon,
 				FullTransactionIdFromEpochAndXid(1, 100), 10));
 		} else {
@@ -4233,7 +4440,7 @@ UT_TEST(test_original_freeze_space_refusal_still_errors)
 	space_buffer_permanent = false; expecting_error = true;
 	PG_TRY();
 	{
-		heap_freeze_apply_prepared(&relation_data, 1, 77, &plan, 1, &space_identity, false, NULL, NULL, NULL, InvalidFullTransactionId);
+		heap_freeze_apply_prepared(&relation_data, 1, 77, &plan, 1, &space_identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId);
 	}
 	PG_CATCH(); { caught = true; } PG_END_TRY();
 	expecting_error = false;
@@ -7544,6 +7751,26 @@ participant_object_read_current(const ClusterKoPeerAdmissionV3 *admission, RelFi
 	return participant_object_admission_current(admission, locator);
 }
 
+#define ctrc_put_u16_le original_participant_origin_put_u16_le
+#define ctrc_put_u32_le original_participant_origin_put_u32_le
+#define ctrc_put_u64_le original_participant_origin_put_u64_le
+#define ctrc_get_u16_le original_participant_origin_get_u16_le
+#define ctrc_get_u32_le original_participant_origin_get_u32_le
+#define ctrc_get_u64_le original_participant_origin_get_u64_le
+#define ctrc_txn_key_encode original_participant_origin_txn_key_encode
+#define ctrc_txn_key_decode original_participant_origin_txn_key_decode
+#define cluster_ctrc_origin_fullxid_match_v2 original_participant_origin_fullxid_match_v2
+#define ctrc_origin_fullxid_encode_v2 original_participant_origin_fullxid_encode_v2
+#include "test_cluster_heap_ctrc_origin_v2.inc"
+#undef ctrc_txn_key_decode
+#undef ctrc_txn_key_encode
+#undef ctrc_get_u64_le
+#undef ctrc_get_u32_le
+#undef ctrc_get_u16_le
+#undef ctrc_put_u64_le
+#undef ctrc_put_u32_le
+#undef ctrc_put_u16_le
+
 #define cluster_ctrc_shmem_ready original_census_shmem_ready
 #define cluster_ctrc_stat_bump original_census_stat_bump
 #define ctrc_origin_index original_census_origin_index
@@ -7584,7 +7811,22 @@ participant_object_read_current(const ClusterKoPeerAdmissionV3 *admission, RelFi
 #define ctrc_target_pending_itl_valid original_participant_target_pending_itl_valid
 #define ctrc_target_pending_offnum_valid original_participant_target_pending_offnum_valid
 #define ctrc_target_predecessor_version_valid original_participant_target_predecessor_version_valid
+static bool original_certificate_delegation_path_valid(const ClusterCtrcDelegationPathV2 *path,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcDelegationCustodyV1 *parent, const uint8 *origin_v2,
+	uint32 grant, FullTransactionId full);
+#define ctrc_delegation_path_valid original_certificate_delegation_path_valid
+static bool original_certificate_participant_delegations_valid(const ClusterCtrcParticipantEntry *participant);
+#define ctrc_participant_delegations_valid original_certificate_participant_delegations_valid
+#define ctrc_participant_delegation_merge_matches original_participant_delegation_merge_matches
+#include "test_cluster_heap_ctrc_publication_domain.inc"
+#include "test_cluster_heap_ctrc_delegation_merge.inc"
 #include "test_cluster_heap_ctrc_participant.inc"
+#undef ctrc_delegation_path_valid
+#undef ctrc_participant_delegation_merge_matches
+#undef ctrc_participant_delegations_valid
+#undef ctrc_origin_fullxid_encode_v2
+#undef cluster_ctrc_origin_fullxid_match_v2
 #undef ctrc_target_predecessor_version_valid
 #undef ctrc_target_pending_offnum_valid
 #undef ctrc_target_pending_itl_valid
@@ -8339,7 +8581,17 @@ certificate_pool_upgrade(void)
 #define CtrcLocalProgress certificate_local_progress
 #define LWLockAcquire participant_publisher_lock_acquire
 #define LWLockRelease participant_publisher_lock_release
+#define ctrc_participant_delegations_empty original_certificate_participant_delegations_empty
+#define ctrc_participant_delegations_valid original_certificate_participant_delegations_valid
+#define cluster_ctrc_origin_fullxid_match_v2 original_participant_origin_fullxid_match_v2
+#define ctrc_delegation_path_valid original_certificate_delegation_path_valid
+#include "test_cluster_heap_ctrc_delegation_path.inc"
+#include "test_cluster_heap_ctrc_delegation.inc"
+#undef ctrc_delegation_path_valid
+#undef cluster_ctrc_origin_fullxid_match_v2
 #include "test_cluster_heap_ctrc_certificate.inc"
+#undef ctrc_participant_delegations_valid
+#undef ctrc_participant_delegations_empty
 #undef LWLockRelease
 #undef LWLockAcquire
 #undef CtrcLocalProgress
@@ -9309,6 +9561,7 @@ UT_TEST(test_census_original_origin_retirement_advances_walk_and_rejects_old_can
  * Current-lock, physical I/O, admission and WAL insertion are explicit leaves;
  * in-memory readback here does not certify disk durability or live authority. */
 #include "cluster/cluster_undo_segment.h"
+#include "storage/checksum.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -9327,6 +9580,9 @@ typedef enum DurableCertificateFault {
 } DurableCertificateFault;
 static DurableCertificateFault durable_fault;
 static const ClusterCtrcOriginCertificateSnapshot *durable_snapshot;
+static xl_undo_tt_slot_ctrc_release_v2 durable_record_v2;
+static bool durable_wal_v2;
+static unsigned durable_v2_final_fault;
 static PGAlignedBlock durable_disk, durable_resident;
 static xl_undo_tt_slot_ctrc_release_v1 durable_record;
 static bool durable_admitted, durable_current, durable_pinned;
@@ -9436,6 +9692,20 @@ durable_read(ClusterUndoPathIntent intent, uint32 segment, uint8 owner, uint32 b
 		((UndoSegmentHeaderData *)durable_disk.data)->tt_slots[durable_snapshot->origin.key.slot_offset].flags = 0;
 		memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
 	}
+	if (durable_reads == 2 && durable_v2_final_fault != 0) {
+		UndoSegmentHeaderDataV2 *v2 = (UndoSegmentHeaderDataV2 *)durable_disk.data;
+		switch (durable_v2_final_fault) {
+		case 1: v2->tt_slots[durable_snapshot->origin.key.slot_offset].original_full_xid ^= UINT64_C(1) << 32; break;
+		case 2: v2->tt_layout_version = 0; v2->tt_slot_bytes = 0; break;
+		case 3: v2->_reserved[1] ^= 1; break;
+		case 4: v2->tt_slots[durable_snapshot->origin.key.slot_offset].flags |= 0x80; break;
+		case 5: v2->wrap_count++; break;
+		case 6: v2->tt_slots[durable_snapshot->origin.key.slot_offset].commit_scn++; break;
+		case 7: v2->_reserved[3] ^= 1; break;
+		}
+		if (durable_v2_final_fault != 3) v2->pd_checksum = pg_checksum_page(durable_disk.data, 0);
+		memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
+	}
 	memcpy(out, durable_disk.data, BLCKSZ);
 	if ((durable_reads == 1 && durable_fault == DURABLE_INITIAL_MISMATCH)
 		|| (durable_reads == 2 && durable_fault == DURABLE_FINAL_MISMATCH)) out[BLCKSZ - 1] ^= 1;
@@ -9454,6 +9724,12 @@ static XLogRecPtr durable_insert(const xl_undo_tt_slot_ctrc_release_v1 *record) 
 	UT_ASSERT_EQ(ctrc_origin_entries()[durable_snapshot->origin_index].state, CTRC_ORIGIN_CERTIFYING);
 	durable_record = *record; durable_event('W');
 	return durable_fault == DURABLE_WAL_INVALID ? InvalidXLogRecPtr : UINT64_C(0x123450);
+}
+static XLogRecPtr durable_insert_v2(const xl_undo_tt_slot_ctrc_release_v2 *record) pg_attribute_unused();
+static XLogRecPtr durable_insert_v2(const xl_undo_tt_slot_ctrc_release_v2 *record) {
+	durable_record_v2 = *record; durable_wal_v2 = true;
+	UT_ASSERT(cluster_undo_tt_ctrc_release_v2_valid(record));
+	return durable_insert(&record->release);
 }
 static void durable_flush(ClusterUndoBlock0Pin *pin, const char *successor, XLogRecPtr lsn, bool metadata_only) {
 	UT_ASSERT(durable_admitted && durable_current && durable_pinned); UT_ASSERT(!metadata_only); UT_ASSERT_EQ(lsn, UINT64_C(0x123450));
@@ -9526,6 +9802,7 @@ static bool durable_commit(const ClusterCtrcOriginCertificateSnapshot *snapshot)
 #define cluster_undo_block0_unpin durable_unpin
 #define cluster_undo_smgr_read_block durable_read
 #define cluster_undo_xlog_insert_tt_ctrc_release durable_insert
+#define cluster_undo_xlog_insert_tt_ctrc_release_v2 durable_insert_v2
 #define cluster_undo_block0_flush_sync durable_flush
 #define pg_usleep durable_pause
 #define InterruptPending durable_interrupt_pending
@@ -9535,6 +9812,7 @@ static bool durable_commit(const ClusterCtrcOriginCertificateSnapshot *snapshot)
 #undef InterruptPending
 #undef pg_usleep
 #undef cluster_undo_block0_flush_sync
+#undef cluster_undo_xlog_insert_tt_ctrc_release_v2
 #undef cluster_undo_xlog_insert_tt_ctrc_release
 #undef cluster_undo_smgr_read_block
 #undef cluster_undo_block0_unpin
@@ -9578,6 +9856,7 @@ static bool durable_commit(const ClusterCtrcOriginCertificateSnapshot *snapshot)
 
 static void durable_observers_reset(const ClusterCtrcOriginCertificateSnapshot *snapshot) {
 	UndoSegmentHeaderData *header;
+	memset(&durable_record_v2, 0, sizeof(durable_record_v2)); durable_wal_v2 = false; durable_v2_final_fault = 0;
 	durable_snapshot = snapshot; durable_fault = DURABLE_OK; durable_node = snapshot->origin.key.origin_node_id;
 	durable_admitted = durable_current = durable_pinned = false;
 	durable_enters = durable_leaves = durable_roots = durable_reads = durable_wals = durable_flushes = 0;
@@ -9616,6 +9895,169 @@ static bool durable_snapshot_fixture(QualifiedXminFixture *f, CensusRuntimeAlloc
 }
 static bool census_origin_durable_certificate_publish(const ClusterCtrcOriginCertificateSnapshot *snapshot) {
 	return original_durable_publish(snapshot);
+}
+
+
+static void
+durable_tt40_page(const ClusterCtrcOriginCertificateSnapshot *snapshot, bool aborted, bool replay)
+{
+	UndoSegmentHeaderDataV2 *v2;
+	TTSlotV2 *slot;
+	memset(durable_disk.data, 0, BLCKSZ);
+	v2 = (UndoSegmentHeaderDataV2 *)durable_disk.data;
+	((PageHeader)durable_disk.data)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)durable_disk.data)->pd_upper = BLCKSZ;
+	((PageHeader)durable_disk.data)->pd_special = BLCKSZ;
+	v2->pd_flags = PD_UNDO_SEG_HEADER;
+	v2->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	v2->segment_id = snapshot->origin.key.segment_id;
+	v2->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	v2->owner_instance = snapshot->origin.key.owner_instance;
+	v2->segment_state = SEGMENT_ACTIVE;
+	v2->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	v2->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+	v2->tt_slot_bytes = CLUSTER_UNDO_TT_SLOT_V2_BYTES;
+	v2->wrap_count = snapshot->origin.key.segment_generation;
+	slot = &v2->tt_slots[snapshot->origin.key.slot_offset];
+	slot->xid = snapshot->origin.key.xid;
+	slot->wrap = snapshot->origin.key.slot_wrap;
+	slot->status = aborted ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+	slot->commit_scn = aborted ? InvalidScn : 9;
+	slot->flags = replay ? TT_SLOT_FLAG_CTRC_RELEASE_PROVEN : TT_FLAGS_RESERVED;
+	slot->original_full_xid = U64FromFullTransactionId(snapshot->origin.original_full_xid);
+	v2->_reserved[sizeof(v2->_reserved) - 1] = 0x5a;
+	v2->pd_checksum = pg_checksum_page(durable_disk.data, 0);
+	memcpy(durable_resident.data, durable_disk.data, BLCKSZ);
+}
+
+UT_TEST(test_tt40_release_original_publisher_preserves_full_identity_and_sealed_page)
+{
+	for (int shape = 0; shape < 4; shape++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; PGAlignedBlock expected; uint64 index;
+		UndoSegmentHeaderDataV2 *v2; bool replay = (shape & 1) != 0;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		durable_tt40_page(&snapshot, (shape & 2) != 0, replay); expected = durable_disk;
+		v2 = (UndoSegmentHeaderDataV2 *)expected.data;
+		v2->tt_slots[handle.key.slot_offset].flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		v2->pd_checksum = pg_checksum_page(expected.data, 0);
+		UT_ASSERT(census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(ctrc_origin_entries()[index].state, CTRC_ORIGIN_RELEASE_PROVEN);
+		UT_ASSERT(memcmp(durable_disk.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(durable_resident.data, expected.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(durable_wals, !replay); UT_ASSERT_EQ(durable_flushes, !replay);
+		UT_ASSERT_EQ(durable_reads, 2); UT_ASSERT_EQ(durable_commits, 1);
+		UT_ASSERT(strcmp(durable_events, replay ? "EAPURLC" : "EAPWFURLC") == 0);
+		UT_ASSERT_EQ(durable_wal_v2, !replay);
+		if (!replay) {
+			UT_ASSERT_EQ(durable_record_v2.release.format_version, CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION);
+			UT_ASSERT_EQ(durable_record_v2.original_full_xid, U64FromFullTransactionId(snapshot.origin.original_full_xid));
+			UT_ASSERT_EQ(durable_record_v2.release.segment_generation, snapshot.origin.key.segment_generation);
+			UT_ASSERT_EQ(durable_record_v2.release.seal_generation, snapshot.origin.seal_generation);
+			UT_ASSERT(!ctrc_bytes_zero(durable_record_v2.release.ack_set_digest, 16));
+		}
+		UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+		census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_tt40_release_refuses_bad_format_fullxid_or_predecessor_without_wal)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry origin_before;
+		PGAlignedBlock before; uint64 index; UndoSegmentHeaderDataV2 *v2; TTSlotV2 *slot;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		durable_tt40_page(&snapshot, false, false); v2 = (UndoSegmentHeaderDataV2 *)durable_disk.data;
+		slot = &v2->tt_slots[handle.key.slot_offset];
+		switch (fault) {
+		case 0: slot->original_full_xid = 0; break;
+		case 1: slot->original_full_xid = UINT64_MAX; break;
+		case 2: slot->original_full_xid ^= UINT64_C(1) << 32; break;
+		case 3: slot->original_full_xid++; break;
+		case 4: v2->tt_layout_version = 3; break;
+		case 5: v2->tt_slot_bytes = sizeof(TTSlot); break;
+		case 6: v2->tt_layout_reserved = 1; break;
+		case 7: v2->wrap_count++; break;
+		case 8: v2->tt_slots_count--; break;
+		case 9: slot->flags = 0x80; break;
+		case 10: slot->status = TT_SLOT_ACTIVE; break;
+		case 11: v2->tt_layout_version = 0; v2->tt_slot_bytes = 0; break;
+		case 12: break; /* Checksum corruption with intact framing and identity. */
+		case 13: slot->commit_scn = UINT64_MAX; break;
+		case 14: break; /* New-page marker must refuse before checksum implementation. */
+		}
+		if (fault != 12) v2->pd_checksum = pg_checksum_page(durable_disk.data, 0);
+		else v2->_reserved[2] ^= 1;
+		if (fault == 14) ((PageHeader)durable_disk.data)->pd_upper = 0;
+		memcpy(durable_resident.data, durable_disk.data, BLCKSZ); before = durable_disk;
+		origin_before = ctrc_origin_entries()[index];
+		UT_ASSERT(!census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(durable_wals, 0); UT_ASSERT_EQ(durable_flushes, 0); UT_ASSERT_EQ(durable_commits, 0);
+		UT_ASSERT(memcmp(&origin_before, &ctrc_origin_entries()[index], sizeof(origin_before)) == 0);
+		UT_ASSERT(memcmp(before.data, durable_disk.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(before.data, durable_resident.data, BLCKSZ) == 0);
+		UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+		UT_ASSERT_EQ(durable_enters, durable_leaves); census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_tt40_release_original_page_view_refuses_replay_unqualified_context)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcOriginCertificateSnapshot snapshot; uint64 index;
+	if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcTxnKeyV1 key = snapshot.origin.key; TTSlot slot; bool tt_v2 = false;
+		UndoSegmentHeaderDataV2 *page;
+		durable_tt40_page(&snapshot, false, false); page = (UndoSegmentHeaderDataV2 *)durable_disk.data;
+		switch (fault) {
+		case 0: key.segment_generation = page->wrap_count = 0; break;
+		case 1: key.segment_generation = page->wrap_count = UINT32_MAX; break;
+		case 2: key.cluster_epoch = 0; break;
+		case 3: key.formation_epoch = 0; break;
+		}
+		page->pd_checksum = pg_checksum_page(durable_disk.data, 0);
+		UT_ASSERT(!ctrc_certificate_slot_read(durable_disk.data, &key,
+											 snapshot.origin.original_full_xid, &tt_v2, &slot));
+		UT_ASSERT_EQ(durable_wals + durable_flushes + durable_commits, 0);
+	}
+	census_full_layout_release(&runtime);
+}
+
+UT_TEST(test_tt40_release_readback_rechecks_format_fullxid_and_checksum)
+{
+	for (unsigned fault = 1; fault <= 7; fault++) {
+		QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+		ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry before; uint64 index;
+		if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+		durable_tt40_page(&snapshot, false, false); before = ctrc_origin_entries()[index]; durable_v2_final_fault = fault;
+		UT_ASSERT(!census_origin_durable_certificate_publish(&snapshot));
+		UT_ASSERT_EQ(durable_wals, 1); UT_ASSERT_EQ(durable_flushes, 1); UT_ASSERT_EQ(durable_commits, 0);
+		UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)) == 0);
+		UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+		UT_ASSERT_EQ(durable_enters, durable_leaves); census_full_layout_release(&runtime);
+	}
+}
+
+UT_TEST(test_tt40_release_error_after_durable_write_replays_without_duplicate_wal)
+{
+	QualifiedXminFixture f; CensusRuntimeAllocation runtime; ClusterCtrcReceiptHandle handle;
+	ClusterCtrcOriginCertificateSnapshot snapshot; ClusterCtrcOriginEntry before; uint64 index;
+	volatile bool caught = false;
+	if (!durable_snapshot_fixture(&f, &runtime, NULL, false, &handle, &index, &snapshot)) { UT_ASSERT(false); return; }
+	durable_tt40_page(&snapshot, false, false); before = ctrc_origin_entries()[index]; durable_fault = DURABLE_ERROR_READBACK;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) { (void)census_origin_durable_certificate_publish(&snapshot); UT_ASSERT(false); }
+	else { caught = true; UT_ASSERT(PG_exception_stack == NULL); }
+	expecting_error = false;
+	UT_ASSERT(caught); UT_ASSERT_EQ(durable_wals, 1); UT_ASSERT_EQ(durable_flushes, 1);
+	UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[index], sizeof(before)) == 0);
+	UT_ASSERT(!durable_admitted && !durable_current && !durable_pinned);
+	durable_fault = DURABLE_OK;
+	UT_ASSERT(census_origin_durable_certificate_publish(&snapshot));
+	UT_ASSERT_EQ(durable_wals, 1); UT_ASSERT_EQ(durable_flushes, 1); UT_ASSERT_EQ(durable_commits, 1);
+	UT_ASSERT_EQ(durable_enters, durable_leaves); census_full_layout_release(&runtime);
 }
 
 UT_TEST(test_census_durable_certificate_rejects_empty_snapshot_without_commit)
@@ -9768,10 +10210,18 @@ UT_TEST(test_census_original_durable_publish_then_retirement_keeps_old_native_ca
  * The compact LVRelState is a fixture, not a production VACUUM lifecycle. */
 typedef struct LVRelState
 {
+	Relation rel;
+	bool versioned, shared_maintenance_restricted;
+	BlockNumber shared_freeze_changed_pages;
+	ClusterSpaceIdentity identity;
+	uint64 shared_freeze_proof_calls, shared_freeze_proof_requests;
+	uint64 shared_freeze_proof_exchanges;
+	bool shared_freeze_proof_cost_incomplete;
 	struct VacuumCutoffs cutoffs;
 	ClusterHeapFreezePageInputV1 shared_freeze_input;
 	ClusterHeapFreezePageBatchV1 shared_freeze_batch;
 	ClusterHeapFreezeProofBatchV1 shared_freeze_proofs;
+	ClusterCtrcItlReadGuardV1 shared_freeze_source_guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
 	ClusterHeapFreezeFinalFenceV1 shared_freeze_fence;
 	ClusterHeapFreezeXminCandidateBatchV1 shared_freeze_xmin_candidates;
 	ClusterHeapFreezeAbortedXmaxCandidateBatchV1 shared_freeze_aborted_xmax_candidates;
@@ -9782,6 +10232,17 @@ typedef struct LVRelState
 } LVRelState;
 
 static const QualifiedXminFixture *bounds_source;
+/* Only the real outer-owner cases borrow its stack token. Legacy cases keep
+ * their original fixture-owned token and all original checks. */
+static const ClusterSemanticAdmissionToken *bounds_borrowed_admission;
+
+static const ClusterSemanticAdmissionToken *
+bounds_expected_admission(void)
+{
+	return bounds_borrowed_admission != NULL ? bounds_borrowed_admission
+		: &bounds_source->admission;
+}
+
 static unsigned bounds_policy_reads, bounds_cohort_reads, bounds_census_reads;
 static unsigned bounds_clock_reads, bounds_clock_observes, bounds_target_reads;
 static unsigned bounds_fault;
@@ -9797,7 +10258,10 @@ bounds_assert_unlocked(void)
 {
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
 	UT_ASSERT_EQ(CritSectionCount, 0);
-	UT_ASSERT_EQ(inserts + edges + dirties + flushes + conditional_resumes, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(conditional_resumes,
+		phase_use_original_resident && phase_resident_completed
+		? phase_resident_expected_resumes : 0);
 }
 
 /* Acquisition now executes the original local fold, worker publication getter,
@@ -9953,7 +10417,11 @@ static SCN bounds_original_retention_horizon(void);
 #define cluster_undo_retention_sample_min bounds_original_retention_min
 #define cluster_undo_retention_horizon_sample bounds_original_retention_sample
 #define cluster_undo_retention_horizon bounds_original_retention_horizon
+#define cluster_mrp_should_start bounds_original_mrp_should_start
+#define cluster_mrp_standby_consistent_scn bounds_original_mrp_consistent_scn
 #include "test_cluster_retention_sample.inc"
+#undef cluster_mrp_standby_consistent_scn
+#undef cluster_mrp_should_start
 #undef cluster_undo_retention_horizon
 #undef cluster_undo_retention_horizon_sample
 #undef cluster_undo_retention_sample_min
@@ -10254,6 +10722,30 @@ static bool bounds_original_census_current(const ClusterSemanticAdmissionToken *
 #undef SemanticActivationDescriptors
 
 static void
+bounds_admission_publish_change(unsigned mode)
+{
+	SemanticActivationAdmissionSnapshot before, after;
+	uint64 bits, generation, epoch;
+	bool closed;
+
+	UT_ASSERT(mode < 5);
+	UT_ASSERT(semantic_activation_snapshot(&before));
+	bits = (mode == 1 || mode == 2) ? 0 : before.active_bits;
+	generation = before.record_generation + (mode == 4 ? 0 : 1);
+	epoch = before.formation_epoch + (mode == 4 ? 1 : 0);
+	closed = mode < 2 || mode == 4;
+	/* The original private publisher supplies its full seqlock transaction.
+	 * These are gate images, not a replacement for the LMON round/ACK proof. */
+	UT_ASSERT(semantic_activation_lmon_publish_gate(&before, bits, generation, epoch, closed));
+	UT_ASSERT(semantic_activation_snapshot(&after));
+	UT_ASSERT_EQ(after.seq, before.seq + 2);
+	UT_ASSERT_EQ(after.active_bits, bits);
+	UT_ASSERT_EQ(after.record_generation, generation);
+	UT_ASSERT_EQ(after.formation_epoch, epoch);
+	UT_ASSERT_EQ(after.transition_closed, closed);
+}
+
+static void
 bounds_admission_change(unsigned fault)
 {
 	int feature_index;
@@ -10283,6 +10775,8 @@ bounds_admission_change(unsigned fault)
 		pg_atomic_write_u64(&native_admission_shared.record_generation, 0);
 		bounds_mutable_admission->record_generation = 0;
 		bounds_admission_error_kind = 3; break;
+	case 24: case 25: case 26: case 27: case 28:
+		bounds_admission_publish_change(fault - 24); break;
 	}
 }
 
@@ -10304,7 +10798,7 @@ static bool
 bounds_census_current(const ClusterSemanticAdmissionToken *token)
 {
 	bounds_assert_unlocked();
-	UT_ASSERT(token == &bounds_source->admission && token->entered);
+	UT_ASSERT(token == bounds_expected_admission() && token->entered);
 	bounds_census_reads++;
 	if (bounds_after_target && bounds_fault == 4) return false;
 	if (bounds_census_reads == bounds_census_fault_at) bounds_admission_change(bounds_census_fault);
@@ -10318,7 +10812,7 @@ static bool
 bounds_target_current(const ClusterSemanticAdmissionToken *token)
 {
 	bounds_assert_unlocked();
-	UT_ASSERT(token == &bounds_source->admission && token->entered);
+	UT_ASSERT(token == bounds_expected_admission() && token->entered);
 	bounds_target_reads++;
 	bounds_after_target = true;
 	if (bounds_fault == 3) return false;
@@ -10342,7 +10836,16 @@ bounds_clock_observe(SCN horizon)
 	bounds_assert_unlocked();
 	bounds_clock_observes++;
 	if (bounds_fault == 7) elog(ERROR, "injected collector clock ERROR");
-	if (bounds_fault != 9) fixture_wal_clock = horizon;
+	if (bounds_fault != 9)
+	{
+		if (source_exit_history_requested)
+		{
+			/* The new combined source uses a later clock than H. Keep this
+			 * explicit clock leaf monotone, as the original observer does. */
+			if (scn_time_cmp(fixture_wal_clock, horizon) < 0) fixture_wal_clock = horizon;
+		}
+		else fixture_wal_clock = horizon;
+	}
 	bounds_after_clock = true;
 }
 
@@ -10373,6 +10876,7 @@ bounds_observer_setup(LVRelState *v, QualifiedXminFixture *f)
 	v->shared_freeze_input.freeze_policy = NULL;
 	v->shared_freeze_input.freeze_cohort = NULL;
 	bounds_source = f;
+	bounds_borrowed_admission = NULL;
 	bounds_mutable_admission = &f->admission;
 	f->admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	f->admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
@@ -10659,6 +11163,9 @@ UT_TEST(test_collector_original_history_same_cut_clock_and_compact_snapshot)
 	UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
 	UT_ASSERT_EQ(history.contributor_token, 0);
 	UT_ASSERT_EQ(bounds_original_retention_horizon(), 10);
+	/* Independent typed-source cut: establish the older original protection
+	 * in a fresh boot before sampling. Never lower an already exported H. */
+	sampler_proc_array->cluster_read_scn_floor = InvalidScn;
 	/* Visit an unknown entry first, then the equal-time known compact member.
 	 * The diagnostic token is its physical slot, not the compact ordinal. */
 	sampler_proc_array->numProcs = 2;
@@ -11917,11 +12424,88 @@ static unsigned phase_preflights, phase_resolves, phase_rechecks;
 static unsigned phase_error_stage, phase_finally_calls, phase_finally_debt;
 static unsigned phase_finally_pins;
 static bool phase_finally_owned_writer;
+static bool phase_mixed_proof_subset;
+static uint8 phase_unknown_proof_mask;
+static unsigned phase_foreign_checks, phase_foreign_refuse_at, phase_foreign_error_at;
+static unsigned phase_foreign_target_checks, phase_foreign_target_refuse_at;
+
+/* Actual runtime current checks are covered in outcome tests; this collector
+ * fixture controls source retirement and asserts that no page lock is held. */
+bool
+cluster_runtime_visibility_foreign_companion_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *token)
+{
+	UT_ASSERT(token == bounds_expected_admission() && token->entered);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 0);
+	phase_foreign_checks++;
+	if (phase_foreign_error_at == phase_foreign_checks)
+		elog(ERROR, "injected foreign receiver retention ERROR");
+	return phase_foreign_refuse_at != phase_foreign_checks
+		&& !resolution->local_canonical_valid && ClusterR4TxCompanionIsValid(resolution);
+}
+
+
+bool
+cluster_runtime_visibility_foreign_companion_target_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *token)
+{
+	const ClusterHeapFreezePageBatchV1 *page = &phase_source->page;
+	const ClusterHeapFreezeCarrierRequestV1 *request = &page->carrier_requests[0];
+	UT_ASSERT(target != NULL);
+	UT_ASSERT_EQ(target->spc_oid, page->identity.key.locator.spcOid);
+	UT_ASSERT_EQ(target->db_oid, page->identity.key.locator.dbOid);
+	UT_ASSERT_EQ(target->rel_number, page->identity.key.locator.relNumber);
+	UT_ASSERT_EQ(target->fork_number, MAIN_FORKNUM);
+	UT_ASSERT_EQ(target->block_number, page->block);
+	UT_ASSERT_EQ(target->itl_xid, request->carrier.xid);
+	UT_ASSERT_EQ(target->itl_slot_index, request->locator.itl_slot_index);
+	UT_ASSERT_EQ(target->itl_slot_wrap, request->carrier.wrap);
+	UT_ASSERT_EQ(target->itl_class, request->carrier.flags);
+	UT_ASSERT(target->needs_wal && target->reserved8[0] == 0 && target->reserved8[1] == 0);
+	UT_ASSERT_EQ(memcmp(target->uba, &request->carrier.undo_segment_head, sizeof(target->uba)), 0);
+	phase_foreign_target_checks++;
+	return cluster_runtime_visibility_foreign_companion_current_admitted(resolution, token)
+		&& phase_foreign_target_refuse_at != phase_foreign_target_checks;
+}
+
+static unsigned phase_foreign_holds, phase_foreign_releases, phase_foreign_held;
+static bool phase_foreign_assert_release_owner;
+bool
+cluster_runtime_visibility_foreign_companion_target_hold_admitted(
+	const ClusterTxResolution *r, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *token, ClusterCtrcItlReadGuardV1 *guard)
+{
+	if (!cluster_runtime_visibility_foreign_companion_target_current_admitted(r, target, token)) return false;
+	guard->serial = ++phase_foreign_holds; guard->pid = 2901;
+	phase_foreign_held++; return true;
+}
+bool
+cluster_runtime_visibility_foreign_companion_target_guard_current_admitted(
+	const ClusterTxResolution *r, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *token, const ClusterCtrcItlReadGuardV1 *guard)
+{
+	UT_ASSERT(guard->serial != 0 && phase_foreign_held != 0);
+	return cluster_runtime_visibility_foreign_companion_target_current_admitted(r, target, token);
+}
+bool
+cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard)
+{
+	if (guard->serial == 0) return true;
+	UT_ASSERT(phase_foreign_held != 0);
+	if (phase_foreign_assert_release_owner) {
+		UT_ASSERT(bounds_borrowed_admission != NULL && bounds_borrowed_admission->entered);
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		UT_ASSERT(!local_x && !resumed_writer);
+	}
+	phase_foreign_held--; phase_foreign_releases++;
+	memset(guard, 0, sizeof(*guard)); return true;
+}
 
 static void
 phase_preflight(void)
 {
-	UT_ASSERT(phase_source->admission.entered && bounds_original_backend_has_admission());
+	UT_ASSERT(bounds_expected_admission()->entered && bounds_original_backend_has_admission());
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == 0);
 	phase_preflights++;
 	if (phase_error_stage == 1) elog(ERROR, "injected admitted preflight ERROR");
@@ -11933,13 +12517,16 @@ phase_resolve(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	ClusterTxResolveReason *reason)
 {
 	const ClusterHeapFreezeCanonicalProofV1 *proof;
-	UT_ASSERT(token == &phase_source->admission && token->entered);
+	UT_ASSERT(token == bounds_expected_admission() && token->entered);
 	UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS);
 	UT_ASSERT(phase_resolves < phase_source->proofs.proof_count);
 	proof = &phase_source->proofs.proofs[phase_resolves++];
 	UT_ASSERT(memcmp(locator, &proof->requested_locator, sizeof(*locator)) == 0);
 	if (phase_error_stage == 2) elog(ERROR, "injected admitted resolver ERROR");
 	*out = proof->resolution; *reason = CLUSTER_TX_RESOLVE_NONE;
+	if ((phase_mixed_proof_subset && phase_resolves == 2)
+		|| (phase_unknown_proof_mask & (1U << (phase_resolves - 1))))
+		out->outcome = CLUSTER_TX_UNKNOWN;
 	return out->outcome;
 }
 
@@ -11954,15 +12541,28 @@ phase_retained_resolve(const ClusterTxLocator *locator, SCN scn,
 }
 
 static ClusterHeapFreezeProofStatusV1
+phase_real_resident_recheck(LVRelState *, Buffer, const PcmAuthoritySnapshot *,
+	const ClusterSemanticAdmissionToken *, ClusterHeapFreezeProofBatchV1 *,
+	const ClusterTxResolution *, uint8, ClusterHeapFreezeFinalFenceV1 *, bool *, bool *);
+
+static ClusterHeapFreezeProofStatusV1
 phase_resident_recheck(LVRelState *v, Buffer buffer,
 	const PcmAuthoritySnapshot *authority, const ClusterSemanticAdmissionToken *token,
-	const ClusterHeapFreezeProofBatchV1 *proofs, const ClusterTxResolution *retained,
+	ClusterHeapFreezeProofBatchV1 *proofs, const ClusterTxResolution *retained,
 	uint8 retained_mask, ClusterHeapFreezeFinalFenceV1 *current,
 	bool *cleaned, bool *rows_current)
 {
+	if (phase_use_original_resident) {
+		phase_rechecks++;
+		return phase_real_resident_recheck(v, buffer, authority, token, proofs,
+			retained, retained_mask, current, cleaned, rows_current);
+	}
 	(void)retained;
-	UT_ASSERT(v != NULL && buffer == 1 && authority == &phase_source->authority);
-	UT_ASSERT(token == &phase_source->admission && token->entered);
+	UT_ASSERT(v != NULL && buffer == 1);
+	UT_ASSERT(bounds_borrowed_admission != NULL
+		? memcmp(authority, &phase_source->authority, sizeof(*authority)) == 0
+		: authority == &phase_source->authority);
+	UT_ASSERT(token == bounds_expected_admission() && token->entered);
 	UT_ASSERT(!local_x && !local_share && backend_pin_count == 0);
 	UT_ASSERT_EQ(retained_mask, 0); UT_ASSERT_EQ(proofs->proof_count, phase_resolves);
 	phase_rechecks++;
@@ -12021,6 +12621,8 @@ phase_setup(QualifiedXminFixture *f, LVRelState *v,
 {
 	bounds_lifecycle_setup(f, v, targets, batch);
 	phase_source = f; phase_preflights = phase_resolves = phase_rechecks = 0;
+	phase_foreign_checks = phase_foreign_refuse_at = phase_foreign_error_at = 0;
+	phase_foreign_target_checks = phase_foreign_target_refuse_at = 0;
 	phase_error_stage = phase_finally_calls = phase_finally_debt = phase_finally_pins = 0;
 	phase_finally_owned_writer = false;
 	v->shared_freeze_batch = f->page;
@@ -12148,6 +12750,8 @@ fixture_recent_xmin_apply(QualifiedXminFixture *f,
 		&f->admission, targets, count, FullTransactionIdFromEpochAndXid(1, 100), 10);
 }
 
+static void phase_recent_native_begin(const LVRelState *v);
+
 /* The original collector phase now forbids a caller-owned heap pin. Join
  * its complete body directly to the recent-resident native entry, without
  * the older fixture wrapper's synthetic restoration of a pinned caller. */
@@ -12168,9 +12772,13 @@ phase_then_recent_native_owned(QualifiedXminFixture *f, LVRelState *v)
 			f->fence.master_sequence, &f->admission, &rows_current);
 		phase_pin_released = false;
 		UT_ASSERT_EQ(backend_pin_count, 0);
-		if (status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN && rows_current
-			&& v->shared_freeze_xmin_candidates.target_count > 0)
+		if ((status == CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+			 || ((phase_mixed_proof_subset || phase_unknown_proof_mask != 0)
+				 && status == CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN))
+			&& rows_current && v->shared_freeze_xmin_candidates.target_count > 0)
 		{
+			if (phase_use_original_recent_pin && phase_use_original_resident)
+				phase_recent_native_begin(v);
 			phase_copy_to_native(f, v);
 			applied = fixture_recent_xmin_apply(f,
 				v->shared_freeze_xmin_candidates.targets,
@@ -12704,6 +13312,9 @@ page_owner_capture_from_original(Buffer buffer, const BufferTag *tag,
 /* Mapping, private pin/resource owner and LWLock scheduling are controlled.
  * Original resident bodies own all live checks and refusal/success cleanup. */
 #include "test_cluster_heap_resident_stamp_types.inc"
+static bool page_owner_use_original_resource_owner;
+static unsigned page_owner_original_owner_enlarges, page_owner_original_owner_remembers;
+static unsigned page_owner_original_owner_forgets, page_owner_original_owner_allocations;
 static LWLock page_owner_resident_mapping_lock;
 static bool page_owner_resident_active, page_owner_resident_partition_held;
 static unsigned page_owner_resident_pins, page_owner_resident_unpins;
@@ -12736,11 +13347,83 @@ page_owner_resident_reserve(void)
 {
 	UT_ASSERT(page_owner_resident_active && !page_owner_resident_partition_held && !page_owner_page_locked);
 }
+/* Original buffer ResourceOwner/array routines and complete private types.
+ * Memory context allocation is a bounded provider, not a PG context lifetime. */
+static void *
+page_owner_resource_alloc(MemoryContext context, Size size)
+{
+	void *memory;
+	UT_ASSERT(context == (MemoryContext)&page_owner_context_cookie);
+	UT_ASSERT(page_owner_use_original_resource_owner && page_owner_resident_active);
+	UT_ASSERT(!page_owner_resident_partition_held && !page_owner_page_locked && !local_x);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, 0);
+	UT_ASSERT_EQ(size, 16 * sizeof(Datum));
+	memory = malloc(size); UT_ASSERT(memory != NULL);
+	memset(memory, 0xa5, size); page_owner_original_owner_allocations++;
+	return memory;
+}
+static void
+page_owner_resource_free_unexpected(void *memory)
+{
+	UT_ASSERT(false); /* No growth/rehash is required for one outstanding pin. */
+	free(memory);
+}
+#define MemoryContextAlloc page_owner_resource_alloc
+#define TopMemoryContext ((MemoryContext)&page_owner_context_cookie)
+#define pfree page_owner_resource_free_unexpected
+#define ResourceArrayInit original_touch_owner_array_init
+#define ResourceArrayEnlarge original_touch_owner_array_enlarge
+#define ResourceArrayAdd original_touch_owner_array_add
+#define ResourceArrayRemove original_touch_owner_array_remove
+#define ResourceOwnerEnlargeBuffers original_touch_owner_enlarge
+#define ResourceOwnerRememberBuffer original_touch_owner_remember
+#define ResourceOwnerForgetBuffer original_touch_owner_forget
+#include "test_cluster_heap_resource_owner.inc"
+
+static Datum
+page_owner_buffer_datum(Buffer buffer)
+{
+	return BufferGetDatum(buffer);
+}
+#undef BufferGetDatum
+#undef ResourceOwnerForgetBuffer
+#undef ResourceOwnerRememberBuffer
+#undef ResourceOwnerEnlargeBuffers
+#undef ResourceArrayRemove
+#undef ResourceArrayAdd
+#undef ResourceArrayEnlarge
+#undef ResourceArrayInit
+#undef pfree
+#undef TopMemoryContext
+#undef MemoryContextAlloc
+#undef MAX_RESOWNER_LOCKS
+#undef RESARRAY_MAX_ITEMS
+#undef RESARRAY_IS_ARRAY
+#undef RESARRAY_MAX_ARRAY
+#undef RESARRAY_INIT_SIZE
+
+static ResourceOwnerData page_owner_native_resource_owner;
+static ResourceOwner
+page_owner_active_resource_owner(void)
+{
+	return page_owner_use_original_resource_owner
+		? &page_owner_native_resource_owner : (ResourceOwner)&page_owner_wal_cookie;
+}
+
 static void
 page_owner_resident_enlarge(ResourceOwner owner)
 {
-	UT_ASSERT(owner == (ResourceOwner)&page_owner_wal_cookie);
+	UT_ASSERT(owner == page_owner_active_resource_owner());
 	page_owner_resident_reserve();
+	if (page_owner_use_original_resource_owner)
+	{
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 0);
+		original_touch_owner_enlarge(owner); page_owner_original_owner_enlarges++;
+		UT_ASSERT_EQ(owner->bufferarr.capacity, 16); UT_ASSERT_EQ(owner->bufferarr.maxitems, 16);
+		if (page_owner_original_owner_enlarges == 1)
+			for (unsigned i = 0; i < owner->bufferarr.capacity; i++)
+				UT_ASSERT_EQ(owner->bufferarr.itemsarr[i], page_owner_buffer_datum(InvalidBuffer));
+	}
 }
 static bool
 page_owner_resident_lock(LWLock *lock, LWLockMode mode)
@@ -12899,20 +13582,33 @@ static void
 page_owner_primitive_remember(ResourceOwner owner, Buffer buffer)
 {
 	uint32 state = pg_atomic_read_u32(&GetBufferDescriptor(0)->state);
-	UT_ASSERT(owner == (ResourceOwner)&page_owner_wal_cookie); UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(owner == page_owner_active_resource_owner()); UT_ASSERT_EQ(buffer, 1);
 	UT_ASSERT(page_owner_primitive_ref_live && !page_owner_primitive_reserved);
 	UT_ASSERT_EQ(page_owner_active_private_ref()->refcount, 1);
 	UT_ASSERT_EQ(state, BM_VALID | BUF_REFCOUNT_ONE | BUF_USAGECOUNT_ONE);
 	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins);
+	if (page_owner_use_original_resource_owner)
+	{
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 0);
+		original_touch_owner_remember(owner, buffer); page_owner_original_owner_remembers++;
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 1); UT_ASSERT_EQ(owner->bufferarr.lastidx, 0);
+		UT_ASSERT_EQ(owner->bufferarr.itemsarr[0], page_owner_buffer_datum(buffer));
+	}
 	backend_pin_count++; page_owner_resident_pins++; page_owner_primitive_remembers++;
 }
 static void
 page_owner_primitive_forget(ResourceOwner owner, Buffer buffer)
 {
-	UT_ASSERT(owner == (ResourceOwner)&page_owner_wal_cookie); UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(owner == page_owner_active_resource_owner()); UT_ASSERT_EQ(buffer, 1);
 	UT_ASSERT(page_owner_primitive_ref_live && !page_owner_resident_partition_held);
 	UT_ASSERT_EQ(page_owner_active_private_ref()->refcount, 1);
 	UT_ASSERT_EQ(backend_pin_count, page_owner_resident_saved.pins + 1);
+	if (page_owner_use_original_resource_owner)
+	{
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 1);
+		original_touch_owner_forget(owner, buffer); page_owner_original_owner_forgets++;
+		UT_ASSERT_EQ(owner->bufferarr.nitems, 0);
+	}
 	backend_pin_count--; page_owner_primitive_forgets++;
 }
 static void
@@ -12963,7 +13659,7 @@ page_owner_primitive_signal(int pgprocno)
 #define ForgetPrivateRefCountEntry page_owner_primitive_forget_ref
 #define ResourceOwnerRememberBuffer page_owner_primitive_remember
 #define ResourceOwnerForgetBuffer page_owner_primitive_forget
-#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define CurrentResourceOwner page_owner_active_resource_owner()
 #define WaitBufHdrUnlocked page_owner_primitive_wait_header
 #define cluster_bufmgr_pcm_read_image_last_pin page_owner_primitive_last_pin
 #define LWLockHeldByMe page_owner_primitive_content_held
@@ -13055,7 +13751,7 @@ page_owner_lookup_aux_remember(ResourceOwner owner, Buffer buffer)
 #define LockBufHdr original_touch_header_lock
 #define NewPrivateRefCountEntry page_owner_lookup_aux_ref
 #define ResourceOwnerRememberBuffer page_owner_lookup_aux_remember
-#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define CurrentResourceOwner page_owner_active_resource_owner()
 #define PinBuffer page_owner_lookup_pin_leaf
 #define PinBufferForLookup original_touch_lookup_pin
 #include "test_cluster_heap_lookup_pin.inc"
@@ -13129,7 +13825,7 @@ page_owner_resident_error_detail(const char *format, ...)
 #define BufMappingPartitionLock page_owner_resident_partition
 #define ReservePrivateRefCountEntry page_owner_resident_reserve
 #define ResourceOwnerEnlargeBuffers page_owner_resident_enlarge
-#define CurrentResourceOwner ((ResourceOwner)&page_owner_wal_cookie)
+#define CurrentResourceOwner page_owner_active_resource_owner()
 #define LWLockAcquire page_owner_resident_lock
 #define LWLockRelease page_owner_resident_release_lock
 #define BufTableLookup page_owner_resident_lookup
@@ -13714,6 +14410,88 @@ native_exit_certificate_retire(const ClusterCtrcReceiptHandle *handle, bool fina
 	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
 }
 
+static void phase_recent_native_setup(QualifiedXminFixture *, LVRelState *,
+	ClusterHeapFreezeXminTargetV1 *, bool, bool);
+static void phase_recent_native_finish(const QualifiedXminFixture *, const LVRelState *, bool);
+static ClusterSemanticActiveSampleFence source_exit_member_source;
+
+static void
+source_exit_member_wakeup(PGSemaphore sema)
+{
+	PGPROC *member = &sampler_slots[1];
+	FullTransactionId reference, future;
+	ClusterXidStripeSampleFence fence;
+	ClusterCtrcActiveScan scan;
+	uint64 census_before = census_step_lock_acquires;
+
+	if (!source_exit_member_requested) { UT_ASSERT(false); abort(); }
+	UT_ASSERT(!source_exit_lock_held && !sampler_lock_held && !census_step_lock_held);
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == 0);
+	UT_ASSERT_EQ(source_exit_locks, 1); UT_ASSERT_EQ(source_exit_unlocks, 1);
+	UT_ASSERT(sema == member->sem && source_exit_member_wakeups == 0);
+	UT_ASSERT(!member->procArrayGroupMember && sampler_slots[0].procArrayGroupMember);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&member->procArrayGroupNext), INVALID_PGPROCNO);
+	for (unsigned i = 0; i < 2; i++) {
+		UT_ASSERT_EQ(sampler_slots[i].xid, InvalidTransactionId);
+		UT_ASSERT_EQ(sampler_xids[i], InvalidTransactionId);
+		UT_ASSERT_EQ(sampler_slots[i].xmin, InvalidTransactionId);
+		UT_ASSERT_EQ(sampler_slots[i].lxid, InvalidLocalTransactionId);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&sampler_slots[i].cluster_top_full_xid_atomic), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&sampler_slots[i].cluster_read_scn_atomic), 0);
+		UT_ASSERT_EQ(source_exit_subxids[i].count, 0);
+		UT_ASSERT_EQ(source_exit_status[i] & PROC_VACUUM_STATE_MASK, 0);
+	}
+	UT_ASSERT(original_native_fullxid_sample(&reference, &future, &source_exit_member_wake_minimum, &fence));
+	UT_ASSERT(FullTransactionIdEquals(source_exit_member_wake_minimum, future));
+	UT_ASSERT(original_census_scan_begin(&scan, reference));
+	scan.future_full = future; scan.min_full = source_exit_member_wake_minimum;
+	for (uint64 slices = 0; scan.status == CTRC_ACTIVE_SCAN_INCOMPLETE && slices <= scan.total_entries; slices++)
+		original_census_step_source(&scan, &source_exit_member_source);
+	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	UT_ASSERT_EQ(scan.next_index, scan.total_entries); UT_ASSERT(!scan.lock_busy);
+	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&scan));
+	UT_ASSERT_EQ(census_step_lock_acquires - census_before, scan.total_entries);
+	UT_ASSERT_EQ(census_step_lock_releases, census_step_lock_acquires);
+	source_exit_member_census_minimum = scan.min_full;
+	UT_ASSERT(FullTransactionIdEquals(scan.min_full, source_exit_member_wait_minimum));
+	if (source_exit_history_requested)
+	{
+		ClusterUndoRetentionSample history, zero = {0};
+		PGPROC *reader = &sampler_slots[2];
+
+		/* The queued transactions have retired, but this independent
+		 * snapshot is still installed. Unknown SCN and a replication pin
+		 * each refuse the original sampler; neither may become CLOCK. */
+		UT_ASSERT_EQ(reader->xmin, 90);
+		pg_atomic_write_u64(&reader->cluster_read_scn_atomic, InvalidScn);
+		memset(&history, 0xa5, sizeof(history));
+		UT_ASSERT(!bounds_original_retention_sample(&history));
+		UT_ASSERT(memcmp(&history, &zero, sizeof(history)) == 0);
+		pg_atomic_write_u64(&reader->cluster_read_scn_atomic, 10);
+		sampler_proc_array->replication_slot_xmin = 90;
+		memset(&history, 0xa5, sizeof(history));
+		UT_ASSERT(!bounds_original_retention_sample(&history));
+		UT_ASSERT(memcmp(&history, &zero, sizeof(history)) == 0);
+		sampler_proc_array->replication_slot_xmin = InvalidTransactionId;
+		UT_ASSERT(bounds_original_local_report(&history));
+		UT_ASSERT_EQ(history.clock_scn, 20); UT_ASSERT_EQ(history.horizon_scn, 10);
+		UT_ASSERT_EQ(history.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+		UT_ASSERT_EQ(history.contributor_token, 3);
+		UT_ASSERT_EQ(bounds_history_locks, 3); UT_ASSERT_EQ(bounds_history_unlocks, 3);
+		UT_ASSERT(!bounds_history_held);
+		source_exit_history_report = history;
+		source_exit_history_samples++;
+	}
+	source_exit_member_wakeups++;
+}
+
+static void
+source_exit_receiver_on_second_pin(void)
+{
+	if (recent_pin_calls == 2) recent_register_unknown_receiver();
+}
+
 static void
 full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool retire_native, unsigned terminal_receipt, unsigned certificate_retirement)
 {
@@ -13728,7 +14506,14 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 	uint32 grant;
 	uint64 total, passes = 1, expected_passes;
 
-	phase_setup(&f, &v, targets, batch);
+	if (source_exit_group_requested)
+	{
+		phase_recent_native_setup(&f, &v, targets, batch, true);
+		/* Source sampling precedes the admitted phase and owns no heap pin. */
+		phase_pin_released = true;
+	}
+	else
+		phase_setup(&f, &v, targets, batch);
 	census_runtime_initialize_requested = true;
 	if (!census_full_layout_setup(&runtime, 2)) { UT_ASSERT(false); return; }
 	key = census_key_for_full(&f.cohort.admission_fence, full);
@@ -13765,15 +14550,81 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 		sampler_variables.oldestXid = FirstNormalTransactionId;
 		sampler_variables.latestCompletedXid = FullTransactionIdFromEpochAndXid(1, 99);
 		source_exit_locks = source_exit_unlocks = 0; source_exit_lock_held = false;
+		if (source_exit_group_requested)
+		{
+			proc->pgprocno = 0; proc->procArrayGroupMember = false;
+			pg_atomic_init_u32(&proc->procArrayGroupNext, INVALID_PGPROCNO);
+			pg_atomic_init_u32(&sampler_procs.procArrayGroupFirst, INVALID_PGPROCNO);
+		}
+		if (source_exit_member_requested)
+		{
+			PGPROC *member = &sampler_slots[1];
+			FullTransactionId other = FullTransactionIdFromU64(U64FromFullTransactionId(full) + 64);
+
+			member->pgprocno = member->pgxactoff = 1; member->pid = proc->pid + 1;
+			member->xid = member->xmin = sampler_xids[1] = XidFromFullTransactionId(other);
+			member->lxid = 24; member->sem = (PGSemaphore)member;
+			member->subxidStatus.count = 2;
+			member->subxids.xids[0] = member->xid + 1; member->subxids.xids[1] = member->xid + 2;
+			source_exit_subxids[1] = member->subxidStatus;
+			member->statusFlags = source_exit_status[1] = PROC_IN_VACUUM;
+			pg_atomic_write_u64(&member->cluster_top_full_xid_atomic, U64FromFullTransactionId(other));
+			pg_atomic_write_u64(&member->cluster_read_scn_atomic, 11);
+			pg_atomic_init_u32(&member->procArrayGroupNext, INVALID_PGPROCNO);
+			sampler_proc_array->numProcs = 2; sampler_proc_array->pgprocnos[1] = 1;
+			source_exit_member_wakeups = 0;
+			source_exit_member_wait_minimum = source_exit_member_wake_minimum = InvalidFullTransactionId;
+			source_exit_member_census_minimum = InvalidFullTransactionId;
+			source_exit_member_source = f.cohort.admission_fence;
+		}
+		if (source_exit_history_requested)
+		{
+			PGPROC *reader = &sampler_slots[2];
+
+			UT_ASSERT(source_exit_group_requested && source_exit_member_requested);
+			/* Snapshot publication is a controlled leaf. Both complete
+			 * original samplers consume this same compact ProcArray. */
+			reader->pgprocno = reader->pgxactoff = 2;
+			reader->pid = proc->pid + 2; reader->xmin = 90;
+			reader->xid = sampler_xids[2] = InvalidTransactionId;
+			pg_atomic_write_u64(&reader->cluster_top_full_xid_atomic, 0);
+			pg_atomic_write_u64(&reader->cluster_read_scn_atomic, 10);
+			sampler_proc_array->numProcs = 3; sampler_proc_array->pgprocnos[2] = 2;
+			bounds_history_clock = 20;
+			fixture_wal_clock = 20;
+		}
 		source_exit_end_transaction(proc, key.xid);
+		if (source_exit_history_requested)
+		{
+			/* The cached expected source comes from the original wake-time
+			 * sampler; the admitted cohort independently samples it again. */
+			f.cohort.source_local_history.sample_clock_scn = source_exit_history_report.clock_scn;
+			f.cohort.source_local_history.contributor_kind = source_exit_history_report.contributor_kind;
+			f.cohort.source_local_history.contributor_token = source_exit_history_report.contributor_token;
+		}
+
 		UT_ASSERT_EQ(source_exit_locks, 1); UT_ASSERT_EQ(source_exit_unlocks, 1);
 		UT_ASSERT(!source_exit_lock_held);
 		UT_ASSERT_EQ(proc->xid, InvalidTransactionId); UT_ASSERT_EQ(sampler_xids[0], InvalidTransactionId);
 		UT_ASSERT_EQ(proc->xmin, InvalidTransactionId); UT_ASSERT_EQ(proc->lxid, InvalidLocalTransactionId);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&proc->cluster_top_full_xid_atomic), 0);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&proc->cluster_read_scn_atomic), 0);
-		UT_ASSERT(FullTransactionIdEquals(sampler_variables.latestCompletedXid, full));
-		UT_ASSERT_EQ(sampler_variables.xactCompletionCount, 1);
+		UT_ASSERT(FullTransactionIdEquals(sampler_variables.latestCompletedXid,
+			source_exit_member_requested ? FullTransactionIdFromU64(U64FromFullTransactionId(full) + 66) : full));
+		UT_ASSERT_EQ(sampler_variables.xactCompletionCount, source_exit_member_requested ? 2 : 1);
+		if (source_exit_member_requested) {
+			UT_ASSERT_EQ(source_exit_member_wakeups, 1);
+			UT_ASSERT(FullTransactionIdEquals(source_exit_member_wait_minimum, full));
+			UT_ASSERT(FullTransactionIdEquals(source_exit_member_census_minimum, full));
+			UT_ASSERT(FullTransactionIdFollows(source_exit_member_wake_minimum, full));
+			UT_ASSERT(!sampler_slots[1].procArrayGroupMember);
+		}
+		if (source_exit_group_requested)
+		{
+			UT_ASSERT(!proc->procArrayGroupMember);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&proc->procArrayGroupNext), INVALID_PGPROCNO);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&sampler_procs.procArrayGroupFirst), INVALID_PGPROCNO);
+		}
 		UT_ASSERT(original_native_fullxid_sample(&reference, &future, &minimum, &fence));
 		UT_ASSERT(FullTransactionIdEquals(minimum, future));
 		UT_ASSERT(FullTransactionIdFollows(minimum, full));
@@ -13835,7 +14686,10 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 	UT_ASSERT(!publisher_scan.lock_busy); UT_ASSERT_EQ(publisher_scan.unqualified_entries, 0);
 	UT_ASSERT_EQ(publisher_scan.unqualified_registration_generation, 1);
 	UT_ASSERT(FullTransactionIdEquals(publisher_scan.min_full, full));
-	UT_ASSERT_EQ(census_step_lock_acquires, total); UT_ASSERT_EQ(census_step_lock_releases, total);
+	/* Preserve both full traversals in member mode: the original wake-time
+	 * observation and this later complete original worker publication. */
+	UT_ASSERT_EQ(census_step_lock_acquires, total * (source_exit_member_requested ? 2 : 1));
+	UT_ASSERT_EQ(census_step_lock_releases, total * (source_exit_member_requested ? 2 : 1));
 	UT_ASSERT_EQ(native_worker_shared.active_sample.sample_id, f.cohort.source_local_sample_id);
 	f.cohort.local_registration_cut = publisher_scan;
 	UT_ASSERT(cluster_ctrc_active_scan_registration_current(&f.cohort.local_registration_cut));
@@ -13869,7 +14723,7 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 		f.cohort.local_registration_cut = publisher_scan;
 		UT_ASSERT(cluster_ctrc_active_scan_registration_current(&f.cohort.local_registration_cut));
 		UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
-			[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 1);
+			[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), source_exit_group_requested ? 8 : 1);
 	}
 	if (late_receiver)
 	{
@@ -13887,18 +14741,38 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 		UT_ASSERT(original_participant_participant_index(&recent_registration_key, cluster_node_id, &late_index));
 		UT_ASSERT(known_index != late_index);
 		recent_registration_refused = false; recent_registration_calls = 0;
-		recent_pin_observer = recent_register_unknown_receiver;
+		recent_pin_observer = source_exit_group_requested
+			? source_exit_receiver_on_second_pin : recent_register_unknown_receiver;
 	}
 	backend_pin_count = 0;
 	relation_data.rd_isvalid = resume_allowed = true;
+	if (source_exit_group_requested) phase_pin_released = false;
 	UT_ASSERT_EQ(phase_then_recent_native_owned(&f, &v), !late_receiver);
+	if (source_exit_history_requested)
+	{
+		UT_ASSERT_EQ(source_exit_history_samples, 1);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.horizon_scn, 10);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_horizon_scn, 10);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_history.sample_clock_scn, 20);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_history.contributor_kind,
+			CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+		UT_ASSERT_EQ(v.shared_freeze_cohort.source_local_history.contributor_token, 3);
+		UT_ASSERT_EQ(bounds_history_locks, 4); UT_ASSERT_EQ(bounds_history_unlocks, 4);
+		UT_ASSERT_EQ(bounds_history_clocks, 4); UT_ASSERT(!bounds_history_held);
+		UT_ASSERT_EQ(sampler_slots[2].xmin, 90);
+		UT_ASSERT_EQ(inserted_wal_clock, late_receiver ? InvalidScn : 20);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&sampler_slots[2].cluster_read_scn_atomic), 10);
+	}
+
 	recent_pin_observer = NULL;
 	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
 	UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
-	UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
-	UT_ASSERT_EQ(conditional_resumes, !late_receiver); UT_ASSERT_EQ(conditional_unlocks, !late_receiver);
+	UT_ASSERT_EQ(recent_pin_calls, source_exit_group_requested ? 2 : 1);
+	UT_ASSERT_EQ(recent_unpins, source_exit_group_requested ? 2 : 1);
+	UT_ASSERT_EQ(conditional_resumes, (source_exit_group_requested ? 1 : 0) + !late_receiver);
+	UT_ASSERT_EQ(conditional_unlocks, !late_receiver);
 	UT_ASSERT_EQ(inserts, !late_receiver); UT_ASSERT_EQ(flushes, !late_receiver);
-	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 1);
+	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, source_exit_group_requested ? 8 : 1);
 	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
 	UT_ASSERT_EQ(backend_pin_count, 0);
 	UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
@@ -13926,7 +14800,8 @@ full_source_then_recent_lifecycle_case(bool batch, bool late_receiver, bool reti
 		UT_ASSERT_EQ(edges + dirties, 0);
 		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 	}
-	bounds_lifecycle_assert_empty(&f.admission);
+	if (source_exit_group_requested) phase_recent_native_finish(&f, &v, !late_receiver);
+	else bounds_lifecycle_assert_empty(&f.admission);
 	census_full_layout_release(&runtime);
 }
 
@@ -14017,6 +14892,29 @@ UT_TEST(test_original_private_ref_table_feeds_pin_stamp_and_recent_freeze)
 	}
 	page_owner_original_private_reserved = NULL;
 	page_owner_use_original_private_refs = false;
+}
+
+UT_TEST(test_original_resource_owner_feeds_pin_stamp_and_recent_freeze)
+{
+	page_owner_use_original_resource_owner = true;
+	page_owner_original_owner_enlarges = page_owner_original_owner_remembers = 0;
+	page_owner_original_owner_forgets = page_owner_original_owner_allocations = 0;
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_native_resource_owner.name = "freeze-maintenance-unit";
+	original_touch_owner_array_init(&page_owner_native_resource_owner.bufferarr, page_owner_buffer_datum(InvalidBuffer));
+	test_original_private_ref_table_feeds_pin_stamp_and_recent_freeze();
+	UT_ASSERT_EQ(page_owner_original_owner_enlarges, 24);
+	UT_ASSERT_EQ(page_owner_original_owner_remembers, 16);
+	UT_ASSERT_EQ(page_owner_original_owner_forgets, 16);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, 1);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.capacity, 16);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.maxitems, 16);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.invalidval, page_owner_buffer_datum(InvalidBuffer));
+	UT_ASSERT(page_owner_native_resource_owner.bufferarr.itemsarr != NULL);
+	free(page_owner_native_resource_owner.bufferarr.itemsarr);
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_use_original_resource_owner = false;
 }
 
 UT_TEST(test_original_resident_stamp_owner_feeds_shared_retention_and_recent_freeze)
@@ -14294,7 +15192,9 @@ UT_TEST(test_recent_xmin_native_refusal_releases_only_new_resident_pin)
 		if (fault == 2) authority_current = false;
 		if (fault == 3) object_current = false;
 		UT_ASSERT(!fixture_recent_xmin_apply(&f, &target, 1));
-		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		/* Missing saved policy is now refused before a temporary pin. */
+		UT_ASSERT_EQ(recent_pin_calls, fault == 0 ? 0 : 1);
+		UT_ASSERT_EQ(recent_unpins, fault == 0 ? 0 : 1);
 		UT_ASSERT_EQ(backend_pin_count, 0);
 		UT_ASSERT(!local_x && !resumed_writer && f.admission.entered);
 		UT_ASSERT_EQ(inserts + dirties + flushes, 0);
@@ -14311,7 +15211,8 @@ UT_TEST(test_recent_xmin_refusal_preserves_preowned_pin_and_content_lock)
 		if (!owned_x) fixture_release_original_writer();
 		relation_data.rd_isvalid = true; f.input.freeze_policy = NULL;
 		UT_ASSERT(!fixture_recent_xmin_apply(&f, &target, 1));
-		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		/* The saved policy is absent; keep only the caller's existing pin. */
+		UT_ASSERT_EQ(recent_pin_calls, 0); UT_ASSERT_EQ(recent_unpins, 0);
 		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT_EQ(local_x, owned_x);
 		UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, owned_x);
 		UT_ASSERT(f.admission.entered); UT_ASSERT_EQ(conditional_resumes + conditional_unlocks, 0);
@@ -14420,11 +15321,2263 @@ UT_TEST(test_recent_xmin_share_lock_refusal_keeps_borrowed_pin_without_upgrade)
 	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
 }
 
+/* Join the original outer VACUUM owner to the complete admitted collector.
+ * Route, resolver/resident checks and transport counters remain explicit leaves;
+ * the token, registration, debt and enter/leave bodies are original. There is no
+ * continuation after outer leave and no production freeze qualification here. */
+static unsigned proof_owner_enters, proof_owner_leaves, proof_owner_cost_reads;
+static unsigned proof_owner_expected_pins;
+static ClusterSemanticAdmissionToken proof_owner_left_token;
+static LVRelState *proof_owner_retirement_observer;
+static unsigned proof_owner_retired_before_leave;
+
+static ClusterSemanticAdmissionResult
+proof_owner_enter(ClusterSemanticAdmissionToken *token)
+{
+	ClusterSemanticAdmissionResult result;
+
+	proof_owner_enters++;
+	result = bounds_original_census_enter(token);
+	if (result == CLUSTER_SEMANTIC_ADMISSION_OK) {
+		bounds_borrowed_admission = token;
+		bounds_mutable_admission = token;
+		recent_pin_admission = token;
+		if (native_original_admission_enabled) native_admission_expected_token = token;
+	}
+	return result;
+}
+
+static void
+proof_owner_leave(ClusterSemanticAdmissionToken *token)
+{
+	UT_ASSERT(token == bounds_borrowed_admission && token->entered);
+	UT_ASSERT_EQ(proof_owner_leaves, 0);
+	if (phase_foreign_assert_release_owner) UT_ASSERT_EQ(phase_foreign_held, 0);
+	UT_ASSERT_EQ(backend_pin_count, proof_owner_expected_pins);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 8);
+	if (proof_owner_retirement_observer != NULL) {
+		const LVRelState *v = proof_owner_retirement_observer;
+		const unsigned char *cohort = (const unsigned char *)&v->shared_freeze_cohort;
+		bool retired = !v->shared_freeze_fence_valid && !v->shared_freeze_cohort_observed
+			&& v->shared_freeze_input.freeze_policy == NULL
+			&& v->shared_freeze_input.freeze_cohort == NULL
+			&& v->shared_freeze_xmin_candidates.target_count == 0
+			&& v->shared_freeze_aborted_xmax_candidates.target_count == 0
+			&& !FullTransactionIdIsValid(v->shared_freeze_candidate_limit_full);
+
+		for (unsigned i = 0; i < sizeof(v->shared_freeze_cohort); i++)
+			retired = retired && cohort[i] == 0;
+		proof_owner_retired_before_leave += retired ? 1 : 0;
+	}
+	bounds_original_census_leave(token);
+	proof_owner_left_token = *token;
+	proof_owner_leaves++;
+	bounds_borrowed_admission = NULL;
+	recent_pin_admission = NULL;
+	bounds_mutable_admission = &phase_source->admission;
+}
+
+static void
+proof_owner_transport_snapshot(uint64 *out)
+{
+	bool before_leave = proof_owner_cost_reads++ == 0;
+
+	UT_ASSERT(proof_owner_cost_reads <= 2);
+	UT_ASSERT_EQ(proof_owner_leaves, before_leave ? 0 : 1);
+	UT_ASSERT_EQ(bounds_original_backend_has_admission(), before_leave);
+	for (unsigned i = 0; i < 15; i++)
+		out[i] = 100 + i + (before_leave ? 0 : i % 3 + 1);
+}
+
+#define cluster_semantic_activation_enter_r4_terminal_census proof_owner_enter
+#define cluster_semantic_activation_leave proof_owner_leave
+#define lazy_shared_freeze_transport_snapshot proof_owner_transport_snapshot
+#define lazy_collect_shared_freeze_proofs_admitted phase_actual_admitted
+#define lazy_collect_shared_freeze_proofs proof_owner_collect
+#include "test_cluster_vacuum_proof_owner.inc"
+#undef lazy_collect_shared_freeze_proofs
+#undef lazy_collect_shared_freeze_proofs_admitted
+#undef lazy_shared_freeze_transport_snapshot
+#undef cluster_semantic_activation_leave
+#undef cluster_semantic_activation_enter_r4_terminal_census
+
+static void
+proof_owner_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch)
+{
+	bounds_lifecycle_setup(f, v, targets, batch);
+	phase_source = f;
+	phase_preflights = phase_resolves = phase_rechecks = phase_error_stage = 0;
+	v->rel = &relation_data;
+	v->shared_freeze_batch = f->page;
+	v->shared_freeze_proof_calls = 17;
+	v->shared_freeze_proof_requests = 23;
+	v->shared_freeze_proof_exchanges = 31;
+	fixture_release_original_writer();
+	backend_pin_count = 0;
+	phase_pin_released = true;
+	proof_owner_enters = proof_owner_leaves = proof_owner_cost_reads = 0;
+	proof_owner_expected_pins = 0;
+	memset(&proof_owner_left_token, 0, sizeof(proof_owner_left_token));
+	pg_atomic_write_u32(&native_admission_shared.inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()], 7);
+}
+
+static void
+proof_owner_assert_released(const LVRelState *v, bool admitted)
+{
+	ClusterSemanticAdmissionToken zero = {0};
+
+	UT_ASSERT_EQ(proof_owner_leaves, admitted ? 1 : 0);
+	UT_ASSERT_EQ(proof_owner_cost_reads, admitted ? 2 : 0);
+	UT_ASSERT_EQ(semantic_activation_local_inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()], 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 7);
+	UT_ASSERT(!bounds_original_backend_has_admission());
+	UT_ASSERT(memcmp(&proof_owner_left_token, &zero, sizeof(zero)) == 0);
+	UT_ASSERT(bounds_borrowed_admission == NULL);
+	UT_ASSERT_EQ(v->shared_freeze_proof_calls, admitted ? 22 : 17);
+	UT_ASSERT_EQ(v->shared_freeze_proof_requests, admitted ? 33 : 23);
+	UT_ASSERT_EQ(v->shared_freeze_proof_exchanges, admitted ? 46 : 31);
+	UT_ASSERT(!v->shared_freeze_proof_cost_incomplete);
+	UT_ASSERT_EQ(backend_pin_count, proof_owner_expected_pins);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+	phase_pin_released = false;
+}
+
+UT_TEST(test_real_outer_collector_enters_and_leaves_around_actual_admitted_phase)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		proof_owner_setup(&f, &v, targets, batch != 0);
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(proof_owner_enters, 1);
+		UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
+		UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
+		UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+		proof_owner_assert_released(&v, true);
+	}
+}
+
+UT_TEST(test_real_outer_collector_early_refusals_preserve_caller_pin_and_other_debt)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		Buffer recent = 1;
+		proof_owner_setup(&f, &v, targets, false);
+		switch (fault) {
+		case 0: v.shared_freeze_batch.carrier_request_count = 0; break;
+		case 1: route_current = false; break;
+		case 2: pg_atomic_write_u32(&native_admission_shared.transition_closed, 1); break;
+		case 3: recent = InvalidBuffer; break;
+		case 4: backend_pin_count = proof_owner_expected_pins = 1; phase_pin_released = false; break;
+		}
+		UT_ASSERT_EQ(proof_owner_collect(&v, recent), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(proof_owner_enters, fault >= 2 ? 1 : 0);
+		UT_ASSERT_EQ(phase_preflights + phase_resolves + phase_rechecks, 0);
+		UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
+		UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+		UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL
+			&& v.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+		proof_owner_assert_released(&v, fault >= 3);
+	}
+}
+
+UT_TEST(test_real_outer_collector_rethrows_after_original_leave_on_admitted_errors)
+{
+	/* Heap-owned state remains defined after the error harness longjmp. */
+	QualifiedXminFixture *f = malloc(sizeof(*f));
+	LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned stage = 1; stage <= 4; stage++) {
+		proof_owner_setup(f, v, targets, true);
+		if (stage == 4) bounds_fault = 7;
+		else phase_error_stage = stage;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			(void)proof_owner_collect(v, 1);
+			UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT_EQ(proof_owner_enters, 1);
+		UT_ASSERT_EQ(phase_preflights, 1);
+		UT_ASSERT_EQ(phase_rechecks, stage >= 3 ? 1 : 0);
+		proof_owner_assert_released(v, true);
+	}
+	free(v); free(f);
+}
+
+/* An outer collector result retains read-only proofs, not its released owner.
+ * A nonempty request with its zeroed token and retired inputs must stop before
+ * a resident pin, writer restoration or WAL. No replacement token is made. */
+UT_TEST(test_real_outer_collector_result_cannot_outlive_its_original_admission)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		proof_owner_setup(&f, &v, targets, batch != 0);
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		proof_owner_assert_released(&v, true);
+		phase_copy_to_native(&f, &v);
+		f.admission = proof_owner_left_token;
+		UT_ASSERT(!f.admission.entered);
+		phase_pin_released = true;
+		UT_ASSERT(!fixture_recent_xmin_apply(&f,
+			targets, batch ? 3 : 1));
+		UT_ASSERT_EQ(recent_pin_calls + recent_unpins + conditional_resumes, 0);
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(proof_owner_enters, 1); UT_ASSERT_EQ(proof_owner_leaves, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+			[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 7);
+		phase_pin_released = false;
+	}
+}
+
+UT_TEST(test_real_outer_collector_reuse_refusal_retires_previous_observations)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	proof_owner_setup(&f, &v, targets, true);
+	UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	proof_owner_assert_released(&v, true);
+	UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+	UT_ASSERT(v.shared_freeze_proofs.proof_count > 0);
+	route_current = false;
+	UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+	UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL
+		&& v.shared_freeze_input.freeze_cohort == NULL);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 0);
+	UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+	for (unsigned i = 0; i < v.shared_freeze_batch.tuple_count; i++) {
+		UT_ASSERT_EQ(v.shared_freeze_batch.tuples[i].creation_target_proof_index,
+			CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+		UT_ASSERT_EQ(v.shared_freeze_batch.tuples[i].aborted_xmax_target_proof_index,
+			CLUSTER_HEAP_FREEZE_NO_ABORTED_XMAX_TARGET);
+		UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_batch.tuples[i].original_creator_full_xid));
+	}
+	UT_ASSERT_EQ(proof_owner_enters, 1); UT_ASSERT_EQ(proof_owner_leaves, 1);
+	UT_ASSERT_EQ(proof_owner_cost_reads, 2);
+	UT_ASSERT_EQ(backend_pin_count, 0); UT_ASSERT(!local_x && !local_share);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 7);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+}
+
+/* Execute the original resident recheck and all three original paired releases.
+ * Recent mapping and physical hint publication remain explicit leaves. The
+ * opt-in cleanout mode executes the full original helper and stamp predicate;
+ * the old mode keeps its false-only provider. */
+#include "test_cluster_vacuum_resident_release.inc"
+static unsigned phase_resident_releases[3], phase_resident_hint_calls;
+static bool phase_resident_hint_error;
+
+static void
+phase_resident_release_read(Buffer buffer)
+{
+	phase_resident_releases[0]++;
+	ClusterUnlockReleaseBufferAfterConditionalRead(buffer);
+}
+
+static void
+phase_resident_release_hint(Buffer buffer)
+{
+	phase_resident_releases[1]++;
+	ClusterUnlockReleaseBufferAfterConditionalHint(buffer);
+}
+
+static void
+phase_resident_release_mutation(Buffer buffer)
+{
+	phase_resident_releases[2]++;
+	ClusterUnlockReleaseBufferAfterConditionalMutation(buffer);
+}
+
+#include "cluster/cluster_itl_cleanout.h"
+#include "test_cluster_vacuum_proof_cleanout.inc"
+
+static ClusterSpaceHintResult
+phase_optional_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
+{
+	UT_ASSERT(buffer == 1 && local_x && backend_pin_count == 1);
+	UT_ASSERT(phase_use_original_cleanout && batch != NULL);
+	memset(batch, 0, sizeof(*batch));
+	phase_optional_hint_begins++;
+	return CLUSTER_SPACE_HINT_VERSIONED;
+}
+
+static void
+phase_optional_hint_finish(Buffer buffer, bool standard,
+	const RfPageProducerBatchV1 *batch)
+{
+	UT_ASSERT(buffer == 1 && standard && batch != NULL);
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	phase_optional_hint_finishes++;
+	((PageHeader)current_page.data)->pd_block_scn++;
+}
+
+#define cluster_space_hint_begin phase_optional_hint_begin
+#define cluster_space_hint_finish phase_optional_hint_finish
+#include "test_cluster_vacuum_freeze_cleanout.inc"
+#undef cluster_space_hint_finish
+#undef cluster_space_hint_begin
+
+static bool
+phase_resident_hint_unavailable(LVRelState *v, Buffer buffer,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterTxResolution *retained, uint8 retained_mask)
+{
+	(void)retained;
+	UT_ASSERT(v != NULL && buffer == 1 && proofs->proof_count > 0);
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	UT_ASSERT(bounds_expected_admission()->entered && bounds_original_backend_has_admission());
+	UT_ASSERT_EQ(retained_mask, 0);
+	phase_resident_hint_calls++;
+	if (phase_resident_hint_error) elog(ERROR, "injected resident hint preparation ERROR");
+	if (phase_use_original_cleanout)
+		return lazy_cleanout_shared_freeze_page(v, buffer, proofs, retained, retained_mask);
+	return false;
+}
+
+static void
+phase_resident_census_error_at_pin(void)
+{
+	UT_ASSERT(recent_pin_held && backend_pin_count == 1 && !local_x);
+	UT_ASSERT(bounds_expected_admission()->entered);
+	bounds_admission_error_kind = 1;
+}
+
+static bool
+phase_resident_original_census_current(const ClusterSemanticAdmissionToken *token)
+{
+	UT_ASSERT(token == bounds_expected_admission() && token->entered);
+	UT_ASSERT(local_x && backend_pin_count == 1);
+	return bounds_original_census_current(token);
+}
+
+#define lazy_cleanout_shared_freeze_page phase_resident_hint_unavailable
+#define cluster_semantic_activation_recheck_r4_terminal_census phase_resident_original_census_current
+#define ClusterUnlockReleaseBufferAfterConditionalRead phase_resident_release_read
+#define ClusterUnlockReleaseBufferAfterConditionalHint phase_resident_release_hint
+#define ClusterUnlockReleaseBufferAfterConditionalMutation phase_resident_release_mutation
+#define lazy_recheck_shared_freeze_page phase_actual_resident_recheck
+#include "test_cluster_vacuum_resident_recheck.inc"
+#undef lazy_recheck_shared_freeze_page
+#undef ClusterUnlockReleaseBufferAfterConditionalMutation
+#undef ClusterUnlockReleaseBufferAfterConditionalHint
+#undef ClusterUnlockReleaseBufferAfterConditionalRead
+#undef cluster_semantic_activation_recheck_r4_terminal_census
+#undef lazy_cleanout_shared_freeze_page
+
+static ClusterHeapFreezeProofStatusV1
+phase_real_resident_recheck(LVRelState *v, Buffer buffer,
+	const PcmAuthoritySnapshot *authority, const ClusterSemanticAdmissionToken *token,
+	ClusterHeapFreezeProofBatchV1 *proofs, const ClusterTxResolution *retained,
+	uint8 retained_mask, ClusterHeapFreezeFinalFenceV1 *current,
+	bool *cleaned, bool *rows_current)
+{
+	volatile ClusterHeapFreezeProofStatusV1 result = CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED;
+
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer);
+	recent_caller_pins = 0;
+	recent_caller_local_x = recent_caller_share = recent_caller_writer = false;
+	recent_pin_admission = token;
+	native_original_admission_enabled = true;
+	native_admission_expected_token = token;
+	native_admission_stage = 4;
+	phase_pin_released = false;
+	PG_TRY();
+	{
+		result = phase_actual_resident_recheck(v, buffer, authority, token,
+			proofs, retained, retained_mask, current, cleaned, rows_current);
+	}
+	PG_FINALLY();
+	{
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		UT_ASSERT(!recent_pin_held && !local_x && !resumed_writer);
+		phase_resident_completed = true;
+		phase_pin_released = true;
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static void
+phase_real_resident_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch, bool writer)
+{
+	proof_owner_setup(f, v, targets, batch);
+	phase_use_original_resident = true;
+	phase_resident_completed = false;
+	phase_resident_expected_resumes = writer ? 1 : 0;
+	phase_resident_hint_error = false;
+	phase_resident_hint_calls = 0;
+	memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+	v->identity = space_identity;
+	v->shared_freeze_input.writer_context_valid = writer;
+	relation_data.rd_isvalid = resume_allowed = true;
+}
+
+UT_TEST(test_original_resident_recheck_unpins_before_real_outer_admission_leave)
+{
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned batch = 0; batch < 2; batch++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_real_resident_setup(&f, &v, targets, batch != 0, writer != 0);
+			UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(phase_rechecks, 1);
+			UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+			UT_ASSERT_EQ(phase_resident_hint_calls, 1);
+			UT_ASSERT_EQ(phase_resident_releases[0], 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], writer ? 0 : 1);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer ? 1 : 0);
+			UT_ASSERT_EQ(conditional_resumes, writer ? 1 : 0);
+			UT_ASSERT_EQ(conditional_unlocks, 0);
+			UT_ASSERT_EQ(local_unlocks, 1);
+			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+			proof_owner_assert_released(&v, true);
+		}
+	}
+}
+
+UT_TEST(test_original_resident_refusals_release_only_their_pin_before_outer_leave)
+{
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned fault = 0; fault < 4; fault++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_real_resident_setup(&f, &v, targets, false, writer != 0);
+			if (fault == 0) recent_pin_allowed = false;
+			if (fault == 1) resume_allowed = false;
+			if (fault == 2) authority_current = false;
+			if (fault == 3) relation_data.rd_isvalid = false;
+			if (fault == 0 || fault == 3) phase_resident_expected_resumes = 0;
+			UT_ASSERT(proof_owner_collect(&v, 1) != CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(recent_pin_calls, fault == 3 ? 0 : 1);
+			UT_ASSERT_EQ(recent_unpins, fault == 0 || fault == 3 ? 0 : 1);
+			UT_ASSERT_EQ(phase_resident_hint_calls, 0);
+			UT_ASSERT_EQ(phase_resident_releases[0], !writer && fault == 2 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], 0);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer && fault == 2 ? 1 : 0);
+			UT_ASSERT(!v.shared_freeze_fence_valid);
+			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+			proof_owner_assert_released(&v, true);
+		}
+	}
+}
+
+UT_TEST(test_original_resident_errors_unpin_before_real_outer_error_propagation)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f));
+	LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned stage = 0; stage < 3; stage++) {
+			phase_real_resident_setup(f, v, targets, true, writer != 0);
+			if (stage == 0) recent_pin_error = true;
+			if (stage == 1) recent_pin_observer = phase_resident_census_error_at_pin;
+			if (stage == 2) phase_resident_hint_error = true;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)proof_owner_collect(v, 1);
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			recent_pin_observer = NULL;
+			UT_ASSERT_EQ(phase_rechecks, 1);
+			UT_ASSERT_EQ(recent_unpins, stage == 0 ? 0 : 1);
+			UT_ASSERT_EQ(phase_resident_releases[0], !writer && stage == 1 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], !writer && stage == 2 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer && stage != 0 ? 1 : 0);
+			proof_owner_assert_released(v, true);
+		}
+	}
+	free(v); free(f);
+}
+
+
+/* First-pin recent lookup uses the existing original private array,
+ * ResourceOwner and native CAS unpin implementations. Header contention,
+ * local buffers and an active KO read bracket are outside this MAIN-fork
+ * fixture; unsupported branches fail loudly instead of granting authority. */
+static BufferUsage phase_recent_usage;
+static unsigned phase_recent_fault, phase_recent_ko_samples;
+static uint32 phase_recent_saved_state;
+static BufferTag phase_recent_saved_tag;
+
+static void
+phase_recent_enlarge(ResourceOwner owner)
+{
+	UT_ASSERT(phase_use_original_recent_pin && owner == page_owner_active_resource_owner());
+	UT_ASSERT_EQ(owner->bufferarr.nitems, 0);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!local_x && !local_share && recent_pin_admission->entered);
+	original_touch_owner_enlarge(owner);
+	page_owner_original_owner_enlarges++;
+}
+
+static void
+phase_recent_reserve(void)
+{
+	UT_ASSERT(phase_use_original_recent_pin && page_owner_resident_active);
+	UT_ASSERT(!page_owner_resident_partition_held && !page_owner_page_locked && !local_x);
+	UT_ASSERT(!page_owner_primitive_reserved && !page_owner_primitive_ref_live);
+	original_touch_private_reserve(); page_owner_original_private_reserves++;
+	UT_ASSERT(page_owner_original_private_reserved == &page_owner_original_private_array[0]);
+	page_owner_primitive_reserved = true; page_owner_primitive_reserves++;
+}
+
+static int32
+phase_recent_private_count(Buffer buffer)
+{
+	PrivateRefCountEntry *ref = original_touch_private_get(buffer, false);
+	UT_ASSERT(phase_use_original_recent_pin); UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(ref == NULL); /* The actual collector released its capture pin. */
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	return ref == NULL ? 0 : ref->refcount;
+}
+
+static bool
+phase_recent_ko_unavailable(RelFileLocator locator, ForkNumber fork,
+	BlockNumber block, ClusterKoPeerAdmissionV3 *sample)
+{
+	UT_ASSERT(phase_use_original_recent_pin && !local_x);
+	UT_ASSERT(RelFileLocatorEquals(locator, relation_data.rd_locator));
+	UT_ASSERT_EQ(fork, MAIN_FORKNUM); UT_ASSERT_EQ(block, 7);
+	UT_ASSERT(sample != NULL); phase_recent_ko_samples++;
+	return false; /* No native KO bracket is qualified by this unit fixture. */
+}
+
+static bool
+phase_recent_ko_current_unexpected(const ClusterKoPeerAdmissionV3 *sample,
+	RelFileLocator locator, ForkNumber fork, BlockNumber block)
+{
+	(void)sample; (void)locator; (void)fork; (void)block;
+	UT_ASSERT(false);
+	return false;
+}
+
+static void
+phase_recent_ko_remember_unexpected(BufferDesc *buf, const ClusterKoPeerAdmissionV3 *sample)
+{
+	(void)buf; (void)sample; UT_ASSERT(false);
+	ereport(ERROR, (errmsg("unexpected KO pin publication in first-pin fixture")));
+}
+
+static bool
+phase_recent_pcm_active(void)
+{
+	UT_ASSERT(phase_use_original_recent_pin && recent_pin_admission->entered);
+	UT_ASSERT_EQ(GetBufferDescriptor(0)->tag.forkNum, MAIN_FORKNUM);
+	return true;
+}
+
+static BufferDesc *
+phase_recent_local_unexpected(uint32 id)
+{
+	(void)id; UT_ASSERT(false);
+	ereport(ERROR, (errmsg("local buffer outside shared recent-pin fixture")));
+	return NULL;
+}
+
+static bool
+phase_recent_pin_local_unexpected(BufferDesc *buf, bool adjust)
+{
+	(void)buf; (void)adjust; UT_ASSERT(false);
+	ereport(ERROR, (errmsg("local pin outside shared recent-pin fixture")));
+	return false;
+}
+
+static void
+phase_recent_unpin_local_unexpected(Buffer buffer)
+{
+	(void)buffer; UT_ASSERT(false);
+	ereport(ERROR, (errmsg("local unpin outside shared recent-pin fixture")));
+}
+
+static void phase_actual_pin_locked(BufferDesc *buf);
+#define ResourceOwnerEnlargeBuffers phase_recent_enlarge
+#define ReservePrivateRefCountEntry phase_recent_reserve
+#define GetPrivateRefCount phase_recent_private_count
+#define GetPrivateRefCountEntry page_owner_primitive_private_ref
+#define NewPrivateRefCountEntry page_owner_primitive_new_ref
+#define ResourceOwnerRememberBuffer page_owner_primitive_remember
+#define CurrentResourceOwner page_owner_active_resource_owner()
+#define LockBufHdr original_touch_header_lock
+#define cluster_bufmgr_ko_native_read_sample phase_recent_ko_unavailable
+#define cluster_ko_peer_read_current_v3 phase_recent_ko_current_unexpected
+#define cluster_bufmgr_ko_remember_pin phase_recent_ko_remember_unexpected
+#define cluster_pcm_is_active phase_recent_pcm_active
+#define cluster_bufmgr_should_pcm_track original_touch_pin_tracked
+#define GetLocalBufferDescriptor phase_recent_local_unexpected
+#define PinLocalBuffer phase_recent_pin_local_unexpected
+#define UnpinLocalBuffer phase_recent_unpin_local_unexpected
+#define pgBufferUsage phase_recent_usage
+#define PinBuffer original_touch_primitive_pin
+#define UnpinBuffer original_touch_primitive_unpin
+#define PinBuffer_Locked phase_actual_pin_locked
+#define ReadRecentBuffer phase_actual_read_recent
+#define ReleaseBuffer phase_actual_release_recent
+#include "test_cluster_vacuum_recent_pin.inc"
+#undef ReleaseBuffer
+#undef ReadRecentBuffer
+#undef PinBuffer_Locked
+#undef UnpinBuffer
+#undef PinBuffer
+#undef pgBufferUsage
+#undef UnpinLocalBuffer
+#undef PinLocalBuffer
+#undef GetLocalBufferDescriptor
+#undef cluster_bufmgr_should_pcm_track
+#undef cluster_pcm_is_active
+#undef cluster_bufmgr_ko_remember_pin
+#undef cluster_ko_peer_read_current_v3
+#undef cluster_bufmgr_ko_native_read_sample
+#undef LockBufHdr
+#undef CurrentResourceOwner
+#undef ResourceOwnerRememberBuffer
+#undef NewPrivateRefCountEntry
+#undef GetPrivateRefCountEntry
+#undef GetPrivateRefCount
+#undef ReservePrivateRefCountEntry
+#undef ResourceOwnerEnlargeBuffers
+
+static bool
+phase_original_recent_pin(RelFileLocator locator, ForkNumber fork,
+	BlockNumber block, Buffer recent_buffer)
+{
+	bool pinned;
+	BufferDesc *buf = GetBufferDescriptor(0);
+
+	recent_pin_calls++;
+	UT_ASSERT_EQ(recent_buffer, 1); UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!recent_pin_held && !local_x && !local_share && recent_pin_admission->entered);
+	/* Inject a descriptor change after proof collection, before original lookup. */
+	if (phase_recent_fault == 1)
+		pg_atomic_write_u32(&buf->state, phase_recent_saved_state & ~BM_VALID);
+	if (phase_recent_fault == 2) buf->tag.blockNum++;
+	pinned = phase_actual_read_recent(locator, fork, block, recent_buffer);
+	if (!pinned) {
+		UT_ASSERT_EQ(backend_pin_count, 0);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_LOCKED, 0);
+		buf->tag = phase_recent_saved_tag;
+		pg_atomic_write_u32(&buf->state, phase_recent_saved_state | BUF_USAGECOUNT_ONE);
+		return false;
+	}
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 1);
+	UT_ASSERT_EQ(page_owner_active_private_ref()->refcount, 1);
+	recent_pin_held = true;
+	if (recent_pin_observer != NULL) recent_pin_observer();
+	return true;
+}
+
+static void
+phase_original_recent_release(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1); UT_ASSERT(recent_pin_held);
+	UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer);
+	UT_ASSERT(recent_pin_admission->entered);
+	phase_actual_release_recent(buffer);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
+	recent_unpins++; recent_pin_held = false;
+}
+
+static void
+phase_recent_owner_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch, bool writer)
+{
+	phase_real_resident_setup(f, v, targets, batch, writer);
+	phase_use_original_recent_pin = true;
+	phase_recent_fault = phase_recent_ko_samples = 0;
+	phase_recent_saved_tag = GetBufferDescriptor(0)->tag;
+	phase_recent_saved_state = pg_atomic_read_u32(&GetBufferDescriptor(0)->state);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(phase_recent_saved_state), 0);
+	pg_atomic_write_u32(&GetBufferDescriptor(0)->state, BM_VALID | BUF_USAGECOUNT_ONE);
+	memset(&phase_recent_usage, 0, sizeof(phase_recent_usage));
+	page_owner_resident_active = true;
+	page_owner_resident_partition_held = page_owner_page_locked = false;
+	page_owner_resident_saved.pins = 0;
+	page_owner_use_original_primitive_pin = page_owner_use_original_private_refs = true;
+	page_owner_use_original_resource_owner = true;
+	page_owner_primitive_ref_live = page_owner_primitive_reserved = false;
+	page_owner_primitive_reserves = page_owner_primitive_new_refs = 0;
+	page_owner_primitive_remembers = page_owner_primitive_forgets = page_owner_primitive_unpins = 0;
+	page_owner_primitive_private_reads = page_owner_primitive_last_pin_reads = 0;
+	page_owner_original_private_gets = page_owner_original_private_reserves = 0;
+	page_owner_original_private_news = page_owner_original_private_forgets = 0;
+	memset(page_owner_original_private_array, 0, sizeof(page_owner_original_private_array));
+	page_owner_original_private_reserved = NULL;
+	page_owner_original_private_overflowed = 0; page_owner_original_private_clock = 0;
+	page_owner_original_owner_enlarges = page_owner_original_owner_remembers = 0;
+	page_owner_original_owner_forgets = page_owner_original_owner_allocations = 0;
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_native_resource_owner.name = "actual-recent-pin-unit";
+	original_touch_owner_array_init(&page_owner_native_resource_owner.bufferarr,
+		page_owner_buffer_datum(InvalidBuffer));
+}
+
+static void
+phase_recent_owner_finish(LVRelState *v, bool pinned)
+{
+	UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, pinned ? 1 : 0);
+	UT_ASSERT_EQ(phase_recent_usage.shared_blks_hit, pinned ? 1 : 0);
+	UT_ASSERT_EQ(phase_recent_usage.local_blks_hit, 0);
+	UT_ASSERT_EQ(phase_recent_ko_samples, 1);
+	UT_ASSERT_EQ(page_owner_original_owner_enlarges, 1);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, 1);
+	UT_ASSERT_EQ(page_owner_original_owner_remembers, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_original_owner_forgets, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_original_private_news, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_original_private_forgets, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_primitive_last_pin_reads, pinned ? 1 : 0);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&GetBufferDescriptor(0)->state)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&GetBufferDescriptor(0)->state) & BM_LOCKED, 0);
+	for (unsigned i = 0; i < lengthof(page_owner_original_private_array); i++) {
+		UT_ASSERT_EQ(page_owner_original_private_array[i].buffer, InvalidBuffer);
+		UT_ASSERT_EQ(page_owner_original_private_array[i].refcount, 0);
+	}
+	UT_ASSERT(page_owner_original_private_reserved == &page_owner_original_private_array[0]);
+	proof_owner_assert_released(v, true);
+	free(page_owner_native_resource_owner.bufferarr.itemsarr);
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_original_private_reserved = NULL;
+	page_owner_use_original_resource_owner = page_owner_use_original_private_refs = false;
+	page_owner_use_original_primitive_pin = page_owner_resident_active = false;
+	phase_use_original_recent_pin = false;
+	GetBufferDescriptor(0)->tag = phase_recent_saved_tag;
+	pg_atomic_write_u32(&GetBufferDescriptor(0)->state, phase_recent_saved_state);
+}
+
+UT_TEST(test_original_recent_first_pin_and_owner_release_precede_outer_leave)
+{
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned batch = 0; batch < 2; batch++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_recent_owner_setup(&f, &v, targets, batch != 0, writer != 0);
+			UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+			UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], writer ? 0 : 1);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer ? 1 : 0);
+			phase_recent_owner_finish(&v, true);
+		}
+	}
+}
+
+UT_TEST(test_original_recent_descriptor_misses_never_publish_pin_or_owner)
+{
+	for (unsigned fault = 1; fault < 3; fault++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		phase_recent_owner_setup(&f, &v, targets, true, true);
+		phase_recent_fault = fault; phase_resident_expected_resumes = 0;
+		UT_ASSERT(proof_owner_collect(&v, 1) != CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(!v.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT_EQ(conditional_resumes, 0);
+		phase_recent_owner_finish(&v, false);
+	}
+}
+
+UT_TEST(test_original_recent_owner_unpins_before_collector_error_propagation)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f));
+	LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned writer = 0; writer < 2; writer++) {
+		for (unsigned stage = 0; stage < 2; stage++) {
+			phase_recent_owner_setup(f, v, targets, true, writer != 0);
+			if (stage == 0) recent_pin_observer = phase_resident_census_error_at_pin;
+			if (stage == 1) phase_resident_hint_error = true;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)proof_owner_collect(v, 1);
+				UT_ASSERT(false);
+			}
+			expecting_error = false; recent_pin_observer = NULL;
+			UT_ASSERT_EQ(phase_resident_releases[0], !writer && stage == 0 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[1], !writer && stage == 1 ? 1 : 0);
+			UT_ASSERT_EQ(phase_resident_releases[2], writer ? 1 : 0);
+			phase_recent_owner_finish(v, true);
+		}
+	}
+	free(v); free(f);
+}
+
+
+static void
+phase_recent_native_begin(const LVRelState *v)
+{
+	bool writer = v->shared_freeze_input.writer_context_valid;
+	UT_ASSERT(phase_use_original_recent_pin && phase_use_original_resident && phase_resident_completed);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer && !recent_pin_held);
+	UT_ASSERT_EQ(conditional_resumes, writer ? 1 : 0);
+	UT_ASSERT_EQ(conditional_unlocks, 0); UT_ASSERT_EQ(local_lock_attempts, 1);
+	UT_ASSERT_EQ(writer_checks, writer ? 1 : 0);
+	UT_ASSERT_EQ(route_checks, 1); UT_ASSERT_EQ(authority_checks, 1);
+	UT_ASSERT_EQ(admission_checks, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	phase_prior_lock_activity = conditional_resumes + conditional_unlocks + local_lock_attempts;
+	phase_prior_authority_activity = writer_checks + route_checks + authority_checks + admission_checks;
+	phase_prior_writer_checks = writer_checks;
+	phase_prior_route_checks = route_checks; phase_prior_authority_checks = authority_checks;
+}
+
+static void
+phase_recent_native_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch, bool writer)
+{
+	phase_recent_owner_setup(f, v, targets, batch, writer);
+	phase_finally_calls = phase_finally_debt = phase_finally_pins = 0;
+	phase_finally_owned_writer = false;
+	UT_ASSERT_EQ(bounds_original_census_enter(&f->admission), CLUSTER_SEMANTIC_ADMISSION_OK);
+	phase_pin_released = false;
+}
+
+static void
+phase_recent_native_finish_pins(const QualifiedXminFixture *f, const LVRelState *v,
+	bool changed, unsigned pins)
+{
+	ClusterSemanticAdmissionToken zero = {0};
+	UT_ASSERT_EQ(recent_pin_calls, pins); UT_ASSERT_EQ(recent_unpins, pins);
+	UT_ASSERT_EQ(phase_recent_usage.shared_blks_hit, pins);
+	UT_ASSERT_EQ(phase_recent_usage.local_blks_hit, 0);
+	UT_ASSERT_EQ(phase_recent_ko_samples, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_enlarges, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_allocations, pins != 0);
+	UT_ASSERT_EQ(page_owner_original_owner_remembers, pins);
+	UT_ASSERT_EQ(page_owner_original_owner_forgets, pins);
+	UT_ASSERT_EQ(page_owner_original_private_news, pins);
+	UT_ASSERT_EQ(page_owner_original_private_forgets, pins);
+	UT_ASSERT_EQ(page_owner_primitive_last_pin_reads, pins);
+	UT_ASSERT_EQ(page_owner_native_resource_owner.bufferarr.nitems, 0);
+	UT_ASSERT_EQ(phase_finally_calls, 1); UT_ASSERT_EQ(phase_finally_debt, 8);
+	UT_ASSERT_EQ(phase_finally_pins, 0); UT_ASSERT(!phase_finally_owned_writer);
+	UT_ASSERT_EQ(inserts, changed ? 1 : 0); UT_ASSERT_EQ(flushes, changed ? 1 : 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 7);
+	UT_ASSERT_EQ(semantic_activation_local_inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()], 0);
+	UT_ASSERT(memcmp(&f->admission, &zero, sizeof(zero)) == 0);
+	UT_ASSERT(!bounds_original_backend_has_admission());
+	UT_ASSERT(!local_x && !local_share && !resumed_writer && !recent_pin_held);
+	UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) == NULL);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&GetBufferDescriptor(0)->state)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&GetBufferDescriptor(0)->state) & BM_LOCKED, 0);
+	UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+	for (unsigned i = 0; i < lengthof(page_owner_original_private_array); i++) {
+		UT_ASSERT_EQ(page_owner_original_private_array[i].buffer, InvalidBuffer);
+		UT_ASSERT_EQ(page_owner_original_private_array[i].refcount, 0);
+	}
+	if (changed) {
+		UT_ASSERT(v->shared_freeze_xmin_candidates.target_count > 0);
+		for (unsigned i = 0; i < v->shared_freeze_xmin_candidates.target_count; i++) {
+			uint16 tuple_index = v->shared_freeze_xmin_candidates.targets[i].tuple_index;
+			OffsetNumber offset;
+
+			UT_ASSERT(tuple_index < v->shared_freeze_batch.tuple_count);
+			offset = v->shared_freeze_batch.tuples[tuple_index].offset;
+			UT_ASSERT(OffsetNumberIsValid(offset));
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, offset)));
+		}
+	} else
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	free(page_owner_native_resource_owner.bufferarr.itemsarr);
+	memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+	page_owner_original_private_reserved = NULL;
+	page_owner_use_original_resource_owner = page_owner_use_original_private_refs = false;
+	page_owner_use_original_primitive_pin = page_owner_resident_active = false;
+	phase_use_original_recent_pin = false;
+	GetBufferDescriptor(0)->tag = phase_recent_saved_tag;
+	pg_atomic_write_u32(&GetBufferDescriptor(0)->state, phase_recent_saved_state);
+}
+
+static void
+phase_recent_native_finish(const QualifiedXminFixture *f, const LVRelState *v, bool changed)
+{
+	phase_recent_native_finish_pins(f, v, changed, 2);
+}
+
+UT_TEST(test_original_resident_recent_pin_chain_reaches_same_owner_native_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+		UT_ASSERT(phase_then_recent_native_owned(&f, &v));
+		UT_ASSERT_EQ(conditional_resumes, 2); UT_ASSERT_EQ(conditional_unlocks, 1);
+		UT_ASSERT_EQ(local_unlocks, 2);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, batch ? 3 : 1);
+		phase_recent_native_finish(&f, &v, true);
+	}
+}
+
+static void
+phase_recent_revoke_cut_on_second_pin(void)
+{
+	if (recent_pin_calls != 2) return;
+	UT_ASSERT(phase_resident_completed && recent_pin_held && recent_pin_admission->entered);
+	UT_ASSERT(!local_x && !resumed_writer);
+	ctrc_note_unqualified_registration();
+}
+
+UT_TEST(test_original_resident_recent_native_refuses_read_context_and_late_cut)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned fault = 0; fault < 2; fault++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_recent_native_setup(&f, &v, targets, batch != 0, fault != 0);
+			if (fault != 0) recent_pin_observer = phase_recent_revoke_cut_on_second_pin;
+			UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+			recent_pin_observer = NULL;
+			UT_ASSERT_EQ(conditional_resumes, fault != 0 ? 1 : 0);
+			UT_ASSERT_EQ(conditional_unlocks, 0);
+			UT_ASSERT_EQ(target_preflight_checks + policy_current_checks + cohort_current_checks, 0);
+			phase_recent_native_finish(&f, &v, false);
+		}
+	}
+}
+
+UT_TEST(test_original_resident_recent_native_errors_unwind_two_pin_owner_scopes)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f)); LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned stage = 0; stage < 2; stage++) {
+			phase_recent_native_setup(f, v, targets, batch != 0, true);
+			target_recheck_error = stage == 0; flush_error = stage == 1;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)phase_then_recent_native_owned(f, v); UT_ASSERT(false);
+			}
+			expecting_error = false;
+			UT_ASSERT_EQ(conditional_resumes, 2); UT_ASSERT_EQ(conditional_unlocks, 1);
+			UT_ASSERT_EQ(local_unlocks, 2);
+			phase_recent_native_finish(f, v, stage == 1);
+		}
+	}
+	free(v); free(f);
+}
+
+/* The native shim already invokes the complete original TARGET/census
+ * predicates. Compose their publication/startup cuts with both real pin
+ * cycles; no extra eligibility flag or replacement predicate is needed. */
+static void
+phase_recent_disable_target_on_second_pin(void)
+{
+	if (recent_pin_calls != 2) return;
+	UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(!local_x && !local_share);
+	bounds_admission_change(1);
+	UT_ASSERT(bounds_original_census_current(native_admission_expected_token));
+	UT_ASSERT(!bounds_original_target_current(native_admission_expected_token));
+}
+
+static void
+phase_recent_assert_admission_cut(unsigned stage)
+{
+	UT_ASSERT(stage >= 1 && stage <= 6);
+	for (unsigned i = 1; i <= 6; i++)
+		UT_ASSERT_EQ(native_admission_checks[i], i <= stage ? 1 : 0);
+	UT_ASSERT_EQ(conditional_resumes, stage >= 3 ? 2 : 1);
+	UT_ASSERT_EQ(conditional_unlocks, stage >= 3 ? 1 : 0);
+	UT_ASSERT_EQ(local_unlocks, stage >= 3 ? 2 : 1);
+	UT_ASSERT_EQ(space_observation_checks, stage >= 5 ? 1 : 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+}
+
+UT_TEST(test_original_group_exit_retains_source_through_recent_wal)
+{
+	source_exit_group_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned terminal = 0; terminal <= 2; terminal++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, terminal, 0);
+	source_exit_group_requested = false;
+}
+
+UT_TEST(test_original_group_exit_late_receiver_revokes_second_pin_wal)
+{
+	source_exit_group_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned terminal = 0; terminal <= 2; terminal++)
+			full_source_then_recent_lifecycle_case(batch != 0, true, true, terminal, 0);
+	source_exit_group_requested = false;
+}
+
+UT_TEST(test_original_group_exit_certificate_precedes_fresh_recent_cut)
+{
+	source_exit_group_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned retirement = 1; retirement <= 2; retirement++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 1, retirement);
+	source_exit_group_requested = false;
+}
+
+UT_TEST(test_original_group_member_exit_retains_source_through_recent_wal)
+{
+	source_exit_group_requested = source_exit_member_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned terminal = 0; terminal <= 2; terminal++) {
+			source_exit_member_wakeups = 0;
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, terminal, 0);
+			UT_ASSERT_EQ(source_exit_member_wakeups, 1);
+		}
+	}
+	source_exit_group_requested = source_exit_member_requested = false;
+}
+
+UT_TEST(test_original_group_member_exit_late_receiver_revokes_recent_wal)
+{
+	source_exit_group_requested = source_exit_member_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned terminal = 0; terminal <= 2; terminal++)
+			full_source_then_recent_lifecycle_case(batch != 0, true, true, terminal, 0);
+	source_exit_group_requested = source_exit_member_requested = false;
+}
+
+UT_TEST(test_original_group_member_exit_certificate_needs_fresh_recent_cut)
+{
+	source_exit_group_requested = source_exit_member_requested = true;
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned retirement = 1; retirement <= 2; retirement++)
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, 1, retirement);
+	source_exit_group_requested = source_exit_member_requested = false;
+}
+
+UT_TEST(test_resident_recent_native_original_startup_qualification_at_each_cut)
+{
+	const ClusterNormalStartState serving[] = { CLUSTER_NORMAL_START_EXISTING_OTHER,
+		CLUSTER_NORMAL_START_SOURCE_ZERO, CLUSTER_NORMAL_START_TARGET_READY };
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned n = 0; n < lengthof(serving); n++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+			bounds_start_publish_state(serving[n]);
+			UT_ASSERT(phase_then_recent_native_owned(&f, &v));
+			for (unsigned i = 1; i <= 6; i++) UT_ASSERT_EQ(native_admission_checks[i], 1);
+			phase_recent_native_finish(&f, &v, true);
+		}
+		for (unsigned stage = 1; stage <= 6; stage++) {
+			for (unsigned fault = 0; fault <= 4; fault++) {
+				QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+				phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+				native_start_change_at = stage; native_start_fault = fault;
+				UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+				phase_recent_assert_admission_cut(stage);
+				phase_recent_native_finish(&f, &v, false);
+			}
+		}
+	}
+}
+
+UT_TEST(test_resident_recent_native_original_publication_identity_at_each_cut)
+{
+	const unsigned snapshot_faults[] = { 2, 3, 4, 5, 6 };
+	for (unsigned batch = 0; batch < 2; batch++) {
+		{
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+			/* Read-only census does not grant writer permission. A raw bit-only
+			 * fault is deliberately not a census-identity refusal condition. */
+			recent_pin_observer = phase_recent_disable_target_on_second_pin;
+			UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+			recent_pin_observer = NULL;
+			phase_recent_assert_admission_cut(1);
+			phase_recent_native_finish(&f, &v, false);
+		}
+		for (unsigned stage = 1; stage <= 6; stage++) {
+			/* Torn/closed/drifted snapshots keep the caller's token and debt. */
+			for (unsigned n = 0; n < lengthof(snapshot_faults); n++) {
+				QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+				phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+				native_admission_fault_at = stage; native_admission_fault = snapshot_faults[n];
+				UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+				phase_recent_assert_admission_cut(stage);
+				phase_recent_native_finish(&f, &v, false);
+			}
+			/* Completed original publications: closed images, reopened newer
+			 * generations with either bit value, and epoch closure all retire
+			 * the old writer/census cut before the original native mutation. */
+			for (unsigned mode = 0; mode < 5; mode++) {
+				QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+				phase_recent_native_setup(&f, &v, targets, batch != 0, true);
+				native_admission_fault_at = stage; native_admission_fault = 24 + mode;
+				UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+				phase_recent_assert_admission_cut(stage);
+				phase_recent_native_finish(&f, &v, false);
+			}
+		}
+	}
+}
+
+UT_TEST(test_resident_recent_native_original_admission_errors_retire_owned_debt_last)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f)); LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned stage = 1; stage <= 6; stage++) {
+			for (unsigned fault = 21; fault <= 22; fault++) {
+				phase_recent_native_setup(f, v, targets, batch != 0, true);
+				native_admission_fault_at = stage; native_admission_fault = fault;
+				expecting_error = true;
+				if (setjmp(error_jump) == 0) {
+					(void)phase_then_recent_native_owned(f, v); UT_ASSERT(false);
+				}
+				expecting_error = false;
+				phase_recent_assert_admission_cut(stage);
+				phase_recent_native_finish(f, v, false);
+			}
+		}
+	}
+	free(v); free(f);
+}
+
+
+UT_TEST(test_recent_xmin_saved_bounds_refuse_before_pin)
+{
+	for (unsigned batch = 0; batch < 2; batch++)
+		for (unsigned owned = 0; owned < 2; owned++)
+			for (unsigned fault = 0; fault < 9; fault++)
+			{
+				QualifiedXminFixture f;
+				ClusterHeapFreezeXminTargetV1 targets[3];
+				if (batch) qualified_xmin_batch_setup(&f, targets);
+				else {
+					qualified_xmin_setup(&f, HEAP_XMAX_IS_MULTI);
+					targets[0] = (ClusterHeapFreezeXminTargetV1) {
+						0, FullTransactionIdFromEpochAndXid(1, 77)};
+				}
+				if (!owned) {
+					fixture_release_original_writer();
+					backend_pin_count = 0;
+				}
+				relation_data.rd_isvalid = true;
+				switch (fault) {
+				case 0: f.input.freeze_policy = NULL; break;
+				case 1: f.policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 99); break;
+				case 2: f.cohort.horizon_scn++; break;
+				case 3: f.cohort.source_local_horizon_scn--; break;
+				case 4: f.cohort.record_generation++; break;
+				case 5: f.cohort.formation_epoch++; break;
+				case 6: f.cohort.admission_fence.admitted_members_lo = 0; break;
+				case 7: f.cohort.source_local_history.sample_clock_scn = InvalidScn; break;
+				case 8: f.cohort.local_registration_cut.min_full = FullTransactionIdFromEpochAndXid(1, 99); break;
+				}
+				UT_ASSERT(!fixture_recent_xmin_apply(&f, targets, batch ? 3 : 1));
+				UT_ASSERT_EQ(recent_pin_calls + recent_unpins, 0);
+				UT_ASSERT_EQ(backend_pin_count, owned ? 1 : 0);
+				UT_ASSERT_EQ(local_x, owned != 0);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, owned != 0);
+				UT_ASSERT(f.admission.entered);
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + local_lock_attempts, 0);
+				UT_ASSERT_EQ(target_preflight_checks + census_preflight_checks + full_target_checks + admission_checks, 0);
+				UT_ASSERT_EQ(policy_current_checks + cohort_current_checks + wal_clock_reads, 0);
+				UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+}
+
+
+UT_TEST(test_original_snapshot_h_survives_group_exit_to_recent_wal)
+{
+	source_exit_history_requested = true;
+	source_exit_group_requested = source_exit_member_requested = true;
+	for (unsigned receipt = 0; receipt < 3; receipt++)
+		for (unsigned batch = 0; batch < 2; batch++) {
+			source_exit_history_samples = 0;
+			full_source_then_recent_lifecycle_case(batch != 0, false, true, receipt, 0);
+			UT_ASSERT_EQ(source_exit_history_samples, 1);
+		}
+	source_exit_history_requested = false;
+	source_exit_group_requested = source_exit_member_requested = false;
+}
+
+
+/* The outer owner may retain read-only proof results for reporting, but its
+ * continuation fence, borrowed sources and candidates must retire before leave. */
+UT_TEST(test_real_outer_collector_retires_continuation_before_admission_leave)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		proof_owner_setup(&f, &v, targets, batch != 0);
+		proof_owner_retirement_observer = &v;
+		proof_owner_retired_before_leave = 0;
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		proof_owner_retirement_observer = NULL;
+		UT_ASSERT_EQ(proof_owner_retired_before_leave, 1);
+		UT_ASSERT(v.shared_freeze_proofs.proof_count > 0);
+		UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_rechecks, 1);
+		UT_ASSERT_EQ(phase_resolves, f.page.carrier_request_count);
+		proof_owner_assert_released(&v, true);
+	}
+}
+
+UT_TEST(test_real_outer_collector_errors_retire_continuation_before_admission_leave)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f));
+	LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned stage = 1; stage <= 4; stage++) {
+			proof_owner_setup(f, v, targets, batch != 0);
+			v->shared_freeze_fence_valid = true;
+			proof_owner_retirement_observer = v;
+			proof_owner_retired_before_leave = 0;
+			if (stage == 4) bounds_fault = 7;
+			else phase_error_stage = stage;
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)proof_owner_collect(v, 1);
+				UT_ASSERT(false);
+			}
+			expecting_error = false;
+			proof_owner_retirement_observer = NULL;
+			UT_ASSERT_EQ(proof_owner_retired_before_leave, 1);
+			UT_ASSERT_EQ(proof_owner_enters, 1);
+			UT_ASSERT_EQ(phase_preflights, 1);
+			proof_owner_assert_released(v, true);
+		}
+	}
+	free(v); free(f);
+}
+
+/* Reusing a borrowed owner does not carry a previous attempt's continuation
+ * through a new preflight refusal. Caller pins and the entered owner remain. */
+UT_TEST(test_admitted_reuse_refusals_retire_previous_continuation)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		ClusterSemanticAdmissionToken original, rejected;
+		const ClusterSemanticAdmissionToken *token;
+		const PcmAuthoritySnapshot *authority;
+		bool rows_current = false, *out = &rows_current;
+		unsigned preflights, resolves, rechecks, proof_count;
+		Buffer recent = 1;
+		phase_setup(&f, &v, targets, true);
+		/* Release only the fixture's legacy pin model, then call the complete
+		 * production admitted body directly, including the caller-pin guard. */
+		backend_pin_count = 0; phase_pin_released = true;
+		UT_ASSERT_EQ(phase_actual_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows_current), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT(rows_current && v.shared_freeze_fence_valid);
+		UT_ASSERT(v.shared_freeze_xmin_candidates.target_count > 0);
+		preflights = phase_preflights; resolves = phase_resolves; rechecks = phase_rechecks;
+		proof_count = v.shared_freeze_proofs.proof_count;
+		memcpy(&original, &f.admission, sizeof(original));
+		memcpy(&rejected, &f.admission, sizeof(rejected));
+		token = &f.admission; authority = &f.authority;
+		if (fault == 0) recent = InvalidBuffer;
+		if (fault == 1) backend_pin_count = 1;
+		if (fault == 2) { rejected.entered = false; token = &rejected; }
+		if (fault == 3) authority = NULL;
+		if (fault == 4) out = NULL;
+		UT_ASSERT_EQ(phase_actual_admitted(&v, recent, authority,
+			f.fence.master_sequence, token, out), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT(!v.shared_freeze_fence_valid && !v.shared_freeze_cohort_observed);
+		UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL
+			&& v.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 0);
+		UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+		for (unsigned i = 0; i < sizeof(v.shared_freeze_cohort); i++)
+			UT_ASSERT_EQ(((const unsigned char *)&v.shared_freeze_cohort)[i], 0);
+		UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, proof_count);
+		if (out != NULL) UT_ASSERT(!rows_current);
+		UT_ASSERT_EQ(phase_preflights, preflights);
+		UT_ASSERT_EQ(phase_resolves, resolves); UT_ASSERT_EQ(phase_rechecks, rechecks);
+		UT_ASSERT_EQ(backend_pin_count, fault == 1 ? 1 : 0);
+		UT_ASSERT(memcmp(&f.admission, &original, sizeof(original)) == 0);
+		UT_ASSERT(bounds_original_backend_has_admission());
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		backend_pin_count = 0;
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
+/* Join the real admitted/resident path to the existing qualified subset
+ * native entry. Whole-page KEEP is never upgraded to whole-page proof. */
+UT_TEST(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	bool applied;
+
+	phase_recent_native_setup(&f, &v, targets, true, true);
+	phase_mixed_proof_subset = true;
+	applied = phase_then_recent_native_owned(&f, &v);
+	phase_mixed_proof_subset = false;
+	UT_ASSERT(applied);
+	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_resolves, 3);
+	UT_ASSERT_EQ(phase_rechecks, 1);
+	UT_ASSERT_EQ(v.shared_freeze_batch.carrier_request_count, 3);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 2);
+	UT_ASSERT(!v.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 2);
+	UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, 77);
+	for (int i = 1; i <= 3; i++) {
+		HeapTupleHeader tuple = freeze_tuple(current_page.data, i);
+		HeapTupleHeader old = freeze_tuple(before_page.data, i);
+		UT_ASSERT_EQ(tuple->t_infomask,
+			i == 2 ? old->t_infomask : old->t_infomask | HEAP_XMIN_FROZEN);
+		UT_ASSERT_EQ(tuple->t_infomask2, old->t_infomask2);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple), HeapTupleHeaderGetRawXmin(old));
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(tuple), HeapTupleHeaderGetRawXmax(old));
+		UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i - 1),
+			ClusterPageGetItlSlot(before_page.data, i - 1), sizeof(ClusterItlSlotData)) == 0);
+	}
+	UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+		freeze_tuple(before_page.data, 2), 64) == 0);
+	check_publication(true);
+	replay_freeze_record();
+	phase_recent_native_finish(&f, &v, true);
+}
+
+/* Every proper terminal subset must use its complete creators for the WAL
+ * horizon, even when the greatest raw XID belongs to the previous epoch. */
+UT_TEST(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows)
+{
+	for (unsigned mask = 1; mask < 7; mask++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		unsigned count = 3 - ((mask & 1) != 0) - ((mask & 2) != 0) - ((mask & 4) != 0);
+		TransactionId horizon = !(mask & 1) ? 77 : !(mask & 4) ? 66 : UINT32_MAX - 2;
+		bool applied;
+
+		phase_recent_native_setup(&f, &v, targets, true, true);
+		expected_nplans = !(mask & 1) + ((mask & 6) != 6);
+		phase_unknown_proof_mask = mask;
+		applied = phase_then_recent_native_owned(&f, &v);
+		phase_unknown_proof_mask = 0;
+		UT_ASSERT(applied);
+		if (!applied) {
+			/* No recent-write pin was taken. Release fixture storage without
+			 * asserting the unrelated outer collector accounting. */
+			free(page_owner_native_resource_owner.bufferarr.itemsarr);
+			memset(&page_owner_native_resource_owner, 0, sizeof(page_owner_native_resource_owner));
+			return;
+		}
+		UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_resolves, 3);
+		UT_ASSERT_EQ(phase_rechecks, 1);
+		UT_ASSERT_EQ(v.shared_freeze_batch.carrier_request_count, 3);
+		UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, count);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, count);
+		UT_ASSERT(!v.shared_freeze_fence_valid);
+		UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, horizon);
+		for (int i = 0; i < 3; i++) {
+			PGAlignedBlock expected;
+			HeapTupleHeader tuple = freeze_tuple(current_page.data, i + 1);
+			HeapTupleHeader old = freeze_tuple(before_page.data, i + 1);
+
+			memcpy(expected.data, old, 64);
+			if (!(mask & (1U << i)))
+				((HeapTupleHeader)expected.data)->t_infomask |= HEAP_XMIN_FROZEN;
+			UT_ASSERT(memcmp(tuple, expected.data, 64) == 0);
+			UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i),
+				ClusterPageGetItlSlot(before_page.data, i), sizeof(ClusterItlSlotData)) == 0);
+		}
+		check_publication(true);
+		replay_freeze_record();
+		phase_recent_native_finish(&f, &v, true);
+	}
+}
+
+/* Invalid selected-target requests cannot start a recent-resident write. */
+UT_TEST(test_recent_xmin_invalid_target_batch_refuses_before_resident_pin)
+{
+	for (int pins = 0; pins < 2; pins++) {
+		for (int writer = 0; writer < 2; writer++) {
+			for (int fault = 0; fault < 4; fault++) {
+				QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+				ClusterSemanticAdmissionToken saved_admission;
+				uint16 count;
+
+				qualified_xmin_batch_setup(&f, targets);
+				if (!writer) { fixture_release_original_writer(); resume_allowed = true; }
+				relation_data.rd_isvalid = true; backend_pin_count = pins;
+				count = fault == 0 ? 0 : fault == 1 ? MaxHeapTuplesPerPage + 1 : 4;
+				if (fault == 3) { f.page.tuple_count = 0; count = 1; }
+				saved_admission = f.admission;
+				UT_ASSERT(!fixture_recent_xmin_apply(&f, targets, count));
+				UT_ASSERT_EQ(recent_pin_calls + recent_unpins, 0);
+				UT_ASSERT_EQ(backend_pin_count, pins); UT_ASSERT_EQ(local_x, writer);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_x_writer_find(GetBufferDescriptor(0)) != NULL, writer);
+				UT_ASSERT(memcmp(&f.admission, &saved_admission, sizeof(saved_admission)) == 0);
+				UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+				UT_ASSERT(!recent_pin_held && !resumed_writer);
+				UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+			}
+		}
+	}
+}
+
+/* Finite cutoff inputs cannot replace missing terminal proof. */
+UT_TEST(test_all_unknown_admitted_carriers_skip_resident_and_native_work)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+
+	phase_recent_native_setup(&f, &v, targets, true, true);
+	UT_ASSERT(FullTransactionIdIsValid(f.policy.freeze_limit));
+	UT_ASSERT(SCN_VALID(f.cohort.horizon_scn));
+	phase_unknown_proof_mask = 7;
+	UT_ASSERT(!phase_then_recent_native_owned(&f, &v));
+	phase_unknown_proof_mask = 0;
+	UT_ASSERT_EQ(phase_preflights, 1); UT_ASSERT_EQ(phase_resolves, 3);
+	UT_ASSERT_EQ(phase_rechecks, 0);
+	UT_ASSERT_EQ(v.shared_freeze_batch.carrier_request_count, 3);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 0);
+	UT_ASSERT(!v.shared_freeze_fence_valid);
+	UT_ASSERT(!v.shared_freeze_cohort_observed);
+	UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+	UT_ASSERT_EQ(recent_pin_calls, 0); UT_ASSERT_EQ(recent_unpins, 0);
+	UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	phase_recent_native_finish_pins(&f, &v, false, 0);
+}
+
+/* A canonical aborted modifier remains separate from a committed creator,
+ * even when its old row has the same raw xmin as another proven carrier. */
+UT_TEST(test_mixed_aborted_modifier_stays_unchanged_through_recent_xmin_wal)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	HeapTupleHeader modified;
+	ClusterTxResolution *abort;
+
+	phase_recent_native_setup(&f, &v, targets, true, true);
+	modified = freeze_tuple(current_page.data, 2);
+	HeapTupleHeaderSetXmin(modified, 77);
+	HeapTupleHeaderSetXmax(modified, UINT32_MAX - 2);
+	modified->t_infomask &= ~HEAP_XMAX_BITS;
+	memcpy(before_page.data, current_page.data, BLCKSZ);
+	memcpy(f.input.image.data, current_page.data, BLCKSZ);
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f.input, &f.page));
+	v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+	abort = &f.proofs.proofs[1].resolution;
+	abort->outcome = CLUSTER_TX_ABORTED;
+	abort->commit_scn = InvalidScn;
+	abort->local_creation_target.valid = false;
+	abort->local_aborted_xmax_target = (ClusterTxModificationTarget) {
+		.locator = relation_data.rd_locator, .fork = MAIN_FORKNUM,
+		.block = 7, .offset = 2, .tuple_length = 64, .valid = true };
+	UT_ASSERT(phase_then_recent_native_owned(&f, &v));
+	UT_ASSERT_EQ(phase_resolves, 3); UT_ASSERT_EQ(phase_rechecks, 1);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 3);
+	UT_ASSERT(v.shared_freeze_fence_valid);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 2);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.targets[0].tuple_index, 0);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.targets[1].tuple_index, 2);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proofs[1].resolution.outcome, CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.target_count, 1);
+	UT_ASSERT_EQ(v.shared_freeze_aborted_xmax_candidates.tuple_indexes[0], 1);
+	UT_ASSERT_EQ(((xl_heap_freeze_page *)freeze_main_data.data)->snapshotConflictHorizon, 77);
+	UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+		freeze_tuple(before_page.data, 2), 64) == 0);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(freeze_tuple(current_page.data, 2)), UINT32_MAX - 2);
+	for (int i = 0; i < 3; i++) {
+		PGAlignedBlock expected;
+		memcpy(expected.data, freeze_tuple(before_page.data, i + 1), 64);
+		if (i != 1)
+			((HeapTupleHeader)expected.data)->t_infomask |= HEAP_XMIN_FROZEN;
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, i + 1), expected.data, 64) == 0);
+		UT_ASSERT(memcmp(ClusterPageGetItlSlot(current_page.data, i),
+			ClusterPageGetItlSlot(before_page.data, i), sizeof(ClusterItlSlotData)) == 0);
+	}
+	check_publication(true);
+	replay_freeze_record();
+	phase_recent_native_finish(&f, &v, true);
+}
+
+#define ctrc_local_ack_shape_valid original_certificate_local_ack_shape_valid
+#define ctrc_get_u32_le original_certificate_get_u32_le
+#define ctrc_put_u64_le original_certificate_put_u64_le
+#define ctrc_put_u32_le original_certificate_put_u32_le
+#define ctrc_crc32c_exact original_certificate_crc32c_exact
+#define ctrc_participant_delegations_valid original_certificate_participant_delegations_valid
+#define ctrc_receipts_reclaim_validate original_certificate_receipts_reclaim_validate
+#define ctrc_receipt_entries original_participant_receipt_entries
+#define ctrc_receipt_probe_states original_participant_receipt_probe_states
+#define ctrc_receipt_links original_participant_receipt_links
+#define ctrc_participant_index original_participant_participant_index
+#define ctrc_participant_ack_entries original_certificate_participant_ack_entries
+#define ctrc_participant_receipt_heads original_participant_participant_receipt_heads
+#define ctrc_delegated_local_ack_summary_exact original_ack_delegated_local_ack_summary_exact
+#define ctrc_receipt_chain_exact_locked original_participant_receipt_chain_exact_locked
+#define ctrc_receipt_prepare_table_observed original_participant_receipt_prepare_table_observed
+#define cluster_ctrc_local_release_ack_encode original_certificate_local_release_ack_encode
+#define cluster_ctrc_empty_sha256 certificate_empty_sha256
+#define cluster_ctrc_origin_fullxid_match_v2 original_participant_origin_fullxid_match_v2
+#define cluster_ctrc_participant_open original_participant_participant_open
+#include "test_cluster_heap_ctrc_creator_dependencies.inc"
+#undef cluster_ctrc_origin_fullxid_match_v2
+#undef cluster_ctrc_participant_open
+
+#undef ctrc_local_ack_shape_valid
+#undef ctrc_get_u32_le
+#undef ctrc_put_u64_le
+#undef ctrc_put_u32_le
+#undef ctrc_crc32c_exact
+#undef ctrc_participant_delegations_valid
+#undef ctrc_receipts_reclaim_validate
+#undef ctrc_receipt_entries
+#undef ctrc_receipt_probe_states
+#undef ctrc_receipt_links
+#undef ctrc_participant_index
+#undef ctrc_participant_ack_entries
+#undef ctrc_participant_receipt_heads
+#undef ctrc_delegated_local_ack_summary_exact
+#undef ctrc_receipt_chain_exact_locked
+#undef ctrc_receipt_prepare_table_observed
+#undef cluster_ctrc_local_release_ack_encode
+#undef cluster_ctrc_empty_sha256
+
+
+/* Foreign observations keep their origin projection separate from local-only
+ * fields. Storage/authentication are inputs here; no receiver lifetime is
+ * certified by this pure creation-row test. */
+static void
+foreign_creation_project(QualifiedXminFixture *f)
+{
+	ClusterHeapFreezeCanonicalProofV1 *proof;
+	ClusterTxResolution *r;
+	ClusterItlSlotData *slot;
+	ClusterTxCreationTarget target;
+	FullTransactionId original;
+
+	proof = &f->proofs.proofs[0]; r = &proof->resolution;
+	target = r->local_creation_target; original = r->local_original_full_xid;
+	slot = ClusterPageGetItlSlot((Page)current_page.data, 0);
+	slot->undo_segment_head = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 1, 0, 128);
+	memcpy(f->input.image.data, current_page.data, BLCKSZ);
+	memcpy(before_page.data, current_page.data, BLCKSZ);
+	UT_ASSERT(cluster_heap_freeze_prepare_page_v1(&f->input, &f->page));
+	proof->requested_locator = f->page.carrier_requests[0].locator;
+	r->locator_echo = proof->requested_locator; r->locator_echo.tt_wrap = 2;
+	r->top_xid = r->locator_echo.xid;
+	r->authority.origin_epoch = f->admission.formation_epoch;
+	r->local_canonical_valid = false; r->local_canonical_generation = 0;
+	memset(&r->local_canonical, 0, sizeof(r->local_canonical));
+	memset(&r->local_creation_target, 0, sizeof(r->local_creation_target));
+	r->local_original_full_xid = InvalidFullTransactionId;
+	r->origin_companion = (ClusterTxCanonicalCompanionV1){
+		.key = {.format_version = CLUSTER_CTRC_FORMAT_VERSION, .owner_instance = 2,
+			.origin_node_id = 1, .segment_id = CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+			.segment_generation = 1, .slot_wrap = 2, .xid = r->top_xid,
+			.cluster_epoch = f->admission.formation_epoch, .system_identifier = 42,
+			.origin_boot_incarnation = 43, .formation_epoch = f->admission.formation_epoch,
+			.admission_record_generation = f->admission.record_generation,
+			.root_descriptor_incarnation = 1, .root_id = 1, .root_generation = 1},
+		.original_full_xid = original, .creation_target = target, .present = true};
+	UT_ASSERT(ClusterR4TxCompanionIsValid(r));
+}
+
+static void
+foreign_creation_setup(QualifiedXminFixture *f)
+{
+	qualified_xmin_setup(f, HEAP_XMAX_IS_MULTI);
+	foreign_creation_project(f);
+}
+
+UT_TEST(test_foreign_companion_binds_only_its_exact_creation_row)
+{
+	QualifiedXminFixture f;
+	ClusterHeapFreezeXminCandidateBatchV1 candidates = {0};
+	foreign_creation_setup(&f);
+	UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&f.proofs.proofs[0]),
+		CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 1);
+	UT_ASSERT(FullTransactionIdEquals(f.page.tuples[0].original_creator_full_xid,
+		f.proofs.proofs[0].resolution.origin_companion.original_full_xid));
+	UT_ASSERT(cluster_heap_freeze_select_xmin_candidates_v1(&f.page, &f.proofs,
+		&f.fence, f.policy.freeze_limit, 10, &candidates));
+	UT_ASSERT_EQ(candidates.target_count, 1);
+	UT_ASSERT(!f.proofs.proofs[0].resolution.local_canonical_valid);
+	UT_ASSERT(!FullTransactionIdIsValid(f.proofs.proofs[0].resolution.local_original_full_xid));
+}
+
+UT_TEST(test_foreign_creation_rejects_mixed_identity_carrier_row_and_final_fence)
+{
+	for (unsigned fault = 0; fault < 24; fault++) {
+		QualifiedXminFixture f;
+		ClusterTxResolution *r;
+		foreign_creation_setup(&f); r = &f.proofs.proofs[0].resolution;
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 1);
+		switch (fault) {
+		case 0: r->origin_companion.present = false; break;
+		case 1: r->origin_companion.key.format_version = 0; break;
+		case 2: r->origin_companion.key.reserved[0] = 1; break;
+		case 3: r->origin_companion.key.slot_wrap++; break;
+		case 4: r->origin_companion.key.segment_generation = 0; break;
+		case 5: r->origin_companion.original_full_xid = FullTransactionIdFromU64(UINT64_MAX); break;
+		case 6: r->origin_companion.original_full_xid = FullTransactionIdFromEpochAndXid(1, 78); break;
+		case 7: r->origin_companion.key.origin_node_id++; break;
+		case 8: r->origin_companion.key.owner_instance++; break;
+		case 9: r->top_xid++; break;
+		case 10: r->local_canonical.segment_id = 1; break;
+		case 11: r->local_canonical_generation = 1; break;
+		case 12: r->local_original_full_xid = r->origin_companion.original_full_xid; break;
+		case 13: r->local_creation_target.valid = true; break;
+		case 14: r->origin_companion.creation_target.offset = 4; break;
+		case 15: r->origin_companion.creation_target.tuple_length--; break;
+		case 16: r->origin_companion.creation_target.locator.relNumber++; break;
+		case 17: r->origin_companion.creation_target.fork++; break;
+		case 18: f.page.tuples[0].raw_xmin++; break;
+		case 19: f.fence.page_lsn++; break;
+		case 20: f.proofs.proofs[0].admission_current = false; break;
+		case 21: f.proofs.proofs[0].c1b_finalized = false; break;
+		case 22: f.proofs.proofs[0].authority_current = false; break;
+		case 23: f.proofs.proofs[0].requested_locator.uba = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 2, 0, 128); break;
+		}
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 0);
+		UT_ASSERT_EQ(f.page.tuples[0].creation_target_proof_index, CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET);
+		UT_ASSERT(!FullTransactionIdIsValid(f.page.tuples[0].original_creator_full_xid));
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	}
+}
+
+UT_TEST(test_foreign_candidate_never_enters_unqualified_native_writer)
+{
+	for (int batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f;
+		ClusterHeapFreezeXminTargetV1 targets[3];
+		if (batch) {
+			qualified_xmin_batch_setup(&f, targets);
+			foreign_creation_project(&f);
+		} else foreign_creation_setup(&f);
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), batch ? 3 : 1);
+		UT_ASSERT(!(batch ? qualified_xmin_batch_apply(&f, targets, 3) : qualified_xmin_apply(&f, 0)));
+		UT_ASSERT_EQ(conditional_resumes + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered);
+	}
+}
+
+UT_TEST(test_actual_collector_binds_current_foreign_creation_without_hint_or_wal)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	bool rows = false;
+	phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+	v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+	phase_use_original_resident = true; phase_resident_completed = false;
+	phase_resident_expected_resumes = 0; phase_resident_hint_error = false;
+	phase_resident_hint_calls = 0; memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+	v.rel = &relation_data; v.identity = space_identity;
+	v.shared_freeze_input.writer_context_valid = false;
+	relation_data.rd_isvalid = resume_allowed = true;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+		f.fence.master_sequence, &f.admission, &rows), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(rows); UT_ASSERT_EQ(phase_foreign_checks, 2);
+	UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 1);
+	UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 1);
+	UT_ASSERT(FullTransactionIdEquals(v.shared_freeze_batch.tuples[0].original_creator_full_xid,
+		f.proofs.proofs[0].resolution.origin_companion.original_full_xid));
+	UT_ASSERT(!v.shared_freeze_proofs.proofs[0].resolution.local_canonical_valid);
+	UT_ASSERT_EQ(hints + inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(!local_x && f.admission.entered);
+	bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+}
+
+UT_TEST(test_actual_collector_foreign_retention_refusal_retires_only_candidate)
+{
+	for (unsigned stage = 1; stage <= 2; stage++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		bool rows = false;
+		phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+		v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+		phase_use_original_resident = true; phase_foreign_refuse_at = stage;
+		phase_resident_completed = false; phase_resident_expected_resumes = 0;
+		phase_resident_hint_error = false; phase_resident_hint_calls = 0;
+		memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+		v.rel = &relation_data; v.identity = space_identity;
+		v.shared_freeze_input.writer_context_valid = false;
+		relation_data.rd_isvalid = resume_allowed = true;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows), CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT(!rows); UT_ASSERT_EQ(phase_foreign_checks, stage);
+		UT_ASSERT_EQ(v.shared_freeze_proofs.proof_count, 0);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, 0);
+		UT_ASSERT(!v.shared_freeze_cohort_observed && !v.shared_freeze_fence_valid);
+		UT_ASSERT(v.shared_freeze_input.freeze_policy == NULL && v.shared_freeze_input.freeze_cohort == NULL);
+		UT_ASSERT(!FullTransactionIdIsValid(v.shared_freeze_candidate_limit_full));
+		UT_ASSERT_EQ(hints + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(!local_x && f.admission.entered);
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
+UT_TEST(test_actual_collector_requires_its_own_foreign_page_receipt_twice)
+{
+	for (unsigned refuse_at = 0; refuse_at <= 2; refuse_at++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		bool rows = false;
+		phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+		v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+		phase_use_original_resident = true; phase_foreign_target_refuse_at = refuse_at;
+		phase_resident_completed = false; phase_resident_expected_resumes = 0;
+		phase_resident_hint_error = false; phase_resident_hint_calls = 0;
+		memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+		v.rel = &relation_data; v.identity = space_identity;
+		v.shared_freeze_input.writer_context_valid = false;
+		relation_data.rd_isvalid = resume_allowed = true;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows), refuse_at == 0
+			? CLUSTER_HEAP_FREEZE_PROOF_PROVEN : CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(rows, refuse_at == 0);
+		UT_ASSERT_EQ(phase_foreign_target_checks, refuse_at == 1 ? 1 : 2);
+		UT_ASSERT_EQ(v.shared_freeze_xmin_candidates.target_count, refuse_at == 0 ? 1 : 0);
+		UT_ASSERT_EQ(hints + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(!local_x && f.admission.entered);
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
+UT_TEST(test_actual_admitted_foreign_continuation_keeps_one_scope_until_original_finally)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	bool rows = false;
+	phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+	v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+	phase_use_original_resident = true;
+	phase_resident_completed = false; phase_resident_expected_resumes = 0;
+	phase_resident_hint_error = false; phase_resident_hint_calls = 0;
+	memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+	v.rel = &relation_data; v.identity = space_identity;
+	v.shared_freeze_input.writer_context_valid = false;
+	relation_data.rd_isvalid = resume_allowed = true;
+	phase_foreign_holds = phase_foreign_releases = phase_foreign_held = 0;
+	UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+		f.fence.master_sequence, &f.admission, &rows), CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+	UT_ASSERT(rows); UT_ASSERT(v.shared_freeze_source_guards[0].serial != 0);
+	UT_ASSERT_EQ(phase_foreign_holds, 1); UT_ASSERT_EQ(phase_foreign_held, 1);
+	UT_ASSERT_EQ(phase_foreign_releases, 0);
+	/* The original borrowed admission is still live across the continuation. */
+	UT_ASSERT(f.admission.entered); UT_ASSERT(!local_x);
+	UT_ASSERT(lazy_release_shared_freeze_sources(&v));
+	UT_ASSERT_EQ(phase_foreign_held, 0); UT_ASSERT_EQ(phase_foreign_releases, 1);
+	bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+}
+
+UT_TEST(test_original_outer_finally_releases_foreign_scope_before_admission_leave)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f));
+	LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned fault = 0; fault < 4; fault++) {
+		phase_real_resident_setup(f, v, targets, false, false);
+		/* Bind the controlled origin to the record the real outer enter will read. */
+		f->admission.record_generation = f->cohort.record_generation;
+		f->admission.formation_epoch = f->cohort.formation_epoch;
+		foreign_creation_project(f);
+		v->shared_freeze_input = f->input; v->shared_freeze_batch = f->page;
+		v->shared_freeze_input.writer_context_valid = false;
+		phase_foreign_checks = phase_foreign_refuse_at = 0;
+		phase_foreign_error_at = phase_foreign_target_checks = phase_foreign_target_refuse_at = 0;
+		phase_foreign_holds = phase_foreign_releases = phase_foreign_held = 0;
+		phase_foreign_assert_release_owner = true;
+		if (fault == 1) phase_foreign_error_at = 2;
+		if (fault == 2) phase_resident_hint_error = true;
+		if (fault == 3) phase_foreign_refuse_at = 2;
+		if (fault == 1 || fault == 2) {
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)proof_owner_collect(v, 1); UT_ASSERT(false);
+			}
+			expecting_error = false;
+		} else {
+			UT_ASSERT_EQ(proof_owner_collect(v, 1), fault == 0
+				? CLUSTER_HEAP_FREEZE_PROOF_PROVEN : CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		}
+		UT_ASSERT_EQ(phase_foreign_holds, 1);
+		UT_ASSERT_EQ(phase_foreign_held, 0); UT_ASSERT_EQ(phase_foreign_releases, 1);
+		UT_ASSERT_EQ(v->shared_freeze_source_guards[0].serial, 0);
+		proof_owner_assert_released(v, true);
+		phase_foreign_assert_release_owner = false;
+	}
+	free(v); free(f);
+}
+
+UT_TEST(test_retained_foreign_scope_reaches_original_resumed_native_writer)
+{
+	QualifiedXminFixture f;
+	ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH] = {0};
+	foreign_creation_setup(&f);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 1);
+	guards[0] = (ClusterCtrcItlReadGuardV1){.serial = 315, .slot = 0, .pid = 2901};
+	f.input.freeze_source_proofs = &f.proofs;
+	f.input.freeze_source_guards = guards;
+	fixture_release_original_writer(); resume_allowed = true;
+	UT_ASSERT(qualified_xmin_apply(&f, 0));
+	UT_ASSERT_EQ(conditional_resumes, 1); UT_ASSERT_EQ(conditional_unlocks, 1);
+	UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+	UT_ASSERT_EQ(guards[0].serial, 315);
+	UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered && !local_x);
+}
+
+static void
+retained_foreign_native_setup(QualifiedXminFixture *f,
+	ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH])
+{
+	foreign_creation_setup(f);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f->page, &f->proofs, &f->fence), 1);
+	memset(guards, 0, sizeof(*guards) * CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH);
+	guards[0] = (ClusterCtrcItlReadGuardV1){.serial = 315, .slot = 0, .pid = 2901};
+	f->input.freeze_source_proofs = &f->proofs; f->input.freeze_source_guards = guards;
+	native_foreign_source_checks = native_foreign_guard_checks = 0;
+	native_foreign_guard_refuse_at = 0;
+	native_foreign_source_refused = native_foreign_source_error = false;
+}
+
+UT_TEST(test_foreign_native_missing_or_stale_scope_refuses_before_writer)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		QualifiedXminFixture f; ClusterHeapFreezeProofBatchV1 other;
+		ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+		retained_foreign_native_setup(&f, guards); other = f.proofs;
+		switch (fault) {
+		case 0: f.input.freeze_source_guards = NULL; break;
+		case 1: f.input.freeze_source_proofs = &other; break;
+		case 2: guards[0].serial++; break;
+		case 3: guards[0].slot++; break;
+		case 4: guards[0].pid++; break;
+		case 5: guards[0].serial = 0; break;
+		case 6: break; /* A preowned foreign content lock is never queried. */
+		}
+		if (fault != 6) fixture_release_original_writer();
+		resume_allowed = true;
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(conditional_resumes + conditional_unlocks + inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(native_foreign_source_checks, 0);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(test_foreign_native_source_refusal_and_error_preserve_original_scope)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		QualifiedXminFixture f;
+		ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+		retained_foreign_native_setup(&f, guards);
+		fixture_release_original_writer(); resume_allowed = true;
+		if (fault == 0) native_foreign_source_refused = true;
+		if (fault == 1) native_foreign_source_error = true;
+		if (fault == 2) resume_allowed = false;
+		if (fault == 3) target_recheck_error = true;
+		if (fault == 1 || fault == 3) {
+			expecting_error = true;
+			if (setjmp(error_jump) == 0) {
+				(void)qualified_xmin_apply(&f, 0); UT_ASSERT(false);
+			}
+			expecting_error = false;
+		} else UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(native_foreign_source_checks, 1);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(guards[0].serial, 315);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered && !local_x && !resumed_writer);
+		UT_ASSERT_EQ(conditional_unlocks, fault == 3 ? 1 : 0);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+	}
+	native_foreign_source_refused = native_foreign_source_error = false;
+}
+
+UT_TEST(test_foreign_native_guard_is_rechecked_through_final_space_before_crit)
+{
+	for (unsigned stage = 1; stage <= 4; stage++) {
+		QualifiedXminFixture f;
+		ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH];
+		retained_foreign_native_setup(&f, guards);
+		fixture_release_original_writer(); resume_allowed = true;
+		native_foreign_guard_refuse_at = stage;
+		UT_ASSERT(!qualified_xmin_apply(&f, 0));
+		UT_ASSERT_EQ(native_foreign_guard_checks, stage);
+		UT_ASSERT_EQ(native_foreign_source_checks, stage <= 2 ? 0 : 1);
+		UT_ASSERT_EQ(conditional_resumes, stage <= 2 ? 0 : 1);
+		UT_ASSERT_EQ(conditional_unlocks, stage <= 2 ? 0 : 1);
+		UT_ASSERT_EQ(space_observation_checks, stage == 4 ? 1 : 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(guards[0].serial, 315); UT_ASSERT_EQ(backend_pin_count, 1);
+		UT_ASSERT(f.admission.entered && !local_x && !resumed_writer);
+		UT_ASSERT_EQ(memcmp(current_page.data, before_page.data, BLCKSZ), 0);
+	}
+	native_foreign_guard_refuse_at = 0;
+}
+
+UT_TEST(test_mixed_foreign_local_native_batch_keeps_guard_and_native_redo)
+{
+	QualifiedXminFixture f; ClusterHeapFreezeXminTargetV1 targets[3];
+	ClusterCtrcItlReadGuardV1 guards[CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH] = {0};
+	qualified_xmin_batch_setup(&f, targets); foreign_creation_project(&f);
+	UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&f.page, &f.proofs, &f.fence), 3);
+	guards[0] = (ClusterCtrcItlReadGuardV1){.serial = 315, .slot = 0, .pid = 2901};
+	f.input.freeze_source_proofs = &f.proofs; f.input.freeze_source_guards = guards;
+	native_foreign_source_checks = native_foreign_guard_checks = native_foreign_guard_refuse_at = 0;
+	native_foreign_source_refused = native_foreign_source_error = false;
+	fixture_release_original_writer(); resume_allowed = true;
+	UT_ASSERT(qualified_xmin_batch_apply(&f, targets, 3));
+	UT_ASSERT_EQ(native_foreign_source_checks, 1); UT_ASSERT_EQ(native_foreign_guard_checks, 4);
+	UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+	UT_ASSERT_EQ(guards[0].serial, 315); UT_ASSERT_EQ(backend_pin_count, 1);
+	UT_ASSERT(f.admission.entered && !local_x && !resumed_writer);
+	for (unsigned i = 1; i <= 3; i++) UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, i)));
+}
+
+UT_TEST(test_actual_collector_exports_only_its_original_native_source_borrow)
+{
+	for (unsigned refusal = 0; refusal <= 2; refusal++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		bool rows = false;
+		phase_setup(&f, &v, targets, false); foreign_creation_project(&f);
+		v.shared_freeze_input = f.input; v.shared_freeze_batch = f.page;
+		phase_use_original_resident = true; phase_foreign_refuse_at = refusal;
+		phase_resident_completed = false; phase_resident_expected_resumes = 0;
+		phase_resident_hint_error = false; phase_resident_hint_calls = 0;
+		memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+		v.rel = &relation_data; v.identity = space_identity;
+		v.shared_freeze_input.writer_context_valid = false;
+		relation_data.rd_isvalid = resume_allowed = true;
+		UT_ASSERT_EQ(lazy_collect_shared_freeze_proofs_admitted(&v, 1, &f.authority,
+			f.fence.master_sequence, &f.admission, &rows), refusal == 0
+			? CLUSTER_HEAP_FREEZE_PROOF_PROVEN : CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN);
+		UT_ASSERT_EQ(rows, refusal == 0);
+		UT_ASSERT(v.shared_freeze_input.freeze_source_proofs == (refusal == 0
+			? &v.shared_freeze_proofs : NULL));
+		UT_ASSERT(v.shared_freeze_input.freeze_source_guards == (refusal == 0
+			? v.shared_freeze_source_guards : NULL));
+		UT_ASSERT(lazy_release_shared_freeze_sources(&v));
+		UT_ASSERT(v.shared_freeze_input.freeze_source_proofs == NULL);
+		UT_ASSERT(v.shared_freeze_input.freeze_source_guards == NULL);
+		UT_ASSERT_EQ(backend_pin_count, 1); UT_ASSERT(f.admission.entered && !local_x);
+		bounds_original_census_leave(&f.admission); bounds_lifecycle_assert_empty(&f.admission);
+	}
+}
+
+static void
+production_xmin_pin_observer(void)
+{
+	/* Record the actual boundary before the native writer resumes. The
+	 * original resident recheck, when enabled, owns the preceding pin. */
+	phase_pin_released = false;
+	if (!phase_use_original_resident || phase_resident_completed) {
+		phase_prior_lock_activity = conditional_resumes + conditional_unlocks + local_lock_attempts;
+		phase_prior_authority_activity = writer_checks + route_checks + authority_checks + admission_checks;
+		phase_prior_writer_checks = writer_checks;
+		phase_prior_route_checks = route_checks; phase_prior_authority_checks = authority_checks;
+	}
+}
+
+static void
+production_xmin_owner_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch)
+{
+	proof_owner_setup(f, v, targets, batch);
+	v->versioned = v->shared_maintenance_restricted = true;
+	relation_data.rd_isvalid = resume_allowed = true;
+	native_original_admission_enabled = true;
+	recent_pin_observer = production_xmin_pin_observer;
+	recent_caller_pins = 0;
+	recent_caller_local_x = recent_caller_share = recent_caller_writer = false;
+}
+
+static void
+production_xmin_owner_assert_released(const LVRelState *v)
+{
+	UT_ASSERT_EQ(proof_owner_enters, 1); UT_ASSERT_EQ(proof_owner_leaves, 1);
+	UT_ASSERT_EQ(proof_owner_cost_reads, 2); UT_ASSERT_EQ(backend_pin_count, 0);
+	UT_ASSERT(!local_x && !local_share && !resumed_writer && !recent_pin_held);
+	UT_ASSERT(!bounds_original_backend_has_admission());
+	UT_ASSERT_EQ(pg_atomic_read_u32(&native_admission_shared.inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][bounds_lifecycle_feature()]), 7);
+	UT_ASSERT(!v->shared_freeze_fence_valid && !v->shared_freeze_cohort_observed);
+	UT_ASSERT(v->shared_freeze_input.freeze_policy == NULL
+		&& v->shared_freeze_input.freeze_cohort == NULL);
+	UT_ASSERT_EQ(v->shared_freeze_xmin_candidates.target_count, 0);
+	UT_ASSERT(PG_exception_stack == NULL && error_context_stack == NULL);
+	phase_pin_released = false;
+}
+
+UT_TEST(test_production_outer_selected_xmin_writes_before_original_leave)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		production_xmin_owner_setup(&f, &v, targets, batch != 0);
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT_EQ(v.shared_freeze_changed_pages, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		for (unsigned row = 1; row <= (batch ? 3 : 1); row++)
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+		UT_ASSERT(memcmp(ClusterPageGetItlSlots(current_page.data),
+			ClusterPageGetItlSlots(before_page.data),
+			CLUSTER_ITL_ARRAY_SIZE) == 0);
+		production_xmin_owner_assert_released(&v);
+	}
+}
+
+UT_TEST(test_production_outer_shared_age_above_native_cutoff_reaches_wal)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		production_xmin_owner_setup(&f, &v, targets, batch != 0);
+		v.cutoffs.OldestXmin = v.cutoffs.FreezeLimit = 50;
+		/* This fixture's creator is raw 77 in the same epoch, above 50. */
+		UT_ASSERT(HeapTupleHeaderGetRawXmin(freeze_tuple(current_page.data, 1))
+			> v.cutoffs.FreezeLimit);
+		UT_ASSERT(FullTransactionIdEquals(v.cutoffs.SharedFreezeLimitFull, f.policy.freeze_limit));
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT_EQ(v.cutoffs.OldestXmin, 50); UT_ASSERT_EQ(v.cutoffs.FreezeLimit, 50);
+		UT_ASSERT_EQ(v.shared_freeze_changed_pages, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		for (unsigned row = 1; row <= (batch ? 3 : 1); row++)
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+		UT_ASSERT(memcmp(ClusterPageGetItlSlots(current_page.data),
+			ClusterPageGetItlSlots(before_page.data), CLUSTER_ITL_ARRAY_SIZE) == 0);
+		production_xmin_owner_assert_released(&v);
+	}
+}
+
+static void
+production_xmin_optional_cleanout_setup(QualifiedXminFixture *f, LVRelState *v,
+	ClusterHeapFreezeXminTargetV1 targets[3], bool batch)
+{
+	production_xmin_owner_setup(f, v, targets, batch);
+	phase_use_original_resident = phase_use_original_cleanout = true;
+	phase_resident_completed = false;
+	phase_resident_expected_resumes = 1;
+	phase_resident_hint_error = false;
+	phase_resident_hint_calls = 0;
+	memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+	v->identity = space_identity;
+}
+
+UT_TEST(test_production_outer_no_old_creation_candidate_keeps_optional_cleanout)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		for (unsigned bound = 0; bound < 3; bound++) {
+			QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+			FullTransactionId oldest, limit;
+			production_xmin_optional_cleanout_setup(&f, &v, targets, batch != 0);
+			/* The original batch includes (0,MAX-2), (1,66), (1,77).
+			 * Equal/earlier complete bounds select none, including when
+			 * an older epoch has a numerically higher raw xid. */
+			oldest = batch ? FullTransactionIdFromEpochAndXid(0, UINT32_MAX - 2)
+				: FullTransactionIdFromEpochAndXid(1, 77);
+			limit = bound == 0 ? oldest
+				: bound == 1 ? FullTransactionIdFromU64(U64FromFullTransactionId(oldest) - 1)
+				: FullTransactionIdFromEpochAndXid(0, batch ? UINT32_MAX - 100 : 100);
+			for (unsigned i = 0; i < f.proofs.proof_count; i++)
+				UT_ASSERT(!FullTransactionIdPrecedes(f.proofs.proofs[i].resolution.local_original_full_xid,
+					limit));
+			f.policy.freeze_limit = limit;
+			v.cutoffs.SharedFreezePolicySample.freeze_limit = limit;
+			v.cutoffs.SharedFreezeLimitFull = limit;
+			(void)proof_owner_collect(&v, 1);
+			UT_ASSERT_EQ(v.shared_freeze_changed_pages, 0);
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT_EQ(phase_resident_hint_calls, 1);
+			UT_ASSERT_EQ(phase_optional_hint_begins, 1);
+			UT_ASSERT_EQ(phase_optional_hint_finishes, 1);
+			UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+			for (unsigned row = 1; row <= (batch ? 3 : 1); row++) {
+				UT_ASSERT(!HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+				UT_ASSERT(memcmp(freeze_tuple(current_page.data, row),
+					freeze_tuple(before_page.data, row), 64) == 0);
+			}
+			UT_ASSERT_EQ(ClusterPageGetItlSlots(current_page.data)[0].flags, ITL_FLAG_COMMITTED);
+			UT_ASSERT_EQ(ClusterPageGetItlSlots(current_page.data)[0].commit_scn, 9);
+			production_xmin_owner_assert_released(&v);
+		}
+	}
+}
+
+UT_TEST(test_production_outer_one_old_creation_still_precedes_optional_cleanout)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	production_xmin_optional_cleanout_setup(&f, &v, targets, true);
+	/* Only original row 2, (0,MAX-2), precedes (1,66). */
+	f.policy.freeze_limit = FullTransactionIdFromEpochAndXid(1, 66);
+	v.cutoffs.SharedFreezePolicySample.freeze_limit = f.policy.freeze_limit;
+	v.cutoffs.SharedFreezeLimitFull = f.policy.freeze_limit;
+	expected_nplans = 1;
+	UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(v.shared_freeze_changed_pages, 1);
+	UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+	UT_ASSERT_EQ(phase_resident_hint_calls, 0);
+	UT_ASSERT_EQ(phase_optional_hint_begins + phase_optional_hint_finishes, 0);
+	UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 2)));
+	for (unsigned row = 1; row <= 3; row += 2) {
+		UT_ASSERT(!HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+		UT_ASSERT(memcmp(freeze_tuple(current_page.data, row),
+			freeze_tuple(before_page.data, row), 64) == 0);
+	}
+	UT_ASSERT(memcmp(ClusterPageGetItlSlots(current_page.data),
+		ClusterPageGetItlSlots(before_page.data), CLUSTER_ITL_ARRAY_SIZE) == 0);
+	UT_ASSERT_EQ(recent_pin_calls, 2); UT_ASSERT_EQ(recent_unpins, 2);
+	production_xmin_owner_assert_released(&v);
+}
+
+UT_TEST(test_production_outer_preserves_xmin_input_before_optional_itl_cleanout)
+{
+	for (unsigned batch = 0; batch < 2; batch++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		production_xmin_optional_cleanout_setup(&f, &v, targets, batch != 0);
+		UT_ASSERT_EQ(proof_owner_collect(&v, 1), CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+		UT_ASSERT_EQ(v.shared_freeze_changed_pages, 1);
+		UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1); UT_ASSERT_EQ(edges, 1);
+		UT_ASSERT_EQ(phase_resident_hint_calls, 0);
+		UT_ASSERT_EQ(phase_optional_hint_begins + phase_optional_hint_finishes, 0);
+		UT_ASSERT_EQ(recent_pin_calls, 2); UT_ASSERT_EQ(recent_unpins, 2);
+		for (unsigned row = 1; row <= (batch ? 3 : 1); row++)
+			UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, row)));
+		UT_ASSERT(memcmp(ClusterPageGetItlSlots(current_page.data),
+			ClusterPageGetItlSlots(before_page.data), CLUSTER_ITL_ARRAY_SIZE) == 0);
+		production_xmin_owner_assert_released(&v);
+	}
+}
+
+UT_TEST(test_production_outer_deferred_hint_does_not_bypass_missing_h)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	production_xmin_optional_cleanout_setup(&f, &v, targets, false);
+	/* An installed xmin without a published SCN must keep H unavailable. */
+	sampler_slots[0].xmin = 100;
+	pg_atomic_write_u64(&sampler_slots[0].cluster_read_scn_atomic, InvalidScn);
+	(void)proof_owner_collect(&v, 1);
+	UT_ASSERT_EQ(v.shared_freeze_changed_pages, 0);
+	UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+	UT_ASSERT_EQ(phase_resident_hint_calls, 0);
+	UT_ASSERT_EQ(phase_optional_hint_begins + phase_optional_hint_finishes, 0);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	production_xmin_owner_assert_released(&v);
+}
+
+UT_TEST(test_production_outer_keeps_cleanout_without_original_writer_or_shared_policy)
+{
+	for (unsigned missing = 0; missing < 2; missing++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		production_xmin_optional_cleanout_setup(&f, &v, targets, false);
+		if (missing == 0) {
+			v.shared_freeze_input.writer_context_valid = false;
+			phase_resident_expected_resumes = 0;
+		} else v.cutoffs.SharedFreezeLimitFull = InvalidFullTransactionId;
+		(void)proof_owner_collect(&v, 1);
+		UT_ASSERT_EQ(v.shared_freeze_changed_pages, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT_EQ(phase_resident_hint_calls, 1);
+		UT_ASSERT_EQ(phase_optional_hint_begins, 1);
+		UT_ASSERT_EQ(phase_optional_hint_finishes, 1);
+		UT_ASSERT_EQ(ClusterPageGetItlSlots(current_page.data)[0].flags, ITL_FLAG_COMMITTED);
+		UT_ASSERT_EQ(ClusterPageGetItlSlots(current_page.data)[0].commit_scn, 9);
+		UT_ASSERT(!HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 1)));
+		production_xmin_owner_assert_released(&v);
+	}
+}
+
+UT_TEST(test_production_outer_mixed_keep_writes_only_exact_selected_xmin)
+{
+	QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+	ClusterHeapFreezeProofStatusV1 status;
+	production_xmin_owner_setup(&f, &v, targets, true);
+	phase_use_original_resident = true;
+	phase_resident_completed = false; phase_resident_expected_resumes = 1;
+	phase_resident_hint_error = false; phase_resident_hint_calls = 0;
+	memset(phase_resident_releases, 0, sizeof(phase_resident_releases));
+	v.identity = space_identity;
+	phase_unknown_proof_mask = 2;
+	status = proof_owner_collect(&v, 1);
+	phase_unknown_proof_mask = 0;
+	UT_ASSERT_EQ(status, CLUSTER_HEAP_FREEZE_PROOF_RETRY_CHANGED);
+	UT_ASSERT_EQ(v.shared_freeze_changed_pages, 1);
+	UT_ASSERT_EQ(inserts, 1); UT_ASSERT_EQ(flushes, 1);
+	UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 1)));
+	UT_ASSERT(!HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 2)));
+	UT_ASSERT(HeapTupleHeaderXminFrozen(freeze_tuple(current_page.data, 3)));
+	UT_ASSERT(memcmp(freeze_tuple(current_page.data, 2),
+		freeze_tuple(before_page.data, 2), 64) == 0);
+	production_xmin_owner_assert_released(&v);
+}
+
+UT_TEST(test_production_outer_native_refusals_preserve_page_and_original_owner)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		QualifiedXminFixture f; LVRelState v; ClusterHeapFreezeXminTargetV1 targets[3];
+		production_xmin_owner_setup(&f, &v, targets, true);
+		switch (fault) {
+		case 0: v.versioned = false; break;
+		case 1: v.shared_maintenance_restricted = false; break;
+		case 2: v.shared_freeze_input.writer_context_valid = false; break;
+		case 3: recent_pin_allowed = false; break;
+		case 4: resume_allowed = false; break;
+		case 5: native_admission_fault_at = 1; native_admission_fault = 1; break;
+		}
+		(void)proof_owner_collect(&v, 1);
+		UT_ASSERT_EQ(v.shared_freeze_changed_pages, 0);
+		UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(recent_pin_calls, fault >= 3 ? 1 : 0);
+		UT_ASSERT_EQ(recent_unpins, fault >= 4 ? 1 : 0);
+		production_xmin_owner_assert_released(&v);
+	}
+}
+
+UT_TEST(test_production_outer_native_errors_unwind_pin_before_original_leave)
+{
+	QualifiedXminFixture *f = malloc(sizeof(*f)); LVRelState *v = malloc(sizeof(*v));
+	ClusterHeapFreezeXminTargetV1 targets[3];
+	UT_ASSERT(f != NULL && v != NULL);
+	for (unsigned stage = 0; stage < 3; stage++) {
+		production_xmin_owner_setup(f, v, targets, true);
+		if (stage == 0) error_after_ledger_bind = true;
+		if (stage == 1) space_permanence_error = true;
+		if (stage == 2) flush_error = true;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			(void)proof_owner_collect(v, 1); UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT_EQ(recent_pin_calls, 1); UT_ASSERT_EQ(recent_unpins, 1);
+		if (stage < 2) {
+			UT_ASSERT_EQ(inserts + edges + dirties + flushes, 0);
+			UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+		} else UT_ASSERT_EQ(inserts, 1);
+		production_xmin_owner_assert_released(v);
+	}
+	free(v); free(f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(313);
+	UT_PLAN(376);
 
+	UT_RUN(test_production_outer_shared_age_above_native_cutoff_reaches_wal);
+	UT_RUN(test_production_outer_no_old_creation_candidate_keeps_optional_cleanout);
+	UT_RUN(test_production_outer_one_old_creation_still_precedes_optional_cleanout);
+	UT_RUN(test_production_outer_preserves_xmin_input_before_optional_itl_cleanout);
+	UT_RUN(test_production_outer_deferred_hint_does_not_bypass_missing_h);
+	UT_RUN(test_production_outer_keeps_cleanout_without_original_writer_or_shared_policy);
 	UT_RUN(test_pin_free_admitted_phase_reaches_recent_native_wal_before_owner_leave);
 	UT_RUN(test_pin_free_phase_recent_refusal_retires_only_its_original_owner);
 	UT_RUN(test_pin_free_phase_recent_errors_unwind_pin_before_original_owner_leave);
@@ -14435,6 +17588,7 @@ main(void)
 	UT_RUN(test_original_lookup_pin_feeds_resident_stamp_and_recent_freeze);
 	UT_RUN(test_original_primitive_pin_feeds_resident_stamp_and_recent_freeze);
 	UT_RUN(test_original_private_ref_table_feeds_pin_stamp_and_recent_freeze);
+	UT_RUN(test_original_resource_owner_feeds_pin_stamp_and_recent_freeze);
 	UT_RUN(test_original_resident_stamp_owner_feeds_shared_retention_and_recent_freeze);
 	UT_RUN(test_original_bufmgr_authority_feeds_touch_registration_and_recent_freeze);
 	UT_RUN(test_original_exact_touch_registration_feeds_finish_and_recent_freeze);
@@ -14517,6 +17671,11 @@ main(void)
 	UT_RUN(test_collector_observer_owned_sources_are_rechecked_after_actual_space);
 	UT_RUN(test_collector_observer_error_preserves_caller_pin_admission_and_page);
 	UT_RUN(test_collector_observer_keep_unproven_preserves_selected_native_subset);
+	UT_RUN(test_tt40_release_original_publisher_preserves_full_identity_and_sealed_page);
+	UT_RUN(test_tt40_release_refuses_bad_format_fullxid_or_predecessor_without_wal);
+	UT_RUN(test_tt40_release_original_page_view_refuses_replay_unqualified_context);
+	UT_RUN(test_tt40_release_readback_rechecks_format_fullxid_and_checksum);
+	UT_RUN(test_tt40_release_error_after_durable_write_replays_without_duplicate_wal);
 	UT_RUN(test_census_durable_certificate_rejects_empty_snapshot_without_commit);
 	UT_RUN(test_census_original_durable_publisher_commits_after_readback_and_cleanup);
 	UT_RUN(test_census_original_durable_publisher_preflight_keeps_origin_before_wait);
@@ -14743,6 +17902,62 @@ main(void)
 	UT_RUN(test_xmin_final_admission_refusal_after_actual_space_is_before_wal);
 	UT_RUN(test_xmin_final_admission_error_after_actual_space_unwinds_only_new_writer);
 	UT_RUN(test_xmin_final_admission_callbacks_precede_last_source_match);
+	UT_RUN(test_real_outer_collector_enters_and_leaves_around_actual_admitted_phase);
+	UT_RUN(test_real_outer_collector_early_refusals_preserve_caller_pin_and_other_debt);
+	UT_RUN(test_real_outer_collector_rethrows_after_original_leave_on_admitted_errors);
+
+	UT_RUN(test_real_outer_collector_result_cannot_outlive_its_original_admission);
+	UT_RUN(test_real_outer_collector_reuse_refusal_retires_previous_observations);
+
+	UT_RUN(test_original_resident_recheck_unpins_before_real_outer_admission_leave);
+	UT_RUN(test_original_resident_refusals_release_only_their_pin_before_outer_leave);
+	UT_RUN(test_original_resident_errors_unpin_before_real_outer_error_propagation);
+	UT_RUN(test_original_recent_first_pin_and_owner_release_precede_outer_leave);
+	UT_RUN(test_original_recent_descriptor_misses_never_publish_pin_or_owner);
+	UT_RUN(test_original_recent_owner_unpins_before_collector_error_propagation);
+	UT_RUN(test_original_resident_recent_pin_chain_reaches_same_owner_native_wal);
+	UT_RUN(test_original_resident_recent_native_refuses_read_context_and_late_cut);
+	UT_RUN(test_original_resident_recent_native_errors_unwind_two_pin_owner_scopes);
+	UT_RUN(test_resident_recent_native_original_startup_qualification_at_each_cut);
+	UT_RUN(test_resident_recent_native_original_publication_identity_at_each_cut);
+	UT_RUN(test_resident_recent_native_original_admission_errors_retire_owned_debt_last);
+	UT_RUN(test_original_group_exit_retains_source_through_recent_wal);
+	UT_RUN(test_original_group_exit_late_receiver_revokes_second_pin_wal);
+	UT_RUN(test_original_group_exit_certificate_precedes_fresh_recent_cut);
+	UT_RUN(test_original_group_member_exit_retains_source_through_recent_wal);
+	UT_RUN(test_original_group_member_exit_late_receiver_revokes_recent_wal);
+	UT_RUN(test_original_group_member_exit_certificate_needs_fresh_recent_cut);
+
+	UT_RUN(test_recent_xmin_saved_bounds_refuse_before_pin);
+
+	UT_RUN(test_original_snapshot_h_survives_group_exit_to_recent_wal);
+	UT_RUN(test_real_outer_collector_retires_continuation_before_admission_leave);
+	UT_RUN(test_real_outer_collector_errors_retire_continuation_before_admission_leave);
+	UT_RUN(test_admitted_reuse_refusals_retire_previous_continuation);
+	UT_RUN(test_mixed_admitted_resident_subset_reaches_same_owner_recent_wal);
+	UT_RUN(test_mixed_admitted_subsets_keep_fullxid_wal_horizon_and_unknown_rows);
+	UT_RUN(test_recent_xmin_invalid_target_batch_refuses_before_resident_pin);
+	UT_RUN(test_all_unknown_admitted_carriers_skip_resident_and_native_work);
+	UT_RUN(test_mixed_aborted_modifier_stays_unchanged_through_recent_xmin_wal);
+
+	UT_RUN(test_foreign_companion_binds_only_its_exact_creation_row);
+	UT_RUN(test_foreign_creation_rejects_mixed_identity_carrier_row_and_final_fence);
+	UT_RUN(test_foreign_candidate_never_enters_unqualified_native_writer);
+	UT_RUN(test_actual_collector_binds_current_foreign_creation_without_hint_or_wal);
+	UT_RUN(test_actual_collector_foreign_retention_refusal_retires_only_candidate);
+	UT_RUN(test_actual_collector_requires_its_own_foreign_page_receipt_twice);
+	UT_RUN(test_actual_admitted_foreign_continuation_keeps_one_scope_until_original_finally);
+	UT_RUN(test_original_outer_finally_releases_foreign_scope_before_admission_leave);
+	UT_RUN(test_retained_foreign_scope_reaches_original_resumed_native_writer);
+	UT_RUN(test_foreign_native_missing_or_stale_scope_refuses_before_writer);
+	UT_RUN(test_foreign_native_source_refusal_and_error_preserve_original_scope);
+	UT_RUN(test_foreign_native_guard_is_rechecked_through_final_space_before_crit);
+	UT_RUN(test_mixed_foreign_local_native_batch_keeps_guard_and_native_redo);
+	UT_RUN(test_actual_collector_exports_only_its_original_native_source_borrow);
+	UT_RUN(test_production_outer_selected_xmin_writes_before_original_leave);
+	UT_RUN(test_production_outer_mixed_keep_writes_only_exact_selected_xmin);
+	UT_RUN(test_production_outer_native_refusals_preserve_page_and_original_owner);
+	UT_RUN(test_production_outer_native_errors_unwind_pin_before_original_leave);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

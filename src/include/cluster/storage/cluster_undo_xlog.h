@@ -36,6 +36,7 @@
 #ifndef CLUSTER_UNDO_XLOG_H
 #define CLUSTER_UNDO_XLOG_H
 
+#include "access/transam.h"
 #include "access/xlogreader.h"
 #include "common/relpath.h" /* ForkNumber (spec-5.7 HW records) */
 #include "lib/stringinfo.h"
@@ -45,6 +46,7 @@
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A xl_undo_tt_slot_set_head) */
 #include "cluster/cluster_scn.h"	  /* SCN typedef (spec-3.11 D3 xl_undo_tt_slot_commit) */
 #include "cluster/cluster_tt_slot.h"  /* TTSlot + CTRC release flag */
+#include "cluster/cluster_undo_record.h" /* unchanged explicit operation/control tail */
 #include "cluster/cluster_undo_format.h" /* UndoBlockHeader/UndoSlotDirEntry (spec-3.18 D2 block_write) */
 
 
@@ -166,6 +168,114 @@ StaticAssertDecl(offsetof(xl_undo_tt_slot_bind, xid) == 8, "bind xid offset must
 StaticAssertDecl(offsetof(xl_undo_tt_slot_bind, instance) == 16,
 				 "bind identity trailer offset must remain fixed");
 
+/* Explicit V2 identity prefix. V1's reserved bytes keep their old meaning. */
+#define CLUSTER_UNDO_TT_IDENTITY_V2_VERSION 2
+
+typedef struct xl_undo_tt_identity_v2 {
+	uint32 segment_id;
+	uint32 segment_generation;
+	TransactionId xid;
+	uint16 slot_offset;
+	uint16 wrap;
+	uint8 instance;
+	uint8 format_version;
+	uint16 flags;
+	uint32 reserved;
+	uint64 original_full_xid;
+} xl_undo_tt_identity_v2;
+
+StaticAssertDecl(sizeof(xl_undo_tt_identity_v2) == 32,
+				 "TT V2 identity prefix must be exactly 32 bytes");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, segment_id) == 0,
+				 "TT V2 segment offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, segment_generation) == 4,
+				 "TT V2 generation offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, xid) == 8,
+				 "TT V2 xid offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, slot_offset) == 12,
+				 "TT V2 slot offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, wrap) == 14,
+				 "TT V2 wrap offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, instance) == 16,
+				 "TT V2 instance offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, format_version) == 17,
+				 "TT V2 version offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, flags) == 18,
+				 "TT V2 flags offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, reserved) == 20,
+				 "TT V2 reserved offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_identity_v2, original_full_xid) == 24,
+				 "TT V2 original FullXid offset must remain fixed");
+
+/* Pure shape/identity parse, also used by frontend rmgrdesc. Copy first:
+ * main data need not be aligned. No epoch inference or target authority. */
+static inline bool
+cluster_undo_tt_bind_v2_decode(const void *payload, Size length, xl_undo_tt_identity_v2 *out)
+{
+	xl_undo_tt_identity_v2 rec;
+
+	if (payload == NULL || out == NULL || length != sizeof(rec))
+		return false;
+	memcpy(&rec, payload, sizeof(rec));
+	if (rec.format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION || rec.flags != 0
+		|| rec.reserved != 0 || !TransactionIdIsNormal(rec.xid)
+		|| rec.original_full_xid == UINT64_MAX
+		|| (TransactionId)rec.original_full_xid != rec.xid)
+		return false;
+	*out = rec;
+	return true;
+}
+
+typedef struct xl_undo_tt_slot_commit_v2 {
+	xl_undo_tt_identity_v2 identity;
+	SCN commit_scn;
+} xl_undo_tt_slot_commit_v2;
+
+typedef struct xl_undo_tt_slot_set_head_v2 {
+	xl_undo_tt_identity_v2 identity;
+	UBA first_undo_block;
+} xl_undo_tt_slot_set_head_v2;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_commit_v2) == 40
+				 && offsetof(xl_undo_tt_slot_commit_v2, identity) == 0
+				 && offsetof(xl_undo_tt_slot_commit_v2, commit_scn) == 32,
+				 "TT V2 standalone commit is a 32-byte identity followed by SCN");
+StaticAssertDecl(sizeof(xl_undo_tt_slot_set_head_v2) == 48
+				 && offsetof(xl_undo_tt_slot_set_head_v2, identity) == 0
+				 && offsetof(xl_undo_tt_slot_set_head_v2, first_undo_block) == 32,
+				 "TT V2 top-only head is a 32-byte identity followed by UBA");
+
+static inline bool
+cluster_undo_tt_commit_v2_decode(const void *payload, Size length,
+								 xl_undo_tt_slot_commit_v2 *out)
+{
+	xl_undo_tt_slot_commit_v2 rec;
+
+	if (payload == NULL || out == NULL || length != sizeof(rec))
+		return false;
+	memcpy(&rec, payload, sizeof(rec));
+	if (!cluster_undo_tt_bind_v2_decode(&rec.identity, sizeof(rec.identity), &rec.identity)
+		|| !SCN_VALID(rec.commit_scn) || rec.commit_scn == UINT64_MAX)
+		return false;
+	*out = rec;
+	return true;
+}
+
+static inline bool
+cluster_undo_tt_set_head_v2_decode(const void *payload, Size length,
+								   xl_undo_tt_slot_set_head_v2 *out)
+{
+	xl_undo_tt_slot_set_head_v2 rec;
+
+	if (payload == NULL || out == NULL || length != sizeof(rec))
+		return false;
+	memcpy(&rec, payload, sizeof(rec));
+	if (!cluster_undo_tt_bind_v2_decode(&rec.identity, sizeof(rec.identity), &rec.identity))
+		return false;
+	*out = rec;
+	return true;
+}
+
 /*
  * On-disk WAL payload for XLOG_HW_RESERVE (spec-5.7a D1, §3.1a M1c).
  *
@@ -285,6 +395,208 @@ typedef struct xl_undo_tt_slot_set_head {
 
 StaticAssertDecl(sizeof(xl_undo_tt_slot_set_head) == 32,
 				 "spec-4.8 D7-A: xl_undo_tt_slot_set_head is 32 bytes, no implicit padding");
+
+/* Explicit 80B operation branch of the existing 0x90 opcode. The flag is
+ * illegal in a 32B record; a zero flag is illegal in an 80B record. */
+#define CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG 0x01
+
+typedef struct xl_undo_tt_slot_set_head_operation {
+	xl_undo_tt_slot_set_head head;
+	UndoOperationTrailer operation;
+} xl_undo_tt_slot_set_head_operation;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_set_head_operation) == 80, "operation head WAL is 80B");
+StaticAssertDecl(offsetof(xl_undo_tt_slot_set_head_operation, operation) == 32,
+				 "operation head tail starts at byte 32");
+
+typedef enum ClusterUndoHeadOperationDecision {
+	CLUSTER_UNDO_HEAD_OPERATION_BLOCKED,
+	CLUSTER_UNDO_HEAD_OPERATION_APPLY,
+	CLUSTER_UNDO_HEAD_OPERATION_ALREADY,
+	CLUSTER_UNDO_HEAD_OPERATION_STALE
+} ClusterUndoHeadOperationDecision;
+
+static inline bool
+cluster_undo_head_operation_valid(const xl_undo_tt_slot_set_head_operation *record)
+{
+	UndoRecordHeader child = { 0 };
+	uint32 segment, block;
+	uint16 slot, row;
+	const xl_undo_tt_slot_set_head *head;
+
+	if (record == NULL)
+		return false;
+	head = &record->head;
+	child.xid = (TransactionId)record->operation.operation_fxid;
+	return head->instance > 0 && head->instance <= SCN_MAX_VALID_NODE_ID + 1 && head->segment_id > 0
+		   && (head->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 == head->instance
+		   && head->slot_offset < TT_SLOTS_PER_SEGMENT && head->wrap != TT_WRAP_INVALID
+		   && TransactionIdIsNormal(head->xid)
+		   && head->_pad[0] == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG && head->_pad[1] == 0
+		   && head->_pad[2] == 0
+		   && uba_decode_record(head->first_undo_block, &segment, &block, &slot, &row)
+		   && slot == head->slot_offset
+		   && row < (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
+		   && uba_origin_node_id(head->first_undo_block) == head->instance - 1
+		   && cluster_undo_operation_trailer_valid(&child, &record->operation)
+		   && record->operation.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE
+		   && (TransactionId)record->operation.canonical_top_fxid == head->xid;
+}
+
+/* Structural TT candidate only. Native redo additionally proves the exact
+ * control at the retained UBA; E1 installs its candidates in source WAL order. */
+static inline ClusterUndoHeadOperationDecision
+cluster_undo_head_operation_decide(uint32 generation, const TTSlot *slot,
+								   const xl_undo_tt_slot_set_head_operation *record)
+{
+	if (!cluster_undo_head_operation_valid(record) || slot == NULL || generation == UINT32_MAX
+		|| slot->status > TT_SLOT_RECYCLABLE)
+		return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+	if (generation > record->operation.canonical_segment_generation)
+		return CLUSTER_UNDO_HEAD_OPERATION_STALE;
+	if (generation < record->operation.canonical_segment_generation)
+		return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+	if (slot->wrap > record->head.wrap && slot->wrap != TT_WRAP_INVALID)
+		return CLUSTER_UNDO_HEAD_OPERATION_STALE;
+	if (slot->wrap != record->head.wrap || slot->xid != record->head.xid)
+		return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+	if (slot->status == TT_SLOT_COMMITTED || slot->status == TT_SLOT_ABORTED) {
+		if ((slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+			|| (slot->status == TT_SLOT_COMMITTED) != SCN_VALID(slot->commit_scn))
+			return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+		return CLUSTER_UNDO_HEAD_OPERATION_STALE;
+	}
+	if (slot->status != TT_SLOT_ACTIVE || slot->flags != TT_FLAGS_RESERVED
+		|| slot->commit_scn != InvalidScn)
+		return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+	return cluster_undo_record_uba_equal(slot->first_undo_block, record->head.first_undo_block)
+			   ? CLUSTER_UNDO_HEAD_OPERATION_ALREADY
+			   : CLUSTER_UNDO_HEAD_OPERATION_APPLY;
+}
+
+static inline bool
+cluster_undo_head_operation_matches_control(const xl_undo_tt_slot_set_head_operation *record,
+											const UndoRecordHeader *control, const void *payload,
+											size_t payload_bytes)
+{
+	UndoSavepointRollbackPayload body;
+	UndoOperationTrailer operation;
+
+	return cluster_undo_head_operation_valid(record) && control != NULL
+		   && cluster_undo_record_decode_rollback_payload(control, payload, payload_bytes, &body,
+														  &operation)
+		   && body.phase != UNDO_SAVEPOINT_ROLLBACK_RESERVED
+		   && body.rollback_sequence == record->operation.operation_sequence
+		   && memcmp(&operation, &record->operation, sizeof(operation)) == 0
+		   && control->origin_node_id == record->head.instance - 1
+		   && control->tt_slot_segment_id == record->head.segment_id
+		   && control->tt_slot_id == (uint32)record->head.slot_offset + 1
+		   && control->tt_wrap_plus1 == (uint32)record->head.wrap + 1
+		   && !cluster_undo_record_uba_equal(record->head.first_undo_block, body.start_uba)
+		   && !cluster_undo_record_uba_equal(record->head.first_undo_block, body.stop_uba)
+		   && !cluster_undo_record_uba_equal(record->head.first_undo_block, body.next_uba);
+}
+
+/* Explicit TT40 operation branch: the original 48B trailer is unchanged.
+ * The prefix binds the canonical top, never the child operation FullXid. */
+typedef struct xl_undo_tt_slot_set_head_operation_v2 {
+	xl_undo_tt_slot_set_head_v2 head;
+	UndoOperationTrailer operation;
+} xl_undo_tt_slot_set_head_operation_v2;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_set_head_operation_v2) == 96,
+				 "TT40 operation head WAL is 96B");
+StaticAssertDecl(offsetof(xl_undo_tt_slot_set_head_operation_v2, operation) == 48,
+				 "TT40 operation tail starts at byte 48");
+
+/* Pure structural projection for the original retained-chain/control checks.
+ * It is never a legacy mutation request or a source of an inferred epoch. */
+static inline bool
+cluster_undo_head_operation_v2_project(const xl_undo_tt_slot_set_head_operation_v2 *record,
+									  xl_undo_tt_slot_set_head_operation *legacy)
+{
+	xl_undo_tt_identity_v2 identity;
+	xl_undo_tt_slot_set_head_operation candidate = { 0 };
+
+	if (record == NULL || legacy == NULL
+		|| record->head.identity.flags != CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG)
+		return false;
+	identity = record->head.identity;
+	identity.flags = 0;
+	if (!cluster_undo_tt_bind_v2_decode(&identity, sizeof(identity), &identity)
+		|| identity.segment_generation != record->operation.canonical_segment_generation
+		|| identity.original_full_xid != record->operation.canonical_top_fxid)
+		return false;
+	candidate.head.segment_id = identity.segment_id;
+	candidate.head.slot_offset = identity.slot_offset;
+	candidate.head.wrap = identity.wrap;
+	candidate.head.xid = identity.xid;
+	candidate.head.instance = identity.instance;
+	candidate.head._pad[0] = CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG;
+	candidate.head.first_undo_block = record->head.first_undo_block;
+	candidate.operation = record->operation;
+	if (!cluster_undo_head_operation_valid(&candidate))
+		return false;
+	*legacy = candidate;
+	return true;
+}
+
+static inline bool
+cluster_undo_tt_set_head_operation_v2_decode(const void *payload, Size length,
+											xl_undo_tt_slot_set_head_operation_v2 *out)
+{
+	xl_undo_tt_slot_set_head_operation_v2 record;
+	xl_undo_tt_slot_set_head_operation legacy;
+
+	if (payload == NULL || out == NULL || length != sizeof(record))
+		return false;
+	memcpy(&record, payload, sizeof(record));
+	if (!cluster_undo_head_operation_v2_project(&record, &legacy))
+		return false;
+	*out = record;
+	return true;
+}
+
+/* Same-generation/wrap TT40 ownership requires the whole original FullXid.
+ * A numerically newer FullXid is never used as a stale/reuse proof. */
+static inline ClusterUndoHeadOperationDecision
+cluster_undo_head_operation_v2_decide(uint32 generation, const TTSlotV2 *slot,
+									 const xl_undo_tt_slot_set_head_operation_v2 *record)
+{
+	xl_undo_tt_slot_set_head_operation legacy;
+	TTSlot prefix;
+
+	if (slot == NULL || !cluster_undo_head_operation_v2_project(record, &legacy))
+		return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+	if (generation == record->head.identity.segment_generation) {
+		if (slot->wrap == TT_WRAP_INVALID || (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+			|| slot->commit_scn == UINT64_MAX)
+			return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+		if (slot->status == TT_SLOT_UNUSED) {
+			if (!TTSlotV2_is_zero(slot))
+				return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+				   || (TransactionId)slot->original_full_xid != slot->xid)
+			return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+		if (slot->wrap == record->head.identity.wrap
+			&& slot->original_full_xid != record->head.identity.original_full_xid)
+			return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
+	}
+	memcpy(&prefix, slot, sizeof(prefix));
+	return cluster_undo_head_operation_decide(generation, &prefix, &legacy);
+}
+
+/* Existing recovery authority and retained-control proof, before any write. */
+extern ClusterUndoHeadOperationDecision
+cluster_tt_durable_set_head_operation_preflight(const xl_undo_tt_slot_set_head_operation *record);
+extern void
+cluster_tt_durable_redo_set_head_operation(const xl_undo_tt_slot_set_head_operation *record);
+extern ClusterUndoHeadOperationDecision
+cluster_tt_durable_set_head_operation_v2_preflight(
+	const xl_undo_tt_slot_set_head_operation_v2 *record, const char *expected_block);
+extern XLogRecPtr
+cluster_undo_emit_tt_slot_set_head_operation_v2(
+	const xl_undo_tt_slot_set_head_operation_v2 *record);
 
 /* Spec 8.4D §12.10: field-coded canonical terminal-reference release
  * certificate.  The struct is the decoded logical form; WAL always carries
@@ -447,6 +759,83 @@ cluster_undo_tt_ctrc_release_decode(const uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEA
 	if (!cluster_undo_tt_ctrc_release_valid(&record))
 		return false;
 	*record_out = record;
+	return true;
+}
+
+/* V2 retains the original field-coded offsets and appends the exact FullXid.
+ * The nested V1 type describes those fields; its version is explicitly 2 here. */
+#define CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION UINT8_C(2)
+#define CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES 104
+
+typedef struct xl_undo_tt_slot_ctrc_release_v2 {
+	xl_undo_tt_slot_ctrc_release_v1 release;
+	uint64 original_full_xid;
+} xl_undo_tt_slot_ctrc_release_v2;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_ctrc_release_v2) == 104
+				 && offsetof(xl_undo_tt_slot_ctrc_release_v2, release) == 0
+				 && offsetof(xl_undo_tt_slot_ctrc_release_v1, format_version) == 94
+				 && offsetof(xl_undo_tt_slot_ctrc_release_v2, original_full_xid) == 96,
+				 "TT V2 release version and FullXid must be at bytes 94 and 96");
+
+static inline bool
+cluster_undo_tt_ctrc_release_v2_valid(const xl_undo_tt_slot_ctrc_release_v2 *record)
+{
+	xl_undo_tt_slot_ctrc_release_v1 fields;
+
+	if (record == NULL
+		|| record->release.format_version != CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION
+		|| record->original_full_xid == UINT64_MAX
+		|| (TransactionId)record->original_full_xid != record->release.xid)
+		return false;
+	fields = record->release;
+	fields.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	return cluster_undo_tt_ctrc_release_valid(&fields);
+}
+
+static inline bool
+cluster_undo_tt_ctrc_release_v2_encode(const xl_undo_tt_slot_ctrc_release_v2 *record,
+									 uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES])
+{
+	xl_undo_tt_slot_ctrc_release_v1 fields;
+
+	if (bytes != NULL)
+		memset(bytes, 0, CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES);
+	if (bytes == NULL || !cluster_undo_tt_ctrc_release_v2_valid(record))
+		return false;
+	fields = record->release;
+	fields.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	if (!cluster_undo_tt_ctrc_release_encode(&fields, bytes))
+		return false;
+	bytes[94] = CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION;
+	cluster_undo_tt_ctrc_put_u64_le(bytes + 96, record->original_full_xid);
+	return true;
+}
+
+static inline bool
+cluster_undo_tt_ctrc_release_v2_decode(const void *payload, Size length,
+									 xl_undo_tt_slot_ctrc_release_v2 *out)
+{
+	xl_undo_tt_slot_ctrc_release_v2 rec;
+	uint8 fields[CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES];
+	const uint8 *bytes = (const uint8 *)payload;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (payload == NULL || out == NULL || length != CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES)
+		return false;
+	if (bytes[94] != CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION)
+		return false;
+	/* Reuse the original complete field validation without changing input. */
+	memcpy(fields, bytes, sizeof(fields));
+	fields[94] = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+	if (!cluster_undo_tt_ctrc_release_decode(fields, &rec.release))
+		return false;
+	rec.release.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION;
+	rec.original_full_xid = cluster_undo_tt_ctrc_get_u64_le(bytes + 96);
+	if (!cluster_undo_tt_ctrc_release_v2_valid(&rec))
+		return false;
+	*out = rec;
 	return true;
 }
 
@@ -745,6 +1134,10 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_
 												 uint32 segment_generation, uint16 slot_offset,
 												 uint16 wrap, TransactionId xid);
 
+/* Same opcode, explicit 32-byte V2 identity; invalid input errors before WAL. */
+extern XLogRecPtr cluster_undo_emit_tt_slot_bind_v2(const xl_undo_tt_identity_v2 *identity);
+extern XLogRecPtr cluster_undo_emit_tt_slot_abort_v2(const xl_undo_tt_identity_v2 *identity);
+
 /*
  * cluster_undo_emit_tt_slot_commit (spec-3.11 D3)
  *	  Backend: emit XLOG_UNDO_TT_SLOT_COMMIT for a durable commit_scn stamp on
@@ -772,6 +1165,14 @@ extern void cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segm
 													 uint16 wrap, TransactionId xid,
 													 SCN commit_scn);
 
+/* Recovery only: exact TT40 delta, full-page fsync and same-descriptor
+ * post-read. The original recovery path/source authority must be active. */
+struct ClusterUndoDecoded;
+extern void cluster_tt_durable_redo_tt_v2(const struct ClusterUndoDecoded *decoded);
+struct xl_xact_tt_commit;
+extern void cluster_tt_durable_redo_xact_commit(const struct xl_xact_tt_commit *delta,
+											 uint64 original_full_xid);
+
 /* spec-3.15 D5: emit XLOG_UNDO_TT_SLOT_ABORT (prepared rollback). */
 extern XLogRecPtr cluster_undo_emit_tt_slot_abort(uint8 instance, uint32 segment_id,
 												  uint16 slot_offset, uint16 wrap,
@@ -780,6 +1181,12 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_abort_exact(uint8 instance, uint32 s
 														uint32 segment_generation,
 														uint16 slot_offset, uint16 wrap,
 														TransactionId xid);
+
+/* Prepared finish: the original protected TT40 identity, same opcodes. */
+extern XLogRecPtr cluster_undo_emit_tt_slot_commit_v2(const xl_undo_tt_identity_v2 *identity,
+													  SCN commit_scn);
+extern XLogRecPtr cluster_undo_emit_tt_slot_set_head_v2(const xl_undo_tt_identity_v2 *identity,
+														UBA first_undo_block);
 
 /* spec-4.8 D7-A: emit XLOG_UNDO_TT_SLOT_SET_HEAD (durable undo-chain head). */
 extern XLogRecPtr cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id,
@@ -790,6 +1197,9 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segm
  * must flush the returned LSN before publishing the release bit. */
 extern XLogRecPtr
 cluster_undo_xlog_insert_tt_ctrc_release(const xl_undo_tt_slot_ctrc_release_v1 *record);
+/* Explicit TT40 certificate, same opcode and original durability owner. */
+extern XLogRecPtr
+cluster_undo_xlog_insert_tt_ctrc_release_v2(const xl_undo_tt_slot_ctrc_release_v2 *record);
 
 /* spec-3.13 D3: emit XLOG_UNDO_SEGMENT_RECYCLE (caller XLogFlush + pwrite + fsync). */
 extern XLogRecPtr cluster_undo_emit_segment_recycle(uint8 instance, uint32 segment_id,

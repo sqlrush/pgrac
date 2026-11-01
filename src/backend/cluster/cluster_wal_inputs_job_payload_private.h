@@ -15,7 +15,7 @@
 #define CLUSTER_WAL_INPUT_JOB_BACKLINK_RESERVE sizeof(ClusterWalInputsJobV1 *)
 /* Charge the existing census custody, Startup deadline and borrowed Start owner fields too.
  * The original per-job and four-consumer payload limits remain below. */
-#define CLUSTER_WAL_INPUT_JOB_SCOPE_BYTES (112008 + 24 + 16 + 24)
+#define CLUSTER_WAL_INPUT_JOB_SCOPE_BYTES (112008 + 24 + 16 + 24 + 16)
 #define CLUSTER_WAL_INPUT_JOB_PIN_BYTES 37936
 #define CLUSTER_WAL_INPUT_JOB_REMOTE_CUT_BYTES 392
 #define CLUSTER_WAL_INPUT_JOB_NOTICE_BYTES 19288

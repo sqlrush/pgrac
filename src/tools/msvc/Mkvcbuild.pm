@@ -137,7 +137,7 @@ sub mkvcbuild
 	}
 
 	our @pgcommonallfiles = qw(
-	  archive.c base64.c checksum_helper.c cluster_catalog_init.c cluster_catalog_manifest.c cluster_catalog_verify.c cluster_hw_snapshot_codec.c cluster_recovery_file_identity.c cluster_recovery_registry.c cluster_relmap_file.c cluster_relmap_file_io.c cluster_relmap_init.c cluster_relmap_v2.c cluster_space_identity.c cluster_space_reservation.c compression.c
+	  archive.c base64.c checksum_helper.c cluster_catalog_init.c cluster_catalog_manifest.c cluster_catalog_verify.c cluster_clog_file.c cluster_clog_wal.c cluster_hw_snapshot_codec.c cluster_recovery_file_identity.c cluster_recovery_bootstrap.c cluster_undo_segment_init.c sha2.c cluster_relmap_init.c cluster_space_identity.c cluster_space_reservation.c compression.c
 	  config_info.c controldata_utils.c d2s.c encnames.c exec.c
 	  f2s.c file_perm.c file_utils.c hashfn.c ip.c jsonapi.c
 	  keywords.c kwlookup.c link-canary.c md5_common.c percentrepl.c
@@ -871,6 +871,7 @@ sub mkvcbuild
 		$pg_waldump->AddFile($xf);
 	}
 	$pg_waldump->AddFile('src/backend/access/transam/xlogreader.c');
+	$pg_waldump->AddFile('src/backend/cluster/cluster_uba.c');
 
 	$solution->Save();
 	return $solution->{vcver};

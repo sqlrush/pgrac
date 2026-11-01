@@ -883,42 +883,83 @@ UT_TEST(test_resource_x_length_collisions_preserve_legacy_domains)
 				 -1);
 }
 
-UT_TEST(test_first_fill_service_wire_routes_only_canonical_extension)
+UT_TEST(test_resource_x_v3_image_routes_complete_validated_frame)
 {
-	GcsBlockFirstFillForwardPayload service = {0};
-	BufferTag tag = make_tag(1, 2, 3, MAIN_FORKNUM, 157);
-	int expected = cluster_lms_shard_for_tag(&tag, 4);
-	service.forward.tag = tag;
-	service.forward.request_id = 71;
-	service.forward.epoch = 1;
-	service.forward.original_requester_node = 1;
-	service.forward.requester_backend_id = 3;
-	service.forward.master_node = 2;
-	service.forward.transition_id = PCM_TRANS_N_TO_S;
-	service.forward.reserved_0[6] = GCS_BLOCK_FORWARD_KIND_FIRST_FILL_S;
-	service.binding_generation = 7;
-	service.service_generation = 1;
-	UT_ASSERT_EQ(sizeof(service), 80);
+	BufferTag tag = make_tag(1663, 5, 37003, MAIN_FORKNUM, 773);
+	uint8 payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+	ResourceXDecodedFrame image;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint16 bytes;
+	uint8 *bundle;
+	uint8 *record;
+
+	bytes = make_resource_x_route_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE,
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, tag, payload, RESOURCE_X_IMAGE_V2_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, payload,
+		bytes, &image, &reject));
+	bundle = image.body.image_envelope.ctrc_delegation;
+	record = bundle + RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
+	/* Structural opaque fixture, not origin/delegation authentication. */
+	image.body.image_envelope.ctrc_delegation_bytes = 232;
+	bundle[1] = 1; bundle[3] = 232; bundle[5] = 1;
+	record[1] = 1; record[3] = 224; record[5] = 1;
+	record[8] = 2; record[10] = 144;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &image,
+		payload, sizeof(payload), &bytes, &reject));
+	UT_ASSERT_EQ(bytes, RESOURCE_X_IMAGE_V3_MIN_BYTES);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		payload, bytes, CLUSTER_LMS_MAX_WORKERS), cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS));
+	payload[bytes - 1] ^= 1;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		payload, bytes, CLUSTER_LMS_MAX_WORKERS), -1);
+}
+
+UT_TEST(test_ctrc_forward216_routes_explicit_parent_only_close)
+{
+	uint8 bytes[CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES + 1] = { 0 };
+	ClusterCtrcSealRequestV1 prefix = { 0 };
+	BufferTag tag;
+	int expected;
+
+	prefix.request_id = UINT64CONST(0x7788990011223344);
+	prefix.cluster_epoch = 23;
+	prefix.original_requester_node = 1;
+	prefix.requester_backend_id = CLUSTER_CTRC_INTERNAL_ENDPOINT;
+	prefix.suboperation = CTRC_SEAL_CLOSE_AND_CLEAN;
+	prefix.selector_version = CLUSTER_CTRC_SELECTOR_VERSION;
+	prefix.forward_kind = CLUSTER_CTRC_FORWARD_KIND;
+	prefix.magic = CLUSTER_CTRC_WIRE_MAGIC;
+	prefix.wire_version = CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION;
+	prefix.wire_length = CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES;
+	prefix.participant_capability_record_generation = 29;
+	memcpy(bytes, &prefix, sizeof(prefix));
+	tag = GcsBlockCurrentMxRouteTagMake(prefix.request_id, prefix.cluster_epoch,
+		prefix.original_requester_node, prefix.requester_backend_id);
+	expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-		&service, sizeof(service), 4), expected);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-		&service, sizeof(GcsBlockForwardPayload), 4), -1);
-	service.reserved = 1;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-		&service, sizeof(service), 4), -1);
-	service.reserved = 0; service.service_generation = 0;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-		&service, sizeof(service), 4), -1);
-	service.service_generation = 1; service.binding_generation = UINT64_MAX;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-		&service, sizeof(service), 4), -1);
+		bytes, CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES, CLUSTER_LMS_MAX_WORKERS), expected);
+	for (unsigned fault = 0; fault < 7; fault++) {
+		Size length = CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES;
+
+		memcpy(bytes, &prefix, sizeof(prefix));
+		switch (fault) {
+			case 0: bytes[68] = CLUSTER_CTRC_WIRE_VERSION; break;
+			case 1: bytes[55] = CTRC_SEAL_CERTIFICATE_COMMITTED; break;
+			case 2: bytes[70]--; break;
+			case 3: bytes[132] = 1; break;
+			case 4: length--; break;
+			case 5: length++; break;
+			case 6: length = CLUSTER_CTRC_SEAL_REQUEST_BYTES; break;
+		}
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+			bytes, length, CLUSTER_LMS_MAX_WORKERS), -1);
+	}
 }
 
 int
 main(void)
 {
-	UT_PLAN(17);
-	UT_RUN(test_first_fill_service_wire_routes_only_canonical_extension);
+	UT_PLAN(18);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -935,6 +976,8 @@ main(void)
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_RUN(test_resource_x_reused_types_route_only_after_strict_domain_decode);
 	UT_RUN(test_resource_x_length_collisions_preserve_legacy_domains);
+	UT_RUN(test_resource_x_v3_image_routes_complete_validated_frame);
+	UT_RUN(test_ctrc_forward216_routes_explicit_parent_only_close);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

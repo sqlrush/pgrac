@@ -252,12 +252,18 @@ extern void StartupCLOG(void);
 extern void TrimCLOG(void);
 extern void CheckPointCLOG(void);
 extern void ExtendCLOG(TransactionId newestXact);
-/* Dormant original allocator entry. Supply its actual FullXid candidate
- * while holding the original XidGenLock EXCLUSIVE; skipped page boundaries
- * may be initialized without issuing any transaction. No live caller or
- * birth/era/lifetime grant is installed by this entry. Native ERROR can
- * follow a dirty page or inserted WAL; it is not rollback/retry permission. */
+/* Original allocator only: XidGenLock EX held, actual finite normal FullXid.
+ * Records volatile page birth; raw-only legacy extension remains unqualified. */
 extern void ExtendCLOGFull(FullTransactionId newestXact);
+/* Original issuer preflight only. Selection is separate from page birth and
+ * file I/O permission. Finish returns only this allocation's local borrows. */
+typedef struct ClusterClogAllocationV2 ClusterClogAllocationV2;
+extern bool CLOGAllocationRequired(void);
+extern bool CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last,
+									ClusterClogAllocationV2 **);
+extern void CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last,
+									ClusterClogAllocationV2 **);
+extern void CLOGFinishAllocation(ClusterClogAllocationV2 **);
 extern void TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid);
 
 extern int	clogsyncfiletag(const FileTag *ftag, char *path);

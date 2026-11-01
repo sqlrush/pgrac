@@ -50,6 +50,18 @@ extern bool ProcArrayInstallImportedXmin(TransactionId xmin,
 										 VirtualTransactionId *sourcevxid);
 extern bool ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc);
 #ifdef USE_PGRAC_CLUSTER
+/* Serialize the original reader publication with local H promises.
+ * Guard the added snapshot separately, even when the fold is unknown; use
+ * InvalidScn when only retiring a reader. Refusal preserves the previous
+ * marker and releases ProcArrayLock. */
+extern bool ProcArrayPublishReadScn(SCN read_scn, SCN added_read_scn);
+/* Raw feedback/initial or copied slot history has no SCN interval. Caller holds
+ * ProcArrayLock EX from this check through original slot/PGPROC publication
+ * and slot aggregation. After this boot exports H, only empty feedback can
+ * pass; refusal changes no pins. This does not qualify an SCN interval or
+ * global F/H. */
+extern bool ProcArrayReplicationFeedbackAllowed(TransactionId xmin,
+													TransactionId catalog_xmin);
 /* Finite history handoff: source xmin AND its published read-SCN protection
  * must cover the requested point under the original install lock. Refusal
  * preserves receiver xmin/status/SCN; success clears its old SCN until original

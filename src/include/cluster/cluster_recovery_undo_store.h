@@ -42,7 +42,10 @@ extern ClusterRecoveryRootSet *
 cluster_recovery_undo_store_root_set(ClusterRecoveryUndoStore *store);
 
 /* MORE loads one header; RECORD returns one of its 48 raw TT slots. DRAINED
- * completes only this physical TT inventory, never the recovery graph. */
+ * completes only this physical TT inventory, never the recovery graph.
+ * Explicit TT40 entries preserve their exact original_full_xid separately
+ * from the original32 prefix; legacy entries leave version/FullXid zero.
+ * The raw graph key is unchanged and is not a FullXid/terminal certificate. */
 extern ClusterRecoveryGraphResult cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store,
 																   ClusterRecoveryUndoEntry *out);
 /* Revisit every saved physical slot after enumeration. No new reads or
@@ -51,6 +54,8 @@ extern ClusterRecoveryGraphResult cluster_recovery_undo_store_next(ClusterRecove
 extern ClusterRecoveryGraphResult cluster_recovery_undo_store_at(ClusterRecoveryUndoStore *store,
 																 uint32 index,
 																 ClusterRecoveryUndoEntry *out);
+/* Complete immutable BLCKSZ capture. The legacy type exposes only the common
+ * prefix/raw bytes for TT40; use next/at to obtain versioned slots/generation. */
 extern const UndoSegmentHeaderData *
 cluster_recovery_undo_store_header(const ClusterRecoveryUndoStore *store, uint32 segment);
 

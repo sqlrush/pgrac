@@ -39,6 +39,7 @@
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A set_head) */
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_tt_slot.h"  /* TTSlot */
+#include "cluster/cluster_tt_startup.h"
 
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 
@@ -90,6 +91,9 @@ cluster_tt_terminal_transition_decide(const TTSlot *predecessor, uint32 disk_gen
  * a normal, strictly pre-BIND allocator-rollover result: this call acquired
  * no CTRC reservation and wrote nothing; all current/pin holdings are gone.
  * The backend may discard only its unpublished local reservation and retry.
+ * Explicit V2 pages bind the protected original FullXid into the 40-byte
+ * slot and 32-byte WAL identity. successor_out remains only the legacy
+ * 32-byte prefix and is never a source of FullXid qualification.
  * Every other failure raises ERROR.  In particular a BIND emitter failure
  * never returns this retry result, and zero outputs after ERROR prove nothing.
  */
@@ -189,8 +193,11 @@ cluster_tt_durable_classify(int xid_matches, bool match_has_valid_scn, bool scan
  * the COMMIT/ROLLBACK PREPARED critical section, _prepared_emit inserts the
  * binding's standalone TT WAL (0x30, or 0x31 and 0x90 for a captured undo-chain
  * head) just before the record, and _prepared_apply writes the successor after
- * the record is flushed (PANIC on failure).  _prepared_release never throws.
+ * the record is flushed (PANIC on failure). TT40 borrows the existing modifier
+ * admission and retains a canonical content reservation; its FullXid comes
+ * only from that protected slot. _prepared_release never throws.
  */
+struct TTCommitStage;
 typedef struct ClusterTTPreparedStage {
 	uint32 segment_id;
 	uint16 slot_offset;
@@ -199,11 +206,13 @@ typedef struct ClusterTTPreparedStage {
 	int fd;		  /* private write descriptor, -1 when none */
 	bool emit_head;
 	TTSlot successor;
+	struct TTCommitStage *canonical_stage; /* private TT40 reservation, not persisted */
 } ClusterTTPreparedStage;
 
 extern void cluster_tt_slot_durable_prepared_stage(uint32 segment_id, uint16 slot_offset,
 												   TransactionId xid, uint16 wrap, bool commit,
 												   SCN commit_scn, UBA head,
+												   const ClusterSemanticAdmissionToken *admission,
 												   ClusterTTPreparedStage *stage);
 extern void cluster_tt_slot_durable_prepared_emit(const ClusterTTPreparedStage *stage);
 extern void cluster_tt_slot_durable_prepared_apply(ClusterTTPreparedStage *stage);
@@ -233,9 +242,10 @@ extern uint8 cluster_tt_slot_durable_commit_stage(uint32 segment_id, uint32 segm
 /* True when exactly this transaction's slot stamp is staged and unwritten. */
 extern bool cluster_tt_slot_durable_commit_staged(uint32 segment_id, uint16 slot_offset,
 												  TransactionId xid, uint16 wrap);
-/* Ordinary-transaction commit only: requires a valid native VXID, the commit
- * critical section and DELAY_CHKPT_START held since before WAL insertion.
- * Write the staged stamp after WAL flush; PANIC on any failure. */
+/* Copy the original staged identity into the versioned native COMMIT tail. */
+struct xl_xact_tt_commit_v2;
+extern void cluster_tt_slot_durable_commit_fold(struct xl_xact_tt_commit_v2 *out);
+/* Critical-section safe: write the staged stamp; PANIC on any failure. */
 extern void cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end);
 /* Never throws: release a staged stamp that was never written. */
 extern void cluster_tt_slot_durable_commit_unstage(void);
@@ -262,6 +272,9 @@ extern void cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset,
  *	by a later owner) or UNUSED -> false (never returns another owner's
  *	commit_scn -- spec-3.11 C5).  Returns true + *commit_scn on hit.  Callers
  *	must apply the C1b CLOG cross-check (the slot is stamped at pre-commit).
+ * Selects the actual V1/V2 stride from a complete header; V2 checksum and all
+ * slot identities must validate. This raw-xid interface grants no FullXid
+ * authority and leaves commit_scn unchanged on rejection.
  */
 extern bool cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										   uint32 expected_wrap, SCN *commit_scn);
@@ -272,11 +285,14 @@ typedef bool (*ClusterTTDurableXidCommitCheck)(TransactionId xid);
  * cluster_tt_slot_durable_lookup_committed_stable -- durable lookup variant for
  * visibility paths that need the CLOG cross-check inside the slot-read window.
  *
- * Reads the 32B TTSlot, verifies COMMITTED/exact xid/optional wrap, verifies
- * xid_committed(xid), then re-reads the same 32B slot and requires the bytes to
- * be unchanged before returning commit_scn.  This fail-closes a reader racing a
- * redo/data-file RMW of the same slot; callers that cannot tolerate a torn slot
- * must use this API instead of lookup()+external CLOG check.
+ * Selects the slot from a complete V1/V2 header, verifies COMMITTED/exact
+ * xid/optional wrap, verifies xid_committed(xid), then re-reads the same slot.
+ * Layout, segment generation and all 32/40 slot bytes must be unchanged before
+ * returning commit_scn. V2 also requires a valid checksum and all 48 slot
+ * identities. The raw-xid API supplies no new epoch/history authority.
+ * This fail-closes a reader racing a redo/data-file RMW of the same slot.
+ * Use this API instead of lookup()+external CLOG check when a torn slot
+ * cannot be tolerated.
  */
 extern bool cluster_tt_slot_durable_lookup_committed_stable(
 	uint32 segment_id, uint16 slot_offset, TransactionId xid, uint32 expected_wrap,
@@ -284,8 +300,9 @@ extern bool cluster_tt_slot_durable_lookup_committed_stable(
 
 /*
  * cluster_tt_slot_durable_read_exact_stable -- R4 D5 exact durable slot
- * snapshot.  Reads the same 32-byte on-disk slot twice and publishes it only
- * when both byte images are identical, the status is in the closed on-disk
+ * snapshot. Selects the explicit V1/V2 layout from complete header reads,
+ * requiring unchanged layout/generation and all 32/40 slot bytes. Publishes
+ * only the original 32-byte prefix when the status is in the closed on-disk
  * domain, and both images match the exact xid/wrap identity.  This API never
  * scans by xid and never writes durable or shared state.  On every rejection,
  * a non-NULL slot_out remains canonical zero.
@@ -293,6 +310,12 @@ extern bool cluster_tt_slot_durable_lookup_committed_stable(
 extern bool cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 													  TransactionId xid, uint16 expected_wrap,
 													  TTSlot *slot_out);
+
+/* Same zero-on-refusal stable snapshot, strictly V1. Legacy WAL mutation
+ * consumers must use this entry point: the generic read-only V2 prefix is
+ * never permission to invoke a fixed-32B writer. */
+extern bool cluster_tt_slot_durable_read_exact_legacy_stable(
+	uint32 segment_id, uint16 slot_offset, TransactionId xid, uint16 expected_wrap, TTSlot *slot_out);
 
 /*
  * Recovery-only typed TT mutations.  Unlike the normal transaction helpers,
@@ -465,6 +488,12 @@ extern ClusterTtRecoveryLiveness cluster_tt_recovery_xact_liveness(TransactionId
  *	Backend-only (cluster_tt_recovery.c).
  */
 extern int cluster_tt_recovery_resolve_active_slots(void);
+
+/* Exact TT40 predecessor from the original local Startup scanner. Returns
+ * the sealed successor in selected_base for the next slot in the same scan. */
+extern XLogRecPtr cluster_tt_slot_durable_abort_startup_local(
+	const ClusterTTStartupLocalContext *context, uint32 segment_id, uint16 slot_offset,
+	char selected_base[BLCKSZ]);
 
 /*
  * cluster_tt_recovery_observe_scn_highwater -- spec-4.8 D5 (L222): scan this

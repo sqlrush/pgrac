@@ -28,7 +28,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#ifdef FRONTEND
+#include "postgres_fe.h"
+#else
 #include "postgres.h"
+#endif
 
 #include "cluster/cluster_uba.h"
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */

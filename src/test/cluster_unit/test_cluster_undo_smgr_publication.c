@@ -32,6 +32,10 @@
 
 UT_DEFINE_GLOBALS();
 
+#ifndef UNDO_PUBLICATION_NATIVE_TEST
+#include "cluster_unit_no_native_files.h"
+#endif
+
 int MyProcPid = 4321;
 pg_time_t MyStartTime = 0;
 TimestampTz MyStartTimestamp = INT64CONST(0x102030405060);
@@ -217,14 +221,6 @@ cluster_undo_path_resolve(ClusterUndoPathIntent intent pg_attribute_unused(), ui
 	int ret = snprintf(buf, buf_size, "%s/seg_%u.dat", publication_dir, (unsigned)segment_id);
 
 	return ret < 0 || (size_t)ret >= buf_size ? -1 : 0;
-}
-
-bool
-cluster_undo_segment_header_identity_ok(const char *blockbuf,
-										uint32 segment_id pg_attribute_unused(),
-										uint8 owner_instance pg_attribute_unused())
-{
-	return blockbuf != NULL && (unsigned char)blockbuf[0] == 0xa5;
 }
 
 #undef pg_pwrite
@@ -1126,6 +1122,9 @@ main(void)
 	UT_RUN(test_root_descriptor_mirror_probe_rejects_short_and_symlink);
 	UT_RUN(test_root_descriptor_mirror_probe_rejects_lstat_open_symlink_swap);
 	UT_RUN(test_root_descriptor_mirror_write_failure_cleans_owned_temp);
+	UT_RUN(test_tt40_publish_probe_preserves_complete_identity_and_original_barriers);
+	UT_RUN(test_tt40_eexist_keeps_original_winner_including_last_fullxid);
+	UT_RUN(test_tt40_unknown_or_fullxid_conflict_never_publishes_or_repairs_a_winner);
 	UT_ASSERT_EQ(rmdir(publication_dir), 0);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

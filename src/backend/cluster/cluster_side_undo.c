@@ -26,6 +26,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/rmgr.h"
+#include "access/xact.h"
 #include "access/xlogrecord.h"
 #include "cluster/cluster_side_route.h"
 #include "cluster/cluster_tt_durable.h"
@@ -35,6 +36,58 @@
 #include "cluster/cluster_side_undo.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+
+/* Reconstruct the immutable carrier without losing its operation identity. */
+bool
+cluster_undo_head_operation_from_decoded(const ClusterUndoDecoded *decoded,
+										 xl_undo_tt_slot_set_head_operation *record)
+{
+	if (decoded == NULL || record == NULL || decoded->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD
+		|| decoded->opcode != XLOG_UNDO_TT_SLOT_SET_HEAD
+		|| decoded->flags != CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG || decoded->format_version != 0
+		|| decoded->original_full_xid != 0
+		|| decoded->expected_generation != decoded->head_operation.canonical_segment_generation)
+		return false;
+	memset(record, 0, sizeof(*record));
+	record->head.segment_id = decoded->segment_id;
+	record->head.slot_offset = decoded->slot_offset;
+	record->head.wrap = decoded->wrap;
+	record->head.xid = decoded->xid;
+	record->head.instance = decoded->instance;
+	record->head._pad[0] = decoded->flags;
+	record->head.first_undo_block = decoded->first_undo_block;
+	record->operation = decoded->head_operation;
+	return cluster_undo_head_operation_valid(record);
+}
+
+bool
+cluster_undo_head_operation_v2_from_decoded(const ClusterUndoDecoded *decoded,
+										 xl_undo_tt_slot_set_head_operation_v2 *record)
+{
+	xl_undo_tt_slot_set_head_operation_v2 candidate = { 0 };
+	xl_undo_tt_slot_set_head_operation legacy;
+
+	if (decoded == NULL || record == NULL || decoded->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD
+		|| decoded->opcode != XLOG_UNDO_TT_SLOT_SET_HEAD
+		|| decoded->format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+		|| decoded->flags != CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG)
+		return false;
+	candidate.head.identity.segment_id = decoded->segment_id;
+	candidate.head.identity.segment_generation = decoded->expected_generation;
+	candidate.head.identity.xid = decoded->xid;
+	candidate.head.identity.slot_offset = decoded->slot_offset;
+	candidate.head.identity.wrap = decoded->wrap;
+	candidate.head.identity.instance = decoded->instance;
+	candidate.head.identity.format_version = decoded->format_version;
+	candidate.head.identity.flags = decoded->flags;
+	candidate.head.identity.original_full_xid = decoded->original_full_xid;
+	candidate.head.first_undo_block = decoded->first_undo_block;
+	candidate.operation = decoded->head_operation;
+	if (!cluster_undo_head_operation_v2_project(&candidate, &legacy))
+		return false;
+	*record = candidate;
+	return true;
+}
 
 static bool
 undo_delta_ranges_valid(uint16 rec_off, uint16 rec_len, uint16 slot_off, uint16 slot_len)
@@ -101,6 +154,22 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_TT_BIND: {
 		xl_undo_tt_slot_bind rec;
 
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_identity_v2)) {
+			xl_undo_tt_identity_v2 v2;
+
+			if (!cluster_undo_tt_bind_v2_decode(XLogRecGetData(record),
+											  XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.instance;
+			out->segment_id = v2.segment_id;
+			out->expected_generation = v2.segment_generation;
+			out->slot_offset = v2.slot_offset;
+			out->wrap = v2.wrap;
+			out->xid = v2.xid;
+			out->format_version = v2.format_version;
+			out->original_full_xid = v2.original_full_xid;
+			break;
+		}
 		if (XLogRecGetDataLen(record) != sizeof(rec))
 			return false;
 		memcpy(&rec, XLogRecGetData(record), sizeof(rec));
@@ -120,6 +189,23 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_TT_COMMIT: {
 		xl_undo_tt_slot_commit rec;
 
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_commit_v2)) {
+			xl_undo_tt_slot_commit_v2 v2;
+
+			if (!cluster_undo_tt_commit_v2_decode(XLogRecGetData(record),
+												XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.identity.instance;
+			out->segment_id = v2.identity.segment_id;
+			out->expected_generation = v2.identity.segment_generation;
+			out->slot_offset = v2.identity.slot_offset;
+			out->wrap = v2.identity.wrap;
+			out->xid = v2.identity.xid;
+			out->format_version = v2.identity.format_version;
+			out->original_full_xid = v2.identity.original_full_xid;
+			out->commit_scn = v2.commit_scn;
+			break;
+		}
 		if (XLogRecGetDataLen(record) != sizeof(rec))
 			return false; /* malformed: BLOCKED (U-SIDE-04) */
 		memcpy(&rec, XLogRecGetData(record), sizeof(rec));
@@ -134,7 +220,21 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 		break;
 	}
 	case CLUSTER_UNDO_KIND_TT_ABORT: {
-		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_abort_exact)) {
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_identity_v2)) {
+			xl_undo_tt_identity_v2 v2;
+
+			if (!cluster_undo_tt_bind_v2_decode(XLogRecGetData(record),
+											  XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.instance;
+			out->segment_id = v2.segment_id;
+			out->expected_generation = v2.segment_generation;
+			out->slot_offset = v2.slot_offset;
+			out->wrap = v2.wrap;
+			out->xid = v2.xid;
+			out->format_version = v2.format_version;
+			out->original_full_xid = v2.original_full_xid;
+		} else if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_abort_exact)) {
 			xl_undo_tt_slot_abort_exact rec;
 
 			memcpy(&rec, XLogRecGetData(record), sizeof(rec));
@@ -168,11 +268,59 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_TT_SET_HEAD: {
 		xl_undo_tt_slot_set_head rec;
 
-		if (XLogRecGetDataLen(record) != sizeof(rec))
-			return false;
-		memcpy(&rec, XLogRecGetData(record), sizeof(rec));
-		if (rec._pad[0] != 0 || rec._pad[1] != 0 || rec._pad[2] != 0)
-			return false;
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_set_head_v2)) {
+			xl_undo_tt_slot_set_head_v2 v2;
+
+			if (!cluster_undo_tt_set_head_v2_decode(XLogRecGetData(record),
+												  XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.identity.instance;
+			out->segment_id = v2.identity.segment_id;
+			out->expected_generation = v2.identity.segment_generation;
+			out->slot_offset = v2.identity.slot_offset;
+			out->wrap = v2.identity.wrap;
+			out->xid = v2.identity.xid;
+			out->format_version = v2.identity.format_version;
+			out->original_full_xid = v2.identity.original_full_xid;
+			out->first_undo_block = v2.first_undo_block;
+			break;
+		}
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_set_head_operation_v2)) {
+			xl_undo_tt_slot_set_head_operation_v2 v2;
+
+			if (!cluster_undo_tt_set_head_operation_v2_decode(XLogRecGetData(record),
+														 XLogRecGetDataLen(record), &v2))
+				return false;
+			out->instance = v2.head.identity.instance;
+			out->segment_id = v2.head.identity.segment_id;
+			out->expected_generation = v2.head.identity.segment_generation;
+			out->slot_offset = v2.head.identity.slot_offset;
+			out->wrap = v2.head.identity.wrap;
+			out->xid = v2.head.identity.xid;
+			out->format_version = v2.head.identity.format_version;
+			out->flags = v2.head.identity.flags;
+			out->original_full_xid = v2.head.identity.original_full_xid;
+			out->first_undo_block = v2.head.first_undo_block;
+			out->head_operation = v2.operation;
+			break;
+		}
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_set_head_operation)) {
+			xl_undo_tt_slot_set_head_operation operation;
+
+			memcpy(&operation, XLogRecGetData(record), sizeof(operation));
+			if (!cluster_undo_head_operation_valid(&operation))
+				return false;
+			rec = operation.head;
+			out->flags = rec._pad[0];
+			out->expected_generation = operation.operation.canonical_segment_generation;
+			out->head_operation = operation.operation;
+		} else {
+			if (XLogRecGetDataLen(record) != sizeof(rec))
+				return false;
+			memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+			if (rec._pad[0] != 0 || rec._pad[1] != 0 || rec._pad[2] != 0)
+				return false;
+		}
 		out->instance = rec.instance;
 		out->segment_id = rec.segment_id;
 		out->slot_offset = rec.slot_offset;
@@ -184,7 +332,15 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE: {
 		xl_undo_tt_slot_ctrc_release_v1 rec;
 
-		if (XLogRecGetDataLen(record) != CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES
+		if (XLogRecGetDataLen(record) == CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES) {
+			xl_undo_tt_slot_ctrc_release_v2 v2;
+
+			if (!cluster_undo_tt_ctrc_release_v2_decode(XLogRecGetData(record),
+													  XLogRecGetDataLen(record), &v2))
+				return false;
+			rec = v2.release;
+			out->original_full_xid = v2.original_full_xid;
+		} else if (XLogRecGetDataLen(record) != CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES
 			|| !cluster_undo_tt_ctrc_release_decode((const uint8 *)XLogRecGetData(record), &rec))
 			return false;
 		out->instance = rec.owner_instance;
@@ -350,6 +506,16 @@ cluster_undo_preflight_fields(const ClusterUndoDecoded *decoded)
 
 	if (decoded == NULL || decoded->kind == CLUSTER_UNDO_KIND_UNKNOWN)
 		return false;
+	/* Staged V2 readers must not feed raw-only TT32 mutation/inspection.
+	 * Also reject a caller relabelling a retained full identity as legacy. */
+	if ((decoded->kind == CLUSTER_UNDO_KIND_TT_BIND
+		 || decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT
+		 || decoded->kind == CLUSTER_UNDO_KIND_TT_ABORT
+		 || decoded->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+		 || decoded->kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
+		&& (decoded->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+			|| decoded->original_full_xid != 0))
+		return false;
 
 	/* §2.1-2 route: the D-SIDE-01 registry is the single judgement.
 	 * XLOG_HW_RESERVE routes BLOCKED while STOP-RF-SIDE-SPACE-ABI is
@@ -374,13 +540,20 @@ cluster_undo_preflight_fields(const ClusterUndoDecoded *decoded)
 	}
 	switch (decoded->kind) {
 	case CLUSTER_UNDO_KIND_TT_BIND:
+		/* V2 is readable, but cannot enter a raw-only TT32 mutation path. */
 		if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(decoded->xid)
 			|| decoded->wrap == TT_WRAP_INVALID
-			|| decoded->format_version != CLUSTER_UNDO_TT_BIND_VERSION || decoded->flags != 0)
+			|| decoded->format_version != CLUSTER_UNDO_TT_BIND_VERSION || decoded->flags != 0
+			|| decoded->original_full_xid != 0)
 			return false;
 		break;
 	case CLUSTER_UNDO_KIND_TT_COMMIT:
 	case CLUSTER_UNDO_KIND_TT_SET_HEAD:
+		if (decoded->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD && decoded->flags != 0) {
+			xl_undo_tt_slot_set_head_operation carrier;
+
+			return cluster_undo_head_operation_from_decoded(decoded, &carrier);
+		}
 		if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT)
 			return false;
 		if (!TransactionIdIsNormal(decoded->xid) || decoded->wrap == 0)
@@ -587,6 +760,22 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 		slot->first_undo_block = invalid_head;
 		break;
 	case CLUSTER_UNDO_KIND_TT_SET_HEAD:
+		if (decoded->flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG) {
+			xl_undo_tt_slot_set_head_operation carrier;
+			ClusterUndoHeadOperationDecision decision;
+
+			if (!cluster_undo_head_operation_from_decoded(decoded, &carrier))
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+			decision = cluster_undo_head_operation_decide(header->wrap_count, slot, &carrier);
+			if (decision == CLUSTER_UNDO_HEAD_OPERATION_STALE)
+				return CLUSTER_UNDO_HEADER_SKIP_STALE;
+			if (decision == CLUSTER_UNDO_HEAD_OPERATION_ALREADY)
+				return CLUSTER_UNDO_HEADER_ALREADY;
+			if (decision != CLUSTER_UNDO_HEAD_OPERATION_APPLY)
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+			slot->first_undo_block = decoded->first_undo_block;
+			break;
+		}
 		if (slot->status != TT_SLOT_ABORTED || slot->xid != decoded->xid
 			|| slot->wrap != decoded->wrap)
 			return CLUSTER_UNDO_HEADER_SKIP_STALE;
@@ -615,8 +804,310 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 													  : CLUSTER_UNDO_HEADER_APPLY;
 }
 
-ClusterUndoHeaderPrepareResultV1
-cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
+/* V2 has an explicit target layout. It must never pass through the TT32
+ * execution gates or borrow identity from a raw-only predecessor. */
+static bool
+undo_preflight_tt_v2_for_use(const ClusterUndoDecoded *decoded, bool pi_inspection)
+{
+	ClusterSideRouteRow route;
+	xl_undo_tt_identity_v2 identity = { 0 };
+
+	if (decoded == NULL || decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode)
+		|| decoded->format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+		|| decoded->instance == 0 || decoded->instance > UNDO_OWNER_INSTANCE_MAX
+		|| decoded->segment_id == 0
+		|| ((decoded->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != decoded->instance
+		|| decoded->expected_generation == UINT32_MAX
+		|| decoded->slot_offset >= TT_SLOTS_PER_SEGMENT || decoded->wrap == TT_WRAP_INVALID
+		|| decoded->has_payload || decoded->has_fpi || decoded->payload_length != 0
+		|| !cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, decoded->opcode, &route)
+		|| route.kind != CLUSTER_SIDE_ROUTE_TT_UNDO)
+		return false;
+	identity.xid = decoded->xid;
+	identity.format_version = decoded->format_version;
+	identity.original_full_xid = decoded->original_full_xid;
+	if (!cluster_undo_tt_bind_v2_decode(&identity, sizeof(identity), &identity)
+		|| (decoded->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE
+			&& decoded->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD && decoded->flags != 0))
+		return false;
+	switch (decoded->kind) {
+	case CLUSTER_UNDO_KIND_TT_BIND:
+	case CLUSTER_UNDO_KIND_TT_ABORT:
+		return true;
+	case CLUSTER_UNDO_KIND_TT_COMMIT:
+		return SCN_VALID(decoded->commit_scn) && decoded->commit_scn != UINT64_MAX;
+	case CLUSTER_UNDO_KIND_TT_SET_HEAD: {
+		uint32 segment, block;
+		uint16 slot, row;
+
+		if (decoded->flags != 0) {
+			xl_undo_tt_slot_set_head_operation_v2 operation;
+
+			return cluster_undo_head_operation_v2_from_decoded(decoded, &operation);
+		}
+		return uba_decode_record(decoded->first_undo_block, &segment, &block, &slot, &row)
+			   && segment == decoded->segment_id && slot == decoded->slot_offset;
+	}
+	case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE: {
+		ClusterUndoDecoded projection = *decoded;
+		xl_undo_tt_slot_ctrc_release_v1 record;
+
+		if ((!pi_inspection && decoded->expected_generation == 0) || decoded->cluster_epoch == 0
+			|| decoded->formation_epoch == 0)
+			return false;
+		projection.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+		return cluster_undo_ctrc_release_from_decoded(&projection, &record);
+	}
+	default:
+		return false;
+	}
+}
+
+bool
+cluster_undo_preflight_tt_v2(const ClusterUndoDecoded *decoded)
+{
+	return undo_preflight_tt_v2_for_use(decoded, false);
+}
+
+bool
+cluster_undo_inspect_pi_tt_v2(const ClusterUndoDecoded *decoded)
+{
+	uint8 digest = 0;
+
+	if (!undo_preflight_tt_v2_for_use(decoded, true))
+		return false;
+	if (decoded->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)
+		return true;
+	for (Size i = 0; i < sizeof(decoded->ack_set_digest); i++)
+		digest |= decoded->ack_set_digest[i];
+	return digest != 0;
+}
+
+/* Private byte preparation only. The existing owner still proves source,
+ * current target, isolation, durability and post-read. FullXid is preserved
+ * across every non-BIND operation; its numerical order is never a reuse test. */
+static ClusterUndoHeaderPrepareResultV1
+undo_prepare_tt_header_v2(const ClusterUndoDecoded *decoded, const uint8 *payload,
+						 Size payload_length, const char *base, char *out)
+{
+	PGAlignedBlock prepared;
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)prepared.data;
+	TTSlotV2 *slot, before;
+	TTSlot legacy;
+	static const UBA invalid_head = InvalidUba_init;
+
+	if (base == NULL || out == NULL || payload != NULL || payload_length != 0
+		|| !cluster_undo_preflight_tt_v2(decoded))
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	memcpy(prepared.data, base, BLCKSZ);
+	/* Verify the fixed prefix before reading the V2 generation or slots. */
+	if (!UndoSegmentHeaderV2_identity_matches(prepared.data, BLCKSZ, decoded->segment_id,
+											 decoded->instance))
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if (header->wrap_count > decoded->expected_generation)
+		return CLUSTER_UNDO_HEADER_SKIP_STALE;
+	if (header->wrap_count < decoded->expected_generation)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	slot = &header->tt_slots[decoded->slot_offset];
+	before = *slot;
+	memcpy(&legacy, slot, sizeof(legacy));
+	if (slot->status > TT_SLOT_RECYCLABLE || slot->wrap == TT_WRAP_INVALID
+		|| (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0 || slot->commit_scn == UINT64_MAX)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if (slot->status == TT_SLOT_UNUSED) {
+		if (!TTSlotV2_is_zero(slot))
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+	} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+			   || (TransactionId)slot->original_full_xid != slot->xid
+			   || (slot->wrap == decoded->wrap
+				   && slot->original_full_xid != decoded->original_full_xid))
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+
+	switch (decoded->kind) {
+	case CLUSTER_UNDO_KIND_TT_BIND: {
+		ClusterTTActiveTransitionDecision decision = cluster_tt_active_transition_decide(
+			&legacy, header->wrap_count, decoded->expected_generation, decoded->xid,
+			decoded->wrap, true);
+
+		if (decision == CLUSTER_TT_ACTIVE_STALE)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (decision == CLUSTER_TT_ACTIVE_IDEMPOTENT)
+			return CLUSTER_UNDO_HEADER_ALREADY;
+		if (decision != CLUSTER_TT_ACTIVE_APPLY)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		memset(slot, 0, sizeof(*slot));
+		slot->xid = decoded->xid;
+		slot->wrap = decoded->wrap;
+		slot->status = TT_SLOT_ACTIVE;
+		slot->first_undo_block = invalid_head;
+		slot->original_full_xid = decoded->original_full_xid;
+		break;
+	}
+	case CLUSTER_UNDO_KIND_TT_COMMIT:
+	case CLUSTER_UNDO_KIND_TT_ABORT: {
+		uint8 status = decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT ? TT_SLOT_COMMITTED
+																		 : TT_SLOT_ABORTED;
+		SCN scn = status == TT_SLOT_COMMITTED ? decoded->commit_scn : InvalidScn;
+		ClusterTTTerminalTransitionDecision decision;
+
+		/* A durable prepared ABORT+HEAD image can precede replay of its
+		 * earlier ABORT. Keep the existing exact head on that idempotent
+		 * replay; it remains part of this same FullXid's rollback state. */
+		if (status == TT_SLOT_ABORTED && legacy.status == TT_SLOT_ABORTED
+			&& !UBA_is_invalid(legacy.first_undo_block)) {
+			uint32 segment, block;
+			uint16 offset, row;
+
+			if (legacy.flags != TT_FLAGS_RESERVED
+				|| !uba_decode_record(legacy.first_undo_block, &segment, &block, &offset, &row)
+				|| segment != decoded->segment_id || offset != decoded->slot_offset)
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+			legacy.first_undo_block = invalid_head;
+		}
+		decision = cluster_tt_terminal_transition_decide(
+			&legacy, header->wrap_count, decoded->expected_generation, decoded->xid,
+			decoded->wrap, status, scn);
+
+		if (decision == CLUSTER_TT_TERMINAL_STALE)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (decision == CLUSTER_TT_TERMINAL_IDEMPOTENT)
+			return CLUSTER_UNDO_HEADER_ALREADY;
+		if (decision != CLUSTER_TT_TERMINAL_APPLY)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		slot->status = status;
+		slot->flags = TT_FLAGS_RESERVED;
+		slot->commit_scn = scn;
+		slot->first_undo_block = invalid_head;
+		break;
+	}
+	case CLUSTER_UNDO_KIND_TT_SET_HEAD:
+		if (decoded->flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG) {
+			xl_undo_tt_slot_set_head_operation_v2 record;
+			ClusterUndoHeadOperationDecision decision;
+
+			if (!cluster_undo_head_operation_v2_from_decoded(decoded, &record))
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+			decision = cluster_undo_head_operation_v2_decide(header->wrap_count, slot, &record);
+			if (decision == CLUSTER_UNDO_HEAD_OPERATION_STALE)
+				return CLUSTER_UNDO_HEADER_SKIP_STALE;
+			if (decision == CLUSTER_UNDO_HEAD_OPERATION_ALREADY)
+				return CLUSTER_UNDO_HEADER_ALREADY;
+			if (decision != CLUSTER_UNDO_HEAD_OPERATION_APPLY)
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+			slot->first_undo_block = decoded->first_undo_block;
+			break;
+		}
+		if (slot->wrap > decoded->wrap)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (slot->wrap != decoded->wrap || slot->xid != decoded->xid
+			|| slot->status != TT_SLOT_ABORTED || SCN_VALID(slot->commit_scn))
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		slot->first_undo_block = decoded->first_undo_block;
+		break;
+	case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE: {
+		ClusterUndoDecoded projection = *decoded;
+		xl_undo_tt_slot_ctrc_release_v1 record;
+		ClusterUndoTtCtrcReleaseRedoDecision decision;
+
+		projection.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION;
+		if (!cluster_undo_ctrc_release_from_decoded(&projection, &record))
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		decision = cluster_undo_tt_ctrc_release_redo_decide(header->wrap_count, &legacy, &record);
+		if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT)
+			return CLUSTER_UNDO_HEADER_ALREADY;
+		if (decision != CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		break;
+	}
+	default:
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	}
+	if (memcmp(slot, &before, sizeof(before)) == 0)
+		return CLUSTER_UNDO_HEADER_ALREADY;
+	memcpy(out, prepared.data, BLCKSZ);
+	return CLUSTER_UNDO_HEADER_APPLY;
+}
+
+/* Lifecycle WAL keeps its original length: the complete page prefix selects
+ * the geometry before any shifted management field is read. Only a fresh
+ * INIT/REUSE template may clear the durable transaction identities. */
+static ClusterUndoHeaderPrepareResultV1
+undo_prepare_lifecycle_header_v2(const ClusterUndoDecoded *decoded, const uint8 *payload,
+								 Size payload_length, const char *base, char *out)
+{
+	PGAlignedBlock prepared, prior;
+	UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)prepared.data;
+	const UndoSegmentHeaderDataV2 *before = (const UndoSegmentHeaderDataV2 *)prior.data;
+	bool base_valid = false;
+
+	if (!cluster_undo_preflight(decoded) || decoded->expected_generation == UINT32_MAX)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if (base != NULL) {
+		memcpy(prior.data, base, BLCKSZ);
+		base_valid = UndoSegmentHeaderV2_identity_matches(prior.data, BLCKSZ,
+														decoded->segment_id, decoded->instance);
+		/* An explicit lifecycle image is not an in-place format upgrade. */
+		if (!base_valid || before->wrap_count == UINT32_MAX)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+	}
+	if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE) {
+		xl_undo_segment_recycle record = { 0 };
+		ClusterUndoSegRecycleRedo decision;
+
+		if (!base_valid || decoded->has_payload || decoded->has_fpi || payload_length != 0)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		record.expected_generation = decoded->expected_generation;
+		record.old_state = decoded->old_state;
+		record.new_state = decoded->new_state;
+		decision = cluster_undo_segment_recycle_redo_decide(before->wrap_count,
+															before->segment_state, &record);
+		if (decision == CLUSTER_SEGRECYCLE_REDO_SKIP_STALE)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (decision != CLUSTER_SEGRECYCLE_REDO_APPLY)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		prepared = prior;
+		header->segment_state = decoded->new_state;
+	} else if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+			   || decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE) {
+		static const TTSlotV2 unused = { 0 };
+
+		if (payload == NULL || payload_length != BLCKSZ || !decoded->has_payload)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		memcpy(prepared.data, payload, BLCKSZ);
+		if (!UndoSegmentHeaderV2_identity_matches(prepared.data, BLCKSZ,
+												 decoded->segment_id, decoded->instance)
+			|| header->segment_state != SEGMENT_ALLOCATED || header->tt_active_count != 0
+			|| header->tt_next_free_slot != 0 || header->wrap_count == UINT32_MAX
+			|| header->wrap_count != (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+										 ? 0 : decoded->new_generation))
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		for (uint16 s = 0; s < TT_SLOTS_PER_SEGMENT; s++)
+			if (memcmp(&header->tt_slots[s], &unused, sizeof(unused)) != 0)
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+		if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE) {
+			xl_undo_segment_reuse record = { 0 };
+			ClusterUndoSegReuseRedo decision;
+
+			record.old_generation = decoded->expected_generation;
+			record.new_generation = decoded->new_generation;
+			decision = cluster_undo_segment_reuse_redo_decide(
+				base_valid, base_valid ? before->wrap_count : 0, &record);
+			if (decision == CLUSTER_SEGREUSE_REDO_SKIP_STALE)
+				return CLUSTER_UNDO_HEADER_SKIP_STALE;
+			if (decision != CLUSTER_SEGREUSE_REDO_APPLY)
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+		}
+	} else
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	memcpy(out, prepared.data, BLCKSZ);
+	return CLUSTER_UNDO_HEADER_APPLY;
+}
+
+static ClusterUndoHeaderPrepareResultV1
+undo_prepare_legacy_header(const ClusterUndoDecoded *decoded, const uint8 *payload,
 							   Size payload_length, const char *base, char *out)
 {
 	PGAlignedBlock prepared, prior;
@@ -690,6 +1181,24 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 }
 
 ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
+							   Size payload_length, const char *base, char *out)
+{
+	if (decoded == NULL || out == NULL
+		|| decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode))
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if ((decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+		 || decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE
+		 || decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE)
+		&& ((base != NULL && (uint8)base[57] != 0)
+			|| (payload != NULL && payload_length == BLCKSZ && payload[57] != 0)))
+		return undo_prepare_lifecycle_header_v2(decoded, payload, payload_length, base, out);
+	if (decoded != NULL && decoded->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION)
+		return undo_prepare_tt_header_v2(decoded, payload, payload_length, base, out);
+	return undo_prepare_legacy_header(decoded, payload, payload_length, base, out);
+}
+
+ClusterUndoHeaderPrepareResultV1
 cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generation,
 							   uint16 slot_offset, uint16 wrap, TransactionId xid, SCN commit_scn,
 							   const char *base, char *out)
@@ -723,6 +1232,37 @@ cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generat
 	slot->first_undo_block = invalid_head;
 	memcpy(out, prepared.data, BLCKSZ);
 	return CLUSTER_UNDO_HEADER_APPLY;
+}
+
+ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_xact_commit_v1(const xl_xact_tt_commit *delta, uint64 original_full_xid,
+								  const char *base, char *out)
+{
+	ClusterUndoDecoded decoded = { 0 };
+
+	if (delta == NULL || delta->flags != 0 || delta->reserved != 0)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if (delta->format_version == CLUSTER_XACT_TT_COMMIT_VERSION) {
+		if (original_full_xid != 0)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		return cluster_undo_prepare_commit_v1(delta->instance, delta->segment_id,
+			delta->segment_generation, delta->slot_offset, delta->wrap, delta->xid,
+			delta->commit_scn, base, out);
+	}
+	if (delta->format_version != CLUSTER_XACT_TT_COMMIT_V2_VERSION)
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	decoded.kind = CLUSTER_UNDO_KIND_TT_COMMIT;
+	decoded.opcode = XLOG_UNDO_TT_SLOT_COMMIT;
+	decoded.instance = delta->instance;
+	decoded.segment_id = delta->segment_id;
+	decoded.expected_generation = delta->segment_generation;
+	decoded.slot_offset = delta->slot_offset;
+	decoded.wrap = delta->wrap;
+	decoded.xid = delta->xid;
+	decoded.commit_scn = delta->commit_scn;
+	decoded.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+	decoded.original_full_xid = original_full_xid;
+	return undo_prepare_tt_header_v2(&decoded, NULL, 0, base, out);
 }
 
 static bool
@@ -760,6 +1300,21 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 
 	if (!cluster_undo_preflight(decoded))
 		return CLUSTER_UNDO_TARGET_BLOCKED;
+	if (decoded->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+		&& decoded->flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG) {
+		xl_undo_tt_slot_set_head_operation carrier;
+		ClusterUndoHeadOperationDecision decision;
+
+		if (!cluster_undo_head_operation_from_decoded(decoded, &carrier))
+			return CLUSTER_UNDO_TARGET_BLOCKED;
+		decision = cluster_tt_durable_set_head_operation_preflight(&carrier);
+		if (decision == CLUSTER_UNDO_HEAD_OPERATION_APPLY)
+			return CLUSTER_UNDO_TARGET_APPLY;
+		if (decision == CLUSTER_UNDO_HEAD_OPERATION_ALREADY
+			|| decision == CLUSTER_UNDO_HEAD_OPERATION_STALE)
+			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
+		return CLUSTER_UNDO_TARGET_BLOCKED;
+	}
 	if (decoded->kind == CLUSTER_UNDO_KIND_TT_BIND) {
 		ClusterTTActiveTransitionDecision bind_decision = cluster_tt_durable_bind_preflight_exact(
 			decoded->instance, decoded->segment_id, decoded->expected_generation,
@@ -802,7 +1357,7 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 	if (decoded->kind != CLUSTER_UNDO_KIND_TT_COMMIT && decoded->kind != CLUSTER_UNDO_KIND_TT_ABORT
 		&& decoded->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD)
 		return CLUSTER_UNDO_TARGET_BLOCKED;
-	if (!cluster_tt_slot_durable_read_exact_stable(decoded->segment_id, decoded->slot_offset,
+	if (!cluster_tt_slot_durable_read_exact_legacy_stable(decoded->segment_id, decoded->slot_offset,
 												   decoded->xid, decoded->wrap, &slot))
 		return CLUSTER_UNDO_TARGET_BLOCKED;
 
@@ -854,6 +1409,20 @@ cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
 	target = cluster_undo_preflight_tt_target_v1(decoded);
 	if (target == CLUSTER_UNDO_TARGET_BLOCKED)
 		return CLUSTER_UNDO_APPLY_BLOCKED;
+	if (decoded->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+		&& decoded->flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG) {
+		xl_undo_tt_slot_set_head_operation carrier;
+		ClusterUndoHeadOperationDecision post;
+
+		if (!cluster_undo_head_operation_from_decoded(decoded, &carrier))
+			return CLUSTER_UNDO_APPLY_BLOCKED;
+		cluster_tt_durable_redo_set_head_operation(&carrier);
+		post = cluster_tt_durable_set_head_operation_preflight(&carrier);
+		return post == CLUSTER_UNDO_HEAD_OPERATION_ALREADY
+					   || post == CLUSTER_UNDO_HEAD_OPERATION_STALE
+				   ? CLUSTER_UNDO_APPLY_OK
+				   : CLUSTER_UNDO_APPLY_POST_READ_FAILED;
+	}
 	if (target == CLUSTER_UNDO_TARGET_PROVED_NOOP)
 		return CLUSTER_UNDO_APPLY_OK;
 	switch (decoded->kind) {
@@ -897,7 +1466,7 @@ cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
 	default:
 		return CLUSTER_UNDO_APPLY_BLOCKED;
 	}
-	if (!cluster_tt_slot_durable_read_exact_stable(decoded->segment_id, decoded->slot_offset,
+	if (!cluster_tt_slot_durable_read_exact_legacy_stable(decoded->segment_id, decoded->slot_offset,
 												   decoded->xid, decoded->wrap, &post_slot))
 		return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
 	switch (decoded->kind) {

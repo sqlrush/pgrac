@@ -80,7 +80,7 @@ cluster_sf_peer_capability_word_sample(int32 peer, uint32 required,
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
 	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65)
 			  || (receiver_mode && peer == 0));
-	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
+	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK);
 	sender_capability_reads++;
 	*word = required;
 	*generation = test_capability_generation;
@@ -94,7 +94,7 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
 	UT_ASSERT(peer == 1 || (sender_high_peer_enabled && peer == 65)
 			  || (receiver_mode && peer == 0));
-	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2);
+	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK);
 	if (sender_peer_current_observer != NULL
 		&& (sender_peer_observer_target == 0 || sender_peer_observer_target == peer)) {
 		void (*observe)(void) = sender_peer_current_observer;
@@ -123,6 +123,16 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 		}
 	}
 	return generation == test_capability_generation;
+}
+
+/* This source-handoff fixture keeps H as its declared controlled boundary;
+ * native per-boot coverage is executed by retention_sample/undo_horizon. */
+bool
+cluster_undo_retention_horizon_covers(SCN horizon)
+{
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
+	return SCN_VALID(horizon) && horizon != (SCN)UINT64_MAX;
 }
 
 ClusterICSendResult
@@ -415,10 +425,18 @@ sender_history_clock(void)
 	return sender_sample_clock;
 }
 
+static bool cohort_no_mrp(void);
+static SCN cohort_unavailable_mrp_bound(void);
+#define cluster_mrp_should_start cohort_no_mrp
+#define cluster_mrp_standby_consistent_scn cohort_unavailable_mrp_bound
 #define MainLWLockArray native_locks
 #define allProcs (native_procs.allProcs)
 #define cluster_scn_current sender_history_clock
+#define RecoveryInProgress native_recovery_in_progress
 #include "test_cluster_retention_sample.inc"
+#undef RecoveryInProgress
+#undef cluster_mrp_standby_consistent_scn
+#undef cluster_mrp_should_start
 #undef cluster_scn_current
 #undef allProcs
 #undef MainLWLockArray

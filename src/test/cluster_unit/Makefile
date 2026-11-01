@@ -240,6 +240,7 @@ TESTS += test_cluster_recovery_plan_merge
 TESTS += test_cluster_tt_checkpoint_publish
 TESTS += test_cluster_tt_2pc_finish
 TESTS += test_cluster_tt_rollback_entry
+TESTS += test_cluster_tt_startup_local
 TESTS += test_cluster_cr_native_origin test_cluster_cr_mvcc_origin
 TESTS += test_cluster_resident_record_batch test_cluster_freeze_writer_context
 # Keep registration before all expands its prerequisite list.
@@ -482,6 +483,10 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_horizon,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_abort_exit_guard,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_resident_record_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_tt_normal_start,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_clog_file,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_clog_write_snapshot,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_undo_scan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
 # PGRAC: production journal validation is linked into target command tests.
@@ -493,6 +498,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_epq_wait,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_undo_extent_claim,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_undo_segment,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_guard test_cluster_page_ctrc_capacity,$(SIMPLE_TESTS))
@@ -530,6 +536,7 @@ TESTS += test_cluster_heap_small_redo
 TESTS += test_cluster_btree_redo test_cluster_cold_init_redo
 TESTS += test_cluster_page_dependency
 TESTS += test_cluster_undo_producer
+TESTS += test_cluster_recovery_undo_scan
 TESTS += test_cluster_undo_native_lifecycle
 TESTS += test_cluster_recovery_c0_apply
 TESTS += test_cluster_undo_recovery
@@ -1311,7 +1318,10 @@ test_cluster_hang_acceptance: test_cluster_hang_acceptance.c unit_test.h $(CLUST
 CLUSTER_CR_SERVER_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_cr_server_policy.o
 CLUSTER_CR_SERVER_C0_TEST_O = test_cluster_cr_server_c0_product.o
 $(CLUSTER_CR_SERVER_C0_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_cr_server.c \
-		$(top_srcdir)/src/include/cluster/cluster_cr_server.h
+		$(top_srcdir)/src/include/cluster/cluster_cr_server.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current_wire.h \
+		$(top_srcdir)/src/include/cluster/cluster_ctrc_origin_fullxid.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
 		-c $< -o $@
 
@@ -1345,6 +1355,7 @@ test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $
 
 # Execute the actual bounded header provider and its single-entry consumer.
 TESTS += test_cluster_tt_exact_batch
+all: test_cluster_tt_exact_batch
 
 # Execute owned visibility callers and their actual shared/local debt release.
 TESTS += test_cluster_visibility_admission
@@ -2972,9 +2983,9 @@ test_cluster_heap_borrowed_pin.inc: $(top_srcdir)/src/backend/storage/buffer/buf
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_xmin_apply.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^cluster_heap_freeze_apply_xmin_batch_locked_v1\(/ { print "static bool"; emit=1; found++ } \
+	awk '/^(heap_freeze_retained_sources_current|cluster_heap_freeze_apply_xmin_batch_locked_v1)\(/ { print "static bool"; emit=1; found++ } \
 	     /^cluster_heap_freeze_apply_xmin(_batch(_recent)?)?_v1\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_freeze_redo.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -3006,9 +3017,9 @@ test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/hea
 # Execute original census ingress invalidation with the native freeze/WAL continuation.
 # Original full policy sampler, composed with the actual stripe lease fixture.
 test_cluster_heap_freeze_policy_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c Makefile
-	@awk '/^cluster_heap_freeze_policy_sample_v1\(/ { print "static bool"; emit=1; found++ } \
+	@awk '/^cluster_heap_freeze_policy_sample_(common|v1)\(/ { print "static bool"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original retained stripe types, pointers and current comparison only.
@@ -3177,8 +3188,8 @@ test_cluster_heap_ctrc_init_state.inc: $(top_srcdir)/src/backend/cluster/cluster
 	@awk '/^#define CTRC_CLEANER_(DISPATCH_BATCH|ORIGINS) / { print; constants++ } \
 	     /^typedef (enum CtrcCleanerScanKind|struct (CtrcCleanerOriginHint|CtrcCleanerBatch)) / { emit=1; types++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     /^static .* Ctrc(Batch;|OriginHint\[|DispatchCursor;|WorkerId =|LocalProgress;|LocalPasses;)/ { print; globals++ } \
-	     END { if (constants != 2 || types != 3 || done != 3 || globals != 6 || emit) exit 1 }' $< > $@.tmp
+	     /^static .* Ctrc(Batch;|OriginHint\[|DispatchCursor;|DelegatedReclaimCursor;|DelegationCursor;|DelegationRound;|WorkerId =|LocalProgress;|LocalPasses;)/ { print; globals++ } \
+	     END { if (constants != 2 || types != 3 || done != 3 || globals != 9 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_lwlock_init.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
@@ -3207,6 +3218,24 @@ test_cluster_heap_ctrc_origin.inc: $(top_srcdir)/src/backend/cluster/cluster_ter
 
 # Full original participant/receipt publication closure; production bodies,
 # scoped by the fixture, with exact function-count and completion gates.
+# Original immutable origin V2 codec, used by the actual receiver publisher.
+test_cluster_heap_ctrc_origin_v2.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_put_u16_le|ctrc_put_u32_le|ctrc_put_u64_le|ctrc_get_u16_le|ctrc_get_u32_le|ctrc_get_u64_le|ctrc_txn_key_encode|ctrc_txn_key_decode|cluster_ctrc_origin_fullxid_match_v2|ctrc_origin_fullxid_encode_v2)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
+	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
+	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
+	     END { if (found != 10 || done != 10 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Complete original publication-domain predicates shared by the existing
+# prepare/apply/ACK extracts. Keep the original per-family extraction gates.
+test_cluster_heap_ctrc_publication_domain.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_itl_reference_kind|ctrc_publication_owner_valid|ctrc_image_target_domain_valid)\\(" } \
+	     $$0 ~ pattern { emit=1; count++; print "static bool" } \
+	     emit { print } /^}/ { if (emit) done++; emit=0 } \
+	     END { if (count != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_ctrc_participant.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk 'BEGIN { pattern = "^(cluster_ctrc_origin_has_exact_touch|cluster_ctrc_origin_record_touched|cluster_ctrc_participant_index_compute|cluster_ctrc_participant_open|cluster_ctrc_receipt_prepare_shared_observed|ctrc_allocate_journal_sequence|ctrc_origin_protects_local_receipt_locked|ctrc_participant_identity_valid|ctrc_participant_index|ctrc_participant_locks_acquire|ctrc_participant_locks_release|ctrc_participant_receipt_heads|ctrc_publication_prepare_valid|ctrc_publication_request_equal|ctrc_receipt_chain_exact_locked|ctrc_receipt_entries|ctrc_receipt_handle_fill|ctrc_receipt_hash_bytes|ctrc_receipt_links|ctrc_receipt_prepare_existing_locked|ctrc_receipt_prepare_locators_valid_locked|ctrc_receipt_prepare_refused|ctrc_receipt_prepare_shared_internal|ctrc_receipt_prepare_table_observed|ctrc_receipt_prepare_with_sequence|ctrc_receipt_probe_hash|ctrc_receipt_probe_states|ctrc_receipt_publication_matches|ctrc_relation_namespace_valid|ctrc_target_pending_itl_valid|ctrc_target_pending_offnum_valid|ctrc_target_predecessor_version_valid)\\(" } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
@@ -3238,6 +3267,19 @@ test_cluster_heap_resident_stamp_types.inc: $(top_srcdir)/src/backend/storage/bu
 	     /^typedef struct PrivateRefCountEntry$$/ { emit=1; private_type++ } \
 	     emit { print } emit && /^} (PinBufferLookupResult|PrivateRefCountEntry);/ { emit=0; done++ } \
 	     END { if (found != 1 || private_type != 1 || done != 2 || address != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_resource_owner.inc: $(top_srcdir)/src/backend/utils/resowner/resowner.c Makefile
+	@awk '/^#define BufferGetDatum\(buffer\)/ { print; conversion++ } \
+	     /^typedef struct (ResourceArray|ResourceOwnerData)$$/ { structure=1; structures++ } \
+	     structure { print; if (/^}[ \t]*(ResourceArray|ResourceOwnerData);/) structure=0; next } \
+	     /^#define (RESARRAY_INIT_SIZE |RESARRAY_MAX_ARRAY |RESARRAY_IS_ARRAY\(|MAX_RESOWNER_LOCKS )/ { print; constants++; next } \
+	     /^#define RESARRAY_MAX_ITEMS\(/ { print; getline; print; constants++; next } \
+	     /^static void ResourceArrayAdd\(/ { print; prototype++; next } \
+	     /^(ResourceArray(Init|Enlarge|Add)|ResourceOwner(EnlargeBuffers|RememberBuffer|ForgetBuffer))\(/ { print "static void"; emit=1; found++ } \
+	     /^ResourceArrayRemove\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (conversion != 1 || structures != 2 || structure || constants != 5 || prototype != 1 || found != 7 || done != 7 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_private_ref.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -3293,6 +3335,38 @@ test_cluster_heap_ctrc_terminal.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
 	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
 	     END { if (found != 17 || done != 17 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Exact pending-custody retirement helpers, separate from original core counts.
+test_cluster_heap_ctrc_delegation.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_participant_delegations_empty|ctrc_participant_delegations_valid)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); if (seen[name]++) exit 1; order[++found]=name; ret=prev; sub(/^static[ \t]+/, "", ret); returns[name]="static " ret; emit=1; head=1 } \
+	     emit { body[name]=body[name] $$0 "\n"; if (/^\{/) head=0; else if (head) declaration[name]=declaration[name] $$0 "\n" } \
+	     emit && /^}/ { emit=0; done++ } { prev=$$0 } \
+	     END { if (found != 2 || done != 2 || emit) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Complete path predicate, separate from original participant/delegation counts.
+test_cluster_heap_ctrc_delegation_path.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^ctrc_delegation_path_valid\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# New merge predicate; keep the original participant32/delegation2 gates.
+test_cluster_heap_ctrc_delegation_merge.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk '/^ctrc_participant_delegation_merge_matches\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Complete original successor/root-certificate dependencies of the live row fixture.
+test_cluster_heap_ctrc_creator_dependencies.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	@awk 'BEGIN { pattern = "^(ctrc_delegated_certificate_retired_exact_locked|ctrc_origin_root_metadata_valid|ctrc_participant_successor_exact_locked|ctrc_receipt_prepare_successor_locked|ctrc_root_ack_bytes_exact|ctrc_root_ack_encode_body|ctrc_root_ack_shape_valid|ctrc_root_certificate_notice_locked|ctrc_root_local_ack_exact_locked)\\(" } \
+	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text="" } \
+	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head && /;[ \t]*$$/) candidate=0 } \
+	     candidate && /^}/ { candidate=0; body[name]=text; done++ } { prev=$$0 } \
+	     END { if (found != 9 || done != 9 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original certificate consumer/reclaim closure; skip the original forward declaration.
@@ -3371,11 +3445,11 @@ test_cluster_heap_ctrc_origin_reply.inc: $(top_srcdir)/src/backend/cluster/clust
 
 # Exact original certificate publisher; I/O and scheduling leaves are controlled.
 test_cluster_heap_ctrc_durable_certificate.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c $(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0.c Makefile
-	@awk 'BEGIN { pattern = "^(cluster_ctrc_origin_certificate_digest|ctrc_origin_certificate_snapshot_matches_shared|ctrc_cleaner_publish_certificate|cluster_undo_block0_root_valid|cluster_undo_block0_root_matches|cluster_undo_block0_generation_matches)\\(" } \
+	@awk 'BEGIN { pattern = "^(ctrc_terminal_slot_read|ctrc_certificate_slot_read|cluster_ctrc_origin_certificate_digest|ctrc_origin_certificate_snapshot_matches_shared|ctrc_cleaner_publish_certificate|cluster_undo_block0_root_valid|cluster_undo_block0_root_matches|cluster_undo_block0_generation_matches)\\(" } \
 	     $$0 ~ pattern { name=$$0; sub(/\(.*/, "", name); ret=prev; sub(/^static[ \t]+/, "", ret); candidate=1; head=1; text=""; decl="" } \
 	     candidate { text=text $$0 "\n"; if (/^\{/) { head=0; if (seen[name]++) exit 1; order[++found]=name; returns[name]="static " ret } else if (head) { decl=decl $$0 "\n"; if (/;[ \t]*$$/) candidate=0 } } \
 	     candidate && /^}/ { candidate=0; body[name]=text; declaration[name]=decl; done++ } { prev=$$0 } \
-	     END { if (found != 6 || done != 6 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $(filter %.c,$^) > $@.tmp
+	     END { if (found != 8 || done != 8 || candidate) exit 1; for (i=1;i<=found;i++) print returns[order[i]] "\n" declaration[order[i]] ";"; for (i=1;i<=found;i++) print returns[order[i]] "\n" body[order[i]] }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
@@ -3387,13 +3461,13 @@ test_cluster_heap_ctrc_begin.inc: $(top_srcdir)/src/backend/cluster/cluster_term
 # Original census entry traversal, physical lock selection and widening.
 test_cluster_heap_ctrc_step.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe.c $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
 	@awk '/^cluster_xid_widen\(/ { print "static FullTransactionId"; emit=1; found++ } \
-	     /^(ctrc_bytes_zero|ctrc_txn_key_valid)\(/ { print "static bool"; emit=1; found++ } \
+	     /^(ctrc_bytes_zero|ctrc_txn_key_valid|ctrc_participant_identity_matches_source|ctrc_participant_active_source_matches)\(/ { print "static bool"; emit=1; found++ } \
 	     /^ctrc_origin_entries\(/ { print "static ClusterCtrcOriginEntry *"; emit=1; found++ } \
 	     /^ctrc_participant_entries\(/ { print "static ClusterCtrcParticipantEntry *"; emit=1; found++ } \
 	     /^ctrc_participant_lock_mask\(/ { print "static uint32"; emit=1; found++ } \
 	     /^(ctrc_active_scan_step|cluster_ctrc_active_scan_step_source)\(/ { print "static void"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     END { if (found != 8 || done != 8 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     END { if (found != 10 || done != 10 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
@@ -3403,6 +3477,7 @@ test_cluster_heap_ctrc_registration.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
+		test_cluster_heap_ctrc_creator_dependencies.inc \
 		test_cluster_heap_ctrc_registration.inc \
 		test_cluster_heap_ctrc_attachment.inc \
 		test_cluster_heap_ctrc_ready.inc \
@@ -3411,11 +3486,15 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/storage/proclist_types.h $(top_srcdir)/src/include/storage/lwlock.h \
 		test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_begin.inc \
 		test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_origin.inc \
+		test_cluster_heap_ctrc_origin_v2.inc \
+		test_cluster_heap_ctrc_publication_domain.inc \
 		test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_terminal.inc \
 		test_cluster_heap_itl_finish_discharge.inc \
 		test_cluster_heap_itl_publication.inc \
 		test_cluster_heap_touch_authority.inc \
 		test_cluster_heap_resident_stamp_types.inc test_cluster_heap_resident_stamp.inc \
+		test_cluster_heap_resource_owner.inc $(top_srcdir)/src/include/common/hashfn.h \
+		$(top_srcdir)/src/include/storage/lock.h \
 		test_cluster_heap_private_ref.inc $(top_srcdir)/src/include/utils/hsearch.h \
 		test_cluster_heap_primitive_pin.inc \
 		test_cluster_heap_lookup_pin.inc $(top_srcdir)/src/include/utils/memdebug.h \
@@ -3426,6 +3505,8 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
 		$(top_srcdir)/src/include/access/generic_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_itl.h \
+		test_cluster_heap_ctrc_delegation.inc test_cluster_heap_ctrc_delegation_merge.inc \
+		test_cluster_heap_ctrc_delegation_path.inc \
 		test_cluster_heap_ctrc_certificate.inc $(top_srcdir)/src/include/port/pg_crc32c.h \
 		test_cluster_heap_ctrc_g_scan_relock.inc \
 		test_cluster_heap_ctrc_ack.inc $(top_srcdir)/src/common/sha2_int.h \
@@ -3433,7 +3514,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_ctrc_g_required_ack_decl.inc \
 		test_cluster_heap_ctrc_g_required_ack_body.inc \
 		test_cluster_heap_ctrc_origin_reply_trace_types.inc \
-		test_cluster_heap_ctrc_durable_certificate.inc \
+		test_cluster_heap_ctrc_durable_certificate.inc $(top_srcdir)/src/include/storage/checksum.h \
 		$(top_srcdir)/src/include/utils/memutils.h \
 		test_cluster_heap_freeze_cohort_current.inc \
 		test_cluster_heap_freeze_cohort_backend.inc \
@@ -3450,6 +3531,7 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_freeze_worker_pass.inc \
 		test_cluster_heap_freeze_pgproc_types.inc test_cluster_heap_freeze_pgproc_sample.inc \
 		test_cluster_heap_freeze_pgproc_exit.inc \
+		test_cluster_ctrc_native_group_exit.inc \
 		test_cluster_heap_freeze_stripe_future.inc \
 		$(top_srcdir)/src/include/storage/proc.h $(top_srcdir)/src/include/access/transam.h \
 		test_cluster_heap_freeze_lease_current.inc \
@@ -3467,6 +3549,12 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
 		test_cluster_vacuum_observed_bounds.inc test_cluster_vacuum_freeze_bound_observer.inc \
 		test_cluster_vacuum_admitted_phase.inc \
+		test_cluster_vacuum_proof_owner.inc \
+		test_cluster_vacuum_resident_recheck.inc \
+		test_cluster_vacuum_freeze_cleanout.inc test_cluster_vacuum_proof_cleanout.inc \
+		$(top_srcdir)/src/include/cluster/cluster_itl_cleanout.h \
+		test_cluster_vacuum_recent_pin.inc \
+		test_cluster_vacuum_resident_release.inc \
 		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_heap_maintenance_policy.inc unit_test.h \
 		test_cluster_heap_borrowed_pin.inc $(top_srcdir)/src/include/storage/bufmgr.h \
 		test_cluster_vacuum_freeze_locators.inc \
@@ -3490,11 +3578,13 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c \
 		test_cluster_heap_vacuum_version.inc test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) test_cluster_space_bufpage_product.o \
 		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -3885,15 +3975,40 @@ test_cluster_page_wal_image.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_b
 	awk '/^gcs_block_resource_x_put_u32\(/ || /^gcs_block_resource_x_put_u64\(/ \
 	       { print "static void"; emit=1; n++ } \
 	     /^gcs_block_pcm_x_resource_x_dependency_crc\(/ { print "static uint32"; emit=1; n++ } \
-	     /^gcs_block_pcm_x_resource_x_build_source_frames\(/ { print "static bool"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@
+	     /^gcs_block_pcm_x_resource_x_build_source_frames\(/ \
+	       || /^gcs_block_resource_x_ctrc_source_identities\(/ \
+	       || /^gcs_block_pcm_x_resource_x_delegate_source_frames\(/ \
+	       || /^gcs_block_resource_x_ctrc_receive_image\(/ \
+	       { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 7 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Exact private IMAGE intent owner; no alternate unit implementation.
+test_cluster_gcs_image_receive.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_put_u32\(/ || /^gcs_block_resource_x_put_u64\(/ \
+	       { print "static void"; emit=1; n++ } \
+	     /^gcs_block_resource_x_ctrc_receive_image\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_gcs_image_receipts.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef struct GcsBlockCtrcImageInstall / { types=1; n++ } \
+	     types { print } /^} GcsBlockCtrcImageInstall;/ { types=0 } \
+	     /^gcs_block_resource_x_ctrc_image_slots\(/ \
+	       || /^gcs_block_resource_x_ctrc_image_prepare\(/ \
+	       || /^gcs_block_resource_x_ctrc_image_apply\(/ { print "static bool"; emit=1; n++ } \
+	     /^gcs_block_resource_x_ctrc_image_cancel\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (n != 5 || types || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_page_wal_pregrant.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^[[:space:]]gcs_block_pcm_x_resource_x_install_target_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
 
 test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal_insert.inc \
-		test_cluster_page_wal_pregrant.inc test_cluster_page_data_scn.inc \
+		test_cluster_page_wal_pregrant.inc test_cluster_gcs_image_receipts.inc test_cluster_page_data_scn.inc \
 		test_cluster_page_wal_image.inc test_cluster_pcm_checksum_owner.inc \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
@@ -4024,6 +4139,7 @@ test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_clus
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
 
 test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c \
+		$(top_srcdir)/src/include/access/xact.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_storage.h \
 		$(top_srcdir)/src/include/cluster/cluster_grd.h \
         $(top_srcdir)/src/include/cluster/cluster_ges_handoff.h \
@@ -4502,6 +4618,28 @@ test_cluster_side_route: test_cluster_side_route.c unit_test.h \
 # parser; malformed/unknown -> BLOCKED pre-mutation).
 CLUSTER_SIDE_UNDO_O = test_cluster_side_xact_undo_product.o
 
+# Compile the one shared fresh-page producer in both its real build modes.
+UNDO_HEADER_INIT_DEPS = $(top_srcdir)/src/common/cluster_undo_segment_init.c \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+	$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+test_cluster_undo_segment_init_backend.o: $(UNDO_HEADER_INIT_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+test_cluster_undo_segment_init_frontend.o: $(UNDO_HEADER_INIT_DEPS) Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND \
+		-Dcluster_undo_segment_make_header_bytes=test_frontend_undo_header_v1 \
+		-Dcluster_undo_segment_make_header_v2_bytes=test_frontend_undo_header_v2 \
+		-Dcluster_undo_segment_make_boot_header_v2_bytes=test_frontend_undo_boot_header_v2 \
+		-Dcluster_undo_segment_header_integrity=test_frontend_undo_header_integrity \
+		-Dcluster_undo_segment_header_seal=test_frontend_undo_header_seal \
+		-c $< -o $@
+
+test_cluster_undo_segment: test_cluster_undo_segment.c unit_test.h $(UNDO_HEADER_INIT_DEPS) \
+		test_cluster_undo_segment_init_backend.o test_cluster_undo_segment_init_frontend.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_undo_segment_init_backend.o \
+		test_cluster_undo_segment_init_frontend.o -o $@
+
 # Use the original transition tables, never mock their decisions in typed
 # header preparation tests. The extracted functions retain their real bodies.
 test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_durable.c Makefile
@@ -4513,9 +4651,9 @@ test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
-	awk '/^(cluster_undo_emit_[a-z_]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
+	awk '/^(cluster_undo_emit_[a-z_0-9]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release(_v2)?)\(/ \
 	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
-	     END { if (found != 12) exit 1 }' $< > $@.tmp
+	     END { if (found != 18) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -4523,9 +4661,18 @@ test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cl
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_undo_tt_file_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
+	awk '/^typedef struct UndoTTReplayFile/ { emit=1; found++ } \
+	     /^static void undo_tt_(init_file|reuse_file)\(/ { print; declarations++ } \
+	     /^undo_tt_replay_close\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || declarations != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_undo_lifecycle_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
-	awk '/^cluster_undo_redo_segment_(init|recycle|reuse)\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	awk '/^cluster_undo_lifecycle_v2_(checksum|readback)\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_tt_(recycle_file|init_file|reuse_file|birth_identity|replay_birth)\(/ { print "static void"; emit=1; found++ } \
+	     /^cluster_undo_redo_segment_(init|recycle|reuse)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 10) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_bind_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -4533,9 +4680,41 @@ test_cluster_undo_bind_native.inc: $(top_srcdir)/src/backend/cluster/storage/clu
 	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_undo_header_identity.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c Makefile
-	awk '/^cluster_undo_segment_header_identity_ok\(/ { print "bool"; emit=1; found++ } \
+test_cluster_undo_dispatch_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
+	awk '/^cluster_undo_redo\(/ { print "void"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Direct header dependencies for the shared explicit operation/control ABI.
+UNDO_OPERATION_HEADER_DEPS = $(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+	$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+	$(top_srcdir)/src/include/cluster/cluster_side_undo.h
+cluster_unit_port_stubs.o test_cluster_side_xact_undo_product.o \
+		test_cluster_undo_desc_product.o test_cluster_undo_native_lifecycle \
+		test_cluster_undo_producer test_cluster_side_undo: $(UNDO_OPERATION_HEADER_DEPS)
+
+# The retained control/complete ancestry algorithm is the production body;
+# only the original physical smgr/syscall boundaries are supplied by the fixture.
+test_cluster_undo_head_operation_native.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_durable.c Makefile
+	awk '/^tt_slot_file_offset\(/ { print "static inline uint32"; emit=1; found++ } \
+	     /^tt_head_operation_(member_payload|read_member|walk)\(/ { print "static bool"; emit=1; found++ } \
+	     /^tt_head_operation_(existing_order|target)\(/ { print "static ClusterUndoHeadOperationDecision"; emit=1; found++ } \
+	     /^cluster_tt_durable_set_head_operation(_v2)?_preflight\(/ { print "ClusterUndoHeadOperationDecision"; emit=1; found++ } \
+	     /^cluster_tt_durable_redo_set_head_operation\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 9) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_tt_v2_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
+	awk '/^undo_tt_replay_file\(/ { print "static void"; emit=1; found++ } \
+	     /^cluster_tt_durable_redo_(tt_v2|xact_commit)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_header_identity.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c Makefile
+	awk '/^typedef struct ClusterUndoLifecycleHeaderView/ { emit=1; found++ } \
+	     /^lifecycle_header_view\(/ { print "static bool"; emit=1; found++ } \
+	     /^cluster_undo_segment_header_identity_ok\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_path_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c Makefile
@@ -4593,13 +4772,66 @@ test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_te
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
+		test_cluster_undo_segment_init_backend.o \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
-		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
+		test_cluster_undo_segment_init_backend.o \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
-test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
+test_cluster_undo_native_tt_redo_identity: test_cluster_undo_native_tt_redo_identity.c \
+		test_cluster_undo_native_lifecycle cluster_unit_no_native_files.h \
+		$(top_srcdir)/src/include/access/clog_file.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
+		test_cluster_undo_segment_init_backend.o \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+TESTS += test_cluster_undo_native_tt_recycle_identity
+all: test_cluster_undo_native_tt_recycle_identity
+
+TESTS += test_cluster_undo_native_tt_birth_identity
+all: test_cluster_undo_native_tt_birth_identity
+
+test_cluster_undo_native_tt_birth_identity: test_cluster_undo_native_tt_birth_identity.c \
+		test_cluster_undo_native_tt_redo_identity.c \
+		test_cluster_undo_native_lifecycle cluster_unit_no_native_files.h \
+		$(top_srcdir)/src/include/access/clog_file.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
+		test_cluster_undo_segment_init_backend.o \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_undo_native_tt_recycle_identity: test_cluster_undo_native_tt_recycle_identity.c \
+		test_cluster_undo_native_tt_redo_identity.c \
+		test_cluster_undo_native_lifecycle cluster_unit_no_native_files.h \
+		$(top_srcdir)/src/include/access/clog_file.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
+		test_cluster_undo_segment_init_backend.o \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+
+clean: clean-native-tt-redo-identity
+.PHONY: clean-native-tt-redo-identity
+clean-native-tt-redo-identity:
+	rm -f test_cluster_undo_native_tt_redo_identity test_cluster_undo_native_tt_redo_identity.d \
+		test_cluster_undo_native_tt_recycle_identity test_cluster_undo_native_tt_recycle_identity.d \
+		test_cluster_undo_native_tt_birth_identity test_cluster_undo_native_tt_birth_identity.d
+
+test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h $(CLUSTER_UBA_O) \
 		test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
@@ -4607,15 +4839,28 @@ test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
 		xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) xlogreader_fs.o \
-		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 
 test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
-		$(CLUSTER_RF_ROUTE_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_RF_ROUTE_O) test_cluster_undo_desc_product.o \
+		test_cluster_undo_segment_init_backend.o \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_undo_desc_product.o: $(top_srcdir)/src/backend/access/rmgrdesc/clusterundodesc.c \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+# These objects share the in-memory folded identity and must not retain a
+# stale parsed/immutable layout when xact.h changes.
+test_cluster_side_xact_product.o test_cluster_side_online_plan.o \
+		test_cluster_side_online_owner_product.o test_cluster_side_xact_xactdesc.o \
+		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_UNDO_O): \
+		$(top_srcdir)/src/include/access/xact.h
 
 CLUSTER_SIDE_XACT_O = test_cluster_side_xact_product.o
 CLUSTER_REMOTE_XACT_IDENTITY_O = \
@@ -4672,7 +4917,8 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_ONLINE_TESTING -ffunction-sections -fdata-sections -c $< -o $@
 SIDE_XACT_XACTDESC_O = test_cluster_side_xact_xactdesc.o
-$(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c
+$(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c \
+		$(top_srcdir)/src/include/access/xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 SIDE_XACT_TT_2PC_RECORD_O = $(top_builddir)/src/backend/cluster/cluster_tt_2pc_record.o
 test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
@@ -6532,7 +6778,7 @@ test_cluster_stage5_5_cr_acceptance: test_cluster_stage5_5_cr_acceptance.c unit_
 # and stubs ShmemInitStruct / LWLock* / cluster_undo_smgr_{read,write}_block
 # locally (single-threaded pool-logic test).
 CLUSTER_UNDO_BUF_O = $(top_builddir)/src/backend/cluster/storage/cluster_undo_buf.o
-test_cluster_undo_buf: test_cluster_undo_buf.c unit_test.h $(CLUSTER_UNDO_BUF_O) \
+test_cluster_undo_buf: test_cluster_undo_buf.c unit_test.h cluster_unit_no_native_files.h $(CLUSTER_UNDO_BUF_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0.o \
 		$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_resident.o
@@ -6712,9 +6958,11 @@ test_cluster_subtrans_order: test_cluster_subtrans_order.c unit_test.h test_clus
 		$(top_srcdir)/src/backend/storage/sync/sync.c \
 		$(top_srcdir)/src/backend/postmaster/checkpointer.c \
 		$(top_srcdir)/src/backend/utils/hash/dynahash.c \
-		$(top_srcdir)/src/backend/nodes/list.c $(top_srcdir)/src/common/hashfn.c
+		$(top_srcdir)/src/backend/nodes/list.c $(top_srcdir)/src/common/hashfn.c \
+		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
-		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$< $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: actual native startup/trim, explicit memory SLRU boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -7446,6 +7694,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_wal_insert.inc
 	rm -f test_cluster_hw_remaster_native.inc
 	rm -f test_cluster_hw_authority_gate.inc
+	rm -f test_cluster_gcs_image_receipts.inc test_cluster_gcs_image_receive.inc
 	rm -f test_cluster_page_wal_pregrant.inc
 	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_page_flush.inc
@@ -7460,6 +7709,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc test_cluster_space_extend_resize.inc test_cluster_space_extend_zero.inc test_cluster_space_extend_handoff.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
+	rm -f test_cluster_undo_head_operation_native.inc
 	rm -f test_cluster_undo_bind_native.inc test_cluster_undo_tt_transition.inc
 	rm -f test_cluster_undo_path_native.inc test_cluster_undo_fd_native.inc test_cluster_undo_dir_native.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc
@@ -7511,6 +7761,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_ctrc_types.inc test_cluster_heap_ctrc_types.inc.tmp test_cluster_heap_ctrc_begin.inc test_cluster_heap_ctrc_begin.inc.tmp
 	rm -f test_cluster_heap_ctrc_step.inc test_cluster_heap_ctrc_step.inc.tmp
 	rm -f test_cluster_heap_ctrc_origin.inc test_cluster_heap_ctrc_origin.inc.tmp
+	rm -f test_cluster_heap_ctrc_origin_v2.inc test_cluster_heap_ctrc_origin_v2.inc.tmp
+	rm -f test_cluster_heap_ctrc_publication_domain.inc test_cluster_heap_ctrc_publication_domain.inc.tmp
 	rm -f test_cluster_heap_ctrc_participant.inc test_cluster_heap_ctrc_participant.inc.tmp
 	rm -f test_cluster_heap_ctrc_terminal.inc test_cluster_heap_ctrc_terminal.inc.tmp
 	rm -f test_cluster_heap_itl_finish_discharge.inc test_cluster_heap_itl_finish_discharge.inc.tmp
@@ -7521,6 +7773,10 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_lookup_pin.inc test_cluster_heap_lookup_pin.inc.tmp
 	rm -f test_cluster_heap_primitive_pin.inc test_cluster_heap_primitive_pin.inc.tmp
 	rm -f test_cluster_heap_private_ref.inc test_cluster_heap_private_ref.inc.tmp
+	rm -f test_cluster_heap_resource_owner.inc test_cluster_heap_resource_owner.inc.tmp
+	rm -f test_cluster_heap_ctrc_delegation.inc test_cluster_heap_ctrc_delegation.inc.tmp
+	rm -f test_cluster_heap_ctrc_delegation_path.inc test_cluster_heap_ctrc_delegation_path.inc.tmp
+	rm -f test_cluster_heap_ctrc_delegation_merge.inc test_cluster_heap_ctrc_delegation_merge.inc.tmp
 	rm -f test_cluster_heap_ctrc_certificate.inc test_cluster_heap_ctrc_certificate.inc.tmp
 	rm -f test_cluster_heap_ctrc_g_scan_relock.inc test_cluster_heap_ctrc_g_scan_relock.inc.tmp
 	rm -f test_cluster_heap_ctrc_ack.inc test_cluster_heap_ctrc_ack.inc.tmp
@@ -7601,7 +7857,8 @@ clean distclean maintainer-clean:
 		test_cluster_resource_x_eviction_owner.inc \
 		test_cluster_resource_x_failed_round_observation.inc \
 		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
-		test_cluster_ctrc_dispatch.inc \
+		test_cluster_ctrc_dispatch.inc test_cluster_ctrc_delegation_close.inc \
+		test_cluster_ctrc_delegation_forward.inc test_cluster_ctrc_delegation_reply.inc \
 		test_cluster_ctrc_run_pass.inc \
 		test_cluster_ctrc_read_scope.inc \
 		test_cluster_undo_cleaner_holds.inc \
@@ -8856,7 +9113,9 @@ $(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		test_cluster_undo_pending_product.o: $(top_srcdir)/src/include/cluster/cluster_tx_resolve.h
 $(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
-		$(top_srcdir)/src/include/cluster/cluster_undo_record.h
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
 # Execute the exact local current-MX consumer with the real runtime sampler.
@@ -8873,6 +9132,10 @@ test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
 
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c test_cluster_r4_canonical_sampling.h unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_ctrc_origin_fullxid.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		test_cluster_current_mx_local_sample.inc \
 		test_cluster_undo_pending_product.o \
@@ -8880,6 +9143,7 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c test_cluster_r4_canonic
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
@@ -10043,25 +10307,60 @@ test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
 
+$(top_builddir)/src/backend/cluster/cluster_tt_durable.o test_cluster_tt_durable \
+ test_cluster_tt_active_owner test_cluster_tt_abort_owner test_cluster_tt_rollback_entry: \
+		$(top_srcdir)/src/include/access/xact.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h
+
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked
 # cluster_undo_smgr.  File-I/O behavior is e2e in cluster_tap t/219.
+# Link the real SIDE reader with the real durable producer, without the
+# transition copies used by the standalone SIDE fixture.
+test_cluster_tt_reader_side_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_tt_durable: test_cluster_tt_durable.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(CLUSTER_TT_DURABLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_TT_DURABLE_O) \
+		$(CLUSTER_TT_DURABLE_O) test_cluster_tt_reader_side_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # Includes the real local consumer to seed otherwise unreachable partial
 # publication states; dead stripping removes unrelated local entry points.
+test_cluster_tt_normal_start.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^normal_start_terminal_header\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_normal_start: test_cluster_tt_normal_start.c unit_test.h \
+		test_cluster_tt_normal_start.inc test_cluster_normal_cold_scn.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+		test_cluster_undo_segment_init_backend.o $(CLUSTER_UBA_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_undo_segment_init_backend.o $(CLUSTER_UBA_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_tt_rollback_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_recovery.c Makefile
 	awk '/^typedef struct TTRevertExpect/ { fields=1; types++ } \
 	     fields { print } /^} TTRevertExpect;/ { fields=0 } \
-	     /^cluster_tt_recovery_physical_rollback\(/ { print "int"; emit=1; found++ } \
+	     /^startup_scan_header_valid\(/ { print "static bool"; emit=1; helpers++ } \
+	     /^startup_scan_slot\(/ { print "static TTSlot"; emit=1; helpers++ } \
+	     /^cluster_tt_recovery_(observe_scn_highwater|physical_rollback)\(/ \
+	         { print "int"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (types != 1 || found != 1) exit 1 }' $< > $@
+	     END { if (types != 1 || helpers != 2 || found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_tt_resolve_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_recovery.c Makefile
 	awk '/^tt_recovery_read_header\(/ { print "static bool"; emit=1; found++ } \
@@ -10074,7 +10373,30 @@ test_cluster_tt_resolve_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_
 test_cluster_tt_rollback_entry: test_cluster_tt_rollback_entry.c test_cluster_tt_durable.c \
 		unit_test.h test_cluster_tt_rollback_entry.inc test_cluster_tt_resolve_entry.inc $(CLUSTER_TT_DURABLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_TT_DURABLE_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+# Complete lexical Startup owner; no test-only authority constructor.
+test_cluster_tt_startup_local_owner.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^\/\* STARTUP_LOCAL owner begin \*\// { emit=1; found++; next } \
+	     /^\/\* STARTUP_LOCAL owner end \*\// { emit=0; ended++; next } \
+	     emit { print } END { if (found != 1 || ended != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_startup_local: test_cluster_tt_startup_local.c test_cluster_undo_block0.c \
+		cluster_unit_no_native_files.h \
+		unit_test.h test_cluster_tt_startup_local_owner.inc $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/backend/cluster/cluster_tt_recovery.o \
+		$(top_builddir)/src/backend/cluster/cluster_version.o \
+		$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0.o \
+		$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_resident.o \
+		$(top_builddir)/src/backend/cluster/cluster_undo_root_descriptor.o \
+		$(top_srcdir)/src/include/cluster/cluster_tt_startup.h
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/backend/cluster/cluster_tt_recovery.o \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(PTHREAD_LIBS) -o $@
 
 test_cluster_tt_abort_owner: test_cluster_tt_abort_owner.c test_cluster_tt_durable.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
@@ -10474,12 +10796,41 @@ test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
-		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O)
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) test_cluster_undo_segment_init_backend.o
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
-		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) test_cluster_undo_segment_init_backend.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) $(PTHREAD_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(PTHREAD_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+# Exercise the original resident CU and its exact pin/ResourceOwner paths.
+test_cluster_undo_native_tt_resident: test_cluster_undo_native_tt_resident.c \
+		test_cluster_undo_block0.c cluster_unit_no_native_files.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0_resident.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_root_descriptor.c \
+		$(top_srcdir)/src/backend/cluster/cluster_version.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0_resident.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_root_descriptor.c \
+		$(top_srcdir)/src/backend/cluster/cluster_version.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(PTHREAD_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+TESTS += test_cluster_undo_native_tt_resident
+all: test_cluster_undo_native_tt_resident
+clean: clean-native-tt-resident
+.PHONY: clean-native-tt-resident
+clean-native-tt-resident:
+	rm -f test_cluster_undo_native_tt_resident test_cluster_undo_native_tt_resident.d
 
 # Spec 8.4A Candidate-2: the fixture includes the exact current owner source
 # so it can pin private key/phase invariants without exporting test-only ABI.
@@ -10488,8 +10839,10 @@ test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 # as well would create duplicate definitions instead of adding coverage.
 test_cluster_undo_block0_current: test_cluster_undo_block0_current.c unit_test.h \
 		$(CLUSTER_UNDO_BLOCK0_CURRENT_O) $(CLUSTER_UNDO_BLOCK0_O) \
-		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(CLUSTER_GES_REPLY_WAIT_O) $(CLUSTER_GES_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(CLUSTER_GES_REPLY_WAIT_O) $(CLUSTER_GES_O) \
+		test_cluster_undo_segment_init_backend.o $(CLUSTER_UNDO_ALLOC_TEST_O) $(CLUSTER_UNDO_RETENTION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_undo_segment_init_backend.o \
+		$(CLUSTER_UNDO_ALLOC_TEST_O) $(CLUSTER_UNDO_RETENTION_O) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
@@ -10498,6 +10851,7 @@ test_cluster_undo_block0_current: test_cluster_undo_block0_current.c unit_test.h
 # the real undo buffer pool and block-zero objects, so the checkpoint step runs
 # unmodified.
 test_cluster_undo_header_durability: test_cluster_undo_header_durability.c unit_test.h \
+		cluster_unit_no_native_files.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(CLUSTER_UNDO_BUF_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0.o \
@@ -10602,13 +10956,137 @@ test_cluster_tt_checkpoint_cuts test_cluster_tt_checkpoint_native test_cluster_t
 
 # Spec 8.4A P3 first publication: the fixture includes the real smgr source
 # and runs typed final-path/no-replace behavior against a private temp dir.
+test_cluster_undo_publication_alloc_product.o: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_undo_path_resolve=undo_publication_unused_path_resolve \
+		-c $< -o $@
+
 test_cluster_undo_smgr_publication: test_cluster_undo_smgr_publication.c unit_test.h \
+		cluster_unit_no_native_files.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h cluster_unit_page_checksum.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< cluster_unit_page_checksum.o \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Native TT identity reader reuses the unchanged legacy file-I/O providers,
+# replacing only the selected control table with a bounded custody provider.
+test_cluster_undo_native_tt_read: test_cluster_undo_native_tt_read.c \
+		test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_read
+all: test_cluster_undo_native_tt_read
+clean-undo-native-tt-read:
+	rm -f test_cluster_undo_native_tt_read test_cluster_undo_native_tt_read.d
+clean: clean-undo-native-tt-read
+.PHONY: clean-undo-native-tt-read
+
+test_cluster_undo_native_tt_probe: test_cluster_undo_native_tt_probe.c \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_probe
+all: test_cluster_undo_native_tt_probe
+clean-undo-native-tt-probe:
+	rm -f test_cluster_undo_native_tt_probe test_cluster_undo_native_tt_probe.d
+clean: clean-undo-native-tt-probe
+.PHONY: clean-undo-native-tt-probe
+
+# The physical TT writer shares the original file providers and read fixture;
+# only the finite selected table and ERROR schedule are controlled there.
+test_cluster_undo_native_tt_write: test_cluster_undo_native_tt_write.c \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_write
+all: test_cluster_undo_native_tt_write
+clean-undo-native-tt-write:
+	rm -f test_cluster_undo_native_tt_write test_cluster_undo_native_tt_write.d
+clean: clean-undo-native-tt-write
+.PHONY: clean-undo-native-tt-write
+
+# Noncritical header range I/O and original checkpoint/fsync dispatch share
+# the physical TT providers; control/recorder outcomes are explicitly finite.
+test_cluster_undo_native_tt_header_io: test_cluster_undo_native_tt_header_io.c \
+		test_cluster_undo_native_tt_write.c test_cluster_undo_native_tt_read.c \
+		test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_header_io
+all: test_cluster_undo_native_tt_header_io
+clean-undo-native-tt-header-io:
+	rm -f test_cluster_undo_native_tt_header_io test_cluster_undo_native_tt_header_io.d
+clean: clean-undo-native-tt-header-io
+.PHONY: clean-undo-native-tt-header-io
+
+test_cluster_undo_native_tt_staged_writer: test_cluster_undo_native_tt_staged_writer.c \
+		test_cluster_undo_native_tt_header_io.c test_cluster_undo_native_tt_write.c \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_staged_writer
+all: test_cluster_undo_native_tt_staged_writer
+clean-undo-native-tt-staged-writer:
+	rm -f test_cluster_undo_native_tt_staged_writer test_cluster_undo_native_tt_staged_writer.d
+clean: clean-undo-native-tt-staged-writer
+.PHONY: clean-undo-native-tt-staged-writer
 
 # spec-8.4 D13: these activation policy targets include the real
 # dependency-light product source so static codec/FSM/lock-policy helpers are
@@ -10718,6 +11196,7 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		test_cluster_terminal_peer.inc \
 		test_cluster_stop_membership_observation.inc \
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \
+		test_cluster_tt_startup_local_owner.inc \
 		test_cluster_normal_cold_prepare.inc test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
@@ -11416,9 +11895,68 @@ test_cluster_retention_sample.inc: $(top_srcdir)/src/backend/storage/ipc/procarr
 	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Read the original per-boot native promise without sampling another H cut.
+test_cluster_retention_promise.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^cluster_undo_retention_horizon_covers\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original finite read publication, serialized with successful native H cuts.
+test_cluster_retention_publish.inc: $(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^ProcArrayPublishReadScn\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original feedback publication and its native slot aggregation dependencies.
+test_cluster_retention_feedback.inc: $(top_srcdir)/src/backend/replication/walsender.c Makefile
+	awk '/^PhysicalReplicationSlotNewXminGuts\(/ { print "static void"; emit=1; count++ } \
+	     /^PhysicalReplicationSlotNewXmin\(/ { print "static void"; emit=1; count++ } \
+	     /^PhysicalReplicationFeedbackNewXmin\(/ { print "static void"; emit=1; count++ } \
+	     /^TransactionIdInRecentPast\(/ { print "static bool"; emit=1; count++ } \
+	     /^ProcessStandbyHSFeedbackMessage\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_retention_slot.inc: $(top_srcdir)/src/backend/replication/slot.c \
+		$(top_srcdir)/src/backend/storage/ipc/procarray.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c Makefile
+	awk '/^ReplicationSlotMarkDirty\(/ { print "void"; emit=1; count++ } \
+	     /^ReplicationSlotsComputeRequiredXmin\(/ { print "void"; emit=1; count++ } \
+	     /^ProcArraySetReplicationSlotXmin\(/ { print "void"; emit=1; count++ } \
+	     /^ProcArrayReplicationFeedbackAllowed\(/ { print "bool"; emit=1; count++ } \
+	     /^TransactionIdPrecedes\(/ { print "bool"; emit=1; count++ } \
+	     /^TransactionIdPrecedesOrEquals\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 6 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_retention_logical.inc: $(top_srcdir)/src/backend/replication/logical/logical.c \
+		$(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
+	awk '/^CreateInitDecodingContext\(/ { print "LogicalDecodingContext *"; emit=1; count++ } \
+	     /^GetOldestSafeDecodingTransactionId\(/ { print "TransactionId"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 2 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_retention_copy.inc: $(top_srcdir)/src/backend/replication/slotfuncs.c Makefile
+	awk '/^create_physical_replication_slot\(/ { print "static void"; emit=1; count++ } \
+	     /^copy_replication_slot\(/ { print "static Datum"; emit=1; count++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_retention_sample: test_cluster_retention_sample.c unit_test.h \
+		test_cluster_retention_publish.inc test_cluster_retention_promise.inc \
+		test_cluster_retention_feedback.inc test_cluster_retention_slot.inc \
+		test_cluster_retention_logical.inc test_cluster_retention_copy.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(top_srcdir)/src/include/access/twophase.h \
+		$(top_srcdir)/src/include/replication/logical.h \
+		$(top_srcdir)/src/include/replication/reorderbuffer.h \
+		$(top_srcdir)/src/include/funcapi.h $(top_srcdir)/src/include/access/htup_details.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h $(CLUSTER_UNDO_RETENTION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
@@ -11447,13 +11985,16 @@ test_cluster_heap_freeze_startup_source.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-# Execute the original ordinary TARGET and read-only census admission checks.
+# Execute the original ordinary TARGET/read-only census checks and gate publisher.
 test_cluster_heap_freeze_admission_current.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_(admission_policy|r4_terminal_census_policy)\(/ { print "static ClusterSemanticAdmissionResult"; emit=1; count++ } \
 	     /^semantic_activation_feature_(bit_)?index\(/ { print "static bool"; emit=1; count++ } \
+	     /^semantic_activation_lmon_publish_gate\(/ { signature="static bool\n" $$0; pending=1; next } \
+	     pending { signature=signature "\n" $$0; if ($$0 ~ /;$$/) pending=0; \
+	               else if ($$0 == "{") { print signature; pending=0; emit=1; count++ } next } \
 	     /^cluster_semantic_activation_recheck(_r4_terminal_census)?\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
-	     END { if (count != 6 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 7 || emit || pending) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Original terminal-census admission, debt counters and backend exit cleanup.
@@ -11549,7 +12090,7 @@ test_cluster_ctrc_worker_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_u
 	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
+test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch test_cluster_ctrc_delegation_close \
 test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc_read_scope.inc \
 		test_cluster_ctrc_worker_sample.inc \
 		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
@@ -11560,10 +12101,12 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 		$(top_srcdir)/src/include/storage/pg_sema.h $(top_srcdir)/src/include/utils/wait_event.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h
 
-test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc \
+test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc $(top_srcdir)/src/include/storage/checksum.h \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
-		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h unit_test.h \
+		$(top_builddir)/src/backend/storage/page/checksum.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
@@ -11571,15 +12114,17 @@ test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleane
 	$(top_srcdir)/src/include/miscadmin.h
 
 # These fixtures use the real shared engine and PGPROC allocation identity.
-test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
+test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch test_cluster_ctrc_delegation_close \
 		test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: \
 		$(top_srcdir)/src/include/storage/proc.h
 
-test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc test_cluster_gcs_image_receipts.inc test_cluster_gcs_image_receive.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_SCN_O) \
 		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
@@ -11689,6 +12234,40 @@ test_cluster_ctrc_itl_reuse: test_cluster_ctrc_itl_reuse.c test_cluster_ctrc_cle
 # Verbatim actual dispatcher bodies, with the same fail-if-missing extraction
 # discipline as the terminal-ingress fixture above. Only boundary dependencies
 # are fixture doubles; shared participant/receipt mutations are production C.
+# Compile the complete original receiving handler and checksum, never a local rewrite.
+test_cluster_ctrc_delegation_close.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_compute_checksum\(/ { print "static uint32"; emit=1; checksum++ } \
+	     /^gcs_block_try_ctrc_forward136\(/ { print "static bool"; emit=1; forward++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (checksum != 1 || forward != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_delegation_forward.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_ctrc_dispatch_delegated_request\(/ { print "static bool"; emit=1; common++ } \
+	     /^cluster_gcs_ctrc_dispatch_delegated_close\(/ { print "bool"; emit=1; found++ } \
+	     /^cluster_gcs_ctrc_dispatch_delegated_certificate\(/ { print "bool"; emit=1; certificate++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || common != 1 || certificate != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_delegation_reply.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_land_delegation_merge_reply\(/ { print "static void"; emit=1; merge++ } \
+	     /^gcs_block_land_root_subtree_reply\(/ { print "static void"; emit=1; root++ } \
+	     /^gcs_block_try_land_ctrc_reply\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || merge != 1 || root != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_delegation_close: test_cluster_ctrc_delegation_close.c test_cluster_ctrc_dispatch.c \
+		test_cluster_ctrc_cleaner.c test_cluster_ctrc_dispatch.inc test_cluster_ctrc_delegation_close.inc \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_delegation_forward.inc \
+		test_cluster_ctrc_delegation_reply.inc unit_test.h $(CLUSTER_SCN_O) $(CLUSTER_UBA_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_SCN_O) $(CLUSTER_UBA_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
 test_cluster_ctrc_dispatch.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_ctrc_dispatch_prepare\(/ { print "static bool"; emit=1; prepare++ } \
 	     /^gcs_ctrc_dispatch_local_certificates\(/ { print "static void"; emit=1; local++ } \
@@ -12692,6 +13271,7 @@ test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/trans
 		END { if (emit || starts != 1) exit 1 }' $< > $@
 
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		test_cluster_retention_publish.inc \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
 		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
 		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
@@ -12772,8 +13352,9 @@ clean-undo-horizon-cleaner:
 	rm -f test_cluster_undo_horizon_cleaner.inc test_cluster_undo_horizon_cleaner.inc.tmp
 
 test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
+		test_cluster_ko_native_capability.inc \
 		test_cluster_undo_horizon_cleaner.inc \
-		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc \
+		$(srcdir)/test_cluster_undo_horizon_retention_fixture.inc test_cluster_retention_promise.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
 		$(CLUSTER_UNDO_RETENTION_O) \
 		test_cluster_subtrans_watermark.inc $(CLUSTER_XID_STRIPE_O) \
@@ -13802,17 +14383,61 @@ test_cluster_vacuum_shared_mx.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 
 # Real admission/resident-page owners and inner guard cleanup, with injected errors.
 test_cluster_vacuum_proof_cleanup.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
-	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
+	awk '/^(lazy_release_shared_freeze_sources|lazy_foreign_shared_freeze_companion_current)\(/ { print "static bool"; emit=1; target++ } \
+	     /^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; cleanout++ } \
 	     /^lazy_shared_freeze_transport_snapshot\(/ { print "static void"; emit=1; cost++ } \
 	     /^(lazy_recheck_shared_freeze_page|lazy_observe_shared_freeze_bounds|lazy_collect_shared_freeze_proofs(_admitted)?)\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 4 || target != 2 || cleanout > 1 || cost > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # The real seqlock read used by opt-in collector admission ownership tests.
 test_cluster_vacuum_admitted_phase.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
-	awk '/^lazy_collect_shared_freeze_proofs_admitted\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	awk '/^(lazy_release_shared_freeze_sources|lazy_foreign_shared_freeze_companion_current)\(/ { print "static bool"; emit=1; target++ } \
+	     /^lazy_collect_shared_freeze_proofs_admitted\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || target != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# Execute the original outer VACUUM admission owner around the admitted phase.
+test_cluster_vacuum_proof_owner.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_collect_shared_freeze_proofs\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original optional cleanout before the resident recheck exports row inputs.
+test_cluster_vacuum_freeze_cleanout.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_cleanout_shared_freeze_page\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# The original recent-resident proof recheck, including its local cleanup.
+test_cluster_vacuum_resident_recheck.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_recheck_shared_freeze_page\(/ { print "static ClusterHeapFreezeProofStatusV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Original recent-resident lookup, first-pin owner and release API.
+test_cluster_vacuum_recent_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ReadRecentBuffer\(/ { print "static bool"; emit=1; found++ } \
+	     /^(PinBuffer_Locked|ReleaseBuffer)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+
+# Original read/hint local-unlock/unpin pairs; mutation already comes from
+# test_cluster_freeze_writer_context.inc, with no duplicate definition.
+test_cluster_vacuum_resident_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ClusterUnlockReleaseBufferAfterConditional(Read|Hint)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+.PHONY: clean-vacuum-proof-owner
+clean-vacuum-proof-owner:
+	rm -f test_cluster_vacuum_proof_owner.inc test_cluster_vacuum_proof_owner.inc.tmp
+	rm -f test_cluster_vacuum_resident_recheck.inc test_cluster_vacuum_resident_recheck.inc.tmp
+	rm -f test_cluster_vacuum_recent_pin.inc test_cluster_vacuum_recent_pin.inc.tmp
+	rm -f test_cluster_vacuum_resident_release.inc test_cluster_vacuum_resident_release.inc.tmp
+
+clean distclean maintainer-clean: clean-vacuum-proof-owner
 
 test_cluster_vacuum_admission_snapshot.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; count++ } \
@@ -14579,6 +15204,12 @@ clean-active-sample-fence:
 clean distclean maintainer-clean: clean-retention-sample
 .PHONY: clean-retention-sample
 clean-retention-sample:
+	rm -f test_cluster_retention_publish.inc test_cluster_retention_publish.inc.tmp
+	rm -f test_cluster_retention_promise.inc test_cluster_retention_promise.inc.tmp
+	rm -f test_cluster_retention_feedback.inc test_cluster_retention_feedback.inc.tmp
+	rm -f test_cluster_retention_slot.inc test_cluster_retention_slot.inc.tmp
+	rm -f test_cluster_retention_logical.inc test_cluster_retention_logical.inc.tmp
+	rm -f test_cluster_retention_copy.inc test_cluster_retention_copy.inc.tmp
 	rm -f test_cluster_retention_sample.inc test_cluster_retention_sample.inc.tmp
 
 # Original backend-local writer, with controlled ownership/object/pin leaves.
@@ -14596,8 +15227,21 @@ test_cluster_freeze_writer_context.inc: $(top_srcdir)/src/backend/storage/buffer
 	     END { if (types != 2 || array != 1 || find != 2 || exact != 1 || capture != 2 || resume != 1 || cleanup != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_vacuum_cleanup_pin.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	@awk '/^(ConditionalLockBufferForCleanup|IsBufferCleanupOK)\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vacuum_initial_writer.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	@awk '/^lazy_lock_buffer_for_cleanup\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_freeze_writer_context: test_cluster_freeze_writer_context.c unit_test.h \
-		test_cluster_freeze_writer_context.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		test_cluster_freeze_writer_context.inc test_cluster_vacuum_cleanup_pin.inc \
+		test_cluster_vacuum_initial_writer.inc $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_srcdir)/src/include/storage/bufmgr.h \
 		$(top_srcdir)/src/include/storage/buf_internals.h \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
@@ -15742,7 +16386,7 @@ clean-recovery-identity-codec:
 	rm -f test_cluster_recovery_file_identity test_cluster_recovery_file_identity.d
 
 # Managed envelope: real pair I/O, while control registration remains external.
-test_cluster_relmap_file: test_cluster_relmap_file.c unit_test.h \
+test_cluster_relmap_file: test_cluster_relmap_file.c test_cluster_relmap_file_replay_create.inc unit_test.h \
 		$(top_srcdir)/src/common/cluster_relmap_file_io.c \
 		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \

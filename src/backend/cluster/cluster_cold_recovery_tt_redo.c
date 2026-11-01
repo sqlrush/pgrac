@@ -28,6 +28,29 @@
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_undo_segment_init.h"
 
+#include "cluster_cold_recovery_tt_internal.h"
+
+/* These are exact native identities. Legacy records never acquire a full
+ * identity by widening their raw xid at this reader. */
+static bool
+cold_tt_native_identity(const ClusterUndoDecoded *record, uint8 legacy_version)
+{
+	return record->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+		? cluster_undo_preflight_tt_v2(record)
+		: record->format_version == legacy_version && record->original_full_xid == 0;
+}
+
+static bool
+cold_tt_native_identity_matches(const ClusterUndoDecoded *record,
+								const ClusterColdTtSlotInputV1 *input, uint8 legacy_version)
+{
+	return cold_tt_native_identity(record, legacy_version)
+		&& (input->tt_layout_version == CLUSTER_UNDO_TT_LAYOUT_V2
+			? record->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+				&& record->original_full_xid == input->original_full_xid
+			: record->format_version == legacy_version && input->original_full_xid == 0);
+}
+
 static bool
 cold_tt_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner, uint32 segment,
 			   bool *has_header_work)
@@ -89,7 +112,8 @@ cold_tt_source(const ClusterColdTypedV1 *typed, uint32 participant, uint8 owner,
 			&& (operation.undo.kind == CLUSTER_UNDO_KIND_TT_COMMIT
 				|| operation.undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
 				|| (operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
-					&& operation.undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)))
+					&& !cold_tt_native_identity(&operation.undo,
+						CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))))
 			return false;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO && operation.undo.instance == owner
 			&& operation.undo.segment_id == segment)
@@ -146,6 +170,8 @@ cluster_cold_typed_tt_redo_header_v1(const ClusterColdTypedV1 *typed, uint32 par
 		memcpy(image.page.data, base, BLCKSZ);
 		image.source_index = UINT32_MAX;
 	}
+	if (!cold_tt_header_readable((const UndoSegmentHeaderData *)image.page.data, owner, segment))
+		return false;
 	*out = image;
 	return true;
 }
@@ -335,10 +361,9 @@ cluster_cold_typed_tt_redo_slot_v1(const ClusterColdTypedV1 *typed, uint32 parti
 		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &image))
 		return false;
 	header = (const UndoSegmentHeaderData *)image.page.data;
-	input.slot = header->tt_slots[slot_offset];
-	input.key.segment_generation = header->wrap_count;
-	input.key.xid = input.slot.xid;
-	input.key.slot_wrap = input.slot.wrap;
+	if (!cold_tt_header_readable(header, input.key.owner_instance, input.key.segment_id))
+		return false;
+	cold_tt_slot_copy(header, input.key.owner_instance, input.key.segment_id, slot_offset, &input);
 	*out = input;
 	return true;
 }
@@ -431,7 +456,7 @@ static bool cold_top_tx_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 pa
 static const UndoSegmentHeaderData *
 cold_typed_checkpoint_actor_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 							   TransactionId xid, XLogRecPtr read_rec_ptr,
-							   ClusterColdTtSlotKeyV1 *out_key)
+							   ClusterColdTtSlotInputV1 *out)
 {
 	const UndoSegmentHeaderData *found = NULL;
 	uint32 count = cluster_cold_tt_base_count_v1(typed);
@@ -453,20 +478,19 @@ cold_typed_checkpoint_actor_v1(const ClusterColdTypedV1 *typed, uint32 participa
 		if (owner != typed->participants[participant].thread_id)
 			continue;
 		integrity = cluster_undo_segment_header_integrity(header);
-		if (integrity == CLUSTER_UNDO_HEADER_CORRUPT
-			|| !UndoSegmentHeader_identity_matches((const char *)header, segment, owner))
+		if (!cold_tt_header_readable(header, owner, segment))
 			return NULL;
 		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
 			ClusterColdTtSlotInputV1 input;
 
-			if (header->tt_slots[slot].status != TT_SLOT_ACTIVE
-				|| header->tt_slots[slot].xid != xid)
+			cold_tt_slot_copy(header, owner, segment, slot, &input);
+			if (input.slot.status != TT_SLOT_ACTIVE || input.slot.xid != xid)
 				continue;
 			if (found != NULL || integrity != CLUSTER_UNDO_HEADER_VALID
 				|| !cluster_cold_tt_base_slot_v1(typed, i, slot, &input)
 				|| !cold_top_tx_key_valid_v1(&input.key))
 				return NULL;
-			*out_key = input.key;
+			*out = input;
 			found = header;
 		}
 	}
@@ -480,13 +504,13 @@ cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 							uint32 own_operation, ClusterColdTtSlotKeyV1 *out_key)
 {
 	ClusterColdTtSlotKeyV1 key = { 0 };
+	ClusterColdTtSlotInputV1 original = { 0 }, input;
 	const ClusterColdParticipantV1 *source;
 	const RfSideOnlinePlanV1 *plan;
 	RfSideOnlineOperationV1 prefix;
 	RfSideUndoHeaderImageV1 image;
 	const UndoSegmentHeaderData *base = NULL;
 	const UndoSegmentHeaderData *header;
-	const TTSlot *slot;
 	uint32 count, prefix_index = UINT32_MAX;
 	XLogRecPtr commit_end = InvalidXLogRecPtr;
 	bool has_header_work, found = false;
@@ -527,7 +551,7 @@ cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 		if (operation.kind != RF_SIDE_ONLINE_OPERATION_UNDO
 			|| bind->kind != CLUSTER_UNDO_KIND_TT_BIND || bind->xid != source_xid)
 			continue;
-		if (found || bind->format_version != CLUSTER_UNDO_TT_BIND_VERSION
+		if (found || !cold_tt_native_identity(bind, CLUSTER_UNDO_TT_BIND_VERSION)
 			|| bind->instance != source->thread_id
 			|| (TransactionIdIsValid(operation.source_xid) && operation.source_xid != bind->xid)
 			|| (TransactionIdIsValid(operation.source_top_xid)
@@ -539,14 +563,19 @@ cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 		key.slot_offset = bind->slot_offset;
 		key.slot_wrap = bind->wrap;
 		key.xid = bind->xid;
+		original.original_full_xid = bind->original_full_xid;
+		original.tt_layout_version = bind->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+			? CLUSTER_UNDO_TT_LAYOUT_V2 : 0;
 		prefix = operation;
 		prefix_index = i;
 		found = true;
 	}
 	if (!found) {
-		base = cold_typed_checkpoint_actor_v1(typed, participant, source_xid, read_rec_ptr, &key);
+		base = cold_typed_checkpoint_actor_v1(typed, participant, source_xid, read_rec_ptr,
+			&original);
 		if (base == NULL)
 			return false;
+		key = original.key;
 	}
 	if (!cold_top_tx_key_valid_v1(&key))
 		return false;
@@ -592,9 +621,12 @@ cold_typed_actor_binding_v1(const ClusterColdTypedV1 *typed, uint32 participant,
 			return false;
 		header = (const UndoSegmentHeaderData *)image.page.data;
 	}
-	slot = &header->tt_slots[key.slot_offset];
-	if (header->wrap_count != key.segment_generation || slot->status != TT_SLOT_ACTIVE
-		|| slot->xid != key.xid || slot->wrap != key.slot_wrap)
+	if (!cold_tt_header_readable(header, key.owner_instance, key.segment_id))
+		return false;
+	cold_tt_slot_copy(header, key.owner_instance, key.segment_id, key.slot_offset, &input);
+	if (!cold_top_tx_key_equal_v1(&input.key, &key) || input.slot.status != TT_SLOT_ACTIVE
+		|| input.tt_layout_version != original.tt_layout_version
+		|| input.original_full_xid != original.original_full_xid)
 		return false;
 	*out_key = key;
 	return true;
@@ -706,8 +738,9 @@ cluster_cold_top_tx_c0_v1(const ClusterColdLoserIdentityV1 *loser,
  * older ACTIVE without this input still needs a qualified canonical base.
  * Neither raw ACTIVE bytes nor another slot's BIND can supply that fact. */
 static bool
-cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSlotKeyV1 *key)
+cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSlotInputV1 *active)
 {
+	const ClusterColdTtSlotKeyV1 *key = &active->key;
 	uint32 count = rf_side_online_plan_operation_count_v1(plan);
 
 	if (count == UINT32_MAX)
@@ -720,7 +753,7 @@ cold_top_tx_native_bind_v1(const RfSideOnlinePlanV1 *plan, const ClusterColdTtSl
 			return false;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
 			&& bind->kind == CLUSTER_UNDO_KIND_TT_BIND
-			&& bind->format_version == CLUSTER_UNDO_TT_BIND_VERSION
+			&& cold_tt_native_identity_matches(bind, active, CLUSTER_UNDO_TT_BIND_VERSION)
 			&& bind->instance == key->owner_instance && bind->segment_id == key->segment_id
 			&& bind->expected_generation == key->segment_generation
 			&& bind->slot_offset == key->slot_offset && bind->wrap == key->slot_wrap
@@ -748,17 +781,19 @@ cold_top_tx_empty_bind_prefix_v1(const RfSideOnlinePlanV1 *plan, uint32 previous
 	RfSideOnlineOperationV1 operation;
 	RfSideUndoHeaderImageV1 image;
 	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)image.page.data;
-	const TTSlot *slot = &header->tt_slots[key->slot_offset];
+	ClusterColdTtSlotInputV1 input;
 
 	if (previous == UINT32_MAX || !rf_side_online_plan_operation_v1(plan, previous, &operation)
 		|| rf_side_online_plan_prepare_undo_record_input_header_v1(
 			   plan, previous, &operation.identity, NULL, &image) != RF_PAGE_PROOF_DETAIL_OK
-		|| !image.has_full_image)
+		|| !image.has_full_image
+		|| !cold_tt_header_readable(header, key->owner_instance, key->segment_id))
 		return false;
-	return header->owner_instance == key->owner_instance && header->segment_id == key->segment_id
-		   && header->wrap_count == key->segment_generation && slot->status == TT_SLOT_UNUSED
-		   && !TransactionIdIsValid(slot->xid) && slot->commit_scn == 0
-		   && UBA_is_invalid(slot->first_undo_block);
+	cold_tt_slot_copy(header, key->owner_instance, key->segment_id, key->slot_offset, &input);
+	return input.key.segment_generation == key->segment_generation
+		&& input.slot.status == TT_SLOT_UNUSED && !TransactionIdIsValid(input.slot.xid)
+		&& input.original_full_xid == 0 && input.slot.commit_scn == 0
+		&& UBA_is_invalid(input.slot.first_undo_block);
 }
 
 /* Establish a complete fresh lifecycle from the original native UNUSED image,
@@ -836,7 +871,7 @@ cold_top_tx_fresh_effects_v1(const ClusterColdTypedV1 *typed, uint32 participant
 			&& undo->kind == CLUSTER_UNDO_KIND_TT_BIND && undo->instance == key->owner_instance
 			&& undo->xid == key->xid) {
 			if (found || p != participant || (!physical_effects && operation.history_only)
-				|| undo->format_version != CLUSTER_UNDO_TT_BIND_VERSION
+				|| !cold_tt_native_identity_matches(undo, active, CLUSTER_UNDO_TT_BIND_VERSION)
 				|| undo->segment_id != key->segment_id
 				|| undo->expected_generation != key->segment_generation
 				|| undo->slot_offset != key->slot_offset || undo->wrap != key->slot_wrap
@@ -1025,7 +1060,8 @@ cold_top_tx_frames_v1(const ClusterColdTypedV1 *typed, const ClusterColdTtSlotKe
 			if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
 				&& (operation.undo.kind == CLUSTER_UNDO_KIND_TT_BIND
 					|| (operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
-						&& operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION))
+						&& cold_tt_native_identity(&operation.undo,
+							CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)))
 				&& TransactionIdIsValid(operation.source_xid)
 				&& operation.source_xid != operation.undo.xid)
 				return false;
@@ -1087,7 +1123,8 @@ cold_top_tx_terminals_compatible_v1(const ClusterColdTypedV1 *typed,
 				terminal.xid = delta->xid;
 			} else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO
 					   && operation.undo.kind == CLUSTER_UNDO_KIND_TT_ABORT
-					   && operation.undo.format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION) {
+					   && cold_tt_native_identity(&operation.undo,
+						   CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)) {
 				const ClusterUndoDecoded *abort = &operation.undo;
 
 				terminal.owner_instance = abort->instance;
@@ -1165,8 +1202,9 @@ cold_top_tx_checkpoint_v1(const ClusterColdTypedV1 *typed, uint32 participant)
  * nor can another generation/slot/wrap/xid borrow this predecessor. */
 static bool
 cold_top_tx_checkpoint_base_v1(const ClusterColdTypedV1 *typed,
-								const ClusterColdTtSlotKeyV1 *key)
+									const ClusterColdTtSlotInputV1 *active)
 {
+	const ClusterColdTtSlotKeyV1 *key = &active->key;
 	const UndoSegmentHeaderData *base;
 	ClusterColdTtSlotInputV1 original;
 	uint32 index;
@@ -1177,7 +1215,9 @@ cold_top_tx_checkpoint_base_v1(const ClusterColdTypedV1 *typed,
 		   && cluster_undo_segment_header_integrity(base) == CLUSTER_UNDO_HEADER_VALID
 		   && cluster_cold_tt_base_slot_v1(typed, index, key->slot_offset, &original)
 		   && original.slot.status == TT_SLOT_ACTIVE
-		   && cold_top_tx_key_equal_v1(&original.key, key);
+		   && cold_top_tx_key_equal_v1(&original.key, key)
+		   && original.tt_layout_version == active->tt_layout_version
+		   && original.original_full_xid == active->original_full_xid;
 }
 
 static bool
@@ -1223,7 +1263,7 @@ cold_ctrc_release_census_v1(const ClusterColdTypedV1 *typed, ClusterColdCtrcWork
 		bool qualified;
 
 		post = cluster_cold_tt_after_redo_header_v1(typed, index, &owner, &segment);
-		if (post == NULL) return false;
+		if (post == NULL || !cold_tt_header_readable(post, owner, segment)) return false;
 		for (uint32 p = 0; p < typed->replay_count; p++)
 			if (typed->participants[p].thread_id == owner) {
 				if (participant != UINT32_MAX) return false;
@@ -1248,8 +1288,11 @@ cold_ctrc_release_census_v1(const ClusterColdTypedV1 *typed, ClusterColdCtrcWork
 				== RF_PAGE_PROOF_DETAIL_OK;
 		if (!qualified) value.unqualified_count++;
 		for (uint32 slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++) {
-			const TTSlot *subject = &post->tt_slots[slot];
+			ClusterColdTtSlotInputV1 subject_input;
+			const TTSlot *subject = &subject_input.slot;
 			TTSlot unused = { 0 };
+
+			cold_tt_slot_copy(post, owner, segment, slot, &subject_input);
 			unused.wrap = subject->wrap;
 			if (memcmp(subject, &unused, sizeof(unused)) == 0) continue;
 			if (value.subject_count == UINT32_MAX) return false;
@@ -1257,7 +1300,7 @@ cold_ctrc_release_census_v1(const ClusterColdTypedV1 *typed, ClusterColdCtrcWork
 				ClusterColdTtSlotInputV1 input;
 				if (value.subject_count >= work->counts.subject_count
 					|| !cluster_cold_tt_after_redo_slot_v1(typed, index, slot, &input)
-					|| memcmp(&input.slot, subject, sizeof(*subject)) != 0)
+					|| memcmp(&input, &subject_input, sizeof(input)) != 0)
 					return false;
 				work->entries[value.subject_count] = input;
 			}
@@ -1355,10 +1398,10 @@ cluster_cold_typed_top_tx_loser_producer_v1(
 	/* Either the verified original checkpoint base or this source's exact
 	 * native BIND proves the supported top-only producer format. The caller's
 	 * producer_top bit cannot supply or revoke that native producer fact. */
-	checkpoint_base = cold_top_tx_checkpoint_base_v1(typed, &post_slot.key);
+	checkpoint_base = cold_top_tx_checkpoint_base_v1(typed, &post_slot);
 	qualified = *proof;
 	qualified.producer_top
-		= checkpoint_base || cold_top_tx_native_bind_v1(typed->side_plans[participant], &post_slot.key);
+		= checkpoint_base || cold_top_tx_native_bind_v1(typed->side_plans[participant], &post_slot);
 	/* Without a qualified checkpoint predecessor, retain the alternative
 	 * native INIT/REUSE reconstruction with complete physical agreement.
 	 * Integrity, a checkpoint number or a caller's bit alone is insufficient. */
@@ -1471,7 +1514,8 @@ cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 p
 		|| cluster_cold_tt_base_header_v1(typed, segment_index, &owner, &segment) == NULL
 		|| !uba_decode_record(address, &address_segment, &block_no, &tt_slot, &row)
 		|| address_segment != segment || block_no == 0
-		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &header))
+		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &header)
+		|| !cold_tt_header_readable((const UndoSegmentHeaderData *)header.page.data, owner, segment))
 		return false;
 	/* Use the same sealed source in its entirety. The original block fold
 	 * requires an FPI after the last INIT/REUSE, and refuses an earlier
@@ -1483,7 +1527,7 @@ cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 p
 											 address, out)
 			   != CLUSTER_RECOVERY_UNDO_ENTRY)
 		return false;
-	*generation = ((const UndoSegmentHeaderData *)header.page.data)->wrap_count;
+	*generation = cold_tt_header_generation((const UndoSegmentHeaderData *)header.page.data);
 	return true;
 }
 
@@ -1494,12 +1538,16 @@ cold_tt_undo_base_redo_plan(const ClusterColdTypedV1 *typed, uint32 participant,
 	const UndoSegmentHeaderData *base_header;
 	const RfSideOnlinePlanV1 *plan;
 	RfSideUndoHeaderImageV1 header;
+	const UndoSegmentHeaderData *folded = (const UndoSegmentHeaderData *)header.page.data;
 
 	base_header = cluster_cold_tt_base_header_v1(typed, segment_index, owner, segment);
 	if (base_header == NULL
-		|| cluster_undo_segment_header_integrity(base_header) == CLUSTER_UNDO_HEADER_CORRUPT
+		|| !cold_tt_header_readable(base_header, *owner, *segment)
 		|| !cluster_cold_typed_tt_redo_header_v1(typed, participant, segment_index, &header)
-		|| base_header->wrap_count != ((const UndoSegmentHeaderData *)header.page.data)->wrap_count)
+		|| !cold_tt_header_readable(folded, *owner, *segment)
+		|| cold_tt_header_generation(base_header) != cold_tt_header_generation(folded)
+		|| ((const UndoSegmentHeaderDataV2 *)base_header)->tt_layout_version
+			!= ((const UndoSegmentHeaderDataV2 *)folded)->tt_layout_version)
 		return NULL;
 	plan = typed->side_plans[participant];
 	/* Prefix history is already represented by the captured base. Only a
@@ -1742,10 +1790,14 @@ cold_tt_redo_graph_begin(const ClusterColdTypedV1 *typed, uint32 participant,
 		if (!cluster_cold_typed_tt_redo_header_v1(typed, participant, i, &image))
 			goto identity_failure;
 		header = (const UndoSegmentHeaderData *)image.page.data;
+		if (!cold_tt_header_readable(header, owner, segment))
+			goto identity_failure;
 		for (uint16 offset = 0; offset < TT_SLOTS_PER_SEGMENT; offset++) {
-			const TTSlot *slot = &header->tt_slots[offset];
+			ClusterColdTtSlotInputV1 input;
+			const TTSlot *slot = &input.slot;
 			ClusterRecoveryTxnKey key = { 0 };
 
+			cold_tt_slot_copy(header, owner, segment, offset, &input);
 			/* Retention survives terminal status. A zero head is merely absent
 			 * from this TX forest, never proof that other effects are absent. */
 			if (UBA_is_invalid(slot->first_undo_block))
@@ -1754,7 +1806,7 @@ cold_tt_redo_graph_begin(const ClusterColdTypedV1 *typed, uint32 participant,
 			key.database_incarnation = typed->observer.database_incarnation;
 			key.origin_node_id = owner - 1;
 			key.segment_id = segment;
-			key.segment_generation = header->wrap_count;
+			key.segment_generation = input.key.segment_generation;
 			key.slot_offset = offset;
 			key.slot_wrap = slot->wrap;
 			key.xid = slot->xid;

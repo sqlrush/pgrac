@@ -219,6 +219,88 @@ resource_x_assertion_decode(const uint8 in[24], ResourceXAssertion *assertion)
 }
 
 
+/* Bundle and record headers are network order; original144 stays immutable
+ * little-endian V2. Validate the complete inventory before exposing slices,
+ * so a later malformed record cannot cause an earlier custody registration.
+ * This is framing only, never peer authentication or a retention grant. */
+bool
+cluster_resource_x_ctrc_bundle_layout(const ResourceXDecodedImageEnvelope *body,
+	ResourceXCtrcBundleLayout *out)
+{
+	ResourceXCtrcBundleLayout layout = { 0 };
+	const uint8 *bundle;
+	uint32 length, offset = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
+	uint16 version, count;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (body == NULL)
+		return false;
+	bundle = body->ctrc_delegation;
+	length = body->ctrc_delegation_bytes;
+	if (length > RESOURCE_X_CTRC_BUNDLE_MAX_BYTES
+		|| !resource_x_bytes_zero(bundle + length, RESOURCE_X_CTRC_BUNDLE_MAX_BYTES - length))
+		return false;
+	if (length == 0)
+		return true;
+	if (length < RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
+		|| resource_x_get_u16(bundle + 2) != length
+		|| !resource_x_bytes_zero(bundle + 6, 2))
+		return false;
+	version = resource_x_get_u16(bundle);
+	count = resource_x_get_u16(bundle + 4);
+	if (count == 0 || count > RESOURCE_X_CTRC_BUNDLE_LAYOUT_MAX_RECORDS
+		|| (version != RESOURCE_X_CTRC_BUNDLE_VERSION && version != RESOURCE_X_CTRC_BUNDLE_V2_VERSION)
+		|| (version == RESOURCE_X_CTRC_BUNDLE_VERSION && length > RESOURCE_X_CTRC_BUNDLE_V1_MAX_BYTES)
+		|| (version == RESOURCE_X_CTRC_BUNDLE_V2_VERSION && count > RESOURCE_X_CTRC_BUNDLE_V2_MAX_RECORDS))
+		return false;
+	for (uint16 i = 0; i < count; i++) {
+		const uint8 *record;
+		uint32 record_length, hops, expected_length;
+
+		if (offset > length || length - offset < RESOURCE_X_CTRC_RECORD_BASE_BYTES)
+			return false;
+		record = bundle + offset;
+		record_length = resource_x_get_u16(record + 2);
+		hops = resource_x_get_u16(record + 4);
+		if (!resource_x_bytes_zero(record + 6, 2) || hops == 0)
+			return false;
+		if (version == RESOURCE_X_CTRC_BUNDLE_VERSION) {
+			if (resource_x_get_u16(record) != RESOURCE_X_CTRC_RECORD_VERSION)
+				return false;
+			expected_length = RESOURCE_X_CTRC_RECORD_BASE_BYTES
+				+ hops * RESOURCE_X_CTRC_DELEGATION_HOP_BYTES;
+		} else {
+			if (resource_x_get_u16(record) != CLUSTER_CTRC_DELEGATION_V2_VERSION
+				|| hops > CLUSTER_CTRC_DELEGATION_V2_MAX_HOPS)
+				return false;
+			expected_length = CLUSTER_CTRC_DELEGATION_V2_BASE_BYTES
+				+ hops * CLUSTER_CTRC_DELEGATION_V2_HOP_BYTES;
+		}
+		if (record_length != expected_length || record_length > length - offset
+			|| record[8] != 2 || record[9] != 0 || record[10] != 144 || record[11] != 0)
+			return false;
+		layout.offsets[i] = (uint16)offset;
+		layout.lengths[i] = (uint16)record_length;
+		offset += record_length;
+	}
+	if (offset != length)
+		return false;
+	layout.version = version;
+	layout.count = count;
+	*out = layout;
+	return true;
+}
+
+static bool
+resource_x_image_ctrc_framing_valid(const ResourceXDecodedImageEnvelope *body)
+{
+	ResourceXCtrcBundleLayout layout;
+
+	return cluster_resource_x_ctrc_bundle_layout(body, &layout);
+}
+
 static bool
 resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 {
@@ -235,7 +317,9 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 		return msg_type == RESOURCE_X_MSG_BLOCKED_TO_N
 			   && (len == RESOURCE_X_CONTROL_V1_BYTES || len == RESOURCE_X_PROOF_V1_BYTES);
 	if (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE)
-		return msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT && len == RESOURCE_X_IMAGE_V2_BYTES;
+		return msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT
+			&& (len == RESOURCE_X_IMAGE_V2_BYTES
+				|| (len >= RESOURCE_X_IMAGE_V3_MIN_BYTES && len <= RESOURCE_X_IMAGE_V3_MAX_BYTES));
 	if (kind == RESOURCE_X_WIRE_AUTHORITY_GRANT)
 		return msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT && len == RESOURCE_X_PROOF_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_RELEASE_X)
@@ -275,7 +359,9 @@ resource_x_frame_length(const ResourceXDecodedFrame *frame, uint16 *len)
 		*len = RESOURCE_X_PROOF_V1_BYTES;
 		return true;
 	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
-		*len = RESOURCE_X_IMAGE_V2_BYTES;
+		if (!resource_x_image_ctrc_framing_valid(&frame->body.image_envelope))
+			return false;
+		*len = RESOURCE_X_IMAGE_V2_BYTES + frame->body.image_envelope.ctrc_delegation_bytes;
 		return true;
 	default:
 		return false;
@@ -652,6 +738,7 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame, ResourceXWireReject *r
 				&& body->image_length == RESOURCE_X_PAGE_BYTES
 				&& body->source_disposition == RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE
 				&& body->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER
+				&& resource_x_image_ctrc_framing_valid(body)
 				&& resource_x_image_wal_valid(frame)
 				&& resource_x_dependencies_valid(body->dependencies, body->dependency_count);
 	} break;
@@ -772,6 +859,9 @@ resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame)
 		resource_x_put_u16(bytes + 326, body->image_flags);
 		memcpy(bytes + 328, body->page_bytes, RESOURCE_X_PAGE_BYTES);
 		resource_x_page_wal_encode(bytes + 8520, &body->page_wal);
+		if (body->ctrc_delegation_bytes != 0)
+			memcpy(bytes + RESOURCE_X_IMAGE_V2_BYTES, body->ctrc_delegation,
+				body->ctrc_delegation_bytes);
 	} break;
 	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT: {
 		const ResourceXDecodedInstallSettlement *body = &frame->body.install_settlement;
@@ -876,6 +966,10 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 			return false;
 		}
 		resource_x_page_wal_decode(bytes + 8520, &body->page_wal);
+		body->ctrc_delegation_bytes = frame->payload_bytes - RESOURCE_X_IMAGE_V2_BYTES;
+		if (body->ctrc_delegation_bytes != 0)
+			memcpy(body->ctrc_delegation, bytes + RESOURCE_X_IMAGE_V2_BYTES,
+				body->ctrc_delegation_bytes);
 	} break;
 	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT: {
 		ResourceXDecodedInstallSettlement *body = &frame->body.install_settlement;
@@ -905,7 +999,7 @@ cluster_resource_x_wire_encode(uint8 msg_type, const ResourceXDecodedFrame *fram
 							   uint16 payload_capacity, uint16 *payload_len_out,
 							   ResourceXWireReject *reject)
 {
-	uint8 encoded[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 encoded[RESOURCE_X_IMAGE_V3_MAX_BYTES];
 	uint32 crc;
 	uint16 len;
 
@@ -928,6 +1022,9 @@ cluster_resource_x_wire_encode(uint8 msg_type, const ResourceXDecodedFrame *fram
 
 	memset(encoded, 0, sizeof(encoded));
 	resource_x_common_encode(encoded, frame->kind, &frame->common, len);
+	if (frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		&& frame->body.image_envelope.ctrc_delegation_bytes != 0)
+		encoded[0] = RESOURCE_X_IMAGE_CTRC_WIRE_VERSION;
 	resource_x_body_encode(encoded, frame);
 	crc = resource_x_wire_crc(encoded, len);
 	resource_x_put_u32(encoded + 4, crc);
@@ -950,7 +1047,8 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	if (bytes == NULL || out == NULL)
 		return false;
 	if (payload_len != RESOURCE_X_CONTROL_V1_BYTES && payload_len != RESOURCE_X_SHORT_V1_BYTES
-		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V2_BYTES) {
+		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V2_BYTES
+		&& (payload_len < RESOURCE_X_IMAGE_V3_MIN_BYTES || payload_len > RESOURCE_X_IMAGE_V3_MAX_BYTES)) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_LEGACY_LENGTH);
 		return false;
 	}
@@ -959,9 +1057,9 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
 		return false;
 	}
-	if (bytes[0]
-		!= (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
-												   : RESOURCE_X_WIRE_VERSION)) {
+	if (bytes[0] != (kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_WIRE_VERSION
+		: payload_len == RESOURCE_X_IMAGE_V2_BYTES ? RESOURCE_X_IMAGE_WIRE_VERSION
+		: RESOURCE_X_IMAGE_CTRC_WIRE_VERSION)) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_VERSION);
 		return false;
 	}

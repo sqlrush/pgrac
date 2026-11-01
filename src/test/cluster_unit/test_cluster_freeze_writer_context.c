@@ -22,6 +22,7 @@ ExceptionalCondition(const char *condition pg_attribute_unused(),
 	abort();
 }
 int cluster_node_id = 0;
+int NBuffers = 1, NLocBuffer = 1;
 bool cluster_enabled, cluster_shared_config;
 int cluster_interconnect_tier;
 sigjmp_buf *PG_exception_stack;
@@ -140,6 +141,65 @@ cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *tag,
 	return terminal_current && fixture_node_matches();
 }
 #include "test_cluster_freeze_writer_context.inc"
+
+/* The acquisition/OS leaves remain controlled.  Compile the original cleanup
+ * pin checks and capture/resume bodies, rather than granting a writer to the
+ * read-only conditional-X path. */
+typedef struct LVRelState
+{
+	bool versioned;
+	bool shared_maintenance_restricted;
+} LVRelState;
+static ClusterPcmXWriterLedgerEntry fixture_acquired_writer;
+static uint32 fixture_private_pins, fixture_global_pins;
+static unsigned fixture_writer_acquisitions, fixture_header_checks;
+static int32 fixture_local_pins[1];
+int32 *LocalRefCount = fixture_local_pins;
+
+void
+LockBuffer(Buffer buffer, int mode)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(pinned);
+	if (mode == BUFFER_LOCK_EXCLUSIVE)
+	{
+		UT_ASSERT(!exclusive && !fixture_ledger_live());
+		fixture_writer_acquisitions++;
+		cluster_bufmgr_pcm_x_writer_ledger[0] = fixture_acquired_writer;
+		exclusive = true;
+	}
+	else
+	{
+		ClusterPcmXWriterLedgerEntry *entry;
+
+		UT_ASSERT_EQ(mode, BUFFER_LOCK_UNLOCK);
+		entry = cluster_bufmgr_pcm_x_writer_find(&fixture_buf);
+		if (entry != NULL)
+			cluster_bufmgr_pcm_x_writer_clear(entry);
+		LWLockRelease(BufferDescriptorGetContentLock(&fixture_buf));
+	}
+}
+
+static int32
+fixture_private_refcount(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	return pinned ? fixture_private_pins : 0;
+}
+
+uint32
+LockBufHdr(BufferDesc *buf)
+{
+	UT_ASSERT(buf == &fixture_buf && exclusive && pinned);
+	fixture_header_checks++;
+	return fixture_global_pins | BM_LOCKED;
+}
+
+#define GetPrivateRefCount fixture_private_refcount
+#include "test_cluster_vacuum_cleanup_pin.inc"
+#undef GetPrivateRefCount
+#include "test_cluster_vacuum_initial_writer.inc"
+
 static bool
 fixture_capture_context(Buffer buffer, ResourceXWriterUseContext *out)
 {
@@ -384,10 +444,95 @@ UT_TEST(resume_does_not_replace_original_object_fence_with_new_sample)
 	UT_ASSERT_EQ(lock_attempts, 0);
 }
 
+static LVRelState
+vacuum_lock_setup(bool versioned, bool restricted)
+{
+	LVRelState vacrel = {versioned, restricted};
+
+	setup();
+	fixture_acquired_writer = cluster_bufmgr_pcm_x_writer_ledger[0];
+	cluster_bufmgr_pcm_x_writer_clear(&cluster_bufmgr_pcm_x_writer_ledger[0]);
+	exclusive = false;
+	fixture_private_pins = fixture_global_pins = 1;
+	fixture_writer_acquisitions = fixture_header_checks = 0;
+	return vacrel;
+}
+
+UT_TEST(vacuum_initial_writer_capture_and_original_resume)
+{
+	LVRelState vacrel = vacuum_lock_setup(true, true);
+	ResourceXWriterUseContext context = {0};
+	bool captured;
+
+	UT_ASSERT(lazy_lock_buffer_for_cleanup(&vacrel, 1));
+	UT_ASSERT(pinned && exclusive && fixture_ledger_live());
+	UT_ASSERT_EQ(fixture_writer_acquisitions, 1);
+	UT_ASSERT_EQ(fixture_header_checks, 1);
+	UT_ASSERT_EQ(lock_attempts + object_samples + unpins, 0);
+	captured = fixture_capture_context(1, &context);
+	UT_ASSERT(captured);
+	if (!captured)
+	{
+		LockBuffer(1, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(1);
+		return;
+	}
+	UT_ASSERT(memcmp(&context, &fixture_node_context, sizeof(context)) == 0);
+	/* The later apply may resume this original writer, without current-X. */
+	LockBuffer(1, BUFFER_LOCK_UNLOCK);
+	UT_ASSERT(pinned && !exclusive && !fixture_ledger_live());
+	UT_ASSERT(ClusterConditionalLockBufferWithMutationContext(1, &context,
+		original_object_revision, original_object_checked));
+	UT_ASSERT(ClusterBufferMutationContextMatches(1, &context,
+		original_object_revision, original_object_checked));
+	UT_ASSERT_EQ(fixture_writer_acquisitions, 1);
+	ClusterUnlockReleaseBufferAfterConditionalMutation(1);
+	UT_ASSERT(!pinned && !exclusive && !fixture_ledger_live());
+	UT_ASSERT_EQ(unlocks, 2);
+	UT_ASSERT_EQ(unpins, 1);
+}
+
+UT_TEST(vacuum_cleanup_pin_refusal_keeps_original_pin)
+{
+	for (int which = 0; which < 2; which++)
+	{
+		LVRelState vacrel = vacuum_lock_setup(true, true);
+
+		if (which == 0) fixture_private_pins = 2;
+		else fixture_global_pins = 2;
+		UT_ASSERT(!lazy_lock_buffer_for_cleanup(&vacrel, 1));
+		UT_ASSERT(pinned && !exclusive && !fixture_ledger_live());
+		UT_ASSERT_EQ(fixture_writer_acquisitions, 1);
+		UT_ASSERT_EQ(fixture_header_checks, which);
+		UT_ASSERT_EQ(unlocks, 1);
+		UT_ASSERT_EQ(unpins + lock_attempts, 0);
+		refused_without_output(1);
+		/* The original SHARE/aggressive fallback still owns this pin. */
+		ReleaseBuffer(1);
+	}
+}
+
+UT_TEST(vacuum_other_relations_keep_conditional_cleanup)
+{
+	for (int which = 0; which < 3; which++)
+	{
+		LVRelState vacrel = vacuum_lock_setup(which == 1, which == 0);
+
+		UT_ASSERT(lazy_lock_buffer_for_cleanup(&vacrel, 1));
+		UT_ASSERT(pinned && exclusive && !fixture_ledger_live());
+		UT_ASSERT_EQ(fixture_writer_acquisitions, 0);
+		UT_ASSERT_EQ(lock_attempts, 1);
+		UT_ASSERT_EQ(fixture_header_checks, 1);
+		refused_without_output(1);
+		LockBuffer(1, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(unlock_only_preserves_original_pin_and_original_node_grant);
 	UT_RUN(resume_does_not_replace_original_object_fence_with_new_sample);
 	UT_RUN(resume_original_and_cleanup_only_its_local_scope);
@@ -402,5 +547,8 @@ main(void)
 	UT_RUN(capture_and_match_original_active_writer);
 	UT_RUN(reject_every_changed_logical_context_field);
 	UT_RUN(reject_null_output_and_expectation);
+	UT_RUN(vacuum_initial_writer_capture_and_original_resume);
+	UT_RUN(vacuum_cleanup_pin_refusal_keeps_original_pin);
+	UT_RUN(vacuum_other_relations_keep_conditional_cleanup);
 	UT_DONE(); return ut_failed_count != 0;
 }

@@ -69,6 +69,26 @@ fixture_panic(void)
 {
 	abort();
 }
+#ifdef USE_PGRAC_CLUSTER
+bool
+cluster_xid_stripe_sample_future(FullTransactionId reference pg_attribute_unused(),
+								FullTransactionId *future pg_attribute_unused(),
+								ClusterXidStripeSampleFence *fence pg_attribute_unused())
+{
+	fixture_panic();
+}
+bool
+cluster_xid_stripe_sample_fence_current(
+	const ClusterXidStripeSampleFence *fence pg_attribute_unused())
+{
+	fixture_panic();
+}
+bool
+cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out pg_attribute_unused())
+{
+	fixture_panic();
+}
+#endif
 void
 ExceptionalCondition(const char *condition pg_attribute_unused(),
 					 const char *file pg_attribute_unused(), int line pg_attribute_unused())

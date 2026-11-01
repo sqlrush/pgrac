@@ -921,6 +921,7 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_ins
 	UndoSegmentHeaderData *next;
 	ClusterUndoBlock0LogicalKey key;
 	ClusterUndoBlock0Generation generation;
+	uint32 header_generation;
 	bool dirty = false;
 	bool advanced = false;
 	ClusterUndoBlock0Result result;
@@ -940,7 +941,12 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_ins
 		return; /* L212: identity, not template bytes -> retain */
 	}
 	hdr = (UndoSegmentHeaderData *)predecessor.data;
-	if (hdr->wrap_count == UINT32_MAX) {
+	/* Identity validation has selected the complete layout. In TT40 the
+	 * legacy generation offset belongs to the block bitmap. */
+	header_generation = (uint8)predecessor.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
+							? ((const UndoSegmentHeaderDataV2 *)predecessor.data)->wrap_count
+							: hdr->wrap_count;
+	if (header_generation == UINT32_MAX) {
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		return;
 	}
@@ -1001,7 +1007,7 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner_ins
 	key.segment_id = seg;
 	key.owner_instance = owner_instance;
 	generation.known = true;
-	generation.value = hdr->wrap_count;
+	generation.value = header_generation;
 	result = cluster_undo_block0_current_live_owner_mutate_exact(
 		&key, &generation, predecessor.data, successor.data, 10000);
 	if (advanced && result == CLUSTER_UNDO_BLOCK0_OK)
@@ -3258,6 +3264,7 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	ClusterCtrcReceiptHandle handle;
 	ClusterCtrcPrepareResult result;
 	ClusterCtrcPreparePath shared_prepare_path = CLUSTER_CTRC_PREPARE_PATH_UNKNOWN;
+	uint8 original_identity[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 	TransactionId xid = GetTopTransactionIdIfAny();
 	uint32 grant = 0;
 	uint8 target_bit;
@@ -3301,6 +3308,13 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 		}
 		return false;
 	}
+	/* Ordinary ITL publication must register its original identity while the
+	 * origin still protects the exact grant. A later raw-only participant
+	 * cannot be qualified after native PGPROC responsibility has retired. */
+	if (!cluster_ctrc_origin_fullxid_capture_v2(&key, &participant, grant, original_identity)) {
+		cluster_undo_receipt_reason = "CTRC_ORIGINAL_FULL_XID_REQUIRED";
+		return false;
+	}
 
 	publication.requester_node_id = participant.node_id;
 	publication.requester_boot_incarnation = participant.boot_incarnation;
@@ -3317,20 +3331,9 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	publication.reference_kind = CTRC_REF_HEAP_ITL_UBA;
 	publication.target_kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
 	publication.grant_generation = grant;
-	if (cluster_trace_normal_stop) {
-		UndoReceiptOwnerTrace trace = { owner_exact, &status_key, &status, grant, &key, &participant };
-
-		undo_receipt_lifecycle_trace("prepare.begin", "original_shared_call", receipt,
-			target_ordinal, xid, &trace, &publication, NULL, -1,
-			CLUSTER_CTRC_PREPARE_PATH_UNKNOWN, -1, NULL);
-	}
-	if (cluster_trace_normal_stop)
-		result = cluster_ctrc_receipt_prepare_shared_observed(&key, &participant, grant,
-			&publication, &receipt->ctrc_pending_targets[target_ordinal], &handle,
-			&shared_prepare_path);
-	else
-		result = cluster_ctrc_receipt_prepare_shared(&key, &participant, grant, &publication,
-			&receipt->ctrc_pending_targets[target_ordinal], &handle);
+	result = cluster_ctrc_receipt_prepare_origin_v2(&key, &participant, grant, &publication,
+		&receipt->ctrc_pending_targets[target_ordinal], original_identity,
+		sizeof(original_identity), &handle);
 	if (result != CLUSTER_CTRC_PREPARE_READY && result != CLUSTER_CTRC_PREPARE_DUPLICATE) {
 		cluster_undo_receipt_reason = "CTRC_PREPARE_REFUSED";
 		if (cluster_trace_normal_stop) {

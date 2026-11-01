@@ -696,8 +696,8 @@ StaticAssertDecl(offsetof(ClusterCurrentMxMemberDesc, member_status) == 4,
 StaticAssertDecl(offsetof(ClusterCurrentMxMemberDesc, reserved8) == 5,
 				 "current MX descriptor reserved offset changed");
 
-StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 48,
-				 "current MX member proof must remain 48 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 192,
+				 "current MX V6 member proof must be 192 bytes");
 StaticAssertDecl(offsetof(ClusterCurrentMemberProof, key) == 0,
 				 "current MX proof key offset changed");
 StaticAssertDecl(offsetof(ClusterCurrentMemberProof, commit_scn) == 24,
@@ -807,7 +807,7 @@ UT_TEST(test_current_multixact_public_symbols_link)
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_build_proof_requests);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_reply);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_reply_frame);
-	UT_ASSERT_EQ(CLUSTER_CURRENT_MX_WIRE_VERSION, 5);
+	UT_ASSERT_EQ(CLUSTER_CURRENT_MX_WIRE_VERSION, 6);
 }
 
 
@@ -1489,6 +1489,79 @@ UT_TEST(test_current_multixact_proof_reply_wire_binding)
 				 false);
 	UT_ASSERT_EQ(out_count, 0);
 	UT_ASSERT_EQ(out[0].state, CCM_UNKNOWN);
+}
+
+
+UT_TEST(test_current_multixact_origin_fullxid_v6_wire)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterCurrentMxProofReplyPage page;
+	ClusterCurrentMemberProof out[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+	ClusterCurrentMemberProof active;
+	ClusterCurrentMemberProof *proof = &page.body.proofs[0];
+	ClusterCurrentMxMemberDesc member;
+	ClusterCurrentUpdaterProof updater_out;
+	ClusterMxResolveResult frame_result;
+	uint32 capability;
+	uint16 count;
+
+	test_proof_request(&request, CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS, 1);
+	memset(&page, 0, sizeof(page));
+	page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	page.header.result = CMX_RESOLVE_OK;
+	page.header.source_node_id = 5;
+	page.header.request_id = request.prefix.request_id;
+	page.header.mxkey = request.prefix.mxkey;
+	page.header.descriptor_hash = ClusterCurrentMxProofPrefixGetDescriptorHash(&request.prefix);
+	page.header.total_count = request.prefix.total_count;
+	page.header.entry_count = request.prefix.entry_count;
+	page.header.chunk_ordinal = request.prefix.chunk_ordinal;
+	page.header.chunk_count_minus_one = request.prefix.chunk_count_minus_one;
+	page.header.requester_capability_generation = 41;
+	page.header.wire_length = sizeof(page.header) + sizeof(*proof);
+	test_member(&member, request.trailer.body.asks[0].xid,
+				request.trailer.body.asks[0].member_status);
+	test_proof(proof, &member, request.trailer.body.asks[0].member_ordinal, CCM_ACTIVE, 5, 20);
+	memset(proof->origin_fullxid_v2, 0x5a, sizeof(proof->origin_fullxid_v2));
+	proof->origin_fullxid_v2[0] = CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION;
+	proof->origin_fullxid_v2[1] = 0;
+	proof->origin_fullxid_v2[2] = CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES;
+	proof->origin_fullxid_v2[3] = 0;
+	active = *proof;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply_frame(
+					 &page, sizeof(page), 5, 9, &request, &frame_result, out, lengthof(out),
+					 &count, &updater_out, &capability), true);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(memcmp(out[0].origin_fullxid_v2, proof->origin_fullxid_v2,
+					   sizeof(proof->origin_fullxid_v2)), 0);
+	page.header.version = 5;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply_frame(
+					 &page, sizeof(page), 5, 9, &request, &frame_result, out, lengthof(out),
+					 &count, &updater_out, &capability), false);
+	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	proof->origin_fullxid_v2[0] = 3;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply_frame(
+					 &page, sizeof(page), 5, 9, &request, &frame_result, out, lengthof(out),
+					 &count, &updater_out, &capability), false);
+	*proof = active;
+	memset(&proof->key, 0, sizeof(proof->key));
+	ClusterCurrentMemberProofSetCtrcGrant(proof, 0);
+	proof->state = CCM_ABORTED;
+	proof->commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply_frame(
+					 &page, sizeof(page), 5, 9, &request, &frame_result, out, lengthof(out),
+					 &count, &updater_out, &capability), false);
+	proof->state = CCM_COMMITTED;
+	proof->commit_scn = 42;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply_frame(
+					 &page, sizeof(page), 5, 9, &request, &frame_result, out, lengthof(out),
+					 &count, &updater_out, &capability), false);
+	memset(proof->origin_fullxid_v2, 0, sizeof(proof->origin_fullxid_v2));
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply_frame(
+					 &page, sizeof(page), 5, 9, &request, &frame_result, out, lengthof(out),
+					 &count, &updater_out, &capability), true);
 }
 
 
@@ -3564,7 +3637,7 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(56);
 	UT_RUN(test_current_mx_local_updater_precommit_scrubs_batch);
 	UT_RUN(test_current_mx_local_updater_retry_preserves_deadline);
 	UT_RUN(test_current_multixact_precommit_retry_respects_original_deadline);
@@ -3579,6 +3652,7 @@ main(void)
 	UT_RUN(test_current_mx_updater_provenance_alias_canonical_matrix);
 	UT_RUN(test_current_multixact_proof_forward_wire_binding);
 	UT_RUN(test_current_multixact_proof_reply_wire_binding);
+	UT_RUN(test_current_multixact_origin_fullxid_v6_wire);
 	UT_RUN(test_current_multixact_members_resolve_all_or_nothing);
 	UT_RUN(test_current_mx_updater_provenance_local_remote_parity);
 	UT_RUN(test_current_multixact_local_member_uses_target_canonical_not_source);

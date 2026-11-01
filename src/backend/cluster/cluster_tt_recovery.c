@@ -26,9 +26,13 @@
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
  *
- *	  Shared transaction completion uses the typed recovery owners. The
- *	  legacy WAL-free physical DELETE cleanup below is also excluded from
- *	  shared mode; these local helpers are not substitutes for that service.
+ *	  Explicit TT40 ACTIVE is persisted by the canonical publication owner.
+ *	  Its nonshared pre-open sweep takes the original FullXid from the exact
+ *	  selected base, logs V2 ABORT, and writes one sealed page through the
+ *	  block-zero content owner. The older TT32 writer is kept for V1 pages.
+ *	  Shared recovery uses its original ROOT/SIDE authority and never this
+ *	  local Startup context. CLOG/proc-array liveness is not a historical
+ *	  FullXid or receiver-retention certificate.
  *
  *-------------------------------------------------------------------------
  */
@@ -51,11 +55,16 @@
 #include "cluster/cluster_undo_record.h"		/* UndoRecordHeader, UNDO_RECORD_DELETE (D7) */
 #include "cluster/cluster_undo_record_api.h"	/* cluster_undo_get_record (D7) */
 #include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"			/* cluster_undo_smgr_read_block */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 
 /* spec-4.8 D7: hard cap on an undo chain walk (malformed-chain loop guard). */
 #define CLUSTER_TT_RECOVERY_MAX_CHAIN_STEPS 1000000
+
+static bool startup_scan_header_valid(const char block[BLCKSZ], uint32 segment_id,
+									 uint8 owner, bool *is_v2);
+static TTSlot startup_scan_slot(const char block[BLCKSZ], bool is_v2, uint16 offset);
 
 /*
  * Both startup consumers require the same published-header read contract.
@@ -131,10 +140,12 @@ cluster_tt_recovery_xact_liveness(TransactionId xid)
  *	prepared set loaded, RecoveryInProgress() false).  Gated by cluster.enabled
  *	+ cluster.tt_recovery_resolve_active.
  *
- *	This instance-local scan is not a complete shared inventory: no caller
- *	may interpret zero resolved slots as transaction recovery completion.
- *	Nonshared durable_abort performs a targeted slot RMW, preserving the
- *	other slots in the in-memory iteration snapshot.
+ *	Fail-safe on read failure: an existing-but-unreadable or absent segment is
+ *	skipped (we never abort a slot we cannot read).  Leaving a slot ACTIVE is no
+ *	worse than the pre-D1 behaviour (the by-xid 0-match path); aborting a slot we
+ *	cannot read would risk a false-abort. TT40 validates all 48 slots and the
+ *	checksum before any transition, then carries the successful sealed successor
+ *	forward as the exact base for the next slot. V1 retains its 32-byte writer.
  */
 int
 cluster_tt_recovery_resolve_active_slots(void)
@@ -145,8 +156,12 @@ cluster_tt_recovery_resolve_active_slots(void)
 	uint32 seg_hi;
 	uint32 segment_id;
 	PGAlignedBlock blockbuf;
+	const ClusterTTStartupLocalContext *context = cluster_tt_startup_local_context_current();
 	int resolved = 0;
 
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("legacy ACTIVE sweep cannot supply shared recovery proof")));
 	if (!cluster_enabled || !cluster_tt_recovery_resolve_active)
 		return 0;
 	if (cluster_node_id < 0)
@@ -158,15 +173,22 @@ cluster_tt_recovery_resolve_active_slots(void)
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
-		UndoSegmentHeaderData *hdr;
+		bool is_v2;
 		uint16 i;
 
 		if (!tt_recovery_read_header(segment_id, owner, blockbuf.data))
 			continue;
 
-		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		if (!startup_scan_header_valid(blockbuf.data, segment_id, owner, &is_v2)
+			|| (is_v2 && (cluster_undo_segment_header_integrity(blockbuf.data)
+							!= CLUSTER_UNDO_HEADER_VALID
+				|| !cluster_tt_startup_local_context_valid(context, owner))))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid TT base or local Startup owner in ACTIVE sweep of segment %u",
+								   segment_id)));
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *s = &hdr->tt_slots[i];
+			TTSlot slot = startup_scan_slot(blockbuf.data, is_v2, i);
+			const TTSlot *s = &slot;
 			ClusterTtRecoveryLiveness verdict;
 
 			if (s->status != (uint8)TT_SLOT_ACTIVE)
@@ -189,8 +211,12 @@ cluster_tt_recovery_resolve_active_slots(void)
 			if (verdict == CLUSTER_TT_RECOVERY_LIVE)
 				continue; /* committed / resurrected prepared -> keep ACTIVE */
 
-			/* Original nonshared DEAD/AMBIGUOUS resolution only. */
-			cluster_tt_slot_durable_abort(segment_id, i, s->xid, s->wrap);
+			/* DEAD or AMBIGUOUS -> fail-closed ABORTED (durable, WAL 0x60). */
+			if (is_v2)
+				(void)cluster_tt_slot_durable_abort_startup_local(context, segment_id, i,
+															 blockbuf.data);
+			else
+				cluster_tt_slot_durable_abort(segment_id, i, s->xid, s->wrap);
 			cluster_tt_recovery_count_active_resolved_aborted();
 			resolved++;
 		}
@@ -203,6 +229,54 @@ cluster_tt_recovery_resolve_active_slots(void)
 					resolved)));
 
 	return resolved;
+}
+
+/* Startup's read-only consumers must select the actual layout before
+ * indexing any slot. Validate all TT40 identities before observing an SCN
+ * or handing a chain to the existing nonshared rollback owner. This is not
+ * permission to use the legacy ACTIVE abort writer on a TT40 page. */
+static bool
+startup_scan_header_valid(const char block[BLCKSZ], uint32 segment_id, uint8 owner,
+						  bool *is_v2)
+{
+	const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)block;
+
+	*is_v2 = false;
+	if (segment_id == 0 || owner == 0 || owner > UNDO_OWNER_INSTANCE_MAX)
+		return false;
+	if (!UndoSegmentHeaderV2_identity_matches(block, BLCKSZ, segment_id, owner))
+		return UndoSegmentHeader_identity_matches(block, segment_id, owner);
+	if (header->wrap_count == UINT32_MAX)
+		return false;
+	for (uint16 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const TTSlotV2 *slot = &header->tt_slots[i];
+
+		if (slot->status > TT_SLOT_RECYCLABLE || (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+			|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
+			return false;
+		if (slot->status == TT_SLOT_UNUSED) {
+			if (!TTSlotV2_is_zero(slot))
+				return false;
+		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+				   || (TransactionId)slot->original_full_xid != slot->xid)
+			return false;
+		if (slot->status == TT_SLOT_ABORTED && SCN_VALID(slot->commit_scn))
+			return false;
+	}
+	*is_v2 = true;
+	return true;
+}
+
+static TTSlot
+startup_scan_slot(const char block[BLCKSZ], bool is_v2, uint16 offset)
+{
+	TTSlot slot;
+	Size stride = is_v2 ? sizeof(TTSlotV2) : sizeof(TTSlot);
+
+	Assert(offset < TT_SLOTS_PER_SEGMENT);
+	memcpy(&slot, block + offsetof(UndoSegmentHeaderData, tt_slots) + offset * stride,
+		   sizeof(slot));
+	return slot;
 }
 
 /*
@@ -247,15 +321,19 @@ cluster_tt_recovery_observe_scn_highwater(void)
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
-		UndoSegmentHeaderData *hdr;
+		bool is_v2;
 		uint16 i;
 
 		if (!tt_recovery_read_header(segment_id, owner, blockbuf.data))
 			continue;
 
-		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		if (!startup_scan_header_valid(blockbuf.data, segment_id, owner, &is_v2))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid TT block zero in startup SCN scan of segment %u",
+								   segment_id)));
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *s = &hdr->tt_slots[i];
+			TTSlot slot = startup_scan_slot(blockbuf.data, is_v2, i);
+			const TTSlot *s = &slot;
 
 			if (s->status != (uint8)TT_SLOT_COMMITTED)
 				continue;
@@ -506,16 +584,20 @@ cluster_tt_recovery_physical_rollback(void)
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 
 	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
-		UndoSegmentHeaderData *hdr;
+		bool is_v2;
 		uint16 i;
 
 		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
 										  0, blockbuf.data))
 			continue; /* absent / unreadable -> skip */
 
-		hdr = (UndoSegmentHeaderData *)blockbuf.data;
+		if (!startup_scan_header_valid(blockbuf.data, segment_id, owner, &is_v2))
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("invalid TT block zero in startup rollback scan of segment %u",
+								   segment_id)));
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-			const TTSlot *s = &hdr->tt_slots[i];
+			TTSlot slot = startup_scan_slot(blockbuf.data, is_v2, i);
+			const TTSlot *s = &slot;
 
 			if (s->status != (uint8)TT_SLOT_ABORTED)
 				continue;

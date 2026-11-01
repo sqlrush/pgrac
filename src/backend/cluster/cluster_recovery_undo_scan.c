@@ -16,10 +16,11 @@
 struct ClusterRecoveryUndoScan {
 	UndoSegmentHeaderData header;
 	uint16 next_slot;
+	uint8 tt_layout_version;
 };
 
 static ClusterRecoveryUndoResult
-recovery_undo_layout(const UndoSegmentHeaderData *header, uint32 segment, uint8 owner)
+recovery_undo_layout_v1(const UndoSegmentHeaderData *header, uint32 segment, uint8 owner)
 {
 	Page page = (Page)header;
 
@@ -39,6 +40,51 @@ recovery_undo_layout(const UndoSegmentHeaderData *header, uint32 segment, uint8 
 		if (header->tt_slots[i].status > TT_SLOT_RECYCLABLE
 			|| (header->tt_slots[i].flags & ~TT_SLOT_FLAGS_KNOWN) != 0)
 			return CLUSTER_RECOVERY_UNDO_CORRUPT;
+	return CLUSTER_RECOVERY_UNDO_MORE;
+}
+
+/* Version dispatch precedes every slot, counter, bitmap or generation read.
+ * The original legacy candidate rules stay in the separate 32-byte reader. */
+static ClusterRecoveryUndoResult
+recovery_undo_layout(const UndoSegmentHeaderData *prefix, uint32 segment, uint8 owner)
+{
+	static const uint8 legacy[7] = { 0 };
+	const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)prefix;
+	Page page = (Page)prefix;
+
+	if (memcmp(prefix->_pad_57, legacy, sizeof(legacy)) == 0)
+		return recovery_undo_layout_v1(prefix, segment, owner);
+	if (cluster_undo_segment_header_integrity(prefix) == CLUSTER_UNDO_HEADER_CORRUPT)
+		return CLUSTER_RECOVERY_UNDO_CORRUPT;
+	if (header->tt_layout_version != CLUSTER_UNDO_TT_LAYOUT_V2
+		|| header->tt_slot_bytes != sizeof(TTSlotV2) || header->tt_layout_reserved != 0)
+		return CLUSTER_RECOVERY_UNDO_UNSUPPORTED;
+	if (PageGetPageSize(page) != BLCKSZ || PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| (header->pd_flags & PD_UNDO_SEG_HEADER) == 0)
+		return CLUSTER_RECOVERY_UNDO_UNSUPPORTED;
+	if (header->segment_id != segment || header->owner_instance != owner)
+		return CLUSTER_RECOVERY_UNDO_IDENTITY;
+	if (!UndoSegmentHeaderV2_identity_matches((const char *)header, BLCKSZ, segment, owner)
+		|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_HAS_ITL | PD_SPACE_METADATA)) != 0
+		|| header->pd_lower != SizeOfPageHeaderData || header->pd_upper != BLCKSZ
+		|| header->pd_special != BLCKSZ || (header->segment_flags & ~UNDO_SEGMENT_FLAG_FULL) != 0)
+		return CLUSTER_RECOVERY_UNDO_CORRUPT;
+
+	/* Validate the entire inventory before publishing the opaque scan. An
+	 * incomplete terminal SCN remains only a candidate, never a terminal grant. */
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const TTSlotV2 *slot = &header->tt_slots[i];
+
+		if (slot->status > TT_SLOT_RECYCLABLE || (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0
+			|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
+			return CLUSTER_RECOVERY_UNDO_CORRUPT;
+		if (slot->status == TT_SLOT_UNUSED) {
+			if (!TTSlotV2_is_zero(slot))
+				return CLUSTER_RECOVERY_UNDO_CORRUPT;
+		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
+			|| (TransactionId)slot->original_full_xid != slot->xid)
+			return CLUSTER_RECOVERY_UNDO_CORRUPT;
+	}
 	return CLUSTER_RECOVERY_UNDO_MORE;
 }
 
@@ -64,6 +110,7 @@ cluster_recovery_undo_scan_begin(const void *page, size_t length, uint32 expecte
 		free(scan);
 		return result;
 	}
+	scan->tt_layout_version = ((const UndoSegmentHeaderDataV2 *)&scan->header)->tt_layout_version;
 	*out = scan;
 	return CLUSTER_RECOVERY_UNDO_MORE;
 }
@@ -84,10 +131,21 @@ cluster_recovery_undo_scan_next(ClusterRecoveryUndoScan *scan, ClusterRecoveryUn
 	if (scan->next_slot == TT_SLOTS_PER_SEGMENT)
 		return CLUSTER_RECOVERY_UNDO_END;
 	out->segment_id = scan->header.segment_id;
-	out->segment_generation = scan->header.wrap_count;
 	out->owner_instance = scan->header.owner_instance;
 	out->slot_offset = scan->next_slot;
-	out->slot = scan->header.tt_slots[scan->next_slot++];
+	out->tt_layout_version = scan->tt_layout_version;
+	if (scan->tt_layout_version == CLUSTER_UNDO_TT_LAYOUT_V2) {
+		const UndoSegmentHeaderDataV2 *header = (const UndoSegmentHeaderDataV2 *)&scan->header;
+		const TTSlotV2 *slot = &header->tt_slots[scan->next_slot];
+
+		out->segment_generation = header->wrap_count;
+		memcpy(&out->slot, slot, sizeof(out->slot));
+		out->original_full_xid = slot->original_full_xid;
+	} else {
+		out->segment_generation = scan->header.wrap_count;
+		out->slot = scan->header.tt_slots[scan->next_slot];
+	}
+	scan->next_slot++;
 	return CLUSTER_RECOVERY_UNDO_ENTRY;
 }
 

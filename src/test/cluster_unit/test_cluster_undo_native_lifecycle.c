@@ -10,6 +10,8 @@
 
 #include <setjmp.h>
 
+#include "access/xact.h"
+#include "access/clog_file.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_uba.h"
@@ -19,7 +21,18 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "storage/checksum.h"
 #include "unit_test.h"
+
+#ifndef UNDO_NATIVE_TT_REDO_SELECTED_TEST
+#include "cluster_unit_no_native_files.h"
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+void pg_re_throw(void) { abort(); }
+#endif
+#ifndef UNDO_NATIVE_TT_REDO_IO
+#define UNDO_NATIVE_TT_REDO_IO() ((void)0)
+#endif
 
 UT_DEFINE_GLOBALS();
 
@@ -37,6 +50,10 @@ static size_t last_write_length;
 static bool header_locked;
 static uint32 header_locks, header_unlocks;
 static jmp_buf panic_jump;
+static PGAlignedBlock operation_pages[8];
+static uint32 operation_header_reads, operation_data_reads;
+static bool fail_operation_read, drift_operation_header;
+
 
 bool
 cluster_undo_block0_header_write_lock(uint32 segment, uint8 owner, uint32 *acquired)
@@ -81,13 +98,19 @@ fixture_path(int intent, uint8 instance, uint32 segment, char *path, size_t leng
 static int
 fixture_open(const char *path, int flags)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	opens++;
+	if (fail_open) {
+		errno = ENOENT;
+		return -1;
+	}
 	return 42;
 }
 
 static int
 fixture_extend(int fd, off_t size)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT_EQ(size, UNDO_SEGMENT_SIZE_BYTES);
 	extends++;
@@ -97,21 +120,30 @@ fixture_extend(int fd, off_t size)
 static ssize_t
 fixture_read(int fd, void *buffer, size_t length, off_t offset)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT_EQ(length, BLCKSZ);
 	UT_ASSERT_EQ(offset, 0);
+	reads++;
+	if (reads == short_read_number)
+		return BLCKSZ - 1;
 	memcpy(buffer, disk.data, length);
+	if (corrupt_post_read && reads == 2)
+		((char *)buffer)[BLCKSZ - 1] ^= 1;
 	return length;
 }
 
 static ssize_t
 fixture_write(int fd, const void *buffer, size_t length, off_t offset)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT((length == BLCKSZ && offset == 0)
 			  || (length == sizeof(TTSlot)
 				  && offset == offsetof(UndoSegmentHeaderData, tt_slots) + 4 * sizeof(TTSlot)));
 	UT_ASSERT_EQ(syncs, 0);
+	if (fail_write)
+		return -1;
 	writes++;
 	last_write_length = length;
 	memcpy(disk.data + offset, buffer, length);
@@ -121,6 +153,7 @@ fixture_write(int fd, const void *buffer, size_t length, off_t offset)
 static int
 fixture_sync(int fd)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT(writes <= 1);
 	UT_ASSERT_EQ(closes, 0);
@@ -166,14 +199,16 @@ fixture_power_loss(void)
 static int
 fixture_close(int fd)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	closes++;
-	return 0;
+	return fail_close ? -1 : 0;
 }
 
 static void
 fixture_dir_sync(const char *path, bool isdir)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT(isdir);
 	UT_ASSERT(strcmp(path, "undo/instance_2") == 0);
 	UT_ASSERT_EQ(syncs, 1);
@@ -202,11 +237,78 @@ fixture_dir_sync(const char *path, bool isdir)
 #define fsync_fname fixture_dir_sync
 #define cluster_vis_bump_recovery_undo_redo_applies() (applies++)
 #define cluster_vis_bump_recovery_undo_redo_skips() (skips++)
+#include "test_cluster_undo_tt_file_owner.inc"
 #include "test_cluster_undo_lifecycle_native.inc"
 #define cluster_undo_redo_open_segment(instance_, segment_, path_, create_) fixture_open(path_, 0)
 #define cluster_tt_durable_count_redo_apply() ((void)0)
 static const UBA InvalidUbaVal = InvalidUba_init; /* the legacy stamp's head reset */
 #include "test_cluster_undo_bind_native.inc"
+/* Original recovery namespace/physical reads only. All payload and TT
+ * validation below runs in the actual retained-chain implementation. */
+bool
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment, uint8 owner,
+							 uint32 block, char *out)
+{
+	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RECOVERY_SHARED);
+	UT_ASSERT_EQ(owner, 3);
+	if (segment != 513 || block >= lengthof(operation_pages))
+		return false;
+	if (block == 0) {
+		operation_header_reads++;
+		memcpy(out, disk.data, BLCKSZ);
+		if (drift_operation_header && operation_header_reads == 2)
+			((UndoSegmentHeaderDataV2 *)out)->tt_slots[4].original_full_xid ^= UINT64_C(1) << 32;
+	} else {
+		operation_data_reads++;
+		if (fail_operation_read)
+			return false;
+		memcpy(out, operation_pages[block].data, BLCKSZ);
+	}
+	return true;
+}
+
+bool
+cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segment, uint8 owner,
+									uint32 offset, const char *bytes, uint32 length)
+{
+	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RECOVERY_SHARED);
+	UT_ASSERT_EQ(segment, 513);
+	UT_ASSERT_EQ(owner, 3);
+	return fixture_write(42, bytes, length, offset) == length;
+}
+
+bool
+cluster_undo_smgr_fsync_segment_file(uint32 segment, uint8 owner)
+{
+	UT_ASSERT_EQ(segment, 513);
+	UT_ASSERT_EQ(owner, 3);
+	return fixture_sync(42) == 0;
+}
+
+/* Wait instrumentation and checkpoint accounting are not I/O authority. */
+#define cluster_tt_durable_io_wait_start() ((void)0)
+#define cluster_tt_durable_io_wait_end() ((void)0)
+#define tt_redo_present_durable(instance_, segment_) \
+	do { if (fixture_sync(42) != 0) abort(); } while (0)
+#include "test_cluster_heap_small_scn.inc"
+#include "test_cluster_undo_head_operation_native.inc"
+#undef tt_redo_present_durable
+#undef cluster_tt_durable_io_wait_start
+#undef cluster_tt_durable_io_wait_end
+
+#include "test_cluster_undo_tt_v2_native.inc"
+
+/* Other legacy terminal/data-block owners are outside this fixture. An
+ * accidental dispatch to one is a failure, never a successful substitute. */
+#define RecoveryInProgress() true
+#define InRecovery true
+#define cluster_undo_redo_tt_slot_commit(decoded_) abort()
+#define cluster_undo_redo_tt_slot_abort(decoded_) abort()
+#define cluster_undo_redo_tt_slot_set_head(decoded_) abort()
+#define cluster_undo_redo_tt_ctrc_release(decoded_) abort()
+#define cluster_undo_redo_block_write(decoded_, payload_, lsn_) abort()
+#define cluster_hw_redo_reserve(record_) abort()
+#include "test_cluster_undo_dispatch_native.inc"
 
 static void
 reset_io(void)
@@ -949,6 +1051,25 @@ main(void)
 	UT_RUN(test_native_reuse_durability_and_stale_generation);
 	UT_RUN(test_private_header_decision_preserves_native_generation_and_output);
 	UT_RUN(test_native_recycle_fsync_failure_does_not_report_completion);
+	UT_RUN(test_native_v2_bind_keeps_original_full_xid);
+	UT_RUN(test_native_v2_all_terminal_deltas_keep_full_page_identity);
+	UT_RUN(test_native_v2_conflicts_refuse_before_write);
+	UT_RUN(test_native_v2_present_or_physical_stale_is_durable_without_write);
+	UT_RUN(test_native_v2_io_failure_never_reports_completion);
+	UT_RUN(test_folded_v2_native_commit_uses_the_same_fullxid_owner);
+	UT_RUN(test_folded_native_dispatch_preserves_v1_and_refuses_bad_identity);
+	UT_RUN(test_native_v2_bad_record_refuses_before_file_access);
+	UT_RUN(test_native_legacy_record_cannot_use_tt40_slot_geometry);
+	UT_RUN(test_native_v2_lifecycle_init_validates_sealed_fresh_template);
+	UT_RUN(test_native_init_cannot_upgrade_or_downgrade_existing_layout);
+	UT_RUN(test_native_v2_reuse_generation_and_format_are_exact);
+	UT_RUN(test_native_v2_recycle_keeps_all_full_xids_and_checks_readback);
+	UT_RUN(test_prepared_v2_abort_head_prefix_replay_preserves_original_head);
+	UT_RUN(test_operation_v2_native_control_and_exact_ancestry_keep_tt40_identity);
+	UT_RUN(test_operation_v2_native_refuses_bad_control_chain_and_owner_before_write);
+	UT_RUN(test_operation_v2_native_physical_stale_and_old_format_are_separate);
+	UT_RUN(test_legacy_operation80_retains_original_control_and_tt32_owner);
+	UT_RUN(test_native_old_commit_refuses_new_and_unknown_slot_layout);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

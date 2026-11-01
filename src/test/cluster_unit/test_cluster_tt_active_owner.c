@@ -32,6 +32,7 @@ static bool modifier_refused;
 static int rollovers_on_enter;
 static bool first_recheck_pending;
 static bool cold_fixture;
+static bool v2_fixture;
 static bool cold_capacity_refused;
 static uint32 cold_successor;
 static int cold_selection_calls;
@@ -540,7 +541,7 @@ reset_active_owner(void)
 	active_owner_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 	active_owner_recovered_open = true;
 	first_recheck_pending = false;
-	cold_fixture = cold_capacity_refused = false;
+	cold_fixture = cold_capacity_refused = v2_fixture = false;
 	cold_selection_calls = 0;
 	fail_next_memory_allocation = false;
 	capacity_test = capacity_cancel = capacity_other_admission = false;
@@ -1532,6 +1533,54 @@ UT_TEST(test_allocator_snapshot_is_complete_readonly_and_unavailable_leaves_outp
 int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 #define main TT_ACTIVE_OWNER_FIXTURE_MAIN
 #endif
+
+
+UT_TEST(test_original_local_v2_active_to_commit_or_abort_uses_persistent_fullxid)
+{
+	for (int committed = 0; committed < 2; committed++) {
+		ClusterCanonicalTxnBinding binding;
+		xl_xact_tt_commit_v2 fold;
+		UndoSegmentHeaderDataV2 *disk = (UndoSegmentHeaderDataV2 *)g_canned_block;
+		uint64 original;
+		reset_active_owner();
+		v2_fixture = true;
+		select_physical_fixture(1);
+		UT_ASSERT(cluster_tt_local_prepare_canonical_active(100, &binding));
+		UT_ASSERT_EQ(g_bind_v2_emit_calls, 1);
+		/* The ACTIVE fixture reselects physical storage only during allocation.
+		 * Terminal admission must retain the already-published canonical page. */
+		g_modifier_recheck_hook = NULL;
+		original = g_last_bind_v2.original_full_xid;
+		UT_ASSERT_EQ(disk->tt_slots[binding.slot_offset].original_full_xid, original);
+		/* The terminal producer must consume the captured canonical identity,
+		 * even after the optional origin/sidecar source is no longer available. */
+		g_ctrc_original_available = false;
+		if (committed) {
+			UT_ASSERT(cluster_tt_local_precommit_durable_finish(100, 42, &fold));
+			UT_ASSERT_EQ(fold.delta.format_version, 2);
+			UT_ASSERT_EQ(fold.original_full_xid, original);
+			UT_ASSERT_EQ(fold.delta.segment_generation, binding.segment_generation);
+			UT_ASSERT_EQ(fold.delta.slot_offset, binding.slot_offset);
+			UT_ASSERT_EQ(g_write_hdr_calls, 1); /* Only ACTIVE so far. */
+			UT_ASSERT_EQ(modifier_enters, modifier_leaves + 1);
+			g_flush_ptr = 0x5000;
+			cluster_tt_local_commit_durable_apply(0x5000);
+			UT_ASSERT_EQ(disk->tt_slots[binding.slot_offset].status, TT_SLOT_COMMITTED);
+			UT_ASSERT_EQ(disk->tt_slots[binding.slot_offset].commit_scn, 42);
+		} else {
+			UT_ASSERT(cluster_tt_local_preabort_durable_finish(100));
+			UT_ASSERT_EQ(g_abort_v2_emit_calls, 1);
+			UT_ASSERT_EQ(g_last_abort_v2.original_full_xid, original);
+			UT_ASSERT_EQ(disk->tt_slots[binding.slot_offset].status, TT_SLOT_ABORTED);
+		}
+		UT_ASSERT_EQ(disk->tt_slots[binding.slot_offset].original_full_xid, original);
+		UT_ASSERT_EQ(disk->pd_checksum, pg_checksum_page(g_canned_block, 0));
+		UT_ASSERT_EQ(memcmp(g_canned_block, g_current_resident, BLCKSZ), 0);
+		UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+		UT_ASSERT_EQ(g_current_pin_calls, g_current_unpin_calls);
+		UT_ASSERT_EQ(lock_depth, 0);
+	}
+}
 
 int
 main(void)

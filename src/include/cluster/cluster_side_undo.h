@@ -44,6 +44,7 @@
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/itemptr.h" /* TransactionId */
 
 typedef enum ClusterUndoDecodedKind {
@@ -103,6 +104,8 @@ typedef struct ClusterUndoDecoded {
 	uint8 new_state;
 	uint8 reserved_zero[1];
 	UBA first_undo_block;
+	uint64 original_full_xid; /* explicit V2 identity; zero for legacy records */
+	UndoOperationTrailer head_operation; /* explicit 80B/96B operation only */
 } ClusterUndoDecoded;
 
 /*
@@ -111,6 +114,10 @@ typedef struct ClusterUndoDecoded {
  * payload length — the caller must not mutate anything (U-SIDE-04).
  */
 extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out);
+extern bool cluster_undo_head_operation_from_decoded(
+	const ClusterUndoDecoded *decoded, xl_undo_tt_slot_set_head_operation *record);
+extern bool cluster_undo_head_operation_v2_from_decoded(
+	const ClusterUndoDecoded *decoded, xl_undo_tt_slot_set_head_operation_v2 *record);
 
 /*
  * §2.1-2 preflight: route (D-SIDE-01) + field integrity for the parsed
@@ -119,6 +126,11 @@ extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out
  * STOP-RF-SIDE-SPACE-ABI is active.
  */
 extern bool cluster_undo_preflight(const ClusterUndoDecoded *decoded);
+/* Pure V2 TT shape/route check. It grants no target or write authority;
+ * legacy SIDE target APIs remain closed to TT40 records. */
+extern bool cluster_undo_preflight_tt_v2(const ClusterUndoDecoded *decoded);
+/* Read-only PI keeps exact generation zero and requires a release digest. */
+extern bool cluster_undo_inspect_pi_tt_v2(const ClusterUndoDecoded *decoded);
 /* Historical record classification only; never permits a TT transition. */
 extern bool cluster_undo_inspect_pi(const ClusterUndoDecoded *decoded);
 
@@ -142,7 +154,10 @@ typedef enum ClusterUndoHeaderPrepareResultV1 {
  * Native generation decisions are preserved, including REUSE's torn-header
  * repair. TT records use the existing exact generation/slot transition tables
  * and preserve all unrelated header bytes. Only APPLY changes out; base and
- * out may alias. ALREADY is a byte-identical TT result, not a stale generation. */
+ * out may alias. ALREADY is a byte-identical TT result, not a stale generation.
+ * Explicit V2 standalone TT records dispatch only to a validated TT40 base;
+ * BIND establishes original FullXid and every later delta must preserve it.
+ * The V1 execution/target APIs below still reject these V2 identities. */
 extern ClusterUndoHeaderPrepareResultV1
 cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
 							   Size payload_length, const char *base, char *out);
@@ -153,6 +168,13 @@ extern ClusterUndoHeaderPrepareResultV1
 cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generation,
 							   uint16 slot_offset, uint16 wrap, TransactionId xid, SCN commit_scn,
 							   const char *base, char *out);
+
+/* Bounded folded input dispatch into the original V1 or exact TT40 private
+ * successor. No target/write authority; legacy identity cannot enter TT40. */
+struct xl_xact_tt_commit;
+extern ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_xact_commit_v1(const struct xl_xact_tt_commit *delta,
+								  uint64 original_full_xid, const char *base, char *out);
 
 typedef enum ClusterUndoApplyResultV1 {
 	CLUSTER_UNDO_APPLY_OK = 0,

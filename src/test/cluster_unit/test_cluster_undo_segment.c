@@ -36,6 +36,7 @@
 #include <string.h> /* memset */
 
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_segment_init.h"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
  * stdlib printf and we don't link libpgport in this test binary. */
@@ -45,6 +46,16 @@
 
 
 UT_DEFINE_GLOBALS();
+
+extern void test_frontend_undo_header_v1(uint32 segment_id, uint8 owner_instance, char *page);
+extern bool test_frontend_undo_header_v2(uint32 segment_id, uint8 owner_instance, char *page);
+
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(), int lineNumber pg_attribute_unused())
+{
+	abort();
+}
 
 
 /*
@@ -278,10 +289,180 @@ UT_TEST(test_spec122_pd_has_itl_undo_disjoint)
 }
 
 
+UT_TEST(test_legacy_header_identity_refuses_versioned_tt_stride)
+{
+	UndoSegmentHeaderData header = { 0 };
+	uint8 *bytes = (uint8 *)&header;
+	uint16 stride = 40;
+
+	header.pd_flags = PD_UNDO_SEG_HEADER;
+	header.pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	header.segment_id = 7;
+	header.segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	header.owner_instance = 1;
+	header.tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	UT_ASSERT(UndoSegmentHeader_identity_matches((char *)&header, 7, 1));
+	/* V2 framing lives in the old reserved prefix, before either slot stride. */
+	bytes[57] = 2;
+	memcpy(bytes + 58, &stride, sizeof(stride));
+	UT_ASSERT(!UndoSegmentHeader_identity_matches((char *)&header, 7, 1));
+	for (unsigned offset = 57; offset < 64; offset++) {
+		memset(bytes + 57, 0, 7);
+		bytes[offset] = 1;
+		UT_ASSERT(!UndoSegmentHeader_identity_matches((char *)&header, 7, 1));
+	}
+}
+
+UT_TEST(test_tt_v2_slot_and_block_zero_exact_layout)
+{
+	struct { char prefix; TTSlotV2 slot; } alignment;
+
+	UT_ASSERT_EQ(sizeof(TTSlotV2), 40);
+	UT_ASSERT_EQ(offsetof(TTSlotV2, original_full_xid), 32);
+	UT_ASSERT_EQ((char *)&alignment.slot - (char *)&alignment, 8);
+	UT_ASSERT_EQ(sizeof(UndoSegmentHeaderDataV2), BLCKSZ);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, tt_layout_version), 57);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, tt_slot_bytes), 58);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, tt_layout_reserved), 60);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, tt_slots), 112);
+	UT_ASSERT_EQ(sizeof(((UndoSegmentHeaderDataV2 *)0)->tt_slots), 1920);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, tt_next_free_slot), 2032);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, tt_active_count), 2036);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, free_block_bitmap), 2040);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, wrap_count), 3064);
+	UT_ASSERT_EQ(offsetof(UndoSegmentHeaderDataV2, _reserved), 3068);
+	UT_ASSERT_EQ(sizeof(((UndoSegmentHeaderDataV2 *)0)->_reserved), 5124);
+}
+
+UT_TEST(test_tt_v2_fresh_frontend_backend_bytes_match_and_legacy_stays_v1)
+{
+	UndoSegmentHeaderDataV2 backend, frontend;
+	UndoSegmentHeaderData legacy, legacy_frontend;
+	const uint8 *bytes = (const uint8 *)&backend;
+
+	memset(&backend, 0xa5, sizeof(backend));
+	memset(&frontend, 0x5a, sizeof(frontend));
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(7, 1, (char *)&backend));
+	UT_ASSERT(test_frontend_undo_header_v2(7, 1, (char *)&frontend));
+	UT_ASSERT(memcmp(&backend, &frontend, BLCKSZ) == 0);
+	UT_ASSERT(UndoSegmentHeaderV2_identity_matches((char *)&backend, BLCKSZ, 7, 1));
+	UT_ASSERT(!UndoSegmentHeader_identity_matches((char *)&backend, 7, 1));
+	UT_ASSERT_EQ(backend.tt_layout_version, 2);
+	UT_ASSERT_EQ(backend.tt_slot_bytes, 40);
+	UT_ASSERT_EQ(backend.tt_layout_reserved, 0);
+	for (Size i = 112; i < BLCKSZ; i++)
+		UT_ASSERT_EQ(bytes[i], 0);
+	for (int i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		UT_ASSERT_EQ(backend.tt_slots[i].status, TT_SLOT_UNUSED);
+		UT_ASSERT_EQ(backend.tt_slots[i].original_full_xid, 0);
+	}
+	cluster_undo_segment_make_header_bytes(7, 1, (char *)&legacy);
+	test_frontend_undo_header_v1(7, 1, (char *)&legacy_frontend);
+	UT_ASSERT(memcmp(&legacy, &legacy_frontend, BLCKSZ) == 0);
+	UT_ASSERT(UndoSegmentHeader_identity_matches((char *)&legacy, 7, 1));
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&legacy, BLCKSZ, 7, 1));
+	UT_ASSERT(memcmp(&legacy, &backend, 57) == 0);
+	UT_ASSERT(memcmp((char *)&legacy + 64, (char *)&backend + 64, BLCKSZ - 64) == 0);
+	UT_ASSERT_EQ(backend.pd_checksum, 0); /* template, not a sealed durable page */
+}
+
+UT_TEST(test_tt_v2_constructor_refusal_preserves_output)
+{
+	UndoSegmentHeaderDataV2 output, before;
+	const struct { uint32 segment; uint8 owner; } invalid[] = {
+		{ 0, 1 }, { 7, 0 }, { 7, 129 }, { 7, 255 }
+	};
+
+	memset(&output, 0xa5, sizeof(output));
+	before = output;
+	for (Size i = 0; i < lengthof(invalid); i++) {
+		UT_ASSERT(!cluster_undo_segment_make_header_v2_bytes(invalid[i].segment,
+			invalid[i].owner, (char *)&output));
+		UT_ASSERT(memcmp(&output, &before, BLCKSZ) == 0);
+		UT_ASSERT(!test_frontend_undo_header_v2(invalid[i].segment,
+			invalid[i].owner, (char *)&output));
+		UT_ASSERT(memcmp(&output, &before, BLCKSZ) == 0);
+	}
+	UT_ASSERT(!cluster_undo_segment_make_header_v2_bytes(7, 1, NULL));
+	UT_ASSERT(!test_frontend_undo_header_v2(7, 1, NULL));
+}
+
+UT_TEST(test_tt_v2_identity_rejects_wrong_prefix_before_slot_stride)
+{
+	UndoSegmentHeaderDataV2 valid, page;
+	const uint8 versions[] = { 0, 1, 3, 255 };
+	const uint16 strides[] = { 0, 32, 39, 41, UINT16_MAX };
+	const Size lengths[] = { 0, 1, 63, 64, BLCKSZ - 1, BLCKSZ + 1 };
+	char short_buffer[1] = { 0 };
+
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(7, 1, (char *)&valid));
+	for (Size i = 0; i < lengthof(versions); i++) {
+		page = valid;
+		page.tt_layout_version = versions[i];
+		UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	}
+	for (Size i = 0; i < lengthof(strides); i++) {
+		page = valid;
+		page.tt_slot_bytes = strides[i];
+		UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	}
+	page = valid;
+	page.tt_layout_reserved = 1;
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	for (Size i = 0; i < lengthof(lengths); i++)
+		UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&valid, lengths[i], 7, 1));
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches(short_buffer, sizeof(short_buffer), 7, 1));
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches(NULL, BLCKSZ, 7, 1));
+}
+
+UT_TEST(test_tt_v2_mutable_identity_uses_new_management_offsets)
+{
+	UndoSegmentHeaderDataV2 page, valid;
+	const uint8 states[] = { SEGMENT_ALLOCATED, SEGMENT_ACTIVE,
+		SEGMENT_COMMITTED, SEGMENT_RECYCLABLE };
+	const uint64 full = (UINT64_C(7) << 32) | 1234;
+
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(7, 1, (char *)&valid));
+	valid.tt_next_free_slot = TT_SLOTS_PER_SEGMENT;
+	valid.tt_active_count = 1;
+	valid.wrap_count = 9;
+	valid.free_block_bitmap[1] = 0xff;
+	valid.tt_slots[47].xid = 1234;
+	valid.tt_slots[47].status = TT_SLOT_ACTIVE;
+	valid.tt_slots[47].original_full_xid = full;
+	for (Size i = 0; i < lengthof(states); i++) {
+		valid.segment_state = states[i];
+		UT_ASSERT(UndoSegmentHeaderV2_identity_matches((char *)&valid, BLCKSZ, 7, 1));
+		UT_ASSERT_EQ(valid.tt_slots[47].original_full_xid, full);
+	}
+	page = valid;
+	page.tt_next_free_slot++;
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	page = valid;
+	page.tt_active_count = TT_SLOTS_PER_SEGMENT + 1;
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	page = valid;
+	page.segment_state = SEGMENT_INVALID;
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	page = valid;
+	page.segment_size_bytes--;
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	page = valid;
+	page.tt_slots_count--;
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	page = valid;
+	page.pd_flags &= ~PD_UNDO_SEG_HEADER;
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&page, BLCKSZ, 7, 1));
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&valid, BLCKSZ, 8, 1));
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&valid, BLCKSZ, 7, 2));
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&valid, BLCKSZ, 0, 1));
+	UT_ASSERT(!UndoSegmentHeaderV2_identity_matches((char *)&valid, BLCKSZ, 7, 0));
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(27);
 
 	/* Layout invariants (9) */
 	UT_RUN(test_spec121_segheader_size_is_8192_bytes);
@@ -315,6 +496,12 @@ main(void)
 	UT_RUN(test_spec122_pd_undo_seg_header_bit_value);
 	UT_RUN(test_spec122_pd_valid_flag_bits_bumped);
 	UT_RUN(test_spec122_pd_has_itl_undo_disjoint);
+	UT_RUN(test_legacy_header_identity_refuses_versioned_tt_stride);
+	UT_RUN(test_tt_v2_slot_and_block_zero_exact_layout);
+	UT_RUN(test_tt_v2_fresh_frontend_backend_bytes_match_and_legacy_stays_v1);
+	UT_RUN(test_tt_v2_constructor_refusal_preserves_output);
+	UT_RUN(test_tt_v2_identity_rejects_wrong_prefix_before_slot_stride);
+	UT_RUN(test_tt_v2_mutable_identity_uses_new_management_offsets);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

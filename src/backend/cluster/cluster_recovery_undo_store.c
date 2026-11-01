@@ -34,6 +34,36 @@ struct ClusterRecoveryUndoStore {
 	char page[BLCKSZ];
 };
 
+/* These bytes belong to an immutable capture already checked in full by
+ * cluster_recovery_undo_scan_begin. Never index its legacy management area
+ * or slot array until the fixed-prefix layout has been selected. */
+static uint32
+undo_store_generation(const UndoSegmentHeaderData *header)
+{
+	if (header->_pad_57[0] == CLUSTER_UNDO_TT_LAYOUT_V2)
+		return ((const UndoSegmentHeaderDataV2 *)header)->wrap_count;
+	return header->wrap_count;
+}
+
+static void
+undo_store_slot(const UndoSegmentHeaderData *header, uint16 offset,
+				ClusterRecoveryUndoEntry *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->segment_id = header->segment_id;
+	out->owner_instance = header->owner_instance;
+	out->segment_generation = undo_store_generation(header);
+	out->slot_offset = offset;
+	if (header->_pad_57[0] == CLUSTER_UNDO_TT_LAYOUT_V2) {
+		const TTSlotV2 *slot = &((const UndoSegmentHeaderDataV2 *)header)->tt_slots[offset];
+
+		memcpy(&out->slot, slot, sizeof(out->slot));
+		out->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+		out->original_full_xid = slot->original_full_xid;
+	} else
+		out->slot = header->tt_slots[offset];
+}
+
 static ClusterRecoveryGraphResult
 undo_store_fail(ClusterRecoveryUndoStore *store, ClusterRecoveryGraphResult result)
 {
@@ -134,6 +164,7 @@ ClusterRecoveryGraphResult
 cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecoveryUndoEntry *out)
 {
 	RecoveryUndoFile *file;
+	ClusterRecoveryUndoEntry entry;
 	uint8 digest[32];
 
 	if (out != NULL)
@@ -234,8 +265,9 @@ cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecover
 		file->loaded = true;
 		return CLUSTER_RECOVERY_GRAPH_MORE;
 	}
+	undo_store_slot(&file->header, store->slot, &entry);
 	if (store->graph != NULL) {
-		const TTSlot *slot = &file->header.tt_slots[store->slot];
+		const TTSlot *slot = &entry.slot;
 
 		/* The legacy first_undo_block field is the transaction-chain head.
 		 * Status/SCN/CTRC flags do not establish that any dependency vanished. */
@@ -246,7 +278,7 @@ cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecover
 			key.system_identifier = store->system_identifier;
 			key.database_incarnation = store->database_incarnation;
 			key.segment_id = file->header.segment_id;
-			key.segment_generation = file->header.wrap_count;
+			key.segment_generation = entry.segment_generation;
 			key.origin_node_id = file->header.owner_instance - 1;
 			key.slot_offset = store->slot;
 			key.slot_wrap = slot->wrap;
@@ -257,11 +289,8 @@ cluster_recovery_undo_store_next(ClusterRecoveryUndoStore *store, ClusterRecover
 				return undo_store_fail(store, added);
 		}
 	}
-	out->segment_id = file->header.segment_id;
-	out->segment_generation = file->header.wrap_count;
-	out->owner_instance = file->header.owner_instance;
-	out->slot_offset = store->slot;
-	out->slot = file->header.tt_slots[store->slot++];
+	*out = entry;
+	store->slot++;
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 }
 
@@ -289,11 +318,7 @@ cluster_recovery_undo_store_at(ClusterRecoveryUndoStore *store, uint32 index,
 	if (!store->files[file].loaded)
 		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_INVALID);
 	header = &store->files[file].header;
-	out->segment_id = header->segment_id;
-	out->segment_generation = header->wrap_count;
-	out->owner_instance = header->owner_instance;
-	out->slot_offset = slot;
-	out->slot = header->tt_slots[slot];
+	undo_store_slot(header, slot, out);
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 }
 
@@ -340,7 +365,7 @@ cluster_recovery_undo_store_read(void *arg, const ClusterRecoveryTxnKey *key, UB
 		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_IDENTITY);
 	canonical = cluster_recovery_undo_store_header(store, key->segment_id);
 	physical = cluster_recovery_undo_store_header(store, segment);
-	if (canonical == NULL || canonical->wrap_count != key->segment_generation
+	if (canonical == NULL || undo_store_generation(canonical) != key->segment_generation
 		|| canonical->owner_instance != key->origin_node_id + 1)
 		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_IDENTITY);
 	if (physical == NULL)
@@ -358,12 +383,13 @@ cluster_recovery_undo_store_read(void *arg, const ClusterRecoveryTxnKey *key, UB
 		memset(record, 0, sizeof(*record));
 		return undo_store_fail(store, CLUSTER_RECOVERY_GRAPH_CORRUPT);
 	}
-	checked = cluster_recovery_tx_record_check(key, address, record, physical->wrap_count);
+	checked = cluster_recovery_tx_record_check(key, address, record,
+											 undo_store_generation(physical));
 	if (checked != CLUSTER_RECOVERY_GRAPH_MORE) {
 		memset(record, 0, sizeof(*record));
 		return undo_store_fail(store, checked);
 	}
-	*generation = physical->wrap_count;
+	*generation = undo_store_generation(physical);
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 }
 
@@ -373,7 +399,7 @@ cluster_recovery_undo_store_read_base(ClusterRecoveryUndoStore *store, UBA addre
 									ClusterRecoveryUndoRecord *record, uint32 *generation)
 {
 	const UndoSegmentHeaderData *physical, *canonical;
-	const TTSlot *binding;
+	ClusterRecoveryUndoEntry binding;
 	ClusterRecoveryTxnKey key = { 0 };
 	ClusterRecoveryRootsResult read;
 	ClusterRecoveryGraphResult result;
@@ -421,27 +447,28 @@ cluster_recovery_undo_store_read_base(ClusterRecoveryUndoStore *store, UBA addre
 	/* A complete matching base is an independent binding. A current segment
 	 * number alone, or the local PAGE wrap, is never sufficient. Reused and
 	 * legacy identities remain for the later independently seeded WAL forest. */
-	if (canonical == NULL || canonical->wrap_count == UINT32_MAX
+	if (canonical == NULL || undo_store_generation(canonical) == UINT32_MAX
 		|| record->header.tt_wrap_plus1 == 0)
 		goto pending;
-	binding = &canonical->tt_slots[slot];
-	if (binding->status < TT_SLOT_ACTIVE || binding->status > TT_SLOT_ABORTED
-		|| binding->xid != xid || binding->wrap == TT_WRAP_INVALID
-		|| binding->wrap != record->header.tt_wrap_plus1 - 1)
+	undo_store_slot(canonical, slot, &binding);
+	if (binding.slot.status < TT_SLOT_ACTIVE || binding.slot.status > TT_SLOT_ABORTED
+		|| binding.slot.xid != xid || binding.slot.wrap == TT_WRAP_INVALID
+		|| binding.slot.wrap != record->header.tt_wrap_plus1 - 1)
 		goto pending;
 	key.system_identifier = store->system_identifier;
 	key.database_incarnation = store->database_incarnation;
 	key.segment_id = canonical->segment_id;
-	key.segment_generation = canonical->wrap_count;
+	key.segment_generation = binding.segment_generation;
 	key.origin_node_id = canonical->owner_instance - 1;
 	key.slot_offset = slot;
-	key.slot_wrap = binding->wrap;
+	key.slot_wrap = binding.slot.wrap;
 	key.xid = xid;
-	result = cluster_recovery_tx_record_check(&key, address, record, physical->wrap_count);
+	result = cluster_recovery_tx_record_check(&key, address, record,
+											undo_store_generation(physical));
 	if (result != CLUSTER_RECOVERY_GRAPH_MORE)
 		goto refuse;
 	*transaction = key;
-	*generation = physical->wrap_count;
+	*generation = undo_store_generation(physical);
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 pending:
 	memset(record, 0, sizeof(*record));

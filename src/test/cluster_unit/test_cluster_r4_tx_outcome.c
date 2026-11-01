@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "access/heapam.h"
 #include "access/xact.h"
 #include "access/subtrans.h"
 #include "access/twophase.h"
@@ -211,6 +212,9 @@ static bool test_candidate_extract_short;
 static uint32 test_candidate_data_generation;
 static uint32 test_candidate_tt_generation;
 static bool test_candidate_copy_physical_slot;
+static bool test_candidate_tt_v2;
+static uint64 test_candidate_persisted_full;
+static int test_candidate_tt_fault;
 static bool test_current_owner_available;
 static bool test_current_owner_drift_on_recheck;
 static int test_current_owner_calls;
@@ -280,6 +284,12 @@ static int test_remote_origin_calls;
 static uint32 test_remote_origin_generation;
 static ClusterTxOutcome test_remote_origin_outcome;
 static bool test_remote_origin_revoke_admission;
+static const uint8 *test_remote_origin_verdict_page;
+static bool test_receiver_registered;
+static ClusterTxResolution test_receiver_retained;
+static uint64 test_receiver_peer_boot, test_receiver_peer_generation, test_receiver_peer_epoch;
+static uint64 test_receiver_self_admitted;
+static unsigned test_receiver_checks, test_receiver_drift;
 static ClusterUndoBlock0CurrentStep test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 static ClusterUndoBlock0CurrentStep test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 static ClusterUndoBlock0CurrentStep test_candidate_after_wait_step
@@ -582,26 +592,108 @@ cluster_qvotec_get_self_incarnation(void)
 }
 
 bool
-cluster_reconfig_get_observed_slot(int32 node_id pg_attribute_unused(), uint64 *incarnation,
+cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation,
 								   uint64 *generation)
 {
 	if (incarnation != NULL)
-		*incarnation = 0;
+		*incarnation = test_receiver_registered && node_id == 0 ? test_receiver_peer_boot : 0;
 	if (generation != NULL)
-		*generation = 0;
-	return false;
+		*generation = test_receiver_registered && node_id == 0 ? test_receiver_peer_generation : 0;
+	return test_receiver_registered && node_id == 0;
 }
 
 uint64
-cluster_reconfig_get_observed_epoch(int32 node_id pg_attribute_unused())
+cluster_reconfig_get_observed_epoch(int32 node_id)
 {
-	return 0;
+	return test_receiver_registered && node_id == 0 ? test_receiver_peer_epoch : 0;
 }
 
 uint64
-cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
+cluster_membership_get_last_admitted_incarnation(int32 node_id)
 {
-	return 0;
+	return !test_receiver_registered ? 0
+		: node_id == 0 ? test_receiver_peer_boot : node_id == 1 ? test_receiver_self_admitted : 0;
+}
+
+static ClusterCtrcItlTargetIdentity test_receiver_target;
+static unsigned test_receiver_target_checks;
+static unsigned test_reader_holds, test_reader_releases, test_reader_live;
+static bool test_reader_throw;
+
+/* The shared owner is exercised in test_cluster_ctrc_cleaner. This boundary
+ * is an explicitly installed exact receiver record, never codec success. */
+bool
+cluster_ctrc_itl_original_full_xid_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver)
+{
+	const ClusterCtrcTxnKeyV1 *expected = &test_receiver_retained.origin_companion.key;
+	bool matched = test_receiver_registered && key != NULL && locator != NULL && receiver != NULL
+		&& memcmp(key, expected, sizeof(*key)) == 0
+		&& FullTransactionIdEquals(original, test_receiver_retained.origin_companion.original_full_xid)
+		&& memcmp(locator, &test_receiver_retained.locator_echo, sizeof(*locator)) == 0
+		&& receiver->node_id == 1 && receiver->boot_incarnation == test_receiver_self_admitted
+		&& receiver->capability_record_generation == expected->admission_record_generation
+		&& receiver->formation_epoch == expected->formation_epoch
+		&& receiver->admission_record_generation == expected->admission_record_generation;
+
+	test_receiver_checks++;
+	switch (test_receiver_drift) {
+	case 1: return false;
+	case 2: test_boot_incarnation++; break;
+	case 3: test_receiver_peer_boot++; break;
+	case 4: test_receiver_peer_generation++; break;
+	case 5: test_receiver_peer_epoch++; break;
+	case 6: test_system_identifier++; break;
+	case 7: test_candidate_root_drift = true; test_regular_root_resolve_calls = 2; break;
+	case 8: test_admission_revoked = true; break;
+	case 9: test_receiver_self_admitted++; break;
+	}
+	return matched;
+}
+
+bool
+cluster_ctrc_itl_original_full_xid_target_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target)
+{
+	test_receiver_target_checks++;
+	return target != NULL && memcmp(target, &test_receiver_target, sizeof(*target)) == 0
+		&& cluster_ctrc_itl_original_full_xid_matches_shared(key, original, locator, receiver);
+}
+
+bool
+cluster_ctrc_itl_original_full_xid_target_hold_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target, ClusterCtrcItlReadGuardV1 *guard)
+{
+	if (!cluster_ctrc_itl_original_full_xid_target_matches_shared(key, original, locator, receiver, target)) return false;
+	test_reader_holds++; test_reader_live++;
+	guard->serial = test_reader_holds; guard->pid = 2901; guard->slot = 0;
+	if (test_reader_throw) pg_re_throw();
+	return true;
+}
+
+bool
+cluster_ctrc_itl_read_guard_matches_v1(
+	const ClusterCtrcItlReadGuardV1 *guard, const ClusterCtrcTxnKeyV1 *key,
+	FullTransactionId original, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target)
+{
+	return guard != NULL && guard->serial != 0 && test_reader_live != 0
+		&& cluster_ctrc_itl_original_full_xid_target_matches_shared(key, original, &test_receiver_retained.locator_echo, receiver, target);
+}
+
+bool
+cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard)
+{
+	if (guard->serial != 0) {
+		UT_ASSERT(test_reader_live > 0); test_reader_live--; test_reader_releases++;
+		memset(guard, 0, sizeof(*guard));
+	}
+	return true;
 }
 
 ClusterSemanticAdmissionResult
@@ -866,8 +958,41 @@ cluster_undo_block0_current_copy_resident(
 	UT_ASSERT_EQ(expected->value, root->root_id == 91 ? test_candidate_data_generation
 													  : test_candidate_tt_generation);
 	memset(private_page, 0, BLCKSZ);
+	/* Supply the real identity prefix, not just a slot-shaped byte array. */
+	header->pd_flags = PD_UNDO_SEG_HEADER;
+	header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	header->segment_id = root->root_id == 91 ? TEST_RECORD_SEGMENT : TEST_TT_SEGMENT;
+	header->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	header->segment_state = SEGMENT_ACTIVE;
+	header->owner_instance = 1;
+	header->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	header->wrap_count = expected->value;
 	if (test_candidate_copy_physical_slot)
 		header->tt_slots[TEST_TT_OFFSET] = test_tt_slot;
+	if (test_candidate_tt_v2) {
+		UndoSegmentHeaderDataV2 *v2 = (UndoSegmentHeaderDataV2 *)private_page;
+
+		memset(private_page + offsetof(UndoSegmentHeaderData, tt_slots), 0,
+			   BLCKSZ - offsetof(UndoSegmentHeaderData, tt_slots));
+		v2->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+		v2->tt_slot_bytes = CLUSTER_UNDO_TT_SLOT_V2_BYTES;
+		v2->wrap_count = expected->value;
+		if (test_candidate_copy_physical_slot) {
+			memcpy(&v2->tt_slots[TEST_TT_OFFSET], &test_tt_slot, sizeof(test_tt_slot));
+			v2->tt_slots[TEST_TT_OFFSET].original_full_xid = test_candidate_persisted_full;
+		}
+		switch (test_candidate_tt_fault) {
+		case 1: v2->tt_slot_bytes--; break;
+		case 2: v2->tt_layout_version++; break;
+		case 3: v2->tt_layout_reserved = 1; break;
+		case 4: v2->wrap_count++; break;
+		case 5: v2->owner_instance++; break;
+		case 6: v2->tt_slots[TEST_TT_OFFSET].original_full_xid = 0; break;
+		case 7: v2->tt_slots[TEST_TT_OFFSET].original_full_xid = UINT64_MAX; break;
+		case 8: v2->tt_slots[TEST_TT_OFFSET].original_full_xid++; break;
+		default: break;
+		}
+	}
 	if (test_candidate_copy_generation_drift)
 		test_candidate_tt_generation++;
 	if (test_candidate_after_block0_copy != NULL)
@@ -1060,6 +1185,41 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	handle->key = *key;
 	handle->valid = true;
 	return CLUSTER_CTRC_PREPARE_READY;
+}
+
+/* Controlled original144 leaf for the already-real pending producer. The
+ * unit observes exact key/receiver/grant continuity; shared locking/encoding
+ * has its own original-source tests. No arbitrary receiver is accepted. */
+bool
+cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES])
+{
+	memset(bytes, 0, CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES);
+	if (grant == 0 || grant != test_ctrc_touch_grant
+		|| memcmp(key, &test_ctrc_touched_key, sizeof(*key)) != 0
+		|| memcmp(receiver, &test_ctrc_touched_participant, sizeof(*receiver)) != 0)
+		return false;
+	memcpy(bytes, key, sizeof(*key));
+	memcpy(bytes + sizeof(*key), receiver, sizeof(*receiver));
+	memcpy(bytes + sizeof(*key) + sizeof(*receiver), &grant, sizeof(grant));
+	return true;
+}
+
+ClusterCtrcPrepareResult
+cluster_ctrc_receipt_prepare_origin_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	const uint8 *bytes, Size length, ClusterCtrcReceiptHandle *handle)
+{
+	uint8 expected[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
+
+	if (length != sizeof(expected) || bytes == NULL
+		|| !cluster_ctrc_origin_fullxid_capture_v2(key, receiver, grant, expected)
+		|| memcmp(bytes, expected, sizeof(expected)) != 0)
+		return CLUSTER_CTRC_PREPARE_REFUSED;
+	return cluster_ctrc_receipt_prepare_shared(key, receiver, grant, publication,
+		target, handle);
 }
 
 bool
@@ -1359,6 +1519,15 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterT
 	UT_ASSERT_EQ(memcmp(locator, &test_origin_locator, sizeof(*locator)), 0);
 	test_remote_origin_calls++;
 	test_remote_origin_generation = expected_physical_generation;
+	if (test_remote_origin_verdict_page != NULL) {
+		bool decoded = ClusterR4TxVerdictPageDecode(test_remote_origin_verdict_page, locator, out);
+
+		UT_ASSERT(decoded);
+		*reason_out = decoded ? CLUSTER_TX_RESOLVE_NONE : CLUSTER_TX_RESOLVE_PROTOCOL;
+		if (test_remote_origin_revoke_admission)
+			test_formation_epoch++;
+		return decoded ? out->outcome : CLUSTER_TX_UNKNOWN;
+	}
 	/* Transport/proof validation is covered by the real GCS suite. This seam
 	 * records what the real admitted consumer asks the exact origin to do. */
 	memset(out, 0, sizeof(*out));
@@ -1495,6 +1664,9 @@ reset_exact_origin_fixture(void)
 	test_candidate_data_generation = 17;
 	test_candidate_tt_generation = 23;
 	test_candidate_copy_physical_slot = true;
+	test_candidate_tt_v2 = false;
+	test_candidate_persisted_full = 0;
+	test_candidate_tt_fault = 0;
 	test_current_owner_available = false;
 	test_current_owner_drift_on_recheck = false;
 	test_current_owner_calls = 0;
@@ -1575,6 +1747,12 @@ reset_exact_origin_fixture(void)
 	test_remote_origin_generation = 0;
 	test_remote_origin_outcome = CLUSTER_TX_IN_PROGRESS;
 	test_remote_origin_revoke_admission = false;
+	test_remote_origin_verdict_page = NULL;
+	test_receiver_registered = false;
+	memset(&test_receiver_retained, 0, sizeof(test_receiver_retained));
+	test_receiver_peer_boot = test_receiver_peer_generation = test_receiver_peer_epoch = 0;
+	test_receiver_self_admitted = 0;
+	test_receiver_checks = test_receiver_drift = 0;
 	test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	test_candidate_after_wait_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
@@ -7502,7 +7680,7 @@ UT_TEST(test_aborted_modification_projection_rejects_malformed_record_image)
 				else ((UndoDeletePayload *)test_origin_payload)->full_tuple_offset = BLCKSZ;
 				break;
 			case 7: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = 0; break;
-			case 8: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = UINT8_MAX; break;
+			case 8: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = (char)UINT8_MAX; break;
 			case 9: test_origin_record.flags = 0; break;
 			}
 			resolve_creation_record(false, 0, &resolution);
@@ -8080,6 +8258,29 @@ main(void)
 	UT_RUN(test_update_creation_target_names_replacement_not_old_tuple);
 	UT_RUN(test_noncreation_or_malformed_payload_keeps_verdict_without_target);
 	UT_RUN(test_creation_target_is_not_exported_after_final_data_fence_drift);
+	UT_RUN(test_original_canonical_creation_selects_explicit_wire_version);
+	UT_RUN(test_origin_companion_missing_source_stays_v3_and_fence_drift_clears_candidate);
+	UT_RUN(test_foreign_v4_remains_separate_and_original_final_admission_clears_all);
+	UT_RUN(test_foreign_v4_without_receiver_retention_discards_only_companion);
+	UT_RUN(test_foreign_retained_companion_cannot_escape_source_or_root_drift);
+	UT_RUN(test_foreign_current_observation_uses_original_entered_receiver_retention);
+	UT_RUN(test_foreign_target_current_preserves_source_and_admission_checks);
+	UT_RUN(test_foreign_target_validation_releases_its_held_source_on_refusal);
+	UT_RUN(test_foreign_target_scope_survives_return_and_current_refusal_until_owner_release);
+	UT_RUN(test_tt40_canonical_persisted_identity_without_live_source);
+	UT_RUN(test_tt40_canonical_live_sources_match_persisted_full_identity);
+	UT_RUN(test_tt40_canonical_same_raw_different_full_identity_refuses);
+	UT_RUN(test_tt40_canonical_malformed_slot_refuses_before_native_lookup);
+	UT_RUN(test_tt40_canonical_original_final_fences_still_clear_identity);
+	UT_RUN(test_tt40_held_physical_and_current_owner_status_readers);
+	UT_RUN(test_tt40_known_generation_zero_reaches_freeze_plan);
+	UT_RUN(test_tt40_zero_rollover_count_reaches_freeze_plan);
+	UT_RUN(test_tt40_initial_epoch_and_all_zero_counters_reach_freeze_plan);
+	UT_RUN(test_tt40_initial_counters_keep_identity_current_and_strict_bounds);
+	UT_RUN(test_tt40_held_status_rejects_live_same_raw_different_epoch);
+	UT_RUN(test_tt40_held_status_keeps_optional_sources_and_legacy_behavior);
+	UT_RUN(test_tt40_held_status_source_drift_cannot_escape_original_fences);
+	UT_RUN(test_tt40_physical_memo_cannot_hide_later_fullxid_conflict);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

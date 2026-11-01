@@ -11,6 +11,7 @@ OBJS = \
 	$(RMGRDESCOBJS) \
 	$(WIN32RES) \
 	compat.o \
+	cluster_uba.o \
 	pg_waldump.o \
 	rmgrdesc.o \
 	xlogreader.o \
@@ -33,6 +34,9 @@ xlogreader.c: % : $(top_srcdir)/src/backend/access/transam/%
 xlogstats.c: % : $(top_srcdir)/src/backend/access/transam/%
 	rm -f $@ && $(LN_S) $< .
 
+cluster_uba.c: % : $(top_srcdir)/src/backend/cluster/%
+	rm -f $@ && $(LN_S) $< .
+
 $(RMGRDESCSOURCES): % : $(top_srcdir)/src/backend/access/rmgrdesc/%
 	rm -f $@ && $(LN_S) $< .
 
@@ -46,7 +50,7 @@ uninstall:
 	rm -f '$(DESTDIR)$(bindir)/pg_waldump$(X)'
 
 clean distclean maintainer-clean:
-	rm -f pg_waldump$(X) $(OBJS) $(RMGRDESCSOURCES) xlogreader.c xlogstats.c
+	rm -f pg_waldump$(X) $(OBJS) $(RMGRDESCSOURCES) xlogreader.c xlogstats.c cluster_uba.c
 	rm -rf tmp_check
 
 check:

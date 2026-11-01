@@ -163,13 +163,22 @@ cluster_pcm_lock_resource_x_requester_join_current_exact(const ResourceXDecodedF
 														 uint32 master_ingress, uint64 r4,
 														 ResourceXRequesterJoinSnapshot *out)
 {
-	(void)frame;
 	(void)out;
 	UT_ASSERT_EQ(source, 1);
 	UT_ASSERT_EQ(source_ingress, 61);
 	UT_ASSERT_EQ(current_master, master);
 	UT_ASSERT_EQ(master_ingress, 61);
 	UT_ASSERT_EQ(r4, 77);
+	if (frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		&& frame->body.image_envelope.ctrc_delegation_bytes != 0) {
+		UT_ASSERT_EQ(receive_custody_calls, 1);
+		UT_ASSERT(receive_custody_admission != NULL && receive_custody_admission->entered);
+		UT_ASSERT_EQ(leaves, 0);
+		if (receive_join_outcome == 2)
+			siglongjmp(*PG_exception_stack, 1);
+		if (receive_join_outcome == 1)
+			return RESOURCE_X_APPLY_BAD_STATE;
+	}
 	joins++;
 	if (delivery_enabled)
 		return RESOURCE_X_APPLY_STALE;
@@ -305,6 +314,14 @@ cluster_semantic_activation_resource_x_peer_open_check(const ClusterSemanticAdmi
 													   int32 node, uint32 generation)
 {
 	peer_checks++;
+	if (receive_custody_calls != 0) {
+		if ((receive_after_custody == 2 && node == 1)
+			|| (receive_after_custody == 3 && node == 0))
+			return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
+		if ((receive_after_custody == 6 && node == 1)
+			|| (receive_after_custody == 7 && node == 0))
+			return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN;
+	}
 	if (!token->entered || node < 0 || generation != 61 || scenario == 7
 		|| (scenario == 13 && peer_checks == 2))
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_ADMISSION_DRIFT;
@@ -370,10 +387,12 @@ gcs_block_resource_x_gate_session_recheck(const BufferTag *tag, const ResourceXG
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_join_terminal_owned_try(const ResourceXAcquisitionRef *input,
 												   bool scheduled_retry,
+	const ClusterSemanticAdmissionToken *admission,
 												   ResourceXAcquisitionRef *ref, uint64 *ownership,
 												   uint64 *authority)
 {
 	(void)scheduled_retry;
+	UT_ASSERT(admission != NULL && admission->entered);
 	installs++;
 	ref->assertion = input->assertion;
 	ref->formation = 17;
@@ -551,10 +570,12 @@ cluster_pcm_lock_resource_x_delivery_complete_exact(const ResourceXDeliveryClaim
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion, bool retry,
 											 const ResourceXDeliveryClaim *claim,
+	const ClusterSemanticAdmissionToken *admission,
 											 ResourceXAcquisitionRef *out, uint64 *generation,
 											 uint64 *authority)
 {
 	UT_ASSERT(retry && delivery_active);
+	UT_ASSERT(admission != NULL && admission->entered);
 	UT_ASSERT_EQ(claim->executor_sequence, delivery_sequence);
 	UT_ASSERT(resource_x_assertion_equal(assertion, &delivery_ref.assertion));
 	installs++;
@@ -661,7 +682,8 @@ errdetail_log(const char *fmt pg_attribute_unused(), ...)
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_source_block_to_n(
 	const ResourceXDecodedFrame *frame pg_attribute_unused(), int32 node pg_attribute_unused(),
-	uint64 r4 pg_attribute_unused())
+	uint64 r4 pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused())
 {
 	authority_mutations++;
 	return RESOURCE_X_APPLY_APPLIED;
@@ -707,13 +729,13 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	const ResourceXDecodedFrame *frame, int32 node, uint32 ingress pg_attribute_unused(), uint64 r4,
 	const ClusterSemanticAdmissionToken *admission pg_attribute_unused())
 {
-	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4);
+	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4, admission);
 }
 
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_block_to_n_exact(const ResourceXDecodedFrame *frame, int32 node)
 {
-	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, 77);
+	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, 77, NULL);
 }
 
 ResourceXApplyResult
@@ -722,7 +744,7 @@ cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	uint64 session pg_attribute_unused(), uint32 outbound pg_attribute_unused(),
 	ResourceXMasterSnapshot *out pg_attribute_unused())
 {
-	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4);
+	return gcs_block_pcm_x_resource_x_source_block_to_n(frame, node, r4, NULL);
 }
 
 ResourceXApplyResult
@@ -761,6 +783,32 @@ cluster_pcm_lock_resource_x_itl_recycle_finish_exact(const ResourceXLocalOwnerHa
 	UT_ASSERT_EQ(handle->owner_generation, 19);
 	recycle_finishes++;
 	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static bool
+gcs_block_resource_x_ctrc_receive_image(const ResourceXDecodedFrame *frame,
+	const ClusterSemanticAdmissionToken *admission, int32 source, uint32 connection)
+{
+	UT_ASSERT(admission->entered);
+	UT_ASSERT_EQ(admission->record_generation, 77);
+	UT_ASSERT_EQ(source, 1);
+	UT_ASSERT_EQ(connection, 61);
+	UT_ASSERT_EQ(frame->body.image_envelope.ctrc_delegation_bytes, 232);
+	receive_custody_calls++;
+	receive_custody_admission = admission;
+	if (receive_after_custody == 1)
+		scenario = 10;
+	if (receive_after_custody == 4)
+		scenario = 12;
+	if (receive_after_custody == 5)
+		session_gap = true;
+	if (receive_after_custody == 8)
+		master = 3;
+	if (receive_after_custody == 9)
+		scenario = 9;
+	if (receive_after_custody == 10)
+		siglongjmp(*PG_exception_stack, 1);
+	return receive_custody_ok;
 }
 
 #include "test_cluster_resource_x_terminal_owner.inc"
@@ -852,6 +900,8 @@ gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag, Resource
 		(*node)++;
 	else if (terminal_identity_conflict == 3)
 		(*session)++;
+	if (receive_after_custody == 11 && receive_custody_calls != 0)
+		scenario = 10;
 	return PCM_X_SESSION_AUTH_OK;
 }
 
@@ -1171,6 +1221,8 @@ reset_delivery_fixture(void)
 	recycle_gap_after_arm = recycle_gap_after_context = false;
 	recycle_arms = recycle_cancels = recycle_finishes = 0;
 	recycle_cancel_result = RESOURCE_X_APPLY_APPLIED;
+	receive_custody_calls = receive_after_custody = receive_join_outcome = 0;
+	receive_custody_admission = NULL;
 }
 
 UT_TEST(test_actual_quiet_tick_installs_or_redrives_without_foreground)
@@ -1628,6 +1680,8 @@ UT_TEST(test_actual_peer_observation_gap_keeps_delivery_and_ingress_owned)
 static int first_error_step, first_private_refs, first_pending_refs, first_releases;
 static uint32 first_requester_caps, first_master_caps, first_copied_caps;
 static bool first_master_sample_ok;
+static uint32 first_local_caps;
+static unsigned first_delegation_frames;
 
 static bool
 first_master_capability_sample(int32 node, uint32 required, uint32 *word, uint32 *generation)
@@ -1702,6 +1756,8 @@ run_actual_source_first_cleanup(int route, bool semantic_retained)
 	(first_copied_caps = (peer_caps), first_capture_fixture((ClusterPageWalRefV1 *)(first)))
 #define cluster_sf_peer_capability_word_sample first_master_capability_sample
 #define gcs_block_pcm_x_resource_x_build_source_frames(...) first_frame_fixture()
+#define gcs_block_pcm_x_resource_x_delegate_source_frames(...) (first_delegation_frames++, true)
+#define cluster_ic_local_capability_word() first_local_caps
 #define cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(...) first_pair_fixture(NULL)
 #define cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(a, b, c, d, e, f, first)        \
 	first_pair_fixture((ClusterPageWalRefV1 *)(first))
@@ -1718,6 +1774,8 @@ pre_retained_failure:
 #undef cluster_bufmgr_copy_block_for_gcs
 #undef cluster_sf_peer_capability_word_sample
 #undef gcs_block_pcm_x_resource_x_build_source_frames
+#undef gcs_block_pcm_x_resource_x_delegate_source_frames
+#undef cluster_ic_local_capability_word
 #undef cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact
 #undef cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact
 #undef cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact
@@ -1775,6 +1833,23 @@ UT_TEST(test_actual_source_copy_requires_requester_and_master_pi_capability)
 		UT_ASSERT_EQ(first_pending_refs, 1);
 	}
 	first_requester_caps = first_master_caps = 0;
+}
+
+UT_TEST(test_source_delegation_requires_original_qualified_pi_path)
+{
+	for (unsigned variant = 0; variant < 5; variant++) {
+		first_requester_caps = variant == 1 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_master_caps = variant == 2 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_local_caps = variant == 3 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_master_sample_ok = variant != 4;
+		first_error_step = first_private_refs = first_pending_refs = first_releases = 0;
+		first_delegation_frames = 0;
+		UT_ASSERT_EQ(run_actual_source_first_cleanup(1, false), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(first_delegation_frames, variant == 0 ? 1 : 0);
+		UT_ASSERT_EQ(first_private_refs, 0);
+		UT_ASSERT_EQ(first_pending_refs, 1);
+	}
+	first_requester_caps = first_master_caps = first_local_caps = 0;
 }
 
 static ResourceXApplyResult
@@ -2669,6 +2744,119 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 	scenario = 0;
 }
 
+UT_TEST(test_actual_v3_receive_requires_custody_before_pcm)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		ClusterICEnvelope env = { 0 };
+		ResourceXDecodedFrame frame = { 0 };
+		ResourceXRequesterJoinSnapshot out = { 0 };
+
+		reset_delivery_fixture();
+		delivery_enabled = false;
+		master = 1;
+		scenario = variant == 2 ? 9 : 0;
+		peer_checks = rechecks = leaves = joins = installs = publishes = 0;
+		receive_custody_calls = 0;
+		receive_custody_ok = variant == 0;
+		env.source_node_id = 1;
+		frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+		frame.common.resource_formation = 17;
+		frame.common.master_session_incarnation = 31;
+		frame.body.image_envelope.ctrc_delegation_bytes = 232;
+		UT_ASSERT_EQ(gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out),
+			variant == 0 ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(receive_custody_calls, variant == 2 ? 0 : 1);
+		UT_ASSERT_EQ(joins, variant == 0 ? 1 : 0);
+		UT_ASSERT_EQ(installs + publishes + cleanup_joins, 0);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
+UT_TEST(test_actual_qualified_v3_custody_reaches_original_join_before_visibility)
+{
+	ClusterICEnvelope env = { 0 };
+	ResourceXDecodedFrame frame = { 0 };
+	ResourceXRequesterJoinSnapshot out = { 0 };
+
+	reset_delivery_fixture();
+	delivery_enabled = false;
+	receive_custody_ok = true;
+	env.source_node_id = 1;
+	frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+	frame.common.resource_formation = 17;
+	frame.common.master_session_incarnation = 31;
+	frame.body.image_envelope.ctrc_delegation_bytes = 232;
+	UT_ASSERT_EQ(gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(receive_custody_calls, 1);
+	UT_ASSERT_EQ(joins, 1);
+	UT_ASSERT_EQ(installs + publishes + cleanup_joins, 0);
+	UT_ASSERT_EQ(leaves, 1);
+}
+
+UT_TEST(test_actual_v3_custody_gap_rechecks_source_master_gate_and_admission)
+{
+	for (unsigned drift = 1; drift <= 11; drift++) {
+		ClusterICEnvelope env = { 0 };
+		ResourceXDecodedFrame frame = { 0 };
+		ResourceXRequesterJoinSnapshot out = { 0 };
+
+		if (drift == 10) /* ERROR is checked by the following test. */
+			continue;
+		reset_delivery_fixture();
+		delivery_enabled = false;
+		receive_custody_ok = true;
+		receive_after_custody = drift;
+		env.source_node_id = 1;
+		frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+		frame.common.resource_formation = 17;
+		frame.common.master_session_incarnation = 31;
+		frame.body.image_envelope.ctrc_delegation_bytes = 232;
+		UT_ASSERT_EQ(gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out),
+			(drift >= 5 && drift <= 7) ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(receive_custody_calls, 1);
+		UT_ASSERT_EQ(joins + installs + publishes + cleanup_joins, 0);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
+UT_TEST(test_actual_v3_custody_and_join_errors_leave_original_admission_once)
+{
+	for (unsigned stage = 0; stage < 3; stage++) {
+		ClusterICEnvelope env = { 0 };
+		ResourceXDecodedFrame frame = { 0 };
+		ResourceXRequesterJoinSnapshot out = { 0 };
+		volatile bool caught = false;
+		ResourceXApplyResult result = RESOURCE_X_APPLY_INVALID;
+
+		reset_delivery_fixture();
+		delivery_enabled = false;
+		receive_custody_ok = true;
+		receive_after_custody = stage == 0 ? 10 : 0;
+		receive_join_outcome = stage == 1 ? 2 : stage == 2 ? 1 : 0;
+		env.source_node_id = 1;
+		frame.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
+		frame.common.resource_formation = 17;
+		frame.common.master_session_incarnation = 31;
+		frame.body.image_envelope.ctrc_delegation_bytes = 232;
+		PG_TRY();
+		{
+			result = gcs_block_resource_x_requester_join_ingress(&env, &frame, 61, &out);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, stage < 2);
+		if (stage == 2)
+			UT_ASSERT_EQ(result, RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(receive_custody_calls, 1);
+		UT_ASSERT_EQ(joins + installs + publishes + cleanup_joins, 0);
+		UT_ASSERT_EQ(leaves, 1);
+	}
+}
+
 int
 main(void)
 {
@@ -2686,6 +2874,7 @@ main(void)
 	UT_RUN(test_actual_image_ingress_yields_before_join_and_after_t3);
 	UT_RUN(test_actual_source_first_ref_is_released_across_errors);
 	UT_RUN(test_actual_source_copy_requires_requester_and_master_pi_capability);
+	UT_RUN(test_source_delegation_requires_original_qualified_pi_path);
 	UT_RUN(test_actual_source_gate_never_rolls_back_armed_pair_for_sample_gap);
 	UT_RUN(test_actual_source_before_mutation_waits_without_exporting_session);
 	UT_RUN(test_actual_foreground_retained_and_predecessor_wait_reobserve_without_fuse);

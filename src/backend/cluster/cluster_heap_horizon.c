@@ -248,13 +248,14 @@ cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out)
 /*
  * Derive both VACUUM age policies from one original durable allocation
  * promise at the local nextXid cut. A lagging raw nextXid is not the next
- * legal striped allocation. The cutoff still obeys the caller's existing
- * conservative ceiling. An available global candidate may only lower it;
- * neither observation is a terminal or freeze certificate.
+ * legal striped allocation. The native policy keeps its existing deletion
+ * ceiling; the independently proved shared policy uses the FullXid age bound.
+ * An available global candidate may only lower either policy. Neither
+ * observation is a terminal or freeze certificate.
  */
-bool
-cluster_heap_freeze_policy_sample_v1(TransactionId ceiling, TransactionId frozen,
-	int min_age, int table_age, ClusterHeapFreezePolicySampleV1 *out)
+static bool
+cluster_heap_freeze_policy_sample_common(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, bool native_ceiling, ClusterHeapFreezePolicySampleV1 *out)
 {
 	ClusterXidStripeSampleFence fence = {0};
 	ClusterHeapFreezePolicySampleV1 sample;
@@ -290,18 +291,20 @@ cluster_heap_freeze_policy_sample_v1(TransactionId ceiling, TransactionId frozen
 	next = U64FromFullTransactionId(legal_next);
 	oldest = U64FromFullTransactionId(frozen_full);
 	bound = U64FromFullTransactionId(ceiling_full);
-	if (oldest > next || bound > next || next - oldest >= UINT64CONST(0x80000000)
+	if ((!native_ceiling && next == UINT64_MAX)
+		|| oldest > next || bound > next || next - oldest >= UINT64CONST(0x80000000)
 		|| next - bound >= UINT64CONST(0x80000000))
 		return false;
 	/*
 	 * Saturate before subtraction at the first valid FullXid, and skip
-	 * raw 0..2 within later epochs. Never move the original ceiling.
+	 * raw 0..2 within later epochs. The native policy must retain its ceiling.
 	 */
 	candidate = next > (uint64)min_age ? next - (uint64)min_age : FirstNormalTransactionId;
 	candidate = Max(candidate, FirstNormalTransactionId);
 	if ((TransactionId)candidate < FirstNormalTransactionId)
 		candidate += FirstNormalTransactionId - (TransactionId)candidate;
-	candidate = Min(candidate, bound);
+	if (native_ceiling)
+		candidate = Min(candidate, bound);
 	if (have_watermark)
 		candidate = Min(candidate, watermark.active_full_xid_min);
 	/* A more restrictive global F can be older than the representable raw
@@ -316,6 +319,22 @@ cluster_heap_freeze_policy_sample_v1(TransactionId ceiling, TransactionId frozen
 	sample.aggressive = next - oldest >= (uint64)table_age;
 	*out = sample;
 	return true;
+}
+
+bool
+cluster_heap_freeze_policy_sample_v1(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, ClusterHeapFreezePolicySampleV1 *out)
+{
+	return cluster_heap_freeze_policy_sample_common(ceiling, frozen,
+		min_age, table_age, true, out);
+}
+
+bool
+cluster_heap_freeze_shared_policy_sample_v1(TransactionId ceiling, TransactionId frozen,
+	int min_age, int table_age, ClusterHeapFreezePolicySampleV1 *out)
+{
+	return cluster_heap_freeze_policy_sample_common(ceiling, frozen,
+		min_age, table_age, false, out);
 }
 
 bool

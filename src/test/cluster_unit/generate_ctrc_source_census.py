@@ -200,27 +200,31 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_runtime_visibility.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_origin_touch_exact\s*\(",
+        r"\bcluster_ctrc_origin_(?:touch_exact|grant_fullxid_v2)\s*\(",
     ),
     ScanRule(
         "CTRC_ORIGIN_PROVENANCE",
         (
             "src/backend/cluster/cluster_terminal_ref_census.c",
+            "src/backend/cluster/cluster_undo_record.c",
+            "src/backend/cluster/cluster_multixact_current.c",
+            "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_runtime_visibility.c",
             "src/backend/cluster/cluster_tt_slot.c",
             "src/backend/cluster/cluster_tt_durable.c",
         ),
-        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
+        r"\b(?:cluster_ctrc_origin_original_full_xid_(?:exact|shared)|cluster_ctrc_itl_original_full_xid_(?:(?:target_)?matches|target_hold)_shared|cluster_ctrc_itl_read_guard_(?:release_shared|matches_v1)|cluster_runtime_visibility_foreign_companion_target_(?:hold|guard_current)_admitted|cluster_ctrc_origin_fullxid_(?:capture_v2|match_v2)|cluster_ctrc_origin_grant_fullxid_v2|cluster_ctrc_itl_delegate_(?:prepare|accept)_v[12]|ctrc_itl_delegate_(?:prepare|accept)|gcs_block_resource_x_ctrc_receive_image|ctrc_origin_fullxid_encode_v2|cluster_multixact_current_member_proof_bind_origin_v2|cluster_tt_slot_origin_identity_(?:retain|read))\s*\(",
     ),
     ScanRule(
         "CTRC_RECEIPT_LIFECYCLE",
         (
             "src/backend/access/heap/heapam.c",
+            "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_itl_touch.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
             "src/backend/cluster/cluster_undo_record.c",
         ),
-        r"\b(?:cluster_ctrc_receipt_(?:prepare_shared|apply_shared|retarget_itl_shared|cancel_shared|discharge_itl_shared)|ctrc_receipt_prepare_shared_internal)\s*\(",
+        r"\b(?:cluster_ctrc_receipt_(?:prepare_shared|prepare_origin_v2|apply_shared|retarget_itl_shared|cancel_shared|discharge_itl_shared)|cluster_ctrc_itl_image_prepare_v[12]|ctrc_receipt_prepare_shared_internal)\s*\(",
     ),
     ScanRule(
         "CTRC_CLOSE_WIRE",
@@ -228,7 +232,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_gcs_block.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
         ),
-        r"\bcluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|participant_request_shared|origin_ack_land_shared)\s*\(",
+        r"\b(?:cluster_ctrc_(?:seal_request_(?:encode|decode)|seal_reply_(?:encode|decode)|root_ack_reply_(?:encode|decode)|delegated_ack_reply_(?:encode|decode)|delegation_(?:close|certificate)_(?:encode|decode)_v1|participant_(?:request_shared|certificate_request_shared|certificate_batch_shared|delegated_(?:close|certificate)_shared|delegated_local_ack_shared|delegated_subtree_ack_shared|root_subtree_ack_shared|delegated_ack_land_shared|next_delegated_(?:close|dispatch)_shared|delegated_(?:close|certificate)_matches_shared|delegated_close_snapshot_shared|delegated_certificate_(?:snapshot|land)_shared|delegation_merge_(?:observed|land)_shared)|origin_(?:ack_land_shared|root_ack_land_shared))|ctrc_delegated_certificate_retired_exact_locked|ctrc_participant_reclaim_delegated_batch_shared|ctrc_root_certificate_notice_locked|ctrc_participant_certificate_batch_apply_shared|ctrc_root_local_ack_exact_locked|ctrc_participant_next_delegated_request_shared|ctrc_delegated_certificate_snapshot_locked|gcs_ctrc_dispatch_delegated_request)\s*\(",
     ),
     ScanRule(
         "CTRC_RELATION_GATE",
@@ -283,6 +287,7 @@ _classify_owners(
     "src/backend/cluster/cluster_gcs_block.c",
     (
         "cluster_gcs_ctrc_dispatch_close",
+        "cluster_gcs_ctrc_dispatch_delegated_close",
         "gcs_ctrc_dispatch_prepare",
         "gcs_ctrc_dispatch_local_closes",
         "gcs_block_try_ctrc_forward136",
@@ -306,12 +311,177 @@ _classify_owners(
         "cluster_ctrc_seal_request_decode",
         "cluster_ctrc_seal_request_encode",
         "ctrc_ack_matches_request",
+        "cluster_ctrc_delegation_close_encode_v1",
+        "cluster_ctrc_delegation_close_decode_v1",
+        "ctrc_seal_reply_request_decode",
+        "cluster_ctrc_participant_delegated_close_shared",
+        "cluster_ctrc_participant_next_delegated_close_shared",
+        "cluster_ctrc_participant_delegated_close_matches_shared",
+        "cluster_ctrc_cleaner_run_pass",
     ),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",
     "NO_SUCCESSOR_ON_CLOSE",
     "cluster_ctrc_participant_request_apply",
+    "MXA-T24",
+)
+# A delegated local receipt proof retains the accepted parent and cannot
+# enter the ordinary ACK/certificate domain or close any subtree edge.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_delegated_local_ack_shared",
+     "cluster_ctrc_participant_delegated_subtree_ack_shared",
+     "cluster_ctrc_participant_delegated_ack_land_shared",
+     "ctrc_subtree_reply_header", "ctrc_subtree_ack_digest",
+     "cluster_ctrc_delegated_ack_reply_encode",
+     "cluster_ctrc_delegated_ack_reply_decode"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_PARENT_UNTIL_SUBTREE_CLOSE_ACK",
+    "MXA-T24",
+)
+# Wire3 MERGED discharges only redundant outgoing pending custody. Explicit
+# wire4 subtree evidence retains every accepted parent, child and receipt.
+# The shared GCS handler can select either protected observation.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_gcs_block.c",
+    ("gcs_block_land_delegation_merge_reply",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "cluster_ctrc_participant_delegation_merge_land_shared|cluster_ctrc_participant_delegated_ack_land_shared",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_delegation_merge_land_shared",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "cluster_ctrc_participant_delegation_merge_land_shared",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_delegation_merge_observed_shared",
+     "cluster_ctrc_participant_delegated_close_snapshot_shared"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_PENDING_UNTIL_PROTECTED_MERGE",
+    "MXA-T24",
+)
+
+# Explicit root proofs enter the original origin ACK ledger and certificate
+# digest. Participant/child custody remains until exact certificate notice.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_gcs_block.c",
+    ("gcs_block_land_root_subtree_reply",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "cluster_ctrc_origin_root_ack_land_shared",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_root_ack_reply_encode", "cluster_ctrc_root_ack_reply_decode",
+     "cluster_ctrc_participant_root_subtree_ack_shared", "cluster_ctrc_origin_root_ack_land_shared"),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "cluster_ctrc_origin_root_ack_land_shared|RETAIN_CUSTODY_UNTIL_CERTIFICATE",
+    "MXA-T24",
+)
+
+
+# A retained certificate notice is negative custody, not child retirement.
+# The original shared batch still owns ordinary flat receipt reclamation.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_certificate_request_shared",
+     "cluster_ctrc_participant_certificate_batch_shared",
+     "ctrc_participant_certificate_batch_apply_shared",
+     "ctrc_root_certificate_notice_locked", "ctrc_root_local_ack_exact_locked"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_CUSTODY_UNTIL_DESCENDANT_CERTIFICATE_COMPLETION",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_gcs_block.c",
+    ("gcs_ctrc_dispatch_local_certificates",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "ctrc_participant_certificate_batch_apply_shared|RETAIN_SUBTREE_NOTICE_PENDING",
+    "MXA-T24",
+)
+
+# Original receipt reclamation precedes explicit protected wire6 completion.
+# Counts/ACK and accepted tree custody remain retained until their owner retires.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_participant_delegated_certificate_snapshot_shared",
+     "cluster_ctrc_participant_delegated_certificate_land_shared",
+     "ctrc_participant_reclaim_delegated_batch_shared",
+     "ctrc_delegated_certificate_retired_exact_locked",
+     "ctrc_normal_stop_participants_locked"),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_SUCCESSOR_ON_CLOSE",
+    "RECLAIM_FROZEN_RECEIPTS_RETAIN_EXACT_PARENT_COMPLETION_STUB",
+    "MXA-T24",
+)
+# Explicit wire6 retains parent/child custody even after local receipt
+# completion. Ordinary origin ACK/certificate authority is not widened.
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_delegation_certificate_encode_v1",
+     "cluster_ctrc_delegation_certificate_decode_v1",
+     "cluster_ctrc_participant_delegated_certificate_shared",
+     "ctrc_delegated_certificate_snapshot_locked",
+     "ctrc_participant_next_delegated_request_shared",
+     "cluster_ctrc_participant_next_delegated_dispatch_shared",
+     "cluster_ctrc_participant_delegated_certificate_matches_shared"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_CUSTODY_UNTIL_DESCENDANT_CERTIFICATE_COMPLETION",
+    "MXA-T24",
+)
+_classify_owners(
+    "CTRC_CLOSE_WIRE",
+    "src/backend/cluster/cluster_gcs_block.c",
+    ("gcs_ctrc_dispatch_delegated_request", "cluster_gcs_ctrc_dispatch_delegated_certificate"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_CUSTODY_UNTIL_DESCENDANT_CERTIFICATE_COMPLETION",
     "MXA-T24",
 )
 
@@ -366,6 +536,7 @@ _classify_owners(
         "cluster_ctrc_receipt_apply_shared",
         "cluster_ctrc_receipt_prepare_shared",
         "cluster_ctrc_receipt_prepare_shared_observed",
+        "cluster_ctrc_receipt_prepare_origin_v2",
         "ctrc_receipt_prepare_shared_internal",
     ),
     "REGISTERED_REFERENCE",
@@ -517,6 +688,7 @@ _classify_owners(
     (
         "cluster_ctrc_origin_original_full_xid_exact",
         "cluster_ctrc_origin_original_full_xid_shared",
+        "ctrc_participant_active_source_matches",
     ),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
@@ -528,12 +700,293 @@ _classify_owners(
 _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_runtime_visibility.c",
-    ("cluster_runtime_visibility_origin_original_full_xid",),
+    ("cluster_runtime_visibility_origin_original_full_xid",
+     "cluster_runtime_visibility_tt_identity_matches_live"),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",
     "NO_REFERENCE_TRANSFER_REQUIRED",
     "NO_REFERENCE_TO_DISCHARGE",
+    "MXA-T40",
+)
+# Identity-only retention lookups issue no successor and retire no responsibility.
+for path, owners in (
+    ("src/backend/cluster/cluster_terminal_ref_census.c",
+     ("cluster_ctrc_itl_original_full_xid_matches_shared",
+      "cluster_ctrc_itl_original_full_xid_target_matches_shared",)),
+):
+    _classify_owners(
+        "CTRC_ORIGIN_PROVENANCE", path, owners,
+        "REGISTERED_REFERENCE",
+        "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_EXACT_ITL_SLOT",
+        "NO_REFERENCE_TRANSFER_REQUIRED",
+        "NO_REFERENCE_TO_DISCHARGE",
+        "MXA-T40",
+    )
+# Exact target readers borrow the existing participant responsibility. Receipt
+# cleanup proceeds, but original CLOSE/ACK/certificate cannot retire the key
+# until the exact local scope releases. This never creates a successor grant.
+for path, owners in (
+    ("src/backend/cluster/cluster_terminal_ref_census.c",
+     ("ctrc_itl_original_full_xid_matches_shared",
+      "cluster_ctrc_itl_original_full_xid_target_hold_shared",
+      "cluster_ctrc_itl_read_guard_release_shared", "cluster_ctrc_itl_read_guard_matches_v1",
+      "cluster_ctrc_itl_read_guard_matches_admission_v1", "ctrc_itl_reader_exit",)),
+    ("src/backend/cluster/cluster_runtime_visibility.c",
+     ("cluster_runtime_visibility_foreign_companion_retained",
+      "cluster_runtime_visibility_foreign_companion_target_current_admitted",
+      "cluster_runtime_visibility_foreign_companion_target_hold_admitted",
+      "cluster_runtime_visibility_foreign_companion_target_guard_current_admitted",)),
+):
+    _classify_owners(
+        "CTRC_ORIGIN_PROVENANCE", path, owners,
+        "REGISTERED_REFERENCE", "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_EXACT_ITL_SLOT",
+        "cluster_ctrc_itl_original_full_xid_target_hold_shared",
+        "cluster_ctrc_itl_read_guard_release_shared:EXACT_LOCAL_READER_ONLY",
+        "MXA-T40",
+    )
+
+# Background forwarding reads the original identity and pending child only;
+# selecting or enqueuing CLOSE cannot retire a downstream responsibility.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_delegated_close_snapshot_locked",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_participant_next_delegated_close_shared",
+    "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
+    "MXA-T40",
+)
+# A completed physical receiver can be replaced only by a later protected
+# original grant in the same boot/scope, never by absence or a raw xid.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_participant_successor_exact_locked",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "ctrc_receipt_prepare_successor_locked|ctrc_itl_delegate_accept",
+    "RETAIN_RETRY_CUSTODY_UNTIL_LATER_PROTECTED_ORIGINAL_GRANT",
+    "MXA-T40",
+)
+# First-hop matching checks the original sender binding; receiving a local
+# receipt does not authorize retiring its incoming parent responsibility.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_delegation_first_hop_match", "ctrc_participant_delegations_valid",
+     "ctrc_participant_delegation_merge_matches"),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_receipt_prepare_delegation_v1",
+    "RETAIN_PENDING_PARENT_CLOSE_ACK",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_RECEIPT_LIFECYCLE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_receipt_prepare_delegation_v1",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_receipt_prepare_delegation_v1",
+    "LOCAL_RECEIPT_DISCHARGE_ONLY|RETAIN_PENDING_PARENT_CLOSE_ACK",
+    "MXA-T21",
+)
+# Explicit V2 complete paths retain the original root and immediate parent;
+# the separate pending outgoing stub has no implicit subtree ACK.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_delegation_path_valid", "ctrc_delegation_path_match"),
+    "REGISTERED_REFERENCE", "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+    "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+    "cluster_ctrc_itl_image_prepare_v2", "RETAIN_PENDING_PARENT_CLOSE_ACK", "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_participant_delegate_path_prepare_locked",),
+    "REGISTERED_REFERENCE", "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+    "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+    "cluster_ctrc_itl_delegate_prepare_v2", "RETAIN_PENDING_SUBTREE_CLOSE_ACK", "MXA-T40",
+)
+# Typed IMAGE copy intents retain the authenticated immutable parent first.
+# The original shared journal owns the new publication domain; no caller ID
+# or epoch inference can qualify it, and no page visibility is implied.
+for category in ("CTRC_ORIGIN_PROVENANCE", "CTRC_RECEIPT_LIFECYCLE"):
+    _classify_owners(
+        category, "src/backend/cluster/cluster_terminal_ref_census.c",
+        ("cluster_ctrc_itl_image_prepare_v1", "cluster_ctrc_itl_image_prepare_v2"),
+        "REGISTERED_REFERENCE",
+        "CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        "cluster_ctrc_receipt_apply_shared",
+        "cluster_ctrc_receipt_cancel_shared|cluster_ctrc_receipt_discharge_itl_shared|RETAIN_PENDING_PARENT_CLOSE_ACK",
+        "MXA-T40",
+    )
+# Original GCS physical install owns a bounded set of journaled IMAGE intents.
+# Only premutation cleanup may cancel; after copy the receipt/parent survives.
+for category, owners in (
+    ("CTRC_ORIGIN_PROVENANCE", ("gcs_block_resource_x_ctrc_image_prepare",)),
+    ("CTRC_RECEIPT_LIFECYCLE", ("gcs_block_resource_x_ctrc_image_prepare",
+                             "gcs_block_resource_x_ctrc_image_apply",
+                             "gcs_block_resource_x_ctrc_image_cancel")),
+):
+    _classify_owners(
+        category, "src/backend/cluster/cluster_gcs_block.c", owners,
+        "REGISTERED_REFERENCE", "CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        "gcs_block_resource_x_ctrc_image_apply",
+        "PREMUTATION_ONLY:gcs_block_resource_x_ctrc_image_cancel|RETAIN_POSTCOPY_RECEIPT_AND_PARENT",
+        "MXA-T40",
+    )
+# Ordinary DATA/PI source preparation registers the existing exact ITL
+# producer before publishing the bundle. Neither its local receipt nor a
+# rejected partial image may retire pending downstream CLOSE/ACK custody.
+for path, owners in (
+    ("src/backend/cluster/cluster_gcs_block.c",
+     ("gcs_block_pcm_x_resource_x_delegate_source_frames",)),
+    ("src/backend/cluster/cluster_terminal_ref_census.c",
+     ("cluster_ctrc_itl_delegate_prepare_v1",)),
+):
+    _classify_owners(
+        "CTRC_ORIGIN_PROVENANCE", path, owners,
+        "REGISTERED_REFERENCE",
+        "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        "cluster_ctrc_itl_delegate_prepare_v2" if path.endswith("cluster_gcs_block.c")
+        else "cluster_ctrc_itl_delegate_prepare_v1",
+        "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
+        "MXA-T40",
+    )
+# Protective IMAGE receive owns the original parent before PCM admission.
+# It cannot install a page or release a parent when local receipts are absent.
+for path, owners in (
+    ("src/backend/cluster/cluster_gcs_block.c",
+     ("gcs_block_resource_x_ctrc_receive_image", "gcs_block_resource_x_requester_join_ingress")),
+    ("src/backend/cluster/cluster_terminal_ref_census.c",
+     ("cluster_ctrc_itl_delegate_accept_v1",)),
+):
+    _classify_owners(
+        "CTRC_ORIGIN_PROVENANCE", path, owners,
+        "REGISTERED_REFERENCE",
+        "CTRC_REF_HEAP_ITL_UBA",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        "cluster_ctrc_itl_delegate_accept_v1|cluster_ctrc_itl_delegate_accept_v2"
+        if path.endswith("cluster_gcs_block.c") else "cluster_ctrc_itl_delegate_accept_v1",
+        "RETAIN_PENDING_PARENT_CLOSE_ACK",
+        "MXA-T40",
+    )
+# Complete-path dispatchers own the same ordinary ITL domains, with their
+# explicit V2 or shared V1/V2 successor. The original V1 rows remain unchanged.
+for owners, successor, retention in (
+    (("cluster_ctrc_itl_delegate_prepare_v2",), "cluster_ctrc_itl_delegate_prepare_v2",
+     "RETAIN_PENDING_SUBTREE_CLOSE_ACK"),
+    (("ctrc_itl_delegate_prepare",), "cluster_ctrc_itl_delegate_prepare_v1|cluster_ctrc_itl_delegate_prepare_v2",
+     "RETAIN_PENDING_SUBTREE_CLOSE_ACK"),
+    (("cluster_ctrc_itl_delegate_accept_v2",), "cluster_ctrc_itl_image_prepare_v2",
+     "RETAIN_PENDING_PARENT_CLOSE_ACK"),
+    (("ctrc_itl_delegate_accept",), "cluster_ctrc_itl_image_prepare_v1|cluster_ctrc_itl_image_prepare_v2",
+     "RETAIN_PENDING_PARENT_CLOSE_ACK"),
+):
+    _classify_owners(
+        "CTRC_ORIGIN_PROVENANCE", "src/backend/cluster/cluster_terminal_ref_census.c", owners,
+        "REGISTERED_REFERENCE", "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
+        "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+        successor, retention, "MXA-T40",
+    )
+# The producer retains outgoing custody; local receipt discharge and retained
+# subtree ACK evidence do not retire it. Certificate/live use remains closed.
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_delegated_local_ack_eligible",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "NO_REFERENCE_TRANSFER_REQUIRED",
+    "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_participant_delegate_prepare_locked",),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_participant_delegate_prepare_v1",
+    "RETAIN_PENDING_SUBTREE_CLOSE_ACK",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    (
+        "ctrc_origin_fullxid_encode_v2",
+        "ctrc_receipt_prepare_shared_internal",
+        "cluster_ctrc_origin_fullxid_capture_v2",
+        "cluster_ctrc_origin_grant_fullxid_v2",
+        "cluster_ctrc_origin_fullxid_match_v2",
+        "cluster_ctrc_receipt_prepare_origin_v2",
+        "ctrc_cleaner_prepare_current_mx_successor",
+    ),
+    "REGISTERED_REFERENCE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "ALL_CTRC_TARGET_KINDS",
+    "cluster_ctrc_receipt_prepare_origin_v2",
+    "cluster_ctrc_receipt_discharge_current_mx_shared|cluster_ctrc_receipt_discharge_itl_shared",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_undo_record.c",
+    ("cluster_undo_record_ctrc_prepare_pending",),
+    "REGISTERED_REFERENCE",
+    "CTRC_REF_HEAP_ITL_UBA",
+    "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
+    "cluster_ctrc_receipt_prepare_origin_v2",
+    "cluster_ctrc_receipt_discharge_itl_shared",
+    "MXA-T23",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_multixact_current.c",
+    ("cluster_multixact_current_member_proof_bind_origin_v2",),
+    "REGISTERED_REFERENCE",
+    "CTRC_REF_CURRENT_MX_LOCKER|CTRC_REF_CURRENT_MX_UPDATER|CTRC_REF_HOT_FOLLOW_EDGE",
+    "CTRC_TARGET_EXACT_TID",
+    "cluster_ctrc_receipt_prepare_origin_v2",
+    "cluster_ctrc_receipt_discharge_current_mx_shared",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_ORIGIN_PROVENANCE",
+    "src/backend/cluster/cluster_gcs_block.c",
+    ("gcs_block_current_mx_origin_sample_held",),
+    "REGISTERED_REFERENCE",
+    "CTRC_REF_CURRENT_MX_LOCKER|CTRC_REF_CURRENT_MX_UPDATER|CTRC_REF_HOT_FOLLOW_EDGE",
+    "CTRC_TARGET_EXACT_TID",
+    "cluster_ctrc_receipt_prepare_origin_v2",
+    "cluster_ctrc_receipt_discharge_current_mx_shared",
+    "MXA-T40",
+)
+_classify_owners(
+    "CTRC_TOUCH_BEFORE_PROOF",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("cluster_ctrc_origin_grant_fullxid_v2",),
+    "REGISTERED_REFERENCE",
+    "CTRC_REF_CURRENT_MX_LOCKER|CTRC_REF_CURRENT_MX_UPDATER|CTRC_REF_HOT_FOLLOW_EDGE",
+    "CTRC_TARGET_EXACT_TID",
+    "cluster_ctrc_receipt_prepare_origin_v2",
+    "cluster_ctrc_receipt_discharge_current_mx_shared",
     "MXA-T40",
 )
 _classify_owners(
@@ -1069,7 +1522,7 @@ _classify_owners(
         "ctrc_cleaner_clean_itl_receipt",
     ),
     "TERMINAL_PROJECTION_DISCHARGE",
-    "CTRC_REF_HEAP_ITL_UBA",
+    "CTRC_REF_HEAP_ITL_UBA|CTRC_REF_IMAGE_ITL_V1",
     "CTRC_TARGET_EXACT_ITL_SLOT",
     "TERMINAL_INDEPENDENT_ITL_PROJECTION",
     "cluster_ctrc_receipt_discharge_itl_shared",
@@ -1345,6 +1798,7 @@ _classify_owners(
         "cluster_tt_durable_redo_abort_slot",
         "cluster_tt_durable_redo_abort_slot_exact",
         "cluster_tt_slot_durable_abort",
+        "cluster_tt_slot_durable_abort_startup_local",
     ),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
@@ -1356,7 +1810,7 @@ _classify_owners(
 _classify_owners(
     "TT_STATUS_WRITER",
     "src/backend/cluster/cluster_side_undo.c",
-    ("undo_prepare_tt_slot",),
+    ("undo_prepare_tt_slot", "undo_prepare_tt_header_v2"),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "ALL_CTRC_REFERENCE_KINDS",
     "CANONICAL_TT_SLOT",
@@ -1389,7 +1843,7 @@ _classify_owners(
 _classify_owners(
     "TT_RELEASE_FLAG_WRITER",
     "src/backend/cluster/cluster_side_undo.c",
-    ("undo_prepare_tt_slot",),
+    ("undo_prepare_tt_slot", "undo_prepare_tt_header_v2"),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
     "CANONICAL_TT_SLOT",

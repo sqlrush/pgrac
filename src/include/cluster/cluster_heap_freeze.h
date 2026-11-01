@@ -26,6 +26,8 @@
  */
 struct ClusterHeapFreezePolicySampleV1;
 struct ClusterHeapFreezeCohortObservation;
+struct ClusterHeapFreezeProofBatchV1;
+struct ClusterCtrcItlReadGuardV1;
 
 typedef struct ClusterHeapFreezePageInputV1
 {
@@ -45,6 +47,11 @@ typedef struct ClusterHeapFreezePageInputV1
 	 * retention or mutation authority and are never serialized. */
 	const struct ClusterHeapFreezePolicySampleV1 *freeze_policy;
 	const struct ClusterHeapFreezeCohortObservation *freeze_cohort;
+	/* Original collector-owned scopes, indexed by this exact proof batch.
+	 * Borrow until its original finally; native apply never acquires or
+	 * releases these scopes. NULL keeps foreign proofs unqualified. */
+	const struct ClusterHeapFreezeProofBatchV1 *freeze_source_proofs;
+	const struct ClusterCtrcItlReadGuardV1 *freeze_source_guards;
 	PGAlignedBlock image;
 } ClusterHeapFreezePageInputV1;
 
@@ -137,7 +144,10 @@ typedef struct ClusterHeapFreezePageBatchV1
 /*
  * A proof result is deliberately narrower than a freeze or retention
  * certificate.  It binds one exact row carrier to the origin's canonical
- * TT projection and to one final holder/master/admission fence.  The VACUUM
+ * TT projection (local or separate origin companion) and to one final
+ * holder/master/admission fence. A foreign companion additionally requires
+ * the collector's current receiver-retention check; these copied gates do
+ * not extend that observation into a lifetime token. The VACUUM
  * caller still has to perform the final current check, WAL and conditional
  * apply while holding the appropriate ownership; this predicate never does
  * I/O, acquires locks, mutates a page, or grants authority on its own.
@@ -458,6 +468,13 @@ extern bool cluster_heap_freeze_prepare_xmin_batch_v1(
  * supply remote/provenance/producer-retention qualification.
  * Their separate current/provenance/retention qualification remains required;
  * the match performs no sampling or callback under page locks.
+ * Foreign proofs additionally borrow the original collector's exact proof
+ * batch and indexed receiver guards. Source/current checks run before writer
+ * restoration without content locks; pure guard/identity/target matching is
+ * repeated after the final callbacks and SPACE, before CRIT. Apply never
+ * acquires or releases a source guard. Preowned foreign content locks refuse
+ * rather than invoking source checks under that lock. Original finally must
+ * keep all borrowed scopes until native apply has returned or unwound.
  *
  * Dormant: production VACUUM must not call this until ORIGINAL FullXid,
  * cutoff/H provenance and admission are closed independently of raw XIDs.
@@ -480,7 +497,9 @@ extern bool cluster_heap_freeze_apply_xmin_batch_v1(
 /* Same dormant qualification contract as the pinned batch above. The caller
  * holds the relation and the original entered admission, but recent_buffer is
  * only a saved shared-buffer hint. This entry adds one exact resident pin (no
- * fetch), delegates all source/physical/writer/WAL checks to the original batch,
+ * fetch) after rejecting target counts beyond the captured page row count
+ * and after the original pure same-admission F/H and ingress-cut checks,
+ * delegates the repeated source/physical/writer/WAL checks to the original batch,
  * and releases that pin on success, refusal or ERROR before the caller leaves
  * admission. Previously owned pins/content locks remain the caller's. An absent
  * or changed resident returns false; this grants no positive freeze authority.

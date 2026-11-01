@@ -188,9 +188,11 @@ static void FreeSnapshot(Snapshot snapshot);
 static void SnapshotResetXmin(void);
 #ifdef USE_PGRAC_CLUSTER
 static void cluster_recompute_proc_read_scn(void); /* PGRAC: spec-3.12 D1 */
+static void cluster_publish_pending_snapshot(Snapshot snapshot);
 static void cluster_snapshot_read_invalidate(Snapshot snapshot);
 #else
 #define cluster_recompute_proc_read_scn() ((void) 0)
+#define cluster_publish_pending_snapshot(snapshot) ((void) 0)
 #define cluster_snapshot_read_invalidate(snapshot) ((void) 0)
 #endif
 
@@ -330,17 +332,11 @@ GetTransactionSnapshot(void)
 				CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
 			/* Make a saved copy */
 			CurrentSnapshot = CopySnapshot(CurrentSnapshot);
+			cluster_publish_pending_snapshot(CurrentSnapshot);
 			FirstXactSnapshot = CurrentSnapshot;
 			/* Mark it as "registered" in FirstXactSnapshot */
 			FirstXactSnapshot->regd_count++;
 			pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
-#ifdef USE_PGRAC_CLUSTER
-			/*
-			 * spec-3.12 D1: transaction-level snapshots bypass
-			 * RegisterSnapshotOnOwner(), so publish their read_scn here.
-			 */
-			cluster_recompute_proc_read_scn();
-#endif
 		}
 		else
 			CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
@@ -495,8 +491,10 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 
 	if (CatalogSnapshot == NULL)
 	{
+		Snapshot	snapshot;
+
 		/* Get new snapshot. */
-		CatalogSnapshot = GetSnapshotData(&CatalogSnapshotData);
+		snapshot = GetSnapshotData(&CatalogSnapshotData);
 
 #ifdef USE_PGRAC_CLUSTER
 		if (!cluster_catalog_services_ready())
@@ -519,9 +517,9 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 			 * loudly (53R97 UNKNOWN) rather than silently take a stale
 			 * comparison.
 			 */
-			CatalogSnapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
-			CatalogSnapshot->read_scn = InvalidScn;
-			CatalogSnapshot->read_epoch = 0;
+			snapshot->cluster_source = (uint8) SNAPSHOT_SOURCE_LOCAL;
+			snapshot->read_scn = InvalidScn;
+			snapshot->read_epoch = 0;
 		}
 
 		/*
@@ -534,6 +532,9 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 		 * no-recursion guard above keeps the resolve path honest.
 		 */
 #endif
+		/* Refusal must precede both the cached pointer and heap membership. */
+		cluster_publish_pending_snapshot(snapshot);
+		CatalogSnapshot = snapshot;
 
 		/*
 		 * Make sure the catalog snapshot will be accounted for in decisions
@@ -548,13 +549,6 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 		 * CatalogSnapshot pointer is already valid.
 		 */
 		pairingheap_add(&RegisteredSnapshots, &CatalogSnapshot->ph_node);
-#ifdef USE_PGRAC_CLUSTER
-		/* This manual registration has no subsequent RegisterSnapshot or
-		 * PushActiveSnapshot to publish its history protection.  Hand the
-		 * original read SCN to PGPROC before returning the catalog reader;
-		 * recomputing the full minimum preserves any older live snapshot. */
-		cluster_recompute_proc_read_scn();
-#endif
 	}
 
 	return CatalogSnapshot;
@@ -764,23 +758,11 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 											   sourcepid);
 		/* Make a saved copy */
 		CurrentSnapshot = CopySnapshot(CurrentSnapshot);
+		cluster_publish_pending_snapshot(CurrentSnapshot);
 		FirstXactSnapshot = CurrentSnapshot;
 		/* Mark it as "registered" in FirstXactSnapshot */
 		FirstXactSnapshot->regd_count++;
 		pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
-#ifdef USE_PGRAC_CLUSTER
-		/*
-		 * spec-5.22e D5-1 (S3.0 row 2): publish the imported snapshot's
-		 * read_scn IMMEDIATELY, exactly as the GetTransactionSnapshot
-		 * register path does.  Without this, the exporter could release
-		 * its pin before our first PushActiveSnapshot recompute, leaving
-		 * a window where this node's published retention floor (and hence
-		 * its cluster horizon report) sits above a live imported snapshot
-		 * -- breaking the report lower-bound theorem the cluster-wide
-		 * recycle brake is built on.
-		 */
-		cluster_recompute_proc_read_scn();
-#endif
 	}
 
 	FirstSnapshotSet = true;
@@ -910,14 +892,12 @@ PushActiveSnapshotWithLevel(Snapshot snapshot, int snap_level)
 	newactive->as_next = ActiveSnapshot;
 	newactive->as_level = snap_level;
 
+	cluster_publish_pending_snapshot(newactive->as_snap);
 	newactive->as_snap->active_count++;
 
 	ActiveSnapshot = newactive;
 	if (OldestActiveSnapshot == NULL)
 		OldestActiveSnapshot = ActiveSnapshot;
-
-	/* PGRAC: spec-3.12 D1 — a newly live snapshot may lower the retention min. */
-	cluster_recompute_proc_read_scn();
 }
 
 /*
@@ -1053,14 +1033,12 @@ RegisterSnapshotOnOwner(Snapshot snapshot, ResourceOwner owner)
 
 	/* and tell resowner.c about it */
 	ResourceOwnerEnlargeSnapshots(owner);
+	cluster_publish_pending_snapshot(snap);
 	snap->regd_count++;
 	ResourceOwnerRememberSnapshot(owner, snap);
 
 	if (snap->regd_count == 1)
 		pairingheap_add(&RegisteredSnapshots, &snap->ph_node);
-
-	/* PGRAC: spec-3.12 D1 — a newly registered snapshot may lower retention min. */
-	cluster_recompute_proc_read_scn();
 
 	return snap;
 }
@@ -1303,8 +1281,9 @@ cluster_snapshot_cr_identity_v1(Snapshot expected, uint64 *identity)
  * PGRAC: spec-3.12 D1 — recompute this backend's retention read_scn.
  *
  * Publishes min(CLUSTER read_scn) over the backend's live snapshots (active
- * stack + registered heap) into MyProc->cluster_read_scn_atomic; InvalidScn
- * when none.  cluster_undo_retention_horizon() (procarray.c) takes the min of
+ * stack + registered heap, including a pending snapshot before ownership)
+ * into MyProc->cluster_read_scn_atomic; InvalidScn when none.
+ * cluster_undo_retention_horizon() (procarray.c) takes the min of
  * these across the ProcArray to gate undo/TT-slot recycle.
  *
  * Unlike SnapshotResetXmin's xmin (which uses the heap's min-xmin node), we
@@ -1315,8 +1294,8 @@ cluster_snapshot_cr_identity_v1(Snapshot expected, uint64 *identity)
  * We therefore walk every live snapshot for the true min read_scn.  A live
  * unknown or unbounded source must retain its original marker, not borrow
  * a finite sibling's protection.  The native H sampler rejects that marker
- * with the original installed xmin.  Atomic write because this helper runs
- * outside ProcArrayLock.
+ * with the original installed xmin. The original fold is published under
+ * ProcArrayLock so it cannot introduce history older than an exported cut.
  */
 static bool
 cluster_min_read_scn_heap_walk(pairingheap_node *node, SCN *minp)
@@ -1341,10 +1320,11 @@ cluster_min_read_scn_heap_walk(pairingheap_node *node, SCN *minp)
 }
 
 static void
-cluster_recompute_proc_read_scn(void)
+cluster_publish_pending_snapshot(Snapshot pending)
 {
 	SCN			min = InvalidScn;
 	ActiveSnapshotElt *ae;
+	bool		known = true;
 
 	/* Storage-mode gate: matches ClusterSnapshotRefreshFields read_scn gate. */
 	if (!cluster_enabled || cluster_node_id < 0 || MyProc == NULL)
@@ -1357,16 +1337,32 @@ cluster_recompute_proc_read_scn(void)
 		if (!SCN_VALID(s->read_scn) || s->read_scn == (SCN) UINT64_MAX)
 		{
 			min = s->read_scn;
+			known = false;
 			goto publish;
 		}
 		if (!SCN_VALID(min) || scn_time_cmp(s->read_scn, min) < 0)
 			min = s->read_scn;
 	}
 	if (!pairingheap_is_empty(&RegisteredSnapshots))
-		(void) cluster_min_read_scn_heap_walk(RegisteredSnapshots.ph_root, &min);
+		known = cluster_min_read_scn_heap_walk(RegisteredSnapshots.ph_root, &min);
 
 publish:
-	pg_atomic_write_u64(&MyProc->cluster_read_scn_atomic, (uint64) min);
+	if (pending != InvalidSnapshot && known &&
+		(!SCN_VALID(pending->read_scn) || pending->read_scn == (SCN) UINT64_MAX ||
+		 !SCN_VALID(min) || scn_time_cmp(pending->read_scn, min) < 0))
+		min = pending->read_scn;
+	/* Check the pending reader separately: an existing unknown marker must
+	 * not hide a finite reader that abort cleanup would later expose. */
+	if (!ProcArrayPublishReadScn(min, pending ? pending->read_scn : InvalidScn))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD),
+				 errmsg("snapshot read SCN precedes the retained local horizon")));
+}
+
+static void
+cluster_recompute_proc_read_scn(void)
+{
+	cluster_publish_pending_snapshot(InvalidSnapshot);
 }
 #endif
 
@@ -1622,6 +1618,8 @@ ExportSnapshot(Snapshot snapshot)
 	 * transaction.
 	 */
 	snapshot = CopySnapshot(snapshot);
+	/* Refusal leaves no exported-list, heap or resource-owner registration. */
+	cluster_publish_pending_snapshot(snapshot);
 
 	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
 	esnap = (ExportedSnapshot *) palloc(sizeof(ExportedSnapshot));
@@ -1632,9 +1630,6 @@ ExportSnapshot(Snapshot snapshot)
 
 	snapshot->regd_count++;
 	pairingheap_add(&RegisteredSnapshots, &snapshot->ph_node);
-	/* Publish this original registered protection before its file can become
-	 * visible. ERROR/cancel retains it until the original EOXact cleanup. */
-	cluster_recompute_proc_read_scn();
 
 	/*
 	 * Fill buf with a text serialization of the snapshot, plus identification

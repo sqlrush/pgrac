@@ -367,5 +367,12 @@ extern bool cluster_relmap_authority_managed_checkpoint_v2(
  * consumer, never inferred from a target path or a source file header. */
 extern bool cluster_relmap_authority_managed_create_v2(
 	const ClusterRecoveryFileIdentityV2 *, const RelMapFile *, ClusterRelmapFilePairV2 *);
+/* Same original X/MappingLock and independent target protection. The original
+ * recovery owner, not this storage step, validates the creation batch, actual
+ * EndRecPtr and episode/RESERVED registration. Exact generation-one pairs are
+ * synced/reread; partial, different or later pairs refuse without repair.
+ * No replay success, control completion or debt release is published here. */
+extern bool cluster_relmap_authority_managed_replay_create_v2(
+	const ClusterRecoveryFileIdentityV2 *, const RelMapFile *, ClusterRelmapFilePairV2 *);
 
 #endif /* CLUSTER_RELMAP_AUTHORITY_H */

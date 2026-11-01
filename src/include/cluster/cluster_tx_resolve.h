@@ -16,6 +16,7 @@
 #define CLUSTER_TX_RESOLVE_H
 
 #include "c.h"
+#include "cluster/cluster_ctrc_origin_fullxid.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_uba.h"
 #include "common/relpath.h"
@@ -133,10 +134,10 @@ typedef struct ClusterTxLocator {
 StaticAssertDecl(sizeof(ClusterTxLocator) == 24,
 				 "R4 ClusterTxLocator must remain an exact 24-byte value");
 
-/* Optional process-local physical projection of an exact INSERT or UPDATE
- * record. This is neither original FullXid provenance nor freeze permission;
- * it is never serialized, cached as a terminal verdict, or accepted from a
- * peer. An UPDATE names its replacement, not the old tuple in the header. */
+/* Physical projection of an exact INSERT or UPDATE record. The local field
+ * below is origin-only; a versioned peer observation is kept separately.
+ * Neither representation grants provenance or freeze permission. An UPDATE
+ * names its replacement, not the old tuple in the header. */
 typedef struct ClusterTxCreationTarget {
 	RelFileLocator locator;
 	ForkNumber fork;
@@ -159,6 +160,16 @@ typedef struct ClusterTxModificationTarget {
 	bool valid;
 } ClusterTxModificationTarget;
 
+/* Optional original-origin observation carried by an explicit verdict version.
+ * Receipt custody, source currentness and row/page authority are independent.
+ * In particular, decoding this never populates the local-only fields below. */
+typedef struct ClusterTxCanonicalCompanionV1 {
+	ClusterCtrcTxnKeyV1 key;
+	FullTransactionId original_full_xid;
+	ClusterTxCreationTarget creation_target;
+	bool present;
+} ClusterTxCanonicalCompanionV1;
+
 typedef struct ClusterTxResolution {
 	ClusterTxLocator locator_echo;
 	TransactionId top_xid;
@@ -178,6 +189,7 @@ typedef struct ClusterTxResolution {
 	ClusterTxCreationTarget local_creation_target;
 	/* ABORTED outcome alone does not prove that physical rollback completed. */
 	ClusterTxModificationTarget local_aborted_xmax_target;
+	ClusterTxCanonicalCompanionV1 origin_companion;
 } ClusterTxResolution;
 
 /* A page-derived request carries TT_WRAP_INVALID until the origin reads the

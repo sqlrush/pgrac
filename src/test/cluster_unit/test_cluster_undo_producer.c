@@ -15,6 +15,7 @@
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/proc.h"
@@ -24,6 +25,7 @@ UT_DEFINE_GLOBALS();
 
 static char payload[BLCKSZ + 256];
 static uint32 payload_length;
+static uint32 inserts_begun;
 static RmgrId emitted_rmid;
 static uint8 emitted_info;
 static bool writeback, full_page_writes;
@@ -45,6 +47,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 void
 XLogBeginInsert(void)
 {
+	inserts_begun++;
 	payload_length = 0;
 	memset(payload, 0, sizeof(payload));
 }
@@ -478,18 +481,369 @@ UT_TEST(test_native_block_writer_uses_typed_preparation_before_write_and_sync)
 	}
 }
 
+
+/* Explicit V2 producer, through the original XLogInsert boundary and the
+ * actual native decoder. An epoch-zero normal FullXid is also valid. */
+UT_TEST(test_v2_bind_producer_preserves_original_fullxid_and_opcode)
+{
+	for (unsigned epoch = 0; epoch < 2; epoch++) {
+		xl_undo_tt_identity_v2 identity = { 0 }, emitted;
+		ClusterUndoDecoded decoded;
+
+		identity.segment_id = 513;
+		identity.segment_generation = 9;
+		identity.xid = 801;
+		identity.slot_offset = 4;
+		identity.wrap = 7;
+		identity.instance = 3;
+		identity.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+		identity.original_full_xid = ((uint64)(epoch ? 7 : 0) << 32) | identity.xid;
+		UT_ASSERT_EQ(cluster_undo_emit_tt_slot_bind_v2(&identity), 0x900);
+		UT_ASSERT_EQ(emitted_rmid, RM_CLUSTER_UNDO_ID);
+		UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_BIND);
+		UT_ASSERT_EQ(payload_length, 32);
+		UT_ASSERT(memcmp(payload, &identity, sizeof(identity)) == 0);
+		UT_ASSERT(cluster_undo_tt_bind_v2_decode(payload, payload_length, &emitted));
+		UT_ASSERT(memcmp(&emitted, &identity, sizeof(identity)) == 0);
+		/* The generic TT32 consumer stays closed to V2; its explicit typed
+		 * consumer must retain the complete original identity. */
+		decoded = decode_emitted(false);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, identity.original_full_xid);
+		UT_ASSERT_EQ(decoded.expected_generation, identity.segment_generation);
+	}
+}
+
+UT_TEST(test_v2_bind_producer_refuses_bad_identity_before_insertion)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		xl_undo_tt_identity_v2 identity = { 0 };
+
+		identity.segment_id = 513;
+		identity.segment_generation = 9;
+		identity.xid = 801;
+		identity.slot_offset = 4;
+		identity.wrap = 7;
+		identity.instance = 3;
+		identity.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+		identity.original_full_xid = (UINT64_C(7) << 32) | identity.xid;
+		switch (fault) {
+		case 0: identity.format_version = 1; break;
+		case 1: identity.flags = 1; break;
+		case 2: identity.reserved = 1; break;
+		case 3: identity.original_full_xid = UINT64_MAX; break;
+		case 4: identity.original_full_xid++; break;
+		case 5: identity.xid = FrozenTransactionId; break;
+		case 6: identity.instance = 0; break;
+		case 7: identity.segment_id = 1; break;
+		case 8: identity.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 9: identity.wrap = TT_WRAP_INVALID; break;
+		case 10: identity.segment_generation = UINT32_MAX; break;
+		case 11: break; /* NULL payload */
+		}
+		payload_length = 123;
+		emitted_info = 0xee;
+		expect_panic = true;
+		if (setjmp(panic_jump) == 0) {
+			(void)cluster_undo_emit_tt_slot_bind_v2(fault == 11 ? NULL : &identity);
+			UT_ASSERT(false);
+		}
+		expect_panic = false;
+		UT_ASSERT_EQ(payload_length, 123);
+		UT_ASSERT_EQ(emitted_info, 0xee);
+	}
+}
+
+
+UT_TEST(test_v2_abort_producer_preserves_original_identity_and_rejects_before_insert)
+{
+	for (unsigned fault = 0; fault < 13; fault++) {
+		xl_undo_tt_identity_v2 identity = { .segment_id = 513, .segment_generation = 9,
+			.xid = 801, .slot_offset = 4, .wrap = 7, .instance = 3,
+			.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION,
+			.original_full_xid = UINT64_C(0x700000321) };
+		ClusterUndoDecoded decoded;
+		switch (fault) {
+		case 1: identity.format_version = 1; break;
+		case 2: identity.flags = 1; break;
+		case 3: identity.reserved = 1; break;
+		case 4: identity.original_full_xid = UINT64_MAX; break;
+		case 5: identity.original_full_xid++; break;
+		case 6: identity.xid = FrozenTransactionId; break;
+		case 7: identity.instance = 0; break;
+		case 8: identity.segment_id = 1; break;
+		case 9: identity.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 10: identity.wrap = TT_WRAP_INVALID; break;
+		case 11: identity.segment_generation = UINT32_MAX; break;
+		case 12: break;
+		}
+		payload_length = 123;
+		emitted_info = 0xee;
+		if (fault == 0) {
+			UT_ASSERT_EQ(cluster_undo_emit_tt_slot_abort_v2(&identity), 0x900);
+			UT_ASSERT_EQ(emitted_rmid, RM_CLUSTER_UNDO_ID);
+			UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_ABORT);
+			UT_ASSERT_EQ(payload_length, sizeof(identity));
+			UT_ASSERT_EQ(memcmp(payload, &identity, sizeof(identity)), 0);
+			decoded = decode_emitted(false);
+			UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+			UT_ASSERT_EQ(decoded.original_full_xid, identity.original_full_xid);
+		} else {
+			expect_panic = true;
+			if (setjmp(panic_jump) == 0) {
+				(void)cluster_undo_emit_tt_slot_abort_v2(fault == 12 ? NULL : &identity);
+				UT_ASSERT(false);
+			}
+			expect_panic = false;
+			UT_ASSERT_EQ(payload_length, 123);
+			UT_ASSERT_EQ(emitted_info, 0xee);
+		}
+	}
+}
+
+
+UT_TEST(test_v2_release_producer_preserves_104_bytes_and_rejects_before_insert)
+{
+	for (unsigned fault = 0; fault < 21; fault++) {
+		xl_undo_tt_slot_ctrc_release_v2 record = { 0 };
+		uint8 expected[CLUSTER_UNDO_TT_CTRC_RELEASE_V2_BYTES];
+		ClusterUndoDecoded decoded;
+		record.release.segment_id = 513; record.release.segment_generation = 9;
+		record.release.xid = 801; record.release.cluster_epoch = 11;
+		record.release.root_id = 12; record.release.root_generation = 13;
+		record.release.formation_epoch = 14; record.release.admission_record_generation = 15;
+		record.release.seal_generation = 16; record.release.touched_nodes_low = 4;
+		record.release.slot_offset = 4; record.release.slot_wrap = 7;
+		record.release.owner_instance = 3; record.release.terminal_status = TT_SLOT_COMMITTED;
+		record.release.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_V2_VERSION;
+		record.release.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED;
+		memset(record.release.ack_set_digest, 0x5a, 16);
+		record.original_full_xid = UINT64_C(0x700000321);
+		switch (fault) {
+		case 1: record.release.format_version = 1; break;
+		case 2: record.original_full_xid = 0; break;
+		case 3: record.original_full_xid = UINT64_MAX; break;
+		case 4: record.original_full_xid++; break;
+		case 5: record.release.xid = FrozenTransactionId; record.original_full_xid = FrozenTransactionId; break;
+		case 6: record.release.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+		case 7: record.release.slot_wrap = TT_WRAP_INVALID; break;
+		case 8: record.release.owner_instance = 0; break;
+		case 9: record.release.root_id = 0; break;
+		case 10: record.release.seal_generation = 0; break;
+		case 11: record.release.touched_nodes_high = 1; break;
+		case 12: record.release.flags = 0; break;
+		case 13: record.release.terminal_status = TT_SLOT_ACTIVE; break;
+		case 14: record.release.segment_generation = UINT32_MAX; break;
+		case 15: record.release.segment_id = 1; break; /* Different physical owner. */
+		case 16: record.release.segment_id = UINT32_MAX; break;
+		case 17: break; /* NULL input. */
+		case 18: record.release.segment_generation = 0; break;
+		case 19: record.release.cluster_epoch = 0; break;
+		case 20: record.release.formation_epoch = 0; break;
+		}
+		payload_length = 123; emitted_info = 0xee;
+		if (fault == 0) {
+			UT_ASSERT(cluster_undo_tt_ctrc_release_v2_encode(&record, expected));
+			UT_ASSERT_EQ(cluster_undo_xlog_insert_tt_ctrc_release_v2(&record), 0x900);
+			UT_ASSERT_EQ(payload_length, 104); UT_ASSERT_EQ(emitted_rmid, RM_CLUSTER_UNDO_ID);
+			UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_CTRC_RELEASE);
+			UT_ASSERT_EQ(memcmp(payload, expected, 104), 0);
+			decoded = decode_emitted(false);
+			UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+			UT_ASSERT_EQ(decoded.original_full_xid, record.original_full_xid);
+			UT_ASSERT_EQ(decoded.expected_generation, 9);
+			UT_ASSERT_EQ(decoded.seal_generation, 16);
+			UT_ASSERT_EQ(memcmp(decoded.ack_set_digest, record.release.ack_set_digest, 16), 0);
+		} else {
+			expect_panic = true;
+			if (setjmp(panic_jump) == 0) {
+				(void)cluster_undo_xlog_insert_tt_ctrc_release_v2(fault == 17 ? NULL : &record);
+				UT_ASSERT(false);
+			}
+			expect_panic = false;
+			UT_ASSERT_EQ(payload_length, 123); UT_ASSERT_EQ(emitted_info, 0xee);
+		}
+	}
+}
+
+UT_TEST(test_v2_prepared_commit_and_head_producers_reach_original_decoder)
+{
+	for (unsigned epoch = 0; epoch < 2; epoch++) {
+		xl_undo_tt_identity_v2 identity = { .segment_id = 513, .segment_generation = 9,
+			.xid = 801, .slot_offset = 4, .wrap = 7, .instance = 3,
+			.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION };
+		xl_undo_tt_slot_commit_v2 commit;
+		xl_undo_tt_slot_set_head_v2 head_record;
+		ClusterUndoDecoded decoded;
+		UBA head = uba_encode(513, 2, 4, 0);
+		identity.original_full_xid = ((uint64)(epoch ? 7 : 0) << 32) | identity.xid;
+		UT_ASSERT_EQ(cluster_undo_emit_tt_slot_commit_v2(&identity, 42), 0x900);
+		UT_ASSERT_EQ(payload_length, 40);
+		UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_COMMIT);
+		UT_ASSERT(cluster_undo_tt_commit_v2_decode(payload, payload_length, &commit));
+		UT_ASSERT_EQ(memcmp(&commit.identity, &identity, sizeof(identity)), 0);
+		UT_ASSERT_EQ(commit.commit_scn, 42);
+		decoded = decode_emitted(false);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, identity.original_full_xid);
+		UT_ASSERT_EQ(decoded.commit_scn, 42);
+		UT_ASSERT_EQ(cluster_undo_emit_tt_slot_set_head_v2(&identity, head), 0x900);
+		UT_ASSERT_EQ(payload_length, 48);
+		UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_SET_HEAD);
+		UT_ASSERT(cluster_undo_tt_set_head_v2_decode(payload, payload_length, &head_record));
+		UT_ASSERT_EQ(memcmp(&head_record.identity, &identity, sizeof(identity)), 0);
+		UT_ASSERT_EQ(memcmp(&head_record.first_undo_block, &head, sizeof(head)), 0);
+		decoded = decode_emitted(false);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, identity.original_full_xid);
+		UT_ASSERT_EQ(memcmp(&decoded.first_undo_block, &head, sizeof(head)), 0);
+	}
+}
+
+UT_TEST(test_v2_prepared_emitters_reject_bad_identity_scn_or_head_before_insert)
+{
+	for (unsigned is_head = 0; is_head < 2; is_head++) {
+		for (unsigned fault = 0; fault < 15; fault++) {
+			xl_undo_tt_identity_v2 identity = { .segment_id = 513, .segment_generation = 9,
+				.xid = 801, .slot_offset = 4, .wrap = 7, .instance = 3,
+				.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION,
+				.original_full_xid = UINT64_C(0x700000321) };
+			UBA head = uba_encode(513, 2, 4, 0);
+			SCN scn = 42;
+			switch (fault) {
+			case 0: identity.format_version = 1; break;
+			case 1: identity.flags = 1; break;
+			case 2: identity.reserved = 1; break;
+			case 3: identity.original_full_xid = UINT64_MAX; break;
+			case 4: identity.original_full_xid++; break;
+			case 5: identity.xid = FrozenTransactionId; break;
+			case 6: identity.instance = 0; break;
+			case 7: identity.segment_id = 1; break;
+			case 8: identity.slot_offset = TT_SLOTS_PER_SEGMENT; break;
+			case 9: identity.wrap = TT_WRAP_INVALID; break;
+			case 10: identity.segment_generation = UINT32_MAX; break;
+			case 11: break; /* NULL identity */
+			case 12: scn = InvalidScn; head = (UBA)InvalidUba_init; break;
+			case 13: scn = UINT64_MAX; head = uba_encode(513, 2, 5, 0); break;
+			case 14: scn = UINT64_MAX; head = uba_encode(514, 2, 4, 0); break;
+			}
+			payload_length = 123; emitted_info = 0xee;
+			expect_panic = true;
+			if (setjmp(panic_jump) == 0) {
+				if (is_head)
+					(void)cluster_undo_emit_tt_slot_set_head_v2(fault == 11 ? NULL : &identity, head);
+				else
+					(void)cluster_undo_emit_tt_slot_commit_v2(fault == 11 ? NULL : &identity, scn);
+				UT_ASSERT(false);
+			}
+			expect_panic = false;
+			UT_ASSERT_EQ(payload_length, 123);
+			UT_ASSERT_EQ(emitted_info, 0xee);
+		}
+	}
+}
+
+static xl_undo_tt_slot_set_head_operation_v2
+producer_operation(uint64 top)
+{
+	xl_undo_tt_slot_set_head_operation_v2 record = { 0 };
+
+	record.head.identity.segment_id = 513;
+	record.head.identity.segment_generation = 9;
+	record.head.identity.xid = (TransactionId)top;
+	record.head.identity.slot_offset = 4;
+	record.head.identity.wrap = 7;
+	record.head.identity.instance = 3;
+	record.head.identity.format_version = CLUSTER_UNDO_TT_IDENTITY_V2_VERSION;
+	record.head.identity.flags = CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG;
+	record.head.identity.original_full_xid = top;
+	/* A retained data segment may differ from the canonical TT segment. */
+	record.head.first_undo_block = uba_encode(514, 2, 4, 0);
+	record.operation.version = UNDO_OPERATION_TRAILER_VERSION;
+	record.operation.length = UNDO_OPERATION_TRAILER_LENGTH;
+	record.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	record.operation.canonical_top_fxid = top;
+	record.operation.operation_fxid = top + 1;
+	record.operation.operation_sequence = 3;
+	record.operation.canonical_segment_generation = 9;
+	record.operation.command_id = 7;
+	record.operation.subid = 2;
+	return record;
+}
+
+UT_TEST(test_operation_v2_producer_preserves_96_bytes_through_native_wal_decode)
+{
+	const uint64 tops[] = { 801, (UINT64_C(7) << 32) | 801 };
+
+	for (Size i = 0; i < lengthof(tops); i++) {
+		xl_undo_tt_slot_set_head_operation_v2 record = producer_operation(tops[i]);
+		ClusterUndoDecoded decoded;
+
+		UT_ASSERT_EQ(cluster_undo_emit_tt_slot_set_head_operation_v2(&record), 0x900);
+		UT_ASSERT_EQ(payload_length, 96);
+		UT_ASSERT_EQ(emitted_info, XLOG_UNDO_TT_SLOT_SET_HEAD);
+		UT_ASSERT_EQ(memcmp(payload, &record, sizeof(record)), 0);
+		decoded = decode_emitted(false);
+		UT_ASSERT(cluster_undo_preflight_tt_v2(&decoded));
+		UT_ASSERT_EQ(decoded.original_full_xid, tops[i]);
+		UT_ASSERT_EQ(decoded.head_operation.operation_fxid, tops[i] + 1);
+		UT_ASSERT_EQ(memcmp(&decoded.head_operation, &record.operation, 48), 0);
+	}
+}
+
+UT_TEST(test_operation_v2_producer_refuses_before_any_wal_insertion)
+{
+	const uint64 top = (UINT64_C(7) << 32) | 801;
+
+	for (unsigned fault = 0; fault < 13; fault++) {
+		xl_undo_tt_slot_set_head_operation_v2 record = producer_operation(top);
+		uint32 prior = inserts_begun;
+
+		switch (fault) {
+		case 0: record.head.identity.original_full_xid ^= UINT64_C(1) << 32; break;
+		case 1: record.operation.operation_fxid = top; break;
+		case 2: record.operation.canonical_top_fxid ^= UINT64_C(1) << 32; break;
+		case 3: record.head.identity.flags = 0; break;
+		case 4: record.head.identity.reserved = 1; break;
+		case 5: record.head.identity.format_version = 3; break;
+		case 6: record.head.identity.segment_generation++; break;
+		case 7: record.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED; break;
+		case 8: record.operation.reserved_end = 1; break;
+		case 9: record.head.first_undo_block = uba_encode(1, 2, 4, 0); break;
+		case 10: record.operation.operation_sequence = 0; break;
+		case 11: record.operation.version++; break;
+		case 12: break; /* NULL */
+		}
+		expect_panic = true;
+		if (setjmp(panic_jump) == 0) {
+			cluster_undo_emit_tt_slot_set_head_operation_v2(fault == 12 ? NULL : &record);
+			UT_ASSERT(false);
+		}
+		expect_panic = false;
+		UT_ASSERT_EQ(inserts_begun, prior);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(16);
 	UT_RUN(test_segment_lifecycle_producer_payloads);
 	UT_RUN(test_tt_producer_identity_and_polarity);
 	UT_RUN(test_ctrc_release_producer_certificate);
+	UT_RUN(test_v2_release_producer_preserves_104_bytes_and_rejects_before_insert);
 	UT_RUN(test_block_write_producer_checkpoint_boundary);
 	UT_RUN(test_block_write_multi_producer_checkpoint_boundary);
 	UT_RUN(test_unowned_segment_and_hwm_do_not_gain_authority);
 	UT_RUN(test_private_block_preparation_refusal_is_atomic);
 	UT_RUN(test_native_block_writer_uses_typed_preparation_before_write_and_sync);
+	UT_RUN(test_v2_bind_producer_preserves_original_fullxid_and_opcode);
+	UT_RUN(test_v2_bind_producer_refuses_bad_identity_before_insertion);
+	UT_RUN(test_v2_abort_producer_preserves_original_identity_and_rejects_before_insert);
+	UT_RUN(test_v2_prepared_commit_and_head_producers_reach_original_decoder);
+	UT_RUN(test_v2_prepared_emitters_reject_bad_identity_scn_or_head_before_insert);
+	UT_RUN(test_operation_v2_producer_preserves_96_bytes_through_native_wal_decode);
+	UT_RUN(test_operation_v2_producer_refuses_before_any_wal_insertion);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

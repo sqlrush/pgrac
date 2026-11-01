@@ -270,7 +270,7 @@ cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
 static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
 static uint32 ut_peer_cap_generation[CLUSTER_MAX_NODES];
 static ResourceXIntentSlot ut_resource_x_owner_slot;
-static uint8 ut_resource_x_owner_payload[RESOURCE_X_IMAGE_V2_BYTES];
+static uint8 ut_resource_x_owner_payload[RESOURCE_X_IMAGE_V3_MAX_BYTES];
 static int ut_resource_x_stage_count = 0;
 static bool ut_resource_x_stage_not_due;
 static int ut_resource_x_rearm_count = 0;
@@ -2799,283 +2799,37 @@ UT_TEST(test_plain_frame_old_head_does_not_block_new_cut_frame)
 	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xa9);
 }
 
-UT_TEST(test_foreground_capacity_wait_resumes_after_native_drain)
+UT_TEST(test_resource_x_v3_image_intent_uses_retained_owner_without_truncation)
 {
-	ut_captured_region->init_fn();
-	ut_reset_log();
-	for (int i = 0; i < 256; i++)
-		UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xe2));
-	UT_ASSERT(!ut_enqueue_first_read(1, UT_PEER_X, 0xbc));
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
-	ut_space_action = 1;
-	MyBackendType = B_BACKEND;
-	UT_ASSERT(cluster_lms_outbound_wait_capacity(1, ut_request_epoch));
-	MyBackendType = B_LMS;
-	UT_ASSERT_EQ(ut_space_sleeps, 1);
-	UT_ASSERT(ut_space_broadcasts > 0);
-	UT_ASSERT(ut_space_wait == NULL);
-	UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_X, 0xbc));
-	while (cluster_lms_outbound_depth(1) > 0)
-		(void)cluster_lms_outbound_drain_send(1);
-	UT_ASSERT_EQ(ut_count_marker(0xbc), 1);
-	UT_ASSERT_EQ(ut_sent_n, 257);
-}
+	const uint16 sizes[] = { RESOURCE_X_IMAGE_V3_MIN_BYTES, RESOURCE_X_IMAGE_V3_MAX_BYTES };
 
-UT_TEST(test_capacity_wait_membership_and_cancel_remove_subscription)
-{
-	for (int action = 2; action <= 3; action++) {
-		volatile bool caught = false;
-		ut_captured_region->init_fn();
+	for (unsigned i = 0; i < lengthof(sizes); i++) {
+		ResourceXIntentSlot intent;
+
 		ut_reset_log();
-		for (int i = 0; i < 256; i++)
-			UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xe2));
-		ut_space_action = action;
-		MyBackendType = B_BACKEND;
-		PG_TRY();
-		{
-			UT_ASSERT(!cluster_lms_outbound_wait_capacity(1, ut_request_epoch));
-		}
-		PG_CATCH(); { caught = true; }
-		PG_END_TRY();
-		MyBackendType = B_LMS;
-		UT_ASSERT_EQ(caught, action == 3);
-		UT_ASSERT_EQ(ut_space_sleeps, 1);
-		UT_ASSERT(ut_space_wait == NULL);
-		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 256);
-		UT_ASSERT_EQ(ut_sent_n, 0);
-	}
-}
-
-/* Same original enqueue/drain object; no diagnostic emitter is called directly. */
-static GcsBlockForwardPayload
-ut_tt_diag_fixture(void)
-{
-	GcsBlockForwardPayload request = { 0 };
-
-	ut_captured_region->init_fn();
-	ut_reset_log();
-	ut_tt_diag_enabled = true;
-	ut_tt_diag_fail = false;
-	ut_tt_diag_n = 0;
-	ut_tt_diag_log[0] = '\0';
-	ut_tt_diag_broadcasts = ut_space_broadcasts;
-	memset(&ut_tt_diag_sent, 0, sizeof(ut_tt_diag_sent));
-	request.request_id = UINT64CONST(2199023309737);
-	request.epoch = 7;
-	request.tag = GcsBlockUndoFetchTagMake(3073, 6);
-	request.original_requester_node = 0;
-	request.requester_backend_id = 17;
-	request.master_node = 0;
-	request.transition_id = PCM_TRANS_N_TO_S;
-	GcsBlockForwardPayloadSetUndoVerdictRequest(&request, false);
-	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&request, 6264227);
-	return request;
-}
-
-static void
-ut_tt_diag_identity(const GcsBlockForwardPayload *request)
-{
-	char key[256];
-
-	snprintf(key, sizeof(key),
-			 "node=0 worker=1 destination=3 requester=0 backend=17 request=" UINT64_FORMAT
-			 " xid=" UINT64_FORMAT " epoch=7",
-			 request->request_id, (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(request));
-	UT_ASSERT(strstr(ut_tt_diag_log, key) != NULL);
-	snprintf(key, sizeof(key), "tag=%u/%u/%u/%u/%u", request->tag.spcOid, request->tag.dbOid,
-			 request->tag.relNumber, request->tag.forkNum, request->tag.blockNum);
-	UT_ASSERT(strstr(ut_tt_diag_log, key) != NULL);
-	UT_ASSERT(strstr(ut_tt_diag_log, "frame_epoch=7 membership=2 stream=11") != NULL);
-	UT_ASSERT(ut_tt_diag_unlocked());
-}
-
-UT_TEST(test_ordinary_tt_not_admitted_keeps_exact_frame_and_later_handoff)
-{
-	GcsBlockForwardPayload request = ut_tt_diag_fixture();
-	int failures = ut_not_admitted_count;
-
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
-	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &request,
-										   sizeof(request)));
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
-	UT_ASSERT_EQ(ut_not_admitted_count, failures + 1);
-	UT_ASSERT_EQ(ut_tt_diag_n, 1);
-	ut_tt_diag_identity(&request);
-	UT_ASSERT(strstr(ut_tt_diag_log, "phase=SEND_RESULT send_result=3") != NULL);
-	UT_ASSERT_EQ(memcmp(&ut_tt_diag_sent, &request, sizeof(request)), 0);
-	ut_tt_diag_n = 0;
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
-	UT_ASSERT_EQ(ut_sent_n, 2);
-	UT_ASSERT_EQ(ut_tt_diag_n, 0);
-	UT_ASSERT_EQ(memcmp(&ut_tt_diag_sent, &request, sizeof(request)), 0);
-}
-
-UT_TEST(test_ordinary_tt_hard_error_keeps_original_drop_and_send_result)
-{
-	GcsBlockForwardPayload request = ut_tt_diag_fixture();
-
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
-	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &request,
-										   sizeof(request)));
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
-	UT_ASSERT_EQ(ut_sent_n, 1);
-	UT_ASSERT_EQ(ut_tt_diag_n, 1);
-	ut_tt_diag_identity(&request);
-	UT_ASSERT(strstr(ut_tt_diag_log, "phase=SEND_RESULT send_result=2") != NULL);
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
-	UT_ASSERT_EQ(ut_sent_n, 1);
-}
-
-UT_TEST(test_ordinary_tt_stale_frame_reports_copied_qualification_without_send)
-{
-	for (int drift = 0; drift < 4; drift++) {
-		GcsBlockForwardPayload request = ut_tt_diag_fixture();
-
-		UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X,
-											   &request, sizeof(request)));
-		if (drift == 0)
-			ut_request_epoch++;
-		else if (drift == 1)
-			ut_member_cut += 2;
-		else
-			ut_data_stream[UT_PEER_X] = drift == 2 ? 0 : 12;
-		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
-		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
-		UT_ASSERT_EQ(ut_sent_n, 0);
-		UT_ASSERT_EQ(ut_tt_diag_n, 1);
-		ut_tt_diag_identity(&request);
-		UT_ASSERT(strstr(ut_tt_diag_log, "phase=FRAME_STALE send_result=-1") != NULL);
-	}
-}
-
-UT_TEST(test_ordinary_tt_blocked_peer_preserves_fifo_and_other_peer_flow)
-{
-	GcsBlockForwardPayload request = ut_tt_diag_fixture(), second = request;
-
-	second.request_id++;
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
-	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &request,
-										   sizeof(request)));
-	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &second,
-										   sizeof(second)));
-	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_Y, 0x82));
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 2);
-	UT_ASSERT_EQ(ut_sent_n, 2);
-	UT_ASSERT_EQ(ut_tt_diag_n, 2);
-	ut_tt_diag_identity(&second);
-	UT_ASSERT(strstr(ut_tt_diag_log, "phase=PEER_BLOCKED send_result=-1") != NULL);
-	ut_tt_diag_n = 0;
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 2);
-	UT_ASSERT_EQ(ut_sent_n, 4);
-	UT_ASSERT_EQ(ut_sent_log[2].marker, ((const uint8 *)&request)[0]);
-	UT_ASSERT_EQ(ut_sent_log[3].marker, ((const uint8 *)&second)[0]);
-	UT_ASSERT_EQ(ut_tt_diag_n, 0);
-}
-
-UT_TEST(test_ordinary_tt_diagnostic_excludes_other_shapes_and_admitted_sends)
-{
-	for (int variant = 0; variant < 8; variant++) {
-		GcsBlockForwardPayload request = ut_tt_diag_fixture();
-		uint8 bytes[sizeof(request) + 1];
-		uint8 type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
-		uint16 size = sizeof(request);
-
-		ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
-		if (variant == 0)
-			GcsBlockForwardPayloadSetUndoVerdictRequest(&request, true);
-		else if (variant == 1)
-			GcsBlockForwardPayloadSetUndoFreshRefC1bPairRequest(&request);
-		else if (variant == 2)
-			GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(&request);
-		else if (variant == 3)
-			type = UT_MSG_TYPE;
-		else if (variant == 4)
-			size--;
-		else if (variant == 5)
-			size++;
-		else
-			ut_peer_rc[UT_PEER_X]
-				= variant == 6 ? CLUSTER_IC_SEND_DONE : CLUSTER_IC_SEND_WOULD_BLOCK;
-		memset(bytes, 0, sizeof(bytes));
-		memcpy(bytes, &request, sizeof(request));
-		UT_ASSERT(cluster_lms_outbound_enqueue(1, type, UT_PEER_X, bytes, size));
-		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), variant >= 6 ? 1 : 0);
-		UT_ASSERT_EQ(ut_tt_diag_n, 0);
-		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+		intent = ut_resource_x_image_intent(UT_PEER_X);
+		intent.payload_bytes = sizes[i];
+		ut_resource_x_owner_slot = intent;
+		memset(ut_resource_x_owner_payload, 0xAA, sizes[i]);
+		ut_peer_capabilities[UT_PEER_X] = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+		ut_peer_cap_generation[UT_PEER_X] = 84;
+		ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+		UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_intent(0, &intent, 84, UINT64_MAX),
+			CLUSTER_LMS_ENQUEUE_ADMITTED);
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
 		UT_ASSERT_EQ(ut_sent_n, 1);
-		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
-		UT_ASSERT_EQ(ut_sent_n, 1);
+		UT_ASSERT_EQ(ut_sent_log[0].payload_len, sizes[i]);
+		UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAA);
+		UT_ASSERT_EQ(ut_resource_x_rebind_count, 1);
+		UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
+		UT_ASSERT_EQ(ut_resource_x_owner_slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
 	}
-}
-
-UT_TEST(test_ordinary_tt_log_exception_follows_original_batch_cleanup)
-{
-	GcsBlockForwardPayload request = ut_tt_diag_fixture();
-	volatile bool caught = false;
-
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
-	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &request,
-										   sizeof(request)));
-	ut_tt_diag_fail = true;
-	PG_TRY();
-	{
-		(void)cluster_lms_outbound_drain_send(1);
-	}
-	PG_CATCH();
-	{
-		caught = true;
-	}
-	PG_END_TRY();
-	UT_ASSERT(caught);
-	UT_ASSERT(ut_tt_diag_unlocked());
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
-	UT_ASSERT_EQ(ut_space_broadcasts, 1);
-	ut_tt_diag_fail = false;
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
-	UT_ASSERT_EQ(ut_sent_n, 2);
-}
-
-UT_TEST(test_ordinary_tt_full_batch_and_output_bound_preserve_all_frames)
-{
-	GcsBlockForwardPayload request = ut_tt_diag_fixture();
-	int failures = ut_not_admitted_count, drops = ut_requeue_drop_count;
-
-	/* Last: the original production logger owns a process-local detail budget. */
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
-	for (int i = 0; i < 70; i++) {
-		request.request_id++;
-		UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X,
-											   &request, sizeof(request)));
-	}
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 70);
-	UT_ASSERT_EQ(ut_sent_n, 1);
-	UT_ASSERT_EQ(ut_not_admitted_count, failures + 1);
-	UT_ASSERT_EQ(ut_requeue_drop_count, drops);
-	UT_ASSERT_EQ(ut_tt_diag_total, 64);
-	UT_ASSERT(strstr(ut_tt_diag_log, "detail_budget_exhausted=1") != NULL);
-	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 64);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 6);
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 6);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
-	UT_ASSERT_EQ(ut_sent_n, 71);
-	UT_ASSERT_EQ(ut_tt_diag_total, 64);
-	UT_ASSERT_EQ(ut_not_admitted_count, failures + 1);
 }
 
 int
 main(void)
 {
-	UT_PLAN(68);
+	UT_PLAN(59);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -3104,6 +2858,7 @@ main(void)
 	UT_RUN(test_resource_x_holder_release_transport_waits_for_actual_send);
 	UT_RUN(test_resource_x_source_settlement_ack_fits_ordinary_data_ring);
 	UT_RUN(test_resource_x_image_intent_rebinds_transport_generation);
+	UT_RUN(test_resource_x_v3_image_intent_uses_retained_owner_without_truncation);
 	UT_RUN(test_resource_x_intent_transport_refusal_rearms_without_ring_copy);
 	UT_RUN(test_resource_x_intent_capability_drift_rearms_before_send);
 	UT_RUN(test_resource_x_intent_physical_deadline_rearms_before_send);

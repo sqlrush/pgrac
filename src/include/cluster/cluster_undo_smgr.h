@@ -69,6 +69,11 @@
  *	  buf                         -- caller-provided 8KB buffer (BLCKSZ)
  *
  *	Returns: true on success, false on I/O error or short read.
+ *  Managed TT block zero additionally borrows the independently selected
+ *  UNDO identity and validates the complete TT40 reference and checksum on
+ *  the same FD, including cache hits. Refusal/ERROR preserves buf. This I/O
+ *  borrow grants no current/recovery authority or longer resident lifetime;
+ *  the original caller retains those obligations. DATA blocks are unchanged.
  */
 extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id,
 										 uint8 owner_instance, uint32 block_no, char *buf);
@@ -87,6 +92,9 @@ extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 se
  *
  *	NOT critical-section safe.
  */
+/* Selected native block-zero writes require a valid TT40 successor and an
+ * already matching on-disk page. One file-identity borrow spans write/fsync;
+ * the caller still owns content-X, WAL and the original file lifetime. */
 extern bool cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id,
 										  uint8 owner_instance, uint32 block_no, const char *buf,
 										  bool do_fsync);
@@ -132,6 +140,9 @@ extern bool cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 inst
  *	block-zero content lock or inside a DELAY_CHKPT_START window.  offset+len
  *	must be within BLCKSZ.  Returns true on success, false on bad args / I/O
  *	error / short transfer.  NOT critical-section safe.
+ *	Managed TT40 reads validate a complete page before copying the range;
+ *	writes require offset 0 / BLCKSZ with the original content-X owner's sealed
+ *	page. The file identity stays borrowed through I/O/checkpoint bookkeeping.
  */
 extern bool cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
 												uint8 owner_instance, uint32 offset, char *buf,
@@ -142,9 +153,16 @@ extern bool cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, u
 
 /*
  * Header writer for a critical section: _open resolves and opens a private
- * descriptor beforehand (returns -1 on failure); _write performs the same
+ * descriptor beforehand, returning a process-local opaque handle (-1 on
+ * failure), never an OS FD. Its value is not reused after close or original
+ * ResourceOwner cleanup. The caller must have a CurrentResourceOwner.
+ * _write performs the same
  * write and checkpoint bookkeeping as cluster_undo_smgr_write_header_bytes
- * without path resolution, allocation or ERROR; _close never throws.
+ * without path resolution, allocation or ERROR; managed TT40 requires a
+ * complete sealed page and holds an address-bound file borrow from open to
+ * close/ResourceOwner cleanup. Failed writes retain both for original cleanup.
+ * _close raises no ordinary ERROR; failed FD/borrow cleanup PANICs instead of
+ * discarding the original duty. Unknown/previously closed handles are no-ops.
  */
 extern int cluster_undo_smgr_header_writer_open(ClusterUndoPathIntent intent, uint32 segment_id,
 												uint8 owner_instance);
@@ -282,7 +300,9 @@ extern bool cluster_undo_smgr_recovery_ctrc_finish_record_v2(
 extern bool cluster_undo_smgr_header_unchanged_durable(ClusterUndoPathIntent intent,
 													   uint32 segment_id, uint8 owner_instance);
 
-/* Checkpoint: fsync one segment file through the intent its header used. */
+/* Checkpoint: fsync one segment file through the intent its header used.
+ * Managed TT40 validates the complete selected block zero and holds its file
+ * identity through the same-FD fsync; this alone grants no coverage authority. */
 extern bool cluster_undo_smgr_fsync_header(ClusterUndoPathIntent intent, uint32 segment_id,
 										   uint8 owner_instance);
 

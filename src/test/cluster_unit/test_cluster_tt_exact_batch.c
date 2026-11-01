@@ -477,10 +477,199 @@ UT_TEST(test_shorter_batch_clears_unused_tail)
 	UT_ASSERT_EQ(fetch_calls, 2);
 }
 
+static UndoSegmentHeaderDataV2 *
+reset_v2_fixture(void)
+{
+	UndoSegmentHeaderDataV2 *hdr = (UndoSegmentHeaderDataV2 *)fetched_page.data;
+	const uint32 epochs[] = { 0, 1, UINT32_MAX, 7 };
+
+	reset_fixture();
+	memset(fetched_page.data + 112, 0, BLCKSZ - 112);
+	hdr->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+	hdr->tt_slot_bytes = sizeof(TTSlotV2);
+	hdr->wrap_count = 41;
+	for (uint32 i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		TTSlotV2 *slot = &hdr->tt_slots[i];
+
+		slot->xid = 1000 + i;
+		slot->wrap = 12 + i;
+		slot->status = i % 2 ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+		slot->commit_scn = i % 2 ? InvalidScn : (SCN)(777 + i);
+		slot->original_full_xid = ((uint64)epochs[i % lengthof(epochs)] << 32) | slot->xid;
+	}
+	/* The V1 generation offset is in the V2 bitmap, never its generation. */
+	header()->wrap_count = 99;
+	return hdr;
+}
+
+UT_TEST(test_v2_all_slots_publish_exact_persisted_identity)
+{
+	UndoSegmentHeaderDataV2 *hdr = reset_v2_fixture();
+	ClusterVisTtExactBatch out;
+
+	for (uint32 first = 0; first < TT_SLOTS_PER_SEGMENT; first += 8) {
+		for (uint32 i = 0; i < 8; i++) {
+			const TTSlotV2 *slot = &hdr->tt_slots[first + i];
+
+			requests[i].slot_offset = first + i;
+			requests[i].xid = slot->xid;
+			requests[i].slot_wrap = slot->wrap;
+		}
+		UT_ASSERT(cluster_runtime_visibility_remote_exact_tt_batch(1, 7, 41, requests, 8, &out));
+		UT_ASSERT_EQ(out.count, 8);
+		for (uint32 i = 0; i < 8; i++) {
+			const TTSlotV2 *slot = &hdr->tt_slots[first + i];
+
+			UT_ASSERT_EQ(out.proofs[i], i % 2 ? CLUSTER_VIS_TT_PROOF_ABORTED
+										   : CLUSTER_VIS_TT_PROOF_COMMITTED);
+			UT_ASSERT_EQ(out.commit_scns[i], slot->commit_scn);
+			UT_ASSERT_EQ(U64FromFullTransactionId(out.original_full_xids[i]),
+						 slot->original_full_xid);
+		}
+		assert_authority(out.authority);
+		UT_ASSERT_EQ(fetch_calls, first / 8 + 1);
+	}
+}
+
+UT_TEST(test_v2_rejects_bad_framing_before_slot_use)
+{
+	for (int variant = 0; variant < 11; variant++) {
+		UndoSegmentHeaderDataV2 *hdr = reset_v2_fixture();
+
+		switch (variant) {
+		case 0:
+			hdr->tt_layout_version = 3;
+			break;
+		case 1:
+			hdr->tt_layout_version = 0;
+			break;
+		case 2:
+			hdr->tt_slot_bytes = sizeof(TTSlot);
+			break;
+		case 3:
+			hdr->tt_slot_bytes = 0;
+			break;
+		case 4:
+			hdr->tt_layout_reserved = 1;
+			break;
+		case 5:
+			hdr->tt_next_free_slot = TT_SLOTS_PER_SEGMENT + 1;
+			break;
+		case 6:
+			hdr->tt_active_count = TT_SLOTS_PER_SEGMENT + 1;
+			break;
+		case 7:
+			hdr->tt_slots_count--;
+			break;
+		case 8:
+			hdr->owner_instance++;
+			break;
+		case 9:
+			hdr->pd_pagesize_version = 0;
+			break;
+		case 10:
+			hdr->segment_state = UINT8_MAX;
+			break;
+		}
+		assert_refused(1, 7, 41, requests, 8, 1);
+	}
+}
+
+UT_TEST(test_v2_bad_last_identity_clears_full_batch)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		UndoSegmentHeaderDataV2 *hdr = reset_v2_fixture();
+		TTSlotV2 *slot = &hdr->tt_slots[7];
+
+		switch (variant) {
+		case 0:
+			slot->original_full_xid = 0;
+			break;
+		case 1:
+			slot->original_full_xid = UINT64_MAX;
+			break;
+		case 2:
+			slot->original_full_xid++;
+			break;
+		case 3:
+			slot->original_full_xid = UINT64CONST(0x100000002);
+			break;
+		case 4:
+			slot->wrap++;
+			break;
+		case 5:
+			slot->status = TT_SLOT_INVALID;
+			break;
+		case 6:
+			slot->flags = UINT8_C(0x80);
+			break;
+		case 7:
+			slot->commit_scn = UINT64_MAX;
+			break;
+		}
+		assert_refused(1, 7, 41, requests, 8, 1);
+	}
+}
+
+UT_TEST(test_v2_raw_aliases_keep_distinct_full_identity)
+{
+	UndoSegmentHeaderDataV2 *hdr = reset_v2_fixture();
+	ClusterVisTtExactBatch out;
+
+	hdr->tt_slots[1].xid = requests[0].xid;
+	requests[1].xid = requests[0].xid;
+	hdr->tt_slots[1].original_full_xid = (UINT64CONST(9) << 32) | requests[0].xid;
+	UT_ASSERT(cluster_runtime_visibility_remote_exact_tt_batch(1, 7, 41, requests, 2, &out));
+	UT_ASSERT_EQ(U64FromFullTransactionId(out.original_full_xids[0]), requests[0].xid);
+	UT_ASSERT_EQ(U64FromFullTransactionId(out.original_full_xids[1]),
+				 hdr->tt_slots[1].original_full_xid);
+	UT_ASSERT(!FullTransactionIdEquals(out.original_full_xids[0], out.original_full_xids[1]));
+	UT_ASSERT_EQ(fetch_calls, 1);
+	/* Refuse newer segment generations, even with the same raw/full bytes. */
+	hdr->wrap_count++;
+	assert_refused(1, 7, 41, requests, 2, 2);
+}
+
+UT_TEST(test_v2_single_entry_uses_same_exact_reader)
+{
+	UndoSegmentHeaderDataV2 *hdr = reset_v2_fixture();
+	ClusterVisTtProof proof;
+	SCN scn;
+	ClusterLiveAuthority auth;
+
+	UT_ASSERT(cluster_runtime_visibility_remote_exact_tt_proof(1, 7, 41, 46, 1046, 58,
+															  &proof, &scn, &auth));
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_COMMITTED);
+	UT_ASSERT_EQ(scn, 823);
+	assert_authority(auth);
+	hdr->tt_slots[46].original_full_xid++;
+	UT_ASSERT(!cluster_runtime_visibility_remote_exact_tt_proof(1, 7, 41, 46, 1046, 58,
+															   &proof, &scn, &auth));
+	UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+	UT_ASSERT_EQ(scn, InvalidScn);
+	UT_ASSERT_EQ(auth.origin_epoch, 0);
+	UT_ASSERT_EQ(fetch_calls, 2);
+}
+
+UT_TEST(test_legacy_and_short_batch_never_invent_full_identity)
+{
+	ClusterVisTtExactBatch out;
+
+	reset_v2_fixture();
+	UT_ASSERT(cluster_runtime_visibility_remote_exact_tt_batch(1, 7, 41, requests, 8, &out));
+	UT_ASSERT(cluster_runtime_visibility_remote_exact_tt_batch(1, 7, 41, requests, 1, &out));
+	for (uint32 i = 1; i < 8; i++)
+		UT_ASSERT_EQ(U64FromFullTransactionId(out.original_full_xids[i]), 0);
+	reset_fixture();
+	UT_ASSERT(cluster_runtime_visibility_remote_exact_tt_batch(1, 7, 41, requests, 8, &out));
+	for (uint32 i = 0; i < 8; i++)
+		UT_ASSERT_EQ(U64FromFullTransactionId(out.original_full_xids[i]), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(26);
 	UT_RUN(test_eight_mixed_facts_one_header);
 	UT_RUN(test_request_order_is_preserved);
 	UT_RUN(test_same_xid_distinct_carriers);
@@ -501,6 +690,12 @@ main(void)
 	UT_RUN(test_single_entry_requires_all_outputs);
 	UT_RUN(test_valid_domain_boundaries);
 	UT_RUN(test_shorter_batch_clears_unused_tail);
+	UT_RUN(test_v2_all_slots_publish_exact_persisted_identity);
+	UT_RUN(test_v2_rejects_bad_framing_before_slot_use);
+	UT_RUN(test_v2_bad_last_identity_clears_full_batch);
+	UT_RUN(test_v2_raw_aliases_keep_distinct_full_identity);
+	UT_RUN(test_v2_single_entry_uses_same_exact_reader);
+	UT_RUN(test_legacy_and_short_batch_never_invent_full_identity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

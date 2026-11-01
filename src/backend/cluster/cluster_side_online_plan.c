@@ -21,6 +21,7 @@
 #include "catalog/storage_xlog.h"
 #include "replication/origin.h"
 #include "storage/standbydefs.h"
+#include "storage/checksum.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "utils/relmapper.h"
@@ -1246,9 +1247,13 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO) {
 			uint32 length = XLogRecGetDataLen(record_plan->source_record);
 			if (!cluster_undo_decode(record_plan->source_record, &candidate->undo)
-				|| (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
-					? !cluster_undo_inspect_pi(&candidate->undo)
-					: !cluster_undo_preflight(&candidate->undo))
+				|| (candidate->undo.format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+					? (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
+						? !cluster_undo_inspect_pi_tt_v2(&candidate->undo)
+						: !cluster_undo_preflight_tt_v2(&candidate->undo))
+					: (plan->purpose == RF_SIDE_PLAN_PI_CONTRIBUTIONS
+						? !cluster_undo_inspect_pi(&candidate->undo)
+						: !cluster_undo_preflight(&candidate->undo)))
 				|| candidate->undo.instance != identity->record.origin_thread
 				|| candidate->undo.payload_offset > length
 				|| candidate->undo.payload_length > length - candidate->undo.payload_offset)
@@ -2322,6 +2327,20 @@ rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 	return false;
 }
 
+/* Preserve the original cold payload check when that producer API is present.
+ * The ordinary carrier has no separately owned effects. */
+static bool
+side_plan_abort_carrier_preflight(const RfSideOnlineOperationV1 *operation)
+{
+#ifdef CLUSTER_SIDE_XACT_COLD_COMPLETION_V1
+	if (operation->xact.cold_completion_effects)
+		return rf_side_xact_cold_completion_preflight_v1(
+			&operation->xact, operation->owned_payload, operation->owned_payload_length);
+#endif
+	return operation->owned_payload == NULL && operation->owned_payload_length == 0
+		   && rf_side_xact_structural_preflight_v1(&operation->xact);
+}
+
 static bool
 side_plan_abort_identity(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV1 *operation,
 						 ClusterUndoDecoded *out, bool include_history)
@@ -2335,11 +2354,7 @@ side_plan_abort_identity(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOpera
 		|| (operation->history_only && !include_history)
 		|| operation->kind != RF_SIDE_ONLINE_OPERATION_XACT
 		|| operation->xact.kind != RF_SIDE_XACT_ABORT
-		|| (operation->xact.cold_completion_effects
-				? !rf_side_xact_cold_completion_preflight_v1(
-					  &operation->xact, operation->owned_payload, operation->owned_payload_length)
-				: (operation->owned_payload != NULL || operation->owned_payload_length != 0
-				   || !rf_side_xact_structural_preflight_v1(&operation->xact)))
+		|| !side_plan_abort_carrier_preflight(operation)
 		|| rf_side_online_plan_origin_operation_count_v1(plan, operation->xact.origin_thread)
 			   == UINT32_MAX)
 		return false;
@@ -2369,8 +2384,11 @@ side_plan_abort_identity(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOpera
 			continue;
 		if (abort != NULL || op->identity.participant_index != operation->identity.participant_index
 			|| op->identity.record.end_rec_ptr > operation->identity.record.read_rec_ptr
-			|| op->undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION
-			|| !cluster_undo_preflight(&op->undo))
+			|| (op->undo.format_version != CLUSTER_UNDO_TT_ABORT_EXACT_VERSION
+				&& op->undo.format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION)
+			|| (op->undo.format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+				? !cluster_undo_preflight_tt_v2(&op->undo)
+				: !cluster_undo_preflight(&op->undo)))
 			return false;
 		abort = op;
 	}
@@ -2391,6 +2409,9 @@ side_plan_abort_identity(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOpera
 			if (d->kind == CLUSTER_UNDO_KIND_TT_COMMIT || d->instance != key->instance
 				|| d->segment_id != key->segment_id || d->slot_offset != key->slot_offset
 				|| d->wrap != key->wrap
+				|| (d->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION)
+					   != (key->format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION)
+				|| d->original_full_xid != key->original_full_xid
 				|| (d->kind == CLUSTER_UNDO_KIND_TT_BIND
 					&& d->expected_generation != key->expected_generation))
 				return false;
@@ -2444,17 +2465,16 @@ side_plan_slot_step(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV
 	if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT) {
 		const xl_xact_tt_commit *d = &op->xact.tt_delta;
 
-		return cluster_undo_prepare_commit_v1(d->instance, d->segment_id, d->segment_generation,
-											  d->slot_offset, d->wrap, d->xid, d->commit_scn, base,
-											  out);
+		return cluster_undo_prepare_xact_commit_v1(d, op->xact.tt_original_full_xid, base, out);
 	} else {
 		const ClusterUndoDecoded *d = &op->undo;
 		const UndoSegmentHeaderData *h = (const UndoSegmentHeaderData *)base;
 
 		if (d->slot_offset >= TT_SLOTS_PER_SEGMENT)
 			return CLUSTER_UNDO_HEADER_BLOCKED;
-		if ((d->kind == CLUSTER_UNDO_KIND_TT_COMMIT || d->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
-			 || (d->kind == CLUSTER_UNDO_KIND_TT_ABORT && d->format_version == 0))
+		if (d->format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+			&& (d->kind == CLUSTER_UNDO_KIND_TT_COMMIT || d->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+				|| (d->kind == CLUSTER_UNDO_KIND_TT_ABORT && d->format_version == 0))
 			&& cluster_undo_preflight_legacy_slot_v1(d, &h->tt_slots[d->slot_offset])
 				   == CLUSTER_UNDO_TARGET_BLOCKED)
 			return CLUSTER_UNDO_HEADER_BLOCKED;
@@ -2580,13 +2600,281 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 s
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+
+/* V2 retains the original complete-source generation walk. Slot equality
+ * includes all forty bytes; neither an epoch nor a retired prefix is inferred
+ * from raw xid or numeric FullXid order. */
 static RfPageProofDetailV1
-side_plan_prepare_undo_block(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
-							 uint32 block_no, uint32 end, RfSideUndoBlockImageV1 *out)
+side_plan_prepare_slots_v2(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment,
+						uint32 begin, uint32 end, const char *base, const char *observed,
+						bool full_image, RfSideUndoHeaderImageV1 *prepared)
+{
+	PGAlignedBlock scratch;
+	const UndoSegmentHeaderDataV2 *original = (const UndoSegmentHeaderDataV2 *)observed;
+	UndoSegmentHeaderDataV2 *candidate = (UndoSegmentHeaderDataV2 *)scratch.data;
+	UndoSegmentHeaderDataV2 *final = (UndoSegmentHeaderDataV2 *)prepared->page.data;
+
+	if (base == NULL || !UndoSegmentHeaderV2_identity_matches(base, BLCKSZ, segment, instance))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	for (uint16 s = 0; s < TT_SLOTS_PER_SEGMENT; s++) {
+		bool started = false, proved = original == NULL;
+		uint32 last_source = UINT32_MAX;
+
+		memcpy(scratch.data, base, BLCKSZ);
+		if (full_image && original != NULL)
+			proved = memcmp(&candidate->tt_slots[s], &original->tt_slots[s], sizeof(TTSlotV2)) == 0;
+		for (uint32 i = begin; i < end; i++) {
+			const RfSideOnlineOperationV1 *op = &plan->operations[i];
+			ClusterUndoHeaderPrepareResultV1 result;
+			uint16 slot;
+
+			if (!side_plan_slot_operation(op, instance, segment, &slot) || slot != s)
+				continue;
+			if (!started) {
+				if (!full_image) {
+					if (original != NULL) {
+						result = side_plan_slot_step(plan, op, observed, scratch.data);
+						proved = result == CLUSTER_UNDO_HEADER_APPLY
+								 || result == CLUSTER_UNDO_HEADER_ALREADY;
+					}
+					memcpy(scratch.data, base, BLCKSZ);
+					{
+						TTSlot anchor;
+
+						memcpy(&anchor, &candidate->tt_slots[s], sizeof(anchor));
+						side_plan_slot_anchor(op, &anchor);
+						memcpy(&candidate->tt_slots[s], &anchor, sizeof(anchor));
+						if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT
+							|| op->undo.kind == CLUSTER_UNDO_KIND_TT_COMMIT
+							|| op->undo.kind == CLUSTER_UNDO_KIND_TT_ABORT)
+							candidate->tt_slots[s].original_full_xid
+								= op->kind == RF_SIDE_ONLINE_OPERATION_XACT
+									  ? op->xact.tt_original_full_xid : op->undo.original_full_xid;
+						else if (op->undo.kind == CLUSTER_UNDO_KIND_TT_BIND)
+							candidate->tt_slots[s].original_full_xid = 0;
+					}
+					/* A retired prefix has no publishable DATA predecessor. These
+					 * first-operation constraints validate its source suffix only;
+					 * the following full REUSE image discards this entire page. */
+					if (original == NULL && op->kind == RF_SIDE_ONLINE_OPERATION_UNDO
+						&& (op->undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+							|| op->undo.kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)) {
+						TTSlotV2 *slot_image = &candidate->tt_slots[s];
+						memset(slot_image, 0, sizeof(*slot_image));
+						slot_image->xid = op->undo.xid;
+						slot_image->wrap = op->undo.wrap;
+						slot_image->status = op->undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+												 ? TT_SLOT_ABORTED
+												 : op->undo.terminal_status;
+						/* CTRC does not carry the old SCN; only its validity is
+						 * constrained. This representative is never published. */
+						slot_image->commit_scn
+							= slot_image->status == TT_SLOT_COMMITTED ? 1 : InvalidScn;
+						slot_image->first_undo_block = (UBA)InvalidUba_init;
+						slot_image->original_full_xid = op->undo.original_full_xid;
+					}
+				}
+				started = true;
+			}
+			result = side_plan_slot_step(plan, op, scratch.data, scratch.data);
+			/* Stale source is not evidence of a target's membership. */
+			if (result == CLUSTER_UNDO_HEADER_BLOCKED || result == CLUSTER_UNDO_HEADER_SKIP_STALE)
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			if (original != NULL
+				&& memcmp(&candidate->tt_slots[s], &original->tt_slots[s], sizeof(TTSlotV2)) == 0)
+				proved = true;
+			prepared->operation_count++;
+			last_source = i;
+		}
+		if ((started || full_image) && !proved)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		if (started) {
+			final->tt_slots[s] = candidate->tt_slots[s];
+			if ((original == NULL
+				 || memcmp(&candidate->tt_slots[s], &original->tt_slots[s], sizeof(TTSlotV2)) != 0)
+				&& (prepared->source_index == UINT32_MAX || last_source > prepared->source_index))
+				prepared->source_index = last_source;
+		}
+	}
+	/* RECYCLE changes no slot and follows the same exact generation. */
+	for (uint32 i = begin; i < end; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+
+		if (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO && op->undo.instance == instance
+			&& op->undo.segment_id == segment
+			&& op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE) {
+			if (cluster_undo_prepare_header_v1(&op->undo, NULL, 0, prepared->page.data,
+											   prepared->page.data)
+				!= CLUSTER_UNDO_HEADER_APPLY)
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			prepared->source_index = i;
+			prepared->operation_count++;
+		}
+	}
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+
+static RfPageProofDetailV1
+side_plan_prepare_header_v2(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										   uint32 segment_id, const char *base,
+										   RfSideUndoHeaderImageV1 *out)
+{
+	RfSideUndoHeaderImageV1 prepared;
+	PGAlignedBlock seed;
+	Size scratch = sizeof(prepared) + 4 * BLCKSZ;
+	const UndoSegmentHeaderDataV2 *original = (const UndoSegmentHeaderDataV2 *)base;
+	uint32 first_image = UINT32_MAX, begin = 0;
+	bool base_valid, observed = false, full_image = false, found = false;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || out == NULL
+		|| instance == 0 || instance > 128 || segment_id == 0
+		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (scratch > plan->memory_budget || plan->memory_used > plan->memory_budget - scratch)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	memset(&prepared, 0, sizeof(prepared));
+	prepared.source_index = UINT32_MAX;
+	base_valid = base != NULL && UndoSegmentHeaderV2_identity_matches(base, BLCKSZ, segment_id, instance);
+	if (base != NULL) {
+		static const char empty[BLCKSZ] = { 0 };
+
+		if (!base_valid) {
+			if (memcmp(base, empty, BLCKSZ) != 0)
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		} else {
+			memcpy(seed.data, base, BLCKSZ);
+			if (original->pd_checksum != pg_checksum_page(seed.data, 0))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		}
+	}
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+		uint16 slot;
+
+		if (side_plan_slot_operation(op, instance, segment_id, &slot)) {
+			found = true;
+			if ((op->kind == RF_SIDE_ONLINE_OPERATION_XACT
+				 && op->xact.tt_delta.format_version != CLUSTER_XACT_TT_COMMIT_V2_VERSION)
+				|| (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO
+					&& op->undo.format_version != CLUSTER_UNDO_TT_IDENTITY_V2_VERSION))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		}
+		if (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO && op->undo.instance == instance
+			&& op->undo.segment_id == segment_id) {
+			found = true;
+			if (op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+				|| op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE) {
+				const UndoSegmentHeaderDataV2 *image = (const UndoSegmentHeaderDataV2 *)seed.data;
+
+				if (op->owned_payload_length != BLCKSZ)
+					return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+				memcpy(seed.data, plan->owned_payload + op->owned_payload_offset, BLCKSZ);
+				if (!UndoSegmentHeaderV2_identity_matches(seed.data, BLCKSZ, segment_id, instance)
+					|| image->pd_checksum != pg_checksum_page(seed.data, 0))
+					return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			}
+			if ((op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+				 || op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE)
+				&& first_image == UINT32_MAX)
+				first_image = i;
+		}
+	}
+	if (!found || (!base_valid && first_image == UINT32_MAX))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	prepared.has_full_image = first_image != UINT32_MAX;
+	if (first_image == UINT32_MAX)
+		memcpy(seed.data, base, BLCKSZ);
+	else {
+		const RfSideOnlineOperationV1 *op = &plan->operations[first_image];
+
+		if (cluster_undo_prepare_header_v1(&op->undo,
+										   plan->owned_payload + op->owned_payload_offset,
+										   op->owned_payload_length, NULL, seed.data)
+			!= CLUSTER_UNDO_HEADER_APPLY)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		/* Prefix state can be discarded only by this explicit REUSE, never
+		 * by a numerically greater DATA generation. */
+		((UndoSegmentHeaderDataV2 *)seed.data)->wrap_count
+			= op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT ? 0 : op->undo.expected_generation;
+		if (base_valid && original->wrap_count == ((UndoSegmentHeaderDataV2 *)seed.data)->wrap_count)
+			memcpy(seed.data, base, BLCKSZ);
+	}
+	prepared.page = seed;
+	for (uint32 i = 0; i <= plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op
+			= i == plan->operation_count ? NULL : &plan->operations[i];
+		const char *target;
+
+		if (op != NULL) {
+			if (op->kind != RF_SIDE_ONLINE_OPERATION_UNDO || op->undo.instance != instance
+				|| op->undo.segment_id != segment_id
+				|| (op->undo.kind != CLUSTER_UNDO_KIND_SEGMENT_INIT
+					&& op->undo.kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE))
+				continue;
+			if (op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT) {
+				/* INIT cannot erase a preceding incarnation in the same source. */
+				if (full_image || prepared.operation_count != 0)
+					return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+				for (uint32 j = begin; j < i; j++) {
+					uint16 slot;
+					const RfSideOnlineOperationV1 *prior = &plan->operations[j];
+					if (side_plan_slot_operation(prior, instance, segment_id, &slot)
+						|| (prior->kind == RF_SIDE_ONLINE_OPERATION_UNDO
+							&& prior->undo.instance == instance
+							&& prior->undo.segment_id == segment_id))
+						return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+				}
+			}
+		}
+		target
+			= base_valid && original->wrap_count == ((UndoSegmentHeaderDataV2 *)seed.data)->wrap_count
+				  ? base
+				  : NULL;
+		/* Before INIT there is no predecessor to prove. Its full image is
+		 * the first state of generation zero and is checked in the next range. */
+		if (!(op != NULL && op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT)) {
+			if (side_plan_prepare_slots_v2(plan, instance, segment_id, begin, i, seed.data, target,
+										full_image, &prepared)
+				!= RF_PAGE_PROOF_DETAIL_OK)
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			observed |= target != NULL;
+		}
+		if (op == NULL)
+			break;
+		if (op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE
+			&& ((UndoSegmentHeaderDataV2 *)prepared.page.data)->wrap_count
+				   != op->undo.expected_generation)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		if (cluster_undo_prepare_header_v1(
+				&op->undo, plan->owned_payload + op->owned_payload_offset, op->owned_payload_length,
+				prepared.page.data, prepared.page.data)
+			!= CLUSTER_UNDO_HEADER_APPLY)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		seed = prepared.page;
+		full_image = true;
+		prepared.source_index = i;
+		prepared.operation_count++;
+		begin = i + 1;
+	}
+	if (base_valid && !observed)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	((PageHeader)prepared.page.data)->pd_checksum = pg_checksum_page(prepared.page.data, 0);
+	if (base_valid && memcmp(base, prepared.page.data, BLCKSZ) == 0)
+		prepared.source_index = UINT32_MAX;
+	*out = prepared;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										  uint32 segment_id, uint32 block_no,
+										  RfSideUndoBlockImageV1 *out)
 {
 	RfSideUndoBlockImageV1 prepared;
 	bool anchored = false;
 	Size scratch = sizeof(prepared) + BLCKSZ;
+	uint32 end = plan != NULL ? plan->operation_count : 0;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || out == NULL
 		|| end > plan->operation_count || instance == 0 || instance > 128 || segment_id == 0
@@ -2627,8 +2915,9 @@ side_plan_prepare_undo_block(const RfSideOnlinePlanV1 *plan, uint8 instance, uin
 }
 
 static RfPageProofDetailV1
-side_plan_prepare_undo_header(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
-							  const char *base, uint32 end, RfSideUndoHeaderImageV1 *out)
+side_plan_prepare_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										   uint32 segment_id, const char *base, uint32 end,
+										   RfSideUndoHeaderImageV1 *out)
 {
 	RfSideUndoHeaderImageV1 prepared;
 	PGAlignedBlock seed;
@@ -2756,29 +3045,48 @@ side_plan_prepare_undo_header(const RfSideOnlinePlanV1 *plan, uint8 instance, ui
 }
 
 RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
-										  uint32 segment_id, uint32 block_no,
-										  RfSideUndoBlockImageV1 *out)
-{
-	return side_plan_prepare_undo_block(plan, instance, segment_id, block_no,
-										plan != NULL ? plan->operation_count : 0, out);
-}
-
-RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
 										   uint32 segment_id, const char *base,
 										   RfSideUndoHeaderImageV1 *out)
 {
-	return side_plan_prepare_undo_header(plan, instance, segment_id, base,
-										 plan != NULL ? plan->operation_count : 0, out);
+	Size scratch = sizeof(RfSideUndoHeaderImageV1) + 4 * BLCKSZ;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || out == NULL
+		|| instance == 0 || instance > 128 || segment_id == 0
+		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (scratch > plan->memory_budget || plan->memory_used > plan->memory_budget - scratch)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	if (base != NULL && (uint8)base[57] == CLUSTER_UNDO_TT_LAYOUT_V2)
+		return side_plan_prepare_header_v2(plan, instance, segment_id, base, out);
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+		uint16 slot;
+
+		if ((side_plan_slot_operation(op, instance, segment_id, &slot)
+			 && ((op->kind == RF_SIDE_ONLINE_OPERATION_XACT
+				  && op->xact.tt_delta.format_version == CLUSTER_XACT_TT_COMMIT_V2_VERSION)
+				 || (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO
+					 && op->undo.format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION)))
+			|| (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO && op->undo.instance == instance
+				&& op->undo.segment_id == segment_id && op->owned_payload_length == BLCKSZ
+				&& (op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+					|| op->undo.kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE)
+				&& plan->owned_payload[op->owned_payload_offset + 57] != 0))
+			return side_plan_prepare_header_v2(plan, instance, segment_id, base, out);
+	}
+	return side_plan_prepare_header_v1(plan, instance, segment_id, base, plan->operation_count, out);
 }
 
+/* Reconstruct only the selected record's causal prefix. The sealed source and
+ * all retained ownership remain unchanged; this returns no replay authority. */
 static RfPageProofDetailV1
 side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
-							  const RfPageOnlineRecordIdentityV1 *identity, const char *base,
-							  bool header_only, bool allow_history, RfSideUndoHeaderImageV1 *out)
+	const RfPageOnlineRecordIdentityV1 *identity, const char *base, bool header_only,
+	bool allow_history, RfSideUndoHeaderImageV1 *out)
 {
 	const RfSideOnlineOperationV1 *operation;
+	RfSideOnlinePlanV1 prefix;
 	uint8 instance;
 	uint32 segment;
 
@@ -2794,16 +3102,17 @@ side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
 		|| rf_side_online_plan_origin_operation_count_v1(plan, identity->record.origin_thread)
 			   == UINT32_MAX)
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	/* Bound only a private view, after validating the complete original source. */
+	prefix = *plan;
+	prefix.operation_count = index + 1;
 	if (operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO) {
-		const ClusterUndoDecoded *undo = &operation->undo;
-
-		instance = undo->instance;
-		segment = undo->segment_id;
+		instance = operation->undo.instance;
+		segment = operation->undo.segment_id;
 		if (!header_only
-			&& (undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
-				|| undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI))
-			return side_plan_prepare_undo_block(plan, instance, segment, undo->block_no, index + 1,
-												out);
+			&& (operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				|| operation->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI))
+			return rf_side_online_plan_prepare_undo_block_v1(&prefix, instance, segment,
+				operation->undo.block_no, out);
 	} else if (operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
 			   && operation->xact.kind == RF_SIDE_XACT_COMMIT && operation->xact.has_tt_delta) {
 		instance = operation->xact.tt_delta.instance;
@@ -2813,8 +3122,6 @@ side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
 		RfSideOnlineOperationV1 exported;
 		ClusterUndoDecoded target;
 
-		/* Bind the complete native payload and its unique earlier TT_ABORT.
-		 * Native ABORT itself is not another TT transition. */
 		if (!rf_side_online_plan_operation_v1(plan, index, &exported)
 			|| !rf_side_online_plan_abort_target_v1(plan, &exported, &target))
 			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -2822,24 +3129,20 @@ side_plan_prepare_undo_record(const RfSideOnlinePlanV1 *plan, uint32 index,
 		segment = target.segment_id;
 	} else
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-	/* Original immutable full-source input stays intact. Only the private
-	 * reconstruction endpoint changes; later lifecycle/terminal records
-	 * cannot establish the selected prefix's base or enter its output. */
-	return side_plan_prepare_undo_header(plan, instance, segment, base, index + 1, out);
+	/* A later full image or terminal cannot supply this prefix's base. */
+	return rf_side_online_plan_prepare_undo_header_v1(&prefix, instance, segment, base, out);
 }
 
 RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
-										   const RfPageOnlineRecordIdentityV1 *identity,
-										   const char *base, RfSideUndoHeaderImageV1 *out)
+	const RfPageOnlineRecordIdentityV1 *identity, const char *base, RfSideUndoHeaderImageV1 *out)
 {
 	return side_plan_prepare_undo_record(plan, index, identity, base, false, false, out);
 }
 
 RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
-												  const RfPageOnlineRecordIdentityV1 *identity,
-												  const char *base, RfSideUndoHeaderImageV1 *out)
+	const RfPageOnlineRecordIdentityV1 *identity, const char *base, RfSideUndoHeaderImageV1 *out)
 {
 	return side_plan_prepare_undo_record(plan, index, identity, base, true, false, out);
 }
@@ -2854,10 +3157,10 @@ rf_side_online_plan_prepare_undo_record_input_header_v1(
 
 RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
-											   const RfPageOnlineRecordIdentityV1 *identity,
-											   RfSideUndoBlockImageV1 *out)
+	const RfPageOnlineRecordIdentityV1 *identity, RfSideUndoBlockImageV1 *out)
 {
 	const RfSideOnlineOperationV1 *op;
+	RfSideOnlinePlanV1 prefix;
 	uint32 segment, block;
 	uint16 slot, row;
 
@@ -2873,10 +3176,14 @@ rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, u
 		|| memcmp(&identity->record, &op->identity.record, sizeof(identity->record)) != 0
 		|| rf_side_online_plan_origin_operation_count_v1(plan, identity->record.origin_thread)
 			   == UINT32_MAX
-		|| !cluster_undo_preflight(&op->undo)
+		|| !(op->undo.format_version == CLUSTER_UNDO_TT_IDENTITY_V2_VERSION
+				 ? cluster_undo_preflight_tt_v2(&op->undo) : cluster_undo_preflight(&op->undo))
 		|| !uba_decode_record(op->undo.first_undo_block, &segment, &block, &slot, &row))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-	return side_plan_prepare_undo_block(plan, op->undo.instance, segment, block, index, out);
+	/* Only DATA before the selected head can prove that head's predecessor. */
+	prefix = *plan;
+	prefix.operation_count = index;
+	return rf_side_online_plan_prepare_undo_block_v1(&prefix, op->undo.instance, segment, block, out);
 }
 
 typedef struct SideSpaceSourceInput {

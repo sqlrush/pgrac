@@ -31,12 +31,17 @@ int ctrc_cleaner_original_main(void);
 #include "cluster/cluster_write_fence.h"
 
 int cluster_lms_workers = 1;
+static uint64 dispatch_self_boot = 1101;
+static uint32 dispatch_peer_connection_generation = 29;
+static int dispatch_excluded_member = -1;
+static uint64 dispatch_observed_boot_delta;
 static unsigned enters, leaves, enqueues, rechecks;
 static bool data_plane = true, root_exact = true, fence_ok = true;
 static unsigned fail_recheck;
 static unsigned throw_resolve;
 static unsigned resolves;
 static bool observe_enqueue_order, enqueue_order_exact;
+static bool (*dispatch_enqueue_hook)(int, uint8, uint32, const void *, uint16, uint32, uint32);
 
 bool
 cluster_gcs_block_family_on_data_plane(void)
@@ -56,7 +61,7 @@ cluster_write_fence_allowed(void)
 bool
 cluster_membership_is_member(int node)
 {
-	return node >= 0 && node < 4;
+	return node >= 0 && node < 4 && node != dispatch_excluded_member;
 }
 uint64
 cluster_epoch_get_current(void)
@@ -71,7 +76,7 @@ GetSystemIdentifier(void)
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	return 1101;
+	return dispatch_self_boot;
 }
 uint64
 cluster_membership_get_last_admitted_incarnation(int node)
@@ -91,7 +96,7 @@ cluster_reconfig_get_observed_epoch(int node pg_attribute_unused())
 bool
 cluster_reconfig_get_observed_slot(int node, uint64 *incarnation, uint64 *generation)
 {
-	*incarnation = 1101 + node;
+	*incarnation = 1101 + node + dispatch_observed_boot_delta;
 	*generation = 1;
 	return true;
 }
@@ -100,7 +105,7 @@ cluster_sf_peer_capability_generation_matches(int node pg_attribute_unused(),
 											  uint32 required pg_attribute_unused(),
 											  uint32 generation)
 {
-	return generation == 29;
+	return generation == dispatch_peer_connection_generation;
 }
 ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionToken *token)
@@ -161,6 +166,8 @@ cluster_lms_outbound_enqueue_cap_bound(int worker pg_attribute_unused(),
 {
 	if (held_count != 0)
 		abort();
+	if (dispatch_enqueue_hook != NULL)
+		return dispatch_enqueue_hook(worker, type, destination, payload, bytes, required, generation);
 	enqueues++;
 	if (observe_enqueue_order)
 		enqueue_order_exact
@@ -175,6 +182,10 @@ static void
 reset_dispatch_fixture(void)
 {
 	reset_fixture();
+	dispatch_self_boot = 1101;
+	dispatch_peer_connection_generation = 29;
+	dispatch_excluded_member = -1;
+	dispatch_observed_boot_delta = 0;
 	test_capability_generation = 29;
 	test_cluster_epoch = 23;
 	enters = leaves = enqueues = rechecks = fail_recheck = 0;
@@ -182,6 +193,9 @@ reset_dispatch_fixture(void)
 	allocation_failure = false;
 	data_plane = root_exact = fence_ok = true;
 	observe_enqueue_order = enqueue_order_exact = false;
+	dispatch_enqueue_hook = NULL;
+	driver_delegation_dispatch = NULL;
+	driver_certificate_dispatch = NULL;
 }
 
 static bool
@@ -959,7 +973,7 @@ UT_TEST(test_local_batch_trace_log_error_keeps_all_progress_and_gcs_cleanup)
 }
 
 int
-main(void)
+CTRC_DISPATCH_MAIN(void)
 {
 	UT_PLAN(23);
 	UT_RUN(test_local_batch_trace_off_preserves_actual_dispatch);

@@ -67,6 +67,16 @@
 extern void cluster_undo_segment_make_header_bytes(uint32 segment_id, uint8 owner_instance,
 												   char *page);
 
+/* Fresh V2 template only, not an upgrade of the previous destination bytes.
+ * Same aligned BLCKSZ destination contract. Refusal leaves it unchanged;
+ * disabled-cluster builds always refuse. Live V1 callers are not switched. */
+extern bool cluster_undo_segment_make_header_v2_bytes(uint32 segment_id, uint8 owner_instance,
+													char *page);
+
+
+/* Original initdb seed0/owner1 only. Same aligned fresh destination contract;
+ * does not admit segment0 to any runtime TT40 reader/writer. */
+extern bool cluster_undo_segment_make_boot_header_v2_bytes(char *page);
 
 /* Integrity is independent of checkpoint coverage or transaction identity.
  * Zero is a legacy, unverified page, never a qualification certificate. */

@@ -325,6 +325,10 @@ undo_horizon_v2_publish(ClusterHeapFreezeReportV2SlotShmem *slot,
 	pg_atomic_write_u32(&slot->seq, seq + 2);
 }
 
+/* The codec capability cannot attest implementation of the original
+ * FullXid/custody producers. Require both protocol bits in the same current
+ * HELLO generation everywhere this report is consumed; never join separate
+ * observations. This is necessary source support, not F/H authority. */
 static void
 undo_horizon_v2_receive(const ClusterICEnvelope *env, const void *payload)
 {
@@ -368,9 +372,10 @@ undo_horizon_v2_receive(const ClusterICEnvelope *env, const void *payload)
 									 .plane = CLUSTER_IC_PLANE_CONTROL,
 									 .channel = -1 };
 	if (!cluster_ic_tier1_stream_current(&stream)
-		|| !cluster_sf_peer_capability_word_sample(sender, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2,
+		|| !cluster_sf_peer_capability_word_sample(sender, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK,
 												   &word, &generation)
-		|| (word & PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2) == 0 || generation == 0
+		|| (word & PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK) != PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK
+		|| generation == 0
 		|| !cluster_semantic_activation_active_sample_capture(&fence)
 		|| fence.local_node_id != cluster_node_id || report.sysid != fence.system_identifier
 		|| report.record_generation != fence.record_generation
@@ -408,7 +413,7 @@ undo_horizon_v2_receive(const ClusterICEnvelope *env, const void *payload)
 	now = GetCurrentTimestamp();
 	if (now <= 0 || !cluster_ic_tier1_stream_current(&stream)
 		|| !cluster_sf_peer_capability_generation_matches(
-			sender, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation)
+			sender, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK, generation)
 		|| !cluster_semantic_activation_active_sample_current(&fence)) {
 		undo_horizon_reject("v2 identity changed before publish", sender);
 		return;
@@ -604,7 +609,8 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 		|| fence->local_node_id != cluster_node_id || (members & (UINT64_C(1) << (peer % 64))) == 0
 		|| fence->admitted_incarnation[peer] == 0 || scn_time_cmp(h->horizon_scn, h->clock_scn) > 0
 		|| UndoHorizonShmem->report_sequence == UINT64_MAX
-		|| !cluster_sf_peer_capability_word_sample(peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2,
+		|| !cluster_undo_retention_horizon_covers(h->horizon_scn)
+		|| !cluster_sf_peer_capability_word_sample(peer, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK,
 												   &word, &generation)
 		|| generation == 0)
 		return;
@@ -634,7 +640,8 @@ undo_horizon_send_v2(int32 peer, const ClusterUndoCleanerActiveSample *active,
 	 * source. Finish with its full original check before sequence debit. */
 	if (!cluster_heap_freeze_report_v2_encode(&report, bytes)
 		|| !cluster_sf_peer_capability_generation_matches(
-			peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation)
+			peer, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK, generation)
+		|| !cluster_undo_retention_horizon_covers(h->horizon_scn)
 		|| !undo_horizon_local_source_current(fence, active))
 		return;
 	UndoHorizonShmem->report_sequence = report.report_sequence;
@@ -808,7 +815,7 @@ undo_horizon_v2_slot_sample(int32 peer, ClusterHeapFreezeReportV2View *out, uint
 			return CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE;
 		if (!cluster_semantic_activation_active_sample_current(&fence)
 			|| !cluster_sf_peer_capability_generation_matches(
-				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, generation))
+				peer, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK, generation))
 			return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 		*out = view;
 		*out_generation = generation;
@@ -858,7 +865,7 @@ undo_horizon_watermark_sources_current(
 			continue;
 		if (source->seq == 0 || (source->seq & 1) != 0 || source->generation == 0
 			|| !cluster_sf_peer_capability_generation_matches(
-				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, source->generation))
+				peer, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK, source->generation))
 			return false;
 	}
 	if (!cluster_semantic_activation_active_sample_current(fence))
@@ -877,7 +884,7 @@ undo_horizon_watermark_sources_current(
 		/* This original CONTROL-locked read has no identity callbacks. A
 		 * later peer's earlier callback may have reconnected this peer. */
 		if (!cluster_sf_peer_capability_word_sample(
-				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, &word, &generation)
+				peer, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK, &word, &generation)
 			|| generation != sources[peer].generation)
 			return false;
 		pg_read_barrier();
@@ -941,6 +948,7 @@ cluster_heap_freeze_watermark_sample(ClusterHeapFreezeWatermark *out)
 				   XidFromFullTransactionId(active_min))
 			|| !SCN_VALID((SCN)watermark.horizon_scn)
 			|| watermark.horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
+			|| !cluster_undo_retention_horizon_covers((SCN)watermark.horizon_scn)
 			|| !cluster_semantic_activation_active_sample_current(&fence)
 			|| !cluster_undo_cleaner_active_sample(&active)
 			|| active.sample_id != active_sample_id
@@ -1046,7 +1054,7 @@ undo_horizon_v2_cohort_current(const ClusterSemanticActiveSampleFence *fence,
 		if (p->seq != pg_atomic_read_u32(&UndoHorizonShmem->freeze_slots[peer].seq))
 			return CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH;
 		if (!cluster_sf_peer_capability_generation_matches(
-				peer, PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2, p->generation))
+				peer, PGRAC_IC_HELLO_HEAP_FREEZE_RETAINED_MASK, p->generation))
 			return CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED;
 	}
 	/* Peer observers may replace or revoke the local worker/lease/admission
@@ -1128,7 +1136,8 @@ undo_horizon_v2_cohort_observe(ClusterHeapFreezeCohortObservation *out,
 		|| FullTransactionIdFollows(active.scan.min_full, active.scan.future_full)
 		|| !SCN_VALID(history.horizon_scn) || !SCN_VALID(history.clock_scn)
 		|| history.horizon_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
-		|| scn_time_cmp(history.horizon_scn, history.clock_scn) > 0)
+		|| scn_time_cmp(history.horizon_scn, history.clock_scn) > 0
+		|| !cluster_undo_retention_horizon_covers(history.horizon_scn))
 		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	candidate.source_local_sample_id = active.sample_id;
 	candidate.source_started_at_us = (uint64)started;
@@ -1200,7 +1209,9 @@ undo_horizon_publish_freeze_watermark(const ClusterHeapFreezeCohortObservation *
 	uint32 seq;
 
 	if (cohort == NULL || observed == NULL || now_us == 0 || UndoHorizonShmem == NULL
-		|| !cluster_enabled || !cluster_semantic_activation_active_sample_current(&observed->fence)
+		|| !cluster_enabled
+		|| !cluster_undo_retention_horizon_covers((SCN)cohort->source_local_horizon_scn)
+		|| !cluster_semantic_activation_active_sample_current(&observed->fence)
 		|| !cluster_undo_cleaner_active_sample(&active))
 		return false;
 	future = FullTransactionIdFromU64(cohort->future_full_xid_max);
@@ -1299,6 +1310,10 @@ cluster_heap_freeze_cohort_current(const ClusterHeapFreezeCohortObservation *exp
 			|| p->interval_ms > CLUSTER_UNDO_HORIZON_INTERVAL_MAX_MS)
 			return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	}
+	/* Read the retained per-boot promise without a replacement H sample.
+	 * Release its lock before the original final source/admission callbacks. */
+	if (!cluster_undo_retention_horizon_covers((SCN)expected->source_local_horizon_scn))
+		return CLUSTER_HEAP_FREEZE_COHORT_INVALID;
 	/* This reads the completed publication, not nextXid, PGPROC or H. Its
 	 * original current getter checks lease/admission then the same worker cut. */
 	if (!cluster_undo_cleaner_active_sample(&active))

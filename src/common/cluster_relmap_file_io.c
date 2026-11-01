@@ -41,6 +41,13 @@ cluster_relmap_file_pair_create_v2(int directory,
 {
 	return false;
 }
+bool
+cluster_relmap_file_pair_replay_create_v2(int directory,
+	const ClusterRecoveryFileIdentityV2 *identity, const RelMapFile *committed,
+	ClusterRelmapFilePairV2 *output)
+{
+	return false;
+}
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -271,6 +278,56 @@ done:
 	if (ok) ok = !memcmp(identity, &bound, sizeof(bound));
 	if (ok) *output = pair;
 	return ok;
+}
+
+bool
+cluster_relmap_file_pair_replay_create_v2(int directory,
+	const ClusterRecoveryFileIdentityV2 *identity, const RelMapFile *committed,
+	ClusterRelmapFilePairV2 *output)
+{
+	ClusterRelmapV2Image image = {0};
+	ClusterRelmapFilePairV2 pair;
+	ClusterRecoveryFileIdentityV2 bound;
+	unsigned char expected[CLUSTER_RELMAP_FILE_SIZE_V2];
+	struct stat named;
+	unsigned present = 0;
+	bool ok;
+
+	if (!identity || !committed || !output
+		|| managed_overlap(identity, sizeof(*identity), output, sizeof(*output))
+		|| managed_overlap(committed, sizeof(*committed), output, sizeof(*output)))
+		return false;
+	bound = *identity;
+	image.identity = (ClusterRelmapV2Namespace){bound.system_identifier,
+		bound.database_incarnation, bound.database_oid, bound.database_oid == InvalidOid};
+	image.committed_generation = 1;
+	image.committed = *committed;
+	/* Validate the complete replay image before even probing target names. */
+	if (!cluster_relmap_file_encode_v2(&bound, &image, expected, sizeof(expected))
+		|| !managed_directory_safe(directory))
+		return false;
+	for (int i = 0; i < 2; ++i) {
+		if (fstatat(directory, managed_names[i], &named, AT_SYMLINK_NOFOLLOW) == 0)
+			++present;
+		else if (errno != ENOENT)
+			return false;
+	}
+	/* The original creator owns uncertainty. Never fill a missing half or
+	 * replace any prior material, even if its surviving bytes look expected. */
+	if (!present)
+		ok = cluster_relmap_file_pair_create_v2(directory, &bound, &image.committed, &pair);
+	else if (present == 2)
+		ok = managed_pair_observe(directory, &bound, &pair, true);
+	else
+		return false;
+	if (!ok
+		|| memcmp(pair.bytes[0], expected, sizeof(expected))
+		|| memcmp(pair.bytes[1], expected, sizeof(expected))
+		|| memcmp(identity, &bound, sizeof(bound))
+		|| memcmp(committed, &image.committed, sizeof(*committed)))
+		return false;
+	*output = pair;
+	return true;
 }
 
 #endif /* WIN32 */

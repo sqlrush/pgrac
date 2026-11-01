@@ -9487,6 +9487,7 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 		ClusterUndoBlock0Generation final_generation = { false, 0 };
 		ClusterUndoBlock0ResolvedRoot final_root;
 		ClusterCtrcTxnKeyV1 ctrc_key;
+		uint8 origin_fullxid_v2[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 		ClusterCtrcTouchResult touch_result;
 		bool ctrc_physical_active = false;
 		bool precommit_retry = false;
@@ -9537,11 +9538,11 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 					!= CLUSTER_UNDO_BLOCK0_OK
 				|| !gcs_block_current_mx_ctrc_key(context, i, &generation, &ctrc_key))
 				return false;
-			touch_result = cluster_ctrc_origin_touch_exact(
+			touch_result = cluster_ctrc_origin_grant_fullxid_v2(
 				&ctrc_key, &context->current_mx_requester_identity,
 				context->current_mx_proofs[i].state == CCM_SELF ? CTRC_PROOF_SELF
 																: CTRC_PROOF_ACTIVE,
-				&ctrc_grant);
+				&ctrc_grant, origin_fullxid_v2);
 			if ((touch_result != CLUSTER_CTRC_TOUCH_RECORDED
 				 && touch_result != CLUSTER_CTRC_TOUCH_DUPLICATE)
 				|| ctrc_grant == 0
@@ -9557,11 +9558,16 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 				return false;
 			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], ctrc_grant);
 			if (!cluster_multixact_current_member_proof_bind_ctrc(&context->current_mx_proofs[i],
-																  &ctrc_key))
+				&ctrc_key))
 				return false;
+			memcpy(context->current_mx_proofs[i].origin_fullxid_v2, origin_fullxid_v2,
+				   sizeof(origin_fullxid_v2));
 			context->current_mx_ctrc_keys[i] = ctrc_key;
-		} else
+		} else {
 			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], 0);
+			memset(context->current_mx_proofs[i].origin_fullxid_v2, 0,
+				   sizeof(context->current_mx_proofs[i].origin_fullxid_v2));
+		}
 		context->current_mx_sampled_bitmap |= (uint8)(1U << i);
 	}
 	if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
@@ -10829,7 +10835,9 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
-			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES;
+			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES
+			   || (payload_length >= RESOURCE_X_IMAGE_V3_MIN_BYTES
+				   && payload_length <= RESOURCE_X_IMAGE_V3_MAX_BYTES);
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES;
@@ -11509,6 +11517,278 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	return true;
 }
 
+/* Ordinary ITL receipts use the original OPEN record as their participant
+ * stamp (runtime_visibility's local producer uses the same domain). A DATA
+ * connection generation is separately checked in its local HELLO domain;
+ * never copy that transport counter into an origin's immutable144B record. */
+static bool
+gcs_block_resource_x_ctrc_source_identities(
+	const ClusterSemanticAdmissionToken *admission, int32 requester_node,
+	uint32 requester_connection_generation, uint64 source_boot,
+	ClusterCtrcParticipantIdentity *sender, ClusterCtrcParticipantIdentity *receiver)
+{
+	uint64 observed_boot = 0;
+	uint64 observed_generation = 0;
+	const uint32 required = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1
+		| PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+
+	memset(sender, 0, sizeof(*sender));
+	memset(receiver, 0, sizeof(*receiver));
+	if (!cluster_enabled || !cluster_shared_config || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS || requester_node < 0
+		|| requester_node >= CLUSTER_CTRC_MAX_PARTICIPANTS || requester_node == cluster_node_id
+		|| admission == NULL || !admission->entered
+		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
+		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| admission->record_generation == 0 || admission->record_generation > UINT32_MAX
+		|| admission->formation_epoch != cluster_epoch_get_current()
+		|| !cluster_semantic_activation_recheck(admission)
+		|| source_boot == 0 || source_boot != cluster_qvotec_get_self_incarnation()
+		|| (cluster_ic_local_capability_word() & required) != required
+		|| !cluster_membership_is_member(requester_node)
+		|| !cluster_reconfig_get_observed_slot(requester_node, &observed_boot, &observed_generation)
+		|| observed_boot == 0 || observed_generation == 0
+		|| cluster_reconfig_get_observed_epoch(requester_node) != admission->formation_epoch
+		|| cluster_membership_get_last_admitted_incarnation(requester_node) != observed_boot
+		|| !cluster_sf_peer_capability_generation_matches(requester_node, required,
+			requester_connection_generation)
+		|| cluster_semantic_activation_resource_x_peer_open_check(admission, requester_node,
+			requester_connection_generation) != CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
+		|| !cluster_semantic_activation_recheck(admission))
+		return false;
+
+	sender->node_id = (uint16)cluster_node_id;
+	sender->capability_record_generation = (uint32)admission->record_generation;
+	sender->boot_incarnation = source_boot;
+	sender->formation_epoch = admission->formation_epoch;
+	sender->admission_record_generation = admission->record_generation;
+	*receiver = *sender;
+	receiver->node_id = (uint16)requester_node;
+	receiver->boot_incarnation = observed_boot;
+	return true;
+}
+
+/* The caller still owns the original REVOKING source/copy and entered
+ * admission. First validate every slot, then retain each exact destination
+ * custody before encoding any output. Partial refusal retains responsibility;
+ * it never cancels a producer's edge or stages an incomplete image. The V3
+ * receiver retains its parent before the original join; typed IMAGE receipts
+ * still precede physical visibility. No capability is enabled
+ * here, and non-ITL V2 construction remains byte-exact. */
+static bool
+gcs_block_pcm_x_resource_x_delegate_source_frames(
+	const ResourceXDecodedFrame *block, const ClusterSemanticAdmissionToken *admission,
+	uint32 peer_capabilities, ResourceXDecodedFrame *status, ResourceXDecodedFrame *image)
+{
+	ResourceXDecodedFrame canonical;
+	ClusterCtrcParticipantIdentity sender, receiver, final_sender, final_receiver;
+	ClusterCtrcItlTargetIdentity target = { 0 };
+	ClusterItlSlotData *slots;
+	PageHeader header;
+	uint8 bundle[RESOURCE_X_CTRC_BUNDLE_MAX_BYTES] = { 0 };
+	uint8 encoded[RESOURCE_X_IMAGE_V3_MAX_BYTES];
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint16 encoded_bytes = 0;
+	uint16 count = 0, used = RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES;
+	uint64 source_boot;
+	uint32 connection;
+	const BufferTag *tag;
+
+	StaticAssertStmt(RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
+		+ CLUSTER_ITL_INITRANS_DEFAULT * CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES
+		<= RESOURCE_X_CTRC_BUNDLE_MAX_BYTES, "ordinary ITL bundle must fit retained IMAGE");
+	if (block == NULL || status == NULL || image == NULL
+		|| block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
+		|| status->kind != RESOURCE_X_WIRE_BLOCKED_TO_N
+		|| image->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		|| image->body.image_envelope.image_length != BLCKSZ
+		|| image->body.image_envelope.ctrc_delegation_bytes != 0)
+		goto refused;
+	header = (PageHeader)image->body.image_envelope.page_bytes;
+	if (!PageHasItl((Page)header))
+		return true;
+	tag = &block->common.logical_assertion.resource;
+	if (tag->forkNum != MAIN_FORKNUM
+		|| !BufferTagsEqual(tag, &image->common.logical_assertion.resource)
+		|| block->common.logical_assertion.requester_node
+			!= image->common.logical_assertion.requester_node
+		|| (peer_capabilities & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0
+		|| PageGetPageSize((Page)header) != BLCKSZ
+		|| PageGetPageLayoutVersion((Page)header) != PG_PAGE_LAYOUT_VERSION
+		|| (header->pd_flags & ~PD_VALID_FLAG_BITS) != 0
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special != MAXALIGN(header->pd_special)
+		|| header->pd_special > BLCKSZ - CLUSTER_ITL_ARRAY_SIZE)
+		goto refused;
+	slots = ClusterPageGetItlSlots((Page)header);
+	/* Unknown/lock-only/MX slots are not ordinary ITL transaction records.
+	 * A FREE slot may keep only its reuse counter, not a hidden old reference. */
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE) {
+			ClusterItlSlotData empty = { 0 };
+
+			empty.wrap = slots[i].wrap;
+			if (memcmp(&empty, &slots[i], sizeof(empty)) != 0)
+				goto refused;
+		} else if (slots[i].flags < ITL_FLAG_ACTIVE || slots[i].flags > ITL_FLAG_NEEDS_CLEANOUT
+			|| !TransactionIdIsNormal(slots[i].xid) || UBA_is_invalid(slots[i].undo_segment_head))
+			goto refused;
+		else
+			count++;
+	}
+	connection = image->common.sender_connection_generation;
+	/* source_fence is the already-built canonical original local proof. */
+	source_boot = cluster_qvotec_get_self_incarnation();
+	{
+		uint8 expected[8];
+
+		gcs_block_resource_x_put_u64(expected, source_boot);
+		if (memcmp(expected, image->body.image_envelope.source_fence + 4, sizeof(expected)) != 0)
+			goto refused;
+	}
+	if (!gcs_block_resource_x_ctrc_source_identities(admission,
+		block->common.logical_assertion.requester_node, connection, source_boot, &sender, &receiver))
+		goto refused;
+	if (count == 0)
+		return true;
+	target.spc_oid = tag->spcOid;
+	target.db_oid = tag->dbOid;
+	target.rel_number = tag->relNumber;
+	target.fork_number = tag->forkNum;
+	target.block_number = tag->blockNum;
+	target.needs_wal = true;
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		Size record_bytes = 0;
+		Size capacity = Min(sizeof(bundle) - used, CLUSTER_CTRC_DELEGATION_V2_MAX_BYTES);
+
+		if (slots[i].flags == ITL_FLAG_FREE)
+			continue;
+		target.itl_xid = slots[i].xid;
+		target.itl_slot_index = i;
+		target.itl_slot_wrap = slots[i].wrap;
+		target.itl_class = slots[i].flags;
+		memcpy(target.uba, &slots[i].undo_segment_head, sizeof(target.uba));
+		if (!cluster_ctrc_itl_delegate_prepare_v2(&target, &slots[i], &sender, &receiver,
+			bundle + used, capacity, &record_bytes)
+			|| record_bytes == 0 || record_bytes > capacity)
+			goto refused;
+		used += (uint16)record_bytes;
+	}
+	if (!gcs_block_resource_x_ctrc_source_identities(admission,
+		block->common.logical_assertion.requester_node, connection, source_boot,
+		&final_sender, &final_receiver)
+		|| memcmp(&sender, &final_sender, sizeof(sender)) != 0
+		|| memcmp(&receiver, &final_receiver, sizeof(receiver)) != 0)
+		goto refused;
+	bundle[1] = RESOURCE_X_CTRC_BUNDLE_V2_VERSION;
+	bundle[2] = (uint8)(used >> 8);
+	bundle[3] = (uint8)used;
+	bundle[5] = (uint8)count;
+	image->body.image_envelope.ctrc_delegation_bytes = used;
+	memcpy(image->body.image_envelope.ctrc_delegation, bundle, used);
+	image->payload_bytes = RESOURCE_X_IMAGE_V2_BYTES + used;
+	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image, encoded,
+		sizeof(encoded), &encoded_bytes, &reject) || encoded_bytes != image->payload_bytes
+		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, encoded,
+			encoded_bytes, &canonical, &reject)
+		|| canonical.kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE || canonical.common.semantic_crc32c == 0)
+		goto refused;
+	*image = canonical;
+	status->body.blocked_to_n.source_proof_crc32c = image->common.semantic_crc32c;
+	return true;
+refused:
+	if (status != NULL)
+		memset(status, 0, sizeof(*status));
+	if (image != NULL)
+		memset(image, 0, sizeof(*image));
+	return false;
+}
+
+/* Versioned protective receive, not image authority. The Tier1 caller has
+ * already authenticated the DATA source; R11's original admission and OPEN
+ * table independently supply both expected identities. Preserve every local
+ * parent on later refusal/ERROR. No page or PCM join is published here. */
+static bool
+gcs_block_resource_x_ctrc_receive_image(const ResourceXDecodedFrame *frame,
+	const ClusterSemanticAdmissionToken *admission, int32 source, uint32 connection)
+{
+	ClusterCtrcParticipantIdentity sender, receiver, final_sender, final_receiver;
+	const ResourceXDecodedImageEnvelope *image;
+	const ClusterItlSlotData *slots;
+	const uint8 *bundle;
+	PageHeader page;
+	uint8 expected_source[12];
+	ResourceXCtrcBundleLayout layout;
+	uint16 bytes, count = 0, record_index = 0;
+	uint64 self_boot = cluster_qvotec_get_self_incarnation();
+
+	if (frame == NULL || frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		|| frame->common.logical_assertion.requester_node != cluster_node_id
+		|| frame->common.logical_assertion.resource.forkNum != MAIN_FORKNUM)
+		return false;
+	image = &frame->body.image_envelope;
+	bytes = image->ctrc_delegation_bytes;
+	bundle = image->ctrc_delegation;
+	page = (PageHeader)image->page_bytes;
+	if (image->image_length != BLCKSZ || !PageHasItl((Page)page)
+		|| bytes < RESOURCE_X_CTRC_BUNDLE_HEADER_BYTES
+		|| bytes > RESOURCE_X_CTRC_BUNDLE_MAX_BYTES
+		|| PageGetPageSize((Page)page) != BLCKSZ
+		|| PageGetPageLayoutVersion((Page)page) != PG_PAGE_LAYOUT_VERSION
+		|| (page->pd_flags & ~PD_VALID_FLAG_BITS) != 0
+		|| page->pd_lower < SizeOfPageHeaderData || page->pd_lower > page->pd_upper
+		|| page->pd_upper > page->pd_special || page->pd_special != MAXALIGN(page->pd_special)
+		|| page->pd_special > BLCKSZ - CLUSTER_ITL_ARRAY_SIZE)
+		return false;
+	slots = ClusterPageGetItlSlots((Page)page);
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE) {
+			ClusterItlSlotData empty = { 0 };
+
+			empty.wrap = slots[i].wrap;
+			if (memcmp(&empty, &slots[i], sizeof(empty)) != 0)
+				return false;
+		} else if (slots[i].flags < ITL_FLAG_ACTIVE || slots[i].flags > ITL_FLAG_NEEDS_CLEANOUT
+			|| !TransactionIdIsNormal(slots[i].xid) || UBA_is_invalid(slots[i].undo_segment_head))
+			return false;
+		else
+			count++;
+	}
+	if (count == 0 || !cluster_resource_x_ctrc_bundle_layout(image, &layout)
+		|| layout.count != count)
+		return false;
+	/* Legacy V1 custody supports only complete first-hop records. Validate
+	 * every length before the first registration, preserving its meaning. */
+	if (layout.version == RESOURCE_X_CTRC_BUNDLE_VERSION) {
+		for (uint16 i = 0; i < layout.count; i++)
+			if (layout.lengths[i] != CLUSTER_CTRC_DELEGATION_V1_BYTES)
+				return false;
+	}
+	if (!gcs_block_resource_x_ctrc_source_identities(admission, source, connection,
+		self_boot, &receiver, &sender))
+		return false;
+	gcs_block_resource_x_put_u32(expected_source, sender.node_id);
+	gcs_block_resource_x_put_u64(expected_source + 4, sender.boot_incarnation);
+	if (memcmp(expected_source, image->source_fence, sizeof(expected_source)) != 0)
+		return false;
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE)
+			continue;
+		if (layout.version == RESOURCE_X_CTRC_BUNDLE_V2_VERSION) {
+			if (!cluster_ctrc_itl_delegate_accept_v2(&slots[i], &sender, &receiver,
+				bundle + layout.offsets[record_index], layout.lengths[record_index]))
+				return false;
+		} else if (!cluster_ctrc_itl_delegate_accept_v1(&slots[i], &sender, &receiver,
+			bundle + layout.offsets[record_index], layout.lengths[record_index]))
+			return false;
+		record_index++;
+	}
+	return gcs_block_resource_x_ctrc_source_identities(admission, source, connection,
+			self_boot, &final_receiver, &final_sender)
+		&& memcmp(&receiver, &final_receiver, sizeof(receiver)) == 0
+		&& memcmp(&sender, &final_sender, sizeof(sender)) == 0;
+}
+
 static bool
 gcs_block_pcm_x_resource_x_abort_pre_arm(BufferDesc *buf, const ClusterPcmOwnSnapshot *revoking)
 {
@@ -11988,7 +12268,8 @@ gcs_block_resource_x_source_finish_owned_observed(
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 											 int32 authenticated_master_node,
-											 uint64 r4_record_generation)
+											 uint64 r4_record_generation,
+											 const ClusterSemanticAdmissionToken *admission)
 {
 	PGAlignedBlock aligned_page;
 	ClusterPageWalBindingV1 page_wal = { 0 };
@@ -12482,6 +12763,12 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 				block, &revoking, aligned_page.data, page_lsn, page_scn, &page_wal,
 				requester_connection_generation, source_boot_incarnation, source_mode, &status,
 				&image);
+			/* Only the original fully-qualified PI path carries delegation.
+			 * Legacy shared-storage V2 copies retain their original behavior. */
+			if (frame_ready && (capability_word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+				&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0)
+				frame_ready = gcs_block_pcm_x_resource_x_delegate_source_frames(
+					block, admission, capability_word, &status, &image);
 		}
 		if (!frame_ready)
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -12613,25 +12900,225 @@ pre_retained_done:
 	return failure_result;
 }
 
+/* Local lifetime only: immutable retained IMAGE/admission are borrowed from
+ * the original executor. Never cancel an intent once any page byte may have
+ * been copied, including a later apply/publish ERROR. Heap allocation keeps
+ * this progress stable across the original owner's PG_TRY longjmp. */
+typedef struct GcsBlockCtrcImageInstall {
+	const ResourceXDecodedFrame *frame;
+	ClusterPcmOwnSnapshot reservation_base;
+	uint64 reservation_token;
+	ClusterCtrcReceiptHandle receipts[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterCtrcTargetV1 targets[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint16 prepared_mask;
+	bool ready;
+	bool copy_started;
+} GcsBlockCtrcImageInstall;
+
+/* Validate the complete inventory before any receipt/copy; an all-FREE ITL
+ * page needs no transaction receipt, but malformed FREE bytes are not empty. */
+static bool
+gcs_block_resource_x_ctrc_image_slots(Page page, uint16 *mask)
+{
+	PageHeader header = (PageHeader)page;
+	const ClusterItlSlotData *slots;
+
+	*mask = 0;
+	if (!PageHasItl(page))
+		return true;
+	if (PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| (header->pd_flags & ~PD_VALID_FLAG_BITS) != 0
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special != MAXALIGN(header->pd_special)
+		|| header->pd_special > BLCKSZ - CLUSTER_ITL_ARRAY_SIZE)
+		return false;
+	slots = ClusterPageGetItlSlots(page);
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE) {
+			ClusterItlSlotData empty = { 0 };
+
+			empty.wrap = slots[i].wrap;
+			if (memcmp(&empty, &slots[i], sizeof(empty)) != 0)
+				return false;
+		} else {
+			if (slots[i].flags < ITL_FLAG_ACTIVE || slots[i].flags > ITL_FLAG_NEEDS_CLEANOUT
+				|| !TransactionIdIsNormal(slots[i].xid) || UBA_is_invalid(slots[i].undo_segment_head))
+				return false;
+			*mask |= (uint16)(1U << i);
+		}
+	}
+	return true;
+}
+
+static void
+gcs_block_resource_x_ctrc_image_cancel(GcsBlockCtrcImageInstall *install)
+{
+	if (install == NULL || install->copy_started)
+		return;
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if ((install->prepared_mask & (1U << i)) != 0) {
+			if (cluster_ctrc_receipt_cancel_shared(&install->receipts[i]))
+				install->prepared_mask &= (uint16)~(1U << i);
+			else
+				gcs_block_resource_x_fail_closed_current();
+		}
+	}
+	install->ready = false;
+}
+
+/* Called only with content-X released. The original protected peer table,
+ * not the IMAGE's requester-local connection counter, supplies source ingress.
+ * The selected retained frame supplies only its originally authenticated boot.
+ * Planned generation is the original T2 successor, not present X authority. */
+static bool
+gcs_block_resource_x_ctrc_image_prepare(GcsBlockCtrcImageInstall *install,
+	const ResourceXDecodedFrame *frame, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXAcquisitionRef *ref, const ClusterPcmOwnSnapshot *base, uint64 reservation_token)
+{
+	ClusterCtrcParticipantIdentity sender, receiver, final_sender, final_receiver;
+	ClusterCtrcTargetV1 pending = { 0 };
+	const ResourceXDecodedImageEnvelope *image;
+	const ClusterItlSlotData *slots;
+	ResourceXCtrcBundleLayout layout;
+	uint16 mask, record_index = 0;
+	uint32 source, connection = 0, final_connection = 0;
+	uint8 expected_source[12];
+	int origin = -1;
+
+	if (install == NULL || frame == NULL || ref == NULL || base == NULL
+		|| frame->kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
+		|| !resource_x_assertion_equal(&frame->common.logical_assertion, &ref->assertion)
+		|| frame->common.resource_formation != ref->formation
+		|| frame->common.assertion_sequence != ref->acquisition_generation
+		|| !BufferTagsEqual(&base->tag, &ref->assertion.resource)
+		|| base->generation >= UINT64_MAX - 1 || reservation_token == 0
+		|| base->pcm_state != (uint8)PCM_STATE_N || base->flags != 0)
+		return false;
+	image = &frame->body.image_envelope;
+	if (image->image_length != BLCKSZ
+		|| !gcs_block_resource_x_ctrc_image_slots((Page)image->page_bytes, &mask))
+		return false;
+	/* Existing V2/non-ITL images keep their original path. Ordinary slots
+	 * require the explicit complete V3 bundle; no raw-only fallback. */
+	if (mask == 0)
+		return image->ctrc_delegation_bytes == 0;
+	if (ref->assertion.resource.forkNum != MAIN_FORKNUM
+		|| ref->acquisition_generation == 0 || ref->acquisition_generation == UINT64_MAX
+		|| !cluster_resource_x_ctrc_bundle_layout(image, &layout))
+		return false;
+	source = ((uint32)image->source_fence[0] << 24) | ((uint32)image->source_fence[1] << 16)
+		| ((uint32)image->source_fence[2] << 8) | image->source_fence[3];
+	if (source >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| !gcs_block_pcm_x_resource_x_peer_ready_exact((int32)source, &connection)
+		|| !gcs_block_resource_x_ctrc_receive_image(frame, admission, (int32)source, connection)
+		|| !gcs_block_resource_x_ctrc_source_identities(admission, (int32)source, connection,
+			cluster_qvotec_get_self_incarnation(), &receiver, &sender))
+		return false;
+	gcs_block_resource_x_put_u32(expected_source, sender.node_id);
+	gcs_block_resource_x_put_u64(expected_source + 4, sender.boot_incarnation);
+	if (memcmp(expected_source, image->source_fence, sizeof(expected_source)) != 0
+		|| !PageGetLSNOrigin((Page)image->page_bytes, &origin))
+		return false;
+	pending.kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+	pending.relation_persistence = RELPERSISTENCE_PERMANENT;
+	pending.needs_wal = 1;
+	pending.page_operation_kind = CLUSTER_CTRC_IMAGE_INSTALL_V1;
+	pending.spc_oid = base->tag.spcOid;
+	pending.db_oid = base->tag.dbOid;
+	pending.rel_number = base->tag.relNumber;
+	pending.fork_number = base->tag.forkNum;
+	pending.block_number = base->tag.blockNum;
+	pending.predecessor_page_lsn_origin_node_id = (uint16)origin;
+	pending.predecessor_page_lsn = PageGetLSN((Page)image->page_bytes);
+	pending.predecessor_page_scn = ((PageHeader)image->page_bytes)->pd_block_scn;
+	pending.publication_own_generation = base->generation + 1;
+	pending.publication_acquisition_epoch = ref->acquisition_generation;
+	install->frame = frame;
+	install->reservation_base = *base;
+	install->reservation_token = reservation_token;
+	slots = ClusterPageGetItlSlots((Page)image->page_bytes);
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		ClusterCtrcTargetV1 *exact = &install->targets[i];
+		ClusterCtrcPrepareResult result;
+
+		if ((mask & (1U << i)) == 0)
+			continue;
+		*exact = pending;
+		exact->kind = CTRC_TARGET_EXACT_ITL_SLOT;
+		exact->itl_slot_index = i;
+		exact->itl_slot_wrap = slots[i].wrap;
+		exact->itl_xid = slots[i].xid;
+		exact->itl_class = slots[i].flags;
+		memcpy(exact->uba, &slots[i].undo_segment_head, sizeof(exact->uba));
+		/* IMAGE copies an unchanged slot from this immutable carrier.
+		 * Neither digest asserts that old, non-current N/PI bytes match. */
+		if (!cluster_ctrc_sha256_exact(&slots[i], sizeof(slots[i]), exact->planned_successor_sha256))
+			return false;
+		memcpy(exact->planned_predecessor_sha256, exact->planned_successor_sha256, 32);
+		if (layout.version == RESOURCE_X_CTRC_BUNDLE_V2_VERSION)
+			result = cluster_ctrc_itl_image_prepare_v2(&slots[i], &sender, &receiver,
+				image->ctrc_delegation + layout.offsets[record_index], layout.lengths[record_index],
+				&pending, &install->receipts[i]);
+		else
+			result = cluster_ctrc_itl_image_prepare_v1(&slots[i], &sender, &receiver,
+				image->ctrc_delegation + layout.offsets[record_index], layout.lengths[record_index],
+				&pending, &install->receipts[i]);
+		if (result != CLUSTER_CTRC_PREPARE_READY)
+			return false;
+		install->prepared_mask |= (uint16)(1U << i);
+		record_index++;
+	}
+	install->ready = gcs_block_pcm_x_resource_x_peer_ready_exact((int32)source, &final_connection)
+		&& connection == final_connection
+		&& gcs_block_resource_x_ctrc_source_identities(admission, (int32)source, connection,
+			cluster_qvotec_get_self_incarnation(), &final_receiver, &final_sender)
+		&& memcmp(&receiver, &final_receiver, sizeof(receiver)) == 0
+		&& memcmp(&sender, &final_sender, sizeof(sender)) == 0;
+	return install->ready;
+}
+
+/* Content-X and the original exact N/reservation are held by the caller.
+ * Apply every physical slot before the original installed-image publication. */
+static bool
+gcs_block_resource_x_ctrc_image_apply(GcsBlockCtrcImageInstall *install, Page page)
+{
+	const ClusterItlSlotData *slots = ClusterPageGetItlSlots(page);
+
+	for (uint16 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		ClusterCtrcApplyToken token;
+		uint8 digest[32];
+
+		if ((install->prepared_mask & (1U << i)) == 0)
+			continue;
+		if (!cluster_ctrc_sha256_exact(&slots[i], sizeof(slots[i]), digest)
+			|| memcmp(digest, install->targets[i].planned_successor_sha256, sizeof(digest)) != 0
+			|| cluster_ctrc_receipt_apply_shared(&install->receipts[i], &install->targets[i], &token)
+				!= CLUSTER_CTRC_APPLY_APPLIED || !token.valid)
+			return false;
+	}
+	return true;
+}
+
 /* Deferred work alone has no executor PID. Publish only while the native
  * source service actually runs on this process, and retire before returning. */
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_source_block_to_n_observed(const ResourceXDecodedFrame *block,
 	int32 authenticated_master_node, uint64 r4_record_generation,
-	const ClusterWaitPcmAdmission *admission)
+	const ClusterSemanticAdmissionToken *token, const ClusterWaitPcmAdmission *admission)
 {
 	ClusterContentTraceServiceScope scope;
 	volatile ResourceXApplyResult result;
 
 	if (!cluster_trace_tx_identity || block == NULL)
 		return gcs_block_pcm_x_resource_x_source_block_to_n(block, authenticated_master_node,
-			r4_record_generation);
+			r4_record_generation, token);
 	gcs_block_pcm_service_begin(&scope, &block->common, CLWAIT_SITE_PCM_SOURCE_SERVICE,
 		authenticated_master_node, r4_record_generation, admission);
 	PG_TRY();
 	{
 		result = gcs_block_pcm_x_resource_x_source_block_to_n(block, authenticated_master_node,
-			r4_record_generation);
+			r4_record_generation, token);
 	}
 	PG_FINALLY();
 	{
@@ -12650,12 +13137,13 @@ static ClusterPcmOwnResult
 PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 	gcs_block_pcm_x_resource_x_install_target_image_exact(
 		BufferDesc *buf, const ClusterPcmOwnSnapshot *reservation_base, uint64 reservation_token,
-		const ResourceXCurrentImage *image)
+		const ResourceXCurrentImage *image, GcsBlockCtrcImageInstall *install)
 {
 	PGAlignedBlock verified;
 	ClusterPageWalInstallV1 prepared_wal = { 0 };
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult own_result;
+	uint16 mask;
 	Page page;
 
 	if (buf == NULL || reservation_base == NULL || image == NULL || image->page_bytes == NULL
@@ -12663,6 +13151,13 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 		|| !LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
 		return CLUSTER_PCM_OWN_INVALID;
 	memcpy(verified.data, image->page_bytes, BLCKSZ);
+	if (!gcs_block_resource_x_ctrc_image_slots((Page)verified.data, &mask)
+		|| (mask != 0 && (install == NULL || !install->ready || install->copy_started
+			|| install->prepared_mask != mask || install->frame == NULL
+			|| !cluster_pcm_own_snapshot_equal_exact(&install->reservation_base, reservation_base)
+			|| install->reservation_token != reservation_token
+			|| memcmp(verified.data, install->frame->body.image_envelope.page_bytes, BLCKSZ) != 0)))
+		return CLUSTER_PCM_OWN_STALE;
 	if (PageGetLSN((Page)verified.data) != image->page_lsn
 		|| ((PageHeader)verified.data)->pd_block_scn != image->page_scn
 		|| cluster_gcs_block_compute_checksum(verified.data) != image->page_checksum
@@ -12670,40 +13165,55 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 			&& !cluster_page_wal_prepare_install_v1(
 				BufferDescriptorGetBuffer(buf), &image->page_wal, verified.data, &prepared_wal)))
 		return CLUSTER_PCM_OWN_CORRUPT;
-	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
-	if (own_result != CLUSTER_PCM_OWN_OK)
-		goto done;
-	if (!gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base, reservation_token)) {
-		own_result = cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
-							 == CLUSTER_PCM_OWN_CORRUPT
-						 ? CLUSTER_PCM_OWN_CORRUPT
-						 : CLUSTER_PCM_OWN_STALE;
-		goto done;
-	}
+	PG_TRY();
+	{
+		own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			goto done;
+		if (!gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base, reservation_token)) {
+			own_result = cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
+								 == CLUSTER_PCM_OWN_CORRUPT
+							 ? CLUSTER_PCM_OWN_CORRUPT
+							 : CLUSTER_PCM_OWN_STALE;
+			goto done;
+		}
 
-	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
-	memcpy(page, verified.data, BLCKSZ);
-	gcs_block_note_install_copy();
-	PageSetLSNPreserveOrigin(page, image->page_lsn);
-	((PageHeader)page)->pd_block_scn = image->page_scn;
-	own_result = cluster_bufmgr_pcm_own_publish_installed_x_image(buf, reservation_base,
-																  reservation_token);
-	if (own_result != CLUSTER_PCM_OWN_OK) {
-		gcs_block_resource_x_fail_closed_current();
-		own_result = CLUSTER_PCM_OWN_CORRUPT;
-		goto done;
+		page = BufferGetPage(BufferDescriptorGetBuffer(buf));
+		if (install != NULL && mask != 0)
+			install->copy_started = true;
+		memcpy(page, verified.data, BLCKSZ);
+		gcs_block_note_install_copy();
+		PageSetLSNPreserveOrigin(page, image->page_lsn);
+		((PageHeader)page)->pd_block_scn = image->page_scn;
+		if (mask != 0 && !gcs_block_resource_x_ctrc_image_apply(install, page)) {
+			gcs_block_resource_x_fail_closed_current();
+			own_result = CLUSTER_PCM_OWN_CORRUPT;
+			goto done;
+		}
+		own_result = cluster_bufmgr_pcm_own_publish_installed_x_image(buf, reservation_base,
+																	  reservation_token);
+		if (own_result != CLUSTER_PCM_OWN_OK) {
+			gcs_block_resource_x_fail_closed_current();
+			own_result = CLUSTER_PCM_OWN_CORRUPT;
+			goto done;
+		}
+		own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
+		if (own_result != CLUSTER_PCM_OWN_OK
+			|| !gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base,
+														   reservation_token)) {
+			gcs_block_resource_x_fail_closed_current();
+			own_result = CLUSTER_PCM_OWN_CORRUPT;
+		}
+	done:
+		;
 	}
-	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
-	if (own_result != CLUSTER_PCM_OWN_OK
-		|| !gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base,
-													   reservation_token)) {
-		gcs_block_resource_x_fail_closed_current();
-		own_result = CLUSTER_PCM_OWN_CORRUPT;
+	PG_FINALLY();
+	{
+		/* Release the original source-pool preparation on apply ERROR too.
+		 * This does not cancel any post-copy receipt or parent custody. */
+		cluster_page_wal_release_install_v1(&prepared_wal);
 	}
-done:
-	/* This pre-grant copy is still non-authoritative. T2 subsequently
-	 * reserves/publishes the exact retained carrier with its activation. */
-	cluster_page_wal_release_install_v1(&prepared_wal);
+	PG_END_TRY();
 	return own_result;
 }
 
@@ -12714,7 +13224,8 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 		bool direct_init_bound, uint64 direct_init_reservation_token, bool capture_local_image,
 		bool require_clean_n, const ResourceXCurrentImage *precommit_image,
 		PGAlignedBlock *aligned_page, ResourceXCurrentImage *image_out,
-		uint64 *committed_generation_out, const ResourceXDeliveryClaim *delivery_claim)
+		uint64 *committed_generation_out, const ResourceXDeliveryClaim *delivery_claim,
+		const ResourceXDecodedFrame *retained_image, const ClusterSemanticAdmissionToken *admission)
 {
 	BufferDesc *buf;
 	ClusterPcmOwnSnapshot base;
@@ -12735,7 +13246,8 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 	uint8 claim_source = RESOURCE_X_INSTALL_CLAIM_NONE;
 	int buffer_id = -1;
 	ResourceXBufferActivationResult result = RESOURCE_X_BUFFER_STALE;
-	bool content_locked = false;
+	volatile bool content_locked = false;
+	GcsBlockCtrcImageInstall *install;
 	bool direct_init_remote_install;
 	bool trace_current_known = false;
 	ClusterWaitTraceGuard trace_guard = CLWAIT_GUARD_FINISH;
@@ -12793,9 +13305,12 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 		&& delivery_claim->target.buffer_id_plus_one != (uint32)buffer_id + 1)
 		return RESOURCE_X_BUFFER_STALE;
 	content_lock = BufferDescriptorGetContentLock(buf);
+	install = retained_image != NULL
+		&& retained_image->body.image_envelope.ctrc_delegation_bytes != 0
+		? palloc0(sizeof(*install)) : NULL;
 	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
-		gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_TARGET_PREPARE, NULL, ref, -1, 0,
-			&current, CLWAIT_GUARD_CONTENT, RESOURCE_X_BUFFER_BUSY, NULL);
+		if (install != NULL)
+			pfree(install);
 		return RESOURCE_X_BUFFER_BUSY;
 	}
 	content_locked = true;
@@ -12982,8 +13497,25 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 						result = RESOURCE_X_BUFFER_CORRUPT;
 						break;
 					}
+					if (install != NULL) {
+						/* The journal/object/participant prepare must not run under
+						 * content-X. Retain the original pending tuple; after the
+						 * gap the physical owner rechecks it before touching bytes. */
+						LWLockRelease(content_lock);
+						content_locked = false;
+						if (!gcs_block_resource_x_ctrc_image_prepare(install, retained_image,
+								admission, ref, &base, reservation_token)) {
+							result = RESOURCE_X_BUFFER_STALE;
+							break;
+						}
+						if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+							result = RESOURCE_X_BUFFER_BUSY;
+							break;
+						}
+						content_locked = true;
+					}
 					own_result = gcs_block_pcm_x_resource_x_install_target_image_exact(
-						buf, &base, reservation_token, precommit_image);
+						buf, &base, reservation_token, precommit_image, install);
 					if (own_result != CLUSTER_PCM_OWN_OK) {
 						result = own_result == CLUSTER_PCM_OWN_BUSY	   ? RESOURCE_X_BUFFER_BUSY
 								 : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_BUFFER_STALE
@@ -13027,19 +13559,25 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 			*committed_generation_out = committed_generation;
 			result = RESOURCE_X_BUFFER_T2_INSTALLED;
 		} while (false);
-		LWLockRelease(content_lock);
+		if (content_locked)
+			LWLockRelease(content_lock);
 		content_locked = false;
+		gcs_block_resource_x_ctrc_image_cancel(install);
 	}
 	PG_CATCH();
 	{
+		if (install != NULL && install->copy_started)
+			gcs_block_resource_x_fail_closed_current();
 		if (content_locked && LWLockHeldByMe(content_lock))
 			LWLockRelease(content_lock);
+		gcs_block_resource_x_ctrc_image_cancel(install);
+		if (install != NULL)
+			pfree(install);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (result != RESOURCE_X_BUFFER_T2_INSTALLED)
-		gcs_block_pcm_trace_guard(CLWAIT_SITE_PCM_TARGET_PREPARE, NULL, ref, -1, 0,
-			trace_current_known ? &current : NULL, trace_guard, result, NULL);
+	if (install != NULL)
+		pfree(install);
 	return result;
 }
 
@@ -13049,6 +13587,7 @@ static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion,
 											 bool scheduled_retry,
 											 const ResourceXDeliveryClaim *delivery_claim,
+											 const ClusterSemanticAdmissionToken *admission,
 											 ResourceXAcquisitionRef *terminal_ref_out,
 											 uint64 *terminal_ownership_generation_out,
 											 uint64 *terminal_authority_generation_out)
@@ -13325,7 +13864,8 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 			buffer_result = gcs_block_pcm_x_resource_x_prepare_target_x(
 				&ref, expected_local_generation, true, direct_init_bound, direct_init_token,
 				local_proof, durable_proof, remote_proof ? &joined_image : NULL, &aligned_image,
-				&image, &committed_generation, delivery_claim);
+				&image, &committed_generation, delivery_claim, remote_proof ? &image_frame : NULL,
+				admission);
 			if (buffer_result != RESOURCE_X_BUFFER_T2_INSTALLED
 				&& buffer_result != RESOURCE_X_BUFFER_ALREADY_INSTALLED) {
 				cluster_pcm_lock_resource_x_publish_no_progress_exact(
@@ -13476,6 +14016,7 @@ gcs_block_resource_x_delivery_finish_exact(const ResourceXDeliveryClaim *claim)
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_join_terminal_owned_try(const ResourceXAcquisitionRef *ref,
 												   bool scheduled_retry,
+	const ClusterSemanticAdmissionToken *admission,
 												   ResourceXAcquisitionRef *terminal_ref_out,
 												   uint64 *ownership_out, uint64 *authority_out)
 {
@@ -13487,7 +14028,7 @@ gcs_block_pcm_x_resource_x_join_terminal_owned_try(const ResourceXAcquisitionRef
 	result = cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(ref, &observation, &target);
 	if (result == RESOURCE_X_APPLY_NOT_FOUND)
 		return gcs_block_pcm_x_resource_x_join_terminal_try(
-			&ref->assertion, scheduled_retry, NULL, terminal_ref_out, ownership_out, authority_out);
+			&ref->assertion, scheduled_retry, NULL, admission, terminal_ref_out, ownership_out, authority_out);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
 	result = cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
@@ -13497,7 +14038,7 @@ gcs_block_pcm_x_resource_x_join_terminal_owned_try(const ResourceXAcquisitionRef
 	PG_TRY();
 	{
 		result = gcs_block_pcm_x_resource_x_join_terminal_try(&ref->assertion, scheduled_retry,
-															  &claim, terminal_ref_out,
+															  &claim, admission, terminal_ref_out,
 															  ownership_out, authority_out);
 		if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 			result = gcs_block_resource_x_delivery_finish_exact(&claim);
@@ -14849,7 +15390,7 @@ cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *w
 				block.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
 				block.common = work->request;
 				result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(
-					&block, master, admission.record_generation, &observation);
+					&block, master, admission.record_generation, &admission, &observation);
 			}
 		}
 	}
@@ -14922,7 +15463,7 @@ gcs_block_resource_x_delivery_run_exact(const ResourceXAcquisitionRef *ref,
 			result = gcs_block_resource_x_delivery_finish_exact(&claim);
 		else {
 			result = gcs_block_pcm_x_resource_x_join_terminal_try(
-				&ref->assertion, true, &claim, &terminal, &ownership, &authority);
+				&ref->assertion, true, &claim, admission, &terminal, &ownership, &authority);
 			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 				result = gcs_block_resource_x_delivery_finish_exact(&claim);
 			else if ((result == RESOURCE_X_APPLY_NOT_FOUND || result == RESOURCE_X_APPLY_BAD_STATE)
@@ -15167,18 +15708,10 @@ gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
 		if (admission_exact) {
 			if ((frame->common.observed_mode == (uint8)PCM_STATE_X
 				 || frame->common.observed_mode == (uint8)PCM_STATE_S)
-				&& frame->common.source_candidate == 1 && frame->common.retain_pi_if_dirty == 1) {
-				ClusterWaitPcmAdmission observation;
-				gcs_block_pcm_service_admission(&observation, &admission, &gate,
-					CLWAIT_PCM_SERVICE_INGRESS, master_node, master_session,
-					authenticated_connection_generation);
-				result = gcs_block_pcm_x_resource_x_source_block_to_n_observed(frame, master_node,
-																	  admission.record_generation, &observation);
-				if (result == RESOURCE_X_APPLY_BAD_STATE && frame->common.observed_mode == PCM_STATE_X)
-					(void)cluster_pcm_lock_resource_x_source_drain_defer_exact(
-						frame, master_node, admission.record_generation,
-						authenticated_connection_generation);
-			} else if (frame->common.observed_mode == (uint8)PCM_STATE_S
+				&& frame->common.source_candidate == 1 && frame->common.retain_pi_if_dirty == 1)
+				result = gcs_block_pcm_x_resource_x_source_block_to_n(frame, master_node,
+																	  admission.record_generation, &admission);
+			else if (frame->common.observed_mode == (uint8)PCM_STATE_S
 					 && frame->common.logical_assertion.requester_node != cluster_node_id)
 				result = gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 					frame, master_node, authenticated_connection_generation,
@@ -15560,6 +16093,32 @@ gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 					result = gcs_block_resource_x_gate_session_recheck_result(
 						&frame->common.logical_assertion.resource, &gate, master_node,
 						master_session);
+				if (result == RESOURCE_X_APPLY_APPLIED
+					&& frame->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
+					&& frame->body.image_envelope.ctrc_delegation_bytes != 0) {
+					/* Retain the upstream parent before the original join.
+					 * Participant work crosses lock domains, so recheck the
+					 * same admitted endpoints and original master session.
+					 * Later refusal retains custody; physical installation
+					 * still requires all exact typed IMAGE receipts. */
+					if (!gcs_block_resource_x_ctrc_receive_image(frame, &admission,
+							source, authenticated_connection_generation))
+						result = RESOURCE_X_APPLY_STALE;
+					else {
+						result = gcs_block_resource_x_target_peer_result_exact(&admission, source,
+							authenticated_connection_generation);
+						if (result == RESOURCE_X_APPLY_APPLIED)
+							result = gcs_block_resource_x_target_peer_result_exact(&admission,
+								master_node, master_ingress);
+						if (result == RESOURCE_X_APPLY_APPLIED)
+							result = gcs_block_resource_x_gate_session_recheck_result(
+								&frame->common.logical_assertion.resource, &gate, master_node,
+								master_session);
+						if (result == RESOURCE_X_APPLY_APPLIED
+							&& !cluster_semantic_activation_recheck(&admission))
+							result = RESOURCE_X_APPLY_STALE;
+					}
+				}
 				if (result == RESOURCE_X_APPLY_APPLIED) {
 					result = cluster_pcm_lock_resource_x_requester_join_current_exact(
 						frame, source, authenticated_connection_generation, master_node,
@@ -15647,7 +16206,7 @@ gcs_block_resource_x_requester_terminal_try(const ClusterICEnvelope *env,
 			delivery_ref.formation = frame->common.resource_formation;
 			delivery_ref.acquisition_generation = frame->common.assertion_sequence;
 			result = gcs_block_pcm_x_resource_x_join_terminal_owned_try(
-				&delivery_ref, scheduled_retry, &terminal_ref, &terminal_ownership_generation,
+				&delivery_ref, scheduled_retry, &admission, &terminal_ref, &terminal_ownership_generation,
 				&terminal_authority_generation);
 			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
 				result = gcs_block_resource_x_gate_session_recheck_result(
@@ -15939,6 +16498,8 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 										   &frame, &reject)) {
 		return true;
 	}
+	/* Delegated images reach the authenticated protective receiver before
+	 * the retained join; typed receipts still precede physical visibility. */
 	cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_RECEIVE, &frame,
 											(int32)env->source_node_id, 0);
 	if (env->epoch != cluster_epoch_get_current()) {
@@ -22033,49 +22594,157 @@ gcs_ctrc_dispatch_prepare(const ClusterCtrcCloseDispatch *dispatch,
 bool
 cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 {
-	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionToken admission = { 0 };
 	uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
 	bool dispatched = false;
+	bool prepared = gcs_ctrc_dispatch_prepare(dispatch, &admission, request);
 
-	if (gcs_ctrc_dispatch_prepare(dispatch, &admission, request)) {
-		if (dispatch->participant.node_id == (uint16)cluster_node_id) {
-			ClusterCtrcLocalReleaseAckV1 ack;
-			ClusterCtrcSealReplyResult result;
-			uint16 first_reason = CTRC_SEAL_REASON_IDENTITY;
+	PG_TRY();
+	{
+		if (prepared) {
+			if (dispatch->participant.node_id == (uint16)cluster_node_id) {
+				ClusterCtrcLocalReleaseAckV1 ack;
+				ClusterCtrcRootSubtreeAckV1 root_ack;
+				ClusterCtrcSealReplyResult result;
+				uint16 first_reason = CTRC_SEAL_REASON_IDENTITY;
 
-			MemSet(&ack, 0, sizeof(ack));
-			result = cluster_ctrc_participant_request_shared(
-				&dispatch->key, &dispatch->participant, dispatch->grant_generation,
-				dispatch->seal_generation, (ClusterCtrcSealSuboperation)dispatch->suboperation,
-				&first_reason, &ack);
-			if (cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+				MemSet(&ack, 0, sizeof(ack));
 				if (dispatch->suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED)
-					dispatched = cluster_ctrc_origin_note_certificate_reply_shared(
-						dispatch->request_id, dispatch->participant.node_id, result);
-				else if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
-					dispatched = cluster_ctrc_origin_ack_land_shared(dispatch->request_id, &ack);
+					result = cluster_ctrc_participant_certificate_request_shared(dispatch, &first_reason);
 				else
-					dispatched = cluster_ctrc_origin_note_close_reply_shared(
-						dispatch->request_id, dispatch->participant.node_id, result);
+					result = cluster_ctrc_participant_request_shared(
+						&dispatch->key, &dispatch->participant, dispatch->grant_generation,
+						dispatch->seal_generation, (ClusterCtrcSealSuboperation)dispatch->suboperation,
+						&first_reason, &ack);
+				if (cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+					if (dispatch->suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED)
+						dispatched = cluster_ctrc_origin_note_certificate_reply_shared(
+							dispatch->request_id, dispatch->participant.node_id, result);
+					else if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
+						dispatched = cluster_ctrc_origin_ack_land_shared(dispatch->request_id, &ack);
+					else if (result == CTRC_SEAL_REPLY_PENDING_DRAIN
+						&& cluster_ctrc_participant_root_subtree_ack_shared(&dispatch->key,
+							&dispatch->participant, dispatch->grant_generation, dispatch->seal_generation, &root_ack)
+						&& cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+						dispatched = cluster_ctrc_origin_root_ack_land_shared(dispatch->request_id, &root_ack);
+					else
+						dispatched = cluster_ctrc_origin_note_close_reply_shared(
+							dispatch->request_id, dispatch->participant.node_id, result);
+				}
+			} else {
+				BufferTag route_tag
+					= GcsBlockCurrentMxRouteTagMake(dispatch->request_id, dispatch->key.cluster_epoch,
+													cluster_node_id, CLUSTER_CTRC_INTERNAL_ENDPOINT);
+				int worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
+				uint32 required_capabilities
+					= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+				dispatched
+					= worker_id >= 0 && worker_id < cluster_lms_workers
+					  && cluster_lms_outbound_enqueue_cap_bound(
+						  worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, dispatch->participant.node_id,
+						  request, sizeof(request), required_capabilities,
+						  dispatch->participant.capability_record_generation);
 			}
-		} else {
-			BufferTag route_tag
-				= GcsBlockCurrentMxRouteTagMake(dispatch->request_id, dispatch->key.cluster_epoch,
-												cluster_node_id, CLUSTER_CTRC_INTERNAL_ENDPOINT);
-			int worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
-			uint32 required_capabilities
-				= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
-			dispatched
-				= worker_id >= 0 && worker_id < cluster_lms_workers
-				  && cluster_lms_outbound_enqueue_cap_bound(
-					  worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, dispatch->participant.node_id,
-					  request, sizeof(request), required_capabilities,
-					  dispatch->participant.capability_record_generation);
 		}
 	}
-	if (admission.entered)
-		cluster_semantic_activation_leave(&admission);
+	PG_FINALLY();
+	{
+		if (admission.entered)
+			cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
 	return dispatched;
+}
+
+/* The existing background CLOSE family, for a retained immediate child.
+ * HELLO connection counters and OPEN custody counters are distinct domains. */
+static bool
+gcs_ctrc_dispatch_delegated_request(const ClusterCtrcDelegationCloseV1 *request, bool certificate)
+{
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0LogicalKey logical;
+	uint8 bytes[CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES];
+	uint64 child_boot = 0, child_observed = 0;
+	uint64 self_boot;
+	uint32 connection_generation = 0;
+	uint32 required = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+		| PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+	bool dispatched = false;
+
+	if (request == NULL || !(certificate
+			? cluster_ctrc_delegation_certificate_encode_v1(request, bytes, sizeof(bytes))
+			: cluster_ctrc_delegation_close_encode_v1(request, bytes, sizeof(bytes)))
+		|| cluster_node_id < 0 || request->parent.node_id != (uint16)cluster_node_id
+		|| request->key.system_identifier != GetSystemIdentifier()
+		|| request->key.cluster_epoch != cluster_epoch_get_current()
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| (cluster_ic_local_capability_word() & required) != required
+		|| !cluster_membership_is_member(cluster_node_id)
+		|| !cluster_membership_is_member(request->receiver.node_id)
+		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed()))
+		return false;
+	self_boot = cluster_qvotec_get_self_incarnation();
+	if (self_boot == 0 || self_boot != request->parent.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self_boot
+		|| !cluster_reconfig_get_observed_slot(request->receiver.node_id, &child_boot, &child_observed)
+		|| child_boot == 0 || child_observed == 0 || child_boot != request->receiver.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(request->receiver.node_id) != child_boot
+		|| cluster_reconfig_get_observed_epoch(request->receiver.node_id) != request->key.formation_epoch
+		|| !cluster_sf_peer_multixact_current_capability_generation(request->receiver.node_id,
+			&connection_generation)
+		|| connection_generation == 0
+		|| !cluster_sf_peer_capability_generation_matches(request->receiver.node_id,
+			required, connection_generation)
+		|| cluster_semantic_activation_enter_r4_terminal_census(&admission)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	PG_TRY();
+	{
+		MemSet(&root, 0, sizeof(root));
+		logical.owner_instance = request->key.owner_instance;
+		logical.segment_id = request->key.segment_id;
+		if (admission.record_generation <= UINT32_MAX
+			&& admission.formation_epoch == request->key.formation_epoch
+			&& admission.record_generation == request->key.admission_record_generation
+			&& request->parent.capability_record_generation == (uint32)admission.record_generation
+			&& request->receiver.capability_record_generation == (uint32)admission.record_generation
+			&& cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(&admission,
+				CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance, logical.segment_id, &root)
+			&& root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == request->key.root_id
+			&& root.root_generation == request->key.root_generation
+			&& request->key.root_descriptor_incarnation == root.root_generation
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+			&& (certificate ? cluster_ctrc_participant_delegated_certificate_matches_shared(request)
+				: cluster_ctrc_participant_delegated_close_matches_shared(request))
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+			BufferTag route = GcsBlockCurrentMxRouteTagMake(request->request_id,
+				request->key.cluster_epoch, cluster_node_id, CLUSTER_CTRC_INTERNAL_ENDPOINT);
+			int worker = cluster_lms_shard_for_tag(&route, cluster_lms_workers);
+
+			dispatched = worker >= 0 && worker < cluster_lms_workers
+				&& cluster_lms_outbound_enqueue_cap_bound(worker, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+					request->receiver.node_id, bytes, sizeof(bytes), required, connection_generation);
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return dispatched;
+}
+
+bool
+cluster_gcs_ctrc_dispatch_delegated_close(const ClusterCtrcDelegationCloseV1 *request)
+{
+	return gcs_ctrc_dispatch_delegated_request(request, false);
+}
+
+bool
+cluster_gcs_ctrc_dispatch_delegated_certificate(const ClusterCtrcDelegationCloseV1 *request)
+{
+	return gcs_ctrc_dispatch_delegated_request(request, true);
 }
 
 static void
@@ -22205,6 +22874,7 @@ gcs_ctrc_dispatch_local_closes(const ClusterCtrcCloseDispatch *dispatches, Size 
 		for (Size i = 0; i < count; i++) {
 			uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
 			uint16 first_reason = CTRC_SEAL_REASON_IDENTITY;
+			ClusterCtrcRootSubtreeAckV1 root_ack;
 
 			if (!gcs_ctrc_dispatch_prepare(&dispatches[i], &admissions[i], request)
 				|| !cluster_semantic_activation_recheck_r4_terminal_census(&admissions[i])) {
@@ -22216,6 +22886,13 @@ gcs_ctrc_dispatch_local_closes(const ClusterCtrcCloseDispatch *dispatches, Size 
 				&dispatches[i].key, &dispatches[i].participant, dispatches[i].grant_generation,
 				dispatches[i].seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN, &first_reason,
 				&acks[accepted_count]);
+			if (results[accepted_count] == CTRC_SEAL_REPLY_PENDING_DRAIN
+				&& cluster_ctrc_participant_root_subtree_ack_shared(&dispatches[i].key,
+					&dispatches[i].participant, dispatches[i].grant_generation,
+					dispatches[i].seal_generation, &root_ack)
+				&& cluster_semantic_activation_recheck_r4_terminal_census(&admissions[i])
+				&& cluster_ctrc_origin_root_ack_land_shared(dispatches[i].request_id, &root_ack))
+				continue;
 			if (cluster_semantic_activation_recheck_r4_terminal_census(&admissions[i])) {
 				accepted[accepted_count] = dispatches[i];
 				accepted_to_input[accepted_count++] = i;
@@ -22288,6 +22965,166 @@ cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size
 	}
 }
 
+/* Explicit delegated-only merge/subtree reply: reconstruct the exact retained216B
+ * request, authenticate its original child, and retain the parent's other
+ * local/ancestor responsibility. Subtree proofs never grant origin release. */
+static void
+gcs_block_land_delegation_merge_reply(const ClusterICEnvelope *env,
+	const GcsBlockReplyHeader *outer, const uint8 *page)
+{
+	ClusterCtrcDelegationCloseV1 request;
+	ClusterCtrcSealReplyHeaderV1 header;
+	ClusterCtrcLocalReleaseAckV1 ignored_ack;
+	ClusterCtrcDelegatedSubtreeAckV1 subtree_ack;
+	bool subtree = page[4] == CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION;
+	bool certificate = page[4] == CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION;
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0LogicalKey logical;
+	uint8 bytes[CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES];
+	uint64 self_boot, child_boot = 0, observed = 0;
+	uint32 connection = 0;
+	uint32 required = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+
+	if (env->epoch != outer->epoch || !cluster_gcs_block_family_on_data_plane()
+		|| (cluster_ic_local_capability_word() & required) != required
+		|| !cluster_membership_is_member(cluster_node_id)
+		|| !cluster_membership_is_member((int32)env->source_node_id)
+		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed())
+		|| !(certificate
+			? cluster_ctrc_participant_delegated_certificate_snapshot_shared(outer->request_id,
+				(uint16)env->source_node_id, &request)
+			: cluster_ctrc_participant_delegated_close_snapshot_shared(outer->request_id,
+				(uint16)env->source_node_id, &request))
+		|| request.key.system_identifier != GetSystemIdentifier()
+		|| request.key.cluster_epoch != outer->epoch
+		|| !(certificate ? cluster_ctrc_delegation_certificate_encode_v1(&request, bytes, sizeof(bytes))
+			: cluster_ctrc_delegation_close_encode_v1(&request, bytes, sizeof(bytes)))
+		|| (subtree
+			? !cluster_ctrc_delegated_ack_reply_decode(page, GCS_BLOCK_DATA_SIZE, &request, &subtree_ack)
+			: (!cluster_ctrc_seal_reply_decode(page, GCS_BLOCK_DATA_SIZE, bytes, sizeof(bytes),
+				(int32)env->source_node_id, cluster_node_id, &header, &ignored_ack)
+				|| header.result != (certificate ? CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED
+					: CTRC_SEAL_REPLY_DELEGATION_MERGED))))
+		return;
+	self_boot = cluster_qvotec_get_self_incarnation();
+	if (self_boot == 0 || self_boot != request.parent.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self_boot
+		|| !cluster_reconfig_get_observed_slot(request.receiver.node_id, &child_boot, &observed)
+		|| child_boot == 0 || observed == 0 || child_boot != request.receiver.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(request.receiver.node_id) != child_boot
+		|| cluster_reconfig_get_observed_epoch(request.receiver.node_id) != request.key.formation_epoch
+		|| !cluster_sf_peer_multixact_current_capability_generation(request.receiver.node_id, &connection)
+		|| connection == 0
+		|| !cluster_sf_peer_capability_generation_matches(request.receiver.node_id, required, connection)
+		|| cluster_semantic_activation_enter_r4_terminal_census(&admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return;
+	PG_TRY();
+	{
+		MemSet(&root, 0, sizeof(root));
+		logical.owner_instance = request.key.owner_instance;
+		logical.segment_id = request.key.segment_id;
+		if (admission.record_generation <= UINT32_MAX
+			&& admission.formation_epoch == request.key.formation_epoch
+			&& admission.record_generation == request.key.admission_record_generation
+			&& request.parent.capability_record_generation == (uint32)admission.record_generation
+			&& request.receiver.capability_record_generation == (uint32)admission.record_generation
+			&& cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(&admission,
+				CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance, logical.segment_id, &root)
+			&& root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == request.key.root_id
+			&& root.root_generation == request.key.root_generation
+			&& request.key.root_descriptor_incarnation == root.root_generation
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+			&& cluster_sf_peer_capability_generation_matches(request.receiver.node_id, required, connection)
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+			if (certificate)
+				(void)cluster_ctrc_participant_delegated_certificate_land_shared(&request);
+			else if (subtree)
+				(void)cluster_ctrc_participant_delegated_ack_land_shared(&request, &subtree_ack);
+			else
+				(void)cluster_ctrc_participant_delegation_merge_land_shared(&request);
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+}
+
+/* Root ACKs use the original staged136 request. HELLO authenticates the
+ * connection; the retained participant identity remains in the OPEN domain. */
+static void
+gcs_block_land_root_subtree_reply(const ClusterICEnvelope *env,
+	const GcsBlockReplyHeader *outer, const uint8 *page)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity identity;
+	ClusterCtrcSealSuboperation suboperation = 0;
+	ClusterCtrcRootSubtreeAckV1 proof;
+	ClusterSemanticAdmissionToken admission = { 0 };
+	ClusterUndoBlock0ResolvedRoot root = { 0 };
+	ClusterUndoBlock0LogicalKey logical = { 0 };
+	uint8 request[CLUSTER_CTRC_SEAL_REQUEST_BYTES];
+	uint32 grant = 0, connection = 0;
+	uint64 seal = 0, self_boot, peer_boot = 0, observed = 0;
+	uint32 required = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+
+	if (env->epoch != outer->epoch || !cluster_gcs_block_family_on_data_plane()
+		|| (cluster_ic_local_capability_word() & required) != required
+		|| !cluster_membership_is_member(cluster_node_id)
+		|| !cluster_membership_is_member((int32)env->source_node_id)
+		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed())
+		|| !cluster_ctrc_origin_request_snapshot_shared(outer->request_id, (uint16)env->source_node_id,
+			&key, &identity, &grant, &seal, &suboperation)
+		|| suboperation != CTRC_SEAL_CLOSE_AND_CLEAN || key.origin_node_id != (uint16)cluster_node_id
+		|| key.system_identifier != GetSystemIdentifier() || key.cluster_epoch != outer->epoch
+		|| !cluster_ctrc_seal_request_encode(&key, outer->request_id, grant, seal,
+			identity.capability_record_generation, suboperation, request, sizeof(request))
+		|| !cluster_ctrc_root_ack_reply_decode(page, GCS_BLOCK_DATA_SIZE, request,
+			(int32)env->source_node_id, cluster_node_id, &proof))
+		return;
+	self_boot = cluster_qvotec_get_self_incarnation();
+	if (self_boot == 0 || self_boot != key.origin_boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self_boot
+		|| !cluster_reconfig_get_observed_slot(identity.node_id, &peer_boot, &observed)
+		|| peer_boot == 0 || observed == 0 || peer_boot != identity.boot_incarnation
+		|| proof.local_ack.participant_boot_incarnation != peer_boot
+		|| cluster_membership_get_last_admitted_incarnation(identity.node_id) != peer_boot
+		|| cluster_reconfig_get_observed_epoch(identity.node_id) != key.formation_epoch
+		|| !cluster_sf_peer_multixact_current_capability_generation(identity.node_id, &connection)
+		|| connection == 0
+		|| !cluster_sf_peer_capability_generation_matches(identity.node_id, required, connection)
+		|| cluster_semantic_activation_enter_r4_terminal_census(&admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return;
+	PG_TRY();
+	{
+		logical.owner_instance = key.owner_instance;
+		logical.segment_id = key.segment_id;
+		if (admission.record_generation <= UINT32_MAX
+			&& admission.formation_epoch == key.formation_epoch
+			&& admission.record_generation == key.admission_record_generation
+			&& identity.capability_record_generation == (uint32)admission.record_generation
+			&& cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(&admission,
+				CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance, logical.segment_id, &root)
+			&& root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == key.root_id
+			&& root.root_generation == key.root_generation && key.root_descriptor_incarnation == root.root_generation
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+			&& cluster_sf_peer_capability_generation_matches(identity.node_id, required, connection)
+			&& cluster_membership_get_last_admitted_incarnation(identity.node_id) == peer_boot
+			&& cluster_membership_get_last_admitted_incarnation(cluster_node_id) == self_boot
+			&& cluster_qvotec_get_self_incarnation() == self_boot
+			&& cluster_reconfig_get_observed_epoch(identity.node_id) == key.formation_epoch
+			&& cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+			(void)cluster_ctrc_origin_root_ack_land_shared(outer->request_id, &proof);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+}
+
 /* CTRC status 30 uses the legacy-sized outer carriage but has no backend
  * outstanding slot: requester_backend_id is the closed internal endpoint.
  * Reconstruct the exact staged CLOSE or certificate-notification request and
@@ -22331,6 +23168,23 @@ gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *env, const void *payload)
 		|| GcsBlockReplyHeaderGetForwardingMasterNode(outer) != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
 		|| outer->checksum != gcs_block_compute_checksum((const char *)page))
 		return true;
+	if ((page[4] == CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION
+			|| page[4] == CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION) && page[5] == 0) {
+		gcs_block_land_delegation_merge_reply(env, outer, page);
+		return true;
+	}
+
+	if (page[4] == CLUSTER_CTRC_ROOT_ACK_WIRE_VERSION && page[5] == 0) {
+		gcs_block_land_root_subtree_reply(env, outer, page);
+		return true;
+	}
+
+	/* Wire6 completion belongs only to the retained immediate parent, never
+	 * to the origin's original136 request correlation. */
+	if (page[4] == CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION && page[5] == 0) {
+		gcs_block_land_delegation_merge_reply(env, outer, page);
+		return true;
+	}
 
 	MemSet(&key, 0, sizeof(key));
 	MemSet(&identity, 0, sizeof(identity));
@@ -22877,7 +23731,7 @@ gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload *fwd)
 	pfree(deny_buf);
 }
 
-/* The 136-byte CTRC family is disjoint from every BufferTag forward.  It is
+/* The explicit 136/216-byte CTRC family is disjoint from every BufferTag forward.  It is
  * consumed here even when malformed, so no byte collision can reach legacy
  * holder logic.  A positive ACK is built only while the exact target R4
  * formation/root and both endpoint identities remain current. */
@@ -22885,9 +23739,13 @@ static bool
 gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterCtrcSealRequestV1 request;
+	ClusterCtrcDelegationCloseV1 delegated_close;
+	bool delegated, certificate;
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
 	ClusterCtrcLocalReleaseAckV1 ack;
+	ClusterCtrcDelegatedSubtreeAckV1 subtree_ack;
+	ClusterCtrcRootSubtreeAckV1 root_ack;
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0ResolvedRoot root;
@@ -22909,22 +23767,50 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 	bool source_capability_current;
 	bool bracket_current = false;
 
-	if (env == NULL || payload == NULL || env->payload_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES)
+	if (env == NULL || payload == NULL
+		|| (env->payload_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+			&& env->payload_length != CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES))
 		return false;
+	delegated = env->payload_length == CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES;
+	certificate = delegated && ((const uint8 *)payload)[68]
+		== (uint8)CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION
+		&& ((const uint8 *)payload)[69] == 0;
+	MemSet(&delegated_close, 0, sizeof(delegated_close));
 	MemSet(&request, 0, sizeof(request));
 	MemSet(&key, 0, sizeof(key));
 	MemSet(&identity, 0, sizeof(identity));
 	MemSet(&ack, 0, sizeof(ack));
+	MemSet(&subtree_ack, 0, sizeof(subtree_ack));
+	MemSet(&root_ack, 0, sizeof(root_ack));
 	MemSet(&admission, 0, sizeof(admission));
 	MemSet(&logical, 0, sizeof(logical));
 	MemSet(&root, 0, sizeof(root));
 	if (env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
 		|| env->dest_node_id != (uint32)cluster_node_id || env->epoch != cluster_epoch_get_current()
-		|| !cluster_gcs_block_family_on_data_plane()
-		|| !cluster_ctrc_seal_request_decode((const uint8 *)payload, env->payload_length,
-											 GetSystemIdentifier(), (int32)env->source_node_id,
-											 cluster_node_id, cluster_epoch_get_current(), &request,
-											 &key))
+		|| !cluster_gcs_block_family_on_data_plane())
+		return true;
+	if (delegated) {
+		if (!(certificate
+			? cluster_ctrc_delegation_certificate_decode_v1((const uint8 *)payload, env->payload_length,
+				GetSystemIdentifier(), (int32)env->source_node_id, cluster_node_id,
+				cluster_epoch_get_current(), &delegated_close)
+			: cluster_ctrc_delegation_close_decode_v1((const uint8 *)payload, env->payload_length,
+				GetSystemIdentifier(), (int32)env->source_node_id, cluster_node_id,
+				cluster_epoch_get_current(), &delegated_close)))
+			return true;
+		key = delegated_close.key;
+		request.request_id = delegated_close.request_id;
+		request.cluster_epoch = key.cluster_epoch;
+		request.original_requester_node = delegated_close.parent.node_id;
+		request.requester_backend_id = CLUSTER_CTRC_INTERNAL_ENDPOINT;
+		request.grant_generation = delegated_close.grant_generation;
+		request.seal_generation = delegated_close.seal_generation;
+		request.suboperation = certificate ? CTRC_SEAL_CERTIFICATE_COMMITTED : CTRC_SEAL_CLOSE_AND_CLEAN;
+		request.participant_capability_record_generation
+			= delegated_close.receiver.capability_record_generation;
+	} else if (!cluster_ctrc_seal_request_decode((const uint8 *)payload, env->payload_length,
+		GetSystemIdentifier(), (int32)env->source_node_id, cluster_node_id,
+		cluster_epoch_get_current(), &request, &key))
 		return true;
 
 	route_tag = GcsBlockCurrentMxRouteTagMake(request.request_id, request.cluster_epoch,
@@ -22957,47 +23843,118 @@ gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 		&& cluster_membership_get_last_admitted_incarnation((int32)env->source_node_id)
 			   == source_incarnation
 		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id) == self_incarnation
-		&& source_incarnation == key.origin_boot_incarnation
+		&& source_incarnation == (delegated ? delegated_close.parent.boot_incarnation
+			: key.origin_boot_incarnation)
 		&& cluster_reconfig_get_observed_epoch((int32)env->source_node_id) == key.formation_epoch
 		&& (!cluster_write_fence_enforcing() || cluster_write_fence_allowed())
 		&& cluster_semantic_activation_enter_r4_terminal_census(&admission)
 			   == CLUSTER_SEMANTIC_ADMISSION_OK) {
-		logical.owner_instance = key.owner_instance;
-		logical.segment_id = key.segment_id;
-		bracket_current
-			= admission.formation_epoch == key.formation_epoch
-			  && admission.record_generation == key.admission_record_generation
-			  && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-				  logical.segment_id, &root)
-			  && root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == key.root_id
-			  && root.root_generation == key.root_generation
-			  && key.root_descriptor_incarnation == root.root_generation
-			  && cluster_semantic_activation_recheck_r4_terminal_census(&admission);
-		if (bracket_current) {
-			identity.node_id = (uint16)cluster_node_id;
-			identity.capability_record_generation
-				= request.participant_capability_record_generation;
-			identity.boot_incarnation = self_incarnation;
-			identity.formation_epoch = admission.formation_epoch;
-			identity.admission_record_generation = admission.record_generation;
-			result = cluster_ctrc_participant_request_shared(
-				&key, &identity, request.grant_generation, request.seal_generation,
-				(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
-			if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
-				&& !cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
-				MemSet(&ack, 0, sizeof(ack));
-				first_reason = CTRC_SEAL_REASON_IDENTITY;
-				result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
+		PG_TRY();
+		{
+			logical.owner_instance = key.owner_instance;
+			logical.segment_id = key.segment_id;
+			bracket_current
+				= admission.formation_epoch == key.formation_epoch
+				  && admission.record_generation == key.admission_record_generation
+				  && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+					  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+					  logical.segment_id, &root)
+				  && root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == key.root_id
+				  && root.root_generation == key.root_generation
+				  && key.root_descriptor_incarnation == root.root_generation
+				  && cluster_semantic_activation_recheck_r4_terminal_census(&admission);
+			if (bracket_current) {
+				identity.node_id = (uint16)cluster_node_id;
+				identity.capability_record_generation
+					= request.participant_capability_record_generation;
+				identity.boot_incarnation = self_incarnation;
+				identity.formation_epoch = admission.formation_epoch;
+				identity.admission_record_generation = admission.record_generation;
+				if (delegated) {
+					if (memcmp(&identity, &delegated_close.receiver, sizeof(identity)) == 0
+						&& admission.record_generation <= UINT32_MAX
+						&& identity.capability_record_generation == (uint32)admission.record_generation
+						/* Custody uses the OPEN record domain, independently
+						 * of the HELLO connection generation checked above. */
+						&& delegated_close.parent.capability_record_generation
+							== (uint32)admission.record_generation) {
+						result = certificate
+							? cluster_ctrc_participant_delegated_certificate_shared(&delegated_close, &first_reason)
+							: cluster_ctrc_participant_delegated_close_shared(&delegated_close, &first_reason);
+						if (!certificate && result == CTRC_SEAL_REPLY_BLOCKED_RETAIN
+							&& cluster_ctrc_participant_delegation_merge_observed_shared(&delegated_close)) {
+							result = CTRC_SEAL_REPLY_DELEGATION_MERGED;
+							first_reason = 0;
+						}
+						if (!certificate && result == CTRC_SEAL_REPLY_PENDING_DRAIN
+							&& cluster_ctrc_participant_delegated_subtree_ack_shared(&delegated_close, &subtree_ack)) {
+							result = CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK;
+							first_reason = 0;
+						}
+					}
+				} else {
+					if (request.suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED) {
+						ClusterCtrcCloseDispatch notice = { 0 };
+
+						notice.key = key;
+						notice.participant = identity;
+						notice.request_id = request.request_id;
+						notice.grant_generation = request.grant_generation;
+						notice.seal_generation = request.seal_generation;
+						notice.suboperation = CTRC_SEAL_CERTIFICATE_COMMITTED;
+						result = cluster_ctrc_participant_certificate_request_shared(&notice, &first_reason);
+					} else
+						result = cluster_ctrc_participant_request_shared(
+							&key, &identity, request.grant_generation, request.seal_generation,
+							(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
+					if (result == CTRC_SEAL_REPLY_PENDING_DRAIN
+						&& request.suboperation == CTRC_SEAL_CLOSE_AND_CLEAN
+						&& cluster_ctrc_participant_root_subtree_ack_shared(&key, &identity,
+							request.grant_generation, request.seal_generation, &root_ack)) {
+						result = CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK;
+						first_reason = 0;
+					}
+				}
+				if ((result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
+						|| result == CTRC_SEAL_REPLY_DELEGATION_MERGED
+						|| result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
+						|| result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK
+						|| (request.suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED
+							&& result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
+					&& (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
+						|| ((result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
+							|| result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK
+							|| (request.suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED
+								&& result == CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED))
+							&& (((int32)env->source_node_id == cluster_node_id
+									? (cluster_ic_local_capability_word() & required_capabilities) != required_capabilities
+									: !cluster_sf_peer_capability_generation_matches((int32)env->source_node_id,
+										required_capabilities, source_capability_generation))
+								|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self_incarnation
+								|| cluster_membership_get_last_admitted_incarnation((int32)env->source_node_id) != source_incarnation)))) {
+					MemSet(&ack, 0, sizeof(ack));
+					MemSet(&subtree_ack, 0, sizeof(subtree_ack));
+					MemSet(&root_ack, 0, sizeof(root_ack));
+					first_reason = CTRC_SEAL_REASON_IDENTITY;
+					result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
+				}
 			}
 		}
-		cluster_semantic_activation_leave(&admission);
+		PG_FINALLY();
+		{
+			cluster_semantic_activation_leave(&admission);
+		}
+		PG_END_TRY();
 	}
 
 	reply = (char *)palloc0(reply_total);
 	outer = (GcsBlockReplyHeader *)reply;
 	page = (uint8 *)(reply + sizeof(*outer));
-	if (!cluster_ctrc_seal_reply_encode(
+	if (result == CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK
+		? !cluster_ctrc_root_ack_reply_encode((const uint8 *)payload, &root_ack, page, GCS_BLOCK_DATA_SIZE)
+		: result == CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK
+		? !cluster_ctrc_delegated_ack_reply_encode(&delegated_close, &subtree_ack, page, GCS_BLOCK_DATA_SIZE)
+		: !cluster_ctrc_seal_reply_encode(
 			(const uint8 *)payload, env->payload_length, cluster_node_id,
 			(int32)env->source_node_id, result, first_reason,
 			result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK ? &ack : NULL, page, GCS_BLOCK_DATA_SIZE)) {

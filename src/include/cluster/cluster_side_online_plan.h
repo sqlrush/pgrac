@@ -249,17 +249,15 @@ extern bool rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1
 														XLogRecPtr native_redo);
 extern bool rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 												   const RfSideXactOperationV1 *operation);
-/* Identify the preceding versioned TT abort for a replay operation only.
- * Target reconstruction, durability and terminal publication remain separate. */
+/* Match the complete immutable native ABORT to its unique earlier exact TT
+ * terminal. V2 also requires the original FullXid; legacy never supplies it.
+ * target excludes retained history, identity may observe it. No output on refusal. */
 extern bool rf_side_online_plan_abort_target_v1(const RfSideOnlinePlanV1 *plan,
-												const RfSideOnlineOperationV1 *operation,
-												ClusterUndoDecoded *out);
-/* Read-only identity from the same unique immutable carrier, including
- * retained history. This does not authorize replay, IO or terminal publication.
- * Failure leaves out untouched. The replay-only target accessor stays strict. */
+												 const RfSideOnlineOperationV1 *operation,
+												 ClusterUndoDecoded *out);
 extern bool rf_side_online_plan_abort_identity_v1(const RfSideOnlinePlanV1 *plan,
-												  const RfSideOnlineOperationV1 *operation,
-												  ClusterUndoDecoded *out);
+												   const RfSideOnlineOperationV1 *operation,
+												   ClusterUndoDecoded *out);
 /* Only later native TRUNCATE in this exact sealed source can justify an
  * absent CREATE page. No visibility or mutation authority is returned. */
 extern bool rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *plan,
@@ -312,32 +310,24 @@ extern RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
 										   uint32 segment_id, const char *base,
 										   RfSideUndoHeaderImageV1 *out);
-/* Prepare only the selected TT/undo record's source prefix. Full identity,
- * source uniqueness and recovery purpose are required. This is a private
- * image, not an apply/terminal or complete-source proof; the original owner
- * still owes whole-source preflight, target binding and durability. A header
- * base outside the prefix is refused, never inferred covered by later WAL.
- * Block images require a prefix FPI and do not inspect target DATA. No output
- * change on refusal. */
-extern RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_record_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
-										   const RfPageOnlineRecordIdentityV1 *identity,
-										   const char *base, RfSideUndoHeaderImageV1 *out);
-/* The same exact prefix's segment header, including for a block record or
- * native ABORT bound to its unique preceding exact TT_ABORT.
- * This is private byte preparation, not permission to install a header. */
-extern RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_record_header_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
-												  const RfPageOnlineRecordIdentityV1 *identity,
-												  const char *base, RfSideUndoHeaderImageV1 *out);
-/* Read-only header input at the same exact prefix, also allowing a retained
- * history record as its endpoint. Original source/identity and lifecycle/base
- * checks still apply. This grants no apply, durability or coverage authority;
- * the execution preparation APIs above continue to reject history endpoints.
- * No output change on refusal. */
+/* Read the header through this exact source record only, including retained
+ * history inputs. Native ABORT retains target's stricter history boundary.
+ * Full source validation precedes the private prefix; no mutation or retirement. */
 extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_record_input_header_v1(
 	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
 	const char *base, RfSideUndoHeaderImageV1 *out);
+/* Selected replay excludes history. Header-only reads may cover a native
+ * ABORT, but DATA and head reads stay within its exact retained prefix.
+ * The original owner retains authority, installation and durability. */
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_record_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out);
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_record_header_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	const char *base, RfSideUndoHeaderImageV1 *out);
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_head_block_v1(
+	const RfSideOnlinePlanV1 *plan, uint32 index, const RfPageOnlineRecordIdentityV1 *identity,
+	RfSideUndoBlockImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 typedef struct RfSideSpaceContributionV1 {
 	ClusterSpaceIdentity result;

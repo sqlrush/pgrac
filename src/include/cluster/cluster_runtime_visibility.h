@@ -34,9 +34,11 @@
 #ifndef CLUSTER_RUNTIME_VISIBILITY_H
 #define CLUSTER_RUNTIME_VISIBILITY_H
 
+#include "access/transam.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_scn.h"	  /* SCN */
+#include "cluster/cluster_tt_slot.h" /* TTSlot observation */
 #include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -51,6 +53,8 @@ typedef enum ClusterTxResolveReason ClusterTxResolveReason;
 typedef enum ClusterTxOutcome ClusterTxOutcome;
 typedef struct ClusterTxLocator ClusterTxLocator;
 typedef struct ClusterTxResolution ClusterTxResolution;
+typedef struct ClusterCtrcItlTargetIdentity ClusterCtrcItlTargetIdentity;
+typedef struct ClusterCtrcItlReadGuardV1 ClusterCtrcItlReadGuardV1;
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
 typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
@@ -97,7 +101,7 @@ typedef struct ClusterCurrentMemberProofKey ClusterCurrentMemberProofKey;
 /* Stack/process-local continuation for the exact origin DATA -> canonical TT
  * -> DATA proof.  The representation is private to the provider; it is not a
  * wire or shared-memory ABI and never grants authority by itself. */
-#define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES 8704
+#define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES 8960
 typedef union ClusterRuntimeVisibilityOriginPlan {
 	uint64 align;
 	uint8 opaque[CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES];
@@ -210,6 +214,27 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_admitted
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
+/* Readonly current observation of already-retained foreign identity under
+ * the original entered census admission. No lookup/grant RPC, mutation or
+ * lifetime token; callers must keep final page and authority checks. */
+extern bool cluster_runtime_visibility_foreign_companion_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterSemanticAdmissionToken *admission);
+/* Exact captured page/ITL variant; retains the original source/admission
+ * checks. This observation does not replace final page or writer ownership. */
+extern bool cluster_runtime_visibility_foreign_companion_target_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission);
+/* Transfer a validated exact source scope to the original caller. On success
+ * caller must release before its admission leaves; refusal/ERROR releases.
+ * This is neither F/H qualification nor a page/writer grant. */
+extern bool cluster_runtime_visibility_foreign_companion_target_hold_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission, ClusterCtrcItlReadGuardV1 *guard);
+/* Validate the same held key/FullXid/page source, without reacquiring OPEN.
+ * Refusal does not release caller ownership; its original finally does. */
+extern bool cluster_runtime_visibility_foreign_companion_target_guard_current_admitted(
+	const ClusterTxResolution *resolution, const ClusterCtrcItlTargetIdentity *target,
+	const ClusterSemanticAdmissionToken *admission, const ClusterCtrcItlReadGuardV1 *guard);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_terminal_census_retained_exact(
 	const ClusterTxLocator *locator, SCN retained_commit_scn,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
@@ -461,6 +486,25 @@ extern ClusterVisTtProof cluster_vis_tt_block_exact_proof(
 	uint32 expected_segment_generation, uint16 expected_slot_offset,
 	TransactionId expected_xid, uint16 expected_wrap, SCN *out_commit_scn);
 
+/* Copy one slot only after explicit TT32/TT40 framing, owner and generation
+ * checks. TT40 additionally validates the stored original identity. This is
+ * an observation, not a transaction verdict or a live-origin grant; callers
+ * retain their exact xid/wrap, C1b and final current/ROOT/admission checks.
+ * TT32 leaves FullXid invalid. Refusal clears both outputs. */
+extern bool cluster_vis_tt_block_slot_read(
+	const char *block, uint32 expected_segment_id, uint8 expected_owner_instance,
+	uint32 expected_segment_generation, uint16 expected_slot_offset,
+	TTSlot *out_slot, FullTransactionId *out_original_full_xid);
+
+/* Same exact predicate, additionally copying the persisted TT40 FullXid.
+ * TT32 leaves it invalid; no epoch is inferred. NONE clears both outputs.
+ * A known FullXid from an independent carrier must still match in full. */
+extern ClusterVisTtProof cluster_vis_tt_block_exact_fact(
+	const char *block, uint32 expected_segment_id, uint8 expected_owner_instance,
+	uint32 expected_segment_generation, uint16 expected_slot_offset,
+	TransactionId expected_xid, uint16 expected_wrap, SCN *out_commit_scn,
+	FullTransactionId *out_original_full_xid);
+
 /* A local, bounded same-header batch; no wire or persistent layout. */
 #define CLUSTER_VIS_TT_EXACT_BATCH_MAX CLUSTER_ITL_INITRANS_DEFAULT
 
@@ -474,6 +518,8 @@ typedef struct ClusterVisTtExactBatch {
 	uint32 count;
 	ClusterVisTtProof proofs[CLUSTER_VIS_TT_EXACT_BATCH_MAX];
 	SCN commit_scns[CLUSTER_VIS_TT_EXACT_BATCH_MAX];
+	/* Same exact TT40 bytes; legacy TT32 leaves these invalid. No grant. */
+	FullTransactionId original_full_xids[CLUSTER_VIS_TT_EXACT_BATCH_MAX];
 	ClusterLiveAuthority authority;
 } ClusterVisTtExactBatch;
 
@@ -484,6 +530,8 @@ typedef struct ClusterVisTtExactBatch {
  * in request order; any missing/mismatching fact refuses the complete batch
  * and zeroes out.  Input and output must not overlap.  Equal xids are never
  * coalesced: each slot/wrap is checked independently against the same bytes.
+ * TT40 also returns that exact slot's persisted FullXid; TT32 leaves it
+ * invalid. A known caller FullXid must match in full before consumption.
  *
  * These are TT facts, not row terminal verdicts: COMMITTED remains precommit
  * evidence requiring the origin's C1b finalization.  The caller must still

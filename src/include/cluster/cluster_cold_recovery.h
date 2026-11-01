@@ -550,7 +550,27 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 
 #ifndef FRONTEND
 
+#include "cluster/cluster_tt_slot.h"
 #include "utils/guc.h"
+
+/* Raw physical TT address; this key grants no terminal or epoch authority. */
+typedef struct ClusterColdTtSlotKeyV1 {
+	uint8 owner_instance;
+	uint32 segment_id;
+	uint32 segment_generation;
+	uint32 slot_offset;
+	TransactionId xid;
+	uint16 slot_wrap;
+} ClusterColdTtSlotKeyV1;
+
+/* Copied immutable slot input. Legacy input leaves both identity fields zero.
+ * Durable TT40 identity does not qualify a top transaction or recovery owner. */
+typedef struct ClusterColdTtSlotInputV1 {
+	ClusterColdTtSlotKeyV1 key;
+	TTSlot slot;
+	uint64 original_full_xid;
+	uint8 tt_layout_version; /* zero: legacy raw input, two: exact durable TT40 */
+} ClusterColdTtSlotInputV1;
 
 /*
  * cluster.cold_recovery_plan_memory (kB, PGC_POSTMASTER): everything one
@@ -1043,14 +1063,6 @@ extern bool cluster_cold_tt_base_namespace_matches_v1(const ClusterColdTypedV1 *
 
 /* Physical input identity only: xid is raw, not FullXid, and there is no
  * cluster epoch or checkpoint/terminal proof. Generation zero is valid. */
-typedef struct ClusterColdTtSlotKeyV1 {
-	uint8 owner_instance;
-	uint32 segment_id;
-	uint32 segment_generation;
-	uint32 slot_offset;
-	TransactionId xid;
-	uint16 slot_wrap;
-} ClusterColdTtSlotKeyV1;
 
 /* Read-only canonical input for the new creator of one retained heap record.
  * This covers INSERT/UPDATE/HOT_UPDATE and MULTI_INSERT only, not old tuple
@@ -1084,10 +1096,6 @@ typedef struct ClusterColdPageActorV1 {
 extern bool cluster_cold_typed_page_actor_v1(const ClusterColdTypedV1 *typed, uint32 frame_index,
 											 ClusterColdPageActorV1 *out);
 
-typedef struct ClusterColdTtSlotInputV1 {
-	ClusterColdTtSlotKeyV1 key;
-	TTSlot slot;
-} ClusterColdTtSlotInputV1;
 
 /* Physical identity of a slot that remains ACTIVE after sealed redo. The
  * key already carries the raw xid; this value deliberately has no FullXid,

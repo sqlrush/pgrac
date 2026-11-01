@@ -83,6 +83,7 @@ typedef enum UndoRecordType {
 	UNDO_RECORD_UPDATE = 2,
 	UNDO_RECORD_DELETE = 3,
 	UNDO_RECORD_ITL = 4,
+	UNDO_RECORD_SAVEPOINT_ROLLBACK = 5,
 } UndoRecordType;
 
 
@@ -93,6 +94,7 @@ typedef enum UndoRecordType {
 #define UNDO_REC_FLAG_CONTINUED 0x02	   /* continued from previous block (future) */
 #define UNDO_REC_FLAG_TOAST 0x04		   /* payload references TOAST (future) */
 #define UNDO_REC_FLAG_HAS_ITL_HISTORY 0x08 /* complete prior page-slot images */
+#define UNDO_REC_FLAG_HAS_OPERATION 0x10 /* explicit child operation trailer */
 
 
 /*
@@ -391,7 +393,124 @@ typedef struct UndoItlHistoryTrailer {
 StaticAssertDecl(sizeof(UndoItlHistoryEntry) == 64, "undo history entry is 64B");
 StaticAssertDecl(sizeof(UndoItlHistoryTrailer) == 136, "undo history trailer is 136B");
 
+/* The explicitly flagged operation trailer follows the ITL history.  Its
+ * fields use the same native byte order as the containing undo record.
+ * Copy it from an unaligned payload before accessing any field. */
+#define UNDO_OPERATION_TRAILER_VERSION 1
+#define UNDO_OPERATION_TRAILER_LENGTH 48
+
+typedef enum ClusterSavepointEffectState {
+	CLUSTER_SAVEPOINT_EFFECT_LIVE = 1,
+	CLUSTER_SAVEPOINT_EFFECT_DISCARDED = 2
+} ClusterSavepointEffectState;
+
+typedef struct UndoOperationTrailer {
+	uint16 version;
+	uint16 length;
+	uint8 effect_state;
+	uint8 reserved[3];
+	uint64 canonical_top_fxid;
+	uint64 operation_fxid;
+	uint64 operation_sequence;
+	uint32 canonical_segment_generation;
+	CommandId command_id;
+	SubTransactionId subid;
+	uint32 reserved_end;
+} UndoOperationTrailer;
+
+StaticAssertDecl(sizeof(UndoOperationTrailer) == UNDO_OPERATION_TRAILER_LENGTH,
+				 "undo operation trailer is 48B");
+StaticAssertDecl(offsetof(UndoOperationTrailer, version) == 0, "operation version offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, length) == 2, "operation length offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, effect_state) == 4, "operation state offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, reserved) == 5, "operation reserved offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, canonical_top_fxid) == 8, "operation top offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, operation_fxid) == 16, "operation writer offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, operation_sequence) == 24,
+				 "operation sequence offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, canonical_segment_generation) == 32,
+				 "operation canonical generation offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, command_id) == 36, "operation command offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, subid) == 40, "operation subid offset");
+StaticAssertDecl(offsetof(UndoOperationTrailer, reserved_end) == 44,
+				 "operation reserved end offset");
+
+/* Control nodes have no heap target/history.  They retain an operation
+ * identity but do not represent a data effect.  Native byte order matches
+ * the containing undo record; received payloads may be unaligned.
+ * Spec: 2026-10-26-pre2-p013-full-savepoint-design.md */
+#define UNDO_SAVEPOINT_ROLLBACK_VERSION 1
+#define UNDO_SAVEPOINT_ROLLBACK_LENGTH 96
+#define UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH                                                     \
+	(UNDO_SAVEPOINT_ROLLBACK_LENGTH + UNDO_OPERATION_TRAILER_LENGTH)
+
+typedef enum UndoSavepointRollbackPhase {
+	UNDO_SAVEPOINT_ROLLBACK_RESERVED = 1,
+	UNDO_SAVEPOINT_ROLLBACK_PENDING = 2,
+	UNDO_SAVEPOINT_ROLLBACK_MARKING = 3,
+	UNDO_SAVEPOINT_ROLLBACK_COMPLETE = 4
+} UndoSavepointRollbackPhase;
+
+typedef struct UndoSavepointRollbackPayload {
+	uint16 version;
+	uint16 length;
+	uint8 phase;
+	uint8 reserved[3];
+	uint64 rollback_sequence;
+	UBA start_uba;
+	UBA stop_uba;
+	UBA next_uba;
+	uint64 scope_child_fxid;
+	XLogRecPtr last_effect_wal_lsn;
+	uint64 visited_count;
+	uint64 reserved_end;
+} UndoSavepointRollbackPayload;
+
+StaticAssertDecl(sizeof(UndoSavepointRollbackPayload) == UNDO_SAVEPOINT_ROLLBACK_LENGTH,
+				 "undo rollback body is 96B");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, version) == 0, "rollback version offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, length) == 2, "rollback length offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, phase) == 4, "rollback phase offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, reserved) == 5, "rollback reserved offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, rollback_sequence) == 8,
+				 "rollback sequence offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, start_uba) == 16, "rollback start offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, stop_uba) == 32, "rollback stop offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, next_uba) == 48, "rollback next offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, scope_child_fxid) == 64,
+				 "rollback scope offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, last_effect_wal_lsn) == 72,
+				 "rollback effect LSN offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, visited_count) == 80,
+				 "rollback visited count offset");
+StaticAssertDecl(offsetof(UndoSavepointRollbackPayload, reserved_end) == 88,
+				 "rollback reserved end offset");
+
 #ifdef USE_PGRAC_CLUSTER
+/* Structural validation only; canonical ownership and scope membership
+ * still require the caller's original protected authority checks. */
+static inline bool
+cluster_undo_operation_trailer_valid(const UndoRecordHeader *record,
+									 const UndoOperationTrailer *operation)
+{
+	return operation->version == UNDO_OPERATION_TRAILER_VERSION
+		   && operation->length == UNDO_OPERATION_TRAILER_LENGTH
+		   && (operation->effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE
+			   || operation->effect_state == CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
+		   && operation->reserved[0] == 0 && operation->reserved[1] == 0
+		   && operation->reserved[2] == 0 && operation->reserved_end == 0
+		   && TransactionIdIsNormal((TransactionId)operation->canonical_top_fxid)
+		   && TransactionIdIsNormal((TransactionId)operation->operation_fxid)
+		   && (TransactionId)operation->operation_fxid == record->xid
+		   && operation->operation_fxid > operation->canonical_top_fxid
+		   && operation->operation_sequence != 0
+		   && operation->canonical_segment_generation != PG_UINT32_MAX
+		   && operation->command_id != InvalidCommandId && operation->subid > TopSubTransactionId;
+}
+
+/* History validation invokes the backend SCN comparison API. Frontend
+ * descriptors use only the explicit operation/control structure checks. */
+#ifndef FRONTEND
 static inline bool
 cluster_undo_history_prior_valid(const ClusterItlSlotData *prior)
 {
@@ -564,6 +683,154 @@ cluster_undo_record_decode_payload(const UndoRecordHeader *record, const void *p
 	*history_out = history;
 	return true;
 }
+/* Strict data-operation decoding preserves the original body offsets.
+ * Outputs clear before refusal; payload may be unaligned. */
+static inline bool
+cluster_undo_record_decode_operation_payload(const UndoRecordHeader *record, const void *payload,
+											 size_t payload_bytes, uint16 *body_length_out,
+											 UndoItlHistoryTrailer *history_out,
+											 UndoOperationTrailer *operation_out)
+{
+	UndoOperationTrailer operation;
+	UndoItlHistoryTrailer history;
+	UndoRecordHeader body_record;
+	uint16 body_length;
+	size_t original_bytes;
+	const uint8 required = UNDO_REC_FLAG_HAS_OPERATION | UNDO_REC_FLAG_HAS_ITL_HISTORY;
+
+	if (body_length_out != NULL)
+		*body_length_out = 0;
+	if (history_out != NULL)
+		memset(history_out, 0, sizeof(*history_out));
+	if (operation_out != NULL)
+		memset(operation_out, 0, sizeof(*operation_out));
+	if (record == NULL || payload == NULL || body_length_out == NULL || history_out == NULL
+		|| operation_out == NULL || payload_bytes != record->payload_length
+		|| payload_bytes < sizeof(operation) || (record->flags & required) != required
+		|| record->record_type < UNDO_RECORD_INSERT || record->record_type > UNDO_RECORD_ITL)
+		return false;
+
+	original_bytes = payload_bytes - sizeof(operation);
+	memcpy(&operation, (const char *)payload + original_bytes, sizeof(operation));
+	if (!cluster_undo_operation_trailer_valid(record, &operation))
+		return false;
+
+	/* Preserve the raw writer and original body offsets for all old checks,
+	 * including ITL lock_xid.  Only this local view loses the extension. */
+	body_record = *record;
+	body_record.flags &= ~UNDO_REC_FLAG_HAS_OPERATION;
+	body_record.payload_length = (uint16)original_bytes;
+	if (!cluster_undo_record_decode_payload(&body_record, payload, original_bytes, &body_length,
+											&history))
+		return false;
+	*body_length_out = body_length;
+	*history_out = history;
+	*operation_out = operation;
+	return true;
+}
+
+#endif /* !FRONTEND */
+
+/* A cursor may cross data segments while retaining the original TT slot
+ * and origin. No address ordering or generation proof is inferred here. */
+static inline bool
+cluster_undo_rollback_address_valid(const UndoRecordHeader *record, UBA address, bool allow_invalid)
+{
+	uint32 segment;
+	uint32 block;
+	uint16 tt;
+	uint16 row;
+
+	if (UBA_is_invalid(address))
+		return allow_invalid;
+	return uba_decode_record(address, &segment, &block, &tt, &row)
+		   && row < (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
+		   && (uint32)tt + 1 == record->tt_slot_id
+		   && (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE == record->origin_node_id;
+}
+
+
+static inline bool
+cluster_undo_rollback_body_valid(const UndoRecordHeader *record,
+								 const UndoSavepointRollbackPayload *body)
+{
+	if (body->version != UNDO_SAVEPOINT_ROLLBACK_VERSION
+		|| body->length != UNDO_SAVEPOINT_ROLLBACK_LENGTH
+		|| body->phase < UNDO_SAVEPOINT_ROLLBACK_RESERVED
+		|| body->phase > UNDO_SAVEPOINT_ROLLBACK_COMPLETE || body->reserved[0] != 0
+		|| body->reserved[1] != 0 || body->reserved[2] != 0 || body->reserved_end != 0
+		|| body->rollback_sequence == 0)
+		return false;
+	if (body->phase == UNDO_SAVEPOINT_ROLLBACK_RESERVED)
+		return UBA_is_invalid(record->prev_uba) && UBA_is_invalid(body->start_uba)
+			   && UBA_is_invalid(body->stop_uba) && UBA_is_invalid(body->next_uba)
+			   && body->last_effect_wal_lsn == InvalidXLogRecPtr && body->visited_count == 0;
+	if (!cluster_undo_rollback_address_valid(record, body->start_uba, false)
+		|| !cluster_undo_rollback_address_valid(record, body->stop_uba, true)
+		|| !cluster_undo_rollback_address_valid(record, body->next_uba, true)
+		|| !cluster_undo_record_uba_equal(record->prev_uba, body->start_uba)
+		|| cluster_undo_record_uba_equal(body->start_uba, body->stop_uba)
+		|| (UBA_is_invalid(body->next_uba) && !UBA_is_invalid(body->stop_uba)))
+		return false;
+	if (body->visited_count == 0) {
+		if (body->last_effect_wal_lsn != InvalidXLogRecPtr
+			|| !cluster_undo_record_uba_equal(body->next_uba, body->start_uba))
+			return false;
+	} else if (body->last_effect_wal_lsn == InvalidXLogRecPtr
+			   || cluster_undo_record_uba_equal(body->next_uba, body->start_uba))
+		return false;
+	if (body->phase == UNDO_SAVEPOINT_ROLLBACK_PENDING)
+		return body->visited_count == 0;
+	if (body->phase == UNDO_SAVEPOINT_ROLLBACK_COMPLETE)
+		return body->visited_count != 0
+			   && cluster_undo_record_uba_equal(body->next_uba, body->stop_uba);
+	return true;
+}
+
+/* The original current/CRC, canonical TT/generation and retained-source
+ * proofs remain caller-owned; decoding grants no visibility or completion. */
+static inline bool
+cluster_undo_record_decode_rollback_payload(const UndoRecordHeader *record, const void *payload,
+											size_t payload_bytes,
+											UndoSavepointRollbackPayload *body_out,
+											UndoOperationTrailer *operation_out)
+{
+	UndoSavepointRollbackPayload body;
+	UndoOperationTrailer operation;
+	const uint8 allowed = UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_OPERATION;
+
+	if (body_out != NULL)
+		memset(body_out, 0, sizeof(*body_out));
+	if (operation_out != NULL)
+		memset(operation_out, 0, sizeof(*operation_out));
+	if (record == NULL || payload == NULL || body_out == NULL || operation_out == NULL
+		|| payload_bytes != UNDO_SAVEPOINT_ROLLBACK_PAYLOAD_LENGTH
+		|| payload_bytes != record->payload_length
+		|| record->record_type != UNDO_RECORD_SAVEPOINT_ROLLBACK || (record->flags & ~allowed) != 0
+		|| (record->flags & UNDO_REC_FLAG_HAS_OPERATION) == 0
+		|| ((record->flags & UNDO_REC_FLAG_FIRST_IN_TX) != 0) != UBA_is_invalid(record->prev_uba)
+		|| !SCN_VALID(record->write_scn) || record->origin_node_id > SCN_MAX_VALID_NODE_ID
+		|| record->tt_slot_segment_id == 0
+		|| (record->tt_slot_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+			   != record->origin_node_id
+		|| record->tt_slot_id == 0 || record->tt_slot_id > TT_SLOTS_PER_SEGMENT
+		|| record->tt_wrap_plus1 == 0 || record->target_locator.spcOid != 0
+		|| record->target_locator.dbOid != 0 || record->target_locator.relNumber != 0
+		|| record->target_fork != 0 || record->target_block != 0 || record->target_offset != 0)
+		return false;
+	memcpy(&body, payload, sizeof(body));
+	memcpy(&operation, (const char *)payload + sizeof(body), sizeof(operation));
+	if (!cluster_undo_operation_trailer_valid(record, &operation)
+		|| operation.effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+		|| body.scope_child_fxid != operation.operation_fxid
+		|| !cluster_undo_rollback_body_valid(record, &body))
+		return false;
+	*body_out = body;
+	*operation_out = operation;
+	return true;
+}
+
+
 #endif
 
 

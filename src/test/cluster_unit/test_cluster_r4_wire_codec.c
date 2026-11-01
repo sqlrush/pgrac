@@ -741,10 +741,171 @@ UT_TEST(test_kind4_generation_request_distinguishes_origin_sample_from_zero)
 															 &decoded, &generation));
 }
 
+static ClusterTxResolution
+companion_resolution(void)
+{
+	ClusterTxResolution resolution = verdict_resolution(CLUSTER_TX_COMMITTED,
+		CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+	ClusterTxCanonicalCompanionV1 *companion = &resolution.origin_companion;
+
+	resolution.locator_echo.uba = uba_encode(1, 1, 3, 100);
+	resolution.top_xid = resolution.locator_echo.xid;
+	resolution.authority.origin_epoch = 42;
+	companion->key = (ClusterCtrcTxnKeyV1){
+		.format_version = CLUSTER_CTRC_FORMAT_VERSION, .owner_instance = 1,
+		.origin_node_id = 0, .segment_id = 2, .segment_generation = 9,
+		.slot_offset = 4, .slot_wrap = 7, .xid = resolution.top_xid,
+		.cluster_epoch = 42, .system_identifier = UINT64_C(0x1122334455667788),
+		.origin_boot_incarnation = 23, .formation_epoch = 42,
+		.admission_record_generation = 5, .root_descriptor_incarnation = 7,
+		.root_id = 91, .root_generation = 7
+	};
+	companion->original_full_xid = FullTransactionIdFromEpochAndXid(9, resolution.top_xid);
+	companion->creation_target = (ClusterTxCreationTarget){
+		.locator = {1663, 1, 42}, .fork = MAIN_FORKNUM, .block = 9,
+		.offset = 2, .tuple_length = 32, .valid = true
+	};
+	companion->present = true;
+	resolution.local_canonical = (ClusterTTSlotPhysicalLocator){
+		.segment_id = 2, .slot_offset = 4, .wrap = 7, .xid = resolution.top_xid
+	};
+	resolution.local_canonical_generation = 9;
+	resolution.local_canonical_valid = true;
+	resolution.local_original_full_xid = companion->original_full_xid;
+	resolution.local_creation_target = companion->creation_target;
+	return resolution;
+}
+
+UT_TEST(test_companion_v4_exact_roundtrip_is_separate_from_local_authority)
+{
+	ClusterTxResolution input = companion_resolution(), output;
+	uint8 page[BLCKSZ];
+
+	UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+	UT_ASSERT_EQ(ClusterR4WireReadU16(page + 4), 4);
+	UT_ASSERT_EQ(ClusterR4WireReadU16(page + 6), 224);
+	UT_ASSERT_EQ(ClusterR4WireReadU32(page + 84), 2);
+	UT_ASSERT_EQ(ClusterR4WireReadU64(page + 176), U64FromFullTransactionId(input.local_original_full_xid));
+	UT_ASSERT(bytes_are_zero(page + 208, BLCKSZ - 208));
+	UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+	UT_ASSERT_EQ(memcmp(&output.origin_companion, &input.origin_companion,
+		sizeof(input.origin_companion)), 0);
+	UT_ASSERT(!output.local_canonical_valid);
+	UT_ASSERT(bytes_are_zero((const uint8 *)&output.local_canonical, sizeof(output.local_canonical)));
+	UT_ASSERT_EQ(output.local_canonical_generation, 0);
+	UT_ASSERT(!FullTransactionIdIsValid(output.local_original_full_xid));
+	UT_ASSERT(!output.local_creation_target.valid);
+	UT_ASSERT(!output.local_aborted_xmax_target.valid);
+	UT_ASSERT_EQ(output.authority.live_hwm_lsn, InvalidXLogRecPtr);
+}
+
+UT_TEST(test_companion_absence_preserves_exact_v3_bytes)
+{
+	ClusterTxResolution input = companion_resolution(), output;
+	uint8 baseline[BLCKSZ], page[BLCKSZ];
+
+	input.origin_companion.present = false;
+	UT_ASSERT(ClusterR4TxVerdictPageEncode(baseline, &input));
+	UT_ASSERT_EQ(ClusterR4WireReadU16(baseline + 4), 3);
+	UT_ASSERT_EQ(ClusterR4WireReadU16(baseline + 6), 80);
+	UT_ASSERT(bytes_are_zero(baseline + 80, BLCKSZ - 80));
+	input.origin_companion.present = true;
+	input.origin_companion.creation_target.valid = false;
+	UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+	UT_ASSERT_EQ(memcmp(baseline, page, BLCKSZ), 0);
+	UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+	UT_ASSERT(!output.origin_companion.present);
+}
+
+UT_TEST(test_companion_received_observation_cannot_be_reexported_as_origin)
+{
+	ClusterTxResolution input = companion_resolution(), output;
+	uint8 page[BLCKSZ];
+
+	UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+	UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+	memset(page, 0xa5, sizeof(page));
+	UT_ASSERT(!ClusterR4TxVerdictPageEncode(page, &output));
+	UT_ASSERT(bytes_are_zero(page, sizeof(page)));
+}
+
+UT_TEST(test_companion_v4_rejects_malformed_framing_identity_and_target_atomically)
+{
+	static const struct { uint16 offset; uint8 width; uint64 value; } bad[] = {
+		{4,2,5}, {6,2,80}, {6,2,225}, {10,1,1}, {11,1,1},
+		{80,1,2}, {81,1,2}, {82,2,1}, {84,4,257}, {88,4,0},
+		{88,4,UINT32_MAX}, {92,2,TT_SLOTS_PER_SEGMENT}, {94,2,TT_WRAP_INVALID},
+		{96,4,799}, {100,4,43}, {104,8,0}, {112,8,0}, {120,8,43},
+		{128,8,0}, {136,8,0}, {144,8,0}, {152,8,0}, {160,1,1},
+		{175,1,1}, {176,8,0}, {176,8,UINT64_MAX}, {192,4,0},
+		{196,4,1}, {200,4,InvalidBlockNumber}, {204,2,0}, {204,2,MaxHeapTuplesPerPage+1},
+		{206,2,1}, {206,2,BLCKSZ}, {208,1,1}, {223,1,1}, {224,1,1},
+		{BLCKSZ-1,1,1}, {8,1,CLUSTER_TX_ABORTED}, {9,1,CLUSTER_TX_PROOF_ITL_CLEANOUT},
+		{36,4,799}, {56,8,43}, {12,8,0}
+	};
+	ClusterTxResolution input = companion_resolution(), output;
+	uint8 original[BLCKSZ], page[BLCKSZ];
+
+	UT_ASSERT(ClusterR4TxVerdictPageEncode(original, &input));
+	for (size_t i = 0; i < lengthof(bad); i++) {
+		memcpy(page, original, BLCKSZ);
+		switch (bad[i].width) {
+		case 1: page[bad[i].offset] = (uint8)bad[i].value; break;
+		case 2: ClusterR4WireWriteU16(page + bad[i].offset, (uint16)bad[i].value); break;
+		case 4: ClusterR4WireWriteU32(page + bad[i].offset, (uint32)bad[i].value); break;
+		case 8: ClusterR4WireWriteU64(page + bad[i].offset, bad[i].value); break;
+		}
+		memset(&output, 0xa5, sizeof(output));
+		UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+		UT_ASSERT(bytes_are_zero((const uint8 *)&output, sizeof(output)));
+	}
+}
+
+UT_TEST(test_companion_v4_encoding_requires_exact_local_source)
+{
+	for (int variant = 0; variant < 12; variant++) {
+		ClusterTxResolution input = companion_resolution();
+		uint8 page[BLCKSZ];
+
+		switch (variant) {
+		case 0: input.local_canonical_valid = false; break;
+		case 1: input.local_canonical.segment_id++; break;
+		case 2: input.local_canonical.slot_offset++; break;
+		case 3: input.local_canonical.wrap++; break;
+		case 4: input.local_canonical.xid++; break;
+		case 5: input.local_canonical_generation++; break;
+		case 6: input.local_original_full_xid = FullTransactionIdFromEpochAndXid(10, input.top_xid); break;
+		case 7: input.local_creation_target.locator.relNumber++; break;
+		case 8: input.local_creation_target.block++; break;
+		case 9: input.local_creation_target.offset++; break;
+		case 10: input.local_creation_target.tuple_length++; break;
+		case 11: input.origin_companion.key.reserved[15] = 1; break;
+		}
+		memset(page, 0xa5, sizeof(page));
+		UT_ASSERT(!ClusterR4TxVerdictPageEncode(page, &input));
+		UT_ASSERT(bytes_are_zero(page, sizeof(page)));
+	}
+}
+
+UT_TEST(test_companion_v4_wildcard_wrap_and_update_length_remain_explicit)
+{
+	ClusterTxResolution input = companion_resolution(), output;
+	ClusterTxLocator request = input.locator_echo;
+	uint8 page[BLCKSZ];
+
+	input.local_creation_target.tuple_length = 0;
+	input.origin_companion.creation_target.tuple_length = 0;
+	request.tt_wrap = TT_WRAP_INVALID;
+	UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+	UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &request, &output));
+	UT_ASSERT_EQ(output.origin_companion.creation_target.tuple_length, 0);
+	UT_ASSERT_EQ(output.origin_companion.key.slot_wrap, 7);
+}
+
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(102);
 	UT_RUN(test_kind4_generation_request_distinguishes_origin_sample_from_zero);
 	RUN_WIRE_TEST(0);
 	RUN_WIRE_TEST(1);
@@ -841,6 +1002,12 @@ main(void)
 	UT_RUN(test_r4_and_legacy_reply_status_domains_are_disjoint);
 	UT_RUN(test_r4_undo_data_status_selects_existing_authenticated_reply_shape);
 	UT_RUN(test_r4_status24_physical_generation_echo_is_exact);
+	UT_RUN(test_companion_v4_exact_roundtrip_is_separate_from_local_authority);
+	UT_RUN(test_companion_absence_preserves_exact_v3_bytes);
+	UT_RUN(test_companion_received_observation_cannot_be_reexported_as_origin);
+	UT_RUN(test_companion_v4_rejects_malformed_framing_identity_and_target_atomically);
+	UT_RUN(test_companion_v4_encoding_requires_exact_local_source);
+	UT_RUN(test_companion_v4_wildcard_wrap_and_update_length_remain_explicit);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

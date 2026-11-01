@@ -31,6 +31,7 @@
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "storage/procarray.h"
+#include "storage/ipc.h"
 #include "utils/wait_event.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
@@ -217,7 +218,7 @@ static FullTransactionId native_future;
 static TransactionId native_completed_xid;
 static GlobalTransaction native_locked_gxact;
 static BackendId native_backend_id = 1;
-static bool native_postmaster_environment = true;
+static bool native_postmaster_environment pg_attribute_unused() = true;
 static LWLock *native_prepared_locks[2];
 static LWLockMode native_prepared_modes[2];
 static unsigned native_prepared_depth;
@@ -808,6 +809,8 @@ s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribu
 {
 	abort();
 }
+
+static int fixture_declared_nodes = 4;
 
 int
 cluster_conf_declared_node_count_early(void)
@@ -4053,6 +4056,20 @@ UT_TEST(test_ack_batch_final_count_summary_and_identity_faults_are_isolated)
  * and finally cleanup. Only physical I/O/network leaves are fixture inputs. */
 static bool driver_other_progress;
 static bool driver_interrupt;
+static bool (*driver_delegation_dispatch)(const ClusterCtrcDelegationCloseV1 *request);
+static bool (*driver_certificate_dispatch)(const ClusterCtrcDelegationCloseV1 *request);
+
+static bool
+driver_delegation_dispatch_boundary(const ClusterCtrcDelegationCloseV1 *request)
+{
+	return driver_delegation_dispatch != NULL && driver_delegation_dispatch(request);
+}
+
+static bool
+driver_certificate_dispatch_boundary(const ClusterCtrcDelegationCloseV1 *request)
+{
+	return driver_certificate_dispatch != NULL && driver_certificate_dispatch(request);
+}
 
 static bool
 driver_no_receipt(void)
@@ -4097,6 +4114,8 @@ bool ctrc_fixture_run_pass(void);
 #define ctrc_cleaner_publish_certificate driver_no_certificate
 #define ctrc_cleaner_terminal_sample_exact driver_no_terminal
 #define cluster_gcs_ctrc_dispatch_batch driver_dispatch_boundary
+#define cluster_gcs_ctrc_dispatch_delegated_close driver_delegation_dispatch_boundary
+#define cluster_gcs_ctrc_dispatch_delegated_certificate driver_certificate_dispatch_boundary
 #ifndef CLUSTER_CTRC_DRIVER_BODY
 #define CLUSTER_CTRC_DRIVER_BODY "test_cluster_ctrc_run_pass.inc"
 #endif
@@ -4106,6 +4125,8 @@ bool ctrc_fixture_run_pass(void);
 #undef ctrc_cleaner_publish_certificate
 #undef ctrc_cleaner_terminal_sample_exact
 #undef cluster_gcs_ctrc_dispatch_batch
+#undef cluster_gcs_ctrc_dispatch_delegated_close
+#undef cluster_gcs_ctrc_dispatch_delegated_certificate
 
 static bool
 bind_test_worker(unsigned worker)
@@ -6154,7 +6175,9 @@ UT_TEST(test_active_scan_foreign_origin_uses_original_cohort_member)
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
 	finish_source_active_scan(&scan, &source);
 	UT_ASSERT_EQ(scan.status, CTRC_ACTIVE_SCAN_COMPLETE);
-	UT_ASSERT_EQ(scan.unqualified_entries, 0);
+	/* Knowing the original FullXid without a receiver handoff remains
+	 * unqualified, even when the origin is an admitted cohort member. */
+	UT_ASSERT_EQ(scan.unqualified_entries, 1);
 	UT_ASSERT(FullTransactionIdEquals(scan.min_full, entry->original_full_xid));
 	source.admitted_incarnation[1]++;
 	UT_ASSERT(cluster_ctrc_active_scan_begin(&scan, FullTransactionIdFromEpochAndXid(9, 10000)));
@@ -7814,6 +7837,8 @@ main(void)
 
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
+	printf("# participant_bytes=%zu read_guard_bytes=%zu reader_registry_bytes=%zu\n",
+		sizeof(ClusterCtrcParticipantEntry), sizeof(ClusterCtrcItlReadGuardV1), sizeof(CtrcItlReaders));
 	UT_RUN(test_origin_reserve_requires_published_local_top_protection);
 	UT_RUN(test_origin_reserve_requires_same_published_original_fullxid);
 	UT_RUN(test_origin_reserve_protected_pending_can_cancel);
@@ -7942,6 +7967,77 @@ main(void)
 	UT_RUN(test_actual_worker_active_pass_restarts_after_original_lease_refusal);
 	UT_RUN(test_actual_worker_active_pass_restarts_after_original_source_refusal);
 	UT_RUN(test_actual_worker_active_pass_does_not_sample_native_without_source);
+	UT_RUN(test_origin_fullxid_v2_foreign_receiver_retains_source);
+	UT_RUN(test_origin_grant_v2_registers_and_captures_in_one_original_lock);
+	UT_RUN(test_origin_grant_v2_refuses_unknown_identity_before_registration);
+	UT_RUN(test_receiver_retains_original_v2_bytes_for_delegation);
+	UT_RUN(test_local_first_registration_captures_protected_original_v2);
+	UT_RUN(test_v2_registration_never_backfills_missing_original_bytes);
+	UT_RUN(test_origin_fullxid_v2_local_producer_retains_source);
+	UT_RUN(test_origin_fullxid_v2_local_producer_rechecks_locked_source);
+	UT_RUN(test_origin_fullxid_v2_rejects_missing_or_mismatched_identity);
+	UT_RUN(test_origin_fullxid_v2_refuses_raw_only_receiver_backfill);
+	UT_RUN(test_delegation_custody_precedes_immutable_record_and_retry);
+	UT_RUN(test_delegation_custody_refusal_preserves_row_and_clears_output);
+	UT_RUN(test_delegation_custody_destination_restart_does_not_close_old_obligation);
+	UT_RUN(test_delegation_custody_prevents_drained_close_and_ack);
+	UT_RUN(test_delegation_custody_blocks_frozen_certificate_reclamation);
+	UT_RUN(test_delegation_receiver_registers_original_and_parent_before_handle);
+	UT_RUN(test_delegation_receiver_rejects_unbound_or_malformed_carrier_without_owner_change);
+	UT_RUN(test_delegation_receiver_never_backfills_existing_raw_only_registration);
+	UT_RUN(test_delegation_receiver_parent_or_sequence_cannot_be_replaced);
+	UT_RUN(test_delegation_receiver_local_drain_cannot_retire_parent);
+	UT_RUN(test_itl_delegation_source_binds_applied_slot_before_outgoing_custody);
+	UT_RUN(test_itl_delegation_source_rejects_every_changed_slot_byte);
+	UT_RUN(test_itl_delegation_source_requires_exact_page_and_itl_target);
+	UT_RUN(test_itl_delegation_source_rejects_nonapplied_or_corrupt_owner);
+	UT_RUN(test_itl_delegation_source_exact_retry_reuses_original_obligation);
+	UT_RUN(test_itl_delegation_source_record_reaches_original_receiver_engine);
+	UT_RUN(test_image_receiver_retains_original_parent_before_any_local_receipt);
+	UT_RUN(test_image_receiver_rejects_physical_or_authenticated_identity_mismatch);
+	UT_RUN(test_image_receiver_does_not_qualify_old_rows_or_replace_parent);
+	UT_RUN(test_image_receiver_custody_composes_with_original_receipt_prepare);
+	UT_RUN(test_image_receiver_first_registration_revokes_prior_scan_cut);
+	UT_RUN(test_image_publication_allocates_original_journal_identity_without_backend);
+	UT_RUN(test_image_publication_uses_exact_original_apply_and_premutation_cancel);
+	UT_RUN(test_image_publication_refuses_invalid_target_before_custody_or_sequence);
+	UT_RUN(test_image_publication_keeps_parent_when_journal_is_exhausted);
+	UT_RUN(test_image_publication_cannot_be_forged_through_ordinary_publication_api);
+	UT_RUN(test_actual_gcs_install_receipt_binds_original_fullxid_and_cancels_only_before_copy);
+	UT_RUN(test_actual_gcs_install_refused_after_copy_keeps_prepared_receipt_and_parent);
+	UT_RUN(test_registered_image_receiver_merges_without_new_parent_or_source_retirement);
+	UT_RUN(test_registered_ordinary_receiver_merges_into_original_receipt_owner);
+	UT_RUN(test_registered_receiver_merge_refuses_unknown_conflicting_or_closed_owner);
+	UT_RUN(test_registered_receiver_merge_does_not_extend_foreign_mx_domain);
+	UT_RUN(test_multihop_original_identity_reaches_actual_image_receipts);
+	UT_RUN(test_multihop_receiver_refuses_malformed_chain_before_registration);
+	UT_RUN(test_multihop_source_refuses_cycle_capacity_and_changed_applied_slot);
+	UT_RUN(test_multihop_receiver_merge_keeps_first_path_and_rejects_raw_only);
+	UT_RUN(test_multihop_actual_path_visits_each_nonorigin_node_once);
+	UT_RUN(test_multihop_maximum_record_bound_and_stored_path_validation);
+	UT_RUN(test_multihop_registered_path_merges_first_hop_without_replacing_its_parent);
+	UT_RUN(test_actual_gcs_multihop_image_registers_original_path_before_apply);
+	UT_RUN(test_actual_gcs_compact_inventory_is_atomic_before_first_registration);
+	UT_RUN(test_receiver_companion_requires_exact_retained_origin_and_applied_itl);
+	UT_RUN(test_receiver_companion_accepts_direct_parent_and_full_path_only_after_apply);
+	UT_RUN(test_receiver_companion_multiple_pages_share_identity_but_entire_chain_must_match);
+	UT_RUN(test_receiver_companion_data_segment_does_not_replace_canonical_key);
+	UT_RUN(test_qualified_foreign_first_registration_revokes_each_local_scan_cut);
+	UT_RUN(test_qualified_foreign_refusal_and_exact_duplicate_keep_registration_cut);
+	UT_RUN(test_qualified_foreign_registration_saturates_without_losing_custody);
+	UT_RUN(test_receiver_companion_target_requires_its_own_page_and_itl);
+	UT_RUN(test_retained_reader_blocks_key_ack_after_receipt_cleanup);
+	UT_RUN(test_retained_reader_rejects_stale_tokens_and_exit_releases_only_its_own);
+	UT_RUN(test_retained_reader_binds_exact_source_after_close_without_new_receipt);
+	UT_RUN(test_retained_native_reader_matches_original_admission_after_close);
+	UT_RUN(test_source_scan_stale_receiver_keeps_fullxid_but_cannot_qualify);
+	UT_RUN(test_source_scan_requires_exact_receiver_and_original_foreign_envelope);
+	UT_RUN(test_source_scan_accepts_only_exact_protected_parent_and_multihop_path);
+	UT_RUN(test_source_scan_local_origin_keeps_original_locked_fullxid_handoff);
+	UT_RUN(test_source_scan_requires_current_original_first_parent);
+	UT_RUN(test_source_scan_checks_every_actual_multihop_ancestor_in_same_cut);
+	UT_RUN(test_reserved_original_fullxid_is_read_only_under_original_origin_lock);
+	UT_RUN(test_reserved_original_fullxid_refuses_stale_and_foreign_without_mutation);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

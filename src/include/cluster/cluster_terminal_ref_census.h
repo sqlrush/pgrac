@@ -24,6 +24,7 @@
 #define CLUSTER_TERMINAL_REF_CENSUS_H
 
 #include "c.h"
+#include "cluster/cluster_ctrc_origin_fullxid.h"
 
 #include "access/transam.h"
 #include "access/xlogdefs.h"
@@ -35,9 +36,15 @@
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
 
-#define CLUSTER_CTRC_FORMAT_VERSION UINT8_C(1)
-#define CLUSTER_CTRC_TXN_KEY_BYTES 96
 #define CLUSTER_CTRC_SEAL_REQUEST_BYTES 136
+/* Explicit parent-bound CLOSE extension; wire2 keeps its origin-only meaning. */
+#define CLUSTER_CTRC_DELEGATION_CLOSE_V1_BYTES 216
+#define CLUSTER_CTRC_DELEGATION_CLOSE_WIRE_VERSION UINT16_C(3)
+#define CLUSTER_CTRC_DELEGATION_CERTIFICATE_WIRE_VERSION UINT16_C(6)
+#define CLUSTER_CTRC_SUBTREE_ACK_WIRE_VERSION UINT16_C(4)
+#define CLUSTER_CTRC_SUBTREE_ACK_BYTES 592
+#define CLUSTER_CTRC_ROOT_ACK_WIRE_VERSION UINT16_C(5)
+#define CLUSTER_CTRC_ROOT_ACK_BYTES 600
 #define CLUSTER_CTRC_REPLY_HEADER_BYTES 64
 #define CLUSTER_CTRC_LOCAL_ACK_BYTES 416
 #define CLUSTER_CTRC_REPLY_ACK_OFFSET 64
@@ -66,7 +73,12 @@ typedef enum ClusterCtrcSealReplyResult {
 	CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK = 1,
 	CTRC_SEAL_REPLY_PENDING_DRAIN = 2,
 	CTRC_SEAL_REPLY_BLOCKED_RETAIN = 3,
-	CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED = 4
+	CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED = 4,
+	/* Explicit wire3 only: redundant pending custody, never a release ACK. */
+	CTRC_SEAL_REPLY_DELEGATION_MERGED = 5,
+	/* Explicit wire4 only. Retained subtree proof, not an origin release. */
+	CTRC_SEAL_REPLY_DELEGATION_SUBTREE_ACK = 6,
+	CTRC_SEAL_REPLY_ROOT_SUBTREE_ACK = 7
 } ClusterCtrcSealReplyResult;
 
 typedef enum ClusterCtrcSealReason {
@@ -155,8 +167,14 @@ typedef enum ClusterCtrcReferenceKind {
 	CTRC_REF_CURRENT_MX_LOCKER = 2,
 	CTRC_REF_CURRENT_MX_UPDATER = 3,
 	CTRC_REF_RECOMPOSED_SURVIVOR = 4,
-	CTRC_REF_HOT_FOLLOW_EDGE = 5
+	CTRC_REF_HOT_FOLLOW_EDGE = 5,
+	/* Explicit publication domain; never an ordinary backend operation.
+	 * Canonical publication TLV tag 11 dispatches this versioned kind. */
+	CTRC_REF_IMAGE_ITL_V1 = 6
 } ClusterCtrcReferenceKind;
+
+/* In-process pending target operation; not an undo record opcode. */
+#define CLUSTER_CTRC_IMAGE_INSTALL_V1 UINT8_C(128)
 
 typedef enum ClusterCtrcTargetKind {
 	CTRC_TARGET_EXACT_ITL_SLOT = 1,
@@ -203,6 +221,15 @@ typedef enum ClusterCtrcReleaseDisposition {
 	CTRC_RELEASE_CLEANED_SUCCESSOR_REPLACED = 4
 } ClusterCtrcReleaseDisposition;
 
+/* Receipt retirement is separate from accepted-parent/tree custody. */
+typedef enum ClusterCtrcDelegationCertificateState {
+	CTRC_DELEGATION_CERTIFICATE_NONE = 0,
+	CTRC_DELEGATION_RECEIPTS_RECLAIMED = 1,
+	/* Published only by successful protected whole-pool reclamation.
+	 * Active references are retired; immutable retry custody remains. */
+	CTRC_DELEGATION_PROTECTION_RETIRED = 2
+} ClusterCtrcDelegationCertificateState;
+
 typedef enum ClusterCtrcParticipantState {
 	CTRC_PARTICIPANT_EMPTY = 0,
 	CTRC_PARTICIPANT_OPEN,
@@ -222,26 +249,6 @@ typedef enum ClusterCtrcOriginState {
 	CTRC_ORIGIN_RELEASE_PROVEN,
 	CTRC_ORIGIN_BLOCKED
 } ClusterCtrcOriginState;
-
-typedef struct ClusterCtrcTxnKeyV1 {
-	uint8 format_version;
-	uint8 owner_instance;
-	uint16 origin_node_id;
-	uint32 segment_id;
-	uint32 segment_generation;
-	uint16 slot_offset;
-	uint16 slot_wrap;
-	TransactionId xid;
-	uint32 cluster_epoch;
-	uint64 system_identifier;
-	uint64 origin_boot_incarnation;
-	uint64 formation_epoch;
-	uint64 admission_record_generation;
-	uint64 root_descriptor_incarnation;
-	uint64 root_id;
-	uint64 root_generation;
-	uint8 reserved[16];
-} ClusterCtrcTxnKeyV1;
 
 typedef struct ClusterCtrcPublicationIdV1 {
 	uint16 requester_node_id;
@@ -340,6 +347,19 @@ typedef struct ClusterCtrcCloseDispatch {
 	uint32 reserved32;
 } ClusterCtrcCloseDispatch;
 
+/* Node-indexed suffix retained with the original origin ACK. The first
+ * 416 bytes of a root proof remain in the original local-ACK inbox. */
+typedef struct ClusterCtrcRootSubtreeSuffixV1 {
+	uint64 subtree_bitmap;
+	uint8 children_digest_sha256[32];
+	XLogRecPtr required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
+	FullTransactionId original_full_xid;
+	uint32 crc32c;
+	uint32 reserved;
+} ClusterCtrcRootSubtreeSuffixV1;
+StaticAssertDecl(sizeof(ClusterCtrcRootSubtreeSuffixV1) == 184,
+	"CTRC root suffix must remain 184 bytes");
+
 typedef struct ClusterCtrcOriginEntry {
 	ClusterCtrcTxnKeyV1 key;
 	uint64 reservation_generation;
@@ -356,6 +376,9 @@ typedef struct ClusterCtrcOriginEntry {
 	uint8 reserved8[6];
 	ClusterCtrcParticipantIdentity touched[CLUSTER_CTRC_MAX_PARTICIPANTS];
 	uint64 close_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	uint32 root_subtree_ack_bitmap;
+	uint32 root_subtree_reserved;
+	ClusterCtrcRootSubtreeSuffixV1 root_subtree_acks[CLUSTER_CTRC_MAX_PARTICIPANTS];
 } ClusterCtrcOriginEntry;
 
 typedef enum ClusterCtrcOriginReservationKind {
@@ -377,12 +400,50 @@ typedef struct ClusterCtrcOriginReservation {
 	uint8 reserved8[6];
 } ClusterCtrcOriginReservation;
 
+/* Pending outgoing responsibility, not evidence that the receiver installed
+ * a tree edge. It survives local receipt drain until subtree CLOSE/ACK. */
+typedef struct ClusterCtrcDelegationCustodyV1 {
+	ClusterCtrcParticipantIdentity receiver;
+	uint64 sequence;
+} ClusterCtrcDelegationCustodyV1;
+StaticAssertDecl(sizeof(ClusterCtrcDelegationCustodyV1) == 40,
+	"CTRC custody entry must remain 40 bytes");
+
+/* Original accepted path only. Outgoing pending custody is separate: a
+ * sender must not interpret a copied path as subtree closure or page authority. */
+typedef struct ClusterCtrcDelegationPathV2 {
+	uint16 version;
+	uint16 hop_count;
+	uint32 reserved;
+	ClusterCtrcParticipantIdentity root_receiver;
+	ClusterCtrcDelegationCustodyV1 hops[CLUSTER_CTRC_DELEGATION_V2_MAX_HOPS];
+} ClusterCtrcDelegationPathV2;
+StaticAssertDecl(sizeof(ClusterCtrcDelegationPathV2) == 640,
+	"CTRC complete path must remain bounded at 640 bytes");
+
+/* Decoded, process-local request, not a shared or persistent record. A copy
+ * of FullXid is compared with existing custody; it never creates provenance. */
+typedef struct ClusterCtrcDelegationCloseV1 {
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity parent;
+	ClusterCtrcParticipantIdentity receiver;
+	FullTransactionId original_full_xid;
+	uint64 request_id;
+	uint64 seal_generation;
+	uint64 delegation_sequence;
+	uint32 grant_generation;
+	uint32 reserved;
+} ClusterCtrcDelegationCloseV1;
+
 typedef struct ClusterCtrcParticipantEntry {
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity identity;
 	/* Volatile original identity handed off by a protected local origin.
 	 * Invalid remains unknown, particularly for unqualified foreign grants. */
 	FullTransactionId original_full_xid;
+	/* Immutable origin-issued bytes for ordinary DATA/PI delegation. A
+	 * numeric FullXid cannot reconstruct or replace this receiver binding. */
+	uint8 original_identity_v2[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 	uint32 grant_generation;
 	uint8 state;
 	uint8 reserved8[3];
@@ -395,6 +456,38 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint64 cancelled_count;
 	uint64 cleaned_count;
 	uint64 ack_frozen_count;
+	/* Original local reader responsibility; no receipt or authority grant.
+	 * Serialized by the original participant lock, never persisted/wired. */
+	uint64 retained_reader_count;
+	/* Immediate parent is retained independently of local receipts. The
+	 * immutable original names the path root, never a re-signed local grant. */
+	ClusterCtrcDelegationCustodyV1 delegation_parent;
+	/* Zero for direct/V1 rows. Explicit V2 never backfills an old row. */
+	ClusterCtrcDelegationPathV2 delegation_path;
+	uint32 delegation_count;
+	uint32 delegation_reserved;
+	uint64 last_delegation_sequence;
+	ClusterCtrcDelegationCustodyV1 delegations[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	/* Original request-id domain, armed once per pending child. Neither an
+	 * enqueue nor a negative reply retires the custody it identifies. */
+	uint64 delegation_close_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	/* Frozen child evidence never removes its custody or request correlation.
+	 * Digests bind the whole original request and explicit subtree proof. */
+	uint64 delegation_ack_bitmap;
+	uint64 delegation_subtree_bitmap[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	uint8 delegation_ack_digest[CLUSTER_CTRC_MAX_PARTICIPANTS][32];
+	XLogRecPtr delegation_required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
+	/* Authenticated origin certificate notice retained while child custody
+	 * still exists. It is not a child completion or a release certificate. */
+	uint64 root_certificate_request_id;
+	/* Original accepted parent notice and outgoing per-child phase IDs.
+	 * Neither is a child completion or permission to retire custody. */
+	uint64 parent_certificate_request_id;
+	uint64 delegation_certificate_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	/* Counts/ACK remain immutable historical proof after receipt reclamation.
+	 * Parent/path/children remain occupied until the original owner retires them. */
+	uint32 delegation_certificate_state;
+	uint32 delegation_certificate_confirmed_bitmap;
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -500,6 +593,15 @@ typedef struct ClusterCtrcItlTargetIdentity {
 	uint8 uba[16];
 } ClusterCtrcItlTargetIdentity;
 
+/* Process-local issuer/PID/serial token. A copied/stale handle cannot
+ * release a different scope. Caller must release in PG_FINALLY. */
+typedef struct ClusterCtrcItlReadGuardV1 {
+	uint64 serial;
+	uint32 slot;
+	int32 pid;
+} ClusterCtrcItlReadGuardV1;
+#define CLUSTER_CTRC_ITL_READ_GUARDS 8
+
 typedef struct ClusterCtrcLocalReleaseAckV1 {
 	ClusterCtrcTxnKeyV1 transaction_key;
 	uint32 grant_generation;
@@ -529,6 +631,22 @@ typedef struct ClusterCtrcLocalReleaseAckV1 {
 	uint8 reserved[20];
 	uint32 crc32c;
 } ClusterCtrcLocalReleaseAckV1;
+
+typedef struct ClusterCtrcRootSubtreeAckV1 {
+	ClusterCtrcLocalReleaseAckV1 local_ack;
+	ClusterCtrcRootSubtreeSuffixV1 subtree;
+} ClusterCtrcRootSubtreeAckV1;
+StaticAssertDecl(sizeof(ClusterCtrcRootSubtreeAckV1) == CLUSTER_CTRC_ROOT_ACK_BYTES,
+	"CTRC root proof must remain 600 bytes");
+
+typedef struct ClusterCtrcDelegatedSubtreeAckV1 {
+	ClusterCtrcLocalReleaseAckV1 local_ack;
+	uint64 subtree_bitmap;
+	uint8 children_digest_sha256[32];
+	XLogRecPtr required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
+	uint32 crc32c;
+	uint32 reserved;
+} ClusterCtrcDelegatedSubtreeAckV1;
 
 typedef struct ClusterCtrcSealRequestV1 {
 	uint64 request_id;
@@ -739,6 +857,10 @@ typedef struct ClusterCtrcCertificateInput {
 	uint64 seal_generation;
 	bool block0_terminal_exact;
 	bool all_dependencies_durable;
+	const ClusterCtrcRootSubtreeSuffixV1 *root_subtrees;
+	uint32 root_subtree_bitmap;
+	uint32 reserved32;
+	FullTransactionId original_full_xid;
 } ClusterCtrcCertificateInput;
 
 /* Stack-only immutable copy used across the no-CTRC-lock block-0 certificate
@@ -872,6 +994,8 @@ StaticAssertDecl(sizeof(ClusterCtrcSealReplyHeaderV1) == CLUSTER_CTRC_REPLY_HEAD
 				 "CTRC reply header must remain exactly 64 bytes");
 StaticAssertDecl(sizeof(ClusterCtrcLocalReleaseAckV1) == CLUSTER_CTRC_LOCAL_ACK_BYTES,
 				 "CTRC local release ACK must remain exactly 416 bytes");
+StaticAssertDecl(sizeof(ClusterCtrcDelegatedSubtreeAckV1) == CLUSTER_CTRC_SUBTREE_ACK_BYTES,
+				 "CTRC subtree proof must remain exactly 592 bytes");
 StaticAssertDecl(offsetof(ClusterCtrcLocalReleaseAckV1, row_digest_sha256) == 224,
 				 "CTRC ACK digest offset must remain 224");
 StaticAssertDecl(offsetof(ClusterCtrcLocalReleaseAckV1, crc32c) == 412,
@@ -890,6 +1014,57 @@ extern bool cluster_ctrc_seal_request_decode(const uint8 *bytes, Size length,
 											 uint64 current_epoch,
 											 ClusterCtrcSealRequestV1 *request_out,
 											 ClusterCtrcTxnKeyV1 *key_out);
+extern bool cluster_ctrc_delegation_close_encode_v1(const ClusterCtrcDelegationCloseV1 *request,
+	uint8 *bytes, Size length);
+extern bool cluster_ctrc_delegation_close_decode_v1(const uint8 *bytes, Size length,
+	uint64 authenticated_system_identifier, int32 envelope_source_node, int32 local_node,
+	uint64 current_epoch, ClusterCtrcDelegationCloseV1 *request_out);
+/* Same explicit216B fields, separate wire6 CERTIFICATE phase; wire3 is CLOSE only. */
+extern bool cluster_ctrc_delegation_certificate_encode_v1(const ClusterCtrcDelegationCloseV1 *request,
+	uint8 *bytes, Size length);
+extern bool cluster_ctrc_delegation_certificate_decode_v1(const uint8 *bytes, Size length,
+	uint64 authenticated_system_identifier, int32 envelope_source_node, int32 local_node,
+	uint64 current_epoch, ClusterCtrcDelegationCloseV1 *request_out);
+/* Retains the exact notice on already frozen accepted custody. Never reclaims
+ * receipts/edges or exports a positive certificate reply. */
+extern ClusterCtrcSealReplyResult cluster_ctrc_participant_delegated_certificate_shared(
+	const ClusterCtrcDelegationCloseV1 *request, uint16 *first_reason);
+/* Only an existing exact accepted parent can close local admission. Pending
+ * parent/children remain registered; this entry cannot return a release ACK. */
+extern ClusterCtrcSealReplyResult cluster_ctrc_participant_delegated_close_shared(
+	const ClusterCtrcDelegationCloseV1 *request, uint16 *first_reason);
+/* Local durable receipt inventory only. Keeps the accepted parent/path and
+ * CLOSED_DRAINING state; cannot authorize an ordinary ACK or certificate. */
+extern bool cluster_ctrc_participant_delegated_local_ack_shared(
+	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcLocalReleaseAckV1 *local_ack_out);
+/* Original non-root parent only: all retained children must have exact
+ * proofs before the original local freeze may contribute to this aggregate.
+ * Neither production nor consumption retires any parent/child or receipt. */
+/* Root proof uses the original 136-byte request and fixed-page reply.
+ * It retains all local/child custody until the exact certificate notification. */
+extern bool cluster_ctrc_root_ack_reply_encode(const uint8 *request,
+	const ClusterCtrcRootSubtreeAckV1 *ack, uint8 *page, Size page_length);
+extern bool cluster_ctrc_root_ack_reply_decode(const uint8 *page, Size page_length,
+	const uint8 *request, int32 source, int32 destination, ClusterCtrcRootSubtreeAckV1 *out);
+extern bool cluster_ctrc_participant_root_subtree_ack_shared(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *identity, uint32 grant, uint64 seal,
+	ClusterCtrcRootSubtreeAckV1 *out);
+extern bool cluster_ctrc_origin_root_ack_land_shared(uint64 request_id,
+	const ClusterCtrcRootSubtreeAckV1 *ack);
+
+extern bool cluster_ctrc_participant_delegated_subtree_ack_shared(
+	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcDelegatedSubtreeAckV1 *out);
+extern bool cluster_ctrc_participant_delegated_ack_land_shared(
+	const ClusterCtrcDelegationCloseV1 *request, const ClusterCtrcDelegatedSubtreeAckV1 *ack);
+extern bool cluster_ctrc_delegated_ack_reply_encode(
+	const ClusterCtrcDelegationCloseV1 *request, const ClusterCtrcDelegatedSubtreeAckV1 *ack,
+	uint8 *page, Size page_length);
+extern bool cluster_ctrc_delegated_ack_reply_decode(const uint8 *page, Size page_length,
+	const ClusterCtrcDelegationCloseV1 *request, ClusterCtrcDelegatedSubtreeAckV1 *out);
+/* Read-only observation of an already-qualified OPEN receiver whose immutable
+ * original registration has a different parent (or a direct origin grant). */
+extern bool cluster_ctrc_participant_delegation_merge_observed_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_local_release_ack_encode(const ClusterCtrcLocalReleaseAckV1 *ack,
 												  uint8 bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES]);
 extern bool cluster_ctrc_local_release_ack_decode(const uint8 bytes[CLUSTER_CTRC_LOCAL_ACK_BYTES],
@@ -966,6 +1141,10 @@ cluster_ctrc_origin_block_post_bind_entry(ClusterCtrcOriginEntry *origin, uint64
 										  const ClusterCtrcOriginReservation *reservation);
 extern bool cluster_ctrc_origin_cancel_pre_bind(const ClusterCtrcOriginReservation *reservation);
 extern bool cluster_ctrc_origin_block_post_bind(const ClusterCtrcOriginReservation *reservation);
+/* Copy only the exact local PENDING/OPEN reservation's original identity
+ * under the original origin lock. No allocation, widening or row mutation. */
+extern bool cluster_ctrc_origin_reserved_full_xid(
+	const ClusterCtrcOriginReservation *reservation, FullTransactionId *full_xid_out);
 extern bool cluster_ctrc_origin_open_reserved(const ClusterCtrcOriginReservation *reservation,
 											  uint32 *grant_generation);
 extern ClusterCtrcTouchResult
@@ -991,6 +1170,137 @@ extern bool cluster_ctrc_origin_original_full_xid_exact(
 extern bool cluster_ctrc_origin_original_full_xid_shared(
 												const ClusterCtrcTxnKeyV1 *key,
 												FullTransactionId *full_xid_out);
+/* Capture only under the original local origin lock after its exact grant
+ * registered this receiver. V1 key bytes and reserved zeros are unchanged.
+ * Decode is a source match, not authentication: production consumers must
+ * receive these bytes only from the original authenticated origin reply
+ * or this backend's protected local origin capture. */
+extern bool cluster_ctrc_origin_fullxid_capture_v2(const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES]);
+/* Original current/grant producer: validate its original FullXid before
+ * registering the receiver, and copy both identities under that same lock.
+ * Legacy/raw-only origins cannot create a V2 grant. */
+extern ClusterCtrcTouchResult cluster_ctrc_origin_grant_fullxid_v2(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	ClusterCtrcProofClass proof_class, uint32 *grant_out,
+	uint8 bytes[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES]);
+extern bool cluster_ctrc_origin_fullxid_match_v2(const uint8 *bytes, Size length,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	uint32 grant, FullTransactionId *out);
+/* Read-only receiver provenance prerequisite for a foreign canonical
+ * companion. Caller supplies its original current admission identity and
+ * rechecks it after return. Require an already retained original144/path
+ * and APPLIED ordinary/IMAGE ITL reference for this exact DATA locator.
+ * This is neither a page selector nor a lifetime/freeze authority token. */
+extern bool cluster_ctrc_itl_original_full_xid_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver);
+/* Same retained identity, additionally bound to this exact captured page/ITL.
+ * Read-only observation only: no page lock, owner or lifetime is acquired. */
+extern bool cluster_ctrc_itl_original_full_xid_target_matches_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target);
+/* Hold this existing original participant across source validation. Only
+ * the exact OPEN/APPLIED target may acquire. Receipt cleanup may progress;
+ * original key ACK/retirement waits for this local responsibility to leave.
+ * No CTRC lock crosses return; no page/writer/remote authority is acquired. */
+extern bool cluster_ctrc_itl_original_full_xid_target_hold_shared(
+	const ClusterCtrcTxnKeyV1 *key, FullTransactionId original,
+	const ClusterTxLocator *locator, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target, ClusterCtrcItlReadGuardV1 *guard);
+extern bool cluster_ctrc_itl_read_guard_release_shared(ClusterCtrcItlReadGuardV1 *guard);
+/* Process-local exact binding only; no locks, source refresh or page authority. */
+extern bool cluster_ctrc_itl_read_guard_matches_v1(
+	const ClusterCtrcItlReadGuardV1 *guard, const ClusterCtrcTxnKeyV1 *key,
+	FullTransactionId original, const ClusterCtrcParticipantIdentity *receiver,
+	const ClusterCtrcItlTargetIdentity *target);
+/* Pure issuer-local binding to the original receiver/admission. Does not
+ * sample source state or replace the caller's current admission checks. */
+extern bool cluster_ctrc_itl_read_guard_matches_admission_v1(
+	const ClusterCtrcItlReadGuardV1 *guard, const ClusterCtrcTxnKeyV1 *key,
+	FullTransactionId original, const ClusterCtrcItlTargetIdentity *target,
+	uint16 node_id, uint64 formation_epoch, uint64 admission_generation);
+/* New receivers only; an old raw-only participant is never backfilled.
+ * Local producers recheck the envelope's FullXid under origin_lock and retain
+ * that lock through receiver publication; foreign producers use the original
+ * authenticated grant/CLOSE responsibility handoff. */
+extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_origin_v2(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver,
+	uint32 grant, const ClusterCtrcPublicationIdV1 *publication,
+	const ClusterCtrcTargetV1 *target, const uint8 *bytes, Size length,
+	ClusterCtrcReceiptHandle *handle);
+/* First-hop custody only: use this node's exact OPEN participant and its
+ * immutable origin-issued receiver binding. Retain responsibility under the
+ * original participant lock before publishing the record; retries reuse it.
+ * No new origin grant, tree admission, receiver installation or release.
+ * Callers must keep their original current/PI admission protection. */
+extern bool cluster_ctrc_participant_delegate_prepare_v1(
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *sender,
+	uint32 grant, const ClusterCtrcParticipantIdentity *receiver,
+	uint8 *record, Size length);
+/* Source owner keeps the original current/PI page protection. Select only
+ * the exact APPLIED ordinary ITL receipt matching the complete copied slot;
+ * use its retained original key/FullXid, never a key inferred from raw XID.
+ * Outgoing custody precedes record publication under the same shard lock.
+ * This supplies neither page-install authority nor parent/tree retirement. */
+extern bool cluster_ctrc_itl_delegate_prepare_v1(
+	const ClusterCtrcItlTargetIdentity *target, const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size length);
+/* Before-visible first-hop retention on an authenticated current/PI receive.
+ * The immutable record supplies the original key/grant/FullXid; the incoming
+ * ordinary slot must match its physical TT origin/segment/slot and raw xid.
+ * Retain the parent under the original participant -> receipt locks, even
+ * before a local receipt exists. Exact retry only; no raw-only backfill,
+ * alternate parent merge, page authority, local drain or subtree ACK. */
+
+extern bool cluster_ctrc_itl_delegate_accept_v1(const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length);
+/* Prepare one IMAGE copy intent after retaining its original parent. No
+ * backend/PID or operation sequence is accepted from the caller. The original
+ * journal supplies one unique operation and receipt generation. A retry owns
+ * a new intent; retain the returned handle through apply or premutation cancel.
+ * This does not prove an image was installed or authorize page visibility. */
+extern ClusterCtrcPrepareResult cluster_ctrc_itl_image_prepare_v1(
+	const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length,
+	const ClusterCtrcTargetV1 *pending_target, ClusterCtrcReceiptHandle *handle);
+
+/* Explicit complete-path V2. The source must own the exact APPLIED ordinary
+ * ITL under its existing current/PI protection. capacity <= MAX_BYTES; failures
+ * clear that buffer and length_out. Original V2 is copied, never re-signed.
+ * Receiver identities are protected transport inputs. Each accepted path is
+ * simple and bounded by N-1; global pending/tree CLOSE remains independent.
+ * These APIs do not activate live IMAGE V3, freeze, release or subtree ACK. */
+extern bool cluster_ctrc_itl_delegate_prepare_v2(
+	const ClusterCtrcItlTargetIdentity *target, const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint8 *record, Size capacity,
+	Size *length_out);
+extern bool cluster_ctrc_itl_delegate_accept_v2(const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length);
+extern ClusterCtrcPrepareResult cluster_ctrc_itl_image_prepare_v2(
+	const ClusterItlSlotData *slot,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, const uint8 *record, Size length,
+	const ClusterCtrcTargetV1 *pending_target, ClusterCtrcReceiptHandle *handle);
+
+/* First receipt at the delegated receiver only. authenticated_sender must
+ * come from the existing protected current/PI transport, never the record.
+ * A successful registration retains the parent before exposing a handle;
+ * neither an old raw-only row nor a different parent may be backfilled.
+ * No page/current authority, parent ACK, or live V3 install is granted. */
+extern ClusterCtrcPrepareResult cluster_ctrc_receipt_prepare_delegation_v1(
+	const ClusterCtrcTxnKeyV1 *key,
+	const ClusterCtrcParticipantIdentity *authenticated_sender,
+	const ClusterCtrcParticipantIdentity *receiver, uint32 grant,
+	const ClusterCtrcPublicationIdV1 *publication, const ClusterCtrcTargetV1 *target,
+	const uint8 *record, Size length, ClusterCtrcReceiptHandle *handle);
 extern bool cluster_ctrc_origin_begin_seal_entry(ClusterCtrcOriginEntry *origin,
 												 uint64 seal_generation);
 extern bool cluster_ctrc_origin_arm_close_entry(ClusterCtrcOriginEntry *origin,
@@ -1033,6 +1343,27 @@ extern bool cluster_ctrc_origin_note_local_close_batch_shared(
 extern bool cluster_ctrc_origin_next_open_shared(ClusterCtrcTxnKeyV1 *key_out);
 extern bool cluster_ctrc_origin_begin_seal_shared(const ClusterCtrcTxnKeyV1 *key);
 extern bool cluster_ctrc_origin_next_close_dispatch_shared(ClusterCtrcCloseDispatch *dispatch_out);
+extern bool cluster_ctrc_participant_next_delegated_close_shared(
+	ClusterCtrcDelegationCloseV1 *request_out);
+/* Same one-circumference cleaner budget: CLOSE before retained notice,
+ * CERTIFICATE after notice. The output phase is never inferred from an ID. */
+extern bool cluster_ctrc_participant_next_delegated_dispatch_shared(
+	ClusterCtrcDelegationCloseV1 *request_out, bool *certificate_out);
+extern bool cluster_ctrc_participant_delegated_certificate_snapshot_shared(uint64 request_id,
+	uint16 source_node, ClusterCtrcDelegationCloseV1 *request_out);
+/* Protected original wire6 completion only; no edge or origin retirement. */
+extern bool cluster_ctrc_participant_delegated_certificate_land_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
+extern bool cluster_ctrc_participant_delegated_certificate_matches_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
+extern bool cluster_ctrc_participant_delegated_close_matches_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
+extern bool cluster_ctrc_participant_delegated_close_snapshot_shared(uint64 request_id,
+	uint16 source_node, ClusterCtrcDelegationCloseV1 *request_out);
+/* Caller must hold the original current R4 admission and have authenticated
+ * the exact wire3 MERGED reply. Only redundant outgoing pending is removed. */
+extern bool cluster_ctrc_participant_delegation_merge_land_shared(
+	const ClusterCtrcDelegationCloseV1 *request);
 extern bool cluster_ctrc_cleaner_run_pass(void);
 
 typedef enum ClusterCtrcNormalStopDomain {
@@ -1159,6 +1490,10 @@ extern bool cluster_ctrc_receipts_reclaim_batch_locked(ClusterCtrcReclaimWork *w
 													   Size work_count,
 													   ClusterCtrcReceipt *receipts,
 													   uint8 *probe_states, Size receipt_count);
+/* Caller has authenticated the original origin request and owns its admission.
+ * A retained root notice returns PENDING, never a successful retirement. */
+extern ClusterCtrcSealReplyResult cluster_ctrc_participant_certificate_request_shared(
+	const ClusterCtrcCloseDispatch *dispatch, uint16 *first_reason);
 /* Caller has authenticated each local certificate request separately. */
 extern bool
 cluster_ctrc_participant_certificate_batch_shared(const ClusterCtrcCloseDispatch *dispatches,

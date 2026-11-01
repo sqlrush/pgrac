@@ -14,6 +14,7 @@
 #define SLRU_H
 
 #include "access/xlogdefs.h"
+#include "access/clog_file.h"
 #include "access/slrudefs.h"
 #include "storage/lwlock.h"
 #include "storage/sync.h"
@@ -69,6 +70,14 @@ typedef struct SlruSharedData
 	 * page.
 	 */
 	XLogRecPtr *group_lsn;
+	/* CLOG-only provenance, protected with page bytes by ControlLock.
+	 * Raw reads/zeroes leave it unknown until an original producer supplies it. */
+	ClusterClogPageIdentityV2 *clog_page_identity;
+	/* Complete independently selected file binding for a managed cache page.
+	 * Reserved throughout managed read I/O, retained on successful read or
+	 * by the original fresh-birth writer, under ControlLock. A reservation
+	 * is not installed payload and this value is not write authority. */
+	ClusterClogFileBindingV2 *clog_file_binding;
 	int			lsn_groups_per_page;
 
 	/*----------
@@ -97,6 +106,10 @@ typedef struct SlruSharedData
 
 typedef SlruSharedData *SlruShared;
 
+#ifdef USE_PGRAC_CLUSTER
+typedef struct ClusterControlNativeFileBorrowV2 ClusterControlNativeFileBorrowV2;
+#endif
+
 /*
  * SlruCtlData is an unshared structure that points to the active information
  * in shared memory.
@@ -104,6 +117,19 @@ typedef SlruSharedData *SlruShared;
 typedef struct SlruCtlData
 {
 	SlruShared	shared;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Original CLOG owner adapters. The table borrow is address-bound and
+	 * remains on the native call's stack through slot/FD/I/O cleanup. These
+	 * process-local callbacks confer neither file authority nor CF custody.
+	 * Other SLRUs leave them NULL and retain their original implementation. */
+	bool (*clog_native_required) (void);
+	bool (*clog_native_acquire) (int pageno, ClusterControlNativeFileBorrowV2 *);
+	bool (*clog_native_current) (const ClusterControlNativeFileBorrowV2 *);
+	bool (*clog_native_release) (ClusterControlNativeFileBorrowV2 *);
+	int (*clog_native_read) (struct SlruCtlData *, int pageno, bool write_ok);
+	void (*clog_native_write) (struct SlruCtlData *, int slotno, bool checkpoint);
+#endif
 
 	/*
 	 * Which sync handler function to use when handing sync requests over to
@@ -139,6 +165,15 @@ typedef struct SlruCtlData
 
 typedef SlruCtlData *SlruCtl;
 
+#ifdef USE_PGRAC_CLUSTER
+/* Installed only by the original CLOG owner. Other SLRUs do not link a CLOG
+ * writer/reader merely by using the common raw cache implementation. */
+/* Original issuer only, with XidGenLock and ControlLock exclusive. Retains
+ * selected AVAILABLE custody through birth WAL and cache publication. */
+extern int SimpleLruNativeClogZeroV2(SlruCtl ctl, FullTransactionId birth);
+extern int SimpleLruNativeClogReadV2(SlruCtl ctl, int pageno, bool write_ok);
+extern void SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint);
+#endif
 
 extern Size SimpleLruShmemSize(int nslots, int nlsns);
 extern void SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
@@ -150,6 +185,45 @@ extern int	SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
 extern int	SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno,
 									   TransactionId xid);
 extern void SimpleLruWritePage(SlruCtl ctl, int slotno);
+
+/* Load an explicitly reserved EMPTY or clean VALID slot from a borrowed V2
+ * FD. Caller holds ControlLock EX and the same original registration/source/
+ * file custody as the managed writer. No LRU eviction, raw read, zero fill,
+ * dirty writeback, file open or authority acquisition is performed here.
+ * Each successful call physically validates the selected header/frame; a raw
+ * cache hit is not evidence. The full binding reserves this slot throughout
+ * READ_IN_PROGRESS so raw paths cannot zero it in the I/O gap. Another slot
+ * containing this page is refused.
+ *
+ * Success atomically installs complete bytes, observed birth/source/image and
+ * full selected binding, clears group LSNs and returns a clean VALID page.
+ * A read refusal/ERROR leaves EMPTY with unknown provenance and no installed
+ * payload, restores ControlLock and releases only this I/O lock. Invalid
+ * arguments or an occupied/dirty reservation leave it unchanged. No fallback
+ * or missing-file-as-zero is allowed, including recovery. */
+extern bool SimpleLruReadClogPageV2(SlruCtl ctl, int slotno, int pageno, int fd,
+										const ClusterClogFileBindingV2 *expected);
+
+/* Managed CLOG overwrite through the original SLRU snapshot/I/O locks. Caller
+ * holds ControlLock EX and continuously owns the selected registration, file
+ * lifetime, borrowed read/write FD and original write authority. This entry
+ * neither selects/opens/creates a file nor acquires control/source custody.
+ * It requires a known original birth and an already initialized V2 segment.
+ * Reloaded pages require the exact managed cache binding. For an original
+ * unwritten birth (image_lsn=0), an entirely unknown binding is fixed from
+ * this owner's independent expected registration before the first I/O.
+ * No raw-file fallback, legacy sync tag, bootstrap or recovery write is used.
+ *
+ * Returns the actual flushed image end only after full sync/readback and a
+ * same-birth cache recheck; InvalidXLogRecPtr means no successful write (also
+ * for a clean/replaced slot). Refusal/error retains dirty responsibility and
+ * the FD. ControlLock is held at normal/error exit; only our I/O lock is
+ * released. Concurrent re-dirty/source watermarks are preserved. Native WAL
+ * errors propagate after restoring state. No checkpoint/coverage authority
+ * is returned; the original owner must recheck custody before publication.
+ */
+extern XLogRecPtr SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
+										 const ClusterClogFileBindingV2 *expected);
 extern void SimpleLruWriteAll(SlruCtl ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING
 extern void SlruPagePrecedesUnitTests(SlruCtl ctl, int per_page);

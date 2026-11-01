@@ -30,7 +30,9 @@ typedef struct ClusterRecoveryUndoEntry {
 	uint32 segment_generation;
 	uint8 owner_instance;
 	uint16 slot_offset;
-	TTSlot slot;
+	TTSlot slot; /* Original 32-byte prefix, never a standalone FullXid proof. */
+	uint8 tt_layout_version; /* 0 = legacy, 2 = explicit TT40. */
+	uint64 original_full_xid; /* Exact durable TT40 bytes; zero for legacy. */
 } ClusterRecoveryUndoEntry;
 
 typedef struct ClusterRecoveryUndoScan ClusterRecoveryUndoScan;
@@ -44,13 +46,19 @@ extern ClusterRecoveryUndoResult cluster_recovery_undo_scan_begin(const void *pa
 																  uint8 expected_owner,
 																  ClusterRecoveryUndoScan **out);
 
-/* Borrow the complete immutable header, including bitmap, retention fields
- * and counters. Counts and segment lifecycle never shorten the slot scan. */
+/* Borrow the complete immutable 8192 raw bytes, including bitmap, retention
+ * and counters. The pointer's type exposes only the common prefix for TT40:
+ * never index legacy slots or read legacy management offsets on a V2 page.
+ * scan_next supplies the versioned slot/generation and original identity.
+ * Counts and segment lifecycle never shorten the slot scan. */
 extern const UndoSegmentHeaderData *
 cluster_recovery_undo_scan_header(const ClusterRecoveryUndoScan *scan);
 
 /* All 48 slots, including UNUSED and RECYCLABLE, one per call. Raw incomplete
  * terminal fields remain candidates; no CLOG or online liveness is consulted.
+ * V2 exports the exact original FullXid; legacy never derives or backfills it.
+ * The 32-byte slot prefix alone is not a full identity. All 48 V2 identities
+ * are checked before begin publishes any scan, including the last slot.
  * END completes this header only, not the segment/record graph or recovery. */
 extern ClusterRecoveryUndoResult cluster_recovery_undo_scan_next(ClusterRecoveryUndoScan *scan,
 																 ClusterRecoveryUndoEntry *out);

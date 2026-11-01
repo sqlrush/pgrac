@@ -58,12 +58,18 @@
 
 #include "access/slru.h"
 #include "access/transam.h"
+#include "access/clog_storage.h"
+#include "access/clog_wal.h"
+#include "access/xloginsert.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "postmaster/bgwriter.h"
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_guc.h"
+#include "storage/proc.h"
 #endif
 #include "storage/fd.h"
 #include "storage/shmem.h"
@@ -87,6 +93,14 @@ typedef struct SlruWriteAllData
 } SlruWriteAllData;
 
 typedef struct SlruWriteAllData *SlruWriteAll;
+
+/* CLOG page bytes and their WAL dependency captured under ControlLock. */
+typedef struct SlruWriteSnapshot
+{
+	PGAlignedBlock page;
+	XLogRecPtr	flush_lsn;
+	ClusterClogPageIdentityV2 clog_page;
+} SlruWriteSnapshot;
 
 /*
  * Populate a file tag describing a segment file.  We only use the segment
@@ -148,9 +162,13 @@ static void SimpleLruWaitIO(SlruCtl ctl, int slotno);
 static void SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata);
 static bool SlruPhysicalReadPage(SlruCtl ctl, int pageno, int slotno);
 static bool SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno,
-								  SlruWriteAll fdata);
+								  SlruWriteAll fdata,
+								  const SlruWriteSnapshot *snapshot);
 static void SlruReportIOError(SlruCtl ctl, int pageno, TransactionId xid);
 static int	SlruSelectLRUPage(SlruCtl ctl, int pageno);
+#ifdef USE_PGRAC_CLUSTER
+static bool SlruNativeClogRequired(SlruCtl ctl);
+#endif
 
 static bool SlruScanDirCbDeleteCutoff(SlruCtl ctl, char *filename,
 									  int segpage, void *data);
@@ -178,7 +196,11 @@ SimpleLruShmemSize(int nslots, int nlsns)
 	sz += MAXALIGN(nslots * sizeof(LWLockPadded));	/* buffer_locks[] */
 
 	if (nlsns > 0)
+	{
 		sz += MAXALIGN(nslots * nlsns * sizeof(XLogRecPtr));	/* group_lsn[] */
+		sz += MAXALIGN(nslots * sizeof(ClusterClogPageIdentityV2));
+		sz += MAXALIGN(nslots * sizeof(ClusterClogFileBindingV2));
+	}
 
 	return BUFFERALIGN(sz) + BLCKSZ * nslots;
 }
@@ -259,6 +281,14 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 		{
 			shared->group_lsn = (XLogRecPtr *) (ptr + offset);
 			offset += MAXALIGN(nslots * nlsns * sizeof(XLogRecPtr));
+			shared->clog_page_identity = (ClusterClogPageIdentityV2 *) (ptr + offset);
+			offset += MAXALIGN(nslots * sizeof(ClusterClogPageIdentityV2));
+			memset(shared->clog_page_identity, 0,
+				   nslots * sizeof(ClusterClogPageIdentityV2));
+			shared->clog_file_binding = (ClusterClogFileBindingV2 *) (ptr + offset);
+			offset += MAXALIGN(nslots * sizeof(ClusterClogFileBindingV2));
+			memset(shared->clog_file_binding, 0,
+				   nslots * sizeof(ClusterClogFileBindingV2));
 		}
 
 		ptr += BUFFERALIGN(offset);
@@ -295,6 +325,407 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 	strlcpy(ctl->Dir, subdir, sizeof(ctl->Dir));
 }
 
+/* A managed cache entry cannot be consumed or overwritten through a raw
+ * path. The complete binding comes from a managed physical read or the
+ * original fresh-birth writer; legacy slots retain their original behavior. */
+static void
+SlruRequireRawSlot(SlruCtl ctl, int slotno)
+{
+	SlruShared shared = ctl->shared;
+
+	if (shared->clog_file_binding != NULL &&
+		shared->clog_file_binding[slotno].identity.format_id != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("managed CLOG cache page requires selected file I/O")));
+}
+
+static bool
+SlruClogBindingMatches(const ClusterClogFileBindingV2 *left,
+					   const ClusterClogFileBindingV2 *right)
+{
+	uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+	return left->segment == right->segment &&
+		cluster_recovery_file_identity_encode_v2(&left->identity, reference, sizeof(reference)) &&
+		cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &right->identity);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+static bool
+SlruNativeClogRequired(SlruCtl ctl)
+{
+	return ctl->sync_handler == SYNC_HANDLER_CLOG &&
+		ctl->clog_native_required != NULL && ctl->clog_native_required();
+}
+
+static void
+SlruNativeClogRefuse(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("native CLOG requires a current selected file and original I/O custody")));
+}
+
+/* Drop only ControlLock while opening the original selected path. The same
+ * address-bound table borrow survives this gap; no file creation or CF lookup.
+ * The family lock is restored even when the FD owner raises ERROR. */
+static int
+SlruNativeClogOpen(SlruCtl ctl, int pageno, int flags)
+{
+	volatile int fd = -1;
+	char path[MAXPGPATH];
+
+	SlruFileName(ctl, path, pageno / SLRU_PAGES_PER_SEGMENT);
+	LWLockRelease(ctl->shared->ControlLock);
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, flags | PG_BINARY | O_NOFOLLOW);
+	}
+	PG_CATCH();
+	{
+		LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+	return fd;
+}
+
+static void
+SlruNativeClogAcquire(SlruCtl ctl, int pageno,
+					  ClusterControlNativeFileBorrowV2 *borrow)
+{
+	if (!LWLockHeldByMeInMode(ctl->shared->ControlLock, LW_EXCLUSIVE) ||
+		ctl->clog_native_acquire == NULL || ctl->clog_native_current == NULL ||
+		ctl->clog_native_release == NULL ||
+		!ctl->clog_native_acquire(pageno, borrow))
+		SlruNativeClogRefuse();
+}
+
+/* Cleanup does not forget a refused release. A retains that original borrow
+ * duty; no success is returned and no alternate table row is acquired. */
+static bool
+SlruNativeClogFinish(SlruCtl ctl, ClusterControlNativeFileBorrowV2 *borrow, int fd)
+{
+	bool closed = fd < 0 || CloseTransientFile(fd) == 0;
+	bool released = ctl->clog_native_release(borrow);
+
+	return closed && released;
+}
+
+/* Birth is supplied by the original issuer, never recovered from empty disk
+ * bytes. The original I/O reservation covers both probes and birth WAL. */
+int
+SimpleLruNativeClogZeroV2(SlruCtl ctl, FullTransactionId birth)
+{
+	SlruShared shared;
+	ClusterControlNativeFileBorrowV2 borrow = {0};
+	ClusterClogFileBindingV2 binding;
+	ClusterClogPageIdentityV2 page = {0};
+	uint8 record[CLUSTER_CLOG_PAGE_WAL_BYTES_V2];
+	uint8 zero[BLCKSZ] = {0};
+	PGPROC *proc = MyProc;
+	TransactionId xid = XidFromFullTransactionId(birth);
+	int pageno = xid / 32768;
+	volatile int fd = -1;
+	volatile int slotno = -1;
+	volatile bool io_locked = false;
+	volatile bool control_dropped = false;
+	volatile bool pending = false;
+	volatile bool own_delay = false;
+	volatile bool body_complete = false;
+
+	if (ctl == NULL || (shared = ctl->shared) == NULL ||
+		shared->ControlLock == NULL || shared->clog_page_identity == NULL ||
+		shared->clog_file_binding == NULL || shared->group_lsn == NULL ||
+		shared->lsn_groups_per_page <= 0 || shared->num_slots <= 0 ||
+		!SlruNativeClogRequired(ctl) || !FullTransactionIdIsValid(birth) ||
+		!TransactionIdIsNormal(xid) || U64FromFullTransactionId(birth) == PG_UINT64_MAX ||
+		(xid % 32768 != 0 && xid != FirstNormalTransactionId) ||
+		!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE) ||
+		!LWLockHeldByMeInMode(shared->ControlLock, LW_EXCLUSIVE) ||
+		proc == NULL || !enableFsync || InRecovery || RecoveryInProgress() ||
+		IsBootstrapProcessingMode())
+		SlruNativeClogRefuse();
+	SlruNativeClogAcquire(ctl, pageno, &borrow);
+	binding.identity = borrow.expected;
+	binding.segment = (uint32) pageno / SLRU_PAGES_PER_SEGMENT;
+	PG_TRY();
+	{
+		page.identity.logical_page = pageno;
+		page.identity.page_generation = U64FromFullTransactionId(birth);
+		page.identity.birth_full_xid = birth;
+		page.identity.birth_observed = true;
+		if (binding.identity.origin != (cluster_enabled ? cluster_node_id : 0) ||
+			binding.identity.system_identifier != GetSystemIdentifier() ||
+			binding.identity.redo_timeline != GetWALInsertionTimeLine() ||
+			!cluster_recovery_file_identity_encode_v2(&binding.identity, record, 128) ||
+			!cluster_clog_file_page_encode_v2(&binding, &page, zero, BLCKSZ,
+											 record + 128, CLUSTER_CLOG_FRAME_BYTES))
+			SlruNativeClogRefuse();
+		for (;;)
+		{
+			if (!ctl->clog_native_current(&borrow))
+				SlruNativeClogRefuse();
+			slotno = SlruSelectLRUPage(ctl, pageno);
+			if (shared->page_number[slotno] == pageno &&
+				shared->page_status[slotno] != SLRU_PAGE_EMPTY)
+			{
+				ClusterClogPageIdentityV2 *current;
+
+				if (shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS ||
+					shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS)
+				{
+					SimpleLruWaitIO(ctl, slotno);
+					continue;
+				}
+				current = &shared->clog_page_identity[slotno];
+				if (shared->page_status[slotno] != SLRU_PAGE_VALID ||
+					!SlruClogBindingMatches(&shared->clog_file_binding[slotno], &binding) ||
+					!current->identity.birth_observed ||
+					current->identity.logical_page != (uint64) pageno ||
+					current->identity.page_generation != U64FromFullTransactionId(birth) ||
+					!FullTransactionIdEquals(current->identity.birth_full_xid, birth) ||
+					current->identity.page_lsn == PG_UINT64_MAX ||
+					current->image_lsn == PG_UINT64_MAX)
+					SlruNativeClogRefuse();
+				/* A retry must preserve every already-published status bit. */
+				SlruRecentlyUsed(shared, slotno);
+				pgstat_count_slru_page_hit(shared->slru_stats_idx);
+				break;
+			}
+			if (fd < 0)
+			{
+				fd = SlruNativeClogOpen(ctl, pageno, O_RDONLY);
+				if (fd < 0)
+					SlruNativeClogRefuse();
+				continue; /* Open dropped ControlLock: reselect the original LRU. */
+			}
+			if (shared->page_status[slotno] != SLRU_PAGE_EMPTY &&
+				(shared->page_status[slotno] != SLRU_PAGE_VALID || shared->page_dirty[slotno]))
+				SlruNativeClogRefuse();
+			shared->page_number[slotno] = pageno;
+			shared->page_status[slotno] = SLRU_PAGE_READ_IN_PROGRESS;
+			shared->page_dirty[slotno] = false;
+			memset(&shared->clog_page_identity[slotno], 0, sizeof(page));
+			shared->clog_file_binding[slotno] = binding;
+			SimpleLruZeroLSNs(ctl, slotno);
+			pending = true;
+			LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
+			io_locked = true;
+			own_delay = (proc->delayChkptFlags & DELAY_CHKPT_START) == 0;
+			proc->delayChkptFlags |= DELAY_CHKPT_START;
+			LWLockRelease(shared->ControlLock);
+			control_dropped = true;
+			if (cluster_clog_storage_page_unwritten_v2(fd, &binding, pageno))
+			{
+				XLogRecPtr end;
+
+				XLogBeginInsert();
+				XLogRegisterData((char *) record, sizeof(record));
+				end = XLogInsert(RM_CLOG_ID, CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2);
+				if (XLogRecPtrIsInvalid(end) || end == PG_UINT64_MAX)
+					SlruNativeClogRefuse();
+				XLogFlush(end);
+				if (enableFsync && cluster_clog_storage_page_unwritten_v2(fd, &binding, pageno))
+					page.identity.page_lsn = end;
+			}
+			LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+			control_dropped = false;
+			if (XLogRecPtrIsInvalid(page.identity.page_lsn) ||
+				!ctl->clog_native_current(&borrow) ||
+				shared->page_number[slotno] != pageno ||
+				shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS ||
+				shared->page_dirty[slotno] ||
+				!SlruClogBindingMatches(&shared->clog_file_binding[slotno], &binding))
+				SlruNativeClogRefuse();
+			memcpy(shared->page_buffer[slotno], zero, BLCKSZ);
+			shared->clog_page_identity[slotno] = page;
+			shared->page_status[slotno] = SLRU_PAGE_VALID;
+			shared->page_dirty[slotno] = true;
+			pending = false;
+			SlruRecentlyUsed(shared, slotno);
+			shared->latest_page_number = pageno;
+			pgstat_count_slru_page_zeroed(shared->slru_stats_idx);
+			break;
+		}
+		body_complete = true;
+	}
+	PG_FINALLY();
+	{
+		/* ERROR resets holdoffs but leaves locks held. Do not restore caller
+		 * holds that abort cleanup will release through LWLockReleaseAll. */
+		if (!body_complete)
+			InterruptHoldoffCount = 0;
+		PG_TRY(cleanup);
+		{
+			if (control_dropped)
+				LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+			if (io_locked)
+			{
+				if (pending && shared->page_number[slotno] == pageno &&
+					shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS &&
+					SlruClogBindingMatches(&shared->clog_file_binding[slotno], &binding))
+				{
+					memset(&shared->clog_page_identity[slotno], 0, sizeof(page));
+					memset(&shared->clog_file_binding[slotno], 0, sizeof(binding));
+					shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+					shared->page_dirty[slotno] = false;
+				}
+				if (!body_complete)
+					HOLD_INTERRUPTS(); /* match this old lock's retail release */
+				LWLockRelease(&shared->buffer_locks[slotno].lock);
+			}
+			if (own_delay)
+				proc->delayChkptFlags &= ~DELAY_CHKPT_START;
+			if (!SlruNativeClogFinish(ctl, &borrow, fd))
+				ereport(PANIC, (errcode(ERRCODE_IO_ERROR),
+								errmsg("could not finish native CLOG birth cleanup")));
+		}
+		PG_CATCH(cleanup);
+		{
+			/* A second ERROR must not discard an unreleased identity/FD or
+			 * reservation. Crash recovery retains the original WAL duties. */
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("error during native CLOG birth cleanup")));
+		}
+		PG_END_TRY(cleanup);
+		if (!body_complete)
+			InterruptHoldoffCount = 0; /* neutralize cleanup's ControlLock reacquire */
+	}
+	PG_END_TRY();
+	return slotno;
+}
+
+int
+SimpleLruNativeClogReadV2(SlruCtl ctl, int pageno, bool write_ok)
+{
+	SlruShared shared = ctl->shared;
+	ClusterControlNativeFileBorrowV2 borrow = {0};
+	ClusterClogFileBindingV2 binding;
+	volatile int fd = -1;
+	volatile int slotno = -1;
+
+	SlruNativeClogAcquire(ctl, pageno, &borrow);
+	binding.identity = borrow.expected;
+	binding.segment = (uint32) pageno / SLRU_PAGES_PER_SEGMENT;
+	PG_TRY();
+	{
+		for (;;)
+		{
+			if (!ctl->clog_native_current(&borrow))
+				SlruNativeClogRefuse();
+			slotno = SlruSelectLRUPage(ctl, pageno);
+			if (shared->page_number[slotno] == pageno &&
+				shared->page_status[slotno] != SLRU_PAGE_EMPTY)
+			{
+				ClusterClogPageIdentityV2 *page;
+
+				if (shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS ||
+					(shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS && !write_ok))
+				{
+					SimpleLruWaitIO(ctl, slotno);
+					continue;
+				}
+				if (shared->clog_file_binding == NULL || shared->clog_page_identity == NULL ||
+					!SlruClogBindingMatches(&shared->clog_file_binding[slotno], &binding))
+					SlruNativeClogRefuse();
+				page = &shared->clog_page_identity[slotno];
+				if (!page->identity.birth_observed ||
+					page->identity.logical_page != (uint64) pageno ||
+					page->identity.page_generation == 0 ||
+					page->identity.page_generation == PG_UINT64_MAX ||
+					U64FromFullTransactionId(page->identity.birth_full_xid) == PG_UINT64_MAX ||
+					!TransactionIdIsNormal(XidFromFullTransactionId(page->identity.birth_full_xid)) ||
+					XidFromFullTransactionId(page->identity.birth_full_xid) / 32768 != pageno ||
+					page->identity.page_lsn == PG_UINT64_MAX || page->image_lsn == PG_UINT64_MAX)
+					SlruNativeClogRefuse();
+				SlruRecentlyUsed(shared, slotno);
+				pgstat_count_slru_page_hit(shared->slru_stats_idx);
+				break;
+			}
+			if (fd < 0)
+			{
+				fd = SlruNativeClogOpen(ctl, pageno, O_RDONLY);
+				if (fd < 0)
+					SlruNativeClogRefuse();
+				/* Opening dropped ControlLock: reselect, including victim write. */
+				continue;
+			}
+			if (!SimpleLruReadClogPageV2(ctl, slotno, pageno, fd, &binding))
+				SlruNativeClogRefuse();
+			break;
+		}
+		if (!ctl->clog_native_current(&borrow))
+			SlruNativeClogRefuse();
+	}
+	PG_FINALLY();
+	{
+		if (!SlruNativeClogFinish(ctl, &borrow, fd))
+			SlruNativeClogRefuse();
+	}
+	PG_END_TRY();
+	/* Caller consumes the slot before releasing the SAME family lock. The
+	 * original control transition must acquire/drain that lock and its slots. */
+	return slotno;
+}
+
+void
+SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint)
+{
+	SlruShared shared = ctl->shared;
+	int pageno = shared->page_number[slotno];
+	ClusterControlNativeFileBorrowV2 borrow = {0};
+	ClusterClogFileBindingV2 binding;
+	volatile int fd = -1;
+
+	SlruNativeClogAcquire(ctl, pageno, &borrow);
+	binding.identity = borrow.expected;
+	binding.segment = (uint32) pageno / SLRU_PAGES_PER_SEGMENT;
+	PG_TRY();
+	{
+		fd = SlruNativeClogOpen(ctl, pageno, O_RDWR);
+		if (fd < 0 || !ctl->clog_native_current(&borrow))
+			SlruNativeClogRefuse();
+		/* Open released ControlLock. Another original writer may now own IO
+		 * with dirty temporarily cleared. Preserve the original completion
+		 * wait before deciding whether this attempt has anything left to do. */
+		while (shared->page_number[slotno] == pageno &&
+			   shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS)
+			SimpleLruWaitIO(ctl, slotno);
+		if (!ctl->clog_native_current(&borrow))
+			SlruNativeClogRefuse();
+		/* A concurrent original writer may finish while open dropped the lock.
+		 * Never apply the old expected to a replacement slot. */
+		if (shared->page_number[slotno] == pageno &&
+			shared->page_status[slotno] == SLRU_PAGE_VALID && shared->page_dirty[slotno])
+		{
+			XLogRecPtr end = SimpleLruWriteClogPageV2(ctl, slotno, fd, &binding);
+
+			if (XLogRecPtrIsInvalid(end) || !ctl->clog_native_current(&borrow))
+			{
+				if (shared->page_number[slotno] == pageno)
+					shared->page_dirty[slotno] = true;
+				SlruNativeClogRefuse();
+			}
+			if (checkpoint)
+				CheckpointStats.ckpt_bufs_written++;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!SlruNativeClogFinish(ctl, &borrow, fd))
+		{
+			if (shared->page_number[slotno] == pageno)
+				shared->page_dirty[slotno] = true;
+			SlruNativeClogRefuse();
+		}
+	}
+	PG_END_TRY();
+}
+#endif
+
 /*
  * Initialize (or reinitialize) a page to zeroes.
  *
@@ -309,12 +740,20 @@ SimpleLruZeroPage(SlruCtl ctl, int pageno)
 	SlruShared	shared = ctl->shared;
 	int			slotno;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Birth must consume the original allocator's complete pre-registered
+	 * range and full-image WAL. Raw callers cannot zero a
+	 * selected-format page or emit a legacy ZERO through an empty raw slot. */
+	if (SlruNativeClogRequired(ctl))
+		SlruNativeClogRefuse();
+#endif
 	/* Find a suitable buffer slot for the page */
 	slotno = SlruSelectLRUPage(ctl, pageno);
 	Assert(shared->page_status[slotno] == SLRU_PAGE_EMPTY ||
 		   (shared->page_status[slotno] == SLRU_PAGE_VALID &&
 			!shared->page_dirty[slotno]) ||
 		   shared->page_number[slotno] == pageno);
+	SlruRequireRawSlot(ctl, slotno);
 
 	/* Mark the slot as containing this page */
 #ifdef USE_PGRAC_CLUSTER
@@ -324,6 +763,14 @@ SimpleLruZeroPage(SlruCtl ctl, int pageno)
 	shared->page_status[slotno] = SLRU_PAGE_VALID;
 	shared->page_dirty[slotno] = true;
 	SlruRecentlyUsed(shared, slotno);
+
+	/* A raw zero or reuse never inherits a previous page birth. */
+	if (shared->clog_page_identity != NULL)
+		memset(&shared->clog_page_identity[slotno], 0,
+			   sizeof(ClusterClogPageIdentityV2));
+	if (shared->clog_file_binding != NULL)
+		memset(&shared->clog_file_binding[slotno], 0,
+			   sizeof(ClusterClogFileBindingV2));
 
 	/* Set the buffer to zeroes */
 	MemSet(shared->page_buffer[slotno], 0, BLCKSZ);
@@ -432,6 +879,15 @@ SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
 {
 	SlruShared	shared = ctl->shared;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (SlruNativeClogRequired(ctl))
+	{
+		if (ctl->clog_native_read == NULL)
+			SlruNativeClogRefuse();
+		return ctl->clog_native_read(ctl, pageno, write_ok);
+	}
+#endif
+
 	/* Outer loop handles restart if we must wait for someone else's I/O */
 	for (;;)
 	{
@@ -440,6 +896,7 @@ SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
 
 		/* See if page already is in memory; if not, pick victim slot */
 		slotno = SlruSelectLRUPage(ctl, pageno);
+		SlruRequireRawSlot(ctl, slotno);
 
 		/* Did we find the page in memory? */
 		if (shared->page_number[slotno] == pageno &&
@@ -478,6 +935,14 @@ SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
 		shared->page_number[slotno] = pageno;
 		shared->page_status[slotno] = SLRU_PAGE_READ_IN_PROGRESS;
 		shared->page_dirty[slotno] = false;
+		/* Legacy payload reads have no persisted FullXid provenance. Clear
+		 * before dropping ControlLock, including read-error paths. */
+		if (shared->clog_page_identity != NULL)
+			memset(&shared->clog_page_identity[slotno], 0,
+				   sizeof(ClusterClogPageIdentityV2));
+		if (shared->clog_file_binding != NULL)
+			memset(&shared->clog_file_binding[slotno], 0,
+				   sizeof(ClusterClogFileBindingV2));
 
 		/* Acquire per-buffer lock (cannot deadlock, see notes at top) */
 		LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
@@ -535,6 +1000,16 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno, TransactionId xid)
 	SlruShared	shared = ctl->shared;
 	int			slotno;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (SlruNativeClogRequired(ctl))
+	{
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+		if (ctl->clog_native_read == NULL)
+			SlruNativeClogRefuse();
+		return ctl->clog_native_read(ctl, pageno, true);
+	}
+#endif
+
 	/* Try to find the page while holding only shared lock */
 	LWLockAcquire(shared->ControlLock, LW_SHARED);
 
@@ -546,6 +1021,7 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno, TransactionId xid)
 			shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS)
 		{
 			/* See comments for SlruRecentlyUsed macro */
+			SlruRequireRawSlot(ctl, slotno);
 			SlruRecentlyUsed(shared, slotno);
 
 			/* update the stats counter of pages found in the SLRU */
@@ -562,6 +1038,30 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno, TransactionId xid)
 	return SimpleLruReadPage(ctl, pageno, true, xid);
 }
 
+/* The caller holds ControlLock across this complete, by-value observation. */
+static void
+SlruCaptureWriteSnapshot(SlruCtl ctl, int slotno, SlruWriteSnapshot *snapshot)
+{
+	SlruShared	shared = ctl->shared;
+	int			lsnindex = slotno * shared->lsn_groups_per_page;
+
+	Assert(LWLockHeldByMe(shared->ControlLock));
+	memcpy(snapshot->page.data, shared->page_buffer[slotno], BLCKSZ);
+	memset(&snapshot->clog_page, 0, sizeof(snapshot->clog_page));
+	if (shared->clog_page_identity != NULL)
+		snapshot->clog_page = shared->clog_page_identity[slotno];
+	snapshot->flush_lsn = InvalidXLogRecPtr;
+	if (shared->group_lsn != NULL)
+	{
+		for (int i = 0; i < shared->lsn_groups_per_page; i++)
+			snapshot->flush_lsn = Max(snapshot->flush_lsn,
+									 shared->group_lsn[lsnindex + i]);
+	}
+	snapshot->clog_page.identity.page_lsn =
+		Max(snapshot->clog_page.identity.page_lsn, snapshot->flush_lsn);
+}
+
+
 /*
  * Write a page from a shared buffer, if necessary.
  * Does nothing if the specified slot is not dirty.
@@ -573,12 +1073,15 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno, TransactionId xid)
  *
  * Control lock must be held at entry, and will be held at exit.
  */
+
 static void
 SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 {
 	SlruShared	shared = ctl->shared;
 	int			pageno = shared->page_number[slotno];
 	bool		ok;
+	SlruWriteSnapshot snapshot;
+	const SlruWriteSnapshot *write_snapshot = NULL;
 
 	/* If a write is in progress, wait for it to finish */
 	while (shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS &&
@@ -597,6 +1100,30 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 		// cppcheck-suppress knownConditionTrueFalse
 		shared->page_number[slotno] != pageno)
 		return;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (SlruNativeClogRequired(ctl))
+	{
+		if (ctl->clog_native_write == NULL)
+			SlruNativeClogRefuse();
+		ctl->clog_native_write(ctl, slotno, fdata != NULL);
+		return;
+	}
+#endif
+	SlruRequireRawSlot(ctl, slotno);
+
+	/*
+	 * CLOG updaters can modify the shared page and its async-commit LSNs as
+	 * soon as we release ControlLock.  Capture both now, so WAL flush and
+	 * physical data write refer to the same bytes.  A subsequent update still
+	 * sets page_dirty and must be written by a later attempt.  Other SLRUs
+	 * retain their existing shared-buffer write path.
+	 */
+	if (ctl->sync_handler == SYNC_HANDLER_CLOG)
+	{
+		SlruCaptureWriteSnapshot(ctl, slotno, &snapshot);
+		write_snapshot = &snapshot;
+	}
 
 	/*
 	 * Mark the slot write-busy, and clear the dirtybit.  After this point, a
@@ -617,7 +1144,7 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	LWLockRelease(shared->ControlLock);
 
 	/* Do the write */
-	ok = SlruPhysicalWritePage(ctl, pageno, slotno, fdata);
+	ok = SlruPhysicalWritePage(ctl, pageno, slotno, fdata, write_snapshot);
 
 	/* If we failed, and we're in a flush, better close the files */
 	if (!ok && fdata)
@@ -664,6 +1191,193 @@ void
 SimpleLruWritePage(SlruCtl ctl, int slotno)
 {
 	SlruInternalWritePage(ctl, slotno, NULL);
+}
+
+bool
+SimpleLruReadClogPageV2(SlruCtl ctl, int slotno, int pageno, int fd,
+						 const ClusterClogFileBindingV2 *expected)
+{
+	SlruShared shared;
+	ClusterClogFileBindingV2 binding;
+	ClusterClogPageIdentityV2 observed;
+	PGAlignedBlock payload;
+	bool ok = false;
+
+	if (ctl == NULL || expected == NULL || fd < 0 || pageno < 0 || pageno >= 131072 ||
+		ctl->sync_handler != SYNC_HANDLER_CLOG || (shared = ctl->shared) == NULL ||
+		slotno < 0 || slotno >= shared->num_slots || shared->ControlLock == NULL ||
+		shared->page_buffer == NULL || shared->page_buffer[slotno] == NULL ||
+		shared->page_status == NULL || shared->page_dirty == NULL ||
+		shared->page_number == NULL || shared->page_lru_count == NULL ||
+		shared->buffer_locks == NULL || shared->clog_page_identity == NULL ||
+		shared->clog_file_binding == NULL || shared->group_lsn == NULL ||
+		shared->lsn_groups_per_page <= 0 ||
+		!LWLockHeldByMeInMode(shared->ControlLock, LW_EXCLUSIVE))
+		return false;
+	if (shared->page_dirty[slotno] ||
+		(shared->page_status[slotno] != SLRU_PAGE_EMPTY &&
+		 shared->page_status[slotno] != SLRU_PAGE_VALID))
+		return false;
+	/* This caller-reserved slot must not create a second cache owner. */
+	for (int i = 0; i < shared->num_slots; i++)
+		if (i != slotno && shared->page_status[i] != SLRU_PAGE_EMPTY &&
+			shared->page_number[i] == pageno)
+			return false;
+	binding = *expected;
+	if ((uint32) pageno / CLUSTER_CLOG_PAGES_PER_FILE != binding.segment ||
+		!cluster_clog_file_header_encode_v2(&binding, payload.data, BLCKSZ))
+		return false;
+
+	shared->page_number[slotno] = pageno;
+	shared->page_status[slotno] = SLRU_PAGE_READ_IN_PROGRESS;
+	memset(&shared->clog_page_identity[slotno], 0, sizeof(ClusterClogPageIdentityV2));
+	/* Retain the selected binding as a reservation throughout the I/O gap.
+	 * It blocks raw same-page zero/read/write before payload is installed. */
+	shared->clog_file_binding[slotno] = binding;
+	SimpleLruZeroLSNs(ctl, slotno);
+	LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
+	LWLockRelease(shared->ControlLock);
+	PG_TRY();
+	{
+		pgstat_report_wait_start(WAIT_EVENT_SLRU_READ);
+		ok = cluster_clog_storage_read_page_v2(fd, &binding, pageno, &observed,
+												payload.data, BLCKSZ);
+		pgstat_report_wait_end();
+	}
+	PG_CATCH();
+	{
+		pgstat_report_wait_end();
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+		memset(&shared->clog_file_binding[slotno], 0, sizeof(ClusterClogFileBindingV2));
+		shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+		LWLockRelease(&shared->buffer_locks[slotno].lock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	if (shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS ||
+		shared->page_number[slotno] != pageno || shared->page_dirty[slotno])
+		ok = false;
+	if (ok)
+	{
+		memcpy(shared->page_buffer[slotno], payload.data, BLCKSZ);
+		shared->clog_page_identity[slotno] = observed;
+		shared->clog_file_binding[slotno] = binding;
+		SlruRecentlyUsed(shared, slotno);
+	}
+	if (!ok)
+		memset(&shared->clog_file_binding[slotno], 0, sizeof(ClusterClogFileBindingV2));
+	shared->page_status[slotno] = ok ? SLRU_PAGE_VALID : SLRU_PAGE_EMPTY;
+	LWLockRelease(&shared->buffer_locks[slotno].lock);
+	if (ok)
+		pgstat_count_slru_page_read(shared->slru_stats_idx);
+	return ok;
+}
+
+/* A managed write uses the same slot/ControlLock/per-buffer I/O protocol, but
+ * its full-image WAL can raise ERROR and its durable file is generation-bound.
+ * Keep it separate from the raw writer and its segno-only sync queue. */
+XLogRecPtr
+SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
+						  const ClusterClogFileBindingV2 *expected)
+{
+	SlruShared shared;
+	SlruWriteSnapshot snapshot;
+	ClusterClogFileBindingV2 binding;
+	ClusterClogPageIdentityV2 *current;
+	uint8 unknown_binding[sizeof(ClusterClogFileBindingV2)] = {0};
+	uint8 checked_frame[CLUSTER_CLOG_FRAME_BYTES];
+	XLogRecPtr end = InvalidXLogRecPtr;
+	bool ok = false;
+	bool fresh_binding;
+	int pageno;
+
+	if (ctl == NULL || expected == NULL || fd < 0 ||
+		ctl->sync_handler != SYNC_HANDLER_CLOG || (shared = ctl->shared) == NULL ||
+		slotno < 0 || slotno >= shared->num_slots || shared->ControlLock == NULL ||
+		shared->page_buffer == NULL || shared->page_status == NULL ||
+		shared->page_dirty == NULL || shared->page_number == NULL ||
+		shared->buffer_locks == NULL || shared->clog_page_identity == NULL ||
+		shared->clog_file_binding == NULL ||
+		shared->group_lsn == NULL || shared->lsn_groups_per_page <= 0 ||
+		!LWLockHeldByMeInMode(shared->ControlLock, LW_EXCLUSIVE))
+		return InvalidXLogRecPtr;
+	pageno = shared->page_number[slotno];
+	while (shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS &&
+		   shared->page_number[slotno] == pageno)
+		SimpleLruWaitIO(ctl, slotno);
+	if (!shared->page_dirty[slotno] || shared->page_status[slotno] != SLRU_PAGE_VALID ||
+		shared->page_number[slotno] != pageno || pageno < 0 ||
+		shared->page_buffer[slotno] == NULL)
+		return InvalidXLogRecPtr;
+
+	/* Validate the complete by-value snapshot before changing any slot state.
+	 * In particular, a raw page number or an LSN cannot supply missing birth. */
+	binding = *expected;
+	SlruCaptureWriteSnapshot(ctl, slotno, &snapshot);
+	fresh_binding = snapshot.clog_page.image_lsn == InvalidXLogRecPtr &&
+		memcmp(&shared->clog_file_binding[slotno], unknown_binding,
+			   sizeof(unknown_binding)) == 0;
+	if ((!fresh_binding && !SlruClogBindingMatches(&shared->clog_file_binding[slotno], &binding)) ||
+		snapshot.clog_page.identity.logical_page != (uint64) pageno ||
+		!cluster_clog_file_page_encode_v2(&binding, &snapshot.clog_page,
+										 snapshot.page.data, BLCKSZ,
+										 checked_frame, sizeof(checked_frame)))
+		return InvalidXLogRecPtr;
+
+	/* Only the original unwritten birth may first bind the independent
+	 * expected file. Keep that responsibility even when the first I/O fails. */
+	if (fresh_binding)
+		shared->clog_file_binding[slotno] = binding;
+	shared->page_status[slotno] = SLRU_PAGE_WRITE_IN_PROGRESS;
+	shared->page_dirty[slotno] = false;
+	LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
+	LWLockRelease(shared->ControlLock);
+
+	PG_TRY();
+	{
+		pgstat_count_slru_page_written(shared->slru_stats_idx);
+		pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
+		ok = cluster_clog_storage_write_page_v2(fd, &binding, &snapshot.clog_page,
+												 snapshot.page.data, BLCKSZ, &end);
+		pgstat_report_wait_end();
+	}
+	PG_CATCH();
+	{
+		pgstat_report_wait_end();
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+		shared->page_dirty[slotno] = true;
+		shared->page_status[slotno] = SLRU_PAGE_VALID;
+		LWLockRelease(&shared->buffer_locks[slotno].lock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	current = &shared->clog_page_identity[slotno];
+	if (!SlruClogBindingMatches(&shared->clog_file_binding[slotno], &binding) ||
+		shared->page_number[slotno] != pageno ||
+		shared->page_status[slotno] != SLRU_PAGE_WRITE_IN_PROGRESS ||
+		current->identity.logical_page != snapshot.clog_page.identity.logical_page ||
+		current->identity.page_generation != snapshot.clog_page.identity.page_generation ||
+		!current->identity.birth_observed ||
+		!FullTransactionIdEquals(current->identity.birth_full_xid,
+							 snapshot.clog_page.identity.birth_full_xid) ||
+		current->image_lsn != snapshot.clog_page.image_lsn)
+		ok = false;
+	if (ok)
+	{
+		current->image_lsn = end;
+		current->identity.page_lsn = Max(current->identity.page_lsn,
+									 snapshot.clog_page.identity.page_lsn);
+		/* A live page may already differ from the captured on-disk image. */
+		current->identity.payload_crc = current->identity.metadata_crc = 0;
+	}
+	else
+		shared->page_dirty[slotno] = true;
+	shared->page_status[slotno] = SLRU_PAGE_VALID;
+	LWLockRelease(&shared->buffer_locks[slotno].lock);
+	return ok ? end : InvalidXLogRecPtr;
 }
 
 /*
@@ -803,7 +1517,8 @@ SlruPhysicalReadPage(SlruCtl ctl, int pageno, int slotno)
  * SimpleLruWriteAll.
  */
 static bool
-SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
+SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata,
+					  const SlruWriteSnapshot *snapshot)
 {
 	SlruShared	shared = ctl->shared;
 	int			segno = pageno / SLRU_PAGES_PER_SEGMENT;
@@ -819,7 +1534,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 	 * write out data before associated WAL records.  This is the same action
 	 * performed during FlushBuffer() in the main buffer manager.
 	 */
-	if (shared->group_lsn != NULL)
+	if (snapshot != NULL || shared->group_lsn != NULL)
 	{
 		/*
 		 * We must determine the largest async-commit LSN for the page. This
@@ -832,14 +1547,19 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 		int			lsnindex,
 					lsnoff;
 
-		lsnindex = slotno * shared->lsn_groups_per_page;
-		max_lsn = shared->group_lsn[lsnindex++];
-		for (lsnoff = 1; lsnoff < shared->lsn_groups_per_page; lsnoff++)
+		if (snapshot != NULL)
+			max_lsn = snapshot->flush_lsn;
+		else
 		{
-			XLogRecPtr	this_lsn = shared->group_lsn[lsnindex++];
+			lsnindex = slotno * shared->lsn_groups_per_page;
+			max_lsn = shared->group_lsn[lsnindex++];
+			for (lsnoff = 1; lsnoff < shared->lsn_groups_per_page; lsnoff++)
+			{
+				XLogRecPtr	this_lsn = shared->group_lsn[lsnindex++];
 
-			if (max_lsn < this_lsn)
-				max_lsn = this_lsn;
+				if (max_lsn < this_lsn)
+					max_lsn = this_lsn;
+			}
 		}
 
 		if (!XLogRecPtrIsInvalid(max_lsn))
@@ -923,7 +1643,8 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
-	if (pg_pwrite(fd, shared->page_buffer[slotno], BLCKSZ, offset) != BLCKSZ)
+	if (pg_pwrite(fd, snapshot != NULL ? snapshot->page.data : shared->page_buffer[slotno],
+				  BLCKSZ, offset) != BLCKSZ)
 	{
 		pgstat_report_wait_end();
 		/* if write didn't set errno, assume problem is no disk space */

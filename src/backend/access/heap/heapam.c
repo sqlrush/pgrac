@@ -9496,9 +9496,15 @@ cluster_current_mx_stamp_prepare_slow(
 				: CTRC_REF_RECOMPOSED_SURVIVOR;
 		publication.target_kind = CTRC_TARGET_PAGE_PENDING_OFFNUM;
 		publication.grant_generation = grant;
-		prepare_result = cluster_ctrc_receipt_prepare_shared(
-			&ctrc_key, &participant, grant, &publication,
-			pending_target, &handles[*receipt_count]);
+		if (found && ctrc_key.origin_node_id != (uint16)cluster_node_id)
+			prepare_result = cluster_ctrc_receipt_prepare_origin_v2(
+				&ctrc_key, &participant, grant, &publication, pending_target,
+				proof.origin_fullxid_v2, sizeof(proof.origin_fullxid_v2),
+				&handles[*receipt_count]);
+		else
+			prepare_result = cluster_ctrc_receipt_prepare_shared(
+				&ctrc_key, &participant, grant, &publication,
+				pending_target, &handles[*receipt_count]);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 		{
@@ -20946,6 +20952,67 @@ heap_execute_freeze_tuple(HeapTupleHeader tuple, HeapTupleFreeze *frz)
 	tuple->t_infomask2 = frz->t_infomask2;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Borrow only the collector's original scopes. Current source queries belong
+ * outside content locks; the final locked checks use issuer-local memory only.
+ * No copied foreign proof can stand in for a live exact guard. */
+static bool
+heap_freeze_retained_sources_current(
+	const ClusterHeapFreezePageInputV1 *input,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
+	const ClusterSemanticAdmissionToken *admission, bool recheck_source)
+{
+	if (input == NULL || proofs == NULL || admission == NULL || !admission->entered
+		|| proofs->proof_count == 0 || proofs->proof_count > CLUSTER_HEAP_FREEZE_MAX_PROOF_BATCH)
+		return false;
+	for (uint8 index = 0; index < proofs->proof_count; index++)
+	{
+		const ClusterHeapFreezeCanonicalProofV1 *proof = &proofs->proofs[index];
+		const ClusterTxResolution *resolution = &proof->resolution;
+		const ClusterTxLocator *locator = &resolution->locator_echo;
+		const ClusterItlSlotData *slot;
+		ClusterCtrcItlTargetIdentity target = {0};
+
+		if (resolution->local_canonical_valid)
+			continue;
+		if (input->freeze_source_proofs != proofs || input->freeze_source_guards == NULL
+			|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+			|| cluster_heap_freeze_validate_canonical_proof_v1(proof)
+				!= CLUSTER_HEAP_FREEZE_PROOF_PROVEN
+			|| resolution->origin_companion.key.origin_node_id == (uint16)cluster_node_id
+			|| cluster_heap_freeze_validate_page_v1(input, &input->identity, input->block,
+				(Page)input->image.data) != CLUSTER_HEAP_FREEZE_PAGE_MATCHED
+			|| !PageHasItl((Page)input->image.data)
+			|| locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+			return false;
+		slot = ClusterPageGetItlSlot((Page)input->image.data, locator->itl_slot_index);
+		if (slot == NULL || slot->xid != locator->xid || slot->flags != locator->itl_kind
+			|| memcmp(&slot->undo_segment_head, &locator->uba, sizeof(locator->uba)) != 0)
+			return false;
+		target.spc_oid = input->identity.key.locator.spcOid;
+		target.db_oid = input->identity.key.locator.dbOid;
+		target.rel_number = input->identity.key.locator.relNumber;
+		target.fork_number = MAIN_FORKNUM;
+		target.block_number = input->block;
+		target.itl_xid = slot->xid;
+		target.itl_slot_index = locator->itl_slot_index;
+		target.itl_slot_wrap = slot->wrap;
+		target.itl_class = slot->flags;
+		target.needs_wal = true;
+		memcpy(target.uba, &slot->undo_segment_head, sizeof(target.uba));
+		if (!cluster_ctrc_itl_read_guard_matches_admission_v1(
+			&input->freeze_source_guards[index], &resolution->origin_companion.key,
+			resolution->origin_companion.original_full_xid, &target,
+			(uint16)cluster_node_id, admission->formation_epoch, admission->record_generation)
+			|| (recheck_source
+				&& !cluster_runtime_visibility_foreign_companion_target_guard_current_admitted(
+					resolution, &target, admission, &input->freeze_source_guards[index])))
+			return false;
+	}
+	return true;
+}
+#endif
+
 /*
  * Apply already-qualified freeze plans under the caller's exclusive content
  * lock.  Eligibility checks belong to the caller; this private mutation/WAL
@@ -20961,6 +21028,7 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 						   , const ClusterSpaceIdentity *identity, bool conditional,
 						   const ClusterHeapFreezePageInputV1 *freeze_input,
 						   const ClusterSemanticAdmissionToken *freeze_admission,
+						   const ClusterHeapFreezeProofBatchV1 *freeze_proofs,
 						   const ClusterHeapFreezeObservedBoundsV1 *expected_bounds,
 						   FullTransactionId expected_legal_next
 #endif
@@ -21022,7 +21090,9 @@ heap_freeze_apply_prepared(Relation rel, Buffer buffer,
 			|| !FullTransactionIdEquals(final_bounds.freeze_limit, expected_bounds->freeze_limit)
 			|| final_bounds.horizon_scn != expected_bounds->horizon_scn
 			|| !FullTransactionIdEquals(freeze_input->freeze_policy->legal_next,
-				expected_legal_next)))
+				expected_legal_next)
+			|| !heap_freeze_retained_sources_current(freeze_input, freeze_proofs,
+				freeze_admission, false)))
 		return false;
 #endif
 	START_CRIT_SECTION();
@@ -21092,6 +21162,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	Relation rel, Buffer buffer,
 	const ClusterHeapFreezePageInputV1 *input,
 	const ClusterHeapFreezePageBatchV1 *page,
+	const ClusterHeapFreezeProofBatchV1 *proofs,
 	const ClusterHeapFreezeFinalFenceV1 *fence,
 	const PcmAuthoritySnapshot *authority_before,
 	const ClusterSemanticAdmissionToken *admission,
@@ -21213,7 +21284,8 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	if (!cluster_heap_freeze_observed_bounds_v1(input->freeze_policy,
 		input->freeze_cohort, admission, cluster_node_id, &bounds)
 		|| !FullTransactionIdEquals(bounds.freeze_limit, freeze_limit_full)
-		|| bounds.horizon_scn != horizon_scn)
+		|| bounds.horizon_scn != horizon_scn
+		|| !heap_freeze_retained_sources_current(input, proofs, admission, false))
 		return false;
 
 	/* Native FREEZE_PAGE keeps a raw conflict horizon. Recheck the original
@@ -21238,7 +21310,7 @@ cluster_heap_freeze_apply_xmin_batch_locked_v1(
 	/* Native redo and the existing SPACE version edge remain the only format. */
 	if (!heap_freeze_apply_prepared(rel, buffer,
 		conflict_horizon, plans, target_count,
-		&fence->identity, true, input, admission, &bounds, legal_next))
+		&fence->identity, true, input, admission, proofs, &bounds, legal_next))
 		return false;
 	XLogFlush(PageGetLSN(live_page));
 	return true;
@@ -21300,6 +21372,10 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 	/* Plan only from the caller's immutable captured inputs. Finish the
 	 * whole batch before restoring a writer or taking its local content X;
 	 * the locked kernel still rechecks every physical row and final fence. */
+	/* The native continuation borrows the exact original receiver scopes.
+	 * Refusal never retires them; the original collector finally owns that. */
+	if (!heap_freeze_retained_sources_current(input, proofs, admission, false))
+		return false;
 	if (!cluster_heap_freeze_prepare_xmin_batch_v1(page, proofs, fence,
 		targets, target_count, freeze_limit_full, horizon_scn,
 		plans, lengthof(plans), &conflict_horizon))
@@ -21316,9 +21392,16 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 			return false;
 	buf = GetBufferDescriptor(buffer - 1);
 	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+	{
+		/* A foreign scope needs its source/current check outside page locks.
+		 * Keep preowned foreign writers closed; never query ROOT under X. */
+		for (uint8 index = 0; index < proofs->proof_count; index++)
+			if (!proofs->proofs[index].resolution.local_canonical_valid)
+				return false;
 		return cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
-			input, page, fence, authority_before, admission,
+			input, page, proofs, fence, authority_before, admission,
 			targets, target_count, plans, conflict_horizon, freeze_limit_full, horizon_scn);
+	}
 	if (input == NULL || !input->writer_context_valid)
 		return false;
 	/* A census-read token cannot restore an ordinary writer. Validate the
@@ -21335,6 +21418,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 		|| !cluster_heap_freeze_policy_sample_current_v1(input->freeze_policy)
 		|| cluster_heap_freeze_cohort_current(input->freeze_cohort)
 			!= CLUSTER_HEAP_FREEZE_COHORT_READY
+		|| !heap_freeze_retained_sources_current(input, proofs, admission, true)
 		|| !cluster_semantic_activation_recheck_r4_terminal_census(admission))
 		return false;
 
@@ -21345,7 +21429,7 @@ cluster_heap_freeze_apply_xmin_batch_v1(
 			input->writer_object_checked);
 		if (resumed)
 			applied = cluster_heap_freeze_apply_xmin_batch_locked_v1(rel, buffer,
-				input, page, fence, authority_before, admission,
+				input, page, proofs, fence, authority_before, admission,
 				targets, target_count, plans, conflict_horizon, freeze_limit_full, horizon_scn);
 	}
 	PG_FINALLY();
@@ -21372,21 +21456,29 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
 	FullTransactionId freeze_limit_full, SCN horizon_scn)
 {
+	ClusterHeapFreezeObservedBoundsV1 bounds;
 	volatile bool applied = false;
 
 	/* The proof phase may have released its pin. Reuse only the original
 	 * resident hint under the caller's still-entered admission: no fetch,
 	 * new current, proof request or replacement source observation.
-	 * Reject an already obsolete local ingress cut before acquiring this
-	 * pin; the pinned continuation repeats the same check after acquisition. */
+	 * Match the original saved F/H and reject an already obsolete local
+	 * ingress cut before acquiring this pin. These pure checks supply no
+	 * provenance or retention authority; the pinned continuation repeats
+	 * them after acquisition and retains its final TARGET/WAL fences. */
 	if (rel == NULL || !rel->rd_isvalid || input == NULL || page == NULL
 		|| proofs == NULL || fence == NULL || authority_before == NULL
 		|| admission == NULL || !admission->entered || targets == NULL
 		|| target_count == 0 || target_count > MaxHeapTuplesPerPage
+		|| target_count > page->tuple_count
 		|| recent_buffer <= 0 || recent_buffer > NBuffers
 		|| BufferDescriptors == NULL
 		|| admission->record_generation != fence->admission_generation
 		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator)
+		|| !cluster_heap_freeze_observed_bounds_v1(input->freeze_policy,
+			input->freeze_cohort, admission, cluster_node_id, &bounds)
+		|| !FullTransactionIdEquals(bounds.freeze_limit, freeze_limit_full)
+		|| bounds.horizon_scn != horizon_scn
 		|| input->freeze_cohort == NULL
 		|| input->freeze_cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
 		|| input->freeze_cohort->local_registration_cut.unqualified_entries != 0
@@ -21518,7 +21610,7 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 	heap_freeze_apply_prepared(rel, buffer, snapshotConflictHorizon, tuples,
 							   ntuples
 #ifdef USE_PGRAC_CLUSTER
-							   , identity, false, NULL, NULL, NULL, InvalidFullTransactionId
+							   , identity, false, NULL, NULL, NULL, NULL, InvalidFullTransactionId
 #endif
 							   );
 }

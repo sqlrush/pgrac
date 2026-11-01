@@ -53,11 +53,14 @@ OBJS_COMMON = \
 	cluster_catalog_init.o \
 	cluster_catalog_manifest.o \
 	cluster_catalog_verify.o \
+	cluster_clog_file.o \
+	cluster_clog_wal.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_recovery_file_identity.o \
 	cluster_recovery_registry.o \
 	cluster_relmap_file.o \
 	cluster_relmap_file_io.o \
+	cluster_recovery_bootstrap.o \
 	cluster_relmap_init.o \
 	cluster_relmap_v2.o \
 	cluster_space_identity.o \
@@ -114,6 +117,7 @@ OBJS_COMMON += \
 	md5.o \
 	sha1.o
 endif
+
 
 # A few files are currently only built for frontend, not server
 # (Mkvcbuild.pm has a copy of this list, too).  logging.c is excluded

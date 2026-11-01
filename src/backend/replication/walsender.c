@@ -2418,7 +2418,8 @@ ProcessStandbyReplyMessage(void)
 
 /* compute new replication slot xmin horizon if needed */
 static void
-PhysicalReplicationSlotNewXmin(TransactionId feedbackXmin, TransactionId feedbackCatalogXmin)
+PhysicalReplicationSlotNewXminGuts(TransactionId feedbackXmin,
+								 TransactionId feedbackCatalogXmin, bool already_locked)
 {
 	bool		changed = false;
 	ReplicationSlot *slot = MyReplicationSlot;
@@ -2452,8 +2453,91 @@ PhysicalReplicationSlotNewXmin(TransactionId feedbackXmin, TransactionId feedbac
 	if (changed)
 	{
 		ReplicationSlotMarkDirty();
-		ReplicationSlotsComputeRequiredXmin(false);
+		ReplicationSlotsComputeRequiredXmin(already_locked);
 	}
+}
+
+static void
+PhysicalReplicationSlotNewXmin(TransactionId feedbackXmin, TransactionId feedbackCatalogXmin)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_node_id >= 0)
+	{
+		/* Same order as initial logical-slot publication. Keep the native
+		 * aggregate in this cut: a check after slot writes is too late. */
+		LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		PG_TRY();
+		{
+			if (!ProcArrayReplicationFeedbackAllowed(feedbackXmin, feedbackCatalogXmin))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("replication feedback history is not covered by the retained cluster read horizon")));
+			PhysicalReplicationSlotNewXminGuts(feedbackXmin, feedbackCatalogXmin, true);
+		}
+		PG_FINALLY();
+		{
+			LWLockRelease(ProcArrayLock);
+			LWLockRelease(ReplicationSlotControlLock);
+		}
+		PG_END_TRY();
+		return;
+	}
+#endif
+	PhysicalReplicationSlotNewXminGuts(feedbackXmin, feedbackCatalogXmin, false);
+}
+
+/* Publish both valid feedback and its original clear operation through the
+ * same owner. Epoch/range validation remains with the message handler. */
+static void
+PhysicalReplicationFeedbackNewXmin(TransactionId feedbackXmin,
+								  TransactionId feedbackCatalogXmin)
+{
+	TransactionId xmin = InvalidTransactionId;
+
+	if (MyReplicationSlot != NULL)
+	{
+		PhysicalReplicationSlotNewXmin(feedbackXmin, feedbackCatalogXmin);
+		return;
+	}
+	if (TransactionIdIsNormal(feedbackXmin) || TransactionIdIsNormal(feedbackCatalogXmin))
+	{
+		if (TransactionIdIsNormal(feedbackCatalogXmin) &&
+			TransactionIdPrecedes(feedbackCatalogXmin, feedbackXmin))
+			xmin = feedbackCatalogXmin;
+		else
+			xmin = feedbackXmin;
+	}
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_node_id >= 0)
+	{
+		/* A catalog-only request is still a history owner. Native raw-XID
+		 * ordering against Invalid/Frozen must not turn it into an empty
+		 * cluster publication or bypass the retained-H check. */
+		if (!TransactionIdIsNormal(feedbackXmin) &&
+			TransactionIdIsNormal(feedbackCatalogXmin))
+			xmin = feedbackCatalogXmin;
+		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+		PG_TRY();
+		{
+			if (!ProcArrayReplicationFeedbackAllowed(xmin, InvalidTransactionId))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("replication feedback history is not covered by the retained cluster read horizon")));
+			MyProc->xmin = xmin;
+			/* This raw-only history owner cannot borrow a previous SQL
+			 * snapshot's SCN when the next native H cut scans its PGPROC. */
+			pg_atomic_write_u64(&MyProc->cluster_read_scn_atomic, InvalidScn);
+		}
+		PG_FINALLY();
+		{
+			LWLockRelease(ProcArrayLock);
+		}
+		PG_END_TRY();
+		return;
+	}
+#endif
+	MyProc->xmin = xmin;
 }
 
 /*
@@ -2553,9 +2637,7 @@ ProcessStandbyHSFeedbackMessage(void)
 	if (!TransactionIdIsNormal(feedbackXmin)
 		&& !TransactionIdIsNormal(feedbackCatalogXmin))
 	{
-		MyProc->xmin = InvalidTransactionId;
-		if (MyReplicationSlot != NULL)
-			PhysicalReplicationSlotNewXmin(feedbackXmin, feedbackCatalogXmin);
+		PhysicalReplicationFeedbackNewXmin(feedbackXmin, feedbackCatalogXmin);
 		return;
 	}
 
@@ -2588,11 +2670,13 @@ ProcessStandbyHSFeedbackMessage(void)
 	 * xmins, this could only happen during the first reply cycle, else our
 	 * own xmin would prevent nextXid from advancing so far.
 	 *
-	 * We don't bother taking the ProcArrayLock here.  Setting the xmin field
+	 * Native PostgreSQL need not take ProcArrayLock here. Setting the xmin field
 	 * is assumed atomic, and there's no real need to prevent concurrent
 	 * horizon determinations.  (If we're moving our xmin forward, this is
 	 * obviously safe, and if we're moving it backwards, well, the data is at
 	 * risk already since a VACUUM could already have determined the horizon.)
+	 * Cluster publication additionally serializes with the retained SCN promise
+	 * in PhysicalReplicationFeedbackNewXmin before exposing raw-only history.
 	 *
 	 * If we're using a replication slot we reserve the xmin via that,
 	 * otherwise via the walsender's PGPROC entry. We can only track the
@@ -2602,16 +2686,7 @@ ProcessStandbyHSFeedbackMessage(void)
 	 * XXX: It might make sense to generalize the ephemeral slot concept and
 	 * always use the slot mechanism to handle the feedback xmin.
 	 */
-	if (MyReplicationSlot != NULL)	/* XXX: persistency configurable? */
-		PhysicalReplicationSlotNewXmin(feedbackXmin, feedbackCatalogXmin);
-	else
-	{
-		if (TransactionIdIsNormal(feedbackCatalogXmin)
-			&& TransactionIdPrecedes(feedbackCatalogXmin, feedbackXmin))
-			MyProc->xmin = feedbackCatalogXmin;
-		else
-			MyProc->xmin = feedbackXmin;
-	}
+	PhysicalReplicationFeedbackNewXmin(feedbackXmin, feedbackCatalogXmin);
 }
 
 /*
