@@ -11961,10 +11961,10 @@ test_cluster_source_coverage_types.inc: $(top_srcdir)/src/backend/cluster/cluste
 	mv $@.tmp $@
 test_cluster_source_coverage_job.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
 	awk '/^wb_local_advance_locked\(/ { print "static bool"; emit=1; n++ } \
-	     /^wb_(server_finish|forget_server|resource_release)\(/ { print "static void"; emit=1; n++ } \
+	     /^wb_(server_finish|forget_server|resource_release|exit)\(/ { print "static void"; emit=1; n++ } \
 	     /^wb_source_tick\(/ { print "static bool"; emit=1; n++ } \
 	     /^cluster_pi_writeback_source_begin_v1\(/ { print "ClusterControlRootResult"; emit=1; n++ } \
-	     emit { print } /^}/ { emit=0 } END { if (n != 6) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (n != 7) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_source_coverage_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_acquire_s_source_capture_(owned|with_plan)\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \

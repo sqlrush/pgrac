@@ -46,7 +46,12 @@ ClusterPcmOwnResult cluster_bufmgr_pcm_own_abort_x_revoke(BufferDesc *buf, const
 { coverage_aborts++; return CLUSTER_PCM_OWN_OK; }
 ClusterPcmOwnResult cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf, const ClusterPcmOwnSnapshot *exact)
 { return cluster_bufmgr_pcm_own_abort_x_revoke(buf, exact); }
-static void gcs_block_resource_x_fail_closed_current(void) { UT_ASSERT(false); }
+/* Failure reporting is a leaf, not an admission decision. Frozen-gate
+ * cases expect this original refusal and still execute all product guards. */
+static bool coverage_expected_fail_closed;
+static unsigned coverage_refusals;
+static void gcs_block_resource_x_fail_closed_current(void)
+{ UT_ASSERT(coverage_expected_fail_closed); coverage_refusals++; }
 /* Authenticated remote-master observation is an environment leaf; local
  * boot remains independent, as it is in separate instances. */
 static PcmXSessionAuthResult coverage_session_sample(const BufferTag *tag,
@@ -78,7 +83,9 @@ static void wb_plan_rejected(ClusterControlRootResult r, RfPageProofDetailV1 d,
 static WritebackBatch *wb_batch;
 static ResourceOwner wb_scan_owner;
 static void wb_cancel(ClusterPiWritebackJobV1 *job) { UT_ASSERT(job == NULL); }
-static void wb_forget_batch(void) { UT_ASSERT(false); }
+/* No DATA batch is created by these source-job cases. The original exit
+ * hook still calls this independent owner even when its pointer is NULL. */
+static void wb_forget_batch(void) { UT_ASSERT(wb_batch == NULL); }
 #include "test_cluster_source_coverage_job.inc"
 ClusterControlRootResult cluster_wal_inputs_begin_v1(const uint8 uuid[16], uint64 sysid, ClusterWalInputsV1 **out)
 {
@@ -475,9 +482,238 @@ UT_TEST(test_unproved_prior_domain_cannot_use_ACK_capacity)
 		UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0); replace_end(&f);
 	}
 }
+/* Original cleanup bodies run below. Native ROOT/WALR ResourceOwner
+ * callbacks are explicit provider leaves, as in the existing ERROR case. */
+static unsigned lifecycle_scenarios;
+static ClusterPiWritebackNoticeV1 *
+lifecycle_pause(ReplaceFixture *f, ResourceXSourceDrainWork *work, unsigned cut)
+{
+	volatile bool caught = false;
+	CurrentResourceOwner = (ResourceOwner)1;
+	if (!coverage_start(f, work)) { UT_ASSERT(false); return NULL; }
+	lifecycle_scenarios++;
+	UT_ASSERT(coverage_enqueue(f, work));
+	MyBackendType = B_BG_WRITER;
+	if (cut == 0) coverage_begin_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	else if (cut == 1) coverage_input_wait = true;
+	else coverage_capture_error = true;
+	PG_TRY(); { UT_ASSERT(wb_source_tick()); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	UT_ASSERT_EQ(caught, cut == 2); UT_ASSERT(wb_notice != NULL);
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_RUNNING);
+	UT_ASSERT_EQ(wb_shared->inbound_pid, MyProcPid);
+	UT_ASSERT_EQ(f->old.source.m.state->holder_coverage_claimed, 1);
+	return wb_notice;
+}
+static void lifecycle_native_release(ClusterPiWritebackNoticeV1 *old)
+{
+	UT_ASSERT(wb_notice != old);
+	cluster_thread_recovery_fabric_plan_destroy_v1(&old->plan);
+	cluster_wal_inputs_release_v1(&old->inputs); pfree(old);
+}
+static void lifecycle_service_current(ReplaceFixture *f, const ResourceXSourceDrainWork *work,
+	const WritebackSourceRequest *saved, const ClusterPcmResourceXPiCarrier *pi, int refs)
+{
+	ResourceXDecodedFrame retained;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(work, &retained), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&retained, &f->block, sizeof(retained)) == 0);
+	UT_ASSERT(memcmp(&wb_shared->source_request, saved, sizeof(*saved)) == 0);
+	UT_ASSERT(memcmp(pi, &f->old.source.m.state->pi_carrier, sizeof(*pi)) == 0);
+	UT_ASSERT_EQ(replace_references, refs);
+}
+static void lifecycle_finish(ReplaceFixture *f)
+{
+	ResourceXSourceDrainWork next = {0};
+	coverage_begin_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	coverage_input_wait = coverage_capture_error = false; coverage_input_current = true;
+	MyBackendType = B_BG_WRITER;
+	if (!wb_source_tick()) { UT_ASSERT(false); return; }
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY); UT_ASSERT(wb_notice == NULL);
+	MyBackendType = B_LMS;
+	if (!replace_claim(&next) && !replace_claim(&next)) { UT_ASSERT(false); return; }
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(&f->block, 2, 7,
+		&f->prepared, &f->finished), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&next,
+		RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+}
+static void lifecycle_owner_release(bool commit)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work; WritebackSourceRequest saved;
+		ClusterPcmResourceXPiCarrier pi; int refs;
+		ClusterPiWritebackNoticeV1 *old = lifecycle_pause(&f, &work, cut);
+		if (!old) { coverage_end(&f); return; }
+		saved = wb_shared->source_request; pi = f.old.source.m.state->pi_carrier; refs = replace_references;
+		wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, commit, true, NULL);
+		UT_ASSERT(wb_notice == NULL); UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+		UT_ASSERT_EQ(wb_shared->inbound_pid, 0);
+		lifecycle_service_current(&f, &work, &saved, &pi, refs); lifecycle_native_release(old);
+		lifecycle_finish(&f); coverage_end(&f);
+	}
+}
+UT_TEST(test_source_job_abort_cleanup_preserves_original_service)
+{ lifecycle_owner_release(false); }
+UT_TEST(test_source_job_commit_cleanup_preserves_original_service)
+{ lifecycle_owner_release(true); }
+UT_TEST(test_unrelated_ResourceOwner_cannot_take_running_source_job)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work; ClusterPiWritebackNoticeV1 *old = lifecycle_pause(&f, &work, cut);
+		if (!old) { coverage_end(&f); return; }
+		CurrentResourceOwner = (ResourceOwner)2;
+		wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		UT_ASSERT(wb_notice == old); UT_ASSERT_EQ(wb_shared->inbound_state, WB_RUNNING);
+		CurrentResourceOwner = (ResourceOwner)1; lifecycle_finish(&f); coverage_end(&f);
+	}
+}
+UT_TEST(test_late_release_phases_cannot_take_source_job)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work; ClusterPiWritebackNoticeV1 *old = lifecycle_pause(&f, &work, cut);
+		if (!old) { coverage_end(&f); return; }
+		wb_resource_release(RESOURCE_RELEASE_LOCKS, false, true, NULL);
+		UT_ASSERT(wb_notice == old); UT_ASSERT_EQ(wb_shared->inbound_state, WB_RUNNING);
+		wb_resource_release(RESOURCE_RELEASE_AFTER_LOCKS, false, true, NULL);
+		UT_ASSERT(wb_notice == old); UT_ASSERT_EQ(wb_shared->inbound_state, WB_RUNNING);
+		lifecycle_finish(&f); coverage_end(&f);
+	}
+}
+UT_TEST(test_original_BG_exit_requeues_and_replacement_owner_finishes)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work; WritebackSourceRequest saved;
+		ClusterPcmResourceXPiCarrier pi; int refs, pid = MyProcPid;
+		ClusterPiWritebackNoticeV1 *old = lifecycle_pause(&f, &work, cut);
+		if (!old) { coverage_end(&f); return; }
+		saved = wb_shared->source_request; pi = f.old.source.m.state->pi_carrier; refs = replace_references;
+		wb_shared->bgwriter_pid = MyProcPid; wb_shared->bgwriter_procno = 3;
+		wb_exit(0, (Datum)0);
+		UT_ASSERT(wb_notice == NULL); UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+		UT_ASSERT_EQ(wb_shared->inbound_pid, 0); UT_ASSERT_EQ(wb_shared->bgwriter_pid, 0);
+		UT_ASSERT_EQ(wb_shared->bgwriter_procno, -1);
+		lifecycle_service_current(&f, &work, &saved, &pi, refs); lifecycle_native_release(old);
+		/* Process identity/ResourceOwner are native-provider inputs; the new
+		 * job still has to acquire the real original shared request. */
+		MyProcPid++; CurrentResourceOwner = (ResourceOwner)2;
+		lifecycle_finish(&f); MyProcPid = pid; CurrentResourceOwner = (ResourceOwner)1; coverage_end(&f);
+	}
+}
+UT_TEST(test_BG_exit_does_not_remove_another_worker_registration)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work; ClusterPiWritebackNoticeV1 *old = lifecycle_pause(&f, &work, cut);
+		if (!old) { coverage_end(&f); return; }
+		wb_shared->bgwriter_pid = MyProcPid + 1; wb_shared->bgwriter_procno = 3;
+		wb_exit(0, (Datum)0); UT_ASSERT(wb_notice == NULL);
+		UT_ASSERT_EQ(wb_shared->bgwriter_pid, MyProcPid + 1); UT_ASSERT_EQ(wb_shared->bgwriter_procno, 3);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+		lifecycle_native_release(old); lifecycle_finish(&f); coverage_end(&f);
+	}
+}
+UT_TEST(test_exact_cancel_during_BG_wait_keeps_old_PI_and_WAL)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work; ResourceXDecodedFrame block;
+		ClusterPcmResourceXPiCarrier pi; int refs;
+		if (!lifecycle_pause(&f, &work, cut)) { coverage_end(&f); return; }
+		pi = f.old.source.m.state->pi_carrier; refs = replace_references;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_claim_exact(&work, &f.block, false, true), RESOURCE_X_APPLY_APPLIED);
+		coverage_begin_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY; coverage_input_wait = coverage_capture_error = false;
+		UT_ASSERT(wb_source_tick()); UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY); UT_ASSERT(wb_notice == NULL);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(&work, &block), RESOURCE_X_APPLY_STALE);
+		UT_ASSERT(memcmp(&pi, &f.old.source.m.state->pi_carrier, sizeof(pi)) == 0);
+		UT_ASSERT_EQ(replace_references, refs); coverage_end(&f);
+	}
+}
+UT_TEST(test_cancel_before_BG_claim_never_starts_new_image_capture)
+{
+	for (unsigned queued = 0; queued < 2; queued++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work; int refs;
+		if (!coverage_start(&f, &work)) { UT_ASSERT(false); return; }
+		lifecycle_scenarios++; refs = replace_references;
+		if (queued) UT_ASSERT(coverage_enqueue(&f, &work));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_claim_exact(&work, &f.block, false, true), RESOURCE_X_APPLY_APPLIED);
+		MyBackendType = B_BG_WRITER; UT_ASSERT_EQ(wb_source_tick(), queued != 0);
+		UT_ASSERT_EQ(coverage_plans, 0); UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY);
+		UT_ASSERT_EQ(replace_references, refs); UT_ASSERT_EQ(f.old.source.m.state->pi_carrier.pi_refs, 1);
+		coverage_end(&f);
+	}
+}
+UT_TEST(test_late_cancel_cannot_undo_transferred_carrier_or_native_work)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work, next; ClusterPcmResourceXMasterState before;
+	if (!coverage_start(&f, &work)) { UT_ASSERT(false); return; }
+	lifecycle_scenarios++; UT_ASSERT(coverage_enqueue(&f, &work));
+	MyBackendType = B_BG_WRITER; UT_ASSERT(wb_source_tick()); before = *f.old.source.m.state;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_claim_exact(&work, &f.block, false, true), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	MyBackendType = B_LMS; if (!replace_claim(&next)) UT_ASSERT(replace_claim(&next));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(&f.block, 2, 7,
+		&f.prepared, &f.finished), RESOURCE_X_APPLY_APPLIED);
+	before = *f.old.source.m.state;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_claim_exact(&work, &f.block, false, true), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&next, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+	coverage_end(&f);
+}
+UT_TEST(test_frozen_gate_keeps_unproved_source_debt)
+{
+	for (unsigned cut = 0; cut < 3; cut++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work; ResourceXGateSnapshot gate;
+		ClusterPcmResourceXPiCarrier pi; int refs;
+		if (!lifecycle_pause(&f, &work, cut)) { coverage_end(&f); return; }
+		pi = f.old.source.m.state->pi_carrier; refs = replace_references;
+		UT_ASSERT(cluster_pcm_lock_resource_x_gate_snapshot(&gate));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_fail_closed_exact(&gate), RESOURCE_X_APPLY_APPLIED);
+		coverage_begin_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY; coverage_input_wait = coverage_capture_error = false;
+		coverage_expected_fail_closed = true; coverage_refusals = 0;
+		UT_ASSERT(wb_source_tick()); coverage_expected_fail_closed = false;
+		UT_ASSERT_EQ(coverage_refusals, 1); UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+		UT_ASSERT(!cluster_pcm_lock_resource_x_gate_open_exact(work.request.resource_formation));
+		UT_ASSERT(memcmp(&pi, &f.old.source.m.state->pi_carrier, sizeof(pi)) == 0);
+		UT_ASSERT_EQ(replace_references, refs); coverage_end(&f);
+	}
+}
+UT_TEST(test_forged_cancel_identity_cannot_clear_original_source_job)
+{
+	for (unsigned cut = 0; cut < 7; cut++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work, forged; ResourceXDecodedFrame block;
+		ClusterPcmResourceXMasterState before; ResourceXApplyResult result;
+		if (!coverage_start(&f, &work)) { UT_ASSERT(false); return; }
+		lifecycle_scenarios++; UT_ASSERT(coverage_enqueue(&f, &work)); forged = work; block = f.block;
+		if (cut == 0) forged.r4_record_generation++;
+		else if (cut == 1) forged.authenticated_connection_generation++;
+		else if (cut == 2) forged.attempt_generation += 2;
+		else if (cut == 3) forged.request.master_session_incarnation++;
+		else if (cut == 4) forged.request.logical_assertion.resource.blockNum++;
+		else if (cut == 5) forged.request.resource_formation++;
+		else block.body.acquire_decision.source_service_generation++;
+		before = *f.old.source.m.state;
+		result = cluster_pcm_lock_resource_x_source_coverage_claim_exact(&forged, &block, false, true);
+		UT_ASSERT(result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+		lifecycle_finish(&f); coverage_end(&f);
+	}
+}
+UT_TEST(test_old_owner_cleanup_cannot_consume_replacement_BG_notice)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work; ClusterPiWritebackNoticeV1 *old, *next;
+	old = lifecycle_pause(&f, &work, 1); if (!old) { coverage_end(&f); return; }
+	wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(wb_notice == NULL); lifecycle_native_release(old);
+	CurrentResourceOwner = (ResourceOwner)2; MyBackendType = B_BG_WRITER;
+	UT_ASSERT(wb_source_tick()); next = wb_notice; UT_ASSERT(next != NULL);
+	CurrentResourceOwner = (ResourceOwner)1;
+	wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(wb_notice == next); UT_ASSERT_EQ(wb_shared->inbound_state, WB_RUNNING);
+	CurrentResourceOwner = (ResourceOwner)2; lifecycle_finish(&f);
+	CurrentResourceOwner = (ResourceOwner)1; coverage_end(&f);
+	printf("# source lifecycle scenarios=%u; native input cleanup is a provider boundary\n", lifecycle_scenarios);
+}
+
 int main(void)
 {
-	UT_PLAN(21); UT_RUN(test_original_holder_park_job_carrier_and_LMS_resume);
+	UT_PLAN(33); UT_RUN(test_original_holder_park_job_carrier_and_LMS_resume);
 	UT_RUN(test_ROOT_lock_contention_keeps_the_same_service_and_PI);
 	UT_RUN(test_old_DATA_completion_does_not_hide_the_new_FORWARD);
 	UT_RUN(test_ordinary_job_capacity_release_wakes_the_parked_source);
@@ -498,5 +734,17 @@ int main(void)
 	UT_RUN(test_DATA_already_retired_before_FORWARD_keeps_ACK_owner);
 	UT_RUN(test_original_intent_completion_also_releases_capacity);
 	UT_RUN(test_unproved_prior_domain_cannot_use_ACK_capacity);
+	UT_RUN(test_source_job_abort_cleanup_preserves_original_service);
+	UT_RUN(test_source_job_commit_cleanup_preserves_original_service);
+	UT_RUN(test_unrelated_ResourceOwner_cannot_take_running_source_job);
+	UT_RUN(test_late_release_phases_cannot_take_source_job);
+	UT_RUN(test_original_BG_exit_requeues_and_replacement_owner_finishes);
+	UT_RUN(test_BG_exit_does_not_remove_another_worker_registration);
+	UT_RUN(test_exact_cancel_during_BG_wait_keeps_old_PI_and_WAL);
+	UT_RUN(test_cancel_before_BG_claim_never_starts_new_image_capture);
+	UT_RUN(test_late_cancel_cannot_undo_transferred_carrier_or_native_work);
+	UT_RUN(test_frozen_gate_keeps_unproved_source_debt);
+	UT_RUN(test_forged_cancel_identity_cannot_clear_original_source_job);
+	UT_RUN(test_old_owner_cleanup_cannot_consume_replacement_BG_notice);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }
