@@ -68,6 +68,11 @@
  *	  buf                         -- caller-provided 8KB buffer (BLCKSZ)
  *
  *	Returns: true on success, false on I/O error or short read.
+ *  Managed TT block zero additionally borrows the independently selected
+ *  UNDO identity and validates the complete TT40 reference and checksum on
+ *  the same FD, including cache hits. Refusal/ERROR preserves buf. This I/O
+ *  borrow grants no current/recovery authority or longer resident lifetime;
+ *  the original caller retains those obligations. DATA blocks are unchanged.
  */
 extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id,
 										 uint8 owner_instance, uint32 block_no, char *buf);

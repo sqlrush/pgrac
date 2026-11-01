@@ -68,6 +68,7 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+#include "cluster_unit_no_native_files.h"
 
 /* ----- backend globals ----- */
 int cluster_node_id = 0;

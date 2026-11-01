@@ -29,6 +29,10 @@
 
 UT_DEFINE_GLOBALS();
 
+#ifndef UNDO_PUBLICATION_NATIVE_TEST
+#include "cluster_unit_no_native_files.h"
+#endif
+
 int MyProcPid = 4321;
 pg_time_t MyStartTime = 0;
 TimestampTz MyStartTimestamp = INT64CONST(0x102030405060);

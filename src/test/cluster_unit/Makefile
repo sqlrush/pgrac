@@ -8382,6 +8382,7 @@ test_cluster_undo_block0_current: test_cluster_undo_block0_current.c unit_test.h
 # the real undo buffer pool and block-zero objects, so the checkpoint step runs
 # unmodified.
 test_cluster_undo_header_durability: test_cluster_undo_header_durability.c unit_test.h \
+		cluster_unit_no_native_files.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(CLUSTER_UNDO_BUF_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0.o \
@@ -8403,6 +8404,7 @@ test_cluster_undo_publication_alloc_product.o: $(top_srcdir)/src/backend/cluster
 		-c $< -o $@
 
 test_cluster_undo_smgr_publication: test_cluster_undo_smgr_publication.c unit_test.h \
+		cluster_unit_no_native_files.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
 		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
 		test_cluster_undo_publication_alloc_product.o
@@ -8411,6 +8413,29 @@ test_cluster_undo_smgr_publication: test_cluster_undo_smgr_publication.c unit_te
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Native TT identity reader reuses the unchanged legacy file-I/O providers,
+# replacing only the selected control table with a bounded custody provider.
+test_cluster_undo_native_tt_read: test_cluster_undo_native_tt_read.c \
+		test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_read
+all: test_cluster_undo_native_tt_read
+clean-undo-native-tt-read:
+	rm -f test_cluster_undo_native_tt_read test_cluster_undo_native_tt_read.d
+clean: clean-undo-native-tt-read
+.PHONY: clean-undo-native-tt-read
 
 # spec-8.4 D13: these activation policy targets include the real
 # dependency-light product source so static codec/FSM/lock-policy helpers are

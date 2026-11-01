@@ -51,6 +51,12 @@
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_block0.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "access/clog_file.h"
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_undo_segment_init.h"
+#endif
 
 
 /*
@@ -416,6 +422,60 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* This protects only this physical read. The original caller still owns its
+ * path/current/recovery authority and must bind any longer resident lifetime.
+ * An idle cached FD has no table borrow: each operation reselects and checks
+ * the complete on-disk identity, including on an FD-cache hit. */
+static bool
+undo_native_tt_read(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+					char *buf)
+{
+	ClusterControlFileKeyV2 key = { 0 };
+	ClusterControlNativeFileBorrowV2 borrow = { 0 };
+	PGAlignedBlock page;
+	volatile bool ok = false;
+
+	if (owner_instance == 0 || owner_instance > UNDO_OWNER_INSTANCE_MAX || segment_id == 0
+		|| segment_id > UINT16_MAX
+		|| (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != owner_instance)
+		return false;
+	key.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+	key.origin = owner_instance - 1;
+	key.object_id = segment_id;
+	if (!cluster_control_native_file_acquire_v2(&key, &borrow))
+		return false;
+	PG_TRY();
+	{
+		int fd;
+
+		if (cluster_control_native_file_current_v2(&borrow)
+			&& (fd = get_segment_fd(intent, segment_id, owner_instance)) >= 0
+			&& cluster_control_native_file_current_v2(&borrow)) {
+			ssize_t count = pg_pread(fd, page.data, BLCKSZ, 0);
+
+			cluster_undo_record_note_smgr_pread();
+			ok = count == BLCKSZ
+				 && cluster_tt_file_reference_matches_v2(page.data, BLCKSZ, &borrow.expected)
+				 && cluster_undo_segment_header_integrity(page.data) == CLUSTER_UNDO_HEADER_VALID
+				 && cluster_control_native_file_current_v2(&borrow);
+		}
+	}
+	PG_FINALLY();
+	{
+		/* A failed release retains the original duty; never return success or
+		 * erase the address-bound handle in that case. */
+		if (!cluster_control_native_file_release_v2(&borrow))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not release native TT file identity borrow")));
+	}
+	PG_END_TRY();
+	if (ok)
+		memcpy(buf, page.data, BLCKSZ);
+	return ok;
+}
+#endif
+
 bool
 cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
 							 uint32 block_no, char *buf)
@@ -427,6 +487,14 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id, ui
 
 	if (buf == NULL || block_no >= UNDO_BLOCKS_PER_SEGMENT)
 		return false;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* TT40 is block zero; DATA block and nonmanaged legacy policies remain
+	 * separate. No format is activated by this reader. */
+	if (block_no == 0 && (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2))
+		return undo_native_tt_read(intent, segment_id, owner_instance, buf);
+#endif
 
 	fd = get_segment_fd(intent, segment_id, owner_instance);
 	if (fd < 0)
