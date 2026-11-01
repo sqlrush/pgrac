@@ -5,6 +5,8 @@
 #include <dirent.h>
 #include <setjmp.h>
 #include "common/pgrac_initdb_cohort.h"
+#include "common/pgrac_initdb_recovery.h"
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_initdb_config.h"
 #include "../../backend/cluster/cluster_initdb_origin_private.h"
 #include "../../backend/cluster/cluster_initdb_tree_private.h"
@@ -372,10 +374,65 @@ UT_TEST(legacy_publisher_remains_legacy_and_managed_child_is_closed)
 	UT_ASSERT(faccessat(global_dir.fd, "pgrac_control_root", F_OK, 0) != 0);
 	cleanup();
 }
+UT_TEST(managed_child_requires_its_complete_captured_relmap_inventory) {
+	setup();
+	origins[0].managed_relmap = true;
+	UT_ASSERT(!creation_registry_valid(&original_config, origins, &root, &reg, 4096));
+	cleanup();
+}
+UT_TEST(managed_registry_matches_each_captured_image_and_preallocated_identity) {
+	ClusterRecoveryCheckpointFileV2 complete[8], saved;
+	ClusterRecoveryFileIdentityV2 ids[4];
+	PgracInitdbRecoveryContext *ctx;
+	setup();
+	origins[0].managed_relmap = true;
+	ctx = &origins[0].relmap_registration;
+	ctx->magic = PGRAC_INITDB_RECOVERY_MAGIC;
+	ctx->version = 2;
+	ctx->creator_pid = getpid();
+	ctx->config.fd = 3;
+	ctx->config.bytes = 1;
+	ctx->config.sha256[0] = 1;
+	ctx->first = files[0].identity;
+	ctx->first.database_oid = ctx->first.object_id = 0;
+	ctx->first.tablespace_oid = GLOBALTABLESPACE_OID;
+	UT_ASSERT(pgrac_initdb_recovery_relmaps_v2(ctx, ids));
+	for (unsigned i = 0; i < 8; ++i) {
+		ClusterRecoveryCheckpointFileV2 *o = &origins[0].relmap_observations[i];
+		memset(o, 0, sizeof(*o));
+		o->identity = ids[i / 2];
+		o->copy_index = i % 2;
+		o->copy_count = 2;
+		o->synced_bytes = 2304;
+		o->page_count = 1;
+		o->image_digest[0] = i + 1;
+		complete[i] = *o;
+		complete[i].source_count = 2;
+		complete[i].sources = intervals[0];
+	}
+	reg.coverage.files = complete;
+	reg.coverage.file_count = 8;
+	UT_ASSERT(creation_registry_valid(&original_config, origins, &root, &reg, 16384));
+	for (unsigned i = 0; i < 8; ++i) {
+		saved = complete[i];
+		complete[i].image_digest[0] ^= 1;
+		UT_ASSERT(!creation_registry_valid(&original_config, origins, &root, &reg, 16384));
+		complete[i] = saved;
+		++complete[i].identity.creation_generation;
+		UT_ASSERT(!creation_registry_valid(&original_config, origins, &root, &reg, 16384));
+		complete[i] = saved;
+	}
+	reg.coverage.file_count = 6;
+	UT_ASSERT(!creation_registry_valid(&original_config, origins, &root, &reg, 16384));
+	reg.coverage.file_count = 8;
+	UT_ASSERT(creation_registry_valid(&original_config, origins, &root, &reg, 16384));
+	cleanup();
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_original_codec_v4_extent_and_exact_reference);
 	UT_RUN(test_v4_refuses_forged_reference_and_record);
 	UT_RUN(test_selected_root_registry_real_files_and_late_change);
@@ -388,6 +445,8 @@ main(void)
 	UT_RUN(late_source_or_registry_changes_leave_primary_absent);
 	UT_RUN(backup_and_startup_changes_are_rechecked_before_primary);
 	UT_RUN(legacy_publisher_remains_legacy_and_managed_child_is_closed);
+	UT_RUN(managed_child_requires_its_complete_captured_relmap_inventory);
+	UT_RUN(managed_registry_matches_each_captured_image_and_preallocated_identity);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

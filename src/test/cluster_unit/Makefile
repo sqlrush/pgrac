@@ -15807,7 +15807,17 @@ test_cluster_initdb_recovery_fixture.inc: test_cluster_initdb_relmap.c
 test_cluster_initdb_recovery_dispatch.inc: $(top_srcdir)/src/bin/initdb/initdb.c
 	awk '/^pgrac_native_create_relmaps\(const ControlFileData \*control\)/ { print "static bool"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
-test_cluster_initdb_recovery: test_cluster_initdb_recovery.c test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_dispatch.inc unit_test.h \
+test_cluster_initdb_recovery_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c $(srcdir)/extract_cluster_initdb_recovery.py
+	python3 $(srcdir)/extract_cluster_initdb_recovery.py $< $@
+test_cluster_initdb_recovery: test_cluster_initdb_recovery.c test_cluster_initdb_recovery_owner.inc test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_dispatch.inc unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_contract_private.h \
+		$(top_srcdir)/src/bin/initdb/pgrac_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_shared_config.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
 		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
 		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
 		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h \
@@ -15818,7 +15828,7 @@ test_cluster_initdb_recovery: test_cluster_initdb_recovery.c test_cluster_initdb
 clean: clean-initdb-recovery
 .PHONY: clean-initdb-recovery
 clean-initdb-recovery:
-	rm -f test_cluster_initdb_recovery test_cluster_initdb_recovery.d test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_fixture.inc.tmp test_cluster_initdb_recovery_dispatch.inc test_cluster_initdb_recovery_dispatch.inc.tmp
+	rm -f test_cluster_initdb_recovery_owner.inc test_cluster_initdb_recovery_owner.inc.tmp test_cluster_initdb_recovery test_cluster_initdb_recovery.d test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_fixture.inc.tmp test_cluster_initdb_recovery_dispatch.inc test_cluster_initdb_recovery_dispatch.inc.tmp
 
 TESTS += test_cluster_control_file_selection
 all: test_cluster_control_file_selection
@@ -15852,6 +15862,8 @@ test_cluster_initdb_registry_publish.inc: $(top_srcdir)/src/backend/cluster/clus
 	python3 $(srcdir)/extract_cluster_initdb_registry_publish.py $< $@
 test_cluster_initdb_registry_publish: test_cluster_initdb_registry_publish.c test_cluster_initdb_registry_publish.inc \
 		test_cluster_control_registry.c test_cluster_recovery_registry.c unit_test.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
@@ -15867,6 +15879,7 @@ test_cluster_initdb_registry_publish: test_cluster_initdb_registry_publish.c tes
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/common/file_perm.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		cluster_registry_common_test.o cluster_control_registry_original.o \
 		$(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \

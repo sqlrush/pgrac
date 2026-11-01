@@ -30,13 +30,29 @@ pgrac_initdb_recovery_read_v2(int fd, const PgracInitdbConfigContext *c, uint64 
 {
 	return false;
 }
+bool
+pgrac_initdb_recovery_relmap_observe_v2(const PgracInitdbRecoveryContext *ctx, int data_fd,
+											 int shared_fd,
+											 ClusterRecoveryCheckpointFileV2 out[8]) {
+	return false;
+}
+bool
+pgrac_initdb_recovery_relmap_current_v2(
+	const PgracInitdbRecoveryContext *ctx, int data_fd, int shared_fd,
+	const ClusterRecoveryCheckpointFileV2 captured[8]) {
+	return false;
+}
+
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "catalog/pg_database_d.h"
+#include "common/cluster_relmap_file.h"
+#include "sha2_int.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_recovery_format.h"
 #include "common/pgrac_initdb_recovery.h"
@@ -228,6 +244,161 @@ done:
 	if (ok)
 		*out = ctx;
 	return ok;
+}
+
+static bool
+created_directory_same(const struct stat *a, const struct stat *b) {
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_uid == b->st_uid &&
+		   a->st_mode == b->st_mode;
+}
+
+static bool
+created_databases(int base) {
+	DIR *dir;
+	struct dirent *entry;
+	unsigned found = 0;
+	bool ok = true;
+	int fd = openat(base, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	dir = fdopendir(fd);
+	if (!dir) {
+		(void)close(fd);
+		return false;
+	}
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		unsigned bit;
+		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+			continue;
+		bit = !strcmp(entry->d_name, "1")   ? 1
+			  : !strcmp(entry->d_name, "4") ? 2
+			  : !strcmp(entry->d_name, "5") ? 4
+											: 0;
+		if (!bit || (found & bit)) {
+			ok = false;
+			break;
+		}
+		found |= bit;
+	}
+	if (errno || found != 7)
+		ok = false;
+	if (closedir(dir))
+		ok = false;
+	return ok;
+}
+
+static bool
+created_directories_current(const PgracInitdbRecoveryContext *ctx, int data_fd,
+										int shared_fd, const int dirs[5],
+										const struct stat states[5]) {
+	static const char *const names[5] = {"global", "base", "1", "4", "5"};
+	struct stat data, shared, held, named;
+	if (!directory(data_fd, &data) || !directory(shared_fd, &shared) ||
+		ctx->data_device != data.st_dev || ctx->data_inode != data.st_ino ||
+		ctx->shared_device != shared.st_dev || ctx->shared_inode != shared.st_ino)
+		return false;
+	for (unsigned i = 0; i < 5; ++i) {
+		int parent = i < 2 ? shared_fd : dirs[1];
+		if (!directory(dirs[i], &held) ||
+			fstatat(parent, names[i], &named, AT_SYMLINK_NOFOLLOW) ||
+			!created_directory_same(&held, &states[i]) ||
+			!created_directory_same(&held, &named))
+			return false;
+	}
+	return created_databases(dirs[1]);
+}
+
+static bool
+created_relmap_observations(const PgracInitdbRecoveryContext *ctx, int data_fd,
+										int shared_fd, bool synchronize,
+										ClusterRecoveryCheckpointFileV2 out[8]) {
+	static const char *const names[5] = {"global", "base", "1", "4", "5"};
+	PgracInitdbRecoveryContext original;
+	ClusterRecoveryFileIdentityV2 ids[4];
+	ClusterRecoveryCheckpointFileV2 observations[8] = {0};
+	ClusterRelmapFilePairV2 pair;
+	struct stat states[5], data, shared;
+	int dirs[5] = {-1, -1, -1, -1, -1};
+	bool ok = false;
+	if (!ctx || !out || overlaps(ctx, sizeof(*ctx), out, sizeof(observations)))
+		return false;
+	memcpy(&original, ctx, sizeof(original));
+	if (original.creator_pid != (uint64)getpid() ||
+		!pgrac_initdb_recovery_relmaps_v2(&original, ids) || !directory(data_fd, &data) ||
+		!directory(shared_fd, &shared) || original.data_device != data.st_dev ||
+		original.data_inode != data.st_ino || original.shared_device != shared.st_dev ||
+		original.shared_inode != shared.st_ino)
+		return false;
+	for (unsigned i = 0; i < 5; ++i) {
+		int parent = i < 2 ? shared_fd : dirs[1];
+		dirs[i] = openat(parent, names[i], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (dirs[i] < 0 || !directory(dirs[i], &states[i]))
+			goto done;
+	}
+	if (!created_directories_current(&original, data_fd, shared_fd, dirs, states))
+		goto done;
+	for (unsigned i = 0; i < 4; ++i) {
+		int dir = dirs[i ? i + 1 : 0];
+		if (!(synchronize ? cluster_relmap_file_pair_checkpoint_v2(dir, &ids[i], &pair)
+						  : cluster_relmap_file_pair_read_v2(dir, &ids[i], &pair)) ||
+			pair.view.committed_generation != 1 || pair.view.has_pending ||
+			pair.view.used_backup ||
+			memcmp(pair.bytes[0], pair.bytes[1], sizeof(pair.bytes[0])) ||
+			!created_directories_current(&original, data_fd, shared_fd, dirs, states))
+			goto done;
+		for (unsigned copy = 0; copy < 2; ++copy) {
+			ClusterRecoveryCheckpointFileV2 *f = &observations[2 * i + copy];
+			pg_sha256_ctx hash;
+			f->identity = ids[i];
+			f->copy_index = copy;
+			f->copy_count = 2;
+			f->synced_bytes = sizeof(pair.bytes[copy]);
+			f->page_count = 1;
+			pg_sha256_init(&hash);
+			pg_sha256_update(&hash, pair.bytes[copy], sizeof(pair.bytes[copy]));
+			pg_sha256_final(&hash, f->image_digest);
+		}
+	}
+	ok = memcmp(ctx, &original, sizeof(original)) == 0 &&
+		 created_directories_current(&original, data_fd, shared_fd, dirs, states);
+done:
+	for (int i = 4; i >= 0; --i)
+		if (dirs[i] >= 0 && close(dirs[i]))
+			ok = false;
+	if (ok)
+		memcpy(out, observations, sizeof(observations));
+	return ok;
+}
+
+bool
+pgrac_initdb_recovery_relmap_observe_v2(const PgracInitdbRecoveryContext *ctx, int data_fd,
+											 int shared_fd,
+											 ClusterRecoveryCheckpointFileV2 out[8]) {
+	return created_relmap_observations(ctx, data_fd, shared_fd, true, out);
+}
+
+bool
+pgrac_initdb_recovery_relmap_current_v2(
+	const PgracInitdbRecoveryContext *ctx, int data_fd, int shared_fd,
+	const ClusterRecoveryCheckpointFileV2 captured[8]) {
+	ClusterRecoveryCheckpointFileV2 actual[8];
+	uint8 identity[128];
+	if (!captured || !created_relmap_observations(ctx, data_fd, shared_fd, false, actual))
+		return false;
+	for (unsigned i = 0; i < 8; ++i) {
+		const ClusterRecoveryCheckpointFileV2 *f = &captured[i], *a = &actual[i];
+		if (!cluster_recovery_file_identity_encode_v2(&f->identity, identity,
+													  sizeof(identity)) ||
+			!cluster_recovery_file_identity_matches_v2(identity, sizeof(identity),
+													   &a->identity) ||
+			f->copy_index != a->copy_index || f->copy_count != a->copy_count ||
+			f->synced_bytes != a->synced_bytes || f->first_page != a->first_page ||
+			f->page_count != a->page_count || memcmp(f->image_digest, a->image_digest, 32) ||
+			f->source_count != 0 || f->sources != NULL)
+			return false;
+	}
+	return true;
 }
 
 #endif
