@@ -187,6 +187,7 @@ cluster_semantic_survivor_ordinary_wait(void)
   ResetLatch(MyLatch);
   (void)cluster_semantic_survivor_close_observe(&sample);
   if (!sample.blocked) return;
+  cluster_semantic_survivor_backend_start_wait();
   /* Only the original caller advances its cleanup debt, without acquiring
    * fresh inputs. ACK latch wakes drive this, not a timer or another owner. */
   cluster_cf_retirement_poll();

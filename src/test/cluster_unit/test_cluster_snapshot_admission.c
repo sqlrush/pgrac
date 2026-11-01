@@ -78,7 +78,11 @@ int fixture_native_xact_children(TransactionId **ptr);
 CommandId fixture_native_xact_command_id(bool used);
 int fixture_native_xact_nesting(void);
 bool fixture_native_xact_parallel(void);
+#define CurTransactionResourceOwner fixture_native_transaction_owner
+#define TopTransactionResourceOwner fixture_native_top_owner
 #include "../../backend/access/transam/xact.c"
+#undef TopTransactionResourceOwner
+#undef CurTransactionResourceOwner
 #undef IsInParallelMode
 #undef GetCurrentTransactionNestLevel
 #undef GetCurrentCommandId
@@ -1154,6 +1158,7 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 #include "test_cluster_survivor_backend_interrupt_fixture.h"
 #include "test_cluster_survivor_backend_route_fixture.h"
 #include "test_cluster_survivor_backend_census_fixture.h"
+#include "test_cluster_survivor_close_backend.inc"
 int
 main(void)
 {
@@ -1178,7 +1183,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(158);
+	UT_PLAN(173);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1337,6 +1342,21 @@ main(void)
 	UT_RUN(backend_census_gate_drift_withdraws_original_returned_observation);
 	UT_RUN(backend_census_keeps_next_native_owner_pending_after_backend_observation);
 	UT_RUN(backend_census_real_reap_retires_transport_without_snapshot_return);
+	UT_RUN(close_query_command_read_reports_only_original_return_fact);
+	UT_RUN(close_query_exec_copy_and_pre_start_gap_cannot_claim_return);
+	UT_RUN(close_query_retains_actual_transaction_subtransaction_and_cleanup_phases);
+	UT_RUN(close_query_idle_transaction_and_resource_or_xid_residue_do_not_prove_return);
+	UT_RUN(close_query_original_start_wait_covers_chain_and_next_transaction);
+	UT_RUN(close_query_cancel_exit_holdoff_and_lock_keep_original_priority);
+	UT_RUN(close_query_withdraws_close_gate_owner_target_and_epoch_drift);
+	UT_RUN(close_query_rejects_malformed_binding_and_fact_without_receipt);
+	UT_RUN(close_query_purpose_cannot_cross_consume_callback);
+	UT_RUN(close_census_uses_actual_close_and_never_grants_qualification);
+	UT_RUN(close_census_new_birth_withdraws_reading_without_reusing_callback);
+	UT_RUN(close_query_reading_needs_actual_reap_and_preserves_original_snapshot);
+	UT_RUN(close_query_original_return_error_publishes_refusal_and_rethrows);
+	UT_RUN(close_census_first_birth_after_unknown_cut_reasks_original_process_table);
+	UT_RUN(close_census_switch_retires_original_candidate_callback_before_rebinding);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

@@ -9,6 +9,11 @@
 
 #define CLUSTER_SURVIVOR_LOCAL_BYTES 2048
 #define CLUSTER_SURVIVOR_LOCAL_ABI 1
+#define CLUSTER_SURVIVOR_LOCAL_CLOSE_ABI 2
+#define CLUSTER_SURVIVOR_LOCAL_CLOSE_BOUND 1
+#define CLUSTER_SURVIVOR_LOCAL_CLOSE_PAYLOAD 1256
+#define CLUSTER_SURVIVOR_RETURN_COMMAND 1
+#define CLUSTER_SURVIVOR_RETURN_START_WAIT 2
 #define CLUSTER_SURVIVOR_LOCAL_EMPTY 0
 #define CLUSTER_SURVIVOR_LOCAL_REQUESTED 1
 #define CLUSTER_SURVIVOR_LOCAL_READING 2
@@ -68,6 +73,14 @@ extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_local
  * PENDING, never CURRENT/receipt/closure/ordinary or GCS permission. */
 extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_local_poll(
  ClusterSurvivorLocalReply *out);
+/* Separate close-bound local purpose. The outer result remains unconfirmed;
+ * neither this limited fact nor any module observation is a receipt. */
+extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_local_close_begin(
+ const ClusterSurvivorLocalTarget *target);
+extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_local_close_poll(
+ ClusterSurvivorLocalReply *out);
+extern void cluster_semantic_survivor_backend_command_return(void);
+extern void cluster_semantic_survivor_backend_start_wait(void);
 extern void cluster_semantic_survivor_local_process(void);
 extern void cluster_semantic_survivor_local_invalidate(void);
 /* Called only adjacent to the original successful postmaster waitpid. */

@@ -270,6 +270,8 @@ UT_TEST(reaped_callback_does_not_hide_replacement_identity){run_targets(14);}
 UT_TEST(new_round_withdraws_only_old_unclaimed_query){run_targets(15);}
 UT_TEST(new_round_collects_returned_old_callback){run_targets(16);}
 UT_TEST(new_round_waits_for_real_reap_before_reusing_reading_slot){run_targets(17);}
+
+#ifndef SURVIVOR_CLOSE_SCOPE_FIXTURE
 int main(void)
 {
  UT_PLAN(17);
@@ -292,3 +294,5 @@ int main(void)
  UT_RUN(new_round_waits_for_real_reap_before_reusing_reading_slot);
  UT_DONE();return ut_failed_count?1:0;
 }
+
+#endif /* SURVIVOR_CLOSE_SCOPE_FIXTURE */

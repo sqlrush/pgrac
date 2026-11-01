@@ -1622,6 +1622,7 @@ LmonMain(void)
 
 				cluster_reconfig_lmon_tick();
 				(void)cluster_semantic_survivor_close_begin();
+				cluster_semantic_survivor_targets_close_tick();
 				cluster_semantic_activation_lmon_tick();
 				cluster_thread_recovery_lmon_tick();
 
@@ -2386,6 +2387,7 @@ LmonMain(void)
 
 				cluster_reconfig_lmon_tick();
 				(void)cluster_semantic_survivor_close_begin();
+				cluster_semantic_survivor_targets_close_tick();
 				cluster_semantic_activation_lmon_tick();
 				cluster_thread_recovery_lmon_tick();
 				/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */

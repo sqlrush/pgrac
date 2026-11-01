@@ -539,6 +539,22 @@ cluster_transaction_service_pending(void)
 		|| TopTransactionStateData.state != TRANS_DEFAULT
 		|| TopTransactionStateData.blockState != TBLOCK_DEFAULT;
 }
+
+/* Actual original transaction return only. Does not prove session resources,
+ * transferred PREPARED/CTRC responsibility or asynchronous retirement empty.
+ * No caller-supplied completion flag and no ResourceOwner traversal. */
+bool
+cluster_transaction_survivor_returned(void)
+{
+	TransactionState s = &TopTransactionStateData;
+
+	return CurrentTransactionState == s && s->state == TRANS_DEFAULT
+		&& s->parent == NULL && s->nestingLevel == 0
+		&& !FullTransactionIdIsValid(s->fullTransactionId)
+		&& !FullTransactionIdIsValid(XactTopFullTransactionId)
+		&& s->curTransactionOwner == NULL && TopTransactionResourceOwner == NULL
+		&& CurTransactionResourceOwner == NULL;
+}
 #endif
 
 /*

@@ -321,6 +321,7 @@ UT_TEST(service_ack_at_latch_reset_is_observed_before_interrupt_handling)
 #define SURVIVOR_LOCAL_INPUT_ROUTE
 #include "test_cluster_survivor_producer_inputs.inc"
 #include "test_cluster_survivor_input_route_fixture.h"
+#include "test_cluster_survivor_close_inputs.inc"
 
 int
 main(void)
@@ -338,7 +339,7 @@ main(void)
 	cluster_control_request_shmem_init();
 	control_driver = retire_driver = cluster_control_request_driver_start();
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(26);
+	UT_PLAN(27);
 	UT_RUN(service_bgwriter_128_acks_progress_without_delay_or_new_wait);
 	UT_RUN(service_checkpointer_128_acks_progress_without_checkpoint_timer);
 	UT_RUN(service_ack_at_latch_reset_is_observed_before_interrupt_handling);
@@ -365,6 +366,7 @@ main(void)
 	UT_RUN(input_route_query_at_original_reset_is_not_lost);
 	UT_RUN(input_route_pending_scope_drift_keeps_original_debt);
 	UT_RUN(input_route_unknown_status_never_counts_as_returned);
+	UT_RUN(close_query_auxiliary_keeps_cf_ack_progress_and_zero_ordinary_coverage);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

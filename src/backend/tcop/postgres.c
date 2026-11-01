@@ -3292,8 +3292,11 @@ ProcessInterrupts(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/* Preserve the original interrupt priority and cancel holdoff reentry. */
-	if (!QueryCancelPending)
+	if (!QueryCancelPending) {
+		if (DoingCommandRead)
+			cluster_semantic_survivor_backend_command_return();
 		cluster_semantic_survivor_local_process();
+	}
 #endif
 }
 
@@ -4413,6 +4416,9 @@ PostgresMain(const char *dbname, const char *username)
 		 * STDIN doing the same thing.)
 		 */
 		DoingCommandRead = true;
+#ifdef USE_PGRAC_CLUSTER
+		cluster_semantic_survivor_backend_command_return();
+#endif
 
 		/*
 		 * (3) read a command (loop blocks here)
