@@ -476,9 +476,11 @@ static void actual_startup_eor_claim(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 /* Saved-receipt readers remain real. The physical recheck boundary is
  * controlled here; the Startup storage component exercises its full body. */
 bool test_start_unused_relmap_recheck(const struct ClusterRecoveryStartV1 *start);
+#ifndef TEST_CLUSTER_STARTUP_RELMAP_FILES
 #define cluster_cold_relmap_replay_recheck_v1 test_start_unused_relmap_recheck
 #include "../../backend/cluster/cluster_cold_recovery_relmap.c"
 #undef cluster_cold_relmap_replay_recheck_v1
+#endif
 #include "test_cluster_cold_tx_owner.inc"
 #include "test_cluster_cold_tx_xid_maximum.inc"
 #include "test_cluster_cold_tx_consumer.inc"
@@ -501,6 +503,10 @@ static ColdRelmapInput relmap_start_entries[2];
 static unsigned relmap_observe_checks, relmap_observe_fault_at;
 static bool relmap_observe_allowed;
 static void (*relmap_observe_step)(void);
+#ifdef TEST_CLUSTER_STARTUP_RELMAP_FILES
+static bool relmap_files_active;
+volatile uint32 InterruptHoldoffCount;
+#endif
 static bool ctrc_census_ok, ctrc_census_drift;
 static unsigned ctrc_census_calls;
 static ClusterColdCtrcReleaseCensusV1 ctrc_census;
@@ -712,6 +718,9 @@ static void reset(void)
 	relmap_observe_checks = relmap_observe_fault_at = 0;
 	relmap_observe_allowed = false;
 	relmap_observe_step = NULL;
+#ifdef TEST_CLUSTER_STARTUP_RELMAP_FILES
+	relmap_files_active = false;
+#endif
 	memset(&startup_first_floor, 0, sizeof(startup_first_floor));
 	startup_first_calls = 0; startup_first_available = true; startup_first_step = NULL;
 	ctrc_driver_acquires = ctrc_driver_authorizations = ctrc_driver_waits = 0;
@@ -2549,9 +2558,15 @@ static void startup_local_empty_reset(void);
 
 #include "test_cluster_cold_tx_relmap_handoff.inc"
 #include "test_cluster_cold_ctrc_relmap_gate.inc"
+#ifdef TEST_CLUSTER_STARTUP_RELMAP_FILES
+#include "test_cluster_cold_ctrc_relmap_files.inc"
+#endif
 
 int main(void)
 {
+#ifdef TEST_CLUSTER_STARTUP_RELMAP_FILES
+	return test_ctrc_relmap_files_main();
+#endif
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 	if (getenv("PGRAC_PRE2_TEST_REDIRECT_GRAPH") != NULL) {
 		UT_PLAN(5);

@@ -15519,3 +15519,70 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_tuple_graph.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_hot_graph.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_coverage.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_redirect_graph.inc
+
+# PGRAC: original Start -> full staged-pair reader, SIDE and retained pins.
+ifeq ($(enable_pgrac_cluster),yes)
+TESTS += test_cluster_cold_ctrc_relmap_files
+all: test_cluster_cold_ctrc_relmap_files
+endif
+
+CTRC_RELMAP_FILES_O = $(COLD_NATIVE_SIDE_OBJS) \
+	test_cluster_cold_recovery_startup_plan_core.o test_cluster_cold_recovery_plan_store_core.o \
+	$(filter-out test_cluster_cold_startup_relmap_executor.o,$(COLD_STARTUP_RELMAP_OBJS)) \
+	test_cluster_cold_ctrc_relmap_executor.o
+
+test_cluster_cold_ctrc_relmap_files: test_cluster_cold_history_scn.inc \
+		test_cluster_cold_tx_claim_eor_boundary.inc \
+		test_cluster_cold_tx_consumer.inc \
+		test_cluster_cold_tx_finish_boundary.inc \
+		test_cluster_cold_tx_owner.inc \
+		test_cluster_cold_tx_start_boundary.inc \
+		test_cluster_cold_tx_writer.inc \
+		test_cluster_cold_tx_xid_maximum.inc \
+		test_cluster_ctrc_projector.inc
+
+test_cluster_cold_ctrc_relmap_files: test_cluster_cold_ctrc_relmap_files.c \
+		test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc \
+		test_cluster_cold_ctrc_relmap_files.inc test_cluster_cold_startup_relmap_storage.h \
+		test_cluster_cold_native_side_namespace.h test_cluster_startup_native_ctrc.h \
+		$(wildcard $(srcdir)/test_cluster_cold_tx_*.inc $(srcdir)/test_cluster_cold_ctrc_*.inc) \
+		$(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_PAGE_STABLE_TEST_O) $(CTRC_RELMAP_FILES_O) $(CLUSTER_UNIT_CRYPTOHASH_O) unit_test.h Makefile \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(STARTUP_NATIVE_CTRC_TEST_CPPFLAGS) \
+		-ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_PAGE_STABLE_TEST_O) $(CTRC_RELMAP_FILES_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_cold_ctrc_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
+		test_cluster_cold_native_side_namespace.h test_cluster_cold_startup_relmap_storage_namespace.h \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT \
+		-include $(srcdir)/test_cluster_cold_native_side_namespace.h \
+		-DLWLockAcquire=test_cold_relmap_storage_acquire \
+		-DLWLockRelease=startup_relmap_storage_LWLockRelease \
+		-DLWLockHeldByMe=startup_relmap_storage_LWLockHeldByMe \
+		-DenableFsync=startup_relmap_storage_enableFsync \
+		-Dcluster_relmap_authority_x_held=startup_relmap_storage_cluster_relmap_authority_x_held \
+		-DForEachLWLockHeldByMe=test_cold_relmap_storage_each_lock \
+		-Dcluster_cold_relmap_replay_recheck_v1=test_start_unused_relmap_recheck \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
+.PHONY: clean-ctrc-relmap-files
+clean: clean-ctrc-relmap-files
+clean-ctrc-relmap-files:
+	rm -f test_cluster_cold_ctrc_relmap_files test_cluster_cold_ctrc_relmap_executor.o
