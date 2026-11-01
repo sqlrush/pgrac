@@ -235,23 +235,81 @@ UT_TEST(test_resident_ERROR_after_C_before_IO_end_only_rolls_forward)
 
 UT_TEST(test_resident_C_real_LMS_callback_and_authenticated_ACK_retire_in_either_order)
 {
-	for (int source = 0; source <= 3; source += source == 0 ? 2 : 1) for (int order = 0; order < 2; order++) {
+	/* Original REQUEST callback, notification callback and M consumption
+	 * are independent prerequisites, not interchangeable completion signals. */
+	static const uint8 orders[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+		{1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+	for (int source = 0; source <= 3; source += source == 0 ? 2 : 1) for (unsigned order = 0; order < lengthof(orders); order++) {
 		ClusterGcsFirstFill request; ResourceXIntentSlot slot;
+		ClusterPcmResourceXBootstrapRound *round;
+		ClusterPcmOwnEntry own; PGAlignedBlock page;
+		ResourceXAcquireReadReceipt receipt; ResourceXIntentSlot request_send;
+		ResourceXIntentSlot *owned_slot = NULL; unsigned matches = 0;
+		unsigned char *memory = (void *)fake_pcm_header.data;
+		bool request_done = false, notice_done = false, master_done = false;
 		UT_ASSERT(rf_start(&request, 2, source)); RESIDENT_REQUIRE_EQ(rf_run(), RESOURCE_X_APPLY_APPLIED);
-		slot = qn_stage();
-		if (order == 0) {
-			UT_ASSERT_EQ(rf_ack(false), RESOURCE_X_APPLY_APPLIED);
-			UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.has_acquire_intent, 1);
-			UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&slot, true, ++fake_pcm_clock_us));
-		} else {
-			UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&slot, true, ++fake_pcm_clock_us));
-			UT_ASSERT_EQ(rf_ack(false), RESOURCE_X_APPLY_APPLIED);
+		round = &request_entry()->resource_x_bootstrap_round;
+		request_send = ordinary_material.ticket;
+		UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&request_send));
+		UT_ASSERT_EQ(round->send.pending, 1); UT_ASSERT_EQ(round->acquire_read_handoff, 1);
+		own = request_own; memcpy(page.data, disk_shared.data, BLCKSZ);
+		receipt = round->acquire_read_receipt; slot = qn_stage();
+		/* Find the actual owned descriptor by its whole staged identity,
+		 * without manufacturing a notice or borrowing another role's state. */
+		for (Size n = 0; n + sizeof(slot) <= fake_pcm_header_requested_size; n += sizeof(uint64))
+			if (memcmp(memory + n, &slot, sizeof(slot)) == 0) {
+				owned_slot = (void *)(memory + n); matches++;
+			}
+		UT_ASSERT_EQ(matches, 1); if (matches != 1) return;
+		for (unsigned step = 0; step < 3; step++) {
+			switch (orders[order][step]) {
+				case 0:
+					UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(
+						&request_send, true, ++fake_pcm_clock_us));
+					request_done = true;
+					break;
+				case 1:
+					UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
+						&slot, true, ++fake_pcm_clock_us));
+					notice_done = true;
+					break;
+				case 2:
+					UT_ASSERT_EQ(rf_ack(false), RESOURCE_X_APPLY_APPLIED);
+					master_done = true;
+					break;
+			}
+			if (step == 2 && orders[order][step] == 0) {
+				/* REQUEST completion wakes the original passive LMS owner;
+				 * it does not manufacture a notification send callback. */
+				UT_ASSERT_EQ(round->delivery_executor_purpose, RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED);
+				UT_ASSERT_EQ(round->has_acquire_intent, 1);
+			}
+			{
+				uint32 cursor = RESOURCE_X_PROTOCOL_NODE_LIMIT + 3;
+				ResourceXIntentSlot offered;
+				ResourceXIntentProbeResult probe = cluster_pcm_lock_resource_x_ready_intent_probe_exact(
+					&request_buf.tag, &cursor, &offered);
+				UT_ASSERT(probe == RESOURCE_X_INTENT_PROBE_COMPLETE || probe == RESOURCE_X_INTENT_PROBE_FOUND);
+				if (step == 2) UT_ASSERT_EQ(probe, RESOURCE_X_INTENT_PROBE_COMPLETE);
+			}
+			UT_ASSERT_EQ(round->send.pending, request_done ? 0 : 1);
+			UT_ASSERT_EQ(round->has_acquire_intent, step == 2 ? 0 : 1);
+			UT_ASSERT_EQ(round->resident_s_authorized, step == 2 ? 1 : 0);
+			UT_ASSERT_EQ(round->delivery_executor_purpose, step == 2
+				? RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED : master_done
+					? RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED : RESOURCE_X_DELIVERY_ACQUIRE_READ_NOTICE);
+			if (!notice_done) UT_ASSERT(memcmp(owned_slot, &slot, sizeof(slot)) == 0);
+			UT_ASSERT(memcmp(&receipt, &round->acquire_read_receipt, sizeof(receipt)) == 0);
+			UT_ASSERT(memcmp(&own, &request_own, sizeof(own)) == 0);
+			UT_ASSERT(memcmp(page.data, disk_shared.data, BLCKSZ) == 0);
+			rf_installed(source, 1);
+			if (ut_current_failed)
+				printf("# resident settlement source=%d order=%u step=%u\n", source, order, step);
 		}
-		/* Notification/receipt debt ends; the bounded resident S provenance
-		 * remains until the real release/revoke owner terminates it. */
-		UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.has_acquire_intent, 1);
-		UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
-			RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED);
+		UT_ASSERT(request_done && notice_done && master_done);
+		UT_ASSERT(memcmp(owned_slot, &(ResourceXIntentSlot){0}, sizeof(slot)) == 0);
+		/* Retain bounded E/A/I as resident S authorization, never a pending
+		 * acquisition; actual release/revoke owns its eventual termination. */
 		UT_ASSERT(!qn_probe(&slot));
 		rf_installed(source, 1); cluster_gcs_block_first_fill_end(&request); complete_idle();
 	}
