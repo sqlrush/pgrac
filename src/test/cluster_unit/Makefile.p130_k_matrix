@@ -1,0 +1,11 @@
+# Additional K matrix targets. Include after the original Makefile.
+K_P130_PYTHON ?= python3
+K_P130_H31 = $(srcdir)/../cluster_tap/pre2/test_k_p130_h31.py
+K_P130_H31_PRODUCT = $(srcdir)/../cluster_tap/pre2/wait_graph_capture.py
+
+.PHONY: k-p130-h31 k-p130-h31-optimized
+k-p130-h31: $(K_P130_H31) $(K_P130_H31_PRODUCT)
+	$(K_P130_PYTHON) -B $(K_P130_H31)
+
+k-p130-h31-optimized: $(K_P130_H31) $(K_P130_H31_PRODUCT)
+	$(K_P130_PYTHON) -B -O $(K_P130_H31)
