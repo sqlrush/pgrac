@@ -3505,6 +3505,30 @@ clean-update-index:
 		test_cluster_heap_update_am.inc test_cluster_heap_update_am.inc.tmp \
 		test_cluster_heap_update_executor.inc test_cluster_heap_update_executor.inc.tmp
 
+# DELETE publishes AFTER/RETURNING only after the original heap/VM WAL chain.
+TESTS += test_cluster_heap_delete_after test_cluster_heap_delete_after_noassert
+all: test_cluster_heap_delete_after test_cluster_heap_delete_after_noassert
+
+test_cluster_heap_delete_am.inc: extract_update_index_fixture.py extract_vacuum_mx_fixture.py $(top_srcdir)/src/backend/access/heap/heapam_handler.c
+	python3 $(srcdir)/extract_update_index_fixture.py $(top_srcdir)/src/backend/access/heap/heapam_handler.c --delete-am > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_delete_executor.inc: extract_update_index_fixture.py extract_vacuum_mx_fixture.py $(top_srcdir)/src/backend/executor/nodeModifyTable.c
+	python3 $(srcdir)/extract_update_index_fixture.py $(top_srcdir)/src/backend/executor/nodeModifyTable.c --delete-executor > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_delete_after test_cluster_heap_delete_after_noassert: test_cluster_heap_delete_after.c test_cluster_heap_dml_vm_wal_chain.c test_cluster_heap_dml_vm_wal_chain test_cluster_heap_update_context.inc test_cluster_heap_delete_am.inc test_cluster_heap_delete_executor.inc $(top_srcdir)/src/include/access/tableam.h $(top_srcdir)/src/include/commands/trigger.h $(top_srcdir)/src/include/foreign/fdwapi.h $(top_srcdir)/src/include/utils/snapmgr.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+clean: clean-delete-after
+.PHONY: clean-delete-after
+clean-delete-after:
+	rm -f test_cluster_heap_delete_am.inc test_cluster_heap_delete_am.inc.tmp \
+		test_cluster_heap_delete_executor.inc test_cluster_heap_delete_executor.inc.tmp
+
 # Direct repair must not bypass shared heap/VM publication obligations.
 TESTS += test_cluster_heap_surgery_admission test_cluster_heap_surgery_admission_noassert
 all: test_cluster_heap_surgery_admission test_cluster_heap_surgery_admission_noassert

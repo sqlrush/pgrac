@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract the original UPDATE executor and heap AM consumers.
+"""Extract the original UPDATE/DELETE executor and heap AM consumers.
 
 Copyright (c) 2026, pgrac contributors
 Author: SqlRush <sqlrush@gmail.com>
@@ -19,6 +19,14 @@ if __name__ == "__main__":
             print(source[start:end])
     elif sys.argv[2] == "--am":
         print(function(source, "heapam_tuple_update", "static TM_Result"))
+    elif sys.argv[2] == "--delete-am":
+        print(function(source, "heapam_tuple_delete", "static TM_Result"))
+    elif sys.argv[2] == "--delete-executor":
+        for name, result in (("ExecDeletePrologue", "static bool"),
+                             ("ExecDeleteAct", "static TM_Result"),
+                             ("ExecDeleteEpilogue", "static void"),
+                             ("ExecDelete", "static TupleTableSlot *")):
+            print(function(source, name, result))
     elif sys.argv[2] == "--executor":
         for name, result in (("ExecUpdatePrepareSlot", "static void"),
                              ("ExecUpdateAct", "static TM_Result"),
