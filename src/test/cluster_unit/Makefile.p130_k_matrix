@@ -256,3 +256,24 @@ k-p130-h06: test_cluster_k_p130_h06
 
 clean-k-p130-h06:
 	rm -f test_cluster_k_p130_h06 test_cluster_k_p130_h06_replace.inc test_cluster_k_p130_h06_replace.inc.tmp
+
+.PHONY: k-p130-h07 clean-k-p130-h07
+test_cluster_k_p130_h07: test_cluster_k_p130_h07.c test_cluster_k_p130_h03_request.inc \
+		test_cluster_k_p130_h03_fill.inc test_cluster_k_p130_h03_lock.inc \
+		test_cluster_k_p130_h03_current.inc test_cluster_k_p130_h03_notice.inc \
+		test_cluster_k_p130_h02_three.inc test_cluster_k_p130_h02_leaves.inc \
+		test_cluster_k_p130_h01_drain.inc k-p130-h03-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H07_CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+k-p130-h07: test_cluster_k_p130_h07
+	./test_cluster_k_p130_h07
+
+clean-k-p130-h07:
+	rm -f test_cluster_k_p130_h07
