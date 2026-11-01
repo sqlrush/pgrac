@@ -33,7 +33,7 @@ expect_detail(const char *site, const char *field)
 	UT_ASSERT(strstr(detail, site) != NULL);
 	UT_ASSERT(strstr(detail, field) != NULL);
 	UT_ASSERT(strstr(detail, "top_xid=100 active_slot_pending=1") != NULL);
-	UT_ASSERT(strlen(detail) < 4096);
+	UT_ASSERT(strlen(detail) < sizeof(undo_capacity_refusal_text));
 	UT_ASSERT_EQ(test_pool_calls, probes);
 	UT_ASSERT_EQ(slept, sleeps);
 	UT_ASSERT_EQ(test_lock_depth, locks);
@@ -172,7 +172,7 @@ UT_TEST(test_first_wins_segment_match_and_bounded_formatting)
 	UT_ASSERT(cluster_undo_cleaner_capacity_refusal_detail(5, 100, true) == NULL);
 	UT_ASSERT(refusal_detail(4) == NULL);
 	{
-		char site[6000];
+		char site[20000];
 		const char *detail;
 
 		memset(site, 'x', sizeof(site));
@@ -181,7 +181,7 @@ UT_TEST(test_first_wins_segment_match_and_bounded_formatting)
 		detail = refusal_detail(4);
 		UT_ASSERT_NOT_NULL(detail);
 		if (detail != NULL) {
-			UT_ASSERT_EQ(strlen(detail), 4095);
+			UT_ASSERT_EQ(strlen(detail), sizeof(undo_capacity_refusal_text) - 1);
 			UT_ASSERT(strstr(detail, " truncated=1") != NULL);
 		}
 		UT_ASSERT(refusal_detail(4) == NULL);

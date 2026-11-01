@@ -846,6 +846,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 	uint32 previous_wait_event = *my_wait_event_info;
 
 	undo_capacity_refusal.valid = false;
+	cluster_undo_cleaner_capacity_trace_reset();
 	if (undo_cleaner_state == NULL || continuation == NULL) {
 		undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){
 			.site = "unavailable", .segment = segment_id, .key = continuation });

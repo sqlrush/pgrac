@@ -17294,3 +17294,16 @@ test_cluster_undo_cleaner_capacity test_cluster_undo_capacity_refusal: $(top_src
 
 # Preserve the shared original CTRC fixture generated-input closure.
 test_cluster_undo_capacity_history_refusal: test_cluster_ctrc_counter_display.inc
+
+# Passive capacity trace is included by real selectors and extracted consumers.
+$(CLUSTER_CTRC_TEST_O) test_cluster_undo_ctrc_product.o \
+test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_dispatch \
+test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence test_cluster_ctrc_allocator_gc \
+test_cluster_ctrc_capacity test_cluster_undo_capacity_history test_cluster_undo_capacity_bind \
+test_cluster_undo_capacity_refusal test_cluster_undo_capacity_refusal_error \
+test_cluster_undo_capacity_history_refusal test_cluster_undo_cleaner_capacity \
+test_cluster_ctrc_capacity_wait.inc test_cluster_undo_capacity_bind_wait.inc: \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_capacity_trace.h
+
+test_cluster_ctrc_capacity test_cluster_ctrc_allocator_gc test_cluster_undo_capacity_history \
+test_cluster_undo_capacity_history_refusal: test_cluster_capacity_route_trace.h
