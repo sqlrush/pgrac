@@ -78,6 +78,8 @@ static ClusterUndoCapacityChangeFence history_fence;
 static unsigned history_schedule;
 static uint64 history_initial_sequence;
 static ClusterCtrcTxnKeyV1 history_writer_key;
+static ClusterHeapFreezeCohortStatus freshness_status;
+static bool freshness_producer;
 static bool maximum_pool_seen_at_wait;
 static UndoSegmentHeaderData maximum_pool_before[CLUSTER_UNDO_SEGS_PER_INSTANCE];
 
@@ -220,6 +222,27 @@ history_wait_scheduler(void)
 				history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
 				history_publish_peer(2, 3000,
 					CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+			}
+			break;
+		case 11: /* A stale gap must retire the first protective pass. */
+		case 12: /* A stale local publisher cannot sustain a report wait. */
+			if (capacity_sleeps == 1) {
+				ClusterHeapFreezeCohortObservation observation;
+
+				/* Controlled clock input, beyond the six-second freshness window.
+				 * Advance time rather than rewriting an accepted publication. */
+				test_now_us += UINT64CONST(6000001);
+				if (history_schedule == 11)
+					history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+				freshness_status
+					= cluster_undo_capacity_history_observe(&observation, &freshness_producer);
+			} else {
+				history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+				history_publish_peer(capacity_sleeps,
+					history_schedule == 12 || capacity_sleeps > 3 ? 3000 : 1000,
+					history_schedule == 12 || capacity_sleeps > 3
+						? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK
+						: CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
 			}
 			break;
 		default:
@@ -756,6 +779,73 @@ UT_TEST(test_required_peer_reconnect_cannot_reuse_the_old_history_report)
 	}
 }
 
+UT_TEST(test_expired_peer_report_breaks_the_original_protective_pair)
+{
+	static const int peers[] = {1, 65};
+
+	for (unsigned index = 0; index < lengthof(peers); index++) {
+		ClusterCtrcTxnKeyV1 continuation = {0};
+		ClusterUndoCapacityStats stats;
+		uint64 original_time;
+
+		history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+		history_admit_peer(peers[index]);
+		original_time = test_now_us;
+		freshness_status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+		freshness_producer = false;
+		history_schedule = 11;
+		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT_EQ(test_now_us, original_time + UINT64CONST(6000001));
+		UT_ASSERT_EQ(freshness_status, CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+		UT_ASSERT(freshness_producer);
+		UT_ASSERT_EQ(history_lmon.report_sequence, 5);
+		UT_ASSERT_EQ(history_lmon.freeze_slots[peers[index]].view.report.report_sequence, 3);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(stats.pool_wait_count, 3);
+		UT_ASSERT_EQ(stats.wakeup_recheck_count, 3);
+		UT_ASSERT_EQ(stats.refused_proof_count, 1);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		UT_ASSERT_EQ(memcmp(peer_headers_before, history_headers, sizeof(history_headers)), 0);
+		history_finish(3);
+		history_peer = -1;
+	}
+}
+
+UT_TEST(test_expired_local_publication_cannot_sustain_the_original_report_wait)
+{
+	static const int peers[] = {1, 65};
+
+	for (unsigned index = 0; index < lengthof(peers); index++) {
+		ClusterCtrcTxnKeyV1 continuation = {0};
+		ClusterUndoCapacityStats stats;
+		UndoHorizonLocalHistoryPublication local_before;
+		ClusterHeapFreezeReportV2SlotShmem peer_before;
+
+		history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+		history_admit_peer(peers[index]);
+		local_before = history_lmon.local_history;
+		peer_before = history_lmon.freeze_slots[peers[index]];
+		freshness_status = CLUSTER_HEAP_FREEZE_COHORT_INVALID;
+		freshness_producer = true;
+		history_schedule = 12;
+		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT_EQ(freshness_status, CLUSTER_HEAP_FREEZE_COHORT_H_STALE);
+		UT_ASSERT(!freshness_producer);
+		UT_ASSERT_EQ(history_lmon.report_sequence, 2);
+		UT_ASSERT_EQ(memcmp(&local_before, &history_lmon.local_history, sizeof(local_before)), 0);
+		UT_ASSERT_EQ(memcmp(&peer_before, &history_lmon.freeze_slots[peers[index]],
+						   sizeof(peer_before)), 0);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(stats.pool_wait_count, 1);
+		UT_ASSERT_EQ(stats.wakeup_recheck_count, 1);
+		UT_ASSERT_EQ(stats.refused_proof_count, 1);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		UT_ASSERT_EQ(memcmp(peer_headers_before, history_headers, sizeof(history_headers)), 0);
+		history_finish(1);
+		history_peer = -1;
+	}
+}
+
 int
 main(void)
 {
@@ -763,7 +853,7 @@ main(void)
 	(void)undo_horizon_send_v2;
 	(void)undo_horizon_v2_publish;
 	(void)undo_horizon_publish_freeze_watermark;
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(test_actual_clock_report_reaches_original_wait_and_physical_supply);
 	UT_RUN(test_actual_protective_pair_requires_distinct_reports);
 	UT_RUN(test_history_non_h_rejections_count_the_actual_reason_union_once);
@@ -778,6 +868,8 @@ main(void)
 	UT_RUN(test_maximum_pool_last_image_cannot_be_hidden_by_a_protected_prefix);
 	UT_RUN(test_required_peer_and_self_reports_both_advance_before_history_refusal);
 	UT_RUN(test_required_peer_reconnect_cannot_reuse_the_old_history_report);
+	UT_RUN(test_expired_peer_report_breaks_the_original_protective_pair);
+	UT_RUN(test_expired_local_publication_cannot_sustain_the_original_report_wait);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count != 0;
