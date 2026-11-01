@@ -205,7 +205,11 @@ UT_TEST(selected_redo_failed_cleanup_keeps_the_original_duty)
 		 * it must not return success or erase an unreturned borrow. */
 	}
 }
-int main(void)
+#ifndef UNDO_NATIVE_TT_REDO_IDENTITY_MAIN
+#define UNDO_NATIVE_TT_REDO_IDENTITY_MAIN main
+#endif
+int UNDO_NATIVE_TT_REDO_IDENTITY_MAIN(void);
+int UNDO_NATIVE_TT_REDO_IDENTITY_MAIN(void)
 {
 	UT_PLAN(8);
 	UT_RUN(selected_redo_keeps_identity_through_write_sync_readback_and_close);

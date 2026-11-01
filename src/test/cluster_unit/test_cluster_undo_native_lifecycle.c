@@ -212,6 +212,7 @@ fixture_dir_sync(const char *path, bool isdir)
 #define fsync_fname fixture_dir_sync
 #define cluster_vis_bump_recovery_undo_redo_applies() (applies++)
 #define cluster_vis_bump_recovery_undo_redo_skips() (skips++)
+#include "test_cluster_undo_tt_file_owner.inc"
 #include "test_cluster_undo_lifecycle_native.inc"
 #define cluster_undo_redo_open_segment(instance_, segment_, path_, create_) fixture_open(path_, 0)
 #define cluster_tt_durable_count_redo_apply() ((void)0)

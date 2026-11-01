@@ -1769,7 +1769,7 @@ cluster_undo_redo_tt_ctrc_release(const ClusterUndoDecoded *decoded)
  *     same gen, illegal state -> PANIC.
  */
 static void
-cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
+undo_tt_recycle_file(const ClusterUndoDecoded *decoded, UndoTTReplayFile *file)
 {
 	char path[MAXPGPATH];
 	int fd;
@@ -1782,46 +1782,65 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", decoded->instance,
 							   decoded->segment_id)));
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
+	file->fd = fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
 	/* The standalone native-header fixture supplies a fixed valid fd. */
 	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not open undo segment \"%s\" for recycle redo: %m", path)));
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native && !cluster_control_native_file_current_v2(&file->native_file))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 recycle identity changed before read")));
+#endif
 	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
 	if (nread != BLCKSZ) {
 		int save_errno = errno;
 
-		close(fd);
+		undo_tt_replay_close(file);
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not read undo segment header \"%s\": read %zd of %d bytes",
 							   path, nread, BLCKSZ)));
 	}
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native
+		&& (!cluster_tt_file_reference_matches_v2(blockbuf.data, BLCKSZ, &file->native_file.expected)
+			|| !cluster_control_native_file_current_v2(&file->native_file)))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 recycle predecessor has a different file identity")));
+#endif
 	if ((uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
 		&& !cluster_undo_lifecycle_v2_checksum(blockbuf.data)) {
-		close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid undo segment V2 recycle predecessor checksum")));
 	}
 	decision = cluster_undo_prepare_header_v1(decoded, NULL, 0, blockbuf.data, blockbuf.data);
 	if (decision == CLUSTER_UNDO_HEADER_BLOCKED) {
-		close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("undo segment \"%s\" has invalid identity or recycle predecessor", path)));
 	}
+	if (decision == CLUSTER_UNDO_HEADER_APPLY
+		&& (uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2)
+		((PageHeader)blockbuf.data)->pd_checksum = pg_checksum_page(blockbuf.data, 0);
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native
+		&& (!cluster_tt_file_reference_matches_v2(blockbuf.data, BLCKSZ, &file->native_file.expected)
+			|| !cluster_control_native_file_current_v2(&file->native_file)))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 recycle identity changed before write or sync")));
+#endif
 	if (decision == CLUSTER_UNDO_HEADER_APPLY) {
 		ssize_t written;
-
-		if ((uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2)
-			((PageHeader)blockbuf.data)->pd_checksum = pg_checksum_page(blockbuf.data, 0);
 		written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
 
 		if (written != BLCKSZ || pg_fsync(fd) != 0) {
 			int save_errno = errno;
 
-			close(fd);
+			undo_tt_replay_close(file);
 			errno = save_errno;
 			ereport(PANIC, (errcode_for_file_access(),
 							errmsg("could not durably write undo segment \"%s\" recycle state: %m",
@@ -1832,26 +1851,86 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 		&& decision != CLUSTER_UNDO_HEADER_APPLY && pg_fsync(fd) != 0) {
 		int save_errno = errno;
 
-		close(fd);
+		undo_tt_replay_close(file);
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not make unchanged undo segment V2 recycle durable: %m")));
 	}
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native && !cluster_control_native_file_current_v2(&file->native_file))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 recycle identity changed after sync")));
+#endif
 	if ((uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
 		&& !cluster_undo_lifecycle_v2_readback(fd, blockbuf.data)) {
-		close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("undo segment V2 recycle readback failed")));
 	}
-	if (close(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close undo segment file \"%s\": %m", path)));
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native && !cluster_control_native_file_current_v2(&file->native_file))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 recycle identity changed after readback")));
+#endif
+	undo_tt_replay_close(file);
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native && !cluster_control_native_file_current_v2(&file->native_file))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 recycle identity changed after close")));
+#endif
 	if (decision == CLUSTER_UNDO_HEADER_APPLY)
 		cluster_vis_bump_recovery_undo_redo_applies();
 	else
 		cluster_vis_bump_recovery_undo_redo_skips();
 }
 
+
+static void
+cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
+{
+	UndoTTReplayFile legacy = { .fd = -1 };
+
+	if (!cluster_undo_preflight(decoded)
+		|| decoded->kind != CLUSTER_UNDO_KIND_SEGMENT_RECYCLE)
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid native TT recycle record")));
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2) {
+		/* Stable original FD/borrow owner across ERROR. No new recovery or
+		 * file-creation authority is acquired from the native identity table. */
+		UndoTTReplayFile *file = palloc0(sizeof(*file));
+
+		file->fd = -1;
+		file->native = true;
+		PG_TRY();
+		{
+			ClusterControlFileKeyV2 key = {0};
+
+			key.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+			key.origin = decoded->instance - 1;
+			key.object_id = decoded->segment_id;
+			if (!cluster_control_native_file_acquire_v2(&key, &file->native_file)
+				|| !cluster_control_native_file_current_v2(&file->native_file))
+				ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("native TT40 recycle has no selected file identity")));
+			undo_tt_recycle_file(decoded, file);
+		}
+		PG_FINALLY();
+		{
+			undo_tt_replay_close(file);
+			if (file->native_file.private_self != 0
+				&& !cluster_control_native_file_release_v2(&file->native_file))
+				ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+								errmsg("could not release native TT40 recycle file identity")));
+			pfree(file);
+		}
+		PG_END_TRY();
+		return;
+	}
+#endif
+	undo_tt_recycle_file(decoded, &legacy);
+}
 
 /*
  * Replay XLOG_UNDO_SEGMENT_REUSE (spec-3.13 D4).
