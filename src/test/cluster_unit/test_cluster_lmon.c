@@ -195,7 +195,25 @@ static void test_producer_prepare(void);
 static void test_producer_poll_boundary(unsigned module);
 static void test_producer_work_boundary(bool event);
 static int test_producer_wait_boundary(WaitEvent *events);
+static bool test_collection_on;
+static void test_collection_prepare(void);
+static void test_collection_work(bool event);
+static int test_collection_wait(WaitEvent *events);
+
 #include "test_cluster_lmon_stop_service.inc"
+static void (*test_collection_barrier_hook)(void);
+static void
+test_collection_read_barrier(void)
+{
+	pg_read_barrier_impl();
+	if (test_collection_barrier_hook != NULL)
+		test_collection_barrier_hook();
+}
+#undef pg_read_barrier
+#define pg_read_barrier() test_collection_read_barrier()
+#include "test_cluster_shared_admission_observe.inc"
+#undef pg_read_barrier
+#define pg_read_barrier() pg_read_barrier_impl()
 #include "test_cluster_lmon_producer_observe.inc"
 
 /* Real staging, refusal/requeue, bounded drain and queue observation. Only
@@ -2568,11 +2586,12 @@ cluster_content_trace_deadline_dump(uint32 reason)
 }
 
 #include "test_cluster_lmon_producer_pause.inc"
+#include "test_cluster_lmon_admission_pause.inc"
 
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(53);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -2622,6 +2641,10 @@ main(void)
 	UT_RUN(test_online_lmon_collection_keeps_invalid_over_pending_in_both_loops);
 	UT_RUN(test_online_lmon_collection_rechecks_actual_caller_after_module_fanout);
 	UT_RUN(test_online_lmon_dispatch_work_reopens_debt_before_the_next_collection);
+	UT_RUN(test_lmon_collects_shared_debt_before_original_owner_returns);
+	UT_RUN(test_lmon_collects_dispatch_created_shared_debt_before_next_duty);
+	UT_RUN(test_lmon_collection_preserves_original_invalid_over_unknown_shared_scope);
+	UT_RUN(test_lmon_collection_detects_shared_scan_generation_and_late_actor_work);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

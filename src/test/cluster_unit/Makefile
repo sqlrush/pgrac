@@ -6269,11 +6269,14 @@ test_cluster_lmon_producer_observe.inc: $(top_srcdir)/src/backend/cluster/cluste
 		$(top_srcdir)/src/include/cluster/cluster_service_observe.h
 	awk '/^cl_native_observe_lock\(/ { print "static void"; emit=1; count++ } \
 	     /^cluster_service_(actor|producer)_observe\(/ { print "ClusterNormalStopPollResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 3) exit 1 }' $< > $@.tmp
+	     /^cluster_service_producer_collect\(/ { print "ClusterSemanticAdmissionObservationResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_lmon: test_cluster_lmon.c unit_test.h test_cluster_lmon_stop_service.inc \
 		test_cluster_lmon_producer_observe.inc test_cluster_lmon_producer_pause.inc \
+		test_cluster_shared_admission_observe.inc test_cluster_lmon_admission_pause.inc \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_grd_outbound.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O)

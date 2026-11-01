@@ -50,6 +50,8 @@ test_producer_prepare(void)
 		test_stop_observation[0] = CLUSTER_NORMAL_STOP_PENDING;
 		test_stop_observation[test_producer_module] = CLUSTER_NORMAL_STOP_INVALID;
 	}
+	if (test_collection_on)
+		test_collection_prepare();
 }
 
 static void
@@ -67,6 +69,10 @@ test_producer_work_boundary(bool event)
 {
 	ClusterServiceProducerObservation out;
 	unsigned polls = test_stop_polls;
+	if (test_collection_on) {
+		test_collection_work(event);
+		return;
+	}
 	UT_ASSERT_EQ(cluster_service_producer_observe(3, &out), CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(out.actor.active_depth, 1);
 	UT_ASSERT_EQ(out.responsibility.modules, 0);
@@ -89,8 +95,10 @@ test_producer_wait_boundary(WaitEvent *events)
 	ClusterServiceProducerObservation out = { 0 };
 	ClusterCleanLeaveSharedState before = test_stop_region;
 	ClusterNormalStopPollResult result, expected;
-	unsigned polls = test_stop_polls;
-	unsigned sample = ++test_producer_samples;
+	unsigned polls = test_stop_polls, sample;
+	if (test_collection_on)
+		return test_collection_wait(events);
+	sample = ++test_producer_samples;
 
 	UT_ASSERT(!cluster_normal_stop_requested());
 	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
