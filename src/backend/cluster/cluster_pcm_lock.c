@@ -26908,14 +26908,14 @@ cluster_pcm_lock_resource_x_acquire_s_source_covered_prepare_exact(const Resourc
 			const ClusterPcmLocalPiSnapshotV1 *local = &replacement->local;
 			bool needs_proof = replacement->carrier.pi_refs && !replacement->carrier.transport_refs;
 
-			/* Two endpoints cannot discard a different immutable WAL source. */
+			/* The carrier keeps its own immutable WAL source. The separate
+			 * logical PI may include a foreign dependency; the sealed plan
+			 * must prove coverage of both scopes before either can move. */
 			if (!needs_proof || (pcm_local_pi_source_equal(&scope.first.source, &wal.source)
 				&& pcm_local_pi_source_equal(&scope.last.source, &wal.source)
 				&& rf_page_online_plan_image_covers_v1(coverage, &wal, page.data, &scope.first, &scope.last)
 				&& (local->first.record_start == 0
-					|| (pcm_local_pi_source_equal(&local->first.source, &wal.source)
-						&& pcm_local_pi_source_equal(&local->last.source, &wal.source)
-						&& rf_page_online_plan_image_covers_v1(coverage, &wal, page.data, &local->first, &local->last)))
+					|| rf_page_online_plan_image_covers_v1(coverage, &wal, page.data, &local->first, &local->last))
 				&& cluster_page_wal_ref_retain_v1(&wal, &replacement->last)))
 				result = pcm_resource_x_acquire_s_source_prepare_internal(&canonical, master, buffer_id, prepared,
 					page.data, &wal, requester_connection, master_connection, r4_generation, authenticated_connection,

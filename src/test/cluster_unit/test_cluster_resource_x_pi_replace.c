@@ -232,6 +232,142 @@ replace_receipt(ReplaceFixture *f)
 	return request;
 }
 
+/* Two-source plan inputs use original PAGE create/bind/queue/seal.
+ * Record identity and dependency edges, never cross-thread LSN order, prove coverage. */
+static bool
+replace_dependency_plan(ReplaceFixture *f, bool first_covered, const ClusterPageWalBindingV1 *foreign,
+	bool foreign_covered)
+{
+	const ClusterPageWalBindingV1 *bindings[4];
+	ClusterWalSourceRef sources[2];
+	RfContributorStreamCutV1 cuts[2] = {{0}};
+	RfPageOnlinePlanRequestV1 request = {0};
+	RfPageOnlineTargetViewV1 target = {0};
+	unsigned count = 0, participants = foreign && foreign_covered ? 2 : 1;
+	if (first_covered) bindings[count++] = &f->old.first;
+	bindings[count++] = &f->old.last;
+	if (participants == 2) bindings[count++] = foreign;
+	bindings[count++] = &f->last;
+	sources[0] = f->old.last.source;
+	if (participants == 2) sources[1] = foreign->source;
+	for (unsigned i = 0; i < participants; i++) {
+		cuts[i].failed_thread = sources[i].claim.identity.origin_thread_id;
+		cuts[i].timeline_id = sources[i].timeline;
+		cuts[i].origin_owner_incarnation = sources[i].claim.identity.origin_owner_incarnation;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = i ? 5 : 80;
+		/* Bound each participant in its own stream; the external dependency
+		 * need not have scanned through the local writer's numeric LSN. */
+		for (unsigned n = 0; n < count; n++)
+			if (bindings[n]->source.claim.identity.origin_thread_id
+				== sources[i].claim.identity.origin_thread_id)
+				cuts[i].scan_end_exclusive = Max(cuts[i].scan_end_exclusive, bindings[n]->record_end);
+	}
+	request.system_identifier = f->last.identity.system_identifier;
+	memcpy(request.storage_uuid, f->last.identity.storage_uuid, 16);
+	request.physical_cuts = cuts; request.participant_count = participants;
+	request.retention_binding_cookie = 41;
+	rf_page_online_plan_destroy_v1(&f->plan);
+	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &f->plan), RF_PAGE_PROOF_DETAIL_OK);
+	if (!f->plan) return false;
+	UT_ASSERT(rf_page_online_plan_bind_sources_v1(f->plan, sources, participants));
+	for (unsigned n = 0; n < count; n++) {
+		const ClusterPageWalBindingV1 *b = bindings[n];
+		XLogReaderState reader = {0};
+		union { DecodedXLogRecord record; char bytes[sizeof(DecodedXLogRecord) + sizeof(DecodedBkpBlock)]; } storage = {0};
+		RfDetachedRecordPlanV1 plan = {0};
+		RfDetachedComponentPlanV1 *c = &plan.components[0];
+		RfPageOnlineRecordIdentityV1 identity = {0};
+		reader.record = &storage.record; reader.system_identifier = b->identity.system_identifier;
+		reader.ReadRecPtr = storage.record.lsn = b->record_start;
+		reader.EndRecPtr = storage.record.next_lsn = b->record_end;
+		storage.record.header.xl_crc = b->record_crc;
+		storage.record.header.xl_rmid = b->rmid; storage.record.header.xl_info = b->info;
+		storage.record.blocks[0].in_use = true;
+		storage.record.blocks[0].rlocator = b->identity.locator;
+		storage.record.blocks[0].forknum = b->identity.forknum;
+		storage.record.blocks[0].blkno = b->identity.blockno;
+		plan.source_record = &reader; plan.preflight_complete = true; plan.component_count = 1;
+		c->page_class = RF_PAGE_CLASS_ORDINARY; c->owner = RF_DETACHED_COMPONENT_PAGE_CODEC;
+		c->before_kind = c->result_kind = RF_PAGE_STATE_PRESENT;
+		c->before = n ? bindings[n - 1]->version : b->version;
+		if (n == 0) { c->before.mutation_token = 60; c->edge_flags = RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE; }
+		c->result = b->version;
+		identity.record.system_identifier = b->identity.system_identifier;
+		memcpy(identity.record.storage_uuid, b->identity.storage_uuid, 16);
+		identity.record.origin_thread = b->source.claim.identity.origin_thread_id;
+		identity.participant_index = participants == 2
+			&& b->source.claim.identity.origin_thread_id == sources[1].claim.identity.origin_thread_id ? 1 : 0;
+		identity.record.timeline_id = b->source.timeline;
+		identity.record.read_rec_ptr = b->record_start; identity.record.end_rec_ptr = b->record_end;
+		identity.record.record_crc = b->record_crc; identity.record.rmid = b->rmid; identity.record.info = b->info;
+		UT_ASSERT_EQ(rf_page_online_plan_queue_record_v1(f->plan, &plan, &identity), RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(f->plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_online_plan_target_v1(f->plan, 0, &target));
+	if (!target.canonical_page) return false;
+	memcpy(f->page.data, target.canonical_page, BLCKSZ);
+	return true;
+}
+
+static ClusterPageWalBindingV1
+replace_dependency(ReplaceFixture *f)
+{
+	ClusterPageWalBindingV1 foreign = f->old.last;
+	foreign.source.claim.identity.origin_node_id = 1;
+	foreign.source.claim.identity.origin_thread_id = 2;
+	foreign.source.claim.identity.origin_owner_incarnation = 71;
+	foreign.record_start = 5; foreign.record_end = 9;
+	foreign.version.mutation_token = 85;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(f->old.local.resource, &foreign));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f->old.local.resource, &f->old.local));
+	return foreign;
+}
+
+static void
+replace_dependency_finish(ReplaceFixture *f, int refs)
+{
+	ResourceXSourceDrainWork work;
+	ResourceXDecodedFrame request;
+	ClusterPcmLocalPiSnapshotV1 local;
+	ClusterPcmLocalPiFloorV1 floor;
+	ClusterPageWalBindingV1 first, last;
+	ClusterPcmResourceXMasterState *state = f->old.source.m.state;
+	UT_ASSERT(cluster_page_wal_ref_read_v1(&state->pi_carrier.first, f->last.identity.locator,
+		MAIN_FORKNUM, f->last.identity.blockno, &first));
+	UT_ASSERT(cluster_page_wal_ref_read_v1(&state->pi_carrier.last, f->last.identity.locator,
+		MAIN_FORKNUM, f->last.identity.blockno, &last));
+	UT_ASSERT_EQ(first.version.mutation_token, 70); UT_ASSERT_EQ(first.record_start, 80);
+	UT_ASSERT_EQ(last.version.mutation_token, 90); UT_ASSERT_EQ(last.record_end, 200);
+	UT_ASSERT_EQ(last.source.claim.identity.origin_thread_id, 1);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f->old.local.resource, &local));
+	UT_ASSERT(memcmp(&local, &f->old.local, sizeof(local)) == 0);
+	UT_ASSERT_EQ(local.last.source.claim.identity.origin_thread_id, 2);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&f->last.source, &floor));
+	UT_ASSERT_EQ(floor.floor, 80); UT_ASSERT_EQ(floor.bounded, 2);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&local.last.source, &floor));
+	UT_ASSERT_EQ(floor.unbounded, 1); /* Foreign first cannot supply this source's lower. */
+	UT_ASSERT(replace_claim(&work));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(&f->block,
+		2, 7, &f->prepared, &f->finished), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work,
+		RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+	clean_send(&state->holder_status_intent.slot); clean_send(&state->holder_image_intent);
+	request = replace_receipt(f);
+	UT_ASSERT_EQ(clean_receive(&request), RESOURCE_X_APPLY_APPLIED);
+	clean_send(&state->holder_status_intent.slot);
+	UT_ASSERT_EQ(state->pi_carrier.transport_refs, 0); UT_ASSERT_EQ(state->pi_carrier.pi_refs, 1);
+	UT_ASSERT_EQ(replace_references, refs);
+}
+static bool replace_without_foreign_DATA(const ClusterPcmLocalPiSnapshotV1 *scope)
+{
+	return scope->last.source.claim.identity.origin_thread_id == 1;
+}
+static bool replace_without_carrier_DATA(const ClusterPcmLocalPiSnapshotV1 *scope)
+{
+	return scope->last.source.claim.identity.origin_thread_id == 2;
+}
+
 UT_TEST(test_covered_successor_keeps_earliest_ref_and_original_lms_work)
 {
 	ReplaceFixture f; ResourceXSourceDrainWork work;
@@ -552,10 +688,117 @@ UT_TEST(test_covered_writer_target_requires_its_own_native_quiet_receipt)
 	replace_end(&f);
 }
 
+UT_TEST(test_covered_foreign_dependency_keeps_both_scopes_until_DATA)
+{
+	ReplaceFixture f; ClusterPageWalBindingV1 foreign;
+	ClusterPcmResourceXMasterState before; ClusterPcmLocalPiFloorV1 floor; int refs;
+	if (!replace_start(&f, true)) { UT_ASSERT(false); return; }
+	foreign = replace_dependency(&f);
+	if (!replace_dependency_plan(&f, true, &foreign, true)) { replace_end(&f); return; }
+	refs = replace_references;
+	if (replace_prepare(&f) != RESOURCE_X_APPLY_APPLIED) { UT_ASSERT(false); replace_end(&f); return; }
+	replace_dependency_finish(&f, refs); before = *f.old.source.m.state;
+	local_pi_covered = true;
+	local_pi_coverage_filter = replace_without_foreign_DATA;
+	UT_ASSERT(!pi_retire(&f.old, false));
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	local_pi_coverage_filter = replace_without_carrier_DATA;
+	UT_ASSERT(!pi_retire(&f.old, false));
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(replace_references, refs);
+	local_pi_coverage_filter = NULL;
+	UT_ASSERT(pi_retire(&f.old, false)); UT_ASSERT_EQ(replace_references, refs - 4);
+	UT_ASSERT_EQ(f.old.source.m.state->holder_image.valid, 0);
+	UT_ASSERT_EQ(f.old.source.m.state->pi_carrier.pi_refs, 0);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&foreign.source, &floor));
+	UT_ASSERT_EQ(floor.unbounded, 0); UT_ASSERT_EQ(floor.bounded, 0); UT_ASSERT_EQ(floor.floor, 0);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&f.last.source, &floor));
+	UT_ASSERT_EQ(floor.bounded, 0); UT_ASSERT_EQ(floor.floor, 0);
+	UT_ASSERT(!pi_retire(&f.old, false)); UT_ASSERT_EQ(replace_references, refs - 4);
+	replace_end(&f);
+}
+UT_TEST(test_uncovered_foreign_record_or_first_keeps_original_body)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ReplaceFixture f; ClusterPageWalBindingV1 foreign;
+		ClusterPcmResourceXMasterState before; int refs, allocations;
+		if (!replace_start(&f, true)) { UT_ASSERT(false); return; }
+		foreign = replace_dependency(&f);
+		if (!replace_dependency_plan(&f, fault != 0, &foreign, fault != 1)) { replace_end(&f); return; }
+		if (fault >= 2) {
+			foreign.source.claim.identity.origin_owner_incarnation += fault == 2;
+			foreign.record_crc += fault == 3;
+			UT_ASSERT(cluster_pcm_local_pi_record_v1(f.old.local.resource, &foreign));
+		}
+		before = *f.old.source.m.state; refs = replace_references; allocations = replace_allocations;
+		UT_ASSERT_EQ(replace_prepare(&f), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+		UT_ASSERT_EQ(replace_references, refs); UT_ASSERT_EQ(replace_allocations, allocations);
+		replace_end(&f);
+	}
+}
+UT_TEST(test_foreign_dependency_waits_for_real_old_ACK_completion)
+{
+	ReplaceFixture f; ClusterPageWalBindingV1 foreign; ResourceXIntentSlot ack;
+	ClusterPcmResourceXMasterState before; int refs;
+	if (!replace_start(&f, false)) { UT_ASSERT(false); return; }
+	foreign = replace_dependency(&f);
+	if (!replace_dependency_plan(&f, true, &foreign, true)) { replace_end(&f); return; }
+	ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot);
+	before = *f.old.source.m.state; refs = replace_references;
+	UT_ASSERT_EQ(replace_prepare(&f), RESOURCE_X_APPLY_LOCAL_WAIT);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(replace_references, refs);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, true, ++fake_pcm_clock_us));
+	if (replace_prepare(&f) != RESOURCE_X_APPLY_APPLIED) { UT_ASSERT(false); replace_end(&f); return; }
+	replace_dependency_finish(&f, refs); replace_end(&f);
+}
+UT_TEST(test_foreign_dependency_cancel_releases_only_temporary_reference)
+{
+	ReplaceFixture f; ClusterPageWalBindingV1 foreign; ClusterPcmResourceXMasterState before;
+	int refs, allocations; volatile bool caught = false;
+	if (!replace_start(&f, true)) { UT_ASSERT(false); return; }
+	foreign = replace_dependency(&f);
+	if (!replace_dependency_plan(&f, true, &foreign, true)) { replace_end(&f); return; }
+	before = *f.old.source.m.state; refs = replace_references; allocations = replace_allocations;
+	replace_cancel_after_retain = true;
+	PG_TRY(); { (void)replace_prepare(&f); } PG_CATCH(); { caught = true; } PG_END_TRY();
+	UT_ASSERT(caught); UT_ASSERT(!replace_cancel_after_retain);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(replace_references, refs); UT_ASSERT_EQ(replace_allocations, allocations);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0); replace_cancel_after_retain = false; replace_end(&f);
+}
+UT_TEST(test_foreign_scope_progress_after_coverage_refuses_handoff)
+{
+	ReplaceFixture f; ClusterPageWalBindingV1 foreign; ClusterPcmResourceXMasterState before; int refs;
+	if (!replace_start(&f, true)) { UT_ASSERT(false); return; }
+	foreign = replace_dependency(&f);
+	if (!replace_dependency_plan(&f, true, &foreign, true)) { replace_end(&f); return; }
+	before = *f.old.source.m.state; refs = replace_references;
+	replace_race = &f; replace_lock_visits = 0; object_entry_lock_hook = replace_local_progress;
+	UT_ASSERT_EQ(replace_prepare(&f), RESOURCE_X_APPLY_LOCAL_WAIT); UT_ASSERT_EQ(replace_lock_visits, 3);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(replace_references, refs);
+	object_entry_lock_hook = NULL; replace_race = NULL; replace_end(&f);
+}
+UT_TEST(test_covered_dependency_does_not_relabel_the_carrier_WAL_source)
+{
+	ReplaceFixture f; ClusterPageWalBindingV1 foreign; ClusterPcmResourceXMasterState before; int refs;
+	if (!replace_start(&f, true)) { UT_ASSERT(false); return; }
+	foreign = replace_dependency(&f); f.last.source = foreign.source;
+	if (!replace_dependency_plan(&f, true, &foreign, true)) { replace_end(&f); return; }
+	UT_ASSERT(rf_page_online_plan_image_covers_v1(f.plan, &f.last, f.page.data,
+		&f.old.local.first, &f.old.local.last));
+	before = *f.old.source.m.state; refs = replace_references;
+	UT_ASSERT_EQ(replace_prepare(&f), RESOURCE_X_APPLY_LOCAL_WAIT);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(replace_references, refs); replace_end(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(23);
 	UT_RUN(test_covered_successor_keeps_earliest_ref_and_original_lms_work);
 	UT_RUN(test_covered_pending_publication_keeps_transport_and_pi_separate);
 	UT_RUN(test_covered_replacement_waits_for_original_ack_callback);
@@ -573,5 +816,11 @@ main(void)
 	UT_RUN(test_foreign_local_wal_scope_cannot_disappear_in_replacement);
 	UT_RUN(test_data_covering_old_local_scope_cannot_retire_new_carrier);
 	UT_RUN(test_covered_writer_target_requires_its_own_native_quiet_receipt);
+	UT_RUN(test_covered_foreign_dependency_keeps_both_scopes_until_DATA);
+	UT_RUN(test_uncovered_foreign_record_or_first_keeps_original_body);
+	UT_RUN(test_foreign_dependency_waits_for_real_old_ACK_completion);
+	UT_RUN(test_foreign_dependency_cancel_releases_only_temporary_reference);
+	UT_RUN(test_foreign_scope_progress_after_coverage_refuses_handoff);
+	UT_RUN(test_covered_dependency_does_not_relabel_the_carrier_WAL_source);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }
