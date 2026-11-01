@@ -14252,6 +14252,32 @@ clean-undo-capacity-history:
 TESTS += test_cluster_empty_undo_preflight
 all: test_cluster_empty_undo_preflight
 
+TESTS += test_cluster_empty_undo_xact
+all: test_cluster_empty_undo_xact
+test_cluster_empty_undo_xact.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^RecordTransaction(Commit|Abort)\(/ { print "static TransactionId"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_empty_undo_xact: test_cluster_empty_undo_xact.c test_cluster_empty_undo_preflight.c \
+		test_cluster_empty_undo_xact.inc test_cluster_empty_undo_preflight.inc \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c \
+		test_cluster_tt_locator_stats.inc test_cluster_active_capacity_stats.inc unit_test.h \
+		$(top_srcdir)/src/backend/nodes/list.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-empty-undo-xact
+.PHONY: clean-empty-undo-xact
+clean-empty-undo-xact:
+	rm -f test_cluster_empty_undo_xact test_cluster_empty_undo_xact.inc \
+		test_cluster_empty_undo_xact.inc.tmp
+
 test_cluster_empty_undo_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c \
 		$(top_srcdir)/src/backend/executor/execMain.c Makefile
 	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
