@@ -139,4 +139,36 @@ extern void cluster_control_native_clog_range_destroy_v2(ClusterControlNativeClo
 /* Pure storage predicate for the control producer's output; no table read,
  * borrow, I/O or authority. */
 extern bool cluster_control_native_files_output_distinct_v2(const void *, Size);
+/* CREATE DATABASE's independent target relmap pair. Local address/PID-bound
+ * metadata, not a new owner or file permission; do not copy a live carrier.
+ * SAME original CF-X attempt + creation/file/I/O protection from reserve through
+ * completion. No MappingLock/XidGen/SLRU/ControlFile lock or critical section.
+ * Target db must be nonshared, tablespace valid and nonglobal. Any preexisting
+ * relmap for this target db refuses; no path/source/current-file identity fill.
+ * Original control owner issues expected, persists RESERVED then publishes the
+ * complete table. Ordinary native callers cannot use RESERVED rows.
+ * Completion is ONCE, including false/ERROR. Supply BOTH actual sync/readback
+ * receipts with the original complete source intervals. Release native table
+ * borrows under the continuing CF-X/creation protection BEFORE completion:
+ * changed-table publication refuses outstanding borrows. Original generic batch
+ * validation/publication is unchanged. OK makes only this pair AVAILABLE, not
+ * the whole database, coverage, era/lifetime, OPEN or v2 activation.
+ * REGISTRATION_DEBT/ERROR after one-shot mutation retains original creation
+ * duty; no rollback/retry. Destroy frees only local metadata, never debt/pins. */
+typedef struct ClusterControlNativeRelmapCreateV2 {
+	ClusterControlRelmapReferenceV2 control;
+	ClusterRecoveryFileIdentityV2 expected;
+	uint8 batch_uuid[16];
+	uint64 startup_generation, table_generation;
+	uint64 private_cf_sequence, private_epoch;
+	uintptr_t private_self;
+	int private_pid;
+	bool private_attempted;
+} ClusterControlNativeRelmapCreateV2;
+extern ClusterControlNativeResultV2 cluster_control_native_files_reserve_relmap_create_locked_v2(
+	Oid target_database, Oid target_tablespace, ClusterControlNativeRelmapCreateV2 **fresh);
+extern ClusterControlNativeResultV2 cluster_control_native_files_complete_relmap_create_locked_v2(
+	ClusterControlNativeRelmapCreateV2 *, const ClusterRecoveryCheckpointFileV2 *receipts,
+	uint64 receipt_count);
+extern void cluster_control_native_relmap_create_destroy_v2(ClusterControlNativeRelmapCreateV2 **);
 #endif
