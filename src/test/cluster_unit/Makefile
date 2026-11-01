@@ -18944,3 +18944,33 @@ clean-l1b-index-order:
 	rm -f test_cluster_l1b_index_order.inc test_cluster_l1b_index_order.inc.tmp \
 		cluster_l1b_bufpage_unit.o test_cluster_l1b_index_order
 clean distclean maintainer-clean: clean-l1b-index-order
+# FSM suggestions still pass through original current locking and page checks.
+TESTS += test_cluster_l1b_fsm_hints
+all: test_cluster_l1b_fsm_hints
+
+test_cluster_l1b_fsm_hints.inc: $(top_srcdir)/src/backend/access/heap/hio.c Makefile
+	awk '/^cluster_hio_vm_repin_enabled\(/ { print "static bool"; emit=1; mode++ } \
+	     /^cluster_hio_release_vm_pins\(/ { print "static void"; emit=1; pins++ } \
+	     /^RelationGetBufferForTuple\(/ { print "Buffer"; emit=1; consumer++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (mode != 1 || pins != 1 || consumer != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_l1b_fsm_hints: test_cluster_l1b_fsm_hints.c test_cluster_l1b_fsm_hints.inc \
+		cluster_l1b_bufpage_unit.o unit_test.h \
+		$(addprefix $(top_srcdir)/src/include/,access/heapam.h access/heaptoast.h \
+		access/hio.h access/htup_details.h catalog/pg_class.h \
+		cluster/cluster_guc.h cluster/cluster_mode.h cluster/cluster_space_storage.h \
+		storage/bufmgr.h storage/freespace.h storage/bufpage.h storage/itemid.h) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -ffunction-sections -fdata-sections $< \
+		$(filter %.o %.a,$^) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+.PHONY: clean-l1b-fsm-hints
+clean-l1b-fsm-hints:
+	rm -f test_cluster_l1b_fsm_hints.inc test_cluster_l1b_fsm_hints.inc.tmp \
+		test_cluster_l1b_fsm_hints
+clean distclean maintainer-clean: clean-l1b-fsm-hints
+
+cluster_l1b_bufpage_unit.o: $(top_srcdir)/src/include/storage/bufpage.h \
+		$(top_srcdir)/src/include/storage/itemid.h $(top_builddir)/src/include/pg_config.h
