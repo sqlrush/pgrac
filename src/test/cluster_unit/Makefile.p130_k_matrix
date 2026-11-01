@@ -341,3 +341,38 @@ clean-k-p130-h08:
 		test_cluster_k_p130_h08_master.inc test_cluster_k_p130_h08_master.inc.tmp \
 		test_cluster_k_p130_h08_reader.inc test_cluster_k_p130_h08_reader.inc.tmp \
 		test_cluster_k_p130_h08_reserve.inc test_cluster_k_p130_h08_reserve.inc.tmp
+
+.PHONY: k-p130-h12-deps k-p130-h12 clean-k-p130-h12
+k-p130-h12-deps: k-p130-h02-deps
+
+test_cluster_k_p130_h12_current.inc: test_cluster_native_current.c Makefile.p130_k_matrix
+	awk '/^#(define|undef) NATIVE_MASTER_HOLDER_COMPOSITION/ { next } \
+	     /^#include "test_cluster_native_master_fixture.inc"/ { includes++; next } \
+	     /^UT_TEST/ { stop=1; exit } { print } \
+	     END { if (includes != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h12_output.inc: test_cluster_native_holder_writeback.c Makefile.p130_k_matrix
+	awk '/^static void writeback_existing_output_end\(/ { emit=1; found++ } \
+	     emit { print } /^}/ && emit { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h12: test_cluster_k_p130_h12.c test_cluster_k_p130_h12_current.inc \
+		test_cluster_k_p130_h12_output.inc test_cluster_k_p130_h02_leaves.inc \
+		test_cluster_k_p130_h01_drain.inc k-p130-h12-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H12_CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+k-p130-h12: test_cluster_k_p130_h12
+	./test_cluster_k_p130_h12
+
+clean-k-p130-h12:
+	rm -f test_cluster_k_p130_h12 test_cluster_k_p130_h12_current.inc test_cluster_k_p130_h12_current.inc.tmp \
+		test_cluster_k_p130_h12_output.inc test_cluster_k_p130_h12_output.inc.tmp
