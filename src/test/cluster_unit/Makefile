@@ -18917,3 +18917,30 @@ $(MX_PREFLIGHT_TESTS): test_cluster_multixact_preflight.c unit_test.h Makefile \
 # The original link recipe consumes this object even when its variable is
 # defined later in this Makefile; retain the dependency in a fresh VPATH build.
 test_cluster_r4_lock_order: $(top_builddir)/src/backend/cluster/cluster_cr_apply.o
+
+# Native all-index completion gates the original second heap pass.
+TESTS += test_cluster_l1b_index_order
+all: test_cluster_l1b_index_order
+
+test_cluster_l1b_index_order.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c \
+		$(top_srcdir)/src/backend/commands/vacuum.c \
+		$(top_srcdir)/src/backend/access/index/indexam.c \
+		$(srcdir)/extract_l1b_index_fixture.py Makefile
+	python3 $(srcdir)/extract_l1b_index_fixture.py $(word 1,$^) $(word 2,$^) $(word 3,$^) > $@.tmp
+	mv $@.tmp $@
+
+cluster_l1b_bufpage_unit.o: $(top_srcdir)/src/backend/storage/page/bufpage.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_l1b_index_order: test_cluster_l1b_index_order.c test_cluster_l1b_index_order.inc \
+		cluster_l1b_index_test_leaves.h cluster_l1b_bufpage_unit.o unit_test.h \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -ffunction-sections -fdata-sections $< \
+		cluster_l1b_bufpage_unit.o $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+.PHONY: clean-l1b-index-order
+clean-l1b-index-order:
+	rm -f test_cluster_l1b_index_order.inc test_cluster_l1b_index_order.inc.tmp \
+		cluster_l1b_bufpage_unit.o test_cluster_l1b_index_order
+clean distclean maintainer-clean: clean-l1b-index-order
