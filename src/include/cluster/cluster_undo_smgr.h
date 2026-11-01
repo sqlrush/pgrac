@@ -106,12 +106,21 @@ extern void cluster_undo_smgr_ensure_exit_hook(void);
 
 /* Private recovery observation, not persisted authority. All entries require
  * the active qualified RECOVERY_SHARED scope. Short files are distinct from
- * I/O errors; the full-image caller may restore size before publishing block0. */
+ * I/O errors; the full-image caller may restore size before publishing block0.
+ * Managed reads retain the independently selected complete file reference and
+ * table/startup generations by value. This is an observation, not custody or
+ * creation authority; every read must reacquire and match the original value.
+ * Existing managed files require a complete valid TT40 header. An actual
+ * ENOENT remains an absence observation, never permission to create or repair. */
 typedef struct ClusterUndoSmgrRecoveryFileV1 {
 	uint64 device;
 	uint64 inode;
 	uint64 size;
 	bool exists;
+	bool native_selected;
+	uint64 native_table_generation;
+	uint64 native_startup_generation;
+	uint8 native_file_reference[128];
 } ClusterUndoSmgrRecoveryFileV1;
 
 extern bool cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
