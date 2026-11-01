@@ -27,6 +27,7 @@ bool cluster_control_root_relmap_selection_lookup_v4(ClusterControlRelmapSelecti
 {
 	abort();
 }
+#include "test_cluster_recovery_relmap_table_unavailable.h"
 #include "../../backend/cluster/cluster_recovery_relmap_scan.c"
 
 static RelMapFile

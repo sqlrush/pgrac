@@ -16128,3 +16128,19 @@ clean: clean-control-native-files
 .PHONY: clean-control-native-files
 clean-control-native-files:
 	rm -f test_cluster_control_native_files test_cluster_control_native_files.d
+
+# Original full census plus managed relmap scratch and real shared table.
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: \
+        test_cluster_recovery_managed_census_fixture.h test_cluster_recovery_managed_census.inc \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_relmap_scan.c \
+        $(top_srcdir)/src/include/cluster/cluster_control_file_identity.h
+
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: \
+        $(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+        $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+        $(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_relmap_scan.h
+
+test_cluster_recovery_relmap_scan test_cluster_recovery_managed_relmap_scan: \
+        test_cluster_recovery_relmap_table_unavailable.h \
+        $(top_srcdir)/src/include/cluster/cluster_control_native_files.h
