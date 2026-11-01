@@ -206,6 +206,7 @@ pg_re_throw(void)
 static void
 reset_rollover(void)
 {
+	cluster_node_id = 0;
 	memset(&record_storage, 0, sizeof(record_storage));
 	memset(&slot_storage, 0, sizeof(slot_storage));
 	UndoRecordShared = &record_storage;
@@ -455,10 +456,99 @@ UT_TEST(test_retained_stats_unavailable_does_not_publish_zero)
 	assert_rollover_counts(0, 0, 0);
 }
 
+UT_TEST(test_retained_stats_require_a_configured_origin)
+{
+	const int origins[] = { -1, SCN_MAX_VALID_NODE_ID + 1, INT_MIN, INT_MAX };
+	const uint64 counters[][2] = { { 0, 0 }, { UINT64_MAX, UINT64_C(1) << 63 } };
+
+	for (unsigned values = 0; values < lengthof(counters); values++) {
+		reset_rollover();
+		pg_atomic_write_u64(&record_storage.tt_retained_rollover_winner_count, counters[values][0]);
+		pg_atomic_write_u64(&record_storage.tt_retained_rollover_lost_race_count,
+							counters[values][1]);
+		for (unsigned i = 0; i < lengthof(origins); i++) {
+			uint64 winner = 1701, lost_race = 1703;
+
+			cluster_node_id = origins[i];
+			UT_ASSERT(!cluster_undo_tt_retained_rollover_stats_snapshot(&winner, &lost_race));
+			UT_ASSERT_EQ(winner, 1701);
+			UT_ASSERT_EQ(lost_race, 1703);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&record_storage.tt_retained_rollover_winner_count),
+						 counters[values][0]);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&record_storage.tt_retained_rollover_lost_race_count),
+						 counters[values][1]);
+			UT_ASSERT_EQ(cluster_undo_tt_retention_rollover_count(), 0);
+			UT_ASSERT_EQ(held_count, 0);
+		}
+	}
+}
+
+UT_TEST(test_retained_stats_preserve_unsigned_counts_for_every_valid_origin)
+{
+	const uint64 counters[][2] = { { 0, 0 }, { 7, 11 }, { UINT64_C(1) << 63, UINT64_MAX } };
+
+	for (unsigned values = 0; values < lengthof(counters); values++) {
+		reset_rollover();
+		pg_atomic_write_u64(&record_storage.tt_retained_rollover_winner_count, counters[values][0]);
+		pg_atomic_write_u64(&record_storage.tt_retained_rollover_lost_race_count,
+							counters[values][1]);
+		for (int origin = 0; origin <= SCN_MAX_VALID_NODE_ID; origin++) {
+			uint64 winner = 1701, lost_race = 1703;
+
+			cluster_node_id = origin;
+			UT_ASSERT(cluster_undo_tt_retained_rollover_stats_snapshot(&winner, &lost_race));
+			UT_ASSERT_EQ(winner, counters[values][0]);
+			UT_ASSERT_EQ(lost_race, counters[values][1]);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&record_storage.tt_retained_rollover_winner_count),
+						 counters[values][0]);
+			UT_ASSERT_EQ(pg_atomic_read_u64(&record_storage.tt_retained_rollover_lost_race_count),
+						 counters[values][1]);
+			UT_ASSERT_EQ(cluster_undo_tt_retention_rollover_count(), 0);
+			UT_ASSERT_EQ(held_count, 0);
+		}
+	}
+}
+
+UT_TEST(test_actual_rollover_retires_old_volatile_origin_provenance)
+{
+	ClusterTTSlotAllocPerSegment *segment;
+	ClusterTTSlotCurrentSnapshot before, after;
+	ClusterCtrcTxnKeyV1 key, empty_key = { 0 };
+	ClusterTTSlotCurrentOwner owner, empty_owner = { 0 };
+	uint64 binding = 99;
+	bool had_active = true;
+
+	reset_rollover();
+	segment = &slot_storage.per_node[0];
+	/* Seed only the volatile provenance boundary. Publication is not mocked:
+	 * the original allocator performs the rollover and clears these bytes. */
+	segment->origins[7].key.segment_id = 1;
+	segment->origins[7].key.xid = 9123;
+	segment->origins[7].original_full_xid = FullTransactionIdFromEpochAndXid(1, 9123);
+	segment->origins[7].binding_generation = segment->binding_generation;
+	segment->slots[7].status = CTS_COMMITTED;
+	UT_ASSERT(cluster_tt_slot_current_snapshot(0, &before));
+	cluster_tt_slot_rollover(0, 2, &had_active);
+	UT_ASSERT(!had_active);
+	UT_ASSERT(cluster_tt_slot_current_snapshot(0, &after));
+	UT_ASSERT_EQ(after.segment_id, 2);
+	UT_ASSERT_EQ(after.binding_generation, before.binding_generation + 1);
+	for (unsigned i = 0; i < sizeof(segment->origins); i++)
+		UT_ASSERT_EQ(((const unsigned char *)segment->origins)[i], 0);
+	MemSet(&key, 0x7f, sizeof(key));
+	MemSet(&owner, 0x7f, sizeof(owner));
+	UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, 7, &key, &owner, &binding));
+	UT_ASSERT_EQ(memcmp(&key, &empty_key, sizeof(key)), 0);
+	UT_ASSERT_EQ(memcmp(&owner, &empty_owner, sizeof(owner)), 0);
+	UT_ASSERT_EQ(binding, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(14);
+	UT_RUN(test_actual_rollover_retires_old_volatile_origin_provenance);
 	UT_RUN(test_pure_selection_failure_proves_no_effects);
 	UT_RUN(test_passive_winner_adoption_has_no_local_effects);
 	UT_RUN(test_reselection_after_provision_or_reuse_never_regains_no_effects);
@@ -470,6 +560,8 @@ main(void)
 	UT_RUN(test_passive_adoption_does_not_invalidate_or_report_cold_as_retained);
 	UT_RUN(test_adoption_at_each_physical_boundary_counts_one_lost_race);
 	UT_RUN(test_retained_stats_unavailable_does_not_publish_zero);
+	UT_RUN(test_retained_stats_require_a_configured_origin);
+	UT_RUN(test_retained_stats_preserve_unsigned_counts_for_every_valid_origin);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -4697,7 +4697,8 @@ cluster_undo_tt_retention_rollover_count(void)
 bool
 cluster_undo_tt_retained_rollover_stats_snapshot(uint64 *winner, uint64 *lost_race)
 {
-	if (winner == NULL || lost_race == NULL || UndoRecordShared == NULL)
+	if (winner == NULL || lost_race == NULL || UndoRecordShared == NULL
+		|| !SCN_NODE_ID_VALID(cluster_node_id))
 		return false;
 	*winner = pg_atomic_read_u64(&UndoRecordShared->tt_retained_rollover_winner_count);
 	*lost_race = pg_atomic_read_u64(&UndoRecordShared->tt_retained_rollover_lost_race_count);

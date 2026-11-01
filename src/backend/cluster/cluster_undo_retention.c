@@ -229,6 +229,93 @@ cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr
 }
 
 
+static uint32
+undo_segment_record_retain_reasons(const UndoSegmentHeaderData *header, SCN horizon)
+{
+	SCN seal = UndoSegmentHeader_record_seal_upper_scn(header);
+	SCN drain = UndoSegmentHeader_record_drain_upper_scn(header);
+	uint32 reasons = 0;
+
+	if (header->tail_block == 0 && !SCN_VALID(seal))
+		return 0;
+	if (!SCN_VALID(seal) || !SCN_VALID(drain) || scn_time_cmp(drain, seal) < 0)
+		reasons |= CLUSTER_UNDO_RETAIN_SEAL_OR_DRAIN;
+	if (!SCN_VALID(horizon))
+		reasons |= CLUSTER_UNDO_RETAIN_HORIZON_MISSING;
+	else if (reasons == 0 && scn_time_cmp(drain, horizon) >= 0)
+		reasons |= CLUSTER_UNDO_RETAIN_HISTORY_PIN;
+	return reasons;
+}
+
+static uint32
+undo_segment_slot_retain_reasons(const TTSlot *slot, SCN horizon, bool peer_mode)
+{
+	uint32 reasons = 0;
+	bool identity;
+
+	switch (slot->status) {
+	case TT_SLOT_ACTIVE:
+		return CLUSTER_UNDO_RETAIN_ACTIVE_OR_PREPARED;
+	case TT_SLOT_UNUSED:
+	case TT_SLOT_RECYCLABLE:
+		return peer_mode && slot->flags != TT_FLAGS_RESERVED ? CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO
+															 : 0;
+	case TT_SLOT_COMMITTED:
+	case TT_SLOT_ABORTED:
+		break;
+	default:
+		return CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO;
+	}
+	identity = TransactionIdIsNormal(slot->xid) && slot->wrap != TT_WRAP_INVALID;
+	if (!identity)
+		reasons |= CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO;
+	if (slot->status == TT_SLOT_COMMITTED) {
+		if (!SCN_VALID(slot->commit_scn))
+			reasons |= CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO;
+		if (!SCN_VALID(horizon))
+			reasons |= CLUSTER_UNDO_RETAIN_HORIZON_MISSING;
+		else if (identity && SCN_VALID(slot->commit_scn)
+				 && (peer_mode ? scn_time_cmp(slot->commit_scn, horizon) > 0
+							   : scn_time_cmp(slot->commit_scn, horizon) >= 0))
+			reasons |= CLUSTER_UNDO_RETAIN_HISTORY_PIN;
+	} else if (peer_mode && slot->commit_scn != InvalidScn)
+		reasons |= CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO;
+	if (peer_mode) {
+		if (!UBA_is_invalid(slot->first_undo_block))
+			reasons |= CLUSTER_UNDO_RETAIN_REFERENCE_PENDING;
+		if (slot->flags == TT_FLAGS_RESERVED)
+			reasons |= CLUSTER_UNDO_RETAIN_RELEASE_NOT_DURABLE;
+		else if (slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN)
+			reasons |= CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO;
+	}
+	return reasons;
+}
+
+/* Explain a rejection without replacing the original acceptance predicate.
+ * A failed header can have several causes; none is a release certificate. */
+bool
+cluster_undo_segment_recyclable_for_mode_with_reasons(const UndoSegmentHeaderData *header,
+													  SCN horizon, bool peer_mode, uint32 *reasons)
+{
+	bool recyclable = cluster_undo_segment_recyclable_for_mode(header, horizon, peer_mode);
+	uint32 observed = 0;
+
+	if (reasons == NULL)
+		return recyclable;
+	*reasons = 0;
+	if (recyclable)
+		return true;
+	if (header == NULL || header->segment_state != SEGMENT_COMMITTED) {
+		*reasons = CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO;
+		return false;
+	}
+	observed = undo_segment_record_retain_reasons(header, horizon);
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
+		observed |= undo_segment_slot_retain_reasons(&header->tt_slots[i], horizon, peer_mode);
+	*reasons = observed != 0 ? observed : CLUSTER_UNDO_RETAIN_IDENTITY_OR_IO;
+	return false;
+}
+
 /* Single-node C7 policy with the common live-slot and identity protection. */
 bool
 cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN horizon)
