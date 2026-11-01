@@ -321,6 +321,191 @@ UT_TEST(another_creator_epoch_cannot_be_reissued_or_projected)
 	batch_end();
 }
 
+/* Lose only the local projection; the selected ROOT and immutable registry
+ * remain on disk. This is not a server restart or a file-creation receipt. */
+UT_TEST(durable_full_gap_rebuild_preserves_every_creator_identity)
+{
+	ClusterControlNativeClogRangeV2 *r = NULL;
+	ClusterControlNativeFileBorrowV2 *borrows;
+	ClusterControlNativeTableInfoV2 info;
+	unsigned writes;
+
+	table_reset();
+	owner_begin();
+	UT_ASSERT_EQ(prepare(7, 81, &r), 0);
+	if (!r) {
+		batch_end();
+		return;
+	}
+	writes = root_renames;
+	borrows = palloc0(r->count * sizeof(*borrows));
+	table_reset();
+	UT_ASSERT_EQ(cluster_control_native_files_mode_v2(), CLUSTER_NATIVE_FILES_UNKNOWN_V2);
+	UT_ASSERT(cluster_control_native_files_clog_range_v2(0, 7, 81) != 0);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(
+					 &r->config, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2,
+					 r->startup_generation), 0);
+	UT_ASSERT_EQ(cluster_control_native_files_clog_range_v2(0, 7, 81), 0);
+	for (uint64 i = 0; i < r->count; i++) {
+		ClusterControlNativeFileBorrowV2 ordinary = { 0 }, zero = { 0 };
+		const ClusterControlNativeClogEntryV2 *v = &r->entries[i];
+		UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+						 CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 7 + i, &ordinary),
+					 CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2);
+		UT_ASSERT(!memcmp(&ordinary, &zero, sizeof(zero)));
+		UT_ASSERT_EQ(cluster_control_native_file_reserved_acquire_locked_v2(
+						 &r->config, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2,
+						 r->startup_generation, v->batch_uuid, &v->expected, &borrows[i]), 0);
+		UT_ASSERT(identity_same(&borrows[i].expected, &v->expected));
+	}
+	UT_ASSERT(cluster_control_native_files_info_v2(&info));
+	UT_ASSERT_EQ(info.borrowed, 75);
+	UT_ASSERT_EQ(info.reservation_count, 75);
+	UT_ASSERT_EQ(root_renames, writes);
+	for (uint64 i = 0; i < r->count; i++) {
+		UT_ASSERT(cluster_control_native_file_current_v2(&borrows[i]));
+		UT_ASSERT(cluster_control_native_file_release_v2(&borrows[i]));
+	}
+	pfree(borrows);
+	cluster_control_native_clog_range_destroy_v2(&r);
+	batch_end();
+}
+
+UT_TEST(persistent_error_debt_rebuilds_without_retrying_registration)
+{
+	ClusterControlNativeClogRangeV2 *r = NULL;
+	ClusterControlRelmapSelectionV2 *s = NULL;
+	ClusterRecoveryFileReservationV1 saved[6];
+	ClusterControlNativeTableInfoV2 info;
+	volatile bool caught = false;
+	unsigned writes;
+
+	table_reset();
+	owner_begin();
+	error_rename_number = 2;
+	rename_hook = error_after_primary;
+	PG_TRY();
+	{
+		(void)prepare(9, 12, &r);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	config_error = false;
+	rename_hook = NULL;
+	UT_ASSERT(caught && r == NULL);
+	UT_ASSERT_EQ(root_renames, 2);
+	UT_ASSERT(inventory_read(&s));
+	UT_ASSERT_EQ(cluster_control_root_registry_reservation_count_v4(s), 6);
+	for (unsigned i = 0; i < 6; i++)
+		UT_ASSERT(cluster_control_root_registry_reservation_at_v4(s, i, &saved[i]));
+	cluster_control_root_relmap_selection_destroy_v4(&s);
+	writes = root_renames;
+	table_reset();
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(
+					 &expected_config, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, 40), 0);
+	for (unsigned i = 0; i < 6; i++) {
+		ClusterControlNativeFileBorrowV2 b = { 0 };
+		UT_ASSERT_EQ(saved[i].state, CLUSTER_RECOVERY_FILE_RESERVED_V1);
+		UT_ASSERT_EQ(cluster_control_native_file_reserved_acquire_locked_v2(
+						 &expected_config, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, 40,
+						 saved[i].batch_uuid, &saved[i].expected, &b), 0);
+		UT_ASSERT(identity_same(&b.expected, &saved[i].expected));
+		UT_ASSERT(cluster_control_native_file_release_v2(&b));
+	}
+	UT_ASSERT(cluster_control_native_files_info_v2(&info));
+	UT_ASSERT_EQ(info.reservation_count, 6);
+	UT_ASSERT_EQ(info.borrowed, 0);
+	UT_ASSERT_EQ(root_renames, writes);
+	batch_end();
+}
+
+UT_TEST(wrap_halves_rebuild_together_before_any_creator_borrow)
+{
+	ClusterControlNativeClogRangeV2 *halves[2] = { NULL, NULL };
+	ClusterControlNativeFileBorrowV2 borrows[2] = { 0 };
+	ClusterControlNativeTableInfoV2 info;
+	unsigned writes;
+
+	table_reset();
+	owner_begin();
+	UT_ASSERT_EQ(prepare(4095, 4095, &halves[0]), 0);
+	UT_ASSERT_EQ(prepare(0, 2, &halves[1]), 0);
+	if (!halves[0] || !halves[1]) {
+		cluster_control_native_clog_range_destroy_v2(&halves[0]);
+		cluster_control_native_clog_range_destroy_v2(&halves[1]);
+		batch_end();
+		return;
+	}
+	writes = root_renames;
+	UT_ASSERT_EQ(writes, 4);
+	table_reset();
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(
+					 &expected_config, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, 40), 0);
+	UT_ASSERT_EQ(cluster_control_native_files_clog_range_v2(0, 4095, 4095), 0);
+	UT_ASSERT_EQ(cluster_control_native_files_clog_range_v2(0, 0, 2), 0);
+	for (unsigned i = 0; i < 2; i++) {
+		const ClusterControlNativeClogEntryV2 *v = &halves[i]->entries[0];
+		UT_ASSERT_EQ(cluster_control_native_file_reserved_acquire_locked_v2(
+						 &expected_config, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, 40,
+						 v->batch_uuid, &v->expected, &borrows[i]), 0);
+		UT_ASSERT(identity_same(&borrows[i].expected, &v->expected));
+	}
+	UT_ASSERT(cluster_control_native_files_info_v2(&info));
+	UT_ASSERT_EQ(info.borrowed, 2);
+	UT_ASSERT_EQ(info.reservation_count, 6);
+	UT_ASSERT_EQ(root_renames, writes);
+	for (unsigned i = 0; i < 2; i++) {
+		UT_ASSERT(cluster_control_native_file_release_v2(&borrows[i]));
+		cluster_control_native_clog_range_destroy_v2(&halves[i]);
+	}
+	batch_end();
+}
+
+UT_TEST(cancelled_batch_cannot_return_through_a_fresh_projection)
+{
+	ClusterControlNativeClogRangeV2 *r = NULL;
+	ClusterControlRelmapSelectionV2 *s = NULL;
+	ClusterControlRegistryBatchV4 change = { 0 };
+	ClusterControlNativeFileBorrowV2 b = { 0 }, zero = { 0 };
+	ClusterControlNativeTableInfoV2 info;
+	uint8 ref[128];
+	unsigned writes;
+
+	table_reset();
+	owner_begin();
+	UT_ASSERT_EQ(prepare(9, 12, &r), 0);
+	if (!r) {
+		batch_end();
+		return;
+	}
+	change.operation = CLUSTER_CONTROL_REGISTRY_CANCEL_V4;
+	memcpy(change.batch_uuid, r->entries[0].batch_uuid, 16);
+	UT_ASSERT(inventory_read(&s));
+	UT_ASSERT_EQ(cluster_control_root_registry_batch_locked_v4(s, &change, ref), 0);
+	cluster_control_root_relmap_selection_destroy_v4(&s);
+	writes = root_renames;
+	table_reset();
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(
+					 &expected_config, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, 40), 0);
+	for (uint64 i = 0; i < r->count; i++) {
+		const ClusterControlNativeClogEntryV2 *v = &r->entries[i];
+		UT_ASSERT(cluster_control_native_file_reserved_acquire_locked_v2(
+					  &r->config, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2,
+					  r->startup_generation, v->batch_uuid, &v->expected, &b) != 0);
+		UT_ASSERT(!memcmp(&b, &zero, sizeof(zero)));
+	}
+	UT_ASSERT(cluster_control_native_files_clog_range_v2(0, 9, 12) != 0);
+	UT_ASSERT(cluster_control_native_files_info_v2(&info));
+	UT_ASSERT_EQ(info.reservation_count, 2);
+	UT_ASSERT_EQ(info.borrowed, 0);
+	UT_ASSERT_EQ(root_renames, writes);
+	cluster_control_native_clog_range_destroy_v2(&r);
+	batch_end();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -338,6 +523,10 @@ main(int argc, char **argv)
 	UT_RUN(available_segments_keep_identity_and_never_gain_creator_batch);
 	UT_RUN(canonical_registry_budget_refuses_before_one_shot_publication);
 	UT_RUN(another_creator_epoch_cannot_be_reissued_or_projected);
+	UT_RUN(durable_full_gap_rebuild_preserves_every_creator_identity);
+	UT_RUN(persistent_error_debt_rebuilds_without_retrying_registration);
+	UT_RUN(wrap_halves_rebuild_together_before_any_creator_borrow);
+	UT_RUN(cancelled_batch_cannot_return_through_a_fresh_projection);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
