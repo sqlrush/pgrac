@@ -10125,13 +10125,14 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 		$(top_srcdir)/src/backend/access/transam/transam.c \
 		$(top_srcdir)/src/backend/access/transam/twophase.c \
 		$(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
-	awk '/^GetNewTransactionId\(/ { print "FullTransactionId"; emit=1; found++ } \
+	awk '/^GetNewTransactionIdCandidate\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^GetNewTransactionId\(/ { print "FullTransactionId"; emit=1; found++ } \
 	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
 	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
 	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; found++ } \
 	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; found++ } \
 	     /^ProcArrayEndTransactionInternal\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 7) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 8) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_allocation_stripe.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
@@ -10153,6 +10154,17 @@ test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 		$(top_srcdir)/src/include/access/twophase.h \
 		$(top_srcdir)/src/include/storage/proc.h \
 		$(top_srcdir)/src/include/storage/procarray.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_xid_clog_preparation
+all: test_cluster_xid_clog_preparation
+
+# Preparation contract deliberately remains RED until the original control
+# producer is connected; the original allocator suite is kept separately.
+test_cluster_xid_clog_preparation: test_cluster_xid_clog_preparation.c \
+		test_cluster_xid_allocation.c unit_test.h test_cluster_xid_allocation.inc \
+		test_cluster_xid_allocation_stripe.inc test_cluster_pgproc_active_types.inc \
+		$(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency

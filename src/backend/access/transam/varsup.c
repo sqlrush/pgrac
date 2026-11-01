@@ -79,6 +79,34 @@
 VariableCache ShmemVariableCache = NULL;
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* Read-only prediction. Both initial selection and reentry after dropping
+ * XidGenLock use the original counter and the same durable stripe floors.
+ * The caller retains all window, epoch, finite-identity and lease gates. */
+static FullTransactionId
+GetNewTransactionIdCandidate(FullTransactionId next_xid, bool *striped)
+{
+	int			stripe_slot = cluster_xid_allocation_slot();
+
+	*striped = stripe_slot >= 0;
+	if (*striped)
+	{
+		FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
+		FullTransactionId herd_floor = cluster_xid_stripe_herding_floor();
+
+		next_xid = cluster_xid_next_striped_full(next_xid, stripe_slot);
+		if (FullTransactionIdIsValid(slot_floor)
+			&& FullTransactionIdPrecedes(next_xid, slot_floor))
+			next_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
+		if (FullTransactionIdIsValid(herd_floor)
+			&& FullTransactionIdPrecedes(next_xid, herd_floor))
+			next_xid = cluster_xid_next_striped_full(herd_floor, stripe_slot);
+	}
+	return next_xid;
+}
+#endif
+
+
 /*
  * Allocate the next FullTransactionId for a new transaction or
  * subtransaction.
@@ -96,6 +124,9 @@ GetNewTransactionId(bool isSubXact)
 {
 	FullTransactionId full_xid;
 	TransactionId xid;
+#ifdef USE_PGRAC_CLUSTER
+	bool		striped_candidate;
+#endif
 
 	/*
 	 * Workers synchronize transaction state at the beginning of each parallel
@@ -149,27 +180,10 @@ retry_cluster_xid_reservation:
 	 * and this block is a no-op (byte-identical vanilla behaviour).
 	 */
 	{
-		int			stripe_slot = cluster_xid_allocation_slot();
-
-		if (stripe_slot >= 0)
+		full_xid = GetNewTransactionIdCandidate(full_xid, &striped_candidate);
+		xid = XidFromFullTransactionId(full_xid);
+		if (striped_candidate)
 		{
-			FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
-			FullTransactionId herd_floor = cluster_xid_stripe_herding_floor();
-
-			full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
-			/* D5e/D0-F2: never issue below the durable per-slot floor
-			 * (external rewinds only — pg_resetwal below the floor). */
-			if (FullTransactionIdIsValid(slot_floor)
-				&& FullTransactionIdPrecedes(full_xid, slot_floor))
-				full_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
-			/* D3: never issue below the armed herding promise (the
-			 * observe-and-jump lands here — the jump abandons only
-			 * never-issued in-class positions, pure slack). */
-			if (FullTransactionIdIsValid(herd_floor)
-				&& FullTransactionIdPrecedes(full_xid, herd_floor))
-				full_xid = cluster_xid_next_striped_full(herd_floor, stripe_slot);
-			xid = XidFromFullTransactionId(full_xid);
-
 			/*
 			 * D3 window hard limit (spec §3.3): if this candidate runs
 			 * ahead of the slowest active slot's published hwm by more
@@ -302,28 +316,9 @@ retry_cluster_xid_reservation:
 		xid = XidFromFullTransactionId(full_xid);
 
 #ifdef USE_PGRAC_CLUSTER
-		/* PGRAC: spec-6.15 D1 -- re-derive the striped candidate from the
-		 * re-read nextXid (mirrors the derivation at the top). */
-		{
-			int			stripe_slot = cluster_xid_allocation_slot();
-
-			if (stripe_slot >= 0)
-			{
-				FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
-				FullTransactionId herd_floor = cluster_xid_stripe_herding_floor();
-
-				full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
-				/* D5e/D0-F2 + D3: same floor clamps as the first
-				 * derivation (the hard-limit refusal already ran). */
-				if (FullTransactionIdIsValid(slot_floor)
-					&& FullTransactionIdPrecedes(full_xid, slot_floor))
-					full_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
-				if (FullTransactionIdIsValid(herd_floor)
-					&& FullTransactionIdPrecedes(full_xid, herd_floor))
-					full_xid = cluster_xid_next_striped_full(herd_floor, stripe_slot);
-				xid = XidFromFullTransactionId(full_xid);
-			}
-		}
+		/* Reread both floors after releasing the issuer lock. */
+		full_xid = GetNewTransactionIdCandidate(full_xid, &striped_candidate);
+		xid = XidFromFullTransactionId(full_xid);
 
 		/* PGRAC: GCS-race round-3 P0-1 — re-assert the wrap-barrier gate on
 		 * the re-derived candidate (same predicate as the first derivation). */
