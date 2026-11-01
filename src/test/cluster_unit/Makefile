@@ -13355,12 +13355,17 @@ test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c un
 
 # The same fork/exec/wait path as original native creation, with real children.
 test_cluster_initdb_cohort: test_cluster_initdb_cohort.c unit_test.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/common/file_perm.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
@@ -15789,3 +15794,25 @@ cluster_registry_common_test.o: test_cluster_registry_io.c $(top_srcdir)/src/com
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
+
+# Same creator pipe into the original managed relmap file producer.
+TESTS += test_cluster_initdb_recovery
+all: test_cluster_initdb_recovery
+test_cluster_initdb_recovery_fixture.inc: test_cluster_initdb_relmap.c
+	awk '/^UT_TEST/ { found=1; exit } { print } END { if (!found) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_initdb_recovery_dispatch.inc: $(top_srcdir)/src/bin/initdb/initdb.c
+	awk '/^pgrac_native_create_relmaps\(const ControlFileData \*control\)/ { print "static bool"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_initdb_recovery: test_cluster_initdb_recovery.c test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_dispatch.inc unit_test.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -DFRONTEND $< $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-recovery
+.PHONY: clean-initdb-recovery
+clean-initdb-recovery:
+	rm -f test_cluster_initdb_recovery test_cluster_initdb_recovery.d test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_fixture.inc.tmp test_cluster_initdb_recovery_dispatch.inc test_cluster_initdb_recovery_dispatch.inc.tmp

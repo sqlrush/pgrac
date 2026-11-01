@@ -31,6 +31,7 @@ common_sources = files(
   'link-canary.c',
   'md5_common.c',
   'percentrepl.c',
+  'pgrac_initdb_recovery.c',
   'pgrac_control_binding.c',
   'pgrac_external_fence_protocol.c',
   'pgrac_fence_map.c',

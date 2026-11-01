@@ -21,6 +21,8 @@
 #include "common/file_perm.h"
 #include "common/cryptohash.h"
 #include "common/pgrac_initdb_cohort.h"
+#include "cluster/cluster_recovery_format.h"
+#include "catalog/pg_tablespace_d.h"
 #include "miscadmin.h"
 #include "libpq/pqsignal.h"
 #include "utils/guc.h"
@@ -56,6 +58,7 @@ typedef struct InitdbOrigin {
 	ClusterCfContractRecord storage_contract;
 	struct stat storage_contract_identity, storage_contract_directory;
 	bool side_routed;
+	bool managed_relmap;
 	struct stat side_archive;
 	struct stat side_sources[4], side_targets[4], side_links[4];
 	int side_link_fds[4];
@@ -419,20 +422,64 @@ control_read(InitdbOrigin *origin, uint16 thread, uint64 system_identifier, bool
 	directory_current(&origin->wal);
 }
 
+bool
+cluster_initdb_cohort_relmap_prepare_v2(const ClusterSharedConfigRef *config,
+	const PgracInitdbConfigContext *request, const uint8 branch[16],
+	int data_fd, int shared_fd, PgracInitdbRecoveryContext *out)
+{
+	ClusterRecoveryFileIdentityV2 first = {0};
+	uintptr_t output = (uintptr_t)out;
+	uintptr_t inputs[3] = {(uintptr_t)config, (uintptr_t)request, (uintptr_t)branch};
+	size_t lengths[3] = {sizeof(*config), sizeof(*request), 16};
+	for (unsigned i = 0; out != NULL && i < 3; ++i)
+		if (output <= inputs[i] ? inputs[i] - output < sizeof(*out)
+							   : output - inputs[i] < lengths[i]) return false;
+	if (!config || !request || !branch || !out || config->identity.generation != 1
+		|| !(config->identity.configured[0] & 1)
+		|| memcmp(config->sha256, request->sha256, 32) != 0) return false;
+	first.kind = CLUSTER_RECOVERY_FILE_RELMAP_V2;
+	first.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+	first.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+	first.system_identifier = config->identity.system_identifier;
+	first.database_incarnation = config->identity.database_incarnation;
+	memcpy(first.storage_uuid, config->identity.storage_uuid, 16);
+	memcpy(first.redo_branch_uuid, branch, 16);
+	first.redo_branch_generation = 1;
+	first.redo_timeline = 1; /* original native initdb birth; final control rechecks it */
+	first.tablespace_oid = GLOBALTABLESPACE_OID;
+	first.creation_generation = 1;
+	first.registration_generation = 1;
+	return pgrac_initdb_recovery_prepare_v2(&first, request, data_fd, shared_fd, out);
+}
+
 static void
-run_child(char *const *args, uint64 creator_pid)
+run_child_registered(char *const *args, uint64 creator_pid,
+					 const PgracInitdbRecoveryContext *registration)
 {
 	int status;
+	int recovery_fd = -1;
 	pid_t child, waited;
 	bool cancelled = false;
 	if (creation_cancelled || getppid() != creator_pid)
 		refuse("original creation was cancelled");
+	if (getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL
+		|| (registration != NULL
+			&& !pgrac_initdb_recovery_pipe_v2(registration, &recovery_fd)))
+		refuse("cannot bind original managed creation request");
 	fflush(NULL);
 	child = fork();
-	if (child < 0)
+	if (child < 0) {
+		if (recovery_fd >= 0) (void)close(recovery_fd);
 		refuse("cannot start an original native initializer");
+	}
 	if (child == 0) {
 		sigset_t empty;
+		char descriptor[32];
+		if (recovery_fd >= 0) {
+			snprintf(descriptor, sizeof(descriptor), "%d", recovery_fd);
+			if (fcntl(recovery_fd, F_SETFD, 0) != 0
+				|| setenv(PGRAC_INITDB_RECOVERY_ENV, descriptor, 1) != 0) _exit(127);
+		}
 		if (setpgid(0, 0) != 0)
 			_exit(127);
 		pqsignal(SIGINT, SIG_DFL);
@@ -449,7 +496,13 @@ run_child(char *const *args, uint64 creator_pid)
 		do {
 			waited = waitpid(child, &status, 0);
 		} while (waited < 0 && errno == EINTR);
+		if (recovery_fd >= 0) (void)close(recovery_fd);
 		refuse("cannot bind the original native child group");
+	}
+	if (recovery_fd >= 0 && close(recovery_fd) != 0) {
+		(void)kill(-child, SIGKILL);
+		do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+		refuse("cannot close original managed creation request");
 	}
 	for (;;) {
 		if (creation_cancelled || getppid() != creator_pid) {
@@ -474,8 +527,15 @@ run_child(char *const *args, uint64 creator_pid)
 }
 
 static void
+run_child(char *const *args, uint64 creator_pid)
+{
+	run_child_registered(args, creator_pid, NULL);
+}
+
+static void
 run_origin(const char *initdb, const PgracInitdbCohortContext *request,
-		   const ClusterSharedConfigRef *config, const char *shared, InitdbOrigin *origin, int node)
+		   const ClusterSharedConfigRef *config, const char *shared, InitdbOrigin *origin, int node,
+		   const PgracInitdbRecoveryContext *registration)
 {
 	char thread[64], system[96], storage[96], incarnation[96], base[MAXPGPATH + 64];
 	char configuration[MAXPGPATH + 64], local[96], host[96], segment[64], uuid[33];
@@ -527,7 +587,18 @@ run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 	}
 	args[count] = NULL;
 	Assert(count < lengthof(args));
-	run_child(args, request->creator_pid);
+	if (registration != NULL) {
+		ClusterRecoveryFileIdentityV2 identities[4];
+		if (node != 0 || registration->creator_pid != (uint64)getpid()
+			|| registration->first.system_identifier != config->identity.system_identifier
+			|| registration->first.database_incarnation != config->identity.database_incarnation
+			|| memcmp(registration->first.storage_uuid, config->identity.storage_uuid, 16) != 0
+			|| memcmp(registration->config.sha256, config->sha256, 32) != 0
+			|| !pgrac_initdb_recovery_relmaps_v2(registration, identities))
+			refuse("managed founder registration differs from original cohort");
+		run_child_registered(args, request->creator_pid, registration);
+		origin->managed_relmap = true;
+	} else run_child(args, request->creator_pid);
 	request_current(request, config);
 	control_read(origin, node + 1, config->identity.system_identifier, true);
 }
@@ -1020,6 +1091,15 @@ creation_derived_current(const InitdbDirectory *global, const InitdbDirectory *s
 		refuse("original backup ROOT changed before primary publication");
 }
 
+/* The default v3 publisher cannot select even one managed-format child. */
+static void
+creation_legacy_format_current(const InitdbOrigin *origins)
+{
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node)
+		if (origins[node].managed_relmap)
+			refuse("managed creation requires complete ROOTv4 file registration");
+}
+
 static void
 create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roots[4],
 					InitdbOrigin *origins, const ClusterSharedConfigRef *config,
@@ -1040,6 +1120,7 @@ create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roo
 	pg_cryptohash_ctx *hash;
 	char name[112], hex[65];
 
+	creation_legacy_format_current(origins);
 	header->file_txn_seq = 1;
 	header->format_version = 3;
 	header->system_identifier = config->identity.system_identifier;
@@ -1253,7 +1334,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
 		if (!(ref->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64))))
 			continue;
-		run_origin(initdb, &request, ref, roots[1].path, &origins[node], node);
+		run_origin(initdb, &request, ref, roots[1].path, &origins[node], node, NULL);
 		for (int i = 0; i < 4; i++)
 			directory_current(&roots[i]);
 	}
