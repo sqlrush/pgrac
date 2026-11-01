@@ -564,3 +564,38 @@ clean-k-p130-h24:
 		test_cluster_k_p130_h24_receipt.inc test_cluster_k_p130_h24_receipt.inc.tmp \
 		test_cluster_k_p130_h24_transport.inc test_cluster_k_p130_h24_transport.inc.tmp \
 		test_cluster_k_p130_h24_capacity.inc test_cluster_k_p130_h24_capacity.inc.tmp
+
+.PHONY: k-p130-h25-deps k-p130-h25 clean-k-p130-h25
+k-p130-h25-deps:
+	$(MAKE) test_cluster_first_fill_retire
+
+test_cluster_k_p130_h25_fixture.inc: test_cluster_first_fill_retire.c Makefile.p130_k_matrix
+	awk '/^int$$/ { stop=1; exit } /^UT_TEST/ { skip=1; tests++; next } \
+	     skip && /^}/ { skip=0; next } !skip { \
+	       if ($$0 == "\tUT_ASSERT_EQ(backend, 1);") { print "\tUT_ASSERT(backend > 0 && backend <= retire_max_backends);"; backend++ } \
+	       else if ($$0 == "#include \"test_cluster_first_fill_retire.inc\"") { print "#include K_P130_H25_OWNER_INCLUDE"; owner++ } \
+	       else print; \
+	       if ($$0 == "\tretire_ack = *(const GcsBlockInvalidateAckPayload *)payload;") { print "\th25_record_ack(&retire_ack);"; ack++ } \
+	       if ($$0 == "\tretire_confirm_sends++;") { print "\th25_record_done(&retire_confirm);"; done++ } \
+	       if ($$0 == "\tretire_trace_scans++;") { print "\th25_record_scan(worker, workers, begin, end, cap, sampled_at);"; scan++ } \
+	     } END { if (stop != 1 || tests != 21 || skip || backend != 1 || owner != 1 || ack != 1 || done != 1 || scan != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h25_tick.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile.p130_k_matrix
+	awk '/^cluster_gcs_block_pending_s_tick\(/ { print "void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h25: test_cluster_k_p130_h25.c test_cluster_k_p130_h25_fixture.inc \
+		test_cluster_k_p130_h25_tick.inc test_cluster_first_fill_retire_types.inc \
+		test_cluster_first_fill_retire.inc test_cluster_pcm_own.c unit_test.h k-p130-h25-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H25_CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+k-p130-h25: test_cluster_k_p130_h25
+	./test_cluster_k_p130_h25
+
+clean-k-p130-h25:
+	rm -f test_cluster_k_p130_h25 test_cluster_k_p130_h25_fixture.inc \
+		test_cluster_k_p130_h25_fixture.inc.tmp test_cluster_k_p130_h25_tick.inc test_cluster_k_p130_h25_tick.inc.tmp
