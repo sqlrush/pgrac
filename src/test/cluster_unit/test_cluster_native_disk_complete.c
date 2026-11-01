@@ -18,6 +18,7 @@ static ConditionVariableMinimallyPadded complete_iocvs[1];
 ConditionVariableMinimallyPadded *BufferIOCVArray = complete_iocvs;
 static unsigned complete_commits, complete_io_calls, complete_broadcasts;
 static bool complete_before_io_error, complete_after_io_error, complete_publish_error;
+static void (*complete_io_boundary)(bool completed);
 static void (*complete_on_content)(void), (*complete_on_broadcast)(void);
 static void
 complete_broadcast(ConditionVariable *cv)
@@ -59,6 +60,7 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_bits)
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_VALID, 0);
 	UT_ASSERT(ResourceOwnerHasBufferIO(original_io_owner, 1));
+	if (complete_io_boundary != NULL) complete_io_boundary(false);
 	if (complete_before_io_error) {
 #ifdef NATIVE_RESIDENT_FILL_COMPOSITION
 		/* A single injected interrupt, including during nested recovery. */
@@ -67,6 +69,7 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_bits)
 		pg_re_throw();
 	}
 	complete_actual_terminate(buf, clear_dirty, set_bits);
+	if (complete_io_boundary != NULL) complete_io_boundary(true);
 	if (complete_after_io_error)
 		pg_re_throw();
 }
@@ -116,6 +119,7 @@ complete_start(EvidenceFixture *f)
 		return false;
 	complete_commits = complete_io_calls = complete_broadcasts = 0;
 	complete_before_io_error = complete_after_io_error = complete_publish_error = false;
+	complete_io_boundary = NULL;
 	complete_on_content = complete_on_broadcast = NULL;
 	return true;
 }

@@ -1,21 +1,42 @@
-/* Actual ordinary ERROR cleanup and independent M/H source retirement.
+/* Actual ordinary ERROR/exit cleanup and independent M/H source retirement.
  * Authentication, OS locks/storage and error injection are controlled leaves.
  * Author: SqlRush <sqlrush@gmail.com> */
-#ifdef REMOTE_CANCEL_WRITE
-#define NATIVE_HOLDER_X_REQUESTER_COMPOSITION
-#else
-#define NATIVE_HOLDER_RESIDENT_READER_COMPOSITION
+#include "test_cluster_native_remote_x_fixture.inc"
+#ifndef REMOTE_CANCEL_WRITE
+#define NATIVE_RESIDENT_LOCK_REUSE_FIXTURE
+#include "test_cluster_native_resident_lock_fixture.inc"
+#undef NATIVE_RESIDENT_LOCK_REUSE_FIXTURE
 #endif
-#include "test_cluster_native_three_role_fixture.inc"
 
 static unsigned rc_cut, rc_native;
 static bool rc_late_callback;
+static bool rc_exiting;
+static sigjmp_buf rc_exit_jump;
+
+static void rc_interrupt(void)
+{
+	if (!rc_exiting) pg_re_throw();
+	/* Native ipc.c removes each registration before calling it. FATAL/exit
+	 * abandons the interrupted PG_TRY frames instead of running PG_CATCH.
+	 * shmem_exit releases LWLocks first; late ProcKill cancels CV sleep. */
+	error_context_stack = NULL;
+	while (fake_lwlock_depth != 0)
+		LWLockRelease(fake_lwlock_stack[fake_lwlock_depth - 1]);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(disk_exit_count > 0);
+	while (disk_exit_count != 0) {
+		unsigned n = --disk_exit_count;
+		disk_exit_callbacks[n](1, disk_exit_arguments[n]);
+	}
+	ConditionVariableCancelSleep();
+	siglongjmp(rc_exit_jump, 1);
+}
 
 static void rc_deliver(void)
 {
 	nc_deliver();
 	input_observation = ordinary_active->observation;
-	if (rc_cut == 0) pg_re_throw();
+	if (rc_cut == 0) rc_interrupt();
 }
 static void rc_after_copy(void)
 {
@@ -23,7 +44,14 @@ static void rc_after_copy(void)
 		== RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
 		&& memcmp(disk_shared.data, nc_image.body.acquire_image.original_image.page_bytes, BLCKSZ) == 0) {
 		stage_after_content = NULL;
-		pg_re_throw();
+		rc_interrupt();
+	}
+}
+static void rc_io_boundary(bool completed)
+{
+	if ((rc_cut == 2 && !completed) || (rc_cut == 3 && completed)) {
+		complete_io_boundary = NULL;
+		rc_interrupt();
 	}
 }
 static bool rc_probe(ResourceXIntentSlot *slot)
@@ -80,13 +108,27 @@ static bool rc_requester(int master, int holder, int mode, int source, uint64 bo
 	ordinary_delivery_transport = rc_deliver;
 	memcpy(before.data, disk_shared.data, BLCKSZ);
 	if (rc_cut == 1) stage_after_content = rc_after_copy;
-	if (rc_cut == 2) complete_before_io_error = true;
-	if (rc_cut == 3) complete_after_io_error = true;
+	if (rc_cut >= 2) complete_io_boundary = rc_io_boundary;
+	if (rc_exiting) {
+		sigjmp_buf *saved = PG_exception_stack;
+		ErrorContextCallback *context = error_context_stack;
+		if (sigsetjmp(rc_exit_jump, 0) == 0) {
+#ifdef REMOTE_CANCEL_WRITE
+			(void)rx_prepare(NULL);
+#else
+			if (rc_native == 0) (void)ordinary_run(&read); else (void)rl_run(NULL);
+#endif
+			UT_ASSERT(false);
+		}
+		PG_exception_stack = saved; error_context_stack = context;
+		UT_ASSERT_EQ(disk_exit_count, 0); UT_ASSERT_EQ(disk_exit_lifo_errors, 0);
+	} else {
 #ifdef REMOTE_CANCEL_WRITE
 	NM_REQUIRE(rx_prepare(NULL) == NULL);
 #else
 	NM_REQUIRE(rc_native == 0 ? !ordinary_run(&read) : !rl_run(NULL));
 #endif
+	}
 	rc_completed();
 	UT_ASSERT_EQ(ordinary_leaves, 1);
 	UT_ASSERT_EQ(prepared_episode.path, rc_native == 0
@@ -160,15 +202,28 @@ static void rc_run(unsigned cut, int mode, bool late)
 {
 	rc_cut = cut; rc_late_callback = late;
 	nt_requester = rc_requester;
-	nt_source_mode = PCM_STATE_S;
 #ifdef REMOTE_CANCEL_WRITE
 	nt_target_mode = PCM_STATE_X;
-	rc_native = 1;
 #else
 	nt_target_mode = PCM_STATE_S;
-	rc_native = 0;
 #endif
-	for (; rc_native <= 2; rc_native++) nt_run(mode);
+	for (unsigned source = 0; source < 2; source++) {
+		nt_source_mode = source == 0 ? PCM_STATE_S : PCM_STATE_X;
+		nt_seed_holder = source == 0 ? nm_parent_as : xt_seed;
+		nt_source_finished = source == 0 ? NULL : xt_source_finished;
+		nt_keep_seed_bytes = source != 0;
+#ifdef REMOTE_CANCEL_WRITE
+		rc_native = 1;
+#else
+		rc_native = 0;
+#endif
+		for (; rc_native <= 2; rc_native++) {
+			printf("# Remote cleanup: source=%s target=%s native=%u cut=%u exit=%u order=%d late=%u\n",
+				source == 0 ? "S" : "dirty-X", nt_target_mode == PCM_STATE_S ? "S" : "X",
+				rc_native, rc_cut, rc_exiting, mode, rc_late_callback);
+			nt_run(mode);
+		}
+	}
 }
 UT_TEST(test_remote_cancel_before_copy) { rc_run(0, 0, false); }
 UT_TEST(test_remote_cancel_after_copy_before_C) { rc_run(1, 0, false); }
@@ -179,9 +234,18 @@ UT_TEST(test_remote_quiet_waits_holder_image_callback) { rc_run(1, 4, false); }
 UT_TEST(test_remote_quiet_ACK_before_requester_callback) { rc_run(1, 0, true); }
 UT_TEST(test_remote_installed_ACK_before_requester_callback) { rc_run(3, 0, true); }
 UT_TEST(test_remote_duplicate_image_and_retired_notice) { rc_run(1, 3, true); }
+UT_TEST(test_remote_exit_before_copy) { rc_exiting = true; rc_run(0, 0, false); rc_exiting = false; }
+UT_TEST(test_remote_exit_after_copy_before_C) { rc_exiting = true; rc_run(1, 0, false); rc_exiting = false; }
+UT_TEST(test_remote_exit_after_C_before_IO_end) { rc_exiting = true; rc_run(2, 0, false); rc_exiting = false; }
+UT_TEST(test_remote_exit_after_IO) { rc_exiting = true; rc_run(3, 0, false); rc_exiting = false; }
+UT_TEST(test_remote_exit_quiet_before_holder_ACK) { rc_exiting = true; rc_run(1, 2, false); rc_exiting = false; }
+UT_TEST(test_remote_exit_waits_holder_image_callback) { rc_exiting = true; rc_run(1, 4, false); rc_exiting = false; }
+UT_TEST(test_remote_exit_quiet_ACK_before_requester_callback) { rc_exiting = true; rc_run(1, 0, true); rc_exiting = false; }
+UT_TEST(test_remote_exit_installed_ACK_before_requester_callback) { rc_exiting = true; rc_run(3, 0, true); rc_exiting = false; }
+UT_TEST(test_remote_exit_duplicate_image_and_retired_notice) { rc_exiting = true; rc_run(1, 3, true); rc_exiting = false; }
 int main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(18);
 	UT_RUN(test_remote_cancel_before_copy);
 	UT_RUN(test_remote_cancel_after_copy_before_C);
 	UT_RUN(test_remote_ERROR_after_C_before_IO_end);
@@ -191,5 +255,14 @@ int main(void)
 	UT_RUN(test_remote_quiet_ACK_before_requester_callback);
 	UT_RUN(test_remote_installed_ACK_before_requester_callback);
 	UT_RUN(test_remote_duplicate_image_and_retired_notice);
+	UT_RUN(test_remote_exit_before_copy);
+	UT_RUN(test_remote_exit_after_copy_before_C);
+	UT_RUN(test_remote_exit_after_C_before_IO_end);
+	UT_RUN(test_remote_exit_after_IO);
+	UT_RUN(test_remote_exit_quiet_before_holder_ACK);
+	UT_RUN(test_remote_exit_waits_holder_image_callback);
+	UT_RUN(test_remote_exit_quiet_ACK_before_requester_callback);
+	UT_RUN(test_remote_exit_installed_ACK_before_requester_callback);
+	UT_RUN(test_remote_exit_duplicate_image_and_retired_notice);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

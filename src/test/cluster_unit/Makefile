@@ -11735,7 +11735,8 @@ clean-native-resident-cancel-master:
 TESTS += test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel
 all: test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel
 test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel: test_cluster_native_remote_cancel.c \
-		test_cluster_native_three_role test_cluster_native_holder test_cluster_native_resident_lock test_cluster_native_resident_x \
+		test_cluster_native_remote_x test_cluster_native_holder test_cluster_native_resident_lock test_cluster_native_resident_x \
+		test_cluster_native_remote_x_fixture.inc \
 		test_cluster_native_three_role_fixture.inc test_cluster_native_current_fixture.inc \
 		test_cluster_native_resident_lock_fixture.inc test_cluster_native_resident_x_fixture.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
@@ -11746,7 +11747,7 @@ test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel: 
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
 		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_SCN_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 clean distclean maintainer-clean: clean-native-remote-cancel
 .PHONY: clean-native-remote-cancel
 clean-native-remote-cancel:
