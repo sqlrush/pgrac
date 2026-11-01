@@ -5114,6 +5114,7 @@ test_cluster_cold_relmap_terminal_product.o: test_cluster_cold_relmap_terminal_p
 # Original Start fixture under isolated providers; native storage remains
 # in the terminal component, not this owner bridge.
 test_cluster_cold_relmap_terminal_start: test_cluster_cold_relmap_terminal.c \
+		test_cluster_cold_relmap_terminal_batch.inc \
 		test_cluster_relmap_original_start.o test_cluster_relmap_start_ctrc_record.o
 
 test_cluster_cold_tx_start test_cluster_relmap_original_start.o: \
