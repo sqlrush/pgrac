@@ -29,8 +29,10 @@ roundtrip_setup(ClusterTxOutcome outcome, bool discarded)
 	finish_all_discarded = discarded;
 	members[0].xid = 96;
 	members[1].xid = 112;
-	for (unsigned i = 0; i < 2; ++i)
+	for (unsigned i = 0; i < 2; ++i) {
 		roots[i].xid = finish_top;
+		members[i].member_status = MultiXactStatusForShare;
+	}
 	cluster_xid_stripe_latch_runtime(true, cluster_node_id,
 									 FullTransactionIdFromEpochAndXid(1, 3));
 	UT_ASSERT_EQ(cluster_xid_origin_slot(finish_top), 0);
@@ -332,11 +334,102 @@ UT_TEST(collector_receipt_B_challenge_drift_invalidates_all_outputs)
 	clean(c, s);
 }
 
+static ClusterCurrentMxRequestContext
+heap_consumer_context(bool updater)
+{
+	ClusterCurrentMxRequestContext ctx = { .mxkey = mxkey,
+		.top_xid = 129, .current_member_xid = 145, .curcid = 5,
+		.tuple_cmax = InvalidCommandId, .precheck_result = TM_BeingModified,
+		.desired_status = MultiXactStatusForKeyShare, .lock_mode = LockTupleKeyShare,
+		.wait_policy = LockWaitBlock, .action = CCM_ACTION_LOCK,
+		.tuple_shape = updater ? CCM_SHAPE_UPDATED : CCM_SHAPE_LOCK_ONLY,
+		.follow_updates = updater, .wait_for_conflict = 1,
+		.updater_origin_node_id = updater ? 0 : -1 };
+	return ctx;
+}
+UT_TEST(collector_batch_drives_heap_decision_and_original_capability_retention)
+{
+	for (unsigned conflict = 0; conflict < 2; ++conflict) {
+		Snapshot s = roundtrip_setup(CLUSTER_TX_IN_PROGRESS, false);
+		ClusterMxHistoryCollector *c = NULL;
+		ClusterCurrentMxRequestContext ctx = heap_consumer_context(false);
+		ClusterR4CrOwnerChallenge owner = { 0 };
+		MxHeapReadout out;
+		uint32 capabilities[2];
+		if (conflict) {
+			ctx.lock_mode = LockTupleExclusive;
+			ctx.desired_status = MultiXactStatusForUpdate;
+		}
+		finish_distinct_capabilities = true;
+		UT_ASSERT(begin(s, &c));
+		UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+		UT_ASSERT_EQ(receipt_finish(c, capabilities, 2, NULL, NULL), CMXH_COMPLETE);
+		UT_ASSERT_EQ(mx_receipt_decide(members, finish_keys, finish_proofs, capabilities,
+			2, &ctx, &owner, NULL, NULL, NULL, 900, 4, &out),
+			conflict ? CMDL_WAIT_MEMBER : CMDL_CONTINUE);
+		UT_ASSERT_EQ(out.result, conflict ? TM_BeingModified : TM_Ok);
+		UT_ASSERT_EQ(out.retained.proof_count, conflict ? 0 : 1);
+		UT_ASSERT_EQ(out.retained.normalized_count, conflict ? 0 : 2);
+		if (conflict) UT_ASSERT_EQ(out.wait_key.local_xid, 80);
+		else {
+			UT_ASSERT_EQ(out.retained.proofs[0].member_xid, 96);
+			UT_ASSERT_EQ(out.retained.proofs[0].key.local_xid, 80);
+			UT_ASSERT_EQ(out.retained.capabilities[0], 21);
+		}
+		UT_ASSERT_EQ(remembered, 2);
+		UT_ASSERT_EQ(finish_requests, 2);
+		UT_ASSERT_EQ(finish_reads, 2);
+		clean(c, s);
+	}
+}
+UT_TEST(collector_independent_B_reaches_heap_follow_and_updated_decisions)
+{
+	static const ClusterTxOutcome outcomes[] = {
+		CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_COMMITTED, CLUSTER_TX_ABORTED };
+	for (unsigned state = 0; state < lengthof(outcomes); ++state)
+		for (unsigned discarded = 0; discarded < 2; ++discarded) {
+			Snapshot s = roundtrip_setup(outcomes[state], discarded);
+			ClusterMxHistoryCollector *c = NULL;
+			ClusterCurrentUpdaterChallenge challenge = updater_challenge(6);
+			ClusterCurrentUpdaterProof updater;
+			ClusterCurrentMxRequestContext ctx = heap_consumer_context(true);
+			ClusterR4CrOwnerChallenge owner = { 0 };
+			ItemPointerData successor;
+			MxHeapReadout out;
+			uint32 capabilities[2];
+			bool live = !discarded && outcomes[state] == CLUSTER_TX_IN_PROGRESS;
+			bool committed = !discarded && outcomes[state] == CLUSTER_TX_COMMITTED;
+			ItemPointerSet(&successor, 23, 4);
+			finish_successor_in_graph = finish_distinct_capabilities = true;
+			UT_ASSERT(updater_begin(s, &challenge, &c));
+			UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+			UT_ASSERT_EQ(receipt_finish(c, capabilities, 2, &challenge, &updater), CMXH_COMPLETE);
+			UT_ASSERT_EQ(mx_receipt_decide(members, finish_keys, finish_proofs, capabilities,
+				2, &ctx, &owner, &challenge, &updater, &successor, 900, 4, &out),
+				live ? CMDL_FOLLOW_UPDATED : committed ? CMDL_UPDATED : CMDL_CONTINUE);
+			UT_ASSERT_EQ(out.result, committed ? TM_Updated : TM_Ok);
+			UT_ASSERT_EQ(out.follow_updated_chain, live);
+			UT_ASSERT_EQ(out.successor.valid, live || committed);
+			UT_ASSERT_EQ(out.authoritative_updater, discarded ? InvalidTransactionId : 96);
+			UT_ASSERT_EQ(out.retained.proof_count, live ? 1 : 0);
+			if (live || committed) {
+				UT_ASSERT_EQ(out.successor.updater_xid, 96);
+				UT_ASSERT_EQ(out.successor.locator_uba_raw[0], updater.candidate_next_xmin_locator.uba.raw[0]);
+				UT_ASSERT_EQ(out.successor.locator_uba_raw[1], updater.candidate_next_xmin_locator.uba.raw[1]);
+			}
+			if (live) UT_ASSERT_EQ(out.retained.capabilities[0], 21);
+			UT_ASSERT_EQ(remembered, 2);
+			UT_ASSERT_EQ(finish_requests, 3);
+			UT_ASSERT_EQ(finish_reads, 3);
+			clean(c, s);
+		}
+}
+
 int
 main(void)
 {
 	history_fixture_init();
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(collector_wire_and_consumers_preserve_disposition);
 	UT_RUN(late_grant_corruption_rejects_whole_collector_batch);
 	UT_RUN(original_relock_gate_prevents_wire_publication);
@@ -347,6 +440,8 @@ main(void)
 	UT_RUN(collector_receipt_capability_output_is_required_and_bounded);
 	UT_RUN(collector_receipt_batch_keeps_A_capability_separate_from_B);
 	UT_RUN(collector_receipt_B_challenge_drift_invalidates_all_outputs);
+	UT_RUN(collector_batch_drives_heap_decision_and_original_capability_retention);
+	UT_RUN(collector_independent_B_reaches_heap_follow_and_updated_decisions);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

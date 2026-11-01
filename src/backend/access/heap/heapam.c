@@ -8605,6 +8605,157 @@ cluster_current_mx_set_successor_proof(
 	proof->valid = true;
 }
 
+/* Dormant until the complete operation-aware requester family is enabled.
+ * The caller owns the original relocked tuple and retained Snapshot; these
+ * are the consume-once keys/A/B/capabilities from that same attempt. */
+static ClusterCurrentMxDecision pg_attribute_unused()
+cluster_current_mx_result_consume_operations(
+	ClusterCurrentMxHeapResult *heap_result,
+	const ClusterCurrentMxMemberDesc *members,
+	const ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs,
+	const uint32 *capabilities, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *ctx,
+	const ClusterR4CrOwnerChallenge *owner,
+	const ClusterCurrentUpdaterChallenge *challenge,
+	const ClusterCurrentUpdaterProof *updater,
+	const ItemPointerData *successor_tid,
+	const ClusterCurrentMxOperationState *operation,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+{
+	ClusterCurrentMxDecision decision;
+	int updater_ordinal = -1;
+	uint16 i;
+
+	if (wait_key != NULL)
+		memset(wait_key, 0, sizeof(*wait_key));
+	if (trace != NULL)
+	{
+		trace->unknown_reason = CMX_UNKNOWN_PROOF_ENTRY;
+		trace->member_ordinal = -1;
+	}
+	if (heap_result == NULL)
+		return CMDL_UNKNOWN;
+	memset(heap_result, 0, sizeof(*heap_result));
+	heap_result->result = TM_BeingModified;
+	if (operation == NULL || operation->operation_id == 0
+		|| operation->restarts == UINT32_MAX || capabilities == NULL
+		|| wait_key == NULL)
+		return CMDL_UNKNOWN;
+
+	/* Only this typed decision may project exact canonical ownership to
+	 * SELF. Never pass base proofs to the legacy SQL decision compositor. */
+	decision = cluster_multixact_current_decide_operations(members, keys, proofs,
+		nmembers, ctx, owner, challenge, updater, wait_key, trace);
+	if (decision == CMDL_UNKNOWN)
+		goto unknown;
+	for (i = 0; i < nmembers; i++)
+	{
+		bool live = proofs[i].flags == 0
+			|| proofs[i].effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE;
+
+		if (ISUPDATE_from_mxstatus(members[i].member_status))
+		{
+			updater_ordinal = i;
+			if (live)
+				heap_result->authoritative_updater = members[i].xid;
+		}
+		if (live && proofs[i].base.state == CCM_ACTIVE && capabilities[i] == 0)
+			goto invalid;
+	}
+
+	/* B was independently obtained in this same Snapshot/attempt. Require
+	 * that exact delivered result even when A is discarded, compatible, or
+	 * does not require chain following; do not manufacture B from A/echo.
+	 * The original qualified landing proves its source; this is its final
+	 * binding comparison against the freshly relocked successor challenge. */
+	if (ctx->tuple_shape == CCM_SHAPE_UPDATED)
+	{
+		if (updater_ordinal < 0 || challenge == NULL || updater == NULL
+			|| successor_tid == NULL || !ItemPointerIsValid(successor_tid)
+			|| !BlockNumberIsValid(ItemPointerGetBlockNumber(successor_tid))
+			|| challenge->reserved16 != 0 || updater->reserved8 != 0
+			|| updater->verdict != CUCP_MATCH
+			|| updater->mxkey.origin_node_id != ctx->mxkey.origin_node_id
+			|| updater->mxkey.multixact_id != ctx->mxkey.multixact_id
+			|| updater->mxkey.cluster_epoch != ctx->mxkey.cluster_epoch
+			|| challenge->member_ordinal != (uint16) updater_ordinal
+			|| updater->member_ordinal != (uint16) updater_ordinal
+			|| challenge->updater_xid != members[updater_ordinal].xid
+			|| updater->updater_xid != members[updater_ordinal].xid
+			|| !cluster_multixact_current_successor_provenance_well_formed(
+				&challenge->candidate_next_xmin_alias,
+				&challenge->candidate_next_xmin_locator,
+				members[updater_ordinal].xid, (uint16)ctx->updater_origin_node_id,
+				ctx->mxkey.cluster_epoch)
+			|| memcmp(&challenge->candidate_next_xmin_alias,
+				&updater->candidate_next_xmin_alias,
+				sizeof(ClusterCurrentMxSuccessorAlias)) != 0
+			|| updater->candidate_next_xmin_locator.tt_wrap > TT_WRAP_MAX
+			|| !cluster_tx_locator_reply_matches(
+				&challenge->candidate_next_xmin_locator,
+				&updater->candidate_next_xmin_locator))
+			goto invalid;
+	}
+	else if (challenge != NULL)
+		goto invalid;
+
+	switch (decision)
+	{
+		case CMDL_CONTINUE:
+		case CMDL_FOLLOW_UPDATED:
+			if (!cluster_current_mx_result_retain_operations(heap_result,
+					&ctx->mxkey, members, keys, proofs, capabilities, nmembers,
+					ctx->current_member_xid, ctx->desired_status, operation))
+				goto invalid;
+			heap_result->result = TM_Ok;
+			if (decision == CMDL_FOLLOW_UPDATED)
+				heap_result->follow_updated_chain = true;
+			break;
+		case CMDL_INVISIBLE:
+			heap_result->result = TM_Invisible;
+			break;
+		case CMDL_SELF_MODIFIED:
+			heap_result->result = TM_SelfModified;
+			break;
+		case CMDL_WOULD_BLOCK:
+			heap_result->result = TM_WouldBlock;
+			break;
+		case CMDL_UPDATED:
+			heap_result->result = TM_Updated;
+			break;
+		case CMDL_DELETED:
+			heap_result->result = TM_Deleted;
+			break;
+		case CMDL_BEING_MODIFIED:
+		case CMDL_WAIT_MEMBER:
+		case CMDL_LOCK_NOT_AVAILABLE:
+			/* The original caller performs TX wait or raises the SQL error;
+			 * none of these decisions may carry a mutation receipt. */
+			break;
+		case CMDL_UNKNOWN:
+			goto unknown;
+	}
+	if (decision == CMDL_UPDATED || decision == CMDL_FOLLOW_UPDATED)
+		cluster_current_mx_set_successor_proof(&heap_result->successor_proof,
+			successor_tid, heap_result->authoritative_updater,
+			&challenge->candidate_next_xmin_alias,
+			&updater->candidate_next_xmin_locator);
+	return decision;
+
+invalid:
+	if (trace != NULL)
+	{
+		trace->unknown_reason = CMX_UNKNOWN_PROOF_ENTRY;
+		trace->member_ordinal = -1;
+	}
+unknown:
+	memset(heap_result, 0, sizeof(*heap_result));
+	heap_result->result = TM_BeingModified;
+	memset(wait_key, 0, sizeof(*wait_key));
+	return CMDL_UNKNOWN;
+}
+
 /*
  * Compare an authority-proven successor under a held content lock.  Raw xmin
  * equality is insufficient: the live tuple must still carry the exact

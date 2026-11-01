@@ -4,6 +4,7 @@
 #include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_savepoint_reader.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "access/heapam.h"
 typedef struct MxReceiptReadout {
 	MultiXactMember normalized[CLUSTER_CURRENT_MX_MAX_MEMBERS];
 	ClusterCurrentMemberProof proofs[CLUSTER_CURRENT_MX_MAX_MEMBERS];
@@ -12,6 +13,22 @@ typedef struct MxReceiptReadout {
 	uint64 operation_id;
 	uint32 attempt_generation;
 } MxReceiptReadout;
+typedef struct MxHeapReadout {
+	MxReceiptReadout retained;
+	TM_Result result;
+	TransactionId authoritative_updater;
+	bool follow_updated_chain;
+	ClusterHeapSuccessorProof successor;
+	ClusterTTStatusKey wait_key;
+} MxHeapReadout;
+struct ClusterR4CrOwnerChallenge;
+ClusterCurrentMxDecision mx_receipt_decide(
+	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, const uint32 *capabilities, uint16 count,
+	const ClusterCurrentMxRequestContext *ctx, const struct ClusterR4CrOwnerChallenge *owner,
+	const ClusterCurrentUpdaterChallenge *challenge, const ClusterCurrentUpdaterProof *updater,
+	const ItemPointerData *successor_tid, uint64 operation_id, uint32 restarts,
+	MxHeapReadout *out);
 bool mx_receipt_retain(const ClusterCurrentMxKey *key,
 	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,
 	const ClusterCurrentMemberOperationProof *proofs, const uint32 *capabilities,

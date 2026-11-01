@@ -252,9 +252,10 @@ UT_TEST(receipt_committed_live_updater_is_denied_not_silently_dropped)
 	UT_ASSERT(!receipt_retain(&f, 1, TEST_ORIGIN_XID));
 	UT_ASSERT_EQ(memcmp(&f.out, &zero, sizeof(zero)), 0);
 }
+#include "test_cluster_mx_operation_heap.inc"
 int main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(22);
 	UT_RUN(receipt_live_child_keeps_raw_member_and_canonical_top);
 	UT_RUN(receipt_discarded_member_has_no_receipt_or_rewritten_top);
 	UT_RUN(receipt_terminal_locker_has_no_retained_grant);
@@ -265,6 +266,18 @@ int main(void)
 	UT_RUN(receipt_prepare_refusal_cancels_only_new_prior_receipts);
 	UT_RUN(receipt_null_empty_and_over_limit_inputs_clear_output);
 	UT_RUN(receipt_committed_live_updater_is_denied_not_silently_dropped);
+	UT_RUN(heap_typed_continue_reaches_real_receipt_prepare);
+	UT_RUN(heap_typed_conflict_policies_keep_canonical_wait_and_no_receipts);
+	UT_RUN(heap_typed_exact_owner_maps_cid_without_retaining_self);
+	UT_RUN(heap_typed_raw_owner_collision_never_projects_self);
+	UT_RUN(heap_typed_committed_updater_maps_independent_B_to_successor);
+	UT_RUN(heap_typed_active_compatible_follow_retains_A_and_uses_B);
+	UT_RUN(heap_typed_discarded_updater_never_exports_stale_successor);
+	UT_RUN(heap_typed_B_required_even_for_nonfollowing_or_discarded_updater);
+	UT_RUN(heap_typed_B_binding_drift_clears_entire_decision);
+	UT_RUN(heap_typed_bad_member_or_capability_has_no_partial_TM_Ok);
+	UT_RUN(heap_typed_invalid_attempt_or_missing_input_is_whole_unknown);
+	UT_RUN(heap_typed_deleted_and_precheck_results_do_not_allocate_receipts);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
