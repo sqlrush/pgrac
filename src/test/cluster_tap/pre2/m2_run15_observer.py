@@ -53,7 +53,7 @@ class Run15Observer(BaseObserver):
     def _complete_raw(raw, context):
         return BaseObserver._complete_raw(raw, context, reads=RUN15_READS)
 
-    def _endpoint(self, pid):
+    def _endpoint(self, pid, evidence):
         # Search only the registered cohort layout level, never PGDATA contents.
         owned = self.run / 'testdata'
         layouts = list(owned.glob('*/blackbox-layout.json'))
@@ -72,13 +72,44 @@ class Run15Observer(BaseObserver):
         if (not data.is_relative_to(owned.resolve()) or not isinstance(host, str)
                 or not host.startswith('/') or type(port) is not int or not 0 < port < 65536):
             raise ValueError('original node endpoint is invalid')
-        lines = (data / 'postmaster.pid').read_text().splitlines()
-        stat = (self.proc_root / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
-        if (len(lines) < 5 or not lines[0].isdigit() or int(lines[0]) <= 1
-                or lines[1] != str(data) or lines[3] != str(port) or lines[4] != host
-                or int(stat[1]) != int(lines[0])):
+        evidence.update(path=str(layout), sha256=sha256(raw), atomic=False,
+                        diagnostic_authority=False,
+                        expected=dict(data_dir=str(data), port=str(port), host=host))
+        pidfile = data / 'postmaster.pid'
+        pid_raw = pidfile.read_bytes()
+        evidence['postmaster_pidfile'] = dict(path=str(pidfile), sha256=sha256(pid_raw),
+                                              text=pid_raw.decode())
+        statfile = self.proc_root / str(pid) / 'stat'
+        stat_raw = statfile.read_bytes()
+        evidence['producer_stat'] = dict(path=str(statfile), sha256=sha256(stat_raw),
+                                          text=stat_raw.decode())
+        lines = pid_raw.decode().splitlines()
+        stat = stat_raw.decode().rsplit(')', 1)[1].split()
+        pid_text = lines[0] if lines else None
+        postmaster_pid = int(pid_text) if pid_text and pid_text.isdigit() else None
+        pid_valid = postmaster_pid is not None and postmaster_pid > 1
+        try:
+            parent_pid = int(stat[1])
+        except (ValueError, IndexError):
+            parent_pid = None
+        observed = dict(postmaster_pid=pid_text, producer_parent_pid=parent_pid,
+                        data_dir=lines[1] if len(lines) > 1 else None,
+                        port=lines[3] if len(lines) > 3 else None,
+                        host=lines[4] if len(lines) > 4 else None)
+        checks = dict(pidfile_complete=len(lines) >= 5, postmaster_pid_valid=pid_valid,
+                      data_directory_matches=lines[1] == str(data) if len(lines) > 1 else None,
+                      port_matches=lines[3] == str(port) if len(lines) > 3 else None,
+                      socket_directory_matches=lines[4] == host if len(lines) > 4 else None,
+                      producer_parent_valid=parent_pid is not None,
+                      producer_parent_matches=parent_pid == postmaster_pid
+                        if pid_valid and parent_pid is not None else None)
+        evidence.update(observed=observed, checks=checks,
+                        failed_predicates=[key for key, value in checks.items() if value is False],
+                        unknown_predicates=[key for key, value in checks.items() if value is None])
+        if not all(value is True for value in checks.values()):
             raise ValueError('producer and original postmaster endpoint disagree')
-        return node, dict(path=str(layout), sha256=sha256(raw), postmaster_pid=int(lines[0]))
+        evidence['postmaster_pid'] = postmaster_pid
+        return node, evidence
 
     def _process_sample(self, pid):
         result = {}
@@ -108,7 +139,8 @@ class Run15Observer(BaseObserver):
             if (target['birth'] is None or self._birth(pid) != target['birth']
                     or self._context(number)[1] != target['context_sha256']):
                 raise ValueError('producer/context identity changed')
-            node, endpoint = self._endpoint(pid)
+            row['endpoint'] = {}
+            node, endpoint = self._endpoint(pid, row['endpoint'])
             if sha256(self.psql.read_bytes()) != self.identity['psql_sha256']:
                 raise ValueError('frozen SQL client changed')
             sql = ("SELECT row_to_json(s) FROM (SELECT pid,backend_start::text,query_start::text,"
