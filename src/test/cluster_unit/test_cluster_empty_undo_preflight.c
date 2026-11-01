@@ -378,6 +378,11 @@ UT_TEST(test_no_shared_write_explain_and_child_do_not_allocate_a_binding)
 	}
 }
 
+#ifdef EMPTY_UNDO_PREFLIGHT_FIXTURE_MAIN
+int EMPTY_UNDO_PREFLIGHT_FIXTURE_MAIN(void);
+#define main EMPTY_UNDO_PREFLIGHT_FIXTURE_MAIN
+#endif
+
 int
 main(void)
 {
@@ -390,3 +395,7 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+
+#ifdef EMPTY_UNDO_PREFLIGHT_FIXTURE_MAIN
+#undef main
+#endif

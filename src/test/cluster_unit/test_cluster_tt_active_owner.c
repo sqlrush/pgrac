@@ -456,6 +456,7 @@ VirtualXactLock(VirtualTransactionId owner, bool wait)
 	return true;
 }
 
+#ifndef TT_ACTIVE_OWNER_EXTERNAL_CAPACITY_WAIT
 bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment, ClusterCtrcTxnKeyV1 *key)
 {
@@ -497,6 +498,8 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment, ClusterCtrcTxnKeyV1 *key)
 	}
 	return false;
 }
+
+#endif /* TT_ACTIVE_OWNER_EXTERNAL_CAPACITY_WAIT */
 
 bool
 cluster_xid_stripe_sample_future(FullTransactionId reference, FullTransactionId *future,

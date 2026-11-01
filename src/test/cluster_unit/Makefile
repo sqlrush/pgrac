@@ -14205,3 +14205,37 @@ clean distclean maintainer-clean: clean-empty-undo-preflight
 clean-empty-undo-preflight:
 	rm -f test_cluster_empty_undo_preflight.inc test_cluster_empty_undo_preflight.inc.tmp \
 		test_cluster_empty_undo_preflight
+
+# Real early caller, original capacity CV, allocator/BIND and local completion.
+TESTS += test_cluster_undo_capacity_bind
+all: test_cluster_undo_capacity_bind
+
+test_cluster_undo_capacity_bind_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_note_retention\(/ { print "static void"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_(probe|history_probe)\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_(report_wait|real_protector|reports_advance)\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if (n != 9 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_capacity_bind: test_cluster_undo_capacity_bind.c \
+		test_cluster_empty_undo_preflight.c test_cluster_empty_undo_preflight.inc \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c \
+		test_cluster_tt_locator_stats.inc test_cluster_active_capacity_stats.inc \
+		test_cluster_undo_capacity_bind_wait.inc unit_test.h $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/backend/nodes/list.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-undo-capacity-bind
+.PHONY: clean-undo-capacity-bind
+clean-undo-capacity-bind:
+	rm -f test_cluster_undo_capacity_bind_wait.inc test_cluster_undo_capacity_bind_wait.inc.tmp \
+		test_cluster_undo_capacity_bind
