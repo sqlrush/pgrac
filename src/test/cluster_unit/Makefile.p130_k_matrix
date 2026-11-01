@@ -508,3 +508,59 @@ k-p130-h23: test_cluster_k_p130_h23 test_cluster_k_p130_h23_lifecycle
 clean-k-p130-h23:
 	rm -f test_cluster_k_p130_h23 test_cluster_k_p130_h23_lifecycle \
 		test_cluster_k_p130_h23_native.inc test_cluster_k_p130_h23_native.inc.tmp
+
+.PHONY: k-p130-h24-deps k-p130-h24 clean-k-p130-h24
+k-p130-h24-deps:
+	$(MAKE) test_cluster_source_read_receipts test_cluster_resource_x_transport test_cluster_resource_x_decision_publish
+
+test_cluster_k_p130_h24_receipt.inc: test_cluster_source_read_receipts.c Makefile.p130_k_matrix
+	awk '/^UT_TEST/ { stop=1; exit } { print } END { if (stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h24_transport.inc: test_cluster_resource_x_transport.c Makefile.p130_k_matrix
+	awk '/^int$$/ { stop=1; exit } /^UT_TEST/ { skip=1; tests++; next } \
+	     skip && /^}/ { skip=0; next } !skip { print } \
+	     END { if (stop != 1 || tests != 18 || skip) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h24_capacity.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile.p130_k_matrix
+	awk '/^#define PGRAC_LMS_OUTBOUND_CAPACITY / { print; found++ } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h24_ingress: test_cluster_k_p130_h24.c k-p130-h24-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H24_CPPFLAGS)  \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_k_p130_h24_receipt: test_cluster_k_p130_h24.c test_cluster_k_p130_h24_receipt.inc k-p130-h24-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H24_CPPFLAGS) -DK_P130_H24_RECEIPT \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_k_p130_h24_transport: test_cluster_k_p130_h24.c test_cluster_k_p130_h24_transport.inc test_cluster_k_p130_h24_capacity.inc k-p130-h24-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H24_CPPFLAGS) -DK_P130_H24_TRANSPORT \
+		$< $(CLUSTER_VERSION_O) cluster_lms_outbound_test.o \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+k-p130-h24: test_cluster_k_p130_h24_ingress test_cluster_k_p130_h24_receipt test_cluster_k_p130_h24_transport
+	./test_cluster_k_p130_h24_ingress
+	./test_cluster_k_p130_h24_receipt
+	./test_cluster_k_p130_h24_transport
+
+clean-k-p130-h24:
+	rm -f test_cluster_k_p130_h24_ingress test_cluster_k_p130_h24_receipt test_cluster_k_p130_h24_transport \
+		test_cluster_k_p130_h24_receipt.inc test_cluster_k_p130_h24_receipt.inc.tmp \
+		test_cluster_k_p130_h24_transport.inc test_cluster_k_p130_h24_transport.inc.tmp \
+		test_cluster_k_p130_h24_capacity.inc test_cluster_k_p130_h24_capacity.inc.tmp
