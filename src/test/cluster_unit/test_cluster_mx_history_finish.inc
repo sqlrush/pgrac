@@ -11,6 +11,7 @@ static TransactionId finish_top;
 static ClusterTxOutcome finish_outcome;
 static bool finish_all_discarded, finish_successor_in_graph, finish_successor_fxid_drift;
 static bool finish_same_page_successor, finish_native_top_records;
+static bool finish_live_child_successor;
 
 static uint32
 finish_crc(const void *data, size_t n)
@@ -102,12 +103,14 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 												.slot_index = index,
 												.after_kind = ITL_FLAG_ACTIVE,
 												.after_write_scn = h.write_scn };
-	if (finish_native_top_records && index == 2)
+	if ((finish_native_top_records || finish_live_child_successor) && index == 2)
 		history.entries[0].prior.wrap = 1;
 	op.version = UNDO_OPERATION_TRAILER_VERSION;
 	op.length = sizeof(op);
 	op.effect_state = index || finish_all_discarded ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED
 													: CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	if (index == 2 && finish_live_child_successor)
+		op.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
 	op.canonical_top_fxid
 		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, finish_top));
 	op.operation_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, h.xid));
@@ -194,6 +197,7 @@ finish_sources(void)
 	finish_all_discarded = false;
 	finish_successor_in_graph = finish_successor_fxid_drift = false;
 	finish_same_page_successor = finish_native_top_records = false;
+	finish_live_child_successor = false;
 	memset(finish_keys, 0xa5, sizeof(finish_keys));
 	memset(finish_proofs, 0xa5, sizeof(finish_proofs));
 }

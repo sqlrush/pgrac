@@ -243,13 +243,72 @@ UT_TEST(hot_invalid_root_and_descriptor_fail_closed)
 			UT_ASSERT_EQ(hot_promotions, 0); auth_clean(s);
 		}
 }
+static Snapshot
+hot_child_setup(bool scur)
+{
+	Snapshot s = hot_setup(CLUSTER_TX_COMMITTED, scur);
+	ClusterItlSlotData *slots = ClusterPageGetItlSlots(BufferBlocks);
+	/* Physical ITLs retain the canonical top; xmin/member retain the child.
+	 * A and independent LIVE INSERT B have exact operation tails in the
+	 * controlled history source. No raw child is a TT identity. */
+	finish_top = 80;
+	finish_native_top_records = false;
+	finish_live_child_successor = true;
+	for (unsigned i = 0; i < 3; ++i)
+		slots[i].xid = 80;
+	return s;
+}
+
+UT_TEST(hot_child_history_inputs_form_a_typed_member_set)
+{
+	Snapshot s = hot_child_setup(false);
+	ClusterMxHistoryCollector *collector = NULL;
+	UT_ASSERT(begin(s, &collector));
+	UT_ASSERT_EQ(finish_ready(collector, false), CMXH_COMPLETE);
+	UT_ASSERT_EQ(finish_deliver(collector, 2), CMXH_COMPLETE);
+	UT_ASSERT_EQ(finish_reads, 3);
+	UT_ASSERT_EQ(finish_keys[0].locator.xid, 80);
+	UT_ASSERT_EQ(XidFromFullTransactionId(finish_keys[0].top_fxid), 80);
+	UT_ASSERT_EQ(XidFromFullTransactionId(finish_keys[0].operation_fxid), 96);
+	UT_ASSERT_EQ(finish_proofs[0].base.member_xid, 96);
+	UT_ASSERT_EQ(finish_proofs[0].base.key.local_xid, 80);
+	UT_ASSERT_EQ(finish_proofs[0].effect_state, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	UT_ASSERT_EQ(cluster_multixact_current_validate_operation_proof_set(&mxkey, members,
+		finish_keys, finish_proofs, 2), CMX_RESOLVE_OK);
+	clean(collector, s);
+}
+
+UT_TEST(hot_child_canonical_successor_reaches_both_native_consumers)
+{
+	for (unsigned full = 0; full < 2; ++full)
+		for (unsigned scur = 0; scur < 2; ++scur) {
+			Snapshot s = hot_child_setup(scur);
+			MxHotReadout out;
+			HeapTupleData candidate = hot_candidate();
+			int result = hot_call(s, &admission, full, &out);
+			printf("# child96/top80 full=%u scur=%u result=%d error=%d history_requests=%u reads=%u\n",
+				full, scur, result, error_code, finish_requests, finish_reads);
+			UT_ASSERT_EQ(result, 1);
+			UT_ASSERT_EQ(error_code, 0);
+			UT_ASSERT_EQ(out.updater, 96);
+			UT_ASSERT(!out.restart);
+			UT_ASSERT(out.successor.valid);
+			UT_ASSERT(mx_history_hot_matches(1, &candidate, full));
+			UT_ASSERT_EQ(finish_reads, 3);
+			UT_ASSERT(content_locked && !exclusive);
+			UT_ASSERT_EQ(hot_promotions, 0);
+			auth_finished();
+			auth_clean(s);
+		}
+}
+
 #ifdef HISTORY_HOT_CALLER_FIXTURE
 int history_hot_caller_unused_hot_main(void);
 #define main history_hot_caller_unused_hot_main
 #endif
 int main(void)
 {
-	history_fixture_init(); UT_PLAN(8);
+	history_fixture_init(); UT_PLAN(10);
 	UT_RUN(typed_hot_validator_whole_set_and_effect_matrix);
 	UT_RUN(hot_committed_successor_preserves_share_for_both_consumers);
 	UT_RUN(hot_noncommitted_updater_is_not_a_committed_chain_proof);
@@ -258,5 +317,7 @@ int main(void)
 	UT_RUN(hot_ERROR_cleans_snapshot_operation_and_outputs);
 	UT_RUN(hot_read_requalification_and_successor_late_ABA);
 	UT_RUN(hot_invalid_root_and_descriptor_fail_closed);
+	UT_RUN(hot_child_history_inputs_form_a_typed_member_set);
+	UT_RUN(hot_child_canonical_successor_reaches_both_native_consumers);
 	free(procArray); UT_DONE(); return ut_failed_count ? 1 : 0;
 }
