@@ -362,4 +362,10 @@ extern bool cluster_relmap_authority_managed_read_v2(
 extern bool cluster_relmap_authority_managed_checkpoint_v2(
 	const ClusterRecoveryFileIdentityV2 *identity, ClusterRelmapFilePairV2 *output);
 
+/* Original creator-only fresh target. Same global X and exclusive MappingLock;
+ * independent RESERVED identity/file protection is supplied by the control
+ * consumer, never inferred from a target path or a source file header. */
+extern bool cluster_relmap_authority_managed_create_v2(
+	const ClusterRecoveryFileIdentityV2 *, const RelMapFile *, ClusterRelmapFilePairV2 *);
+
 #endif /* CLUSTER_RELMAP_AUTHORITY_H */

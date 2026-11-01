@@ -629,3 +629,14 @@ cluster_control_native_clog_range_destroy_v2(ClusterControlNativeClogRangeV2 **o
 	*out = NULL;
 	pfree(value);
 }
+void
+cluster_control_native_relmap_create_destroy_v2(ClusterControlNativeRelmapCreateV2 **out)
+{
+	ClusterControlNativeRelmapCreateV2 *value;
+	if (!native_distinct(out, sizeof(*out)) || !(value = *out)
+		|| value->private_self != (uintptr_t)value || value->private_pid != MyProcPid
+		|| native_overlap(out, sizeof(*out), value, sizeof(*value)))
+		return;
+	*out = NULL;
+	pfree(value);
+}

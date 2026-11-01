@@ -1038,3 +1038,35 @@ cluster_relmap_authority_managed_checkpoint_v2(const ClusterRecoveryFileIdentity
 {
 	return relmap_managed_observe(identity, output, true);
 }
+
+/* Only the original reserved creator calls this after taking MappingLock-X. */
+bool
+cluster_relmap_authority_managed_create_v2(const ClusterRecoveryFileIdentityV2 *identity,
+	const RelMapFile *committed, ClusterRelmapFilePairV2 *output)
+{
+	RelmapV2Directory dirs;
+	ClusterRecoveryFileIdentityV2 bound;
+	ClusterRelmapV2Namespace ns;
+	ClusterRelmapFilePairV2 pair;
+	bool ok = false;
+	uintptr_t a = (uintptr_t)identity, b = (uintptr_t)output, c = (uintptr_t)committed;
+
+	if (!identity || !committed || !output || !enableFsync
+		|| (a <= b ? b - a < sizeof(*identity) : a - b < sizeof(*output))
+		|| (c <= b ? b - c < sizeof(*committed) : c - b < sizeof(*output))
+		|| !cluster_relmap_authority_x_held()
+		|| !LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE))
+		return false;
+	bound = *identity;
+	ns = (ClusterRelmapV2Namespace){bound.system_identifier,
+		bound.database_incarnation, bound.database_oid, bound.database_oid == InvalidOid};
+	if (relmap_v2_open_dirs(&ns, &dirs))
+		ok = cluster_relmap_file_pair_create_v2(dirs.map, &bound, committed, &pair)
+			&& relmap_v2_dirs_current(&dirs);
+	if (!relmap_v2_close_dirs(&dirs)) ok = false;
+	if (ok) ok = !memcmp(identity, &bound, sizeof(bound)) && enableFsync
+		&& cluster_relmap_authority_x_held()
+		&& LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE);
+	if (ok) *output = pair;
+	return ok;
+}

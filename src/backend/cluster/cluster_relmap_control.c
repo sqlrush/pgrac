@@ -14,6 +14,10 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_relmap_control.h"
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_relmap_lock.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "catalog/pg_tablespace_d.h"
+#include "storage/fd.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
@@ -307,5 +311,157 @@ cluster_relmap_checkpoint_source_at_v2(const ClusterRelmapCheckpointReceiptV2 *r
 		return false;
 	*out = r->sources[index];
 	return true;
+}
+
+/* Heap state survives ERROR longjmp; failed borrow retirement retains its
+ * address-bound original counter, and PANICs rather than discarding custody. */
+typedef struct RelmapCreateWork
+{
+	ClusterControlRelmapSelectionV2 *selection;
+	ClusterControlNativeFileBorrowV2 source, target;
+	ClusterRelmapFilePairV2 source_pair, target_pair;
+	ClusterRecoveryCheckpointFileSourceV2 *sources;
+	ClusterRecoveryCheckpointFileV2 receipts[2];
+	pg_cryptohash_ctx *hash;
+	bool source_held, target_held, mapping;
+} RelmapCreateWork;
+
+static void
+relmap_create_cleanup(RelmapCreateWork *w, bool error_cleanup)
+{
+	HOLD_INTERRUPTS();
+	/* These are table borrows, not the caller's original global X, CF,
+	 * target file duty, reservation or debt. Never retry a failed release. */
+	if (w->source_held) {
+		w->source_held = false;
+		if (!cluster_control_native_file_release_v2(&w->source))
+			elog(PANIC, "could not retire original relmap source borrow");
+	}
+	if (w->target_held) {
+		w->target_held = false;
+		if (!cluster_control_native_file_release_v2(&w->target))
+			elog(PANIC, "could not retire original relmap target borrow");
+	}
+	if (w->mapping) {
+		/* errfinish(ERROR) resets the acquisition's interrupt count. Match
+		 * this retail release as LWLockReleaseAll does, while preserving
+		 * our separate cleanup holdoff. A second ERROR resets again and
+		 * escapes directly to the original outer owner, without RESUME. */
+		if (error_cleanup) HOLD_INTERRUPTS();
+		w->mapping = false;
+		LWLockRelease(RelationMappingLock);
+	}
+	cluster_control_root_relmap_selection_destroy_v4(&w->selection);
+	if (w->hash) pg_cryptohash_free(w->hash);
+	if (w->sources) pfree(w->sources);
+	pfree(w);
+	RESUME_INTERRUPTS();
+}
+
+bool
+cluster_relmap_control_copy_create_v2(ClusterControlNativeRelmapCreateV2 *c,
+	Oid source_database, Oid source_tablespace)
+{
+	RelmapCreateWork *w;
+	ClusterControlRelmapReferenceV2 reference;
+	ClusterRecoveryCheckpointSourceV2 source;
+	volatile bool ok = false;
+
+	if (!cluster_control_native_files_output_distinct_v2(c, sizeof(*c))
+		|| c->private_self != (uintptr_t)c || c->private_pid != MyProcPid
+		|| c->private_attempted || c->private_copy_attempted)
+		return false;
+	c->private_copy_attempted = true;
+	if (!cluster_relmap_authority_x_held() || !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| c->private_cf_sequence != cluster_cf_attempt_sequence() || CritSectionCount
+		|| LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(RelationMappingLock)
+		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactSLRULock)
+		|| LWLockHeldByMe(XactTruncationLock) || !enableFsync
+		|| !OidIsValid(source_database) || source_database == c->expected.database_oid
+		|| source_tablespace != DEFAULTTABLESPACE_OID
+		|| c->expected.tablespace_oid != DEFAULTTABLESPACE_OID)
+		return false;
+	w = palloc0(sizeof(*w));
+	PG_TRY();
+	{
+		do {
+			uint64 count;
+			/* Full original target authorization and sources precede both
+			 * MappingLock and native I/O. No target identity is cloned. */
+			if (cluster_control_native_file_reserved_acquire_locked_v2(&c->control.config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, c->startup_generation,
+					c->batch_uuid, &c->expected, &w->target) != 0) break;
+			w->target_held = true;
+			if (cluster_control_root_relmap_selection_read_locked_v4(&c->control.config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &w->selection) != 0
+				|| !cluster_control_root_relmap_selection_reference_v4(w->selection, &reference)
+				|| memcmp(&reference, &c->control, sizeof(reference))) break;
+			count = cluster_control_root_relmap_selection_source_count_v4(w->selection);
+			if (!count || count > CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2 / sizeof(*w->sources)) break;
+			w->sources = palloc0(count * sizeof(*w->sources));
+			for (uint64 i = 0; i < count; ++i) {
+				if (!cluster_control_root_relmap_selection_source_at_v4(w->selection, i, &source)) goto finished;
+				w->sources[i] = (ClusterRecoveryCheckpointFileSourceV2){i,source.redo_start,source.replay_end};
+			}
+			LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+			w->mapping = true;
+			if (cluster_control_native_file_borrow_by_address_v2(CLUSTER_RECOVERY_FILE_RELMAP_V2,
+					source_database, source_tablespace, 0, &w->source) != 0) break;
+			w->source_held = true;
+			if (!cluster_control_native_file_current_v2(&w->source)
+				|| !cluster_control_native_file_current_v2(&w->target)
+				|| !cluster_relmap_authority_managed_read_v2(&w->source.expected, &w->source_pair)
+				|| !relmap_control_pair(&w->source.expected, &w->source_pair)
+				|| w->source_pair.view.has_pending
+				|| !cluster_control_native_file_current_v2(&w->source)
+				|| !cluster_control_native_file_current_v2(&w->target)
+				|| !cluster_relmap_authority_x_held()
+				|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+				|| c->private_cf_sequence != cluster_cf_attempt_sequence()
+				|| !cluster_relmap_authority_managed_create_v2(&w->target.expected,
+					&w->source_pair.view.committed, &w->target_pair)
+				|| !cluster_control_native_file_current_v2(&w->source)
+				|| !cluster_control_native_file_current_v2(&w->target)) break;
+			for (unsigned i = 0; i < 2; ++i) {
+				ClusterRecoveryCheckpointFileV2 *r = &w->receipts[i];
+				r->identity = w->target.expected;
+				r->synced_bytes = CLUSTER_RELMAP_FILE_SIZE_V2;
+				r->page_count = 1;
+				r->copy_index = i;
+				r->copy_count = 2;
+				r->source_count = count;
+				r->sources = w->sources;
+				w->hash = pg_cryptohash_create(PG_SHA256);
+				if (!w->hash || pg_cryptohash_init(w->hash) < 0
+					|| pg_cryptohash_update(w->hash, w->target_pair.bytes[i], sizeof(w->target_pair.bytes[i])) < 0
+					|| pg_cryptohash_final(w->hash, r->image_digest, sizeof(r->image_digest)) < 0) goto finished;
+				pg_cryptohash_free(w->hash); w->hash = NULL;
+			}
+			/* Publish needs a new table generation. Retire BOTH borrowed
+			 * counters while retaining SAME original X/CF/file protection. */
+			w->source_held = false;
+			if (!cluster_control_native_file_release_v2(&w->source))
+				elog(PANIC, "could not retire original relmap source borrow");
+			w->target_held = false;
+			if (!cluster_control_native_file_release_v2(&w->target))
+				elog(PANIC, "could not retire original relmap target borrow");
+			w->mapping = false;
+			LWLockRelease(RelationMappingLock);
+			if (!cluster_relmap_authority_x_held()
+				|| cluster_control_root_relmap_selection_recheck_locked_v4(w->selection) != 0
+				|| c->private_cf_sequence != cluster_cf_attempt_sequence()) break;
+			ok = cluster_control_native_files_complete_relmap_create_locked_v2(c, w->receipts, 2) == 0
+				&& cluster_relmap_authority_x_held();
+		} while (0);
+finished:;
+	}
+	PG_CATCH();
+	{
+		relmap_create_cleanup(w, true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	relmap_create_cleanup(w, false);
+	return ok;
 }
 #endif /* USE_PGRAC_CLUSTER */
