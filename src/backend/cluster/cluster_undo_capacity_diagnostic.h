@@ -6,6 +6,7 @@
 #define CLUSTER_UNDO_CAPACITY_DIAGNOSTIC_INTERNAL_H
 
 #include <stdarg.h>
+#include "cluster_undo_capacity_trace.h"
 
 enum UndoCapacityDiagnosticValue {
 	D_ENABLED, D_STORAGE, D_CONTEXT, D_HANDLED, D_PROOF, D_PRODUCER,
@@ -36,6 +37,7 @@ typedef struct UndoCapacityRefusalInput {
 
 typedef struct UndoCapacityRefusalRecord {
 	bool valid;
+	bool trace_enabled;
 	int pid, node;
 	UndoCapacityRefusalInput input;
 	bool key_known, observation_known, pass_known, history_known, first_known, floor_known;
@@ -47,12 +49,116 @@ typedef struct UndoCapacityRefusalRecord {
 	uint64 publication_sequence, membership_generation, local_boot;
 	uint64 admitted_lo, admitted_hi, local_report_sequence, first_report_sequence;
 	uint64 expected_coordinator, expected_worker;
+	UndoCapacityRouteTrace trace;
 } UndoCapacityRefusalRecord;
 
-StaticAssertDecl(sizeof(UndoCapacityRefusalRecord) <= 1024,
+/* Two disjoint history locals plus one nested CURRENT/pool candidate row. */
+StaticAssertDecl(sizeof(UndoCapacityRefusalRecord) + 3 * sizeof(UndoCapacityTraceRow) <= 16384,
 				 "capacity refusal snapshot must remain bounded");
 static UndoCapacityRefusalRecord undo_capacity_refusal;
-static char undo_capacity_refusal_text[4096];
+static char undo_capacity_refusal_text[16384];
+StaticAssertDecl(sizeof(undo_capacity_refusal_text) <= 16384,
+				 "capacity refusal output must remain bounded");
+
+void
+cluster_undo_cleaner_capacity_trace_reset(void)
+{
+	undo_capacity_refusal.trace_enabled = cluster_trace_undo_capacity_refusal;
+	if (undo_capacity_refusal.trace_enabled)
+		MemSet(&undo_capacity_refusal.trace, 0, sizeof(undo_capacity_refusal.trace));
+}
+
+void
+cluster_undo_cleaner_capacity_trace_row(const UndoCapacityTraceRow *row)
+{
+	UndoCapacityRouteTrace *trace = &undo_capacity_refusal.trace;
+	UndoCapacityTraceRow *to = NULL;
+
+	if (!cluster_trace_undo_capacity_refusal || !undo_capacity_refusal.trace_enabled || row == NULL)
+		return;
+	if (row->kind == CAP_TRACE_CURRENT && row->position < lengthof(trace->current)) {
+		to = &trace->current[row->position];
+		if ((to->known & CAP_TRACE_PRESENT) == 0) trace->current_count++;
+	} else if (row->kind == CAP_TRACE_POOL && trace->pool_count < lengthof(trace->pool))
+		to = &trace->pool[trace->pool_count++];
+	else if (row->kind == CAP_TRACE_FALLBACK)
+		to = &trace->fallback;
+	else if (row->kind == CAP_TRACE_HISTORY)
+		to = &trace->history;
+	if (to == NULL || (to->known & CAP_TRACE_PRESENT) != 0) {
+		if (trace->dropped != UINT32_MAX) trace->dropped++;
+		return;
+	}
+	*to = *row;
+	to->known |= CAP_TRACE_PRESENT;
+}
+
+void
+cluster_undo_cleaner_capacity_trace_counts(unsigned current_gets, unsigned pool_gets, bool captured)
+{
+	if (cluster_trace_undo_capacity_refusal && undo_capacity_refusal.trace_enabled) {
+		undo_capacity_refusal.trace.counters_known = true;
+		undo_capacity_refusal.trace.current_gets = current_gets;
+		undo_capacity_refusal.trace.pool_gets = pool_gets;
+		undo_capacity_refusal.trace.current_captured = captured;
+	}
+}
+
+void
+cluster_undo_cleaner_capacity_trace_final_read(bool ready)
+{
+	UndoCapacityRouteTrace *trace = &undo_capacity_refusal.trace;
+
+	if (!cluster_trace_undo_capacity_refusal || !undo_capacity_refusal.trace_enabled)
+		return;
+	trace->final_read_known = true;
+	trace->final_read_ready = ready;
+	trace->final_snapshot_known = trace->final_snapshot_equal = false;
+	trace->final_field = ready ? NULL : "snapshot_read";
+	trace->final_slot = -1;
+	trace->final_before = trace->final_after = 0;
+}
+
+void
+cluster_undo_cleaner_capacity_trace_final(bool equal,
+	const ClusterTTSlotCurrentSnapshot *before, const ClusterTTSlotCurrentSnapshot *after)
+{
+	UndoCapacityRouteTrace *trace = &undo_capacity_refusal.trace;
+
+	if (!cluster_trace_undo_capacity_refusal || !undo_capacity_refusal.trace_enabled)
+		return;
+	trace->final_snapshot_known = true;
+	trace->final_snapshot_equal = equal;
+	trace->final_slot = -1;
+	trace->final_field = NULL;
+	trace->final_before = trace->final_after = 0;
+	if (equal)
+		return;
+#define FINAL_FIELD(name, left, right) \
+	do { if ((left) != (right)) { \
+		trace->final_field = (name); trace->final_before = (left); trace->final_after = (right); \
+		return; } } while (0)
+	FINAL_FIELD("binding", before->binding_generation, after->binding_generation);
+	FINAL_FIELD("segment", before->segment_id, after->segment_id);
+	FINAL_FIELD("reserved", before->reserved32, after->reserved32);
+	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const ClusterTTSlotCurrentOwner *a = &before->slots[i], *b = &after->slots[i];
+
+		trace->final_slot = i;
+		FINAL_FIELD("owner.segment", a->segment_id, b->segment_id);
+		FINAL_FIELD("owner.xid", a->xid, b->xid);
+		FINAL_FIELD("owner.scn", a->commit_scn, b->commit_scn);
+		FINAL_FIELD("owner.slot", a->slot_offset, b->slot_offset);
+		FINAL_FIELD("owner.wrap", a->wrap, b->wrap);
+		FINAL_FIELD("owner.status", a->status, b->status);
+		for (unsigned j = 0; j < sizeof(a->reserved8); j++)
+			FINAL_FIELD("owner.reserved", a->reserved8[j], b->reserved8[j]);
+	}
+	/* A padding-only difference is not assigned a semantic field. */
+	trace->final_slot = -1;
+	trace->final_field = "padding_unknown";
+#undef FINAL_FIELD
+}
 
 static void
 undo_capacity_refusal_capture(const UndoCapacityRefusalInput *input)
@@ -61,7 +167,9 @@ undo_capacity_refusal_capture(const UndoCapacityRefusalInput *input)
 
 	if (!cluster_trace_undo_capacity_refusal || record->valid)
 		return;
-	MemSet(record, 0, sizeof(*record));
+	/* Preserve the invocation's diagnostic arm and rows across final capture. */
+	MemSet(&record->pid, 0, offsetof(UndoCapacityRefusalRecord, trace)
+		- offsetof(UndoCapacityRefusalRecord, pid));
 	record->pid = MyProcPid;
 	record->node = cluster_node_id;
 	record->input = *input;
@@ -167,6 +275,64 @@ undo_capacity_refusal_identity(size_t *used, const char *name,
 		identity->admission_record_generation, identity->root_id, identity->root_generation);
 }
 
+/* Compact field order is fixed for offline decoding. known/native_known are
+ * mandatory: a zero from an unexecuted branch is never evidence. */
+static void
+undo_capacity_refusal_route_row(size_t *used, const UndoCapacityTraceRow *row)
+{
+	if ((row->known & CAP_TRACE_PRESENT) == 0)
+		return;
+	undo_capacity_refusal_append(used,
+		" row={kind=%u,pos=%u,branch=%u,result=%d,gate=%s,known=%x,capacity_mode=%d,native=%x/%x,sample_slot=%u",
+		row->kind, row->position, row->branch, row->result,
+		row->gate != NULL ? row->gate : "NONE", row->known,
+		(row->known & CAP_TRACE_SAMPLE) != 0 ? (row->known & CAP_TRACE_CAPACITY_MODE) != 0 : -1,
+		row->native_values, row->native_known, row->sample_slot);
+	if ((row->known & CAP_TRACE_KEY) != 0) {
+		const ClusterCtrcTxnKeyV1 *key = &row->key;
+
+		undo_capacity_refusal_append(used,
+			",key=[%u,%u,%u,%u,%u,%u,%u,%u,%u," UINT64_FORMAT "," UINT64_FORMAT
+			"," UINT64_FORMAT "," UINT64_FORMAT "," UINT64_FORMAT "," UINT64_FORMAT "," UINT64_FORMAT ",",
+			key->format_version, key->owner_instance, key->origin_node_id, key->segment_id,
+			key->segment_generation, key->slot_offset, key->slot_wrap, key->xid, key->cluster_epoch,
+			key->system_identifier, key->origin_boot_incarnation, key->formation_epoch,
+			key->admission_record_generation, key->root_descriptor_incarnation,
+			key->root_id, key->root_generation);
+		for (unsigned i = 0; i < sizeof(key->reserved); i++)
+			undo_capacity_refusal_append(used, "%02x", (unsigned)key->reserved[i]);
+		undo_capacity_refusal_append(used, "]");
+	}
+	if ((row->known & CAP_TRACE_OWNER) != 0)
+		undo_capacity_refusal_append(used,
+			",owner=[%u,%u,%u,%u,%u," UINT64_FORMAT "," UINT64_FORMAT ",%02x%02x%02x]",
+			row->owner_data.owner.segment_id, row->owner_data.owner.slot_offset, row->owner_data.owner.xid, row->owner_data.owner.wrap,
+			row->owner_data.owner.status, row->owner_data.owner.commit_scn, row->binding,
+			(unsigned)row->owner_data.owner.reserved8[0], (unsigned)row->owner_data.owner.reserved8[1],
+			(unsigned)row->owner_data.owner.reserved8[2]);
+	if ((row->known & CAP_TRACE_CLEANER) != 0)
+		undo_capacity_refusal_append(used, ",cleaner=[" UINT64_FORMAT "," UINT64_FORMAT "]",
+			row->owner_data.cleaner.coordinator, row->owner_data.cleaner.worker);
+	if ((row->known & CAP_TRACE_ADMISSION) != 0)
+		undo_capacity_refusal_append(used, ",admission=[" UINT64_FORMAT "," UINT64_FORMAT "]",
+			row->formation, row->record_generation);
+	if ((row->known & CAP_TRACE_ROOT) != 0)
+		undo_capacity_refusal_append(used, ",root=[" UINT64_FORMAT "," UINT64_FORMAT "]",
+			row->root, row->root_generation);
+	if ((row->known & CAP_TRACE_GENERATION) != 0)
+		undo_capacity_refusal_append(used, ",generation=[%u," UINT64_FORMAT "]",
+			row->generation_result, row->generation);
+	if ((row->known & CAP_TRACE_SLOT) != 0) {
+		undo_capacity_refusal_append(used, ",slot=[%u,%u,%u,%u," UINT64_FORMAT ",",
+			row->slot.xid, row->slot.wrap, row->slot.status, row->slot.flags, row->slot.commit_scn);
+		for (unsigned i = 0; i < sizeof(row->slot.first_undo_block); i++)
+			undo_capacity_refusal_append(used, "%02x", ((const uint8 *)&row->slot.first_undo_block)[i]);
+		undo_capacity_refusal_append(used, "]");
+	}
+	undo_capacity_refusal_append(used, ",acquire=%u,release=%u,failure=%u}",
+		row->acquire, row->release, row->failure);
+}
+
 /* One-shot log-only detail for the original error, after original CV cleanup. */
 const char *
 cluster_undo_cleaner_capacity_refusal_detail(uint32 segment, TransactionId top_xid,
@@ -240,6 +406,28 @@ cluster_undo_cleaner_capacity_refusal_detail(uint32 segment, TransactionId top_x
 			pass->first_absent_position, pass->record_segment, pass->configured_cap);
 		undo_capacity_refusal_identity(&used, "pass_identity", &pass->identity);
 	}
+	if (!record->trace_enabled) {
+		undo_capacity_refusal_append(&used, " route_v2={enabled=0}");
+		return undo_capacity_refusal_text;
+	}
+	undo_capacity_refusal_append(&used,
+		" route_v2={current=%u,pool=%u,dropped=%u,counters_known=%d,current_gets=%u,pool_gets=%u,"
+		"current_captured=%d,final_read_known=%d,final_read_ready=%d,"
+		"final_snapshot_known=%d,final_snapshot_equal=%d,final_slot=%d,"
+		"final_field=%s,final_before=" UINT64_FORMAT ",final_after=" UINT64_FORMAT "}",
+		record->trace.current_count, record->trace.pool_count, record->trace.dropped,
+		record->trace.counters_known, record->trace.current_gets, record->trace.pool_gets,
+		record->trace.current_captured, record->trace.final_read_known, record->trace.final_read_ready,
+		record->trace.final_snapshot_known,
+		record->trace.final_snapshot_equal, record->trace.final_slot,
+		record->trace.final_field != NULL ? record->trace.final_field : "UNKNOWN",
+		record->trace.final_before, record->trace.final_after);
+	for (unsigned i = 0; i < lengthof(record->trace.current); i++)
+		undo_capacity_refusal_route_row(&used, &record->trace.current[i]);
+	undo_capacity_refusal_route_row(&used, &record->trace.fallback);
+	undo_capacity_refusal_route_row(&used, &record->trace.history);
+	for (unsigned i = 0; i < record->trace.pool_count; i++)
+		undo_capacity_refusal_route_row(&used, &record->trace.pool[i]);
 	return undo_capacity_refusal_text;
 }
 #endif

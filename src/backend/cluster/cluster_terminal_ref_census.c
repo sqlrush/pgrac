@@ -30,6 +30,7 @@
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_capacity.h"
+#include "cluster_undo_capacity_trace.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
@@ -5252,7 +5253,8 @@ static bool ctrc_capacity_history_inventory(unsigned budget, ClusterCapacityObse
 static bool
 ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_probe,
 								  ClusterCtrcTerminalStatus *status_out, SCN *commit_scn_out,
-								  bool *released_out, PGAlignedBlock *header_out)
+								  bool *released_out, PGAlignedBlock *header_out,
+								  UndoCapacityTraceRow *trace)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
@@ -5276,6 +5278,16 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 	volatile bool current_active = false;
 	bool terminal = false;
 
+	if (trace != NULL) {
+		/* A second original reproof must not inherit an earlier bracket. */
+		trace->known &= ~(CAP_TRACE_SLOT | CAP_TRACE_ADMISSION | CAP_TRACE_ROOT
+			| CAP_TRACE_GENERATION | CAP_TRACE_GENERATION_KNOWN | CAP_TRACE_ACQUIRE | CAP_TRACE_RELEASE);
+		trace->native_known = trace->native_values = 0;
+		trace->acquire = trace->release = trace->failure = 0;
+		trace->known |= CAP_TRACE_SAMPLE;
+		if (capacity_probe) trace->known |= CAP_TRACE_CAPACITY_MODE;
+		else trace->known &= ~CAP_TRACE_CAPACITY_MODE;
+	}
 	if (status_out != NULL)
 		*status_out = CTRC_TERMINAL_UNKNOWN;
 	if (commit_scn_out != NULL)
@@ -5291,32 +5303,43 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 	MemSet(&final_root, 0, sizeof(final_root));
 	MemSet(&page, 0, sizeof(page));
 	MemSet(&slot, 0, sizeof(slot));
-	if (!ctrc_txn_key_valid(key) || cluster_node_id < 0
-		|| key->origin_node_id != (uint16)cluster_node_id
-		|| key->owner_instance != (uint8)(cluster_node_id + 1)
-		|| key->cluster_epoch != cluster_epoch_get_current()
-		|| key->system_identifier != GetSystemIdentifier()
-		|| key->origin_boot_incarnation != cluster_qvotec_get_self_incarnation())
+	if (capacity_trace_failed(trace, "sample.key_1", !ctrc_txn_key_valid(key))
+			|| capacity_trace_failed(trace, "sample.key_2", cluster_node_id < 0)
+			|| capacity_trace_failed(trace, "sample.key_3", key->origin_node_id != (uint16)cluster_node_id)
+			|| capacity_trace_failed(trace, "sample.key_4", key->owner_instance != (uint8)(cluster_node_id + 1))
+			|| capacity_trace_failed(trace, "sample.key_5", key->cluster_epoch != cluster_epoch_get_current())
+			|| capacity_trace_failed(trace, "sample.key_6", key->system_identifier != GetSystemIdentifier())
+			|| capacity_trace_failed(trace, "sample.key_7", key->origin_boot_incarnation != cluster_qvotec_get_self_incarnation()))
 		return false;
-	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
-		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+	if (capacity_trace_failed(trace, "sample.admission", cluster_semantic_activation_enter_r4_terminal_census(&admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK))
 		return false;
 	admission_entered = true;
+	if (trace != NULL) {
+		trace->formation = admission.formation_epoch;
+		trace->record_generation = admission.record_generation;
+		trace->known |= CAP_TRACE_ADMISSION;
+	}
 	logical.owner_instance = key->owner_instance;
 	logical.segment_id = key->segment_id;
 
 	PG_TRY();
 	{
-		if (admission.formation_epoch != key->formation_epoch
-			|| admission.record_generation != key->admission_record_generation
-			|| !cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+		if (capacity_trace_failed(trace, "sample.admission_formation", admission.formation_epoch != key->formation_epoch)
+			|| capacity_trace_failed(trace, "sample.admission_record", admission.record_generation != key->admission_record_generation)
+			|| capacity_trace_failed(trace, "sample.resolve_root", !capacity_trace_root(trace, cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-				logical.segment_id, &root)
-			|| root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || root.root_id != key->root_id
-			|| root.root_generation != key->root_generation
-			|| key->root_descriptor_incarnation != root.root_generation)
+				logical.segment_id, &root), &root))
+			|| capacity_trace_failed(trace, "sample.root_intent", root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED)
+			|| capacity_trace_failed(trace, "sample.root_id", root.root_id != key->root_id)
+			|| capacity_trace_failed(trace, "sample.root_generation", root.root_generation != key->root_generation)
+			|| capacity_trace_failed(trace, "sample.descriptor", key->root_descriptor_incarnation != root.root_generation))
 			goto sample_done;
 
+		if (trace != NULL) {
+			trace->root = root.root_id; trace->root_generation = root.root_generation;
+			trace->known |= CAP_TRACE_ROOT;
+		}
 		if (CtrcCapacityHistory != NULL && CtrcCapacityHistory->current_stage)
 			CtrcCapacityHistory->current_gets++;
 		if (CtrcCapacityHistory != NULL && CtrcCapacityHistory->pool_stage) {
@@ -5328,7 +5351,10 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 		step = cluster_undo_block0_current_acquire_begin_admitted(
 			&logical, CLUSTER_UNDO_BLOCK0_SCUR, cluster_ges_request_timeout_ms, &admission, &guard,
 			&failure);
-		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+		if (trace != NULL) {
+			trace->acquire = step; trace->failure = failure; trace->known |= CAP_TRACE_ACQUIRE;
+		}
+		if (capacity_trace_failed(trace, "sample.acquire_begin", step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED))
 			goto sample_done;
 		current_active = true;
 		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
@@ -5339,50 +5365,63 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 					&guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_ACQUIRE))
 				pg_usleep(1000L);
 		}
-		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+		if (trace != NULL) { trace->acquire = step; trace->failure = failure; }
+		if (capacity_trace_failed(trace, "sample.acquire_held", step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD))
 			goto sample_done;
-		if (cluster_undo_block0_current_sample_generation(&guard, &root, &generation)
-				!= CLUSTER_UNDO_BLOCK0_OK
-			|| !generation.known || generation.value != key->segment_generation
-			|| cluster_undo_block0_current_copy_resident(&guard, &root, &generation, page.data)
-				   != CLUSTER_UNDO_BLOCK0_OK)
+		if (capacity_trace_failed(trace, "sample.generation_result", capacity_trace_generation(trace, cluster_undo_block0_current_sample_generation(&guard, &root, &generation), &generation)
+				!= CLUSTER_UNDO_BLOCK0_OK)
+			|| capacity_trace_failed(trace, "sample.generation_known", !generation.known)
+			|| capacity_trace_failed(trace, "sample.generation_match", generation.value != key->segment_generation)
+			|| capacity_trace_failed(trace, "sample.copy", cluster_undo_block0_current_copy_resident(&guard, &root, &generation, page.data)
+				   != CLUSTER_UNDO_BLOCK0_OK))
 			goto sample_done;
 
-		native_commit_before = TransactionIdDidCommit(key->xid);
-		native_abort_before = TransactionIdDidAbort(key->xid);
-		native_progress_before = TransactionIdIsInProgress(key->xid);
+		if (trace != NULL) {
+			trace->generation = generation.value; trace->known |= CAP_TRACE_GENERATION;
+		}
+		native_commit_before = capacity_trace_native(trace, 0, TransactionIdDidCommit(key->xid));
+		native_abort_before = capacity_trace_native(trace, 1, TransactionIdDidAbort(key->xid));
+		native_progress_before = capacity_trace_native(trace, 2, TransactionIdIsInProgress(key->xid));
 		header = (const UndoSegmentHeaderData *)page.data;
-		if (header->segment_id != key->segment_id || header->owner_instance != key->owner_instance
-			|| header->wrap_count != key->segment_generation
-			|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+		if (capacity_trace_failed(trace, "sample.header_segment", header->segment_id != key->segment_id)
+			|| capacity_trace_failed(trace, "sample.header_owner", header->owner_instance != key->owner_instance)
+			|| capacity_trace_failed(trace, "sample.header_generation", header->wrap_count != key->segment_generation)
+			|| capacity_trace_failed(trace, "sample.header_slots", header->tt_slots_count != TT_SLOTS_PER_SEGMENT))
 			goto sample_done;
 		slot = header->tt_slots[key->slot_offset];
-		native_commit_after = TransactionIdDidCommit(key->xid);
-		native_abort_after = TransactionIdDidAbort(key->xid);
-		native_progress_after = TransactionIdIsInProgress(key->xid);
-		if (native_commit_before != native_commit_after || native_abort_before != native_abort_after
-			|| native_progress_before != native_progress_after || native_progress_after
-			|| slot.xid != key->xid || slot.wrap != key->slot_wrap
-			|| (slot.flags != TT_FLAGS_RESERVED
-				&& !(capacity_probe && slot.flags == TT_SLOT_FLAG_CTRC_RELEASE_PROVEN))
-			|| (capacity_probe && !UBA_is_invalid(slot.first_undo_block)))
+		if (trace != NULL) { trace->slot = slot; trace->known |= CAP_TRACE_SLOT; }
+		native_commit_after = capacity_trace_native(trace, 3, TransactionIdDidCommit(key->xid));
+		native_abort_after = capacity_trace_native(trace, 4, TransactionIdDidAbort(key->xid));
+		native_progress_after = capacity_trace_native(trace, 5, TransactionIdIsInProgress(key->xid));
+		if (capacity_trace_failed(trace, "sample.native_commit_stable", native_commit_before != native_commit_after)
+			|| capacity_trace_failed(trace, "sample.native_abort_stable", native_abort_before != native_abort_after)
+			|| capacity_trace_failed(trace, "sample.native_active_stable", native_progress_before != native_progress_after)
+			|| capacity_trace_failed(trace, "sample.native_active", native_progress_after)
+			|| capacity_trace_failed(trace, "sample.slot_xid", slot.xid != key->xid)
+			|| capacity_trace_failed(trace, "sample.slot_wrap", slot.wrap != key->slot_wrap)
+			|| capacity_trace_failed(trace, "sample.slot_flags", (slot.flags != TT_FLAGS_RESERVED
+				&& !(capacity_probe && slot.flags == TT_SLOT_FLAG_CTRC_RELEASE_PROVEN)))
+			|| capacity_trace_failed(trace, "sample.empty_undo", (capacity_probe && !UBA_is_invalid(slot.first_undo_block))))
 			goto sample_done;
 
 		MemSet(&final_root, 0, sizeof(final_root));
-		if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+		if (capacity_trace_failed(trace, "sample.final_root", !capacity_trace_root(trace, cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-				logical.segment_id, &final_root)
-			|| !cluster_undo_block0_root_matches(&root, &final_root)
-			|| !cluster_semantic_activation_recheck_r4_terminal_census(&admission)
-			|| cluster_undo_block0_current_sample_generation(&guard, &root, &final_generation)
-				   != CLUSTER_UNDO_BLOCK0_OK
-			|| !final_generation.known || final_generation.value != generation.value)
+				logical.segment_id, &final_root), &final_root))
+			|| capacity_trace_failed(trace, "sample.root_match", !cluster_undo_block0_root_matches(&root, &final_root))
+			|| capacity_trace_failed(trace, "sample.recheck", !cluster_semantic_activation_recheck_r4_terminal_census(&admission))
+			|| capacity_trace_failed(trace, "sample.final_generation", capacity_trace_generation(trace, cluster_undo_block0_current_sample_generation(&guard, &root, &final_generation), &final_generation)
+				   != CLUSTER_UNDO_BLOCK0_OK)
+			|| capacity_trace_failed(trace, "sample.final_generation_known", !final_generation.known)
+			|| capacity_trace_failed(trace, "sample.final_generation_match", final_generation.value != generation.value))
 			goto sample_done;
 
 		terminal = (slot.status == TT_SLOT_COMMITTED && SCN_VALID(slot.commit_scn)
 					&& native_commit_after && !native_abort_after)
 				   || (slot.status == TT_SLOT_ABORTED && slot.commit_scn == InvalidScn
 					   && native_abort_after && !native_commit_after);
+
+		terminal = capacity_trace_test(trace, "sample.terminal", terminal);
 
 	sample_done:
 		if (current_active) {
@@ -5396,7 +5435,10 @@ ctrc_cleaner_terminal_sample_mode(const ClusterCtrcTxnKeyV1 *key, bool capacity_
 					pg_usleep(1000L);
 			}
 			current_active = false;
-			if (step != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+			if (trace != NULL) {
+				trace->release = step; trace->failure = failure; trace->known |= CAP_TRACE_RELEASE;
+			}
+			if (capacity_trace_failed(trace, "sample.release", step != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED))
 				terminal = false;
 		}
 	}
@@ -5442,7 +5484,7 @@ ctrc_cleaner_terminal_sample_exact(const ClusterCtrcTxnKeyV1 *key,
 {
 	/* The seal consumer retains its flags-zero contract. Capacity sampling
 	 * cannot broaden any release/certificate producer's acceptance set. */
-	return ctrc_cleaner_terminal_sample_mode(key, false, status_out, commit_scn_out, NULL, NULL);
+	return ctrc_cleaner_terminal_sample_mode(key, false, status_out, commit_scn_out, NULL, NULL, NULL);
 }
 
 /* Validate only the original local CURRENT scope, never slot availability. */
@@ -5492,7 +5534,7 @@ ctrc_capacity_current_certificate_snapshot(uint64 index, uint32 segment_id,
  * shmem status or empty row alone authorizes this wait or any slot reuse. */
 static ClusterCtrcCapacityProbeResult
 ctrc_capacity_current_gc_candidate(uint32 segment_id, uint16 slot_offset, SCN horizon, uint64 epoch,
-								   ClusterCtrcTxnKeyV1 *continuation)
+								   ClusterCtrcTxnKeyV1 *continuation, UndoCapacityTraceRow *trace)
 {
 	ClusterCtrcTxnKeyV1 key, final_key;
 	ClusterTTSlotCurrentOwner owner, final_owner;
@@ -5502,31 +5544,42 @@ ctrc_capacity_current_gc_candidate(uint32 segment_id, uint16 slot_offset, SCN ho
 	uint32 current;
 	bool released;
 
-	if (!cluster_tt_slot_current_origin_snapshot(segment_id, slot_offset, &key, &owner, &binding)
-		|| !ctrc_txn_key_valid(&key) || key.segment_id != segment_id
-		|| key.slot_offset != slot_offset || owner.segment_id != segment_id
-		|| owner.slot_offset != slot_offset || owner.xid != key.xid || owner.wrap != key.slot_wrap
-		|| owner.wrap >= TT_WRAP_MAX || binding == 0 || binding == UINT64_MAX
-		|| !ctrc_bytes_zero(owner.reserved8, sizeof(owner.reserved8))
-		|| (owner.status != CTS_COMMITTED && owner.status != CTS_ABORTED)
-		|| (owner.status == CTS_COMMITTED
+	if (capacity_trace_failed(trace, "gc.snapshot", !capacity_trace_owner(trace, cluster_tt_slot_current_origin_snapshot(segment_id, slot_offset, &key, &owner, &binding), &key, &owner, &binding))
+			|| capacity_trace_failed(trace, "gc.key_valid", !ctrc_txn_key_valid(&key))
+			|| capacity_trace_failed(trace, "gc.key_segment", key.segment_id != segment_id)
+			|| capacity_trace_failed(trace, "gc.key_slot", key.slot_offset != slot_offset)
+			|| capacity_trace_failed(trace, "gc.owner_segment", owner.segment_id != segment_id)
+			|| capacity_trace_failed(trace, "gc.owner_slot", owner.slot_offset != slot_offset)
+			|| capacity_trace_failed(trace, "gc.owner_xid", owner.xid != key.xid)
+			|| capacity_trace_failed(trace, "gc.owner_wrap", owner.wrap != key.slot_wrap)
+			|| capacity_trace_failed(trace, "gc.wrap_limit", owner.wrap >= TT_WRAP_MAX)
+			|| capacity_trace_failed(trace, "gc.binding_zero", binding == 0)
+			|| capacity_trace_failed(trace, "gc.binding_max", binding == UINT64_MAX)
+			|| capacity_trace_failed(trace, "gc.owner_reserved", !ctrc_bytes_zero(owner.reserved8, sizeof(owner.reserved8)))
+			|| capacity_trace_failed(trace, "gc.owner_terminal", (owner.status != CTS_COMMITTED && owner.status != CTS_ABORTED))
+			|| capacity_trace_failed(trace, "gc.owner_horizon", (owner.status == CTS_COMMITTED
 				? (!SCN_VALID(owner.commit_scn) || scn_time_cmp(owner.commit_scn, horizon) > 0)
-				: owner.commit_scn != InvalidScn)
-		|| !ctrc_origin_index(&key, &index) || !ctrc_capacity_origin_absent(index))
+				: owner.commit_scn != InvalidScn))
+			|| capacity_trace_failed(trace, "gc.origin_index", !ctrc_origin_index(&key, &index))
+			|| capacity_trace_failed(trace, "gc.origin_absent", !ctrc_capacity_origin_absent(index)))
 		return CLUSTER_CTRC_CAPACITY_REFUSE;
-	if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released, NULL)
-		|| !released || commit_scn != owner.commit_scn
-		|| status
-			   != (owner.status == CTS_COMMITTED ? CTRC_TERMINAL_COMMITTED : CTRC_TERMINAL_ABORTED))
+	if (capacity_trace_failed(trace, "gc.sample", !ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released, NULL, trace))
+			|| capacity_trace_failed(trace, "gc.released", !released)
+			|| capacity_trace_failed(trace, "gc.commit_scn", commit_scn != owner.commit_scn)
+			|| capacity_trace_failed(trace, "gc.status", status
+			   != (owner.status == CTS_COMMITTED ? CTRC_TERMINAL_COMMITTED : CTRC_TERMINAL_ABORTED)))
 		return CLUSTER_CTRC_CAPACITY_REFUSE;
-	if (epoch != cluster_epoch_get_current() || !ctrc_capacity_local_current(segment_id, &current))
+	if (capacity_trace_failed(trace, "gc.epoch", epoch != cluster_epoch_get_current())
+			|| capacity_trace_failed(trace, "gc.current", !ctrc_capacity_local_current(segment_id, &current)))
 		return CLUSTER_CTRC_CAPACITY_REFUSE;
 	if (current != segment_id)
 		return CLUSTER_CTRC_CAPACITY_RETRY;
-	if (!cluster_tt_slot_current_origin_snapshot(segment_id, slot_offset, &final_key, &final_owner,
-												 &final_binding)
-		|| binding != final_binding || memcmp(&key, &final_key, sizeof(key)) != 0
-		|| memcmp(&owner, &final_owner, sizeof(owner)) != 0 || !ctrc_capacity_origin_absent(index))
+	if (capacity_trace_failed(trace, "gc.final_snapshot", !cluster_tt_slot_current_origin_snapshot(segment_id, slot_offset, &final_key, &final_owner,
+												 &final_binding))
+			|| capacity_trace_failed(trace, "gc.final_binding", binding != final_binding)
+			|| capacity_trace_failed(trace, "gc.final_key", memcmp(&key, &final_key, sizeof(key)) != 0)
+			|| capacity_trace_failed(trace, "gc.final_owner", memcmp(&owner, &final_owner, sizeof(owner)) != 0)
+			|| capacity_trace_failed(trace, "gc.final_absent", !ctrc_capacity_origin_absent(index)))
 		return CLUSTER_CTRC_CAPACITY_RETRY;
 	*continuation = key;
 	return CLUSTER_CTRC_CAPACITY_WAIT;
@@ -5564,6 +5617,15 @@ cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch
 		ClusterCtrcTerminalStatus status;
 		SCN commit_scn;
 		bool released, exact;
+		UndoCapacityTraceRow trace_storage;
+		UndoCapacityTraceRow *trace = NULL;
+
+		if (cluster_trace_undo_capacity_refusal) {
+			MemSet(&trace_storage, 0, sizeof(trace_storage));
+			trace = &trace_storage; trace->kind = CAP_TRACE_CURRENT;
+			trace->position = armed ? continuation->slot_offset : slot;
+			trace->sample_slot = trace->position; trace->branch = armed ? 1 : 2;
+		}
 
 		CHECK_FOR_INTERRUPTS();
 		if (armed)
@@ -5572,26 +5634,35 @@ cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch
 			exact = ctrc_capacity_current_certificate_snapshot(start + slot, segment_id, &snapshot);
 			if (!exact) {
 				ClusterCtrcCapacityProbeResult gc = ctrc_capacity_current_gc_candidate(
-					segment_id, slot, horizon, epoch, continuation);
+					segment_id, slot, horizon, epoch, continuation, trace);
+				if (trace != NULL) trace->branch = 3;
+				(void)capacity_trace_result(trace, gc);
 				if (gc != CLUSTER_CTRC_CAPACITY_REFUSE)
 					return gc;
 				continue;
 			}
 			key = snapshot.origin.key;
 		}
-		if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released, NULL)
-			|| (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0))
+		capacity_trace_key(trace, &key);
+		if (capacity_trace_failed(trace, "current.sample", !ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released, NULL, trace))
+			|| capacity_trace_failed(trace, "current.horizon", (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0)))
+		{
+			(void)capacity_trace_result(trace, CLUSTER_CTRC_CAPACITY_REFUSE);
 			continue;
+		}
 	capacity_sampled:
-		if (epoch != cluster_epoch_get_current()
-			|| !ctrc_capacity_local_current(segment_id, &current))
+		if (capacity_trace_failed(trace, "current.epoch", epoch != cluster_epoch_get_current())
+			|| capacity_trace_failed(trace, "current.scope", !ctrc_capacity_local_current(segment_id, &current)))
+		{
+			(void)capacity_trace_result(trace, CLUSTER_CTRC_CAPACITY_REFUSE);
 			goto refuse;
+		}
 		if (current != segment_id) {
 			MemSet(continuation, 0, sizeof(*continuation));
 			return CLUSTER_CTRC_CAPACITY_RETRY;
 		}
 		if (!armed) {
-			if (!ctrc_origin_certificate_snapshot_matches_shared(&snapshot)) {
+			if (capacity_trace_failed(trace, "current.certificate_changed", !ctrc_origin_certificate_snapshot_matches_shared(&snapshot))) {
 				/* A concurrent completion warrants original allocation again,
 				 * not permission to sleep on an unarmed historical identity. */
 				return CLUSTER_CTRC_CAPACITY_RETRY;
@@ -5609,16 +5680,19 @@ cluster_ctrc_capacity_probe_current(uint32 segment_id, SCN horizon, uint64 epoch
 				/* Completion after SCUR release can remove CERTIFYING. Reprove
 				 * once against the exact durable flag; absence alone cannot
 				 * authorize waiting, and a failed second proof is not retried. */
-				if (!ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released,
-													   NULL)
-					|| !released
-					|| (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0))
+				if (capacity_trace_failed(trace, "current.reproof", !ctrc_cleaner_terminal_sample_mode(&key, true, &status, &commit_scn, &released,
+													   NULL, trace))
+			|| capacity_trace_failed(trace, "current.reproof_released", !released)
+			|| capacity_trace_failed(trace, "current.reproof_horizon", (status == CTRC_TERMINAL_COMMITTED && scn_time_cmp(commit_scn, horizon) > 0)))
+				{
+					(void)capacity_trace_result(trace, CLUSTER_CTRC_CAPACITY_REFUSE);
 					goto refuse;
+				}
 				goto capacity_sampled;
 			}
 		}
 		*continuation = key;
-		return CLUSTER_CTRC_CAPACITY_WAIT;
+		return capacity_trace_result(trace, CLUSTER_CTRC_CAPACITY_WAIT);
 	}
 refuse:
 	MemSet(continuation, 0, sizeof(*continuation));
@@ -5854,6 +5928,7 @@ ctrc_capacity_pool_gc_context(uint32 segment_id, uint32 *record_segment)
 }
 
 typedef struct CtrcCapacitySegmentSample {
+	UndoCapacityTraceRow *trace;
 	ClusterCapacitySegmentIdentityV1 identity;
 	bool physical_inventory;
 	uint32 retain_reasons;
@@ -5888,25 +5963,30 @@ ctrc_capacity_segment_origins_absent(uint32 segment_id)
 /* Every bound terminal slot has its own stable native bracket. Unused and
  * recyclable slots retain the original retention predicate's acceptance. */
 static bool
-ctrc_capacity_segment_native(const UndoSegmentHeaderData *header)
+ctrc_capacity_segment_native(const UndoSegmentHeaderData *header, UndoCapacityTraceRow *trace)
 {
 	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 		const TTSlot *slot = &header->tt_slots[i];
 		bool committed, aborted, active;
 
+		if (trace != NULL) {
+			trace->sample_slot = i; trace->slot = *slot; trace->known |= CAP_TRACE_SLOT;
+			trace->native_known = trace->native_values = 0;
+		}
 		if (slot->status == TT_SLOT_UNUSED || slot->status == TT_SLOT_RECYCLABLE)
 			continue;
-		if (!TransactionIdIsNormal(slot->xid)
-			|| (slot->status != TT_SLOT_COMMITTED && slot->status != TT_SLOT_ABORTED))
+		if (capacity_trace_failed(trace, "segment.native_xid", !TransactionIdIsNormal(slot->xid))
+			|| capacity_trace_failed(trace, "segment.native_status", (slot->status != TT_SLOT_COMMITTED && slot->status != TT_SLOT_ABORTED)))
 			return false;
-		committed = TransactionIdDidCommit(slot->xid);
-		aborted = TransactionIdDidAbort(slot->xid);
-		active = TransactionIdIsInProgress(slot->xid);
-		if (committed != TransactionIdDidCommit(slot->xid)
-			|| aborted != TransactionIdDidAbort(slot->xid)
-			|| active != TransactionIdIsInProgress(slot->xid) || active
-			|| committed != (slot->status == TT_SLOT_COMMITTED)
-			|| aborted != (slot->status == TT_SLOT_ABORTED))
+		committed = capacity_trace_native(trace, 0, TransactionIdDidCommit(slot->xid));
+		aborted = capacity_trace_native(trace, 1, TransactionIdDidAbort(slot->xid));
+		active = capacity_trace_native(trace, 2, TransactionIdIsInProgress(slot->xid));
+		if (capacity_trace_failed(trace, "segment.native_commit_stable", committed != capacity_trace_native(trace, 3, TransactionIdDidCommit(slot->xid)))
+			|| capacity_trace_failed(trace, "segment.native_abort_stable", aborted != capacity_trace_native(trace, 4, TransactionIdDidAbort(slot->xid)))
+			|| capacity_trace_failed(trace, "segment.native_active_stable", active != capacity_trace_native(trace, 5, TransactionIdIsInProgress(slot->xid)))
+			|| capacity_trace_failed(trace, "segment.native_active", active)
+			|| capacity_trace_failed(trace, "segment.native_commit", committed != (slot->status == TT_SLOT_COMMITTED))
+			|| capacity_trace_failed(trace, "segment.native_abort", aborted != (slot->status == TT_SLOT_ABORTED)))
 			return false;
 	}
 	return true;
@@ -5932,12 +6012,13 @@ static bool
 ctrc_capacity_segment_root_current(const CtrcCapacitySegmentSample *sample)
 {
 	ClusterUndoBlock0ResolvedRoot root = { 0 };
+	UndoCapacityTraceRow *trace = sample->trace;
 
-	return cluster_semantic_activation_recheck_r4_terminal_census(&sample->admission)
-		   && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+	return capacity_trace_test(trace, "segment.admission_recheck", cluster_semantic_activation_recheck_r4_terminal_census(&sample->admission))
+		   && capacity_trace_test(trace, "segment.root_resolve", capacity_trace_root(trace, cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 			   &sample->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, sample->logical.owner_instance,
-			   sample->logical.segment_id, &root)
-		   && cluster_undo_block0_root_matches(&sample->root, &root);
+			   sample->logical.segment_id, &root), &root))
+		   && capacity_trace_test(trace, "segment.root_match", cluster_undo_block0_root_matches(&sample->root, &root));
 }
 
 static bool
@@ -5947,40 +6028,48 @@ ctrc_capacity_segment_read(CtrcCapacitySegmentSample *sample, SCN horizon)
 	ClusterUndoBlock0Generation final_generation = { false, 0 };
 	uint32 reasons = 0;
 	bool recyclable;
+	UndoCapacityTraceRow *trace = sample->trace;
 
-	if (cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
-													  &sample->generation)
-			!= CLUSTER_UNDO_BLOCK0_OK
-		|| !sample->generation.known || sample->generation.value == 0
-		|| sample->generation.value == UINT32_MAX
-		|| cluster_undo_block0_current_copy_resident(&sample->guard, &sample->root,
+	if (capacity_trace_failed(trace, "segment.generation_result", capacity_trace_generation(trace, cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
+													  &sample->generation), &sample->generation)
+			!= CLUSTER_UNDO_BLOCK0_OK)
+			|| capacity_trace_failed(trace, "segment.generation_known", !sample->generation.known)
+			|| capacity_trace_failed(trace, "segment.generation_zero", sample->generation.value == 0)
+			|| capacity_trace_failed(trace, "segment.generation_max", sample->generation.value == UINT32_MAX)
+			|| capacity_trace_failed(trace, "segment.copy", cluster_undo_block0_current_copy_resident(&sample->guard, &sample->root,
 													 &sample->generation, sample->page.data)
-			   != CLUSTER_UNDO_BLOCK0_OK
-		|| header->segment_id != sample->logical.segment_id
-		|| header->owner_instance != sample->logical.owner_instance
-		|| header->wrap_count != sample->generation.value
-		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
+			   != CLUSTER_UNDO_BLOCK0_OK)
+			|| capacity_trace_failed(trace, "segment.header_segment", header->segment_id != sample->logical.segment_id)
+			|| capacity_trace_failed(trace, "segment.header_owner", header->owner_instance != sample->logical.owner_instance)
+			|| capacity_trace_failed(trace, "segment.header_generation", header->wrap_count != sample->generation.value)
+			|| capacity_trace_failed(trace, "segment.header_slots", header->tt_slots_count != TT_SLOTS_PER_SEGMENT))
 		return false;
+	if (trace != NULL) {
+		trace->generation = sample->generation.value; trace->known |= CAP_TRACE_GENERATION;
+	}
 	/* A complete negative census needs native evidence even for retained
 	 * rows. This only returns the canonical image; it grants no reuse. */
 	if (sample->physical_inventory) {
-		if (!ctrc_capacity_segment_native(header) || !ctrc_capacity_segment_root_current(sample)
-			|| cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
-															 &final_generation)
-				   != CLUSTER_UNDO_BLOCK0_OK
-			|| !final_generation.known || final_generation.value != sample->generation.value)
+		if (capacity_trace_failed(trace, "segment.native", !ctrc_capacity_segment_native(header, sample->trace))
+			|| capacity_trace_failed(trace, "segment.root_current", !ctrc_capacity_segment_root_current(sample))
+			|| capacity_trace_failed(trace, "segment.final_generation", capacity_trace_generation(trace, cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
+															 &final_generation), &final_generation)
+				   != CLUSTER_UNDO_BLOCK0_OK)
+			|| capacity_trace_failed(trace, "segment.final_generation_known", !final_generation.known)
+			|| capacity_trace_failed(trace, "segment.final_generation_match", final_generation.value != sample->generation.value))
 			return false;
 		sample->identity.segment_generation = sample->generation.value;
 		return true;
 	}
 	recyclable
 		= cluster_undo_segment_recyclable_for_mode_with_reasons(header, horizon, true, &reasons);
-	if ((recyclable && !ctrc_capacity_segment_native(header))
-		|| !ctrc_capacity_segment_root_current(sample)
-		|| cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
-														 &final_generation)
-			   != CLUSTER_UNDO_BLOCK0_OK
-		|| !final_generation.known || final_generation.value != sample->generation.value)
+	if (capacity_trace_failed(trace, "segment.recycle_native", (recyclable && !ctrc_capacity_segment_native(header, sample->trace)))
+			|| capacity_trace_failed(trace, "segment.recycle_root", !ctrc_capacity_segment_root_current(sample))
+			|| capacity_trace_failed(trace, "segment.recycle_generation", capacity_trace_generation(trace, cluster_undo_block0_current_sample_generation(&sample->guard, &sample->root,
+														 &final_generation), &final_generation)
+			   != CLUSTER_UNDO_BLOCK0_OK)
+			|| capacity_trace_failed(trace, "segment.recycle_generation_known", !final_generation.known)
+			|| capacity_trace_failed(trace, "segment.recycle_generation_match", final_generation.value != sample->generation.value))
 		return false;
 	sample->retain_reasons = reasons;
 	if (!recyclable)
@@ -5998,19 +6087,31 @@ ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
 	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	volatile bool active = false;
 	bool proven = false;
+	UndoCapacityTraceRow *trace = sample->trace;
 
-	if (cluster_semantic_activation_enter_r4_terminal_census(&sample->admission)
-		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+	if (capacity_trace_failed(trace, "segment.admission", cluster_semantic_activation_enter_r4_terminal_census(&sample->admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK))
 		return false;
+	if (trace != NULL) {
+		trace->formation = sample->admission.formation_epoch;
+		trace->record_generation = sample->admission.record_generation;
+		trace->known |= CAP_TRACE_ADMISSION;
+	}
 	PG_TRY();
 	{
-		if (sample->admission.formation_epoch == 0 || sample->admission.record_generation == 0
-			|| !cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+		if (capacity_trace_failed(trace, "segment.formation", sample->admission.formation_epoch == 0)
+			|| capacity_trace_failed(trace, "segment.admission_record", sample->admission.record_generation == 0)
+			|| capacity_trace_failed(trace, "segment.resolve_root", !capacity_trace_root(trace, cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 				&sample->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				sample->logical.owner_instance, sample->logical.segment_id, &sample->root)
-			|| sample->root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || sample->root.root_id == 0
-			|| sample->root.root_generation == 0)
+				sample->logical.owner_instance, sample->logical.segment_id, &sample->root), &sample->root))
+			|| capacity_trace_failed(trace, "segment.root_intent", sample->root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED)
+			|| capacity_trace_failed(trace, "segment.root_zero", sample->root.root_id == 0)
+			|| capacity_trace_failed(trace, "segment.root_generation_zero", sample->root.root_generation == 0))
 			goto segment_done;
+		if (trace != NULL) {
+			trace->root = sample->root.root_id; trace->root_generation = sample->root.root_generation;
+			trace->known |= CAP_TRACE_ROOT;
+		}
 		if (CtrcCapacityHistory != NULL && CtrcCapacityHistory->pool_stage) {
 			unsigned position = (sample->logical.segment_id - 1) % CLUSTER_UNDO_SEGS_PER_INSTANCE;
 
@@ -6020,7 +6121,10 @@ ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
 		step = cluster_undo_block0_current_acquire_begin_admitted(
 			&sample->logical, CLUSTER_UNDO_BLOCK0_SCUR, cluster_ges_request_timeout_ms,
 			&sample->admission, &sample->guard, &failure);
-		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+		if (trace != NULL) {
+			trace->acquire = step; trace->failure = failure; trace->known |= CAP_TRACE_ACQUIRE;
+		}
+		if (capacity_trace_failed(trace, "segment.acquire_begin", step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED))
 			goto segment_done;
 		active = true;
 		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
@@ -6031,7 +6135,8 @@ ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
 					&sample->guard, CLUSTER_UNDO_BLOCK0_WAIT_CTRC_CLEANER_SAMPLE_ACQUIRE))
 				pg_usleep(1000L);
 		}
-		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+		if (trace != NULL) { trace->acquire = step; trace->failure = failure; }
+		if (capacity_trace_test(trace, "segment.acquire_held", step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD))
 			proven = ctrc_capacity_segment_read(sample, horizon);
 	segment_done:
 		if (active) {
@@ -6045,13 +6150,16 @@ ctrc_capacity_segment_sample(CtrcCapacitySegmentSample *sample, SCN horizon)
 					pg_usleep(1000L);
 			}
 			active = false;
-			proven = proven && step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
-			if (step != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+			if (trace != NULL) {
+				trace->release = step; trace->failure = failure; trace->known |= CAP_TRACE_RELEASE;
+			}
+			proven = proven && capacity_trace_test(trace, "segment.release", step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
+			if (!capacity_trace_test(trace, "segment.release", step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED))
 				sample->retain_reasons = 0;
 		}
 		if ((proven || sample->retain_reasons != 0)
-			&& (!ctrc_capacity_segment_root_current(sample)
-				|| !ctrc_capacity_segment_current(&sample->identity))) {
+			&& (!capacity_trace_test(trace, "segment.after_root", ctrc_capacity_segment_root_current(sample))
+				|| !capacity_trace_test(trace, "segment.after_current", ctrc_capacity_segment_current(&sample->identity)))) {
 			proven = false;
 			sample->retain_reasons = 0;
 		}
@@ -6121,27 +6229,38 @@ ctrc_capacity_history_identity_current(const ClusterCapacityHistoryPass *pass)
  * only exact terminal rows above H can contribute to the negative proof. */
 static ClusterCapacityReasonV1
 ctrc_capacity_history_current(const ClusterTTSlotCurrentSnapshot *snapshot,
-							  const UndoSegmentHeaderData *header, SCN horizon)
+							  const UndoSegmentHeaderData *header, SCN horizon, UndoCapacityTraceRow *trace)
 {
-	if (!ctrc_capacity_segment_native(header)
-		|| !cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET))
+	if (capacity_trace_failed(trace, "history.native", !ctrc_capacity_segment_native(header, trace))
+			|| capacity_trace_failed(trace, "history.handoff", !cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET)))
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 		const ClusterTTSlotCurrentOwner *owner = &snapshot->slots[i];
 		const TTSlot *slot = &header->tt_slots[i];
 
-		if (owner->status == CTS_FREE)
+		if (trace != NULL) {
+			trace->native_known = trace->native_values = 0;
+			trace->sample_slot = i; trace->owner_data.owner = *owner; trace->slot = *slot;
+			trace->known |= CAP_TRACE_OWNER | CAP_TRACE_SLOT;
+		}
+		if (!capacity_trace_test(trace, "history.free", owner->status != CTS_FREE))
 			return CLUSTER_CAPACITY_SUPPLY_RECHECK;
-		if (owner->segment_id != header->segment_id || owner->slot_offset != i
-			|| !ctrc_bytes_zero(owner->reserved8, sizeof(owner->reserved8))
-			|| owner->status != CTS_COMMITTED || !TransactionIdIsNormal(owner->xid)
-			|| owner->wrap == TT_WRAP_INVALID || owner->wrap >= TT_WRAP_MAX
-			|| owner->xid != slot->xid || owner->wrap != slot->wrap
-			|| slot->status != TT_SLOT_COMMITTED || owner->commit_scn != slot->commit_scn
-			|| !SCN_VALID(slot->commit_scn) || !UBA_is_invalid(slot->first_undo_block)
-			|| slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN)
+		if (capacity_trace_failed(trace, "history.segment", owner->segment_id != header->segment_id)
+			|| capacity_trace_failed(trace, "history.slot_offset", owner->slot_offset != i)
+			|| capacity_trace_failed(trace, "history.reserved", !ctrc_bytes_zero(owner->reserved8, sizeof(owner->reserved8)))
+			|| capacity_trace_failed(trace, "history.owner_committed", owner->status != CTS_COMMITTED)
+			|| capacity_trace_failed(trace, "history.xid_normal", !TransactionIdIsNormal(owner->xid))
+			|| capacity_trace_failed(trace, "history.wrap_invalid", owner->wrap == TT_WRAP_INVALID)
+			|| capacity_trace_failed(trace, "history.wrap_max", owner->wrap >= TT_WRAP_MAX)
+			|| capacity_trace_failed(trace, "history.xid", owner->xid != slot->xid)
+			|| capacity_trace_failed(trace, "history.wrap", owner->wrap != slot->wrap)
+			|| capacity_trace_failed(trace, "history.slot_committed", slot->status != TT_SLOT_COMMITTED)
+			|| capacity_trace_failed(trace, "history.scn_match", owner->commit_scn != slot->commit_scn)
+			|| capacity_trace_failed(trace, "history.scn_valid", !SCN_VALID(slot->commit_scn))
+			|| capacity_trace_failed(trace, "history.undo", !UBA_is_invalid(slot->first_undo_block))
+			|| capacity_trace_failed(trace, "history.released", slot->flags != TT_SLOT_FLAG_CTRC_RELEASE_PROVEN))
 			return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
-		if (scn_time_cmp(slot->commit_scn, horizon) <= 0)
+		if (!capacity_trace_test(trace, "history.horizon", scn_time_cmp(slot->commit_scn, horizon) > 0))
 			return CLUSTER_CAPACITY_SUPPLY_RECHECK;
 	}
 	return CLUSTER_CAPACITY_PROTECTED_HISTORY;
@@ -6271,6 +6390,8 @@ ctrc_capacity_unarmed_gc_candidate(uint32 segment_id, uint32 current_segment, SC
 								   uint64 epoch, ClusterCapacityObservationV1 *observation)
 {
 	CtrcCapacitySegmentSample sample;
+	UndoCapacityTraceRow trace_storage;
+	UndoCapacityTraceRow *trace = NULL;
 	ClusterTTSlotCurrentSnapshot current;
 	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)sample.page.data;
 	uint32 record, final_record;
@@ -6278,17 +6399,25 @@ ctrc_capacity_unarmed_gc_candidate(uint32 segment_id, uint32 current_segment, SC
 	unsigned worker_id = (segment_id - 1) % CLUSTER_CTRC_CLEANER_WORKERS;
 
 	MemSet(&sample, 0, sizeof(sample));
-	if (!ctrc_capacity_pool_gc_context(segment_id, &record)
-		|| !ctrc_capacity_segment_origins_absent(segment_id)
-		|| !cluster_undo_cleaner_capacity_owner_snapshot(worker_id, &coordinator, &worker)) {
-		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
-		return false;
+	if (cluster_trace_undo_capacity_refusal) {
+		MemSet(&trace_storage, 0, sizeof(trace_storage));
+		trace = sample.trace = &trace_storage; trace->kind = CAP_TRACE_POOL;
+		trace->position = segment_id;
 	}
-	if (!cluster_tt_slot_current_snapshot(cluster_node_id, &current)
-		|| current.segment_id != current_segment || current.segment_id == segment_id
-		|| current.binding_generation == 0 || current.binding_generation == UINT64_MAX) {
+
+	if (capacity_trace_failed(trace, "unarmed.entry_1", !ctrc_capacity_pool_gc_context(segment_id, &record))
+			|| capacity_trace_failed(trace, "unarmed.entry_2", !ctrc_capacity_segment_origins_absent(segment_id))
+			|| capacity_trace_failed(trace, "unarmed.entry_3", !capacity_trace_cleaner(trace, cluster_undo_cleaner_capacity_owner_snapshot(worker_id, &coordinator, &worker), &coordinator, &worker))) {
+		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
+		return capacity_trace_result(trace, false);
+	}
+	if (capacity_trace_failed(trace, "unarmed.current_1", !cluster_tt_slot_current_snapshot(cluster_node_id, &current))
+			|| capacity_trace_failed(trace, "unarmed.current_2", current.segment_id != current_segment)
+			|| capacity_trace_failed(trace, "unarmed.current_3", current.segment_id == segment_id)
+			|| capacity_trace_failed(trace, "unarmed.current_4", current.binding_generation == 0)
+			|| capacity_trace_failed(trace, "unarmed.current_5", current.binding_generation == UINT64_MAX)) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
-		return false;
+		return capacity_trace_result(trace, false);
 	}
 	sample.logical.owner_instance = cluster_node_id + 1;
 	sample.logical.segment_id = segment_id;
@@ -6299,21 +6428,24 @@ ctrc_capacity_unarmed_gc_candidate(uint32 segment_id, uint32 current_segment, SC
 	sample.identity.epoch = epoch;
 	sample.identity.system_identifier = GetSystemIdentifier();
 	sample.identity.origin_boot_incarnation = cluster_qvotec_get_self_incarnation();
-	if (sample.identity.system_identifier == 0 || sample.identity.origin_boot_incarnation == 0
-		|| !ctrc_capacity_segment_sample(&sample, horizon)) {
+	if (capacity_trace_failed(trace, "unarmed.sample_1", sample.identity.system_identifier == 0)
+			|| capacity_trace_failed(trace, "unarmed.sample_2", sample.identity.origin_boot_incarnation == 0)
+			|| capacity_trace_failed(trace, "unarmed.sample_3", !ctrc_capacity_segment_sample(&sample, horizon))) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
 		observation->retain_reasons |= sample.retain_reasons;
-		return false;
+		return capacity_trace_result(trace, false);
 	}
-	if (!cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET)
-		|| !ctrc_capacity_segment_origins_absent(segment_id)
-		|| !ctrc_capacity_pool_gc_context(segment_id, &final_record) || record != final_record
-		|| !cluster_undo_cleaner_capacity_owner_snapshot(worker_id, &final_coordinator,
-														 &final_worker)
-		|| coordinator != final_coordinator || worker != final_worker
-		|| !ctrc_capacity_segment_current(&sample.identity)) {
+	if (capacity_trace_failed(trace, "unarmed.finish_1", !cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET))
+			|| capacity_trace_failed(trace, "unarmed.finish_2", !ctrc_capacity_segment_origins_absent(segment_id))
+			|| capacity_trace_failed(trace, "unarmed.finish_3", !ctrc_capacity_pool_gc_context(segment_id, &final_record))
+			|| capacity_trace_failed(trace, "unarmed.finish_4", record != final_record)
+			|| capacity_trace_failed(trace, "unarmed.finish_5", !capacity_trace_cleaner(trace, cluster_undo_cleaner_capacity_owner_snapshot(worker_id, &final_coordinator,
+														 &final_worker), &final_coordinator, &final_worker))
+			|| capacity_trace_failed(trace, "unarmed.finish_6", coordinator != final_coordinator)
+			|| capacity_trace_failed(trace, "unarmed.finish_7", worker != final_worker)
+			|| capacity_trace_failed(trace, "unarmed.finish_8", !ctrc_capacity_segment_current(&sample.identity))) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_IDENTITY;
-		return false;
+		return capacity_trace_result(trace, false);
 	}
 	MemSet(&observation->key, 0, sizeof(observation->key));
 	observation->segment = sample.identity;
@@ -6322,7 +6454,7 @@ ctrc_capacity_unarmed_gc_candidate(uint32 segment_id, uint32 current_segment, SC
 	observation->owner_worker = worker_id;
 	observation->coordinator_generation = coordinator;
 	observation->owner_generation = worker;
-	return true;
+	return capacity_trace_result(trace, true);
 }
 
 /* A separate bounded walk preserves GC fairness even if ordinary origin work
@@ -6372,7 +6504,7 @@ ctrc_capacity_unarmed_gc_probe(uint32 current_segment, SCN horizon, uint64 epoch
  * one released slot never proves that the segment is recyclable. */
 static ClusterCapacityReasonV1
 ctrc_capacity_pool_gc_candidate(const CtrcCapacityCandidate *candidate, SCN horizon,
-								ClusterCapacityObservationV1 *observation)
+								ClusterCapacityObservationV1 *observation, UndoCapacityTraceRow *trace)
 {
 	PGAlignedBlock page;
 	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)page.data;
@@ -6380,17 +6512,18 @@ ctrc_capacity_pool_gc_candidate(const CtrcCapacityCandidate *candidate, SCN hori
 	uint64 coordinator, worker, final_coordinator, final_worker;
 	bool released;
 
-	if (!ctrc_capacity_origin_absent(candidate->index))
+	if (capacity_trace_failed(trace, "pool_gc.absent", !ctrc_capacity_origin_absent(candidate->index)))
 		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
-	if (!ctrc_capacity_pool_gc_context(candidate->key.segment_id, &record_segment)
-		|| !cluster_undo_cleaner_capacity_owner_snapshot(observation->owner_worker, &coordinator,
-														 &worker)) {
+	if (capacity_trace_failed(trace, "pool_gc.context", !ctrc_capacity_pool_gc_context(candidate->key.segment_id, &record_segment))
+			|| capacity_trace_failed(trace, "pool_gc.owner", !capacity_trace_cleaner(trace, cluster_undo_cleaner_capacity_owner_snapshot(observation->owner_worker, &coordinator,
+														 &worker), &coordinator, &worker))) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	}
-	if (!ctrc_cleaner_terminal_sample_mode(&candidate->key, true, NULL, NULL, &released, &page)
-		|| !released || !cluster_undo_segment_recyclable_for_mode(header, horizon, true)
-		|| !cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET)) {
+	if (capacity_trace_failed(trace, "pool_gc.sample", !ctrc_cleaner_terminal_sample_mode(&candidate->key, true, NULL, NULL, &released, &page, trace))
+			|| capacity_trace_failed(trace, "pool_gc.released", !released)
+			|| capacity_trace_failed(trace, "pool_gc.recyclable", !cluster_undo_segment_recyclable_for_mode(header, horizon, true))
+			|| capacity_trace_failed(trace, "pool_gc.handoff", !cluster_ctrc_reuse_handoff_complete(header, INVALID_TT_SLOT_OFFSET))) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	}
@@ -6398,8 +6531,8 @@ ctrc_capacity_pool_gc_candidate(const CtrcCapacityCandidate *candidate, SCN hori
 		|| !ctrc_capacity_pool_gc_context(candidate->key.segment_id, &final_record)
 		|| record_segment != final_record)
 		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
-	if (!cluster_undo_cleaner_capacity_owner_snapshot(observation->owner_worker, &final_coordinator,
-													  &final_worker)) {
+	if (!capacity_trace_cleaner(trace, cluster_undo_cleaner_capacity_owner_snapshot(observation->owner_worker, &final_coordinator,
+													  &final_worker), &final_coordinator, &final_worker)) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	}
@@ -6419,6 +6552,8 @@ ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate, SCN horizo
 	ClusterCtrcOriginCertificateSnapshot snapshot;
 	ClusterCtrcOriginCertificateSnapshot final_snapshot;
 	const ClusterCtrcOriginEntry *origin;
+	UndoCapacityTraceRow trace_storage;
+	UndoCapacityTraceRow *trace = NULL;
 	bool same_identity;
 	bool exact;
 	bool released = false;
@@ -6426,12 +6561,18 @@ ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate, SCN horizo
 	uint64 final_coordinator, final_worker;
 	unsigned worker = (candidate->key.segment_id - 1) % CLUSTER_CTRC_CLEANER_WORKERS;
 
+	if (cluster_trace_undo_capacity_refusal) {
+		MemSet(&trace_storage, 0, sizeof(trace_storage));
+		trace = &trace_storage; trace->kind = CAP_TRACE_POOL;
+		trace->position = candidate->key.slot_offset; trace->sample_slot = trace->position;
+		trace->branch = candidate->phase; capacity_trace_key(trace, &candidate->key);
+	}
 	observation->key = candidate->key;
 	observation->phase = candidate->phase;
 	observation->owner_worker = worker;
 	observation->coordinator_generation = observation->owner_generation = 0;
 	if (candidate->phase == CTRC_ORIGIN_EMPTY)
-		return ctrc_capacity_pool_gc_candidate(candidate, horizon, observation);
+		return capacity_trace_result(trace, ctrc_capacity_pool_gc_candidate(candidate, horizon, observation, trace));
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	origin = &ctrc_origin_entries()[candidate->index];
 	same_identity = origin->state == candidate->phase
@@ -6439,44 +6580,45 @@ ctrc_capacity_candidate_probe(const CtrcCapacityCandidate *candidate, SCN horizo
 					&& memcmp(&origin->key, &candidate->key, sizeof(origin->key)) == 0;
 	exact = same_identity && ctrc_capacity_snapshot_index_locked(candidate->index, &snapshot);
 	LWLockRelease(&CtrcShared->origin_lock);
-	if (!same_identity)
-		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
-	if (!exact) {
+	if (capacity_trace_failed(trace, "pool.same_identity", !same_identity))
+		return capacity_trace_result(trace, CLUSTER_CAPACITY_SUPPLY_RECHECK);
+	if (capacity_trace_failed(trace, "pool.required_ack", !exact)) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_REQUIRED_ACK;
-		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+		return capacity_trace_result(trace, CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
 	}
-	if (!cluster_undo_cleaner_capacity_owner_snapshot(worker, &coordinator_generation,
-													  &worker_generation)) {
+	if (capacity_trace_failed(trace, "pool.owner", !capacity_trace_cleaner(trace, cluster_undo_cleaner_capacity_owner_snapshot(worker, &coordinator_generation,
+													  &worker_generation), &coordinator_generation, &worker_generation))) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
-		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+		return capacity_trace_result(trace, CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
 	}
 	/* Seal/close work can precede H and uses the original terminal sample:
 	 * zero flags, with a possible undo chain still awaiting the missing ACK.
 	 * Neither phase proof grants GC/reuse or proves a real long reader. */
-	if (!ctrc_cleaner_terminal_sample_mode(&snapshot.origin.key,
+	if (capacity_trace_failed(trace, "pool.sample", !ctrc_cleaner_terminal_sample_mode(&snapshot.origin.key,
 										   candidate->phase != CTRC_ORIGIN_OPEN
 											   && snapshot.origin.ack_bitmap
 													  == snapshot.origin.touched_bitmap,
-										   NULL, NULL, &released, NULL)
-		|| (candidate->phase == CTRC_ORIGIN_RELEASE_PROVEN && !released)) {
+										   NULL, NULL, &released, NULL, trace))
+			|| capacity_trace_failed(trace, "pool.released", (candidate->phase == CTRC_ORIGIN_RELEASE_PROVEN && !released))) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_CANONICAL;
-		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+		return capacity_trace_result(trace, CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
 	}
 	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
 	exact = ctrc_capacity_snapshot_index_locked(candidate->index, &final_snapshot)
 			&& memcmp(&snapshot, &final_snapshot, sizeof(snapshot)) == 0;
 	LWLockRelease(&CtrcShared->origin_lock);
-	if (!exact)
-		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
-	if (!cluster_undo_cleaner_capacity_owner_snapshot(worker, &final_coordinator, &final_worker)) {
+	if (capacity_trace_failed(trace, "pool.final_snapshot", !exact))
+		return capacity_trace_result(trace, CLUSTER_CAPACITY_SUPPLY_RECHECK);
+	if (capacity_trace_failed(trace, "pool.final_owner", !capacity_trace_cleaner(trace, cluster_undo_cleaner_capacity_owner_snapshot(worker, &final_coordinator, &final_worker), &final_coordinator, &final_worker))) {
 		observation->unproven_reasons |= CLUSTER_CAPACITY_UNPROVEN_OWNER;
-		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
+		return capacity_trace_result(trace, CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
 	}
-	if (coordinator_generation != final_coordinator || worker_generation != final_worker)
-		return CLUSTER_CAPACITY_SUPPLY_RECHECK;
+	if (capacity_trace_failed(trace, "pool.coordinator_changed", coordinator_generation != final_coordinator)
+			|| capacity_trace_failed(trace, "pool.worker_changed", worker_generation != final_worker))
+		return capacity_trace_result(trace, CLUSTER_CAPACITY_SUPPLY_RECHECK);
 	observation->coordinator_generation = coordinator_generation;
 	observation->owner_generation = worker_generation;
-	return CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE;
+	return capacity_trace_result(trace, CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
 }
 
 /* Every pool outcome belongs to the original CURRENT and epoch. A failed
@@ -6677,6 +6819,7 @@ cluster_ctrc_capacity_probe_history_v1(uint32 current_segment, SCN horizon, uint
 	volatile ClusterCapacityReasonV1 reason = CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	bool initialized;
 
+	cluster_undo_cleaner_capacity_trace_reset();
 	if (pass == NULL || observation == NULL)
 		return CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER;
 	MemSet(observation, 0, sizeof(*observation));
@@ -6765,25 +6908,42 @@ cluster_ctrc_capacity_probe_history_v1(uint32 current_segment, SCN horizon, uint
 			} else {
 				if (!context.current_captured && context.current_gets < TT_SLOTS_PER_SEGMENT) {
 					CtrcCapacitySegmentSample sample = { 0 };
+					UndoCapacityTraceRow trace_storage;
+
+					if (cluster_trace_undo_capacity_refusal) {
+						MemSet(&trace_storage, 0, sizeof(trace_storage));
+						sample.trace = &trace_storage; sample.trace->kind = CAP_TRACE_FALLBACK;
+						sample.trace->position = current_segment;
+					}
 
 					sample.identity = pass->identity;
 					sample.identity.segment_id = current_segment;
 					sample.logical.owner_instance = pass->identity.owner_instance;
 					sample.logical.segment_id = current_segment;
 					sample.physical_inventory = true;
-					if (ctrc_capacity_segment_sample(&sample, horizon)) {
+					if (capacity_trace_result(sample.trace, ctrc_capacity_segment_sample(&sample, horizon))) {
 						context.current_page = sample.page;
 						context.sampled_identity = sample.identity;
 						context.current_captured = true;
 					}
 				}
 				if (context.current_captured) {
-					ClusterCapacityReasonV1 current_reason = ctrc_capacity_history_current(
-						&snapshot, (UndoSegmentHeaderData *)context.current_page.data, horizon);
+					UndoCapacityTraceRow trace_storage;
+					UndoCapacityTraceRow *trace = NULL;
+					ClusterCapacityReasonV1 current_reason;
+
+					if (cluster_trace_undo_capacity_refusal) {
+						MemSet(&trace_storage, 0, sizeof(trace_storage));
+						trace = &trace_storage; trace->kind = CAP_TRACE_HISTORY;
+					}
+					current_reason = ctrc_capacity_history_current(
+						&snapshot, (UndoSegmentHeaderData *)context.current_page.data, horizon, trace);
+					(void)capacity_trace_result(trace, current_reason);
 
 					if (current_reason == CLUSTER_CAPACITY_PROTECTED_HISTORY
-						&& cluster_tt_slot_current_snapshot(cluster_node_id, &final_snapshot)
-						&& memcmp(&snapshot, &final_snapshot, sizeof(snapshot)) == 0) {
+						&& capacity_trace_final_read(cluster_tt_slot_current_snapshot(cluster_node_id, &final_snapshot))
+						&& capacity_trace_final_snapshot(
+							memcmp(&snapshot, &final_snapshot, sizeof(snapshot)) == 0, &snapshot, &final_snapshot)) {
 						pass->identity = context.sampled_identity;
 						pass->current_proven = true;
 						pass->saw_history = true;
@@ -6818,6 +6978,8 @@ cluster_ctrc_capacity_probe_history_v1(uint32 current_segment, SCN horizon, uint
 	}
 	PG_FINALLY();
 	{
+		cluster_undo_cleaner_capacity_trace_counts(context.current_gets, context.pool_gets,
+			context.current_captured);
 		CtrcCapacityHistory = NULL;
 	}
 	PG_END_TRY();

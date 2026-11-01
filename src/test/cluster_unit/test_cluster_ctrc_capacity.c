@@ -5493,6 +5493,8 @@ UT_TEST(test_history_negative_never_hides_io_free_current_or_missing_release)
 	test_cluster_epoch = 13;
 }
 
+#include "test_cluster_capacity_route_trace.h"
+
 #if defined(G320_CAPACITY_REAL_HISTORY) || defined(CLUSTER_CTRC_REAL_ALLOCATOR_GC)
 int capacity_component_main(void);
 int
@@ -5502,7 +5504,7 @@ int
 main(void)
 #endif
 {
-	UT_PLAN(105);
+	UT_PLAN(109);
 	UT_RUN(test_history_inventory_gc_drops_a_failed_ordinary_candidate_key);
 	UT_RUN(test_history_unknown_inventory_keeps_independent_original_gc_positive);
 	UT_RUN(test_history_unavailable_fence_preserves_actual_owner_positive);
@@ -5609,6 +5611,10 @@ main(void)
 	UT_RUN(test_capacity_continues_after_release_without_weakening_seal);
 	UT_RUN(test_capacity_proof_negative_matrix_retains_all_bytes);
 	UT_RUN(test_capacity_abort_and_witness_loss_are_not_guessed);
+	UT_RUN(test_route_trace_current_first_gate_and_native_known_bits);
+	UT_RUN(test_route_trace_current_is_not_overwritten_by_pool);
+	UT_RUN(test_route_trace_history_first_mismatch_and_existing_counters);
+	UT_RUN(test_route_trace_caps_loss_and_final_refusal_only);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count != 0;
