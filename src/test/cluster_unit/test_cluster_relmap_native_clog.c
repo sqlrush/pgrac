@@ -173,3 +173,40 @@ test_relmap_native_clog_done(void)
 	PG_exception_stack = NULL;
 	return result;
 }
+
+/* The original shared observation, without touching status bytes. */
+void test_relmap_native_clog_mutate(bool begin)
+{
+	if (begin) clog_relmap_native_mutation(fixture_origin);
+	else clog_relmap_native_mutation_end(fixture_origin);
+}
+bool test_relmap_native_clog_seal(ClusterClogNativeBaseHandleV1 *held)
+{ return cluster_clog_native_terminal_seal_v1(held); }
+bool test_relmap_native_clog_current(ClusterClogNativeBaseHandleV1 *held)
+{ return cluster_clog_native_terminal_current_v1(held); }
+
+/* Reproduce loss of the original fd.c allocation while OS identity is equal.
+ * New descriptor belongs to this test, not to the retained opaque handle. */
+void test_relmap_native_clog_reopen_same_fd(ClusterClogNativeBaseHandleV1 *held, bool cleanup)
+{
+	int fd = held->fd;
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(CloseTransientFile(fd), 0);
+	if (cleanup) held->fd = -1;
+	else UT_ASSERT_EQ(OpenTransientFile(relmap_native_path, O_RDWR), fd);
+}
+
+/* Reopen with an existing file fault or an observed mutation in the gap. */
+void test_relmap_native_clog_reopen_fault(ClusterClogNativeBaseHandleV1 *held, unsigned fault)
+{
+	int fd = held->fd;
+	UT_ASSERT_EQ(CloseTransientFile(fd), 0);
+	if (fault == 0) {
+		clog_relmap_native_mutation(fixture_origin);
+		clog_relmap_native_mutation_end(fixture_origin);
+	} else {
+		relmap_native_fault = fault;
+		relmap_native_apply_fault();
+	}
+	UT_ASSERT_EQ(OpenTransientFile(relmap_native_path, O_RDWR), fd);
+}

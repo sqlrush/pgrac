@@ -473,6 +473,30 @@ static void actual_startup_eor_claim(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 #include "test_cluster_cold_tx_writer.inc"
+#include "test_cluster_relmap_native_clog.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
+#include "test_cluster_cold_terminal_checkpoint.inc"
+
+/* Original identity reader, isolated CLOG globals. Missing-receipt tests
+ * never install a successful terminal leaf or enter a mutation lock. */
+bool
+cluster_clog_native_terminal_current_v1(ClusterClogNativeBaseHandleV1 *held)
+{
+	return test_relmap_native_clog_current(held);
+}
+volatile uint32 InterruptHoldoffCount;
+bool LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	(void)lock; (void)mode; UT_ASSERT(false); return false;
+}
+void LWLockRelease(LWLock *lock)
+{
+	(void)lock; UT_ASSERT(false);
+}
+bool LWLockHeldByMe(LWLock *lock)
+{
+	(void)lock; return false;
+}
 /* Saved-receipt readers remain real. The physical recheck boundary is
  * controlled here; the Startup storage component exercises its full body. */
 bool test_start_unused_relmap_recheck(const struct ClusterRecoveryStartV1 *start);
@@ -2555,10 +2579,11 @@ int main(void)
 {
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 	if (getenv("PGRAC_PRE2_TEST_RELMAP_CONSUMER") != NULL) {
-		UT_PLAN(3);
+		UT_PLAN(4);
 		UT_RUN(test_start_owner_graph_requires_declared_relmap_terminal_input);
 		UT_RUN(test_start_observation_graph_cannot_bypass_declared_terminal_input);
 		UT_RUN(test_start_undeclared_page_owner_graph_keeps_original_contribution);
+		UT_RUN(test_start_owner_graph_terminal_provider_error_keeps_original_debt);
 		reset();
 		UT_DONE(); return ut_failed_count != 0;
 	}

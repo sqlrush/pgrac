@@ -19,6 +19,10 @@
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_relmap_lock.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
+#include "cluster/cluster_recovery_plan.h"
+#include "cluster/cluster_wal_writer.h"
+#include <unistd.h>
 #include "cluster/cluster_side_online_plan.h"
 #include "storage/lwlock.h"
 #include "utils/relmapper.h"
@@ -702,6 +706,317 @@ cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start
 		check.plan->relmap_failed = false;
 	else
 		ClusterColdRecoveryRelmapFail(start);
+	return ok;
+}
+/* Immutable evidence lives in the original typed plan, not in Start's output.
+ * All FD custody is local; failure never retires the original pin carrier. */
+typedef struct ColdRelmapTerminalEntry {
+	ColdRelmapInput input;
+	ClusterRelmapTerminalCustodyV1 native;
+} ColdRelmapTerminalEntry;
+
+typedef struct ColdRelmapTerminal {
+	ClusterColdTypedV1 *typed;
+	ClusterColdPlanV1 *plan;
+	const ColdRelmapInput *original;
+	ClusterRelmapRecoveryPins *pins;
+	const struct ClusterRecoveryStartV1 *start;
+	const struct ClusterRecoveryFencePlan *fence, *typed_fence;
+	ClusterRecoveryCheckpointOwnerV1 owner;
+	ClusterWalWriterToken writer;
+	uint8 operation[16];
+	uint64 install_generation, system_identifier;
+	pid_t pid;
+	uint32 count, participants, replay_count;
+	bool failed, sealed;
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterColdParticipantV1 cuts[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterControlRootSnapshot roots[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterWalRecoveryCheckpointV1 checkpoints[CLUSTER_COLD_MAX_PARTICIPANTS];
+	const RfSideOnlinePlanV1 *sides[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ColdRelmapTerminalEntry entries[FLEXIBLE_ARRAY_MEMBER];
+} ColdRelmapTerminal;
+
+static Size
+relmap_terminal_bytes(uint32 count)
+{
+	return offsetof(ColdRelmapTerminal, entries) + (Size)count * sizeof(ColdRelmapTerminalEntry);
+}
+
+static void
+relmap_terminal_release(void *value)
+{
+	ColdRelmapTerminal *receipt = value;
+	ClusterColdPlanV1 *plan = receipt->plan;
+	Size bytes = relmap_terminal_bytes(receipt->count);
+	for (uint32 i = 0; i < receipt->count; ++i)
+		cluster_clog_native_recovery_base_release_v1(&receipt->entries[i].native.held);
+	cold_free(receipt);
+	cold_plan_release(plan, bytes);
+}
+
+/* The original replay owner moves NULL to this exact fence after scope leave;
+ * Start requires the completed transfer. No other fence is a valid successor.
+ * Value identity only. No old cold-scope provider, terminal reader, CLOG I/O
+ * or expired role permission is used by the Start path. */
+static bool
+relmap_terminal_inputs(const ColdRelmapTerminal *receipt)
+{
+	const ClusterColdTypedV1 *typed = receipt->typed;
+	const ClusterColdPlanV1 *plan = receipt->plan;
+	if (receipt->pid != getpid() || typed->refusal != CLUSTER_COLD_OK
+		|| typed->plan != plan || !plan_valid(plan)
+		|| (typed->tx_fence != receipt->typed_fence && typed->tx_fence != receipt->fence) || plan->phase != COLD_PHASE_SEALED
+		|| plan->relmap_terminal != receipt || !plan->relmap_terminal_attempted
+		|| plan->relmap_inputs != receipt->original || plan->relmap_count != receipt->count
+		|| plan->relmap_recovery != receipt->pins
+		|| typed->participant_count != receipt->participants
+		|| plan->participant_count != receipt->participants
+		|| typed->replay_count != receipt->replay_count
+		|| typed->system_identifier != receipt->system_identifier)
+		return false;
+	for (uint32 p = 0; p < receipt->participants; ++p) {
+		ClusterControlRootSnapshot root;
+		ClusterWalRecoveryCheckpointV1 checkpoint;
+		if (!cluster_cold_typed_checkpoint_v1(typed, p, &root, &checkpoint)
+			|| memcmp(&root, &receipt->roots[p], sizeof(root)) != 0
+			|| memcmp(&checkpoint, &receipt->checkpoints[p], sizeof(checkpoint)) != 0
+			|| memcmp(&typed->sources[p], &receipt->sources[p], sizeof(receipt->sources[p])) != 0
+			|| !cold_relmap_cut_equal(&typed->participants[p], &receipt->cuts[p])
+			|| typed->side_plans[p] != receipt->sides[p])
+			return false;
+	}
+	for (uint32 i = 0; i < receipt->count; ++i) {
+		const ColdRelmapInput *entry = &receipt->entries[i].input;
+		if (memcmp(&receipt->original[i], entry, sizeof(*entry)) != 0
+			|| !relmap_entry_pin(plan, entry, true)
+			|| !relmap_side_matches(typed, &entry->input, NULL))
+			return false;
+	}
+	return true;
+}
+
+static bool
+relmap_terminal_start(ColdRelmapTerminal *receipt,
+	const struct ClusterRecoveryStartV1 *start, ClusterRecoveryCheckpointOwnerV1 *owner)
+{
+	ClusterWalWriterToken writer;
+	uint8 operation[16];
+	uint64 generation;
+	if (MyBackendType != B_STARTUP || RecoveryInProgress() || CritSectionCount != 0
+		|| !ClusterColdRecoveryRelmapCurrent(start)
+		|| ClusterColdRecoveryTxInputs(start) != receipt->typed
+		|| receipt->typed->tx_fence != receipt->fence
+		|| !ClusterColdRecoveryTxCheckpointOwnerV1(start, owner)
+		|| owner->owner_pid != MyProcPid || owner->owner_boot == 0
+		|| owner->start_generation == 0 || owner->start_serial == 0
+		|| !relmap_terminal_inputs(receipt)
+		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation, &generation)
+		|| generation == 0 || owner->install_generation != generation
+		|| memcmp(&owner->writer, &writer, sizeof(writer)) != 0
+		|| memcmp(owner->operation_uuid, operation, sizeof(operation)) != 0)
+		return false;
+	/* The installed writer exists only after native DONE. Bind it once via
+	 * this original Start; capture never borrows that later role permission.
+	 * Start serial may advance under the same original generation; Current
+	 * and CheckpointOwner retain responsibility for that current serial. */
+	if (receipt->start == NULL) {
+		receipt->start = start;
+		receipt->owner = *owner;
+		receipt->writer = writer;
+		memcpy(receipt->operation, operation, sizeof(operation));
+		receipt->install_generation = generation;
+	}
+	return receipt->start == start && receipt->owner.owner_pid == owner->owner_pid
+		&& receipt->owner.owner_boot == owner->owner_boot
+		&& receipt->owner.start_generation == owner->start_generation
+		&& receipt->install_generation == generation
+		&& memcmp(&receipt->writer, &writer, sizeof(writer)) == 0
+		&& memcmp(receipt->operation, operation, sizeof(operation)) == 0;
+}
+
+bool
+cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	ClusterColdPlanV1 *plan;
+	ColdRelmapTerminal *receipt;
+	ClusterRelmapRecoveryHandle *volatile handle = NULL;
+	uint32 count;
+	bool held = false;
+	volatile bool ok = false;
+
+	if (typed == NULL || fence == NULL || !plan_valid(typed->plan))
+		return false;
+	plan = typed->plan;
+	if (plan->relmap_terminal_attempted)
+		return false;
+	count = cluster_cold_typed_relmap_replay_count_v1(typed);
+	/* Lock the attempt before any provider/allocation; partial capture never
+	 * becomes an empty successful batch and cannot be retried. */
+	plan->relmap_terminal_attempted = true;
+	if (count == UINT32_MAX || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| (typed->tx_fence != NULL && typed->tx_fence != fence)
+		|| MyBackendType != B_STARTUP || !RecoveryInProgress() || CritSectionCount != 0) {
+		plan->relmap_failed = true;
+		return false;
+	}
+	ForEachLWLockHeldByMe(relmap_recheck_held_lock, &held);
+	if (held) { plan->relmap_failed = true; return false; }
+	/* Declarations are unique namespaces; reject an inconsistent saved batch
+	 * in full before its first native reader. */
+	for (uint32 i = 0; i < count; ++i)
+		for (uint32 j = 0; j < i; ++j) {
+			const ClusterRelmapV2Namespace *a = &plan->relmap_inputs[i].input.staged.identity;
+			const ClusterRelmapV2Namespace *b = &plan->relmap_inputs[j].input.staged.identity;
+			if (a->system_identifier == b->system_identifier
+				&& a->database_incarnation == b->database_incarnation
+				&& a->dbid == b->dbid && a->shared == b->shared) {
+				plan->relmap_failed = true; return false;
+			}
+		}
+	receipt = cold_plan_scratch(plan, relmap_terminal_bytes(count), NULL);
+	if (receipt == NULL) { plan->relmap_failed = true; return false; }
+	receipt->plan = plan; receipt->typed = typed; receipt->pid = getpid();
+	receipt->fence = fence; receipt->typed_fence = typed->tx_fence;
+	receipt->count = count; receipt->participants = typed->participant_count;
+	receipt->replay_count = typed->replay_count;
+	receipt->system_identifier = typed->system_identifier;
+	receipt->original = plan->relmap_inputs; receipt->pins = plan->relmap_recovery;
+	receipt->failed = true;
+	plan->relmap_terminal = receipt;
+	plan->relmap_terminal_bytes = relmap_terminal_bytes(count);
+	plan->relmap_terminal_release = relmap_terminal_release;
+	for (uint32 p = 0; p < receipt->participants; ++p) {
+		receipt->sources[p] = typed->sources[p];
+		receipt->cuts[p] = typed->participants[p];
+		receipt->sides[p] = typed->side_plans[p];
+	}
+	for (uint32 i = 0; i < count; ++i)
+		receipt->entries[i].input = plan->relmap_inputs[i];
+	PG_TRY();
+	{
+		ok = true;
+		for (uint32 p = 0; p < receipt->participants && ok; ++p)
+			ok = cluster_cold_typed_checkpoint_v1(typed, p, &receipt->roots[p], &receipt->checkpoints[p]);
+		ok = ok && cluster_cold_typed_relmap_ready_v1(typed, fence);
+		plan->relmap_failed = true;
+		ok = ok && relmap_terminal_inputs(receipt);
+		for (uint32 i = 0; i < count && ok; ++i) {
+			ColdRelmapTerminalEntry *entry = &receipt->entries[i];
+			const ClusterColdRelmapInputV1 *input = &entry->input.input;
+			ClusterRelmapV2View view = {0};
+			ClusterRelmapRecoveryTerminalV1 terminal;
+			view.committed = view.pending_committed = input->staged.committed;
+			view.committed_generation = view.pending_committed_generation = input->staged.committed_generation;
+			view.pending = input->staged.pending;
+			view.pending_generation = input->staged.pending_generation;
+			view.pending_owner = input->staged.pending_owner;
+			view.pending_complete = view.has_pending = true;
+			ok = relmap_terminal_inputs(receipt)
+				&& relmap_current(typed, fence, input)
+				&& cluster_relmap_recovery_prepare_cold_v1(&input->staged.identity, &view,
+					(ClusterRelmapRecoveryHandle **)&handle)
+				&& cluster_relmap_recovery_terminal_read(handle, &input->staged.identity, &view, &terminal)
+				&& terminal.top_full_xid == input->staged.pending_owner.top_full_xid
+				&& (terminal.status == TRANSACTION_STATUS_COMMITTED || terminal.status == TRANSACTION_STATUS_ABORTED)
+				&& cluster_relmap_recovery_terminal_detach_v1(handle, &entry->native);
+			cluster_relmap_recovery_handle_release_v1((ClusterRelmapRecoveryHandle **)&handle);
+			ok = ok && memcmp(&entry->native.selected.source, &input->source, sizeof(input->source)) == 0
+				&& memcmp(&entry->native.selected.checkpoint, &receipt->roots[input->participant],
+					sizeof(entry->native.selected.checkpoint)) == 0
+				&& entry->native.selected.checkpoint_start == receipt->checkpoints[input->participant].checkpoint_start
+				&& memcmp(&entry->native.selected.native_checkpoint,
+					&receipt->checkpoints[input->participant].checkpoint, sizeof(CheckPoint)) == 0
+				&& memcmp(entry->native.selected.native_window,
+					receipt->checkpoints[input->participant].native_window, CLUSTER_RELMAP_CHECKPOINT_WINDOW_SIZE) == 0
+				&& entry->native.selected.native_redo == input->cut.native_redo
+				&& entry->native.selected.checkpoint.validated_tail_lsn_exclusive == input->cut.tail_end
+				&& relmap_current(typed, fence, input) && relmap_terminal_inputs(receipt);
+		}
+		for (uint32 i = 0; i < count && ok; ++i)
+			ok = cluster_clog_native_terminal_current_v1(receipt->entries[i].native.held);
+		ok = ok && relmap_terminal_inputs(receipt);
+		if (ok) {
+			receipt->sealed = true; receipt->failed = false;
+			plan->relmap_failed = false;
+		}
+	}
+	PG_CATCH();
+	{
+		plan->relmap_failed = true;
+		cluster_relmap_recovery_handle_release_v1((ClusterRelmapRecoveryHandle **)&handle);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
+cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdRelmapTerminalCheckV1 *out)
+{
+	const ClusterColdTypedV1 *typed;
+	ColdRelmapTerminal *volatile receipt = NULL;
+	ClusterRecoveryCheckpointOwnerV1 owner = {0};
+	volatile bool ok = false;
+	bool held = false;
+
+	if (out == NULL || start == NULL
+		|| !cluster_recovery_plan_output_distinct_v1(start, out, sizeof(*out)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	/* Locate only borrowed identity before touching output. Both initial
+	 * providers are inside TRY: their ERROR still closes the original Start. */
+	PG_TRY();
+	{
+		do {
+			if (!ClusterColdRecoveryRelmapCurrent(start))
+				break;
+			typed = ClusterColdRecoveryTxInputs(start);
+			if (typed == NULL || !plan_valid(typed->plan))
+				break;
+			receipt = typed->plan->relmap_terminal;
+			if (receipt == NULL || receipt->failed || !receipt->sealed || typed->plan->relmap_failed)
+				break;
+			receipt->failed = true; typed->plan->relmap_failed = true;
+			ForEachLWLockHeldByMe(relmap_recheck_held_lock, &held);
+			if (held || MyBackendType != B_STARTUP || RecoveryInProgress() || CritSectionCount != 0)
+				break;
+			ok = relmap_terminal_start(receipt, start, &owner);
+			for (uint32 i = 0; i < receipt->count && ok; ++i)
+				ok = cluster_clog_native_terminal_current_v1(receipt->entries[i].native.held);
+			ok = ok && relmap_terminal_start(receipt, start, &owner);
+			for (uint32 i = 0; i < receipt->count && ok; ++i)
+				ok = cluster_clog_native_terminal_current_v1(receipt->entries[i].native.held);
+			if (!ok) break;
+			/* No fallible work after this all-entry identity preflight. */
+			for (uint32 i = 0; i < receipt->count; ++i) {
+				const ColdRelmapTerminalEntry *entry = &receipt->entries[i];
+				out->entries[i].participant = entry->input.input.participant;
+				out->entries[i].identity = entry->input.input.staged.identity;
+				out->entries[i].generation = entry->input.input.staged.pending_generation;
+				out->entries[i].top_full_xid = entry->native.terminal.top_full_xid;
+				out->entries[i].status = entry->native.terminal.status;
+				out->entries[i].staged = entry->input.input.staged;
+			}
+			out->count = receipt->count;
+			receipt->failed = false; typed->plan->relmap_failed = false;
+		} while (false);
+	}
+	PG_CATCH();
+	{
+		ClusterColdRecoveryRelmapFail(start);
+		/* No entered provider may leave a previous local result usable. */
+		if (receipt != NULL) { receipt->failed = true; receipt->plan->relmap_failed = true; }
+		memset(out, 0, sizeof(*out));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok) {
+		memset(out, 0, sizeof(*out));
+		ClusterColdRecoveryRelmapFail(start);
+	}
 	return ok;
 }
 #endif

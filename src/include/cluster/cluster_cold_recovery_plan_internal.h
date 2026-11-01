@@ -261,6 +261,11 @@ struct ClusterColdPlanV1 {
 	Size space_scratch_bytes;
 	uint32 *schedule;
 	uint32 schedule_count;
+	/* Only local FD/memory custody; never a debt/pin retirement callback. */
+	void *relmap_terminal;
+	Size relmap_terminal_bytes;
+	void (*relmap_terminal_release)(void *);
+	bool relmap_terminal_attempted;
 	ClusterRelmapRecoveryPins *relmap_recovery;
 	ColdRelmapInput *relmap_inputs;
 	uint32 relmap_count;
@@ -307,6 +312,51 @@ static inline const ColdRelation *
 cold_relation(const ClusterColdPlanV1 *plan, uint32 index)
 {
 	return &((const ColdRelation *)plan->relations.entries)[index];
+}
+
+/* Storage-only check at the original Start owner, before current providers.
+ * It includes failed and never-captured plans; no receipt registry is needed. */
+static inline bool
+cold_relmap_storage_overlap(const void *out, Size bytes, const void *value, Size size)
+{
+	uintptr_t a = (uintptr_t)out, b = (uintptr_t)value;
+	return value != NULL && size != 0 && (a <= b ? b - a < bytes : a - b < size);
+}
+
+static inline bool
+cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Size bytes)
+{
+	const ClusterColdPlanV1 *plan;
+	if (typed == NULL) return true;
+	if (cold_relmap_storage_overlap(out, bytes, typed, sizeof(*typed))) return false;
+	plan = typed->plan;
+	if (plan == NULL) return true;
+	if (cold_relmap_storage_overlap(out, bytes, plan, sizeof(*plan))
+		|| plan->magic != CLUSTER_COLD_PLAN_MAGIC
+		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS
+		|| (plan->relmap_terminal != NULL && plan->relmap_terminal_bytes == 0))
+		return false;
+	return !cold_relmap_storage_overlap(out, bytes, plan->relmap_inputs,
+			(Size)plan->relmap_count * sizeof(ColdRelmapInput))
+		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_recovery,
+			sizeof(ClusterRelmapRecoveryPins))
+		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_terminal,
+			plan->relmap_terminal_bytes);
+}
+
+static inline void
+cold_relmap_terminal_cleanup(ClusterColdPlanV1 *plan)
+{
+	if (plan != NULL && plan->magic == CLUSTER_COLD_PLAN_MAGIC
+		&& plan->relmap_terminal_release != NULL) {
+		void *receipt = plan->relmap_terminal;
+		void (*release)(void *) = plan->relmap_terminal_release;
+		plan->relmap_terminal = NULL;
+		plan->relmap_terminal_bytes = 0;
+		plan->relmap_terminal_release = NULL;
+		plan->relmap_failed = true;
+		release(receipt);
+	}
 }
 
 static inline ColdSpaceOp *

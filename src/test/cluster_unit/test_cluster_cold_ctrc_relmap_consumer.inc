@@ -39,6 +39,7 @@ UT_TEST(test_start_owner_graph_requires_declared_relmap_terminal_input)
 	out = ClusterColdRecoveryCtrcPageProjectedGraph(info.cluster_tx_start, 1024 * 1024);
 	UT_ASSERT(out.detail != RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(owner_scope_empty(&out) && page_contribution_empty(&out));
+	UT_ASSERT_EQ(startup_image_calls, 0);
 	relmap_consumer_preserved(destroyed);
 	/* Discard returned observation storage even on the failing parent. This
 	 * does not retire any native descriptor, pin or original shared duty. */
@@ -58,8 +59,37 @@ UT_TEST(test_start_observation_graph_cannot_bypass_declared_terminal_input)
 	out = ClusterColdRecoveryCtrcPageOwnerGraph(info.cluster_tx_start, 1024 * 1024);
 	UT_ASSERT(out.detail != RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(owner_scope_empty(&out) && page_contribution_empty(&out));
+	UT_ASSERT_EQ(startup_image_calls, 0);
 	relmap_consumer_preserved(destroyed);
 	if (out.detail == RF_PAGE_PROOF_DETAIL_OK) owner_scope_free(&out);
+	owner_scope_cleanup();
+}
+
+static void
+relmap_consumer_owner_error(void)
+{
+	pg_re_throw();
+}
+
+UT_TEST(test_start_owner_graph_terminal_provider_error_keeps_original_debt)
+{
+	RfPageCtrcOwnerGraphV1 out = {0};
+	unsigned destroyed;
+	volatile bool caught = false;
+	owner_scope_after_subject = relmap_consumer_declare;
+	projected_graph_ready(true, false, false);
+	owner_scope_after_subject = NULL;
+	destroyed = input_destroys;
+	relmap_owner_check_step = relmap_consumer_owner_error;
+	PG_TRY(); { out = ClusterColdRecoveryCtrcPageProjectedGraph(info.cluster_tx_start, 1024 * 1024); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	relmap_owner_check_step = NULL;
+	UT_ASSERT(caught);
+	UT_ASSERT(owner_scope_empty(&out) && page_contribution_empty(&out));
+	UT_ASSERT_EQ(startup_image_calls, 0);
+	UT_ASSERT(!ClusterColdRecoveryTxCurrent(info.cluster_tx_start));
+	relmap_consumer_preserved(destroyed);
 	owner_scope_cleanup();
 }
 

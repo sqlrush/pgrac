@@ -346,9 +346,10 @@ UT_TEST(test_relmap_counter_input_preserves_structural_effect_obligation)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(test_relmap_counter_input_preserves_structural_effect_obligation);
 	UT_RUN(test_startup_publish_requires_both_original_and_relmap_receipts);
+	UT_RUN(test_startup_publish_captures_declared_terminal_before_scope_handoff);
 	UT_RUN(test_startup_publish_refuses_missing_effects_before_completion);
 	UT_RUN(test_startup_publish_rejects_inconsistent_coverage_and_clears_receipt);
 	UT_RUN(test_startup_publish_empty_sealed_cut_keeps_later_gates);

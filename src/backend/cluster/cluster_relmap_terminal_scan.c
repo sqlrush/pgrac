@@ -13,6 +13,7 @@
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_recovery.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_relmap_owner.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_side_xact.h"
@@ -535,6 +536,8 @@ struct ClusterRelmapRecoveryHandle {
 	uint8 native_base_fingerprint[32];
 	ClusterClogNativeFileV1 native_base_file;
 	ClusterClogNativeBaseHandleV1 *native_base;
+	bool terminal_captured;
+	ClusterRelmapRecoveryTerminalV1 terminal;
 };
 
 static bool
@@ -1314,6 +1317,7 @@ cluster_relmap_recovery_handle_matches_v1(ClusterRelmapRecoveryHandle *handle,
 		|| recovery_overlap(handle, sizeof(*handle), pending, sizeof(*pending)))
 		return false;
 	/* Original source/owner checks can ERROR. Leave this local handle dead. */
+	handle->terminal_captured = false;
 	handle->failed = true;
 	if (CritSectionCount != 0
 		|| !recovery_pending_encode(identity, pending, &image, pending_wire, committed_wire)
@@ -1409,8 +1413,37 @@ cluster_relmap_recovery_terminal_read(ClusterRelmapRecoveryHandle *handle,
 	result.terminal_end = terminal->terminal_end;
 	result.source_cut = terminal->cut;
 	memcpy(result.fingerprint, handle->native_base_fingerprint, sizeof(result.fingerprint));
+	handle->terminal = result;
+	handle->terminal_captured = true;
 	handle->failed = false;
 	*out = result;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_terminal_detach_v1(ClusterRelmapRecoveryHandle *handle,
+	ClusterRelmapTerminalCustodyV1 *out)
+{
+	if (out == NULL || recovery_overlap(out, sizeof(*out), handle, sizeof(*handle))
+		|| (handle != NULL && handle->scan != NULL
+			&& recovery_overlap(out, sizeof(*out), handle->scan, sizeof(*handle->scan))))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (handle == NULL || handle->pid != getpid() || handle->failed
+		|| !handle->terminal_captured || handle->native_base == NULL)
+		return false;
+	handle->failed = true;
+	if (!recovery_handle_current(handle)
+		|| !cluster_clog_native_terminal_seal_v1(handle->native_base)
+		|| !recovery_handle_current(handle))
+		return false;
+	out->selected = handle->scan->selected;
+	out->scope_serial = handle->scope_serial;
+	out->terminal = handle->terminal;
+	out->file = handle->native_base_file;
+	out->held = handle->native_base;
+	handle->native_base = NULL;
+	/* The old scanner is now release-only, still before scope leave. */
 	return true;
 }
 
