@@ -139,7 +139,30 @@ RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
 
 /* Compile the complete, unchanged production implementation in this unit.
  * Internal state is visible only here for corruption and overflow cases. */
+/* Explicit host lock/context and barrier scheduling inputs for read-only
+ * observations. They never implement a job, pin, receipt or retirement. */
+#include "storage/lwlock.h"
+static bool job_observation_lock_held;
+static void (*job_observation_barrier_hook)(void);
+static LWLockPadded job_observation_lock;
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *argument)
+{
+	if (job_observation_lock_held)
+		callback(&job_observation_lock.lock, LW_EXCLUSIVE, argument);
+}
+static void
+job_observation_barrier(void)
+{
+	pg_read_barrier();
+	if (job_observation_barrier_hook != NULL)
+		job_observation_barrier_hook();
+}
+#pragma push_macro("pg_read_barrier")
+#undef pg_read_barrier
+#define pg_read_barrier() job_observation_barrier()
 #include "cluster_wal_inputs_job.c"
+#pragma pop_macro("pg_read_barrier")
 
 static MemoryContext caller_context, work_context;
 

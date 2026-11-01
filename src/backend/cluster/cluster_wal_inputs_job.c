@@ -9,6 +9,8 @@
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "storage/lwlock.h"
+#include "cluster/cluster_epoch.h"
 #include "utils/memutils.h"
 #include "cluster_wal_inputs_job_private.h"
 
@@ -711,6 +713,124 @@ cluster_wal_inputs_jobs_service_poll_v1(void)
 				|| inputs_jobs[i].job->state == WAL_INPUT_JOB_STATE_RETIRING_WALR)
 			&& cluster_wal_inputs_job_poll_v1(inputs_jobs[i].job) == WAL_INPUT_JOB_INVALID)
 			elog(FATAL, "could not confirm original WAL input job cleanup");
+}
+
+/* Read only the original owner's four locators. The old stop census and
+	* service poll keep their distinct semantics and all retirement responsibility.
+	* Author: SqlRush <sqlrush@gmail.com> */
+static bool
+inputs_jobs_observation_caller(void)
+{
+	return IsUnderPostmaster && cluster_enabled && cluster_shared_config
+		&& MyProc != NULL && MyProcPid > 0 && MyProc->pid == MyProcPid
+		&& MyProc->pgprocno >= 0 && MyProc->backendId == InvalidBackendId
+		&& MyProc->cluster_grd_generation != 0 && MyProc->cluster_grd_generation != UINT64_MAX
+		&& ((MyBackendType == B_CHECKPOINTER && AmCheckpointerProcess()
+							&& inputs_job_caller(WAL_INPUT_JOB_RETAINED_CUT, false))
+						|| (MyBackendType == B_BG_WRITER && AmBackgroundWriterProcess()
+										&& inputs_job_caller(WAL_INPUT_JOB_PI_NOTICE, false)));
+}
+
+static void
+inputs_jobs_observation_lock(LWLock *lock, LWLockMode mode, void *argument)
+{
+	(void)lock; (void)mode;
+	*(bool *)argument = true;
+}
+
+static void
+inputs_jobs_observation_row(const ClusterWalInputsJobV1 *job, ClusterWalInputJobObservationV1 *row)
+{
+	memset(row, 0, sizeof(*row));
+	row->generation = job->generation; row->pin_generation = job->pin_generation;
+	row->state = job->state; row->cf_state = job->cf.state;
+	row->flags = job->flags; row->walr_next = job->walr_next;
+	row->has_scope = job->inputs != NULL; row->has_pin = job->pin != NULL;
+}
+
+ClusterWalInputsJobsObservationResultV1
+cluster_wal_inputs_jobs_service_observe_v1(uint64 expected_epoch, ClusterWalInputsJobsObservationV1 *out)
+{
+	ClusterWalInputsJobsObservationV1 sample = {0};
+	ClusterWalInputsJobSlotV1 locators[CLUSTER_WAL_INPUT_JOB_COUNT];
+	ClusterWalInputJobObservationV1 after;
+	PGPROC *owner;
+	BackendType backend;
+	AuxProcType aux;
+	ResourceOwner resource;
+	bool held_lock = false;
+
+	StaticAssertStmt(CLUSTER_WAL_INPUT_JOB_COUNT == CLUSTER_WAL_INPUT_JOB_OBSERVATIONS,
+																		"all original consumer slots must be observed");
+	StaticAssertStmt(sizeof(sample) + sizeof(locators) + sizeof(after) <= 1024,
+																		"input job collection uses bounded caller stack");
+	if (out == NULL)
+		return WAL_INPUT_JOBS_OBSERVATION_INVALID;
+	memset(out, 0, sizeof(*out));
+	out->reason = "INPUT_JOBS_OWNER_OR_CONTEXT_INVALID";
+	if (expected_epoch == 0 || expected_epoch == UINT64_MAX || !inputs_jobs_observation_caller())
+		return WAL_INPUT_JOBS_OBSERVATION_INVALID;
+	ForEachLWLockHeldByMe(inputs_jobs_observation_lock, &held_lock);
+	if (held_lock)
+		return WAL_INPUT_JOBS_OBSERVATION_INVALID;
+	if (cluster_epoch_get_current() != expected_epoch) {
+		out->reason = "INPUT_JOBS_EPOCH_CHANGED";
+		return WAL_INPUT_JOBS_OBSERVATION_STALE;
+	}
+	owner = MyProc; backend = MyBackendType; aux = MyAuxProcType;
+	resource = CurrentResourceOwner;
+	sample.pid = MyProcPid; sample.pgprocno = owner->pgprocno;
+	sample.backend_id = owner->backendId; sample.proc_generation = owner->cluster_grd_generation;
+	sample.epoch = expected_epoch;
+	for (unsigned i = 0; i < CLUSTER_WAL_INPUT_JOB_COUNT; ++i) {
+		ClusterWalInputsJobV1 *job = inputs_jobs[i].job;
+
+		locators[i] = inputs_jobs[i];
+		if (inputs_job_empty(&inputs_jobs[i]))
+			continue;
+		if (inputs_job_find(job, false) == NULL || job->generation == UINT64_MAX) {
+			out->reason = "INPUT_JOBS_ORIGINAL_BINDING_INVALID";
+			return WAL_INPUT_JOBS_OBSERVATION_INVALID;
+		}
+		sample.present |= UINT32_C(1) << i;
+		inputs_jobs_observation_row(job, &sample.jobs[i]);
+	}
+	pg_read_barrier();
+	ForEachLWLockHeldByMe(inputs_jobs_observation_lock, &held_lock);
+	if (held_lock || !inputs_jobs_observation_caller() || MyProc != owner
+		|| MyBackendType != backend || MyAuxProcType != aux
+		|| CurrentResourceOwner != resource || AuxProcessResourceOwner != resource
+		|| MyProcPid != sample.pid || owner->pgprocno != sample.pgprocno
+		|| owner->cluster_grd_generation != sample.proc_generation) {
+		out->reason = "INPUT_JOBS_RETURN_IDENTITY_INVALID";
+		return WAL_INPUT_JOBS_OBSERVATION_INVALID;
+	}
+	if (cluster_epoch_get_current() != expected_epoch) {
+		out->reason = "INPUT_JOBS_EPOCH_CHANGED";
+		return WAL_INPUT_JOBS_OBSERVATION_STALE;
+	}
+	for (unsigned i = 0; i < CLUSTER_WAL_INPUT_JOB_COUNT; ++i) {
+		if (memcmp(&locators[i], &inputs_jobs[i], sizeof(locators[i])) != 0) {
+			out->reason = "INPUT_JOBS_LOCATOR_CHANGED";
+			return WAL_INPUT_JOBS_OBSERVATION_INVALID;
+		}
+		if ((sample.present & (UINT32_C(1) << i)) == 0)
+			continue;
+		if (inputs_job_find(inputs_jobs[i].job, false) == NULL) {
+			out->reason = "INPUT_JOBS_ORIGINAL_BINDING_INVALID";
+			return WAL_INPUT_JOBS_OBSERVATION_INVALID;
+		}
+		inputs_jobs_observation_row(inputs_jobs[i].job, &after);
+		if (memcmp(&sample.jobs[i], &after, sizeof(after)) != 0) {
+			out->reason = "INPUT_JOBS_POINT_CHANGED";
+			return WAL_INPUT_JOBS_OBSERVATION_INVALID;
+		}
+	}
+	sample.known = true;
+	sample.reason = sample.present != 0 ? "INPUT_JOBS_ORIGINAL_RESPONSIBILITY_PENDING"
+		: "INPUT_JOBS_PRODUCER_CLOSURE_UNPROVED";
+	*out = sample;
+	return WAL_INPUT_JOBS_OBSERVATION_PENDING;
 }
 
 #endif

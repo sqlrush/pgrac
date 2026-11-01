@@ -68,6 +68,39 @@ extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_finish_v1(ClusterWalIn
 extern void cluster_wal_inputs_jobs_service_poll_v1(void);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_jobs_stop_census_v1(void);
 
+/* Original checkpointer/bgwriter only, at an unlocked return boundary.
+	* These are process-local point observations, not job/pin/CF receipts, input
+	* use, a producer seal or a reusable completion cut. In particular DONE may
+	* retain the failed caller's original business scope. Empty stays PENDING.
+	* State/flags are opaque original job diagnostics; no new wire/layout state.
+	* Invalid or changed identity clears all samples. No polling or retirement.
+	*/
+#define CLUSTER_WAL_INPUT_JOB_OBSERVATIONS 4
+typedef struct ClusterWalInputJobObservationV1 {
+	uint64 generation, pin_generation;
+	uint32 state, cf_state;
+	uint16 flags, walr_next;
+	bool has_scope, has_pin;
+} ClusterWalInputJobObservationV1;
+typedef struct ClusterWalInputsJobsObservationV1 {
+	int32 pid, pgprocno, backend_id;
+	uint32 present;
+	uint64 proc_generation, epoch;
+	ClusterWalInputJobObservationV1 jobs[CLUSTER_WAL_INPUT_JOB_OBSERVATIONS];
+	bool known;
+	const char *reason;
+} ClusterWalInputsJobsObservationV1;
+typedef enum ClusterWalInputsJobsObservationResultV1 {
+	WAL_INPUT_JOBS_OBSERVATION_INVALID = -1,
+	WAL_INPUT_JOBS_OBSERVATION_PENDING = 0,
+	WAL_INPUT_JOBS_OBSERVATION_STALE = 1
+} ClusterWalInputsJobsObservationResultV1;
+StaticAssertDecl(sizeof(ClusterWalInputsJobsObservationV1) <= 256,
+																	"input job observation is bounded caller storage");
+extern ClusterWalInputsJobsObservationResultV1 cluster_wal_inputs_jobs_service_observe_v1(
+	uint64 expected_epoch, ClusterWalInputsJobsObservationV1 *out);
+
+
 /* Release every read pin while a background job waits for a peer. Suspended
  * scopes cannot expose inputs, read WAL or qualify use of an existing plan.
  * Resume reacquires the same sorted pin set and compares the complete original

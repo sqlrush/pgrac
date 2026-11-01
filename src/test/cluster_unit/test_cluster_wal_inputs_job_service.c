@@ -316,6 +316,8 @@ UT_TEST(service_ack_at_latch_reset_is_observed_before_interrupt_handling)
 	}
 }
 
+#include "test_cluster_input_job_observation.inc"
+
 int
 main(void)
 {
@@ -332,7 +334,7 @@ main(void)
 	cluster_control_request_shmem_init();
 	control_driver = retire_driver = cluster_control_request_driver_start();
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(9);
+	UT_PLAN(17);
 	UT_RUN(service_bgwriter_128_acks_progress_without_delay_or_new_wait);
 	UT_RUN(service_checkpointer_128_acks_progress_without_checkpoint_timer);
 	UT_RUN(service_ack_at_latch_reset_is_observed_before_interrupt_handling);
@@ -342,6 +344,14 @@ main(void)
 	UT_RUN(service_original_cf_confirmation_precedes_walr_in_both_aux_loops);
 	UT_RUN(service_stopped_publication_loop_keeps_original_ack_progress);
 	UT_RUN(service_foreign_identity_refuses_before_interrupt_or_business_work);
+ UT_RUN(input_observation_empty_original_owner_stays_pending);
+ UT_RUN(input_observation_all_four_consumers_preserve_original_cf_and_done);
+ UT_RUN(input_observation_128_walr_acks_are_passive_at_original_ticks);
+ UT_RUN(input_observation_never_confirms_cf_or_releases_walr);
+ UT_RUN(input_observation_invalid_slot_dominates_prior_pending);
+ UT_RUN(input_observation_rejects_wrong_owner_and_context);
+ UT_RUN(input_observation_discards_identity_epoch_and_job_drift);
+ UT_RUN(input_observation_retained_done_detect_keeps_business_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

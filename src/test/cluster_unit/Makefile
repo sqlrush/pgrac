@@ -13502,7 +13502,7 @@ test_cluster_wal_inputs_job_quiesce.inc: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_stop.inc test_cluster_wal_inputs_job_quiesce.inc
 
 test_cluster_wal_inputs_job_stop_module.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c Makefile
-	awk '/^cl_normal_stop_modules_poll\(/ { owner=1 } \
+	awk '/^cl_shared_native_observe\(/ { owner=1 } \
 	     owner && /^[ \t]*case 15:/ { emit=1; cases++ } \
 	     emit { print } emit && /^[ \t]*break;/ { emit=0; owner=0 } \
 	     END { if (cases != 1 || emit) exit 1 }' $< > $@.tmp
@@ -13674,3 +13674,6 @@ test_cluster_survivor_candidate: test_cluster_survivor_candidate.c test_cluster_
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) \
 		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# Original input-job owner observations in the real ACK/service-loop fixture.
+test_cluster_wal_inputs_job_service: test_cluster_input_job_observation.inc
