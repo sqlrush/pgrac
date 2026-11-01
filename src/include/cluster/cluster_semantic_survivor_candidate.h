@@ -10,6 +10,9 @@
  * Begin requires zeroed storage. Invalidation retains original obligations;
  * it does not permit reuse. Inputs are untrusted syntax, including receipts
  * and transport generation: staging never authenticates an ingress owner.
+ * Begin/stage recheck actual native epoch and original shared gate scope;
+ * these negative fences do not qualify ROOT, membership or producer closure.
+ * A confirmed local change invalidates; unknown publication stays PENDING.
  * None of these operations can return CURRENT or set confirmed table bits.
  * There is no live routing, allocation, wakeup, closure or service effect.
  */

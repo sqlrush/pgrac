@@ -13685,3 +13685,6 @@ test_cluster_wal_inputs_job_service test_cluster_snapshot_admission test_cluster
  test_cluster_survivor_producer_fixture.h \
  $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_producer.c \
  $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_producer.h
+
+# Original pending collection rejects local epoch/gate drift.
+test_cluster_survivor_candidate: test_cluster_survivor_candidate_invalidation.inc test_cluster_backend_return_gate.inc
