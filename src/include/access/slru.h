@@ -164,6 +164,10 @@ extern void SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint)
  * and IO locks, borrows existing AVAILABLE file, no segment creation or WAL. */
 extern void SimpleLruNativeClogReplayV2(SlruCtl ctl, const void *record, Size length,
 									  XLogRecPtr record_end);
+/* Same Startup custody for an existing selected segment's immutable header.
+ * Original cached page effects/dirty/LSNs survive; no segment or page birth. */
+extern void SimpleLruNativeClogSegmentReplayV2(SlruCtl ctl, const void *record, Size length,
+										 XLogRecPtr record_end);
 #endif
 
 extern Size SimpleLruShmemSize(int nslots, int nlsns);

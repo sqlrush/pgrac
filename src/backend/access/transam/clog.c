@@ -1605,13 +1605,18 @@ clog_redo(XLogReaderState *record)
 	{
 		/* This original rmgr call owns Startup's retained source/cut. WAL
 		 * supplies neither a selected file registration nor foreign authority. */
-		if (info != CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2 ||
+		if ((info != CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2 &&
+			 info != CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2) ||
 			XLogRecHasAnyBlockRefs(record) ||
 			record->ReadRecPtr == InvalidXLogRecPtr ||
 			record->EndRecPtr == PG_UINT64_MAX || record->EndRecPtr <= record->ReadRecPtr)
 			CLOGRequireLegacyLifecycle();
-		SimpleLruNativeClogReplayV2(XactCtl, XLogRecGetData(record),
-								  XLogRecGetDataLen(record), record->EndRecPtr);
+		if (info == CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2)
+			SimpleLruNativeClogSegmentReplayV2(XactCtl, XLogRecGetData(record),
+											 XLogRecGetDataLen(record), record->EndRecPtr);
+		else
+			SimpleLruNativeClogReplayV2(XactCtl, XLogRecGetData(record),
+									  XLogRecGetDataLen(record), record->EndRecPtr);
 		return;
 	}
 #endif

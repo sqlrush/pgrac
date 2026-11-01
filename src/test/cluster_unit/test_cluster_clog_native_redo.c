@@ -162,18 +162,115 @@ UT_TEST(fsync_and_real_error_count_failures_keep_original_cache_and_duties)
 		UT_ASSERT_EQ(identities[0].image_lsn, 100); redo_done(false);
 	}
 }
+static void segment_reset(bool resident)
+{
+	redo_reset(resident);
+	UT_ASSERT(cluster_clog_file_header_encode_v2(&binding, redo_record + 128, 8192));
+	redo_decoded.header.xl_info = CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2;
+	redo_decoded.main_data_len = CLUSTER_CLOG_SEGMENT_WAL_BYTES_V2;
+}
+static void segment_cache_unchanged(const PGAlignedBlock *before,
+	const ClusterClogPageIdentityV2 *identity, const XLogRecPtr *before_lsn, bool resident)
+{
+	UT_ASSERT_EQ(memcmp(page.data, before->data, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(identities, identity, sizeof(*identity)), 0);
+	UT_ASSERT_EQ(memcmp(lsns, before_lsn, sizeof(lsns)), 0);
+	UT_ASSERT_EQ(states[0], resident ? SLRU_PAGE_VALID : SLRU_PAGE_EMPTY);
+	UT_ASSERT_EQ(numbers[0], 3);
+	UT_ASSERT_EQ(dirty[0], resident);
+}
+UT_TEST(original_segment_rmgr_repairs_header_without_changing_resident_effects)
+{
+	PGAlignedBlock before;
+	ClusterClogPageIdentityV2 identity;
+	uint8 header[8192], disk_frame[8256], checked[8256], torn = 0;
+	XLogRecPtr before_lsn[2];
+
+	segment_reset(true); before = page; identity = identities[0];
+	memcpy(before_lsn, lsns, sizeof(lsns));
+	UT_ASSERT_EQ(pread(borrowed, disk_frame, sizeof(disk_frame), 8192 + 3 * 8256), sizeof(disk_frame));
+	UT_ASSERT_EQ(pwrite(borrowed, &torn, 1, 0), 1);
+	UT_ASSERT(redo_run());
+	UT_ASSERT_EQ(pread(borrowed, header, sizeof(header), 0), sizeof(header));
+	UT_ASSERT_EQ(memcmp(header, redo_record + 128, sizeof(header)), 0);
+	UT_ASSERT_EQ(pread(borrowed, checked, sizeof(checked), 8192 + 3 * 8256), sizeof(checked));
+	UT_ASSERT_EQ(memcmp(disk_frame, checked, sizeof(checked)), 0);
+	segment_cache_unchanged(&before, &identity, before_lsn, true);
+	UT_ASSERT_EQ(writes, 1); UT_ASSERT_EQ(syncs, 1); redo_done(true);
+}
+UT_TEST(original_segment_rmgr_empty_existing_file_creates_no_page_birth)
+{
+	PGAlignedBlock before;
+	ClusterClogPageIdentityV2 identity;
+	XLogRecPtr before_lsn[2];
+	struct stat st;
+
+	segment_reset(false); before = page; identity = identities[0];
+	memcpy(before_lsn, lsns, sizeof(lsns));
+	UT_ASSERT_EQ(ftruncate(borrowed, 0), 0);
+	UT_ASSERT(redo_run());
+	UT_ASSERT_EQ(fstat(borrowed, &st), 0); UT_ASSERT_EQ(st.st_size, 8192);
+	segment_cache_unchanged(&before, &identity, before_lsn, false);
+	UT_ASSERT_EQ(writes, 1); UT_ASSERT_EQ(syncs, 1); redo_done(true);
+}
+UT_TEST(original_segment_rmgr_rejects_missing_identity_and_other_valid_header)
+{
+	for (unsigned f = 0; f < 5; f++) {
+		PGAlignedBlock before;
+		ClusterClogPageIdentityV2 identity;
+		ClusterClogFileBindingV2 other;
+		uint8 header[8192];
+		XLogRecPtr before_lsn[2];
+
+		segment_reset(true); before = page; identity = identities[0];
+		memcpy(before_lsn, lsns, sizeof(lsns)); other = binding;
+		other.identity.creation_generation++;
+		if (f == 0) redo_missing = true;
+		if (f == 1) {
+			UT_ASSERT(cluster_recovery_file_identity_encode_v2(&other.identity, redo_record, 128));
+			UT_ASSERT(cluster_clog_file_header_encode_v2(&other, redo_record + 128, 8192));
+		}
+		if (f == 2) {
+			UT_ASSERT(cluster_clog_file_header_encode_v2(&other, header, sizeof(header)));
+			UT_ASSERT_EQ(pwrite(borrowed, header, sizeof(header), 0), sizeof(header));
+		}
+		if (f == 3) redo_decoded.main_data_len--;
+		if (f == 4) redo_reader.EndRecPtr = redo_reader.ReadRecPtr;
+		UT_ASSERT(!redo_run()); segment_cache_unchanged(&before, &identity, before_lsn, true);
+		UT_ASSERT_EQ(writes + syncs, 0); redo_done(false);
+	}
+}
+UT_TEST(original_segment_rmgr_failures_preserve_cache_and_release_only_own_duties)
+{
+	for (unsigned f = 0; f < 6; f++) {
+		PGAlignedBlock before;
+		ClusterClogPageIdentityV2 identity;
+		XLogRecPtr before_lsn[2];
+
+		segment_reset(true); before = page; identity = identities[0];
+		memcpy(before_lsn, lsns, sizeof(lsns));
+		fail_sync = f == 0; redo_throw_read = f == 1; redo_open_error = f == 2;
+		redo_drift = f == 3; short_write = f == 4; fail_write = f == 5;
+		UT_ASSERT(!redo_run()); segment_cache_unchanged(&before, &identity, before_lsn, true);
+		redo_done(false);
+	}
+}
 int main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-redo-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(6);
+	UT_PLAN(10);
 	UT_RUN(original_rmgr_merges_dirty_resident_only_after_durable_same_fd_replay);
 	UT_RUN(original_rmgr_miss_reconstructs_complete_selected_frame);
 	UT_RUN(replay_is_idempotent_and_retains_newer_resident_source);
 	UT_RUN(unknown_legacy_wrong_identity_or_end_refuse_before_disk_mutation);
 	UT_RUN(conflicting_terminal_or_cache_birth_never_overwrites);
 	UT_RUN(fsync_and_real_error_count_failures_keep_original_cache_and_duties);
+	UT_RUN(original_segment_rmgr_repairs_header_without_changing_resident_effects);
+	UT_RUN(original_segment_rmgr_empty_existing_file_creates_no_page_birth);
+	UT_RUN(original_segment_rmgr_rejects_missing_identity_and_other_valid_header);
+	UT_RUN(original_segment_rmgr_failures_preserve_cache_and_release_only_own_duties);
 	unlink(filename); rmdir(directory);
 	UT_DONE(); return ut_failed_count != 0;
 }
