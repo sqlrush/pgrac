@@ -6853,6 +6853,8 @@ test_cluster_undo_pending_product.o: test_cluster_undo_pending_product.c \
 
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_tx_resolve.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_freeze.h \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
 		$(top_srcdir)/src/include/cluster/cluster_ctrc_origin_fullxid.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
@@ -6862,6 +6864,7 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_freeze.c \
 		test_cluster_undo_pending_product.o \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \

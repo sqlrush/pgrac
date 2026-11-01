@@ -20,11 +20,13 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "access/heapam.h"
 #include "access/xact.h"
 #include "access/subtrans.h"
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_heap_freeze.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_membership.h"
@@ -8095,10 +8097,189 @@ UT_TEST(test_tt40_held_physical_and_current_owner_status_readers)
 	}
 }
 
+/* Use the real canonical TT40 producer and freeze CU. Page/final-owner facts
+ * are caller inputs here; this does not exercise a live VACUUM lifetime. */
+static void
+init_tt40_freeze_consumer(bool same_segment, unsigned zero_fields,
+	ClusterHeapFreezePageBatchV1 *page, ClusterHeapFreezeProofBatchV1 *proofs,
+	ClusterHeapFreezeFinalFenceV1 *fence)
+{
+	ClusterTxResolution resolution;
+	ClusterSemanticAdmissionToken admission = {
+		.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		.record_generation = 5, .side = CLUSTER_SEMANTIC_TARGET_SIDE, .entered = true
+	};
+	ClusterHeapFreezeTupleInputV1 *tuple;
+	ClusterTxResolveReason reason;
+
+	setup_original_full_xid(same_segment);
+	test_candidate_tt_v2 = true;
+	test_candidate_persisted_full = U64FromFullTransactionId(test_original_full_xid);
+	test_original_available = false;
+	if (zero_fields & 1)
+		test_candidate_data_generation = test_candidate_tt_generation = 0;
+	if (zero_fields & 2)
+		test_tt_generation = 0;
+	if (zero_fields & 4)
+		test_formation_epoch = CLUSTER_EPOCH_INITIAL;
+	admission.formation_epoch = test_formation_epoch;
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &admission,
+		&resolution, &reason), CLUSTER_TX_COMMITTED);
+	UT_ASSERT(resolution.local_canonical_valid);
+	UT_ASSERT(resolution.local_creation_target.valid);
+	UT_ASSERT(!resolution.origin_companion.present);
+	UT_ASSERT_EQ(U64FromFullTransactionId(resolution.local_original_full_xid),
+		test_candidate_persisted_full);
+	UT_ASSERT_EQ(resolution.local_canonical_generation,
+		same_segment ? test_candidate_data_generation : test_candidate_tt_generation);
+	UT_ASSERT_EQ(resolution.authority.origin_epoch, test_formation_epoch);
+	UT_ASSERT_EQ(resolution.authority.tt_generation, test_tt_generation);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+
+	memset(page, 0, sizeof(*page));
+	memset(proofs, 0, sizeof(*proofs));
+	memset(fence, 0, sizeof(*fence));
+	fence->identity.state = CLUSTER_SPACE_IDENTITY_LIVE;
+	fence->identity.key.locator = resolution.local_creation_target.locator;
+	fence->identity.sequence = 1;
+	fence->block = resolution.local_creation_target.block;
+	fence->page_lsn = 0x987654321ULL;
+	fence->page_version = scn_encode(0, 90);
+	fence->holder_sequence = 11;
+	fence->master_sequence = 12;
+	fence->admission_generation = 5;
+	proofs->proof_count = 1;
+	UT_ASSERT(cluster_heap_freeze_build_canonical_proof_v1(&test_origin_locator,
+		&resolution, fence, fence, true, true, true, &proofs->proofs[0]));
+	page->identity = fence->identity;
+	page->block = fence->block;
+	page->page_lsn = fence->page_lsn;
+	page->page_version = fence->page_version;
+	page->carrier_request_count = 1;
+	page->carrier_requests[0].locator = test_origin_locator;
+	page->carrier_requests[0].carrier.xid = test_origin_locator.xid;
+	page->carrier_requests[0].carrier.undo_segment_head = test_origin_locator.uba;
+	page->tuple_count = 1;
+	tuple = &page->tuples[0];
+	tuple->offset = resolution.local_creation_target.offset;
+	tuple->tuple_offset = MAXALIGN(SizeOfPageHeaderData);
+	tuple->tuple_length = resolution.local_creation_target.tuple_length;
+	tuple->header_length = SizeofHeapTupleHeader;
+	tuple->raw_xmin = test_origin_locator.xid;
+	tuple->infomask = HEAP_XMAX_INVALID;
+	tuple->infomask2 = 5;
+	tuple->has_carrier = true;
+	tuple->itl_slot_index = test_origin_locator.itl_slot_index;
+	tuple->carrier = page->carrier_requests[0].carrier;
+	tuple->creation_target_proof_index = CLUSTER_HEAP_FREEZE_NO_CREATION_TARGET;
+}
+
+static void
+check_tt40_initial_freeze_consumer(unsigned zero_fields)
+{
+	for (int same = 0; same < 2; same++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeXminCandidateBatchV1 candidates;
+		HeapTupleFreeze single, batch;
+		TransactionId horizon = InvalidTransactionId;
+		FullTransactionId limit = FullTransactionIdFromEpochAndXid(9, 900);
+		SCN h = scn_encode(0, 200);
+		int acquires;
+
+		init_tt40_freeze_consumer(same, zero_fields, &page, &proofs, &fence);
+		acquires = test_candidate_acquire_calls;
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proofs.proofs[0]),
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 1);
+		UT_ASSERT_EQ(U64FromFullTransactionId(page.tuples[0].original_creator_full_xid),
+			test_candidate_persisted_full);
+		UT_ASSERT(cluster_heap_freeze_select_xmin_candidates_v1(&page, &proofs, &fence,
+			limit, h, &candidates));
+		UT_ASSERT_EQ(candidates.target_count, 1);
+		UT_ASSERT(cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
+			candidates.targets[0].original_creator_full_xid, limit, h, &single));
+		UT_ASSERT(cluster_heap_freeze_prepare_xmin_batch_v1(&page, &proofs, &fence,
+			candidates.targets, 1, limit, h, &batch, 1, &horizon));
+		UT_ASSERT_EQ(single.offset, page.tuples[0].offset);
+		UT_ASSERT_EQ(single.t_infomask, page.tuples[0].infomask | HEAP_XMIN_FROZEN);
+		UT_ASSERT_EQ(single.t_infomask2, page.tuples[0].infomask2);
+		UT_ASSERT_EQ(single.xmax, page.tuples[0].raw_xmax);
+		UT_ASSERT(memcmp(&single, &batch, sizeof(single)) == 0);
+		UT_ASSERT_EQ(horizon, TEST_ORIGIN_XID);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, acquires);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
+UT_TEST(test_tt40_known_generation_zero_reaches_freeze_plan)
+{
+	check_tt40_initial_freeze_consumer(0);
+	check_tt40_initial_freeze_consumer(1);
+}
+
+UT_TEST(test_tt40_zero_rollover_count_reaches_freeze_plan)
+{
+	check_tt40_initial_freeze_consumer(2);
+}
+
+UT_TEST(test_tt40_initial_epoch_and_all_zero_counters_reach_freeze_plan)
+{
+	check_tt40_initial_freeze_consumer(4);
+	check_tt40_initial_freeze_consumer(7);
+}
+
+UT_TEST(test_tt40_initial_counters_keep_identity_current_and_strict_bounds)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		ClusterHeapFreezePageBatchV1 page;
+		ClusterHeapFreezeProofBatchV1 proofs;
+		ClusterHeapFreezeFinalFenceV1 fence;
+		ClusterHeapFreezeXminCandidateBatchV1 candidates;
+		HeapTupleFreeze plan, saved_plan;
+		FullTransactionId original = FullTransactionIdFromEpochAndXid(9, TEST_ORIGIN_XID);
+		FullTransactionId limit = FullTransactionIdFromEpochAndXid(9, 900);
+		SCN h = scn_encode(0, 200);
+
+		init_tt40_freeze_consumer(false, 7, &page, &proofs, &fence);
+		UT_ASSERT_EQ(cluster_heap_freeze_validate_canonical_proof_v1(&proofs.proofs[0]),
+			CLUSTER_HEAP_FREEZE_PROOF_PROVEN);
+		switch (fault) {
+		case 0: proofs.proofs[0].c1b_finalized = false; break;
+		case 1: proofs.proofs[0].authority_current = false; break;
+		case 2: proofs.proofs[0].admission_current = false; break;
+		case 3: proofs.proofs[0].current_fence.page_lsn++; break;
+		case 4: proofs.proofs[0].resolution.local_canonical_generation = UINT32_MAX; break;
+		case 5: proofs.proofs[0].resolution.local_canonical.xid++; break;
+		case 6: proofs.proofs[0].resolution.local_canonical.wrap++; break;
+		case 7: proofs.proofs[0].resolution.local_canonical_valid = false; break;
+		case 8: proofs.proofs[0].resolution.local_original_full_xid = InvalidFullTransactionId; break;
+		case 9: proofs.proofs[0].resolution.local_creation_target.offset++; break;
+		case 10: limit = original; break;
+		case 11: limit = FullTransactionIdFromEpochAndXid(8, 900); break;
+		case 12: h = proofs.proofs[0].resolution.commit_scn; break;
+		case 13: original = FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID); break;
+		case 14: proofs.proofs[0].resolution.authority.live_hwm_lsn = InvalidXLogRecPtr; break;
+		}
+		cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence);
+		memset(&candidates, 0xA5, sizeof(candidates));
+		if (cluster_heap_freeze_select_xmin_candidates_v1(&page, &proofs, &fence,
+			limit, h, &candidates))
+			UT_ASSERT_EQ(candidates.target_count, fault == 13 ? 1 : 0);
+		memset(&plan, 0xA5, sizeof(plan)); saved_plan = plan;
+		UT_ASSERT(!cluster_heap_freeze_prepare_xmin_v1(&page, &proofs, &fence, 0,
+			original, limit, h, &plan));
+		UT_ASSERT(memcmp(&plan, &saved_plan, sizeof(plan)) == 0);
+		UT_ASSERT_EQ(test_candidate_held_count, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(220);
+	UT_PLAN(224);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);
@@ -8319,6 +8500,10 @@ main(void)
 	UT_RUN(test_tt40_canonical_malformed_slot_refuses_before_native_lookup);
 	UT_RUN(test_tt40_canonical_original_final_fences_still_clear_identity);
 	UT_RUN(test_tt40_held_physical_and_current_owner_status_readers);
+	UT_RUN(test_tt40_known_generation_zero_reaches_freeze_plan);
+	UT_RUN(test_tt40_zero_rollover_count_reaches_freeze_plan);
+	UT_RUN(test_tt40_initial_epoch_and_all_zero_counters_reach_freeze_plan);
+	UT_RUN(test_tt40_initial_counters_keep_identity_current_and_strict_bounds);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

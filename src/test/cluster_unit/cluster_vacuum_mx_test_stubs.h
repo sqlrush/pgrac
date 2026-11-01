@@ -96,6 +96,14 @@ ConditionalLockBufferForCleanup(Buffer buf)
 	return fixture_cleanup;
 }
 
+bool
+IsBufferCleanupOK(Buffer buf)
+{
+	(void)buf;
+	UT_ASSERT(fixture_locks > 0);
+	return fixture_cleanup;
+}
+
 void
 LockBuffer(Buffer buf, int mode)
 {

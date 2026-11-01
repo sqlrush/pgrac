@@ -38,6 +38,7 @@ def extract(source):
         print(function(source, "lazy_validate_shared_freeze", "static void"))
     if re.search(r"^lazy_prepare_shared_freeze\(", source, re.M):
         print(function(source, "lazy_prepare_shared_freeze", "static void"))
+    print(function(source, "lazy_lock_buffer_for_cleanup", "static bool"))
     print(function(source, "lazy_scan_heap", "static void"))
 
     # Keep both native assertions and the real publication decision intact.

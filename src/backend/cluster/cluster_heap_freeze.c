@@ -401,8 +401,9 @@ freeze_canonical_locator_shape_valid(const ClusterTxLocator *request,
 			&& !resolution->local_creation_target.valid
 			&& ClusterR4TxCompanionIsValid(resolution);
 	}
-	if (resolution->local_canonical_generation == 0
-		|| resolution->local_canonical_generation == UINT32_MAX
+	/* The explicit canonical-valid marker distinguishes a sampled generation
+	 * from an absent locator. Zero is a valid initial physical generation. */
+	if (resolution->local_canonical_generation == UINT32_MAX
 		|| resolution->local_canonical.reserved32 != 0
 		|| resolution->local_canonical.segment_id == 0
 		|| resolution->local_canonical.segment_id > UINT16_MAX
@@ -477,9 +478,9 @@ cluster_heap_freeze_validate_canonical_proof_v1(
 		return CLUSTER_HEAP_FREEZE_PROOF_KEEP_UNPROVEN;
 
 	resolution = &proof->resolution;
-	if (resolution->authority.origin_epoch == 0
-		|| XLogRecPtrIsInvalid(resolution->authority.live_hwm_lsn)
-		|| resolution->authority.tt_generation == 0
+	/* Epoch and rollover count both start at zero. Their currentness comes
+	 * from the explicit gates above, not a nonzero numeric sentinel. */
+	if (XLogRecPtrIsInvalid(resolution->authority.live_hwm_lsn)
 		|| !SCN_VALID(resolution->authority.authority_scn)
 		|| !freeze_canonical_locator_shape_valid(&proof->requested_locator, resolution))
 		return CLUSTER_HEAP_FREEZE_PROOF_HARD_ERROR;

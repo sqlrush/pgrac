@@ -2702,7 +2702,7 @@ UT_TEST(creation_provenance_rejection_clears_preceding_attempt)
 		switch (variant) {
 		case 0: proofs.proof_count = 0; break;
 		case 1: fence.page_version++; break;
-		case 2: proofs.proofs[0].resolution.local_canonical_generation = 0; break;
+		case 2: proofs.proofs[0].resolution.local_canonical_generation = UINT32_MAX; break;
 		case 3: proofs.proofs[0].resolution.local_creation_target.valid = false; break;
 		}
 		UT_ASSERT_EQ(cluster_heap_freeze_bind_creation_targets_v1(&page, &proofs, &fence), 0);
