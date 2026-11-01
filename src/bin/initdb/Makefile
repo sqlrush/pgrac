@@ -79,3 +79,9 @@ check:
 
 installcheck:
 	$(prove_installcheck)
+
+# PGRAC: rebuild the original creator when the managed file contract changes.
+pgrac_relmap.o: pgrac_relmap.h \
+	$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
