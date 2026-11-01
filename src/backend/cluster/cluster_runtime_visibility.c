@@ -1015,7 +1015,7 @@ static FullTransactionId
 cluster_runtime_visibility_origin_original_full_xid(
 	const ClusterTxResolution *candidate, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission,
-	const ClusterUndoBlock0ResolvedRoot *root)
+	const ClusterUndoBlock0ResolvedRoot *root, bool operation_aware)
 {
 	ClusterTTSlotCurrentOwner owner = {0};
 	ClusterUndoBlock0Generation generation = {false, 0};
@@ -1024,11 +1024,18 @@ cluster_runtime_visibility_origin_original_full_xid(
 
 	/* Optional local observation only. Its absence must not change the
 	 * transaction verdict or invoke another TT/DATA read or acquisition. */
-	if (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS || candidate == NULL
+	if ((mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
+		 && (!operation_aware || mode != CLUSTER_TX_RESOLVE_VISIBILITY)) || candidate == NULL
 		|| admission == NULL || root == NULL || !admission->entered
-		|| candidate->outcome != CLUSTER_TX_COMMITTED
+		|| (candidate->outcome != CLUSTER_TX_COMMITTED
+			&& !(operation_aware
+				 && (candidate->outcome == CLUSTER_TX_ABORTED
+					 || (candidate->outcome == CLUSTER_TX_IN_PROGRESS
+						 && mode == CLUSTER_TX_RESOLVE_VISIBILITY))))
 		|| candidate->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
-		|| !SCN_VALID(candidate->commit_scn) || !candidate->local_canonical_valid
+		|| (candidate->outcome == CLUSTER_TX_COMMITTED
+				? !SCN_VALID(candidate->commit_scn) : candidate->commit_scn != InvalidScn)
+		|| !candidate->local_canonical_valid
 		|| candidate->top_xid != candidate->locator_echo.xid
 		|| candidate->local_canonical.xid != candidate->locator_echo.xid
 		|| candidate->local_canonical.wrap != candidate->locator_echo.tt_wrap
@@ -1052,9 +1059,11 @@ cluster_runtime_visibility_origin_original_full_xid(
 	generation.value = candidate->local_canonical_generation;
 	if (!cluster_runtime_visibility_ctrc_key_fill(&owner, &generation, root, admission, &key))
 		return InvalidFullTransactionId;
-	/* The original origin row may already be retired.  Only the exact
-	 * original ACTIVE slot handoff is an alternative local source; neither
-	 * miss changes the verdict or obtains new canonical/current authority. */
+	/* The operation/history plan may attach the same exact identity to an
+	 * already-decided visibility ACTIVE or terminal ABORTED sample. Raw
+	 * top-only readers retain their committed-terminal-only observation.
+	 * An original row may be retired: the exact retained slot handoff is
+	 * an alternative source, never a verdict or new current authority. */
 	if ((!cluster_ctrc_origin_original_full_xid_shared(&key, &original)
 		 && !cluster_tt_slot_origin_identity_read(&key, &original))
 		|| !FullTransactionIdIsNormal(original)
@@ -2316,7 +2325,7 @@ cluster_runtime_visibility_origin_plan_freeze_data_internal(
 	plan_data->candidate.local_canonical_valid = true;
 	plan_data->candidate.local_original_full_xid
 		= cluster_runtime_visibility_origin_original_full_xid(
-			&plan_data->candidate, mode, admission, root);
+			&plan_data->candidate, mode, admission, root, false);
 	if (plan_data->candidate.authority.origin_epoch != admission->formation_epoch
 		|| XLogRecPtrIsInvalid(plan_data->candidate.authority.live_hwm_lsn)
 		|| !SCN_VALID(plan_data->candidate.authority.authority_scn)
@@ -2674,7 +2683,7 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	plan_data->candidate.local_canonical_valid = true;
 	plan_data->candidate.local_original_full_xid
 		= cluster_runtime_visibility_origin_original_full_xid(
-			&plan_data->candidate, mode, admission, root);
+			&plan_data->candidate, mode, admission, root, plan_data->operation_plan != 0);
 	if (plan_data->candidate.authority.origin_epoch != admission->formation_epoch
 		|| XLogRecPtrIsInvalid(plan_data->candidate.authority.live_hwm_lsn)
 		|| !SCN_VALID(plan_data->candidate.authority.authority_scn)) {

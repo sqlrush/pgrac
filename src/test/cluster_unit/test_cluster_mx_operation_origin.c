@@ -292,6 +292,10 @@ UT_TEST(mx_origin_unavailable_active_abort_and_visibility_identity_refuse)
 	for (int kind = 0; kind < 3; kind++) {
 		MxOriginFixture f;
 		mx_origin_init(&f, false);
+		/* These cases exercise unavailable identity, not a permanent ban
+		 * on terminal abort or ordinary visibility with an exact source. */
+		if (kind != 0)
+			test_original_available = false;
 		if (kind == 0) {
 			test_tt_slot.status = TT_SLOT_ACTIVE;
 			test_tt_slot.commit_scn = InvalidScn;
@@ -313,7 +317,7 @@ UT_TEST(mx_origin_unavailable_active_abort_and_visibility_identity_refuse)
 		} else if (!mx_origin_begin(&f))
 			return;
 		UT_ASSERT_EQ(mx_origin_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED);
-		UT_ASSERT_EQ(test_original_calls, 0);
+		UT_ASSERT_EQ(test_original_calls, kind == 0 ? 0 : 1);
 		UT_ASSERT_EQ(test_candidate_acquire_calls, 2);
 		mx_origin_empty(&f);
 	}
@@ -827,10 +831,161 @@ UT_TEST(mx_held_fresh_copy_rejects_drift_and_pre_sample)
 	}
 }
 
+/* State 0/1/2 exercise ordinary visibility; state 3 is terminal abort.
+ * The outcome is decided by the existing TT/native reader, not the source. */
+static ClusterTxResolveMode
+mx_identity_state(int state)
+{
+	if (state == 1) {
+		test_tt_slot.status = TT_SLOT_ACTIVE;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+	} else if (state >= 2) {
+		test_tt_slot.status = TT_SLOT_ABORTED;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_native_status = TRANSACTION_STATUS_ABORTED;
+	}
+	return state == 3 ? CLUSTER_TX_RESOLVE_TERMINAL_CENSUS : CLUSTER_TX_RESOLVE_VISIBILITY;
+}
+
+static void
+mx_identity_source(bool retained)
+{
+	test_original_available = !retained;
+	g_retained_origin_available = retained;
+	g_retained_origin_full = test_original_full_xid;
+}
+
+UT_TEST(mx_identity_visibility_and_abort_use_independent_source)
+{
+	const ClusterTxOutcome expected[] = {
+		CLUSTER_TX_COMMITTED, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_ABORTED, CLUSTER_TX_ABORTED
+	};
+	for (int same = 0; same < 2; same++)
+		for (int source = 0; source < 2; source++)
+			for (int state = 0; state < 4; state++) {
+				MxOriginFixture f;
+				ClusterTxResolveMode mode;
+				mx_origin_init(&f, same);
+				mode = mx_identity_state(state);
+				mx_identity_source(source != 0);
+				UT_ASSERT(cluster_runtime_visibility_mx_operation_origin_read_begin(
+					&f.read, &f.key, mode, &f.origin.admission, &f.origin.reason));
+				UT_ASSERT_EQ(mx_origin_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE);
+				UT_ASSERT_EQ(f.effect.top_outcome, expected[state]);
+				UT_ASSERT_EQ(f.effect.top_commit_scn, state == 0 ? test_commit_scn : InvalidScn);
+				UT_ASSERT(FullTransactionIdEquals(f.effect.identity.top_fxid, f.key.top_fxid));
+				UT_ASSERT(FullTransactionIdEquals(f.effect.identity.operation_fxid,
+												f.key.operation_fxid));
+				UT_ASSERT(cluster_savepoint_reader_mx_effect_valid(&f.effect));
+				UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+				UT_ASSERT_EQ(test_candidate_release_calls, 3);
+				UT_ASSERT_EQ(test_original_calls, 1);
+				UT_ASSERT_EQ(g_retained_origin_reads, source);
+				UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+			}
+}
+
+UT_TEST(mx_identity_visibility_refuses_missing_or_mismatched_source)
+{
+	for (int state = 0; state < 4; state++)
+		for (int fault = 0; fault < 7; fault++) {
+			MxOriginFixture f;
+			ClusterTxResolveMode mode;
+			mx_origin_init(&f, false);
+			mode = mx_identity_state(state);
+			mx_identity_source(true);
+			switch (fault) {
+			case 0: g_retained_origin_available = false; break;
+			case 1: g_retained_origin_full = InvalidFullTransactionId; break;
+			case 2: g_retained_origin_full = FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID); break;
+			case 3: test_original_key.slot_wrap++; break;
+			case 4: test_original_key.segment_generation++; break;
+			case 5: test_original_key.root_generation++; break;
+			case 6: test_original_key.origin_boot_incarnation++; break;
+			}
+			UT_ASSERT(cluster_runtime_visibility_mx_operation_origin_read_begin(
+				&f.read, &f.key, mode, &f.origin.admission, &f.origin.reason));
+			UT_ASSERT_EQ(mx_origin_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED);
+			UT_ASSERT_EQ(test_original_calls, 1);
+			UT_ASSERT_EQ(g_retained_origin_reads, 1);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, 2);
+			mx_origin_empty(&f);
+		}
+}
+
+UT_TEST(mx_identity_source_drift_is_fenced_before_final_data)
+{
+	for (int state = 0; state < 4; state++)
+		for (int source = 0; source < 2; source++)
+			for (int drift = 1; drift <= 4; drift++) {
+				MxOriginFixture f;
+				ClusterTxResolveMode mode;
+				mx_origin_init(&f, false);
+				mode = mx_identity_state(state);
+				mx_identity_source(source != 0);
+				if (source)
+					g_retained_origin_drift = drift;
+				else
+					test_original_drift = drift;
+				/* The common root leaf uses its regular-call fence to
+				 * expose drift; terminal census has no such calls. */
+				if (mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS && drift == 2)
+					test_regular_root_resolve_calls = 2;
+				UT_ASSERT(cluster_runtime_visibility_mx_operation_origin_read_begin(
+					&f.read, &f.key, mode, &f.origin.admission, &f.origin.reason));
+				UT_ASSERT_EQ(mx_origin_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED);
+				UT_ASSERT_EQ(test_original_calls, 1);
+				UT_ASSERT_EQ(g_retained_origin_reads, source);
+				UT_ASSERT_EQ(test_candidate_acquire_calls, 2);
+				mx_origin_empty(&f);
+			}
+}
+
+UT_TEST(mx_identity_held_active_projection_does_not_upgrade_or_grant)
+{
+	for (int physical = 0; physical < 2; physical++) {
+		MxOriginFixture f;
+		ClusterTxResolution top;
+		bool live = false, active = true;
+		mx_held_init(&f, false);
+		(void)mx_identity_state(1);
+		if (!physical) {
+			test_tt_slot.status = TT_SLOT_COMMITTED;
+			test_tt_slot.commit_scn = test_commit_scn;
+		}
+		mx_identity_source(true);
+		UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_mx_operation_held(
+			&f.key, CLUSTER_TX_RESOLVE_VISIBILITY, &f.origin.admission, &f.origin.guard,
+			&f.origin.data_root, &f.origin.plan, &f.origin.reason),
+			CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL);
+		UT_ASSERT(cluster_runtime_visibility_origin_plan_sample_mx_operation_held(
+			&f.origin.plan, &f.key, CLUSTER_TX_RESOLVE_VISIBILITY, &f.origin.admission,
+			&f.origin.guard, &f.origin.tt_root, &live, &f.origin.reason));
+		UT_ASSERT(live);
+		UT_ASSERT(cluster_runtime_visibility_origin_plan_mx_sampled_top(&f.origin.plan, &top, &active));
+		UT_ASSERT_EQ(active, physical != 0);
+		UT_ASSERT_EQ(top.outcome, CLUSTER_TX_IN_PROGRESS);
+		UT_ASSERT_EQ(top.commit_scn, InvalidScn);
+		/* Later native COMMIT does not replace this attempt's ACTIVE sample. */
+		test_native_status = TRANSACTION_STATUS_COMMITTED;
+		UT_ASSERT(cluster_runtime_visibility_origin_plan_copy_mx_operation_held(
+			&f.origin.plan, &f.key, CLUSTER_TX_RESOLVE_VISIBILITY, &f.origin.admission,
+			&f.origin.guard, &f.origin.data_root, &f.origin.top, &f.effect, &f.origin.reason));
+		UT_ASSERT_EQ(f.effect.top_outcome, CLUSTER_TX_IN_PROGRESS);
+		UT_ASSERT_EQ(test_original_calls, 1);
+		UT_ASSERT_EQ(g_retained_origin_reads, 1);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+		UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+		test_candidate_held_count = 0;
+	}
+}
+
 int
 MX_OPERATION_ORIGIN_TEST_MAIN(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(29);
 	UT_RUN(mx_operation_before_mutation_rechecks_runtime_identity);
 	UT_RUN(mx_origin_same_and_cross_segment_three_current_phases);
 	UT_RUN(mx_origin_stages_until_final_release);
@@ -856,6 +1011,10 @@ MX_OPERATION_ORIGIN_TEST_MAIN(void)
 	UT_RUN(mx_held_original_full_xid_is_independent);
 	UT_RUN(mx_held_bad_or_cold_freeze_has_no_io);
 	UT_RUN(mx_held_fresh_copy_rejects_drift_and_pre_sample);
+	UT_RUN(mx_identity_visibility_and_abort_use_independent_source);
+	UT_RUN(mx_identity_visibility_refuses_missing_or_mismatched_source);
+	UT_RUN(mx_identity_source_drift_is_fenced_before_final_data);
+	UT_RUN(mx_identity_held_active_projection_does_not_upgrade_or_grant);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

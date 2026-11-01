@@ -493,6 +493,10 @@ UT_TEST(history_origin_unavailable_active_abort_visibility_fail_closed)
 	for (int kind = 0; kind < 3; kind++) {
 		HistoryOriginFixture f;
 		history_origin_init(&f, false);
+		/* Exact-source positive cases are separate; retain this negative
+		 * contract by making identity genuinely unavailable. */
+		if (kind != 0)
+			test_original_available = false;
 		if (kind == 0) {
 			test_tt_slot.status = TT_SLOT_ACTIVE;
 			test_tt_slot.commit_scn = InvalidScn;
@@ -512,7 +516,7 @@ UT_TEST(history_origin_unavailable_active_abort_visibility_fail_closed)
 		} else if (!history_begin(&f))
 			return;
 		UT_ASSERT_EQ(history_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED);
-		UT_ASSERT_EQ(test_original_calls, 0);
+		UT_ASSERT_EQ(test_original_calls, kind == 0 ? 0 : 1);
 		UT_ASSERT_EQ(test_candidate_acquire_calls, 2);
 	}
 }
@@ -921,10 +925,88 @@ UT_TEST(creator_origin_refuses_missing_identity_and_unflushed_commit)
 
 #include "test_cluster_mx_exact_cold_runtime.inc"
 
+static bool
+history_identity_begin(HistoryOriginFixture *f, ClusterTxResolveMode mode)
+{
+	return cluster_mx_history_request_encode(&f->request, &f->wire)
+		&& cluster_runtime_visibility_history_origin_read_begin(&f->base.read, &f->wire,
+			mode, &f->base.origin.admission, &f->base.origin.reason);
+}
+
+UT_TEST(history_identity_visibility_and_abort_bind_independent_source)
+{
+	const ClusterTxOutcome expected[] = {
+		CLUSTER_TX_COMMITTED, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_ABORTED, CLUSTER_TX_ABORTED
+	};
+	for (int v1 = 0; v1 < 2; v1++)
+		for (int source = 0; source < 2; source++)
+			for (int state = 0; state < 4; state++) {
+				HistoryOriginFixture f;
+				ClusterTxResolveMode mode;
+				history_origin_init(&f, false);
+				if (v1)
+					history_origin_v1();
+				mode = mx_identity_state(state);
+				mx_identity_source(source != 0);
+				UT_ASSERT(history_identity_begin(&f, mode));
+				UT_ASSERT_EQ(history_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE);
+				UT_ASSERT_EQ(f.top.outcome, expected[state]);
+				UT_ASSERT_EQ(f.top.commit_scn, state == 0 ? test_commit_scn : InvalidScn);
+				UT_ASSERT_EQ(f.record.record_class, v1 ? CMXH_V1_TOP : CMXH_OPERATION);
+				UT_ASSERT(FullTransactionIdEquals(f.record.identity.top_fxid, f.base.key.top_fxid));
+				UT_ASSERT(FullTransactionIdEquals(f.record.identity.operation_fxid,
+					v1 ? f.base.key.top_fxid : f.base.key.operation_fxid));
+				UT_ASSERT_EQ(test_original_calls, 1);
+				UT_ASSERT_EQ(g_retained_origin_reads, source);
+				UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+				UT_ASSERT_EQ(test_candidate_release_calls, 3);
+				UT_ASSERT_EQ(memcmp(f.output.data, test_operation_page.data, BLCKSZ), 0);
+			}
+}
+
+UT_TEST(history_identity_active_missing_or_drifting_source_stays_unknown)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		HistoryOriginFixture f;
+		history_origin_init(&f, false);
+		(void)mx_identity_state(1);
+		mx_identity_source(true);
+		if (fault == 0)
+			g_retained_origin_available = false;
+		else if (fault == 1)
+			g_retained_origin_full = FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID);
+		else
+			g_retained_origin_drift = fault - 1;
+		UT_ASSERT(history_identity_begin(&f, CLUSTER_TX_RESOLVE_VISIBILITY));
+		UT_ASSERT_EQ(history_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED);
+		UT_ASSERT_EQ(test_original_calls, 1);
+		UT_ASSERT_EQ(g_retained_origin_reads, 1);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 2);
+		UT_ASSERT(history_is_zero(&f.top, sizeof(f.top)));
+		UT_ASSERT(history_is_zero(&f.record, sizeof(f.record)));
+	}
+}
+
+UT_TEST(history_identity_prepared_never_becomes_active)
+{
+	HistoryOriginFixture f;
+	history_origin_init(&f, false);
+	(void)mx_identity_state(1);
+	test_twophase_prepared = true;
+	mx_identity_source(true);
+	UT_ASSERT(history_identity_begin(&f, CLUSTER_TX_RESOLVE_VISIBILITY));
+	UT_ASSERT_EQ(history_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED);
+	UT_ASSERT_EQ(test_original_calls, 0);
+	UT_ASSERT_EQ(g_retained_origin_reads, 0);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 2);
+	UT_ASSERT(history_is_zero(&f.top, sizeof(f.top)));
+	UT_ASSERT(history_is_zero(&f.record, sizeof(f.record)));
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(29);
 	UT_RUN(history_origin_root_three_phases_same_and_cross_segment);
 	UT_RUN(history_origin_global_and_v1_keep_exact_identity);
 	UT_RUN(history_origin_control_returns_fresh_snapshot);
@@ -951,6 +1033,9 @@ main(void)
 	UT_RUN(mx_cold_real_loader_error_accounts_before_rethrow);
 	UT_RUN(creator_origin_reuses_three_phases_without_live_grant);
 	UT_RUN(creator_origin_refuses_missing_identity_and_unflushed_commit);
+	UT_RUN(history_identity_visibility_and_abort_bind_independent_source);
+	UT_RUN(history_identity_active_missing_or_drifting_source_stays_unknown);
+	UT_RUN(history_identity_prepared_never_becomes_active);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
