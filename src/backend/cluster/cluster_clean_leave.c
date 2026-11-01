@@ -1842,52 +1842,18 @@ cl_normal_stop_fronts_lmon_tick(void)
 		SetLatch(ProcGlobal->checkpointerLatch);
 }
 
+/* Point observations only. The caller separately establishes its original
+ * identity, producer/actor cut and final revalidation. No stop state changes. */
 static ClusterNormalStopPollResult
-cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
-							ClusterNormalStopModuleObservation *observation,
-							const ClusterPhase1FullStopPlan *current_observation)
+cl_shared_native_observe(bool post_checkpoint, bool require_pi_retired,
+	const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], uint64 epoch,
+	ClusterNormalStopModuleObservation *observation)
 {
 	static const char *const names[]
 		= { "ACTIVE_WRITE", "TT_SLOT", "UNDO_BLOCK0", "CTRC", "PCM",	  "GCS", "SF",
 			"GES_REPLY",	"GRD",	   "BUFMGR",	  "OID",  "SEQUENCE", "HW",	 "CF", "KO",
 			"WAL_INPUT_JOB" };
-	ClusterNormalStopModuleObservation ignored;
-	ClusterPhase1FullStopPlan identity;
 	ClusterNormalStopPollResult result, aggregate = CLUSTER_NORMAL_STOP_READY;
-	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
-	uint64 epoch;
-	uint32 phase;
-	const char *reason;
-
-	if (observation == NULL)
-		observation = &ignored;
-	memset(observation, 0, sizeof(*observation));
-	observation->module = "COORDINATOR";
-	observation->reason = "NORMAL_STOP_MODULE_CONTEXT_INVALID";
-	if (!IsUnderPostmaster || (!AmCheckpointerProcess() && !(post_checkpoint && AmLmonProcess()))
-		|| cl_state == NULL || cl_normal_stop == NULL || !cluster_normal_stop_requested()
-		|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
-		return CLUSTER_NORMAL_STOP_INVALID;
-	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
-	if ((!post_checkpoint
-		 && (phase < CLUSTER_NORMAL_STOP_DRAIN || phase > CLUSTER_NORMAL_STOP_CHECKPOINT))
-		|| (post_checkpoint && phase != CLUSTER_NORMAL_STOP_CHECKPOINT
-			&& phase != CLUSTER_NORMAL_STOP_POST_STOPPED)) {
-		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
-		return CLUSTER_NORMAL_STOP_INVALID;
-	}
-	result = cluster_shared_config && current_observation != NULL
-				 ? cl_normal_stop_identity_recheck(post_checkpoint, current_observation, &identity,
-												   &reason)
-				 : cl_normal_stop_identity_poll(post_checkpoint, &identity, &reason);
-	if (result != CLUSTER_NORMAL_STOP_READY) {
-		observation->reason = reason;
-		return result;
-	}
-	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
-	memcpy(root, cl_normal_stop->root_descriptor, sizeof(root));
-	epoch = cl_normal_stop->epoch;
-	LWLockRelease(&cl_state->lock);
 
 	/* Observations are deliberately not an atomic snapshot. Each owner uses
 	 * its original locks; the caller must also establish the producer/actor
@@ -2034,6 +2000,108 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 			*observation = current;
 		}
 	}
+	return aggregate;
+}
+
+static void
+cl_native_observe_lock(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)arg = true;
+}
+
+ClusterNormalStopPollResult
+cluster_native_producers_observe(
+	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], uint64 expected_epoch,
+	ClusterNormalStopModuleObservation *observation)
+{
+	ClusterNormalStopPollResult result;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	bool held_lock = false;
+
+	if (observation == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	memset(observation, 0, sizeof(*observation));
+	observation->module = "NATIVE_OWNER";
+	observation->reason = "NATIVE_OWNER_OR_INPUT_INVALID";
+	if (!IsUnderPostmaster || !AmCheckpointerProcess() || MyBackendType != B_CHECKPOINTER
+		|| !cluster_enabled || !cluster_shared_config || root_descriptor == NULL
+		|| expected_epoch == 0 || expected_epoch == UINT64_MAX || CritSectionCount != 0)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	ForEachLWLockHeldByMe(cl_native_observe_lock, &held_lock);
+	if (held_lock) {
+		observation->reason = "NATIVE_CALLER_LOCK_HELD";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	observation->reason = "NATIVE_EPOCH_CHANGED";
+	if (cluster_epoch_get_current() != expected_epoch)
+		return CLUSTER_NORMAL_STOP_PENDING;
+	memcpy(root, root_descriptor, sizeof(root));
+	result = cl_shared_native_observe(false, false, root, expected_epoch, observation);
+	/* Keep a real module contradiction even if the surrounding view changed.
+		* This closes the local observation interval, never the producer cut. */
+	if (result == CLUSTER_NORMAL_STOP_INVALID)
+		return result;
+	if (cluster_epoch_get_current() != expected_epoch
+		|| memcmp(root, root_descriptor, sizeof(root)) != 0) {
+		observation->module = "NATIVE_INPUT";
+		observation->reason = "NATIVE_INPUT_CHANGED";
+		observation->object[0] = '\0';
+		return CLUSTER_NORMAL_STOP_PENDING;
+	}
+	if (result == CLUSTER_NORMAL_STOP_READY) {
+		observation->module = "ALL_SHARED_OWNERS";
+		observation->reason = "NATIVE_SHARED_POINT_READY_NOT_A_PRODUCER_CUT";
+	}
+	return result;
+}
+
+static ClusterNormalStopPollResult
+cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
+							ClusterNormalStopModuleObservation *observation,
+							const ClusterPhase1FullStopPlan *current_observation)
+{
+	ClusterNormalStopModuleObservation ignored;
+	ClusterPhase1FullStopPlan identity;
+	ClusterNormalStopPollResult result, aggregate = CLUSTER_NORMAL_STOP_READY;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint64 epoch;
+	uint32 phase;
+	const char *reason;
+
+	if (observation == NULL)
+		observation = &ignored;
+	memset(observation, 0, sizeof(*observation));
+	observation->module = "COORDINATOR";
+	observation->reason = "NORMAL_STOP_MODULE_CONTEXT_INVALID";
+	if (!IsUnderPostmaster || (!AmCheckpointerProcess() && !(post_checkpoint && AmLmonProcess()))
+		|| cl_state == NULL || cl_normal_stop == NULL || !cluster_normal_stop_requested()
+		|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	if ((!post_checkpoint
+		 && (phase < CLUSTER_NORMAL_STOP_DRAIN || phase > CLUSTER_NORMAL_STOP_CHECKPOINT))
+		|| (post_checkpoint && phase != CLUSTER_NORMAL_STOP_CHECKPOINT
+			&& phase != CLUSTER_NORMAL_STOP_POST_STOPPED)) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	result = cluster_shared_config && current_observation != NULL
+				 ? cl_normal_stop_identity_recheck(post_checkpoint, current_observation, &identity,
+												   &reason)
+				 : cl_normal_stop_identity_poll(post_checkpoint, &identity, &reason);
+	if (result != CLUSTER_NORMAL_STOP_READY) {
+		observation->reason = reason;
+		return result;
+	}
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	memcpy(root, cl_normal_stop->root_descriptor, sizeof(root));
+	epoch = cl_normal_stop->epoch;
+	LWLockRelease(&cl_state->lock);
+
+	aggregate = cl_shared_native_observe(post_checkpoint, require_pi_retired, root, epoch,
+		observation);
 	if (aggregate == CLUSTER_NORMAL_STOP_INVALID) {
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 		return aggregate;

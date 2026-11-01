@@ -80,6 +80,7 @@ static TimestampTz fixture_now = 1000000;
 static ClusterNormalStopPollResult module_results[14];
 static unsigned module_calls[14];
 static unsigned module_post_calls;
+static uint64 native_observe_fixture_epoch = 9, native_observe_epoch_after_poll;
 static bool module_pi_pending;
 static unsigned module_pi_retire_calls;
 static void (*pi_cut_race_after_shared_unlock)(void);
@@ -288,6 +289,8 @@ module_fixture(unsigned index, bool post, const char **reason)
 		abort();
 	module_calls[index]++;
 	module_post_calls += post;
+	if (index == 13 && native_observe_epoch_after_poll != 0)
+		native_observe_fixture_epoch = native_observe_epoch_after_poll;
 	if (index == 12 && module_change_root)
 		identity_root[80] ^= 1;
 	if (index == 12 && identity_read_dispatch_lmon && cl_normal_stop_service_depth != 0) {
@@ -2201,7 +2204,7 @@ int cluster_interconnect_connect_timeout_ms = 1000;
 uint64
 cluster_epoch_get_current(void)
 {
-	return 9;
+	return native_observe_fixture_epoch;
 }
 int
 cluster_ic_tier1_my_data_channel(void)
@@ -6645,6 +6648,8 @@ UT_TEST(test_pre_front_buffer_observation_never_advances_cut)
 	cluster_trace_cleanup = false;
 }
 
+#include "test_cluster_native_producers_observe.inc"
+
 int
 main(void)
 {
@@ -6654,7 +6659,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(169);
+	UT_PLAN(175);
 	UT_RUN(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
@@ -6824,6 +6829,12 @@ main(void)
 	UT_RUN(test_pre2_pair_release_never_shrinks_or_rebinds_members);
 	UT_RUN(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal);
 	UT_RUN(test_pre2_pair_identity_rejects_root_serving_set_mismatch);
+	UT_RUN(test_online_native_observation_keeps_original_stop_gate);
+	UT_RUN(test_online_native_each_pending_and_exact_original_return);
+	UT_RUN(test_online_native_invalid_and_unknown_never_poison_stop);
+	UT_RUN(test_online_native_owner_input_and_unlocked_guards);
+	UT_RUN(test_online_native_epoch_and_input_changes_remain_provisional);
+	UT_RUN(test_online_native_observation_does_not_need_leave_state);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
