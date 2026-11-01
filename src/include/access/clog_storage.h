@@ -73,4 +73,31 @@ extern bool cluster_clog_storage_initialize_v2(int fd,
 									 const void *payload, Size payload_length,
 									 XLogRecPtr *last_end);
 
+/* Replay a selected native segment-header (0x40) or full-page (0x50) record
+ * through an original Startup recovery owner's borrowed read/write FD. The
+ * owner continuously holds exact control registration, legal retained source/
+ * cut, file lifetime, page I/O serialization and old-writer exclusion. Neither
+ * a matching record nor InRecovery supplies those rights. The owner must know
+ * independently that this is its registered managed file, including when its
+ * header is torn. No open/create, directory sync, WAL insertion, truncate or
+ * ordinary recovery authority is added here.
+ *
+ * The actual record end is required. Complete existing valid disk effects are
+ * preserved. Optional current_frame is the original owner's complete private
+ * same-birth replay state, including all effects not yet on disk; it must cover
+ * every valid disk effect. NULL/0 asserts no extra unflushed replay state, not
+ * permission to discard valid disk terminal bits. Conflicts refuse before
+ * mutation. A damaged header needs its own selected segment record first.
+ *
+ * Success follows whole-header/frame write, fsync and complete same-FD
+ * readback, then stores the consumed record end (not checkpoint coverage).
+ * Refusal/ERROR retains inputs/output, borrowed FD and partial material; the
+ * original recovery owner retains retry/error responsibility. All native,
+ * SIDE/cold and lifecycle callers must be composed before format activation. */
+extern bool cluster_clog_storage_replay_v2(int fd,
+									const ClusterClogFileBindingV2 *expected,
+									uint8 info, const void *record, Size record_length,
+									XLogRecPtr record_end, const void *current_frame,
+									Size current_length, XLogRecPtr *applied_end);
+
 #endif
