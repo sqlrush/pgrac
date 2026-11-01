@@ -29,24 +29,28 @@ history_no_mrp_bound(void)
 	return InvalidScn;
 }
 
-/* Only self is admitted in these cases. A remote capability query would be
- * an unexpected expansion of this actual local-publication test. */
+/* Remote capability and report contents are controlled input leaves. The
+ * original self-only cases still reject every remote-capability query. */
+static int history_peer = -1;
+static uint32 history_peer_generation;
+
 bool
-cluster_sf_peer_capability_word_sample(int32 peer pg_attribute_unused(),
-									   uint32 required pg_attribute_unused(),
-									   uint32 *word pg_attribute_unused(),
-									   uint32 *generation pg_attribute_unused())
+cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word,
+									   uint32 *generation)
 {
-	abort();
-	return false;
+	if (peer != history_peer || required != PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2
+		|| word == NULL || generation == NULL)
+		abort();
+	*word = required;
+	*generation = history_peer_generation;
+	return true;
 }
 bool
-cluster_sf_peer_capability_generation_matches(int32 peer pg_attribute_unused(),
-											  uint32 required pg_attribute_unused(),
-											  uint32 generation pg_attribute_unused())
+cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint32 generation)
 {
-	abort();
-	return false;
+	if (peer != history_peer || required != PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2)
+		abort();
+	return generation != 0 && generation == history_peer_generation;
 }
 
 #undef SpinLockAcquire
@@ -89,6 +93,40 @@ history_publish(SCN h, uint32 kind)
 	if (!native_cleaner_sample(&active))
 		abort();
 	undo_horizon_publish_local_history(&active, &raw);
+}
+
+/* This is an accepted remote-input boundary, not an authenticated sender.
+ * Its original slot publisher and every subsequent consumer remain real. */
+static void
+history_publish_peer(uint64 sequence, SCN horizon, uint32 kind)
+{
+	ClusterUndoCleanerActiveSample active;
+	ClusterHeapFreezeReportV2 report = {0};
+	uint8 image[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	if ((history_peer != 1 && history_peer != 65) || !native_cleaner_sample(&active))
+		abort();
+	report.version = CLUSTER_HEAP_FREEZE_REPORT_V2_VERSION;
+	report.length = CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES;
+	report.sysid = active.admission_fence.system_identifier;
+	report.record_generation = active.admission_fence.record_generation;
+	report.formation_epoch = active.admission_fence.formation_epoch;
+	report.incarnation = active.admission_fence.admitted_incarnation[history_peer];
+	report.origin = history_peer;
+	report.report_sequence = sequence;
+	report.future_full_xid = U64FromFullTransactionId(active.scan.future_full);
+	report.active_full_xid_min = U64FromFullTransactionId(active.scan.min_full);
+	report.f_sample_id = active.sample_id;
+	report.horizon_scn = horizon;
+	report.h_sample_clock_scn = 3000;
+	report.h_contributor_kind = kind;
+	report.h_contributor_token = kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK ? 0 : 91;
+	report.sender_interval_ms = cluster_lmon_main_loop_interval;
+	if (!cluster_heap_freeze_report_v2_encode(&report, image))
+		abort();
+	undo_horizon_v2_publish(&history_lmon.freeze_slots[history_peer], &report,
+							&active.admission_fence, history_peer_generation,
+							GetCurrentTimestamp(), false);
 }
 
 /* Exercise the actual shared reserve/cancel producers between complete passes.
@@ -155,6 +193,34 @@ history_wait_scheduler(void)
 							history_schedule == 6
 								? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK
 								: CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+			break;
+		case 8: /* Only local publication advances on the first wake. */
+		case 9: /* Only the required peer advances on the first wake. */
+			if (capacity_sleeps == 1) {
+				if (history_schedule == 8)
+					history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+				else
+					history_publish_peer(2, 1000,
+						CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+			} else if (capacity_sleeps == 2) {
+				history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+				history_publish_peer(3, 1000,
+					CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+			} else {
+				/* A bad policy must fail assertions instead of waiting forever. */
+				history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+				history_publish_peer(4, 3000,
+					CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+			}
+			break;
+		case 10: /* A reconnect does not replace the old admitted report. */
+			if (capacity_sleeps == 1)
+				history_peer_generation++;
+			else {
+				history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+				history_publish_peer(2, 3000,
+					CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+			}
 			break;
 		default:
 			abort();
@@ -591,6 +657,105 @@ UT_TEST(test_maximum_pool_last_image_cannot_be_hidden_by_a_protected_prefix)
 	}
 }
 
+static UndoSegmentHeaderData peer_headers_before[CLUSTER_UNDO_SEGS_PER_INSTANCE];
+
+static void
+history_admit_peer(int peer)
+{
+	history_peer = peer;
+	history_peer_generation = 17;
+	if (peer < 64)
+		native_pass_source.admitted_members_lo |= UINT64CONST(1) << peer;
+	else
+		native_pass_source.admitted_members_hi |= UINT64CONST(1) << (peer - 64);
+	native_pass_source.admitted_incarnation[peer] = 1100 + peer;
+	do {
+		undo_cleaner_sample_active_pass();
+	} while (undo_cleaner_active_scan_pending);
+	pg_atomic_init_u32(&history_lmon.freeze_slots[peer].seq, 0);
+	history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+	history_publish_peer(1, 1000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+	memcpy(peer_headers_before, history_headers, sizeof(history_headers));
+}
+
+UT_TEST(test_required_peer_and_self_reports_both_advance_before_history_refusal)
+{
+	static const int peers[] = {1, 65};
+
+	for (unsigned index = 0; index < lengthof(peers); index++)
+		for (unsigned peer_only = 0; peer_only < 2; peer_only++) {
+			ClusterCtrcTxnKeyV1 continuation = {0};
+			ClusterHeapFreezeCohortObservation observation;
+			ClusterUndoCapacityStats stats;
+			bool producer = false;
+			int peer = peers[index];
+
+			history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+			history_admit_peer(peer);
+			UT_ASSERT_EQ(cluster_undo_capacity_history_observe(&observation, &producer),
+				CLUSTER_HEAP_FREEZE_COHORT_READY);
+			UT_ASSERT(producer);
+			UT_ASSERT_EQ(observation.source_local_report_sequence, 2);
+			UT_ASSERT_EQ(observation.source_peer_report_sequence[peer], 1);
+			UT_ASSERT_EQ(observation.source_local_horizon_scn, 3000);
+			UT_ASSERT_EQ(observation.source_local_history.contributor_kind,
+				CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+			UT_ASSERT_EQ(observation.source_peer_history[peer].contributor_kind,
+				CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+			UT_ASSERT_EQ(observation.horizon_scn, 1000);
+			history_schedule = peer_only ? 9 : 8;
+			UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+			UT_ASSERT_EQ(history_lmon.report_sequence, peer_only ? 3 : 4);
+			UT_ASSERT_EQ(history_lmon.freeze_slots[peer].view.report.report_sequence, 3);
+			UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+			UT_ASSERT_EQ(stats.pool_wait_count, 2);
+			UT_ASSERT_EQ(stats.wakeup_recheck_count, 2);
+			UT_ASSERT_EQ(stats.refused_proof_count, 1);
+			UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+			UT_ASSERT_EQ(memcmp(peer_headers_before, history_headers, sizeof(history_headers)), 0);
+			history_finish(2);
+			history_peer = -1;
+		}
+}
+
+UT_TEST(test_required_peer_reconnect_cannot_reuse_the_old_history_report)
+{
+	static const int peers[] = {1, 65};
+
+	for (unsigned index = 0; index < lengthof(peers); index++) {
+		ClusterCtrcTxnKeyV1 continuation = {0};
+		ClusterHeapFreezeCohortObservation original;
+		ClusterHeapFreezeReportV2SlotShmem before;
+		ClusterUndoCapacityStats stats;
+		bool producer = false;
+		int peer = peers[index];
+
+		history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+		history_admit_peer(peer);
+		before = history_lmon.freeze_slots[peer];
+		UT_ASSERT_EQ(cluster_undo_capacity_history_observe(&original, &producer),
+			CLUSTER_HEAP_FREEZE_COHORT_READY);
+		UT_ASSERT(producer);
+		history_schedule = 10;
+		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT_EQ(cluster_undo_capacity_history_current(&original),
+			CLUSTER_HEAP_FREEZE_COHORT_IDENTITY_CHANGED);
+		UT_ASSERT_EQ(history_peer_generation, 18);
+		UT_ASSERT_EQ(history_lmon.freeze_slots[peer].capability_generation, 17);
+		UT_ASSERT_EQ(history_lmon.freeze_slots[peer].view.report.report_sequence, 1);
+		UT_ASSERT_EQ(history_lmon.report_sequence, 2);
+		UT_ASSERT_EQ(memcmp(&before, &history_lmon.freeze_slots[peer], sizeof(before)), 0);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(stats.pool_wait_count, 1);
+		UT_ASSERT_EQ(stats.wakeup_recheck_count, 1);
+		UT_ASSERT_EQ(stats.refused_proof_count, 1);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		UT_ASSERT_EQ(memcmp(peer_headers_before, history_headers, sizeof(history_headers)), 0);
+		history_finish(1);
+		history_peer = -1;
+	}
+}
+
 int
 main(void)
 {
@@ -598,7 +763,7 @@ main(void)
 	(void)undo_horizon_send_v2;
 	(void)undo_horizon_v2_publish;
 	(void)undo_horizon_publish_freeze_watermark;
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_actual_clock_report_reaches_original_wait_and_physical_supply);
 	UT_RUN(test_actual_protective_pair_requires_distinct_reports);
 	UT_RUN(test_history_non_h_rejections_count_the_actual_reason_union_once);
@@ -611,6 +776,8 @@ main(void)
 	UT_RUN(test_maximum_pool_requires_complete_bounded_physical_passes);
 	UT_RUN(test_maximum_pool_clock_and_protector_reach_original_controller);
 	UT_RUN(test_maximum_pool_last_image_cannot_be_hidden_by_a_protected_prefix);
+	UT_RUN(test_required_peer_and_self_reports_both_advance_before_history_refusal);
+	UT_RUN(test_required_peer_reconnect_cannot_reuse_the_old_history_report);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count != 0;
