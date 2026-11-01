@@ -1194,8 +1194,10 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel, Oid 
 	Assert(elevel >= ERROR);
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: on-mode reads adopt the shared relmap authority (spec-6.14 D5). */
-	if (cluster_shared_catalog && !IsBootstrapProcessingMode())
+	/* PGRAC: control-selected shared files do not depend on the catalog GUC.
+	 * Keep bootstrap and explicit nonshared configurations on their original
+	 * paths; a managed or unknown registration must never select a local map. */
+	if ((cluster_shared_config || cluster_shared_catalog) && !IsBootstrapProcessingMode())
 	{
 		if (cluster_shared_config && (lock_held ||
 			cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_MANAGED_V2))

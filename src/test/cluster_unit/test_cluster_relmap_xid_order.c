@@ -81,6 +81,7 @@ static unsigned int begins, inserts, flushes, stages, preserves, sync_commits;
 static unsigned int registered;
 static bool managed_writer_test;
 static bool managed_cache_test;
+static bool cache_route_pg_io;
 static bool managed_checkpoint_test;
 static int managed_checkpoint_sync(int fd);
 static unsigned managed_cache_fault;
@@ -405,15 +406,32 @@ cluster_relmap_authority_read_committed(bool shared, Oid dbid,
 	return true;
 }
 
-/* The cluster path must never fall back to a node-local map file. */
+/* The route regression explicitly supplies a valid conflicting local file.
+ * All other cluster tests still abort on a node-local map fallback. */
 int
-OpenTransientFile(const char *name pg_attribute_unused(), int flags pg_attribute_unused())
+OpenTransientFile(const char *name, int flags)
 {
+	if (cache_route_pg_io)
+		return open(name, flags, 0600);
 	abort();
 }
 
 int
-CloseTransientFile(int fd pg_attribute_unused())
+CloseTransientFile(int fd)
+{
+	if (cache_route_pg_io)
+		return close(fd);
+	abort();
+}
+
+/* Making the PG read leaf reachable also retains the original writer's link
+ * references. These abort-only providers must never execute in read tests. */
+bool cluster_smgr_user_relations;
+void CacheInvalidateRelmap(Oid db pg_attribute_unused()) { abort(); }
+void cluster_smgr_invalidate_relmap(bool shared pg_attribute_unused()) { abort(); }
+int
+durable_rename(const char *old pg_attribute_unused(), const char *new pg_attribute_unused(),
+			   int elevel pg_attribute_unused())
 {
 	abort();
 }
@@ -1179,6 +1197,15 @@ int
 main(void)
 {
 	bool focus = getenv("PGRAC_RELMAP_RETAINED_FOCUS") != NULL;
+	if (getenv("PGRAC_RELMAP_CACHE_ROUTE_FOCUS")) {
+		UT_PLAN(4);
+		UT_RUN(native_cache_catalog_guc_cannot_select_local_file);
+		UT_RUN(native_cache_cross_database_guc_cannot_select_local_file);
+		UT_RUN(native_cache_catalog_guc_cannot_bypass_registration_refusal);
+		UT_RUN(native_cache_explicit_nonshared_and_bootstrap_keep_local_file);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_RELMAP_NATIVE_CHECKPOINT_FOCUS")) {
 		UT_PLAN(6);
 		UT_RUN(native_checkpoint_pending_pair_and_old_cache);
@@ -1191,7 +1218,7 @@ main(void)
 		return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_RELMAP_NATIVE_CACHE_FOCUS")) {
-		UT_PLAN(10);
+		UT_PLAN(14);
 		UT_RUN(native_cache_registered_address_under_original_mapping_lock);
 		UT_RUN(native_cache_uses_committed_image_while_writer_pending);
 		UT_RUN(native_cache_unknown_missing_and_ambiguous_never_fall_back);
@@ -1202,6 +1229,10 @@ main(void)
 		UT_RUN(native_cache_borrow_capacity_refuses_before_file_io);
 		UT_RUN(native_cache_fatal_refusal_retires_local_borrow_before_exit);
 		UT_RUN(native_cache_cleanup_release_error_preserves_original_duties);
+		UT_RUN(native_cache_catalog_guc_cannot_select_local_file);
+		UT_RUN(native_cache_cross_database_guc_cannot_select_local_file);
+		UT_RUN(native_cache_catalog_guc_cannot_bypass_registration_refusal);
+		UT_RUN(native_cache_explicit_nonshared_and_bootstrap_keep_local_file);
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
@@ -1228,7 +1259,7 @@ main(void)
 		return ut_failed_count != 0;
 	}
 
-	UT_PLAN(focus ? 4 : 128);
+	UT_PLAN(focus ? 4 : 132);
 	UT_RUN(retained_stage_uses_native_writer_identity_before_mapping_and_wal);
 	UT_RUN(retained_stage_missing_writer_never_assigns_or_stages);
 	UT_RUN(retained_stage_allocator_error_preserves_outputs_and_pins);
@@ -1364,6 +1395,10 @@ main(void)
 	if (!focus) UT_RUN(native_checkpoint_late_control_and_release_refuse_whole_receipt);
 	if (!focus) UT_RUN(native_checkpoint_source_recheck_is_sticky);
 	if (!focus) UT_RUN(native_checkpoint_inherited_cf_and_preflight);
+	if (!focus) UT_RUN(native_cache_catalog_guc_cannot_select_local_file);
+	if (!focus) UT_RUN(native_cache_cross_database_guc_cannot_select_local_file);
+	if (!focus) UT_RUN(native_cache_catalog_guc_cannot_bypass_registration_refusal);
+	if (!focus) UT_RUN(native_cache_explicit_nonshared_and_bootstrap_keep_local_file);
 
 	UT_DONE();
 	return ut_failed_count != 0;

@@ -165,6 +165,152 @@ UT_TEST(native_cache_read_failure_and_error_release_only_local_duty)
 			cache_cleanup();
 		}
 }
+
+/* A valid local PG image deliberately conflicts with the independent managed
+ * pair. The actual reader must choose by configuration/registration, never
+ * by the catalog convenience GUC. File leaves execute real open/read/close. */
+static void
+cache_route_path(char path[MAXPGPATH], unsigned slot)
+{
+	if (slot)
+		snprintf(path, MAXPGPATH, "%s/base/%u", managed_root, MyDatabaseId);
+	else
+		snprintf(path, MAXPGPATH, "%s/global", managed_root);
+}
+
+static void
+cache_route_setup(void)
+{
+	RelMapFile raw;
+	cache_setup();
+	raw = committed;
+	raw.mappings[0].mapfilenumber = 9999;
+	INIT_CRC32C(raw.crc);
+	COMP_CRC32C(raw.crc, &raw, offsetof(RelMapFile, crc));
+	FIN_CRC32C(raw.crc);
+	for (unsigned slot = 0; slot < 2; slot++) {
+		char path[MAXPGPATH];
+		int dir, fd;
+		cache_route_path(path, slot);
+		dir = open(path, O_RDONLY | O_DIRECTORY);
+		if (dir < 0) abort();
+		fd = openat(dir, RELMAPPER_FILENAME, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd < 0 || write(fd, &raw, sizeof(raw)) != sizeof(raw) || close(fd) || close(dir))
+			abort();
+	}
+	cache_route_pg_io = true;
+	cluster_shared_catalog = false;
+}
+
+static void
+cache_route_cleanup(void)
+{
+	for (unsigned slot = 0; slot < 2; slot++) {
+		char path[MAXPGPATH];
+		int dir;
+		cache_route_path(path, slot);
+		dir = open(path, O_RDONLY | O_DIRECTORY);
+		if (dir < 0 || unlinkat(dir, RELMAPPER_FILENAME, 0) || close(dir)) abort();
+	}
+	cache_route_pg_io = false;
+	cluster_shared_catalog = cluster_shared_config = true;
+	Mode = NormalProcessing;
+	cache_cleanup();
+}
+
+UT_TEST(native_cache_catalog_guc_cannot_select_local_file)
+{
+	for (unsigned held = 0; held < 2; held++)
+		for (unsigned slot = 0; slot < 2; slot++) {
+			RelMapFile out = { 0 };
+			char path[MAXPGPATH];
+			cache_route_setup();
+			cache_route_path(path, slot);
+			if (held) LWLockAcquire(RelationMappingLock, LW_SHARED);
+			read_relmap_file(&out, path, held != 0, ERROR,
+							 slot ? MyDatabaseId : InvalidOid,
+							 slot ? MyDatabaseTableSpace : GLOBALTABLESPACE_OID);
+			UT_ASSERT_EQ(out.mappings[0].mapfilenumber, 500);
+			UT_ASSERT_EQ(borrowed_count(), 0);
+			UT_ASSERT_EQ(local_held, held != 0);
+			UT_ASSERT(!managed_cf);
+			if (held) LWLockRelease(RelationMappingLock);
+			UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+			cache_route_cleanup();
+		}
+}
+
+UT_TEST(native_cache_cross_database_guc_cannot_select_local_file)
+{
+	char path[MAXPGPATH];
+	cache_route_setup();
+	cache_route_path(path, 1);
+	UT_ASSERT_EQ(RelationMapOidToFilenumberForDatabase(path, 1259,
+													  MyDatabaseId, MyDatabaseTableSpace), 500);
+	UT_ASSERT_EQ(borrowed_count(), 0);
+	UT_ASSERT(!local_held && !managed_cf);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	cache_route_cleanup();
+}
+
+UT_TEST(native_cache_catalog_guc_cannot_bypass_registration_refusal)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		RelMapFile out, before;
+		char path[MAXPGPATH];
+		volatile bool caught = false;
+		Oid db;
+		cache_route_setup();
+		cache_route_path(path, 1);
+		db = fault == 1 ? 98765 : MyDatabaseId;
+		if (fault != 1) {
+			memset(native_files, 0, sizeof(*native_files));
+			SpinLockInit(&native_files->lock);
+			if (fault == 2) {
+				borrow_table_files[1].creation_generation++;
+				UT_ASSERT_EQ(borrow_publish(), CLUSTER_NATIVE_FILES_OK_V2);
+			}
+		}
+		memset(&out, 0x4b, sizeof(out));
+		before = out;
+		LWLockAcquire(RelationMappingLock, LW_SHARED);
+		error_expected = true;
+		if (sigsetjmp(error_target, 1) == 0)
+			read_relmap_file(&out, path, true, ERROR, db, MyDatabaseTableSpace);
+		else
+			caught = true;
+		error_expected = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+		UT_ASSERT_EQ(borrowed_count(), 0);
+		UT_ASSERT(local_held && !managed_cf);
+		/* Original ERROR clears acquisition holdoff; test-only caller teardown
+		 * replaces the one consumed by release, as LWLockReleaseAll does. */
+		if (InterruptHoldoffCount == 0) HOLD_INTERRUPTS();
+		LWLockRelease(RelationMappingLock);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		cache_route_cleanup();
+	}
+}
+
+UT_TEST(native_cache_explicit_nonshared_and_bootstrap_keep_local_file)
+{
+	for (unsigned bootstrap = 0; bootstrap < 2; bootstrap++) {
+		RelMapFile out;
+		char path[MAXPGPATH];
+		cache_route_setup();
+		cache_route_path(path, 1);
+		cluster_shared_config = bootstrap != 0;
+		cluster_shared_catalog = bootstrap != 0;
+		Mode = bootstrap ? BootstrapProcessing : NormalProcessing;
+		read_relmap_file(&out, path, false, ERROR, MyDatabaseId, MyDatabaseTableSpace);
+		UT_ASSERT_EQ(out.mappings[0].mapfilenumber, 9999);
+		UT_ASSERT_EQ(borrowed_count(), 0);
+		UT_ASSERT(!local_held && !managed_cf);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		cache_route_cleanup();
+	}
+}
 UT_TEST(native_cache_current_failure_keeps_borrow_and_refuses_reentry)
 {
 	pid_t child;
