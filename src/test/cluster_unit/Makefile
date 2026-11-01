@@ -5114,8 +5114,9 @@ test_cluster_cold_relmap_terminal_product.o: test_cluster_cold_relmap_terminal_p
 # Original Start fixture under isolated providers; native storage remains
 # in the terminal component, not this owner bridge.
 test_cluster_cold_relmap_terminal_start: test_cluster_cold_relmap_terminal.c \
-		test_cluster_cold_relmap_terminal_batch.inc \
-		test_cluster_relmap_original_start.o test_cluster_relmap_start_ctrc_record.o
+		test_cluster_cold_relmap_terminal_batch.inc test_cluster_cold_relmap_staging_terminal.inc \
+		test_cluster_relmap_original_start.o test_cluster_relmap_start_ctrc_record.o \
+		test_cluster_cold_recovery_plan_core.o
 
 test_cluster_cold_tx_start test_cluster_relmap_original_start.o: \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
@@ -5355,7 +5356,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
 		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_observation_namespace.o,$(top_builddir)/src/backend/cluster/cluster_recovery_namespace.o) \
 		$(if $(filter test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_cold_relmap_terminal_product.o test_cluster_cold_recovery_plan_store_core.o) \
-		$(if $(filter test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_original_start.o test_cluster_relmap_start_ctrc_record.o) \
+		$(if $(filter test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_original_start.o test_cluster_relmap_start_ctrc_record.o test_cluster_cold_recovery_plan_core.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_wal_targets.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_record_hash.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \

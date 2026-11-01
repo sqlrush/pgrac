@@ -587,13 +587,14 @@ UT_TEST(test_terminal_original_start_missing_capture_refuses)
 
 #ifdef TEST_TERMINAL_REAL_START
 #include "test_cluster_cold_relmap_terminal_batch.inc"
+#include "test_cluster_cold_relmap_staging_terminal.inc"
 #endif
 
 int main(int argc, char **argv)
 {
 	test_program_path = argv[0]; setup_fixture();
 #ifdef TEST_TERMINAL_REAL_START
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_terminal_original_start_commit_abort_and_repeat);
 	UT_RUN(test_terminal_original_start_drift_keeps_debt);
 	UT_RUN(test_terminal_original_start_full_alias_guard);
@@ -602,6 +603,10 @@ int main(int argc, char **argv)
 	UT_RUN(test_terminal_batch_second_fd_loss_withdraws_whole_output);
 	UT_RUN(test_terminal_batch_second_saved_image_drift_keeps_all_debt);
 	UT_RUN(test_terminal_batch_partial_capture_error_never_enters_start);
+	UT_RUN(test_start_staging_and_terminal_both_required_for_complete_batch);
+	UT_RUN(test_start_staging_refusal_does_not_borrow_valid_terminal);
+	UT_RUN(test_start_terminal_refusal_does_not_borrow_valid_staging);
+	UT_RUN(test_start_staging_repeat_rereads_the_second_copy);
 	UT_DONE(); return ut_failed_count != 0;
 #endif
 	if (argc > 1 && strcmp(argv[1], "handoff") == 0) {

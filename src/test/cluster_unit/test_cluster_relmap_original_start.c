@@ -2,6 +2,9 @@
  * Native binding, claim, fence and ResourceOwner leaves remain controlled.
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "test_cluster_relmap_original_start_namespace.h"
+#include "postgres.h"
+#include "test_cluster_relmap_original_start.h"
+static bool terminal_staging_active;
 #define TEST_CLUSTER_STARTUP_RELMAP_TERMINAL 1
 int d3_terminal_start_fixture_main(void);
 #define main d3_terminal_start_fixture_main
@@ -15,6 +18,7 @@ test_relmap_start_begin(ClusterColdTypedV1 *input, int pid)
 	ClusterColdTypedV1 *borrowed = input;
 
 	reset();
+	terminal_staging_active = false;
 	MyProcPid = pid;
 	/* Original reset installs a distinct, fully identified successor. Old
 	 * replay-source tokens do not stand in for that installed writer. */
@@ -60,8 +64,20 @@ void test_relmap_start_fault(unsigned fault)
 }
 bool test_relmap_start_done(void)
 {
+	terminal_staging_active = false;
 	ClusterColdRecoveryRelmapFail(info.cluster_tx_start);
 	ClusterReleaseColdRecoveryInputs(&info);
 	return cluster_recovery_cold_start == NULL && cluster_recovery_cold_inputs == NULL
 		&& ut_failed_count == 0;
+}
+
+bool
+test_relmap_start_staging(const struct ClusterRecoveryStartV1 *start)
+{
+	bool result;
+	if (start != info.cluster_tx_start) return false;
+	terminal_staging_active = true;
+	result = cluster_recovery_cold_relmap_recheck(info.cluster_tx_start);
+	terminal_staging_active = false;
+	return result;
 }
