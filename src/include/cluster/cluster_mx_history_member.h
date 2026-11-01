@@ -36,5 +36,30 @@ extern ClusterMxHistoryStep cluster_mx_history_assemble_updater(
 	const ClusterMxHistoryCapture *capture, const ClusterMxHistoryGraph *graph,
 	const ClusterCurrentMemberOperationProof *proofs,
 	const ClusterCurrentUpdaterChallenge *challenge, ClusterCurrentUpdaterProof *out);
+/* Operation-aware successor compare input. No canonical identity is inferred
+ * from xmin or the tuple's current ITL slot. Backend-private, never wire. */
+typedef struct ClusterMxHistorySuccessorChallenge {
+	ClusterUndoRecordTarget target;
+	TransactionId xmin;
+	uint16 member_ordinal, reserved16;
+} ClusterMxHistorySuccessorChallenge;
+typedef struct ClusterMxHistorySuccessorProof {
+	ClusterSavepointOperationKey key;
+	ClusterCurrentMemberOperationProof member;
+	uint32 requester_capability_generation;
+} ClusterMxHistorySuccessorProof;
+/* keys/proofs are the complete A output of this same finished graph. Borrowed
+ * inputs require the original capture/relock scope; this pure assembly does
+ * not acquire or retain authority. COMPLETE returns independently qualified
+ * LIVE creation B, not a legacy raw updater proof. PENDING means no creation
+ * record for the target, never permission for a raw child lookup. UNKNOWN
+ * includes found-but-unprovable/ambiguous B. Every non-success resets out.
+ * No output may overlap inputs; graph views expire when its collector ends. */
+extern ClusterMxHistoryStep cluster_mx_history_assemble_successor(
+	const ClusterMxHistoryCapture *capture, const ClusterMxHistoryGraph *graph,
+	const ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs,
+	const ClusterMxHistorySuccessorChallenge *challenge,
+	ClusterMxHistorySuccessorProof *out);
 #endif
 #endif

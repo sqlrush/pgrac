@@ -12,6 +12,9 @@ static ClusterTxOutcome finish_outcome;
 static bool finish_all_discarded, finish_successor_in_graph, finish_successor_fxid_drift;
 static bool finish_same_page_successor, finish_native_top_records;
 static bool finish_live_child_successor;
+static unsigned finish_successor_body_kind;
+static bool finish_successor_discarded;
+static unsigned finish_successor_order;
 
 static uint32
 finish_crc(const void *data, size_t n)
@@ -62,14 +65,17 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	uint16 tt, row;
 	unsigned index;
 	char *body;
+	char operation_body[sizeof(UndoUpdatePayload) + SizeofHeapTupleHeader] = { 0 };
+	size_t operation_body_length = sizeof(insert);
 	memset(out, 0, sizeof(*out));
 	if (finish_pending)
 		return CMXH_PENDING;
 	if (!cluster_mx_history_request_decode(wire, sizeof(*wire), cluster_node_id, 0, 7, &r)
 		|| !uba_decode_record(r.locator.uba, &segment, &block, &tt, &row)
-		|| ((block < 7 || block > 8) && !(finish_successor_in_graph && block == 6)))
+		|| ((block < 7 || block > 8) && !(finish_successor_in_graph && block == 6)
+			&& !(finish_successor_order && block == 5)))
 		return CMXH_UNKNOWN;
-	index = block == 6 ? 2 : block - 7;
+	index = block == 5 ? 3 : block == 6 ? 2 : block - 7;
 	finish_reads++;
 	bh.magic = PGRAC_UNDO_BLOCK_MAGIC;
 	bh.block_version = UNDO_BLOCK_VERSION_1;
@@ -78,7 +84,7 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	h.record_type = UNDO_RECORD_INSERT;
 	h.flags
 		= UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_HAS_OPERATION | UNDO_REC_FLAG_FIRST_IN_TX;
-	h.xid = members[index == 2 ? 0 : index].xid;
+	h.xid = members[index >= 2 ? 0 : index].xid;
 	if (finish_successor_in_graph && index == 0) {
 		h.flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
 		h.prev_uba = uba_encode(1, 6, 3, 0);
@@ -87,14 +93,15 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	h.tt_slot_segment_id = 1;
 	h.tt_slot_id = 4;
 	h.tt_wrap_plus1 = 1;
-	h.write_scn = index == 2 ? 79 : 80 + index;
+	h.write_scn = index == 3 ? (finish_successor_order == 2 ? 82 : 78)
+		: index == 2 ? 79 : 80 + index;
 	h.target_locator = r.target_locator;
 	h.target_fork = r.target_fork;
 	h.target_block = r.target_block;
 	h.target_offset = r.target_offset;
-	if (index == 2 && !finish_same_page_successor)
+	if (index >= 2 && !finish_same_page_successor)
 		h.target_block++; /* B may create a successor on another heap page. */
-	if (index == 2 && finish_same_page_successor)
+	if (index >= 2 && finish_same_page_successor)
 		h.target_offset++; /* Same-page B creates the captured successor. */
 	history.magic = UNDO_ITL_HISTORY_MAGIC;
 	history.version = UNDO_ITL_HISTORY_VERSION;
@@ -103,20 +110,29 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 												.slot_index = index,
 												.after_kind = ITL_FLAG_ACTIVE,
 												.after_write_scn = h.write_scn };
-	if ((finish_native_top_records || finish_live_child_successor) && index == 2)
+	if ((finish_native_top_records || finish_live_child_successor) && index >= 2)
 		history.entries[0].prior.wrap = 1;
+	if (index == 3 && finish_successor_order == 2) {
+		history.entries[0].slot_index = 2;
+		history.entries[0].prior = (ClusterItlSlotData){ .xid = finish_top,
+			.flags = ITL_FLAG_ACTIVE, .wrap = 1, .undo_segment_head = uba_encode(1, 6, 3, 0),
+			.write_scn = 79 };
+	}
 	op.version = UNDO_OPERATION_TRAILER_VERSION;
 	op.length = sizeof(op);
 	op.effect_state = index || finish_all_discarded ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED
 													: CLUSTER_SAVEPOINT_EFFECT_LIVE;
-	if (index == 2 && finish_live_child_successor)
+	if (index >= 2 && finish_live_child_successor)
 		op.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	if (index >= 2 && finish_successor_discarded)
+		op.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
 	op.canonical_top_fxid
 		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, finish_top));
 	op.operation_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, h.xid));
-	op.operation_sequence = finish_successor_in_graph ? (index == 2 ? 1 : index + 2) : index + 1;
-	if (index == 2 && finish_successor_fxid_drift)
+	op.operation_sequence = finish_successor_in_graph ? (index >= 2 ? 1 : index + 2) : index + 1;
+	if (index >= 2 && finish_successor_fxid_drift)
 		op.operation_fxid += UINT64CONST(1) << 32;
+	if (index == 3) op.operation_sequence = 4;
 	op.command_id = 4;
 	op.subid = 3;
 	if (finish_native_top_records && index != 1) {
@@ -125,10 +141,32 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 		op.operation_sequence = 0;
 	}
 	body = (char *)out->data + sizeof(bh) + sizeof(h);
-	memcpy(body, &insert, sizeof(insert));
-	memcpy(body + sizeof(insert), &history, sizeof(history));
-	memcpy(body + sizeof(insert) + sizeof(history), &op, sizeof(op));
-	h.payload_length = sizeof(insert) + sizeof(history) + sizeof(op);
+	memcpy(operation_body, &insert, sizeof(insert));
+	if (index >= 2 && finish_successor_body_kind != 0) {
+		if (finish_successor_body_kind <= 2) {
+			UndoUpdatePayload update = { .new_block = h.target_block,
+				.new_offset = h.target_offset, .old_tuple_length = SizeofHeapTupleHeader,
+				.old_tuple_offset = sizeof(update) };
+			h.record_type = UNDO_RECORD_UPDATE;
+			if (finish_successor_body_kind == 1) h.target_offset++;
+			else update.new_offset++;
+			memcpy(operation_body, &update, sizeof(update));
+			operation_body_length = sizeof(update) + SizeofHeapTupleHeader;
+		} else if (finish_successor_body_kind == 3) {
+			UndoDeletePayload deleted = { .full_tuple_length = SizeofHeapTupleHeader,
+				.full_tuple_offset = sizeof(deleted) };
+			h.record_type = UNDO_RECORD_DELETE;
+			memcpy(operation_body, &deleted, sizeof(deleted));
+			operation_body_length = sizeof(deleted) + SizeofHeapTupleHeader;
+		} else {
+			insert.inserted_tuple_len = 0;
+			memcpy(operation_body, &insert, sizeof(insert));
+		}
+	}
+	memcpy(body, operation_body, operation_body_length);
+	memcpy(body + operation_body_length, &history, sizeof(history));
+	memcpy(body + operation_body_length + sizeof(history), &op, sizeof(op));
+	h.payload_length = operation_body_length + sizeof(history) + sizeof(op);
 	if (!(h.flags & UNDO_REC_FLAG_HAS_OPERATION))
 		h.payload_length -= sizeof(op);
 	dir.record_offset = sizeof(bh);
@@ -198,6 +236,9 @@ finish_sources(void)
 	finish_successor_in_graph = finish_successor_fxid_drift = false;
 	finish_same_page_successor = finish_native_top_records = false;
 	finish_live_child_successor = false;
+	finish_successor_body_kind = 0;
+	finish_successor_discarded = false;
+	finish_successor_order = 0;
 	memset(finish_keys, 0xa5, sizeof(finish_keys));
 	memset(finish_proofs, 0xa5, sizeof(finish_proofs));
 }

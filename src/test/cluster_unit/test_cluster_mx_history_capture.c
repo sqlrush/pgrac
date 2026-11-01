@@ -771,6 +771,7 @@ collector_never_waits_under_content_lock_or_without_pin(void)
 #include "test_cluster_mx_history_finish.inc"
 #include "test_cluster_mx_history_local_updater.inc"
 #include "test_cluster_mx_history_wait_capture.inc"
+#include "test_cluster_mx_history_successor.inc"
 
 static void
 history_fixture_init(void)
@@ -800,7 +801,7 @@ int
 main(void)
 {
 	history_fixture_init();
-	UT_PLAN(51);
+	UT_PLAN(58);
 	UT_RUN(real_capture_and_relock);
 	UT_RUN(snapshot_own_reference_keeps_original_floor);
 	UT_RUN(original_scope_restored_and_older_floor_preserved);
@@ -852,6 +853,13 @@ main(void)
 	UT_RUN(history_wait_invalid_heap_never_sleeps);
 	UT_RUN(history_wait_requalification_discards_whole_batch);
 	UT_RUN(history_wait_requires_and_reuses_independent_B);
+	UT_RUN(successor_child_top_independent_outcomes);
+	UT_RUN(successor_requires_creation_role);
+	UT_RUN(successor_missing_discarded_and_wrong_fullxid);
+	UT_RUN(successor_challenge_is_actual_captured_target);
+	UT_RUN(successor_rejects_partial_or_mixed_A);
+	UT_RUN(successor_failure_and_native_relock_cleanup);
+	UT_RUN(successor_uses_proven_page_order_not_lsn_or_slot);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

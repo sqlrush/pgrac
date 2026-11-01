@@ -66,7 +66,7 @@ history_member_echo(const ClusterMxHistoryCapture *c, const ClusterMxHistoryRequ
 /* A compare input from the actual retained entry, including GLOBAL records
  * whose incoming edge deliberately has no ITL head/slot. No head is invented. */
 static bool
-history_member_key(const ClusterMxHistoryCapture *c, const ClusterMxHistoryNodeView *v,
+history_member_key_target(const ClusterUndoRecordTarget *target, const ClusterMxHistoryNodeView *v,
 				   ClusterSavepointOperationKey *key)
 {
 	const UndoItlHistoryEntry *entry = NULL;
@@ -77,7 +77,7 @@ history_member_key(const ClusterMxHistoryCapture *c, const ClusterMxHistoryNodeV
 		return false;
 	for (unsigned i = 0; i < v->record->payload.history.count; ++i) {
 		const UndoItlHistoryEntry *e = &v->record->payload.history.entries[i];
-		if (e->block != ItemPointerGetBlockNumber(&c->tid))
+		if (e->block != target->blockno)
 			continue;
 		if (entry != NULL)
 			return false;
@@ -90,20 +90,33 @@ history_member_key(const ClusterMxHistoryCapture *c, const ClusterMxHistoryNodeV
 									   .tt_wrap = v->peer->canonical.wrap,
 									   .itl_kind = entry->after_kind,
 									   .itl_slot_index = entry->slot_index };
-	key->target = (ClusterUndoRecordTarget){ .locator = { c->pcm.tag.spcOid, c->pcm.tag.dbOid,
-														  c->pcm.tag.relNumber },
-											 .forknum = c->pcm.tag.forkNum,
-											 .blockno = ItemPointerGetBlockNumber(&c->tid),
-											 .offnum = ItemPointerGetOffsetNumber(&c->tid) };
+	key->target = *target;
 	key->top_fxid = v->peer->top_fxid;
 	key->operation_fxid = v->peer->operation_fxid;
 	return true;
 }
 
+static ClusterUndoRecordTarget
+history_capture_target(const ClusterMxHistoryCapture *c)
+{
+	return (ClusterUndoRecordTarget){ .locator = { c->pcm.tag.spcOid, c->pcm.tag.dbOid,
+		c->pcm.tag.relNumber }, .forknum = c->pcm.tag.forkNum,
+		.blockno = ItemPointerGetBlockNumber(&c->tid), .offnum = ItemPointerGetOffsetNumber(&c->tid) };
+}
+
 static bool
-history_member_assemble_peer(const ClusterMxHistoryCapture *c, const ClusterMxHistoryNodeView *v,
+history_member_key(const ClusterMxHistoryCapture *c, const ClusterMxHistoryNodeView *v,
+	ClusterSavepointOperationKey *key)
+{
+	ClusterUndoRecordTarget target = history_capture_target(c);
+	return history_member_key_target(&target, v, key);
+}
+
+static bool
+history_member_assemble_peer_target(const ClusterMxHistoryCapture *c, const ClusterMxHistoryNodeView *v,
 							 uint16 ordinal, const ClusterSavepointOperationKey *key,
-							 ClusterCurrentMemberOperationProof *out)
+							 ClusterCurrentMemberOperationProof *out,
+							 const ClusterUndoRecordTarget *target, bool require_root)
 {
 	ClusterMxHistoryRecord record;
 	ClusterSavepointReaderIdentity identity;
@@ -119,7 +132,7 @@ history_member_assemble_peer(const ClusterMxHistoryCapture *c, const ClusterMxHi
 		|| !v->record->canonical_generation_known
 		|| !cluster_mx_history_record_from_bytes(v->request, v->bytes, v->record->record_length,
 												 v->record->record_offset, &record)
-		|| !record.matches_target || record.record_class > CMXH_OPERATION
+		|| (require_root && !record.matches_target) || record.record_class > CMXH_OPERATION
 		|| !cluster_mx_history_record_bind_peer(v->request, &record, v->peer, &identity))
 		return false;
 	peer = v->peer;
@@ -135,7 +148,7 @@ history_member_assemble_peer(const ClusterMxHistoryCapture *c, const ClusterMxHi
 		return false;
 	decoded = *v;
 	decoded.record = &record;
-	if (!history_member_key(c, &decoded, &exact) || memcmp(key, &exact, sizeof(exact)) != 0)
+	if (!history_member_key_target(target, &decoded, &exact) || memcmp(key, &exact, sizeof(exact)) != 0)
 		return false;
 	proof.base.member_xid = c->members[ordinal].xid;
 	proof.base.member_ordinal = ordinal;
@@ -179,6 +192,14 @@ history_member_assemble_peer(const ClusterMxHistoryCapture *c, const ClusterMxHi
 	}
 	*out = proof;
 	return true;
+}
+
+static bool
+history_member_assemble_peer(const ClusterMxHistoryCapture *c, const ClusterMxHistoryNodeView *v,
+	uint16 ordinal, const ClusterSavepointOperationKey *key, ClusterCurrentMemberOperationProof *out)
+{
+	ClusterUndoRecordTarget target = history_capture_target(c);
+	return history_member_assemble_peer_target(c, v, ordinal, key, out, &target, true);
 }
 
 /* Standalone peer assembly checks the complete immutable descriptor. The
@@ -447,5 +468,166 @@ cluster_mx_history_assemble_updater(const ClusterMxHistoryCapture *c,
 		return CMXH_COMPLETE;
 	}
 	return CMXH_PENDING;
+}
+/* The target role is separate from a row merely touched by the operation.
+ * Decoded bodies include the structural checks before reaching this helper. */
+static bool
+history_successor_target(const ClusterUndoRecordTarget *target,
+	const ClusterMxHistoryRecord *record, const char *body, bool *creation)
+{
+	const UndoRecordHeader *h = &record->header;
+	bool old_side, new_side = false;
+	*creation = false;
+	if (h->target_locator.spcOid != target->locator.spcOid
+		|| h->target_locator.dbOid != target->locator.dbOid
+		|| h->target_locator.relNumber != target->locator.relNumber
+		|| h->target_fork != target->forknum)
+		return false;
+	old_side = h->target_block == target->blockno && h->target_offset == target->offnum;
+	if (h->record_type == UNDO_RECORD_INSERT) {
+		UndoInsertPayload insert;
+		memcpy(&insert, body, sizeof(insert));
+		*creation = old_side && insert.inserted_tuple_len >= SizeofHeapTupleHeader
+			&& insert.inserted_tuple_len <= BLCKSZ - SizeOfPageHeaderData;
+	} else if (h->record_type == UNDO_RECORD_UPDATE) {
+		UndoUpdatePayload update;
+		memcpy(&update, body, sizeof(update));
+		new_side = update.new_block == target->blockno && update.new_offset == target->offnum;
+		*creation = new_side;
+	}
+	return old_side || new_side;
+}
+
+static bool
+history_successor_identity(const ClusterCurrentMemberOperationProof *a,
+	const ClusterSavepointReaderIdentity *b)
+{
+	return FullTransactionIdEquals(a->top_fxid, b->top_fxid)
+		&& FullTransactionIdEquals(a->operation_fxid, b->operation_fxid)
+		&& a->base.key.undo_segment_id == b->canonical.segment_id
+		&& a->base.key.local_xid == b->canonical.xid
+		&& a->base.key.tt_slot_id == (uint32)b->canonical.slot_offset + 1
+		&& a->base.key.segment_generation == b->canonical_generation
+		&& a->base.key.slot_wrap == b->canonical.wrap;
+}
+
+ClusterMxHistoryStep
+cluster_mx_history_assemble_successor(const ClusterMxHistoryCapture *c,
+	const ClusterMxHistoryGraph *g, const ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs,
+	const ClusterMxHistorySuccessorChallenge *challenge, ClusterMxHistorySuccessorProof *out)
+{
+	const ClusterCurrentMemberOperationProof *a;
+	ClusterMxHistorySuccessorProof chosen = { 0 };
+	HistoryPageOrder *order = NULL;
+	ItemPointerData next;
+	size_t n, selected = CMXH_NO_NODE;
+	uint16 ordinal;
+	bool found_a = false, saw_target = false;
+	ClusterMxHistoryStep result = CMXH_UNKNOWN;
+
+	if (out == NULL)
+		return CMXH_UNKNOWN;
+	memset(out, 0, sizeof(*out));
+	history_members_reset(NULL, &out->member, 1);
+	if (!history_members_capture_valid(c) || challenge == NULL || keys == NULL || proofs == NULL
+		|| challenge->reserved16 != 0 || challenge->member_ordinal >= c->nmembers
+		|| challenge->target._pad != 0 || challenge->target.forknum != c->pcm.tag.forkNum
+		|| challenge->target.locator.spcOid != c->pcm.tag.spcOid
+		|| challenge->target.locator.dbOid != c->pcm.tag.dbOid
+		|| challenge->target.locator.relNumber != c->pcm.tag.relNumber
+		|| cluster_multixact_current_validate_operation_proof_set(&c->mxkey, c->members,
+			keys, proofs, c->nmembers) != CMX_RESOLVE_OK)
+		return CMXH_UNKNOWN;
+	memcpy(&next, c->tuple_header + offsetof(HeapTupleHeaderData, t_ctid), sizeof(next));
+	if (challenge->target.blockno != ItemPointerGetBlockNumber(&c->tid)
+		|| challenge->target.blockno != ItemPointerGetBlockNumber(&next)
+		|| challenge->target.offnum != ItemPointerGetOffsetNumber(&next)
+		|| !OffsetNumberIsValid(challenge->target.offnum)
+		|| challenge->target.offnum > MaxHeapTuplesPerPage
+		|| (ItemPointerGetBlockNumber(&next) == ItemPointerGetBlockNumber(&c->tid)
+			&& ItemPointerGetOffsetNumber(&next) == ItemPointerGetOffsetNumber(&c->tid)))
+		return CMXH_UNKNOWN;
+	ordinal = challenge->member_ordinal;
+	a = &proofs[ordinal];
+	if (!ISUPDATE_from_mxstatus(c->members[ordinal].member_status)
+		|| challenge->xmin != c->members[ordinal].xid
+		|| a->flags != CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+		|| a->effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE)
+		return CMXH_UNKNOWN;
+	n = cluster_mx_history_graph_count(g);
+	if (n == 0 || n > MaxAllocSize / sizeof(*order))
+		return CMXH_UNKNOWN;
+	/* Reject an otherwise valid A from another graph, including a changed
+	 * committed SCN/grant/binding. No A read or authority is repeated. */
+	for (size_t i = 0; i < n; ++i) {
+		ClusterMxHistoryNodeView v;
+		ClusterCurrentMemberOperationProof actual;
+		if (!cluster_mx_history_graph_view(g, i, &v))
+			return CMXH_UNKNOWN;
+		if (!cluster_undo_record_uba_equal(v.peer->record, a->operation_uba))
+			continue;
+		if (!history_member_assemble_peer(c, &v, ordinal, &keys[ordinal], &actual)
+			|| memcmp(&actual, a, sizeof(actual)) != 0)
+			return CMXH_UNKNOWN;
+		found_a = true;
+	}
+	if (!found_a)
+		return CMXH_UNKNOWN;
+	order = MemoryContextAllocExtended(CurrentMemoryContext, n * sizeof(*order), MCXT_ALLOC_NO_OOM);
+	if (order == NULL || !history_member_order(g, order, n))
+		goto done;
+	for (size_t i = 0; i < n; ++i) {
+		ClusterMxHistoryNodeView v, decoded;
+		ClusterMxHistoryRecord record;
+		ClusterSavepointReaderIdentity identity;
+		ClusterMxHistorySuccessorProof b = { 0 };
+		bool creation;
+		if (!cluster_mx_history_graph_view(g, i, &v))
+			goto done;
+		if (v.record->record_class != CMXH_OPERATION || v.record->header.xid != challenge->xmin)
+			continue;
+		if (!history_member_echo(c, v.request)
+			|| !cluster_mx_history_record_from_bytes(v.request, v.bytes, v.record->record_length,
+				v.record->record_offset, &record)
+			|| !cluster_mx_history_record_bind_peer(v.request, &record, v.peer, &identity))
+			goto done;
+		if (!history_successor_target(&challenge->target, &record,
+			v.bytes + sizeof(UndoRecordHeader), &creation))
+			continue;
+		saw_target = true;
+		if (!history_successor_identity(a, &identity))
+			goto done;
+		if (!creation || record.effect != CLUSTER_SAVEPOINT_EFFECT_LIVE)
+			continue;
+		decoded = v;
+		decoded.record = &record;
+		if (!history_member_key_target(&challenge->target, &decoded, &b.key)
+			|| !history_member_assemble_peer_target(c, &decoded, ordinal, &b.key, &b.member,
+				&challenge->target, false)
+			|| b.member.base.state != a->base.state
+			|| b.member.base.commit_scn != a->base.commit_scn)
+			goto done;
+		b.requester_capability_generation = v.request->requester_capability_generation;
+		if (selected != CMXH_NO_NODE) {
+			if (!history_member_ancestor(order, selected, i)
+				&& !history_member_ancestor(order, i, selected))
+				goto done;
+			if (history_member_ancestor(order, i, selected))
+				continue;
+		}
+		selected = i;
+		chosen = b;
+	}
+	if (selected == CMXH_NO_NODE) {
+		result = saw_target ? CMXH_UNKNOWN : CMXH_PENDING;
+		goto done;
+	}
+	*out = chosen;
+	result = CMXH_COMPLETE;
+done:
+	if (order != NULL)
+		pfree(order);
+	return result;
 }
 #endif

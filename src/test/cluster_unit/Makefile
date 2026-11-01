@@ -13411,7 +13411,7 @@ test_cluster_mx_history_admission.inc: $(top_srcdir)/src/backend/cluster/cluster
 	     END { if (count != 1 || emit) exit 1 }' $< > $@
 
 test_cluster_mx_history_capture: test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
-		test_cluster_mx_history_finish.inc test_cluster_mx_history_local_updater.inc test_cluster_mx_history_wait_capture.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
+		test_cluster_mx_history_finish.inc test_cluster_mx_history_local_updater.inc test_cluster_mx_history_wait_capture.inc test_cluster_mx_history_successor.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
 		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
 		test_cluster_mx_history_admission.inc $(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_mx_history.h \
@@ -13522,7 +13522,7 @@ test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster
 		$(CLUSTER_ITL_O) $(CLUSTER_TX_RESOLVE_O) $(CLUSTER_MXID_STRIPE_O) $(CLUSTER_MULTIXACT_CURRENT_STATS_O) \
 		test_cluster_mx_operation_receipt_product.o test_cluster_mx_operation_receipt.h \
 		test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
-		test_cluster_mx_history_finish.inc test_cluster_mx_history_local_updater.inc test_cluster_mx_history_wait_capture.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
+		test_cluster_mx_history_finish.inc test_cluster_mx_history_local_updater.inc test_cluster_mx_history_wait_capture.inc test_cluster_mx_history_successor.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
 		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
 		test_cluster_mx_history_admission.inc $(top_builddir)/src/backend/storage/lmgr/lock.o \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
