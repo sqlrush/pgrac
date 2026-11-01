@@ -97,6 +97,14 @@ extern ClusterRelmapV2Validity cluster_relmap_v2_decode(const void *bytes, size_
 extern ClusterRelmapV2Validity cluster_relmap_v2_encode(const ClusterRelmapV2Image *image,
 														void *bytes, size_t length);
 
+/* WAL intent has a pending image and its own not-yet-known end is zero.
+ * These do not accept installable file images or grant replay permission. */
+extern ClusterRelmapV2Validity cluster_relmap_v2_decode_intent(const void *bytes, size_t length,
+												const ClusterRelmapV2Namespace *expected,
+												ClusterRelmapV2Image *output);
+extern ClusterRelmapV2Validity cluster_relmap_v2_encode_intent(const ClusterRelmapV2Image *image,
+												void *bytes, size_t length);
+
 /* Pending output is a retention obligation, never a terminal/release proof. */
 extern ClusterRelmapV2PairResult
 cluster_relmap_v2_read_pair(const void *primary, size_t primary_length, const void *backup,

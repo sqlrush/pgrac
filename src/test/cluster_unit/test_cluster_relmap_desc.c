@@ -58,6 +58,24 @@ prepare(bool pending)
 	memset(desc_text, 0, sizeof(desc_text)); description = (StringInfoData) {desc_text, 0, sizeof(desc_text), 0};
 }
 
+static void
+prepare_wal_intent(void)
+{
+	ClusterRecoveryFileIdentityV2 identity;
+	ClusterRelmapV2Image image;
+	prepare(true);
+	UT_ASSERT(cluster_relmap_file_observe_v2(bytes, sizeof(bytes), &identity, &image));
+	image.pending_owner.wal_end = 0;
+	UT_ASSERT(cluster_relmap_wal_encode_intent_v2(&identity, &image, bytes, sizeof(bytes)));
+}
+
+UT_TEST(managed_intent_descriptor_reports_complete_identity)
+{
+	prepare_wal_intent(); relmap_desc(&description, &reader);
+	UT_ASSERT(strcmp(desc_text, "WAL_INTENT database 0 tablespace 1664 origin 0 creation 103 registration 19 committed 7 pending 8") == 0);
+	UT_ASSERT(strcmp(relmap_identify(0x10 | XLR_INFO_MASK), "UPDATE_V2") == 0);
+}
+
 UT_TEST(legacy_update_descriptor_and_identity_remain_unchanged)
 {
 	xl_relmap_update legacy = {0};
@@ -69,29 +87,29 @@ UT_TEST(legacy_update_descriptor_and_identity_remain_unchanged)
 	UT_ASSERT(strcmp(relmap_identify(0), "UPDATE") == 0);
 }
 
-UT_TEST(managed_descriptor_reads_complete_registered_identity)
+UT_TEST(managed_clean_file_is_not_a_wal_intent)
 {
 	prepare(false); relmap_desc(&description, &reader);
 	UT_ASSERT(relmap_identify(0x10) != NULL && strcmp(relmap_identify(0x10), "UPDATE_V2") == 0);
 	UT_ASSERT(relmap_identify(0x10 | XLR_INFO_MASK) != NULL
 		&& strcmp(relmap_identify(0x10 | XLR_INFO_MASK), "UPDATE_V2") == 0);
-	UT_ASSERT(strcmp(desc_text, "database 0 tablespace 1664 origin 0 creation 103 registration 19 committed 7 pending 0") == 0);
+	UT_ASSERT(strcmp(desc_text, "invalid managed relmap record") == 0);
 }
 
-UT_TEST(managed_pending_is_reported_as_observed_pending_only)
+UT_TEST(managed_pending_file_is_not_a_wal_intent)
 {
 	prepare(true); relmap_desc(&description, &reader);
-	UT_ASSERT(strstr(desc_text, "committed 7 pending 8") != NULL);
+	UT_ASSERT(strcmp(desc_text, "invalid managed relmap record") == 0);
 }
 
 UT_TEST(managed_short_long_or_null_payload_is_invalid)
 {
 	const uint32 lengths[] = {0, 128, 2176, 2303, 2305, UINT32_MAX};
 	for (unsigned i = 0; i < lengthof(lengths); ++i) {
-		prepare(false); decoded.main_data_len = lengths[i]; relmap_desc(&description, &reader);
+		prepare_wal_intent(); decoded.main_data_len = lengths[i]; relmap_desc(&description, &reader);
 		UT_ASSERT(strcmp(desc_text, "invalid managed relmap record") == 0);
 	}
-	prepare(false); decoded.main_data = NULL; relmap_desc(&description, &reader);
+	prepare_wal_intent(); decoded.main_data = NULL; relmap_desc(&description, &reader);
 	UT_ASSERT(strcmp(desc_text, "invalid managed relmap record") == 0);
 }
 
@@ -99,32 +117,33 @@ UT_TEST(managed_header_and_image_damage_never_print_fields)
 {
 	const unsigned offsets[] = {0, 12, 96, 104, 116, 120, 124, 200, 2303};
 	for (unsigned i = 0; i < lengthof(offsets); ++i) {
-		prepare(false); bytes[offsets[i]] ^= 1; relmap_desc(&description, &reader);
+		prepare_wal_intent(); bytes[offsets[i]] ^= 1; relmap_desc(&description, &reader);
 		UT_ASSERT(strcmp(desc_text, "invalid managed relmap record") == 0);
 	}
 }
 
 UT_TEST(managed_block_or_page_edge_records_are_invalid)
 {
-	prepare(false); decoded.max_block_id = 0; relmap_desc(&description, &reader);
+	prepare_wal_intent(); decoded.max_block_id = 0; relmap_desc(&description, &reader);
 	UT_ASSERT(strcmp(desc_text, "invalid managed relmap record") == 0);
-	prepare(false); decoded.has_page_version_edge = true; relmap_desc(&description, &reader);
+	prepare_wal_intent(); decoded.has_page_version_edge = true; relmap_desc(&description, &reader);
 	UT_ASSERT(strcmp(desc_text, "invalid managed relmap record") == 0);
 }
 
 UT_TEST(unknown_opcode_stays_unknown_without_partial_description)
 {
-	prepare(false); decoded.header.xl_info = 0x20; relmap_desc(&description, &reader);
+	prepare_wal_intent(); decoded.header.xl_info = 0x20; relmap_desc(&description, &reader);
 	UT_ASSERT_EQ(description.len, 0); UT_ASSERT(relmap_identify(0x20) == NULL);
 }
 
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(legacy_update_descriptor_and_identity_remain_unchanged);
-	UT_RUN(managed_descriptor_reads_complete_registered_identity);
-	UT_RUN(managed_pending_is_reported_as_observed_pending_only);
+	UT_RUN(managed_intent_descriptor_reports_complete_identity);
+	UT_RUN(managed_clean_file_is_not_a_wal_intent);
+	UT_RUN(managed_pending_file_is_not_a_wal_intent);
 	UT_RUN(managed_short_long_or_null_payload_is_invalid);
 	UT_RUN(managed_header_and_image_damage_never_print_fields);
 	UT_RUN(managed_block_or_page_edge_records_are_invalid);

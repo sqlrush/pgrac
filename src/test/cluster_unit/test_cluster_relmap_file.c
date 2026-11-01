@@ -427,10 +427,12 @@ UT_TEST(observation_rejects_short_long_null_or_legacy_inputs)
 	cleanup();
 }
 
+#include "test_cluster_relmap_wal_intent.inc"
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(23);
 	UT_RUN(assigned_format_matches_the_complete_big_endian_byte_table);
 	UT_RUN(complete_envelope_preserves_inner_and_rejects_old_format);
 	UT_RUN(creation_identity_is_independent_of_map_generation);
@@ -445,6 +447,15 @@ main(void)
 	UT_RUN(observation_checks_assigned_shape_after_forged_envelope_checksums);
 	UT_RUN(observation_rejects_all_output_aliases_before_writing);
 	UT_RUN(observation_rejects_short_long_null_or_legacy_inputs);
+	UT_RUN(wal_intent_roundtrip_remains_noninstallable);
+	UT_RUN(wal_intent_rebuild_is_the_exact_pending_file);
+	UT_RUN(wal_intent_and_file_modes_refuse_each_other);
+	UT_RUN(wal_intent_validates_complete_owner_and_namespace);
+	UT_RUN(wal_intent_damage_never_publishes_partial_outputs);
+	UT_RUN(wal_intent_rebuild_requires_expected_and_actual_end);
+	UT_RUN(wal_intent_output_aliases_refuse_before_mutation);
+	UT_RUN(wal_intent_null_and_length_errors_preserve_output);
+	UT_RUN(wal_intent_state_and_end_are_checked_after_resigned_crcs);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

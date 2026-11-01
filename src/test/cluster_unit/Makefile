@@ -802,6 +802,7 @@ test_cluster_relmap_pending_product.o: $(top_srcdir)/src/backend/cluster/cluster
 
 test_cluster_relmap_v2_codec_product.o: $(top_srcdir)/src/common/cluster_relmap_v2.c \
 		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 		$(top_srcdir)/src/include/common/relmap.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
 
@@ -14824,7 +14825,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_terminal_episode.inc \
  $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
 
 # Managed envelope: real pair I/O, while control registration remains external.
-test_cluster_relmap_file: test_cluster_relmap_file.c unit_test.h \
+test_cluster_relmap_file: test_cluster_relmap_file.c test_cluster_relmap_wal_intent.inc unit_test.h \
 		$(top_srcdir)/src/common/cluster_relmap_file_io.c \
 		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \

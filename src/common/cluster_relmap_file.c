@@ -51,9 +51,9 @@ file_crc(const void *first, size_t first_length, const void *last, size_t last_l
 	return crc;
 }
 
-bool
-cluster_relmap_file_encode_v2(const ClusterRecoveryFileIdentityV2 *identity,
-							const ClusterRelmapV2Image *image, void *output, size_t length)
+static bool
+file_encode(const ClusterRecoveryFileIdentityV2 *identity,
+			const ClusterRelmapV2Image *image, void *output, size_t length, bool intent)
 {
 	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2] = {0};
 	if (identity == NULL || identity->kind != CLUSTER_RECOVERY_FILE_RELMAP_V2
@@ -68,7 +68,8 @@ cluster_relmap_file_encode_v2(const ClusterRecoveryFileIdentityV2 *identity,
 		|| !cluster_recovery_file_identity_encode_v2(identity, bytes, 128))
 		return false;
 	memcpy(bytes, "RFM2", 4);
-	if (cluster_relmap_v2_encode(image, bytes + 128, CLUSTER_RELMAP_V2_FILE_SIZE)
+	if ((intent ? cluster_relmap_v2_encode_intent(image, bytes + 128, CLUSTER_RELMAP_V2_FILE_SIZE)
+			 : cluster_relmap_v2_encode(image, bytes + 128, CLUSTER_RELMAP_V2_FILE_SIZE))
 		!= CLUSTER_RELMAP_V2_VALID)
 		return false;
 	file_put32(bytes + 112, CLUSTER_RELMAP_V2_FILE_SIZE);
@@ -79,10 +80,9 @@ cluster_relmap_file_encode_v2(const ClusterRecoveryFileIdentityV2 *identity,
 	return true;
 }
 
-bool
-cluster_relmap_file_observe_v2(const void *input, size_t length,
-							ClusterRecoveryFileIdentityV2 *identity_out,
-							ClusterRelmapV2Image *output)
+static bool
+file_observe(const void *input, size_t length, ClusterRecoveryFileIdentityV2 *identity_out,
+			 ClusterRelmapV2Image *output, bool intent)
 {
 	const unsigned char *bytes = input;
 	unsigned char reference[CLUSTER_RECOVERY_IDENTITY_REFERENCE_V2_BYTES];
@@ -112,12 +112,64 @@ cluster_relmap_file_observe_v2(const void *input, size_t length,
 		return false;
 	ns = (ClusterRelmapV2Namespace) {observed.system_identifier,
 		observed.database_incarnation, observed.database_oid, observed.database_oid == InvalidOid};
-	if (cluster_relmap_v2_decode(bytes + 128, CLUSTER_RELMAP_V2_FILE_SIZE, &ns, &image)
+	if ((intent ? cluster_relmap_v2_decode_intent(bytes + 128, CLUSTER_RELMAP_V2_FILE_SIZE, &ns, &image)
+			 : cluster_relmap_v2_decode(bytes + 128, CLUSTER_RELMAP_V2_FILE_SIZE, &ns, &image))
 		!= CLUSTER_RELMAP_V2_VALID)
 		return false;
 	*identity_out = observed;
 	*output = image;
 	return true;
+}
+
+bool
+cluster_relmap_file_encode_v2(const ClusterRecoveryFileIdentityV2 *identity,
+							const ClusterRelmapV2Image *image, void *output, size_t length)
+{
+	return file_encode(identity, image, output, length, false);
+}
+
+bool
+cluster_relmap_file_observe_v2(const void *input, size_t length,
+							 ClusterRecoveryFileIdentityV2 *identity_out,
+							 ClusterRelmapV2Image *output)
+{
+	return file_observe(input, length, identity_out, output, false);
+}
+
+bool
+cluster_relmap_wal_encode_intent_v2(const ClusterRecoveryFileIdentityV2 *identity,
+								  const ClusterRelmapV2Image *image, void *output, size_t length)
+{
+	return file_encode(identity, image, output, length, true);
+}
+
+bool
+cluster_relmap_wal_observe_intent_v2(const void *input, size_t length,
+								   ClusterRecoveryFileIdentityV2 *identity_out,
+								   ClusterRelmapV2Image *output)
+{
+	return file_observe(input, length, identity_out, output, true);
+}
+
+bool
+cluster_relmap_wal_rebuild_pending_v2(const void *input, size_t length,
+									const ClusterRecoveryFileIdentityV2 *expected,
+									uint64 actual_end, void *output, size_t output_length)
+{
+	ClusterRecoveryFileIdentityV2 observed;
+	ClusterRelmapV2Image image;
+	unsigned char reference[CLUSTER_RECOVERY_IDENTITY_REFERENCE_V2_BYTES];
+
+	if (expected == NULL || output == NULL || actual_end == 0
+		|| output_length != CLUSTER_RELMAP_FILE_SIZE_V2
+		|| file_overlap(output, output_length, input, length)
+		|| file_overlap(output, output_length, expected, sizeof(*expected))
+		|| !cluster_relmap_wal_observe_intent_v2(input, length, &observed, &image)
+		|| !cluster_recovery_file_identity_encode_v2(&observed, reference, sizeof(reference))
+		|| !cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), expected))
+		return false;
+	image.pending_owner.wal_end = actual_end;
+	return cluster_relmap_file_encode_v2(expected, &image, output, output_length);
 }
 
 bool

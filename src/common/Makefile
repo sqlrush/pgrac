@@ -235,3 +235,8 @@ cluster_relmap_file_io.o cluster_relmap_file_io_srv.o cluster_relmap_file_io_shl
 cluster_recovery_file_identity.o cluster_recovery_file_identity_srv.o cluster_recovery_file_identity_shlib.o: \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
+# Both installable images and WAL intents consume the assigned inner state.
+cluster_relmap_v2.o cluster_relmap_v2_srv.o cluster_relmap_v2_shlib.o: \
+	$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h

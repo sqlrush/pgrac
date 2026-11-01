@@ -36,12 +36,12 @@ relmap_desc(StringInfo buf, XLogReaderState *record)
 		ClusterRelmapV2Image image;
 
 		if (XLogRecHasAnyBlockRefs(record) || XLogRecHasPageVersionEdge(record)
-			|| !cluster_relmap_file_observe_v2(rec, XLogRecGetDataLen(record), &identity, &image))
+			|| !cluster_relmap_wal_observe_intent_v2(rec, XLogRecGetDataLen(record), &identity, &image))
 		{
 			appendStringInfoString(buf, "invalid managed relmap record");
 			return;
 		}
-		appendStringInfo(buf, "database %u tablespace %u origin %u creation " UINT64_FORMAT
+		appendStringInfo(buf, "WAL_INTENT database %u tablespace %u origin %u creation " UINT64_FORMAT
 						 " registration " UINT64_FORMAT " committed " UINT64_FORMAT
 						 " pending " UINT64_FORMAT,
 						 identity.database_oid, identity.tablespace_oid, identity.origin,

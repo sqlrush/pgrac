@@ -23,6 +23,7 @@
 #endif
 
 #include "common/cluster_relmap_v2.h"
+#include "cluster/cluster_recovery_format.h"
 
 /* Header offsets are wire constants, never offsetof an in-memory struct. */
 static uint64
@@ -89,19 +90,22 @@ valid_native_map(const unsigned char *slot, RelMapFile *map)
 }
 
 static bool
-valid_wire_format(const unsigned char *p)
+valid_wire_format(const unsigned char *p, bool intent)
 {
 	return read_le(p, 4) == CLUSTER_RELMAP_V2_MAGIC
 		   && read_le(p + 4, 2) == CLUSTER_RELMAP_V2_VERSION
 		   && read_le(p + 6, 2) == CLUSTER_RELMAP_V2_HEADER_SIZE
 		   && read_le(p + 8, 4) == CLUSTER_RELMAP_V2_FILE_SIZE
-		   && read_le(p + 12, 4) == sizeof(RelMapFile) && p[52] <= 1 && p[53] == 0
+		   && read_le(p + 12, 4) == sizeof(RelMapFile) && p[52] <= 1
+		   && p[CLUSTER_RECOVERY_RELMAP_IMAGE_V2_STATE_OFFSET]
+			   == (intent ? CLUSTER_RECOVERY_RELMAP_WAL_INTENT_V2
+					  : CLUSTER_RECOVERY_RELMAP_FILE_PENDING_V2)
 		   && all_zero(p + 96, 20);
 }
 
 static ClusterRelmapV2Validity
 decode_header(const unsigned char *p, const ClusterRelmapV2Namespace *expected,
-			  ClusterRelmapV2Image *image)
+			  ClusterRelmapV2Image *image, bool intent)
 {
 	image->identity.system_identifier = read_le(p + 16, 8);
 	image->identity.database_incarnation = read_le(p + 24, 8);
@@ -126,18 +130,20 @@ decode_header(const unsigned char *p, const ClusterRelmapV2Namespace *expected,
 	image->pending_owner.wal_end = read_le(p + 80, 8);
 	image->pending_owner.boot_incarnation = read_le(p + 88, 8);
 	if (image->pending_generation == 0)
-		return all_zero(p + 54, 42) ? CLUSTER_RELMAP_V2_VALID : CLUSTER_RELMAP_V2_INVALID_OWNER;
+		return !intent && all_zero(p + 54, 42)
+			? CLUSTER_RELMAP_V2_VALID : CLUSTER_RELMAP_V2_INVALID_OWNER;
 	/* node_id is 0..127; a FullXid must also have a normal low 32-bit xid. */
 	if (image->pending_owner.node >= 128 || (uint32)image->pending_owner.top_full_xid < 3
-		|| image->pending_owner.admitted_incarnation == 0 || image->pending_owner.wal_end == 0
+		|| image->pending_owner.admitted_incarnation == 0
+		|| (intent ? image->pending_owner.wal_end != 0 : image->pending_owner.wal_end == 0)
 		|| image->pending_owner.boot_incarnation == 0)
 		return CLUSTER_RELMAP_V2_INVALID_OWNER;
 	return CLUSTER_RELMAP_V2_VALID;
 }
 
-ClusterRelmapV2Validity
-cluster_relmap_v2_decode(const void *bytes, size_t length, const ClusterRelmapV2Namespace *expected,
-						 ClusterRelmapV2Image *output)
+static ClusterRelmapV2Validity
+decode_image(const void *bytes, size_t length, const ClusterRelmapV2Namespace *expected,
+			 ClusterRelmapV2Image *output, bool intent)
 {
 	const unsigned char *p = bytes;
 	ClusterRelmapV2Image image;
@@ -149,7 +155,7 @@ cluster_relmap_v2_decode(const void *bytes, size_t length, const ClusterRelmapV2
 		return CLUSTER_RELMAP_V2_INVALID_ARGUMENT;
 	if (bytes == NULL || length != CLUSTER_RELMAP_V2_FILE_SIZE)
 		return CLUSTER_RELMAP_V2_INVALID_LENGTH;
-	if (!valid_wire_format(p))
+	if (!valid_wire_format(p, intent))
 		return CLUSTER_RELMAP_V2_INVALID_FORMAT;
 	if (read_le(p + 124, 4) != image_crc(p, 124)
 		|| read_le(p + 116, 4)
@@ -158,7 +164,7 @@ cluster_relmap_v2_decode(const void *bytes, size_t length, const ClusterRelmapV2
 			   != image_crc(p + CLUSTER_RELMAP_V2_PENDING_OFFSET, CLUSTER_RELMAP_V2_SLOT_SIZE))
 		return CLUSTER_RELMAP_V2_INVALID_CRC;
 	memset(&image, 0, sizeof(image));
-	validity = decode_header(p, expected, &image);
+	validity = decode_header(p, expected, &image, intent);
 	if (validity != CLUSTER_RELMAP_V2_VALID)
 		return validity;
 	if (!valid_native_map(p + CLUSTER_RELMAP_V2_COMMITTED_OFFSET, &image.committed))
@@ -172,8 +178,8 @@ cluster_relmap_v2_decode(const void *bytes, size_t length, const ClusterRelmapV2
 	return CLUSTER_RELMAP_V2_VALID;
 }
 
-ClusterRelmapV2Validity
-cluster_relmap_v2_encode(const ClusterRelmapV2Image *image, void *bytes, size_t length)
+static ClusterRelmapV2Validity
+encode_image(const ClusterRelmapV2Image *image, void *bytes, size_t length, bool intent)
 {
 	unsigned char wire[CLUSTER_RELMAP_V2_FILE_SIZE];
 	ClusterRelmapV2Image checked;
@@ -195,6 +201,9 @@ cluster_relmap_v2_encode(const ClusterRelmapV2Image *image, void *bytes, size_t 
 	write_le(wire + 40, image->pending_generation, 8);
 	write_le(wire + 48, image->identity.dbid, 4);
 	wire[52] = image->identity.shared ? 1 : 0;
+	wire[CLUSTER_RECOVERY_RELMAP_IMAGE_V2_STATE_OFFSET]
+		= intent ? CLUSTER_RECOVERY_RELMAP_WAL_INTENT_V2
+				 : CLUSTER_RECOVERY_RELMAP_FILE_PENDING_V2;
 	write_le(wire + 54, image->pending_owner.node, 2);
 	write_le(wire + 56, image->pending_owner.top_full_xid, 8);
 	write_le(wire + 64, image->pending_owner.membership_epoch, 8);
@@ -208,10 +217,36 @@ cluster_relmap_v2_encode(const ClusterRelmapV2Image *image, void *bytes, size_t 
 	write_le(wire + 120,
 			 image_crc(wire + CLUSTER_RELMAP_V2_PENDING_OFFSET, CLUSTER_RELMAP_V2_SLOT_SIZE), 4);
 	write_le(wire + 124, image_crc(wire, 124), 4);
-	validity = cluster_relmap_v2_decode(wire, sizeof(wire), &image->identity, &checked);
+	validity = decode_image(wire, sizeof(wire), &image->identity, &checked, intent);
 	if (validity == CLUSTER_RELMAP_V2_VALID)
 		memcpy(bytes, wire, sizeof(wire));
 	return validity;
+}
+
+ClusterRelmapV2Validity
+cluster_relmap_v2_decode(const void *bytes, size_t length, const ClusterRelmapV2Namespace *expected,
+						ClusterRelmapV2Image *output)
+{
+	return decode_image(bytes, length, expected, output, false);
+}
+
+ClusterRelmapV2Validity
+cluster_relmap_v2_encode(const ClusterRelmapV2Image *image, void *bytes, size_t length)
+{
+	return encode_image(image, bytes, length, false);
+}
+
+ClusterRelmapV2Validity
+cluster_relmap_v2_decode_intent(const void *bytes, size_t length,
+							  const ClusterRelmapV2Namespace *expected, ClusterRelmapV2Image *output)
+{
+	return decode_image(bytes, length, expected, output, true);
+}
+
+ClusterRelmapV2Validity
+cluster_relmap_v2_encode_intent(const ClusterRelmapV2Image *image, void *bytes, size_t length)
+{
+	return encode_image(image, bytes, length, true);
 }
 
 static bool
