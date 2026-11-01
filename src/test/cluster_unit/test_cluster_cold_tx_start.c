@@ -2543,6 +2543,7 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_hot_graph.inc"
 #include "test_cluster_cold_ctrc_reference_coverage.inc"
 #include "test_cluster_cold_ctrc_redirect_graph.inc"
+#include "test_cluster_cold_ctrc_relmap_consumer.inc"
 #endif
 
 #include "test_cluster_cold_ctrc_page_raw.inc"
@@ -2553,6 +2554,14 @@ static void startup_local_empty_reset(void);
 int main(void)
 {
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (getenv("PGRAC_PRE2_TEST_RELMAP_CONSUMER") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_start_owner_graph_requires_declared_relmap_terminal_input);
+		UT_RUN(test_start_observation_graph_cannot_bypass_declared_terminal_input);
+		UT_RUN(test_start_undeclared_page_owner_graph_keeps_original_contribution);
+		reset();
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_REDIRECT_GRAPH") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_start_redirect_graph_keeps_actual_line_pointer_and_full_target_identity);
