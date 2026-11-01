@@ -46,11 +46,13 @@ print encode_json(evaluate_sample($input, 'empty_undo_preflight.py'));
     else:
         suffix = r'''
 my $client = bless {stderr => $input->{stderr}}, 'EmptyClient';
+my $entry = {client => $client, pending => $input->{pending_completion} ? 1 : 0};
 my $sample;
-my $ok = eval { $sample = empty_statement('offline', {client => $client},
-                                         'SELECT 1;', $input->{trigger}); 1; };
+my $ok = eval { $sample = empty_statement('offline', $entry,
+                    $input->{pending_completion} ? undef : 'SELECT 1;', $input->{trigger}); 1; };
 print encode_json({sample => $sample, failure => $ok ? '' : $@,
-                   stderr_after => $client->{stderr}, saved => \@saved});
+                   stderr_after => $client->{stderr}, pending_after => $entry->{pending},
+                   saved => \@saved});
 '''
     result = subprocess.run(["perl", "-e", prefix + matches[0] + suffix],
                             input=json.dumps(sample), text=True, capture_output=True,
@@ -248,6 +250,63 @@ class EmptyUndoEvidenceTests(unittest.TestCase):
             result = perl_bridge("empty_statement", bad)
             self.assertTrue(result["failure"])
             self.assertIsNone(result["sample"])
+
+    def test_actual_perl_statement_reader_consumes_psql_source_notices(self):
+        first = evidence("statement_trigger_error", "abort")["first"]
+        notice = {key: first[key] for key in ("pid", "top", "binding", "snapshot")}
+        for prefix, ending in (("", "\r\n"), ("psql:<stdin>:24: ", "\n"),
+                               ("psql:/tmp/a:b case.sql:42: ", "\r\n"),
+                               ("psql:<stdin>:24:\t", "\n")):
+            for pending in (False, True):
+                with self.subTest(prefix=prefix, ending=ending, pending=pending):
+                    stderr = (prefix + "NOTICE:  00000: G_EMPTY_OBSERVATION "
+                              + json.dumps(notice) + ending
+                              + prefix + "ERROR:  P0001: G_EMPTY_EXPECTED_TRIGGER_ERROR" + ending)
+                    sample = dict(trigger=1, output="G_EMPTY_SQLSTATE P0001", error=1,
+                                  counters=first["counters"], stderr=stderr,
+                                  pending_completion=pending)
+                    result = perl_bridge("empty_statement", sample)
+                    self.assertEqual(result["failure"], "")
+                    self.assertEqual(result["sample"], first)
+                    self.assertEqual(result["stderr_after"], "")
+                    self.assertEqual(result["pending_after"], 0)
+                    self.assertEqual(result["saved"], [["offline-statement", dict(
+                        output=sample["output"], error=1, stderr=stderr)]])
+
+    def test_actual_perl_statement_reader_keeps_prefixed_rejections_and_raw_stderr(self):
+        first = evidence("statement_trigger_error", "abort")["first"]
+        notice = {key: first[key] for key in ("pid", "top", "binding", "snapshot")}
+        body = "NOTICE:  00000: G_EMPTY_OBSERVATION " + json.dumps(notice) + "\n"
+        line = "psql:<stdin>:24: " + body
+        error = "psql:<stdin>:24: ERROR:  P0001: G_EMPTY_EXPECTED_TRIGGER_ERROR\n"
+        faults = (
+            ("missing", error, "G_EMPTY_SQLSTATE P0001", 1),
+            ("duplicate", line * 2 + error, "G_EMPTY_SQLSTATE P0001", 1),
+            ("mixed duplicate", body + line + error, "G_EMPTY_SQLSTATE P0001", 1),
+            ("wrong source", "server: " + body + error, "G_EMPTY_SQLSTATE P0001", 1),
+            ("wrong line number", "psql:<stdin>:bad: " + body + error,
+             "G_EMPTY_SQLSTATE P0001", 1),
+            ("wrong severity", line.replace("NOTICE:", "WARNING:") + error,
+             "G_EMPTY_SQLSTATE P0001", 1),
+            ("context text", "CONTEXT: " + line + error, "G_EMPTY_SQLSTATE P0001", 1),
+            ("malformed JSON", "psql:<stdin>:24: NOTICE: G_EMPTY_OBSERVATION {bad}\n" + error,
+             "G_EMPTY_SQLSTATE P0001", 1),
+            ("wrong SQLSTATE", line + error, "G_EMPTY_SQLSTATE 57014", 1),
+            ("duplicate SQLSTATE", line + error,
+             "G_EMPTY_SQLSTATE P0001\nG_EMPTY_SQLSTATE P0001", 1),
+            ("wrong error", line + error.replace("P0001:", "57014:"),
+             "G_EMPTY_SQLSTATE P0001", 1),
+            ("missing query error", line + error, "G_EMPTY_SQLSTATE P0001", 0))
+        for name, stderr, output, status in faults:
+            with self.subTest(fault=name):
+                sample = dict(trigger=1, output=output, error=status,
+                              counters=first["counters"], stderr=stderr)
+                result = perl_bridge("empty_statement", sample)
+                self.assertTrue(result["failure"])
+                self.assertIsNone(result["sample"])
+                self.assertEqual(result["stderr_after"], stderr)
+                self.assertEqual(result["saved"], [["offline-statement", dict(
+                    output=output, error=status, stderr=stderr)]])
 
 
 if __name__ == "__main__":
