@@ -383,6 +383,20 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin_images_v1(
 extern ClusterRecoveryCensusResult cluster_recovery_census_begin_ctrc_images_v1(
 	ClusterWalInputsV1 *inputs, size_t memory_budget, ClusterRecoveryCensus **out);
 
+/* Opt in immediately after any original begin, before the first next call.
+ * Copy the complete table published by the SAME original Start under narrow
+ * CF-X, then released before traversal. No CF acquire/reentry or live selection
+ * crosses WAL/namespace calls. Fixed table/startup generation and all control
+ * fields are checked on every tick and final/DONE gates. Original native
+ * address-bound current/release bracket each complete physical pair. Unknown,
+ * missing/changed table or incomplete pairs refuse, never raw fallback.
+ * The original owner retains the same episode/full-source/cut/IR/WALR/FD/pins
+ * duties. Failures invalidate this census; no apply/discharge/COMPLETE grant.
+ * Reentry/late binding cannot switch modes. Input is copied, not borrowed. */
+extern bool
+cluster_recovery_census_bind_managed_relmap_v2(ClusterRecoveryCensus *census,
+											   const ClusterControlNativeTableInfoV2 *table);
+
 /* Run the existing ROOT/WAL union, all TT slots, physical PAGE/history root
  * discovery and seeded TX records. Discovery adds exact canonical-base roots
  * before the TX walk; deferred bindings/structures remain obligations for

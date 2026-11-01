@@ -25,6 +25,8 @@ struct ClusterRecoveryCensus {
 	ClusterRecoveryMultixactScan *mx;
 	ClusterRecoverySlruScan *slru;
 	ClusterRecoveryRelmapScan *relmap;
+	bool managed_relmap;
+	ClusterControlNativeTableInfoV2 relmap_table;
 	ClusterRecoveryCensusPagesV1 *pages;
 	uint32 page_count, page_capacity;
 	uint8 pages_sha256[32];
@@ -94,6 +96,68 @@ census_fail(ClusterRecoveryCensus *census, ClusterRecoveryCensusResult result)
 	census->status = result;
 	census_release(census);
 	return result;
+}
+
+static bool
+census_output_distinct(const ClusterRecoveryCensus *census, const void *out, Size length)
+{
+	uintptr_t a = (uintptr_t)census, b = (uintptr_t)out;
+
+	if (out == NULL || length == 0)
+		return false;
+	if (census == NULL)
+		return true;
+	return (a <= b ? b - a >= sizeof(*census) : a - b >= length)
+		   && (census->roots == NULL
+			   || cluster_recovery_root_set_output_distinct(census->roots, out, length))
+		   && cluster_recovery_relmap_scan_output_distinct_v2(census->relmap, out, length);
+}
+
+/* Full original Start table snapshot; borrowed count is not an identity. */
+static bool
+census_relmap_current(ClusterRecoveryCensus *census)
+{
+	ClusterControlNativeTableInfoV2 now, expected = census->relmap_table;
+	if (!census->managed_relmap)
+		return true;
+	if (!cluster_control_native_files_info_v2(&now))
+		return false;
+	now.borrowed = expected.borrowed = 0;
+	return memcmp(&now, &expected, sizeof(now)) == 0;
+}
+
+bool
+cluster_recovery_census_bind_managed_relmap_v2(ClusterRecoveryCensus *census,
+											   const ClusterControlNativeTableInfoV2 *table)
+{
+	volatile bool ok = false;
+	if (census == NULL || table == NULL || !census_output_distinct(census, table, sizeof(*table))
+		|| census->status != CLUSTER_RECOVERY_CENSUS_MORE
+		|| census->diag.phase != CLUSTER_RECOVERY_CENSUS_WAL || census->inventory != NULL
+		|| census->managed_relmap)
+		return false;
+	PG_TRY();
+	{
+		census->managed_relmap = true;
+		census->relmap_table = *table;
+		ok = table->mode == CLUSTER_NATIVE_FILES_MANAGED_V2 && table->table_generation
+			 && table->startup_generation && table->control.logical_count
+			 && table->control.logical_count <= UINT64_MAX / 2
+			 && table->control.logical_count <= table->count && table->count <= table->capacity
+			 && table->control.config.identity.system_identifier == census->system_identifier
+			 && table->control.config.identity.database_incarnation == census->database_incarnation
+			 && memcmp(table->control.config.identity.storage_uuid, census->storage_uuid, 16) == 0
+			 && census_relmap_current(census);
+		if (!ok)
+			(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+	}
+	PG_CATCH();
+	{
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
 }
 
 static ClusterRecoveryCensusResult
@@ -883,11 +947,15 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 	case CLUSTER_RECOVERY_CENSUS_TT_TERMINALS:
 		return census_tt_terminal(census, out);
 	case CLUSTER_RECOVERY_CENSUS_RELMAP_PHYSICAL:
-		if (census->relmap == NULL)
-			d->relmap_result = cluster_recovery_relmap_scan_begin(
-				census->roots, census->system_identifier, census->database_incarnation,
-				census->storage_uuid, census->child_budget, &census->relmap);
-		else
+		if (census->relmap == NULL) {
+			if (census->managed_relmap)
+				d->relmap_result = cluster_recovery_relmap_scan_begin_native_v2(
+					census->roots, &census->relmap_table, census->child_budget, &census->relmap);
+			else
+				d->relmap_result = cluster_recovery_relmap_scan_begin(
+					census->roots, census->system_identifier, census->database_incarnation,
+					census->storage_uuid, census->child_budget, &census->relmap);
+		} else
 			d->relmap_result
 				= cluster_recovery_relmap_scan_next(census->relmap, &out->value.relmap);
 		if (d->relmap_result == CLUSTER_RECOVERY_RELMAP_ENTRY) {
@@ -940,10 +1008,10 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 		d->inventory_result = cluster_recovery_native_inventory_recheck(
 			census->inputs, census->inventory, &d->inventory);
 		if (d->inventory_result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
-			|| !census_build_manifest(census)
-			|| !census_pages_digest(census, census->pages_sha256)
+			|| !census_build_manifest(census) || !census_pages_digest(census, census->pages_sha256)
 			|| !census_references_digest(census, census->references_sha256)
-			|| !census_images_digest(census, census->images_sha256))
+			|| !census_images_digest(census, census->images_sha256)
+			|| !census_relmap_current(census))
 			break;
 		census->pages_complete = true;
 		d->phase = CLUSTER_RECOVERY_CENSUS_DONE;
@@ -952,7 +1020,7 @@ census_step(ClusterRecoveryCensus *census, ClusterRecoveryCensusEntry *out)
 	case CLUSTER_RECOVERY_CENSUS_DONE: {
 		uint8 digest[32], inputs_digest[32], pages_digest[32], references_digest[32], images_digest[32];
 		d->input_result = cluster_wal_inputs_revalidate_v1(census->inputs);
-		if (d->input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		if (d->input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || !census_relmap_current(census)
 			|| !cluster_recovery_root_set_digest(census->roots, digest)
 			|| !cluster_recovery_reference_graph_observed(census->graph)
 			|| !cluster_recovery_native_inventory_digest(census->inventory, inputs_digest)
@@ -981,6 +1049,8 @@ cluster_recovery_census_next(ClusterRecoveryCensus *census, ClusterRecoveryCensu
 {
 	ClusterRecoveryCensusResult result;
 
+	if (out != NULL && !census_output_distinct(census, out, sizeof(*out)))
+		return census_fail(census, CLUSTER_RECOVERY_CENSUS_INVALID);
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (census == NULL)
@@ -993,13 +1063,18 @@ cluster_recovery_census_next(ClusterRecoveryCensus *census, ClusterRecoveryCensu
 	{
 		int fd = -1;
 
-		if (census->ctrc_namespace
-			&& ((census->diag.input_result = cluster_wal_inputs_ctrc_namespace_v1(
-				census->inputs, &fd)) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-				|| fd != census->ctrc_namespace_fd))
+		if (!census_relmap_current(census))
+			result = census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
+		else if (census->ctrc_namespace
+				 && ((census->diag.input_result
+					  = cluster_wal_inputs_ctrc_namespace_v1(census->inputs, &fd))
+						 != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					 || fd != census->ctrc_namespace_fd))
 			result = census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
 		else
 			result = census_step(census, out);
+		if (result <= CLUSTER_RECOVERY_CENSUS_DRAINED && !census_relmap_current(census))
+			result = census_fail(census, CLUSTER_RECOVERY_CENSUS_REFUSED);
 	}
 	PG_CATCH();
 	{
@@ -1018,6 +1093,10 @@ cluster_recovery_census_manifest(ClusterRecoveryCensus *census, ClusterRecoveryC
 {
 	ClusterRecoveryCensusEntry entry;
 
+	if (out != NULL && !census_output_distinct(census, out, sizeof(*out))) {
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_INVALID);
+		return false;
+	}
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (out == NULL || census == NULL || census->status != CLUSTER_RECOVERY_CENSUS_DRAINED)
@@ -1445,6 +1524,10 @@ cluster_recovery_census_wal_source_count_v1(ClusterRecoveryCensus *census, uint3
 	ClusterRecoveryCensusManifest manifest;
 	bool ok = false;
 
+	if (out != NULL && !census_output_distinct(census, out, sizeof(*out))) {
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_INVALID);
+		return false;
+	}
 	if (out != NULL) *out = 0;
 	if (out == NULL || census == NULL)
 		return false;
@@ -1476,6 +1559,10 @@ cluster_recovery_census_wal_source_at_v1(ClusterRecoveryCensus *census, uint32 i
 	uint32 count;
 	bool ok = false;
 
+	if (out != NULL && !census_output_distinct(census, out, sizeof(*out))) {
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_INVALID);
+		return false;
+	}
 	if (out != NULL) memset(out, 0, sizeof(*out));
 	if (out == NULL || !cluster_recovery_census_wal_source_count_v1(census, &count)
 		|| index >= count)
@@ -1501,6 +1588,10 @@ cluster_recovery_census_page_wal_count_v1(ClusterRecoveryCensus *census, uint32 
 	ClusterRecoveryCensusManifest manifest;
 	bool ok = false;
 
+	if (out != NULL && !census_output_distinct(census, out, sizeof(*out))) {
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_INVALID);
+		return false;
+	}
 	if (out != NULL) *out = 0;
 	if (out == NULL || census == NULL)
 		return false;
@@ -1528,6 +1619,10 @@ cluster_recovery_census_page_wal_at_v1(ClusterRecoveryCensus *census, uint32 ind
 	uint32 count;
 	bool ok = false;
 
+	if (out != NULL && !census_output_distinct(census, out, sizeof(*out))) {
+		(void)census_fail(census, CLUSTER_RECOVERY_CENSUS_INVALID);
+		return false;
+	}
 	if (out != NULL) memset(out, 0, sizeof(*out));
 	if (out == NULL || !cluster_recovery_census_page_wal_count_v1(census, &count)
 		|| index >= count)
@@ -1553,6 +1648,9 @@ cluster_recovery_census_page_wal_at_v1(ClusterRecoveryCensus *census, uint32 ind
 bool
 cluster_recovery_census_diag(const ClusterRecoveryCensus *census, ClusterRecoveryCensusDiag *out)
 {
+	if (out != NULL && !census_output_distinct(census, out, sizeof(*out)))
+		return false;
+
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (out == NULL || census == NULL)
