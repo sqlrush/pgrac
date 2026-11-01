@@ -389,10 +389,164 @@ UT_TEST(actual_copy_cost)
 		(unsigned long long)(nanos() - begin), sizeof(b.expected), sizeof(info));
 	selection_end();
 }
+UT_TEST(address_unique_available_pair_uses_registered_origin_without_cf)
+{
+	ClusterControlNativeFileBorrowV2 b = { 0 };
+	ClusterControlNativeTableInfoV2 info;
+	table_reset();
+	inventory_begin(2);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	cf_held = false;
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_RELMAP_V2, 1001, DEFAULTTABLESPACE_OID, 0, &b),
+		CLUSTER_NATIVE_FILES_OK_V2);
+	UT_ASSERT_EQ(b.expected.origin, 1);
+	UT_ASSERT_EQ(b.expected.database_oid, 1001);
+	UT_ASSERT_EQ(b.expected.tablespace_oid, DEFAULTTABLESPACE_OID);
+	UT_ASSERT(cluster_control_native_file_current_v2(&b));
+	UT_ASSERT(cluster_control_native_files_info_v2(&info));
+	UT_ASSERT_EQ(info.count, 2); /* two physical pairs, two logical identities */
+	UT_ASSERT_EQ(info.borrowed, 1);
+	UT_ASSERT(cluster_control_native_file_release_v2(&b));
+	cf_held = true;
+	selection_end();
+}
+UT_TEST(address_multiple_origins_refuse_instead_of_selecting_first)
+{
+	ClusterControlNativeFileBorrowV2 b = { 0 }, zero = { 0 };
+	ClusterControlNativeTableInfoV2 before, after;
+	ClusterControlFileKeyV2 k = key(0);
+	table_reset();
+	native_inventory(2);
+	inventory[3].identity.object_id = 0;
+	inventory[3].identity.origin = 127;
+	inventory_write();
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	UT_ASSERT(cluster_control_native_files_info_v2(&before));
+	cf_held = false;
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 0, &b), CLUSTER_NATIVE_FILES_AMBIGUOUS_V2);
+	UT_ASSERT(!memcmp(&b, &zero, sizeof(b)));
+	UT_ASSERT(cluster_control_native_files_info_v2(&after));
+	UT_ASSERT(!memcmp(&before, &after, sizeof(before)));
+	/* The original explicit-origin API is unchanged. */
+	UT_ASSERT(cluster_control_native_file_acquire_v2(&k, &b));
+	UT_ASSERT_EQ(b.expected.origin, 0);
+	UT_ASSERT(cluster_control_native_file_release_v2(&b));
+	cf_held = true;
+	selection_end();
+}
+UT_TEST(address_missing_and_invalid_outputs_keep_original_duty)
+{
+	ClusterControlNativeFileBorrowV2 b = { 0 }, copy, before;
+	ClusterControlNativeTableInfoV2 info;
+	table_reset();
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 0, &b), CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2);
+	native_inventory(1);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 1, 0, 0, &b), CLUSTER_NATIVE_FILES_NOT_FOUND_V2);
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 1, 0, &b), CLUSTER_NATIVE_FILES_NOT_FOUND_V2);
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_UNDO_V2, 0, 0, 0, &b), CLUSTER_NATIVE_FILES_NOT_FOUND_V2);
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 1, &b), CLUSTER_NATIVE_FILES_NOT_FOUND_V2);
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_UNKNOWN_V2, 0, 0, 0, &b), CLUSTER_NATIVE_FILES_REFUSED_V2);
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 0, NULL), CLUSTER_NATIVE_FILES_REFUSED_V2);
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 0, (void *)native_files), CLUSTER_NATIVE_FILES_REFUSED_V2);
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 0, &b), 0);
+	before = copy = b;
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 0, &b), CLUSTER_NATIVE_FILES_REFUSED_V2);
+	UT_ASSERT(!memcmp(&b, &before, sizeof(b)));
+	UT_ASSERT(!cluster_control_native_file_current_v2(&copy));
+	UT_ASSERT(!cluster_control_native_file_release_v2(&copy));
+	UT_ASSERT(cluster_control_native_files_info_v2(&info));
+	UT_ASSERT_EQ(info.borrowed, 1);
+	UT_ASSERT(cluster_control_native_file_release_v2(&b));
+	UT_ASSERT(!cluster_control_native_file_release_v2(&b));
+	selection_end();
+}
+UT_TEST(address_full_inventory_borrow_blocks_changed_publication)
+{
+	ClusterControlNativeFileBorrowV2 b = { 0 };
+	ClusterControlNativeTableInfoV2 before, after;
+	uint64 begin;
+	ClusterControlNativeResultV2 (*volatile borrow_fn)(ClusterRecoveryFileKindV2, Oid, Oid,
+		uint64, ClusterControlNativeFileBorrowV2 *) = cluster_control_native_file_borrow_by_address_v2;
+	table_reset();
+	native_inventory(65);
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	UT_ASSERT_EQ(borrow_fn(CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 64, &b), 0);
+	UT_ASSERT_EQ(b.expected.object_id, 64);
+	UT_ASSERT(cluster_control_native_files_info_v2(&before));
+	inventory[67] = inventory[66];
+	inventory[67].identity.object_id = 65;
+	reg.coverage.file_count = 68;
+	inventory_write();
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9),
+		CLUSTER_NATIVE_FILES_BUSY_V2);
+	UT_ASSERT(cluster_control_native_files_info_v2(&after));
+	UT_ASSERT(!memcmp(&before, &after, sizeof(before)));
+	UT_ASSERT(cluster_control_native_file_current_v2(&b));
+	UT_ASSERT(cluster_control_native_file_release_v2(&b));
+	UT_ASSERT_EQ(cluster_control_native_files_publish_locked_v2(&expected_config, 65536, 9), 0);
+	cf_held = false;
+	begin = nanos();
+	for (unsigned i = 0; i < 10000; i++) {
+		if (borrow_fn(CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 64, &b) != 0
+			|| !cluster_control_native_file_current_v2(&b) || !cluster_control_native_file_release_v2(&b))
+			abort();
+	}
+	printf("# address borrow+current+release 10000 ns=%llu rows=67\n",
+		(unsigned long long)(nanos() - begin));
+	cf_held = true;
+	selection_end();
+}
+UT_TEST(address_unpublished_creation_is_not_ordinary_available)
+{
+	ClusterControlNativeFileBorrowV2 b = { 0 }, zero = { 0 };
+	ClusterControlFileKeyV2 k = key(0);
+	table_reset();
+	native_inventory(1);
+	memset(&creator_batch, 0, sizeof(creator_batch));
+	creator_batch.magic = PGRAC_INITDB_RECOVERY_MAGIC;
+	creator_batch.version = 2;
+	creator_batch.creator_pid = getpid();
+	creator_batch.config.fd = 3;
+	creator_batch.config.bytes = 1;
+	creator_batch.config.sha256[0] = 1;
+	creator_batch.first = inventory[0].identity;
+	creator_batch.first.object_id = 0;
+	creator_batch.boot_file_count = 2;
+	for (unsigned i = 0; i < 2; i++) {
+		creator_batch.boot_files[i] = creator_batch.first;
+		creator_batch.boot_files[i].kind = i ? CLUSTER_RECOVERY_FILE_UNDO_V2 : CLUSTER_RECOVERY_FILE_CLOG_V2;
+		creator_batch.boot_files[i].database_oid = creator_batch.boot_files[i].tablespace_oid = 0;
+		creator_batch.boot_files[i].creation_generation += 4 + i;
+	}
+	creation = &creator_batch;
+	cf_held = false;
+	registered->init_fn();
+	UT_ASSERT_EQ(cluster_control_native_file_borrow_by_address_v2(
+		CLUSTER_RECOVERY_FILE_CLOG_V2, 0, 0, 0, &b), CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2);
+	UT_ASSERT(!memcmp(&b, &zero, sizeof(b)));
+	UT_ASSERT(cluster_control_native_file_acquire_v2(&k, &b));
+	UT_ASSERT(cluster_control_native_file_release_v2(&b));
+	creation = NULL;
+	cf_held = true;
+	selection_end();
+}
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(33);
 	UT_RUN(test_original_codec_v4_extent_and_exact_reference);
 	UT_RUN(test_v4_refuses_forged_reference_and_record);
 	UT_RUN(test_selected_root_registry_real_files_and_late_change);
@@ -422,6 +576,11 @@ main(void)
 	UT_RUN(late_error_releases_only_local_publish_latch_and_keeps_old_table);
 	UT_RUN(capacity_wrap_and_full_gap_never_truncate);
 	UT_RUN(actual_copy_cost);
+	UT_RUN(address_unique_available_pair_uses_registered_origin_without_cf);
+	UT_RUN(address_multiple_origins_refuse_instead_of_selecting_first);
+	UT_RUN(address_missing_and_invalid_outputs_keep_original_duty);
+	UT_RUN(address_full_inventory_borrow_blocks_changed_publication);
+	UT_RUN(address_unpublished_creation_is_not_ordinary_available);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

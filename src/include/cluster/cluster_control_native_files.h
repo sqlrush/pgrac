@@ -19,7 +19,10 @@ typedef enum ClusterControlNativeResultV2 {
 	CLUSTER_NATIVE_FILES_REFUSED_V2,
 	CLUSTER_NATIVE_FILES_NEEDS_REGISTRATION_V2,
 	CLUSTER_NATIVE_FILES_CAPACITY_EXCEEDED_V2,
-	CLUSTER_NATIVE_FILES_BUSY_V2
+	CLUSTER_NATIVE_FILES_BUSY_V2,
+	CLUSTER_NATIVE_FILES_NOT_FOUND_V2,
+	CLUSTER_NATIVE_FILES_AMBIGUOUS_V2,
+	CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2
 } ClusterControlNativeResultV2;
 /* Local, address-bound borrow. Zero-initialize; never copy a live borrow.
  * expected is immutable by-value. Keep it with the ORIGINAL slot/FD/I/O duty
@@ -50,6 +53,18 @@ extern ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void);
 extern bool cluster_control_native_files_info_v2(ClusterControlNativeTableInfoV2 *out);
 extern bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *,
 												   ClusterControlNativeFileBorrowV2 *fresh);
+/* Resolve an address without guessing its creation origin. Exactly one
+ * AVAILABLE identity in the complete selected table is required. Missing and
+ * multiple origins have distinct results; refusal leaves fresh unchanged and
+ * takes no borrow. The current MANAGED producer installs only full coverage
+ * identities; UNKNOWN and the unpublished CREATION batch are NOT_AVAILABLE.
+ * RESERVED/inactive identities must never enter that available vector.
+ * Same address/process-bound borrow, current and release as acquire_v2; no CF,
+ * I/O, allocation or family-lock acquisition. Caller retains original locks
+ * and file-lifetime duty through cleanup. Zero-initialize fresh. */
+extern ClusterControlNativeResultV2 cluster_control_native_file_borrow_by_address_v2(
+	ClusterRecoveryFileKindV2 kind, Oid database_oid, Oid tablespace_oid, uint64 object_id,
+	ClusterControlNativeFileBorrowV2 *fresh);
 extern bool cluster_control_native_file_current_v2(const ClusterControlNativeFileBorrowV2 *);
 /* Release remains possible after a failed current check; clears only a valid
  * local borrow. False leaves the original duty intact. No CF/IO/reselection. */

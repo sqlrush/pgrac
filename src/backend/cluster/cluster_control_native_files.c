@@ -304,6 +304,54 @@ cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 	SpinLockRelease(&native_files->lock);
 	return valid;
 }
+ClusterControlNativeResultV2
+cluster_control_native_file_borrow_by_address_v2(ClusterRecoveryFileKindV2 kind, Oid db, Oid ts,
+											   uint64 object, ClusterControlNativeFileBorrowV2 *out)
+{
+	ClusterControlNativeFileBorrowV2 zero = { 0 }, value = { 0 };
+	ClusterControlNativeResultV2 result = CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2;
+	NativeFileBank *bank;
+	int at = -1;
+	if (!native_distinct(out, sizeof(*out)) || memcmp(out, &zero, sizeof(zero))
+		|| kind < CLUSTER_RECOVERY_FILE_CLOG_V2 || kind > CLUSTER_RECOVERY_FILE_DEBT_V2)
+		return CLUSTER_NATIVE_FILES_REFUSED_V2;
+	if (!native_files)
+		return result;
+	SpinLockAcquire(&native_files->lock);
+	bank = &native_files->banks[native_files->active];
+	if (bank->info.mode == CLUSTER_NATIVE_FILES_MANAGED_V2
+		&& bank->info.count <= CLUSTER_NATIVE_FILES_CAPACITY_V2) {
+		result = CLUSTER_NATIVE_FILES_NOT_FOUND_V2;
+		/* One snapshot traversal, never an origin-by-origin probe/reselection. */
+		for (uint64 i = 0; i < bank->info.count; i++) {
+			const ClusterRecoveryFileIdentityV2 *id = &bank->files[i];
+			if (id->kind != kind || id->database_oid != db || id->tablespace_oid != ts
+				|| id->object_id != object)
+				continue;
+			if (at >= 0) {
+				result = CLUSTER_NATIVE_FILES_AMBIGUOUS_V2;
+				break;
+			}
+			at = (int)i;
+		}
+		if (at >= 0 && result != CLUSTER_NATIVE_FILES_AMBIGUOUS_V2) {
+			result = CLUSTER_NATIVE_FILES_BUSY_V2;
+			if (native_files->borrowed != UINT64_MAX) {
+				value.expected = bank->files[at];
+				value.table_generation = bank->info.table_generation;
+				value.startup_generation = bank->info.startup_generation;
+				value.private_self = (uintptr_t)out;
+				value.private_pid = MyProcPid;
+				value.private_index = at;
+				++native_files->borrowed;
+				*out = value;
+				result = CLUSTER_NATIVE_FILES_OK_V2;
+			}
+		}
+	}
+	SpinLockRelease(&native_files->lock);
+	return result;
+}
 bool
 cluster_control_native_file_current_v2(const ClusterControlNativeFileBorrowV2 *b)
 {
