@@ -25,6 +25,20 @@
 SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WHERE name = 'cluster.xnode_profile';
 ```
 
+## `cluster.trace_undo_capacity_refusal`
+
+布尔参数，默认 `off`，修改配置文件后 reload 生效。开启后，原 undo 容量控制器返回拒绝时，
+在原 `54000` 错误的 DETAIL 末尾追加一份 `undo_capacity_first_refusal_v1` 记录；服务端日志和
+客户端均可见。原错误内容前缀、SQLSTATE、等待和取消行为保留。成功或正常重查不输出。
+
+记录包括原拒绝位置、PID、node、所选段、调用方 top XID、已有事务/段身份、history/pass、
+已求值谓词及 owner 代次。谓词值 `-1` 表示未执行或不可用；结构的 `*_known=0` 表示随后
+对应的零值不能当作有效观察。`epoch` 仅在 `floor_known=1` 时有效；history 路径的原调用
+epoch 另有 `probe_epoch_known`/`route_epoch_known`。字段不代表同一时刻的全池快照或回收许可。
+
+每次原容量调用最多保存一份进程本地快照，快照不超过 1024 字节，附加文本不超过 4095 字节；
+极端输入导致截断时带 `truncated=1`。不补采报告、扫描池或读取块。结束采集后关闭该参数。
+
 ## `cluster.trace_block_io`
 
 布尔参数，默认 `off`；超级用户可在会话或配置文件中设置。需要跨节点与后台写者的完整记录时，在所有参与节点的启动配置中启用。输出为服务端日志中的 `BLOCK_IO` 行。

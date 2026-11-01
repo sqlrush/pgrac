@@ -11104,7 +11104,8 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h
 
 # Same actual producer-to-consumer path, including the original CV cleanup.
-test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c $(top_srcdir)/src/backend/cluster/cluster_undo_capacity_diagnostic.h Makefile
+	@printf '%s\n' '#include "$(top_srcdir)/src/backend/cluster/cluster_undo_capacity_diagnostic.h"' > $@.tmp
 	awk '/^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
@@ -11113,7 +11114,7 @@ test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_u
 	     /^undo_cleaner_capacity_(probe|history_probe)\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_(report_wait|real_protector|reports_advance)\(/ { print "static bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}$$/ { emit=0 } END { if (found != 11 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}$$/ { emit=0 } END { if (found != 11 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 clean distclean maintainer-clean: clean-ctrc-capacity-wait
@@ -14312,14 +14313,15 @@ clean-empty-undo-preflight:
 TESTS += test_cluster_undo_capacity_bind
 all: test_cluster_undo_capacity_bind
 
-test_cluster_undo_capacity_bind_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+test_cluster_undo_capacity_bind_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c $(top_srcdir)/src/backend/cluster/cluster_undo_capacity_diagnostic.h Makefile
+	@printf '%s\n' '#include "$(top_srcdir)/src/backend/cluster/cluster_undo_capacity_diagnostic.h"' > $@.tmp
 	awk '/^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; n++ } \
 	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; n++ } \
 	     /^undo_cleaner_capacity_note_retention\(/ { print "static void"; emit=1; n++ } \
 	     /^undo_cleaner_capacity_(probe|history_probe)\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; n++ } \
 	     /^undo_cleaner_capacity_(report_wait|real_protector|reports_advance)\(/ { print "static bool"; emit=1; n++ } \
 	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; n++ } \
-	     emit { print } /^}$$/ { emit=0 } END { if (n != 9 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}$$/ { emit=0 } END { if (n != 9 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_capacity_bind: test_cluster_undo_capacity_bind.c \
@@ -14441,3 +14443,62 @@ clean distclean maintainer-clean: clean-native-slot-context
 clean-native-slot-context:
 	rm -f test_cluster_native_slot_context test_cluster_native_slot_context.inc \
 		test_cluster_native_slot_context.inc.tmp
+
+# Bounded diagnostics through the actual controller and original error sink.
+TESTS += test_cluster_undo_capacity_refusal test_cluster_undo_capacity_refusal_error
+all: test_cluster_undo_capacity_refusal test_cluster_undo_capacity_refusal_error
+
+test_cluster_undo_capacity_refusal: test_cluster_undo_capacity_refusal.c test_cluster_undo_cleaner_capacity.c test_cluster_undo_cleaner_holds.inc \
+		test_cluster_pgproc_active_types.inc test_cluster_worker_pgproc_sample.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/storage/procarray.h \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/utils/wait_event.h \
+		$(top_srcdir)/src/include/miscadmin.h unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+test_cluster_undo_capacity_refusal_error: test_cluster_undo_capacity_refusal_error.c test_cluster_undo_capacity_bind.c \
+		test_cluster_empty_undo_preflight.c test_cluster_empty_undo_preflight.inc \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c \
+		test_cluster_tt_locator_stats.inc test_cluster_active_capacity_stats.inc \
+		test_cluster_undo_capacity_bind_wait.inc unit_test.h $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/backend/nodes/list.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_capacity_history_refusal
+all: test_cluster_undo_capacity_history_refusal
+
+test_cluster_undo_capacity_history_refusal: test_cluster_undo_capacity_history_refusal.c test_cluster_undo_capacity_history.c \
+		test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_capacity_wait.inc test_cluster_ctrc_horizon_sender.inc \
+		test_cluster_ctrc_horizon_cohort.inc test_cluster_undo_capacity_history_lmon.inc \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_worker_sample.inc \
+		test_cluster_ctrc_read_scope.inc test_cluster_ctrc_native_exit.inc \
+		test_cluster_ctrc_native_group_exit.inc test_cluster_ctrc_native_prepare.inc \
+		test_cluster_pgproc_active_types.inc unit_test.h cluster_undo_capacity_unit.o \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# Internal capture helpers are included by the real cleaner and extracted waits.
+test_cluster_undo_cleaner_capacity test_cluster_undo_capacity_refusal: $(top_srcdir)/src/backend/cluster/cluster_undo_capacity_diagnostic.h

@@ -162,6 +162,7 @@ extern bool cluster_trace_block_io;
 /* Passive abort/invalidation phase logging; default off. */
 extern bool cluster_trace_cleanup;
 extern bool cluster_trace_normal_stop;
+extern bool cluster_trace_undo_capacity_refusal;
 extern char *cluster_trace_visibility_relids;
 extern bool cluster_trace_visibility_enabled;
 struct ClusterVisibilityTraceFilter;

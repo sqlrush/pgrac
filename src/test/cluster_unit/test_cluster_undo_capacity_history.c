@@ -846,6 +846,11 @@ UT_TEST(test_expired_local_publication_cannot_sustain_the_original_report_wait)
 	}
 }
 
+#ifdef UNDO_CAPACITY_HISTORY_FIXTURE_MAIN
+int UNDO_CAPACITY_HISTORY_FIXTURE_MAIN(void);
+#define main UNDO_CAPACITY_HISTORY_FIXTURE_MAIN
+#endif
+
 int
 main(void)
 {
@@ -874,3 +879,7 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+
+#ifdef UNDO_CAPACITY_HISTORY_FIXTURE_MAIN
+#undef main
+#endif
