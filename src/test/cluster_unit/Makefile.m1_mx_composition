@@ -1,5 +1,6 @@
 # K composition component only; no old wire or consumer registration.
 MX_COMPOSITION_O = $(top_builddir)/src/backend/cluster/cluster_multixact_composition.o
+MX_RANGE_WIRE_O = $(top_builddir)/src/backend/cluster/cluster_multixact_range_wire.o
 
 $(MX_COMPOSITION_O): $(top_srcdir)/src/include/cluster/cluster_multixact_composition.h
 
@@ -14,7 +15,8 @@ clean-m1-mx-composition:
 
 test_cluster_mx_native_range: test_cluster_mx_native_range.c test_cluster_mx_composition.c \
 		unit_test.h $(top_srcdir)/src/backend/access/transam/multixact.c $(MX_COMPOSITION_O) \
+		$(MX_RANGE_WIRE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
-		$< $(MX_COMPOSITION_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$< $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

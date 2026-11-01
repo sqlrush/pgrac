@@ -11,10 +11,9 @@ test_k_mx_g5_legacy_domain: test_k_mx_g5_legacy_domain.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PGPORT) -o $@
 
-# Opt-in RED target until the range codec and C's headers are composed.
-# Override these only to supply the exact composed headers/product objects.
+# Standalone range codec; no caller or HELLO activation.
 K_MX_G5_CPPFLAGS ?=
-K_MX_G5_CODEC_OBJECTS ?=
+K_MX_G5_CODEC_OBJECTS ?= $(top_builddir)/src/backend/cluster/cluster_multixact_range_wire.o
 test_k_mx_g5_range_contract: test_k_mx_g5_range_contract.c \
 		test_cluster_multixact_current.c unit_test.h \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \

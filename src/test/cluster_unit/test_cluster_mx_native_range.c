@@ -5,6 +5,7 @@ int composition_component_main(void);
 #include "test_cluster_mx_composition.c"
 #undef main
 #include "../../backend/access/transam/multixact.c"
+#include "cluster/cluster_multixact_range_wire.h"
 
 bool InRecovery;
 int cluster_node_id = 0;
@@ -283,9 +284,72 @@ UT_TEST(test_native_unqualified_local_context_is_unknown)
  cluster_enabled=true; cluster_node_id=0; native_epoch=7;
 }
 
+/* Native segment metadata is the controlled source for this component test;
+ * it is not a production service/storage/H admission or a visibility proof. */
+static void native_wire_complete(uint32 count, uint32 start, bool corrupt_tail)
+{
+	ClusterMxCompositionReceive *op = NULL;
+	ClusterMxCompositionReceiveStats stats = {0};
+	ClusterMxCompositionNativeChunk chunk;
+	ClusterMxCompositionNativeSource saved;
+	ClusterMxRangeWireContext ctx = {0};
+	PGAlignedBlock wire;
+	uint32 first = 0, output = 0, seen = 0;
+	const ClusterMxCompositionPage *page;
+
+	native_seed(count, start, 100);
+	do {
+		ClusterMxCompositionReply r, decoded;
+		uint32 bytes = 0;
+		ClusterMxCompositionReadStatus status = native_read(100, first ? &saved : NULL,
+			first, 256, &chunk);
+
+		UT_ASSERT_EQ(status, MXCOMP_READ_OK); if (status != MXCOMP_READ_OK) break;
+		if (first == 0) {
+			saved = chunk.source;
+			UT_ASSERT(cluster_mx_composition_begin(&op, &saved, sizeof(saved), saved.span, saved.start, &stats));
+			ctx.request_id = 901; ctx.epoch = native_epoch;
+			ctx.key.origin_node_id = 0; ctx.key.cluster_epoch = (uint32)native_epoch; ctx.key.multixact_id = 100;
+			ctx.format_id = CLUSTER_FOREIGN_MX_FORMAT_ID_V1; ctx.version = CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1;
+			ctx.loaded_catalog = 202611010; ctx.peer_capabilities = CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES;
+			ctx.peer_generation = 42; ctx.requested_cap = 256; ctx.source = &saved; ctx.source_bytes = sizeof(saved);
+		}
+		r = native_reply(&chunk);
+		UT_ASSERT(cluster_mx_range_wire_encode_reply(&ctx, status, &r, wire.data, BLCKSZ, &bytes));
+		if (corrupt_tail && chunk.last) wire.data[sizeof(ClusterMxRangeWireHeader)] ^= 1;
+		status = cluster_mx_range_wire_decode_reply(wire.data, bytes, &ctx, &decoded);
+		if (corrupt_tail && chunk.last) {
+			UT_ASSERT_EQ(status, MXCOMP_READ_UNKNOWN);
+			UT_ASSERT_EQ(cluster_mx_composition_accept(&op, status, &decoded), MXCOMP_UNKNOWN);
+			check_discarded(op); UT_ASSERT_EQ(stats.unknown_results, 1); return;
+		}
+		UT_ASSERT_EQ(status, MXCOMP_READ_OK);
+		UT_ASSERT_EQ(cluster_mx_composition_accept(&op, status, &decoded), chunk.last ? MXCOMP_COMPLETE : MXCOMP_PARTIAL);
+		memset(wire.data, 0xa5, BLCKSZ); /* G2 must have copied this borrowed frame. */
+		if (!chunk.last) { UT_ASSERT_NULL(cluster_mx_composition_pages(op, &output)); UT_ASSERT_EQ(output, 0); }
+		first = chunk.next;
+	} while (!chunk.last);
+	page = cluster_mx_composition_pages(op, &output);
+	UT_ASSERT_EQ(output, count);
+	for (; page; page = page->next)
+		for (uint32 i = 0; i < page->count; i++, seen++) UT_ASSERT_EQ(page->members[i].xid, 100 + seen);
+	UT_ASSERT_EQ(seen, count);
+	cluster_mx_composition_finish(&op); check_discarded(op);
+}
+
+UT_TEST(test_native_wire_receiver_complete_metadata)
+{
+	native_wire_complete(2, 100, false); native_wire_complete(256, 100, false);
+	native_wire_complete(257, 1635, false); native_wire_complete(65537, 100, false);
+	native_wire_complete(2, UINT32_MAX - 1, false);
+}
+
+UT_TEST(test_native_wire_bad_tail_discards_prefix)
+{ native_wire_complete(257, 100, true); }
+
 int main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(29);
 	UT_RUN(test_complete_2_256_257_without_partial_output);
 	UT_RUN(test_totals_and_chunk_ordinals_exceed_old_uint16_and_uint8);
 	UT_RUN(test_large_composition_does_not_require_one_large_seen_array);
@@ -313,5 +377,7 @@ int main(void)
 	UT_RUN(test_receiver_refuses_forged_placeholder_and_wrong_physical_advance);
 	UT_RUN(test_native_reused_chunk_and_latest_zero_endpoint);
 	UT_RUN(test_native_unqualified_local_context_is_unknown);
+	UT_RUN(test_native_wire_receiver_complete_metadata);
+	UT_RUN(test_native_wire_bad_tail_discards_prefix);
 	UT_DONE(); return ut_failed_count?1:0;
 }

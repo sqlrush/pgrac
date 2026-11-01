@@ -711,7 +711,9 @@
 /* Shared catalog, SPACE identity/reservations and original ROOT initialization.
  * Fresh homogeneous databases only; not an in-place/rolling format upgrade. */
 /* Target FULL CR diagnostic entry (oid 8980). Fresh homogeneous initdb only. */
-#define CATALOG_VERSION_NO 202610220
+/* PGRAC: complete foreign-MultiXact and identity-only registry reservations.
+ * Fresh homogeneous databases only; no in-place or rolling format upgrade. */
+#define CATALOG_VERSION_NO 202611010
 
 /* Minimum loaded catalog admitting qualified shared VM bits. Zero keeps
  * the shortcut disabled until the integrated catalog identity is assigned. */

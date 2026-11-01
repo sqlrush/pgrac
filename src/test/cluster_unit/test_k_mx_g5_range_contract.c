@@ -86,7 +86,8 @@ k_roundtrip_range(uint32 total, uint32 first, uint32 count)
 	ClusterMxRangeWireContext ctx = k_range_context();
 	ClusterCurrentMxMemberDesc members[256];
 	ClusterMxCompositionReply r = k_range_reply(total, first, count, members), out;
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	uint32 bytes = k_encode_range(&ctx, &r, wire);
 
 	memset(&out, 0xa5, sizeof(out));
@@ -128,7 +129,8 @@ UT_TEST(k_range_requires_exact_physical_and_declared_lengths)
 	ClusterMxRangeWireContext ctx = k_range_context();
 	ClusterCurrentMxMemberDesc members[2];
 	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members);
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	ClusterMxRangeWireHeader h;
 	uint32 bytes = k_encode_range(&ctx, &r, wire);
 
@@ -147,7 +149,8 @@ UT_TEST(k_range_binds_allocated_identity_and_exact_lineage)
 	ClusterMxRangeWireContext ctx = k_range_context();
 	ClusterCurrentMxMemberDesc members[2];
 	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members);
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	int fault;
 
 	for (fault = 0; fault < 9; fault++) {
@@ -176,7 +179,8 @@ UT_TEST(k_range_compares_every_source_byte)
 	ClusterMxRangeWireContext ctx = k_range_context();
 	ClusterCurrentMxMemberDesc members[2];
 	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members);
-	unsigned char wire[BLCKSZ], changed[64];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data, changed[64];
 	uint32 bytes = k_encode_range(&ctx, &r, wire);
 	Size i;
 
@@ -193,7 +197,8 @@ UT_TEST(k_range_rejects_unqualified_peer_metadata)
 	ClusterMxRangeWireContext good = k_range_context();
 	ClusterCurrentMxMemberDesc members[2];
 	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members);
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	uint32 bytes = k_encode_range(&good, &r, wire);
 	int fault;
 
@@ -221,7 +226,8 @@ UT_TEST(k_new_and_legacy_describe_domains_are_separate)
 	ClusterCurrentMxMemberDesc members[2], old_out[2];
 	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members);
 	ClusterCurrentMxDescribeReplyPage old;
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	uint16 count;
 	uint32 total;
 
@@ -253,7 +259,8 @@ UT_TEST(k_range_rejects_overflow_and_inconsistent_tail)
 	ClusterMxRangeWireContext ctx = k_range_context();
 	ClusterCurrentMxMemberDesc members[2];
 	ClusterMxCompositionReply good = k_range_reply(2, 0, 2, members);
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	int fault;
 
 	for (fault = 0; fault < 5; fault++) {
@@ -276,7 +283,8 @@ UT_TEST(k_range_rejects_overflow_and_inconsistent_tail)
 UT_TEST(k_range_non_ok_never_exports_members)
 {
 	ClusterMxRangeWireContext ctx = k_range_context();
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	int status;
 
 	for (status = MXCOMP_READ_RETRY; status <= MXCOMP_READ_UNKNOWN; status++) {
@@ -297,7 +305,8 @@ UT_TEST(k_proof_asks_roundtrip_32_bit_global_ordinal)
 	ClusterMxRangeWireContext ctx = k_range_context();
 	ClusterCurrentMxMemberDesc members[1];
 	ClusterMxRangeProofAsk out[7];
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	uint32 bytes = 0, count = 99, total = 99;
 
 	test_member(&members[0], 100, MultiXactStatusForShare);
@@ -317,7 +326,8 @@ UT_TEST(k_proof_frame_bound_is_separate_from_total)
 	ClusterMxRangeWireContext ctx = k_range_context();
 	ClusterCurrentMxMemberDesc members[8];
 	ClusterMxRangeProofAsk out[7];
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	uint32 bytes = 0, count = 99, total = 99;
 	uint32 i;
 
@@ -346,7 +356,8 @@ UT_TEST(k_range_and_proof_payload_kinds_are_separate)
 	ClusterCurrentMxMemberDesc members[2];
 	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members);
 	ClusterMxRangeProofAsk out[7], empty[7];
-	unsigned char wire[BLCKSZ];
+	PGAlignedBlock wire_storage;
+	unsigned char *wire = (unsigned char *)wire_storage.data;
 	uint32 bytes = 0, count = 99, total = 99;
 
 	UT_ASSERT(cluster_mx_range_wire_encode_proof_asks(&ctx, 2, 0,
@@ -362,10 +373,141 @@ UT_TEST(k_range_and_proof_payload_kinds_are_separate)
 	UT_ASSERT_EQ(memcmp(out, empty, sizeof(out)), 0);
 }
 
+UT_TEST(k_range_odd_source_padding_and_unaligned_input)
+{
+	ClusterMxRangeWireContext ctx = k_range_context();
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members), out;
+	PGAlignedBlock wire, shifted;
+	unsigned char odd[65];
+	uint32 bytes;
+	Size i, end = sizeof(ClusterMxRangeWireHeader) + sizeof(odd);
+
+	memset(odd, 0x59, sizeof(odd));
+	ctx.source = r.source = odd;
+	ctx.source_bytes = r.source_bytes = sizeof(odd);
+	bytes = k_encode_range(&ctx, &r, (unsigned char *)wire.data);
+	UT_ASSERT_EQ(cluster_mx_range_wire_decode_reply(wire.data, bytes, &ctx, &out), MXCOMP_READ_OK);
+	UT_ASSERT_EQ(out.source_bytes, 65);
+	UT_ASSERT_NOT_NULL(out.members);
+	if (out.members != NULL) UT_ASSERT_EQ(out.members[1].xid, 101);
+	for (i = end; i < MAXALIGN(end); i++) UT_ASSERT_EQ(wire.data[i], 0);
+	wire.data[end] = 1;
+	k_expect_bad_range(wire.data, bytes, &ctx);
+	wire.data[end] = 0;
+	memcpy(shifted.data + 1, wire.data, bytes);
+	k_expect_bad_range(shifted.data + 1, bytes, &ctx);
+}
+
+UT_TEST(k_range_placeholder_tail_is_physical_not_a_member)
+{
+	ClusterMxRangeWireContext ctx = k_range_context();
+	ClusterMxCompositionReply r = k_range_reply(3, 2, 0, NULL), out;
+	PGAlignedBlock wire;
+	uint32 bytes;
+
+	r.skipped_zero = r.last = true;
+	r.next = 3;
+	bytes = k_encode_range(&ctx, &r, (unsigned char *)wire.data);
+	UT_ASSERT_EQ(cluster_mx_range_wire_decode_reply(wire.data, bytes, &ctx, &out), MXCOMP_READ_OK);
+	UT_ASSERT_EQ(out.count, 0);
+	UT_ASSERT_EQ(out.first, 2);
+	UT_ASSERT_EQ(out.next, 3);
+	UT_ASSERT(out.last && out.skipped_zero);
+	UT_ASSERT_NULL(out.members);
+	UT_ASSERT_EQ(out.member_bytes, 0);
+}
+
+UT_TEST(k_range_invalid_headers_and_member_bytes_are_unknown)
+{
+	ClusterMxRangeWireContext ctx = k_range_context();
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members);
+	PGAlignedBlock wire;
+	int fault;
+
+	for (fault = 0; fault < 10; fault++) {
+		ClusterMxRangeWireHeader h;
+		ClusterCurrentMxMemberDesc member;
+		uint32 bytes = k_encode_range(&ctx, &r, (unsigned char *)wire.data);
+		Size second = MAXALIGN(sizeof(h) + sizeof(k_range_source)) + sizeof(member);
+
+		memcpy(&h, wire.data, sizeof(h));
+		memcpy(&member, wire.data + second, sizeof(member));
+		switch (fault) {
+		case 0: h.flags |= 0x80; break;
+		case 1: h.reserved8 = 1; break;
+		case 2: h.reserved32[1] = 1; break;
+		case 3: h.result = 255; break;
+		case 4: h.result = MXCOMP_READ_RETRY; break;
+		case 5: h.total = 0; break;
+		case 6: h.next++; break;
+		case 7: member.xid = InvalidTransactionId; break;
+		case 8: member.member_status = MaxMultiXactStatus + 1; break;
+		case 9: member.reserved8[2] = 1; break;
+		}
+		memcpy(wire.data, &h, sizeof(h));
+		memcpy(wire.data + second, &member, sizeof(member));
+		k_expect_bad_range(wire.data, bytes, &ctx);
+	}
+}
+
+UT_TEST(k_proof_bad_second_ask_clears_the_whole_window)
+{
+	ClusterMxRangeWireContext ctx = k_range_context();
+	ClusterCurrentMxMemberDesc members[2];
+	PGAlignedBlock wire;
+	int fault;
+
+	test_member(&members[0], 100, MultiXactStatusForShare);
+	test_member(&members[1], 101, MultiXactStatusForShare);
+	for (fault = 0; fault < 5; fault++) {
+		ClusterMxRangeProofAsk ask, out[7], empty[7];
+		uint32 bytes = 0, count = 99, total = 99;
+		Size second = MAXALIGN(sizeof(ClusterMxRangeWireHeader) + sizeof(k_range_source)) + sizeof(ask);
+
+		UT_ASSERT(cluster_mx_range_wire_encode_proof_asks(&ctx, 65537, 65535,
+			members, 2, wire.data, BLCKSZ, &bytes));
+		memcpy(&ask, wire.data + second, sizeof(ask));
+		switch (fault) {
+		case 0: ask.member_ordinal = 0; break;
+		case 1: ask.xid = InvalidTransactionId; break;
+		case 2: ask.xid = 100; break;
+		case 3: ask.member_status = MaxMultiXactStatus + 1; break;
+		case 4: ask.reserved[2] = 1; break;
+		}
+		memcpy(wire.data + second, &ask, sizeof(ask));
+		memset(out, 0xa5, sizeof(out)); memset(empty, 0, sizeof(empty));
+		UT_ASSERT(!cluster_mx_range_wire_decode_proof_asks(wire.data, bytes, &ctx,
+			out, 7, &count, &total));
+		UT_ASSERT_EQ(count, 0); UT_ASSERT_EQ(total, 0);
+		UT_ASSERT_EQ(memcmp(out, empty, sizeof(out)), 0);
+	}
+}
+
+UT_TEST(k_encoder_failures_do_not_emit_partial_frames)
+{
+	ClusterMxRangeWireContext ctx = k_range_context();
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterMxCompositionReply r = k_range_reply(2, 0, 2, members);
+	PGAlignedBlock wire, original;
+	uint32 bytes = 99;
+
+	memset(wire.data, 0xa5, BLCKSZ); memcpy(original.data, wire.data, BLCKSZ);
+	UT_ASSERT(!cluster_mx_range_wire_encode_reply(&ctx, MXCOMP_READ_OK, &r,
+		wire.data, 1, &bytes));
+	UT_ASSERT_EQ(bytes, 0); UT_ASSERT_EQ(memcmp(wire.data, original.data, BLCKSZ), 0);
+	members[1].xid = members[0].xid;
+	bytes = 99;
+	UT_ASSERT(!cluster_mx_range_wire_encode_proof_asks(&ctx, 2, 0, members, 2,
+		wire.data, BLCKSZ, &bytes));
+	UT_ASSERT_EQ(bytes, 0); UT_ASSERT_EQ(memcmp(wire.data, original.data, BLCKSZ), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(17);
 	UT_RUN(k_range_accepts_2_256_and_both_257_pieces);
 	UT_RUN(k_range_preserves_32_bit_positions);
 	UT_RUN(k_range_requires_exact_physical_and_declared_lengths);
@@ -378,6 +520,11 @@ main(void)
 	UT_RUN(k_proof_asks_roundtrip_32_bit_global_ordinal);
 	UT_RUN(k_proof_frame_bound_is_separate_from_total);
 	UT_RUN(k_range_and_proof_payload_kinds_are_separate);
+	UT_RUN(k_range_odd_source_padding_and_unaligned_input);
+	UT_RUN(k_range_placeholder_tail_is_physical_not_a_member);
+	UT_RUN(k_range_invalid_headers_and_member_bytes_are_unknown);
+	UT_RUN(k_proof_bad_second_ask_clears_the_whole_window);
+	UT_RUN(k_encoder_failures_do_not_emit_partial_frames);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
