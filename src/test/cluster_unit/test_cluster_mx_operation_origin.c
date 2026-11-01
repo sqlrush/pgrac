@@ -830,7 +830,7 @@ UT_TEST(mx_held_fresh_copy_rejects_drift_and_pre_sample)
 int
 MX_OPERATION_ORIGIN_TEST_MAIN(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 	UT_RUN(mx_operation_before_mutation_rechecks_runtime_identity);
 	UT_RUN(mx_origin_same_and_cross_segment_three_current_phases);
 	UT_RUN(mx_origin_stages_until_final_release);

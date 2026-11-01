@@ -9151,7 +9151,7 @@ main(int argc, char **argv)
 {
 	if (argc == 2 && strcmp(argv[1], "--peer-full-land-fixture") == 0)
 		return peer_projection_land(stdin, stdout);
-	UT_PLAN(172);
+	UT_PLAN(177);
 	UT_RUN(test_native_retry_trace_samples_owner_generation_and_clears);
 	UT_RUN(test_current_mx_updater_precommit_final_release_failure_is_unknown);
 	UT_RUN(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences);
