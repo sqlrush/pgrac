@@ -11395,6 +11395,7 @@ test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/trans
 		END { if (emit || starts != 1) exit 1 }' $< > $@
 
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		$(srcdir)/test_cluster_snapshot_return.inc $(top_srcdir)/src/include/cluster/cluster_service_observe.h \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
 		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
 		$(srcdir)/test_cluster_snapshot_export_fixture.inc \

@@ -55,6 +55,35 @@ typedef struct ClusterServiceProducerObservation {
 StaticAssertDecl(sizeof(ClusterServiceProducerIdentity) == 32, "native owner identity size");
 StaticAssertDecl(sizeof(ClusterServiceProducerObservation) <= 128, "native observation size");
 
+/* Actual current backend snapshot references, not a native/global cut.
+ * Reference flags are private-container presence, never an object count.
+ * identity.actor_bit is zero: this is not an auxiliary service actor. */
+#define CLUSTER_SERVICE_SNAPSHOT_ACTIVE       (1U << 0)
+#define CLUSTER_SERVICE_SNAPSHOT_REGISTERED   (1U << 1)
+#define CLUSTER_SERVICE_SNAPSHOT_TRANSACTION  (1U << 2)
+#define CLUSTER_SERVICE_SNAPSHOT_CATALOG      (1U << 3)
+#define CLUSTER_SERVICE_SNAPSHOT_HISTORIC     (1U << 4)
+#define CLUSTER_SERVICE_SNAPSHOT_EXPORTED     (1U << 5)
+#define CLUSTER_SERVICE_SNAPSHOT_EVALUATOR    (1U << 6)
+#define CLUSTER_SERVICE_SNAPSHOT_XACT_STARTED (1U << 7)
+typedef struct ClusterServiceSnapshotObservation {
+	ClusterServiceProducerIdentity identity;
+	uint64 retained_read_scn;
+	uint32 references;
+	bool known;
+	const char *reason;
+} ClusterServiceSnapshotObservation;
+StaticAssertDecl(sizeof(ClusterServiceSnapshotObservation) <= 64,
+				 "snapshot return point is bounded caller storage");
+
+/* Original ordinary backend only; bounded read-only presence observation.
+ * No new registration, invalidation, retirement, signal, lock or wait.
+ * PENDING even at an empty point: producer closure is separately unproved.
+ * Wrong identity/context refuses; epoch drift is STALE; no usable stale sample.
+ */
+extern ClusterSemanticAdmissionObservationResult cluster_snapshot_service_observe(
+	uint64 expected_epoch, ClusterServiceSnapshotObservation *out);
+
 /* Same original actor, private/module plus shared admission point observations.
  * Caller-owned only: CURRENT does not seal either owner or grant permission.
  * No atomic cross-domain zero proof is implied; producer closure is separate. */
