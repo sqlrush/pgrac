@@ -62,6 +62,31 @@ void fixture_native_forget_buffer(ResourceOwner owner, Buffer buffer);
 #undef CurTransactionResourceOwner
 #include "../../common/hashfn.c"
 
+/* Execute the original private transaction state accessors. Existing snapshot
+ * command/parallel/nesting host boundaries remain; their unused native twins
+ * are renamed. No transaction begin/commit/abort effects are stubbed as success. */
+#define XactIsoLevel fixture_native_xact_iso_level
+#define GetTopTransactionIdIfAny fixture_native_xact_top_id
+#define IsSubTransaction fixture_native_xact_is_sub
+#define xactGetCommittedChildren fixture_native_xact_children
+TransactionId fixture_native_xact_top_id(void);
+bool fixture_native_xact_is_sub(void);
+int fixture_native_xact_children(TransactionId **ptr);
+#define GetCurrentCommandId fixture_native_xact_command_id
+#define GetCurrentTransactionNestLevel fixture_native_xact_nesting
+#define IsInParallelMode fixture_native_xact_parallel
+CommandId fixture_native_xact_command_id(bool used);
+int fixture_native_xact_nesting(void);
+bool fixture_native_xact_parallel(void);
+#include "../../backend/access/transam/xact.c"
+#undef IsInParallelMode
+#undef GetCurrentTransactionNestLevel
+#undef GetCurrentCommandId
+#undef xactGetCommittedChildren
+#undef IsSubTransaction
+#undef GetTopTransactionIdIfAny
+#undef XactIsoLevel
+
 UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true;
@@ -1124,6 +1149,7 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 #include "test_cluster_survivor_buffer_fixture.h"
 #include "test_cluster_survivor_buffer_return.inc"
 #include "test_cluster_survivor_return_context.inc"
+#include "test_cluster_survivor_xact_return.inc"
 int
 main(void)
 {
@@ -1148,7 +1174,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(127);
+	UT_PLAN(132);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1276,6 +1302,11 @@ main(void)
 	UT_RUN(backend_bufferio_change_during_shared_cut_discards_the_point);
 	UT_RUN(survivor_backend_final_refusal_retains_original_bufferio);
 	UT_RUN(backend_bufferio_never_dereferences_a_retired_entry_owner);
+	UT_RUN(backend_return_retains_each_original_transaction_phase);
+	UT_RUN(backend_return_retains_each_original_transaction_block_phase);
+	UT_RUN(backend_return_retains_original_subtransaction_state);
+	UT_RUN(backend_return_discards_transaction_change_during_shared_cut);
+	UT_RUN(backend_return_transaction_observation_preserves_resources_and_empty_pending);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

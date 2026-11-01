@@ -535,6 +535,10 @@ typedef struct xl_xact_parsed_abort
  * ----------------
  */
 extern bool IsTransactionState(void);
+#ifdef USE_PGRAC_CLUSTER
+/* Read-only original lifecycle point; false is not a producer-closure proof. */
+extern bool cluster_transaction_service_pending(void);
+#endif
 extern bool IsAbortedTransactionBlockState(void);
 extern TransactionId GetTopTransactionId(void);
 extern TransactionId GetTopTransactionIdIfAny(void);

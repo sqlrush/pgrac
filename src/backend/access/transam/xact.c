@@ -522,6 +522,22 @@ IsTransactionState(void)
 	return (s->state == TRANS_INPROGRESS);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Original caller's transaction lifecycle only. IsTransactionState() excludes
+ * START/COMMIT/ABORT/PREPARE, which still carry return responsibilities. A
+ * non-top state is pending even before its state/block fields are installed.
+ * False is an idle point, never producer closure or permission. No state,
+ * resources, command IDs, locks or transaction effects are changed here.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_transaction_service_pending(void)
+{
+	return CurrentTransactionState != &TopTransactionStateData
+		|| TopTransactionStateData.state != TRANS_DEFAULT
+		|| TopTransactionStateData.blockState != TBLOCK_DEFAULT;
+}
+#endif
+
 /*
  *	IsAbortedTransactionBlockState
  *

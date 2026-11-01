@@ -1229,7 +1229,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	PGPROC *owner = MyProc;
 	ResourceOwner resource_owner = CurrentResourceOwner;
 	bool held_lock = false;
-	bool gate_known, pins_after, io_after;
+	bool gate_known, pins_after, io_after, transaction_after;
 
 	if (out == NULL)
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
@@ -1259,6 +1259,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	/* A preceding owner callback may already have deleted the entry owner.
 	 * Read only the live current owner; the saved identity is compared below. */
 	sample.buffer_io_pending = ResourceOwnerHasBufferIOs(CurrentResourceOwner);
+	sample.transaction_pending = cluster_transaction_service_pending();
 	admission = cluster_semantic_activation_admission_return_observe(expected_epoch,
 		expected_gate_epoch, expected_generation, &sample.admission);
 	if (admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
@@ -1275,6 +1276,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	}
 	pins_after = cluster_buffer_backend_has_pins();
 	io_after = ResourceOwnerHasBufferIOs(CurrentResourceOwner);
+	transaction_after = cluster_transaction_service_pending();
 	gate_known = cluster_semantic_activation_wait_graph_snapshot(&gate);
 	ForEachLWLockHeldByMe(cluster_backend_collection_lock, &held_lock);
 	if (held_lock || CritSectionCount != 0 || proc_exit_inprogress
@@ -1300,13 +1302,15 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 		|| memcmp(&after.identity, &sample.snapshots.identity, sizeof(after.identity)) != 0
 		|| pins_after != sample.buffer_pins_pending
 		|| io_after != sample.buffer_io_pending
+		|| transaction_after != sample.transaction_pending
 		|| after.references != sample.snapshots.references
 		|| after.retained_read_scn != sample.snapshots.retained_read_scn) {
 		out->reason = "BACKEND_COLLECTION_POINT_CHANGED_OR_UNKNOWN";
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
 	}
 	sample.reason = sample.snapshots.references != 0 || sample.snapshots.retained_read_scn != 0
-		? sample.snapshots.reason : sample.buffer_pins_pending
+		? sample.snapshots.reason : sample.transaction_pending
+		? "BACKEND_COLLECTION_TRANSACTION_PENDING" : sample.buffer_pins_pending
 		? "BACKEND_COLLECTION_BUFFER_PINS_PENDING"
 		: sample.buffer_io_pending && resource_owner != NULL
 		? "BACKEND_COLLECTION_BUFFER_IO_PENDING"
