@@ -14354,3 +14354,21 @@ test_cluster_first_fill_retire: test_cluster_first_fill_retire.c test_cluster_pc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Real current-MX constructor preflight, with both original Assert profiles.
+MX_PREFLIGHT_TESTS = test_cluster_multixact_preflight test_cluster_multixact_preflight_noassert
+TESTS += $(MX_PREFLIGHT_TESTS)
+all: $(MX_PREFLIGHT_TESTS)
+test_cluster_multixact_preflight: MX_PREFLIGHT_MODE = cassert
+test_cluster_multixact_preflight: MX_PREFLIGHT_CPPFLAGS = -DPREFLIGHT_EXPECT_CASSERT
+test_cluster_multixact_preflight_noassert: MX_PREFLIGHT_MODE = nocassert
+test_cluster_multixact_preflight: $(MX_PUBLICATION_PROFILE)/cassert/pg_config.h \
+	$(MX_PUBLICATION_PROFILE)/cassert/postgres.h $(MX_PUBLICATION_PROFILE)/cassert/c.h
+test_cluster_multixact_preflight_noassert: $(MX_PUBLICATION_PROFILE)/nocassert/pg_config.h \
+	$(MX_PUBLICATION_PROFILE)/nocassert/postgres.h $(MX_PUBLICATION_PROFILE)/nocassert/c.h
+$(MX_PREFLIGHT_TESTS): test_cluster_multixact_preflight.c unit_test.h Makefile \
+		$(top_srcdir)/src/backend/access/transam/multixact.c \
+		$(top_srcdir)/src/include/access/multixact.h
+	$(CC) $(CFLAGS) -I$(MX_PUBLICATION_PROFILE)/$(MX_PREFLIGHT_MODE) $(CPPFLAGS) \
+		$(MX_PREFLIGHT_CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@

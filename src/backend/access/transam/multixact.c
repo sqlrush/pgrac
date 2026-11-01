@@ -993,6 +993,41 @@ extern MultiXactId cluster_multixact_test_materialize_local_current(
 #endif
 
 /*
+ * Size the native current descriptor without allocating or reading members.
+ * This is independent of the admitted protocol's member-count limit.
+ */
+bool
+MultiXactIdCurrentMembersSize(uint32 nmembers, Size *member_bytes, uint32 *record_bytes)
+{
+	uint64 members_size;
+	uint64 main_size;
+	uint64 record_size;
+
+	if (member_bytes != NULL)
+		*member_bytes = 0;
+	if (record_bytes != NULL)
+		*record_bytes = 0;
+	if (member_bytes == NULL || record_bytes == NULL || nmembers < 1 || nmembers > INT32_MAX)
+		return false;
+
+	/* Widen before arithmetic; the input is bounded by the native int32. */
+	members_size = (uint64)nmembers * sizeof(MultiXactMember);
+	main_size = (uint64)SizeOfMultiXactCreate + members_size;
+	/* No block references or INCLUDE_ORIGIN; top-XID metadata may be added. */
+	record_size = SizeOfXLogRecord + (uint64)sizeof(uint8) + sizeof(TransactionId)
+		+ (main_size > UINT8_MAX ? SizeOfXLogRecordDataHeaderLong
+								: SizeOfXLogRecordDataHeaderShort)
+		+ main_size;
+	if (members_size > MaxAllocSize || members_size > UINT32_MAX
+		|| main_size > UINT32_MAX || record_size > XLogRecordMaxSize)
+		return false;
+
+	*member_bytes = (Size)members_size;
+	*record_bytes = (uint32)record_size;
+	return true;
+}
+
+/*
  * MultiXactIdCreateLocalCurrentMembers
  *
  * Materialize one complete requester-owned descriptor without publishing a
@@ -1011,8 +1046,15 @@ MultiXactIdCreateLocalCurrentMembers(int nmembers, MultiXactMember *members)
 	xl_multixact_create xlrec;
 #endif
 	bool has_update = false;
+	Size member_bytes = 0;
+	uint32 record_bytes;
 	int i;
 
+	if (nmembers > 0
+		&& !MultiXactIdCurrentMembersSize((uint32)nmembers, &member_bytes, &record_bytes))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("current MultiXact member set exceeds native memory or WAL limits")));
 	if (nmembers < 1 || nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS
 		|| members == NULL)
 		ereport(ERROR,
@@ -1035,6 +1077,9 @@ MultiXactIdCreateLocalCurrentMembers(int nmembers, MultiXactMember *members)
 		}
 	}
 
+	/* Reserve before GetNewMultiXactId can emit zero-page WAL or enter CRIT. */
+	XLogEnsureRecordSpace(0, 2);
+
 #ifdef USE_CLUSTER_UNIT
 	/* The fixture replaces only the allocator/WAL/SLRU persistence tail. */
 	return cluster_multixact_test_materialize_local_current(nmembers, members);
@@ -1053,7 +1098,7 @@ MultiXactIdCreateLocalCurrentMembers(int nmembers, MultiXactMember *members)
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, SizeOfMultiXactCreate);
 	XLogRegisterData((char *) members,
-					 nmembers * sizeof(MultiXactMember));
+					 (uint32)member_bytes);
 	(void) XLogInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID);
 	RecordNewMultiXact(multi, offset, nmembers, members);
 	END_CRIT_SECTION();

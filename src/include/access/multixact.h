@@ -116,6 +116,8 @@ extern MultiXactId MultiXactIdCreateFromCurrentMembers(int nmembers,
 												MultiXactMember *members);
 extern MultiXactId MultiXactIdCreateLocalCurrentMembers(
 	int nmembers, MultiXactMember *members);
+extern bool MultiXactIdCurrentMembersSize(uint32 nmembers, Size *member_bytes,
+										uint32 *record_bytes);
 #endif
 
 extern MultiXactId ReadNextMultiXactId(void);

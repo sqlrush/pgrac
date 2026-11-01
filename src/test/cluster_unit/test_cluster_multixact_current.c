@@ -26,6 +26,7 @@
 #include <stdio.h>
 
 #include "access/htup_details.h"
+#include "access/xloginsert.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
@@ -138,6 +139,10 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 {
 	abort();
 }
+
+void
+XLogEnsureRecordSpace(int max_block_id pg_attribute_unused(), int ndatas pg_attribute_unused())
+{}
 
 
 /*
