@@ -15703,3 +15703,19 @@ clean: clean-recovery-carriers
 .PHONY: clean-recovery-carriers
 clean-recovery-carriers:
 	rm -f test_cluster_recovery_carriers
+
+# Pure shared RFI2 codec; no backend authority or file provider is linked.
+TESTS += test_cluster_recovery_file_identity
+all: test_cluster_recovery_file_identity
+test_cluster_recovery_file_identity: test_cluster_recovery_file_identity.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/port/libpgport.a -o $@
+clean: clean-recovery-identity-codec
+.PHONY: clean-recovery-identity-codec
+clean-recovery-identity-codec:
+	rm -f test_cluster_recovery_file_identity test_cluster_recovery_file_identity.d
