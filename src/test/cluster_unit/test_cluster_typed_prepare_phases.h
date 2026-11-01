@@ -38,6 +38,9 @@ prepare_probe_leaf(unsigned phase)
 bool
 errstart(int level, const char *domain pg_attribute_unused())
 {
+	/* Native ARM CRC dispatch emits DEBUG1 before its first checksum. */
+	if (level == DEBUG1)
+		return false;
 	if (!prepare_probe_active || level != FATAL)
 		abort();
 	return true;

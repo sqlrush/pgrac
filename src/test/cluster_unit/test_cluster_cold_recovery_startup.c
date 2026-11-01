@@ -77,6 +77,28 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 #include "test_cluster_cold_source_completion.inc"
 #include "test_cluster_cold_endpoints.h"
 
+UT_TEST(test_prepare_platform_debug_preserves_original_fatal_trap)
+{
+	int			active;
+	int			code = MAKE_SQLSTATE('5', '3', 'R', 'A', '3');
+
+	/* ARM CRC dispatch can log before the first prepare probe is active. */
+	for (active = 0; active < 2; ++active)
+	{
+		prepare_probe_active = (active != 0);
+		UT_ASSERT(!errstart(DEBUG1, NULL));
+		UT_ASSERT(!errstart_cold(DEBUG1, NULL));
+		elog(DEBUG1, "using armv8 crc32 hardware = %d", 1);
+		UT_ASSERT_EQ(prepare_probe_active, active != 0);
+	}
+
+	prepare_probe_code = 0;
+	if (sigsetjmp(prepare_probe_exception, 1) == 0)
+		ereport(FATAL, (errcode(code), errmsg("prepare deadline expired")));
+	UT_ASSERT_EQ(prepare_probe_code, code);
+	prepare_probe_active = false;
+}
+
 UT_TEST(test_prepare_invalidates_old_retention_before_first_root)
 {
 	ClusterColdTypedV1 *typed;
@@ -4205,7 +4227,8 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(168);
+	UT_PLAN(169);
+	UT_RUN(test_prepare_platform_debug_preserves_original_fatal_trap);
 	UT_RUN(test_pass2_source_drift_waits_for_post_ir_and_never_replays);
 	UT_RUN(test_pass2_current_and_sync_do_not_read_root);
 
