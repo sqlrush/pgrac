@@ -613,14 +613,18 @@ def build_graph(snapshots, resources):
                 edges=edges, cycles=_cycles(edges), unknown=unknown)
 
 
-def capture_failed_watchdog(collect):
+def capture_failed_workload(collect, *, reason='original_workload_failed'):
     """The caller has reached its original failure boundary; never turns PASS."""
-    result = dict(status='FAIL', reason='original_watchdog_expired', capture_error=None)
+    result = dict(status='FAIL', reason=reason, capture_error=None)
     try:
         result['capture'] = collect()
     except BaseException as exc:
         result['capture_error'] = repr(exc)
     return result
+
+
+def capture_failed_watchdog(collect):
+    return capture_failed_workload(collect, reason='original_watchdog_expired')
 
 
 def _read_proc_text(path, limit=8192):
