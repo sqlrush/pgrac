@@ -25149,6 +25149,7 @@ UT_TEST(test_wal_inputs_cold_selection_and_pin_lifetime_are_exact)
 }
 
 #include "test_cluster_control_cold_census.inc"
+#include "test_cluster_control_online_census.inc"
 #include "test_cluster_control_catalog.inc"
 #include "test_cluster_control_root_serving.inc"
 
@@ -26691,7 +26692,14 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(42);
+		UT_PLAN(48);
+		UT_RUN(test_online_source_census_reuses_complete_physical_cuts);
+		UT_RUN(test_online_source_census_pending_has_no_partial_callbacks);
+		UT_RUN(test_online_source_census_refusal_error_and_final_drift_revoke_scope);
+		UT_RUN(test_online_source_census_keeps_original_owner_role_and_cold_rejection);
+		UT_RUN(test_online_source_census_preserves_empty_initializer_source);
+		UT_RUN(test_online_source_census_physical_growth_keeps_original_cut);
+
 		UT_RUN(test_cold_census_visits_all_selected_sources_twice);
 		UT_RUN(test_cold_census_open_source_waits_without_partial_callbacks);
 		UT_RUN(test_cold_census_refusal_error_and_final_drift_never_complete);
@@ -26750,7 +26758,14 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(584);
+	UT_PLAN(590);
+	UT_RUN(test_online_source_census_reuses_complete_physical_cuts);
+	UT_RUN(test_online_source_census_pending_has_no_partial_callbacks);
+	UT_RUN(test_online_source_census_refusal_error_and_final_drift_revoke_scope);
+	UT_RUN(test_online_source_census_keeps_original_owner_role_and_cold_rejection);
+	UT_RUN(test_online_source_census_preserves_empty_initializer_source);
+	UT_RUN(test_online_source_census_physical_growth_keeps_original_cut);
+
 	UT_RUN(test_ctrc_replay_stable_two_actual_origins_without_tt);
 	UT_RUN(test_ctrc_replay_stable_refuses_omitted_or_duplicated_set_origin);
 	UT_RUN(test_ctrc_replay_stable_refuses_changed_native_source_or_uncovered_cut);

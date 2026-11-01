@@ -457,7 +457,7 @@ extern ClusterControlRootResult cluster_wal_inputs_census_v1(ClusterWalInputsV1 
 															 void *arg, uint64 *out_record_count,
 															 RfPageProofDetailV1 *out_detail);
 
-/* Cold-only, read-only enumeration of every selected source. completed is
+/* Read-only enumeration of every selected source. completed is
  * NULL before its physical visit and non-NULL after the original reader has
  * verified its entire cut. Explicit empty initializer terminals also receive
  * both callbacks; they are not missing participants. Each event is provisional
@@ -467,6 +467,14 @@ extern ClusterControlRootResult cluster_wal_inputs_census_v1(ClusterWalInputsV1 
 typedef RfPageProofDetailV1 (*ClusterWalCensusSourceVisitorV1)(
 	const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
 	const ClusterWalTailObservation *completed, void *arg);
+/* Requires the original online scope and both visitors. Uses the same fixed
+ * cuts, physical reads and final checks as census_v1, without a replay graph.
+ * WAIT, refusal or ERROR requires discarding every provisional callback; a
+ * successful caller must still retain and revalidate the original scope. */
+extern ClusterControlRootResult
+cluster_wal_inputs_census_sources_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+				   ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
+				   uint64 *out_record_count, RfPageProofDetailV1 *out_detail);
 /* Requires an original Startup cold scope. OPEN sources return WAIT before
  * callbacks, except the original CTRC scope's exact installed local writer
  * and private fixed native cut described above. No peer live-cut request or

@@ -1668,6 +1668,18 @@ cluster_wal_inputs_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitor
 }
 
 ClusterControlRootResult
+cluster_wal_inputs_census_sources_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+				   ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
+				   uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
+{
+	ClusterThreadRecoveryFabricPlanV1 *unused = NULL;
+	if (visitor == NULL || source_visitor == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return inputs_scan_contributions(inputs, true, visitor, source_visitor, false, arg, &unused,
+									 out_record_count, out_detail);
+}
+
+ClusterControlRootResult
 cluster_wal_inputs_cold_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
 								  ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
 								  uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
