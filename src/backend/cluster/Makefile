@@ -286,6 +286,7 @@ OBJS = \
 	cluster_semantic_activation.o \
 	cluster_semantic_survivor.o \
 	cluster_semantic_survivor_candidate.o \
+	cluster_semantic_survivor_producer.o \
 	cluster_catalog_bootstrap.o \
 	cluster_catalog_startup_input.o \
 	cluster_catalog_migrate.o \

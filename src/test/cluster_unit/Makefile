@@ -13677,3 +13677,11 @@ test_cluster_survivor_candidate: test_cluster_survivor_candidate.c test_cluster_
 
 # Original input-job owner observations in the real ACK/service-loop fixture.
 test_cluster_wal_inputs_job_service: test_cluster_input_job_observation.inc
+
+# Same-process survivor collection uses the complete original owner branch.
+test_cluster_wal_inputs_job_service: test_cluster_survivor_producer_inputs.inc
+test_cluster_snapshot_admission: test_cluster_survivor_producer_backend.inc
+test_cluster_wal_inputs_job_service test_cluster_snapshot_admission test_cluster_survivor_candidate: \
+ test_cluster_survivor_producer_fixture.h \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_producer.c \
+ $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_producer.h

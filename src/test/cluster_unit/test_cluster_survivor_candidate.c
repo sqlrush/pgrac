@@ -14,6 +14,39 @@ int survivor_candidate_original_lmon_main(void);
 #define PENDING CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
 #define REFUSED CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED
 #define STALE CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE
+#define SURVIVOR_POLL_REAL_NATIVE
+#include "test_cluster_survivor_producer_fixture.h"
+static void
+survivor_native_family_test(void)
+{
+ ClusterSurvivorProducerObservation out;ClusterSurvivorProducerScope scope={3,3,11};
+ BackendType backend=MyBackendType;AuxProcType aux=MyAuxProcType;
+ bool saved_lmd=cluster_lmd_enabled;
+ const BackendType backends[]={B_LMON,B_LMS,B_LMD,B_SINVAL_BCAST,B_LMS_WORKER};
+ const AuxProcType auxiliaries[]={LmonProcess,LmsProcess,LmdProcess,SinvalBcastProcess,LmsWorker1Process};
+ cluster_lmd_enabled=true;
+ for(unsigned i=0;i<lengthof(backends);++i) {
+  MyBackendType=backends[i];MyAuxProcType=auxiliaries[i];
+  test_producer_seen=0;
+  if(i!=0)UT_ASSERT(cluster_normal_stop_service_enter());
+  UT_ASSERT_EQ(cluster_semantic_survivor_producer_poll(CLUSTER_SURVIVOR_PRODUCER_NATIVE,scope,&out),PENDING);
+  UT_ASSERT_EQ(out.owner,CLUSTER_SURVIVOR_PRODUCER_NATIVE);
+  UT_ASSERT_EQ(out.sample.native.producer.identity.pid,MyProcPid);
+  UT_ASSERT_EQ(out.sample.native.producer.identity.backend_id,InvalidBackendId);
+  UT_ASSERT(out.sample.native.producer.identity.actor_bit!=0);
+  UT_ASSERT(out.sample.native.admission.known);
+  UT_ASSERT_EQ(out.sample.native.producer.actor.active_depth,i==0?0:1);
+  if(i!=0)UT_ASSERT_EQ(out.sample.native.producer.responsibility.modules,0);
+  for(unsigned owner=0;owner<5;++owner) {
+   if(owner==CLUSTER_SURVIVOR_PRODUCER_NATIVE)continue;
+   UT_ASSERT_EQ(cluster_semantic_survivor_producer_poll((ClusterSurvivorProducerOwner)owner,scope,&out),REFUSED);
+   survivor_poll_unknown(&out);
+  }
+  if(i!=0)UT_ASSERT(cluster_normal_stop_service_leave(true));
+ }
+ cluster_lmd_enabled=saved_lmd;MyBackendType=backend;MyAuxProcType=aux;
+}
+
 static ClusterSurvivorControl candidate, before;
 static uint8 manifest[7952], ack[272], body[1536 + 80 + 128 * 48], format[32];
 static ClusterSurvivorMessageV4 message;
@@ -409,6 +442,7 @@ candidate_wait(WaitEvent *events pg_attribute_unused())
 		}
 		break;
 	}
+	if (candidate_case == 16) survivor_native_family_test();
 	unconfirmed();
 	ShutdownRequestPending = true;
 	return 0;
@@ -436,9 +470,10 @@ UT_TEST(all_original_128_return_cells_keep_their_own_gate) { run_candidate(12); 
 UT_TEST(return_collection_rechecks_original_identity_and_late_work) { run_candidate(13); }
 UT_TEST(return_collection_preserves_refusal_and_pending_priorities) { run_candidate(14); }
 UT_TEST(original_open_historical_source_does_not_replace_current_target) { run_candidate(15); }
+UT_TEST(survivor_native_dispatch_uses_actual_roles_at_original_lmon_return) { run_candidate(16); }
 int main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(candidate_does_not_turn_an_idle_owner_point_into_quiescence);
 	UT_RUN(all_128_untrusted_rows_remain_unconfirmed);
 	UT_RUN(exact_duplicates_are_idempotent_conflicts_preserve_first);
@@ -455,5 +490,6 @@ int main(void)
 	UT_RUN(return_collection_rechecks_original_identity_and_late_work);
 	UT_RUN(return_collection_preserves_refusal_and_pending_priorities);
 	UT_RUN(original_open_historical_source_does_not_replace_current_target);
+	UT_RUN(survivor_native_dispatch_uses_actual_roles_at_original_lmon_return);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }

@@ -1084,6 +1084,7 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 
 #include "test_cluster_snapshot_return.inc"
 #include "test_cluster_backend_return.inc"
+#include "test_cluster_survivor_producer_backend.inc"
 
 int
 main(void)
@@ -1106,7 +1107,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(104);
+	UT_PLAN(106);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1211,6 +1212,8 @@ main(void)
 	UT_RUN(backend_collection_discards_owner_and_gate_drift_at_return);
 	UT_RUN(backend_collection_discards_unknown_or_contended_shared_samples);
 	UT_RUN(backend_collection_never_retires_original_debt_or_grants_closure);
+	UT_RUN(survivor_backend_poll_keeps_actual_snapshot_and_original_gate);
+	UT_RUN(survivor_backend_poll_discards_final_owner_drift_and_leaf_stale);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

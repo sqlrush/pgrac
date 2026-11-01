@@ -317,6 +317,7 @@ UT_TEST(service_ack_at_latch_reset_is_observed_before_interrupt_handling)
 }
 
 #include "test_cluster_input_job_observation.inc"
+#include "test_cluster_survivor_producer_inputs.inc"
 
 int
 main(void)
@@ -334,7 +335,7 @@ main(void)
 	cluster_control_request_shmem_init();
 	control_driver = retire_driver = cluster_control_request_driver_start();
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(17);
+	UT_PLAN(21);
 	UT_RUN(service_bgwriter_128_acks_progress_without_delay_or_new_wait);
 	UT_RUN(service_checkpointer_128_acks_progress_without_checkpoint_timer);
 	UT_RUN(service_ack_at_latch_reset_is_observed_before_interrupt_handling);
@@ -352,6 +353,10 @@ main(void)
  UT_RUN(input_observation_rejects_wrong_owner_and_context);
  UT_RUN(input_observation_discards_identity_epoch_and_job_drift);
  UT_RUN(input_observation_retained_done_detect_keeps_business_owner);
+ UT_RUN(survivor_input_poll_retains_cf_and_128_walr_at_original_returns);
+ UT_RUN(survivor_input_poll_refuses_wrong_family_and_preserves_unknown);
+ UT_RUN(survivor_input_poll_rechecks_actual_original_owner_at_final_return);
+ UT_RUN(survivor_input_poll_keeps_original_invalid_and_stale_outcomes);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

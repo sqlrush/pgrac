@@ -11,6 +11,7 @@
 #include "storage/proc.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_semantic_survivor_candidate.h"
+#include "cluster/cluster_semantic_survivor_producer.h"
 #include "../../common/sha2_int.h"
 
 #define CANDIDATE_INVALID 1U
@@ -247,6 +248,8 @@ cluster_semantic_survivor_candidate_probe(ClusterSurvivorControl *c,
 {
 	ClusterSemanticAdmissionObservationResult result;
 	ClusterSemanticActivationRecord open;
+	ClusterSurvivorProducerObservation observation;
+	ClusterSurvivorProducerScope scope;
 	if (!candidate_owner() || out == NULL || c == NULL)
 		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_owner_invalid");
 	if (!candidate_live(c))
@@ -263,8 +266,12 @@ cluster_semantic_survivor_candidate_probe(ClusterSurvivorControl *c,
 		|| open.target_feature_bitmap != c->tables[0].header.target_features
 		|| open.target_feature_bitmap != c->tables[0].header.source_features)
 		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_open_baseline_invalid");
-	result = cluster_service_producer_collect_return(c->header.epoch, open.transition_epoch,
-		c->basis.open_generation, out);
+	scope.native_epoch = c->header.epoch; scope.gate_epoch = open.transition_epoch;
+	scope.record_generation = c->basis.open_generation;
+	result = cluster_semantic_survivor_producer_poll(CLUSTER_SURVIVOR_PRODUCER_NATIVE,
+		scope, &observation);
+	if (result == CANDIDATE_PENDING)
+		*out = observation.sample.native;
 	if (result == CANDIDATE_STALE) {
 		(void)cluster_semantic_survivor_candidate_invalidate(c, NULL);
 		return candidate_result(result, reason, "candidate_native_changed");
