@@ -4387,7 +4387,7 @@ test_cluster_recovery_native_inputs: $(top_srcdir)/src/backend/cluster/cluster_r
 		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_page_roots.h
 test_cluster_recovery_native_inputs: test_cluster_recovery_manifest_inputs.inc test_cluster_recovery_terminal_inputs.inc test_cluster_recovery_tt_terminal_inputs.inc test_cluster_recovery_page_roots_inputs.inc
-test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc
+test_cluster_recovery_native_inputs: $(RECOVERY_CENSUS_TEST_OBJS) test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_inputs.inc test_cluster_recovery_online_inventory.inc
 test_cluster_recovery_native_inputs: test_cluster_recovery_xact_join_inputs.inc test_cluster_recovery_relmap_physical_inputs.inc test_cluster_recovery_relmap_inputs.inc test_cluster_recovery_relmap_fixture.h
 
 # The prefix/base composition consumes both public native-owner declarations.

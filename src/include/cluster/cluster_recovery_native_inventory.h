@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * cluster_recovery_native_inventory.h
- *    Native and undo effects observed through the original cold inputs.
+ *    Native and undo WAL effects observed through original owned inputs.
  *
  * Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
@@ -113,6 +113,18 @@ extern ClusterRecoveryNativeInventoryResult
 cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memory_budget,
 										ClusterRecoveryNativeInventory **out,
 										ClusterRecoveryNativeInventoryDiag *diag);
+/* Online WAL-only observations through the original online source census.
+ * Retain the same two-pass full-record comparison and owned-memory bound.
+ * The caller holds and revalidates the original input scope through use.
+ * This establishes no native file/TT freeze, producer closure, isolation,
+ * apply or service authority; other records remain unresolved obligations.
+ * The cold APIs and physical-root collection keep their original scope. */
+extern ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_build_online(ClusterWalInputsV1 *inputs, size_t memory_budget,
+	ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag);
+extern ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_recheck_online(ClusterWalInputsV1 *inputs,
+	ClusterRecoveryNativeInventory *inventory, ClusterRecoveryNativeInventoryDiag *diag);
 /* Same two cold passes, also collecting PAGE/FSM/native storage/SPACE/undo
  * targets into an unstarted root set. Both outputs remain provisional
  * until all source records (including non-native bytes) agree. Failure

@@ -41,9 +41,27 @@ inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visi
 	return result;
 }
 
+static ClusterControlRootResult
+inventory_test_online_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+							ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
+							uint64 *records, RfPageProofDetailV1 *detail)
+{
+	ClusterControlRootResult result;
+
+	inventory_census_calls++;
+	result = cluster_wal_inputs_census_sources_v1(inputs, visitor, source_visitor, arg,
+													 records, detail);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && inventory_census_calls == 1
+		&& inventory_between_passes != NULL)
+		inventory_between_passes();
+	return result;
+}
+
+#define cluster_wal_inputs_census_sources_v1 inventory_test_online_census
 #define cluster_wal_inputs_cold_census_v1 inventory_test_census
 #include "../../backend/cluster/cluster_recovery_native_inventory.c"
 #undef cluster_wal_inputs_cold_census_v1
+#undef cluster_wal_inputs_census_sources_v1
 #include "../../backend/cluster/cluster_recovery_census.c"
 
 static ClusterWalSourceRef inventory_fault_source;
@@ -960,6 +978,8 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 	ctrc_local_done(&inputs);
 }
 
+#include "test_cluster_recovery_online_inventory.inc"
+
 int
 main(int argc, char **argv)
 {
@@ -967,7 +987,14 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
-	UT_PLAN(82);
+	UT_PLAN(88);
+	UT_RUN(test_online_inventory_reads_complete_native_wal_twice);
+	UT_RUN(test_online_inventory_remote_wait_has_no_partial_inventory);
+	UT_RUN(test_online_inventory_drift_io_and_error_never_publish);
+	UT_RUN(test_online_inventory_recheck_preserves_cursor_and_fixed_end);
+	UT_RUN(test_online_inventory_keeps_cold_owner_and_budget_guards);
+	UT_RUN(test_online_inventory_keeps_actual_empty_terminal_identity);
+
 	UT_RUN(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes);
 	UT_RUN(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work);
 	UT_RUN(test_owned_ctrc_census_rejects_other_purpose_and_namespace_switch);
