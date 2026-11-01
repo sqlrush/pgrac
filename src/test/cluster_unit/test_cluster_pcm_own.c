@@ -9259,7 +9259,7 @@ UT_TEST(test_bufmgr_abort_cleanup_is_never_silent)
 	free(source);
 }
 
-UT_TEST(test_bufmgr_finish_failure_rolls_back_acquired_master_grant)
+UT_TEST(test_bufmgr_legacy_rollback_is_isolated_from_ordinary_acquisition)
 {
 	static const char *const rollback_contract[]
 		= { "cluster_pcm_own_finish_grant_reservation",
@@ -9271,12 +9271,21 @@ UT_TEST(test_bufmgr_finish_failure_rolls_back_acquired_master_grant)
 			"cluster_pcm_own_abort_grant_after_master_rollback",
 			"ereport(ERROR" };
 	char *source = read_bufmgr_source();
+	const char *ordinary = strstr(source, "\ncluster_bufmgr_pcm_lock_shared(");
+	const char *ordinary_end = ordinary != NULL
+		? strstr(ordinary, "/* End ordinary resident SHARE driver. */") : NULL;
+	const char *legacy = ordinary != NULL
+		? strstr(ordinary, "cluster_pcm_own_finish_grant_or_rollback(") : NULL;
 
-	/* Definition plus the remaining S-side LockBuffer caller.  The source-
-	 * removed X path is Resource-X native and has no legacy direct-lock caller;
-	 * the surviving grant path still cannot leak a master holder when local
-	 * finish rejects the token/tuple. */
-	UT_ASSERT(count_occurrences(source, "cluster_pcm_own_finish_grant_or_rollback(") >= 2);
+	/* The old exact rollback remains guarded, but neither ordinary S nor X
+	 * calls it. Ordinary acquisition owns its original episode cleanup. */
+	UT_ASSERT_EQ(count_occurrences(source, "cluster_pcm_own_finish_grant_or_rollback("), 1);
+	UT_ASSERT_NOT_NULL(ordinary);
+	UT_ASSERT_NOT_NULL(ordinary_end);
+	if (ordinary_end != NULL)
+		UT_ASSERT(legacy == NULL || legacy >= ordinary_end);
+	assert_source_range_contains(ordinary, ordinary_end, "cluster_gcs_block_resident_read_begin(");
+	assert_source_range_contains(ordinary, ordinary_end, "cluster_bufmgr_first_fill_error");
 	assert_ordered_in_function(source, "\ncluster_pcm_own_finish_grant_or_rollback(", "\nstatic ",
 							   rollback_contract, lengthof(rollback_contract));
 	free(source);
@@ -9303,7 +9312,7 @@ UT_TEST(test_bufmgr_s_base_rollback_normalizes_to_n_under_header_authority)
 	 * and remains N.  All prechecks precede abort, so rejection leaves the live
 	 * flag as fail-closed evidence rather than advertising successful cleanup. */
 	assert_ordered_in_function(source, "\ncluster_pcm_own_abort_grant_after_master_rollback(",
-							   "\nstatic void\ncluster_pcm_own_finish_grant_or_rollback(",
+							   "\ncluster_pcm_own_finish_grant_or_rollback(",
 							   s_to_n_contract, lengthof(s_to_n_contract));
 	free(source);
 }
@@ -9332,7 +9341,7 @@ UT_TEST(test_bufmgr_generation_bump_failure_is_classified_under_header_lock)
 	UT_ASSERT_NOT_NULL(strstr(source, "active reservation"));
 	UT_ASSERT_NOT_NULL(strstr(source, "generation exhausted"));
 	UT_ASSERT_NOT_NULL(strstr(source, "LockBuffer unlock READ_IMAGE"));
-	UT_ASSERT_NOT_NULL(strstr(source, "LockBuffer S read-image publish"));
+	UT_ASSERT_NOT_NULL(strstr(source, "LockBuffer resident S reservation"));
 	UT_ASSERT_NOT_NULL(strstr(source, "LockBuffer SHARE local-cache-off mirror"));
 	free(source);
 }
@@ -9404,41 +9413,63 @@ UT_TEST(test_read_image_lifecycle_is_exact_monotonic_and_header_atomic)
 	free(source);
 }
 
-UT_TEST(test_share_read_image_publication_has_no_clean_n_observation_gap)
+UT_TEST(test_share_current_publication_has_no_clean_n_observation_gap)
 {
+	static const char *const ordinary_contract[] = {
+		"cluster_bufmgr_pcm_begin_grant_reservation_wait(",
+		"read->pending = !covered",
+		"if (!covered)",
+		"cluster_gcs_block_resident_read_begin(",
+		"cluster_gcs_block_first_fill_wait(",
+		"cluster_bufmgr_pcm_own_acquire_claim_exact(",
+		"cluster_bufmgr_pcm_own_acquire_stage_begin_exact(",
+		"cluster_bufmgr_pcm_own_acquire_fill_resident_exact(",
+		"resident read could not complete its original GCS acquisition",
+		"read->pending = false",
+		"cluster_gcs_block_first_fill_end(",
+		"LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)",
+		"cluster_bufmgr_pcm_own_snapshot(buf, &live)",
+		"BM_TAG_VALID | BM_VALID | BM_IO_ERROR",
+		"cluster_pcm_x_cached_cover_reverify_accepts(",
+		"locked = true" };
+	static const char *const native_contract[] = {
+		"LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)",
+		"ResourceOwnerHasBufferIO(",
+		"expected.flags = PCM_OWN_FLAG_GRANT_PENDING",
+		"LockBufHdr(buf)",
+		"cluster_pcm_own_snapshot_locked(",
+		"cluster_pcm_own_snapshot_equal_exact(",
+		"cluster_pcm_own_delivery_attempt_get(",
+		"cluster_pcm_own_delivery_read_commit_exact(",
+		"buf->pcm_state = PCM_STATE_S",
+		"buf->buffer_type = BUF_TYPE_SCUR",
+		"UnlockBufHdr(buf, state)" };
+	static const char *const io_contract[] = {
+		"cluster_bufmgr_acquire_read_cut(",
+		"cluster_bufmgr_acquire_read_native(",
+		"ResourceOwnerHasBufferIO(",
+		"TerminateBufferIO(buf, false, BM_VALID)" };
+	static const char *const completion_contract[] = {
+		"LWLockAcquire(content, LW_EXCLUSIVE)",
+		"cluster_bufmgr_acquire_read_continue_native(",
+		"PG_FINALLY()",
+		"LWLockRelease(content)",
+		"cluster_bufmgr_acquire_read_terminal(",
+		"cluster_pcm_lock_resource_x_requester_acquire_read_complete_exact(",
+		"cluster_bufmgr_pcm_own_acquire_complete_disk_exact(" };
 	char *source = read_bufmgr_source();
-	const char *lockbuffer = strstr(source, "\nLockBufferInternal(Buffer buffer, int mode");
-	const char *lockbuffer_end
-		= lockbuffer != NULL ? strstr(lockbuffer, "\nvoid\nLockBuffer(Buffer buffer, int mode)")
-							 : NULL;
-	const char *non_durable
-		= lockbuffer != NULL ? strstr(lockbuffer, "else if (pcm_pending_set)") : NULL;
-	const char *branch_end = non_durable != NULL ? strstr(non_durable, "\n\t\t\t\tbreak;") : NULL;
-	const char *publish = non_durable != NULL
-							  ? strstr(non_durable, "cluster_pcm_own_publish_read_image_exact(")
-							  : NULL;
-	const char *pending_clear = publish != NULL ? strstr(publish, "pcm_pending_set = false") : NULL;
-	const char *old_abort
-		= non_durable != NULL ? strstr(non_durable, "cluster_pcm_own_abort_grant_or_error(") : NULL;
-	const char *old_transition
-		= non_durable != NULL ? strstr(non_durable, "cluster_pcm_own_transition(") : NULL;
 
-	UT_ASSERT_NOT_NULL(lockbuffer);
-	UT_ASSERT_NOT_NULL(lockbuffer_end);
-	UT_ASSERT_NOT_NULL(non_durable);
-	UT_ASSERT_NOT_NULL(branch_end);
-	UT_ASSERT_NOT_NULL(publish);
-	UT_ASSERT_NOT_NULL(pending_clear);
-	if (publish != NULL && branch_end != NULL)
-		UT_ASSERT(publish < branch_end);
-	if (pending_clear != NULL && branch_end != NULL)
-		UT_ASSERT(pending_clear < branch_end);
-	if (old_abort != NULL && branch_end != NULL)
-		UT_ASSERT(old_abort >= branch_end);
-	if (old_transition != NULL && branch_end != NULL)
-		UT_ASSERT(old_transition >= branch_end);
-	if (lockbuffer_end != NULL)
-		UT_ASSERT(branch_end == NULL || branch_end < lockbuffer_end);
+	/* Shared current C replaces the old one-shot READ_IMAGE publication.
+	 * Header-atomic S/SCUR precedes INPUT completion; shared C and the
+	 * ordinary caller's content-locked recheck precede returning readable. */
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_lock_shared(",
+		"/* End ordinary resident SHARE driver. */", ordinary_contract, lengthof(ordinary_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_acquire_read_native(",
+		"\n/* A completed native observation", native_contract, lengthof(native_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_acquire_read_continue_native(",
+		"\n/* Observe original bytes", io_contract, lengthof(io_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_acquire_continue_disk_exact(",
+		"/* End original armed disk continuation. */", completion_contract, lengthof(completion_contract));
 	free(source);
 }
 
@@ -10562,7 +10593,7 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 	const char *flush;
 	const char *dirty;
 	const char *hint;
-	const char *lockbuffer;
+	const char *shared_reader;
 	const char *conditional;
 	const char *resident_stamp;
 	const char *storage_refresh;
@@ -10584,7 +10615,7 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 	flush = strstr(source, "\nFlushBufferWithRecovery(");
 	dirty = strstr(source, "\nMarkBufferDirty(Buffer buffer)");
 	hint = strstr(source, "\nMarkBufferDirtyHint(Buffer buffer, bool buffer_std)");
-	lockbuffer = strstr(source, "\nLockBufferInternal(Buffer buffer, int mode");
+	shared_reader = strstr(source, "\ncluster_bufmgr_pcm_lock_shared(");
 	conditional = strstr(source, "\nConditionalLockBuffer(Buffer buffer)");
 	resident_stamp = strstr(source, "\ncluster_bufmgr_lock_resident_for_stamp(");
 	storage_refresh = strstr(source, "\ncluster_bufmgr_refresh_block_from_storage_for_gcs(");
@@ -10593,7 +10624,7 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 	UT_ASSERT_NOT_NULL(flush);
 	UT_ASSERT_NOT_NULL(dirty);
 	UT_ASSERT_NOT_NULL(hint);
-	UT_ASSERT_NOT_NULL(lockbuffer);
+	UT_ASSERT_NOT_NULL(shared_reader);
 	UT_ASSERT_NOT_NULL(conditional);
 	UT_ASSERT_NOT_NULL(resident_stamp);
 	UT_ASSERT_NOT_NULL(storage_refresh);
@@ -10641,19 +10672,21 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 		if (tracked != NULL && gate != NULL && refuse != NULL && dirty_flags != NULL)
 			UT_ASSERT(gate < tracked && tracked < refuse && refuse < dirty_flags);
 	}
-	if (lockbuffer != NULL) {
+	if (shared_reader != NULL) {
 		const char *reserve
-			= strstr(lockbuffer, "cluster_bufmgr_pcm_begin_grant_reservation_wait(");
+			= strstr(shared_reader, "cluster_bufmgr_pcm_begin_grant_reservation_wait(");
 		const char *content
-			= strstr(lockbuffer, "LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)");
+			= strstr(shared_reader, "LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)");
 		const char *w1_reverify
-			= strstr(lockbuffer, "cluster_pcm_x_cached_cover_reverify_accepts(");
+			= strstr(shared_reader, "cluster_pcm_x_cached_cover_reverify_accepts(");
+		const char *end = strstr(shared_reader, "/* End ordinary resident SHARE driver. */");
 
 		UT_ASSERT_NOT_NULL(reserve);
 		UT_ASSERT_NOT_NULL(content);
 		UT_ASSERT_NOT_NULL(w1_reverify);
-		if (reserve != NULL && content != NULL)
-			UT_ASSERT(reserve < content);
+		UT_ASSERT_NOT_NULL(end);
+		if (reserve != NULL && content != NULL && w1_reverify != NULL && end != NULL)
+			UT_ASSERT(reserve < content && content < w1_reverify && w1_reverify < end);
 	}
 	if (conditional != NULL) {
 		const char *content
@@ -10839,22 +10872,28 @@ UT_TEST(test_r11_lockbuffer_writer_selector_is_single_ingress_choice_and_exclusi
 			"LWLockRelease(",
 			"cluster_lockbuffer_barrier_refusal" };
 	char *source = read_bufmgr_source();
+	const char *ingress = source != NULL
+		? strstr(source, "\nLockBufferInternal_trace_impl(Buffer buffer, int mode") : NULL;
+	const char *end = ingress != NULL ? strstr(ingress, "\nvoid\nLockBuffer(") : NULL;
+	const char *choice = ingress != NULL
+		? strstr(ingress, "cluster_resource_x_writer_path_snapshot(") : NULL;
+	const char *another = choice != NULL
+		? strstr(choice + 1, "cluster_resource_x_writer_path_snapshot(") : NULL;
 
 	UT_ASSERT_NOT_NULL(source);
 	if (source == NULL)
 		return;
-	/* One LockBuffer ingress selection, two ordinary TARGET post-T3/content-lock
-	 * revalidations, two known-new direct-init proof revalidations, and the
-	 * direct-init ledger bind's exact post-T3 revalidation, plus one cached-X
-	 * explicit-invalidation and clock-sweep eviction snapshots under descriptor
-	 * authority.  None may resnapshot into
-	 * the other implementation. */
-	UT_ASSERT_EQ(count_occurrences(source, "cluster_resource_x_writer_path_snapshot("), 8);
-	if (strstr(source, "cluster_resource_x_writer_path_snapshot(") == NULL) {
-		free(source);
-		return;
+	/* Count this ingress, not independent direct-init/eviction/resident-X
+	 * revalidations elsewhere. A second implementation selection here is
+	 * forbidden even when the whole-file call count happens to be unchanged. */
+	UT_ASSERT_NOT_NULL(ingress);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(choice);
+	if (end != NULL && choice != NULL) {
+		UT_ASSERT(choice < end);
+		UT_ASSERT(another == NULL || another >= end);
 	}
-	assert_ordered_in_function(source, "\nLockBufferInternal(Buffer buffer, int mode",
+	assert_ordered_in_function(source, "\nLockBufferInternal_trace_impl(Buffer buffer, int mode",
 							   "\nvoid\nLockBuffer(", selector_contract,
 							   lengthof(selector_contract));
 	/* The selected target wrapper receives the exact sampled R4 generation. */
@@ -11867,10 +11906,20 @@ UT_TEST(test_non_source_s_holder_uses_actual_native_finish_without_image_lsn)
 	PageSetLSNPreserveOrigin((Page)transition_page.data, UINT64_C(0x76540));
 	UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(acquire_source_publishes, 1); UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
-	UT_ASSERT_EQ(buf.buffer_type, BUF_TYPE_PI); UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(buf.buffer_type, BUF_TYPE_PI); UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(acquire_source_handoffs, 1);
+	UT_ASSERT_EQ(acquire_source_carrier.flags, 0);
+	UT_ASSERT_EQ(acquire_source_carrier.pcm_state, PCM_STATE_N);
+	UT_ASSERT_EQ(acquire_source_carrier.buffer_type, BUF_TYPE_PI);
+	UT_ASSERT_EQ(acquire_source_carrier.reservation_token, acquire_source_prepared.reservation_token);
 	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), acquire_source_prepared.generation + 1);
+	UT_ASSERT_EQ(acquire_source_carrier.generation, acquire_source_prepared.generation + 1);
 	UT_ASSERT_EQ(PageGetLSN((Page)transition_page.data), UINT64_C(0x76540));
 	UT_ASSERT_EQ(transition_pin_count, 0); UT_ASSERT_EQ(source_finish_fuses, 0);
+	UT_ASSERT_EQ(acquire_source_consume(), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(acquire_source_publishes, 1); UT_ASSERT_EQ(acquire_source_handoffs, 1);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), acquire_source_prepared.generation + 1);
+	UT_ASSERT_EQ(PageGetLSN((Page)transition_page.data), UINT64_C(0x76540));
 	ClusterPcmOwnArray = saved;
 }
 
@@ -12483,11 +12532,11 @@ main(void)
 	UT_RUN(test_target_eviction_bufferdesc_lifecycle_is_reversible_before_local_commit);
 	UT_RUN(test_bufmgr_d5a_commitlocked_uses_locked_commit_and_saved_tag_release);
 	UT_RUN(test_bufmgr_abort_cleanup_is_never_silent);
-	UT_RUN(test_bufmgr_finish_failure_rolls_back_acquired_master_grant);
+	UT_RUN(test_bufmgr_legacy_rollback_is_isolated_from_ordinary_acquisition);
 	UT_RUN(test_bufmgr_s_base_rollback_normalizes_to_n_under_header_authority);
 	UT_RUN(test_bufmgr_generation_bump_failure_is_classified_under_header_lock);
 	UT_RUN(test_read_image_lifecycle_is_exact_monotonic_and_header_atomic);
-	UT_RUN(test_share_read_image_publication_has_no_clean_n_observation_gap);
+	UT_RUN(test_share_current_publication_has_no_clean_n_observation_gap);
 	UT_RUN(test_read_image_normal_unlock_clears_exactly_before_content_release);
 	UT_RUN(test_read_image_abandoned_reclaim_wait_is_content_x_and_successor_exact);
 	UT_RUN(test_pending_x_denied_retry_drops_removed_queue_gap);
