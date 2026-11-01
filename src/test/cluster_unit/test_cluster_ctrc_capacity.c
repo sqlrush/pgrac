@@ -188,6 +188,7 @@ static uint8 segment_native_states[TT_SLOTS_PER_SEGMENT];
 
 /* Original allocator bytes are a boundary in this physical-reader fixture.
  * Their real publication/lifetime is tested by test_cluster_tt_active_owner. */
+#ifndef CLUSTER_CTRC_REAL_ALLOCATOR_GC
 extern bool cluster_tt_slot_current_origin_snapshot(uint32 segment, uint16 offset,
 													ClusterCtrcTxnKeyV1 *key,
 													ClusterTTSlotCurrentOwner *owner,
@@ -210,6 +211,7 @@ cluster_tt_slot_current_origin_snapshot(uint32 segment, uint16 offset, ClusterCt
 	*binding = gc_bindings[offset];
 	return true;
 }
+#endif
 
 /* Original owner identity is a boundary here; its actual producer is exercised
  * by test_cluster_undo_cleaner_capacity. No PID is treated as liveness proof. */
@@ -275,6 +277,7 @@ cluster_undo_record_active_segment_id(void)
 	return sample_record_segment;
 }
 
+#ifndef CLUSTER_CTRC_REAL_ALLOCATOR_GC
 uint32
 cluster_tt_slot_current_segment(int node pg_attribute_unused())
 {
@@ -295,6 +298,7 @@ cluster_tt_slot_current_snapshot(int node, ClusterTTSlotCurrentSnapshot *out)
 		*out = history_current;
 	return true;
 }
+#endif
 
 static bool
 segment_native_is(TransactionId xid, uint8 status)
@@ -5477,7 +5481,7 @@ UT_TEST(test_history_negative_never_hides_io_free_current_or_missing_release)
 	test_cluster_epoch = 13;
 }
 
-#ifdef G320_CAPACITY_REAL_HISTORY
+#if defined(G320_CAPACITY_REAL_HISTORY) || defined(CLUSTER_CTRC_REAL_ALLOCATOR_GC)
 int capacity_component_main(void);
 int
 capacity_component_main(void)

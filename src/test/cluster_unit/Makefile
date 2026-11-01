@@ -14239,3 +14239,28 @@ clean distclean maintainer-clean: clean-undo-capacity-bind
 clean-undo-capacity-bind:
 	rm -f test_cluster_undo_capacity_bind_wait.inc test_cluster_undo_capacity_bind_wait.inc.tmp \
 		test_cluster_undo_capacity_bind
+
+# Actual shared certificate/handoff and allocator GC in the same process.
+TESTS += test_cluster_ctrc_allocator_gc
+all: test_cluster_ctrc_allocator_gc
+
+test_cluster_ctrc_allocator_gc: test_cluster_ctrc_allocator_gc.c \
+		test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_capacity_wait.inc \
+		test_cluster_ctrc_read_scope.inc test_cluster_ctrc_worker_sample.inc \
+		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
+		test_cluster_ctrc_native_prepare.inc test_cluster_pgproc_active_types.inc \
+		test_cluster_capacity_pool_compat.h unit_test.h $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_UNDO_RETENTION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+clean distclean maintainer-clean: clean-ctrc-allocator-gc
+.PHONY: clean-ctrc-allocator-gc
+clean-ctrc-allocator-gc:
+	rm -f test_cluster_ctrc_allocator_gc
