@@ -358,6 +358,29 @@ extern ClusterRuntimeVisibilityOperationStep cluster_runtime_visibility_history_
 	ClusterMxHistoryRecord *record_out, uint32 *data_generation_out, char data_out[BLCKSZ],
 	ClusterTxResolveReason *reason_out);
 
+/* Held strategy for the original LMS origin context; never acquires/releases
+ * a guard or reads cold DATA. Pass the same exact key through all phases.
+ * sample's LIVE is provisional first-DATA input for conservative CTRC touch,
+ * not an effect proof. Original TT FullXid must independently match the key.
+ * copy consumes the plan once and clears top/effect on failure. The caller
+ * must finish guard release and final admission checks before publication. */
+extern ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_mx_operation_held(
+	const ClusterSavepointOperationKey *key, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason);
+extern bool cluster_runtime_visibility_origin_plan_sample_mx_operation_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterSavepointOperationKey *key,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	bool *live, ClusterTxResolveReason *reason);
+extern bool cluster_runtime_visibility_origin_plan_copy_mx_operation_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterSavepointOperationKey *key,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolution *top, ClusterSavepointEffectProof *effect, ClusterTxResolveReason *reason);
+
 /* Exact MX compare inputs use the same original DATA/TT/fresh-DATA guard
  * lifecycle. The caller zeroes the address-stable state before begin and
  * owns cancellation. Pending/failure clears effect; resident poll never

@@ -3866,6 +3866,81 @@ failed:
 	return CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED;
 }
 
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_mx_operation_held(
+	const ClusterSavepointOperationKey *key, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason)
+{
+	if (key == NULL) {
+		if (plan != NULL)
+			memset(plan, 0, sizeof(*plan));
+		if (reason != NULL)
+			*reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+	}
+	return cluster_runtime_visibility_origin_plan_freeze_operation_internal(
+		&key->locator, NULL, NULL, NULL, NULL, mode, admission, NULL, guard, root, plan,
+		reason, false, key);
+}
+
+bool
+cluster_runtime_visibility_origin_plan_sample_mx_operation_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterSavepointOperationKey *key,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	bool *live, ClusterTxResolveReason *reason)
+{
+	const ClusterRuntimeVisibilityOriginPlanData *data;
+	UndoOperationTrailer tail;
+
+	if (live != NULL)
+		*live = false;
+	if (live == NULL || key == NULL
+		|| !cluster_runtime_visibility_origin_plan_sample_canonical_held(
+			plan, mode, admission, guard, root, reason))
+		return false;
+	data = cluster_runtime_visibility_origin_plan_data_const(plan);
+	if (!FullTransactionIdIsNormal(data->candidate.local_original_full_xid)
+		|| !FullTransactionIdEquals(data->candidate.local_original_full_xid, key->top_fxid)
+		|| data->record_length < sizeof(UndoOperationTrailer)) {
+		if (reason != NULL)
+			*reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		return false;
+	}
+	/* Already decoded and identity-bound in the first DATA phase. Packed
+	 * record bodies do not guarantee the trailer's native alignment. */
+	memcpy(&tail, data->record_buf.data + data->record_length - sizeof(tail), sizeof(tail));
+	*live = tail.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	return true;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_copy_mx_operation_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterSavepointOperationKey *key,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolution *top, ClusterSavepointEffectProof *effect, ClusterTxResolveReason *reason)
+{
+	ClusterSavepointReaderRecord operation;
+	PGAlignedBlock page;
+
+	if (effect != NULL)
+		memset(effect, 0, sizeof(*effect));
+	if (key == NULL || effect == NULL || top == NULL
+		|| cluster_runtime_visibility_origin_plan_copy_operation_held(plan, mode, admission,
+			guard, root, top, &operation, page.data, reason) == CLUSTER_TX_UNKNOWN
+		|| !cluster_savepoint_reader_mx_effect(key, top, page.data, effect)) {
+		if (top != NULL)
+			memset(top, 0, sizeof(*top));
+		if (reason != NULL)
+			*reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		return false;
+	}
+	return true;
+}
+
 ClusterRuntimeVisibilityOperationStep
 cluster_runtime_visibility_mx_operation_origin_read_poll(
 	ClusterRuntimeVisibilityOperationRead *state, ClusterSavepointEffectProof *effect_out,

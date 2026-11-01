@@ -631,10 +631,178 @@ UT_TEST(mx_operation_before_mutation_rechecks_runtime_identity)
 #ifndef MX_OPERATION_ORIGIN_TEST_MAIN
 #define MX_OPERATION_ORIGIN_TEST_MAIN main
 #endif
+
+static bool
+mx_held_freeze(MxOriginFixture *f)
+{
+	return cluster_runtime_visibility_origin_plan_freeze_mx_operation_held(
+		&f->key, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &f->origin.admission,
+		&f->origin.guard, &f->origin.data_root, &f->origin.plan, &f->origin.reason)
+		== CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL;
+}
+
+static void
+mx_held_init(MxOriginFixture *f, bool same)
+{
+	mx_origin_init(f, same);
+	/* The held strategy neither obtains nor releases its caller's guard.
+	 * Only this external current-ownership leaf is controlled here. */
+	test_candidate_held_count = 1;
+}
+
+static bool
+mx_held_sample(MxOriginFixture *f, bool *live)
+{
+	return cluster_runtime_visibility_origin_plan_sample_mx_operation_held(
+		&f->origin.plan, &f->key, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+		&f->origin.admission, &f->origin.guard, &f->origin.tt_root, live,
+		&f->origin.reason);
+}
+
+static bool
+mx_held_copy(MxOriginFixture *f)
+{
+	return cluster_runtime_visibility_origin_plan_copy_mx_operation_held(
+		&f->origin.plan, &f->key, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+		&f->origin.admission, &f->origin.guard, &f->origin.data_root,
+		&f->origin.top, &f->effect, &f->origin.reason);
+}
+
+UT_TEST(mx_held_unaligned_tail_and_final_effect)
+{
+	for (int variant = 0; variant < 4; ++variant) {
+		MxOriginFixture f;
+		UndoRecordHeader record;
+		bool live = false;
+		bool discard = (variant & 2) != 0;
+		mx_held_init(&f, (variant & 1) != 0);
+		memcpy(&record, test_operation_page.data + sizeof(UndoBlockHeader), sizeof(record));
+		/* The packed record is valid; its trailer need not be 8-byte aligned. */
+		UT_ASSERT((sizeof(record) + record.payload_length - sizeof(UndoOperationTrailer)) % 8 != 0);
+		UT_ASSERT(mx_held_freeze(&f));
+		UT_ASSERT(mx_held_sample(&f, &live));
+		UT_ASSERT(live);
+		if (discard)
+			operation_plan_effect(CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+		UT_ASSERT(mx_held_copy(&f));
+		UT_ASSERT_EQ(f.effect.effect_state, discard ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED
+												 : CLUSTER_SAVEPOINT_EFFECT_LIVE);
+		UT_ASSERT_EQ(f.effect.top_outcome, CLUSTER_TX_COMMITTED);
+		UT_ASSERT(cluster_savepoint_reader_mx_effect_valid(&f.effect));
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+		UT_ASSERT_EQ(test_candidate_release_calls, 0);
+		UT_ASSERT_EQ(test_candidate_held_count, 1);
+		UT_ASSERT_EQ(test_operation_pin_depth, 0);
+		UT_ASSERT(!mx_held_copy(&f));
+		UT_ASSERT_EQ(f.effect.top_outcome, CLUSTER_TX_UNKNOWN);
+	}
+}
+
+UT_TEST(mx_held_null_key_clears_plan_and_reason)
+{
+	MxOriginFixture f;
+	ClusterRuntimeVisibilityOriginPlan empty = { 0 };
+	mx_held_init(&f, false);
+	memset(&f.origin.plan, 0xa5, sizeof(f.origin.plan));
+	f.origin.reason = CLUSTER_TX_RESOLVE_NONE;
+	UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_mx_operation_held(
+		NULL, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &f.origin.admission,
+		&f.origin.guard, &f.origin.data_root, &f.origin.plan, &f.origin.reason),
+		CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED);
+	UT_ASSERT_EQ(memcmp(&f.origin.plan, &empty, sizeof(empty)), 0);
+	UT_ASSERT_EQ(f.origin.reason, CLUSTER_TX_RESOLVE_PROTOCOL);
+	UT_ASSERT_EQ(test_candidate_data_copy_calls, 0);
+	UT_ASSERT_EQ(test_original_calls, 0);
+}
+
+UT_TEST(mx_held_original_full_xid_is_independent)
+{
+	for (int fault = 0; fault < 3; ++fault) {
+		MxOriginFixture f;
+		ClusterSavepointEffectProof empty = { 0 };
+		ClusterTxResolution no_top = { 0 };
+		bool live = true;
+		mx_held_init(&f, false);
+		UT_ASSERT(mx_held_freeze(&f));
+		if (fault == 0)
+			test_original_available = false;
+		if (fault == 1)
+			test_original_full_xid = FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID);
+		if (fault == 2)
+			test_original_full_xid = InvalidFullTransactionId;
+		UT_ASSERT(!mx_held_sample(&f, &live));
+		UT_ASSERT(!live);
+		memset(&f.effect, 0xa5, sizeof(f.effect));
+		memset(&f.origin.top, 0xa5, sizeof(f.origin.top));
+		UT_ASSERT(!mx_held_copy(&f));
+		UT_ASSERT_EQ(memcmp(&f.effect, &empty, sizeof(empty)), 0);
+		UT_ASSERT_EQ(memcmp(&f.origin.top, &no_top, sizeof(no_top)), 0);
+		UT_ASSERT_EQ(test_original_calls, 1);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	}
+}
+
+UT_TEST(mx_held_bad_or_cold_freeze_has_no_io)
+{
+	for (int fault = 0; fault < 5; ++fault) {
+		MxOriginFixture f;
+		ClusterRuntimeVisibilityOriginPlan empty = { 0 };
+		mx_held_init(&f, false);
+		if (fault == 0)
+			f.key.target.offnum++;
+		if (fault == 1)
+			f.key.operation_fxid = FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID + 1);
+		if (fault == 2)
+			f.key.locator.tt_wrap++;
+		if (fault == 3)
+			test_admission_revoked = true;
+		if (fault == 4)
+			test_candidate_cold_copy_mask = 1;
+		UT_ASSERT(!mx_held_freeze(&f));
+		UT_ASSERT_EQ(memcmp(&f.origin.plan, &empty, sizeof(empty)), 0);
+		UT_ASSERT(f.origin.reason != CLUSTER_TX_RESOLVE_NONE);
+		UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+		UT_ASSERT_EQ(test_original_calls, 0);
+	}
+}
+
+UT_TEST(mx_held_fresh_copy_rejects_drift_and_pre_sample)
+{
+	for (int fault = 0; fault < 6; ++fault) {
+		MxOriginFixture f;
+		ClusterSavepointEffectProof empty = { 0 };
+		ClusterTxResolution no_top = { 0 };
+		bool live = false;
+		mx_held_init(&f, false);
+		UT_ASSERT(mx_held_freeze(&f));
+		if (fault != 0)
+			UT_ASSERT(mx_held_sample(&f, &live));
+		if (fault == 1)
+			test_candidate_data_generation++;
+		if (fault == 2)
+			operation_plan_tail()[offsetof(UndoOperationTrailer, operation_sequence)]++;
+		if (fault == 3)
+			test_admission_revoked = true;
+		if (fault == 4)
+			f.key.target.offnum++;
+		if (fault == 5)
+			test_candidate_cold_copy_mask = 2;
+		memset(&f.effect, 0xa5, sizeof(f.effect));
+		memset(&f.origin.top, 0xa5, sizeof(f.origin.top));
+		UT_ASSERT(!mx_held_copy(&f));
+		UT_ASSERT_EQ(memcmp(&f.effect, &empty, sizeof(empty)), 0);
+		UT_ASSERT_EQ(memcmp(&f.origin.top, &no_top, sizeof(no_top)), 0);
+		UT_ASSERT(f.origin.reason != CLUSTER_TX_RESOLVE_NONE);
+		UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	}
+}
+
 int
 MX_OPERATION_ORIGIN_TEST_MAIN(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(24);
 	UT_RUN(mx_operation_before_mutation_rechecks_runtime_identity);
 	UT_RUN(mx_origin_same_and_cross_segment_three_current_phases);
 	UT_RUN(mx_origin_stages_until_final_release);
@@ -654,6 +822,11 @@ MX_OPERATION_ORIGIN_TEST_MAIN(void)
 	UT_RUN(mx_origin_blocking_waits_and_error_cleanup);
 	UT_RUN(mx_origin_bad_inputs_refuse_without_losing_active_guard);
 	UT_RUN(mx_origin_provisional_key_is_only_an_exact_challenge);
+	UT_RUN(mx_held_unaligned_tail_and_final_effect);
+	UT_RUN(mx_held_null_key_clears_plan_and_reason);
+	UT_RUN(mx_held_original_full_xid_is_independent);
+	UT_RUN(mx_held_bad_or_cold_freeze_has_no_io);
+	UT_RUN(mx_held_fresh_copy_rejects_drift_and_pre_sample);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
