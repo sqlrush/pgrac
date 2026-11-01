@@ -36,6 +36,91 @@ clog_write_same_birth(const ClusterClogPageIdentityV2 *left,
 		FullTransactionIdEquals(left->identity.birth_full_xid, right->identity.birth_full_xid);
 }
 
+static bool
+clog_write_slot_unwritten(int fd, off_t file_size, uint64 offset)
+{
+	uint8 frame[CLUSTER_CLOG_FRAME_BYTES];
+	ssize_t count;
+
+	if (file_size <= (off_t)offset)
+		return true;
+	/* A partly present target, even entirely zero, is not a complete sparse
+	 * slot. Never turn short/torn material into a fresh page. */
+	if (file_size < (off_t)(offset + sizeof(frame)))
+	{
+		errno = EILSEQ;
+		return false;
+	}
+	count = pg_pread(fd, frame, sizeof(frame), (off_t)offset);
+	if (count != sizeof(frame))
+	{
+		if (count >= 0)
+			errno = EIO;
+		return false;
+	}
+	for (Size i = 0; i < sizeof(frame); i++)
+	{
+		if (frame[i] != 0)
+		{
+			errno = EILSEQ;
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+clog_write_page_unwritten(int fd, const ClusterClogFileBindingV2 *binding,
+						  uint64 offset)
+{
+	uint8 header[CLUSTER_CLOG_FILE_HEADER_BYTES];
+	struct stat before, after;
+	ssize_t count;
+
+	if (fstat(fd, &before) != 0)
+		return false;
+	if (!S_ISREG(before.st_mode) || before.st_size < sizeof(header) ||
+		before.st_size > sizeof(header) + CLUSTER_CLOG_PAGES_PER_FILE * CLUSTER_CLOG_FRAME_BYTES)
+	{
+		errno = EILSEQ;
+		return false;
+	}
+	count = pg_pread(fd, header, sizeof(header), 0);
+	if (count != sizeof(header))
+	{
+		if (count >= 0)
+			errno = EIO;
+		return false;
+	}
+	if (!cluster_clog_file_header_matches_v2(header, sizeof(header), binding))
+	{
+		errno = EILSEQ;
+		return false;
+	}
+	if (!clog_write_slot_unwritten(fd, before.st_size, offset))
+		return false;
+	count = pg_pread(fd, header, sizeof(header), 0);
+	if (count != sizeof(header))
+	{
+		if (count >= 0)
+			errno = EIO;
+		return false;
+	}
+	if (fstat(fd, &after) != 0)
+		return false;
+	if (!cluster_clog_file_header_matches_v2(header, sizeof(header), binding) ||
+		!S_ISREG(after.st_mode) || after.st_size < sizeof(header) ||
+		after.st_size > sizeof(header) + CLUSTER_CLOG_PAGES_PER_FILE * CLUSTER_CLOG_FRAME_BYTES ||
+		before.st_dev != after.st_dev || before.st_ino != after.st_ino)
+	{
+		errno = EILSEQ;
+		return false;
+	}
+	/* Another page may have extended the file across this target. Recheck
+	 * the entire slot against the new extent rather than trusting old EOF. */
+	return clog_write_slot_unwritten(fd, after.st_size, offset);
+}
+
 bool
 cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expected,
 								  const ClusterClogPageIdentityV2 *page,
@@ -50,7 +135,7 @@ cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expec
 	PGPROC *proc = MyProc;
 	XLogRecPtr end = InvalidXLogRecPtr;
 	uint64 offset;
-	bool own_delay, success = false;
+	bool own_delay, success = false, fresh = false;
 	int origin = 0;
 #ifndef WIN32
 	int flags;
@@ -107,15 +192,25 @@ cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expec
 	{
 		do
 		{
-			if (!cluster_clog_storage_read_page_v2(fd, &binding, snapshot.identity.logical_page,
-												 &previous, checked_payload, sizeof(checked_payload)))
-				break;
-			if (!clog_write_same_birth(&snapshot, &previous) ||
-				snapshot.image_lsn != previous.image_lsn ||
-				snapshot.identity.page_lsn < previous.identity.page_lsn)
+			if (cluster_clog_storage_read_page_v2(fd, &binding, snapshot.identity.logical_page,
+												&previous, checked_payload, sizeof(checked_payload)))
 			{
-				errno = EILSEQ;
-				break;
+				if (!clog_write_same_birth(&snapshot, &previous) ||
+					snapshot.image_lsn != previous.image_lsn ||
+					snapshot.identity.page_lsn < previous.identity.page_lsn)
+				{
+					errno = EILSEQ;
+					break;
+				}
+			}
+			else
+			{
+				/* The codec already validated the original observed FullXid birth.
+				 * Empty bytes supply no identity and never authorize recovery. */
+				if (snapshot.image_lsn != InvalidXLogRecPtr ||
+					!clog_write_page_unwritten(fd, &binding, offset))
+					break;
+				fresh = true;
 			}
 			/* Always include the complete captured frame. Native insertion still
 			 * rechecks its redo state under its insertion lock; no cached redo
@@ -136,15 +231,23 @@ cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expec
 					CLUSTER_CLOG_PAGE_BYTES, frame, CLUSTER_CLOG_FRAME_BYTES))
 				break;
 			XLogFlush(end);
-			if (!cluster_clog_storage_read_page_v2(fd, &binding, snapshot.identity.logical_page,
-												 &checked, checked_payload, sizeof(checked_payload)))
-				break;
-			if (!enableFsync || !clog_write_same_birth(&previous, &checked) ||
-				previous.image_lsn != checked.image_lsn ||
-				previous.identity.page_lsn != checked.identity.page_lsn)
+			if (fresh)
 			{
-				errno = EILSEQ;
-				break;
+				if (!enableFsync || !clog_write_page_unwritten(fd, &binding, offset))
+					break;
+			}
+			else
+			{
+				if (!cluster_clog_storage_read_page_v2(fd, &binding, snapshot.identity.logical_page,
+													 &checked, checked_payload, sizeof(checked_payload)))
+					break;
+				if (!enableFsync || !clog_write_same_birth(&previous, &checked) ||
+					previous.image_lsn != checked.image_lsn ||
+					previous.identity.page_lsn != checked.identity.page_lsn)
+				{
+					errno = EILSEQ;
+					break;
+				}
 			}
 			written = pg_pwrite(fd, frame, CLUSTER_CLOG_FRAME_BYTES, (off_t)offset);
 			if (written != CLUSTER_CLOG_FRAME_BYTES)

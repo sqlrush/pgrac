@@ -19,7 +19,7 @@ extern bool cluster_clog_storage_read_page_v2(int fd,
 									 ClusterClogPageIdentityV2 *page_out,
 									 void *payload_out, Size payload_length);
 
-/* Overwrite an existing, completely validated local frame. The original owner
+/* Write a local frame. The original owner
  * holds file lifetime and page I/O serialization throughout, and supplies one
  * private control-lock snapshot of page identity, bytes and group-LSN maximum
  * (page_lsn). It rechecks original control/source custody before publication.
@@ -28,8 +28,15 @@ extern bool cluster_clog_storage_read_page_v2(int fd,
  * then writes, syncs and reads back the complete frame. This conservatively
  * protects every overwrite without a slot-based or cached redo-point shortcut.
  * WAL contains the captured frame; replay must stamp the actual record end as
- * image_lsn, as this writer does after insertion. No new birth, header creation,
- * foreign/recovery write, fsync-disabled or bootstrap phony WAL is accepted here.
+ * image_lsn, as this writer does after insertion. Existing valid frames require
+ * the same observed birth and captured image_lsn, with no source-watermark
+ * regression. A fresh original allocator birth with captured image_lsn=0 may
+ * fill a wholly absent or complete zero sparse slot in an existing, fully
+ * validated segment. Empty bytes do not supply birth or control authority.
+ * Before WAL and again after flush the header/FD/entire target slot must agree;
+ * partial/nonzero/corrupt targets are never repaired or replaced as new pages.
+ * Other pages may extend under their own I/O serialization. Header creation,
+ * foreign/recovery write, fsync-disabled or bootstrap phony WAL is refused here.
  *
  * The borrowed FD, inputs, preowned checkpoint-delay flag and last_end output
  * are retained on failure. Partial writes/material are never rolled back or
