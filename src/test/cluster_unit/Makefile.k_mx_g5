@@ -54,6 +54,27 @@ test_k_mx_g5_native_caller: test_k_mx_g5_native_caller.c test_k_mx_g5_service.c 
 		$(K_MX_NATIVE_CALLER_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a -o $@
 
+# Original bounded heap consumer; no proof or HELLO activation.
+K_MX_HEAP_RECHECK_O ?= test_k_mx_g5_heap_recheck_product.o
+$(K_MX_HEAP_RECHECK_O): $(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/backend/access/heap/heapam_r4_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_range.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
+		-c $< -o $@
+
+test_k_mx_g5_heap_recheck: test_k_mx_g5_heap_recheck.c test_cluster_r4_lock_order.c \
+		unit_test.h cluster_r4_activation_test_stubs.h cluster_snapshot_test_stubs.h \
+		test_cluster_heap_capacity_vm_unwind.inc test_cluster_heap_writer_wait_delete.inc \
+		test_cluster_heap_writer_wait_update.inc test_cluster_heap_writer_wait_lock.inc \
+		$(K_MX_HEAP_RECHECK_O) $(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+		test_cluster_space_storage_product.o test_cluster_space_producer_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(K_MX_HEAP_RECHECK_O) $(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+		test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # Standalone range codec; no caller or HELLO activation.
 K_MX_G5_CPPFLAGS ?=
 K_MX_G5_CODEC_OBJECTS ?= $(top_builddir)/src/backend/cluster/cluster_multixact_range_wire.o
