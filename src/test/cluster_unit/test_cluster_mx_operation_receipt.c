@@ -253,6 +253,9 @@ UT_TEST(receipt_committed_live_updater_is_denied_not_silently_dropped)
 	UT_ASSERT_EQ(memcmp(&f.out, &zero, sizeof(zero)), 0);
 }
 #include "test_cluster_mx_operation_heap.inc"
+#ifdef RECEIPT_PUBLICATION_FIXTURE
+#define main publication_unused_receipt_main
+#endif
 int main(void)
 {
 	UT_PLAN(22);

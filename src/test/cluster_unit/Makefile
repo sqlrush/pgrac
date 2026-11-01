@@ -13565,22 +13565,24 @@ test_cluster_r4_route_policy test_cluster_mx_history_backend \
         $(top_srcdir)/src/include/cluster/cluster_multixact_operation_wire.h
 
 # Dormant typed survivor identities through the original heap receipt consumer.
-TESTS += test_cluster_mx_operation_receipt
-all: test_cluster_mx_operation_receipt
+TESTS += test_cluster_mx_operation_receipt test_cluster_mx_receipt_publication
+all: test_cluster_mx_operation_receipt test_cluster_mx_receipt_publication
 
 test_cluster_mx_operation_receipt_product.o: test_cluster_mx_operation_receipt_product.c \
 		test_cluster_mx_operation_receipt.h $(top_srcdir)/src/backend/access/heap/heapam.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_mx_operation_receipt: test_cluster_mx_operation_receipt.c \
+test_cluster_mx_operation_receipt test_cluster_mx_receipt_publication: %: %.c \
+		test_cluster_mx_operation_receipt.c \
 		test_cluster_mx_operation_receipt.h test_cluster_mx_operation_heap.inc test_cluster_r4_tx_outcome \
-		test_cluster_mx_operation_receipt_product.o $(top_builddir)/src/backend/storage/lmgr/lock.o
+		test_cluster_mx_operation_receipt_product.o $(CLUSTER_MXID_STRIPE_O) $(top_builddir)/src/backend/storage/lmgr/lock.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_mx_operation_receipt_product.o \
 		$(CLUSTER_OPERATION_WORKER_TEST_O) $(CLUSTER_SAVEPOINT_READER_O) \
 		test_cluster_hot_bufpage_product.o $(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		test_cluster_undo_pending_product.o $(CLUSTER_R4_RUNTIME_VIS_TEST_O) \
 		$(CLUSTER_MX_HISTORY_WIRE_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_MXID_STRIPE_O) \
 		$(top_builddir)/src/backend/storage/lmgr/lock.o \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		test_cluster_r4_multi_resolve_product.o $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \

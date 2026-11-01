@@ -3,6 +3,63 @@
 #include "../../backend/access/heap/heapam.c"
 #include "test_cluster_mx_operation_receipt.h"
 static ClusterCurrentMxHeapResult receipt_result;
+static ClusterCurrentMxStampPlan publication_plan;
+static void
+mx_publication_readout(MxPublicationReadout *out)
+{
+	out->descriptor = publication_plan.descriptor_mxid;
+	out->descriptor_hash = publication_plan.descriptor_hash;
+	out->receipt_count = publication_plan.receipt_count;
+	out->stage = publication_plan.stage;
+	out->active = publication_plan.active;
+	out->apply_started = publication_plan.apply_started;
+}
+bool
+mx_publication_prepare(TransactionId requester, int kind, LockTupleMode mode,
+	const ClusterCtrcTargetV1 *target, MxPublicationReadout *out)
+{
+	TransactionId xmax;
+	bool prepared;
+	memset(out, 0, sizeof(*out));
+	/* Same catch/cancel contract as the native existing-TID caller. */
+	PG_TRY();
+	{
+		prepared = cluster_current_mx_stamp_prepare_plan(&receipt_result, requester,
+			(ClusterCurrentMxStampKind) kind, mode, target, &publication_plan,
+			&xmax, &out->infomask, &out->infomask2);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_stamp_cancel(&publication_plan);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	mx_publication_readout(out);
+	return prepared;
+}
+int
+mx_publication_apply(const ClusterCtrcTargetV1 *target, bool prior_applied,
+	MxPublicationReadout *out)
+{
+	ClusterHeapCurrentMxExactPublication publication = { 0 };
+	ClusterHeapNoRetryBoundaryResult result;
+	/* The test supplies an already-qualified exact target. This adapter does
+	 * not stand in for native page capture or the final boundary recheck. */
+	publication.valid = true;
+	publication.plan = &publication_plan;
+	publication.final_target = *target;
+	out->any_applied = prior_applied;
+	result = cluster_current_mx_stamp_apply_exact_publication(&publication,
+		&out->any_applied);
+	mx_publication_readout(out);
+	return result;
+}
+void
+mx_publication_cancel(MxPublicationReadout *out)
+{
+	cluster_current_mx_stamp_cancel(&publication_plan);
+	mx_publication_readout(out);
+}
 static ClusterCurrentMxOperationState authorize_operation;
 void
 mx_history_authorize_reset(void)

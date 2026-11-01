@@ -22,6 +22,19 @@ typedef struct MxHeapReadout {
 	ClusterTTStatusKey wait_key;
 	ClusterCurrentMxDecisionTrace trace;
 } MxHeapReadout;
+/* Native descriptor/PREPARE/APPLY stages, before physical publication. */
+typedef struct MxPublicationReadout {
+	MultiXactId descriptor;
+	uint64 descriptor_hash;
+	uint16 receipt_count, infomask, infomask2;
+	int stage;
+	bool active, apply_started, any_applied;
+} MxPublicationReadout;
+extern bool mx_publication_prepare(TransactionId requester, int kind,
+	LockTupleMode mode, const ClusterCtrcTargetV1 *target, MxPublicationReadout *out);
+extern int mx_publication_apply(const ClusterCtrcTargetV1 *target,
+	bool prior_applied, MxPublicationReadout *out);
+extern void mx_publication_cancel(MxPublicationReadout *out);
 struct ClusterR4CrOwnerChallenge;
 #include "cluster/cluster_mx_history.h"
 typedef struct MxAuthorizeState {
