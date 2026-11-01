@@ -61,10 +61,6 @@ bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(Transaction
 	ClusterCtrcTxnKeyV1 *ctrc, ClusterCtrcParticipantIdentity *participant) { abort(); }
 bool cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 	ClusterTTStatusKey *key, ClusterTTStatusResult *result, bool *retry) { abort(); }
-bool cluster_runtime_visibility_current_mx_updater_provenance_exact(const ClusterTxLocator *locator,
-	TimestampTz deadline, ClusterTTStatusKey *key, ClusterTTStatusResult *result, uint32 *grant,
-	uint32 *cap, ClusterCtrcTxnKeyV1 *ctrc, ClusterTxLocator *canonical, bool *cross, bool *retry)
-{ abort(); }
 ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait(int32 origin,
 	struct ClusterCurrentMxProofForwardV2 *request, ClusterCurrentMemberProof *proofs,
 	uint16 capacity, uint16 *count, ClusterCurrentUpdaterProof *updater, uint32 *cap,

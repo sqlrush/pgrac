@@ -13,6 +13,7 @@
 #include "cluster/cluster_multixact_operation_wire.h"
 #include "storage/backendid.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_tt_local.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -467,11 +468,39 @@ cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *collector, R
 	return true;
 }
 
+/* The local sibling of the origin updater FSM owns DATA(B), canonical TT
+ * and fresh DATA(B), including guard/grant/admission cleanup. Its TT outputs
+ * must not be projected into A: the complete operation-aware A is staged
+ * already. Only its exact canonical locator supplies the independent B. */
+static ClusterMxHistoryStep
+history_updater_local(const ClusterMxHistoryCapture *capture,
+	const ClusterCurrentUpdaterChallenge *challenge, ClusterCurrentUpdaterProof *out)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	ClusterCtrcTxnKeyV1 ctrc;
+	ClusterTxLocator canonical;
+	uint32 grant, capability;
+	bool cross, retry;
+
+	if (!cluster_runtime_visibility_current_mx_updater_provenance_exact(
+			&challenge->candidate_next_xmin_locator, 0, &key, &result, &grant,
+			&capability, &ctrc, &canonical, &cross, &retry))
+		return retry ? CMXH_REQUALIFY : CMXH_UNKNOWN;
+	out->mxkey = capture->mxkey;
+	out->candidate_next_xmin_alias = challenge->candidate_next_xmin_alias;
+	out->candidate_next_xmin_locator = canonical;
+	out->updater_xid = challenge->updater_xid;
+	out->member_ordinal = challenge->member_ordinal;
+	out->verdict = CUCP_MATCH;
+	return CMXH_COMPLETE;
+}
+
 /* A is already staged. An absent B uses only the original updater provenance
- * FSM, via a top-only V6 challenge. In particular, do not attach A's exact key
- * here and accidentally run its three phases a second time. The original
- * outstanding slot owns cancellation and the event-driven backend wait. */
-static bool
+ * FSM: the local backend sibling or a top-only remote V6 challenge. Never run
+ * A's three phases again. The original authority/transport owns its guard or
+ * outstanding slot; both proofs remain under this one capture. */
+static ClusterMxHistoryStep
 history_updater_fetch(ClusterMxHistoryCollector *collector)
 {
 	ClusterMxHistoryCapture capture;
@@ -484,47 +513,54 @@ history_updater_fetch(ClusterMxHistoryCollector *collector)
 	uint16 count = 0;
 	uint32 capability = 0;
 	uint16 origin = challenge->candidate_next_xmin_alias.origin_node_id;
-	volatile bool valid = false;
+	volatile ClusterMxHistoryStep step = CMXH_UNKNOWN;
 
-	if (!cluster_mx_history_capture_read(collector, &capture) || origin == cluster_node_id)
-		return false;
-	semantic.prefix.request_id = capture.collector_id;
-	semantic.prefix.epoch = capture.read_epoch;
-	semantic.prefix.mxkey = capture.mxkey;
-	semantic.prefix.original_requester_node = cluster_node_id;
-	semantic.prefix.requester_backend_id = MyBackendId;
-	semantic.prefix.total_count = capture.nmembers;
-	semantic.prefix.entry_count = 1;
-	semantic.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE;
-	semantic.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
-	ClusterCurrentMxProofPrefixSetDescriptorHash(&semantic.prefix, capture.descriptor_hash);
-	semantic.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
-	semantic.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
-	wire->candidate_next_xmin_alias = challenge->candidate_next_xmin_alias;
-	wire->candidate_next_xmin_locator = challenge->candidate_next_xmin_locator;
-	wire->updater_xid = challenge->updater_xid;
-	wire->member_ordinal = challenge->member_ordinal;
-	wire->member_status = capture.members[challenge->member_ordinal].member_status;
-	if (!cluster_multixact_operation_wire_upgrade_top_request(&semantic, cluster_node_id, origin,
-															  capture.read_epoch, &request))
-		return false;
+	if (!cluster_mx_history_capture_read(collector, &capture))
+		return CMXH_UNKNOWN;
+	if (origin != cluster_node_id) {
+		semantic.prefix.request_id = capture.collector_id;
+		semantic.prefix.epoch = capture.read_epoch;
+		semantic.prefix.mxkey = capture.mxkey;
+		semantic.prefix.original_requester_node = cluster_node_id;
+		semantic.prefix.requester_backend_id = MyBackendId;
+		semantic.prefix.total_count = capture.nmembers;
+		semantic.prefix.entry_count = 1;
+		semantic.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE;
+		semantic.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+		ClusterCurrentMxProofPrefixSetDescriptorHash(&semantic.prefix, capture.descriptor_hash);
+		semantic.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+		semantic.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+		wire->candidate_next_xmin_alias = challenge->candidate_next_xmin_alias;
+		wire->candidate_next_xmin_locator = challenge->candidate_next_xmin_locator;
+		wire->updater_xid = challenge->updater_xid;
+		wire->member_ordinal = challenge->member_ordinal;
+		wire->member_status = capture.members[challenge->member_ordinal].member_status;
+		if (!cluster_multixact_operation_wire_upgrade_top_request(&semantic, cluster_node_id,
+				origin, capture.read_epoch, &request))
+			return CMXH_UNKNOWN;
+	}
 	memset(&b, 0, sizeof(b));
 	b.verdict = CUCP_UNKNOWN;
 	PG_TRY();
 	{
-		valid = cluster_gcs_current_mx_operation_proof_fetch_and_wait(origin, &request, &redundant,
-																	  1, &count, &b, &capability, 0)
-				== CMX_RESOLVE_OK;
+		if (origin == cluster_node_id)
+			step = history_updater_local(&capture, challenge, &b);
+		else if (cluster_gcs_current_mx_operation_proof_fetch_and_wait(origin, &request,
+				 &redundant, 1, &count, &b, &capability, 0) == CMX_RESOLVE_OK
+				 && count == 1 && capability != 0)
+			step = CMXH_COMPLETE;
 	}
 	PG_CATCH();
 	{
-		/* Release the whole attempt after the original transport has released
-		 * its outstanding slot; native Snapshot retention is dropped last. */
+		/* Original authority/transport cleanup releases its current guard or
+		 * outstanding slot first; native Snapshot retention is dropped last. */
 		cluster_mx_history_cancel(collector);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (!valid || count != 1 || capability == 0 || b.verdict != CUCP_MATCH || b.reserved8 != 0
+	if (step != CMXH_COMPLETE)
+		return step;
+	if (b.verdict != CUCP_MATCH || b.reserved8 != 0
 		|| memcmp(&b.mxkey, &capture.mxkey, sizeof(b.mxkey)) != 0
 		|| b.updater_xid != challenge->updater_xid || b.member_ordinal != challenge->member_ordinal
 		|| memcmp(&b.candidate_next_xmin_alias, &challenge->candidate_next_xmin_alias,
@@ -533,9 +569,9 @@ history_updater_fetch(ClusterMxHistoryCollector *collector)
 		|| !cluster_tx_locator_reply_matches(&challenge->candidate_next_xmin_locator,
 											 &b.candidate_next_xmin_locator)
 		|| !cluster_mx_history_capture_read(collector, &capture))
-		return false;
+		return CMXH_UNKNOWN;
 	collector->driver->updater = b;
-	return true;
+	return CMXH_COMPLETE;
 }
 
 ClusterMxHistoryStep
@@ -568,8 +604,11 @@ cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
 			= cluster_mx_history_assemble_updater(collector->capture, driver->graph, driver->proofs,
 												  &collector->challenge, &driver->updater);
 		if (step == CMXH_PENDING) {
-			if (!history_updater_fetch(collector))
-				goto failed;
+			step = history_updater_fetch(collector);
+			if (step != CMXH_COMPLETE) {
+				cluster_mx_history_cancel(collector);
+				return step;
+			}
 		} else if (step != CMXH_COMPLETE)
 			goto failed;
 		driver->updater_ready = true;

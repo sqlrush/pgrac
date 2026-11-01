@@ -769,6 +769,7 @@ collector_never_waits_under_content_lock_or_without_pin(void)
 	}
 }
 #include "test_cluster_mx_history_finish.inc"
+#include "test_cluster_mx_history_local_updater.inc"
 #include "test_cluster_mx_history_wait_capture.inc"
 
 static void
@@ -799,7 +800,7 @@ int
 main(void)
 {
 	history_fixture_init();
-	UT_PLAN(45);
+	UT_PLAN(51);
 	UT_RUN(real_capture_and_relock);
 	UT_RUN(snapshot_own_reference_keeps_original_floor);
 	UT_RUN(original_scope_restored_and_older_floor_preserved);
@@ -835,6 +836,12 @@ main(void)
 	UT_RUN(updater_found_wrong_writer_is_unknown_without_retry);
 	UT_RUN(updater_missing_B_uses_original_provenance_once);
 	UT_RUN(updater_missing_B_failure_cancels_whole_attempt);
+	UT_RUN(local_updater_delivers_independent_B_once);
+	UT_RUN(local_updater_failure_invalidates_A_and_B);
+	UT_RUN(local_updater_precommit_requalifies_whole_attempt);
+	UT_RUN(local_updater_scope_drift_discards_both);
+	UT_RUN(local_updater_error_releases_attempt);
+	UT_RUN(local_updater_finish_still_checks_fresh_challenge);
 	UT_RUN(updater_reuses_distinct_B_page_and_checks_full_xid);
 	UT_RUN(updater_graph_reuse_preserves_A_outcome_and_effect);
 	UT_RUN(updater_bad_capture_and_unfinished_attempt_refused);
