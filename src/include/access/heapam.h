@@ -39,6 +39,7 @@
 #include "utils/snapshot.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_r4_projection.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #endif
 
 
@@ -65,6 +66,22 @@ extern bool cluster_heap_preflight_write(Relation relation, const char *operatio
  * against the successor's live ITL/TT binding while holding a content lock;
  * tuple-lock consumers additionally require PCM-X.
  */
+/* Read-only typed-history variant, private to this content-lock bracket.
+ * Exact page/tuple/roots plus fresh read qualification replace no raw gate:
+ * legacy proofs retain their original ITL equality; mutation rejects this
+ * variant until its separate operation-aware receipt path is connected. */
+typedef struct ClusterHeapSuccessorHistory
+{
+	ClusterPcmOwnSnapshot pcm;
+	XLogRecPtr page_lsn;
+	ItemIdData line_pointer;
+	uint16 tuple_len;
+	uint8 tuple_header[SizeofHeapTupleHeader];
+	ClusterItlSlotData roots[CLUSTER_ITL_INITRANS_DEFAULT];
+	FullTransactionId top_fxid, operation_fxid;
+	uint32 canonical_generation;
+} ClusterHeapSuccessorHistory;
+
 typedef struct ClusterHeapSuccessorProof
 {
 	ItemPointerData tid;
@@ -77,6 +94,8 @@ typedef struct ClusterHeapSuccessorProof
 	uint16		locator_tt_wrap;
 	uint8		locator_itl_kind;
 	uint8		locator_itl_slot_index;
+	ClusterHeapSuccessorHistory history;
+	bool		history_valid;
 	bool		valid;
 } ClusterHeapSuccessorProof;
 #endif

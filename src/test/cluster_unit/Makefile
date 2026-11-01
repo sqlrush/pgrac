@@ -13515,7 +13515,7 @@ TESTS += test_cluster_mx_history_native_walk test_cluster_mx_history_full_compan
 all: test_cluster_mx_history_native_walk test_cluster_mx_history_full_companion test_cluster_mx_history_lock_handoff test_cluster_mx_history_lock_scope test_cluster_mx_history_recursive_lock
 
 test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot test_cluster_mx_history_caller test_cluster_mx_history_hot_caller test_cluster_mx_history_native_walk test_cluster_mx_history_full_companion test_cluster_mx_history_lock_handoff test_cluster_mx_history_lock_scope test_cluster_mx_history_recursive_lock: %: %.c \
-		test_cluster_mx_history_native_walk.c test_cluster_mx_history_hot_caller.c test_cluster_mx_history_hot.c test_cluster_mx_history_authorize.c test_cluster_mx_history_roundtrip.c test_cluster_mx_history_heap_bridge.inc \
+		test_cluster_mx_history_typed_hot.inc test_cluster_mx_history_native_walk.c test_cluster_mx_history_hot_caller.c test_cluster_mx_history_hot.c test_cluster_mx_history_authorize.c test_cluster_mx_history_roundtrip.c test_cluster_mx_history_heap_bridge.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_visibility_verdict.c \
 		$(top_srcdir)/src/backend/utils/time/combocid.c $(top_srcdir)/src/include/utils/combocid.h \
 		$(top_srcdir)/src/backend/storage/page/itemptr.c \

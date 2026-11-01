@@ -302,13 +302,15 @@ UT_TEST(hot_child_canonical_successor_reaches_both_native_consumers)
 		}
 }
 
+#include "test_cluster_mx_history_typed_hot.inc"
+
 #ifdef HISTORY_HOT_CALLER_FIXTURE
 int history_hot_caller_unused_hot_main(void);
 #define main history_hot_caller_unused_hot_main
 #endif
 int main(void)
 {
-	history_fixture_init(); UT_PLAN(10);
+	history_fixture_init(); UT_PLAN(16);
 	UT_RUN(typed_hot_validator_whole_set_and_effect_matrix);
 	UT_RUN(hot_committed_successor_preserves_share_for_both_consumers);
 	UT_RUN(hot_noncommitted_updater_is_not_a_committed_chain_proof);
@@ -319,5 +321,11 @@ int main(void)
 	UT_RUN(hot_invalid_root_and_descriptor_fail_closed);
 	UT_RUN(hot_child_history_inputs_form_a_typed_member_set);
 	UT_RUN(hot_child_canonical_successor_reaches_both_native_consumers);
+	UT_RUN(typed_hot_collector_delivers_once_and_rejects_legacy_finish);
+	UT_RUN(typed_hot_collector_rechecks_candidate_and_challenge);
+	UT_RUN(typed_hot_child_relock_drift_restarts_whole_attempt);
+	UT_RUN(typed_hot_child_requires_live_independent_committed_B);
+	UT_RUN(typed_hot_child_late_image_change_is_rejected);
+	UT_RUN(typed_hot_validator_binds_whole_A_and_independent_B);
 	free(procArray); UT_DONE(); return ut_failed_count ? 1 : 0;
 }

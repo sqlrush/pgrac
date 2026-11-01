@@ -39,6 +39,19 @@ typedef struct ClusterMxHistoryCapture {
 	uint64 collector_id, capture_generation, backend_incarnation;
 } ClusterMxHistoryCapture;
 
+/* Operation-aware successor compare input. No canonical identity is inferred
+ * from xmin or the tuple's current ITL slot. Backend-private, never wire. */
+typedef struct ClusterMxHistorySuccessorChallenge {
+	ClusterUndoRecordTarget target;
+	TransactionId xmin;
+	uint16 member_ordinal, reserved16;
+} ClusterMxHistorySuccessorChallenge;
+typedef struct ClusterMxHistorySuccessorProof {
+	ClusterSavepointOperationKey key;
+	ClusterCurrentMemberOperationProof member;
+	uint32 requester_capability_generation;
+} ClusterMxHistorySuccessorProof;
+
 /* Caller retains its relation lock and buffer pin. Begin/recheck require the
  * original content lock and must be outside critical sections. A single
  * capture per backend owns one reference to the actual retained Snapshot. */
@@ -127,5 +140,25 @@ extern bool cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *
 /* Idempotent until TopTransactionContext resets. No waiting or retirement.
  * The original ResourceOwner BEFORE_LOCKS/exit callbacks also cancel it. */
 extern void cluster_mx_history_cancel(ClusterMxHistoryCollector *collector);
+/* Target-aware read attempt; optional raw challenge is retained solely for
+ * the original V1 A branch. EXACT A must independently qualify typed B.
+ * These backend-private entry points do not activate any deployed family. */
+extern bool cluster_mx_history_capture_begin_with_successor(
+	Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterMxHistorySuccessorChallenge *challenge,
+	const ClusterCurrentUpdaterChallenge *legacy, ClusterMxHistoryCollector **out);
+/* Original root/candidate content lock held. One complete A+B copy only;
+ * all bounded outputs reset on non-success; old finish cannot drop typed B.
+ * The optional legacy challenge must equal the captured V1 compare input.
+ * The caller owns the original Snapshot until cancel after consumption. */
+extern ClusterMxHistoryStep cluster_mx_history_recheck_and_finish_with_successor(
+	ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer, HeapTuple tuple,
+	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs,
+	uint32 *capabilities, uint16 capacity, const ClusterMxHistorySuccessorChallenge *challenge,
+	const ClusterCurrentUpdaterChallenge *legacy, ClusterCurrentUpdaterProof *legacy_out,
+	ClusterMxHistorySuccessorProof *out);
 #endif
 #endif

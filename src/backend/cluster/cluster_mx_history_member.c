@@ -511,6 +511,66 @@ history_successor_identity(const ClusterCurrentMemberOperationProof *a,
 		&& a->base.key.slot_wrap == b->canonical.wrap;
 }
 
+/* Structural compare input only; no raw xmin -> canonical conversion. */
+bool
+cluster_mx_history_successor_challenge_valid(const ClusterMxHistoryCapture *c,
+	const ClusterMxHistorySuccessorChallenge *challenge)
+{
+	ItemPointerData next;
+	if (!history_members_capture_valid(c) || challenge == NULL
+		|| challenge->reserved16 != 0 || challenge->member_ordinal >= c->nmembers
+		|| challenge->target._pad != 0 || challenge->target.forknum != c->pcm.tag.forkNum
+		|| challenge->target.locator.spcOid != c->pcm.tag.spcOid
+		|| challenge->target.locator.dbOid != c->pcm.tag.dbOid
+		|| challenge->target.locator.relNumber != c->pcm.tag.relNumber)
+		return false;
+	memcpy(&next, c->tuple_header + offsetof(HeapTupleHeaderData, t_ctid), sizeof(next));
+	return challenge->target.blockno == ItemPointerGetBlockNumber(&c->tid)
+		&& challenge->target.blockno == ItemPointerGetBlockNumber(&next)
+		&& challenge->target.offnum == ItemPointerGetOffsetNumber(&next)
+		&& OffsetNumberIsValid(challenge->target.offnum)
+		&& challenge->target.offnum <= MaxHeapTuplesPerPage
+		&& !ItemPointerEquals(&next, (ItemPointer)&c->tid)
+		&& ISUPDATE_from_mxstatus(c->members[challenge->member_ordinal].member_status)
+		&& challenge->xmin == c->members[challenge->member_ordinal].xid;
+}
+
+/* Validate already qualified independent B, without acquiring any authority.
+ * The singleton descriptor normalizes only its ordinal, not its identities. */
+bool
+cluster_mx_history_validate_successor(const ClusterMxHistoryCapture *c,
+	const ClusterSavepointOperationKey *keys, const ClusterCurrentMemberOperationProof *proofs,
+	const ClusterMxHistorySuccessorChallenge *challenge, const ClusterMxHistorySuccessorProof *b)
+{
+	const ClusterCurrentMemberOperationProof *a;
+	ClusterCurrentMemberOperationProof single;
+	ClusterUndoRecordTarget root;
+	if (!cluster_mx_history_successor_challenge_valid(c, challenge) || keys == NULL
+		|| proofs == NULL || b == NULL || b->requester_capability_generation == 0
+		|| cluster_multixact_current_validate_operation_proof_set(&c->mxkey, c->members,
+			keys, proofs, c->nmembers) != CMX_RESOLVE_OK)
+		return false;
+	a = &proofs[challenge->member_ordinal];
+	root = history_capture_target(c);
+	if (memcmp(&keys[challenge->member_ordinal].target, &root, sizeof(root)) != 0
+		|| a->flags != CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+		|| a->effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+		|| b->member.flags != CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+		|| b->member.effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+		|| b->member.base.member_ordinal != challenge->member_ordinal
+		|| memcmp(&b->key.target, &challenge->target, sizeof(b->key.target)) != 0
+		|| memcmp(&b->member.base.key, &a->base.key, sizeof(a->base.key)) != 0
+		|| !FullTransactionIdEquals(a->top_fxid, b->member.top_fxid)
+		|| !FullTransactionIdEquals(a->operation_fxid, b->member.operation_fxid)
+		|| a->base.state != b->member.base.state
+		|| a->base.commit_scn != b->member.base.commit_scn)
+		return false;
+	single = b->member;
+	single.base.member_ordinal = 0;
+	return cluster_multixact_current_validate_operation_proof_set(&c->mxkey,
+		&c->members[challenge->member_ordinal], &b->key, &single, 1) == CMX_RESOLVE_OK;
+}
+
 ClusterMxHistoryStep
 cluster_mx_history_assemble_successor(const ClusterMxHistoryCapture *c,
 	const ClusterMxHistoryGraph *g, const ClusterSavepointOperationKey *keys,

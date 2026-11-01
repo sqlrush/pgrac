@@ -36,18 +36,11 @@ extern ClusterMxHistoryStep cluster_mx_history_assemble_updater(
 	const ClusterMxHistoryCapture *capture, const ClusterMxHistoryGraph *graph,
 	const ClusterCurrentMemberOperationProof *proofs,
 	const ClusterCurrentUpdaterChallenge *challenge, ClusterCurrentUpdaterProof *out);
-/* Operation-aware successor compare input. No canonical identity is inferred
- * from xmin or the tuple's current ITL slot. Backend-private, never wire. */
-typedef struct ClusterMxHistorySuccessorChallenge {
-	ClusterUndoRecordTarget target;
-	TransactionId xmin;
-	uint16 member_ordinal, reserved16;
-} ClusterMxHistorySuccessorChallenge;
-typedef struct ClusterMxHistorySuccessorProof {
-	ClusterSavepointOperationKey key;
-	ClusterCurrentMemberOperationProof member;
-	uint32 requester_capability_generation;
-} ClusterMxHistorySuccessorProof;
+extern bool cluster_mx_history_successor_challenge_valid(const ClusterMxHistoryCapture *capture,
+	const ClusterMxHistorySuccessorChallenge *challenge);
+extern bool cluster_mx_history_validate_successor(const ClusterMxHistoryCapture *capture,
+	const ClusterSavepointOperationKey *keys, const ClusterCurrentMemberOperationProof *proofs,
+	const ClusterMxHistorySuccessorChallenge *challenge, const ClusterMxHistorySuccessorProof *b);
 /* keys/proofs are the complete A output of this same finished graph. Borrowed
  * inputs require the original capture/relock scope; this pure assembly does
  * not acquire or retain authority. COMPLETE returns independently qualified

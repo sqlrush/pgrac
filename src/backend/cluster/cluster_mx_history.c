@@ -34,6 +34,8 @@ typedef struct HistoryCollectorDriver {
 	ClusterCurrentMemberOperationProof *proofs;
 	uint32 *capabilities;
 	ClusterCurrentUpdaterProof updater;
+	ClusterMxHistorySuccessorProof successor;
+	bool typed_successor;
 	bool prepared, submitted, complete, members_ready, updater_ready, members_delivered;
 	uint8 wait_kind;
 } HistoryCollectorDriver;
@@ -45,6 +47,11 @@ struct ClusterMxHistoryCollector {
 	HistoryCollectorDriver *driver;
 	ClusterCurrentUpdaterChallenge challenge;
 	bool has_updater;
+	ClusterMxHistorySuccessorChallenge successor;
+	ItemIdData successor_line;
+	uint16 successor_length;
+	uint8 successor_header[SizeofHeapTupleHeader];
+	bool has_successor;
 };
 static ClusterMxHistoryCollector *active_collector;
 static uint64 collector_serial;
@@ -182,6 +189,44 @@ history_heap(Relation rel, Buffer buffer, HeapTuple tuple, ClusterMxHistoryCaptu
 	memcpy(out->tuple_header, tuple->t_data, SizeofHeapTupleHeader);
 	memcpy(out->roots, ClusterPageGetItlSlots(page), sizeof(out->roots));
 	return true;
+}
+
+static bool
+history_successor_heap(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer,
+	bool save)
+{
+	const ClusterMxHistorySuccessorChallenge *challenge = &collector->successor;
+	ClusterMxHistoryCapture candidate;
+	HeapTupleData tuple = { 0 };
+	Page page;
+	OffsetNumber off = challenge->target.offnum;
+	ItemId lp;
+	if (buffer <= 0 || buffer > NBuffers)
+		return false;
+	page = BufferGetPage(buffer);
+	if (off < FirstOffsetNumber || off > PageGetMaxOffsetNumber(page))
+		return false;
+	lp = PageGetItemId(page, off);
+	if (!ItemIdIsNormal(lp))
+		return false;
+	ItemPointerSet(&tuple.t_self, challenge->target.blockno, off);
+	tuple.t_tableOid = RelationGetRelid(rel);
+	tuple.t_data = (HeapTupleHeader)PageGetItem(page, lp);
+	tuple.t_len = ItemIdGetLength(lp);
+	if (!history_heap(rel, buffer, &tuple, &candidate)
+		|| HeapTupleHeaderGetRawXmin(tuple.t_data) != challenge->xmin)
+		return false;
+	if (save) {
+		collector->successor_line = candidate.line_pointer;
+		collector->successor_length = candidate.tuple_length;
+		memcpy(collector->successor_header, candidate.tuple_header, sizeof(candidate.tuple_header));
+		return true;
+	}
+	return collector->successor_length == candidate.tuple_length
+		&& memcmp(&collector->successor_line, &candidate.line_pointer,
+			sizeof(candidate.line_pointer)) == 0
+		&& memcmp(collector->successor_header, candidate.tuple_header,
+			sizeof(candidate.tuple_header)) == 0;
 }
 
 static bool
@@ -359,7 +404,8 @@ cluster_mx_history_capture_recheck(ClusterMxHistoryCollector *collector, Relatio
 		|| memcmp(&saved.tid, &fresh.tid, sizeof(saved.tid)) != 0
 		|| memcmp(&saved.line_pointer, &fresh.line_pointer, sizeof(saved.line_pointer)) != 0
 		|| memcmp(saved.tuple_header, fresh.tuple_header, sizeof(saved.tuple_header)) != 0
-		|| memcmp(saved.roots, fresh.roots, sizeof(saved.roots)) != 0) {
+		|| memcmp(saved.roots, fresh.roots, sizeof(saved.roots)) != 0
+		|| (collector->has_successor && !history_successor_heap(collector, rel, buffer, false))) {
 		cluster_mx_history_cancel(collector);
 		return false;
 	}
@@ -599,7 +645,17 @@ cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
 	if (!cluster_mx_history_assemble_members_with_capabilities(collector->capture, driver->graph,
 			driver->keys, driver->proofs, driver->capabilities, n))
 		goto failed;
-	if (collector->has_updater) {
+	if (collector->has_successor
+		&& driver->proofs[collector->successor.member_ordinal].flags
+			== CLUSTER_CURRENT_OPERATION_PROOF_EXACT) {
+		step = cluster_mx_history_assemble_successor(collector->capture, driver->graph,
+			driver->keys, driver->proofs, &collector->successor, &driver->successor);
+		/* Complete graph lacks a qualified creation B: this attempt is UNKNOWN.
+		 * Never convert a child to the original raw B fallback or repeat A. */
+		if (step != CMXH_COMPLETE)
+			goto failed;
+		driver->typed_successor = driver->updater_ready = true;
+	} else if (collector->has_updater) {
 		step
 			= cluster_mx_history_assemble_updater(collector->capture, driver->graph, driver->proofs,
 												  &collector->challenge, &driver->updater);
@@ -612,7 +668,8 @@ cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
 		} else if (step != CMXH_COMPLETE)
 			goto failed;
 		driver->updater_ready = true;
-	}
+	} else if (collector->has_successor)
+		goto failed;
 	driver->members_ready = true;
 	return CMXH_COMPLETE;
 failed:
@@ -685,7 +742,9 @@ history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer
 			   ClusterCurrentMemberOperationProof *proofs, uint32 *capabilities,
 			   bool require_capabilities, uint16 capacity,
 			   const ClusterCurrentUpdaterChallenge *fresh_challenge,
-			   ClusterCurrentUpdaterProof *updater)
+			   ClusterCurrentUpdaterProof *updater,
+			   const ClusterMxHistorySuccessorChallenge *fresh_successor,
+			   ClusterMxHistorySuccessorProof *successor)
 {
 	HistoryCollectorDriver *driver;
 	uint16 n;
@@ -693,6 +752,10 @@ history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer
 	if (updater != NULL) {
 		memset(updater, 0, sizeof(*updater));
 		updater->verdict = CUCP_UNKNOWN;
+	}
+	if (successor != NULL) {
+		memset(successor, 0, sizeof(*successor));
+		history_finish_unknown(NULL, &successor->member, 1);
 	}
 	history_finish_unknown(keys, proofs, capacity);
 	if (capabilities != NULL && capacity <= CLUSTER_CURRENT_MX_MAX_MEMBERS)
@@ -706,17 +769,21 @@ history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer
 	if (CritSectionCount != 0 || capacity > CLUSTER_CURRENT_MX_MAX_MEMBERS || capacity < n
 		|| keys == NULL || proofs == NULL || (require_capabilities && capabilities == NULL)
 		|| (collector->has_updater && (updater == NULL || fresh_challenge == NULL))
-		|| (!collector->has_updater && fresh_challenge != NULL)) {
+		|| (!collector->has_updater && fresh_challenge != NULL)
+		|| (collector->has_successor && (fresh_successor == NULL || successor == NULL))
+		|| (!collector->has_successor && fresh_successor != NULL)) {
 		cluster_mx_history_cancel(collector);
 		return CMXH_UNKNOWN;
 	}
-	if (collector->has_updater
-		&& memcmp(fresh_challenge, &collector->challenge, sizeof(*fresh_challenge)) != 0) {
+	if ((collector->has_updater
+		&& memcmp(fresh_challenge, &collector->challenge, sizeof(*fresh_challenge)) != 0)
+		|| (collector->has_successor && memcmp(fresh_successor, &collector->successor,
+			sizeof(*fresh_successor)) != 0)) {
 		cluster_mx_history_cancel(collector);
 		return CMXH_REQUALIFY;
 	}
 	if (driver == NULL || !driver->members_ready
-		|| (collector->has_updater && !driver->updater_ready))
+		|| ((collector->has_updater || collector->has_successor) && !driver->updater_ready))
 		return CMXH_PENDING;
 	if (!cluster_mx_history_capture_recheck(collector, rel, buffer, tuple, mxkey, members,
 											nmembers))
@@ -727,6 +794,9 @@ history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer
 		memcpy(capabilities, driver->capabilities, n * sizeof(*capabilities));
 	if (collector->has_updater)
 		*updater = driver->updater;
+	if (driver->typed_successor)
+		*successor = driver->successor;
+	memset(&driver->successor, 0, sizeof(driver->successor));
 	memset(&driver->updater, 0, sizeof(driver->updater));
 	driver->members_delivered = true;
 	driver->members_ready = false;
@@ -778,7 +848,7 @@ cluster_mx_history_recheck_and_finish(ClusterMxHistoryCollector *collector, Rela
 									  ClusterCurrentMemberOperationProof *proofs, uint16 capacity)
 {
 	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
-						  NULL, false, capacity, NULL, NULL);
+						  NULL, false, capacity, NULL, NULL, NULL, NULL);
 }
 
 ClusterMxHistoryStep
@@ -789,7 +859,7 @@ cluster_mx_history_recheck_and_finish_with_updater(
 	const ClusterCurrentUpdaterChallenge *fresh_challenge, ClusterCurrentUpdaterProof *updater)
 {
 	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
-						  NULL, false, capacity, fresh_challenge, updater);
+						  NULL, false, capacity, fresh_challenge, updater, NULL, NULL);
 }
 
 /* A receipt consumer cannot silently omit the original capability batch. */
@@ -802,6 +872,47 @@ cluster_mx_history_recheck_and_finish_for_receipts(
 	const ClusterCurrentUpdaterChallenge *fresh_challenge, ClusterCurrentUpdaterProof *updater)
 {
 	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
-		capabilities, true, capacity, fresh_challenge, updater);
+		capabilities, true, capacity, fresh_challenge, updater, NULL, NULL);
+}
+bool
+cluster_mx_history_capture_begin_with_successor(Relation rel, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members,
+	uint16 nmembers, const ClusterSemanticAdmissionToken *admission,
+	const ClusterMxHistorySuccessorChallenge *challenge,
+	const ClusterCurrentUpdaterChallenge *legacy, ClusterMxHistoryCollector **out)
+{
+	bool ok;
+	if (out == NULL) return false;
+	*out = NULL;
+	ok = legacy != NULL
+		? cluster_mx_history_capture_begin_with_updater(rel, buffer, tuple, actual, mxkey,
+			members, nmembers, admission, legacy, out)
+		: cluster_mx_history_capture_begin(rel, buffer, tuple, actual, mxkey,
+			members, nmembers, admission, out);
+	if (!ok) return false;
+	if (!cluster_mx_history_successor_challenge_valid((*out)->capture, challenge)
+		|| (legacy != NULL && (legacy->updater_xid != challenge->xmin
+			|| legacy->member_ordinal != challenge->member_ordinal)))
+		goto failed;
+	(*out)->successor = *challenge;
+	(*out)->has_successor = true;
+	if (history_successor_heap(*out, rel, buffer, true))
+		return true;
+failed:
+	cluster_mx_history_cancel(*out);
+	*out = NULL;
+	return false;
+}
+ClusterMxHistoryStep
+cluster_mx_history_recheck_and_finish_with_successor(ClusterMxHistoryCollector *collector,
+	Relation rel, Buffer buffer, HeapTuple tuple, const ClusterCurrentMxKey *mxkey,
+	const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs,
+	uint32 *capabilities, uint16 capacity, const ClusterMxHistorySuccessorChallenge *challenge,
+	const ClusterCurrentUpdaterChallenge *legacy, ClusterCurrentUpdaterProof *legacy_out,
+	ClusterMxHistorySuccessorProof *out)
+{
+	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
+		capabilities, true, capacity, legacy, legacy_out, challenge, out);
 }
 #endif

@@ -219,13 +219,44 @@ UT_TEST(native_walkers_preserve_tid_when_no_version_is_visible)
 		walk_balanced(latest); auth_clean(s);
 	}
 }
+static Snapshot
+walk_child_setup(bool scur)
+{
+	Snapshot s = walk_setup(scur);
+	finish_top = 80; finish_native_top_records = false; finish_live_child_successor = true;
+	for (unsigned i = 0; i < 3; ++i) ClusterPageGetItlSlots(BufferBlocks)[i].xid = 80;
+	return s;
+}
+UT_TEST(native_walkers_follow_child_canonical_history)
+{
+	for (unsigned latest = 0; latest < 2; ++latest)
+		for (unsigned scur = 0; scur < 2; ++scur) {
+			Snapshot s = walk_child_setup(scur); ItemPointerData tid = tuple.t_self; bool dead = true;
+			UT_ASSERT_EQ(walk_call(s, latest, true, &dead, &tid), 1);
+			UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&tid), 2);
+			UT_ASSERT_EQ(walk_visible[2], 1); UT_ASSERT_EQ(finish_reads, 3);
+			walk_balanced(latest); auth_clean(s);
+		}
+}
+UT_TEST(native_walkers_reject_child_late_ABA_before_visibility)
+{
+	for (unsigned latest = 0; latest < 2; ++latest)
+		for (unsigned fault = 1; fault <= 3; ++fault) {
+			Snapshot s = walk_child_setup(true); ItemPointerData tid = tuple.t_self;
+			walk_late_aba = fault;
+			UT_ASSERT_EQ(walk_call(s, latest, true, NULL, &tid), -1);
+			UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT);
+			UT_ASSERT_EQ(walk_visible[2], 0); UT_ASSERT_EQ(finish_reads, 3);
+			read_balanced(); auth_clean(s);
+		}
+}
 #ifdef HISTORY_FULL_FIXTURE
 int history_full_unused_walk_main(void);
 #define main history_full_unused_walk_main
 #endif
 int main(void)
 {
-	history_fixture_init(); UT_PLAN(8);
+	history_fixture_init(); UT_PLAN(10);
 	UT_RUN(native_walkers_consume_history_successor_under_original_share);
 	UT_RUN(native_walkers_restart_original_root_with_same_snapshot);
 	UT_RUN(native_walkers_reject_late_successor_ABA_before_visibility);
@@ -234,5 +265,7 @@ int main(void)
 	UT_RUN(native_walkers_cannot_follow_noncommitted_or_discarded_updater);
 	UT_RUN(native_hot_second_call_skips_only_original_root);
 	UT_RUN(native_walkers_preserve_tid_when_no_version_is_visible);
+	UT_RUN(native_walkers_follow_child_canonical_history);
+	UT_RUN(native_walkers_reject_child_late_ABA_before_visibility);
 	free(procArray); UT_DONE(); return ut_failed_count ? 1 : 0;
 }

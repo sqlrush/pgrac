@@ -104,7 +104,7 @@
 #include "cluster/cluster_gcs_block.h" /* ACTIVE local writer ledger */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
 #include "cluster/cluster_multixact_current.h" /* current-DML authority */
-#include "cluster/cluster_mx_history.h"
+#include "cluster/cluster_mx_history_member.h"
 #include "cluster/cluster_multixact_current_stats.h" /* authority counters */
 #include "cluster/cluster_mxid_stripe.h" /* derived-own guard for local pg_multixact decode */
 #include "cluster/cluster_pcm_x_bufmgr.h" /* tuple/PCM ABA fingerprint */
@@ -4670,8 +4670,13 @@ typedef struct HeapHotCurrentMxSuccessorProof
 	ClusterCurrentMxSuccessorAlias alias;
 	ClusterTxLocator locator;
 	TransactionId updater_xid;
+	ClusterHeapSuccessorHistory history;
+	bool		history_valid;
 	bool		valid;
 } HeapHotCurrentMxSuccessorProof;
+
+static bool cluster_current_mx_history_successor_matches(Buffer buffer, HeapTuple tuple,
+	const ItemPointerData *tid, TransactionId updater, const ClusterHeapSuccessorHistory *history);
 
 static bool heap_hot_current_mx_history_resolve_updater_caller(
 	Relation relation, Buffer buffer, HeapTuple tuple, Snapshot actual,
@@ -4904,6 +4909,11 @@ heap_hot_current_mx_successor_matches(
 	ClusterUndoTTSlotRef ref;
 	ClusterCurrentMxSuccessorAlias alias;
 	ClusterTxLocator locator;
+
+	if (proof != NULL && proof->valid && proof->history_valid)
+		return proof->alias.cluster_epoch == cluster_epoch_get_current()
+			&& cluster_current_mx_history_successor_matches(buffer, tuple, &proof->tid,
+				proof->updater_xid, &proof->history);
 
 	if (proof == NULL || !proof->valid
 		|| !ItemPointerEquals(&tuple->t_self, (ItemPointer) &proof->tid)
@@ -8683,6 +8693,72 @@ cluster_current_mx_read_capture_equal(
 				  sizeof(left->itl_slots)) == 0;
 }
 
+/* Reconstruct only the actual same-page candidate, with all bounds checked
+ * before header access. This selects no canonical slot or history address. */
+static bool
+cluster_current_mx_history_candidate(Buffer buffer, const ItemPointerData *tid,
+	Oid tableoid, HeapTupleData *candidate)
+{
+	Page page;
+	PageHeader ph;
+	ItemId lp;
+	OffsetNumber off;
+	BufferDesc *desc;
+	if (buffer <= 0 || buffer > NBuffers || !BufferIsPinnedByMe(buffer) || tid == NULL)
+		return false;
+	desc = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(desc), LW_SHARED)
+		&& !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(desc), LW_EXCLUSIVE))
+		return false;
+	page = BufferGetPage(buffer);
+	ph = (PageHeader)page;
+	off = ItemPointerGetOffsetNumber(tid);
+	if (ItemPointerGetBlockNumber(tid) != desc->tag.blockNum || !PageHasItl(page)
+		|| PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| ph->pd_lower < SizeOfPageHeaderData || ph->pd_lower > ph->pd_upper
+		|| ph->pd_upper > ph->pd_special || ph->pd_special > BLCKSZ
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_SPECIAL_SIZE
+		|| off < FirstOffsetNumber || off > PageGetMaxOffsetNumber(page))
+		return false;
+	lp = PageGetItemId(page, off);
+	if (!ItemIdIsNormal(lp) || ItemIdGetLength(lp) < SizeofHeapTupleHeader
+		|| ItemIdGetOffset(lp) < ph->pd_upper
+		|| (Size)ItemIdGetOffset(lp) + ItemIdGetLength(lp) > ph->pd_special)
+		return false;
+	memset(candidate, 0, sizeof(*candidate));
+	candidate->t_self = *tid;
+	candidate->t_tableOid = tableoid;
+	candidate->t_data = (HeapTupleHeader)PageGetItem(page, lp);
+	candidate->t_len = ItemIdGetLength(lp);
+	return candidate->t_data->t_hoff >= SizeofHeapTupleHeader
+		&& candidate->t_data->t_hoff <= candidate->t_len;
+}
+
+/* No unlocked lifetime, remote cache or mutation authority. The producer
+ * saved the post-relock read qualification; an image/ownership change now
+ * invalidates the handoff before any successor visibility evaluation. */
+static bool
+cluster_current_mx_history_successor_matches(Buffer buffer, HeapTuple tuple,
+	const ItemPointerData *tid, TransactionId updater, const ClusterHeapSuccessorHistory *history)
+{
+	ClusterCurrentMxHeapFingerprint live;
+	HeapTupleData candidate;
+	if (tuple == NULL || tuple->t_data == NULL || !ItemPointerEquals(&tuple->t_self, (ItemPointer)tid)
+		|| !cluster_current_mx_history_candidate(buffer, tid, tuple->t_tableOid, &candidate)
+		|| candidate.t_data != tuple->t_data || candidate.t_len != tuple->t_len
+		|| HeapTupleHeaderGetRawXmin(candidate.t_data) != updater
+		|| XidFromFullTransactionId(history->operation_fxid) != updater
+		|| !FullTransactionIdFollows(history->operation_fxid, history->top_fxid)
+		|| !cluster_current_mx_read_capture(buffer, &candidate, &live))
+		return false;
+	return cluster_pcm_own_snapshot_equal_exact(&history->pcm, &live.pcm)
+		&& history->page_lsn == live.page_lsn && history->tuple_len == live.tuple_len
+		&& memcmp(&history->line_pointer, &live.line_pointer, sizeof(live.line_pointer)) == 0
+		&& memcmp(history->tuple_header, live.tuple_header, sizeof(live.tuple_header)) == 0
+		&& memcmp(history->roots, live.itl_slots, sizeof(live.itl_slots)) == 0;
+}
+
 static void
 cluster_current_mx_set_successor_proof(
 	ClusterHeapSuccessorProof *proof, const ItemPointerData *tid,
@@ -8875,6 +8951,11 @@ cluster_current_mx_successor_key_matches(
 	ClusterTxLocator locator;
 	ClusterTxLocator canonical_locator;
 
+	if (proof != NULL && proof->valid && proof->history_valid)
+		return proof->cluster_epoch == cluster_epoch_get_current()
+			&& cluster_current_mx_history_successor_matches(buffer, tuple, &proof->tid,
+				proof->updater_xid, &proof->history);
+
 	if (proof == NULL || !proof->valid
 		|| ItemPointerGetBlockNumber(&tuple->t_self)
 			   != ItemPointerGetBlockNumber(&proof->tid)
@@ -8909,7 +8990,8 @@ cluster_current_mx_successor_matches(
 {
 	ClusterPcmOwnSnapshot pcm;
 
-	return cluster_current_mx_successor_key_matches(buffer, tuple, proof)
+	return proof != NULL && !proof->history_valid
+		&& cluster_current_mx_successor_key_matches(buffer, tuple, proof)
 		&& cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1),
 										  &pcm) == CLUSTER_PCM_OWN_OK
 		&& pcm.pcm_state == (uint8) PCM_STATE_X && pcm.flags == 0;
@@ -9042,6 +9124,66 @@ cluster_current_mx_build_hot_challenge(
 }
 
 static bool
+cluster_current_mx_build_history_challenge(Relation relation, Buffer buffer, HeapTuple root,
+	TransactionId updater, uint16 ordinal, ClusterMxHistorySuccessorChallenge *challenge,
+	ClusterCurrentMxHeapFingerprint *capture)
+{
+	HeapTupleData candidate;
+	BufferTag *tag = &GetBufferDescriptor(buffer - 1)->tag;
+	if (ItemPointerEquals(&root->t_self, &root->t_data->t_ctid)
+		|| ItemPointerIndicatesMovedPartitions(&root->t_data->t_ctid)
+		|| !cluster_current_mx_history_candidate(buffer, &root->t_data->t_ctid,
+			RelationGetRelid(relation), &candidate)
+		|| HeapTupleHeaderGetRawXmin(candidate.t_data) != updater
+		|| !cluster_current_mx_read_capture(buffer, &candidate, capture))
+		return false;
+	memset(challenge, 0, sizeof(*challenge));
+	challenge->target.locator = BufTagGetRelFileLocator(tag);
+	challenge->target.forknum = tag->forkNum;
+	challenge->target.blockno = ItemPointerGetBlockNumber(&candidate.t_self);
+	challenge->target.offnum = ItemPointerGetOffsetNumber(&candidate.t_self);
+	challenge->xmin = updater;
+	challenge->member_ordinal = ordinal;
+	return true;
+}
+
+static bool
+cluster_current_mx_set_history_successor(ClusterHeapSuccessorProof *out,
+	Buffer buffer, Relation relation, const ItemPointerData *tid, TransactionId updater,
+	const ClusterMxHistorySuccessorProof *b)
+{
+	ClusterCurrentMxHeapFingerprint fresh;
+	HeapTupleData candidate;
+	const ClusterCurrentMemberProofKey *key = &b->member.base.key;
+	if (!cluster_current_mx_history_candidate(buffer, tid, RelationGetRelid(relation), &candidate)
+		|| !cluster_current_mx_read_capture(buffer, &candidate, &fresh))
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->tid = *tid;
+	out->updater_xid = updater;
+	out->origin_node_id = key->origin_node_id;
+	out->undo_record_segment_id = key->undo_segment_id;
+	out->tt_slot_id = key->tt_slot_id;
+	out->cluster_epoch = key->cluster_epoch;
+	out->locator_uba_raw[0] = b->key.locator.uba.raw[0];
+	out->locator_uba_raw[1] = b->key.locator.uba.raw[1];
+	out->locator_tt_wrap = b->key.locator.tt_wrap;
+	out->locator_itl_kind = b->key.locator.itl_kind;
+	out->locator_itl_slot_index = b->key.locator.itl_slot_index;
+	out->history.pcm = fresh.pcm;
+	out->history.page_lsn = fresh.page_lsn;
+	out->history.line_pointer = fresh.line_pointer;
+	out->history.tuple_len = fresh.tuple_len;
+	memcpy(out->history.tuple_header, fresh.tuple_header, sizeof(fresh.tuple_header));
+	memcpy(out->history.roots, fresh.itl_slots, sizeof(fresh.itl_slots));
+	out->history.top_fxid = b->member.top_fxid;
+	out->history.operation_fxid = b->member.operation_fxid;
+	out->history.canonical_generation = key->segment_generation;
+	out->history_valid = out->valid = true;
+	return true;
+}
+
+static bool
 cluster_current_mx_hot_capture_still_exact(
 	Buffer buffer, Relation relation, const ItemPointerData *next_tid,
 	const ClusterCurrentMxHeapFingerprint *expected, bool read_only)
@@ -9081,6 +9223,9 @@ typedef struct ClusterCurrentMxHistoryBatch
 	ClusterCurrentUpdaterChallenge challenge;
 	ClusterCurrentUpdaterChallenge fresh_challenge;
 	ClusterCurrentUpdaterProof updater;
+	ClusterMxHistorySuccessorChallenge target_challenge, fresh_target;
+	ClusterMxHistorySuccessorProof typed_successor;
+	bool legacy_challenge;
 	ClusterCurrentMxHeapFingerprint candidate;
 	ClusterCurrentMxRequestContext ctx;
 	ItemPointerData successor;
@@ -9158,16 +9303,31 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 			if (read_only && !have_challenge)
 				break;
 			batch->successor = tuple->t_data->t_ctid;
-			if (have_challenge && !cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
-					members[updater].xid, (uint16)updater, &batch->challenge, &batch->candidate, read_only))
-				break;
-			if (have_challenge) {
-				if (!cluster_mx_history_capture_begin_with_updater(relation, buffer, tuple, actual,
-						key, members, nmembers, admission, &batch->challenge, &batch->collector))
+			if (read_only) {
+				ClusterCurrentMxHeapFingerprint legacy_capture;
+				if (!cluster_current_mx_build_history_challenge(relation, buffer, tuple,
+					members[updater].xid, (uint16)updater, &batch->target_challenge, &batch->candidate))
 					break;
-			} else if (!cluster_mx_history_capture_begin(relation, buffer, tuple, actual,
+				/* Only V1 may consume this optional original raw challenge. */
+				batch->legacy_challenge = cluster_current_mx_build_hot_challenge(relation,
+					buffer, tuple, members[updater].xid, (uint16)updater, &batch->challenge,
+					&legacy_capture, true);
+				if (!cluster_mx_history_capture_begin_with_successor(relation, buffer, tuple,
+					actual, key, members, nmembers, admission, &batch->target_challenge,
+					batch->legacy_challenge ? &batch->challenge : NULL, &batch->collector))
+					break;
+			} else {
+				if (have_challenge && !cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
+					members[updater].xid, (uint16)updater, &batch->challenge, &batch->candidate, false))
+					break;
+				if (have_challenge) {
+					if (!cluster_mx_history_capture_begin_with_updater(relation, buffer, tuple, actual,
+						key, members, nmembers, admission, &batch->challenge, &batch->collector))
+						break;
+				} else if (!cluster_mx_history_capture_begin(relation, buffer, tuple, actual,
 					key, members, nmembers, admission, &batch->collector))
-				break;
+					break;
+			}
 			if (!cluster_mx_history_capture_read(batch->collector, &batch->capture))
 				break;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -9179,37 +9339,57 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 			}
 			if (have_challenge) {
 				ClusterCurrentMxHeapFingerprint fresh;
-				if (!cluster_current_mx_hot_capture_still_exact(buffer, relation,
-						&batch->successor, &batch->candidate, read_only)
-					|| !cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
-						members[updater].xid, (uint16)updater, &batch->fresh_challenge, &fresh, read_only)) {
+				bool exact = cluster_current_mx_hot_capture_still_exact(buffer, relation,
+					&batch->successor, &batch->candidate, read_only);
+				if (exact && read_only)
+					exact = cluster_current_mx_build_history_challenge(relation, buffer, tuple,
+						members[updater].xid, (uint16)updater, &batch->fresh_target, &fresh);
+				if (exact && (!read_only || batch->legacy_challenge))
+					exact = cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
+						members[updater].xid, (uint16)updater, &batch->fresh_challenge, &fresh, read_only);
+				if (!exact) {
 					step = CMXH_REQUALIFY;
 					break;
 				}
 			}
-			collected = cluster_mx_history_recheck_and_finish_for_receipts(batch->collector,
-				relation, buffer, tuple, key, members, nmembers, batch->keys, batch->proofs,
-				batch->capabilities, nmembers, have_challenge ? &batch->fresh_challenge : NULL,
-				&batch->updater);
+			if (read_only)
+				collected = cluster_mx_history_recheck_and_finish_with_successor(batch->collector,
+					relation, buffer, tuple, key, members, nmembers, batch->keys, batch->proofs,
+					batch->capabilities, nmembers, &batch->fresh_target,
+					batch->legacy_challenge ? &batch->fresh_challenge : NULL, &batch->updater,
+					&batch->typed_successor);
+			else
+				collected = cluster_mx_history_recheck_and_finish_for_receipts(batch->collector,
+					relation, buffer, tuple, key, members, nmembers, batch->keys, batch->proofs,
+					batch->capabilities, nmembers, have_challenge ? &batch->fresh_challenge : NULL,
+					&batch->updater);
 			if (collected != CMXH_COMPLETE) {
 				step = collected == CMXH_REQUALIFY ? CMXH_REQUALIFY : CMXH_UNKNOWN;
 				break;
 			}
 			if (read_only) {
-				int origin = cluster_xid_origin_slot(members[updater].xid);
-
-				if (origin < 0 || origin >= CLUSTER_MAX_NODES
-					|| !cluster_multixact_current_validate_operation_updater(key, members,
-						batch->keys, batch->proofs, nmembers, &batch->fresh_challenge,
-						&batch->updater, (uint16)origin))
-					break;
-				/* This is a read continuation only: no recompose, SELF/CID
-				 * decision, TX wait or mutation receipt is produced. */
+				if (batch->typed_successor.member.flags == CLUSTER_CURRENT_OPERATION_PROOF_EXACT) {
+					if (!cluster_mx_history_validate_successor(&batch->capture, batch->keys,
+						batch->proofs, &batch->fresh_target, &batch->typed_successor)
+						|| batch->typed_successor.member.base.state != CCM_COMMITTED
+						|| !cluster_current_mx_set_history_successor(&heap_result->successor_proof,
+							buffer, relation, &batch->successor, members[updater].xid, &batch->typed_successor))
+						break;
+				} else {
+					int origin = cluster_xid_origin_slot(members[updater].xid);
+					if (!batch->legacy_challenge || origin < 0 || origin >= CLUSTER_MAX_NODES
+						|| batch->proofs[updater].flags != 0
+						|| !cluster_multixact_current_validate_operation_updater(key, members,
+							batch->keys, batch->proofs, nmembers, &batch->fresh_challenge,
+							&batch->updater, (uint16)origin))
+						break;
+					cluster_current_mx_set_successor_proof(&heap_result->successor_proof,
+						&batch->successor, members[updater].xid,
+						&batch->fresh_challenge.candidate_next_xmin_alias,
+						&batch->updater.candidate_next_xmin_locator);
+				}
+				/* Read continuation only: no SELF/CID, wait, receipt or X grant. */
 				heap_result->authoritative_updater = members[updater].xid;
-				cluster_current_mx_set_successor_proof(&heap_result->successor_proof,
-					&batch->successor, members[updater].xid,
-					&batch->fresh_challenge.candidate_next_xmin_alias,
-					&batch->updater.candidate_next_xmin_locator);
 				heap_result->result = TM_Updated;
 				*decision = CMDL_UPDATED;
 				step = CMXH_COMPLETE;
@@ -9577,13 +9757,16 @@ cluster_current_mx_hot_successor_project(const ClusterHeapSuccessorProof *proof,
 	successor->alias.undo_record_segment_id = proof->undo_record_segment_id;
 	successor->alias.tt_slot_id = proof->tt_slot_id;
 	successor->alias.cluster_epoch = proof->cluster_epoch;
-	successor->alias.local_xid = proof->updater_xid;
+	successor->alias.local_xid = proof->history_valid
+		? XidFromFullTransactionId(proof->history.top_fxid) : proof->updater_xid;
 	successor->locator.uba.raw[0] = proof->locator_uba_raw[0];
 	successor->locator.uba.raw[1] = proof->locator_uba_raw[1];
-	successor->locator.xid = proof->updater_xid;
+	successor->locator.xid = successor->alias.local_xid;
 	successor->locator.tt_wrap = proof->locator_tt_wrap;
 	successor->locator.itl_kind = proof->locator_itl_kind;
 	successor->locator.itl_slot_index = proof->locator_itl_slot_index;
+	successor->history = proof->history;
+	successor->history_valid = proof->history_valid;
 	successor->valid = true;
 }
 
