@@ -11051,10 +11051,11 @@ test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_u
 	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_note_retention\(/ { print "static void"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_(probe|history_probe)\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_(report_wait|real_protector|reports_advance)\(/ { print "static bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}$$/ { emit=0 } END { if (found != 10 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}$$/ { emit=0 } END { if (found != 11 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 clean distclean maintainer-clean: clean-ctrc-capacity-wait

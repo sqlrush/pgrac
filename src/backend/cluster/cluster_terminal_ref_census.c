@@ -6221,6 +6221,7 @@ ctrc_capacity_history_inventory(unsigned budget, ClusterCapacityObservationV1 *o
 						goto supply;
 					recyclable = cluster_undo_segment_recyclable_for_mode_with_reasons(
 						header, pass->horizon, true, &reasons);
+					out->retain_reasons |= reasons;
 					if (recyclable) {
 						uint64 coordinator, worker;
 						unsigned owner = (segment - 1) % CLUSTER_CTRC_CLEANER_WORKERS;
@@ -6823,6 +6824,7 @@ cluster_ctrc_capacity_probe_history_v1(uint32 current_segment, SCN horizon, uint
 	if (reason != CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER) {
 		pass->complete = pass->history_only = pass->progress = false;
 		pass->incomplete = true;
+		observation->retain_reasons = 0;
 	}
 	observation->reason = reason;
 	return reason;

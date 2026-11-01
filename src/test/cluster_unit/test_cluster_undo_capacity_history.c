@@ -214,8 +214,10 @@ UT_TEST(test_actual_clock_report_reaches_original_wait_and_physical_supply)
 	bool producer = false;
 	ClusterCapacityHistoryPass pass = { 0 };
 	ClusterCapacityObservationV1 physical;
+	ClusterUndoCapacityStats stats;
 	unsigned passes = 0;
 	history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+	CtrcCapacitySegmentCursor = 0;
 	UT_ASSERT_EQ(history_initial_sequence, 1);
 	UT_ASSERT_EQ(cluster_undo_capacity_history_observe(&observed, &producer),
 				 CLUSTER_HEAP_FREEZE_COHORT_READY);
@@ -231,11 +233,18 @@ UT_TEST(test_actual_clock_report_reaches_original_wait_and_physical_supply)
 		UT_ASSERT(sample_holds - before - (segment_reads[0] - current_before) <= 16);
 		if (++passes > 256)
 			abort();
+		/* Positions 0..15 contain CURRENT, the record cursor and fourteen
+		 * retained headers. The remaining positions are absent. This is a
+		 * per-probe union, not fourteen segments or full-pool authority. */
+		UT_ASSERT_EQ(physical.retain_reasons,
+					 passes == 1 ? CLUSTER_UNDO_RETAIN_HISTORY_PIN : 0);
 	} while (!pass.complete && pass.progress);
 	UT_ASSERT(pass.complete && pass.history_only && pass.current_proven);
 	UT_ASSERT_EQ(pass.covered_positions, 256);
 	UT_ASSERT_EQ(pass.allocated_count, 16);
 	UT_ASSERT_EQ(pass.covered_positions - pass.allocated_count, 240);
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.retain_by_reason[4], 0); /* Observing alone does not count. */
 	history_schedule = 1;
 	UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
 	UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
@@ -244,6 +253,12 @@ UT_TEST(test_actual_clock_report_reaches_original_wait_and_physical_supply)
 	UT_ASSERT(segment_reads[0] >= 2);
 	for (unsigned i = 1; i < 16; i++)
 		UT_ASSERT(segment_reads[i] > 0);
+	UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+	for (unsigned bit = 0; bit < lengthof(stats.retain_by_reason); bit++)
+		UT_ASSERT_EQ(stats.retain_by_reason[bit], bit == 4 ? 1 : 0);
+	UT_ASSERT_EQ(stats.pool_wait_count, 1);
+	UT_ASSERT_EQ(stats.wakeup_recheck_count, 1);
+	UT_ASSERT_EQ(stats.refused_proof_count, 0);
 	/* The composed fixture stops at the original allocator re-entry boolean;
   * no allocator/bind implementation is linked here. */
 	history_finish(1);
@@ -253,11 +268,101 @@ UT_TEST(test_actual_protective_pair_requires_distinct_reports)
 {
 	for (unsigned duplicate = 0; duplicate < 2; duplicate++) {
 		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats stats;
 		history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+		CtrcCapacitySegmentCursor = 0;
 		history_schedule = duplicate ? 4 : 2;
 		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
 		UT_ASSERT_EQ(history_lmon.report_sequence, 2);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		for (unsigned bit = 0; bit < lengthof(stats.retain_by_reason); bit++)
+			UT_ASSERT_EQ(stats.retain_by_reason[bit], bit == 4 ? (duplicate ? 3 : 2) : 0);
+		UT_ASSERT_EQ(stats.refused_proof_count, 1);
 		history_finish(duplicate ? 2 : 1);
+	}
+}
+
+UT_TEST(test_history_non_h_rejections_count_the_actual_reason_union_once)
+{
+	static const unsigned expected[][9] = { { 0, 0, 0, 0, 1, 0, 1, 0, 0 },
+										  { 0, 0, 0, 0, 1, 1, 0, 0, 0 },
+										  { 0, 0, 1, 0, 1, 0, 0, 0, 0 },
+										  { 0, 0, 1, 0, 1, 1, 1, 0, 0 } };
+
+	for (unsigned fault = 0; fault < lengthof(expected); fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats stats;
+		UndoSegmentHeaderData before;
+
+		history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+		CtrcCapacitySegmentCursor = 2;
+		if (fault == 0 || fault == 3)
+			history_headers[2].tt_slots[47].flags = 0;
+		if (fault == 1 || fault == 3)
+			history_headers[2].tt_slots[47].first_undo_block.raw[0] = 1;
+		if (fault >= 2)
+			history_headers[2].tail_block = 1;
+		before = history_headers[2];
+		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		for (unsigned bit = 0; bit < lengthof(expected[fault]); bit++)
+			UT_ASSERT_EQ(stats.retain_by_reason[bit], expected[fault][bit]);
+		UT_ASSERT_EQ(stats.refused_proof_count, 1);
+		UT_ASSERT_EQ(stats.pool_wait_count, 0);
+		UT_ASSERT_EQ(memcmp(&before, &history_headers[2], sizeof(before)), 0);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		history_finish(0);
+	}
+}
+
+UT_TEST(test_history_invalid_samples_do_not_fabricate_retention_counts)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats stats;
+
+		history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+		CtrcCapacitySegmentCursor = 2;
+		/* Reject every physical header. A one-shot root drift would allow
+		 * later headers to qualify under the newly sampled root. */
+		for (unsigned i = 0; i < 16; i++) {
+			if (fault == 0)
+				history_headers[i].owner_instance = 2;
+			if (fault == 1)
+				history_headers[i].wrap_count = UINT32_MAX;
+		}
+		sample_release_failure = fault == 2;
+		UT_ASSERT(!cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		for (unsigned bit = 0; bit < lengthof(stats.retain_by_reason); bit++)
+			UT_ASSERT_EQ(stats.retain_by_reason[bit], 0);
+		UT_ASSERT_EQ(stats.refused_proof_count, 1);
+		history_finish(0);
+	}
+}
+
+UT_TEST(test_history_positive_owner_and_retry_do_not_count_prior_retention)
+{
+	for (unsigned retry = 0; retry < 2; retry++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+		ClusterUndoCapacityStats stats;
+
+		history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+		CtrcCapacitySegmentCursor = 2;
+		for (unsigned i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			history_headers[retry ? 0 : 3].tt_slots[i].commit_scn = 1000;
+			if (retry)
+				history_current.slots[i].commit_scn = 1000;
+		}
+		history_schedule = 1;
+		UT_ASSERT(cluster_undo_cleaner_wait_for_capacity(1, &continuation));
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		for (unsigned bit = 0; bit < lengthof(stats.retain_by_reason); bit++)
+			UT_ASSERT_EQ(stats.retain_by_reason[bit], 0);
+		UT_ASSERT_EQ(stats.refused_proof_count, 0);
+		UT_ASSERT_EQ(stats.pool_wait_count, retry ? 0 : 1);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		history_finish(retry ? 0 : 1);
 	}
 }
 
@@ -343,9 +448,12 @@ main(void)
 	(void)undo_horizon_send_v2;
 	(void)undo_horizon_v2_publish;
 	(void)undo_horizon_publish_freeze_watermark;
-	UT_PLAN(6);
+	UT_PLAN(9);
 	UT_RUN(test_actual_clock_report_reaches_original_wait_and_physical_supply);
 	UT_RUN(test_actual_protective_pair_requires_distinct_reports);
+	UT_RUN(test_history_non_h_rejections_count_the_actual_reason_union_once);
+	UT_RUN(test_history_invalid_samples_do_not_fabricate_retention_counts);
+	UT_RUN(test_history_positive_owner_and_retry_do_not_count_prior_retention);
 	UT_RUN(test_actual_reader_exit_next_local_report_rechecks_supply);
 	UT_RUN(test_actual_history_unknown_inputs_refuse_before_wait);
 	UT_RUN(test_actual_history_cancel_retires_original_cv_and_wait_event);

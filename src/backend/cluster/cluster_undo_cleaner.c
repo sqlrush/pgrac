@@ -561,6 +561,22 @@ undo_cleaner_capacity_segment_worker(uint32 current_segment, uint64 epoch,
 	return *worker == observation->owner_worker;
 }
 
+/* Count the qualified observation, not distinct segments or readers.
+ * A recheck can observe the same cause again. Unknown bits cannot index
+ * the counters, and none of these diagnostics changes the decision. */
+static void
+undo_cleaner_capacity_note_retention(ClusterCapacityReasonV1 reason,
+									 const ClusterCapacityObservationV1 *observation)
+{
+	if (reason != CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER || observation->retain_reasons == 0)
+		return;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+	for (unsigned bit = 0; bit < lengthof(undo_cleaner_state->retain_by_reason); bit++)
+		if ((observation->retain_reasons & (UINT32_C(1) << bit)) != 0)
+			undo_cleaner_state->retain_by_reason[bit]++;
+	LWLockRelease(&undo_cleaner_state->lwlock);
+}
+
 /* The CURRENT-only preflight may clear an old pool key. Preserve its exact
  * provenance while observing both paths under the original owner bracket. */
 static ClusterCtrcCapacityProbeResult
@@ -584,16 +600,7 @@ undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *fl
 	}
 	reason = cluster_ctrc_capacity_probe_pool_segment_v1(segment_id, floor->scn, floor->epoch,
 														 &prior, &observation);
-	/* Count the qualified observation, not distinct segments or readers.
-	 * A recheck can observe the same cause again. Unknown bits cannot index
-	 * the counters, and none of these diagnostics changes the decision. */
-	if (reason == CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER && observation.retain_reasons != 0) {
-		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
-		for (unsigned bit = 0; bit < lengthof(undo_cleaner_state->retain_by_reason); bit++)
-			if ((observation.retain_reasons & (UINT32_C(1) << bit)) != 0)
-				undo_cleaner_state->retain_by_reason[bit]++;
-		LWLockRelease(&undo_cleaner_state->lwlock);
-	}
+	undo_cleaner_capacity_note_retention(reason, &observation);
 	if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
 		ClusterCtrcTxnKeyV1 empty;
 
@@ -731,6 +738,7 @@ undo_cleaner_capacity_history_probe(uint32 segment_id, ClusterCtrcTxnKeyV1 *cont
 		reason = cluster_ctrc_capacity_probe_history_v1(segment_id, history.horizon_scn,
 														cluster_epoch_get_current(), continuation,
 														&pass, &observation);
+		undo_cleaner_capacity_note_retention(reason, &observation);
 		if (reason == CLUSTER_CAPACITY_SUPPLY_RECHECK) {
 			MemSet(continuation, 0, sizeof(*continuation));
 			return CLUSTER_CTRC_CAPACITY_RETRY;
