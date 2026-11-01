@@ -1247,12 +1247,18 @@ ExtendCLOGInternal(TransactionId newestXact, FullTransactionId birth)
 #ifdef USE_PGRAC_CLUSTER
 	if (CLOGNativeIORequired())
 	{
+		volatile bool body_complete = false;
+
 		PG_TRY();
 		{
 			(void) SimpleLruNativeClogZeroV2(XactCtl, birth);
+			body_complete = true;
 		}
 		PG_FINALLY();
 		{
+			/* ERROR has reset the holdoff for this still-held family lock. */
+			if (!body_complete)
+				HOLD_INTERRUPTS();
 			LWLockRelease(XactSLRULock);
 		}
 		PG_END_TRY();

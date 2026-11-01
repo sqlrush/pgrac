@@ -4,6 +4,13 @@
 #include "storage/lwlock.h"
 #include "access/rmgr.h"
 #include "access/xlogdefs.h"
+#include <sys/wait.h>
+static bool counted_holdoff, cleanup_throw, expect_cleanup_panic;
+static int birth_error_level;
+static void birth_error_reset(void);
+#define SLRU_FIXTURE_COUNT_HOLDOFF() counted_holdoff
+#define SLRU_FIXTURE_ERROR_LEVEL(level) (birth_error_level = (level))
+#define SLRU_FIXTURE_ERROR_RESET() birth_error_reset()
 static LWLock *birth_issuer_lock(void);
 static LWLock *birth_control_lock(void);
 static XLogRecPtr birth_insert(RmgrId, uint8);
@@ -32,6 +39,21 @@ static LWLock issuer;
 static unsigned borrows, releases, current_calls, fail_current_at, birth_records;
 static bool file_available, release_available, caught_family;
 static ClusterClogPageIdentityV2 birth_observed;
+static void birth_error_reset(void)
+{
+	if (!counted_holdoff) return;
+	/* errfinish(ERROR) resets holds but leaves the locks held. A real PANIC
+	 * never reaches a PG_CATCH, so observe its retained duties and exit. */
+	if (birth_error_level >= FATAL) {
+		bool preserved = expect_cleanup_panic && birth_error_level == PANIC &&
+			borrows == 1 && releases == 0 && closes == 1 && control_held && !io_held &&
+			states[0] == SLRU_PAGE_EMPTY && !dirty[0] &&
+			proc.delayChkptFlags == (DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE) &&
+			fcntl(borrowed, F_GETFD) >= 0;
+		_exit(preserved ? 0 : 2);
+	}
+	InterruptHoldoffCount = 0;
+}
 static LWLock *birth_issuer_lock(void) { return &issuer; }
 static LWLock *birth_control_lock(void) { return &control; }
 ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void)
@@ -58,6 +80,10 @@ static bool birth_current(const ClusterControlNativeFileBorrowV2 *borrow)
 static bool birth_release(ClusterControlNativeFileBorrowV2 *borrow)
 {
 	UT_ASSERT_EQ(borrow->private_self, (uintptr_t)borrow);
+	if (cleanup_throw) {
+		cleanup_throw = false;
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("injected birth cleanup error")));
+	}
 	if (!release_available) return false;
 	releases++; memset(borrow, 0, sizeof(*borrow)); return true;
 }
@@ -76,7 +102,10 @@ static XLogRecPtr birth_insert(RmgrId rmgr, uint8 info)
 	birth_observed = observed.page;
 	memcpy(native_record, registered, sizeof(native_record));
 	inserts++; birth_records++; record_event('I');
-	if (wal_throw == 1) siglongjmp(*PG_exception_stack, 1);
+	if (wal_throw == 1) {
+		birth_error_level = ERROR; birth_error_reset();
+		siglongjmp(*PG_exception_stack, 1);
+	}
 	return actual_end;
 }
 static void birth_flush(XLogRecPtr lsn)
@@ -84,7 +113,10 @@ static void birth_flush(XLogRecPtr lsn)
 	UT_ASSERT(!control_held && io_held && issuer_held);
 	UT_ASSERT(proc.delayChkptFlags & DELAY_CHKPT_START);
 	UT_ASSERT_EQ(lsn, actual_end); flushes++; flushed = lsn; record_event('F');
-	if (wal_throw == 2) siglongjmp(*PG_exception_stack, 1);
+	if (wal_throw == 2) {
+		birth_error_level = ERROR; birth_error_reset();
+		siglongjmp(*PG_exception_stack, 1);
+	}
 }
 static void reset_birth(void)
 {
@@ -103,6 +135,8 @@ static void reset_birth(void)
 	borrows = releases = current_calls = fail_current_at = birth_records = 0;
 	file_available = release_available = issuer_held = true;
 	birth_pending = caught_family = false; control_held = false;
+	counted_holdoff = cleanup_throw = expect_cleanup_panic = false;
+	birth_error_level = 0;
 }
 static bool extend_birth(FullTransactionId birth)
 {
@@ -212,18 +246,78 @@ UT_TEST(other_resident_birth_is_preserved_and_nonboundary_has_no_work)
 	UT_ASSERT(extend_birth(FullTransactionIdFromEpochAndXid(7, 3 * 32768 + 1)));
 	UT_ASSERT_EQ(birth_records, 1); close(borrowed);
 }
+static void counted_birth_child(unsigned fault, unsigned preowned)
+{
+	bool success;
+	reset_birth(); counted_holdoff = true;
+	/* Caller issuer lock plus three unrelated holds must survive success.
+	 * ERROR instead starts cleanup at elog's zero baseline. */
+	InterruptHoldoffCount = 4;
+	proc.delayChkptFlags = DELAY_CHKPT_COMPLETE | (preowned ? DELAY_CHKPT_START : 0);
+	if (fault == 1 || fault == 2) wal_throw = fault;
+	if (fault == 3) fail_current_at = 3;
+	if (fault == 4) fail_current_at = 1;
+	if (fault >= 5) {
+		wal_throw = 2; expect_cleanup_panic = true;
+		if (fault == 5) release_available = false;
+		else cleanup_throw = true;
+	}
+	success = extend_birth(actual_birth());
+	UT_ASSERT_EQ(success, fault == 0);
+	UT_ASSERT(!expect_cleanup_panic); /* A required PANIC cannot return. */
+	UT_ASSERT(!caught_family && !control_held && !io_held);
+	UT_ASSERT_EQ(InterruptHoldoffCount, fault == 0 ? 4 : 0);
+	UT_ASSERT_EQ(borrows, 1); UT_ASSERT_EQ(releases, 1); UT_ASSERT_EQ(closes, fault == 4 ? 0 : 1);
+	UT_ASSERT_EQ(proc.delayChkptFlags, DELAY_CHKPT_COMPLETE | (preowned ? DELAY_CHKPT_START : 0));
+	UT_ASSERT_EQ(states[0], fault == 0 ? SLRU_PAGE_VALID : SLRU_PAGE_EMPTY);
+	UT_ASSERT_EQ(dirty[0], fault == 0);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT(fcntl(borrowed, F_GETFD) >= 0);
+	close(borrowed);
+	fflush(NULL);
+	_exit(ut_current_failed ? 1 : 0);
+}
+static void counted_birth_run(unsigned fault, unsigned preowned)
+{
+	int status = 0;
+	pid_t child;
+	fflush(NULL);
+	child = fork();
+	if (child == 0) counted_birth_child(fault, preowned);
+	UT_ASSERT(child > 0);
+	if (child <= 0) return;
+	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(status, 0);
+}
+UT_TEST(counted_success_preserves_original_caller_holds)
+{
+	counted_birth_run(0, 0); counted_birth_run(0, 1);
+}
+UT_TEST(real_error_reset_balances_each_new_lock_release)
+{
+	for (unsigned fault = 1; fault <= 4; fault++)
+		for (unsigned preowned = 0; preowned < 2; preowned++) counted_birth_run(fault, preowned);
+}
+UT_TEST(cleanup_refusal_or_second_error_retains_borrow_and_panics)
+{
+	counted_birth_run(5, 1); counted_birth_run(6, 1);
+}
 int main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-birth-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(6);
+	UT_PLAN(9);
 	UT_RUN(actual_issuer_birth_logs_full_image_before_cache_and_original_write);
 	UT_RUN(exact_resident_retry_preserves_terminal_bytes_without_another_birth);
 	UT_RUN(unknown_issuer_or_reserved_cannot_zero_or_emit_birth);
 	UT_RUN(existing_disk_frame_header_damage_or_partial_slot_never_becomes_birth);
 	UT_RUN(wal_insert_and_flush_errors_remove_only_the_incomplete_reservation);
 	UT_RUN(other_resident_birth_is_preserved_and_nonboundary_has_no_work);
+	UT_RUN(counted_success_preserves_original_caller_holds);
+	UT_RUN(real_error_reset_balances_each_new_lock_release);
+	UT_RUN(cleanup_refusal_or_second_error_retains_borrow_and_panics);
 	unlink(filename); rmdir(directory);
 	UT_DONE(); return ut_failed_count != 0;
 }

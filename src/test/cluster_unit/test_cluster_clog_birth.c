@@ -15,6 +15,7 @@ UT_DEFINE_GLOBALS();
 
 #ifdef USE_PGRAC_CLUSTER
 bool cluster_enabled;
+volatile uint32 InterruptHoldoffCount;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 void pg_re_throw(void) { abort(); }

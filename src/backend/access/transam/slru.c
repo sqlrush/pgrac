@@ -421,6 +421,7 @@ SimpleLruNativeClogZeroV2(SlruCtl ctl, FullTransactionId birth)
 	volatile bool control_dropped = false;
 	volatile bool pending = false;
 	volatile bool own_delay = false;
+	volatile bool body_complete = false;
 
 	if (ctl == NULL || (shared = ctl->shared) == NULL ||
 		shared->ControlLock == NULL || shared->clog_page_identity == NULL ||
@@ -536,28 +537,49 @@ SimpleLruNativeClogZeroV2(SlruCtl ctl, FullTransactionId birth)
 			pgstat_count_slru_page_zeroed(shared->slru_stats_idx);
 			break;
 		}
+		body_complete = true;
 	}
 	PG_FINALLY();
 	{
-		if (control_dropped)
-			LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
-		if (io_locked)
+		/* ERROR resets holdoffs but leaves locks held. Do not restore caller
+		 * holds that abort cleanup will release through LWLockReleaseAll. */
+		if (!body_complete)
+			InterruptHoldoffCount = 0;
+		PG_TRY(cleanup);
 		{
-			if (pending && shared->page_number[slotno] == pageno &&
-				shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS &&
-				SlruClogBindingMatches(&shared->clog_file_binding[slotno], &binding))
+			if (control_dropped)
+				LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+			if (io_locked)
 			{
-				memset(&shared->clog_page_identity[slotno], 0, sizeof(page));
-				memset(&shared->clog_file_binding[slotno], 0, sizeof(binding));
-				shared->page_status[slotno] = SLRU_PAGE_EMPTY;
-				shared->page_dirty[slotno] = false;
+				if (pending && shared->page_number[slotno] == pageno &&
+					shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS &&
+					SlruClogBindingMatches(&shared->clog_file_binding[slotno], &binding))
+				{
+					memset(&shared->clog_page_identity[slotno], 0, sizeof(page));
+					memset(&shared->clog_file_binding[slotno], 0, sizeof(binding));
+					shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+					shared->page_dirty[slotno] = false;
+				}
+				if (!body_complete)
+					HOLD_INTERRUPTS(); /* match this old lock's retail release */
+				LWLockRelease(&shared->buffer_locks[slotno].lock);
 			}
-			LWLockRelease(&shared->buffer_locks[slotno].lock);
+			if (own_delay)
+				proc->delayChkptFlags &= ~DELAY_CHKPT_START;
+			if (!SlruNativeClogFinish(ctl, &borrow, fd))
+				ereport(PANIC, (errcode(ERRCODE_IO_ERROR),
+								errmsg("could not finish native CLOG birth cleanup")));
 		}
-		if (own_delay)
-			proc->delayChkptFlags &= ~DELAY_CHKPT_START;
-		if (!SlruNativeClogFinish(ctl, &borrow, fd))
-			SlruNativeClogRefuse();
+		PG_CATCH(cleanup);
+		{
+			/* A second ERROR must not discard an unreleased identity/FD or
+			 * reservation. Crash recovery retains the original WAL duties. */
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("error during native CLOG birth cleanup")));
+		}
+		PG_END_TRY(cleanup);
+		if (!body_complete)
+			InterruptHoldoffCount = 0; /* neutralize cleanup's ControlLock reacquire */
 	}
 	PG_END_TRY();
 	return slotno;
