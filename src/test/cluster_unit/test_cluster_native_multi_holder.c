@@ -6,7 +6,36 @@
 #include "test_cluster_native_current_fixture.inc"
 #undef NATIVE_HOLDER_X_REQUESTER_COMPOSITION
 
+enum MhFault {
+	MH_FAULT_NONE, MH_FAULT_MISSING_WITNESS, MH_FAULT_HOLDER_GENERATION,
+	MH_FAULT_CROPPED_MASK, MH_FAULT_CONFLICTING_RECEIPT, MH_FAULT_LATE_MASTER_ACK
+};
+static enum MhFault mh_fault;
 static bool mh_resident(int mode) { return mode >= 5; }
+static bool mh_late_ack(int mode) { return mode == 3 || mh_fault == MH_FAULT_LATE_MASTER_ACK; }
+static bool mh_wire(ResourceXDecodedFrame *frame)
+{
+	uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES]; uint16 len; ResourceXWireReject reject;
+	uint16 type = frame->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+		? RESOURCE_X_MSG_BLOCKED_TO_N : RESOURCE_X_MSG_IMAGE_OR_GRANT;
+	NM_REQUIRE(cluster_resource_x_wire_encode(type, frame, bytes, sizeof(bytes), &len, &reject));
+	NM_REQUIRE(cluster_resource_x_wire_decode(type, bytes, len, frame, &reject));
+	return true;
+}
+static bool mh_master_reject_generation(HolderFixture *f, const ResourceXDecodedFrame *original)
+{
+	ResourceXDecodedFrame bad = *original; ResourceXMasterSnapshot snapshot;
+	ClusterPcmResourceXMasterState *before = malloc(sizeof(*before));
+	NM_REQUIRE(before != NULL); memcpy(before, f->master.state, sizeof(*before));
+	NM_REQUIRE(bad.body.acquire_witness.decision.holders[2].grant_generation > 1);
+	bad.body.acquire_witness.decision.holders[2].grant_generation--;
+	bool valid = mh_wire(&bad);
+	if (valid) {
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&bad, 2, &snapshot), RESOURCE_X_APPLY_STALE);
+		UT_ASSERT(memcmp(before, f->master.state, sizeof(*before)) == 0);
+	}
+	free(before); return valid && !ut_current_failed;
+}
 static unsigned mh_sent;
 static bool mh_send(int fd, uint16 type, const ResourceXDecodedFrame *frame)
 {
@@ -97,14 +126,22 @@ static bool mh_master(int requester, int holder, int mode)
 	NM_REQUIRE(nc_callback(&image_send));
 	NM_REQUIRE(nm_master_callback(&f.master.state->holder_status_intent.slot, true));
 	NM_REQUIRE(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack0, 0, &snapshot) == RESOURCE_X_APPLY_APPLIED);
-	if (mode == 3) {
+	if (mh_late_ack(mode)) {
 		NM_REQUIRE(nm_receive(requester, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &done));
 		NM_REQUIRE(nm_master_done(&done) == RESOURCE_X_APPLY_APPLIED);
-		NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_source_done_snapshot_exact(&f.master.work, &release) == RESOURCE_X_APPLY_LOCAL_WAIT);
+		if (mh_resident(mode))
+			NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.master.work) == RESOURCE_X_APPLY_LOCAL_WAIT);
+		else NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_source_done_snapshot_exact(&f.master.work, &release) == RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT_EQ(f.master.state->requests[1].blocked_holders_bitmap, 1);
+		UT_ASSERT_EQ(f.master.state->acquire_ack_connections[2], 0);
+		UT_ASSERT(f.master.state->requests[1].phase != RESOURCE_X_MASTER_NONE);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->s_holders_bitmap), mh_resident(mode) ? 7 : 5);
+		UT_ASSERT_EQ(((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->x_holder_node, -1);
 	}
 	NM_REQUIRE(nm_receive(holder, RESOURCE_X_MSG_BLOCKED_TO_N, &ack2)); auth_peer_boot = 101;
+	if (mh_fault == MH_FAULT_HOLDER_GENERATION) NM_REQUIRE(mh_master_reject_generation(&f, &ack2));
 	NM_REQUIRE(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack2, 2, &snapshot) == RESOURCE_X_APPLY_APPLIED);
-	if (mode != 3) {
+	if (!mh_late_ack(mode)) {
 		NM_REQUIRE(nm_receive(requester, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &done));
 		NM_REQUIRE(nm_master_done(&done) == RESOURCE_X_APPLY_APPLIED);
 	}
@@ -232,6 +269,132 @@ static bool mh_accept_as(const ResourceXDecodedFrame *frame, int source, Resourc
 }
 static bool mh_accept(const ResourceXDecodedFrame *frame, int source, ResourceXRequesterJoinSnapshot *out)
 { return mh_accept_as(frame, source, RESOURCE_X_APPLY_APPLIED, out); }
+/* Locate the actual retained canonical A for read-only whole-owner checks.
+ * This builds no service, grant or completion; it matches the bytes already
+ * retained by the real receiver after an original peer frame. */
+static bool mh_requester_owner(const ResourceXDecodedFrame *witness, ClusterPcmResourceXMasterState **out)
+{
+	ResourceXDecodedFrame anchor = {0}; uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
+	uint16 len; ResourceXWireReject reject; unsigned matches = 0;
+	unsigned char *memory = (unsigned char *)fake_pcm_header.data;
+	Size offset = offsetof(ClusterPcmResourceXMasterState, requester_join.grant_payload);
+	anchor.kind = RESOURCE_X_WIRE_AUTHORITY_GRANT; anchor.has_acquire_decision = true;
+	anchor.common = witness->common; anchor.common.action_node = 1;
+	anchor.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	anchor.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
+	anchor.body.acquire_decision = witness->body.acquire_witness.decision;
+	NM_REQUIRE(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &anchor, bytes, sizeof(bytes), &len, &reject));
+	NM_REQUIRE(len == sizeof(bytes));
+	for (Size n = offset; n + len <= fake_pcm_header_requested_size; n += 8)
+		if (memcmp(memory + n, bytes, len) == 0 && n - offset + sizeof(**out) <= fake_pcm_header_requested_size) {
+			*out = (void *)(memory + n - offset); matches++;
+		}
+	NM_REQUIRE(matches == 1); return true;
+}
+static bool mh_requester_unchanged(const ResourceXDecodedFrame *original,
+	const ResourceXDecodedFrame *input, int source, ResourceXApplyResult expected)
+{
+	ClusterPcmResourceXMasterState *state = NULL, *before = malloc(sizeof(*before));
+	ClusterPcmResourceXBootstrapRound round = request_entry()->resource_x_bootstrap_round;
+	ClusterPcmOwnEntry native = request_own; char page[BLCKSZ];
+	ResourceXRequesterJoinSnapshot joined; uint32 header = pg_atomic_read_u32(&request_buf.state);
+	NM_REQUIRE(before != NULL);
+	if (!mh_requester_owner(original, &state)) { free(before); return false; }
+	memcpy(before, state, sizeof(*before)); memcpy(page, disk_shared.data, BLCKSZ);
+	bool ok = mh_accept_as(input, source, expected, &joined);
+	UT_ASSERT(memcmp(before, state, sizeof(*before)) == 0);
+	UT_ASSERT(memcmp(&round, &request_entry()->resource_x_bootstrap_round, sizeof(round)) == 0);
+	UT_ASSERT(memcmp(&native, &request_own, sizeof(native)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state), header);
+	UT_ASSERT(memcmp(page, disk_shared.data, BLCKSZ) == 0);
+	free(before); return ok && !ut_current_failed;
+}
+static bool mh_claim_incomplete(void)
+{
+	ResourceXDecodedFrame grant, image; ResourceXRequesterJoinSnapshot joined;
+	ResourceXDeliveryClaim claim = {0};
+	ClusterPcmResourceXBootstrapRound round = request_entry()->resource_x_bootstrap_round;
+	ClusterPcmOwnEntry native = request_own;
+	NM_REQUIRE(cluster_pcm_lock_resource_x_requester_acquire_claim_exact(
+		&ordinary_active->observation, &prepared_episode, &grant, &image, &joined, &claim)
+		== RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT(memcmp(&round, &request_entry()->resource_x_bootstrap_round, sizeof(round)) == 0);
+	UT_ASSERT(memcmp(&native, &request_own, sizeof(native)) == 0);
+	UT_ASSERT_EQ(complete_commits, 0); UT_ASSERT_EQ(complete_io_calls, 0);
+	return !ut_current_failed;
+}
+static bool mh_before_witness(const ResourceXDecodedFrame *witness)
+{
+	ResourceXDecodedFrame bad = *witness;
+	if (mh_fault == MH_FAULT_HOLDER_GENERATION) {
+		NM_REQUIRE(bad.body.acquire_witness.decision.holders[2].grant_generation > 1);
+		bad.body.acquire_witness.decision.holders[2].grant_generation--;
+		NM_REQUIRE(mh_wire(&bad));
+		NM_REQUIRE(mh_requester_unchanged(witness, &bad, 2, RESOURCE_X_APPLY_STALE));
+		NM_REQUIRE(mh_claim_incomplete());
+	} else if (mh_fault == MH_FAULT_CROPPED_MASK) {
+		/* A fully valid, freshly checksummed smaller A is still not M's A.
+		 * A standalone grant lets the cropped set omit the witness sender. */
+		ResourceXDecodedAcquireDecision a = witness->body.acquire_witness.decision;
+		a.holders_bitmap &= ~UINT32_C(4); a.required_holders_bitmap &= ~UINT32_C(4);
+		memset(&a.holders[2], 0, sizeof(a.holders[2]));
+		memset(&bad, 0, sizeof(bad)); bad.kind = RESOURCE_X_WIRE_AUTHORITY_GRANT;
+		bad.has_acquire_decision = true; bad.common = witness->common;
+		bad.common.action_node = 1; bad.common.outcome = RESOURCE_X_OUTCOME_NONE;
+		bad.body.acquire_decision = a;
+		NM_REQUIRE(mh_wire(&bad));
+		NM_REQUIRE(mh_requester_unchanged(witness, &bad, 0, RESOURCE_X_APPLY_STALE));
+		NM_REQUIRE(mh_claim_incomplete());
+	}
+	return true;
+}
+static bool mh_after_witness(const ResourceXDecodedFrame *witness)
+{
+	if (mh_fault == MH_FAULT_CONFLICTING_RECEIPT) {
+		ResourceXDecodedFrame conflict = *witness;
+		NM_REQUIRE(mh_requester_unchanged(witness, witness, 2, RESOURCE_X_APPLY_DUPLICATE));
+		conflict.body.acquire_witness.original_ack.sender_connection_generation++;
+		NM_REQUIRE(mh_wire(&conflict));
+		NM_REQUIRE(mh_requester_unchanged(witness, &conflict, 2, RESOURCE_X_APPLY_STALE));
+		NM_REQUIRE(mh_requester_unchanged(witness, witness, 2, RESOURCE_X_APPLY_DUPLICATE));
+	}
+	return true;
+}
+static unsigned mh_wait_periods, mh_timed_out;
+static int mh_sleep_before;
+static ClusterPcmOwnEntry mh_wait_native;
+static ClusterPcmResourceXBootstrapRound mh_wait_round;
+static char mh_wait_bytes[BLCKSZ];
+static void mh_delayed_witness(void)
+{
+	ResourceXDecodedFrame witness; ResourceXRequesterJoinSnapshot joined;
+	UT_ASSERT_EQ(fake_lwlock_depth, 0); UT_ASSERT_EQ(ordinary_sends, 1);
+	UT_ASSERT_EQ(fake_cv_sleep_count, mh_sleep_before + ++mh_wait_periods);
+	UT_ASSERT(memcmp(&mh_wait_native, &request_own, sizeof(request_own)) == 0);
+	UT_ASSERT(memcmp(&mh_wait_round, &request_entry()->resource_x_bootstrap_round, sizeof(mh_wait_round)) == 0);
+	UT_ASSERT(memcmp(mh_wait_bytes, disk_shared.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(complete_io_calls, 0); UT_ASSERT_EQ(complete_commits, 0);
+	if (fake_cv_timed_sleep_timed_out) mh_timed_out++;
+	UT_ASSERT_EQ(fake_cv_timed_sleep_timeout, 1000);
+	UT_ASSERT_EQ(fake_cv_sleep_wait_event, WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	if (mh_wait_periods < 4) {
+		/* Several diagnostic periods passing cannot end E or reissue it. */
+		fake_pcm_clock_us += UINT64_C(60000000); fake_cv_prepare_hook = mh_delayed_witness; return;
+	}
+	UT_ASSERT(mh_timed_out >= 3);
+	if (!nm_receive(mh_holder_fd, RESOURCE_X_MSG_BLOCKED_TO_N, &witness)
+		|| !mh_accept(&witness, 2, &joined)) { UT_ASSERT(false); pg_re_throw(); }
+	UT_ASSERT(joined.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE);
+}
+static bool mh_park_witness(void)
+{
+	NM_REQUIRE(mh_claim_incomplete());
+	mh_wait_periods = mh_timed_out = 0; mh_sleep_before = fake_cv_sleep_count;
+	mh_wait_native = request_own; mh_wait_round = request_entry()->resource_x_bootstrap_round;
+	memcpy(mh_wait_bytes, disk_shared.data, BLCKSZ);
+	fake_cv_prepare_hook = mh_delayed_witness;
+	return true;
+}
 /* Every witness carries the real A. Local-current needs all remote
  * witnesses, but need not wait for a redundant standalone master grant. */
 static bool mh_no_C(const ResourceXRequesterJoinSnapshot *joined)
@@ -251,7 +414,9 @@ static bool mh_local_join(void)
 		int part = orders[order][n], source = part == 2 ? 2 : 0;
 		uint16 type = part == 0 ? RESOURCE_X_MSG_IMAGE_OR_GRANT : RESOURCE_X_MSG_BLOCKED_TO_N;
 		ResourceXDecodedFrame frame;
+		if (part == 2 && mh_fault == MH_FAULT_MISSING_WITNESS) { NM_REQUIRE(mh_park_witness()); return true; }
 		NM_REQUIRE(nm_receive(part == 2 ? mh_holder_fd : mh_master_fd, type, &frame));
+		if (part == 2) NM_REQUIRE(mh_before_witness(&frame));
 		if (part == 0) {
 			UT_ASSERT_EQ(frame.body.acquire_decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT);
 			UT_ASSERT_EQ(frame.body.acquire_decision.required_holders_bitmap, 5);
@@ -259,6 +424,7 @@ static bool mh_local_join(void)
 		}
 		NM_REQUIRE(mh_accept_as(&frame, source, part == 0 && witnesses != 0
 			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_APPLIED, &joined));
+		if (part == 2) NM_REQUIRE(mh_after_witness(&frame));
 		if (part != 0) witnesses |= UINT32_C(1) << source;
 		if (witnesses != 5) NM_REQUIRE(mh_no_C(&joined));
 		else UT_ASSERT(joined.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE);
@@ -283,7 +449,10 @@ static void mh_deliver(void)
 	UT_ASSERT((joined.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE) == 0);
 	UT_ASSERT_EQ(complete_io_calls, 0); UT_ASSERT_EQ(complete_broadcasts, 0); UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_N);
 	if (image_first) {
-		if (!nm_receive(mh_holder_fd, RESOURCE_X_MSG_BLOCKED_TO_N, &witness) || !mh_accept(&witness, 2, &joined)) pg_re_throw();
+		if (mh_fault == MH_FAULT_MISSING_WITNESS) { if (!mh_park_witness()) pg_re_throw(); return; }
+		if (!nm_receive(mh_holder_fd, RESOURCE_X_MSG_BLOCKED_TO_N, &witness)
+			|| !mh_before_witness(&witness) || !mh_accept(&witness, 2, &joined)
+			|| !mh_after_witness(&witness)) pg_re_throw();
 	} else if (!nm_receive(mh_master_fd, RESOURCE_X_MSG_IMAGE_OR_GRANT, &nc_image) || !mh_accept(&nc_image, 0, &joined)) pg_re_throw();
 	UT_ASSERT(joined.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE);
 	if (mh_mode == 4) {
@@ -325,6 +494,10 @@ static bool mh_parent(int master, int holder, int mode)
 	auth_observation_hook = mh_auth; ordinary_delivery_transport = mh_deliver;
 	entry = rx_prepare(NULL); NM_REQUIRE(entry != NULL);
 	UT_ASSERT_EQ(wc_legacy, 0); UT_ASSERT_EQ(wc_failures, 0); UT_ASSERT_EQ(ordinary_sends, 1);
+	if (mh_fault == MH_FAULT_MISSING_WITNESS) {
+		UT_ASSERT_EQ(mh_wait_periods, 4);
+		printf("# missing witness CV sleeps=%u timed_out=%u REQUEST=%u\n", mh_wait_periods, mh_timed_out, ordinary_sends);
+	}
 	UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, mh_resident(mode) ? 0 : 1);
 	UT_ASSERT_EQ(complete_broadcasts, mh_resident(mode) ? 0 : 1);
 	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_X);
@@ -392,9 +565,23 @@ UT_TEST(test_multi_holder_resident_S_grant_first) { mh_run(5); }
 UT_TEST(test_multi_holder_resident_S_witnesses_first) { mh_run(6); }
 UT_TEST(test_multi_holder_resident_S_witness_then_grant) { mh_run(7); }
 UT_TEST(test_multi_holder_resident_S_busy_resumes_same_episode) { mh_run(8); }
+static void mh_run_fault(bool resident, enum MhFault fault)
+{
+	mh_fault = fault; mh_run(resident ? 5 : 0); mh_fault = MH_FAULT_NONE;
+}
+UT_TEST(test_multi_holder_N_to_X_missing_witness_waits) { mh_run_fault(false, MH_FAULT_MISSING_WITNESS); }
+UT_TEST(test_multi_holder_S_to_X_missing_witness_waits) { mh_run_fault(true, MH_FAULT_MISSING_WITNESS); }
+UT_TEST(test_multi_holder_N_to_X_wrong_holder_generation) { mh_run_fault(false, MH_FAULT_HOLDER_GENERATION); }
+UT_TEST(test_multi_holder_S_to_X_wrong_holder_generation) { mh_run_fault(true, MH_FAULT_HOLDER_GENERATION); }
+UT_TEST(test_multi_holder_N_to_X_cropped_holder_set) { mh_run_fault(false, MH_FAULT_CROPPED_MASK); }
+UT_TEST(test_multi_holder_S_to_X_cropped_holder_set) { mh_run_fault(true, MH_FAULT_CROPPED_MASK); }
+UT_TEST(test_multi_holder_N_to_X_conflicting_duplicate_receipt) { mh_run_fault(false, MH_FAULT_CONFLICTING_RECEIPT); }
+UT_TEST(test_multi_holder_S_to_X_conflicting_duplicate_receipt) { mh_run_fault(true, MH_FAULT_CONFLICTING_RECEIPT); }
+UT_TEST(test_multi_holder_N_to_X_DONE_waits_last_master_ACK) { mh_run_fault(false, MH_FAULT_LATE_MASTER_ACK); }
+UT_TEST(test_multi_holder_S_to_X_DONE_waits_last_master_ACK) { mh_run_fault(true, MH_FAULT_LATE_MASTER_ACK); }
 int main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(19);
 	UT_RUN(test_multi_holder_image_first_then_X_writer);
 	UT_RUN(test_multi_holder_witness_first_then_X_writer);
 	UT_RUN(test_multi_holder_cleanup_waits_witness_callback);
@@ -404,5 +591,15 @@ int main(void)
 	UT_RUN(test_multi_holder_resident_S_witnesses_first);
 	UT_RUN(test_multi_holder_resident_S_witness_then_grant);
 	UT_RUN(test_multi_holder_resident_S_busy_resumes_same_episode);
+	UT_RUN(test_multi_holder_N_to_X_missing_witness_waits);
+	UT_RUN(test_multi_holder_S_to_X_missing_witness_waits);
+	UT_RUN(test_multi_holder_N_to_X_wrong_holder_generation);
+	UT_RUN(test_multi_holder_S_to_X_wrong_holder_generation);
+	UT_RUN(test_multi_holder_N_to_X_cropped_holder_set);
+	UT_RUN(test_multi_holder_S_to_X_cropped_holder_set);
+	UT_RUN(test_multi_holder_N_to_X_conflicting_duplicate_receipt);
+	UT_RUN(test_multi_holder_S_to_X_conflicting_duplicate_receipt);
+	UT_RUN(test_multi_holder_N_to_X_DONE_waits_last_master_ACK);
+	UT_RUN(test_multi_holder_S_to_X_DONE_waits_last_master_ACK);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }
