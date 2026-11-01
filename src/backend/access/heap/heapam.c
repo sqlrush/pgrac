@@ -8310,6 +8310,20 @@ typedef struct ClusterCurrentMxHeapResult
 	ClusterHeapSuccessorProof successor_proof;
 } ClusterCurrentMxHeapResult;
 
+/* One native call owns this bracket; the original caller owns its Snapshot. */
+typedef struct ClusterCurrentMxLockScope
+{
+	Snapshot actual;
+	ResourceOwner owner;
+	uint64 identity;
+	SCN read_scn;
+	uint64 read_epoch;
+	ClusterSemanticAdmissionToken admission;
+	ClusterSnapshotReadScopeV1 evaluation;
+	bool evaluation_entered;
+	ClusterCurrentMxOperationState operation;
+} ClusterCurrentMxLockScope;
+
 typedef enum ClusterCurrentMxStampKind
 {
 	CCMH_STAMP_PRIMARY = 0,
@@ -10327,6 +10341,56 @@ cluster_current_mx_caller_snapshot(Snapshot actual, uint64 *identity)
 	}
 	PG_END_TRY();
 	return valid;
+}
+
+static void
+cluster_current_mx_lock_scope_begin(ClusterCurrentMxLockScope *scope, Snapshot actual)
+{
+	if (actual == NULL && ActiveSnapshotSet())
+		actual = GetActiveSnapshot();
+	if (CritSectionCount != 0 || CurrentResourceOwner == NULL
+		|| !cluster_current_mx_caller_snapshot(actual, &scope->identity))
+		cluster_current_mx_failclosed(&scope->operation, CCMH_FAIL_MEMBER_PROOF,
+			"the tuple-lock caller has no exact retained statement Snapshot");
+	scope->actual = actual;
+	scope->owner = CurrentResourceOwner;
+	scope->read_scn = actual->read_scn;
+	scope->read_epoch = actual->read_epoch;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+			CLUSTER_SEMANTIC_TARGET_SIDE, &scope->admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
+		cluster_current_mx_failclosed(&scope->operation, CCMH_FAIL_MEMBER_PROOF,
+			"the tuple-lock history admission is closed");
+	cluster_snapshot_read_enter_v1(&scope->evaluation, actual);
+	scope->evaluation_entered = true;
+}
+
+static void
+cluster_current_mx_lock_scope_require(ClusterCurrentMxLockScope *scope)
+{
+	uint64 identity = 0;
+
+	if (scope == NULL)
+		return;
+	/* Membership/retention is checked before dereferencing actual. */
+	if (!scope->evaluation_entered || CurrentResourceOwner != scope->owner
+		|| !cluster_semantic_activation_recheck(&scope->admission)
+		|| !cluster_snapshot_cr_identity_v1(scope->actual, &identity)
+		|| identity != scope->identity || scope->actual->read_scn != scope->read_scn
+		|| scope->actual->read_epoch != scope->read_epoch)
+		cluster_current_mx_failclosed(&scope->operation, CCMH_FAIL_MEMBER_PROOF,
+			"the tuple-lock statement scope changed before consumption");
+}
+
+static void
+cluster_current_mx_lock_scope_end(ClusterCurrentMxLockScope *scope)
+{
+	cluster_current_mx_operation_finish(&scope->operation);
+	if (scope->evaluation_entered) {
+		cluster_snapshot_read_exit_v1(&scope->evaluation);
+		scope->evaluation_entered = false;
+	}
+	if (scope->admission.entered)
+		cluster_semantic_activation_leave(&scope->admission);
 }
 
 /* Dormant native caller front door, selected only with the complete family.
@@ -17289,6 +17353,22 @@ cluster_heap_rebind_locked_tuple(Relation relation, Buffer buffer,
 #endif
 
 #ifdef USE_PGRAC_CLUSTER
+static bool
+cluster_current_mx_lock_successor_valid(HeapTuple tuple,
+	const ClusterCurrentMxHeapResult *current)
+{
+	return current->successor_proof.valid
+		&& TransactionIdIsNormal(current->authoritative_updater)
+		&& current->successor_proof.updater_xid == current->authoritative_updater
+		&& ItemPointerIsValid(&current->successor_proof.tid)
+		&& ItemPointerIsValid(&tuple->t_data->t_ctid)
+		&& !ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid)
+		&& ItemPointerGetBlockNumber(&current->successor_proof.tid)
+			== ItemPointerGetBlockNumber(&tuple->t_data->t_ctid)
+		&& ItemPointerGetOffsetNumber(&current->successor_proof.tid)
+			== ItemPointerGetOffsetNumber(&tuple->t_data->t_ctid);
+}
+
 /* One native failure channel for both current-MX producer families. */
 static void
 cluster_current_mx_lock_failure(HeapTuple tuple, TM_Result result, bool handled,
@@ -17300,16 +17380,7 @@ cluster_current_mx_lock_failure(HeapTuple tuple, TM_Result result, bool handled,
 	 * binds the already verified result; the destination still consumes the
 	 * complete ITL/TT key under its own PCM-X before touching the tuple. */
 	if (handled && result == TM_Updated
-		&& (!current->successor_proof.valid
-			|| !TransactionIdIsNormal(current->authoritative_updater)
-			|| current->successor_proof.updater_xid != current->authoritative_updater
-			|| !ItemPointerIsValid(&current->successor_proof.tid)
-			|| !ItemPointerIsValid(&tuple->t_data->t_ctid)
-			|| ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid)
-			|| ItemPointerGetBlockNumber(&current->successor_proof.tid)
-				!= ItemPointerGetBlockNumber(&tuple->t_data->t_ctid)
-			|| ItemPointerGetOffsetNumber(&current->successor_proof.tid)
-				!= ItemPointerGetOffsetNumber(&tuple->t_data->t_ctid)))
+		&& !cluster_current_mx_lock_successor_valid(tuple, current))
 	{
 		ItemPointerSetInvalid(&tmfd->ctid);
 		tmfd->xmax = InvalidTransactionId;
@@ -17348,6 +17419,40 @@ heap_lock_tuple_buffer(Relation relation, Buffer buffer, HeapTuple tuple,
 	cluster_heap_rebind_locked_tuple(relation, buffer, tuple, creation_xmin);
 #endif
 }
+
+#ifdef USE_PGRAC_CLUSTER
+static void
+cluster_current_mx_lock_follow_capture(ClusterCurrentMxLockScope *scope,
+	Buffer buffer, HeapTuple tuple, const ClusterCurrentMxHeapResult *current,
+	ClusterCurrentMxHeapFingerprint *before)
+{
+	cluster_current_mx_lock_scope_require(scope);
+	if (!cluster_current_mx_lock_successor_valid(tuple, current)
+		|| !cluster_current_mx_capture(buffer, tuple, before))
+		cluster_current_mx_failclosed(&scope->operation, CCMH_FAIL_HOT_PROOF,
+			"the tuple-lock follow lacks its exact root or successor proof");
+}
+
+static bool
+cluster_current_mx_lock_follow_recheck(ClusterCurrentMxLockScope *scope,
+	Buffer buffer, HeapTuple tuple, const ClusterCurrentMxHeapFingerprint *before,
+	ClusterCurrentMxHeapResult *current)
+{
+	ClusterCurrentMxHeapFingerprint live;
+
+	cluster_current_mx_lock_scope_require(scope);
+	if (!cluster_current_mx_capture(buffer, tuple, &live)
+		|| !cluster_current_mx_capture_equal(before, &live)) {
+		memset(current, 0, sizeof(*current));
+		current->result = TM_BeingModified;
+		cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
+		cluster_current_mx_memo_purge(&scope->operation);
+		cluster_current_mx_operation_restart(&scope->operation);
+		return false;
+	}
+	return true;
+}
+#endif
 
 /*
  *	heap_lock_tuple - lock a tuple in shared or exclusive mode
@@ -17389,6 +17494,7 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 				, const ClusterHeapSuccessorProof *expected_successor
 				, ClusterHeapSuccessorProof *next_successor
 				, char *owned_storage
+				, ClusterCurrentMxLockScope *history_scope
 #endif
 				)
 {
@@ -17425,7 +17531,9 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 	UBA			cluster_lock_uba = InvalidUba_init;
 	SCN			cluster_lock_write_scn = InvalidScn;
 	ClusterCurrentMxHeapResult cluster_current_mx;
-	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
+	ClusterCurrentMxOperationState legacy_operation = {0};
+	ClusterCurrentMxOperationState *operation = history_scope != NULL
+		? &history_scope->operation : &legacy_operation;
 	ClusterCurrentMxStampPlan cluster_current_mx_lock_plan = {0};
 	uint8		cluster_current_mx_lock_header[SizeofHeapTupleHeader]
 		pg_attribute_aligned(MAXIMUM_ALIGNOF);
@@ -17497,13 +17605,14 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 
 l3:
 #ifdef USE_PGRAC_CLUSTER
+	cluster_current_mx_lock_scope_require(history_scope);
 	cluster_heap_rebind_locked_tuple(relation, *buffer, tuple, &creation_xmin);
 	if (expected_successor != NULL && expected_successor->valid)
 	{
 		if (!cluster_current_mx_successor_matches(
 				*buffer, tuple, expected_successor))
 			cluster_current_mx_failclosed(
-				&cluster_current_mx_operation,
+				operation,
 				CCMH_FAIL_ABA_FENCE,
 				"the update-chain successor no longer matches its full-key proof");
 	}
@@ -17531,7 +17640,7 @@ l3:
 	if (result != TM_BeingModified && result != TM_Updated
 		&& result != TM_Deleted)
 		cluster_current_mx_operation_finish(
-			&cluster_current_mx_operation);
+			operation);
 #endif
 
 	if (result == TM_Invisible)
@@ -17568,11 +17677,18 @@ l3:
 		{
 			ClusterCurrentMxHeapDisposition current_mx_disposition;
 
+			if (history_scope != NULL)
+				current_mx_disposition = cluster_current_mx_history_authorize(
+					relation, *buffer, tuple, history_scope->actual,
+					&history_scope->admission, GetCurrentTransactionId(),
+					CCM_ACTION_LOCK, mode, false, wait_policy, true,
+					follow_updates, &cluster_current_mx, operation);
+			else
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, *buffer, tuple, GetCurrentTransactionId(),
 				CCM_ACTION_LOCK, mode, false, wait_policy, true,
 				follow_updates, &cluster_current_mx,
-				&cluster_current_mx_operation);
+				operation);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l3;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -17580,14 +17696,23 @@ l3:
 				if (cluster_current_mx.follow_updated_chain)
 				{
 					TM_Result follow_result;
+					ClusterCurrentMxHeapFingerprint follow_root;
 
+					if (history_scope != NULL)
+						cluster_current_mx_lock_follow_capture(history_scope,
+							*buffer, tuple, &cluster_current_mx, &follow_root);
 					Assert(cluster_current_mx.successor_proof.valid);
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 					follow_result = heap_lock_updated_tuple_authoritative(
 						relation, &cluster_current_mx.successor_proof,
 						GetCurrentTransactionId(), mode);
 					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
-					if (xmax_infomask_changed(tuple->t_data->t_infomask,
+					if (history_scope != NULL) {
+						if (!cluster_current_mx_lock_follow_recheck(history_scope,
+								*buffer, tuple, &follow_root, &cluster_current_mx))
+							goto l3;
+					}
+					else if (xmax_infomask_changed(tuple->t_data->t_infomask,
 											 infomask)
 						|| !TransactionIdEquals(
 							HeapTupleHeaderGetRawXmax(tuple->t_data), xwait)
@@ -17597,19 +17722,19 @@ l3:
 						cluster_multixact_current_stats_bump(
 							CMX_STAT_ABA_RESTART);
 						cluster_current_mx_operation_restart(
-							&cluster_current_mx_operation);
+							operation);
 						goto l3;
 					}
 					if (follow_result != TM_Ok)
 					{
 						cluster_current_mx_operation_finish(
-							&cluster_current_mx_operation);
+							operation);
 						result = follow_result;
 						goto failed;
 					}
 				}
 				cluster_current_mx_operation_finish(
-					&cluster_current_mx_operation);
+					operation);
 				cluster_current_mx_handled = true;
 				cluster_current_mx_recomposed = cluster_current_mx.result == TM_Ok;
 				result = cluster_current_mx.result;
@@ -17617,10 +17742,10 @@ l3:
 			}
 
 			cluster_current_mx_operation_finish(
-				&cluster_current_mx_operation);
+				operation);
 			current_mx_disposition = cluster_current_mx_compose_remote_single(
 				*buffer, tuple, GetCurrentTransactionId(), mode, false,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, operation);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l3;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -17631,7 +17756,7 @@ l3:
 				goto failed;
 			}
 			cluster_current_mx_operation_finish(
-				&cluster_current_mx_operation);
+				operation);
 		}
 
 		/*
@@ -18278,7 +18403,7 @@ failed:
 			   !ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid));
 #ifdef USE_PGRAC_CLUSTER
 		cluster_current_mx_lock_failure(tuple, result, cluster_current_mx_handled,
-			&cluster_current_mx, &cluster_current_mx_operation, tmfd, next_successor);
+			&cluster_current_mx, operation, tmfd, next_successor);
 #else
 		tmfd->ctid = tuple->t_data->t_ctid;
 		tmfd->xmax = HeapTupleHeaderGetUpdateXid(tuple->t_data);
@@ -18616,7 +18741,7 @@ failed:
 				&cluster_current_mx_lock_plan, &xid,
 				&new_infomask, &new_infomask2))
 		{
-			cluster_current_mx_operation_restart(&cluster_current_mx_operation);
+			cluster_current_mx_operation_restart(operation);
 			goto l3;
 		}
 		if (new_infomask != expected_infomask
@@ -18646,7 +18771,7 @@ failed:
 												  &vm_pin_replaced, &cluster_current_mx_lock_plan,
 												  NULL, &cluster_vm_context, NULL)) {
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_lock_plan);
-			cluster_current_mx_operation_restart(&cluster_current_mx_operation);
+			cluster_current_mx_operation_restart(operation);
 			cluster_did_lock_stamp = false;
 			cluster_lock_needs_itl_slot = false;
 			cluster_lock_undo_ready = false;
@@ -18782,6 +18907,7 @@ failed:
 				mx_publication_count = 1;
 		}
 
+		cluster_current_mx_lock_scope_require(history_scope);
 		boundary_result = zero_apply_retry
 			? CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY
 			: cluster_heap_no_retry_boundary_apply(
@@ -18805,7 +18931,7 @@ failed:
 				vm_locked = false;
 			}
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_lock_plan);
-			cluster_current_mx_operation_restart(&cluster_current_mx_operation);
+			cluster_current_mx_operation_restart(operation);
 			cluster_did_lock_stamp = false;
 			cluster_lock_needs_itl_slot = false;
 			cluster_lock_undo_ready = false;
@@ -19130,7 +19256,7 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	return heap_lock_tuple_internal(relation, tuple, cid, mode, wait_policy,
 		follow_updates, buffer, tmfd
 #ifdef USE_PGRAC_CLUSTER
-		, expected_successor, next_successor, NULL
+		, expected_successor, next_successor, NULL, NULL
 #endif
 		);
 }
@@ -19143,8 +19269,40 @@ cluster_heap_lock_tuple_owned(Relation relation, HeapTuple tuple,
 	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ])
 {
 	return heap_lock_tuple_internal(relation, tuple, cid, mode, wait_policy,
-		follow_updates, buffer, tmfd, expected_successor, next_successor, storage);
+		follow_updates, buffer, tmfd, expected_successor, next_successor, storage, NULL);
 }
+
+/* Dormant statement-aware entry; native fetch and recursive SnapshotAny never
+ * replace actual. Heap allocation keeps mutable state defined across ERROR. */
+TM_Result
+cluster_heap_lock_tuple_history_owned(Relation relation, HeapTuple tuple,
+	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
+	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,
+	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ], Snapshot actual)
+{
+	ClusterCurrentMxLockScope *scope = palloc0(sizeof(*scope));
+	volatile TM_Result result = TM_BeingModified;
+	volatile bool completed = false;
+
+	PG_TRY();
+	{
+		cluster_current_mx_lock_scope_begin(scope, actual);
+		result = heap_lock_tuple_internal(relation, tuple, cid, mode, wait_policy,
+			follow_updates, buffer, tmfd, expected_successor, next_successor, storage, scope);
+		cluster_current_mx_lock_scope_require(scope);
+		completed = true;
+	}
+	PG_FINALLY();
+	{
+		if (!completed && next_successor != NULL)
+			memset(next_successor, 0, sizeof(*next_successor));
+		cluster_current_mx_lock_scope_end(scope);
+		pfree(scope);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 #endif
 
 /*

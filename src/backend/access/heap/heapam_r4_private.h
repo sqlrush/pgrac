@@ -57,6 +57,10 @@ extern TM_Result cluster_heap_lock_tuple_owned(Relation relation, HeapTuple tupl
 	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
 	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,
 	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ]);
+extern TM_Result cluster_heap_lock_tuple_history_owned(Relation relation, HeapTuple tuple,
+	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
+	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,
+	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ], Snapshot actual);
 extern void cluster_heap_rebind_locked_tuple(Relation relation, Buffer buffer,
 	HeapTuple tuple, TransactionId *creation_xmin);
 

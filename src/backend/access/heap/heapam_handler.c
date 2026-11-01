@@ -683,10 +683,14 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 }
 
 static TM_Result
-heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+heapam_tuple_lock_internal(Relation relation, ItemPointer tid, Snapshot snapshot,
 				  TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
 				  LockWaitPolicy wait_policy, uint8 flags,
-				  TM_FailureData *tmfd)
+				  TM_FailureData *tmfd
+#ifdef USE_PGRAC_CLUSTER
+				  , bool history
+#endif
+				  )
 {
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	TM_Result	result;
@@ -712,6 +716,14 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 
 tuple_lock_retry:
 	tuple->t_self = *tid;
+#ifdef USE_PGRAC_CLUSTER
+	if (history)
+		result = cluster_heap_lock_tuple_history_owned(relation, tuple, cid, mode,
+			wait_policy, follow_updates, &buffer, tmfd,
+			expected_successor.valid ? &expected_successor : NULL, &next_successor,
+			owned ? fetched_row.data : NULL, snapshot);
+	else
+#endif
 	result =
 #ifdef USE_PGRAC_CLUSTER
 		cluster_heap_lock_tuple_owned
@@ -975,6 +987,31 @@ tuple_lock_retry:
  * DDL related callbacks for heap AM.
  * ------------------------------------------------------------------------
  */
+
+static TM_Result
+heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+	TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
+	LockWaitPolicy wait_policy, uint8 flags, TM_FailureData *tmfd)
+{
+	return heapam_tuple_lock_internal(relation, tid, snapshot, slot, cid, mode,
+		wait_policy, flags, tmfd
+#ifdef USE_PGRAC_CLUSTER
+		, false
+#endif
+		);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* Enable only with the complete operation-aware family. */
+static TM_Result pg_attribute_unused()
+heapam_tuple_lock_history(Relation relation, ItemPointer tid, Snapshot snapshot,
+	TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
+	LockWaitPolicy wait_policy, uint8 flags, TM_FailureData *tmfd)
+{
+	return heapam_tuple_lock_internal(relation, tid, snapshot, slot, cid, mode,
+		wait_policy, flags, tmfd, true);
+}
+#endif
 
 static void
 heapam_relation_set_new_filelocator(Relation rel,

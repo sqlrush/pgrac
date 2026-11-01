@@ -379,3 +379,67 @@ mx_history_lock_successor_fault(unsigned fault)
 	if (fault == 6) ItemPointerSet(&receipt_result.successor_proof.tid, 3, 1);
 	if (fault == 7) receipt_result.authoritative_updater = InvalidTransactionId;
 }
+
+/* Same production bracket and follow checks as the dormant native entry.
+ * Tests supply the unlocked recursive/I/O work; no native root run claim. */
+static ClusterCurrentMxLockScope window_scope;
+static ClusterCurrentMxHeapFingerprint window_before;
+int
+mx_history_lock_window_open(Relation rel, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, const ClusterCurrentMxRequestContext *requested, MxHeapReadout *out)
+{
+	volatile int result = -1;
+
+	memset(&window_scope, 0, sizeof(window_scope));
+	memset(&receipt_result, 0, sizeof(receipt_result));
+	memset(out, 0, sizeof(*out));
+	PG_TRY();
+	{
+		cluster_current_mx_lock_scope_begin(&window_scope, actual);
+		result = cluster_current_mx_history_authorize(rel, buffer, tuple,
+			window_scope.actual, &window_scope.admission, requested->current_member_xid,
+			requested->action, requested->lock_mode, false, requested->wait_policy,
+			requested->wait_for_conflict, requested->follow_updates,
+			&receipt_result, &window_scope.operation);
+		cluster_current_mx_lock_scope_require(&window_scope);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_lock_scope_end(&window_scope);
+		memset(&receipt_result, 0, sizeof(receipt_result));
+		receipt_result.result = TM_BeingModified;
+		authorize_operation = window_scope.operation;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	authorize_operation = window_scope.operation;
+	out->result = receipt_result.result;
+	out->authoritative_updater = receipt_result.authoritative_updater;
+	out->follow_updated_chain = receipt_result.follow_updated_chain;
+	out->successor = receipt_result.successor_proof;
+	return result;
+}
+void mx_history_lock_window_check(void)
+{
+	cluster_current_mx_lock_scope_require(&window_scope);
+}
+void
+mx_history_lock_window_before(Buffer buffer, HeapTuple tuple)
+{
+	cluster_current_mx_lock_follow_capture(&window_scope, buffer, tuple,
+		&receipt_result, &window_before);
+}
+bool
+mx_history_lock_window_after(Buffer buffer, HeapTuple tuple)
+{
+	bool valid = cluster_current_mx_lock_follow_recheck(&window_scope, buffer, tuple,
+		&window_before, &receipt_result);
+
+	authorize_operation = window_scope.operation;
+	return valid;
+}
+void mx_history_lock_window_close(void)
+{
+	cluster_current_mx_lock_scope_end(&window_scope);
+	authorize_operation = window_scope.operation;
+}

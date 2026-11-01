@@ -96,4 +96,10 @@ extern TransactionId mx_history_full_owned_xmin(void);
 extern void mx_history_lock_failure(HeapTuple tuple, TM_Result result, bool handled,
 	TM_FailureData *failure, ClusterHeapSuccessorProof *next);
 extern void mx_history_lock_successor_fault(unsigned fault);
+extern int mx_history_lock_window_open(Relation rel, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, const ClusterCurrentMxRequestContext *requested, MxHeapReadout *out);
+extern void mx_history_lock_window_check(void);
+extern void mx_history_lock_window_before(Buffer buffer, HeapTuple tuple);
+extern bool mx_history_lock_window_after(Buffer buffer, HeapTuple tuple);
+extern void mx_history_lock_window_close(void);
 #endif
