@@ -84,7 +84,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+	UT_ASSERT(mode == LW_EXCLUSIVE || (lock == &control && mode == LW_SHARED));
 	if (lock == &control) {
 		UT_ASSERT(!control_held);
 		control_held = true;

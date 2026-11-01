@@ -11342,7 +11342,6 @@ test_cluster_slru_clog_managed_write: test_cluster_slru_clog_managed_write.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
-		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
 		$(top_srcdir)/src/common/cluster_clog_file.c \
 		$(top_srcdir)/src/common/cluster_clog_wal.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
