@@ -11509,7 +11509,8 @@ all: test_cluster_native_holder
 test_cluster_native_holder: test_cluster_native_holder.c test_cluster_native_first_fill \
 		test_cluster_native_first_fill_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
 		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_candidate.inc \
-		test_cluster_native_holder_bufmgr.inc test_cluster_native_holder_gcs.inc test_cluster_native_holder_itl.inc
+		test_cluster_native_holder_bufmgr.inc test_cluster_native_holder_gcs.inc test_cluster_native_holder_itl.inc \
+		test_cluster_native_holder_unlock.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
@@ -11538,7 +11539,13 @@ clean-native-holder:
 	rm -f test_cluster_native_holder test_cluster_native_holder_itl.inc \
 		test_cluster_native_holder_itl.inc.tmp test_cluster_native_holder_bufmgr.inc \
 		test_cluster_native_holder_bufmgr.inc.tmp test_cluster_native_holder_gcs.inc \
-		test_cluster_native_holder_gcs.inc.tmp
+		test_cluster_native_holder_gcs.inc.tmp test_cluster_native_holder_unlock.inc \
+		test_cluster_native_holder_unlock.inc.tmp
+
+test_cluster_native_holder_unlock.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
+	awk '/^LWLockRelease(WithoutSourceProgress)?\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ && emit { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_native_holder_itl.inc: $(top_srcdir)/src/backend/cluster/cluster_itl.c Makefile
 	awk '/^cluster_itl_page_has_active_slot\(/ { print "bool"; emit=1; n++ } \
@@ -11571,7 +11578,7 @@ test_cluster_native_holder_flush_guard.inc: $(top_srcdir)/src/backend/storage/bu
 	mv $@.tmp $@
 
 test_cluster_native_holder_content_release.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
-	awk '/^\tif \(lock->tranche == LWTRANCHE_BUFFER_CONTENT\)/ { print; getline; print; n++ } \
+	awk '/^\tif \(lock->tranche == LWTRANCHE_BUFFER_CONTENT && source_progress\)/ { print; getline; print; n++ } \
 	     END { if (n != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 

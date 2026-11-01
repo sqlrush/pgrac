@@ -1853,8 +1853,8 @@ LWLockUpdateVar(LWLock *lock, uint64 *valptr, uint64 val)
 /*
  * LWLockRelease - release a previously acquired lock
  */
-void
-LWLockRelease(LWLock *lock)
+static void
+LWLockReleaseInternal(LWLock *lock, bool source_progress pg_attribute_unused())
 {
 	LWLockMode mode;
 	uint32 oldstate;
@@ -1922,7 +1922,7 @@ LWLockRelease(LWLock *lock)
 #ifdef USE_PGRAC_CLUSTER
 	/* Publish only after the lock and its native waiter handoff are released.
 	 * The notifier is lock-free and is inert without a deferred source task. */
-	if (lock->tranche == LWTRANCHE_BUFFER_CONTENT)
+	if (lock->tranche == LWTRANCHE_BUFFER_CONTENT && source_progress)
 		cluster_pcm_lock_resource_x_source_drain_content_released();
 	cluster_content_trace_lock_changed(lock);
 #endif
@@ -1932,6 +1932,25 @@ LWLockRelease(LWLock *lock)
 	 */
 	RESUME_INTERRUPTS();
 }
+
+void
+LWLockRelease(LWLock *lock)
+{
+	LWLockReleaseInternal(lock, true);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* A source probe that only observes active ITL must not wake itself. Keep
+ * the ordinary waiter handoff, tracing and interrupt release unchanged.
+ * No page, native ownership or IO state may have changed under this lock.
+ * Author: SqlRush <sqlrush@gmail.com> */
+void
+LWLockReleaseWithoutSourceProgress(LWLock *lock)
+{
+	Assert(lock->tranche == LWTRANCHE_BUFFER_CONTENT);
+	LWLockReleaseInternal(lock, false);
+}
+#endif
 
 /*
  * LWLockReleaseClearVar - release a previously acquired lock, reset variable

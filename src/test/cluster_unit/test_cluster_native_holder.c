@@ -58,7 +58,7 @@ static void holder_repair_interrupt_hold(void)
 	UT_ASSERT(LWLockHeldByMe(BufferDescriptorGetContentLock(&request_buf)));
 	holder_interrupt_repairs++;
 }
-static void holder_lock_release(LWLock *lock)
+static void holder_lock_release_internal(LWLock *lock, bool source_progress pg_attribute_unused())
 {
 	if (holder_interrupt_repairs > holder_interrupt_releases) {
 		UT_ASSERT(lock == BufferDescriptorGetContentLock(&request_buf));
@@ -69,6 +69,13 @@ static void holder_lock_release(LWLock *lock)
 #include "test_cluster_native_holder_content_release.inc"
 #endif
 }
+#define LWLockReleaseInternal holder_lock_release_internal
+#define LWLockRelease holder_lock_release
+#define LWLockReleaseWithoutSourceProgress holder_lock_release_without_source_progress
+#include "test_cluster_native_holder_unlock.inc"
+#undef LWLockReleaseWithoutSourceProgress
+#undef LWLockRelease
+#undef LWLockReleaseInternal
 /* Storage write is outside this clean-source composition. Never forge it. */
 static bool holder_write_error;
 static void holder_unexpected_write(void) { UT_ASSERT(holder_write_error); pg_re_throw(); }
@@ -127,6 +134,7 @@ void XLogFlush(XLogRecPtr lsn) { (void)lsn; holder_unexpected_write(); }
 #define cluster_bufmgr_unpin_for_gcs holder_unpin
 #define LWLockConditionalAcquire holder_conditional
 #define LWLockRelease holder_lock_release
+#define LWLockReleaseWithoutSourceProgress holder_lock_release_without_source_progress
 #undef HOLD_INTERRUPTS
 #define HOLD_INTERRUPTS() holder_repair_interrupt_hold()
 #ifdef NATIVE_HOLDER_WRITEBACK
@@ -168,6 +176,7 @@ static ClusterPcmOwnResult holder_abort_s_revoke(BufferDesc *, const ClusterPcmO
 #define cluster_bufmgr_pcm_own_abort_s_revoke holder_abort_s_revoke
 #endif
 #include "test_cluster_native_holder_bufmgr.inc"
+#undef LWLockReleaseWithoutSourceProgress
 #ifdef NATIVE_HOLDER_X_REQUESTER_COMPOSITION
 #undef cluster_bufmgr_pcm_current_image_locked
 #undef cluster_bufmgr_pcm_own_begin_s_revoke
@@ -266,6 +275,7 @@ static void holder_native_start(PcmState mode)
 {
 	ClusterBufmgrFirstFill scratch;
 	ordinary_start(&scratch, 2);
+	BufferDescriptorGetContentLock(&request_buf)->tranche = LWTRANCHE_BUFFER_CONTENT;
 	ResourceOwnerForgetBufferIO(CurrentResourceOwner, 1);
 	memset(&request_own, 0, sizeof(request_own));
 	pg_atomic_init_u64(&request_own.generation, 901);

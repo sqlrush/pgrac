@@ -138,6 +138,66 @@ UT_TEST(output_release_before_BUSY_return_is_not_lost)
 	HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
 	HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED); writeback_idle();
 }
+
+/* An active ITL is an input to the probe, not progress made by the probe.
+ * Schedule an external content release on either side of BUSY completion;
+ * even an unrelated release permits just one new observation, not a loop. */
+static void writeback_itl_progress(bool release_before_complete)
+{
+	for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+		HolderFixture f; ResourceXSourceDrainWork next; PageHeader page;
+		WRITEBACK_START(&f, target);
+		page = (PageHeader)disk_shared.data;
+		page->pd_flags |= PD_HAS_ITL; page->pd_special = BLCKSZ - CLUSTER_ITL_ARRAY_SIZE;
+		page->pd_upper = page->pd_special;
+		memset(ClusterPageGetItlSlots(disk_shared.data), 0, CLUSTER_ITL_ARRAY_SIZE);
+		ClusterPageGetItlSlots(disk_shared.data)[0].flags = ITL_FLAG_ACTIVE;
+		for (int event = 0; event < 2; event++) {
+			HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_BAD_STATE);
+			UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+			UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 901);
+			UT_ASSERT_EQ(f.master.state->holder_status.valid, RESOURCE_X_ACQUIRE_S_SOURCE_FORWARD);
+			UT_ASSERT_EQ(f.master.state->holder_image.valid, 0);
+			if (release_before_complete) {
+				LWLockAcquire(BufferDescriptorGetContentLock(&request_buf), LW_EXCLUSIVE);
+				holder_lock_release(BufferDescriptorGetContentLock(&request_buf));
+			}
+			HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work,
+				RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+			if (!release_before_complete) {
+				UT_ASSERT(!holder_probe(&next));
+				LWLockAcquire(BufferDescriptorGetContentLock(&request_buf), LW_EXCLUSIVE);
+				holder_lock_release(BufferDescriptorGetContentLock(&request_buf));
+			}
+			WRITEBACK_PROBE(&next);
+			UT_ASSERT(memcmp(&next.request, &f.work.request, sizeof(next.request)) == 0);
+			UT_ASSERT_EQ(next.attempt_generation, f.work.attempt_generation + 2); f.work = next;
+		}
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_BAD_STATE);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work,
+			RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(!holder_probe(&next));
+		/* Controlled page-owner input; this is not an undo/commit proof. */
+		LWLockAcquire(BufferDescriptorGetContentLock(&request_buf), LW_EXCLUSIVE);
+		ClusterPageGetItlSlots(disk_shared.data)[0].flags = ITL_FLAG_FREE;
+		holder_lock_release(BufferDescriptorGetContentLock(&request_buf));
+		WRITEBACK_PROBE(&next); f.work = next;
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+		HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work,
+			RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(!holder_probe(&next)); UT_ASSERT_EQ(ordinary_sends, 0);
+		UT_ASSERT_EQ(holder_writes, 0); UT_ASSERT_EQ(disk_reads, 0); writeback_idle();
+	}
+}
+UT_TEST(active_ITL_probe_waits_for_later_external_progress)
+{
+	writeback_itl_progress(false);
+}
+UT_TEST(active_ITL_probe_preserves_external_progress_before_BUSY_completion)
+{
+	writeback_itl_progress(true);
+}
 UT_TEST(redirty_during_write_retains_same_source_and_requires_its_next_write)
 {
 	HolderFixture f; ResourceXSourceDrainWork next;
@@ -284,7 +344,7 @@ UT_TEST(dirty_activation_fence_refuses_before_output_IO_or_file_write)
 
 int main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(dirty_current_write_completes_before_original_holder_publication);
 	UT_RUN(permanent_current_flushes_WAL_before_DATA_without_changing_shared_checksum);
 	UT_RUN(existing_output_event_releases_same_parked_service_without_new_request);
@@ -295,6 +355,8 @@ int main(void)
 	UT_RUN(changed_WAL_source_refuses_without_writing_or_publishing_image);
 	UT_RUN(retained_PI_is_never_an_output_writer_even_if_marked_dirty);
 	UT_RUN(dirty_activation_fence_refuses_before_output_IO_or_file_write);
+	UT_RUN(active_ITL_probe_waits_for_later_external_progress);
+	UT_RUN(active_ITL_probe_preserves_external_progress_before_BUSY_completion);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

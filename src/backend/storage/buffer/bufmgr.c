@@ -24956,7 +24956,13 @@ cluster_bufmgr_pcm_own_prepare_x_source_image_internal(BufferDesc *buf,
 					result = cluster_bufmgr_pcm_own_capture_x_source_locked(buf, &prepared, out_revoking,
 						block_data, out_wal, &content_locked, &io_started);
 				}
-			} else result = CLUSTER_PCM_OWN_BUSY;
+			} else {
+				/* This observation changed nothing. Its own unlock is not
+				 * the external writer/ITL event that can resume this service. */
+				result = CLUSTER_PCM_OWN_BUSY;
+				LWLockReleaseWithoutSourceProgress(content_lock);
+				content_locked = false;
+			}
 		} else result = CLUSTER_PCM_OWN_BUSY;
 		if (content_locked) { LWLockRelease(content_lock); content_locked = false; }
 		if (result == CLUSTER_PCM_OWN_OK && out_wal->record_start != InvalidXLogRecPtr
