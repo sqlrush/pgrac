@@ -6967,6 +6967,7 @@ test_cluster_subtrans_order: test_cluster_subtrans_order.c unit_test.h test_clus
 # PGRAC: actual native startup/trim, explicit memory SLRU boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_clog_startup: test_cluster_clog_startup.c unit_test.h \
+		cluster_unit_no_native_files.h \
 		$(top_srcdir)/src/backend/access/transam/clog.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
@@ -11015,6 +11016,128 @@ clean-undo-native-tt-probe:
 	rm -f test_cluster_undo_native_tt_probe test_cluster_undo_native_tt_probe.d
 clean: clean-undo-native-tt-probe
 .PHONY: clean-undo-native-tt-probe
+
+test_cluster_clog_native_transam: test_cluster_clog_native_transam.c \
+		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/transam.c \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		cluster_catalog_trace_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_catalog_trace_test.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_clog_native_transam
+all: test_cluster_clog_native_transam
+clean-clog-native-transam:
+	rm -f test_cluster_clog_native_transam test_cluster_clog_native_transam.d
+clean: clean-clog-native-transam
+.PHONY: clean-clog-native-transam
+
+test_cluster_clog_native_status: test_cluster_clog_native_status.c \
+		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		cluster_catalog_trace_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_catalog_trace_test.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_clog_native_status
+all: test_cluster_clog_native_status
+clean-clog-native-status:
+	rm -f test_cluster_clog_native_status test_cluster_clog_native_status.d
+clean: clean-clog-native-status
+.PHONY: clean-clog-native-status
+
+test_cluster_undo_native_data_io: test_cluster_undo_native_data_io.c \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_data_io
+all: test_cluster_undo_native_data_io
+clean-undo-native-data-io:
+	rm -f test_cluster_undo_native_data_io test_cluster_undo_native_data_io.d
+clean: clean-undo-native-data-io
+.PHONY: clean-undo-native-data-io
+
+test_cluster_undo_native_tt_recovery_read: test_cluster_undo_native_tt_recovery_read.c \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_recovery_read
+all: test_cluster_undo_native_tt_recovery_read
+clean-undo-native-tt-recovery-read:
+	rm -f test_cluster_undo_native_tt_recovery_read test_cluster_undo_native_tt_recovery_read.d
+clean: clean-undo-native-tt-recovery-read
+.PHONY: clean-undo-native-tt-recovery-read
+
+test_cluster_undo_native_tt_recovery_size: test_cluster_undo_native_tt_recovery_size.c \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_recovery_size
+all: test_cluster_undo_native_tt_recovery_size
+clean-undo-native-tt-recovery-size:
+	rm -f test_cluster_undo_native_tt_recovery_size test_cluster_undo_native_tt_recovery_size.d
+clean: clean-undo-native-tt-recovery-size
+.PHONY: clean-undo-native-tt-recovery-size
 
 # The physical TT writer shares the original file providers and read fixture;
 # only the finite selected table and ERROR schedule are controlled there.
@@ -16990,3 +17113,95 @@ test_cluster_relmap_create_copy: $(top_srcdir)/src/include/common/cluster_relmap
         $(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
         $(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
         $(top_srcdir)/src/include/storage/fd.h
+
+# Recovery authorization shares the original real ROOT/registry creator target.
+test_cluster_control_relmap_creation: test_cluster_control_relmap_recovery.inc $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h
+
+test_cluster_cold_recovery_startup: test_cluster_cold_relmap_create_record.inc $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+
+cluster_registry_common_test.o test_cluster_recovery_registry test_cluster_recovery_reservations: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h $(top_srcdir)/src/include/common/cluster_recovery_registry.h
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h
+
+# Original Main dispatch and complete cohort registration; family leaves controlled.
+TESTS += test_cluster_initdb_main
+all: test_cluster_initdb_main
+test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc: test_cluster_initdb_main.stamp
+	@test -f $@
+test_cluster_initdb_main.stamp: $(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c $(srcdir)/extract_cluster_initdb_main.py
+	python3 $(srcdir)/extract_cluster_initdb_main.py $< test_cluster_initdb_main
+	touch $@
+test_cluster_initdb_main: test_cluster_initdb_main.c test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc unit_test.h \
+ $(top_srcdir)/src/include/common/pgrac_initdb_recovery.h $(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+ $(top_srcdir)/src/common/cluster_recovery_file_identity.c $(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+ $(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+ $(top_srcdir)/src/backend/cluster/cluster_initdb_common_private.h $(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
+ $(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
+ $(top_srcdir)/src/include/common/cluster_recovery_registry.h cluster_registry_common_test.o \
+ $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -I$(top_srcdir)/src/backend/cluster -I$(top_srcdir)/src/bin/initdb -ffunction-sections -fdata-sections $< \
+ $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+ cluster_registry_common_test.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+ $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-main
+.PHONY: clean-initdb-main
+clean-initdb-main:
+	rm -f test_cluster_initdb_main test_cluster_initdb_main.d test_cluster_initdb_main.stamp test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc
+
+# Original Startup CLOG PAGE_IMAGE rmgr to selected SLRU full-frame replay.
+TESTS += test_cluster_clog_native_redo
+all: test_cluster_clog_native_redo
+test_cluster_clog_native_redo: test_cluster_clog_native_redo.c unit_test.h \
+		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_replay.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+.PHONY: clean-clog-native-redo
+clean: clean-clog-native-redo
+clean-clog-native-redo:
+	rm -f test_cluster_clog_native_redo test_cluster_clog_native_redo.d
+
+# Original native startup FullXid cut and full-frame writeback.
+test_cluster_clog_native_trim.inc: $(top_srcdir)/src/backend/access/transam/clog.c Makefile
+	awk '/^#define (CLOG_(BITS_PER_XACT|XACTS_PER_BYTE|XACTS_PER_PAGE)|TransactionIdTo(Page|PgIndex|Byte|BIndex))[ \t(]/ { print; constants++ } \
+	     /^CLOGNativeIORequired\(/ { print "static bool"; emit=1; found++ } \
+	     /^CLOGTrimNative\(/ { print "static void"; emit=1; found++ } \
+	     /^TrimCLOG\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || constants != 7) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+TESTS += test_cluster_clog_native_trim
+all: test_cluster_clog_native_trim
+test_cluster_clog_native_trim: test_cluster_clog_native_trim.c \
+		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
+		test_cluster_clog_native_trim.inc unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog.h $(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/cluster/cluster_native_startup.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-native-trim
+.PHONY: clean-clog-native-trim
+clean-clog-native-trim:
+	rm -f test_cluster_clog_native_trim test_cluster_clog_native_trim.d \
+		test_cluster_clog_native_trim.inc test_cluster_clog_native_trim.inc.tmp

@@ -616,6 +616,37 @@ TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 	LWLockRelease(XactSLRULock);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Check before any bit or group LSN on the page changes. */
+static void
+CLOGCheckNativeStatus(TransactionId xid, XidStatus status, int slotno)
+{
+	XidStatus	current;
+
+	if (!TransactionIdIsNormal(xid) ||
+		(status != TRANSACTION_STATUS_COMMITTED &&
+		 status != TRANSACTION_STATUS_ABORTED &&
+		 status != TRANSACTION_STATUS_SUB_COMMITTED) ||
+		!LWLockHeldByMeInMode(XactSLRULock, LW_EXCLUSIVE) ||
+		slotno < 0 || slotno >= XactCtl->shared->num_slots ||
+		XactCtl->shared->page_number[slotno] != TransactionIdToPage(xid))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid managed CLOG status update for transaction %u", xid)));
+
+	current = (XactCtl->shared->page_buffer[slotno][TransactionIdToByte(xid)] >>
+			   (TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT)) & CLOG_XACT_BITMASK;
+	if (current != TRANSACTION_STATUS_IN_PROGRESS &&
+		current != TRANSACTION_STATUS_SUB_COMMITTED && current != status &&
+		!(InRecovery && status == TRANSACTION_STATUS_SUB_COMMITTED &&
+		  current == TRANSACTION_STATUS_COMMITTED))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("conflicting managed CLOG status for transaction %u: %u to %u",
+						xid, (unsigned) current, (unsigned) status)));
+}
+#endif
+
 /*
  * Record the final state of transaction entry in the commit log
  *
@@ -628,6 +659,33 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 {
 	int			slotno;
 	int			i;
+#ifdef USE_PGRAC_CLUSTER
+	bool		native = CLOGNativeIORequired();
+
+	/* Reject malformed page requests before reading or evicting a slot. */
+	if (native)
+	{
+		if ((status != TRANSACTION_STATUS_COMMITTED &&
+			 status != TRANSACTION_STATUS_ABORTED &&
+			 !(status == TRANSACTION_STATUS_SUB_COMMITTED &&
+			   !TransactionIdIsValid(xid))) ||
+			!LWLockHeldByMeInMode(XactSLRULock, LW_EXCLUSIVE) ||
+			pageno < 0 || pageno >= 131072 ||
+			nsubxids < 0 || nsubxids > CLOG_XACTS_PER_PAGE ||
+			(nsubxids > 0 && subxids == NULL) ||
+			(TransactionIdIsValid(xid) &&
+			 (!TransactionIdIsNormal(xid) || TransactionIdToPage(xid) != pageno)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid managed CLOG page status request")));
+		for (i = 0; i < nsubxids; i++)
+			if (!TransactionIdIsNormal(subxids[i]) ||
+				TransactionIdToPage(subxids[i]) != pageno)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid managed CLOG subtransaction page")));
+	}
+#endif
 
 	Assert(status == TRANSACTION_STATUS_COMMITTED ||
 		   status == TRANSACTION_STATUS_ABORTED ||
@@ -644,6 +702,20 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 	 * we think.
 	 */
 	slotno = SimpleLruReadPage(XactCtl, pageno, XLogRecPtrIsInvalid(lsn), xid);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (native)
+	{
+		if (TransactionIdIsValid(xid))
+			CLOGCheckNativeStatus(xid, status, slotno);
+		for (i = 0; i < nsubxids; i++)
+		{
+			if (TransactionIdIsValid(xid) && status == TRANSACTION_STATUS_COMMITTED)
+				CLOGCheckNativeStatus(subxids[i], TRANSACTION_STATUS_SUB_COMMITTED, slotno);
+			CLOGCheckNativeStatus(subxids[i], status, slotno);
+		}
+	}
+#endif
 
 	/*
 	 * Set the main transaction id, if any.
@@ -912,6 +984,11 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 	char	   *byteptr;
 	char		byteval;
 	char		curval;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired())
+		CLOGCheckNativeStatus(xid, status, slotno);
+#endif
 
 	byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
 	curval = (*byteptr >> bshift) & CLOG_XACT_BITMASK;
@@ -3294,6 +3371,90 @@ StartupCLOG(void)
 	LWLockRelease(XactSLRULock);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* The original Startup owner supplies nextXid before connections can allocate.
+ * A raw page match is insufficient: consume the selected native page and its
+ * actual issuer birth in the same FullXid interval. No epoch is manufactured
+ * for the page, and a shared startup still cannot erase retained status. */
+static void
+CLOGTrimNative(FullTransactionId next)
+{
+	TransactionId xid = XidFromFullTransactionId(next);
+	int pageno = TransactionIdToPage(xid);
+	volatile bool body_complete = false;
+
+	if (!(MyBackendType == B_STARTUP
+		  || (!cluster_shared_config && !IsUnderPostmaster && !IsPostmasterEnvironment
+			  && MyBackendType == B_STANDALONE_BACKEND && IsInitProcessingMode()))
+		|| InRecovery || !enableFsync
+		|| !TransactionIdIsNormal(xid) || U64FromFullTransactionId(next) == PG_UINT64_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native CLOG trim requires the original completed startup cut")));
+	if (TransactionIdToPgIndex(xid) == 0)
+		return; /* The next page need not have been born yet. */
+
+	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		int slotno = SimpleLruReadPage(XactCtl, pageno, false, xid);
+		ClusterClogPageIdentityV2 *page;
+		TransactionId birth;
+
+		/* The managed reader keeps this SAME family lock at return. It has
+		 * checked the original file reference and full frame, including a
+		 * resident hit; the control owner must drain that lock before reuse. */
+		if (!CLOGNativeIORequired() || !FullTransactionIdEquals(next, ShmemVariableCache->nextXid)
+			|| slotno < 0 || slotno >= XactCtl->shared->num_slots
+			|| XactCtl->shared->clog_page_identity == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("native CLOG startup cut changed before trim")));
+		page = &XactCtl->shared->clog_page_identity[slotno];
+		birth = XidFromFullTransactionId(page->identity.birth_full_xid);
+		if (!page->identity.birth_observed || page->identity.logical_page != (uint64)pageno
+			|| !TransactionIdIsNormal(birth)
+			|| (birth % CLOG_XACTS_PER_PAGE != 0 && birth != FirstNormalTransactionId)
+			|| TransactionIdToPage(birth) != pageno
+			|| EpochFromFullTransactionId(page->identity.birth_full_xid) != EpochFromFullTransactionId(next)
+			|| FullTransactionIdFollows(page->identity.birth_full_xid, next))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("native CLOG page birth does not match the startup FullXid cut")));
+		if (cluster_shared_config) {
+			if (!cluster_native_clog_suffix_unused(XactCtl->shared->page_buffer[slotno], xid))
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("shared CLOG startup has transaction status beyond nextXid")));
+		} else {
+			int byteno = TransactionIdToByte(xid);
+			int bshift = TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT;
+			char *byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
+
+			/* Preserve the original prefix, birth and source/group LSNs. The
+			 * original dirty-page writer emits and flushes the full native WAL
+			 * image before physical writeback; no raw ZERO record is emitted. */
+			*byteptr &= (1 << bshift) - 1;
+			MemSet(byteptr + 1, 0, BLCKSZ - byteno - 1);
+			XactCtl->shared->page_dirty[slotno] = true;
+		}
+		body_complete = true;
+	}
+	PG_FINALLY();
+	{
+		/* ERROR reset the holdoff while this original family lock stayed
+		 * held. Discard any subsequent open-catch reacquire count before
+		 * compensating this release; caller abort cleanup owns older locks. */
+		if (!body_complete) {
+			InterruptHoldoffCount = 0;
+			HOLD_INTERRUPTS();
+		}
+		LWLockRelease(XactSLRULock);
+	}
+	PG_END_TRY();
+}
+#endif
+
 /*
  * This must be called ONCE at the end of startup/recovery.
  */
@@ -3304,6 +3465,10 @@ TrimCLOG(void)
 	int			pageno = TransactionIdToPage(xid);
 
 #ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired()) {
+		CLOGTrimNative(ShmemVariableCache->nextXid);
+		return;
+	}
 	/* A completed qualified input, not a guessed crash horizon, owns this
 	 * read-only startup cut. InRecovery would permit a missing SLRU page to
 	 * be fabricated as zero, so it must already have ended. */
@@ -3703,7 +3868,19 @@ clog_redo(XLogReaderState *record)
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
 #ifdef USE_PGRAC_CLUSTER
-	CLOGRequireLegacyLifecycle();
+	if (CLOGNativeIORequired())
+	{
+		/* This original rmgr call owns Startup's retained source/cut. WAL
+		 * supplies neither a selected file registration nor foreign authority. */
+		if (info != CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2 ||
+			XLogRecHasAnyBlockRefs(record) ||
+			record->ReadRecPtr == InvalidXLogRecPtr ||
+			record->EndRecPtr == PG_UINT64_MAX || record->EndRecPtr <= record->ReadRecPtr)
+			CLOGRequireLegacyLifecycle();
+		SimpleLruNativeClogReplayV2(XactCtl, XLogRecGetData(record),
+								  XLogRecGetDataLen(record), record->EndRecPtr);
+		return;
+	}
 #endif
 	/* Backup blocks are not used in clog records */
 	Assert(info == CLOG_ZEROPAGE_FULL || info == CLOG_TRUNCATE_FULL

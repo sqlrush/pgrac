@@ -179,11 +179,11 @@ UT_TEST(native_tt_write_arguments_data_and_legacy_are_separate)
 	fd = open(path, O_WRONLY); UT_ASSERT(fd >= 0);
 	UT_ASSERT_EQ(ftruncate(fd, 2 * BLCKSZ), 0); UT_ASSERT_EQ(close(fd), 0);
 	selected_missing = true;
-	UT_ASSERT(cluster_undo_smgr_write_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 1, next.data, false));
-	UT_ASSERT_EQ(selected_acquires, 0); assert_disk(path, &page);
+	UT_ASSERT(!cluster_undo_smgr_write_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 1, next.data, false));
+	UT_ASSERT_EQ(selected_acquires, 1); assert_disk(path, &page);
 	selected_mode = CLUSTER_NATIVE_FILES_UNKNOWN_V2; cluster_enabled = false;
 	UT_ASSERT(cluster_undo_smgr_write_block(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, 0, next.data, false));
-	UT_ASSERT_EQ(selected_acquires, 0); assert_disk(path, &next); finish_selected(path);
+	UT_ASSERT_EQ(selected_acquires, 1); assert_disk(path, &next); finish_selected(path);
 }
 
 #ifndef UNDO_NATIVE_TT_WRITE_MAIN

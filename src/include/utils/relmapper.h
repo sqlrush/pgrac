@@ -15,6 +15,7 @@
 #define RELMAPPER_H
 
 #include "access/xlogreader.h"
+#include "cluster/cluster_relmap_create_format.h"
 #include "lib/stringinfo.h"
 
 /* ----------------
@@ -23,6 +24,7 @@
  */
 
 #define XLOG_RELMAP_UPDATE		0x00
+#define XLOG_RELMAP_CREATE_V1	CLUSTER_RELMAP_CREATE_WAL_INFO_V1
 
 typedef struct xl_relmap_update
 {

@@ -3215,10 +3215,15 @@ initialize_data_directory(void)
 			pg_fatal("could not create undo seed segment \"%s\": %m",
 					 seed_path);
 
-		if (pgrac_native_recovery_requested && pgrac_native_recovery.boot_file_count != 0) {
+		/* Cohort-local seed is unpublished material, never a registered TT file. */
+		if (pgrac_native_recovery_requested && pgrac_native_recovery.boot_file_count != 0 &&
+			!(pgrac_native_recovery.cohort[0] || pgrac_native_recovery.cohort[1]))
+		{
 			if (!pgrac_native_create_boot_undo(fd))
 				pg_fatal("INITDB_BOOT_UNDO: complete original seed refused");
-		} else {
+		}
+		else
+		{
 			cluster_undo_segment_make_header_bytes(0, /* segment_id */
 												   1, /* owner_instance */
 												   page.data);
@@ -3607,8 +3612,9 @@ pgrac_native_validate_options(void)
 	if (getenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != NULL
 		|| getenv(PGRAC_INITDB_COHORT_ENV) != NULL)
 		pg_fatal("INITDB_WAL_CONTEXT: initdb cannot inherit a child context");
-	if (getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL
-		&& (pgrac_native_cohort || pgrac_native_thread != 1 || pgrac_native_base_path == NULL))
+	if (getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL &&
+		(pgrac_native_cohort || pgrac_native_thread < 1 || pgrac_native_thread > 128 ||
+		 pgrac_native_base_path == NULL))
 		pg_fatal("INITDB_RECOVERY_CONTEXT: only the original founder may receive registration");
 	if (pgrac_native_cohort)
 	{
@@ -3630,10 +3636,11 @@ pgrac_native_validate_options(void)
 		|| pgrac_native_database_incarnation != 0)
 	{
 		uint8 any = 0;
-		if (pgrac_native_base_path == NULL || pgrac_native_storage_uuid == NULL
-			|| pgrac_native_database_incarnation == 0 || pgrac_native_thread != 1
-			|| strlen(pgrac_native_storage_uuid) != 32
-			|| strspn(pgrac_native_storage_uuid, "0123456789abcdef") != 32)
+		if (pgrac_native_base_path == NULL || pgrac_native_storage_uuid == NULL ||
+			pgrac_native_database_incarnation == 0 ||
+			(pgrac_native_thread != 1 && getenv(PGRAC_INITDB_RECOVERY_ENV) == NULL) ||
+			strlen(pgrac_native_storage_uuid) != 32 ||
+			strspn(pgrac_native_storage_uuid, "0123456789abcdef") != 32)
 			pg_fatal("INITDB_BASE_OPTIONS: founder thread 1, new target and complete namespace required");
 		for (int i = 0; i < 16; ++i)
 		{
@@ -3899,7 +3906,8 @@ pgrac_native_bind_creation(void)
 	{
 		if (mkdir(pgrac_native_base_path, pg_dir_create_mode) != 0 && errno != EEXIST)
 			pg_fatal("INITDB_BASE_PATH: cannot create original shared base: %m");
-		if (pg_check_dir(pgrac_native_base_path) != 1)
+		if (pg_check_dir(pgrac_native_base_path) != 1 &&
+			!(pgrac_native_thread != 1 && getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL))
 			pg_fatal("INITDB_BASE_PATH: new shared base is no longer empty");
 		pgrac_native_base_fd = open(pgrac_native_base_path,
 			O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -3914,17 +3922,24 @@ pgrac_native_bind_creation(void)
 			long descriptor;
 			errno = 0;
 			descriptor = strtol(value, &end, 10);
-			if (*value == '\0' || strspn(value, "0123456789") != strlen(value)
-				|| errno != 0 || *end != '\0' || descriptor < 3 || descriptor > INT_MAX
-				|| !pgrac_initdb_recovery_read_v2(descriptor, &pgrac_native_config,
-					pgrac_native_sysid, pgrac_native_database_incarnation,
-					pgrac_native_storage_bytes, pgrac_native_data_fd, pgrac_native_base_fd,
-					&pgrac_native_recovery)
-				|| !pgrac_initdb_recovery_relmaps_v2(&pgrac_native_recovery,
-												   pgrac_native_relmap_identities)
-				|| unsetenv(PGRAC_INITDB_RECOVERY_ENV) != 0)
+			if (*value == '\0' || strspn(value, "0123456789") != strlen(value) || errno != 0 ||
+				*end != '\0' || descriptor < 3 || descriptor > INT_MAX ||
+				!pgrac_initdb_recovery_read_v2(descriptor, &pgrac_native_config, pgrac_native_sysid,
+											   pgrac_native_database_incarnation,
+											   pgrac_native_storage_bytes, pgrac_native_data_fd,
+											   pgrac_native_base_fd, &pgrac_native_recovery) ||
+				((pgrac_native_recovery.cohort[0] || pgrac_native_recovery.cohort[1])
+					 ? pgrac_native_recovery.cohort_origin != (uint64)(pgrac_native_thread - 1)
+					 : pgrac_native_thread != 1) ||
+				!pgrac_initdb_recovery_relmaps_v2(&pgrac_native_recovery,
+												  pgrac_native_relmap_identities) ||
+				unsetenv(PGRAC_INITDB_RECOVERY_ENV) != 0)
 				pg_fatal("INITDB_RECOVERY_CONTEXT: original precreation registration refused");
 			pgrac_native_recovery_requested = true;
+			/* Managed BOOT must sync/read back before registry/ROOT publication.
+			 * The ordinary initdb -F shortcut cannot qualify these files. */
+			boot_options = "-c fsync=on -c log_checkpoints=false";
+			backend_options = "--single -O -j -c fsync=on -c search_path=pg_catalog -c exit_on_error=true -c log_checkpoints=false";
 			pgrac_native_config_check(false);
 		}
 	}
@@ -4100,7 +4115,7 @@ pgrac_native_sync(void)
 	if (memcmp(control, after, sizeof(*control)) != 0)
 		pg_fatal("INITDB_WAL_READBACK: native control changed during WAL readback");
 	free(after);
-	if (pgrac_native_base_fd >= 0)
+	if (pgrac_native_base_fd >= 0 && pgrac_native_thread == 1)
 	{
 		if (control->track_commit_timestamp
 			|| !pgrac_initdb_side_create(pgrac_native_data_fd, pgrac_native_base_fd))

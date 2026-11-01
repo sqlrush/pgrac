@@ -12,6 +12,10 @@ typedef struct ClusterRecoveryRegistryV2
 	uint8 redo_branch_uuid[16];
 	uint64 redo_branch_generation;
 	ClusterRecoveryCheckpointCoverageV2 coverage;
+	/* Local codec selection only: 0 chooses from the caller's batch fields;
+	 * decoded/explicit 2 or 4 retains that exact containing wire family.
+	 * No identity, custody or coverage authority comes from this field. */
+	uint32 coverage_format_version;
 } ClusterRecoveryRegistryV2;
 
 /* Exact full vectors in original order, not self-authenticating file metadata.

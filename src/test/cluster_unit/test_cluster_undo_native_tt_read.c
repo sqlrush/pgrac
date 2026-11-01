@@ -46,6 +46,12 @@ bool cluster_undo_block0_note_unsynced_header(uint32 segment, uint8 owner,
 
 ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void)
 { return selected_mode; }
+#ifndef UNDO_NATIVE_TT_TABLE_GENERATION
+#define UNDO_NATIVE_TT_TABLE_GENERATION 41
+#endif
+#ifndef UNDO_NATIVE_TT_STARTUP_GENERATION
+#define UNDO_NATIVE_TT_STARTUP_GENERATION 1
+#endif
 bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 	ClusterControlNativeFileBorrowV2 *borrow)
 {
@@ -55,7 +61,8 @@ bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 	selected_acquires++;
 	if (selected_missing) return false;
 	borrow->expected = selected;
-	borrow->table_generation = 41; borrow->startup_generation = 1;
+	borrow->table_generation = UNDO_NATIVE_TT_TABLE_GENERATION;
+	borrow->startup_generation = UNDO_NATIVE_TT_STARTUP_GENERATION;
 	borrow->private_self = (uintptr_t) borrow; borrow->private_pid = 4321;
 	if (selected_borrows >= lengthof(selected_handles)) abort();
 	selected_handles[selected_borrows] = borrow;

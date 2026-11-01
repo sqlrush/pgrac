@@ -388,6 +388,8 @@ typedef struct ModelFile {
 
 static ModelFile model_files[MODEL_SEGMENTS];
 static bool model_fsync_fails = false;
+static int model_fsync_error_segment = 0;
+static bool model_fsync_error_after_write = false;
 
 static ModelFile *
 model_file(int fd)
@@ -420,6 +422,8 @@ model_reset(void)
 	for (int i = 1; i < MODEL_SEGMENTS; i++)
 		model_segment_setup(i, 1);
 	model_fsync_fails = false;
+	model_fsync_error_segment = 0;
+	model_fsync_error_after_write = false;
 }
 
 /* A crash discards every page that was not fsynced. */
@@ -445,12 +449,16 @@ pg_fsync(int fd)
 {
 	ModelFile *file = model_file(fd);
 
+	if (fd - MODEL_FD_BASE == model_fsync_error_segment && !model_fsync_error_after_write)
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("injected header sync ERROR")));
 	if (model_fsync_fails) {
 		errno = EIO;
 		return -1;
 	}
 	memcpy(file->durable, file->cache, BLCKSZ);
 	file->fsyncs++;
+	if (fd - MODEL_FD_BASE == model_fsync_error_segment)
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("injected late header sync ERROR")));
 	return 0;
 }
 static ssize_t
@@ -817,10 +825,62 @@ UT_TEST(test_present_header_after_restart_is_made_durable)
 	recovery_scope_active = false;
 }
 
+/* A direct ERROR does not pass through the fsync false-return branch. */
+UT_TEST(test_checkpoint_sync_error_restores_taken_header_debt)
+{
+	char stamp[32];
+
+	for (int late = 0; late < 2; late++) {
+		fresh_instance();
+		stamp_bytes(stamp, 0x81 + late);
+		UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 3, 1,
+													   STAMP_OFFSET, stamp, sizeof(stamp)));
+		model_fsync_error_segment = 3;
+		model_fsync_error_after_write = late != 0;
+		UT_ASSERT(checkpoint_raises());
+		UT_ASSERT_EQ(error_reports, 1);
+		UT_ASSERT_EQ(model_files[3].fsyncs, late);
+		model_fsync_error_segment = 0;
+		cluster_undo_buf_flush_all(true);
+		UT_ASSERT_EQ(model_files[3].fsyncs, late + 1);
+		model_crash();
+		UT_ASSERT_EQ(memcmp(model_files[3].durable + STAMP_OFFSET, stamp, sizeof(stamp)), 0);
+		cluster_undo_buf_flush_all(true);
+		UT_ASSERT_EQ(model_files[3].fsyncs, late + 1);
+	}
+}
+
+/* Prior successful slots retire; the failed slot and later slots stay pending. */
+UT_TEST(test_checkpoint_error_preserves_remaining_owned_and_materialized_debt)
+{
+	char stamp[32];
+
+	fresh_instance();
+	stamp_bytes(stamp, 0x92);
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, 259, 2,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, 261, 2,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	model_fsync_error_segment = 3;
+	UT_ASSERT(checkpoint_raises());
+	UT_ASSERT_EQ(error_reports, 1);
+	UT_ASSERT_EQ(model_files[1].fsyncs, 1);
+	UT_ASSERT_EQ(model_files[3].fsyncs, 0);
+	UT_ASSERT_EQ(model_files[5].fsyncs, 0);
+	model_fsync_error_segment = 0;
+	cluster_undo_buf_flush_all(true);
+	for (int segment = 1; segment <= 5; segment += 2) {
+		UT_ASSERT_EQ(model_files[segment].fsyncs, 1);
+		UT_ASSERT_EQ(memcmp(model_files[segment].durable + STAMP_OFFSET, stamp, sizeof(stamp)), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(test_checkpoint_makes_prior_header_writes_durable);
 	UT_RUN(test_write_after_checkpoint_is_left_to_the_next_checkpoint);
 	UT_RUN(test_checkpoint_fsyncs_each_written_segment_once);
@@ -832,6 +892,8 @@ main(void)
 	UT_RUN(test_owned_and_materialized_header_writes_stay_deferred);
 	UT_RUN(test_runtime_header_write_of_another_owner_is_not_deferred);
 	UT_RUN(test_present_header_after_restart_is_made_durable);
+	UT_RUN(test_checkpoint_sync_error_restores_taken_header_debt);
+	UT_RUN(test_checkpoint_error_preserves_remaining_owned_and_materialized_debt);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

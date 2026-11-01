@@ -16,6 +16,8 @@
 #include "postgres_fe.h"
 #endif
 #include "common/cluster_relmap_file.h"
+#include "common/cluster_relmap_create.h"
+#include "catalog/pg_tablespace_d.h"
 
 /* RFM2 uses the shared RFI2 identity prefix and its assigned byte order. */
 static void
@@ -114,5 +116,124 @@ cluster_relmap_file_decode_v2(const void *input, size_t length,
 		!= CLUSTER_RELMAP_V2_VALID)
 		return false;
 	*output = image;
+	return true;
+}
+
+/* Independent CREATE WAL never borrows an UPDATE/pending owner. */
+#define CREATE_OFFSET(name) CLUSTER_RELMAP_CREATE_##name##_OFFSET_V1
+
+static bool
+create_nonzero_batch(const uint8 batch[16])
+{
+	for (unsigned i = 0; i < 16; ++i)
+		if (batch[i] != 0)
+			return true;
+	return false;
+}
+
+static bool
+create_target(const ClusterRecoveryFileIdentityV2 *id)
+{
+	return id != NULL && id->kind == CLUSTER_RECOVERY_FILE_RELMAP_V2
+		&& OidIsValid(id->database_oid) && OidIsValid(id->tablespace_oid)
+		&& id->tablespace_oid != GLOBALTABLESPACE_OID && id->object_id == 0;
+}
+
+bool
+cluster_relmap_create_encode_v1(const ClusterRecoveryFileIdentityV2 *id,
+	const uint8 batch[16], const RelMapFile *map, void *out, Size length)
+{
+	unsigned char bytes[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1] = {0};
+	ClusterRelmapV2Image image = {0};
+	if (id == NULL || batch == NULL || map == NULL || out == NULL
+		|| length != sizeof(bytes)
+		|| file_overlap(out, length, id, sizeof(*id))
+		|| file_overlap(out, length, batch, 16)
+		|| file_overlap(out, length, map, sizeof(*map))
+		|| !create_target(id) || !create_nonzero_batch(batch))
+		return false;
+	image.identity = (ClusterRelmapV2Namespace){id->system_identifier,
+		id->database_incarnation, id->database_oid, false};
+	image.committed_generation = 1;
+	image.committed = *map;
+	if (!cluster_relmap_file_encode_v2(id, &image, bytes + CREATE_OFFSET(IMAGE), CLUSTER_RELMAP_FILE_SIZE_V2))
+		return false;
+	file_put32(bytes + CREATE_OFFSET(FORMAT_ID), CLUSTER_RELMAP_CREATE_FORMAT_ID_V1);
+	file_put32(bytes + CREATE_OFFSET(FORMAT_VERSION), CLUSTER_RELMAP_CREATE_FORMAT_VERSION_V1);
+	file_put32(bytes + CREATE_OFFSET(STATE), CLUSTER_RELMAP_CREATE_RECORD_STATE_V1);
+	file_put32(bytes + CREATE_OFFSET(RECORD_BYTES), sizeof(bytes));
+	file_put32(bytes + CREATE_OFFSET(HEADER_BYTES), CLUSTER_RELMAP_CREATE_HEADER_BYTES_V1);
+	file_put32(bytes + CREATE_OFFSET(IMAGE_BYTES), CLUSTER_RELMAP_FILE_SIZE_V2);
+	memcpy(bytes + CREATE_OFFSET(BATCH_UUID), batch, CLUSTER_RELMAP_CREATE_BATCH_UUID_BYTES_V1);
+	file_put32(bytes + CREATE_OFFSET(IMAGE_CRC32C),
+		file_crc(bytes + CREATE_OFFSET(IMAGE), CLUSTER_RELMAP_FILE_SIZE_V2, NULL, 0));
+	file_put32(bytes + CREATE_OFFSET(HEADER_CRC32C),
+		file_crc(bytes, CREATE_OFFSET(HEADER_CRC32C), NULL, 0));
+	memcpy(out, bytes, sizeof(bytes));
+	return true;
+}
+
+bool
+cluster_relmap_create_decode_v1(const void *input, Size length, ClusterRelmapCreateWalV1 *out)
+{
+	const unsigned char *bytes = input;
+	unsigned char reference[CLUSTER_RECOVERY_IDENTITY_REFERENCE_V2_BYTES];
+	ClusterRelmapCreateWalV1 record = {0};
+	ClusterRelmapV2Image image;
+	if (input == NULL || out == NULL || length != CLUSTER_RELMAP_CREATE_WAL_SIZE_V1
+		|| file_overlap(out, sizeof(*out), input, length))
+		return false;
+	if (!cluster_relmap_create_format_registered_v1(file_get32(bytes + CREATE_OFFSET(FORMAT_ID)),
+			file_get32(bytes + CREATE_OFFSET(FORMAT_VERSION)), file_get32(bytes + CREATE_OFFSET(STATE)), CATALOG_VERSION_NO)
+		|| file_get32(bytes + CREATE_OFFSET(RECORD_BYTES)) != length
+		|| file_get32(bytes + CREATE_OFFSET(HEADER_BYTES)) != CLUSTER_RELMAP_CREATE_HEADER_BYTES_V1
+		|| file_get32(bytes + CREATE_OFFSET(IMAGE_BYTES)) != CLUSTER_RELMAP_FILE_SIZE_V2
+		|| !create_nonzero_batch(bytes + CREATE_OFFSET(BATCH_UUID))
+		|| file_get32(bytes + CREATE_OFFSET(HEADER_CRC32C))
+			!= file_crc(bytes, CREATE_OFFSET(HEADER_CRC32C), NULL, 0)
+		|| file_get32(bytes + CREATE_OFFSET(IMAGE_CRC32C)) != file_crc(bytes + CREATE_OFFSET(IMAGE), CLUSTER_RELMAP_FILE_SIZE_V2, NULL, 0))
+		return false;
+	for (unsigned i = CREATE_OFFSET(RESERVED_ZERO);
+		 i < CREATE_OFFSET(RESERVED_ZERO) + CLUSTER_RELMAP_CREATE_RESERVED_ZERO_BYTES_V1; ++i)
+		if (bytes[i] != 0)
+			return false;
+	/* Decode only scratch: the complete original RFM2, including its envelope
+	 * CRC and all identity fields, is still independently checked below. */
+	memcpy(reference, bytes + CREATE_OFFSET(IMAGE), sizeof(reference));
+	memcpy(reference, "RFI2", 4);
+	memset(reference + 112, 0, 12);
+	file_put32(reference + 124, file_crc(reference, 124, NULL, 0));
+	if (!cluster_recovery_file_identity_decode_v2(reference, sizeof(reference), &record.identity)
+		|| !create_target(&record.identity)
+		|| !cluster_relmap_file_decode_v2(bytes + CREATE_OFFSET(IMAGE), CLUSTER_RELMAP_FILE_SIZE_V2,
+			&record.identity, &image)
+		|| image.committed_generation != 1 || image.pending_generation != 0)
+		return false;
+	memcpy(record.batch_uuid, bytes + CREATE_OFFSET(BATCH_UUID), CLUSTER_RELMAP_CREATE_BATCH_UUID_BYTES_V1);
+	record.committed = image.committed;
+	*out = record;
+	return true;
+}
+
+bool
+cluster_relmap_create_rebuild_v1(const void *input, Size length,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	XLogRecPtr actual_end, ClusterRelmapCreateReplayV1 *out)
+{
+	ClusterRelmapCreateReplayV1 replay = {0};
+	uint8 reference[CLUSTER_RECOVERY_IDENTITY_REFERENCE_V2_BYTES];
+	if (input == NULL || expected == NULL || batch == NULL || out == NULL
+		|| length != CLUSTER_RELMAP_CREATE_WAL_SIZE_V1
+		|| file_overlap(out, sizeof(*out), input, length)
+		|| file_overlap(out, sizeof(*out), expected, sizeof(*expected))
+		|| file_overlap(out, sizeof(*out), batch, 16)
+		|| XLogRecPtrIsInvalid(actual_end) || actual_end == UINT64_MAX
+		|| !cluster_relmap_create_decode_v1(input, length, &replay.record)
+		|| memcmp(replay.record.batch_uuid, batch, 16)
+		|| !cluster_recovery_file_identity_encode_v2(&replay.record.identity, reference, sizeof(reference))
+		|| !cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), expected))
+		return false;
+	replay.actual_end = actual_end;
+	*out = replay;
 	return true;
 }

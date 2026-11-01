@@ -69,11 +69,12 @@
  *	  buf                         -- caller-provided 8KB buffer (BLCKSZ)
  *
  *	Returns: true on success, false on I/O error or short read.
- *  Managed TT block zero additionally borrows the independently selected
+ *  Managed block reads additionally borrow the independently selected
  *  UNDO identity and validates the complete TT40 reference and checksum on
  *  the same FD, including cache hits. Refusal/ERROR preserves buf. This I/O
  *  borrow grants no current/recovery authority or longer resident lifetime;
- *  the original caller retains those obligations. DATA blocks are unchanged.
+ *  the original caller retains those obligations. DATA reads validate block
+ *  zero on that same FD before reading the requested DATA block.
  */
 extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id,
 										 uint8 owner_instance, uint32 block_no, char *buf);
@@ -92,9 +93,11 @@ extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 se
  *
  *	NOT critical-section safe.
  */
-/* Selected native block-zero writes require a valid TT40 successor and an
- * already matching on-disk page. One file-identity borrow spans write/fsync;
- * the caller still owns content-X, WAL and the original file lifetime. */
+/* Selected native writes require an already matching TT40 file header. A
+ * block-zero successor must also be a valid sealed page. One file-identity
+ * borrow spans header validation and DATA/block-zero write/fsync; the caller
+ * still owns content-X, WAL and the original file lifetime. Late refusal does
+ * not undo any completed write. */
 extern bool cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id,
 										  uint8 owner_instance, uint32 block_no, const char *buf,
 										  bool do_fsync);
@@ -104,12 +107,21 @@ extern void cluster_undo_smgr_ensure_exit_hook(void);
 
 /* Private recovery observation, not persisted authority. All entries require
  * the active qualified RECOVERY_SHARED scope. Short files are distinct from
- * I/O errors; the full-image caller may restore size before publishing block0. */
+ * I/O errors; the full-image caller may restore size before publishing block0.
+ * Managed reads retain the independently selected complete file reference and
+ * table/startup generations by value. This is an observation, not custody or
+ * creation authority; every read must reacquire and match the original value.
+ * Existing managed files require a complete valid TT40 header. An actual
+ * ENOENT remains an absence observation, never permission to create or repair. */
 typedef struct ClusterUndoSmgrRecoveryFileV1 {
 	uint64 device;
 	uint64 inode;
 	uint64 size;
 	bool exists;
+	bool native_selected;
+	uint64 native_table_generation;
+	uint64 native_startup_generation;
+	uint8 native_file_reference[128];
 } ClusterUndoSmgrRecoveryFileV1;
 
 extern bool cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
@@ -119,7 +131,12 @@ extern bool cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 insta
 													 const ClusterUndoSmgrRecoveryFileV1 *expected,
 													 char out[BLCKSZ]);
 /* Only a source-proved INIT/REUSE owner may call materialize. It preserves all
- * existing bytes through the target size and does not publish a new header. */
+ * existing bytes through the target size and does not publish a new header.
+ * Managed preparation requires an existing, fully selected TT40 observation;
+ * one matching identity/generation borrow spans original-inode/base checks,
+ * extension, file/directory sync and cleanup. Both images must match that
+ * identity. Absence is not creation permission. Late failure preserves any
+ * completed extension; the original recovery owner retains its duties. */
 extern bool cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 													  const ClusterUndoSmgrRecoveryFileV1 *expected,
 													  const char block0[BLCKSZ],

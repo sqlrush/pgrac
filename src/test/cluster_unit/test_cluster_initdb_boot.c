@@ -401,10 +401,65 @@ UT_TEST(complete_native_postbootstrap_accepts_only_original_closed_batch)
 		!unlinkat(root, "data", AT_REMOVEDIR) && !unlinkat(root, "shared", AT_REMOVEDIR) && !close(root) && !rmdir(temp));
 }
 
+UT_TEST(peer_native_accepts_only_its_complete_cohort_member)
+{
+	for (unsigned fault_case = 0; fault_case < 3; fault_case++)
+	{
+		char temp[] = "/tmp/pgrac-peer-boot-XXXXXX";
+		PgracInitdbRecoveryContext request;
+		ClusterRecoveryFileIdentityV2 clog;
+		uint64 cohort[2] = {3, 0};
+		PgracInitdbWalContext ctx = {0};
+		int root, data, shared, pipefd, status;
+		pid_t child;
+		setup();
+		UT_ASSERT(mkdtemp(temp) != NULL);
+		root = open(temp, O_RDONLY | O_DIRECTORY);
+		UT_ASSERT(root >= 0 && !mkdirat(root, "data", 0700) && !mkdirat(root, "shared", 0700));
+		data = openat(root, "data", O_RDONLY | O_DIRECTORY);
+		shared = openat(root, "shared", O_RDONLY | O_DIRECTORY);
+		clog = pgrac_native_recovery.boot_files[0];
+		clog.origin = 1;
+		clog.creation_generation = 6;
+		UT_ASSERT(pgrac_initdb_recovery_prepare_cohort_v2(&pgrac_native_recovery.first, &clog,
+														  cohort, 1, &pgrac_native_recovery.config,
+														  data, shared, &request));
+		UT_ASSERT(pgrac_initdb_recovery_pipe_v2(&request, &pipefd));
+		ctx.phase = PGRAC_INITDB_WAL_POSTBOOTSTRAP;
+		ctx.thread_id = fault_case == 1 ? 1 : 2;
+		ctx.system_identifier = request.first.system_identifier;
+		ctx.database_incarnation = request.first.database_incarnation;
+		memcpy(ctx.storage_uuid, request.first.storage_uuid, 16);
+		ctx.base_fd = shared;
+		ctx.recovery_fd = pipefd;
+		ctx.config = request.config;
+		ctx.config.fd = root;
+		if (fault_case == 2)
+			ctx.system_identifier++;
+		child = fork();
+		UT_ASSERT(child >= 0);
+		if (!child)
+		{
+			bool accepted = fchdir(data) == 0 && initdb_boot_recovery_accept(&ctx);
+			bool ok = fault_case ? !accepted && !initdb_recovery_present
+								 : accepted && initdb_recovery_present && ctx.base_fd == 0 &&
+									   ctx.recovery_fd == 0 && fcntl(shared, F_GETFD) < 0 &&
+									   errno == EBADF;
+			_exit(ok ? 0 : 7);
+		}
+		UT_ASSERT(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+				  WEXITSTATUS(status) == 0);
+		UT_ASSERT(!close(pipefd) && !close(data) && !close(shared));
+		UT_ASSERT(!unlinkat(root, "data", AT_REMOVEDIR) &&
+				  !unlinkat(root, "shared", AT_REMOVEDIR) && !close(root) && !rmdir(temp));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
+	UT_RUN(peer_native_accepts_only_its_complete_cohort_member);
 	UT_RUN(complete_native_postbootstrap_accepts_only_original_closed_batch);
 	UT_RUN(postbootstrap_child_keeps_original_creation_batch_and_base_custody);
 	UT_RUN(boot_result_keeps_clog_birth_and_unused_tt_facts_separate);

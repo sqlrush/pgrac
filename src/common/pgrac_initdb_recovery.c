@@ -6,11 +6,18 @@
 #endif
 #include "common/pgrac_initdb_recovery.h"
 #ifdef WIN32
-bool
-pgrac_initdb_recovery_prepare_files_v2(const ClusterRecoveryFileIdentityV2 *a,
-									   const ClusterRecoveryFileIdentityV2 b[2],
-									   const PgracInitdbConfigContext *c, int d, int e,
-									   PgracInitdbRecoveryContext *out)
+bool pgrac_initdb_recovery_prepare_cohort_v2(const ClusterRecoveryFileIdentityV2 *a,
+											 const ClusterRecoveryFileIdentityV2 *b,
+											 const uint64 c[2], uint16 d,
+											 const PgracInitdbConfigContext *e, int f, int g,
+											 PgracInitdbRecoveryContext *h)
+{
+	return false;
+}
+bool pgrac_initdb_recovery_prepare_files_v2(const ClusterRecoveryFileIdentityV2 *a,
+											const ClusterRecoveryFileIdentityV2 b[2],
+											const PgracInitdbConfigContext *c, int d, int e,
+											PgracInitdbRecoveryContext *out)
 {
 	return false;
 }
@@ -177,8 +184,32 @@ pgrac_initdb_recovery_boot_v2(const PgracInitdbRecoveryContext *ctx,
 	ClusterRecoveryFileIdentityV2 relmaps[4], boot[2], expected;
 	uint8 encoded[128];
 	if (!ctx || !out || overlaps(ctx, sizeof(*ctx), out, sizeof(boot))
-		|| ctx->boot_file_count != PGRAC_INITDB_BOOT_FILES_V2
 		|| !pgrac_initdb_recovery_relmaps_v2(ctx, relmaps))
+		return false;
+	if (ctx->cohort[0] || ctx->cohort[1])
+	{
+		static const ClusterRecoveryFileIdentityV2 zero = {0};
+		uint64 origin = ctx->cohort_origin;
+		if (!(ctx->cohort[0] & 1) || origin >= 128 ||
+			!(ctx->cohort[origin / 64] & (UINT64CONST(1) << (origin % 64))) ||
+			ctx->boot_file_count != 1 || memcmp(&ctx->boot_files[1], &zero, sizeof(zero)))
+			return false;
+		expected = ctx->first;
+		expected.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+		expected.database_oid = expected.tablespace_oid = 0;
+		expected.origin = origin;
+		expected.creation_generation = ctx->boot_files[0].creation_generation;
+		if (expected.creation_generation <= relmaps[3].creation_generation ||
+			!cluster_recovery_file_identity_encode_v2(&expected, encoded, sizeof(encoded)) ||
+			!cluster_recovery_file_identity_matches_v2(encoded, sizeof(encoded),
+													   &ctx->boot_files[0]))
+			return false;
+		memset(boot, 0, sizeof(boot));
+		boot[0] = ctx->boot_files[0];
+		memcpy(out, boot, sizeof(boot));
+		return true;
+	}
+	if (ctx->cohort_origin != 0 || ctx->boot_file_count != PGRAC_INITDB_BOOT_FILES_V2)
 		return false;
 	for (unsigned i = 0; i < 2; ++i) {
 		boot[i] = ctx->boot_files[i];
@@ -204,8 +235,10 @@ request_files_valid(const PgracInitdbRecoveryContext *ctx)
 {
 	static const ClusterRecoveryFileIdentityV2 empty[2] = { { 0 } };
 	ClusterRecoveryFileIdentityV2 boot[2];
-	return ctx->boot_file_count == 0 ? memcmp(ctx->boot_files, empty, sizeof(empty)) == 0
-									 : pgrac_initdb_recovery_boot_v2(ctx, boot);
+	if (ctx->boot_file_count == 0 && !(ctx->cohort[0] || ctx->cohort[1]) &&
+		ctx->cohort_origin == 0)
+		return memcmp(ctx->boot_files, empty, sizeof(empty)) == 0;
+	return pgrac_initdb_recovery_boot_v2(ctx, boot);
 }
 
 bool
@@ -223,6 +256,32 @@ pgrac_initdb_recovery_prepare_files_v2(const ClusterRecoveryFileIdentityV2 *firs
 		return false;
 	ctx.boot_file_count = 2;
 	memcpy(ctx.boot_files, boot, sizeof(ctx.boot_files));
+	if (!pgrac_initdb_recovery_boot_v2(&ctx, checked))
+		return false;
+	*out = ctx;
+	return true;
+}
+
+bool pgrac_initdb_recovery_prepare_cohort_v2(const ClusterRecoveryFileIdentityV2 *first,
+											 const ClusterRecoveryFileIdentityV2 *clog,
+											 const uint64 cohort[2], uint16 origin,
+											 const PgracInitdbConfigContext *config, int data_fd,
+											 int shared_fd, PgracInitdbRecoveryContext *out)
+{
+	PgracInitdbRecoveryContext ctx;
+	ClusterRecoveryFileIdentityV2 checked[2];
+	if (!first || !clog || !cohort || !config || !out ||
+		overlaps(out, sizeof(*out), first, sizeof(*first)) ||
+		overlaps(out, sizeof(*out), config, sizeof(*config)) ||
+		overlaps(out, sizeof(*out), clog, sizeof(*clog)) ||
+		overlaps(out, sizeof(*out), cohort, 2 * sizeof(*cohort)) ||
+		!pgrac_initdb_recovery_prepare_v2(first, config, data_fd, shared_fd, &ctx))
+		return false;
+	ctx.cohort[0] = cohort[0];
+	ctx.cohort[1] = cohort[1];
+	ctx.cohort_origin = origin;
+	ctx.boot_file_count = 1;
+	ctx.boot_files[0] = *clog;
 	if (!pgrac_initdb_recovery_boot_v2(&ctx, checked))
 		return false;
 	*out = ctx;

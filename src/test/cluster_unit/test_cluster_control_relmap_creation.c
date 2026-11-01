@@ -1,6 +1,7 @@
 /* Real ROOT/immutable registry/table; only inherited authority/receipt leaves
  * are controlled. This target does not activate CREATE DATABASE. */
 #define TEST_CONTROL_CLOG_PREPARATION 1
+#define TEST_CONTROL_RECOVERY_CREATE 1
 #include "test_cluster_control_native_reservations.c"
 #undef main
 
@@ -364,6 +365,7 @@ UT_TEST(complete_error_after_primary_preserves_pair_and_once_latch)
 	cluster_control_native_relmap_create_destroy_v2(&c);
 	batch_end();
 }
+#include "test_cluster_control_relmap_recovery.inc"
 int
 main(int argc, char **argv)
 {
@@ -380,6 +382,12 @@ main(int argc, char **argv)
 	UT_RUN(creator_borrow_must_retire_under_continuing_creation_protection);
 	UT_RUN(reserve_late_owner_failure_preserves_original_creation_debt);
 	UT_RUN(complete_error_after_primary_preserves_pair_and_once_latch);
+	UT_RUN(recovery_reserved_completes_without_open_creator);
+	UT_RUN(recovery_available_requires_original_batch_and_same_pair);
+	UT_RUN(recovery_wrong_record_binding_and_alias_refuse);
+	UT_RUN(recovery_drift_and_partial_pair_poison_without_publication);
+	UT_RUN(recovery_error_preserves_persistent_creation_debt);
+	UT_RUN(recovery_cf_change_and_mapping_lock_entry_refuse);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

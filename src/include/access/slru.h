@@ -173,6 +173,10 @@ typedef SlruCtlData *SlruCtl;
 extern int SimpleLruNativeClogZeroV2(SlruCtl ctl, FullTransactionId birth);
 extern int SimpleLruNativeClogReadV2(SlruCtl ctl, int pageno, bool write_ok);
 extern void SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint);
+/* Original Startup selected local PAGE_IMAGE replay; owns/retires its family
+ * and IO locks, borrows existing AVAILABLE file, no segment creation or WAL. */
+extern void SimpleLruNativeClogReplayV2(SlruCtl ctl, const void *record, Size length,
+									  XLogRecPtr record_end);
 #endif
 
 extern Size SimpleLruShmemSize(int nslots, int nlsns);

@@ -15,7 +15,10 @@
 
 #include "cluster/cluster_control_file_identity.h"
 #include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_control_relmap_recovery.h"
 #include "common/cluster_relmap_file.h"
+#include "common/cluster_relmap_create.h"
+#include "access/xlogreader.h"
 
 typedef struct ClusterRelmapCheckpointReceiptV2 ClusterRelmapCheckpointReceiptV2;
 typedef struct ClusterRelmapCheckpointSummaryV2
@@ -43,13 +46,40 @@ extern bool cluster_relmap_control_checkpoint_v2(const ClusterSharedConfigRef *e
  * unique AVAILABLE default-tablespace database; target is the exact independent
  * reserved carrier. Locks the carrier's local copy attempt before any fallible
  * work. No retry after false/ERROR; partial files/reservation remain debt.
- * Creates clean generation-one target copies, syncs/full-rereads, then retires
+ * Writes and flushes the independent creation WAL at its actual insert end,
+ * then creates those exact clean generation-one copies, syncs/full-rereads, and retires
  * only native borrows under continuous original protection and calls the
- * original one-shot control completion. No WAL, whole-database admission,
+ * original one-shot control completion. No whole-database admission,
  * retention release or OPEN grant. Original live shared CREATE DATABASE still
- * refuses until its complete native caller/WAL contract is connected. */
+ * refuses until its complete native caller/recovery contract is connected. */
 extern bool cluster_relmap_control_copy_create_v2(ClusterControlNativeRelmapCreateV2 *,
 	Oid source_database, Oid source_tablespace);
+
+/* Read-only native redo input adapter: require the original decoded CREATE
+ * record, no block/PAGE edge, exact main payload and actual current EndRecPtr.
+ * Complete expected identity and batch come from the caller's independent
+ * episode/RESERVED registration. The adapter performs no I/O or completion and
+ * does not replace that authorization, native WAL/source validation or original
+ * protection. Only its successful private result can feed the file replay step.
+ * Refusal preserves out; every overlap with the original reader is refused. */
+extern bool cluster_relmap_control_create_redo_input_v1(XLogReaderState *,
+	const ClusterRecoveryFileIdentityV2 *, const uint8 batch_uuid[16],
+	ClusterRelmapCreateReplayV1 *out);
+
+/* Dormant original Startup executor. Caller retains SAME global relmap X,
+ * CF-X, complete IR/WALR/isolation and target file lifetime. Enter before
+ * MappingLock and the other native family locks. Strictly validate the current
+ * native record against independent expected/batch and the original sealed
+ * scanner frame CRC/XIDs/full source, then acquire the original
+ * recovery authorization before MappingLock. Replay missing or exact existing
+ * clean generation-one pairs only; confirm two real sync/full-read receipts
+ * after MappingLock release. An entered refusal/ERROR poisons that episode and
+ * keeps durable files, registration and all original protections/debt. No new
+ * WAL, role, scope/pin, retry, rmgr activation or OPEN qualification. AVAILABLE
+ * repeats still require the original persisted batch and exact pair receipts. */
+extern bool cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *, uint32 participant, const ClusterWalSourceRef *,
+	XLogReaderState *, const ClusterRecoveryFileIdentityV2 *, const uint8 batch_uuid[16]);
 
 /* Original checkpoint-local copies, never CF custody or a coverage grant.
  * The later original publisher reads a NEW selection under its own CF interval
