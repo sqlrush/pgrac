@@ -35,6 +35,15 @@ extern bool cluster_relmap_file_decode_v2(const void *bytes, size_t length,
 										const ClusterRecoveryFileIdentityV2 *expected,
 										ClusterRelmapV2Image *image);
 
+/* Parse saved file/WAL bytes without importing an expected control binding.
+ * This exposes an observed identity only; it grants no registration, custody,
+ * replay permission, terminal state or checkpoint coverage. Both outputs stay
+ * unchanged on failure and must not overlap each other or the input. Runtime
+ * owners must still use decode_v2 with their independently selected identity. */
+extern bool cluster_relmap_file_observe_v2(const void *bytes, size_t length,
+								ClusterRecoveryFileIdentityV2 *identity,
+								ClusterRelmapV2Image *image);
+
 /* The directory descriptor is borrowed from the original path owner; it is
  * never closed here. That owner serializes map updates and rechecks its path
  * and original registration before publishing any returned observation.

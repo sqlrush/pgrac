@@ -321,10 +321,116 @@ UT_TEST(assigned_format_matches_the_complete_big_endian_byte_table)
 	cleanup();
 }
 
+static void
+refresh_envelope(unsigned char *bytes)
+{
+	pg_crc32c crc;
+	const size_t offsets[] = {116, 120, 124};
+	for (unsigned n = 0; n < 3; ++n) {
+		INIT_CRC32C(crc);
+		if (n == 0) COMP_CRC32C(crc, bytes + 128, CLUSTER_RELMAP_V2_FILE_SIZE);
+		else {
+			COMP_CRC32C(crc, bytes, offsets[n]);
+			if (n == 1) COMP_CRC32C(crc, bytes + 128, CLUSTER_RELMAP_V2_FILE_SIZE);
+		}
+		FIN_CRC32C(crc);
+		for (unsigned i = 0; i < 4; ++i) bytes[offsets[n] + i] = (crc >> (24 - 8*i)) & 255;
+	}
+}
+
+UT_TEST(observed_identity_and_image_are_complete_but_do_not_replace_expected_binding)
+{
+	unsigned char storage[CLUSTER_RELMAP_FILE_SIZE_V2 + 1], reference[128];
+	ClusterRecoveryFileIdentityV2 observed;
+	ClusterRelmapV2Image actual;
+	prepare();
+	UT_ASSERT(cluster_relmap_file_encode_v2(&identity, &image, storage + 1, sizeof(storage) - 1));
+	UT_ASSERT(cluster_relmap_file_observe_v2(storage + 1, sizeof(storage) - 1, &observed, &actual));
+	UT_ASSERT_EQ(observed.origin, 0);
+	UT_ASSERT_EQ(observed.creation_generation, 103);
+	UT_ASSERT_EQ(observed.registration_generation, 19);
+	UT_ASSERT_EQ(actual.committed.mappings[0].mapfilenumber, 9001);
+	UT_ASSERT(cluster_recovery_file_identity_encode_v2(&observed, reference, sizeof(reference)));
+	UT_ASSERT(cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &identity));
+	++identity.creation_generation;
+	UT_ASSERT(!cluster_relmap_file_decode_v2(storage + 1, sizeof(storage) - 1, &identity, &actual));
+	cleanup();
+}
+
+UT_TEST(observation_refuses_each_damaged_byte_without_publishing_either_output)
+{
+	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
+	ClusterRecoveryFileIdentityV2 observed, saved_identity;
+	ClusterRelmapV2Image actual, saved_image;
+	prepare();
+	UT_ASSERT(cluster_relmap_file_encode_v2(&identity, &image, bytes, sizeof(bytes)));
+	memset(&observed, 0xa5, sizeof(observed)); saved_identity = observed;
+	memset(&actual, 0x5a, sizeof(actual)); saved_image = actual;
+	for (size_t i = 0; i < sizeof(bytes); ++i) {
+		bytes[i] ^= 1;
+		UT_ASSERT(!cluster_relmap_file_observe_v2(bytes, sizeof(bytes), &observed, &actual));
+		UT_ASSERT(memcmp(&observed, &saved_identity, sizeof(observed)) == 0);
+		UT_ASSERT(memcmp(&actual, &saved_image, sizeof(actual)) == 0);
+		bytes[i] ^= 1;
+	}
+	cleanup();
+}
+
+UT_TEST(observation_checks_assigned_shape_after_forged_envelope_checksums)
+{
+	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2], saved[CLUSTER_RELMAP_FILE_SIZE_V2];
+	ClusterRecoveryFileIdentityV2 observed;
+	ClusterRelmapV2Image actual;
+	const size_t offsets[] = {4, 7, 9, 12, 19, 84, 31, 128 + 100};
+	prepare();
+	UT_ASSERT(cluster_relmap_file_encode_v2(&identity, &image, saved, sizeof(saved)));
+	for (unsigned i = 0; i < lengthof(offsets); ++i) {
+		memcpy(bytes, saved, sizeof(bytes));
+		if (offsets[i] == 84) memset(bytes + 84, 0, 4);
+		else bytes[offsets[i]] ^= 1;
+		refresh_envelope(bytes);
+		UT_ASSERT(!cluster_relmap_file_observe_v2(bytes, sizeof(bytes), &observed, &actual));
+	}
+	cleanup();
+}
+
+UT_TEST(observation_rejects_all_output_aliases_before_writing)
+{
+	union { ClusterRelmapV2Image image; ClusterRecoveryFileIdentityV2 identity;
+		unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2]; } alias, saved;
+	ClusterRecoveryFileIdentityV2 observed;
+	ClusterRelmapV2Image actual;
+	prepare();
+	UT_ASSERT(cluster_relmap_file_encode_v2(&identity, &image, alias.bytes, sizeof(alias.bytes)));
+	saved = alias;
+	UT_ASSERT(!cluster_relmap_file_observe_v2(alias.bytes, sizeof(alias.bytes), &alias.identity, &actual));
+	UT_ASSERT(!cluster_relmap_file_observe_v2(alias.bytes, sizeof(alias.bytes), &observed, &alias.image));
+	UT_ASSERT(memcmp(&alias, &saved, sizeof(alias)) == 0);
+	UT_ASSERT(!cluster_relmap_file_observe_v2(saved.bytes, sizeof(saved.bytes), &alias.identity, &alias.image));
+	UT_ASSERT(memcmp(&alias, &saved, sizeof(alias)) == 0);
+	cleanup();
+}
+
+UT_TEST(observation_rejects_short_long_null_or_legacy_inputs)
+{
+	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2 + 1];
+	ClusterRecoveryFileIdentityV2 observed;
+	ClusterRelmapV2Image actual;
+	prepare();
+	UT_ASSERT(cluster_relmap_file_encode_v2(&identity, &image, bytes, sizeof(bytes) - 1));
+	UT_ASSERT(!cluster_relmap_file_observe_v2(bytes, 2176, &observed, &actual));
+	UT_ASSERT(!cluster_relmap_file_observe_v2(bytes, 2303, &observed, &actual));
+	UT_ASSERT(!cluster_relmap_file_observe_v2(bytes, 2305, &observed, &actual));
+	UT_ASSERT(!cluster_relmap_file_observe_v2(NULL, 2304, &observed, &actual));
+	UT_ASSERT(!cluster_relmap_file_observe_v2(bytes, 2304, NULL, &actual));
+	UT_ASSERT(!cluster_relmap_file_observe_v2(bytes, 2304, &observed, NULL));
+	cleanup();
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(14);
 	UT_RUN(assigned_format_matches_the_complete_big_endian_byte_table);
 	UT_RUN(complete_envelope_preserves_inner_and_rejects_old_format);
 	UT_RUN(creation_identity_is_independent_of_map_generation);
@@ -334,6 +440,11 @@ main(void)
 	UT_RUN(missing_short_alias_or_foreign_copy_refuses);
 	UT_RUN(all_registration_fields_and_unknown_versions_refuse);
 	UT_RUN(overlapping_outputs_and_late_file_close_never_mutate_identity);
+	UT_RUN(observed_identity_and_image_are_complete_but_do_not_replace_expected_binding);
+	UT_RUN(observation_refuses_each_damaged_byte_without_publishing_either_output);
+	UT_RUN(observation_checks_assigned_shape_after_forged_envelope_checksums);
+	UT_RUN(observation_rejects_all_output_aliases_before_writing);
+	UT_RUN(observation_rejects_short_long_null_or_legacy_inputs);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

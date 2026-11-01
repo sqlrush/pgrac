@@ -14838,3 +14838,23 @@ test_cluster_initdb_relmap test_cluster_relmap_managed_storage test_cluster_relm
 		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
+# Strict managed RELMAP diagnostics use the original backend/frontend descriptor.
+TESTS += test_cluster_relmap_desc
+all: test_cluster_relmap_desc
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_desc,$(SIMPLE_TESTS))
+test_cluster_relmap_desc: test_cluster_relmap_desc.c unit_test.h \
+		$(top_srcdir)/src/backend/access/rmgrdesc/relmapdesc.c \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/backend/access/rmgrdesc/relmapdesc.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+.PHONY: clean-managed-relmap-desc
+clean: clean-managed-relmap-desc
+clean-managed-relmap-desc:
+	rm -f test_cluster_relmap_desc
