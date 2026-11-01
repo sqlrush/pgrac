@@ -1,0 +1,13 @@
+# K composition component only; no old wire or consumer registration.
+MX_COMPOSITION_O = $(top_builddir)/src/backend/cluster/cluster_multixact_composition.o
+
+$(MX_COMPOSITION_O): $(top_srcdir)/src/include/cluster/cluster_multixact_composition.h
+
+test_cluster_mx_composition: test_cluster_mx_composition.c unit_test.h $(MX_COMPOSITION_O) \
+		$(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(MX_COMPOSITION_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+.PHONY: clean-m1-mx-composition
+clean-m1-mx-composition:
+	rm -f test_cluster_mx_composition
