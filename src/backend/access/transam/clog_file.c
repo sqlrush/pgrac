@@ -5,9 +5,8 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "port/pg_crc32c.h"
 
-/* Candidate framing identifiers; no default format/catalog/WAL switch is
- * performed here. Integers in CLOG framing are big endian. TT40 retains
- * its original native page layout and whole-page checksum owner. */
+/* Integers in CLOG framing are big endian. TT40 retains its original
+ * native page layout and whole-page checksum owner. */
 static const uint8 file_magic[8] = {'P', 'C', 'L', 'G', '0', '0', '2', 0};
 static const uint8 page_magic[4] = {'P', 'C', 'P', '2'};
 
@@ -71,48 +70,14 @@ counter_valid(uint64 value)
 	return value != 0 && value != UINT64_MAX;
 }
 
-/* Explicit candidate encoding of the shared logical carrier, never its ABI.
- * The original control owner must independently authenticate these fields. */
+/* Common framing checks do not replace the original family/owner bounds. */
 static bool
 file_reference(const ClusterRecoveryFileIdentityV2 *id, uint8 out[128])
 {
-	pg_crc32c crc;
-
-	if (id == NULL ||
-		(id->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 && id->kind != CLUSTER_RECOVERY_FILE_UNDO_V2) ||
-		id->format_id == 0 || id->format_id == UINT32_MAX ||
-		id->format_version == 0 || id->format_version == UINT32_MAX ||
-		!counter_valid(id->system_identifier) || !counter_valid(id->database_incarnation) ||
-		bytes_zero(id->storage_uuid, sizeof(id->storage_uuid)) ||
-		bytes_zero(id->redo_branch_uuid, sizeof(id->redo_branch_uuid)) ||
-		!counter_valid(id->redo_branch_generation) || id->redo_timeline == 0 ||
-		id->redo_timeline == UINT32_MAX || id->origin >= UNDO_OWNER_INSTANCE_MAX ||
-		!counter_valid(id->creation_generation) || !counter_valid(id->registration_generation))
-		return false;
-	memset(out, 0, 128);
-	memcpy(out, "RFI2", 4);
-	put16(out + 4, 2);
-	put16(out + 6, 128);
-	put16(out + 8, (uint16)id->kind);
-	put16(out + 10, id->origin);
-	put32(out + 12, id->format_id);
-	put32(out + 16, id->format_version);
-	put32(out + 20, id->redo_timeline);
-	put64(out + 24, id->system_identifier);
-	put64(out + 32, id->database_incarnation);
-	memcpy(out + 40, id->storage_uuid, 16);
-	memcpy(out + 56, id->redo_branch_uuid, 16);
-	put64(out + 72, id->redo_branch_generation);
-	put32(out + 80, id->database_oid);
-	put32(out + 84, id->tablespace_oid);
-	put64(out + 88, id->object_id);
-	put64(out + 96, id->creation_generation);
-	put64(out + 104, id->registration_generation);
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, out, 124);
-	FIN_CRC32C(crc);
-	put32(out + 124, (uint32)crc);
-	return true;
+	return id != NULL &&
+		(id->kind == CLUSTER_RECOVERY_FILE_CLOG_V2 || id->kind == CLUSTER_RECOVERY_FILE_UNDO_V2) &&
+		id->origin < UNDO_OWNER_INSTANCE_MAX &&
+		cluster_recovery_file_identity_encode_v2(id, out, CLUSTER_CLOG_FILE_REFERENCE_BYTES);
 }
 
 static bool

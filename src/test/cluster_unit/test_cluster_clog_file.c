@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "access/clog_file.h"
+#include "cluster/cluster_recovery_format.h"
 #include "cluster/cluster_undo_segment.h"
 #include "unit_test.h"
 
@@ -26,8 +27,8 @@ reset(void)
 {
 	memset(&binding, 0, sizeof(binding));
 	binding.identity.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
-	binding.identity.format_id = 700;
-	binding.identity.format_version = 2;
+	binding.identity.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+	binding.identity.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
 	binding.identity.system_identifier = 123;
 	binding.identity.database_incarnation = 456;
 	binding.identity.redo_branch_generation = 2;
@@ -386,13 +387,91 @@ UT_TEST(disabled_build_refuses_cluster_tt_pages)
 }
 #endif
 
+UT_TEST(clog_consumers_require_assigned_format_before_output)
+{
+	uint8 saved_header[8192], saved_frame[8256];
+	ClusterClogPageIdentityV2 decoded, saved_decoded;
+	reset();
+	UT_ASSERT(cluster_clog_file_header_encode_v2(&binding, header, sizeof(header)));
+	UT_ASSERT(cluster_clog_file_page_encode_v2(&binding, &page, payload, 8192, frame, 8256));
+	memcpy(saved_header, header, sizeof(header));
+	memcpy(saved_frame, frame, sizeof(frame));
+	memset(&decoded, 0x67, sizeof(decoded));
+	saved_decoded = decoded;
+	for (int variant = 0; variant < 4; variant++) {
+		binding.identity.format_id = variant < 2 ?
+			(variant == 0 ? 700 : CLUSTER_RECOVERY_FORMAT_ID_V2 + 1) :
+			CLUSTER_RECOVERY_FORMAT_ID_V2;
+		binding.identity.format_version = variant < 2 ? 2 : (variant == 2 ? 1 : 3);
+		UT_ASSERT(!cluster_clog_file_header_encode_v2(&binding, header, sizeof(header)));
+		UT_ASSERT(!cluster_clog_file_page_encode_v2(&binding, &page, payload, 8192, frame, 8256));
+		UT_ASSERT(!cluster_clog_file_header_matches_v2(saved_header, sizeof(saved_header), &binding));
+		UT_ASSERT(!cluster_clog_file_page_decode_v2(&binding, 64, saved_frame, 8256, &decoded, output, 8192));
+		UT_ASSERT(memcmp(header, saved_header, sizeof(header)) == 0);
+		UT_ASSERT(memcmp(frame, saved_frame, sizeof(frame)) == 0);
+		UT_ASSERT(memcmp(&decoded, &saved_decoded, sizeof(decoded)) == 0);
+		for (int i = 0; i < 8192; i++)
+			UT_ASSERT_EQ(output[i], 0x77);
+	}
+}
+
+UT_TEST(common_identity_bytes_do_not_replace_family_guards)
+{
+	uint8 reference[128], saved_header[8192];
+	ClusterRecoveryFileIdentityV2 decoded;
+	reset();
+	UT_ASSERT(cluster_recovery_file_identity_encode_v2(&binding.identity, reference, sizeof(reference)));
+	UT_ASSERT(cluster_clog_file_header_encode_v2(&binding, header, sizeof(header)));
+	UT_ASSERT(memcmp(header + 32, reference, sizeof(reference)) == 0);
+	UT_ASSERT(cluster_recovery_file_identity_decode_v2(header + 32, sizeof(reference), &decoded));
+	UT_ASSERT(cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &decoded));
+	memcpy(saved_header, header, sizeof(header));
+	for (int kind = CLUSTER_RECOVERY_FILE_UNDO_V2; kind <= CLUSTER_RECOVERY_FILE_DEBT_V2; kind++) {
+		binding.identity.kind = (ClusterRecoveryFileKindV2)kind;
+		UT_ASSERT(cluster_recovery_file_identity_encode_v2(&binding.identity, reference, sizeof(reference)));
+		UT_ASSERT(!cluster_clog_file_header_encode_v2(&binding, header, sizeof(header)));
+		UT_ASSERT(!cluster_clog_file_page_encode_v2(&binding, &page, payload, 8192, frame, 8256));
+		UT_ASSERT(memcmp(header, saved_header, sizeof(header)) == 0);
+	}
+#ifdef USE_PGRAC_CLUSTER
+	fresh_tt();
+	UT_ASSERT(cluster_recovery_file_identity_encode_v2(&tt_identity, reference, sizeof(reference)));
+	UT_ASSERT(cluster_tt_file_reference_prepare_v2(tt.data, 8192, &tt_identity));
+	UT_ASSERT(memcmp(tt.data + 3072, reference, sizeof(reference)) == 0);
+	UT_ASSERT(cluster_recovery_file_identity_matches_v2((uint8 *)tt.data + 3072, 128, &tt_identity));
+	/* A common-valid identity is still refused by the original TT owner guard. */
+	tt_identity.object_id++;
+	UT_ASSERT(cluster_recovery_file_identity_encode_v2(&tt_identity, reference, sizeof(reference)));
+	UT_ASSERT(!cluster_tt_file_reference_prepare_v2(tt.data, 8192, &tt_identity));
+#endif
+}
+
+#ifdef USE_PGRAC_CLUSTER
+UT_TEST(tt_consumers_require_assigned_format_before_output)
+{
+	PGAlignedBlock before;
+	reset();
+	for (int variant = 0; variant < 4; variant++) {
+		fresh_tt();
+		memcpy(&before, &tt, sizeof(tt));
+		tt_identity.format_id = variant < 2 ?
+			(variant == 0 ? 700 : CLUSTER_RECOVERY_FORMAT_ID_V2 + 1) :
+			CLUSTER_RECOVERY_FORMAT_ID_V2;
+		tt_identity.format_version = variant < 2 ? 2 : (variant == 2 ? 1 : 3);
+		UT_ASSERT(!cluster_tt_file_reference_prepare_v2(tt.data, 8192, &tt_identity));
+		UT_ASSERT(!cluster_tt_file_reference_matches_v2(tt.data, 8192, &tt_identity));
+		UT_ASSERT(memcmp(&tt, &before, sizeof(tt)) == 0);
+	}
+}
+#endif
+
 int
 main(void)
 {
 #ifdef USE_PGRAC_CLUSTER
-	UT_PLAN(14);
+	UT_PLAN(17);
 #else
-	UT_PLAN(12);
+	UT_PLAN(14);
 #endif
 	UT_RUN(offsets_are_frame_based_and_bounded);
 	UT_RUN(header_roundtrip_exact_binding);
@@ -413,6 +492,11 @@ main(void)
 	UT_RUN(tt_full_framing_rejects_invalid_identity_and_preserves_slots);
 #else
 	UT_RUN(disabled_build_refuses_cluster_tt_pages);
+#endif
+	UT_RUN(clog_consumers_require_assigned_format_before_output);
+	UT_RUN(common_identity_bytes_do_not_replace_family_guards);
+#ifdef USE_PGRAC_CLUSTER
+	UT_RUN(tt_consumers_require_assigned_format_before_output);
 #endif
 	UT_DONE();
 	return ut_failed_count != 0;

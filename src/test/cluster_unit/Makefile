@@ -11301,13 +11301,16 @@ clean-cold-undo-scan:
 
 test_cluster_clog_file: test_cluster_clog_file.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_srcdir)/src/backend/access/transam/clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # CLOG page/WAL dependency snapshot through the complete native SLRU writer.
@@ -11315,3 +11318,19 @@ test_cluster_clog_write_snapshot: test_cluster_clog_write_snapshot.c unit_test.h
 		$(top_srcdir)/src/backend/access/transam/slru.c $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# Pure shared RFI2 codec; no backend authority or file provider is linked.
+TESTS += test_cluster_recovery_file_identity
+all: test_cluster_recovery_file_identity
+test_cluster_recovery_file_identity: test_cluster_recovery_file_identity.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/port/libpgport.a -o $@
+clean: clean-recovery-identity-codec
+.PHONY: clean-recovery-identity-codec
+clean-recovery-identity-codec:
+	rm -f test_cluster_recovery_file_identity test_cluster_recovery_file_identity.d
