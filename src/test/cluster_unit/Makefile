@@ -15472,6 +15472,7 @@ test_cluster_typed_pass2_select.inc: $(top_srcdir)/src/backend/cluster/cluster_w
 
 # Original cold declaration and SIDE input coexistence; no live activation.
 test_cluster_cold_relmap_side: $(CLUSTER_COLD_PLAN_O) $(CLUSTER_WAL_CLAIM_O) test_cluster_cold_relmap_side.inc \
+		test_cluster_relmap_create_side.inc \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
 .PHONY: clean-cold-relmap-side
 clean: clean-cold-relmap-side
@@ -16417,3 +16418,8 @@ test_cluster_cold_recovery_space_refail \
 test_cluster_cold_recovery_validate \
 test_cluster_cold_recovery_xid: $(top_builddir)/src/common/libpgcommon.a
 test_cluster_cold_recovery_refail: $(top_builddir)/src/common/libpgcommon.a
+
+# Canonical creation bytes in the original sealed external SIDE carrier.
+$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_relmap_side: \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
