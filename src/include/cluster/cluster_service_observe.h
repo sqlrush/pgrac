@@ -71,6 +71,15 @@ extern ClusterSemanticAdmissionObservationResult cluster_service_producer_collec
 	uint64 expected_epoch, uint64 expected_generation, ClusterServiceProducerCollection *out);
 
 
+/* Original feature-token return domain plus the same current native owner.
+ * The gate epoch/generation stays bound to the original OPEN; the native
+ * identity uses expected_epoch. Caller-owned, bounded, read-only observation.
+ * Always PENDING/STALE/REFUSED: neither an empty feature domain nor an idle
+ * native point proves native producer closure or produces a receipt. */
+extern ClusterSemanticAdmissionObservationResult cluster_service_producer_collect_return(
+	uint64 expected_epoch, uint64 expected_gate_epoch, uint64 expected_generation,
+	ClusterServiceProducerCollection *out);
+
 /* One actual native owner's point observation, at an unlocked boundary.
  * Binds the existing actor bracket and original role fanout to its own
  * PGPROC identity and epoch, rechecking after the module calls. An active

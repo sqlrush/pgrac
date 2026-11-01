@@ -4563,9 +4563,9 @@ cluster_service_producer_observe(uint64 expected_epoch, ClusterServiceProducerOb
 /* Observe both original domains at the same owner's unlocked return point.
  * This does not close admission, sign a cut, or cache any permission.
  * Author: SqlRush <sqlrush@gmail.com> */
-ClusterSemanticAdmissionObservationResult
-cluster_service_producer_collect(uint64 expected_epoch, uint64 expected_generation,
-								 ClusterServiceProducerCollection *out)
+static ClusterSemanticAdmissionObservationResult
+cl_service_producer_collect(uint64 expected_epoch, uint64 expected_gate_epoch,
+	uint64 expected_generation, ClusterServiceProducerCollection *out, bool returning)
 {
 	ClusterNormalStopPollResult producer, actor;
 	ClusterSemanticAdmissionObservationResult admission;
@@ -4578,14 +4578,19 @@ cluster_service_producer_collect(uint64 expected_epoch, uint64 expected_generati
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
 	memset(out, 0, sizeof(*out));
 	out->reason = "NATIVE_COLLECTION_SCOPE_INVALID";
-	if (expected_generation == 0 || expected_generation == UINT64_MAX)
+	if (expected_generation == 0 || expected_generation == UINT64_MAX
+		|| (returning && (expected_gate_epoch == 0 || expected_gate_epoch == UINT64_MAX
+			|| expected_gate_epoch > expected_epoch)))
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
 	producer = cluster_service_producer_observe(expected_epoch, &out->producer);
 	out->reason = out->producer.reason;
 	if (producer != CLUSTER_NORMAL_STOP_READY && producer != CLUSTER_NORMAL_STOP_PENDING)
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
-	admission = cluster_semantic_activation_admission_observe(expected_epoch, expected_generation,
-		&out->admission);
+	admission = returning
+		? cluster_semantic_activation_admission_return_observe(expected_epoch, expected_gate_epoch,
+			expected_generation, &out->admission)
+		: cluster_semantic_activation_admission_observe(expected_epoch, expected_generation,
+			&out->admission);
 	if (admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT
 		&& admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
 		&& admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE) {
@@ -4635,8 +4640,28 @@ cluster_service_producer_collect(uint64 expected_epoch, uint64 expected_generati
 		out->reason = "NATIVE_COLLECTION_ADMISSION_PENDING";
 		return admission;
 	}
+	if (returning) {
+		out->reason = "NATIVE_COLLECTION_PRODUCER_CLOSURE_UNPROVED";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+	}
 	out->reason = "NATIVE_COLLECTION_POINT_ONLY";
 	return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT;
+}
+
+ClusterSemanticAdmissionObservationResult
+cluster_service_producer_collect(uint64 expected_epoch, uint64 expected_generation,
+								 ClusterServiceProducerCollection *out)
+{
+	return cl_service_producer_collect(expected_epoch, expected_epoch, expected_generation, out, false);
+}
+
+/* Retain the original gate while its tokens return in the current native epoch.
+ * Native closure remains unproved even when both point observations are empty. */
+ClusterSemanticAdmissionObservationResult
+cluster_service_producer_collect_return(uint64 expected_epoch, uint64 expected_gate_epoch,
+	uint64 expected_generation, ClusterServiceProducerCollection *out)
+{
+	return cl_service_producer_collect(expected_epoch, expected_gate_epoch, expected_generation, out, true);
 }
 
 bool

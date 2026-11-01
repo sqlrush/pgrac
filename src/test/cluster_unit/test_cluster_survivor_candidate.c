@@ -8,6 +8,8 @@ int survivor_candidate_original_lmon_main(void);
 #undef main
 #include "cluster/cluster_semantic_survivor_candidate.h"
 #include "../../common/sha2_int.h"
+#include "port/pg_crc32c.h"
+#include "test_cluster_survivor_pgsa.inc"
 
 #define PENDING CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
 #define REFUSED CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED
@@ -27,6 +29,7 @@ put64(uint8 *p, uint64 v)
 static void
 make_manifest(void)
 {
+	ClusterSemanticActivationRecord open = { 0 };
 	pg_sha256_ctx hash;
 	memset(&candidate, 0, sizeof(candidate)); memset(&message, 0, sizeof(message));
 	memset(body, 0, sizeof(body)); memset(format, 0x33, sizeof(format));
@@ -37,7 +40,14 @@ make_manifest(void)
 	message.coordinator = message.sender = 0;
 	message.survivors[0] = message.survivors[1] = UINT64_MAX;
 	memcpy(message.format, format, 32); memset(message.proof, 0x44, 32);
-	memset(body, 0xa5, 512); memset(body + 512, 0xb6, 512);
+	/* Actual original codec; still untrusted syntax, not selected OPEN proof. */
+	open.source_feature_bitmap = open.target_feature_bitmap = 16;
+	open.transition_epoch = candidate_case == 10 ? 2 : 3;
+	open.record_generation = 11; open.phase = CLUSTER_SEMANTIC_PHASE_OPEN;
+	open.admitted_members_lo = open.admitted_members_hi = UINT64_MAX;
+	open.coordinator_incarnation = 17; open.capability_sample_digest = 19;
+	UT_ASSERT(cluster_semantic_activation_record_encode(&open, body));
+	memset(body + 512, 0xb6, 512);
 	memcpy(body + 1104, format, 32); put64(body + 1136, 1);
 	put64(body + 1144, 7); put64(body + 1152, 9); put64(body + 1160, 11);
 	put64(body + 1168, 5); put64(body + 1176, UINT64_MAX); put64(body + 1184, UINT64_MAX);
@@ -104,6 +114,15 @@ probe(ClusterServiceProducerCollection *out)
 	return cluster_semantic_survivor_candidate_probe(&candidate, out, &candidate_reason);
 }
 
+/* Shared counters/roles below are explicit host boundary inputs. The original
+ * LmonMain, actor bracket, module fanout and collection functions run as-is. */
+static ClusterSemanticAdmissionObservationResult
+return_collect(uint64 epoch, uint64 gate_epoch, uint64 generation, ClusterServiceProducerCollection *out)
+{
+	test_producer_seen = 0;
+	return cluster_service_producer_collect_return(epoch, gate_epoch, generation, out);
+}
+
 static int
 candidate_wait(WaitEvent *events pg_attribute_unused())
 {
@@ -114,11 +133,15 @@ candidate_wait(WaitEvent *events pg_attribute_unused())
 	uint8 row[80];
 
 	test_collection_samples++;
+	if (candidate_case == 10)
+		pg_atomic_write_u64(&test_collection_gate.formation_epoch, 2);
 	begin_candidate();
 	/* Each scenario retains the original idle owner observation/fanout. */
 	if (candidate_case != 0) UT_ASSERT_EQ(probe(&out), PENDING);
 	switch (candidate_case) {
 	case 0:
+		/* A closed original feature gate still cannot prove native closure. */
+		pg_atomic_write_u32(&test_collection_gate.transition_closed, 1);
 		memcpy(&gate_before, &test_collection_gate, sizeof(gate_before)); before = candidate;
 		UT_ASSERT_EQ(probe(&out), PENDING);
 		UT_ASSERT_EQ(out.producer.identity.proc_generation, 17);
@@ -235,6 +258,139 @@ candidate_wait(WaitEvent *events pg_attribute_unused())
 			UT_ASSERT_EQ(memcmp(&candidate, &before, sizeof(candidate)), 0);
 		}
 		break;
+	case 12:
+		pg_atomic_write_u64(&test_collection_gate.formation_epoch, 2);
+		before = candidate;
+		for (unsigned side = 0; side < 2; side++)
+			for (unsigned bit = 0; bit < 64; bit++) {
+				pg_atomic_write_u32(&test_collection_gate.inflight[side][bit], 1);
+				memcpy(&gate_before, &test_collection_gate, sizeof(gate_before));
+				UT_ASSERT_EQ(return_collect(3, 2, 11, &out), PENDING);
+				UT_ASSERT(out.admission.known);
+				UT_ASSERT_EQ(out.admission.inflight[side][bit], 1);
+				UT_ASSERT_EQ(out.producer.identity.epoch, 3);
+				UT_ASSERT_EQ(out.admission.formation_epoch, 2);
+				UT_ASSERT_EQ(out.producer.responsibility.modules, 25);
+				UT_ASSERT_EQ(memcmp(&gate_before, &test_collection_gate, sizeof(gate_before)), 0);
+				pg_atomic_write_u32(&test_collection_gate.inflight[side][bit], 0);
+				UT_ASSERT_EQ(return_collect(3, 2, 11, &out), PENDING);
+				UT_ASSERT_EQ(out.admission.inflight[side][bit], 0);
+				UT_ASSERT_EQ(strcmp(out.reason, "NATIVE_COLLECTION_PRODUCER_CLOSURE_UNPROVED"), 0);
+			}
+		pg_atomic_write_u32(&test_collection_gate.inflight[1][63], UINT32_MAX);
+		UT_ASSERT_EQ(return_collect(3, 2, 11, &out), PENDING);
+		UT_ASSERT_EQ(out.admission.inflight[1][63], UINT32_MAX);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&test_collection_gate.inflight[1][63]), UINT32_MAX);
+		pg_atomic_write_u32(&test_collection_gate.inflight[1][63], 0);
+		UT_ASSERT_EQ(memcmp(&candidate, &before, sizeof(candidate)), 0);
+		break;
+	case 13:
+		for (unsigned fault = 0; fault < 5; fault++) {
+			uint64 saved_generation = MyProc->cluster_grd_generation;
+			test_collection_fault = fault; test_collection_barriers = 0;
+			test_collection_barrier_hook = test_collection_change_at_shared_cut;
+			UT_ASSERT_EQ(return_collect(3, 3, 11, &out), fault == 1 || fault == 2 ? STALE : PENDING);
+			test_collection_barrier_hook = NULL;
+			UT_ASSERT_EQ(test_collection_barriers, 3);
+			if (fault != 4) UT_ASSERT(!out.admission.known);
+			if (fault == 4) {
+				UT_ASSERT_EQ(out.producer.actor.active_depth, 1);
+				UT_ASSERT(cluster_normal_stop_service_leave(true));
+			}
+			MyProc->cluster_grd_generation = saved_generation;
+			pg_atomic_write_u64(&test_collection_gate.admission_seq, 2);
+			pg_atomic_write_u64(&test_collection_gate.formation_epoch, 3);
+			pg_atomic_write_u64(&test_collection_gate.record_generation, 11);
+		}
+		break;
+	case 14:
+		for (unsigned fault = 0; fault < 7; fault++) {
+			unsigned seen = test_stop_polls;
+			UT_ASSERT_EQ(return_collect(fault == 5 ? 0 : fault == 6 ? UINT64_MAX : 3,
+				fault == 0 ? 0 : fault == 1 ? UINT64_MAX : fault == 2 ? 4 : 3,
+				fault == 3 ? 0 : fault == 4 ? UINT64_MAX : 11, &out), REFUSED);
+			UT_ASSERT(!out.admission.known);
+			UT_ASSERT_EQ(test_stop_polls, seen);
+		}
+		UT_ASSERT_EQ(return_collect(3, 3, 11, NULL), REFUSED);
+		test_stop_observation[0] = CLUSTER_NORMAL_STOP_PENDING;
+		test_stop_observation[24] = CLUSTER_NORMAL_STOP_INVALID;
+		UT_ASSERT_EQ(return_collect(3, 3, 11, &out), REFUSED);
+		UT_ASSERT_EQ(out.producer.responsibility.modules, 25);
+		UT_ASSERT(!out.admission.known);
+		test_stop_observation[24] = CLUSTER_NORMAL_STOP_READY;
+		UT_ASSERT_EQ(return_collect(3, 3, 11, &out), PENDING);
+		UT_ASSERT_EQ(out.producer.responsibility.modules, 25);
+		test_stop_observation[0] = CLUSTER_NORMAL_STOP_READY;
+		SemanticActivationShmem = NULL;
+		UT_ASSERT_EQ(return_collect(3, 3, 11, &out), REFUSED);
+		SemanticActivationShmem = &test_collection_gate;
+		pg_atomic_write_u64(&test_collection_gate.admission_seq, 3);
+		UT_ASSERT_EQ(return_collect(3, 3, 11, &out), PENDING);
+		UT_ASSERT(!out.admission.known);
+		pg_atomic_write_u64(&test_collection_gate.admission_seq, 2);
+		/* The same open current-epoch zero gate still has no return barrier. */
+		UT_ASSERT_EQ(return_collect(3, 3, 11, &out), PENDING);
+		UT_ASSERT_EQ(strcmp(out.reason, "NATIVE_COLLECTION_ADMISSION_PENDING"), 0);
+		break;
+	case 15:
+		{
+			ClusterSemanticActivationRecord open;
+			UT_ASSERT(cluster_semantic_activation_record_decode(candidate.basis.pgsa, &open, NULL));
+			/* OPEN's historical source may differ from its current target. */
+			open.source_feature_bitmap = 0;
+			UT_ASSERT(cluster_semantic_activation_record_encode(&open, candidate.basis.pgsa));
+			before = candidate;
+			UT_ASSERT_EQ(probe(&out), PENDING);
+			UT_ASSERT_EQ(memcmp(&candidate, &before, sizeof(candidate)), 0);
+		}
+		break;
+	case 11:
+		for (unsigned fault = 0; fault < 12; fault++) {
+			ClusterSemanticActivationRecord open;
+			ClusterSurvivorBasis saved = candidate.basis;
+			unsigned seen;
+			UT_ASSERT(cluster_semantic_activation_record_decode(candidate.basis.pgsa, &open, NULL));
+			switch (fault) {
+			case 0: open.phase = CLUSTER_SEMANTIC_PHASE_PREPARE; break;
+			case 1: open.record_generation = 12; break;
+			case 2: open.record_generation = UINT64_MAX; break;
+			case 3: open.transition_epoch = 0; break;
+			case 4: open.transition_epoch = 4; break;
+			case 5: open.transition_epoch = UINT64_MAX; break;
+			case 6: open.target_feature_bitmap ^= 1; break;
+			}
+			UT_ASSERT(cluster_semantic_activation_record_encode(&open, candidate.basis.pgsa));
+			if (fault == 7) candidate.basis.pgsa[100] = 1; /* Reserved byte. */
+			if (fault == 8) candidate.basis.pgsa[96] ^= 1; /* Original CRC. */
+			if (fault == 9) memset(candidate.basis.pgsa, 0, 512);
+			if (fault == 10) candidate.tables[0].header.source_features ^= 1;
+			if (fault == 11) candidate.basis.open_generation = 0;
+			seen = test_stop_polls;
+			memset(&out, 0xa5, sizeof(out));
+			before = candidate;
+			UT_ASSERT_EQ(probe(&out), REFUSED);
+			UT_ASSERT(!out.admission.known);
+			UT_ASSERT_EQ(test_stop_polls, seen);
+			UT_ASSERT_EQ(memcmp(&candidate, &before, sizeof(candidate)), 0);
+			if (fault == 10) candidate.tables[0].header.source_features ^= 1;
+			candidate.basis = saved;
+		}
+		break;
+	case 10:
+		before = candidate;
+		pg_atomic_write_u32(&test_collection_gate.inflight[1][63], 1);
+		UT_ASSERT_EQ(probe(&out), PENDING);
+		UT_ASSERT(out.admission.known);
+		UT_ASSERT_EQ(out.admission.formation_epoch, 2);
+		UT_ASSERT_EQ(out.producer.identity.epoch, 3);
+		UT_ASSERT_EQ(out.admission.inflight[1][63], 1);
+		UT_ASSERT_EQ(memcmp(&candidate, &before, sizeof(candidate)), 0);
+		pg_atomic_write_u32(&test_collection_gate.inflight[1][63], 0);
+		UT_ASSERT_EQ(probe(&out), PENDING);
+		UT_ASSERT_EQ(out.admission.inflight[1][63], 0);
+		UT_ASSERT_EQ(memcmp(&candidate, &before, sizeof(candidate)), 0);
+		break;
 	case 9:
 		make_ack(1); before = candidate;
 		for (unsigned fault = 0; fault < 5; fault++) {
@@ -274,9 +430,15 @@ UT_TEST(nonempty_or_invalid_begin_cannot_erase_previous_object) { run_candidate(
 UT_TEST(actual_native_debt_refusal_and_generation_drift_remain_distinct) { run_candidate(7); }
 UT_TEST(generations_never_wrap_or_partially_stage) { run_candidate(8); }
 UT_TEST(only_original_auxiliary_owner_can_touch_candidate) { run_candidate(9); }
+UT_TEST(original_epoch_returns_remain_bound_to_current_lmon) { run_candidate(10); }
+UT_TEST(original_open_baseline_is_decoded_and_bound_before_sampling) { run_candidate(11); }
+UT_TEST(all_original_128_return_cells_keep_their_own_gate) { run_candidate(12); }
+UT_TEST(return_collection_rechecks_original_identity_and_late_work) { run_candidate(13); }
+UT_TEST(return_collection_preserves_refusal_and_pending_priorities) { run_candidate(14); }
+UT_TEST(original_open_historical_source_does_not_replace_current_target) { run_candidate(15); }
 int main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(16);
 	UT_RUN(candidate_does_not_turn_an_idle_owner_point_into_quiescence);
 	UT_RUN(all_128_untrusted_rows_remain_unconfirmed);
 	UT_RUN(exact_duplicates_are_idempotent_conflicts_preserve_first);
@@ -287,5 +449,11 @@ int main(void)
 	UT_RUN(actual_native_debt_refusal_and_generation_drift_remain_distinct);
 	UT_RUN(generations_never_wrap_or_partially_stage);
 	UT_RUN(only_original_auxiliary_owner_can_touch_candidate);
+	UT_RUN(original_epoch_returns_remain_bound_to_current_lmon);
+	UT_RUN(original_open_baseline_is_decoded_and_bound_before_sampling);
+	UT_RUN(all_original_128_return_cells_keep_their_own_gate);
+	UT_RUN(return_collection_rechecks_original_identity_and_late_work);
+	UT_RUN(return_collection_preserves_refusal_and_pending_priorities);
+	UT_RUN(original_open_historical_source_does_not_replace_current_target);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }

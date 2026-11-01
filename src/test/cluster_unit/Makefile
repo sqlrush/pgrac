@@ -1638,7 +1638,7 @@ test_cluster_normal_stop_lms.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.
 # Original shared admission point observer, in the native actor fixture.
 test_cluster_shared_admission_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	awk '/^#define CLUSTER_SEMANTIC_ADMISSION_SNAPSHOT_TRIES / { print; n++ } /^typedef struct ClusterSemanticActivationShmem / || /^typedef struct SemanticActivationAdmissionSnapshot / { emit=1; n++ } emit { print } /^} / { emit=0 } /^static ClusterSemanticActivationShmem \*/ { print; n++ } END { if(n!=4 || emit) exit 1 }' $< > $@.tmp
-	awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; n++ } /^cluster_semantic_activation_admission_observe\(/ { print "ClusterSemanticAdmissionObservationResult"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=2 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^semantic_activation_(snapshot|return_snapshot)\(/ { print "static bool"; emit=1; n++ } /^cluster_semantic_activation_admission_(observe|return_observe)\(/ { print "ClusterSemanticAdmissionObservationResult"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=4 || emit) exit 1 }' $< >> $@.tmp
 	mv $@.tmp $@
 test_cluster_normal_stop: test_cluster_shared_admission_observe.inc test_cluster_service_collection_refusals.h $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 
@@ -6269,8 +6269,9 @@ test_cluster_lmon_producer_observe.inc: $(top_srcdir)/src/backend/cluster/cluste
 		$(top_srcdir)/src/include/cluster/cluster_service_observe.h
 	awk '/^cl_native_observe_lock\(/ { print "static void"; emit=1; count++ } \
 	     /^cluster_service_(actor|producer)_observe\(/ { print "ClusterNormalStopPollResult"; emit=1; count++ } \
-	     /^cluster_service_producer_collect\(/ { print "ClusterSemanticAdmissionObservationResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
+	     /^cl_service_producer_collect\(/ { print "static ClusterSemanticAdmissionObservationResult"; emit=1; count++ } \
+	     /^cluster_service_producer_collect(_return)?\(/ { print "ClusterSemanticAdmissionObservationResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 6) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_lmon: test_cluster_lmon.c unit_test.h test_cluster_lmon_stop_service.inc \
@@ -13630,11 +13631,24 @@ test_cluster_pi_empty_batch_release.inc: $(top_srcdir)/src/backend/cluster/clust
 
 test_cluster_wal_inputs_job_service test_cluster_normal_stop: test_cluster_pi_empty_batch_fixture.h test_cluster_pi_empty_batch_release.inc $(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 
+# Extract the original PGSA codec; these are syntax inputs, not durable proof.
+test_cluster_survivor_pgsa.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^#define CLUSTER_SEMANTIC_RECORD_(MAGIC|VERSION|HEADER_LEN|CRC_OFFSET) / { print; defines++ } \
+	     /^semantic_activation_read_u16_le\(/ { print "static uint16"; emit=1; count++ } \
+	     /^semantic_activation_read_u32_le\(/ { print "static uint32"; emit=1; count++ } \
+	     /^semantic_activation_read_u64_le\(/ { print "static uint64"; emit=1; count++ } \
+	     /^semantic_activation_write_u(16|32|64)_le\(/ || /^semantic_activation_set_refusal\(/ { print "static void"; emit=1; count++ } \
+	     /^semantic_activation_bytes_are_zero\(/ { print "static bool"; emit=1; count++ } \
+	     /^cluster_semantic_activation_record_(encode|decode)\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 10 || defines != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # Unconfirmed survivor collection at actual original LMON wait boundaries.
 TESTS += test_cluster_survivor_candidate
 all: test_cluster_survivor_candidate
 
 test_cluster_survivor_candidate: test_cluster_survivor_candidate.c test_cluster_lmon.c unit_test.h \
+		test_cluster_survivor_pgsa.inc \
 		test_cluster_lmon_stop_service.inc test_cluster_lmon_producer_observe.inc \
 		test_cluster_lmon_producer_pause.inc test_cluster_shared_admission_observe.inc \
 		test_cluster_lmon_admission_pause.inc \

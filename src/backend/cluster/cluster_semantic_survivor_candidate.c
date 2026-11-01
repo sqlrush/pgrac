@@ -246,19 +246,34 @@ cluster_semantic_survivor_candidate_probe(ClusterSurvivorControl *c,
 	ClusterServiceProducerCollection *out, const char **reason)
 {
 	ClusterSemanticAdmissionObservationResult result;
+	ClusterSemanticActivationRecord open;
 	if (!candidate_owner() || out == NULL || c == NULL)
 		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_owner_invalid");
 	if (!candidate_live(c))
 		return candidate_result(CANDIDATE_STALE, reason, "candidate_not_live");
-	result = cluster_service_producer_collect(c->header.epoch, c->basis.open_generation, out);
+	memset(out, 0, sizeof(*out));
+	/* Decode the original baseline, not offsets from an untrusted PGSA blob.
+	 * This only binds the collection scope; no durable/current proof is implied. */
+	if (!cluster_semantic_activation_record_decode(c->basis.pgsa, &open, NULL)
+		|| open.phase != CLUSTER_SEMANTIC_PHASE_OPEN
+		|| open.record_generation == UINT64_MAX
+		|| open.record_generation != c->basis.open_generation
+		|| open.transition_epoch == 0 || open.transition_epoch == UINT64_MAX
+		|| open.transition_epoch > c->header.epoch
+		|| open.target_feature_bitmap != c->tables[0].header.target_features
+		|| open.target_feature_bitmap != c->tables[0].header.source_features)
+		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_open_baseline_invalid");
+	result = cluster_service_producer_collect_return(c->header.epoch, open.transition_epoch,
+		c->basis.open_generation, out);
 	if (result == CANDIDATE_STALE) {
 		(void)cluster_semantic_survivor_candidate_invalidate(c, NULL);
 		return candidate_result(result, reason, "candidate_native_changed");
 	}
-	if (result != CANDIDATE_PENDING
-		&& result != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT)
+	if (result != CANDIDATE_PENDING)
 		return candidate_result(CANDIDATE_REFUSED, reason, "candidate_native_refused");
 	/* No receipt is manufactured from an idle point, an empty bitmap or hash. */
 	return candidate_result(CANDIDATE_PENDING, reason,
-		result == CANDIDATE_PENDING ? "candidate_native_pending" : "candidate_producer_closure_unproved");
+		out->reason != NULL
+			&& strcmp(out->reason, "NATIVE_COLLECTION_PRODUCER_CLOSURE_UNPROVED") == 0
+			? "candidate_producer_closure_unproved" : "candidate_native_pending");
 }
