@@ -519,10 +519,154 @@ UT_TEST(test_resident_PI_DATA_retirement_keeps_original_transport_and_allows_ref
 	pi_end();
 }
 
+
+/* The old body and its completion ACK have separate bounded owners. */
+static ResourceXDecodedFrame
+pi_capacity_successor(PiFixture *f)
+{
+	ResourceXDecodedFrame block = f->source.block;
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
+	uint16 length = 0;
+	ResourceXWireReject reject;
+	block.common.assertion_sequence++;
+	block.common.base_authority_generation = block.common.authority_generation++;
+	block.body.acquire_decision.enqueue_order++;
+	block.body.acquire_decision.source_service_generation++;
+	block.body.acquire_decision.episode.reservation_token++;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N,
+		&block, bytes, sizeof(bytes), &length, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N,
+		bytes, length, &block, &reject));
+	return block;
+}
+static void
+pi_capacity_observe(PiFixture *f, const ResourceXDecodedFrame *block,
+	ResourceXApplyResult wanted)
+{
+	ClusterPcmResourceXMasterState before = *f->source.m.state;
+	ClusterPcmLocalPiSnapshotV1 local, after;
+	PGAlignedBlock page = f->source.page;
+	int sleeps = fake_cv_sleep_count;
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f->local.resource, &local));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_prepare_exact(block,
+		2, 7, &f->source.prepared, f->source.page.data, &f->last, 83, 61), wanted);
+	UT_ASSERT(memcmp(&before, f->source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(block,
+		2, 7, &f->source.prepared, f->source.page.data, &f->last, 83, 61, 83, 61), wanted);
+	UT_ASSERT(memcmp(&before, f->source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(block,
+		2, 83, 61), wanted);
+	UT_ASSERT(memcmp(&before, f->source.m.state, sizeof(before)) == 0);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f->local.resource, &after));
+	UT_ASSERT(memcmp(&local, &after, sizeof(local)) == 0);
+	UT_ASSERT(memcmp(page.data, f->source.page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps);
+}
+static void
+pi_capacity_lifetimes(PcmState mode, bool data_first)
+{
+	PiFixture f;
+	ResourceXDecodedFrame block, request;
+	ResourceXIntentSlot staged;
+	ClusterPcmOwnSnapshot next;
+	int wakes;
+	if (!pi_start_mode(&f, true, 2, mode)) { UT_ASSERT(false); return; }
+	block = pi_capacity_successor(&f); request = pi_request(&f);
+	pi_capacity_observe(&f, &block, RESOURCE_X_APPLY_LOCAL_WAIT);
+	if (data_first) {
+		local_pi_covered = true; UT_ASSERT(pi_retire(&f, false));
+		UT_ASSERT_EQ(f.source.m.state->pi_carrier.pi_refs, 0);
+		UT_ASSERT_EQ(f.source.m.state->pi_carrier.transport_refs, 1);
+		pi_capacity_observe(&f, &block, RESOURCE_X_APPLY_LOCAL_WAIT);
+	}
+	UT_ASSERT_EQ(clean_receive(&request), RESOURCE_X_APPLY_APPLIED);
+	if (!data_first) {
+		local_pi_covered = true; UT_ASSERT(pi_retire(&f, false));
+	}
+	UT_ASSERT_EQ(f.source.m.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	pi_capacity_observe(&f, &block, RESOURCE_X_APPLY_LOCAL_WAIT);
+	staged = clean_stage(&f.source.m.state->holder_status_intent.slot);
+	UT_ASSERT_EQ(f.source.m.state->holder_image.valid, 0);
+	UT_ASSERT_EQ(f.source.m.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_STAGED);
+	pi_capacity_observe(&f, &block, RESOURCE_X_APPLY_LOCAL_WAIT);
+	wakes = fake_cv_broadcast_count;
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged,
+		true, ++fake_pcm_clock_us));
+	UT_ASSERT(fake_cv_broadcast_count > wakes);
+	UT_ASSERT_EQ(f.source.m.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT_EQ(f.source.m.state->pi_carrier.pi_refs, 0);
+	UT_ASSERT_EQ(f.source.m.state->pi_carrier.transport_refs, 0);
+	next = f.source.prepared; next.generation += 2; next.reservation_token += 2;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(&block,
+		2, 7, &next, f.source.page.data, &f.last, 83, 61, 83, 61), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(f.source.m.state->holder_image.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
+	UT_ASSERT_EQ(f.source.m.state->holder_status.authority_generation, block.common.authority_generation);
+	printf("# capacity mode=%d DATA-first=%d old-PI=0 old-transport=0 old-ACK=0 successor=owned\n", mode, data_first);
+	pi_end();
+}
+UT_TEST(test_pi_capacity_S_transport_and_ACK_wait_for_original_owners)
+{
+	pi_capacity_lifetimes(PCM_STATE_S, true);
+	pi_capacity_lifetimes(PCM_STATE_S, false);
+}
+UT_TEST(test_pi_capacity_X_transport_and_ACK_wait_for_original_owners)
+{
+	pi_capacity_lifetimes(PCM_STATE_X, true);
+	pi_capacity_lifetimes(PCM_STATE_X, false);
+}
+
+
+UT_TEST(test_pi_capacity_does_not_turn_invalid_ACK_or_old_A_into_wait)
+{
+	PiFixture f;
+	ResourceXDecodedFrame block, request;
+	ResourceXIntentSlot staged;
+	ClusterPcmResourceXMasterState before;
+	int wakes;
+	if (!pi_start_mode(&f, true, 2, PCM_STATE_S)) { UT_ASSERT(false); return; }
+	block = pi_capacity_successor(&f); request = pi_request(&f);
+	UT_ASSERT_EQ(clean_receive(&request), RESOURCE_X_APPLY_APPLIED);
+	local_pi_covered = true; UT_ASSERT(pi_retire(&f, false));
+	staged = clean_stage(&f.source.m.state->holder_status_intent.slot);
+	before = *f.source.m.state;
+	for (int cut = 0; cut < 5; cut++) {
+		ResourceXApplyResult result;
+		ClusterPcmResourceXMasterState changed;
+		switch (cut) {
+			case 0: f.source.m.state->holder_status_intent.payload[0] ^= 1; break;
+			case 1: f.source.m.state->holder_status_intent.slot.state = RESOURCE_X_INTENT_SLOT_STAGED + 1; break;
+			case 2: f.source.m.state->holder_status_intent.slot.authority_generation++; break;
+			case 3: f.source.m.state->holder_status_intent.slot.body.owner_generation++; break;
+			case 4: f.source.m.state->settlement_retry.pending = 1; break;
+		}
+		changed = *f.source.m.state;
+		result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&block, 2, 83, 61);
+		UT_ASSERT(result != RESOURCE_X_APPLY_LOCAL_WAIT && result != RESOURCE_X_APPLY_APPLIED
+			&& result != RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(memcmp(&changed, f.source.m.state, sizeof(changed)) == 0);
+		result = cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(&block,
+			2, 7, &f.source.prepared, f.source.page.data, &f.last, 83, 61, 83, 61);
+		UT_ASSERT(result != RESOURCE_X_APPLY_LOCAL_WAIT && result != RESOURCE_X_APPLY_APPLIED
+			&& result != RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(memcmp(&changed, f.source.m.state, sizeof(changed)) == 0);
+		*f.source.m.state = before;
+	}
+	pi_capacity_observe(&f, &f.source.block, RESOURCE_X_APPLY_STALE);
+	wakes = fake_cv_broadcast_count;
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged,
+		true, ++fake_pcm_clock_us));
+	UT_ASSERT(fake_cv_broadcast_count > wakes);
+	wakes = fake_cv_broadcast_count;
+	UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged,
+		true, ++fake_pcm_clock_us));
+	UT_ASSERT_EQ(fake_cv_broadcast_count, wakes);
+	pi_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(20);
 	UT_RUN(test_pi_master_arms_settlement_without_retiring_pi);
 	UT_RUN(test_pi_transport_settlement_keeps_original_body_and_wal_scope);
 	UT_RUN(test_pi_retirement_after_transport_releases_body_with_ack_still_owned);
@@ -540,6 +684,9 @@ main(void)
 	UT_RUN(test_resident_PI_requires_independent_exact_body_without_retiring_owners);
 	UT_RUN(test_resident_PI_rejects_uncovered_bytes_identity_and_malformed_carrier);
 	UT_RUN(test_resident_PI_DATA_retirement_keeps_original_transport_and_allows_refill);
+	UT_RUN(test_pi_capacity_S_transport_and_ACK_wait_for_original_owners);
+	UT_RUN(test_pi_capacity_X_transport_and_ACK_wait_for_original_owners);
+	UT_RUN(test_pi_capacity_does_not_turn_invalid_ACK_or_old_A_into_wait);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

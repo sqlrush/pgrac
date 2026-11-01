@@ -25705,6 +25705,22 @@ pcm_resource_x_s_source_intent_empty(const ResourceXIntentSlot *slot)
 	return memcmp(&quiet, &empty, sizeof(quiet)) == 0;
 }
 
+/* The old completion ACK owns this bounded slot independently of the
+ * already retired image/PI. Only a fully valid original ACK is capacity
+ * busy; malformed or stale ownership remains a recovery refusal. */
+static ResourceXApplyResult
+pcm_resource_x_s_source_ack_capacity_locked(struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state)
+{
+	const ResourceXIntentSlot *slot = &state->holder_status_intent.slot;
+
+	if (slot->kind != RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
+		return RESOURCE_X_APPLY_APPLIED;
+	return slot->state >= RESOURCE_X_INTENT_SLOT_ARMED && slot->state <= RESOURCE_X_INTENT_SLOT_STAGED
+		&& pcm_resource_x_read_source_ack_send_valid(entry, state, slot, state->holder_status_intent.payload)
+		? RESOURCE_X_APPLY_LOCAL_WAIT : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
 static bool
 pcm_resource_x_s_source_forward_valid(const struct GrdEntry *entry,
 	const ClusterPcmResourceXMasterState *state, ResourceXDecodedFrame *block)
@@ -25800,7 +25816,10 @@ cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(const ResourceXDecode
 	if (!pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, NULL)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
 	}
-	if (state->pi_carrier.pi_refs && !pcm_resource_x_s_source_block_matches(state, &canonical)) {
+	result = pcm_resource_x_s_source_ack_capacity_locked(ref.entry, state);
+	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	if ((state->pi_carrier.pi_refs || state->pi_carrier.transport_refs)
+		&& !pcm_resource_x_s_source_block_matches(state, &canonical)) {
 		result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
 	}
 	if (state->holder_status.valid == RESOURCE_X_HOLDER_SOURCE_FORWARD) {
@@ -26670,6 +26689,12 @@ pcm_resource_x_acquire_s_source_prepare_internal(const ResourceXDecodedFrame *bl
 	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
 	if (!pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, NULL)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
+	}
+	result = pcm_resource_x_s_source_ack_capacity_locked(ref.entry, state);
+	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	if (!state->pi_carrier.pi_refs && state->pi_carrier.transport_refs
+		&& !pcm_resource_x_s_source_block_matches(state, &canonical)) {
+		result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
 	}
 	if (state->pi_carrier.pi_refs && !pcm_resource_x_s_source_block_matches(state, &canonical)) {
 		ClusterPcmLocalPiSnapshotV1 local;
@@ -34792,8 +34817,13 @@ cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXInt
 			}
 			if (applied
 				&& (expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_STATUS
-					|| expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE))
+					|| expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE)) {
 				slot->first_armed_us = expected->first_armed_us;
+				if (expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_STATUS
+					&& expected->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2
+					&& expected->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES)
+					ConditionVariableBroadcast(&entry_ref.entry->wait_cv);
+			}
 		} else {
 			slot->last_attempt_us = now_us;
 			if (sent)
