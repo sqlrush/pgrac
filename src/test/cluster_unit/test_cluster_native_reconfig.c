@@ -11,8 +11,12 @@
 
 static unsigned nr_cut, nr_native;
 static bool nr_late, nr_reached;
+enum { NR_FREEZE, NR_SESSION, NR_ADMISSION, NR_CONNECTION, NR_UNAVAILABLE };
+static unsigned nr_domain;
+static bool nr_cancel_wait;
 static int nr_control[2][2];
 static ResourceXReconfigToken nr_token;
+static ResourceXIntentSlot nr_unsent_callback;
 #ifdef NATIVE_RECONFIG_WRITE
 static sigjmp_buf nr_panic_jump;
 static bool nr_panic_caught;
@@ -60,6 +64,23 @@ static void nr_freeze(void)
 	UT_ASSERT_EQ(nr_token.dead_requester_bitmap, 0);
 	nr_reached = true;
 }
+static void nr_change(void)
+{
+	/* Model another actor's publication, including while the caller holds
+	 * content-X at IO end. Actual GCS sampling still asserts lock freedom. */
+	UT_ASSERT(!nr_reached);
+	if (nr_domain == NR_FREEZE) { nr_freeze(); return; }
+	if (nr_domain == NR_SESSION) {
+		ordinary_master_session++; wc_session_id++;
+	} else if (nr_domain == NR_ADMISSION) {
+		master_durable_admission = false; wc_r4++;
+	} else if (nr_domain == NR_CONNECTION) ordinary_connection++;
+	else {
+		UT_ASSERT_EQ(nr_domain, NR_UNAVAILABLE);
+		ordinary_unavailable = nr_cancel_wait ? 64 : 3;
+	}
+	nr_reached = true;
+}
 static void nr_retained(const ResourceXReconfigToken *token, bool native_namespace)
 {
 	ResourceXReconfigBatch batch;
@@ -102,6 +123,22 @@ static bool nr_master(int requester, int holder, int mode)
 	close(nr_control[0][0]); close(nr_control[1][0]); close(nr_control[1][1]);
 	NM_REQUIRE(nt_seed_master(holder, 0));
 	NM_REQUIRE(nm_receive(requester, RESOURCE_X_MSG_ASSERT_X, &request));
+	if (nr_cut == 4) {
+		ClusterPcmResourceXMasterRequest empty = {0};
+		NM_REQUIRE(nm_master_enqueue(&f, &request));
+		retained = f.state->requests[1];
+		UT_ASSERT_EQ(retained.phase, RESOURCE_X_MASTER_QUEUED);
+		NM_REQUIRE(nr_signal(nr_control[0][1], true));
+		NM_REQUIRE(nr_signal(nr_control[0][1], false));
+		if (nr_domain == NR_FREEZE) {
+			ResourceXReconfigBatch batch;
+			NM_REQUIRE(cluster_resource_x_reconfig_freeze(17, 18, &token));
+			UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch), RESOURCE_X_RECONFIG_MORE);
+			UT_ASSERT(memcmp(&empty, &f.state->requests[1], sizeof(empty)) == 0);
+		} else UT_ASSERT(memcmp(&retained, &f.state->requests[1], sizeof(retained)) == 0);
+		UT_ASSERT_EQ(f.state->bootstrap_receipts[1].highest_attempt_floor, request.common.assertion_sequence);
+		close(nr_control[0][1]); complete_idle(); return true;
+	}
 	NM_REQUIRE(nm_master_admit(&f, &request));
 	block = publish_decode(f.state->block_intents[2].payload, true);
 	UT_ASSERT_EQ(block.body.acquire_decision.source_node, 2);
@@ -117,8 +154,10 @@ static bool nr_master(int requester, int holder, int mode)
 	retained = f.state->requests[1]; pending = f.state->pending_s_bitmap;
 	memcpy(decision, f.state->block_intents[2].payload, sizeof(decision));
 	UT_ASSERT(retained.phase != RESOURCE_X_MASTER_NONE);
-	NM_REQUIRE(cluster_resource_x_reconfig_freeze(17, 18, &token));
-	nr_retained(&token, false);
+	if (nr_domain == NR_FREEZE) {
+		NM_REQUIRE(cluster_resource_x_reconfig_freeze(17, 18, &token));
+		nr_retained(&token, false);
+	}
 	UT_ASSERT(memcmp(&retained, &f.state->requests[1], sizeof(retained)) == 0);
 	UT_ASSERT_EQ(f.state->pending_s_bitmap, pending);
 	UT_ASSERT(memcmp(decision, f.state->block_intents[2].payload, sizeof(decision)) == 0);
@@ -143,6 +182,21 @@ static bool nr_holder(int master, int requester, int mode)
 	(void)mode;
 	close(nr_control[1][0]); close(nr_control[0][0]); close(nr_control[0][1]);
 	NM_REQUIRE(nt_seed_holder(master, 0, 2));
+	if (nr_cut == 4) {
+		NM_REQUIRE(nm_requester_notice(&state));
+		retained = malloc(sizeof(*retained)); NM_REQUIRE(retained != NULL);
+		memcpy(retained, state, sizeof(*state)); native = request_own;
+		bufstate = pg_atomic_read_u32(&request_buf.state); memcpy(page.data, disk_shared.data, BLCKSZ);
+		NM_REQUIRE(nr_signal(nr_control[1][1], false));
+		if (nr_domain == NR_FREEZE) {
+			NM_REQUIRE(cluster_resource_x_reconfig_freeze(17, 18, &token));
+			nr_retained(&token, true);
+		}
+		UT_ASSERT(memcmp(retained, state, sizeof(*state)) == 0);
+		request_native_unchanged(&native, bufstate);
+		UT_ASSERT(memcmp(page.data, disk_shared.data, BLCKSZ) == 0);
+		free(retained); close(nr_control[1][1]); complete_idle(); return true;
+	}
 	holder_pins = holder_fuses = 0; holder_content_busy = false;
 	holder_after_prepare = NULL; holder_peer_current = true; holder_write_error = false;
 	holder_io_enters = holder_io_ends = 0;
@@ -175,8 +229,10 @@ static bool nr_holder(int master, int requester, int mode)
 	retained = malloc(sizeof(*retained)); NM_REQUIRE(retained != NULL);
 	memcpy(retained, state, sizeof(*state)); native = request_own;
 	bufstate = pg_atomic_read_u32(&request_buf.state); memcpy(page.data, disk_shared.data, BLCKSZ);
-	NM_REQUIRE(cluster_resource_x_reconfig_freeze(17, 18, &token));
-	nr_retained(&token, true);
+	if (nr_domain == NR_FREEZE) {
+		NM_REQUIRE(cluster_resource_x_reconfig_freeze(17, 18, &token));
+		nr_retained(&token, true);
+	}
 	UT_ASSERT(memcmp(retained, state, sizeof(*state)) == 0);
 	request_native_unchanged(&native, bufstate);
 	UT_ASSERT(memcmp(page.data, disk_shared.data, BLCKSZ) == 0);
@@ -189,33 +245,45 @@ static bool nr_holder(int master, int requester, int mode)
 	UT_ASSERT(memcmp(&retained->holder_status, &state->holder_status, sizeof(state->holder_status)) == 0);
 	UT_ASSERT_EQ(state->pi_carrier.transport_refs, retained->pi_carrier.transport_refs);
 	UT_ASSERT_EQ(state->pi_carrier.pi_refs, retained->pi_carrier.pi_refs);
-	NM_REQUIRE(!holder_probe(&stale_work));
+	if (nr_domain == NR_FREEZE) NM_REQUIRE(!holder_probe(&stale_work));
 	request_native_unchanged(&native, bufstate);
 	UT_ASSERT(memcmp(page.data, disk_shared.data, BLCKSZ) == 0);
 	free(retained); close(nr_control[1][1]); complete_idle(); return true;
 }
 static void nr_deliver(void)
 {
+	if (nr_cut == 4) {
+		ResourceXDecodedFrame request;
+		ResourceXIntentSlot ticket = request_ticket(&request);
+		nr_unsent_callback = ticket;
+		UT_ASSERT(nm_send(nc_fd, RESOURCE_X_MSG_ASSERT_X, &request));
+		cluster_lms_outbound_resource_x_send_complete(&ticket, true);
+		prepared_episode = request.body.acquire_intent;
+		input_observation = ordinary_active->observation;
+		UT_ASSERT(nr_signal(nr_control[0][0], false)); nr_change(); return;
+	}
 	nc_deliver(); input_observation = ordinary_active->observation;
-	if (nr_cut == 0) nr_freeze();
+	if (nr_cut == 0) nr_change();
 }
 static void nr_after_copy(void)
 {
 	if (request_entry()->resource_x_bootstrap_round.delivery_executor_purpose
 		== RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING
 		&& memcmp(disk_shared.data, nc_image.body.acquire_image.original_image.page_bytes, BLCKSZ) == 0) {
-		stage_after_content = NULL; nr_freeze();
+		stage_after_content = NULL; nr_change();
 	}
 }
 static void nr_io_boundary(bool completed)
 {
 	if ((nr_cut == 2 && !completed) || (nr_cut == 3 && completed)) {
-		complete_io_boundary = NULL; nr_freeze();
+		complete_io_boundary = NULL; nr_change();
 	}
 }
 static bool nr_requester(int master, int holder, int mode, int source, uint64 boot)
 {
-#ifndef NATIVE_RECONFIG_WRITE
+#ifdef NATIVE_RECONFIG_WRITE
+	ClusterPcmXWriterLedgerEntry *entry = NULL;
+#else
 	ClusterBufmgrFirstFill read;
 #endif
 	ClusterPcmOwnEntry native;
@@ -226,6 +294,7 @@ static bool nr_requester(int master, int holder, int mode, int source, uint64 bo
 	uint32 header;
 	volatile bool completed = false;
 	bool panic_expected = false;
+	bool native_completed, copied;
 	(void)mode;
 	close(nr_control[0][1]); close(nr_control[1][1]);
 #ifdef NATIVE_RECONFIG_WRITE
@@ -239,9 +308,9 @@ static bool nr_requester(int master, int holder, int mode, int source, uint64 bo
 	auth_observation_hook = nc_auth_peer; ordinary_delivery_transport = nr_deliver;
 	nr_reached = false; memcpy(before.data, disk_shared.data, BLCKSZ);
 	if (nr_cut == 1) stage_after_content = nr_after_copy;
-	if (nr_cut >= 2) complete_io_boundary = nr_io_boundary;
+	if (nr_cut >= 2 && nr_cut < 4) complete_io_boundary = nr_io_boundary;
 #ifdef NATIVE_RECONFIG_WRITE
-	panic_expected = nr_cut >= 2;
+	panic_expected = nr_domain == NR_FREEZE && nr_cut >= 2 && nr_cut < 4;
 	if (panic_expected) {
 		sigjmp_buf *saved = PG_exception_stack;
 		ErrorContextCallback *context = error_context_stack;
@@ -258,25 +327,38 @@ static bool nr_requester(int master, int holder, int mode, int source, uint64 bo
 		UT_ASSERT(!completed);
 		UT_ASSERT_EQ(disk_exit_count, 2);
 		UT_ASSERT_EQ(fake_lwlock_depth, 0);
-	} else completed = rx_prepare(NULL) != NULL;
+	} else {
+		entry = rx_prepare(NULL); completed = entry != NULL;
+		if (entry != NULL) NM_REQUIRE(xt_use_writer(entry, false));
+	}
 #else
 	completed = nr_native == 0 ? ordinary_run(&read) : rl_run(NULL);
 #endif
 	UT_ASSERT(nr_reached);
+	native_completed = (nr_cut >= 2 && nr_cut < 4)
+		|| (nr_domain == NR_UNAVAILABLE && !nr_cancel_wait);
+	copied = nr_cut >= 1 && nr_cut < 4;
+	if (nr_domain == NR_UNAVAILABLE) {
+		UT_ASSERT_EQ(ordinary_pauses, nr_cancel_wait ? ordinary_pause_limit : 3);
+		UT_ASSERT_EQ(completed, !nr_cancel_wait);
+	} else UT_ASSERT(!completed);
+	printf("# Native domain terminal: domain=%u cut=%u native=%u panic=%u gen=%llu purpose=%llu io=%u\n",
+		nr_domain, nr_cut, nr_native, ordinary_panics, (unsigned long long)cluster_pcm_own_gen_get(0),
+		(unsigned long long)request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
+		complete_io_calls);
 	UT_ASSERT_EQ(ordinary_sends, 1); UT_ASSERT_EQ(disk_reads, 0);
 	UT_ASSERT_EQ(ordinary_panics, panic_expected ? 1 : 0);
 	UT_ASSERT_EQ(ordinary_leaves, panic_expected ? 0 : 1);
-	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation + (nr_cut >= 2));
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), request_base.generation + native_completed);
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), panic_expected ? 1 : 0);
-	UT_ASSERT_EQ(complete_broadcasts, nr_cut >= 2 ? 1 : 0);
-	UT_ASSERT_EQ(complete_io_calls, nr_cut >= 2 ? 1 : 0);
+	UT_ASSERT_EQ(complete_broadcasts, native_completed ? 1 : 0);
+	UT_ASSERT_EQ(complete_io_calls, native_completed ? 1 : 0);
 	UT_ASSERT(!ResourceOwnerHasBufferIO(original_io_owner, 1));
 	UT_ASSERT(!fake_cv_prepared);
-	if (nr_cut < 2) UT_ASSERT(!completed);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state) & (BM_VALID | BM_IO_ERROR | BM_IO_IN_PROGRESS),
-		nr_cut >= 2 || (nr_cut == 0 && nr_native != 0) ? BM_VALID : BM_IO_ERROR);
-	if (nr_cut == 0) UT_ASSERT(memcmp(before.data, disk_shared.data, BLCKSZ) == 0);
+		native_completed || (!copied && nr_native != 0) ? BM_VALID : BM_IO_ERROR);
+	if (!copied) UT_ASSERT(memcmp(before.data, disk_shared.data, BLCKSZ) == 0);
 	else UT_ASSERT(memcmp(disk_shared.data, nc_image.body.acquire_image.original_image.page_bytes, BLCKSZ) == 0);
 	if (LWLockHeldByMe(BufferDescriptorGetContentLock(&request_buf)))
 		LWLockRelease(BufferDescriptorGetContentLock(&request_buf));
@@ -286,21 +368,26 @@ static bool nr_requester(int master, int holder, int mode, int source, uint64 bo
 	NM_REQUIRE(nr_signal(nr_control[0][0], true)); NM_REQUIRE(nr_signal(nr_control[1][0], true));
 	retained = request_entry()->resource_x_bootstrap_round; native = request_own;
 	header = pg_atomic_read_u32(&request_buf.state); memcpy(after.data, disk_shared.data, BLCKSZ);
-	nr_retained(&nr_token, true);
+	if (nr_domain == NR_FREEZE) nr_retained(&nr_token, true);
 	UT_ASSERT(memcmp(&retained, &request_entry()->resource_x_bootstrap_round, sizeof(retained)) == 0);
 	request_native_unchanged(&native, header);
-	env.msg_type = RESOURCE_X_MSG_IMAGE_OR_GRANT; env.source_node_id = source; env.dest_node_id = 1;
-	env.epoch = 17; env.payload_length = nc_image.payload_bytes; auth_peer_boot = boot;
-	replay = gcs_block_resource_x_requester_join_ingress(&env, &nc_image, 61, &joined);
-	UT_ASSERT(replay != RESOURCE_X_APPLY_APPLIED);
+	if (nr_cut == 4) {
+		UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
+			&nr_unsent_callback, true, ++fake_pcm_clock_us));
+	} else {
+		env.msg_type = RESOURCE_X_MSG_IMAGE_OR_GRANT; env.source_node_id = source; env.dest_node_id = 1;
+		env.epoch = 17; env.payload_length = nc_image.payload_bytes; auth_peer_boot = boot;
+		replay = gcs_block_resource_x_requester_join_ingress(&env, &nc_image, 61, &joined);
+		UT_ASSERT(replay != RESOURCE_X_APPLY_APPLIED);
+	}
 	UT_ASSERT(memcmp(&retained, &request_entry()->resource_x_bootstrap_round, sizeof(retained)) == 0);
 	request_native_unchanged(&native, header);
 	UT_ASSERT(memcmp(after.data, disk_shared.data, BLCKSZ) == 0);
 	UT_ASSERT_EQ(ordinary_sends, 1); complete_idle(); return true;
 }
-static void nr_run(unsigned cut, bool late)
+static void nr_run_domain(unsigned domain, unsigned cut, bool late, bool cancel)
 {
-	nr_cut = cut; nr_late = late;
+	nr_domain = domain; nr_cut = cut; nr_late = late; nr_cancel_wait = cancel;
 	nt_requester = nr_requester; nt_master_role = nr_master; nt_holder_role = nr_holder;
 #ifdef NATIVE_RECONFIG_WRITE
 	nt_target_mode = PCM_STATE_X;
@@ -317,9 +404,14 @@ static void nr_run(unsigned cut, bool late)
 		nr_native = 0;
 #endif
 		for (; nr_native <= 2; nr_native++) {
-			printf("# Native freeze: source=%s target=%s native=%u cut=%u late=%u\n",
+			/* Preserve the original eight methods' evidence labels. */
+			if (nr_domain == NR_FREEZE && nr_cut < 4)
+				printf("# Native freeze: source=%s target=%s native=%u cut=%u late=%u\n",
+					source == 0 ? "S" : "dirty-X", nt_target_mode == PCM_STATE_S ? "S" : "X",
+					nr_native, nr_cut, nr_late);
+			printf("# Native domain: source=%s target=%s native=%u domain=%u cut=%u late=%u cancel=%u\n",
 				source == 0 ? "S" : "dirty-X", nt_target_mode == PCM_STATE_S ? "S" : "X",
-				nr_native, nr_cut, nr_late);
+				nr_native, nr_domain, nr_cut, nr_late, nr_cancel_wait);
 			if (socketpair(AF_UNIX, SOCK_STREAM, 0, nr_control[0]) != 0) { UT_ASSERT(false); return; }
 			if (socketpair(AF_UNIX, SOCK_STREAM, 0, nr_control[1]) != 0) {
 				close(nr_control[0][0]); close(nr_control[0][1]); UT_ASSERT(false); return;
@@ -341,6 +433,19 @@ static void nr_run(unsigned cut, bool late)
 		}
 	}
 }
+static void nr_run(unsigned cut, bool late) { nr_run_domain(NR_FREEZE, cut, late, false); }
+static void nr_all_cuts(unsigned domain)
+{
+	for (unsigned cut = 0; cut < 5; cut++)
+		for (unsigned late = 0; late < (cut == 4 ? 1u : 2u); late++)
+			nr_run_domain(domain, cut, late, false);
+}
+static void nr_waits(bool cancel)
+{
+	for (unsigned cut = 1; cut < 4; cut++)
+		for (unsigned late = 0; late < 2; late++)
+			nr_run_domain(NR_UNAVAILABLE, cut, late, cancel);
+}
 UT_TEST(test_freeze_after_SHIP_before_copy) { nr_run(0, false); }
 UT_TEST(test_freeze_after_copy_before_C) { nr_run(1, false); }
 UT_TEST(test_freeze_after_C_before_IO_end) { nr_run(2, false); }
@@ -349,9 +454,15 @@ UT_TEST(test_frozen_SHIP_waits_original_physical_callback) { nr_run(0, true); }
 UT_TEST(test_frozen_copy_waits_original_physical_callback) { nr_run(1, true); }
 UT_TEST(test_frozen_C_waits_original_physical_callback) { nr_run(2, true); }
 UT_TEST(test_frozen_IO_waits_original_physical_callback) { nr_run(3, true); }
+UT_TEST(test_freeze_before_master_decision) { nr_run_domain(NR_FREEZE, 4, false, false); }
+UT_TEST(test_master_session_change_across_ordinary_cuts) { nr_all_cuts(NR_SESSION); }
+UT_TEST(test_admission_change_across_ordinary_cuts) { nr_all_cuts(NR_ADMISSION); }
+UT_TEST(test_connection_change_across_ordinary_cuts) { nr_all_cuts(NR_CONNECTION); }
+UT_TEST(test_unavailable_observations_resume_without_REQUEST) { nr_waits(false); }
+UT_TEST(test_cancel_during_physical_observation_wait) { nr_waits(true); }
 int main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(14);
 	UT_RUN(test_freeze_after_SHIP_before_copy);
 	UT_RUN(test_freeze_after_copy_before_C);
 	UT_RUN(test_freeze_after_C_before_IO_end);
@@ -360,5 +471,11 @@ int main(void)
 	UT_RUN(test_frozen_copy_waits_original_physical_callback);
 	UT_RUN(test_frozen_C_waits_original_physical_callback);
 	UT_RUN(test_frozen_IO_waits_original_physical_callback);
+	UT_RUN(test_freeze_before_master_decision);
+	UT_RUN(test_master_session_change_across_ordinary_cuts);
+	UT_RUN(test_admission_change_across_ordinary_cuts);
+	UT_RUN(test_connection_change_across_ordinary_cuts);
+	UT_RUN(test_unavailable_observations_resume_without_REQUEST);
+	UT_RUN(test_cancel_during_physical_observation_wait);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }
