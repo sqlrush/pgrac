@@ -8578,6 +8578,32 @@ clean-clog-native-transam:
 clean: clean-clog-native-transam
 .PHONY: clean-clog-native-transam
 
+test_cluster_clog_native_status: test_cluster_clog_native_status.c \
+		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		cluster_catalog_trace_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_catalog_trace_test.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_clog_native_status
+all: test_cluster_clog_native_status
+clean-clog-native-status:
+	rm -f test_cluster_clog_native_status test_cluster_clog_native_status.d
+clean: clean-clog-native-status
+.PHONY: clean-clog-native-status
+
 test_cluster_undo_native_data_io: test_cluster_undo_native_data_io.c \
 		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \

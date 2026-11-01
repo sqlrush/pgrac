@@ -579,6 +579,37 @@ TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 	LWLockRelease(XactSLRULock);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Check before any bit or group LSN on the page changes. */
+static void
+CLOGCheckNativeStatus(TransactionId xid, XidStatus status, int slotno)
+{
+	XidStatus	current;
+
+	if (!TransactionIdIsNormal(xid) ||
+		(status != TRANSACTION_STATUS_COMMITTED &&
+		 status != TRANSACTION_STATUS_ABORTED &&
+		 status != TRANSACTION_STATUS_SUB_COMMITTED) ||
+		!LWLockHeldByMeInMode(XactSLRULock, LW_EXCLUSIVE) ||
+		slotno < 0 || slotno >= XactCtl->shared->num_slots ||
+		XactCtl->shared->page_number[slotno] != TransactionIdToPage(xid))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid managed CLOG status update for transaction %u", xid)));
+
+	current = (XactCtl->shared->page_buffer[slotno][TransactionIdToByte(xid)] >>
+			   (TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT)) & CLOG_XACT_BITMASK;
+	if (current != TRANSACTION_STATUS_IN_PROGRESS &&
+		current != TRANSACTION_STATUS_SUB_COMMITTED && current != status &&
+		!(InRecovery && status == TRANSACTION_STATUS_SUB_COMMITTED &&
+		  current == TRANSACTION_STATUS_COMMITTED))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("conflicting managed CLOG status for transaction %u: %u to %u",
+						xid, (unsigned) current, (unsigned) status)));
+}
+#endif
+
 /*
  * Record the final state of transaction entry in the commit log
  *
@@ -591,6 +622,33 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 {
 	int			slotno;
 	int			i;
+#ifdef USE_PGRAC_CLUSTER
+	bool		native = CLOGNativeIORequired();
+
+	/* Reject malformed page requests before reading or evicting a slot. */
+	if (native)
+	{
+		if ((status != TRANSACTION_STATUS_COMMITTED &&
+			 status != TRANSACTION_STATUS_ABORTED &&
+			 !(status == TRANSACTION_STATUS_SUB_COMMITTED &&
+			   !TransactionIdIsValid(xid))) ||
+			!LWLockHeldByMeInMode(XactSLRULock, LW_EXCLUSIVE) ||
+			pageno < 0 || pageno >= 131072 ||
+			nsubxids < 0 || nsubxids > CLOG_XACTS_PER_PAGE ||
+			(nsubxids > 0 && subxids == NULL) ||
+			(TransactionIdIsValid(xid) &&
+			 (!TransactionIdIsNormal(xid) || TransactionIdToPage(xid) != pageno)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid managed CLOG page status request")));
+		for (i = 0; i < nsubxids; i++)
+			if (!TransactionIdIsNormal(subxids[i]) ||
+				TransactionIdToPage(subxids[i]) != pageno)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid managed CLOG subtransaction page")));
+	}
+#endif
 
 	Assert(status == TRANSACTION_STATUS_COMMITTED ||
 		   status == TRANSACTION_STATUS_ABORTED ||
@@ -607,6 +665,20 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 	 * we think.
 	 */
 	slotno = SimpleLruReadPage(XactCtl, pageno, XLogRecPtrIsInvalid(lsn), xid);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (native)
+	{
+		if (TransactionIdIsValid(xid))
+			CLOGCheckNativeStatus(xid, status, slotno);
+		for (i = 0; i < nsubxids; i++)
+		{
+			if (TransactionIdIsValid(xid) && status == TRANSACTION_STATUS_COMMITTED)
+				CLOGCheckNativeStatus(subxids[i], TRANSACTION_STATUS_SUB_COMMITTED, slotno);
+			CLOGCheckNativeStatus(subxids[i], status, slotno);
+		}
+	}
+#endif
 
 	/*
 	 * Set the main transaction id, if any.
@@ -875,6 +947,11 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 	char	   *byteptr;
 	char		byteval;
 	char		curval;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired())
+		CLOGCheckNativeStatus(xid, status, slotno);
+#endif
 
 	byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
 	curval = (*byteptr >> bshift) & CLOG_XACT_BITMASK;
