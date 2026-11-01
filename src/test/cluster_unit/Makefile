@@ -11820,3 +11820,22 @@ clean distclean maintainer-clean: clean-native-unissued-pi
 .PHONY: clean-native-unissued-pi
 clean-native-unissued-pi:
 	rm -f test_cluster_native_unissued_pi
+
+# Same-node requester/master through original native completion and cleanup.
+TESTS += test_cluster_native_local_master
+all: test_cluster_native_local_master
+test_cluster_native_local_master: test_cluster_native_local_master.c \
+		test_cluster_native_master test_cluster_native_resident_x \
+		test_cluster_native_master_fixture.inc test_cluster_native_resident_x_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-local-master
+.PHONY: clean-native-local-master
+clean-native-local-master:
+	rm -f test_cluster_native_local_master
