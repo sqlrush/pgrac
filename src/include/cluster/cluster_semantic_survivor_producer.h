@@ -37,7 +37,9 @@ StaticAssertDecl(sizeof(ClusterSurvivorProducerObservation) <= 1024,
  * No cross-process read, allocation, poll-to-retire, registration or wakeup.
  * Always PENDING/STALE/REFUSED, including empty or DONE samples. It cannot
  * acknowledge a global/native cut or replace the remaining producer census.
- * Unknown results clear every sample; scope is passed by value. */
+ * An exiting original process refuses, including at the final return recheck;
+ * this does not alter its original cleanup. Unknown results clear every sample;
+ * scope is passed by value. */
 extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_producer_poll(
  ClusterSurvivorProducerOwner owner, ClusterSurvivorProducerScope scope,
  ClusterSurvivorProducerObservation *out);

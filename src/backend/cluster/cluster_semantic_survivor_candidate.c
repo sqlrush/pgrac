@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
 #include "storage/proc.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_epoch.h"
@@ -49,7 +50,7 @@ candidate_zero(const void *value, Size n)
 static bool
 candidate_owner(void)
 {
-	return IsUnderPostmaster && MyBackendType == B_LMON && AmLmonProcess()
+	return IsUnderPostmaster && !proc_exit_inprogress && MyBackendType == B_LMON && AmLmonProcess()
 		&& cluster_enabled && cluster_shared_config
 		&& MyProc != NULL && MyProcPid > 0 && MyProc->pid == MyProcPid
 		&& MyProc->pgprocno >= 0 && MyProc->backendId == InvalidBackendId

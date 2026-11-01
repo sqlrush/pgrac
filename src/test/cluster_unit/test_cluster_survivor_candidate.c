@@ -475,7 +475,7 @@ UT_TEST(survivor_native_dispatch_uses_actual_roles_at_original_lmon_return) { ru
 #include "test_cluster_survivor_candidate_invalidation.inc"
 int main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(40);
 	UT_RUN(candidate_does_not_turn_an_idle_owner_point_into_quiescence);
 	UT_RUN(all_128_untrusted_rows_remain_unconfirmed);
 	UT_RUN(exact_duplicates_are_idempotent_conflicts_preserve_first);
@@ -510,5 +510,11 @@ int main(void)
 	UT_RUN(candidate_unknown_cut_during_write_never_confirms);
 	UT_RUN(candidate_probe_clears_all_early_rejections);
 	UT_RUN(candidate_invalidation_uses_one_bounded_generation_change);
+	UT_RUN(native_survivor_entry_refuses_all_exiting_auxiliary_roles);
+	UT_RUN(native_survivor_return_clears_all_exiting_auxiliary_roles);
+	UT_RUN(candidate_exiting_entry_preserves_all_original_obligations);
+	UT_RUN(candidate_exit_during_begin_retains_invalid_original_basis);
+	UT_RUN(candidate_exit_during_stage_retains_rows_jobs_and_callbacks);
+	UT_RUN(candidate_probe_exit_clears_native_sample_without_retiring_debt);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }

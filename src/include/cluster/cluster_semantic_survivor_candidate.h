@@ -13,6 +13,8 @@
  * Begin/stage recheck actual native epoch and original shared gate scope;
  * these negative fences do not qualify ROOT, membership or producer closure.
  * A confirmed local change invalidates; unknown publication stays PENDING.
+ * An exiting original owner refuses; exit during a write invalidates while
+ * retaining the original basis, rows and cleanup obligations.
  * None of these operations can return CURRENT or set confirmed table bits.
  * There is no live routing, allocation, wakeup, closure or service effect.
  */
