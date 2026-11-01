@@ -1305,11 +1305,15 @@ cluster_undo_block0_current_startup_fenced_owned(void)
 	return test_normal_guard_owned;
 }
 
+static void (*test_admission_observe_barrier_hook)(int count);
+
 static void
 test_read_barrier(void)
 {
 	pg_read_barrier_impl();
 	test_read_barrier_count++;
+	if (test_admission_observe_barrier_hook != NULL)
+		test_admission_observe_barrier_hook(test_read_barrier_count);
 	if (test_advance_epoch_on_read_barrier == test_read_barrier_count)
 		test_current_epoch++;
 	if (test_fail_normal_on_read_barrier == test_read_barrier_count)
@@ -12351,10 +12355,212 @@ UT_TEST(test_run15_pending_publication_names_original_first_cut)
 	test_gate_reset();
 }
 
+
+
+/* This shared point observation must not borrow LMON-private stop state. */
+UT_TEST(test_p58_admission_original_token_release_is_observable_online)
+{
+	unsigned side;
+
+	for (side = 0; side < 2; side++) {
+		ClusterSemanticAdmissionToken tokens[2];
+		ClusterSemanticAdmissionObservation out;
+		ClusterSemanticAdmissionObservationResult held, returned;
+
+		test_gate_reset();
+		test_gate_publish(2, side == CLUSTER_SEMANTIC_TARGET_SIDE
+			? CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 : 0, 11, test_current_epoch, false);
+		UT_ASSERT(!AmLmonProcess());
+		for (unsigned i = 0; i < 2; i++)
+			UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+				(ClusterSemanticAdmissionSide)side, &tokens[i]), CLUSTER_SEMANTIC_ADMISSION_OK);
+		held = cluster_semantic_activation_admission_observe(test_current_epoch, 11, &out);
+		UT_ASSERT(out.known);
+		UT_ASSERT_EQ(out.seq, 2);
+		UT_ASSERT_EQ(out.formation_epoch, test_current_epoch);
+		UT_ASSERT_EQ(out.record_generation, 11);
+		UT_ASSERT_EQ(out.active_bits, side == CLUSTER_SEMANTIC_TARGET_SIDE
+			? CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 : 0);
+		UT_ASSERT(!out.transition_closed);
+		UT_ASSERT_EQ(out.inflight[side][0], 2);
+		UT_ASSERT_EQ(semantic_activation_local_inflight[side][0], 2);
+		/* Original stop-only ownership still refuses this backend. */
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+		cluster_semantic_activation_leave(&tokens[0]);
+		UT_ASSERT_EQ(cluster_semantic_activation_admission_observe(test_current_epoch, 11, &out),
+			CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		UT_ASSERT_EQ(out.inflight[side][0], 1);
+		cluster_semantic_activation_leave(&tokens[1]);
+		returned = cluster_semantic_activation_admission_observe(test_current_epoch, 11, &out);
+		UT_ASSERT_EQ(held, CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		UT_ASSERT_EQ(returned, CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT);
+		UT_ASSERT(out.known);
+		UT_ASSERT_EQ(out.inflight[side][0], 0);
+		UT_ASSERT_EQ(semantic_activation_local_inflight[side][0], 0);
+	}
+	test_gate_reset();
+}
+
+UT_TEST(test_p58_admission_samples_all_128_shared_cells_without_retiring_them)
+{
+	ClusterSemanticAdmissionObservation out;
+	unsigned side, bit;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 11, test_current_epoch, true);
+	/* Explicit atomic input boundaries, not fabricated producer receipts.
+	 * Reserved cells must not disappear after the first nonzero feature. */
+	for (side = 0; side < 2; side++)
+		for (bit = 0; bit < 64; bit++)
+			pg_atomic_write_u32(test_gate_inflight((ClusterSemanticAdmissionSide)side, bit),
+				side * 64 + bit + 1);
+	pg_atomic_write_u32(test_gate_inflight(CLUSTER_SEMANTIC_TARGET_SIDE, 63), UINT32_MAX);
+	UT_ASSERT_EQ(cluster_semantic_activation_admission_observe(test_current_epoch, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+	UT_ASSERT(out.known && out.transition_closed);
+	for (side = 0; side < 2; side++)
+		for (bit = 0; bit < 64; bit++) {
+			uint32 expected = side == 1 && bit == 63 ? UINT32_MAX : side * 64 + bit + 1;
+			UT_ASSERT_EQ(out.inflight[side][bit], expected);
+			UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight((ClusterSemanticAdmissionSide)side,
+				bit)), expected);
+			pg_atomic_write_u32(test_gate_inflight((ClusterSemanticAdmissionSide)side, bit), 0);
+		}
+	/* Another actor's observation must not misread this process's private
+	 * copy as global debt. Local/shared consistency remains the stop owner's. */
+	semantic_activation_local_inflight[1][63] = 1;
+	UT_ASSERT_EQ(cluster_semantic_activation_admission_observe(test_current_epoch, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT);
+	UT_ASSERT_EQ(semantic_activation_local_inflight[1][63], 1);
+	semantic_activation_local_inflight[1][63] = 0;
+	test_gate_reset();
+}
+
+UT_TEST(test_p58_admission_refused_and_stale_never_reuse_old_output)
+{
+	ClusterSemanticAdmissionObservation out, zero = { 0 };
+	ClusterSemanticActivationShmem *saved;
+
+	for (unsigned variant = 0; variant < 8; variant++) {
+		uint64 epoch, generation;
+		ClusterSemanticAdmissionObservationResult result;
+
+		test_gate_reset();
+		test_gate_publish(2, 0, 11, test_current_epoch, false);
+		epoch = test_current_epoch;
+		generation = 11;
+		saved = SemanticActivationShmem;
+		if (variant == 0) epoch = 0;
+		if (variant == 1) generation = 0;
+		if (variant == 2) SemanticActivationShmem = NULL;
+		if (variant == 3) IsUnderPostmaster = false;
+		if (variant == 4) MyProcPid = 0;
+		if (variant == 5) epoch++;
+		if (variant == 6) generation++;
+		if (variant == 7) pg_atomic_write_u64(test_gate_u64(TEST_GATE_FORMATION_EPOCH_OFFSET), epoch + 1);
+		memset(&out, 0xa5, sizeof(out));
+		result = cluster_semantic_activation_admission_observe(epoch, generation, &out);
+		UT_ASSERT_EQ(result, variant < 5 ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		SemanticActivationShmem = saved;
+		IsUnderPostmaster = true;
+		MyProcPid = 101;
+	}
+	UT_ASSERT_EQ(cluster_semantic_activation_admission_observe(test_current_epoch, 11, NULL),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED);
+	test_gate_reset();
+}
+
+static unsigned test_admission_observe_change;
+
+static void
+test_admission_observe_change_at_counter_cut(int count)
+{
+	if (count != 3)
+		return;
+	test_admission_observe_barrier_hook = NULL;
+	if (test_admission_observe_change == 0)
+		pg_atomic_write_u64(test_gate_u64(TEST_GATE_SEQ_OFFSET), 3); /* Publisher still busy. */
+	else if (test_admission_observe_change == 1)
+		test_gate_publish(4, 0, 11, test_current_epoch, true);
+	else if (test_admission_observe_change == 2)
+		test_gate_publish(4, 0, 12, test_current_epoch, false);
+	else if (test_admission_observe_change == 3)
+		test_gate_publish(4, 0, 11, test_current_epoch + 1, false);
+	else
+		test_current_epoch++;
+}
+
+UT_TEST(test_p58_admission_publication_and_scope_drift_are_bounded_unknown)
+{
+	ClusterSemanticAdmissionObservation out, zero = { 0 };
+
+	for (unsigned variant = 0; variant < 6; variant++) {
+		uint64 expected_epoch;
+		ClusterSemanticAdmissionObservationResult result;
+
+		test_gate_reset();
+		test_gate_publish(variant == 5 ? 3 : 2, 0, 11, test_current_epoch, false);
+		expected_epoch = test_current_epoch;
+		test_read_barrier_count = 0;
+		test_admission_observe_change = variant;
+		test_admission_observe_barrier_hook = test_admission_observe_change_at_counter_cut;
+		memset(&out, 0xa5, sizeof(out));
+		result = cluster_semantic_activation_admission_observe(expected_epoch, 11, &out);
+		test_admission_observe_barrier_hook = NULL;
+		UT_ASSERT_EQ(result, variant == 2 || variant == 3 || variant == 4
+			? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT(test_read_barrier_count <= 5);
+	}
+	test_gate_reset();
+}
+
+static ClusterSemanticAdmissionToken test_admission_observe_late_token;
+static ClusterSemanticAdmissionResult test_admission_observe_late_result;
+
+static void
+test_admission_observe_enter_after_counter_cut(int count)
+{
+	if (count != 3)
+		return;
+	test_admission_observe_barrier_hook = NULL;
+	/* A real original admission can start after the last counter was read.
+	 * Only the future producer closure can rule this out, not this sample. */
+	test_admission_observe_late_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_SOURCE_SIDE,
+		&test_admission_observe_late_token);
+}
+
+UT_TEST(test_p58_admission_point_sample_is_not_a_global_zero_certificate)
+{
+	ClusterSemanticAdmissionObservation out;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 11, test_current_epoch, false);
+	test_read_barrier_count = 0;
+	test_admission_observe_barrier_hook = test_admission_observe_enter_after_counter_cut;
+	UT_ASSERT_EQ(cluster_semantic_activation_admission_observe(test_current_epoch, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT);
+	test_admission_observe_barrier_hook = NULL;
+	UT_ASSERT_EQ(test_admission_observe_late_result, CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(out.known);
+	UT_ASSERT_EQ(out.inflight[0][0], 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
+	UT_ASSERT_EQ(cluster_semantic_activation_admission_observe(test_current_epoch, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+	cluster_semantic_activation_leave(&test_admission_observe_late_token);
+	UT_ASSERT_EQ(cluster_semantic_activation_admission_observe(test_current_epoch, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT);
+	test_gate_reset();
+}
+
 int
 main(void)
 {
-	UT_PLAN(420);
+	UT_PLAN(425);
 	UT_RUN(test_stop_trace_preserves_recovered_record_acceptance);
 	UT_RUN(test_stop_trace_preserves_recovered_service_owner_guards);
 	UT_RUN(test_stop_trace_recovered_equal_epoch_refuses_before_owner);
@@ -12776,6 +12982,11 @@ main(void)
 	UT_RUN(test_a148_stop_poll_includes_original_phase3_handoff);
 	UT_RUN(test_run15_pending_subpredicate_is_continuing_without_authority_changes);
 	UT_RUN(test_run15_pending_publication_names_original_first_cut);
+	UT_RUN(test_p58_admission_original_token_release_is_observable_online);
+	UT_RUN(test_p58_admission_samples_all_128_shared_cells_without_retiring_them);
+	UT_RUN(test_p58_admission_refused_and_stale_never_reuse_old_output);
+	UT_RUN(test_p58_admission_publication_and_scope_drift_are_bounded_unknown);
+	UT_RUN(test_p58_admission_point_sample_is_not_a_global_zero_certificate);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
