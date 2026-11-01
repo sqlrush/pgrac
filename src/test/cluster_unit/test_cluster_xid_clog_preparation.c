@@ -3,14 +3,13 @@
 #include "access/transam.h"
 
 int xid_allocation_original_main(void);
+#define XID_ALLOCATION_CLOG_PROVIDED
 #define main xid_allocation_original_main
 #include "test_cluster_xid_allocation.c"
 #undef main
 
 /* These are the CLOG-facing boundaries to be connected to the original
  * control producer. They model no file identity, custody or successful I/O. */
-void CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last);
-bool CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last);
 
 static unsigned prepare_calls, range_checks;
 static uint64 prepared_first, prepared_last, preparation_advance;
@@ -22,7 +21,8 @@ static bool preparation_refused, preparation_effect, preparation_error;
 #define TEST_CLOG_XIDS_PER_SEGMENT UINT64CONST(1048576)
 
 void
-CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last)
+CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last,
+						ClusterClogAllocationV2 **state)
 {
 	prepare_calls++;
 	UT_ASSERT(!held);
@@ -54,7 +54,8 @@ CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last)
 }
 
 bool
-CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last)
+CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last,
+						 ClusterClogAllocationV2 **state)
 {
 	range_checks++;
 	UT_ASSERT(held && held_lock == XidGenLock && held_mode == LW_EXCLUSIVE);
@@ -64,6 +65,9 @@ CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last)
 		checked_first / TEST_CLOG_XIDS_PER_SEGMENT >= coverage_first &&
 		checked_last / TEST_CLOG_XIDS_PER_SEGMENT + 2 <= coverage_last;
 }
+
+bool CLOGAllocationRequired(void) { return cluster_enabled; }
+void CLOGFinishAllocation(ClusterClogAllocationV2 **state) { *state = NULL; }
 
 static void
 reset_preparation(void)

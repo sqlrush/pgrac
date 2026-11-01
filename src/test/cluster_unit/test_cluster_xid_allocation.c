@@ -86,6 +86,31 @@ static bool real_stripe, stripe_lock_held, stripe_quorum;
 static LWLock *stripe_lock;
 static uint64 stripe_incarnation;
 static FullTransactionId real_reserved_candidate;
+#ifndef XID_ALLOCATION_EXTENDED
+#define XID_ALLOCATION_EXTENDED() ((void)0)
+#endif
+#ifndef XID_ALLOCATION_WAITED
+#define XID_ALLOCATION_WAITED() ((void)0)
+#endif
+#ifndef XID_ALLOCATION_ALLOW_ERROR_WAIT
+#define XID_ALLOCATION_ALLOW_ERROR_WAIT false
+#endif
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void *palloc0(Size bytes) { void *p = calloc(1, bytes); if (!p) abort(); return p; }
+void pfree(void *p) { free(p); }
+
+/* These older cases isolate allocation from native-file selection. The direct
+ * CLOG composition fixture supplies its actual preparation bodies instead. */
+#ifndef XID_ALLOCATION_CLOG_PROVIDED
+bool CLOGAllocationRequired(void) { return false; }
+bool CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last,
+	ClusterClogAllocationV2 **state) { abort(); }
+void CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last,
+	ClusterClogAllocationV2 **state) { abort(); }
+void CLOGFinishAllocation(ClusterClogAllocationV2 **state) { abort(); }
+#endif
 
 static bool allocation_real_future(FullTransactionId, FullTransactionId *, ClusterXidStripeSampleFence *);
 static bool allocation_real_fence_current(const ClusterXidStripeSampleFence *);
@@ -277,7 +302,7 @@ cluster_xid_stripe_wait_lease(FullTransactionId candidate)
 	waits++;
 	/* A refusal test must never reach this boundary. Stop a parent's mock
 	 * wait with a distinct marker, not a synthetic product ERROR/success. */
-	if (allocation_error_expected)
+	if (allocation_error_expected && !XID_ALLOCATION_ALLOW_ERROR_WAIT)
 		siglongjmp(allocation_error_env, 2);
 	if (held)
 		lock_errors++;
@@ -286,10 +311,12 @@ cluster_xid_stripe_wait_lease(FullTransactionId candidate)
 	limit_full = 8196;
 	if (advance_while_unlocked)
 		variables.nextXid = FullTransactionIdFromU64(2084);
+	XID_ALLOCATION_WAITED();
 }
 static void
 extended(void)
 {
+	XID_ALLOCATION_EXTENDED();
 	extensions++;
 	if (cluster_shared_catalog && (real_stripe
 		? !FullTransactionIdIsValid(real_reserved_candidate)
@@ -339,7 +366,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 bool
 errstart(int level, const char *domain)
 {
-	if (!allocation_error_expected || level != ERROR)
+	if (!allocation_error_expected || (level != ERROR && level != PANIC))
 		abort();
 	return true;
 }
@@ -364,6 +391,18 @@ errfinish(const char *file, int line, const char *function)
 	if (!allocation_error_expected)
 		abort();
 	allocation_errors++;
+	if (PG_exception_stack)
+		siglongjmp(*PG_exception_stack, 1);
+	siglongjmp(allocation_error_env, 1);
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack)
+		siglongjmp(*PG_exception_stack, 1);
+	if (!allocation_error_expected)
+		abort();
 	siglongjmp(allocation_error_env, 1);
 }
 

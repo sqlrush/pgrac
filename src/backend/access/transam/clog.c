@@ -54,6 +54,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_cf_enqueue.h"
 #endif
 
 /*
@@ -171,6 +172,190 @@ CLOGRequireLegacyLifecycle(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("managed CLOG lifecycle requires its selected control owner")));
+}
+
+/* Actual gap files are protected through issuer completion. The two successor
+ * identities are presence only; neither their metadata nor this borrow grants
+ * page birth or access to RESERVED through the ordinary SLRU I/O path. */
+struct ClusterClogAllocationV2 {
+	uint64 first, count;
+	ClusterControlNativeFileBorrowV2 files[FLEXIBLE_ARRAY_MEMBER];
+};
+
+static bool
+CLOGAllocationSegments(FullTransactionId first, FullTransactionId last,
+					   uint64 *begin, uint64 *gap, uint64 *total)
+{
+	uint64 a = U64FromFullTransactionId(first), b = U64FromFullTransactionId(last);
+	uint64 per = (uint64) CLOG_XACTS_PER_PAGE * SLRU_PAGES_PER_SEGMENT;
+
+	if (!FullTransactionIdIsNormal(first) || !FullTransactionIdIsNormal(last)
+		|| a == UINT64_MAX || b == UINT64_MAX || b < a || b - a > PG_INT32_MAX)
+		return false;
+	*begin = (a / per) % 4096;
+	*gap = b / per - a / per + 1;
+	*total = Min(*gap + 2, UINT64CONST(4096));
+	return true;
+}
+
+static bool
+CLOGAllocationPresence(uint64 begin, uint64 count)
+{
+	uint64 tail = Min(count, 4096 - begin);
+
+	return cluster_node_id >= 0 && cluster_node_id < 128
+		&& cluster_control_native_files_clog_range_v2(cluster_node_id, begin, begin + tail - 1)
+			== CLUSTER_NATIVE_FILES_OK_V2
+		&& (count == tail || cluster_control_native_files_clog_range_v2(
+			cluster_node_id, 0, count - tail - 1) == CLUSTER_NATIVE_FILES_OK_V2);
+}
+
+void
+CLOGFinishAllocation(ClusterClogAllocationV2 **state)
+{
+	ClusterClogAllocationV2 *value = *state;
+
+	if (!value)
+		return;
+	for (uint64 i = 0; i < value->count; i++)
+		if (value->files[i].private_self
+			&& !cluster_control_native_file_release_v2(&value->files[i]))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not return CLOG allocation file identity")));
+	*state = NULL;
+	pfree(value);
+}
+
+bool
+CLOGAllocationRequired(void)
+{
+	return CLOGNativeIORequired();
+}
+
+bool
+CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last,
+						 ClusterClogAllocationV2 **state)
+{
+	uint64 begin, gap, total;
+	ClusterClogAllocationV2 *value;
+
+	if (!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE)
+		|| !CLOGAllocationSegments(first, last, &begin, &gap, &total)
+		|| !CLOGAllocationPresence(begin, total))
+		return false;
+	value = *state;
+	if (!value) {
+		value = palloc0(offsetof(ClusterClogAllocationV2, files) + gap * sizeof(value->files[0]));
+		value->first = begin;
+		value->count = gap;
+		*state = value;
+		for (uint64 i = 0; i < gap; i++) {
+			ClusterControlFileKeyV2 key = {0};
+
+			key.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+			key.origin = cluster_node_id;
+			key.object_id = (begin + i) % 4096;
+			if (!cluster_control_native_file_acquire_v2(&key, &value->files[i])) {
+				CLOGFinishAllocation(state);
+				return false;
+			}
+		}
+	}
+	for (uint64 i = 0; i < gap; i++) {
+		uint64 at = ((begin + i) % 4096 + 4096 - value->first) % 4096;
+
+		if (at >= value->count || !cluster_control_native_file_current_v2(&value->files[at]))
+			return false;
+	}
+	return true;
+}
+
+void
+CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last,
+						ClusterClogAllocationV2 **state)
+{
+	struct CLOGPrepareWork {
+		ClusterControlNativeClogRangeV2 *ranges[2];
+		bool attempted;
+	} *work;
+	uint64 begin, gap, total, tail;
+
+	if (CritSectionCount || LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactSLRULock)
+		|| LWLockHeldByMe(XactTruncationLock) || LWLockHeldByMe(ControlFileLock)
+		|| LWLockHeldByMe(RelationMappingLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock) || cluster_node_id < 0 || cluster_node_id >= 128
+		|| !CLOGAllocationSegments(first, last, &begin, &gap, &total))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("CLOG allocation preparation requires the original unlocked issuer")));
+	CLOGFinishAllocation(state);
+	tail = Min(total, 4096 - begin);
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		work->attempted = true;
+		if (!cluster_cf_lock(ExclusiveLock))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("CLOG allocation control owner is unavailable")));
+		/* Publish both physical halves before borrowing either: publication
+		 * cannot replace a table with live borrows. No full-XID epoch is inferred. */
+		for (unsigned half = 0; half < (total == tail ? 1 : 2); half++) {
+			uint64 lo = half ? 0 : begin, hi = half ? total - tail - 1 : begin + tail - 1;
+			ClusterControlNativeResultV2 result
+				= cluster_control_native_files_reserve_clog_range_locked_v2(
+					cluster_node_id, lo, hi, &work->ranges[half]);
+
+			if (result != CLUSTER_NATIVE_FILES_OK_V2 || !work->ranges[half]
+				|| work->ranges[half]->first_segment != lo
+				|| work->ranges[half]->last_segment != hi
+				|| work->ranges[half]->count != hi - lo + 1)
+				ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+								errmsg("could not prepare the complete CLOG allocation range")));
+		}
+		*state = palloc0(offsetof(ClusterClogAllocationV2, files)
+						+ gap * sizeof((*state)->files[0]));
+		(*state)->first = begin;
+		(*state)->count = gap;
+		for (uint64 i = 0; i < gap; i++) {
+			uint64 segment = (begin + i) % 4096;
+			ClusterControlNativeClogRangeV2 *range = work->ranges[segment < begin ? 1 : 0];
+			ClusterControlNativeClogEntryV2 *entry = &range->entries[segment - range->first_segment];
+			ClusterControlNativeFileBorrowV2 *borrow = &(*state)->files[i];
+			ClusterControlFileKeyV2 key = {0};
+			uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+			key.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+			key.origin = cluster_node_id;
+			key.object_id = segment;
+			if ((entry->reserved
+				 ? cluster_control_native_file_reserved_acquire_locked_v2(&range->config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, range->startup_generation,
+					entry->batch_uuid, &entry->expected, borrow) != CLUSTER_NATIVE_FILES_OK_V2
+				 : !cluster_control_native_file_acquire_v2(&key, borrow))
+				|| borrow->expected.kind != key.kind || borrow->expected.origin != key.origin
+				|| borrow->expected.object_id != segment
+				|| !cluster_recovery_file_identity_encode_v2(&entry->expected, reference, sizeof(reference))
+				|| !cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &borrow->expected)
+				|| borrow->startup_generation != range->startup_generation
+				|| borrow->table_generation != work->ranges[total == tail ? 0 : 1]->table_generation
+				|| !cluster_control_native_file_current_v2(borrow))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("CLOG allocation lost its selected creator identity")));
+		}
+		if (!CLOGAllocationPresence(begin, total))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("CLOG allocation range changed during preparation")));
+	}
+	PG_FINALLY();
+	{
+		for (unsigned half = 0; half < 2; half++)
+			cluster_control_native_clog_range_destroy_v2(&work->ranges[half]);
+		if (work->attempted && cluster_cf_held(ExclusiveLock)
+			&& cluster_cf_unlock_confirmed(ExclusiveLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not return CLOG allocation control owner")));
+		pfree(work);
+	}
+	PG_END_TRY();
 }
 #endif
 

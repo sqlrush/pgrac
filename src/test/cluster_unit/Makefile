@@ -10167,13 +10167,14 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 		$(top_srcdir)/src/backend/access/transam/twophase.c \
 		$(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
 	awk '/^GetNewTransactionIdCandidate\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^GetNewTransactionIdInternal\(/ { print "static FullTransactionId"; emit=1; found++ } \
 	     /^GetNewTransactionId\(/ { print "FullTransactionId"; emit=1; found++ } \
 	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
 	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
 	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; found++ } \
 	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; found++ } \
 	     /^ProcArrayEndTransactionInternal\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 8) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 9) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_allocation_stripe.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
@@ -10200,13 +10201,37 @@ test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 TESTS += test_cluster_xid_clog_preparation
 all: test_cluster_xid_clog_preparation
 
-# Preparation contract deliberately remains RED until the original control
-# producer is connected; the original allocator suite is kept separately.
+# Original allocator coordinator contract; native preparation is tested below.
 test_cluster_xid_clog_preparation: test_cluster_xid_clog_preparation.c \
 		test_cluster_xid_allocation.c unit_test.h test_cluster_xid_allocation.inc \
 		test_cluster_xid_allocation_stripe.inc test_cluster_pgproc_active_types.inc \
 		$(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_clog_allocation_prepare.inc: $(top_srcdir)/src/backend/access/transam/clog.c Makefile
+	awk '/^#define CLOG_(BITS_PER_XACT|XACTS_PER_BYTE|XACTS_PER_PAGE)[ \t]/ { print; constants++ } \
+	     /^struct ClusterClogAllocationV2 / { emit=1; types++ } \
+	     /^CLOG(NativeIORequired|AllocationSegments|AllocationPresence)\(/ { print "static bool"; emit=1; found++ } \
+	     /^CLOG(AllocationRequired|AllocationRangeReady)\(/ { print "bool"; emit=1; found++ } \
+	     /^CLOG(FinishAllocation|PrepareForAllocation)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 7 || types != 1 || constants != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+TESTS += test_cluster_clog_allocation_prepare
+all: test_cluster_clog_allocation_prepare
+test_cluster_clog_allocation_prepare: test_cluster_clog_allocation_prepare.c \
+		test_cluster_xid_allocation.c unit_test.h test_cluster_xid_allocation.inc \
+		test_cluster_xid_allocation_stripe.inc test_cluster_pgproc_active_types.inc \
+		test_cluster_clog_allocation_prepare.inc $(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/access/clog_file.h $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean: clean-clog-allocation-prepare
+.PHONY: clean-clog-allocation-prepare
+clean-clog-allocation-prepare:
+	rm -f test_cluster_clog_allocation_prepare test_cluster_clog_allocation_prepare.d \
+		test_cluster_clog_allocation_prepare.inc test_cluster_clog_allocation_prepare.inc.tmp
 
 # Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
 # boundaries are controlled by the test; the admission predicates are not.

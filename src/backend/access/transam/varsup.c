@@ -119,8 +119,8 @@ GetNewTransactionIdCandidate(FullTransactionId next_xid, bool *striped)
  * does something.  So it is safe to do a database lookup if we want to
  * issue a warning about XID wrap.
  */
-FullTransactionId
-GetNewTransactionId(bool isSubXact)
+static FullTransactionId
+GetNewTransactionIdInternal(bool isSubXact, ClusterClogAllocationV2 **clog, bool *lease_effect)
 {
 	FullTransactionId full_xid;
 	TransactionId xid;
@@ -347,6 +347,20 @@ retry_cluster_xid_reservation:
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("refusing to assign a new transaction ID: cluster full transaction identity is exhausted or invalid")));
 
+	/* Complete selected gap and both successors before lease or SLRU effects.
+	 * Control registration never runs while the issuer lock is held. */
+	if (clog && !CLOGAllocationRangeReady(ShmemVariableCache->nextXid, full_xid, clog))
+	{
+		FullTransactionId first = ShmemVariableCache->nextXid;
+
+		LWLockRelease(XidGenLock);
+		if (*lease_effect)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("CLOG allocation range changed after a stripe lease request")));
+		CLOGPrepareForAllocation(first, full_xid, clog);
+		goto retry_cluster_xid_reservation;
+	}
+
 	/* PGRAC: consume a majority-durable stripe reservation before SLRU or
 	 * ProcArray mutation. QVOTEC may need XidGenLock to observe nextXid;
 	 * wait outside the lock, then rederive all candidates and limits.
@@ -355,9 +369,14 @@ retry_cluster_xid_reservation:
 		&& !cluster_xid_stripe_lease_ready(full_xid))
 	{
 		LWLockRelease(XidGenLock);
+		if (lease_effect)
+			*lease_effect = true;
 		cluster_xid_stripe_wait_lease(full_xid);
 		goto retry_cluster_xid_reservation;
 	}
+	if (clog && !CLOGAllocationRangeReady(ShmemVariableCache->nextXid, full_xid, clog))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("CLOG allocation identity changed before storage extension")));
 #endif
 
 	/*
@@ -494,6 +513,34 @@ retry_cluster_xid_reservation:
 	LWLockRelease(XidGenLock);
 
 	return full_xid;
+}
+
+FullTransactionId
+GetNewTransactionId(bool isSubXact)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (!IsBootstrapProcessingMode() && CLOGAllocationRequired())
+	{
+		struct AllocationWork {
+			ClusterClogAllocationV2 *clog;
+			bool lease_effect;
+		} *work = palloc0(sizeof(*work));
+		FullTransactionId result = InvalidFullTransactionId;
+
+		PG_TRY();
+		{
+			result = GetNewTransactionIdInternal(isSubXact, &work->clog, &work->lease_effect);
+		}
+		PG_FINALLY();
+		{
+			CLOGFinishAllocation(&work->clog);
+			pfree(work);
+		}
+		PG_END_TRY();
+		return result;
+	}
+#endif
+	return GetNewTransactionIdInternal(isSubXact, NULL, NULL);
 }
 
 /*
