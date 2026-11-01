@@ -17,6 +17,7 @@
 #include <setjmp.h>
 #include "cluster/cluster_guc.h"
 #include "../../backend/access/transam/clog.c"
+#include "cluster_unit_no_native_files.h"
 
 #undef printf
 #undef fprintf
@@ -26,6 +27,16 @@ UT_DEFINE_GLOBALS();
 bool cluster_shared_config;
 bool InRecovery;
 BackendType MyBackendType;
+/* This fixture has no selected table. Link the new managed exception frame,
+ * but fail loudly if a legacy-only case ever tries to rethrow through it. */
+bool enableFsync;
+bool IsUnderPostmaster;
+bool IsPostmasterEnvironment;
+ProcessingMode Mode;
+volatile uint32 InterruptHoldoffCount;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void pg_re_throw(void) { abort(); }
 static VariableCacheData variables;
 VariableCache ShmemVariableCache = &variables;
 static LWLockPadded locks[128];

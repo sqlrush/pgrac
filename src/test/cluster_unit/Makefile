@@ -4984,6 +4984,7 @@ test_cluster_subtrans_order: test_cluster_subtrans_order.c unit_test.h test_clus
 # PGRAC: actual native startup/trim, explicit memory SLRU boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_clog_startup: test_cluster_clog_startup.c unit_test.h \
+		cluster_unit_no_native_files.h \
 		$(top_srcdir)/src/backend/access/transam/clog.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
@@ -11920,3 +11921,33 @@ test_cluster_clog_native_io: test_cluster_clog_native_io.c \
 clean: clean-clog-native-io
 clean-clog-native-io:
 	rm -f test_cluster_clog_native_io test_cluster_clog_native_io.d
+
+# Original native startup FullXid cut and full-frame writeback.
+test_cluster_clog_native_trim.inc: $(top_srcdir)/src/backend/access/transam/clog.c Makefile
+	awk '/^#define (CLOG_(BITS_PER_XACT|XACTS_PER_BYTE|XACTS_PER_PAGE)|TransactionIdTo(Page|PgIndex|Byte|BIndex))[ \t(]/ { print; constants++ } \
+	     /^CLOGNativeIORequired\(/ { print "static bool"; emit=1; found++ } \
+	     /^CLOGTrimNative\(/ { print "static void"; emit=1; found++ } \
+	     /^TrimCLOG\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3 || constants != 7) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+TESTS += test_cluster_clog_native_trim
+all: test_cluster_clog_native_trim
+test_cluster_clog_native_trim: test_cluster_clog_native_trim.c \
+		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
+		test_cluster_clog_native_trim.inc unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog.h $(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/cluster/cluster_native_startup.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-native-trim
+.PHONY: clean-clog-native-trim
+clean-clog-native-trim:
+	rm -f test_cluster_clog_native_trim test_cluster_clog_native_trim.d \
+		test_cluster_clog_native_trim.inc test_cluster_clog_native_trim.inc.tmp

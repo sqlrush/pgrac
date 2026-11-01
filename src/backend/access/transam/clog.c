@@ -1137,6 +1137,90 @@ StartupCLOG(void)
 	LWLockRelease(XactSLRULock);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* The original Startup owner supplies nextXid before connections can allocate.
+ * A raw page match is insufficient: consume the selected native page and its
+ * actual issuer birth in the same FullXid interval. No epoch is manufactured
+ * for the page, and a shared startup still cannot erase retained status. */
+static void
+CLOGTrimNative(FullTransactionId next)
+{
+	TransactionId xid = XidFromFullTransactionId(next);
+	int pageno = TransactionIdToPage(xid);
+	volatile bool body_complete = false;
+
+	if (!(MyBackendType == B_STARTUP
+		  || (!cluster_shared_config && !IsUnderPostmaster && !IsPostmasterEnvironment
+			  && MyBackendType == B_STANDALONE_BACKEND && IsInitProcessingMode()))
+		|| InRecovery || !enableFsync
+		|| !TransactionIdIsNormal(xid) || U64FromFullTransactionId(next) == PG_UINT64_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native CLOG trim requires the original completed startup cut")));
+	if (TransactionIdToPgIndex(xid) == 0)
+		return; /* The next page need not have been born yet. */
+
+	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		int slotno = SimpleLruReadPage(XactCtl, pageno, false, xid);
+		ClusterClogPageIdentityV2 *page;
+		TransactionId birth;
+
+		/* The managed reader keeps this SAME family lock at return. It has
+		 * checked the original file reference and full frame, including a
+		 * resident hit; the control owner must drain that lock before reuse. */
+		if (!CLOGNativeIORequired() || !FullTransactionIdEquals(next, ShmemVariableCache->nextXid)
+			|| slotno < 0 || slotno >= XactCtl->shared->num_slots
+			|| XactCtl->shared->clog_page_identity == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("native CLOG startup cut changed before trim")));
+		page = &XactCtl->shared->clog_page_identity[slotno];
+		birth = XidFromFullTransactionId(page->identity.birth_full_xid);
+		if (!page->identity.birth_observed || page->identity.logical_page != (uint64)pageno
+			|| !TransactionIdIsNormal(birth)
+			|| (birth % CLOG_XACTS_PER_PAGE != 0 && birth != FirstNormalTransactionId)
+			|| TransactionIdToPage(birth) != pageno
+			|| EpochFromFullTransactionId(page->identity.birth_full_xid) != EpochFromFullTransactionId(next)
+			|| FullTransactionIdFollows(page->identity.birth_full_xid, next))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("native CLOG page birth does not match the startup FullXid cut")));
+		if (cluster_shared_config) {
+			if (!cluster_native_clog_suffix_unused(XactCtl->shared->page_buffer[slotno], xid))
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("shared CLOG startup has transaction status beyond nextXid")));
+		} else {
+			int byteno = TransactionIdToByte(xid);
+			int bshift = TransactionIdToBIndex(xid) * CLOG_BITS_PER_XACT;
+			char *byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
+
+			/* Preserve the original prefix, birth and source/group LSNs. The
+			 * original dirty-page writer emits and flushes the full native WAL
+			 * image before physical writeback; no raw ZERO record is emitted. */
+			*byteptr &= (1 << bshift) - 1;
+			MemSet(byteptr + 1, 0, BLCKSZ - byteno - 1);
+			XactCtl->shared->page_dirty[slotno] = true;
+		}
+		body_complete = true;
+	}
+	PG_FINALLY();
+	{
+		/* ERROR reset the holdoff while this original family lock stayed
+		 * held. Discard any subsequent open-catch reacquire count before
+		 * compensating this release; caller abort cleanup owns older locks. */
+		if (!body_complete) {
+			InterruptHoldoffCount = 0;
+			HOLD_INTERRUPTS();
+		}
+		LWLockRelease(XactSLRULock);
+	}
+	PG_END_TRY();
+}
+#endif
+
 /*
  * This must be called ONCE at the end of startup/recovery.
  */
@@ -1147,6 +1231,10 @@ TrimCLOG(void)
 	int			pageno = TransactionIdToPage(xid);
 
 #ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired()) {
+		CLOGTrimNative(ShmemVariableCache->nextXid);
+		return;
+	}
 	/* A completed qualified input, not a guessed crash horizon, owns this
 	 * read-only startup cut. InRecovery would permit a missing SLRU page to
 	 * be fabricated as zero, so it must already have ended. */
