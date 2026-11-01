@@ -4109,6 +4109,82 @@ cluster_gcs_block_mx_history_prepare(const ClusterMxHistoryRequest *request,
 	return true;
 }
 
+ClusterMxHistoryStep
+cluster_gcs_block_mx_history_wait_event(const ClusterMxHistoryRequestWire *wire)
+{
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterMxHistoryRequest request;
+	ConditionVariable *cv;
+	bool pending = true;
+
+	if (CritSectionCount != 0 || gcs_block_backend_blocks == NULL
+		|| MyBackendId <= 0 || MyBackendId > MaxBackends)
+		return CMXH_UNKNOWN;
+	blk = gcs_block_my_block();
+	if (wire == NULL) {
+		cv = &blk->capacity_cv;
+		/* Register before testing capacity, so retirement cannot lose a wake.
+		 * Do not reserve a slot or mint an identity on behalf of the caller. */
+		ConditionVariablePrepareToSleep(cv);
+		LWLockAcquire(&blk->lock.lock, LW_SHARED);
+		for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+			if (!blk->slots[i].in_use) {
+				pending = false;
+				break;
+			}
+		}
+		LWLockRelease(&blk->lock.lock);
+	} else {
+		if (!gcs_mx_history_decode(wire, &request, true))
+			return CMXH_UNKNOWN;
+		if (!gcs_mx_history_scope(&request))
+			return CMXH_REQUALIFY;
+		LWLockAcquire(&blk->lock.lock, LW_SHARED);
+		slot = gcs_mx_history_find(blk, wire);
+		if (slot == NULL) {
+			LWLockRelease(&blk->lock.lock);
+			return CMXH_UNKNOWN;
+		}
+		if (slot->stale
+			|| (slot->history.submitted
+				&& (slot->history_stream_generation == 0
+					|| slot->history_stream_generation != gcs_mx_history_stream(&request)))) {
+			LWLockRelease(&blk->lock.lock);
+			return CMXH_REQUALIFY;
+		}
+		if (slot->reply_received) {
+			LWLockRelease(&blk->lock.lock);
+			return CMXH_PENDING; /* Only the original poll may consume the reply. */
+		}
+		if (!slot->history.submitted && gcs_mx_history_stream(&request) != 0) {
+			LWLockRelease(&blk->lock.lock);
+			/* Original outbound space waiter owns its CV/epoch/cancel bracket.
+			 * Never nest a reply CV registration or hold the slot lock here. */
+			return cluster_lms_outbound_wait_capacity(0, request.read_epoch)
+					   ? CMXH_PENDING : CMXH_REQUALIFY;
+		}
+		cv = &slot->reply_cv;
+		ConditionVariablePrepareToSleep(cv);
+		LWLockRelease(&blk->lock.lock);
+		/* A first DATA HELLO has no slot-specific notification. Periodic
+		 * wakes refresh that original stream without busy-polling or expiry. */
+	}
+	PG_TRY();
+	{
+		if (pending) {
+			cluster_pcm_lock_check_shutdown_wait();
+			(void)ConditionVariableTimedSleep(cv, 1000L, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+	}
+	PG_FINALLY();
+	{
+		ConditionVariableCancelSleep();
+	}
+	PG_END_TRY();
+	return CMXH_PENDING;
+}
+
 bool
 cluster_gcs_block_mx_history_submit(const ClusterMxHistoryRequestWire *wire)
 {

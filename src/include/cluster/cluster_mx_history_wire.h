@@ -148,6 +148,12 @@ cluster_gcs_block_mx_history_prepare_routed(const ClusterMxHistoryRequest *edge,
 extern bool cluster_gcs_block_mx_history_prepare(const ClusterMxHistoryRequest *request,
 												 ClusterMxHistoryRequestWire *out);
 extern bool cluster_gcs_block_mx_history_submit(const ClusterMxHistoryRequestWire *request);
+/* Outside heap content locks: wait on original reply/capacity/outbound events.
+ * NULL requests backend slot capacity. PENDING means re-poll, including after
+ * a periodic wake; it never grants authority or imposes a SQL deadline.
+ * The caller retains ownership of exact request cancellation on failure. */
+extern ClusterMxHistoryStep
+cluster_gcs_block_mx_history_wait_event(const ClusterMxHistoryRequestWire *request);
 extern ClusterMxHistoryStep
 cluster_gcs_block_mx_history_poll(const ClusterMxHistoryRequestWire *request,
 								  ClusterMxHistoryPeerResult *out);

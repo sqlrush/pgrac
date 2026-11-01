@@ -20,6 +20,23 @@ int snapshot_fixture_unused_main(void);
  * registered landing (covered separately by the real graph/route tests). */
 BackendId MyBackendId = 1;
 static unsigned route_attempts;
+volatile sig_atomic_t InterruptPending;
+static unsigned history_interrupts;
+void
+ProcessInterrupts(void)
+{
+	history_interrupts++;
+	InterruptPending = false;
+	pg_re_throw();
+}
+static ClusterMxHistoryStep (*wait_input)(const ClusterMxHistoryRequestWire *);
+ClusterMxHistoryStep
+cluster_gcs_block_mx_history_wait_event(const ClusterMxHistoryRequestWire *r)
+{
+	if (wait_input)
+		return wait_input(r);
+	abort();
+}
 static ClusterMxHistoryStep (*prepare_input)(const ClusterMxHistoryRequest *,
 											 ClusterMxHistoryRequestWire *);
 static bool (*submit_input)(const ClusterMxHistoryRequestWire *);
@@ -215,6 +232,9 @@ setup(void)
 	publication_source = CLUSTER_CANONICAL_TXN_NONE;
 	memset(&canonical_source, 0, sizeof(canonical_source));
 	canonical_reads = owner_reads = allocation_calls = fail_allocation = 0;
+	wait_input = NULL;
+	InterruptPending = false;
+	history_interrupts = 0;
 	prepare_input = NULL;
 	submit_input = NULL;
 	poll_input = NULL;
@@ -749,6 +769,7 @@ collector_never_waits_under_content_lock_or_without_pin(void)
 	}
 }
 #include "test_cluster_mx_history_finish.inc"
+#include "test_cluster_mx_history_wait_capture.inc"
 
 static void
 history_fixture_init(void)
@@ -778,7 +799,7 @@ int
 main(void)
 {
 	history_fixture_init();
-	UT_PLAN(38);
+	UT_PLAN(45);
 	UT_RUN(real_capture_and_relock);
 	UT_RUN(snapshot_own_reference_keeps_original_floor);
 	UT_RUN(original_scope_restored_and_older_floor_preserved);
@@ -817,6 +838,13 @@ main(void)
 	UT_RUN(updater_reuses_distinct_B_page_and_checks_full_xid);
 	UT_RUN(updater_graph_reuse_preserves_A_outcome_and_effect);
 	UT_RUN(updater_bad_capture_and_unfinished_attempt_refused);
+	UT_RUN(history_wait_complete_retains_snapshot_until_consume);
+	UT_RUN(history_wait_capacity_then_same_batch);
+	UT_RUN(history_wait_error_cancels_before_snapshot_release);
+	UT_RUN(history_wait_interrupt_cancels_whole_attempt);
+	UT_RUN(history_wait_invalid_heap_never_sleeps);
+	UT_RUN(history_wait_requalification_discards_whole_batch);
+	UT_RUN(history_wait_requires_and_reuses_independent_B);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

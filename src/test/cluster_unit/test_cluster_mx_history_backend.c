@@ -1,10 +1,17 @@
 /* Execute the real requester table, registered landing and pure wire verifier.
  * Physical transport and admission scheduling reuse the existing route fixture. */
+#include "postgres.h"
+#include "storage/condition_variable.h"
+bool route_fixture_timed_sleep(ConditionVariable *, long, uint32);
 int route_fixture_main(int, char **);
 #define main route_fixture_main
 #define cluster_lms_outbound_enqueue_cap_bound route_fixture_enqueue
+#define ConditionVariableTimedSleep route_fixture_timed_sleep
+#define cluster_lms_outbound_wait_capacity route_fixture_wait_capacity
 #include "test_cluster_r4_route_policy.c"
 #undef cluster_lms_outbound_enqueue_cap_bound
+#undef ConditionVariableTimedSleep
+#undef cluster_lms_outbound_wait_capacity
 #undef main
 #include "cluster/cluster_mx_history_wire.h"
 #include "utils/resowner.h"
@@ -17,6 +24,34 @@ static ClusterMxHistoryRequestWire sent_history;
 static int history_sends;
 static int history_sent_worker;
 static bool history_reentrant;
+static void (*history_sleep_event)(void);
+static bool history_outbound_wait, history_outbound_ready;
+static unsigned history_outbound_waits;
+bool ConditionVariableTimedSleep(ConditionVariable *, long, uint32);
+bool cluster_lms_outbound_wait_capacity(int, uint64);
+
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv, long timeout, uint32 event)
+{
+	bool result;
+	UT_ASSERT_EQ(reply_lock_acquire_calls, reply_lock_release_calls);
+	UT_ASSERT_EQ(timeout, 1000);
+	result = route_fixture_timed_sleep(cv, timeout, event);
+	if (history_sleep_event)
+		history_sleep_event();
+	return result;
+}
+bool
+cluster_lms_outbound_wait_capacity(int worker, uint64 epoch)
+{
+	if (!history_outbound_wait)
+		return route_fixture_wait_capacity(worker, epoch);
+	UT_ASSERT_EQ(reply_lock_acquire_calls, reply_lock_release_calls);
+	UT_ASSERT_EQ(worker, 0);
+	UT_ASSERT_EQ(epoch, 9);
+	history_outbound_waits++;
+	return history_outbound_ready;
+}
 static void history_deliver(const ClusterMxHistoryRequestWire *, int);
 bool cluster_lms_outbound_enqueue_cap_bound(int, uint8, uint32, const void *, uint16, uint32,
 											uint32);
@@ -113,11 +148,16 @@ history_reset(void)
 {
 	uint64 id;
 	route_seam_reset();
+	reply_cv_prepare_calls = reply_cv_timed_sleep_calls = reply_cv_cancel_calls = 0;
+	memset(reply_cv_prepared, 0, sizeof(reply_cv_prepared));
 	cluster_node_id = 2;
 	MyBackendId = 1;
 	MaxBackends = 1;
 	MyStartTimestamp = 1000;
 	history_sends = 0;
+	history_sleep_event = NULL;
+	history_outbound_wait = history_outbound_ready = false;
+	history_outbound_waits = 0;
 	history_reentrant = false;
 	UT_ASSERT(cluster_gcs_block_test_r4_requester_arm(history_input().forward.tag, 9, 1, 1, &id));
 	UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
@@ -516,13 +556,15 @@ UT_TEST(creator_landing_is_typed_consume_once_and_rejects_mx)
 	cluster_gcs_block_mx_history_cancel(&wire);
 }
 
+#include "test_cluster_mx_history_wait_backend.inc"
+
 #ifndef HISTORY_BACKEND_TEST_MAIN
 #define HISTORY_BACKEND_TEST_MAIN main
 #endif
 int
 HISTORY_BACKEND_TEST_MAIN(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(25);
 	UT_RUN(history_publication_precedes_reentrant_reply);
 	UT_RUN(history_queue_full_preserves_exact_attempt);
 	UT_RUN(history_eight_slots_and_request_id_nonreuse);
@@ -540,6 +582,14 @@ HISTORY_BACKEND_TEST_MAIN(void)
 	UT_RUN(history_data_stream_loss_requalifies_without_resending);
 	UT_RUN(history_data_send_failure_only_retires_exact_attempt);
 	UT_RUN(creator_landing_is_typed_consume_once_and_rejects_mx);
+	UT_RUN(history_wait_ready_reply_does_not_sleep_or_consume);
+	UT_RUN(history_wait_period_rechecks_without_resend);
+	UT_RUN(history_wait_reply_event_keeps_exact_attempt);
+	UT_RUN(history_wait_hello_refresh_and_outbound_backpressure);
+	UT_RUN(history_wait_original_capacity_without_reservation);
+	UT_RUN(history_wait_drift_never_delivers_authority);
+	UT_RUN(history_wait_error_cancels_cv_registration);
+	UT_RUN(history_wait_missing_or_wrong_request_is_isolated);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

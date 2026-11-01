@@ -77,6 +77,11 @@ extern ClusterMxHistoryStep cluster_mx_history_collect_poll(ClusterMxHistoryColl
  * on the original foreign B provenance request (event-driven, cancellable).
  * collect_poll itself remains one bounded graph/transport step. */
 extern ClusterMxHistoryStep cluster_mx_history_poll(ClusterMxHistoryCollector *collector);
+/* Blocking counterpart, outside heap content locks. Uses original local
+ * events, rechecking the capture between bounded steps; ERROR cancels the
+ * whole attempt before native Snapshot release. COMPLETE still requires the
+ * original full relock/finish and retains the Snapshot until cancel. */
+extern ClusterMxHistoryStep cluster_mx_history_wait(ClusterMxHistoryCollector *collector);
 /* Original heap lock held: recheck actual Relation/MX/heap/scope before one
  * complete-set copy. Outputs have capacity entries and must not overlap any
  * input. capacity<=256 is reset to UNKNOWN on non-success; larger capacities

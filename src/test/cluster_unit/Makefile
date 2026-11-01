@@ -13377,7 +13377,7 @@ test_cluster_r4_route_policy: $(CLUSTER_MX_HISTORY_WIRE_O)
 test_cluster_gcs_block_shard: $(CLUSTER_MX_HISTORY_WIRE_O)
 
 test_cluster_mx_history_backend test_cluster_mx_history_gcs: %: %.c \
-        test_cluster_mx_history_backend.c \
+        test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc \
         test_cluster_r4_route_policy.c unit_test.h \
         $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h \
         test_cluster_r4_forward_ingress_boundaries.inc \
@@ -13411,7 +13411,7 @@ test_cluster_mx_history_admission.inc: $(top_srcdir)/src/backend/cluster/cluster
 	     END { if (count != 1 || emit) exit 1 }' $< > $@
 
 test_cluster_mx_history_capture: test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
-		test_cluster_mx_history_finish.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
+		test_cluster_mx_history_finish.inc test_cluster_mx_history_wait_capture.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
 		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
 		test_cluster_mx_history_admission.inc $(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_mx_history.h \
@@ -13449,7 +13449,7 @@ TESTS += test_cluster_mx_history_graph
 all: test_cluster_mx_history_graph
 
 test_cluster_mx_history_graph: test_cluster_mx_history_graph.c \
-		test_cluster_mx_history_backend.c test_cluster_r4_route_policy.c unit_test.h \
+		test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc test_cluster_r4_route_policy.c unit_test.h \
 		test_cluster_r4_forward_ingress_boundaries.inc test_cluster_current_mx_reply_builder.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
 		$(top_srcdir)/src/include/cluster/cluster_mx_history_graph.h \
@@ -13471,7 +13471,7 @@ TESTS += test_cluster_mx_history_members
 all: test_cluster_mx_history_members
 
 test_cluster_mx_history_members: test_cluster_mx_history_members.c test_cluster_mx_history_graph.c \
-		test_cluster_mx_history_backend.c test_cluster_r4_route_policy.c unit_test.h \
+		test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc test_cluster_r4_route_policy.c unit_test.h \
 		test_cluster_r4_forward_ingress_boundaries.inc test_cluster_current_mx_reply_builder.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
 		$(top_srcdir)/src/include/cluster/cluster_mx_history_graph.h \
@@ -13514,7 +13514,7 @@ all: test_cluster_mx_history_roundtrip
 test_cluster_mx_history_roundtrip: test_cluster_mx_history_roundtrip.c \
 		test_cluster_mx_operation_receipt_product.o test_cluster_mx_operation_receipt.h \
 		test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
-		test_cluster_mx_history_finish.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
+		test_cluster_mx_history_finish.inc test_cluster_mx_history_wait_capture.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
 		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
 		test_cluster_mx_history_admission.inc $(top_builddir)/src/backend/storage/lmgr/lock.o \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \

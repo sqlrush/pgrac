@@ -20,6 +20,12 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
+typedef enum HistoryCollectorWait {
+	HISTORY_WAIT_PROGRESS,
+	HISTORY_WAIT_CAPACITY,
+	HISTORY_WAIT_REQUEST
+} HistoryCollectorWait;
+
 typedef struct HistoryCollectorDriver {
 	ClusterMxHistoryGraph *graph;
 	ClusterMxHistoryRequestWire request;
@@ -28,6 +34,7 @@ typedef struct HistoryCollectorDriver {
 	uint32 *capabilities;
 	ClusterCurrentUpdaterProof updater;
 	bool prepared, submitted, complete, members_ready, updater_ready, members_delivered;
+	uint8 wait_kind;
 } HistoryCollectorDriver;
 
 struct ClusterMxHistoryCollector {
@@ -399,6 +406,7 @@ cluster_mx_history_collect_poll(ClusterMxHistoryCollector *collector)
 	}
 	if (driver->complete)
 		return CMXH_COMPLETE;
+	driver->wait_kind = HISTORY_WAIT_PROGRESS;
 	if (driver->prepared) {
 		ClusterMxHistoryPeerResult result;
 		if (!driver->submitted)
@@ -406,8 +414,10 @@ cluster_mx_history_collect_poll(ClusterMxHistoryCollector *collector)
 		/* Poll also distinguishes closed admission from enqueue backpressure.
 		 * A false enqueue cannot suppress scope/stream requalification. */
 		step = cluster_gcs_block_mx_history_poll(&driver->request, &result);
-		if (step == CMXH_PENDING)
+		if (step == CMXH_PENDING) {
+			driver->wait_kind = HISTORY_WAIT_REQUEST;
 			return step;
+		}
 		if (step != CMXH_COMPLETE || !cluster_mx_history_graph_accept(driver->graph, &result))
 			goto failed;
 		driver->prepared = driver->submitted = false;
@@ -424,8 +434,10 @@ cluster_mx_history_collect_poll(ClusterMxHistoryCollector *collector)
 	if (!needs_read)
 		return CMXH_PENDING;
 	step = cluster_gcs_block_mx_history_prepare_routed(&request, &driver->request);
-	if (step == CMXH_PENDING)
+	if (step == CMXH_PENDING) {
+		driver->wait_kind = HISTORY_WAIT_CAPACITY;
 		return step;
+	}
 	if (step != CMXH_COMPLETE)
 		goto failed;
 	driver->prepared = true;
@@ -567,6 +579,47 @@ cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
 failed:
 	cluster_mx_history_cancel(collector);
 	return CMXH_UNKNOWN;
+}
+
+ClusterMxHistoryStep
+cluster_mx_history_wait(ClusterMxHistoryCollector *collector)
+{
+	volatile ClusterMxHistoryStep result = CMXH_UNKNOWN;
+
+	PG_TRY();
+	{
+		for (;;) {
+			HistoryCollectorDriver *driver;
+			ClusterMxHistoryStep step;
+
+			CHECK_FOR_INTERRUPTS();
+			step = cluster_mx_history_poll(collector);
+			if (step != CMXH_PENDING) {
+				result = step;
+				break;
+			}
+			driver = collector->driver;
+			/* Local graph progress is bounded work, not a transport predicate.
+			 * In particular, prepare must reach submit/poll before sleeping. */
+			if (driver->wait_kind == HISTORY_WAIT_PROGRESS)
+				continue;
+			step = cluster_gcs_block_mx_history_wait_event(
+				driver->wait_kind == HISTORY_WAIT_CAPACITY ? NULL : &driver->request);
+			if (step != CMXH_PENDING) {
+				cluster_mx_history_cancel(collector);
+				result = step == CMXH_REQUALIFY ? step : CMXH_UNKNOWN;
+				break;
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		/* Original slot retirement precedes native Snapshot unregister. */
+		cluster_mx_history_cancel(collector);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
 }
 
 static void
