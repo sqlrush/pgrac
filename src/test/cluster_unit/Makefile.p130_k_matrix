@@ -9,3 +9,38 @@ k-p130-h31: $(K_P130_H31) $(K_P130_H31_PRODUCT)
 
 k-p130-h31-optimized: $(K_P130_H31) $(K_P130_H31_PRODUCT)
 	$(K_P130_PYTHON) -B -O $(K_P130_H31)
+
+.PHONY: k-p130-h01-deps k-p130-h01 clean-k-p130-h01
+k-p130-h01-deps:
+	$(MAKE) -C $(top_builddir)/src/backend generated-headers
+	$(MAKE) -C $(top_builddir)/src/port libpgport_srv.a
+	$(MAKE) -C $(top_builddir)/src/common libpgcommon_srv.a
+	$(MAKE) cluster_catalog_trace_test.o
+	$(MAKE) test_cluster_native_master
+
+test_cluster_k_p130_h01_drain.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile.p130_k_matrix
+	awk '/^typedef struct ClusterLmsZeroBlockReplyWire / { emit=1; types++ } \
+	     /^(lms_outbound_resource_x_intent_identity_equal|lms_outbound_r4_refusal_header_valid|lms_outbound_frame_current|lms_outbound_block_request_current|cluster_lms_outbound_drain_send)\(/ { print previous; emit=1; found++ } \
+	     emit { print } /^}/ && emit { emit=0 } { previous=$$0 } \
+	     END { if (found != 5 || types != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h01_master.inc: test_cluster_native_master.c Makefile.p130_k_matrix
+	awk '/^UT_TEST/ { found=1; exit } { print } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h01: test_cluster_k_p130_h01.c test_cluster_k_p130_h01_master.inc test_cluster_k_p130_h01_drain.inc k-p130-h01-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H01_CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+k-p130-h01: test_cluster_k_p130_h01
+	./test_cluster_k_p130_h01
+
+clean-k-p130-h01:
+	rm -f test_cluster_k_p130_h01 test_cluster_k_p130_h01_drain.inc test_cluster_k_p130_h01_drain.inc.tmp test_cluster_k_p130_h01_master.inc test_cluster_k_p130_h01_master.inc.tmp
