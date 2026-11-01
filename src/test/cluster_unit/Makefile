@@ -17637,3 +17637,38 @@ clean-relmap-writer:
 	rm -f test_cluster_relmap_file_writer.o
 clean: clean-relmap-writer
 .PHONY: clean-relmap-writer
+
+# The native/ROOT observation family consumes the shared managed WAL codec.
+RELMAP_WAL_OBSERVER_TESTS = test_cluster_recovery_final_namespace \
+        test_cluster_recovery_native_roots test_cluster_recovery_native_scan \
+        test_cluster_recovery_relation_scan test_cluster_recovery_relmap_scan \
+        test_cluster_recovery_root_set test_cluster_recovery_slru_scan \
+        test_cluster_recovery_undo_store test_cluster_recovery_wal_targets \
+        test_cluster_relmap_census_side test_cluster_relmap_retention_census
+$(RELMAP_WAL_OBSERVER_TESTS): $(top_builddir)/src/common/libpgcommon_srv.a cluster_catalog_trace_test.o
+# Other observers already name a common archive in their original recipe.
+$(filter-out test_cluster_recovery_relation_scan test_cluster_recovery_undo_store \
+        test_cluster_recovery_wal_targets test_cluster_relmap_census_side \
+        test_cluster_relmap_retention_census,$(RELMAP_WAL_OBSERVER_TESTS)): \
+        CLUSTER_UNIT_PORT_LIBS += $(top_builddir)/src/common/libpgcommon_srv.a
+
+test_cluster_recovery_native_scan: test_cluster_recovery_managed_relmap_effects.inc
+
+$(top_builddir)/src/common/libpgcommon_srv.a: \
+        $(top_srcdir)/src/common/cluster_relmap_file.c \
+        $(top_srcdir)/src/common/cluster_relmap_v2.c \
+        $(top_srcdir)/src/include/common/cluster_relmap_file.h \
+        $(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+	$(MAKE) -C $(top_builddir)/src/common libpgcommon_srv.a
+
+test_cluster_recovery_wal_targets: test_cluster_recovery_managed_relmap_targets.inc
+$(RELMAP_WAL_OBSERVER_TESTS): $(top_srcdir)/src/include/cluster/cluster_recovery_relmap_wal_internal.h
+
+# Keep the two original frontend-archive consumers current as well.
+$(top_builddir)/src/common/libpgcommon.a: $(top_builddir)/src/common/libpgcommon_srv.a
+	$(MAKE) -C $(top_builddir)/src/common libpgcommon.a
+
+# These original standalone ROOT fixtures have no SIDE ERROR provider.
+test_cluster_recovery_root_set test_cluster_recovery_relmap_scan: \
+        CPPFLAGS += -DTEST_CLUSTER_RECOVERY_STANDALONE_ERRORS

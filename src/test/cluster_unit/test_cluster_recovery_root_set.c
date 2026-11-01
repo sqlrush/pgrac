@@ -6,6 +6,19 @@ int namespace_fixture_main(void);
 #include "test_cluster_recovery_namespace.c"
 #undef main
 #include "utils/resowner.h"
+/* Standalone roots do not link the SIDE fixture's ERROR runtime. */
+#ifdef TEST_CLUSTER_RECOVERY_STANDALONE_ERRORS
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+#endif
 #define pread namespace_test_pread
 #ifndef RECOVERY_ROOT_SET_PRODUCT_SOURCE
 #define RECOVERY_ROOT_SET_PRODUCT_SOURCE "../../backend/cluster/cluster_recovery_root_set.c"

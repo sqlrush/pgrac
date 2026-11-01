@@ -86,7 +86,10 @@ typedef struct ClusterRecoveryNativeRecord {
 	TransactionId top_xid;
 	uint32 subxacts_offset;			   /* bounded original array within owned payload */
 	uint32 nsubxacts;				   /* membership, not the immediate parent chain */
-	uint32 mappings_offset, nmappings; /* bounded original relmap entries */
+	/* Managed UPDATE_V2 concatenates committed then pending ordinals; offset
+	 * points to pending. The complete envelope stays in payload, unqualified.
+	 * Legacy UPDATE retains its original one-array offset/count. */
+	uint32 mappings_offset, nmappings;
 	uint32 prepared_gid_offset, prepared_gid_length;
 	uint32 prepared_resources_offset, prepared_resource_count; /* excludes END */
 	Oid database;
