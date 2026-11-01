@@ -150,6 +150,11 @@ cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
  * still prevent D1 completion. No terminal, apply, OPEN or GC permission. */
 extern ClusterRecoveryRootsResult cluster_recovery_root_set_step(ClusterRecoveryRootSet *roots,
 																 ClusterRecoveryRootsEvent *out);
+/* Pure known-storage extent check for a borrowed cursor's output. Includes
+ * the ROOT object and all candidate/index arrays; no I/O/currentness grant. */
+extern bool cluster_recovery_root_set_output_distinct(const ClusterRecoveryRootSet *roots,
+	const void *out, size_t length);
+
 /* After dependent graph traversal, re-observe the entire original set.
  * Follow with step(): at most one block / 128 metadata operations per call.
  * The saved baseline never changes. Entries/digest/read stay unavailable

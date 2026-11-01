@@ -217,22 +217,25 @@ roots_overlap(const void *a, size_t a_size, const void *b, size_t b_size)
 		   && (x >= y ? x - y < b_size : y - x < a_size);
 }
 
-/* Refuse known owned-storage aliases before clearing the distinct output. */
+/* Pure extent check shared by borrowers; no I/O, mutation or authority. */
+bool
+cluster_recovery_root_set_output_distinct(const ClusterRecoveryRootSet *previous,
+	const void *out, size_t n)
+{
+	return previous != NULL && out != NULL && n != 0
+		&& !roots_overlap(out, n, previous, sizeof(*previous))
+		&& !roots_overlap(out, n, previous->entries, previous->capacity * sizeof(*previous->entries))
+		&& !roots_overlap(out, n, previous->buckets, previous->bucket_count * sizeof(*previous->buckets))
+		&& !roots_overlap(out, n, previous->order, previous->capacity * sizeof(*previous->order))
+		&& !roots_overlap(out, n, previous->merge, previous->capacity * sizeof(*previous->merge))
+		&& !roots_overlap(out, n, previous->verified, previous->capacity * sizeof(*previous->verified));
+}
+
 static bool
 roots_reobserve_alias(const ClusterRecoveryRootSet *previous, ClusterRecoveryRootSet **out)
 {
-	return previous != NULL
-		   && (roots_overlap(out, sizeof(*out), previous, sizeof(*previous))
-			   || roots_overlap(out, sizeof(*out), previous->entries,
-								previous->capacity * sizeof(*previous->entries))
-			   || roots_overlap(out, sizeof(*out), previous->buckets,
-								previous->bucket_count * sizeof(*previous->buckets))
-			   || roots_overlap(out, sizeof(*out), previous->order,
-								previous->capacity * sizeof(*previous->order))
-			   || roots_overlap(out, sizeof(*out), previous->merge,
-								previous->capacity * sizeof(*previous->merge))
-			   || roots_overlap(out, sizeof(*out), previous->verified,
-								previous->capacity * sizeof(*previous->verified)));
+	return previous != NULL && out != NULL
+		&& !cluster_recovery_root_set_output_distinct(previous, out, sizeof(*out));
 }
 
 ClusterRecoveryRootsResult

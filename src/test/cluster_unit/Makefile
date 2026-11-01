@@ -13517,6 +13517,7 @@ test_cluster_recovery_slru_scan: test_cluster_recovery_slru_scan.c test_cluster_
 test_cluster_recovery_relmap_scan: test_cluster_recovery_relmap_scan.c test_cluster_recovery_root_set.c test_cluster_recovery_relmap_fixture.h test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_relmap_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_relmap_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
@@ -16038,3 +16039,41 @@ $(top_builddir)/src/common/libpgcommon.a: $(top_builddir)/src/common/libpgcommon
 # These original standalone ROOT fixtures have no SIDE ERROR provider.
 test_cluster_recovery_root_set test_cluster_recovery_relmap_scan: \
         CPPFLAGS += -DTEST_CLUSTER_RECOVERY_STANDALONE_ERRORS
+
+# Managed physical maps borrow the original complete control selection.
+TESTS += test_cluster_recovery_managed_relmap_scan
+all: test_cluster_recovery_managed_relmap_scan
+test_cluster_recovery_managed_relmap_scan: test_cluster_recovery_managed_relmap_scan.c test_cluster_control_relmap_selection.c test_cluster_control_file_selection.c test_cluster_control_registry.c test_cluster_recovery_registry.c test_cluster_recovery_crypto_boundary.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_relmap_scan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_relmap_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_relmap_wal_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) cluster_control_registry_original.o cluster_registry_common_test.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(top_srcdir)/src/common/cluster_relmap_v2.c \
+		cluster_control_registry_original.o $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-managed-relmap-scan
+.PHONY: clean-managed-relmap-scan
+clean-managed-relmap-scan:
+	rm -f test_cluster_recovery_managed_relmap_scan test_cluster_recovery_managed_relmap_scan.d

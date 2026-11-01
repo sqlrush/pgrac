@@ -13887,6 +13887,15 @@ static bool control_relmap_distinct_v4(const ClusterControlRelmapSelectionV2 *s,
 	return true;
 }
 
+/* Borrowers must reject output aliases before clearing or dereferencing them.
+ * Reuse the original complete selection/vector bounds; no CF or I/O call. */
+bool
+cluster_control_root_relmap_selection_output_distinct_v4(const ClusterControlRelmapSelectionV2 *s,
+	const void *out, Size length)
+{
+	return s != NULL && length != 0 && control_relmap_distinct_v4(s, out, length);
+}
+
 void
 cluster_control_root_relmap_selection_destroy_v4(ClusterControlRelmapSelectionV2 **out)
 {

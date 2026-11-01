@@ -4,6 +4,29 @@
 #define RECOVERY_ROOT_SET_FIXTURE_ONLY
 #include "test_cluster_recovery_root_set.c"
 #include "test_cluster_recovery_relmap_fixture.h"
+#include "cluster/cluster_control_file_identity.h"
+/* This legacy fixture never supplies managed control custody. Unexpected
+ * managed selection is fatal; the managed companion has its own real selector. */
+bool cluster_control_root_relmap_selection_output_distinct_v4(const ClusterControlRelmapSelectionV2 *s,
+	const void *out, Size length)
+{
+	abort();
+}
+bool cluster_control_root_relmap_selection_reference_v4(ClusterControlRelmapSelectionV2 *s,
+	ClusterControlRelmapReferenceV2 *out)
+{
+	abort();
+}
+ClusterControlRootResult
+cluster_control_root_relmap_selection_recheck_locked_v4(ClusterControlRelmapSelectionV2 *s)
+{
+	abort();
+}
+bool cluster_control_root_relmap_selection_lookup_v4(ClusterControlRelmapSelectionV2 *s,
+	Oid db, Oid ts, uint64 object, ClusterRecoveryFileIdentityV2 *out)
+{
+	abort();
+}
 #include "../../backend/cluster/cluster_recovery_relmap_scan.c"
 
 static RelMapFile
