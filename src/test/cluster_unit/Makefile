@@ -1788,7 +1788,7 @@ test_cluster_config_members: test_cluster_config_members.c unit_test.h \
 
 # PGRAC: actual native-owner adapter with explicit process/transport fixtures.
 # Author: SqlRush <sqlrush@gmail.com>
-test_cluster_service_observe: test_cluster_service_observe.c unit_test.h \
+test_cluster_service_observe: test_cluster_service_observe.c test_cluster_lmon_service_observe.inc unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_service_observe.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/backend/cluster/cluster_service_observe.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -2852,12 +2852,21 @@ test_cluster_normal_stop_lms.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.
 	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_normal_stop: test_cluster_normal_stop.c test_cluster_normal_stop_cleaner.inc test_cluster_normal_stop_sinval.inc test_cluster_normal_stop_lms.inc unit_test.h \
+# Original shared admission point observer, in the native actor fixture.
+test_cluster_shared_admission_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^#define CLUSTER_SEMANTIC_ADMISSION_SNAPSHOT_TRIES / { print; n++ } /^typedef struct ClusterSemanticActivationShmem / || /^typedef struct SemanticActivationAdmissionSnapshot / { emit=1; n++ } emit { print } /^} / { emit=0 } /^static ClusterSemanticActivationShmem \*/ { print; n++ } END { if(n!=4 || emit) exit 1 }' $< > $@.tmp
+	awk '/^semantic_activation_(snapshot|return_snapshot)\(/ { print "static bool"; emit=1; n++ } /^cluster_semantic_activation_admission_(observe|return_observe)\(/ { print "ClusterSemanticAdmissionObservationResult"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=4 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+test_cluster_normal_stop: test_cluster_shared_admission_observe.inc test_cluster_service_collection_refusals.h $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
+
+
+test_cluster_normal_stop: test_cluster_normal_stop.c test_cluster_service_producer_observe.inc test_cluster_native_actor_observe.inc test_cluster_native_producers_observe.inc test_cluster_normal_stop_cleaner.inc test_cluster_normal_stop_sinval.inc test_cluster_normal_stop_lms.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_service_observe.c cluster_unit_service_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_lms_data_plane.c \
-		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h $(CLUSTER_CLEAN_LEAVE_POLICY_O)
+		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h \
+		$(top_srcdir)/src/include/cluster/cluster_service_observe.h $(CLUSTER_CLEAN_LEAVE_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_CLEAN_LEAVE_POLICY_O) \
 		cluster_unit_service_stubs.o \
@@ -6235,7 +6244,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		$(top_builddir)/src/backend/cluster/cluster_recovery_reference_graph.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_store.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_undo_scan.o \
-		test_cluster_control_cold_census.inc test_cluster_control_ctrc_inputs.inc test_cluster_control_ctrc_local_wal.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_slru_inputs.inc test_cluster_recovery_xact_slru_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_recovery_census_inputs.inc test_cluster_heap_small_scn.inc \
+		test_cluster_control_online_census.inc test_cluster_control_cold_census.inc test_cluster_control_ctrc_inputs.inc test_cluster_control_ctrc_local_wal.inc test_cluster_recovery_native_transcript.inc test_cluster_recovery_wal_tt_roots.inc test_cluster_recovery_multixact_inputs.inc test_cluster_recovery_slru_inputs.inc test_cluster_recovery_xact_slru_inputs.inc test_cluster_recovery_multixact_join_inputs.inc test_cluster_recovery_census_inputs.inc test_cluster_heap_small_scn.inc \
 		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc test_cluster_control_catalog.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
@@ -7025,9 +7034,9 @@ test_cluster_wal_inputs_job_scope_types.inc: $(top_srcdir)/src/backend/cluster/c
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_scope_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
-	awk '/^(inputs_prepare_budget|inputs_prepare_current|cluster_wal_inputs_scope_job_binding_v1|cluster_wal_inputs_scope_job_suspended_v1|cluster_wal_inputs_scope_job_allocate_v1|cluster_wal_inputs_scope_job_pin_slot_v1|cluster_wal_inputs_scope_job_revoke_v1|cluster_wal_inputs_scope_job_drained_v1|cluster_wal_inputs_scope_job_forget_v1|inputs_io_role|inputs_owned|inputs_scope_role|inputs_current|cluster_wal_inputs_release_v1|cluster_wal_inputs_count_v1)\(/ { print prev; emit=1; count++ } \
+	awk '/^(inputs_prepare_budget|inputs_prepare_current|cluster_wal_inputs_scope_job_binding_v1|cluster_wal_inputs_scope_job_suspended_v1|cluster_wal_inputs_scope_job_allocate_v1|cluster_wal_inputs_scope_job_pin_slot_v1|cluster_wal_inputs_scope_job_revoke_v1|cluster_wal_inputs_scope_job_drained_v1|cluster_wal_inputs_scope_job_forget_v1|inputs_io_role|inputs_owned|inputs_scope_role|inputs_pin_covers|inputs_current|cluster_wal_inputs_release_v1|cluster_wal_inputs_count_v1)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 15 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 16 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_pin: test_cluster_wal_inputs_job_pin.c test_cluster_wal_inputs_job.c \
@@ -7046,17 +7055,17 @@ test_cluster_wal_inputs_job_pin: test_cluster_wal_inputs_job_pin.c test_cluster_
 		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_wal_inputs_job_pin_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
-	awk '/^#define CLUSTER_WAL_READ_PIN_MAGIC/ { print; constants++ } \
-	     /^typedef struct ClusterWalPinLock \{/ || /^struct ClusterWalReadPinV1 \{/ || /^struct ClusterWalRootPublishGuard \{/ { emit=1; types++ } \
-	     emit { print } /^};/ || /^} ClusterWalPinLock;/ { emit=0 } \
+	awk '/^#define CLUSTER_WAL_(READ_)?PIN_MAGIC/ { print; constants++ } \
+	     /^typedef enum ClusterWalPinState \{/ || /^typedef struct ClusterWalPin(Lock|Thread) \{/ || /^struct ClusterWal(RetentionPin|ReadPinV1|RootPublishGuard) \{/ { emit=1; types++ } \
+	     emit { print } /^}/ { emit=0 } \
 	     /^static .* (read_pin_generation);/ || /^static .*\*(active_pin|active_read_pin|active_root_publish_guard|active_reuse_guard|active_e1_context|active_action_context);/ { print; globals++ } \
-	     END { if (constants != 1 || types != 3 || globals != 7 || emit) exit 1 }' $< > $@.tmp
+	     END { if (constants != 2 || types != 6 || globals != 7 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_pin_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
-	awk '/^(read_pin_acquire|cluster_wal_read_pin_owner_v1|cluster_wal_read_pin_owner_current_v1|cluster_wal_retention_resid_encode|walr_request_current|walr_share_request_init|read_pin_valid|cluster_wal_read_pin_job_binding_v1|cluster_wal_read_pin_covers_v1|cluster_wal_read_pin_release_v1|cluster_wal_read_pin_acquire_v1|read_pin_job_finish_native|cluster_wal_read_pin_acquire_job_v1|read_pin_job_release|cluster_wal_read_pin_release_job_v1|cluster_wal_read_pin_suspend_job_v1|cluster_wal_read_pin_release_job_poll_v1|read_pin_job_owner_cleanup)\(/ { print prev; emit=1; count++ } \
+	awk '/^(pin_valid|pin_walr_for_thread|pin_readers_current|root_publish_member|pin_thread_walr_current|pin_post_ir_current|cluster_wal_read_pin_owner_covers_v1|read_pin_acquire|cluster_wal_read_pin_owner_v1|cluster_wal_read_pin_owner_current_v1|cluster_wal_retention_resid_encode|walr_request_current|walr_share_request_init|read_pin_valid|cluster_wal_read_pin_job_binding_v1|cluster_wal_read_pin_covers_v1|cluster_wal_read_pin_release_v1|cluster_wal_read_pin_acquire_v1|read_pin_job_finish_native|cluster_wal_read_pin_acquire_job_v1|read_pin_job_release|cluster_wal_read_pin_release_job_v1|cluster_wal_read_pin_suspend_job_v1|cluster_wal_read_pin_release_job_poll_v1|read_pin_job_owner_cleanup)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 18 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 25 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_callback.inc: $(top_srcdir)/src/backend/utils/resowner/resowner.c Makefile
@@ -8048,16 +8057,32 @@ test_cluster_gcs_serving_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs
 # t/061_lmon_skeleton.pl where postmaster orchestration is real.
 test_cluster_lmon_stop_service.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h
-	awk '/^cluster_normal_stop_requested\(/ || /^cluster_normal_stop_protocol_closed\(/ || /^cluster_normal_stop_service_(enter|leave|new_work|data_sealed)\(/ { print "bool"; emit=1; count++ } \
+	awk '/^typedef struct ClStopFirstFailureTrace/ { emit=1; types++ } \
+	     /^static ClStopFirstFailureTrace cl_stop_first_failure;/ { print; globals++ } \
+	     /^cl_stop_trace_lock\(/ || /^cl_stop_trace_first_failure\(/ { print "static void"; emit=1; diagnostics++ } \
+	     /^cl_stop_trace_safe\(/ { print "static bool"; emit=1; diagnostics++ } \
+	     /^cluster_normal_stop_requested\(/ || /^cluster_normal_stop_protocol_closed\(/ || /^cluster_normal_stop_service_(enter|leave|new_work|data_sealed)\(/ { print "bool"; emit=1; count++ } \
 	     /^cl_normal_stop_service_mask_valid\(/ { print "static bool"; emit=1; count++ } \
-	     /^cluster_normal_stop_fail\(/ { print "void"; emit=1; count++ } \
+	     /^cluster_normal_stop_fail_at\(/ { print "void"; emit=1; count++ } \
 	     /^cluster_normal_stop_failure\(/ { print "ClusterNormalStopFailure"; emit=1; count++ } \
 	     /^cl_normal_stop_actor_bit\(/ || /^cl_normal_stop_member_mask\(/ { print "static uint32"; emit=1; count++ } \
 	     /^cluster_normal_stop_service_(idle|seal)\(/ { print "ClusterNormalStopPollResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 13) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 13 || types != 1 || globals != 1 || diagnostics != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_lmon_producer_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
+		$(top_srcdir)/src/include/cluster/cluster_service_observe.h
+	awk '/^cl_native_observe_lock\(/ { print "static void"; emit=1; count++ } \
+	     /^cluster_service_(actor|producer)_observe\(/ { print "ClusterNormalStopPollResult"; emit=1; count++ } \
+	     /^cl_service_producer_collect\(/ { print "static ClusterSemanticAdmissionObservationResult"; emit=1; count++ } \
+	     /^cluster_service_producer_collect(_return)?\(/ { print "ClusterSemanticAdmissionObservationResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 6) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_lmon: test_cluster_lmon.c unit_test.h test_cluster_lmon_stop_service.inc \
+		test_cluster_lmon_producer_observe.inc test_cluster_lmon_producer_pause.inc \
+		test_cluster_shared_admission_observe.inc test_cluster_lmon_admission_pause.inc \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
 		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_grd_outbound.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O)
@@ -11867,6 +11892,18 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
 
+# Independent survivor carrier syntax only; no live routing or authority.
+TESTS += test_cluster_survivor_v4
+all: test_cluster_survivor_v4
+
+test_cluster_survivor_v4: test_cluster_survivor_v4.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_survivor.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 TESTS += test_cluster_control_rebind
 all: test_cluster_control_rebind
 
@@ -13860,7 +13897,15 @@ test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/trans
 		emit { print } emit && /^}$$/ { emit=0 } \
 		END { if (emit || starts != 1) exit 1 }' $< > $@
 
+# Keep the actual return gate final recheck with the original snapshot owner.
+test_cluster_backend_return_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^cluster_semantic_activation_wait_graph_snapshot\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		$(srcdir)/test_cluster_backend_return.inc test_cluster_shared_admission_observe.inc test_cluster_backend_return_gate.inc \
+		$(srcdir)/test_cluster_snapshot_return.inc $(top_srcdir)/src/include/cluster/cluster_service_observe.h \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
 		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
 		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
@@ -16454,7 +16499,7 @@ test_cluster_wal_inputs_job_quiesce.inc: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_wal_inputs_job_service: test_cluster_wal_inputs_job_stop.inc test_cluster_wal_inputs_job_quiesce.inc
 
 test_cluster_wal_inputs_job_stop_module.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c Makefile
-	awk '/^cl_normal_stop_modules_poll\(/ { owner=1 } \
+	awk '/^cl_shared_native_observe\(/ { owner=1 } \
 	     owner && /^[ \t]*case 15:/ { emit=1; cases++ } \
 	     emit { print } emit && /^[ \t]*break;/ { emit=0; owner=0 } \
 	     END { if (cases != 1 || emit) exit 1 }' $< > $@.tmp
@@ -17271,3 +17316,52 @@ test_cluster_relmap_desc: test_cluster_relmap_desc.c unit_test.h \
 clean: clean-managed-relmap-desc
 clean-managed-relmap-desc:
 	rm -f test_cluster_relmap_desc
+
+# Online inventory shares the evolved original cold fixture.
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_online_inventory.inc
+# Extract the original PGSA codec; these are syntax inputs, not durable proof.
+test_cluster_survivor_pgsa.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^#define CLUSTER_SEMANTIC_RECORD_(MAGIC|VERSION|HEADER_LEN|CRC_OFFSET) / { print; defines++ } \
+	     /^semantic_activation_read_u16_le\(/ { print "static uint16"; emit=1; count++ } \
+	     /^semantic_activation_read_u32_le\(/ { print "static uint32"; emit=1; count++ } \
+	     /^semantic_activation_read_u64_le\(/ { print "static uint64"; emit=1; count++ } \
+	     /^semantic_activation_write_u(16|32|64)_le\(/ || /^semantic_activation_set_refusal\(/ { print "static void"; emit=1; count++ } \
+	     /^semantic_activation_bytes_are_zero\(/ { print "static bool"; emit=1; count++ } \
+	     /^cluster_semantic_activation_record_(encode|decode)\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 10 || defines != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Unconfirmed survivor collection at actual original LMON wait boundaries.
+TESTS += test_cluster_survivor_candidate
+all: test_cluster_survivor_candidate
+
+test_cluster_survivor_candidate: test_cluster_survivor_candidate.c test_cluster_lmon.c unit_test.h \
+		test_cluster_survivor_pgsa.inc \
+		test_cluster_lmon_stop_service.inc test_cluster_lmon_producer_observe.inc \
+		test_cluster_lmon_producer_pause.inc test_cluster_shared_admission_observe.inc \
+		test_cluster_lmon_admission_pause.inc \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_survivor_candidate.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_survivor.h \
+		$(top_srcdir)/src/include/cluster/cluster_service_observe.h \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# Original input-job owner observations in the real ACK/service-loop fixture.
+test_cluster_wal_inputs_job_service: test_cluster_input_job_observation.inc
+
+# Same-process survivor collection uses the complete original owner branch.
+test_cluster_wal_inputs_job_service: test_cluster_survivor_producer_inputs.inc
+test_cluster_snapshot_admission: test_cluster_survivor_producer_backend.inc
+test_cluster_wal_inputs_job_service test_cluster_snapshot_admission test_cluster_survivor_candidate: \
+ test_cluster_survivor_producer_fixture.h \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_producer.c \
+ $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_producer.h

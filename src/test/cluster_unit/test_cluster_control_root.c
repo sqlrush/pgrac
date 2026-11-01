@@ -25318,6 +25318,7 @@ UT_TEST(test_wal_inputs_cold_selection_and_pin_lifetime_are_exact)
 }
 
 #include "test_cluster_control_cold_census.inc"
+#include "test_cluster_control_online_census.inc"
 #include "test_cluster_control_catalog.inc"
 #include "test_cluster_control_root_serving.inc"
 
@@ -27285,7 +27286,14 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(42);
+		UT_PLAN(48);
+		UT_RUN(test_online_source_census_reuses_complete_physical_cuts);
+		UT_RUN(test_online_source_census_pending_has_no_partial_callbacks);
+		UT_RUN(test_online_source_census_refusal_error_and_final_drift_revoke_scope);
+		UT_RUN(test_online_source_census_keeps_original_owner_role_and_cold_rejection);
+		UT_RUN(test_online_source_census_preserves_empty_initializer_source);
+		UT_RUN(test_online_source_census_physical_growth_keeps_original_cut);
+
 		UT_RUN(test_cold_census_visits_all_selected_sources_twice);
 		UT_RUN(test_cold_census_open_source_waits_without_partial_callbacks);
 		UT_RUN(test_cold_census_refusal_error_and_final_drift_never_complete);
@@ -27439,7 +27447,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(637);
+	UT_PLAN(643);
 	UT_RUN(test_post_eor_scopes_borrow_original_walr_without_native_acquire_or_release);
 	UT_RUN(test_post_eor_borrow_missing_member_and_late_owner_loss_keep_original_debt);
 	UT_RUN(test_ctrc_writer_retention_binds_both_original_sources_without_new_cut);
@@ -27492,6 +27500,13 @@ main(int argc, char **argv)
 	UT_RUN(test_ctrc_page_partial_page_wait_releases_only_new_page_locks);
 	UT_RUN(test_ctrc_page_stale_proof_blocks_use_while_page_retirement_is_owned);
 	UT_RUN(test_ctrc_page_destroy_after_scope_retirement_has_no_borrowed_access);
+	UT_RUN(test_online_source_census_reuses_complete_physical_cuts);
+	UT_RUN(test_online_source_census_pending_has_no_partial_callbacks);
+	UT_RUN(test_online_source_census_refusal_error_and_final_drift_revoke_scope);
+	UT_RUN(test_online_source_census_keeps_original_owner_role_and_cold_rejection);
+	UT_RUN(test_online_source_census_preserves_empty_initializer_source);
+	UT_RUN(test_online_source_census_physical_growth_keeps_original_cut);
+
 	UT_RUN(test_ctrc_replay_stable_two_actual_origins_without_tt);
 	UT_RUN(test_ctrc_replay_stable_refuses_omitted_or_duplicated_set_origin);
 	UT_RUN(test_ctrc_replay_stable_refuses_changed_native_source_or_uncovered_cut);

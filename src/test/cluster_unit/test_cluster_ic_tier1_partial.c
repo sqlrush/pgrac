@@ -98,6 +98,16 @@ static bool ut_rx_sent[8];
 static unsigned ut_rx_completed_count;
 static bool ut_rx_route_send;
 static bool ut_rx_rdma_busy;
+bool cluster_trace_normal_stop;
+static char run15_wire_log[16384];
+volatile uint32 CritSectionCount;
+static bool run15_wire_held;
+void
+ForEachLWLockHeldByMe(void (*visitor)(LWLock *, LWLockMode, void *), void *arg)
+{
+	if (run15_wire_held)
+		visitor(NULL, LW_SHARED, arg);
+}
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 
@@ -274,7 +284,7 @@ errstart(int elevel, const char *domain)
 {
 	(void)elevel;
 	(void)domain;
-	return false; /* suppress body evaluation */
+	return elevel == LOG && cluster_trace_normal_stop; /* capture only the enabled trace */
 }
 
 void
@@ -315,7 +325,14 @@ errmsg_internal(const char *fmt, ...)
 int
 errdetail(const char *fmt, ...)
 {
-	(void)fmt;
+	if (cluster_trace_normal_stop) {
+		va_list args;
+		size_t used = strlen(run15_wire_log);
+		va_start(args, fmt);
+		vsnprintf(run15_wire_log + used, sizeof(run15_wire_log) - used, fmt, args);
+		va_end(args);
+		strlcat(run15_wire_log, "\n", sizeof(run15_wire_log));
+	}
 	return 0;
 }
 
@@ -1935,11 +1952,68 @@ UT_TEST(test_data_first_request_samples_native_transport_readiness)
 	ut_reconnect_peer();
 }
 
+
+UT_TEST(test_run15_real_ack_tail_fifo_completion_and_close_are_distinct)
+{
+	struct {
+		ClusterICEnvelope env;
+		ClusterLeaveAckPayload ack;
+	} pg_attribute_packed() frame;
+	for (int on = 0; on < 2; on++) {
+		memset(&frame, 0, sizeof(frame));
+		frame.env.msg_type = PGRAC_IC_MSG_LEAVE_DRAIN_ACK;
+		frame.env.source_node_id = cluster_node_id;
+		frame.env.dest_node_id = UT_PEER_ID;
+		frame.env.epoch = 7;
+		frame.env.payload_length = sizeof(frame.ack);
+		frame.ack.leave_epoch = 7;
+		frame.ack.leave_nonce = 811;
+		frame.ack.phase1_round = 0;
+		cluster_trace_normal_stop = on;
+		run15_wire_log[0] = 0;
+		ut_backpressure_fd = ut_tx_fd;
+		UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, &frame, sizeof(frame)),
+					 CLUSTER_IC_SEND_WOULD_BLOCK);
+		frame.ack.leave_nonce = 812;
+		UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, &frame, sizeof(frame)),
+					 CLUSTER_IC_SEND_WOULD_BLOCK);
+		UT_ASSERT_EQ(tier1_outbound_fifo_frames[UT_PEER_ID], 1);
+		UT_ASSERT(strstr(run15_wire_log, "event=complete") == NULL);
+		ut_release_backpressure(ut_tx_fd);
+		UT_ASSERT_EQ(ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc)),
+					 2 * sizeof(frame));
+		frame.ack.leave_nonce = 811;
+		UT_ASSERT_EQ(memcmp(ut_acc, &frame, sizeof(frame)), 0);
+		frame.ack.leave_nonce = 812;
+		UT_ASSERT_EQ(memcmp(ut_acc + sizeof(frame), &frame, sizeof(frame)), 0);
+		if (on) {
+			UT_ASSERT(strstr(run15_wire_log, "event=complete") != NULL);
+			UT_ASSERT(strstr(run15_wire_log, "nonce=811") != NULL);
+			UT_ASSERT(strstr(run15_wire_log, "nonce=812") != NULL);
+		} else
+			UT_ASSERT_EQ(strlen(run15_wire_log), 0);
+		run15_wire_log[0] = 0;
+		ut_backpressure_fd = ut_tx_fd;
+		UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, &frame, sizeof(frame)),
+					 CLUSTER_IC_SEND_WOULD_BLOCK);
+		ut_release_backpressure(ut_tx_fd);
+		cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+		if (on) {
+			UT_ASSERT(strstr(run15_wire_log, "event=discard") != NULL);
+			UT_ASSERT(strstr(run15_wire_log, "event=complete") == NULL);
+		}
+		close(ut_rx_fd);
+		ut_rx_fd = -1;
+		ut_reconnect_peer();
+	}
+	cluster_trace_normal_stop = false;
+}
+
 int
 main(void)
 {
 	MyProcPid = getpid();
-	UT_PLAN(35);
+	UT_PLAN(36);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
@@ -1975,6 +2049,7 @@ main(void)
 	UT_RUN(test_terminal_sessions_bind_control_and_all_data_channels);
 	UT_RUN(test_control_hello_generation_survives_first_reconnect_and_exhaustion);
 	UT_RUN(test_data_first_request_samples_native_transport_readiness);
+	UT_RUN(test_run15_real_ack_tail_fifo_completion_and_close_are_distinct);
 	UT_RUN(test_stream_shutdown_and_exhaustion_never_wrap);
 
 	UT_DONE();

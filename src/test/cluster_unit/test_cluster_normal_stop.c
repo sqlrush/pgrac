@@ -12,6 +12,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <sys/mman.h>
+#include <unistd.h>
 #include "cluster/cluster_terminal_ref_census.h"
 #include "postmaster/interrupt.h"
 #include "libpq/pqsignal.h"
@@ -49,6 +51,7 @@ bool cluster_trace_cleanup;
 bool cluster_trace_normal_stop;
 static unsigned stop_trace_records, stop_trace_ko_calls;
 static char stop_trace_detail[1024];
+static char run15_stop_log[32768];
 
 void
 cluster_ko_normal_stop_trace_v1(void)
@@ -80,6 +83,7 @@ static TimestampTz fixture_now = 1000000;
 static ClusterNormalStopPollResult module_results[14];
 static unsigned module_calls[14];
 static unsigned module_post_calls;
+static uint64 native_observe_fixture_epoch = 9, native_observe_epoch_after_poll;
 static bool module_pi_pending;
 static unsigned module_pi_retire_calls;
 static void (*pi_cut_race_after_shared_unlock)(void);
@@ -288,6 +292,8 @@ module_fixture(unsigned index, bool post, const char **reason)
 		abort();
 	module_calls[index]++;
 	module_post_calls += post;
+	if (index == 13 && native_observe_epoch_after_poll != 0)
+		native_observe_fixture_epoch = native_observe_epoch_after_poll;
 	if (index == 12 && module_change_root)
 		identity_root[80] ^= 1;
 	if (index == 12 && identity_read_dispatch_lmon && cl_normal_stop_service_depth != 0) {
@@ -1231,8 +1237,16 @@ errcode(int code pg_attribute_unused())
 	return 0;
 }
 int
-errmsg(const char *format pg_attribute_unused(), ...)
+errmsg(const char *format, ...)
 {
+	if (cluster_trace_normal_stop) {
+		va_list args;
+		size_t used = strlen(run15_stop_log);
+		va_start(args, format);
+		vsnprintf(run15_stop_log + used, sizeof(run15_stop_log) - used, format, args);
+		va_end(args);
+		strlcat(run15_stop_log, "\n", sizeof(run15_stop_log));
+	}
 	return 0;
 }
 int
@@ -1255,6 +1269,8 @@ errdetail(const char *format pg_attribute_unused(), ...)
 		vsnprintf(stop_trace_detail, sizeof(stop_trace_detail), format, args);
 		va_end(args);
 		stop_trace_records++;
+		strlcat(run15_stop_log, stop_trace_detail, sizeof(run15_stop_log));
+		strlcat(run15_stop_log, "\n", sizeof(run15_stop_log));
 	}
 	return 0;
 }
@@ -1779,6 +1795,7 @@ UT_TEST(test_sinval_actual_main_rechecks_before_exit)
 static ClusterLmsSharedState lms_fixture;
 static ClusterLmsSharedState *cluster_lms_state = &lms_fixture;
 static unsigned lms_worker, lms_drains, lms_ticks, lms_closes, lms_polls;
+static void (*producer_observe_during_poll)(void);
 static int lms_scenario;
 static bool lms_data_enabled;
 static ClusterNormalStopPollResult lms_ic_observation, lms_cr_observation;
@@ -2008,6 +2025,8 @@ cluster_ic_normal_stop_poll(const char **domain, int *peer, uint32 *sequence, co
 	*peer = 1;
 	*sequence = 7;
 	*reason = "IC_FIXTURE";
+	if (producer_observe_during_poll != NULL)
+		producer_observe_during_poll();
 	return lms_ic_observation;
 }
 
@@ -2201,7 +2220,7 @@ int cluster_interconnect_connect_timeout_ms = 1000;
 uint64
 cluster_epoch_get_current(void)
 {
-	return 9;
+	return native_observe_fixture_epoch;
 }
 int
 cluster_ic_tier1_my_data_channel(void)
@@ -6645,6 +6664,273 @@ UT_TEST(test_pre_front_buffer_observation_never_advances_cut)
 	cluster_trace_cleanup = false;
 }
 
+#include "test_cluster_native_producers_observe.inc"
+#include "test_cluster_native_actor_observe.inc"
+#include "test_cluster_service_producer_observe.inc"
+
+
+UT_TEST(test_run15_short_ack_never_reads_an_unavailable_tuple)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	uint8 *area = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	UT_ASSERT(area != MAP_FAILED);
+	if (area == MAP_FAILED)
+		return;
+	UT_ASSERT_EQ(mprotect(area + page, page, PROT_NONE), 0);
+	for (int on = 0; on < 2; on++) {
+		ClusterICEnvelope env = { 0 };
+		reset_identity();
+		MyAuxProcType = LmonProcess;
+		cluster_trace_normal_stop = on;
+		env.source_node_id = 1;
+		env.dest_node_id = cluster_node_id;
+		env.msg_type = PGRAC_IC_MSG_LEAVE_DRAIN_ACK;
+		env.payload_length = 0;
+		cl_normal_stop_fronts_ack(&env, (const ClusterLeaveAckPayload *)(area + page));
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+	}
+	cluster_trace_normal_stop = false;
+	UT_ASSERT_EQ(munmap(area, 2 * page), 0);
+}
+
+UT_TEST(test_run15_first_failure_caller_and_budget_are_original)
+{
+	ClusterCleanLeaveSharedState outcomes[2];
+	unsigned calls[2];
+	for (int on = 0; on < 2; on++) {
+		ClusterPhase1FullStopPlan plan;
+		unsigned dumps = deadline_observations;
+		seed_at_checkpoint(&plan);
+		cluster_trace_normal_stop = on;
+		run15_stop_log[0] = 0;
+		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
+		calls[on] = deadline_observations - dumps;
+		outcomes[on] = test_region;
+		if (on) {
+			UT_ASSERT(strstr(run15_stop_log, "normal-stop first failure") != NULL);
+			UT_ASSERT(strstr(run15_stop_log,
+							 "caller=test_run15_first_failure_caller_and_budget_are_original")
+					  != NULL);
+			UT_ASSERT(strstr(run15_stop_log, "phase=4") != NULL);
+			UT_ASSERT(strstr(run15_stop_log, "deadline_pg_us=") != NULL);
+		} else
+			UT_ASSERT_EQ(strlen(run15_stop_log), 0);
+	}
+	UT_ASSERT_EQ(calls[0], calls[1]);
+	UT_ASSERT_EQ(calls[1], 1);
+	UT_ASSERT_EQ(memcmp(outcomes, outcomes + 1, sizeof(outcomes[0])), 0);
+	cluster_trace_normal_stop = false;
+}
+UT_TEST(test_run15_first_failure_defers_emission_under_original_lock)
+{
+	ClusterPhase1FullStopPlan plan;
+	seed_at_checkpoint(&plan);
+	cluster_trace_normal_stop = true;
+	run15_stop_log[0] = 0;
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	UT_ASSERT_EQ(strlen(run15_stop_log), 0);
+	LWLockRelease(&cl_state->lock);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	UT_ASSERT(strstr(run15_stop_log, "normal-stop first failure") != NULL);
+	cluster_trace_normal_stop = false;
+}
+UT_TEST(test_run15_producer_ack_retention_and_consumption_are_observed)
+{
+	ClusterCleanLeaveSharedState outcomes[2];
+	unsigned locks[2];
+	for (int on = 0; on < 2; on++) {
+		ClusterPhase1FullStopPlan out;
+		uint64 nonce;
+		reset_identity();
+		front_local_postmaster_cut(true);
+		UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&out, NULL), CLUSTER_NORMAL_STOP_PENDING);
+		nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+		cluster_trace_normal_stop = on;
+		run15_stop_log[0] = 0;
+		locks[on] = lock_acquisitions;
+		front_peer_ack(1, nonce, false);
+		identity_read_result = CLUSTER_NORMAL_STOP_PENDING;
+		cl_normal_stop_fronts_lmon_tick();
+		UT_ASSERT(cl_normal_stop_front_inbox[1].ack_pending);
+		UT_ASSERT_EQ(cl_state->ack_bitmap[0], 0);
+		fixture_now += 2000000;
+		if (on) {
+			UT_ASSERT(strstr(run15_stop_log, "ack_pending=1") != NULL);
+			UT_ASSERT(strstr(run15_stop_log, "first_reject=identity.poll") != NULL);
+		}
+		identity_read_result = CLUSTER_NORMAL_STOP_READY;
+		front_peer_request(1, 1501);
+		cl_normal_stop_fronts_lmon_tick();
+		UT_ASSERT(!cl_normal_stop_front_inbox[1].ack_pending);
+		UT_ASSERT_EQ(cl_state->ack_bitmap[0], 2);
+		fixture_now += 2000000;
+		if (on)
+			UT_ASSERT(strstr(run15_stop_log, "event=ack.install") != NULL);
+		outcomes[on] = test_region;
+		locks[on] = lock_acquisitions - locks[on];
+	}
+	UT_ASSERT_EQ(memcmp(outcomes, outcomes + 1, sizeof(outcomes[0])), 0);
+	UT_ASSERT_EQ(locks[0], locks[1]);
+	cluster_trace_normal_stop = false;
+}
+
+
+#include "test_cluster_service_collection_refusals.h"
+static void (*collect_barrier_hook)(void);
+static void
+collect_read_barrier(void)
+{
+	pg_read_barrier_impl();
+	if (collect_barrier_hook != NULL)
+		collect_barrier_hook();
+}
+#undef pg_read_barrier
+#define pg_read_barrier() collect_read_barrier()
+#include "test_cluster_shared_admission_observe.inc"
+#undef pg_read_barrier
+#define pg_read_barrier() pg_read_barrier_impl()
+static ClusterSemanticActivationShmem collect_admission;
+static void
+collect_begin(const NativeActorFixtureRole *role)
+{
+	producer_begin(role);
+	collect_barrier_hook = NULL;
+	sinval_observation = ko_observation = CLUSTER_NORMAL_STOP_READY;
+	memset(&collect_admission, 0, sizeof(collect_admission));
+	SemanticActivationShmem = &collect_admission;
+	pg_atomic_init_u64(&collect_admission.admission_seq, 2);
+	pg_atomic_init_u64(&collect_admission.active_bits, 0);
+	pg_atomic_init_u64(&collect_admission.record_generation, 11);
+	pg_atomic_init_u64(&collect_admission.formation_epoch, 9);
+	pg_atomic_init_u32(&collect_admission.transition_closed, 0);
+	for (unsigned side = 0; side < 2; side++)
+		for (unsigned bit = 0; bit < 64; bit++)
+			pg_atomic_init_u32(&collect_admission.inflight[side][bit], 0);
+}
+
+UT_TEST(test_collect_shared_debt_cannot_hide_behind_private_idle)
+{
+	ClusterServiceProducerCollection out;
+	ClusterCleanLeaveSharedState before;
+	unsigned locks;
+	collect_begin(&native_actor_roles[1]);
+	before = test_region;
+	locks = lock_acquisitions;
+	/* Explicit original atomic debt input; not a producer receipt. */
+	pg_atomic_write_u32(&collect_admission.inflight[1][63], 1);
+	UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+	UT_ASSERT(out.admission.known);
+	UT_ASSERT_EQ(out.admission.inflight[1][63], 1);
+	UT_ASSERT_EQ(out.producer.identity.proc_generation, 7);
+	UT_ASSERT_EQ(out.producer.identity.backend_id, InvalidBackendId);
+	UT_ASSERT_EQ(lms_polls, 5);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&collect_admission.inflight[1][63]), 1);
+	pg_atomic_write_u32(&collect_admission.inflight[1][63], 0); /* Original input boundary. */
+	UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT);
+	UT_ASSERT_EQ(lms_polls, 10);
+	UT_ASSERT_EQ(memcmp(&before, &test_region, sizeof(before)), 0);
+	UT_ASSERT_EQ(lock_acquisitions, locks);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_collect_all_original_actor_roles_keep_active_and_module_owners)
+{
+	for (unsigned r = 0; r < lengthof(native_actor_roles); r++) {
+		ClusterServiceProducerCollection out;
+		collect_begin(&native_actor_roles[r]);
+		UT_ASSERT(cluster_normal_stop_service_enter());
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+			CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		UT_ASSERT_EQ(out.producer.actor.active_depth, 1);
+		UT_ASSERT_EQ(out.producer.responsibility.modules, 0);
+		UT_ASSERT_EQ(lms_polls, 0);
+		UT_ASSERT(cluster_normal_stop_service_leave(true));
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+			r == 0 || r == 10 ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT);
+		UT_ASSERT_EQ(out.producer.identity.actor_bit, native_actor_roles[r].bit);
+	}
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterServiceProducerCollection out;
+		collect_begin(&native_actor_roles[1]);
+		lms_cr_observation = CLUSTER_NORMAL_STOP_PENDING;
+		lms_ic_observation = fault == 2 ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_READY;
+		pg_atomic_write_u64(&collect_admission.record_generation, fault == 1 ? 12 : 11);
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out), fault == 2
+			? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED : fault == 1
+			? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		UT_ASSERT_EQ(lms_cr_observation, CLUSTER_NORMAL_STOP_PENDING);
+	}
+	cluster_shared_config = false;
+}
+
+static void
+collect_change_during_admission(void)
+{
+	collect_barrier_hook = NULL;
+	if (producer_fault == 12) {
+		producer_proc.cluster_grd_generation++;
+		pg_atomic_write_u64(&collect_admission.record_generation, 12);
+	} else
+		producer_change_during_poll();
+}
+UT_TEST(test_collect_rechecks_original_identity_after_shared_scan)
+{
+	for (producer_fault = 0; producer_fault < 13; producer_fault++) {
+		ClusterServiceProducerCollection out;
+		collect_begin(&native_actor_roles[1]);
+		collect_barrier_hook = collect_change_during_admission;
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+			(producer_fault == 10 || producer_fault == 11) ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED
+			: (producer_fault == 6 || producer_fault == 12) ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		if (producer_fault < 9 || producer_fault >= 10)
+			UT_ASSERT(!out.admission.known);
+		UT_ASSERT_EQ(lms_polls, 5);
+		lock_holds = 0;
+		CritSectionCount = 0;
+	}
+	collect_barrier_hook = NULL;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_collect_unknown_scope_and_full_matrix_remain_observations)
+{
+	ClusterServiceProducerCollection out;
+	for (unsigned fault = 0; fault < 5; fault++) {
+		collect_begin(&native_actor_roles[1]);
+		if (fault == 0) SemanticActivationShmem = NULL;
+		if (fault == 1) pg_atomic_write_u64(&collect_admission.admission_seq, 3);
+		if (fault == 2) pg_atomic_write_u64(&collect_admission.record_generation, 12);
+		if (fault == 3) MyProc = NULL;
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, fault == 4 ? 0 : 11, &out),
+			fault == 1 ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING : fault == 2
+			? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED);
+		UT_ASSERT(!out.admission.known);
+	}
+	collect_begin(&native_actor_roles[1]);
+	for (unsigned side = 0; side < 2; side++)
+		for (unsigned bit = 0; bit < 64; bit++)
+			pg_atomic_write_u32(&collect_admission.inflight[side][bit], side * 64 + bit + 1);
+	UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+	for (unsigned side = 0; side < 2; side++)
+		for (unsigned bit = 0; bit < 64; bit++)
+			UT_ASSERT_EQ(out.admission.inflight[side][bit], side * 64 + bit + 1);
+	UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, NULL),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED);
+	collect_begin(&native_actor_roles[1]);
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
@@ -6654,7 +6940,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(169);
+	UT_PLAN(194);
 	UT_RUN(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
@@ -6824,6 +7110,31 @@ main(void)
 	UT_RUN(test_pre2_pair_release_never_shrinks_or_rebinds_members);
 	UT_RUN(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal);
 	UT_RUN(test_pre2_pair_identity_rejects_root_serving_set_mismatch);
+	UT_RUN(test_online_native_observation_keeps_original_stop_gate);
+	UT_RUN(test_online_native_each_pending_and_exact_original_return);
+	UT_RUN(test_online_native_invalid_and_unknown_never_poison_stop);
+	UT_RUN(test_online_native_owner_input_and_unlocked_guards);
+	UT_RUN(test_online_native_epoch_and_input_changes_remain_provisional);
+	UT_RUN(test_online_native_observation_does_not_need_leave_state);
+	UT_RUN(test_native_actor_observation_tracks_all_original_nested_owners);
+	UT_RUN(test_native_actor_observation_rejects_empty_copy_and_wrong_identity);
+	UT_RUN(test_native_actor_observation_never_repairs_mismatched_or_full_depth);
+	UT_RUN(test_native_actor_return_does_not_complete_original_module_debt);
+	UT_RUN(test_native_actor_observation_needs_no_stop_storage_or_request);
+	UT_RUN(test_producer_observation_binds_real_lms_roles_and_signed_aux_identity);
+	UT_RUN(test_producer_active_outer_work_precedes_module_observation);
+	UT_RUN(test_producer_module_debt_is_neither_retired_nor_hidden_by_idle_actor);
+	UT_RUN(test_producer_identity_and_unlocked_context_are_required_before_poll);
+	UT_RUN(test_producer_identity_epoch_or_role_change_cannot_return_ready);
+	UT_RUN(test_producer_last_actor_work_and_invalid_module_keep_their_owners);
+	UT_RUN(test_run15_producer_ack_retention_and_consumption_are_observed);
+	UT_RUN(test_run15_short_ack_never_reads_an_unavailable_tuple);
+	UT_RUN(test_run15_first_failure_caller_and_budget_are_original);
+	UT_RUN(test_run15_first_failure_defers_emission_under_original_lock);
+	UT_RUN(test_collect_shared_debt_cannot_hide_behind_private_idle);
+	UT_RUN(test_collect_all_original_actor_roles_keep_active_and_module_owners);
+	UT_RUN(test_collect_rechecks_original_identity_after_shared_scan);
+	UT_RUN(test_collect_unknown_scope_and_full_matrix_remain_observations);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

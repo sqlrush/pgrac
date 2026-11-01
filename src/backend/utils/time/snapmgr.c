@@ -79,6 +79,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_service_observe.h"
+#include "storage/lwlock.h"
 #include "cluster/cluster_guc.h"		/* PGRAC (spec-3.3 D3/D4): cluster_enabled */
 #include "cluster/cluster_catalog_bootstrap.h"	/* PGRAC (spec-6.14 D8): services-ready gate */
 #include "cluster/cluster_visibility_resolve.h" /* PGRAC (spec-6.14 D8): no-recursion guard */
@@ -1147,6 +1149,151 @@ xmin_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
  */
 #ifdef USE_PGRAC_CLUSTER
 static ClusterSnapshotReadScopeV1 *ClusterSnapshotReadScope;
+
+/* Original backend references only. No pointer is dereferenced or retained,
+ * and no original reference/retention or transaction state is changed.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterSemanticAdmissionObservationResult
+cluster_snapshot_service_observe(uint64 expected_epoch, ClusterServiceSnapshotObservation *out)
+{
+	ClusterServiceSnapshotObservation sample = { 0 };
+	PGPROC *owner = MyProc;
+	BackendId backend_id = MyBackendId;
+
+	if (out == NULL)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	memset(out, 0, sizeof(*out));
+	if (!IsUnderPostmaster || !AmRegularBackendProcess() || !cluster_enabled
+		|| !cluster_shared_config || CritSectionCount != 0 || expected_epoch == 0
+		|| expected_epoch == UINT64_MAX || owner == NULL || MyProcPid <= 0
+		|| owner->pid != MyProcPid || owner->pgprocno < 0 || backend_id <= 0
+		|| owner->backendId != backend_id || owner->cluster_grd_generation == 0
+		|| owner->cluster_grd_generation == UINT64_MAX)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	if (cluster_epoch_get_current() != expected_epoch)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE;
+	sample.identity.pid = MyProcPid; sample.identity.pgprocno = owner->pgprocno;
+	sample.identity.backend_id = backend_id;
+	sample.identity.proc_generation = owner->cluster_grd_generation;
+	sample.identity.epoch = expected_epoch;
+	sample.references = (ActiveSnapshot != NULL ? CLUSTER_SERVICE_SNAPSHOT_ACTIVE : 0)
+		| (!pairingheap_is_empty(&RegisteredSnapshots) ? CLUSTER_SERVICE_SNAPSHOT_REGISTERED : 0)
+		| (FirstXactSnapshot != NULL ? CLUSTER_SERVICE_SNAPSHOT_TRANSACTION : 0)
+		| (CatalogSnapshot != NULL ? CLUSTER_SERVICE_SNAPSHOT_CATALOG : 0)
+		| (HistoricSnapshot != NULL ? CLUSTER_SERVICE_SNAPSHOT_HISTORIC : 0)
+		| (exportedSnapshots != NIL ? CLUSTER_SERVICE_SNAPSHOT_EXPORTED : 0)
+		| (ClusterSnapshotReadScope != NULL ? CLUSTER_SERVICE_SNAPSHOT_EVALUATOR : 0)
+		| (FirstSnapshotSet ? CLUSTER_SERVICE_SNAPSHOT_XACT_STARTED : 0);
+	sample.retained_read_scn = pg_atomic_read_u64(&owner->cluster_read_scn_atomic);
+	pg_read_barrier();
+	if (cluster_epoch_get_current() != expected_epoch)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE;
+	if (MyProc != owner || !IsUnderPostmaster || !AmRegularBackendProcess()
+		|| !cluster_enabled || !cluster_shared_config || CritSectionCount != 0
+		|| MyProcPid != sample.identity.pid || owner->pid != sample.identity.pid
+		|| owner->pgprocno != sample.identity.pgprocno || MyBackendId != backend_id
+		|| owner->backendId != backend_id
+		|| owner->cluster_grd_generation != sample.identity.proc_generation)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	sample.known = true;
+	sample.reason = sample.references != 0 ? "SNAPSHOT_ORIGINAL_REFERENCES_PENDING"
+		: sample.retained_read_scn != 0 ? "SNAPSHOT_RETENTION_PENDING"
+		: "SNAPSHOT_PRODUCER_CLOSURE_UNPROVED";
+	*out = sample;
+	return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+}
+
+
+/* Same owner's point observations, bracketed around the original shared
+ * token-return scan. Neither an empty snapshot manager nor a drained feature
+ * domain seals the ordinary producer or signs a reusable service cut.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+cluster_backend_collection_lock(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)arg = true;
+}
+
+ClusterSemanticAdmissionObservationResult
+cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_gate_epoch,
+	uint64 expected_generation, ClusterServiceBackendCollection *out)
+{
+	ClusterServiceBackendCollection sample = { 0 };
+	ClusterServiceSnapshotObservation after;
+	ClusterSemanticWaitGraphSnapshot gate;
+	ClusterSemanticAdmissionObservationResult result, admission;
+	PGPROC *owner = MyProc;
+	bool held_lock = false;
+	bool gate_known;
+
+	if (out == NULL)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	memset(out, 0, sizeof(*out));
+	out->reason = "BACKEND_COLLECTION_SCOPE_INVALID";
+	if (expected_epoch == 0 || expected_epoch == UINT64_MAX || expected_gate_epoch == 0
+		|| expected_gate_epoch == UINT64_MAX || expected_gate_epoch > expected_epoch
+		|| expected_generation == 0 || expected_generation == UINT64_MAX)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	result = cluster_snapshot_service_observe(expected_epoch, &sample.snapshots);
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING || !sample.snapshots.known) {
+		out->reason = "BACKEND_COLLECTION_SNAPSHOT_UNAVAILABLE";
+		return result == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE ? result
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
+	ForEachLWLockHeldByMe(cluster_backend_collection_lock, &held_lock);
+	if (held_lock) {
+		out->reason = "BACKEND_COLLECTION_CALLER_LOCK_HELD";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
+	admission = cluster_semantic_activation_admission_return_observe(expected_epoch,
+		expected_gate_epoch, expected_generation, &sample.admission);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
+		&& admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT) {
+		out->reason = "BACKEND_COLLECTION_ADMISSION_UNAVAILABLE";
+		return admission == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE ? admission
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
+	result = cluster_snapshot_service_observe(expected_epoch, &after);
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING || !after.known) {
+		out->reason = "BACKEND_COLLECTION_SNAPSHOT_CHANGED";
+		return result == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE ? result
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
+	gate_known = cluster_semantic_activation_wait_graph_snapshot(&gate);
+	ForEachLWLockHeldByMe(cluster_backend_collection_lock, &held_lock);
+	if (held_lock || CritSectionCount != 0 || MyProc != owner || !IsUnderPostmaster
+		|| !AmRegularBackendProcess() || !cluster_enabled || !cluster_shared_config
+		|| MyProcPid != sample.snapshots.identity.pid || owner->pid != sample.snapshots.identity.pid
+		|| owner->pgprocno != sample.snapshots.identity.pgprocno
+		|| MyBackendId != sample.snapshots.identity.backend_id
+		|| owner->backendId != sample.snapshots.identity.backend_id
+		|| owner->cluster_grd_generation != sample.snapshots.identity.proc_generation) {
+		out->reason = "BACKEND_COLLECTION_RETURN_CONTEXT_INVALID";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
+	if (cluster_epoch_get_current() != expected_epoch
+		|| (gate_known && gate.known && (gate.record_generation != expected_generation
+			|| gate.formation_epoch != expected_gate_epoch))) {
+		out->reason = "BACKEND_COLLECTION_ADMISSION_STALE";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE;
+	}
+	if (!sample.admission.known || !gate_known || !gate.known
+		|| gate.seq != sample.admission.seq || gate.active_bits != sample.admission.active_bits
+		|| gate.transition_closed != sample.admission.transition_closed
+		|| memcmp(&after.identity, &sample.snapshots.identity, sizeof(after.identity)) != 0
+		|| after.references != sample.snapshots.references
+		|| after.retained_read_scn != sample.snapshots.retained_read_scn) {
+		out->reason = "BACKEND_COLLECTION_POINT_CHANGED_OR_UNKNOWN";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+	}
+	sample.reason = sample.snapshots.references != 0 || sample.snapshots.retained_read_scn != 0
+		? sample.snapshots.reason : admission == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
+		? "BACKEND_COLLECTION_ADMISSION_PENDING" : "BACKEND_COLLECTION_PRODUCER_CLOSURE_UNPROVED";
+	*out = sample;
+	return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+}
 
 static bool
 cluster_snapshot_in_registered_heap(pairingheap_node *node, Snapshot snapshot)

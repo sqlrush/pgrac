@@ -634,6 +634,11 @@ extern bool cluster_normal_stop_postmaster_frontends_gone(void);
 extern bool cluster_normal_stop_requested(void);
 extern bool cluster_normal_stop_native_wal_mode(void);
 extern void cluster_normal_stop_fail(ClusterNormalStopFailure reason);
+/* Caller location is diagnostic only; retain the original ABI for function pointers. */
+extern void cluster_normal_stop_fail_at(ClusterNormalStopFailure reason, const char *caller,
+										int line);
+#define cluster_normal_stop_fail(reason) cluster_normal_stop_fail_at((reason), __func__, __LINE__)
+
 extern ClusterNormalStopFailure cluster_normal_stop_failure(void);
 extern bool cluster_normal_stop_protocol_closed(void);
 /* Checkpointer's first producer cut. READY means all four exact frontend
@@ -646,6 +651,17 @@ typedef struct ClusterNormalStopModuleObservation {
 	const char *reason;
 	char object[512];
 } ClusterNormalStopModuleObservation;
+/* Original checkpointer, at an unlocked online boundary. Observe the same
+ * shared native owners without requesting or advancing shutdown. The caller
+ * retains and revalidates the original bound PGRD/input/formation scope;
+ * native owners validate their own identities and obligations. This is not
+ * a producer seal, atomic snapshot, QUIESCED, durability or service proof.
+ * Private backend/actor/snapshot and admission cuts remain separate. No
+ * owner is retired here. Native errors remain errors; pending is not success.
+ * No elapsed-time bound is added to the original complete owner scans. */
+extern ClusterNormalStopPollResult cluster_native_producers_observe(
+	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], uint64 expected_epoch,
+	ClusterNormalStopModuleObservation *observation);
 /* Checkpointer, or LMON for the post-checkpoint send cut only. Original
  * shared polls execute outside the leave lock; private actor ownership is
  * separately covered by the immutable service cut and original local poll. */

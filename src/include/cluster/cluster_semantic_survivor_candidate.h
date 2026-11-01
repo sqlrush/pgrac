@@ -1,0 +1,31 @@
+/* Caller-owned, unconfirmed survivor collection. No admission or ACK proof.
+ * Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com> */
+#ifndef CLUSTER_SEMANTIC_SURVIVOR_CANDIDATE_H
+#define CLUSTER_SEMANTIC_SURVIVOR_CANDIDATE_H
+#include "cluster/cluster_semantic_survivor.h"
+#include "cluster/cluster_service_observe.h"
+
+/* The original LMON exclusively serializes this process-local object.
+ * Begin requires zeroed storage. Invalidation retains original obligations;
+ * it does not permit reuse. Inputs are untrusted syntax, including receipts
+ * and transport generation: staging never authenticates an ingress owner.
+ * None of these operations can return CURRENT or set confirmed table bits.
+ * There is no live routing, allocation, wakeup, closure or service effect.
+ */
+extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_candidate_begin(
+	ClusterSurvivorControl *control, const uint8 *bytes, Size length,
+	const uint8 format[32], uint32 self, const char **reason);
+extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_candidate_stage(
+	ClusterSurvivorControl *control, const uint8 *bytes, Size length,
+	const uint8 format[32], uint64 transport_generation, const char **reason);
+extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_candidate_invalidate(
+	ClusterSurvivorControl *control, const char **reason);
+/* Actual original native owner observation, at its unlocked idle boundary.
+ * A CURRENT point stays PENDING until separate original producer closure.
+ * out retains the actual observation, never a fabricated completion receipt.
+ */
+extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_candidate_probe(
+	ClusterSurvivorControl *control, ClusterServiceProducerCollection *out,
+	const char **reason);
+#endif

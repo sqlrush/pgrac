@@ -20,6 +20,9 @@
 #include "postgres.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_control_request.h"
+#include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_wal_cut.h"
+#include "cluster/cluster_pi_writeback.h"
 
 #define UNUSED_SIMPLE(name, type)                                                                  \
 	ClusterNormalStopPollResult __attribute__((weak)) name(                                        \
@@ -85,3 +88,15 @@ cluster_control_request_empty(void)
 {
 	abort();
 }
+
+/* Uncalled shared-LMON boundaries remain rejecting in role-specific tests. */
+#define UNUSED_REASON(name) \
+	ClusterNormalStopPollResult __attribute__((weak)) name( \
+		const char **reason pg_attribute_unused()) \
+	{ \
+		abort(); \
+	}
+UNUSED_REASON(cluster_pi_data_normal_stop_poll_v1)
+UNUSED_REASON(cluster_wal_cut_normal_stop_poll_v1)
+UNUSED_REASON(cluster_pi_writeback_normal_stop_poll_v1)
+UNUSED_REASON(cluster_ko_shared_normal_stop_poll_v2)

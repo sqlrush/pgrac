@@ -69,6 +69,39 @@ extern ClusterWalInputsJobResultV1 cluster_wal_inputs_job_finish_v1(ClusterWalIn
 extern void cluster_wal_inputs_jobs_service_poll_v1(void);
 extern ClusterWalInputsJobResultV1 cluster_wal_inputs_jobs_stop_census_v1(void);
 
+/* Original checkpointer/bgwriter only, at an unlocked return boundary.
+	* These are process-local point observations, not job/pin/CF receipts, input
+	* use, a producer seal or a reusable completion cut. In particular DONE may
+	* retain the failed caller's original business scope. Empty stays PENDING.
+	* State/flags are opaque original job diagnostics; no new wire/layout state.
+	* Invalid or changed identity clears all samples. No polling or retirement.
+	*/
+#define CLUSTER_WAL_INPUT_JOB_OBSERVATIONS 4
+typedef struct ClusterWalInputJobObservationV1 {
+	uint64 generation, pin_generation;
+	uint32 state, cf_state;
+	uint16 flags, walr_next;
+	bool has_scope, has_pin;
+} ClusterWalInputJobObservationV1;
+typedef struct ClusterWalInputsJobsObservationV1 {
+	int32 pid, pgprocno, backend_id;
+	uint32 present;
+	uint64 proc_generation, epoch;
+	ClusterWalInputJobObservationV1 jobs[CLUSTER_WAL_INPUT_JOB_OBSERVATIONS];
+	bool known;
+	const char *reason;
+} ClusterWalInputsJobsObservationV1;
+typedef enum ClusterWalInputsJobsObservationResultV1 {
+	WAL_INPUT_JOBS_OBSERVATION_INVALID = -1,
+	WAL_INPUT_JOBS_OBSERVATION_PENDING = 0,
+	WAL_INPUT_JOBS_OBSERVATION_STALE = 1
+} ClusterWalInputsJobsObservationResultV1;
+StaticAssertDecl(sizeof(ClusterWalInputsJobsObservationV1) <= 256,
+																	"input job observation is bounded caller storage");
+extern ClusterWalInputsJobsObservationResultV1 cluster_wal_inputs_jobs_service_observe_v1(
+	uint64 expected_epoch, ClusterWalInputsJobsObservationV1 *out);
+
+
 /* Release every read pin while a background job waits for a peer. Suspended
  * scopes cannot expose inputs, read WAL or qualify use of an existing plan.
  * Resume reacquires the same sorted pin set and compares the complete original
@@ -576,7 +609,7 @@ extern ClusterControlRootResult cluster_wal_inputs_census_v1(ClusterWalInputsV1 
 															 void *arg, uint64 *out_record_count,
 															 RfPageProofDetailV1 *out_detail);
 
-/* Cold-only, read-only enumeration of every selected source. completed is
+/* Read-only enumeration of every selected source. completed is
  * NULL before its physical visit and non-NULL after the original reader has
  * verified its entire cut. Explicit empty initializer terminals also receive
  * both callbacks; they are not missing participants. Each event is provisional
@@ -586,6 +619,14 @@ extern ClusterControlRootResult cluster_wal_inputs_census_v1(ClusterWalInputsV1 
 typedef RfPageProofDetailV1 (*ClusterWalCensusSourceVisitorV1)(
 	const ClusterWalSourceRef *source, const RfContributorStreamCutV1 *cut,
 	const ClusterWalTailObservation *completed, void *arg);
+/* Requires the original online scope and both visitors. Uses the same fixed
+ * cuts, physical reads and final checks as census_v1, without a replay graph.
+ * WAIT, refusal or ERROR requires discarding every provisional callback; a
+ * successful caller must still retain and revalidate the original scope. */
+extern ClusterControlRootResult
+cluster_wal_inputs_census_sources_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+				   ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
+				   uint64 *out_record_count, RfPageProofDetailV1 *out_detail);
 /* Requires an original Startup cold scope. OPEN sources return WAIT before
  * callbacks, except the original CTRC scope's exact installed local writer
  * and private fixed native cut described above. No peer live-cut request or

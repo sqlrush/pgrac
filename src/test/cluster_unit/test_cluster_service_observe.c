@@ -22,9 +22,21 @@
 #include "cluster/cluster_control_request.h"
 #include "cluster/cluster_guc.h"
 #include "miscadmin.h"
+#include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_wal_cut.h"
+#include "cluster/cluster_pi_writeback.h"
 #undef printf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+
+#ifdef USE_ASSERT_CHECKING
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+ (void)condition; (void)file; (void)line;
+ abort();
+}
+#endif
 
 bool IsUnderPostmaster = true;
 BackendType MyBackendType;
@@ -59,6 +71,10 @@ enum {
 	LMD_GRAPH,
 	SINVAL,
 	KO,
+	SHARED_PI_DATA,
+	SHARED_WAL_CUT,
+	SHARED_PI_WRITEBACK,
+	SHARED_KO,
 	MODULES
 };
 static ClusterNormalStopPollResult answers[MODULES];
@@ -310,10 +326,12 @@ UT_TEST(original_transport_position_is_preserved)
 	UT_ASSERT_EQ(out.slot, 3);
 }
 
+#include "test_cluster_lmon_service_observe.inc"
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(native_fanouts_are_exact_without_shutdown);
 	UT_RUN(shutdown_keeps_original_close_stage_instead_of_online_busy_rule);
 	UT_RUN(every_original_pending_owner_prevents_ready);
@@ -322,6 +340,10 @@ main(void)
 	UT_RUN(wrong_or_missing_native_owner_is_not_observed);
 	UT_RUN(control_request_is_not_excluded_for_own_configuration);
 	UT_RUN(original_transport_position_is_preserved);
+	UT_RUN(lmon_shared_pending_is_owned_until_original_owner_returns);
+	UT_RUN(lmon_shared_scan_preserves_first_invalid_and_visits_all);
+	UT_RUN(lmon_complete_point_keeps_original_entry_fanouts);
+	UT_RUN(lmon_complete_point_rejects_wrong_owner_before_any_poll);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -48,6 +48,23 @@ inventory_test_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visi
 	return result;
 }
 
+static ClusterControlRootResult
+inventory_test_online_census(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+							ClusterWalCensusSourceVisitorV1 source_visitor, void *arg,
+							uint64 *records, RfPageProofDetailV1 *detail)
+{
+	ClusterControlRootResult result;
+
+	inventory_census_calls++;
+	result = cluster_wal_inputs_census_sources_v1(inputs, visitor, source_visitor, arg,
+													 records, detail);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && inventory_census_calls == 1
+		&& inventory_between_passes != NULL)
+		inventory_between_passes();
+	return result;
+}
+
+#define cluster_wal_inputs_census_sources_v1 inventory_test_online_census
 #define cluster_wal_inputs_cold_census_v1 inventory_test_census
 #define cluster_wal_inputs_relmap_clog_applied_v1 episode_applied_match
 #include "../../backend/cluster/cluster_recovery_native_inventory.c"
@@ -72,6 +89,7 @@ static ClusterRecoveryGraphResult census_ref_test_find(const ClusterRecoveryRefe
 static ClusterRecoveryNativeRecordObservationV1 census_native_test_record(
  ClusterRecoveryNativeInventory *, uint64);
 #define cluster_recovery_native_inventory_record_v1 census_native_test_record
+#undef cluster_wal_inputs_census_sources_v1
 #include "../../backend/cluster/cluster_recovery_census.c"
 #undef cluster_recovery_native_inventory_record_v1
 #undef cluster_recovery_reference_graph_dependency_find
@@ -1196,6 +1214,8 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 
 #include "test_cluster_recovery_page_raw.inc"
 
+#include "test_cluster_recovery_online_inventory.inc"
+
 int
 main(int argc, char **argv)
 {
@@ -1668,7 +1688,7 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(319);
+	UT_PLAN(325);
 	UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
 	UT_RUN(test_page_raw_borrowed_byte_change_revokes_whole_inventory_without_rebase);
 	UT_RUN(test_page_raw_complete_copy_is_charged_before_any_prefix_publication);
@@ -1860,6 +1880,12 @@ main(int argc, char **argv)
 	UT_RUN(test_owned_page_inventory_mutation_revokes_the_original_complete_view);
 	UT_RUN(test_owned_page_inventory_scope_loss_is_sticky_without_rebasing_inputs);
 	UT_RUN(test_owned_page_inventory_capacity_never_silently_omits_physical_pages);
+	UT_RUN(test_online_inventory_reads_complete_native_wal_twice);
+	UT_RUN(test_online_inventory_remote_wait_has_no_partial_inventory);
+	UT_RUN(test_online_inventory_drift_io_and_error_never_publish);
+	UT_RUN(test_online_inventory_recheck_preserves_cursor_and_fixed_end);
+	UT_RUN(test_online_inventory_keeps_cold_owner_and_budget_guards);
+	UT_RUN(test_online_inventory_keeps_actual_empty_terminal_identity);
 
 	UT_RUN(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes);
 	UT_RUN(test_owned_ctrc_census_borrows_namespace_and_revokes_changed_work);

@@ -698,7 +698,8 @@ semantic_open_proof_carrier_compatible(const ClusterSemanticActivationAckTableV1
  * is captured here. Existing authenticated shared cap records couple the
  * producer's CONTROL stream to this read cut; postmaster uses try-lock only. */
 static SemanticControlRebindCheck
-semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress, bool allow_stop)
+semantic_open_proof_cut_check_diagnostic(const SemanticControlRebindProgress *progress,
+										 bool allow_stop, SemanticStopTrace *trace)
 {
 	const SemanticControlRebindBaseline *base = &SemanticControlRebindState->baseline;
 	const SemanticControlRebindCut *cut = &progress->cut;
@@ -790,6 +791,10 @@ semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress, boo
 															 base->cut.members[node]))
 					continue;
 				missing = true;
+				if (trace != NULL && trace->pending_predicate == NULL) {
+					trace->pending_predicate = "proof.peer_capability_missing";
+					trace->pending_member = node;
+				}
 				continue;
 			}
 			if (caps[node].bits != progress->words[node]
@@ -806,12 +811,21 @@ semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress, boo
 			!= cut->identity.pgrd_seq
 		|| !semantic_open_proof_owner_current(cut))
 		return SEMANTIC_CONTROL_REBIND_BAD;
+	if (!sampled)
+		(void)semantic_stop_pending_if(trace, "proof.capability_snapshot_busy", true);
 	return sampled && !missing ? SEMANTIC_CONTROL_REBIND_SAME : SEMANTIC_CONTROL_REBIND_WAIT;
 }
 
+static SemanticControlRebindCheck
+semantic_open_proof_cut_check(const SemanticControlRebindProgress *progress, bool allow_stop)
+{
+	return semantic_open_proof_cut_check_diagnostic(progress, allow_stop, NULL);
+}
+
 static SemanticOpenProofStatus
-semantic_open_proof_snapshot_mode(ClusterSemanticActivationAckTableV1 *table,
-	ClusterSemanticOpenProofIdentity *identity, bool allow_stop)
+semantic_open_proof_snapshot_diagnostic(ClusterSemanticActivationAckTableV1 *table,
+										ClusterSemanticOpenProofIdentity *identity, bool allow_stop,
+										SemanticStopTrace *trace)
 {
 	SemanticControlRebindShmem *shared = SemanticControlRebindState;
 	SemanticControlRebindProgress progress;
@@ -843,7 +857,9 @@ semantic_open_proof_snapshot_mode(ClusterSemanticActivationAckTableV1 *table,
 		|| progress.nonce != pg_atomic_read_u64(&shared->nonce)
 		|| progress.cut.base_seq != base_seq || !semantic_open_proof_carrier_compatible(table))
 		return SEMANTIC_OPEN_PROOF_INVALID;
-	cut_check = semantic_open_proof_cut_check(&progress, allow_stop);
+	cut_check = trace != NULL
+					? semantic_open_proof_cut_check_diagnostic(&progress, allow_stop, trace)
+					: semantic_open_proof_cut_check(&progress, allow_stop);
 	if (cut_check == SEMANTIC_CONTROL_REBIND_BAD)
 		return SEMANTIC_OPEN_PROOF_INVALID;
 	observation_pending = cut_check == SEMANTIC_CONTROL_REBIND_WAIT;
@@ -858,6 +874,8 @@ semantic_open_proof_snapshot_mode(ClusterSemanticActivationAckTableV1 *table,
 		for (unsigned node = 0; node < 4; node++)
 			unchanged = unchanged && progress.generations[node]
 				== shared->baseline.table.expected[node].capability_generation;
+		if (!unchanged)
+			(void)semantic_stop_pending_if(trace, "proof.collecting_changed", true);
 		/* A peer's REQUEST can own a read/reply without replacing this
 		 * receiver's transport. Keep its still-current ordinary proof; a
 		 * reply responsibility is not a local rebind or a new completion. */
@@ -908,7 +926,9 @@ semantic_open_proof_snapshot_mode(ClusterSemanticActivationAckTableV1 *table,
 		|| pg_atomic_read_u64(&shared->baseline_seq) != base_seq
 		|| pg_atomic_read_u64(&SemanticActivationAckTable->publication_seq) != ordinary_seq)
 		return SEMANTIC_OPEN_PROOF_INVALID;
-	cut_check = semantic_open_proof_cut_check(&progress, allow_stop);
+	cut_check = trace != NULL
+					? semantic_open_proof_cut_check_diagnostic(&progress, allow_stop, trace)
+					: semantic_open_proof_cut_check(&progress, allow_stop);
 	if (cut_check == SEMANTIC_CONTROL_REBIND_BAD)
 		return SEMANTIC_OPEN_PROOF_INVALID;
 	if (observation_pending || cut_check == SEMANTIC_CONTROL_REBIND_WAIT)
@@ -919,6 +939,13 @@ semantic_open_proof_snapshot_mode(ClusterSemanticActivationAckTableV1 *table,
 	identity->completion_seq = completion_seq;
 	identity->round_nonce = nonce;
 	return SEMANTIC_OPEN_PROOF_REBOUND;
+}
+
+static SemanticOpenProofStatus
+semantic_open_proof_snapshot_mode(ClusterSemanticActivationAckTableV1 *table,
+								  ClusterSemanticOpenProofIdentity *identity, bool allow_stop)
+{
+	return semantic_open_proof_snapshot_diagnostic(table, identity, allow_stop, NULL);
 }
 
 /* Online admissions keep their existing stop-request refusal. Only the

@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * cluster_recovery_native_inventory.c
- *    Two-pass native effects under the original cold input scope.
+ *    Two-pass native WAL observations under the original input scope.
  *
  * Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
@@ -1013,7 +1013,7 @@ inventory_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
 }
 
 static void
-inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *inputs)
+inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *inputs, bool online)
 {
 	uint64 records = 0;
 
@@ -1026,8 +1026,11 @@ inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *in
 						 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
 		return;
 	}
-	work->diag.input_result = cluster_wal_inputs_cold_census_v1(
-		inputs, inventory_record, inventory_source, work, &records, &work->diag.input_detail);
+	work->diag.input_result = online
+		? cluster_wal_inputs_census_sources_v1(inputs, inventory_record, inventory_source,
+			work, &records, &work->diag.input_detail)
+		: cluster_wal_inputs_cold_census_v1(inputs, inventory_record, inventory_source,
+			work, &records, &work->diag.input_detail);
 	if (work->diag.input_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		if (work->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
 			work->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_INPUT;
@@ -1046,7 +1049,7 @@ inventory_read_pass(ClusterRecoveryNativeInventory *work, ClusterWalInputsV1 *in
 static ClusterRecoveryNativeInventoryResult
 inventory_build(ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_t memory_budget,
 				ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag,
-				const ClusterRecoveryRelmapSourceV1 *relmap_owner)
+				const ClusterRecoveryRelmapSourceV1 *relmap_owner, bool online)
 {
 	ClusterRecoveryNativeInventory *work;
 	ClusterRecoveryNativeInventoryResult result;
@@ -1083,7 +1086,7 @@ inventory_build(ClusterWalInputsV1 *inputs, ClusterRecoveryRootSet *roots, size_
 		for (work->pass = 0;
 			 work->pass < 2 && work->status == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED;
 			 work->pass++)
-			inventory_read_pass(work, inputs);
+			inventory_read_pass(work, inputs, online);
 	}
 	PG_CATCH();
 	{
@@ -1112,7 +1115,14 @@ cluster_recovery_native_inventory_build(ClusterWalInputsV1 *inputs, size_t memor
 										ClusterRecoveryNativeInventory **out,
 										ClusterRecoveryNativeInventoryDiag *diag)
 {
-	return inventory_build(inputs, NULL, memory_budget, out, diag, NULL);
+	return inventory_build(inputs, NULL, memory_budget, out, diag, NULL, false);
+}
+
+ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_build_online(ClusterWalInputsV1 *inputs, size_t memory_budget,
+	ClusterRecoveryNativeInventory **out, ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return inventory_build(inputs, NULL, memory_budget, out, diag, NULL, true);
 }
 
 ClusterRecoveryNativeInventoryResult
@@ -1130,16 +1140,15 @@ cluster_recovery_native_inventory_collect_roots(ClusterWalInputsV1 *inputs,
 			memset(diag, 0, sizeof(*diag));
 		return CLUSTER_RECOVERY_NATIVE_INVENTORY_INVALID;
 	}
-	result = inventory_build(inputs, roots, memory_budget, out, diag, NULL);
+	result = inventory_build(inputs, roots, memory_budget, out, diag, NULL, false);
 	if (result != CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED)
 		cluster_recovery_root_set_invalidate(roots);
 	return result;
 }
 
-ClusterRecoveryNativeInventoryResult
-cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
-										  ClusterRecoveryNativeInventory *inventory,
-										  ClusterRecoveryNativeInventoryDiag *diag)
+static ClusterRecoveryNativeInventoryResult
+inventory_recheck(ClusterWalInputsV1 *inputs, ClusterRecoveryNativeInventory *inventory,
+	ClusterRecoveryNativeInventoryDiag *diag, bool online)
 {
 	NativeInventoryRecord *saved_cursor;
 
@@ -1170,7 +1179,7 @@ cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 			if (inventory->hash == NULL)
 				inventory->status = CLUSTER_RECOVERY_NATIVE_INVENTORY_CAPACITY;
 			else
-				inventory_read_pass(inventory, inputs);
+				inventory_read_pass(inventory, inputs, online);
 		}
 	}
 	PG_CATCH();
@@ -1320,6 +1329,20 @@ cluster_recovery_native_inventory_page_plan_v1(ClusterWalInputsV1 *inputs,
 	}
 	free(build);
 	return result;
+}
+
+ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
+	ClusterRecoveryNativeInventory *inventory, ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return inventory_recheck(inputs, inventory, diag, false);
+}
+
+ClusterRecoveryNativeInventoryResult
+cluster_recovery_native_inventory_recheck_online(ClusterWalInputsV1 *inputs,
+	ClusterRecoveryNativeInventory *inventory, ClusterRecoveryNativeInventoryDiag *diag)
+{
+	return inventory_recheck(inputs, inventory, diag, true);
 }
 
 ClusterRecoveryNativeInventoryResult
@@ -2815,7 +2838,7 @@ cluster_recovery_relmap_history_build_v1(const ClusterRecoveryRelmapSourceV1 *so
 				memcpy(&history->original, &original, sizeof(original));
 				history->budget = memory_budget;
 				result = inventory_build(original.scope, NULL, memory_budget - reserved,
-					&history->inventory, diag, &history->original);
+					&history->inventory, diag, &history->original, false);
 				diag->owned_bytes += history_owned_bytes(history);
 				if (result == CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED
 					&& (!cluster_wal_inputs_relmap_source_current_v1(&original)

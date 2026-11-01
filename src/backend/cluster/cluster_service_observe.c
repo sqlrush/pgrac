@@ -24,6 +24,9 @@
 #include "cluster/cluster_control_request.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_wal_cut.h"
+#include "cluster/cluster_pi_writeback.h"
 
 typedef enum ServiceModule {
 	SERVICE_GRD_WORK,
@@ -221,4 +224,60 @@ ClusterNormalStopPollResult
 cluster_service_normal_stop_observe(ClusterServiceObservation *out)
 {
 	return service_observe(true, out);
+}
+
+/* Online LMON point observation, including its original shared owners. This
+ * does not borrow the shutdown wrapper's no-request READY or service seal.
+ * Each original owner remains responsible for its own state and retirement.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterNormalStopPollResult
+cluster_lmon_service_observe(ClusterServiceObservation *out)
+{
+	static const char *const domains[] = { "current-holder-data", "native-wal-cut",
+		"physical-pi-writeback", "shared-object-flush" };
+	ClusterNormalStopPollResult aggregate;
+	unsigned modules;
+
+	if (out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	memset(out, 0, sizeof(*out));
+	out->domain = "NATIVE_LMON";
+	out->reason = "OWNER_OR_SHARED_CONTEXT_MISMATCH";
+	out->slot = -1;
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || !AmLmonProcess()
+		|| !cluster_shared_config)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	/* The original private-role census visits every owner. Its first
+	 * highest-priority cause is retained across the additional shared scan. */
+	aggregate = service_observe(false, out);
+	modules = out->modules;
+	for (unsigned i = 0; i < lengthof(domains); i++) {
+		ClusterServiceObservation part = { .domain = domains[i],
+			.reason = "ORIGINAL_SHARED_OWNER_NOT_OBSERVED", .slot = -1 };
+		ClusterNormalStopPollResult result;
+
+		switch (i) {
+		case 0:
+			result = cluster_pi_data_normal_stop_poll_v1(&part.reason);
+			break;
+		case 1:
+			result = cluster_wal_cut_normal_stop_poll_v1(&part.reason);
+			break;
+		case 2:
+			result = cluster_pi_writeback_normal_stop_poll_v1(&part.reason);
+			break;
+		default:
+			result = cluster_ko_shared_normal_stop_poll_v2(&part.reason);
+			break;
+		}
+		if (result != CLUSTER_NORMAL_STOP_READY && result != CLUSTER_NORMAL_STOP_PENDING)
+			result = CLUSTER_NORMAL_STOP_INVALID;
+		if ((result == CLUSTER_NORMAL_STOP_INVALID && aggregate != CLUSTER_NORMAL_STOP_INVALID)
+			|| (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)) {
+			aggregate = result;
+			*out = part;
+		}
+	}
+	out->modules = modules + lengthof(domains);
+	return aggregate;
 }

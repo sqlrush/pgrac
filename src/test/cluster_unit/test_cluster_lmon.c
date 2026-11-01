@@ -49,6 +49,8 @@
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_control_retire.h"
 #include "cluster/cluster_lock_owner.h"
+#include "cluster/cluster_content_trace.h"
+#include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -88,6 +90,7 @@
 
 bool IsUnderPostmaster = false;
 bool cluster_lmd_enabled = true;
+bool cluster_trace_normal_stop;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 int MyProcPid = 0;
@@ -187,7 +190,32 @@ cluster_lock_owners_service_poll(void)
 }
 static void test_stop_work(bool event);
 static int test_stop_wait(WaitEvent *events);
+static bool test_producer_case(void);
+static void test_producer_prepare(void);
+static void test_producer_poll_boundary(unsigned module);
+static void test_producer_work_boundary(bool event);
+static int test_producer_wait_boundary(WaitEvent *events);
+static bool test_collection_on;
+static void test_collection_prepare(void);
+static void test_collection_work(bool event);
+static int test_collection_wait(WaitEvent *events);
+static int (*test_collection_extra_wait)(WaitEvent *events);
+
 #include "test_cluster_lmon_stop_service.inc"
+static void (*test_collection_barrier_hook)(void);
+static void
+test_collection_read_barrier(void)
+{
+	pg_read_barrier_impl();
+	if (test_collection_barrier_hook != NULL)
+		test_collection_barrier_hook();
+}
+#undef pg_read_barrier
+#define pg_read_barrier() test_collection_read_barrier()
+#include "test_cluster_shared_admission_observe.inc"
+#undef pg_read_barrier
+#define pg_read_barrier() pg_read_barrier_impl()
+#include "test_cluster_lmon_producer_observe.inc"
 
 /* Real staging, refusal/requeue, bounded drain and queue observation. Only
  * the unrelated module observations and transport admission are fixtures. */
@@ -1446,6 +1474,8 @@ run_one_real_lmon_duty(uint64 start_us, uint64 finish_us, bool seed_saturation)
 	test_pcm_reclaim_ticks = 0;
 	test_lmon_exit_armed = true;
 
+	if (test_producer_case())
+		test_producer_prepare();
 	if (setjmp(test_lmon_exit_jump) == 0)
 		LmonMain();
 
@@ -1606,6 +1636,8 @@ test_stop_poll(unsigned module)
 	UT_ASSERT_EQ(test_stop_lock_depth, 0);
 	UT_ASSERT_EQ(test_stop_frees, 0);
 	test_stop_polls++;
+	if (test_producer_case())
+		test_producer_poll_boundary(module);
 	return test_stop_observation[module];
 }
 /* Mailbox owners are explicit observations here; their actual transport and
@@ -1852,6 +1884,8 @@ cluster_lmd_probe_normal_stop_poll(uint64 *key, const char **reason)
 static void
 test_stop_work(bool event)
 {
+	if (test_producer_case())
+		test_producer_work_boundary(event);
 	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
 	UT_ASSERT_EQ(test_stop_lock_depth, 0);
 	if (event)
@@ -1891,6 +1925,8 @@ test_stop_wait(WaitEvent *events)
 	UT_ASSERT_EQ(test_stop_lock_depth, 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_active_mask), 0);
 	test_lmon_wait_calls++;
+	if (test_producer_case())
+		return test_producer_wait_boundary(events);
 	if (test_lmon_wait_calls > 3)
 		abort();
 	if (test_outbound_case()) {
@@ -2039,7 +2075,7 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	memset(&test_stop_region, 0, sizeof(test_stop_region));
 	cl_normal_stop = &test_stop_region.normal_stop;
 	pg_atomic_init_u32(&cl_normal_stop->requested,
-					   scenario == 2 || scenario == 10 || scenario == 46 ? 0 : 1);
+					   scenario == 2 || scenario == 10 || scenario == 46 || (scenario >= 60 && scenario <= 63) ? 0 : 1);
 	pg_atomic_init_u32(&cl_normal_stop->frontends_gone, 1);
 	pg_atomic_init_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_DRAIN);
 	pg_atomic_init_u32(&cl_normal_stop->failure_reason, 0);
@@ -2061,7 +2097,7 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	test_stop_exit_code = -1;
 	test_stop_duties = test_stop_events = test_stop_polls = test_stop_frees = 0;
 	test_control_owner_polls = 0;
-	cluster_shared_config = scenario >= 48 && scenario <= 56;
+	cluster_shared_config = (scenario >= 48 && scenario <= 56) || (scenario >= 60 && scenario <= 63);
 	test_stop_last_detail[0] = '\0';
 	test_stop_control_detail[0] = '\0';
 	test_stop_control_logs = 0;
@@ -2129,6 +2165,8 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 		test_outbound_transport_pending = false;
 		test_outbound_event_idle = false;
 	}
+	if (test_producer_case())
+		test_producer_prepare();
 	if (setjmp(test_lmon_exit_jump) == 0)
 		LmonMain();
 	test_stop_on = test_lmon_exit_armed = false;
@@ -2539,10 +2577,22 @@ UT_TEST(test_postmaster_ready_busy_and_suppression_are_nonblocking)
 	cluster_lmon_shmem_init();
 }
 
+/* Read-only deadline diagnostics have no authority or completion result. */
+static unsigned test_deadline_dumps;
+void
+cluster_content_trace_deadline_dump(uint32 reason)
+{
+ UT_ASSERT_EQ(reason, CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+ test_deadline_dumps++;
+}
+
+#include "test_cluster_lmon_producer_pause.inc"
+#include "test_cluster_lmon_admission_pause.inc"
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(53);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -2588,6 +2638,14 @@ main(void)
 	UT_RUN(test_stop_drains_dispatch_created_work_before_post_dispatch_idle);
 	UT_RUN(test_stop_control_debt_survives_until_service_completion);
 	UT_RUN(test_postmaster_ready_busy_and_suppression_are_nonblocking);
+	UT_RUN(test_online_lmon_collection_observes_each_original_owner_in_both_loops);
+	UT_RUN(test_online_lmon_collection_keeps_invalid_over_pending_in_both_loops);
+	UT_RUN(test_online_lmon_collection_rechecks_actual_caller_after_module_fanout);
+	UT_RUN(test_online_lmon_dispatch_work_reopens_debt_before_the_next_collection);
+	UT_RUN(test_lmon_collects_shared_debt_before_original_owner_returns);
+	UT_RUN(test_lmon_collects_dispatch_created_shared_debt_before_next_duty);
+	UT_RUN(test_lmon_collection_preserves_original_invalid_over_unknown_shared_scope);
+	UT_RUN(test_lmon_collection_detects_shared_scan_generation_and_late_actor_work);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

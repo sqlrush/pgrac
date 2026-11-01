@@ -18,7 +18,21 @@
 #include "cluster/cluster_undo_retention.h"
 #include "access/twophase.h"
 #include "test_cluster_pgproc_active_types.inc"
+/* Original source uses barriers unchanged; optional test scheduling is NULL
+ * outside the new identity-recheck cases. No product injection hook. */
+static void (*snapshot_return_schedule)(void);
+static void snapshot_return_read_barrier(void)
+{
+	pg_read_barrier_impl();
+	if (snapshot_return_schedule != NULL) snapshot_return_schedule();
+}
+#undef pg_read_barrier
+#define pg_read_barrier() snapshot_return_read_barrier()
 #include "../../backend/utils/time/snapmgr.c"
+#include "test_cluster_shared_admission_observe.inc"
+#include "test_cluster_backend_return_gate.inc"
+#undef pg_read_barrier
+#define pg_read_barrier() pg_read_barrier_impl()
 #include "test_cluster_snapshot_admission_horizon.inc"
 
 UT_DEFINE_GLOBALS();
@@ -159,10 +173,11 @@ cluster_membership_get_state(int node)
 {
 	return node == cluster_node_id ? self_member : CLUSTER_MEMBER_MEMBER;
 }
+static uint64 snapshot_return_epoch = 7;
 uint64
 cluster_epoch_get_current(void)
 {
-	return 7;
+	return snapshot_return_epoch;
 }
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int node)
@@ -1067,9 +1082,14 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 	UT_ASSERT_EQ(sample.contributor_kind, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
 }
 
+#include "test_cluster_snapshot_return.inc"
+#include "test_cluster_backend_return.inc"
+#include "test_cluster_survivor_producer_backend.inc"
+
 int
 main(void)
 {
+	setvbuf(stdout, NULL, _IOLBF, 0);
 	MyProc = &proc;
 	proc.pid = 1234;
 	procArray = calloc(1, sizeof(ProcArrayStruct) + 2 * sizeof(int));
@@ -1087,7 +1107,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(88);
+	UT_PLAN(106);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1176,6 +1196,24 @@ main(void)
 	UT_RUN(vacuum_database_scan_rejects_invalid_seed_before_fold);
 	UT_RUN(vacuum_database_scan_nontarget_keeps_native_future_refusal);
 	UT_RUN(vacuum_database_scan_keeps_mx_future_refusal);
+	UT_RUN(original_registered_snapshot_requires_independent_return_observation);
+	UT_RUN(snapshot_return_keeps_active_refs_after_original_unregister);
+	UT_RUN(snapshot_return_keeps_catalog_until_original_invalidation);
+	UT_RUN(snapshot_return_keeps_transaction_and_exported_refs_until_eoxact);
+	UT_RUN(snapshot_return_keeps_historic_and_evaluator_owners);
+	UT_RUN(snapshot_return_rejects_wrong_original_backend_identity);
+	UT_RUN(snapshot_return_rechecks_identity_without_keeping_stale_samples);
+	UT_RUN(snapshot_return_never_closes_an_empty_or_unknown_producer);
+	UT_RUN(backend_collection_retains_original_snapshots_after_gate_drains);
+	UT_RUN(backend_collection_keeps_active_catalog_and_evaluator_owners);
+	UT_RUN(backend_collection_preserves_all_original_shared_counter_cells);
+	UT_RUN(backend_collection_binds_original_gate_and_current_native_epochs);
+	UT_RUN(backend_collection_refuses_wrong_owner_scope_or_locked_context);
+	UT_RUN(backend_collection_discards_owner_and_gate_drift_at_return);
+	UT_RUN(backend_collection_discards_unknown_or_contended_shared_samples);
+	UT_RUN(backend_collection_never_retires_original_debt_or_grants_closure);
+	UT_RUN(survivor_backend_poll_keeps_actual_snapshot_and_original_gate);
+	UT_RUN(survivor_backend_poll_discards_final_owner_drift_and_leaf_stale);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

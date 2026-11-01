@@ -71,7 +71,9 @@ cluster_normal_stop_failure(void)
 }
 
 void
-cluster_normal_stop_fail(ClusterNormalStopFailure reason)
+cluster_normal_stop_fail_at(ClusterNormalStopFailure reason,
+							const char *caller pg_attribute_unused(),
+							int line pg_attribute_unused())
 {
 	if (failure == CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		failure = reason;
