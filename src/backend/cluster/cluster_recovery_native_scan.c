@@ -21,6 +21,7 @@
 #include "common/relmap.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_recovery_relmap_wal_internal.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_undo_segment.h"
@@ -149,6 +150,32 @@ native_relmap(ClusterRecoveryNativeScan *scan, uint8 opcode)
 	RelMapFile map;
 	pg_crc32c crc;
 
+	if (opcode == XLOG_RELMAP_UPDATE_V2) {
+		ClusterRecoveryFileIdentityV2 file;
+		ClusterRelmapV2Image image;
+		const size_t committed = CLUSTER_RELMAP_FILE_HEADER_SIZE_V2
+								 + CLUSTER_RELMAP_V2_COMMITTED_OFFSET
+								 + offsetof(RelMapFile, mappings);
+		const size_t pending = CLUSTER_RELMAP_FILE_HEADER_SIZE_V2 + CLUSTER_RELMAP_V2_PENDING_OFFSET
+							   + offsetof(RelMapFile, mappings);
+
+		if (!recovery_relmap_wal_observe_v2(&scan->record, &file, &image))
+			return CLUSTER_RECOVERY_NATIVE_SHAPE;
+		scan->primary = CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE;
+		scan->record.database = file.database_oid;
+		scan->record.tablespace = file.tablespace_oid;
+		/* Managed ordinals concatenate committed then pending entries. The
+		 * original full envelope, including inactive bytes, stays owned. */
+		scan->record.mappings_offset = pending;
+		scan->record.nmappings = image.committed.num_mappings + image.pending.num_mappings;
+		scan->regions[0]
+			= (NativeRegion){ CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY, scan->payload + committed,
+							  image.committed.num_mappings, sizeof(RelMapping) };
+		scan->regions[1]
+			= (NativeRegion){ CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY, scan->payload + pending,
+							  image.pending.num_mappings, sizeof(RelMapping) };
+		return CLUSTER_RECOVERY_NATIVE_MORE;
+	}
 	if (opcode != XLOG_RELMAP_UPDATE)
 		return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
 	if (scan->record.payload_length != MinSizeOfRelmapUpdate + sizeof(map))
@@ -677,6 +704,8 @@ cluster_recovery_native_scan_next(ClusterRecoveryNativeScan *scan, ClusterRecove
 		if (scan->ordinal < region->count) {
 			out->kind = region->kind;
 			out->ordinal = scan->ordinal;
+			if (scan->primary == CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE && scan->region == 1)
+				out->ordinal += scan->regions[0].count;
 			out->record = &scan->record;
 			out->bytes = region->bytes + (size_t)scan->ordinal * region->item_size;
 			out->length = region->item_size;

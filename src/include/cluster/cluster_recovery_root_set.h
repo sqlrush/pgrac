@@ -134,6 +134,9 @@ struct ClusterRecoveryNativeEffect;
  * State/horizon proofs and all other effects need their own
  * consumers. Source/record and lifecycle proofs remain in the cold graph.
  * A missing file is retained, never treated as an already-completed drop. */
+/* Managed relmap WAL contributes both saved maps and two authority paths.
+ * Legacy WAL keeps its original unqualified paths. Neither grants independent
+ * control registration, physical lifetime or permission to publish/install. */
 extern ClusterRecoveryRootsResult
 cluster_recovery_root_set_add_native(ClusterRecoveryRootSet *roots,
 									 const struct ClusterRecoveryNativeEffect *effect);

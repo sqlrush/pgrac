@@ -18,6 +18,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_root_set.h"
 #include "cluster/cluster_recovery_native_scan.h"
+#include "cluster/cluster_recovery_relmap_wal_internal.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "common/cryptohash.h"
@@ -679,6 +680,78 @@ roots_add_xact_slru(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEf
 							   xid / per_page);
 }
 
+/* Managed WAL contributes BOTH saved maps and exactly its two authority
+ * paths. A matching envelope does not grant control registration, physical
+ * file identity, terminal state or permission to install the pending image. */
+static ClusterRecoveryRootsResult
+roots_add_managed_relmap(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffect *effect)
+{
+	const ClusterRecoveryNativeRecord *record = effect->record;
+	ClusterRecoveryFileIdentityV2 file;
+	ClusterRelmapV2Image image;
+	const size_t pending = CLUSTER_RELMAP_FILE_HEADER_SIZE_V2 + CLUSTER_RELMAP_V2_PENDING_OFFSET
+						   + offsetof(RelMapFile, mappings);
+
+	if (!recovery_relmap_wal_observe_v2(record, &file, &image)
+		|| record->database != file.database_oid || record->tablespace != file.tablespace_oid
+		|| record->mappings_offset != pending
+		|| record->nmappings != (uint32)(image.committed.num_mappings + image.pending.num_mappings))
+		return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+	if (effect->kind == CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY) {
+		const ForkNumber forks[]
+			= { MAIN_FORKNUM, FSM_FORKNUM, VISIBILITYMAP_FORKNUM, SPACE_FORKNUM };
+		uint32 ordinal = effect->ordinal;
+		size_t offset = CLUSTER_RELMAP_FILE_HEADER_SIZE_V2;
+		RelMapping mapping;
+		RelFileLocator locator = { file.tablespace_oid, file.database_oid, 0 };
+
+		if (ordinal >= record->nmappings || effect->length != sizeof(mapping))
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		if (ordinal < (uint32)image.committed.num_mappings)
+			offset += CLUSTER_RELMAP_V2_COMMITTED_OFFSET;
+		else {
+			ordinal -= image.committed.num_mappings;
+			offset += CLUSTER_RELMAP_V2_PENDING_OFFSET;
+		}
+		offset += offsetof(RelMapFile, mappings) + (size_t)ordinal * sizeof(mapping);
+		if (effect->bytes != record->payload + offset)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		memcpy(&mapping, effect->bytes, sizeof(mapping));
+		locator.relNumber = mapping.mapfilenumber;
+		for (unsigned i = 0; i < lengthof(forks); i++) {
+			ClusterRecoveryRootsResult result = roots_add_relation(roots, &locator, forks[i], 0);
+			if (result != CLUSTER_RECOVERY_ROOTS_MORE)
+				return result;
+		}
+	} else {
+		const char *names[] = { "pgrac_relmap_authority", "pgrac_relmap_authority.bak" };
+		const ClusterRecoveryFileKind kinds[] = { CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY,
+												  CLUSTER_RECOVERY_FILE_RELMAP_AUTHORITY_BACKUP };
+
+		if (effect->kind != CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE || effect->ordinal != 0
+			|| effect->bytes != record->payload || effect->length != record->payload_length)
+			return roots_fail(roots, CLUSTER_RECOVERY_ROOTS_INVALID);
+		for (unsigned i = 0; i < lengthof(names); i++) {
+			char path[MAXPGPATH];
+			uint32 index;
+			ClusterRecoveryRootEntry *entry;
+
+			if (file.tablespace_oid == GLOBALTABLESPACE_OID)
+				snprintf(path, sizeof(path), "global/%s", names[i]);
+			else
+				snprintf(path, sizeof(path), "base/%u/%s", file.database_oid, names[i]);
+			if (!roots_lookup(roots, path, true, &index))
+				return roots->status;
+			entry = &roots->entries[index];
+			entry->file.kind = kinds[i];
+			entry->file.locator = (RelFileLocator){ file.tablespace_oid, file.database_oid, 0 };
+			entry->file.forknum = InvalidForkNumber;
+			entry->origins |= CLUSTER_RECOVERY_ROOT_FROM_WAL;
+		}
+	}
+	return CLUSTER_RECOVERY_ROOTS_MORE;
+}
+
 /* Every map copy and referenced filenumber remains a candidate, including
  * absent files. Native image syntax does not identify an authority version
  * or prove that a pending map was published. Mapping addresses do not supply
@@ -690,6 +763,9 @@ roots_add_relmap(ClusterRecoveryRootSet *roots, const ClusterRecoveryNativeEffec
 	xl_relmap_update update;
 	RelMapFile map;
 	pg_crc32c crc;
+
+	if ((record->header.xl_info & ~XLR_INFO_MASK) == XLOG_RELMAP_UPDATE_V2)
+		return roots_add_managed_relmap(roots, effect);
 
 	if (!cluster_wal_claim_v2_ref_valid(&record->source.claim)
 		|| record->header.xl_rmid != RM_RELMAP_ID
