@@ -27,6 +27,12 @@
 #define CLUSTER_FOREIGN_MX_FORMAT_ID_V1 UINT32_C(0x4D584731)
 #define CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1 UINT32_C(1)
 #define CLUSTER_FOREIGN_MX_MIN_CATALOG_VERSION UINT32_C(202611010)
+/* Independent GCS service selectors. Consumers must establish this family's
+ * format/version and negotiated capabilities before dispatch. These values
+ * neither extend the old V5 domains nor authorize use of their reserved bytes.
+ * Registration alone does not enable either request or reply handling. */
+#define CLUSTER_FOREIGN_MX_GCS_RANGE_REQUEST_KIND_V1 ((uint8)13)
+#define CLUSTER_FOREIGN_MX_GCS_RANGE_REPLY_STATUS_V1 ((uint8)31)
 #define CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES                                                   \
 	(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1                \
 	 | PGRAC_IC_HELLO_CAP_MULTIXACT_FULL_V1)

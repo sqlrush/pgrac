@@ -102,7 +102,8 @@
 #include "cluster/cluster_pcm_lock.h" /* final holder/master authority */
 #include "cluster/cluster_gcs_block.h" /* ACTIVE local writer ledger */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
-#include "cluster/cluster_multixact_current.h" /* current-DML authority */
+#include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_multixact_range.h" /* current-DML authority */
 #include "cluster/cluster_multixact_current_stats.h" /* authority counters */
 #include "cluster/cluster_mxid_stripe.h" /* derived-own guard for local pg_multixact decode */
 #include "cluster/cluster_pcm_x_bufmgr.h" /* tuple/PCM ABA fingerprint */
@@ -4870,8 +4871,8 @@ heap_hot_current_mx_resolve_updater(
 	key.cluster_epoch = (uint32) current_epoch;
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-	describe_result = cluster_multixact_current_describe(
-		&key, members, lengthof(members), &nmembers, &reported_total);
+	describe_result = cluster_multixact_current_describe_scoped(
+		&key, &root_before.pcm.tag, SnapshotAny, members, lengthof(members), &nmembers, &reported_total);
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 	if (cluster_epoch_get_current() != current_epoch
 		|| !heap_hot_current_mx_capture(buffer, root, &root_after)
@@ -8745,8 +8746,8 @@ cluster_current_mx_hot_updater_for_chain(
 			lengthof(members), &nmembers, &reported_total))
 	{
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		describe_result = cluster_multixact_current_describe(
-			&key, members, lengthof(members), &nmembers,
+		describe_result = cluster_multixact_current_describe_scoped(
+			&key, &before.pcm.tag, SnapshotAny, members, lengthof(members), &nmembers,
 			&reported_total);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		if (!cluster_current_mx_read_capture(buffer, tuple, &live)
@@ -9178,8 +9179,8 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 	{
 		cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		describe_result = cluster_multixact_current_describe(
-			&key, members, lengthof(members), &nmembers,
+		describe_result = cluster_multixact_current_describe_scoped(
+			&key, &before.pcm.tag, SnapshotAny, members, lengthof(members), &nmembers,
 			&reported_total);
 		if (!cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm)
 			|| !cluster_current_mx_capture(buffer, tuple, &live)

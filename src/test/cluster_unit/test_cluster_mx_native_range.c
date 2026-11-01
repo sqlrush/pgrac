@@ -1,9 +1,12 @@
 /* Real native codec/range and composition receiver. SLRU pages/locks,
  * epoch/origin, memory contexts and ERROR delivery are controlled leaves. */
 int composition_component_main(void);
+#pragma push_macro("main")
+#undef main
 #define main composition_component_main
 #include "test_cluster_mx_composition.c"
 #undef main
+#pragma pop_macro("main")
 #include "../../backend/access/transam/multixact.c"
 #include "cluster/cluster_multixact_range_wire.h"
 

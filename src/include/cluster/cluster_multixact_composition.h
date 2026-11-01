@@ -51,6 +51,13 @@ typedef struct ClusterMxCompositionNativeChunk {
 extern ClusterMxCompositionReadStatus cluster_mx_composition_read_native(
 	MultiXactId multi, const ClusterMxCompositionNativeSource *expected,
 	uint32 first, uint32 cap, ClusterMxCompositionNativeChunk *out);
+/* Lock-free original-owner recheck under Truncation/Gen, before and after
+ * reading. It must not allocate, wait or acquire a new lock. */
+typedef bool (*ClusterMxCompositionCheck)(void *arg);
+extern ClusterMxCompositionReadStatus cluster_mx_composition_read_native_checked(
+	MultiXactId multi, const ClusterMxCompositionNativeSource *expected,
+	uint32 first, uint32 cap, ClusterMxCompositionNativeChunk *out,
+	ClusterMxCompositionCheck current, void *arg);
 
 typedef struct ClusterMxCompositionPage {
 	struct ClusterMxCompositionPage *next;

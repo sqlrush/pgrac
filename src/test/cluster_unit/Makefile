@@ -387,7 +387,8 @@ test_cluster_gcs_block_dedup: test_cluster_gcs_block_dedup.c unit_test.h $(CLUST
 # (the REAL staging-path payload -> worker router, extracted as a pure file)
 # + cluster_lms_shard.o so the route == shard_for_tag agreement is asserted
 # against both real objects.  libpgcommon_srv.a for hash_bytes_extended.
-CLUSTER_GCS_BLOCK_SHARD_O = $(top_builddir)/src/backend/cluster/cluster_gcs_block_shard.o
+CLUSTER_GCS_BLOCK_SHARD_O = $(top_builddir)/src/backend/cluster/cluster_gcs_block_shard.o \
+	$(top_builddir)/src/backend/cluster/cluster_multixact_range_wire.o
 test_cluster_gcs_block_shard: test_cluster_gcs_block_shard.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_GCS_BLOCK_SHARD_O) $(CLUSTER_LMS_SHARD_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O)

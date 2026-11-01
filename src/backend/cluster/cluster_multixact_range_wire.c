@@ -1,6 +1,9 @@
 /* Foreign-MX metadata codec. No transport, retained scope or visibility grant. */
 #include "postgres.h"
 #include "cluster/cluster_multixact_range_wire.h"
+#include "cluster/cluster_multixact_range.h"
+#include "cluster/cluster_gcs_block.h"
+#include "port/pg_crc32c.h"
 
 static bool
 range_context_valid(const ClusterMxRangeWireContext *ctx)
@@ -298,5 +301,155 @@ cluster_mx_range_wire_decode_proof_asks(const void *wire, uint32 bytes,
 	memcpy(asks, decoded, (Size)h.count * sizeof(*asks));
 	*count = h.count;
 	*total = h.total;
+	return true;
+}
+
+static uint32
+range_checksum(const void *wire, uint32 bytes)
+{
+	ClusterMxRangeRoute route;
+	pg_crc32c crc;
+
+	memcpy(&route, wire, sizeof(route));
+	route.checksum = 0;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &route, sizeof(route));
+	COMP_CRC32C(crc, (const char *)wire + sizeof(route), bytes - sizeof(route));
+	FIN_CRC32C(crc);
+	return (uint32)crc;
+}
+
+static bool
+range_target_valid(const BufferTag *tag)
+{
+	return tag->spcOid != 0 && tag->relNumber != 0 && tag->forkNum == MAIN_FORKNUM
+		&& tag->blockNum != InvalidBlockNumber;
+}
+
+static bool
+range_snapshot_valid(const ClusterMxRangeSnapshot *snapshot, uint64 epoch)
+{
+	return snapshot->snapshot_type <= SNAPSHOT_NON_VACUUMABLE
+		&& (snapshot->read_epoch == 0 || snapshot->read_epoch == epoch);
+}
+
+static bool
+range_request_valid(const ClusterMxRangeRequest *r)
+{
+	static const ClusterMxRangeSource zero;
+
+	return r->key.reserved16 == 0 && r->key.reserved32 == 0
+		&& r->key.origin_node_id < CLUSTER_MAX_NODES
+		&& r->key.cluster_epoch == r->route.epoch && MultiXactIdIsValid(r->key.multixact_id)
+		&& range_target_valid(&r->target) && range_snapshot_valid(&r->snapshot, r->route.epoch)
+		&& r->cap > 0 && r->cap <= CLUSTER_MX_COMPOSITION_PAGE_MEMBERS
+		&& r->peer_generation > 0 && r->peer_generation != UINT32_MAX
+		&& r->reserved == 0 && r->has_source <= 1
+		&& (r->has_source || (r->first == 0 && memcmp(&r->source, &zero, sizeof(zero)) == 0));
+}
+
+void
+cluster_mx_range_request_seal(ClusterMxRangeRequest *request)
+{
+	request->route.format_id = CLUSTER_FOREIGN_MX_FORMAT_ID_V1;
+	request->route.version = CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1;
+	request->route.kind = CLUSTER_MX_RANGE_REQUEST_KIND;
+	request->route.wire_bytes = sizeof(*request);
+	request->route.checksum = range_checksum(request, sizeof(*request));
+}
+
+/* Legacy frames begin with a legal request_id, whose low word may equal our
+ * format id. First separate message type and length from those old shapes.
+ * Resource-X's variable reply domain has its own distinct fixed prefix. */
+bool
+cluster_mx_range_transport_candidate(const void *wire, uint32 bytes, uint8 message_type)
+{
+	uint32 format;
+	const uint32 minimum = sizeof(ClusterMxRangeRoute) + sizeof(ClusterMxRangeWireHeader)
+		+ sizeof(ClusterMxRangeSource);
+	const uint32 maximum = minimum + CLUSTER_MX_COMPOSITION_PAGE_MEMBERS * sizeof(ClusterCurrentMxMemberDesc);
+
+	if (wire == NULL)
+		return false;
+	if (message_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD) {
+		if (bytes != sizeof(ClusterMxRangeRequest))
+			return false;
+	} else if (message_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY) {
+		if (bytes < minimum || bytes > maximum
+			|| (bytes - minimum) % sizeof(ClusterCurrentMxMemberDesc) != 0)
+			return false;
+	} else
+		return false;
+	memcpy(&format, wire, sizeof(format));
+	return format == CLUSTER_FOREIGN_MX_FORMAT_ID_V1;
+}
+
+bool
+cluster_mx_range_transport_route(const void *wire, uint32 bytes, uint8 message_type,
+	ClusterMxRangeRoute *route, BufferTag *tag)
+{
+	ClusterMxRangeRoute h;
+
+	if (route != NULL) memset(route, 0, sizeof(*route));
+	if (tag != NULL) memset(tag, 0, sizeof(*tag));
+	if (route == NULL || tag == NULL
+		|| !cluster_mx_range_transport_candidate(wire, bytes, message_type))
+		return false;
+	memcpy(&h, wire, sizeof(h));
+	if (h.format_id != CLUSTER_FOREIGN_MX_FORMAT_ID_V1
+		|| h.version != CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1 || h.wire_bytes != bytes
+		|| h.request_id == 0 || h.epoch == 0 || h.epoch > UINT32_MAX
+		|| h.requester_node < 0 || h.requester_node >= CLUSTER_MAX_NODES
+		|| h.requester_backend <= 0 || h.reserved != 0
+		|| h.checksum != range_checksum(wire, bytes))
+		return false;
+	if (message_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD) {
+		ClusterMxRangeRequest request;
+		if (h.kind != CLUSTER_MX_RANGE_REQUEST_KIND || bytes != sizeof(request))
+			return false;
+		memcpy(&request, wire, sizeof(request));
+		if (!range_request_valid(&request))
+			return false;
+	} else if (message_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY) {
+		if (h.kind != CLUSTER_MX_RANGE_RESPONSE_KIND
+			|| bytes < sizeof(h) + sizeof(ClusterMxRangeWireHeader))
+			return false;
+	} else
+		return false;
+	*route = h;
+	*tag = GcsBlockCurrentMxRouteTagMake(h.request_id, h.epoch, h.requester_node, h.requester_backend);
+	return true;
+}
+
+
+void
+cluster_mx_range_response_seal(ClusterMxRangeResponse *response, uint32 body_bytes)
+{
+	response->route.kind = CLUSTER_MX_RANGE_RESPONSE_KIND;
+	response->route.wire_bytes = sizeof(response->route) + body_bytes;
+	response->route.checksum = range_checksum(response, response->route.wire_bytes);
+}
+
+bool
+cluster_mx_range_refuse(const ClusterMxRangeRequest *request, uint32 loaded_catalog,
+	ClusterMxRangeResponse *response, uint32 capacity, uint32 *bytes)
+{
+	ClusterMxRangeSource source = {0};
+	ClusterMxRangeWireContext context = {0};
+	uint32 body_bytes = 0;
+	if (bytes != NULL) *bytes = 0;
+	if (request == NULL || response == NULL || bytes == NULL || capacity < sizeof(*response)) return false;
+	memset(response, 0, sizeof(*response));
+	context.request_id = request->route.request_id; context.epoch = request->route.epoch;
+	context.key = request->key; context.format_id = CLUSTER_FOREIGN_MX_FORMAT_ID_V1;
+	context.version = CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1; context.loaded_catalog = loaded_catalog;
+	context.peer_capabilities = CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES;
+	context.peer_generation = request->peer_generation; context.requested_cap = request->cap;
+	context.source = &source; context.source_bytes = sizeof(source);
+	if (!cluster_mx_range_wire_encode_reply(&context, MXCOMP_READ_UNKNOWN, NULL,
+		response->data.data, BLCKSZ, &body_bytes)) return false;
+	response->route = request->route;
+	cluster_mx_range_response_seal(response, body_bytes);
+	*bytes = response->route.wire_bytes;
 	return true;
 }

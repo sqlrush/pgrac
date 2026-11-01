@@ -291,6 +291,14 @@ extern bool cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 requi
 extern bool cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
 												   uint32 *capability_word_out,
 												   uint32 *generation_out);
+extern bool cluster_sf_peer_foreign_mx_capability_sample_v1(int32 peer_id, uint32 format_id,
+															uint32 format_version,
+															uint32 control_catalog_version,
+															uint32 *generation_out);
+extern bool cluster_sf_peer_foreign_mx_capability_matches_v1(int32 peer_id, uint32 format_id,
+															 uint32 format_version,
+															 uint32 control_catalog_version,
+															 uint32 expected_generation);
 extern bool cluster_sf_peer_capability_generation_matches(int32 peer_id,
 														  uint32 required_capabilities,
 														  uint32 expected_generation);

@@ -34,6 +34,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_foreign_mx_format.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
@@ -639,6 +640,45 @@ cluster_sf_peer_multixact_current_capability_generation(int32 peer_id, uint32 *g
 														generation_out);
 	LWLockRelease(&ClusterSfDep->lock);
 	return supported;
+}
+
+/* One record supplies the complete family and its exact connection lifetime.
+ * This only checks the registered format and learned binary capabilities;
+ * the original caller still owns cohort, epoch, grant and operation checks. */
+bool
+cluster_sf_peer_foreign_mx_capability_sample_v1(int32 peer_id, uint32 format_id,
+												uint32 format_version,
+												uint32 control_catalog_version,
+												uint32 *generation_out)
+{
+	uint32 generation = 0;
+
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (generation_out == NULL
+		|| !cluster_foreign_mx_format_registered_v1(format_id, format_version,
+													control_catalog_version))
+		return false;
+	if (!cluster_sf_peer_capability_family_sample(peer_id, CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES,
+												  0, NULL, &generation)
+		|| generation == 0 || generation == UINT32_MAX)
+		return false;
+	*generation_out = generation;
+	return true;
+}
+
+bool
+cluster_sf_peer_foreign_mx_capability_matches_v1(int32 peer_id, uint32 format_id,
+												 uint32 format_version,
+												 uint32 control_catalog_version,
+												 uint32 expected_generation)
+{
+	if (expected_generation == 0 || expected_generation == UINT32_MAX
+		|| !cluster_foreign_mx_format_registered_v1(format_id, format_version,
+													control_catalog_version))
+		return false;
+	return cluster_sf_peer_capability_generation_matches(
+		peer_id, CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, expected_generation);
 }
 
 /* Drain-side exact fence for a capability-bound LMS slot. */

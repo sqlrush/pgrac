@@ -2079,9 +2079,9 @@ mx_composition_range_retained(const ClusterMxCompositionNativeSource *source)
 }
 
 ClusterMxCompositionReadStatus
-cluster_mx_composition_read_native(MultiXactId multi,
+cluster_mx_composition_read_native_checked(MultiXactId multi,
 	const ClusterMxCompositionNativeSource *expected, uint32 first, uint32 cap,
-	ClusterMxCompositionNativeChunk *out)
+	ClusterMxCompositionNativeChunk *out, ClusterMxCompositionCheck current, void *arg)
 {
 	ClusterMxCompositionNativeChunk chunk = {0};
 	ClusterMxCompositionNativeSource expected_source;
@@ -2102,7 +2102,13 @@ cluster_mx_composition_read_native(MultiXactId multi,
 		|| (cluster_peer_mode_enabled() && !cluster_mxid_is_mine(multi)))
 		return MXCOMP_READ_UNKNOWN;
 
-	MultiXactIdSetOldestVisible();
+	/* LMS has no transactional BackendId. Its checked path is protected by
+	 * the original truncation lock and exact generation on every frame. */
+	if (current == NULL) {
+		if (MyBackendId <= 0 || MyBackendId > MaxBackends)
+			return MXCOMP_READ_UNKNOWN;
+		MultiXactIdSetOldestVisible();
+	}
 	LWLockAcquire(MultiXactTruncationLock, LW_SHARED);
 	PG_TRY();
 	{
@@ -2160,7 +2166,8 @@ cluster_mx_composition_read_native(MultiXactId multi,
 				|| (expected != NULL && memcmp(expected, &chunk.source, sizeof(*expected)) != 0))
 				break;
 			LWLockAcquire(MultiXactGenLock, LW_SHARED); gen_held = true;
-			if (!mx_composition_range_retained(&chunk.source)) {
+			if (!mx_composition_range_retained(&chunk.source)
+				|| (current != NULL && !current(arg))) {
 				LWLockRelease(MultiXactGenLock); gen_held = false;
 				break;
 			}
@@ -2195,7 +2202,8 @@ cluster_mx_composition_read_native(MultiXactId multi,
 			if (chunk.count + (chunk.skipped_zero ? 1 : 0) != physical_count)
 				break;
 			LWLockAcquire(MultiXactGenLock, LW_SHARED); gen_held = true;
-			if (mx_composition_range_retained(&chunk.source))
+			if (mx_composition_range_retained(&chunk.source)
+				&& (current == NULL || current(arg)))
 				result = MXCOMP_READ_OK;
 			LWLockRelease(MultiXactGenLock); gen_held = false;
 		} while (0);
@@ -2213,6 +2221,15 @@ cluster_mx_composition_read_native(MultiXactId multi,
 	if (result == MXCOMP_READ_OK)
 		memcpy(out, &chunk, sizeof(chunk));
 	return result;
+}
+
+ClusterMxCompositionReadStatus
+cluster_mx_composition_read_native(MultiXactId multi,
+	const ClusterMxCompositionNativeSource *expected, uint32 first, uint32 cap,
+	ClusterMxCompositionNativeChunk *out)
+{
+	return cluster_mx_composition_read_native_checked(multi, expected, first, cap,
+		out, NULL, NULL);
 }
 #endif
 
