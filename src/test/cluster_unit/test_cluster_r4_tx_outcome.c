@@ -8276,10 +8276,192 @@ UT_TEST(test_tt40_initial_counters_keep_identity_current_and_strict_bounds)
 	}
 }
 
+static void
+init_tt40_held_status_fixture(int state)
+{
+	setup_original_full_xid(false);
+	test_candidate_tt_v2 = true;
+	test_candidate_persisted_full = U64FromFullTransactionId(test_original_full_xid);
+	test_candidate_held_count = 1;
+	test_current_owner_available = true;
+	if (state == 0) {
+		test_tt_slot.status = TT_SLOT_ACTIVE;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_current_owner.status = CTS_ACTIVE;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+	} else if (state == 1) {
+		test_current_owner.status = CTS_COMMITTED;
+		test_current_owner.commit_scn = test_tt_slot.commit_scn;
+	} else {
+		test_tt_slot.status = TT_SLOT_ABORTED;
+		test_tt_slot.commit_scn = InvalidScn;
+		test_current_owner.status = CTS_ABORTED;
+		test_native_status = TRANSACTION_STATUS_ABORTED;
+	}
+}
+
+static bool
+sample_tt40_held_status(bool physical, ClusterTTStatusKey *key, ClusterTTStatusResult *result,
+						bool *active, bool *retry)
+{
+	ClusterSemanticAdmissionToken admission = {
+		.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		.record_generation = 5, .formation_epoch = 42,
+		.side = CLUSTER_SEMANTIC_TARGET_SIDE, .entered = true
+	};
+	ClusterUndoBlock0CurrentGuard guard = {0};
+	ClusterUndoBlock0ResolvedRoot root = {
+		.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED, .root_id = 92, .root_generation = 7
+	};
+	ClusterTTSlotPhysicalLocator locator = {
+		.segment_id = TEST_TT_SEGMENT, .xid = TEST_ORIGIN_XID,
+		.slot_offset = TEST_TT_OFFSET, .wrap = TEST_ORIGIN_WRAP
+	};
+
+	if (physical) {
+		test_current_segment = TEST_TT_SEGMENT + 1;
+		return cluster_runtime_visibility_physical_locator_sample_held(&locator, &admission,
+			&guard, &root, key, result, active, retry);
+	}
+	return cluster_runtime_visibility_current_owner_sample_held(TEST_ORIGIN_XID,
+		&test_current_owner, &admission, &guard, &root, key, result, active);
+}
+
+/* A valid TT40 page with the same raw xid cannot hide an exact live-source
+ * FullXid conflict in either current-MX status sampler. */
+UT_TEST(test_tt40_held_status_rejects_live_same_raw_different_epoch)
+{
+	for (int physical = 0; physical < 2; physical++) {
+		for (int state = 0; state < 3; state++) {
+			for (int source = 0; source < 2; source++) {
+				ClusterTTStatusKey key;
+				ClusterTTStatusResult result;
+				ClusterRuntimeVisibilityCounters counters;
+				bool active = true, retry = true;
+
+				init_tt40_held_status_fixture(state);
+				g_retained_origin_available = true;
+				g_retained_origin_full = test_original_full_xid;
+				if (source == 0)
+					test_original_full_xid = FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID);
+				else
+					g_retained_origin_full = FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID);
+				memset(&key, 0xa5, sizeof(key));
+				memset(&result, 0xa5, sizeof(result));
+				UT_ASSERT(!sample_tt40_held_status(physical, &key, &result, &active, &retry));
+				UT_ASSERT_EQ(key.local_xid, InvalidTransactionId);
+				UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+				UT_ASSERT(!result.authoritative);
+				UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+				UT_ASSERT(!active);
+				if (physical) UT_ASSERT(!retry);
+				UT_ASSERT_EQ(test_native_status_calls, 0);
+				UT_ASSERT_EQ(test_candidate_held_count, 1);
+				UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+				cluster_runtime_visibility_exact_counters_snapshot(&counters);
+				UT_ASSERT_EQ(counters.local_memo_publishes, 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_tt40_held_status_keeps_optional_sources_and_legacy_behavior)
+{
+	for (int physical = 0; physical < 2; physical++) {
+		for (int state = 0; state < 3; state++) {
+			for (int sources = 0; sources < 5; sources++) {
+				ClusterTTStatusKey key;
+				ClusterTTStatusResult result;
+				bool active = false, retry = false;
+
+				init_tt40_held_status_fixture(state);
+				test_original_available = (sources & 1) != 0;
+				g_retained_origin_available = (sources & 2) != 0;
+				g_retained_origin_full = test_original_full_xid;
+				if (sources == 4) {
+					/* Legacy status has no persisted FullXid to cross-check. */
+					test_candidate_tt_v2 = false;
+					test_original_available = g_retained_origin_available = true;
+					test_original_full_xid = g_retained_origin_full
+						= FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID);
+				} else if (sources == 0) {
+					test_candidate_tt_generation = 0;
+					test_original_key.segment_generation = 0;
+				}
+				UT_ASSERT(sample_tt40_held_status(physical, &key, &result, &active, &retry));
+				UT_ASSERT_EQ(result.status, state == 0 ? CLUSTER_TT_STATUS_IN_PROGRESS :
+					state == 1 ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED);
+				UT_ASSERT(result.authoritative);
+				UT_ASSERT_EQ(active, state == 0);
+				UT_ASSERT(!retry);
+				UT_ASSERT_EQ(test_candidate_held_count, 1);
+				UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+				if (sources == 4) {
+					UT_ASSERT_EQ(test_original_calls, 0);
+					UT_ASSERT_EQ(g_retained_origin_reads, 0);
+				}
+			}
+		}
+	}
+}
+
+UT_TEST(test_tt40_held_status_source_drift_cannot_escape_original_fences)
+{
+	for (int physical = 0; physical < 2; physical++) {
+		for (int source = 0; source < 2; source++) {
+			for (int drift = 1; drift <= 4; drift++) {
+				ClusterTTStatusKey key;
+				ClusterTTStatusResult result;
+				bool active = true, retry = true;
+
+				init_tt40_held_status_fixture(1);
+				/* The shared root provider drifts on its third observation. */
+				if (drift == 2)
+					test_regular_root_resolve_calls = 2;
+				if (source == 0)
+					test_original_drift = drift;
+				else {
+					g_retained_origin_available = true;
+					g_retained_origin_full = test_original_full_xid;
+					g_retained_origin_drift = drift;
+				}
+				UT_ASSERT(!sample_tt40_held_status(physical, &key, &result, &active, &retry));
+				UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+				UT_ASSERT(!result.authoritative);
+				UT_ASSERT(!active);
+				if (physical) UT_ASSERT(!retry);
+				UT_ASSERT_EQ(test_candidate_held_count, 1);
+				UT_ASSERT_EQ(test_candidate_cancel_calls + test_candidate_release_calls, 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_tt40_physical_memo_cannot_hide_later_fullxid_conflict)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	ClusterRuntimeVisibilityCounters before, after;
+	bool active = false, retry = false;
+
+	init_tt40_held_status_fixture(1);
+	UT_ASSERT(sample_tt40_held_status(true, &key, &result, &active, &retry));
+	cluster_runtime_visibility_exact_counters_snapshot(&before);
+	UT_ASSERT_EQ(before.local_memo_publishes, 1);
+	test_original_full_xid = FullTransactionIdFromEpochAndXid(10, TEST_ORIGIN_XID);
+	UT_ASSERT(!sample_tt40_held_status(true, &key, &result, &active, &retry));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT(!result.authoritative);
+	cluster_runtime_visibility_exact_counters_snapshot(&after);
+	UT_ASSERT_EQ(after.local_memo_hits, before.local_memo_hits);
+	UT_ASSERT_EQ(after.local_memo_publishes, before.local_memo_publishes);
+}
+
 int
 main(void)
 {
-	UT_PLAN(224);
+	UT_PLAN(228);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);
@@ -8504,6 +8686,10 @@ main(void)
 	UT_RUN(test_tt40_zero_rollover_count_reaches_freeze_plan);
 	UT_RUN(test_tt40_initial_epoch_and_all_zero_counters_reach_freeze_plan);
 	UT_RUN(test_tt40_initial_counters_keep_identity_current_and_strict_bounds);
+	UT_RUN(test_tt40_held_status_rejects_live_same_raw_different_epoch);
+	UT_RUN(test_tt40_held_status_keeps_optional_sources_and_legacy_behavior);
+	UT_RUN(test_tt40_held_status_source_drift_cannot_escape_original_fences);
+	UT_RUN(test_tt40_physical_memo_cannot_hide_later_fullxid_conflict);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

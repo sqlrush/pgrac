@@ -700,7 +700,8 @@ _classify_owners(
 _classify_owners(
     "CTRC_ORIGIN_PROVENANCE",
     "src/backend/cluster/cluster_runtime_visibility.c",
-    ("cluster_runtime_visibility_origin_original_full_xid",),
+    ("cluster_runtime_visibility_origin_original_full_xid",
+     "cluster_runtime_visibility_tt_identity_matches_live"),
     "REGISTERED_REFERENCE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_CTRC_TARGET_KINDS",

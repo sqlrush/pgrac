@@ -628,6 +628,10 @@ static void cluster_runtime_visibility_terminal_publish_physical(
 	const ClusterTTSlotPhysicalLocator *locator, uint32 generation,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxOutcome outcome,
 	ClusterTxProofKind proof_kind, TransactionId top_xid, SCN commit_scn);
+static bool cluster_runtime_visibility_tt_identity_matches_live(
+	const ClusterTTSlotCurrentOwner *owner, const ClusterUndoBlock0Generation *generation,
+	const ClusterUndoBlock0ResolvedRoot *root, const ClusterSemanticAdmissionToken *admission,
+	FullTransactionId persisted_original);
 
 bool
 cluster_runtime_visibility_physical_locator_sample_held(
@@ -641,6 +645,7 @@ cluster_runtime_visibility_physical_locator_sample_held(
 	ClusterUndoBlock0ResolvedRoot final_root;
 	ClusterTTSlotCurrentOwner current_owner;
 	ClusterTTSlotCurrentOwner final_owner;
+	ClusterTTSlotCurrentOwner physical_owner = {0};
 	ClusterTxLocator tx_locator;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	ClusterTxOutcome outcome;
@@ -649,6 +654,7 @@ cluster_runtime_visibility_physical_locator_sample_held(
 	SCN commit_scn = InvalidScn;
 	PGAlignedBlock block0;
 	TTSlot exact_slot;
+	FullTransactionId persisted_original = InvalidFullTransactionId;
 	uint32 current_segment;
 	uint32 final_current_segment;
 	uint64 epoch;
@@ -703,7 +709,14 @@ cluster_runtime_visibility_physical_locator_sample_held(
 		return false;
 	if (!cluster_vis_tt_block_slot_read(block0.data, locator->segment_id,
 			(uint8)((uint32)cluster_node_id + 1), generation.value, locator->slot_offset,
-			&exact_slot, NULL))
+			&exact_slot, &persisted_original))
+		return false;
+	physical_owner.segment_id = locator->segment_id;
+	physical_owner.xid = locator->xid;
+	physical_owner.slot_offset = locator->slot_offset;
+	physical_owner.wrap = locator->wrap;
+	if (!cluster_runtime_visibility_tt_identity_matches_live(&physical_owner, &generation,
+			root, admission, persisted_original))
 		return false;
 	tx_locator.xid = locator->xid;
 	tx_locator.tt_wrap = locator->wrap;
@@ -855,6 +868,7 @@ cluster_runtime_visibility_current_owner_sample_held_internal(
 	SCN commit_scn = InvalidScn;
 	PGAlignedBlock block0;
 	TTSlot exact_slot;
+	FullTransactionId persisted_original = InvalidFullTransactionId;
 	uint64 epoch;
 
 	if (key_out != NULL)
@@ -887,7 +901,9 @@ cluster_runtime_visibility_current_owner_sample_held_internal(
 		return false;
 	if (!cluster_vis_tt_block_slot_read(block0.data, expected_owner->segment_id,
 			(uint8)((uint32)cluster_node_id + 1), generation.value, expected_owner->slot_offset,
-			&exact_slot, NULL))
+			&exact_slot, &persisted_original)
+		|| !cluster_runtime_visibility_tt_identity_matches_live(expected_owner, &generation,
+			root, admission, persisted_original))
 		return false;
 	locator.xid = xid;
 	locator.tt_wrap = expected_owner->wrap;
@@ -991,6 +1007,37 @@ cluster_runtime_visibility_ctrc_key_fill(const ClusterTTSlotCurrentOwner *owner,
 	key->root_id = root->root_id;
 	key->root_generation = root->root_generation;
 	return true;
+}
+
+/* The held status readers must not discard a TT40 identity conflict before
+ * their native/memo lookup. Live sources are optional corroboration only;
+ * no source, companion or grant is created here. The caller retains SCUR
+ * and performs its original final generation/owner/ROOT/admission checks. */
+static bool
+cluster_runtime_visibility_tt_identity_matches_live(
+	const ClusterTTSlotCurrentOwner *owner, const ClusterUndoBlock0Generation *generation,
+	const ClusterUndoBlock0ResolvedRoot *root, const ClusterSemanticAdmissionToken *admission,
+	FullTransactionId persisted_original)
+{
+	ClusterCtrcTxnKeyV1 key;
+	FullTransactionId origin = InvalidFullTransactionId;
+	FullTransactionId retained = InvalidFullTransactionId;
+	bool origin_found;
+	bool retained_found;
+
+	/* TT32 has no persistent FullXid; preserve its existing status contract. */
+	if (!FullTransactionIdIsValid(persisted_original))
+		return true;
+	if (!FullTransactionIdIsNormal(persisted_original)
+		|| U64FromFullTransactionId(persisted_original) == UINT64_MAX
+		|| XidFromFullTransactionId(persisted_original) != owner->xid
+		|| !cluster_runtime_visibility_ctrc_key_fill(owner, generation, root, admission, &key))
+		return false;
+	origin_found = cluster_ctrc_origin_original_full_xid_shared(&key, &origin);
+	retained_found = cluster_tt_slot_origin_identity_read(&key, &retained);
+	return (!origin_found || FullTransactionIdEquals(origin, persisted_original))
+		   && (!retained_found || FullTransactionIdEquals(retained, persisted_original))
+		   && cluster_qvotec_get_self_incarnation() == key.origin_boot_incarnation;
 }
 
 /* Identity is sampled before the caller's original final generation/root/
