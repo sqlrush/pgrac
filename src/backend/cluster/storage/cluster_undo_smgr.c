@@ -474,6 +474,64 @@ undo_native_tt_read(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner
 		memcpy(buf, page.data, BLCKSZ);
 	return ok;
 }
+
+/* The original caller retains content-X, WAL and file-lifetime authority.
+ * Bind this complete write and optional fsync to one selected identity. The
+ * existing disk must already be that TT40 file: this never creates/repairs it.
+ * Failure after pwrite preserves its effects for the original owner to handle. */
+static bool
+undo_native_tt_write(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+					 const char *buf, bool do_fsync)
+{
+	ClusterControlFileKeyV2 key = { 0 };
+	ClusterControlNativeFileBorrowV2 borrow = { 0 };
+	PGAlignedBlock disk;
+	volatile bool ok = false;
+
+	if (owner_instance == 0 || owner_instance > UNDO_OWNER_INSTANCE_MAX || segment_id == 0
+		|| segment_id > UINT16_MAX
+		|| (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != owner_instance)
+		return false;
+	key.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+	key.origin = owner_instance - 1;
+	key.object_id = segment_id;
+	if (!cluster_control_native_file_acquire_v2(&key, &borrow))
+		return false;
+	PG_TRY();
+	{
+		int fd;
+
+		if (cluster_control_native_file_current_v2(&borrow)
+			&& cluster_tt_file_reference_matches_v2(buf, BLCKSZ, &borrow.expected)
+			&& cluster_undo_segment_header_integrity(buf) == CLUSTER_UNDO_HEADER_VALID
+			&& (fd = get_segment_fd(intent, segment_id, owner_instance)) >= 0
+			&& cluster_control_native_file_current_v2(&borrow)) {
+			ssize_t count = pg_pread(fd, disk.data, BLCKSZ, 0);
+
+			cluster_undo_record_note_smgr_pread();
+			if (count == BLCKSZ
+				&& cluster_tt_file_reference_matches_v2(disk.data, BLCKSZ, &borrow.expected)
+				&& cluster_undo_segment_header_integrity(disk.data) == CLUSTER_UNDO_HEADER_VALID
+				&& cluster_control_native_file_current_v2(&borrow)) {
+				count = pg_pwrite(fd, buf, BLCKSZ, 0);
+				cluster_undo_record_note_smgr_pwrite();
+				ok = count == BLCKSZ;
+				if (ok && do_fsync)
+					ok = pg_fsync(fd) == 0;
+				if (ok)
+					ok = cluster_control_native_file_current_v2(&borrow);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!cluster_control_native_file_release_v2(&borrow))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not release native TT write identity borrow")));
+	}
+	PG_END_TRY();
+	return ok;
+}
 #endif
 
 bool
@@ -519,6 +577,12 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, u
 
 	if (buf == NULL || block_no >= UNDO_BLOCKS_PER_SEGMENT)
 		return false;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (block_no == 0 && (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2))
+		return undo_native_tt_write(intent, segment_id, owner_instance, buf, do_fsync);
+#endif
 
 	fd = get_segment_fd(intent, segment_id, owner_instance);
 	if (fd < 0)

@@ -91,6 +91,9 @@ extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 se
  *
  *	NOT critical-section safe.
  */
+/* Selected native block-zero writes require a valid TT40 successor and an
+ * already matching on-disk page. One file-identity borrow spans write/fsync;
+ * the caller still owns content-X, WAL and the original file lifetime. */
 extern bool cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id,
 										  uint8 owner_instance, uint32 block_no, const char *buf,
 										  bool do_fsync);

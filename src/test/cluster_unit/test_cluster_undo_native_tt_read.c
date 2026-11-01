@@ -232,7 +232,10 @@ UT_TEST(native_tt_read_legacy_path_keeps_original_bytes)
 	finish_selected(path);
 }
 
-int main(void)
+#ifndef UNDO_NATIVE_TT_READ_MAIN
+#define UNDO_NATIVE_TT_READ_MAIN main
+#endif
+int UNDO_NATIVE_TT_READ_MAIN(void)
 {
 	char path[] = "/tmp/pgrac-native-tt-read-XXXXXX";
 	UT_ASSERT_NOT_NULL(mkdtemp(path)); strlcpy(publication_dir, path, sizeof(publication_dir));
