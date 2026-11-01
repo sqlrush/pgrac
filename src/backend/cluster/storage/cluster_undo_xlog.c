@@ -42,6 +42,10 @@
 
 #include "access/xlog.h"
 #include "access/xact.h"
+#include "access/clog_file.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_control_native_files.h"
+#endif
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
@@ -1403,12 +1407,37 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 						errmsg("could not close undo segment file \"%s\": %m", path)));
 }
 
+typedef struct UndoTTReplayFile {
+	int fd;
+	bool close_failed;
+#ifdef USE_PGRAC_CLUSTER
+	bool native;
+	ClusterControlNativeFileBorrowV2 native_file;
+#endif
+} UndoTTReplayFile;
+
+static void
+undo_tt_replay_close(UndoTTReplayFile *file)
+{
+	if (file->close_failed)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not close native TT40 redo file")));
+	if (file->fd >= 0) {
+		if (close(file->fd) != 0) {
+			file->close_failed = true;
+			ereport(PANIC, (errcode_for_file_access(),
+							errmsg("could not close native TT40 redo file")));
+		}
+		file->fd = -1;
+	}
+}
+
 /* A V2 delta needs an existing complete TT40 predecessor. Keep every byte
  * private until preparation succeeds; neither missing files nor TT32 pages
  * can supply the original identity. Native replay already owns isolation and
  * the original recovery path authority. */
-void
-cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
+static void
+undo_tt_replay_file(const ClusterUndoDecoded *decoded, UndoTTReplayFile *file)
 {
 	PGAlignedBlock before, prepared, post;
 	ClusterUndoHeaderPrepareResultV1 decision;
@@ -1425,14 +1454,20 @@ cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
 								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
 		ereport(PANIC, (errmsg("undo segment path is unavailable for TT40 redo")));
 	fd = cluster_undo_redo_open_segment(decoded->instance, decoded->segment_id, path, false);
+	file->fd = fd;
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not open undo segment \"%s\" for TT40 redo: %m", path)));
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native && !cluster_control_native_file_current_v2(&file->native_file))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 redo file identity changed before read")));
+#endif
 	transferred = pg_pread(fd, before.data, BLCKSZ, 0);
 	if (transferred != BLCKSZ) {
 		int save_errno = errno;
 
-		(void)close(fd);
+		undo_tt_replay_close(file);
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not read undo segment \"%s\" for TT40 redo", path),
@@ -1441,10 +1476,17 @@ cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
 	if (!UndoSegmentHeaderV2_identity_matches(before.data, BLCKSZ, decoded->segment_id,
 											 decoded->instance)
 		|| ((PageHeader)before.data)->pd_checksum != pg_checksum_page(before.data, 0)) {
-		(void)close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid TT40 predecessor header in undo segment \"%s\"", path)));
 	}
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native
+		&& (!cluster_tt_file_reference_matches_v2(before.data, BLCKSZ, &file->native_file.expected)
+			|| !cluster_control_native_file_current_v2(&file->native_file)))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 redo predecessor has a different file identity")));
+#endif
 	decision = cluster_undo_prepare_header_v1(decoded, NULL, 0, before.data, prepared.data);
 	if (decision != CLUSTER_UNDO_HEADER_BLOCKED
 		&& decoded->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
@@ -1455,7 +1497,7 @@ cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
 		if (cluster_undo_head_operation_v2_from_decoded(decoded, &operation))
 			proof = cluster_tt_durable_set_head_operation_v2_preflight(&operation, before.data);
 		if (proof == CLUSTER_UNDO_HEAD_OPERATION_BLOCKED) {
-			(void)close(fd);
+			undo_tt_replay_close(file);
 			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("cannot prove exact TT40 operation head redo target")));
 		}
@@ -1466,7 +1508,7 @@ cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
 	}
 	if (decision != CLUSTER_UNDO_HEADER_APPLY && decision != CLUSTER_UNDO_HEADER_ALREADY
 		&& decision != CLUSTER_UNDO_HEADER_SKIP_STALE) {
-		(void)close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("conflicting TT40 predecessor in undo segment \"%s\"", path),
 						errdetail("generation=%u slot=%u wrap=%u xid=%u full_xid=" UINT64_FORMAT,
@@ -1474,13 +1516,21 @@ cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
 								  decoded->xid, decoded->original_full_xid)));
 	}
 	apply = decision == CLUSTER_UNDO_HEADER_APPLY;
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native
+		&& (!cluster_tt_file_reference_matches_v2(apply ? prepared.data : before.data,
+				BLCKSZ, &file->native_file.expected)
+			|| !cluster_control_native_file_current_v2(&file->native_file)))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 redo file identity changed before write or sync")));
+#endif
 	if (apply) {
 		((PageHeader)prepared.data)->pd_checksum = pg_checksum_page(prepared.data, 0);
 		transferred = pg_pwrite(fd, prepared.data, BLCKSZ, 0);
 		if (transferred != BLCKSZ) {
 			int save_errno = errno;
 
-			(void)close(fd);
+			undo_tt_replay_close(file);
 			errno = save_errno;
 			ereport(PANIC, (errcode_for_file_access(),
 							errmsg("could not write undo segment \"%s\" for TT40 redo", path),
@@ -1491,27 +1541,83 @@ cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
 	if (pg_fsync(fd) != 0) {
 		int save_errno = errno;
 
-		(void)close(fd);
+		undo_tt_replay_close(file);
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not fsync undo segment \"%s\" after TT40 redo: %m", path)));
 	}
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native && !cluster_control_native_file_current_v2(&file->native_file))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 redo file identity changed after sync")));
+#endif
 	expected = apply ? prepared.data : before.data;
 	transferred = pg_pread(fd, post.data, BLCKSZ, 0);
 	if (transferred != BLCKSZ || memcmp(post.data, expected, BLCKSZ) != 0) {
-		(void)close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("TT40 redo post-read mismatch in undo segment \"%s\"", path)));
 	}
-	if (close(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close undo segment \"%s\" after TT40 redo: %m", path)));
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native && !cluster_control_native_file_current_v2(&file->native_file))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 redo file identity changed after readback")));
+#endif
+	undo_tt_replay_close(file);
 	if (apply) {
 		if (decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT)
 			cluster_tt_durable_count_redo_apply();
 		cluster_vis_bump_recovery_undo_redo_applies();
 	} else if (decision == CLUSTER_UNDO_HEADER_SKIP_STALE)
 		cluster_vis_bump_recovery_undo_redo_skips();
+}
+
+void
+cluster_tt_durable_redo_tt_v2(const ClusterUndoDecoded *decoded)
+{
+	UndoTTReplayFile legacy = { .fd = -1 };
+
+	if (!cluster_undo_preflight_tt_v2(decoded))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid exact TT40 redo identity")));
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2) {
+		/* The pointer is fixed before setjmp; mutable FD/borrow state lives
+		 * outside automatic storage and keeps its address through cleanup. */
+		UndoTTReplayFile *file = palloc0(sizeof(*file));
+
+		file->fd = -1;
+		file->native = true;
+		PG_TRY();
+		{
+			ClusterControlFileKeyV2 key = {0};
+
+			key.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+			key.origin = decoded->instance - 1;
+			key.object_id = decoded->segment_id;
+			if (!cluster_control_native_file_acquire_v2(&key, &file->native_file)
+				|| !cluster_control_native_file_current_v2(&file->native_file))
+				ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("native TT40 redo has no selected file identity")));
+			/* The selected identity does not replace the original recovery
+			 * scope/path, source cut, isolation or file-writer authority. */
+			undo_tt_replay_file(decoded, file);
+		}
+		PG_FINALLY();
+		{
+			undo_tt_replay_close(file);
+			if (file->native_file.private_self != 0
+				&& !cluster_control_native_file_release_v2(&file->native_file))
+				ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+								errmsg("could not release native TT40 redo file identity")));
+			pfree(file);
+		}
+		PG_END_TRY();
+		return;
+	}
+#endif
+	undo_tt_replay_file(decoded, &legacy);
 }
 
 /* Folded and standalone V2 commits share the exact TT40 mutation owner. */

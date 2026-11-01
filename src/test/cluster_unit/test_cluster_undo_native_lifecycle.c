@@ -11,6 +11,7 @@
 #include <setjmp.h>
 
 #include "access/xact.h"
+#include "access/clog_file.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_uba.h"
@@ -21,6 +22,16 @@
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/checksum.h"
 #include "unit_test.h"
+
+#ifndef UNDO_NATIVE_TT_REDO_SELECTED_TEST
+#include "cluster_unit_no_native_files.h"
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+void pg_re_throw(void) { abort(); }
+#endif
+#ifndef UNDO_NATIVE_TT_REDO_IO
+#define UNDO_NATIVE_TT_REDO_IO() ((void)0)
+#endif
 
 UT_DEFINE_GLOBALS();
 
@@ -65,6 +76,7 @@ fixture_path(int intent, uint8 instance, uint32 segment, char *path, size_t leng
 static int
 fixture_open(const char *path, int flags)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	opens++;
 	if (fail_open) {
 		errno = ENOENT;
@@ -85,6 +97,7 @@ fixture_extend(int fd, off_t size)
 static ssize_t
 fixture_read(int fd, void *buffer, size_t length, off_t offset)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT_EQ(length, BLCKSZ);
 	UT_ASSERT_EQ(offset, 0);
@@ -100,6 +113,7 @@ fixture_read(int fd, void *buffer, size_t length, off_t offset)
 static ssize_t
 fixture_write(int fd, const void *buffer, size_t length, off_t offset)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT((length == BLCKSZ && offset == 0)
 			  || (length == sizeof(TTSlot)
@@ -115,6 +129,7 @@ fixture_write(int fd, const void *buffer, size_t length, off_t offset)
 static int
 fixture_sync(int fd)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT(writes <= 1);
 	UT_ASSERT_EQ(closes, 0);
@@ -160,6 +175,7 @@ fixture_power_loss(void)
 static int
 fixture_close(int fd)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	closes++;
 	return fail_close ? -1 : 0;
