@@ -57,6 +57,7 @@
 #include "utils/wait_event.h" /* RF-ROOT P6: WAIT_EVENT_RECONFIG_BARRIER_WAIT */
 
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_pi_writeback.h"
@@ -4172,6 +4173,45 @@ cl_normal_stop_actor_bit(void)
 	if (AmLmdProcess() && cluster_lmd_enabled)
 		return UINT32_C(1) << 10;
 	return 0;
+}
+
+/* Read the original process-local bracket, never a coordinator's empty copy.
+ * This point does not retire work or sign any producer/service cut.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterNormalStopPollResult
+cluster_service_actor_observe(ClusterServiceActorObservation *out)
+{
+	uint32 bit;
+	bool role_matches;
+
+	if (out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	memset(out, 0, sizeof(*out));
+	out->reason = "NATIVE_ACTOR_OWNER_OR_CONTEXT_INVALID";
+	if (!IsUnderPostmaster || !cluster_enabled || !cluster_shared_config)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	role_matches = (AmLmonProcess() && MyBackendType == B_LMON)
+		|| (AmLmsProcess() && MyBackendType == B_LMS)
+		|| (AmLmsWorkerProcess() && MyBackendType == B_LMS_WORKER)
+		|| (AmSinvalBcastProcess() && MyBackendType == B_SINVAL_BCAST)
+		|| (AmLmdProcess() && MyBackendType == B_LMD);
+	bit = cl_normal_stop_actor_bit();
+	if (!role_matches || bit == 0)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	out->actor_bit = bit;
+	out->bound_actor_bit = cl_normal_stop_service_bit;
+	out->active_depth = cl_normal_stop_service_depth;
+	if ((out->active_depth == 0 && out->bound_actor_bit != 0)
+		|| (out->active_depth != 0 && out->bound_actor_bit != bit)) {
+		out->reason = "NATIVE_ACTOR_BINDING_INVALID";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	if (out->active_depth != 0) {
+		out->reason = "NATIVE_ACTOR_OUTER_WORK_ACTIVE";
+		return CLUSTER_NORMAL_STOP_PENDING;
+	}
+	out->reason = "NATIVE_ACTOR_DEPTH_ZERO_ONLY";
+	return CLUSTER_NORMAL_STOP_READY;
 }
 
 bool

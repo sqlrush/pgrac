@@ -6649,6 +6649,7 @@ UT_TEST(test_pre_front_buffer_observation_never_advances_cut)
 }
 
 #include "test_cluster_native_producers_observe.inc"
+#include "test_cluster_native_actor_observe.inc"
 
 int
 main(void)
@@ -6659,7 +6660,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(175);
+	UT_PLAN(180);
 	UT_RUN(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
@@ -6835,6 +6836,11 @@ main(void)
 	UT_RUN(test_online_native_owner_input_and_unlocked_guards);
 	UT_RUN(test_online_native_epoch_and_input_changes_remain_provisional);
 	UT_RUN(test_online_native_observation_does_not_need_leave_state);
+	UT_RUN(test_native_actor_observation_tracks_all_original_nested_owners);
+	UT_RUN(test_native_actor_observation_rejects_empty_copy_and_wrong_identity);
+	UT_RUN(test_native_actor_observation_never_repairs_mismatched_or_full_depth);
+	UT_RUN(test_native_actor_return_does_not_complete_original_module_debt);
+	UT_RUN(test_native_actor_observation_needs_no_stop_storage_or_request);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -28,6 +28,24 @@ typedef struct ClusterServiceObservation {
 	unsigned modules;
 } ClusterServiceObservation;
 
+/* Process-local observation only; not wire, shared state or a reusable cut. */
+typedef struct ClusterServiceActorObservation {
+	uint32 actor_bit;
+	uint32 bound_actor_bit;
+	uint32 active_depth;
+	const char *reason;
+} ClusterServiceActorObservation;
+
+/* Observe the original native actor's enter/leave bracket even online.
+ * Only its actual matching Aux/BackendType may inspect this private copy.
+ * Active outer work stays PENDING through nesting; mismatched binding is
+ * INVALID and is never repaired here. READY means this bracket is inactive,
+ * not that modules, transport, admission or producer closure have completed.
+ * The original caller still retains/revalidates identity and each separate
+ * owner/cut. No stop storage, request, lock, retirement or failure write. */
+extern ClusterNormalStopPollResult
+cluster_service_actor_observe(ClusterServiceActorObservation *out);
+
 /* Original LMON/LMS/LMD/SINVAL process only, at its unlocked idle boundary.
  * Uses actual native roles and original module polls, even without shutdown.
  * Does not seal, cancel, publish failure or authorize configuration/DATA use.
