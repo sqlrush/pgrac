@@ -14171,3 +14171,37 @@ clean-undo-capacity-history:
 	rm -f test_cluster_undo_capacity_history_lmon.inc test_cluster_undo_capacity_history_lmon.inc.tmp \
 		test_cluster_undo_capacity_history_policy.inc test_cluster_undo_capacity_history_policy.inc.tmp \
 		cluster_undo_capacity_unit.o test_cluster_undo_capacity test_cluster_undo_capacity_history
+
+# Compose the original early preflight with real BIND and empty-undo finish.
+TESTS += test_cluster_empty_undo_preflight
+all: test_cluster_empty_undo_preflight
+
+test_cluster_empty_undo_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/backend/executor/execMain.c Makefile
+	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
+	     { print "static bool"; emit=1; n++ } \
+	     /^cluster_heap_itl_require_top_xact\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_heap_preflight_write\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if(n != 4 || emit) exit 1 }' $< > $@.tmp
+	awk '/^cluster_executor_preflight_write\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if(n != 1 || emit) exit 1 }' \
+		$(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_empty_undo_preflight: test_cluster_empty_undo_preflight.c \
+		test_cluster_empty_undo_preflight.inc test_cluster_tt_active_owner.c \
+		test_cluster_tt_durable.c test_cluster_tt_locator_stats.inc \
+		test_cluster_active_capacity_stats.inc unit_test.h $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/backend/nodes/list.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-empty-undo-preflight
+.PHONY: clean-empty-undo-preflight
+clean-empty-undo-preflight:
+	rm -f test_cluster_empty_undo_preflight.inc test_cluster_empty_undo_preflight.inc.tmp \
+		test_cluster_empty_undo_preflight
