@@ -79,7 +79,7 @@ recovery_undo_layout(const UndoSegmentHeaderData *prefix, uint32 segment, uint8 
 			|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
 			return CLUSTER_RECOVERY_UNDO_CORRUPT;
 		if (slot->status == TT_SLOT_UNUSED) {
-			if (slot->original_full_xid != 0)
+			if (!TTSlotV2_is_zero(slot))
 				return CLUSTER_RECOVERY_UNDO_CORRUPT;
 		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
 			|| (TransactionId)slot->original_full_xid != slot->xid)

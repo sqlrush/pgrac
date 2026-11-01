@@ -1986,7 +1986,7 @@ current_lifecycle_page_valid(const char page[BLCKSZ], const ClusterUndoBlock0Log
 			|| slot->wrap == TT_WRAP_INVALID || slot->commit_scn == UINT64_MAX)
 			return false;
 		if (slot->status == TT_SLOT_UNUSED) {
-			if (slot->original_full_xid != 0)
+			if (!TTSlotV2_is_zero(slot))
 				return false;
 		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
 				   || (TransactionId)slot->original_full_xid != slot->xid)

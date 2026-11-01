@@ -158,7 +158,7 @@ cluster_vis_tt_v2_slot_copy(const TTSlotV2 *source, TTSlot *out)
 		|| source->wrap == TT_WRAP_INVALID || source->commit_scn == UINT64_MAX)
 		return false;
 	if (source->status == TT_SLOT_UNUSED) {
-		if (source->original_full_xid != 0)
+		if (!TTSlotV2_is_zero(source))
 			return false;
 	} else if (!TransactionIdIsNormal(source->xid) || source->original_full_xid == UINT64_MAX
 			   || (TransactionId)source->original_full_xid != source->xid)

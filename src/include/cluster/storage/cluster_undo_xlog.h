@@ -570,7 +570,7 @@ cluster_undo_head_operation_v2_decide(uint32 generation, const TTSlotV2 *slot,
 			|| slot->commit_scn == UINT64_MAX)
 			return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
 		if (slot->status == TT_SLOT_UNUSED) {
-			if (slot->original_full_xid != 0)
+			if (!TTSlotV2_is_zero(slot))
 				return CLUSTER_UNDO_HEAD_OPERATION_BLOCKED;
 		} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
 				   || (TransactionId)slot->original_full_xid != slot->xid)

@@ -912,7 +912,7 @@ undo_prepare_tt_header_v2(const ClusterUndoDecoded *decoded, const uint8 *payloa
 		|| (slot->flags & ~TT_SLOT_FLAGS_KNOWN) != 0 || slot->commit_scn == UINT64_MAX)
 		return CLUSTER_UNDO_HEADER_BLOCKED;
 	if (slot->status == TT_SLOT_UNUSED) {
-		if (slot->original_full_xid != 0)
+		if (!TTSlotV2_is_zero(slot))
 			return CLUSTER_UNDO_HEADER_BLOCKED;
 	} else if (!TransactionIdIsNormal(slot->xid) || slot->original_full_xid == UINT64_MAX
 			   || (TransactionId)slot->original_full_xid != slot->xid

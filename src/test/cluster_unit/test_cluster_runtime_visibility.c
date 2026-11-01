@@ -1440,10 +1440,38 @@ UT_TEST(test_page_exact_locator_preserves_selected_slot)
 	free(source);
 }
 
+/* A good terminal prefix must not hide a malformed UNUSED inventory slot. */
+UT_TEST(test_ttproof_v2_dirty_unused_poison_clears_outputs)
+{
+	for (unsigned byte = 0; byte < 40; byte++) {
+		UndoSegmentHeaderDataV2 *hdr = mk_exact_header_v2();
+		PGAlignedBlock before;
+		int matches = -1;
+		ClusterVisTtProof proof = CLUSTER_VIS_TT_PROOF_COMMITTED;
+		SCN scn = 999;
+		uint16 wrap = 9;
+
+		hdr->tt_slots[0].xid = 1000;
+		hdr->tt_slots[0].wrap = 12;
+		hdr->tt_slots[0].status = TT_SLOT_COMMITTED;
+		hdr->tt_slots[0].commit_scn = 777;
+		hdr->tt_slots[0].original_full_xid = UINT64_C(0x7000003e8);
+		((unsigned char *)&hdr->tt_slots[47])[byte] = 1;
+		memcpy(before.data, exact_proof_block.data, BLCKSZ);
+		UT_ASSERT_EQ(cluster_vis_tt_block_xid_scan(exact_proof_block.data, PROOF_SEG,
+			PROOF_OWNER, 1000, &matches, &proof, &scn, &wrap), CLUSTER_VIS_TT_BLOCK_SCAN_POISONED);
+		UT_ASSERT_EQ(matches, 0);
+		UT_ASSERT_EQ(proof, CLUSTER_VIS_TT_PROOF_NONE);
+		UT_ASSERT_EQ(scn, InvalidScn);
+		UT_ASSERT_EQ(wrap, TT_WRAP_INVALID);
+		UT_ASSERT_EQ(memcmp(before.data, exact_proof_block.data, BLCKSZ), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(36);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -1479,6 +1507,7 @@ main(void)
 	UT_RUN(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo);
 	UT_RUN(test_freshref_failclosed_records_exact_first_local_predicate);
 	UT_RUN(test_page_exact_locator_preserves_selected_slot);
+	UT_RUN(test_ttproof_v2_dirty_unused_poison_clears_outputs);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

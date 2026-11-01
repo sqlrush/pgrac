@@ -775,10 +775,35 @@ UT_TEST(test_legacy_inventory_does_not_retrofit_original_fullxid)
 	cluster_recovery_undo_scan_destroy(scan);
 }
 
+/* A sealed page cannot export a partial inventory around a dirty UNUSED. */
+UT_TEST(test_tt40_unused_requires_every_byte_zero_before_export)
+{
+	const unsigned offsets[] = { 0, 23, 46 };
+
+	for (unsigned i = 0; i < lengthof(offsets); i++) {
+		for (unsigned byte = 0; byte < 40; byte++) {
+			PGAlignedBlock page, before;
+			UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)page.data;
+			ClusterRecoveryUndoScan *scan = NULL;
+			ClusterRecoveryUndoResult result;
+
+			tt40_page(&page);
+			((unsigned char *)&header->tt_slots[offsets[i]])[byte] = 1;
+			UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+			memcpy(before.data, page.data, BLCKSZ);
+			result = cluster_recovery_undo_scan_begin(page.data, BLCKSZ, 257, 2, &scan);
+			UT_ASSERT_EQ(result, CLUSTER_RECOVERY_UNDO_CORRUPT);
+			UT_ASSERT_NULL(scan);
+			UT_ASSERT_EQ(memcmp(before.data, page.data, BLCKSZ), 0);
+			cluster_recovery_undo_scan_destroy(scan);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
 	UT_RUN(test_protected_header_rejects_single_byte_damage_before_export);
 	UT_RUN(test_torn_header_is_not_a_stable_qualified_base);
 	UT_RUN(test_original_initializer_and_generation_zero);
@@ -798,6 +823,7 @@ main(void)
 	UT_RUN(test_tt40_invalid_version_or_last_slot_refuses_before_any_prefix);
 	UT_RUN(test_tt40_checksum_and_wrong_owner_never_export_inventory);
 	UT_RUN(test_legacy_inventory_does_not_retrofit_original_fullxid);
+	UT_RUN(test_tt40_unused_requires_every_byte_zero_before_export);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

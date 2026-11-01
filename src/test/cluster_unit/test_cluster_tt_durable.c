@@ -5015,10 +5015,23 @@ UT_TEST(test_legacy_redo_rejects_tt40_before_mutation_or_durability)
 	reset_header_read_mock();
 }
 
+/* A dirty UNUSED tail poisons resolve, locate and retention inventory alike. */
+UT_TEST(test_scan_v2_dirty_unused_does_not_export_terminal_prefix)
+{
+	for (unsigned byte = 0; byte < 40; byte++) {
+		UndoSegmentHeaderDataV2 *header = (UndoSegmentHeaderDataV2 *)g_canned_block;
+
+		scan_v2_reset();
+		seed_scan_v2_slot(0, TT_SLOT_COMMITTED, 100, 7, 5);
+		((unsigned char *)&header->tt_slots[47])[byte] = 1;
+		scan_expect_unavailable_without_output();
+	}
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(142);
+	UT_PLAN(143);
 
 	UT_RUN(test_layout_sizes);
 
@@ -5175,6 +5188,7 @@ main(int argc, char **argv)
 	UT_RUN(test_lookup_v2_prefix_cannot_authorize_legacy_side_mutations);
 	UT_RUN(test_legacy_preflight_refuses_every_nonzero_layout_byte);
 	UT_RUN(test_legacy_redo_rejects_tt40_before_mutation_or_durability);
+	UT_RUN(test_scan_v2_dirty_unused_does_not_export_terminal_prefix);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }

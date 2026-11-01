@@ -191,6 +191,15 @@ TTSlot_is_committed(const TTSlot *slot)
 	return slot->status == TT_SLOT_COMMITTED && SCN_VALID(slot->commit_scn);
 }
 
+/* An UNUSED V2 slot has no residual transaction, SCN, flags or undo head. */
+static inline bool
+TTSlotV2_is_zero(const TTSlotV2 *slot)
+{
+	static const TTSlotV2 zero = { 0 };
+
+	return memcmp(slot, &zero, sizeof(*slot)) == 0;
+}
+
 
 /*
  * ============================================================
