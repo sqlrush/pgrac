@@ -29,6 +29,21 @@ test_k_mx_g5_full_recompose: test_k_mx_g5_full_recompose.c test_cluster_mx_compo
 		$(K_MX_FULL_RECOMPOSE_TRANSAM_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
+K_MX_FULL_DECISION_O ?= $(top_builddir)/src/backend/cluster/cluster_multixact_decision.o
+K_MX_FULL_DECISION_LOCK_O ?= test_k_mx_g5_full_decision_lock.o
+$(K_MX_FULL_DECISION_LOCK_O): $(top_srcdir)/src/backend/storage/lmgr/lock.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+test_k_mx_g5_full_decision: test_k_mx_g5_full_decision.c test_k_mx_g5_full_recompose.c \
+		test_cluster_mx_composition.c unit_test.h $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
+		$(K_MX_FULL_DECISION_O) $(K_MX_FULL_RECOMPOSE_O) \
+		$(K_MX_FULL_RECOMPOSE_CURRENT_O) $(K_MX_FULL_RECOMPOSE_TRANSAM_O) \
+		$(K_MX_FULL_DECISION_LOCK_O) $(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
+		$(K_MX_FULL_DECISION_O) $(K_MX_FULL_RECOMPOSE_O) \
+		$(K_MX_FULL_RECOMPOSE_CURRENT_O) $(K_MX_FULL_RECOMPOSE_TRANSAM_O) \
+		$(K_MX_FULL_DECISION_LOCK_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
 test_k_mx_g5_service: test_k_mx_g5_service.c test_cluster_mx_native_range.c \
 		test_cluster_mx_composition.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/multixact.c \

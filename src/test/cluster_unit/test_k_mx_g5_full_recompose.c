@@ -6,8 +6,9 @@ int k_full_recompose_fixture_main(void);
 #undef main
 
 static ClusterMxCompositionReceive *
-k_plan_input(uint32 total, bool active, bool tail_only, bool updater,
-			 bool finish_proofs, ClusterMxCompositionReceiveStats *stats)
+k_plan_input_status(uint32 total, bool active, bool tail_only, bool updater,
+			 bool finish_proofs, ClusterMxCompositionReceiveStats *stats,
+			 MultiXactStatus updater_status)
 {
 	ClusterMxCompositionReceive *op = begin(total, stats);
 	ClusterCurrentMxMemberDesc members[256];
@@ -17,7 +18,7 @@ k_plan_input(uint32 total, bool active, bool tail_only, bool updater,
 		ClusterMxCompositionReply r = reply(total, first, n, members);
 		for (uint32 i = 0; i < n; i++)
 			members[i].member_status = updater && first + i + 1 == total
-				? MultiXactStatusUpdate : MultiXactStatusForShare;
+				? updater_status : MultiXactStatusForShare;
 		UT_ASSERT_EQ(cluster_mx_composition_accept(&op, MXCOMP_READ_OK, &r),
 			r.last ? MXCOMP_COMPLETE : MXCOMP_PARTIAL);
 		first += n;
@@ -37,7 +38,7 @@ k_plan_input(uint32 total, bool active, bool tail_only, bool updater,
 			proofs[i].member_ordinal = first + i; proofs[i].origin_node_id = 2;
 			q->member_xid = 100 + first + i; q->member_ordinal = i;
 			q->member_status = updater && first + i + 1 == total
-				? MultiXactStatusUpdate : MultiXactStatusForShare;
+				? updater_status : MultiXactStatusForShare;
 			q->state = live ? CCM_ACTIVE : CCM_COMMITTED;
 			if (live) {
 				q->key.origin_node_id = 2; q->key.undo_segment_id = 1;
@@ -55,6 +56,14 @@ k_plan_input(uint32 total, bool active, bool tail_only, bool updater,
 		first += n;
 	}
 	return op;
+}
+
+static ClusterMxCompositionReceive *
+k_plan_input(uint32 total, bool active, bool tail_only, bool updater,
+			 bool finish_proofs, ClusterMxCompositionReceiveStats *stats)
+{
+	return k_plan_input_status(total, active, tail_only, updater, finish_proofs,
+		stats, MultiXactStatusUpdate);
 }
 
 static MultiXactMember **
@@ -216,7 +225,10 @@ UT_TEST(updater_rules_are_preserved_across_pages)
 		k_output_free(out, 258); cluster_mx_composition_finish(&op); check_discarded(op);
 	}
 }
-int main(void)
+#ifndef K_MX_FULL_RECOMPOSE_MAIN
+#define K_MX_FULL_RECOMPOSE_MAIN main
+#endif
+int K_MX_FULL_RECOMPOSE_MAIN(void)
 {
 	UT_PLAN(8);
 	UT_RUN(terminal_sets_recompose_through_65537_real_members);

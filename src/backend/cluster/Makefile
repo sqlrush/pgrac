@@ -370,6 +370,7 @@ OBJS = \
 	cluster_subtrans.o \
 	cluster_multixact.o \
 	cluster_multixact_composition.o \
+	cluster_multixact_decision.o \
 	cluster_multixact_recompose.o \
 	cluster_multixact_current.o \
 	cluster_multixact_current_stats.o \

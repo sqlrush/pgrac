@@ -127,6 +127,29 @@ cluster_mx_composition_accept_proofs(ClusterMxCompositionReceive **op,
 									 const ClusterMxProofReply *reply);
 extern const ClusterMxCompositionProofPage *
 cluster_mx_composition_proofs(const ClusterMxCompositionReceive *op, uint32 *total);
+/* Process-local global positions; embedded canonical ordinals stay local to
+ * their original proof frame. Neither wrapper is a wire or durable layout. */
+typedef struct ClusterMxFullUpdaterChallenge {
+	uint32 member_ordinal;
+	ClusterCurrentUpdaterChallenge challenge;
+} ClusterMxFullUpdaterChallenge;
+
+typedef struct ClusterMxFullUpdaterProof {
+	uint32 member_ordinal;
+	ClusterCurrentUpdaterProof proof;
+} ClusterMxFullUpdaterProof;
+
+/* Pure candidate from one complete, immutable G2 operation. No proof service,
+ * qualification or publication is performed. The original caller still owes
+ * source/grant/tuple/fence checks and a qualified SELF projection; raw foreign
+ * data cannot manufacture SELF. wait_key is nonzero only for final WAIT.
+ * Diagnostic ordinals are global int32, within the native positive-int32 N.
+ */
+extern ClusterCurrentMxDecision cluster_mx_composition_decide(
+	const ClusterMxCompositionReceive *op, const ClusterCurrentMxRequestContext *ctx,
+	const ClusterMxFullUpdaterChallenge *challenge, const ClusterMxFullUpdaterProof *updater_proof,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace);
+
 /* Pure normalization plan from the same complete composition/proof operation.
  * No allocation, touch, receipt, grant requalification or publication occurs.
  * The caller supplies ceil(cap / PAGE_MEMBERS) distinct writable pages, each
