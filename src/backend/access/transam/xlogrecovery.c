@@ -3926,6 +3926,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	char *tuple_bytes;
 	ClusterRecoveryCTRCGraphV2 contribution = {0};
 	ClusterRecoveryTxResultObservationV1 accepted = {0};
+	ClusterColdRelmapTerminalCheckV1 *relmap_saved, *relmap_current;
 	const ClusterRecoveryCensusReferencesV1 *references;
 	const ClusterColdCtrcWorkV1 *work;
 	ClusterWalInputsV1 *scope;
@@ -3934,11 +3935,13 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	Size graph_node_offset = 0, graph_edge_offset = 0, graph_root_offset = 0;
 	Size tuple_offsets_offset = 0, tuple_bytes_offset = 0, tuple_key_offset = 0, reference_node_offset = 0;
 	Size tuple_node_offset = 0;
+	Size relmap_offset = 0;
 	Size tuple_length = 0;
 	const Size reference_capacity = MAXPGPATH + 105;
 	uint32 reference_count, owner_count, source_count, wal_count, terminal_count, edge_count = 0, max_edges = 0;
 	uint32 unresolved_count = 0;
 	bool ready = false;
+	bool relmap_declared;
 
 	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	if (start == NULL || start != cluster_recovery_cold_start || !cluster_recovery_cold_ctrc_replays_actor()
@@ -3950,6 +3953,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	owner_count = start->ctrc_page_progress->target_count; source_count = start->ctrc_page_source_count;
 	wal_count = start->ctrc_page_wal_count; work = start->ctrc_observation_work; scope = start->ctrc_observation_inputs;
 	if (work == NULL) return out;
+	relmap_declared = start->relmap_declared;
 	terminal_count = projected ? work->counts.subject_count : 0;
 	out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	if (owner_count == 0 || source_count == 0 || source_count > RF_PAGE_STABLE_MAX_PARTICIPANTS) goto refused;
@@ -4004,6 +4008,8 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count * source_count, sizeof(uint32), &indexes_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, stride, &data_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, terminal_count, sizeof(*terminals), &terminal_offset)
+		|| (relmap_declared && !cluster_recovery_cold_page_reference_reserve(&bytes, 2,
+			sizeof(*relmap_saved), &relmap_offset))
 		|| (projected && (!cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*nodes), &graph_node_offset)
 			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 3 * reference_count, sizeof(*edges), &graph_edge_offset)
 			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*roots), &graph_root_offset)
@@ -4026,6 +4032,16 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 			observed = (ClusterRecoveryWalSourceObservationV1 *)((char *)entries + observed_offset);
 			fixed_references = (ClusterRecoveryCensusReferenceV1 *)((char *)entries + reference_offset);
 			terminals = (ClusterColdTtSlotInputV1 *)((char *)entries + terminal_offset);
+			relmap_saved = relmap_declared
+				? (ClusterColdRelmapTerminalCheckV1 *)((char *)entries + relmap_offset) : NULL;
+			relmap_current = relmap_declared ? relmap_saved + 1 : NULL;
+			/* Capture happened in the original replay scope. This same Start
+			 * only rechecks its immutable terminal values and FD/mutation
+			 * identity; neither polarity supplies a PAGE or relmap completion. */
+			valid = !relmap_declared
+				|| (cluster_cold_relmap_terminal_recheck_v1(start, relmap_saved)
+					&& relmap_saved->count != 0
+					&& relmap_saved->count == cluster_cold_typed_relmap_replay_count_v1(start->inputs));
 			memcpy(sources, start->ctrc_page_sources, (Size)source_count * sizeof(*sources));
 			memcpy(fixed_references, references->entries, (Size)reference_count * sizeof(*fixed_references));
 			tuple_offsets = (Size *)((char *)entries + tuple_offsets_offset);
@@ -4284,7 +4300,11 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 				ready = valid && cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
 					sources, observed, source_count, wal_count, references, fixed_references, reference_count)
 					&& (!projected || cluster_recovery_cold_page_tuple_bytes_current(references,
-						fixed_references, reference_count, tuple_offsets, tuple_bytes));
+						fixed_references, reference_count, tuple_offsets, tuple_bytes))
+					&& start->relmap_declared == relmap_declared
+					&& (!relmap_declared
+						|| (cluster_cold_relmap_terminal_recheck_v1(start, relmap_current)
+							&& memcmp(relmap_saved, relmap_current, sizeof(*relmap_saved)) == 0));
 			}
 		}
 	}
@@ -9172,6 +9192,7 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	uint16		origins = cluster_recovery_merge_fence_plan_origin_count(plan);
 	uint16		thread = 0;
 	int			detail = 0;
+	uint32		relmap_count;
 
 	if (!cluster_cold_typed_effects_complete_v1(rep->typed, &rep->effects, result))
 		cluster_typed_replay_unpublished(
@@ -9187,6 +9208,14 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	if (!cluster_cold_typed_relmap_ready_v1(rep->typed, plan))
 		cluster_typed_replay_unpublished(thread,
 			"Declared relmap receipts or their original protection are incomplete", 0);
+	/* The real terminal reader needs the original replay scope, before its
+	 * IR release and the later installed writer exist. Keep only its typed
+	 * receipt/FD across that boundary; Start binds the successor once. */
+	relmap_count = cluster_cold_typed_relmap_replay_count_v1(rep->typed);
+	if (relmap_count == UINT32_MAX
+		|| (relmap_count != 0 && !cluster_cold_relmap_terminal_capture_v1(rep->typed, plan)))
+		cluster_typed_replay_unpublished(thread,
+			"Declared relmap terminal inputs could not be retained", 0);
 	/* Retain read-only ACTIVE inputs before the original pass-2 authority
 	 * is released. Unproven tops stay explicit; C0 requires its own later
 	 * TX_CLOSURE source/isolation and writer authority after native EOR. */

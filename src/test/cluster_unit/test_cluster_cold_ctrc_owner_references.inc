@@ -4,6 +4,7 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 static unsigned owner_reference_fault;
 static void (*owner_scope_before_startup)(void);
+static void (*owner_scope_after_subject)(void);
 
 static ClusterRecoveryCensusReferencesV1 *
 owner_references_ready(bool unchanged, uint32 owners)
@@ -13,6 +14,7 @@ owner_references_ready(bool unchanged, uint32 owners)
 	final_projection_ready(unchanged); final_projection_check = false;
 	prefix_count = owners;
 	if (owner_scope_before_startup != NULL) owner_scope_before_startup();
+	if (owner_scope_after_subject != NULL) owner_scope_after_subject();
 	retirement_run_startup(); UT_ASSERT(retirement_service_reached);
 	startup_image_calls = 0; memset(&startup_image_expected, 93, sizeof(startup_image_expected));
 	start_ref_fault = start_ref_calls = owner_reference_fault = 0; start_ref_complete = true;

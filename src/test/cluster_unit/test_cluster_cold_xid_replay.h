@@ -27,6 +27,8 @@ static unsigned replay_effects_calls;
 static unsigned replay_census_calls;
 static bool replay_census_ok;
 static bool replay_relmap_ok;
+static uint32 replay_relmap_count;
+static unsigned replay_terminal_capture_calls;
 
 /* The original publish function must stop before handing off any failed cut. */
 static bool replay_ready_ok, replay_fatal_armed;
@@ -57,6 +59,27 @@ replay_event(char event)
 		abort();
 	replay_events[replay_event_count++] = event;
 	replay_events[replay_event_count] = '\0';
+}
+
+/* This publisher fixture has no original terminal reader. A declared batch
+ * must reach the production capture entry and refuse, never borrow a true
+ * terminal provider from an unrelated phase. */
+uint32
+cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
+{
+	UT_ASSERT(typed == &replay_typed);
+	return replay_relmap_count;
+}
+
+bool
+cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	UT_ASSERT(typed == &replay_typed);
+	UT_ASSERT(fence == (struct ClusterRecoveryFencePlan *)&replay_fence);
+	replay_terminal_capture_calls++;
+	replay_event('T');
+	return false;
 }
 
 bool
@@ -170,6 +193,23 @@ cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, ui
 	*failed_thread = 3;
 	*failed_detail = 17;
 	return replay_complete_result;
+}
+
+bool
+cluster_cold_typed_sources_readback_v1(void *arg, ClusterRecoveryFencePlan *plan)
+{
+	UT_ASSERT(arg == &replay_typed);
+	UT_ASSERT(plan == (ClusterRecoveryFencePlan *)&replay_fence);
+	return replay_readback_ok;
+}
+
+ClusterRecoveryFenceCompleteV1
+cluster_recovery_merge_fence_plan_complete_checked_v1(ClusterRecoveryFencePlan *plan,
+	ClusterRecoveryPostIrCheckV1 check, void *arg, uint16 *thread, int *detail)
+{
+	UT_ASSERT(check == cluster_cold_typed_sources_readback_v1);
+	UT_ASSERT(check(arg, plan));
+	return cluster_recovery_merge_fence_plan_complete_v1(plan, thread, detail);
 }
 
 void
@@ -369,6 +409,7 @@ replay_xid_reset(int count)
 	replay_barrier_calls = replay_readback_calls = replay_endpoint_calls = 0;
 	replay_effects_calls = 0;
 	replay_census_calls = 0;
+	replay_relmap_count = replay_terminal_capture_calls = 0;
 	replay_census_ok = true;
 	replay_ready_calls = replay_complete_calls = replay_external_calls = 0;
 	replay_fatal_calls = replay_log_calls = 0;
@@ -675,6 +716,28 @@ UT_TEST(test_startup_publish_requires_both_original_and_relmap_receipts)
 	}
 }
 
+UT_TEST(test_startup_publish_captures_declared_terminal_before_scope_handoff)
+{
+	for (unsigned invalid = 0; invalid < 2; ++invalid) {
+		ClusterColdReplayResultV1 result = {.detail = CLUSTER_COLD_REPLAY_OK};
+		bool refused = false;
+		replay_xid_reset(1);
+		replay_relmap_count = invalid ? UINT32_MAX : 1;
+		replay_fatal_armed = true;
+		if (setjmp(replay_fatal) == 0)
+			cluster_typed_replay_publish(&replay_adapter, &result);
+		else
+			refused = true;
+		replay_fatal_armed = false;
+		UT_ASSERT(refused);
+		UT_ASSERT_EQ(replay_terminal_capture_calls, !invalid);
+		UT_ASSERT_EQ(replay_census_calls, 0);
+		UT_ASSERT_EQ(replay_complete_calls, 0);
+		UT_ASSERT_EQ(replay_external_calls, 0);
+		UT_ASSERT(strcmp(replay_events, invalid ? "ECBRX" : "ECBRXT") == 0);
+	}
+}
+
 UT_TEST(test_startup_publish_propagates_all_completion_refusals)
 {
 	/* Every original completion failure, including unknown results, is fatal. */
@@ -690,7 +753,8 @@ UT_TEST(test_startup_publish_propagates_all_completion_refusals)
 		}
 		replay_fatal_armed = false;
 		UT_ASSERT_EQ(replay_error_level, FATAL);
-		UT_ASSERT_EQ(replay_sqlstate, ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(replay_sqlstate, failure == CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE
+			? ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT : ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED);
 		UT_ASSERT_EQ(replay_fatal_calls, 1);
 		UT_ASSERT_EQ(replay_log_calls, 0);
 		UT_ASSERT_EQ(replay_complete_calls, 1);

@@ -8,6 +8,10 @@ int terminal_retained_fixture_main(int argc, char **argv);
 #include "cluster/cluster_recovery_plan.h"
 #include "test_cluster_cold_relmap_terminal_namespace.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
+#ifdef TEST_TERMINAL_REAL_START
+#include "test_cluster_relmap_original_start.h"
+static bool terminal_real_start;
+#endif
 
 static ClusterClogNativeBaseHandleV1 *terminal_last_native;
 bool cluster_clog_native_terminal_seal_v1(ClusterClogNativeBaseHandleV1 *held)
@@ -55,6 +59,9 @@ bool terminal_output_distinct(const struct ClusterRecoveryStartV1 *start,
 bool terminal_output_distinct(const struct ClusterRecoveryStartV1 *start,
 	const void *out, Size bytes)
 {
+#ifdef TEST_TERMINAL_REAL_START
+	if (terminal_real_start) return test_relmap_start_distinct(start, out, bytes);
+#endif
 	return start == terminal_start && out != NULL && bytes != 0
 		&& !cold_relmap_storage_overlap(out, bytes, start, sizeof(terminal_owner))
 		&& cold_relmap_output_distinct(&terminal_typed, out, bytes);
@@ -98,6 +105,9 @@ void terminal_held_locks(void (*callback)(LWLock *, LWLockMode, void *), void *a
 
 bool terminal_start_current(const struct ClusterRecoveryStartV1 *start)
 {
+#ifdef TEST_TERMINAL_REAL_START
+	if (terminal_real_start) return test_relmap_start_current(start);
+#endif
 	terminal_current_calls++;
 	if (terminal_throw) siglongjmp(*PG_exception_stack, 1);
 	return start == terminal_start && terminal_current && !terminal_revoked
@@ -105,19 +115,31 @@ bool terminal_start_current(const struct ClusterRecoveryStartV1 *start)
 }
 void terminal_start_fail(const struct ClusterRecoveryStartV1 *start)
 {
+#ifdef TEST_TERMINAL_REAL_START
+	if (terminal_real_start) { test_relmap_start_fail(start); return; }
+#endif
 	if (start == terminal_start) terminal_revoked = true;
 }
 const ClusterColdTypedV1 *terminal_start_inputs(const struct ClusterRecoveryStartV1 *start)
 {
+#ifdef TEST_TERMINAL_REAL_START
+	if (terminal_real_start) return test_relmap_start_inputs(start);
+#endif
 	return terminal_start_current(start) ? &terminal_typed : NULL;
 }
 bool terminal_start_owner(const struct ClusterRecoveryStartV1 *start, ClusterRecoveryCheckpointOwnerV1 *out)
 {
+#ifdef TEST_TERMINAL_REAL_START
+	if (terminal_real_start) return test_relmap_start_owner(start, out);
+#endif
 	if (!terminal_start_current(start)) return false;
 	*out = terminal_owner; return true;
 }
 bool terminal_installed_writer(ClusterWalWriterToken *writer, uint8 operation[16], uint64 *generation)
 {
+#ifdef TEST_TERMINAL_REAL_START
+	if (terminal_real_start) return test_relmap_start_writer(writer, operation, generation);
+#endif
 	terminal_writer_calls++;
 	if (inputs_native_recovery) return false; /* actual original xlog role gate */
 	*writer = terminal_owner.writer;
@@ -153,6 +175,10 @@ void terminal_held_locks(void (*callback)(LWLock *, LWLockMode, void *), void *a
 static void terminal_setup(bool aborted)
 {
 	ClusterColdRelmapInputV1 *input = &terminal_input.input;
+#ifdef TEST_TERMINAL_REAL_START
+	terminal_real_start = false;
+	MyProcPid = getpid();
+#endif
 	cold_native_real_scope = cold_native_real_clog = true;
 	cold_native_setup(false, aborted, false);
 	memset(&terminal_typed, 0, sizeof(terminal_typed));
@@ -215,6 +241,10 @@ static void terminal_leave(void)
 }
 static void terminal_done(void)
 {
+#ifdef TEST_TERMINAL_REAL_START
+	if (terminal_real_start) UT_ASSERT(test_relmap_start_done());
+	terminal_real_start = false;
+#endif
 	/* Original context cleanup only; never publish or transfer test pins. */
 	cold_relmap_terminal_cleanup(&terminal_plan);
 	inputs_native_recovery = true;
@@ -470,9 +500,102 @@ UT_TEST(test_terminal_duplicate_and_partial_error_are_one_shot)
 	terminal_done();
 }
 
+
+#ifdef TEST_TERMINAL_REAL_START
+static bool terminal_bind_original_start(void)
+{
+	terminal_leave();
+	terminal_real_start = true;
+	terminal_start = test_relmap_start_begin(&terminal_typed, MyProcPid);
+	return terminal_start != NULL;
+}
+
+UT_TEST(test_terminal_original_start_commit_abort_and_repeat)
+{
+	for (unsigned aborted = 0; aborted < 2; ++aborted) {
+		ClusterColdRelmapTerminalCheckV1 *out = calloc(1, sizeof(*out));
+		unsigned reads, syncs;
+		terminal_setup(aborted != 0);
+		UT_ASSERT(cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+		if (terminal_bind_original_start()) {
+			reads = prefix_base_reads; syncs = test_relmap_native_clog_stats().file_syncs;
+			UT_ASSERT(test_relmap_start_inputs(terminal_start) == &terminal_typed);
+			UT_ASSERT(cluster_cold_relmap_terminal_recheck_v1(terminal_start, out));
+			UT_ASSERT(out->count == 1 && out->entries[0].status ==
+				(aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED));
+			UT_ASSERT(cluster_cold_relmap_terminal_recheck_v1(terminal_start, out));
+			UT_ASSERT_EQ(prefix_base_reads, reads);
+			UT_ASSERT_EQ(test_relmap_native_clog_stats().file_syncs, syncs);
+			UT_ASSERT(test_relmap_start_pending() && !terminal_pins.transferred);
+		} else UT_ASSERT(false);
+		free(out); terminal_done();
+	}
+}
+
+UT_TEST(test_terminal_original_start_drift_keeps_debt)
+{
+	for (unsigned fault = 0; fault < 5; ++fault) {
+		ClusterColdRelmapTerminalCheckV1 *out = calloc(1, sizeof(*out));
+		terminal_setup(false);
+		UT_ASSERT(cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+		if (terminal_bind_original_start()) {
+			UT_ASSERT(cluster_cold_relmap_terminal_recheck_v1(terminal_start, out));
+			test_relmap_start_fault(fault);
+			UT_ASSERT(!cluster_cold_relmap_terminal_recheck_v1(terminal_start, out));
+			UT_ASSERT(out->count == 0 && !test_relmap_start_current(terminal_start));
+			UT_ASSERT(!terminal_pins.transferred && terminal_pins.count == 1);
+			UT_ASSERT_EQ(test_relmap_native_clog_stats().open_fds, 1);
+		} else UT_ASSERT(false);
+		free(out); terminal_done();
+	}
+}
+
+UT_TEST(test_terminal_original_start_full_alias_guard)
+{
+	terminal_setup(false);
+	UT_ASSERT(cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+	if (terminal_bind_original_start()) {
+		const void *aliases[] = {terminal_start, (const char *)terminal_start + 8,
+			&terminal_typed, &terminal_plan, &terminal_input, &terminal_pins,
+			terminal_plan.relmap_terminal};
+		for (unsigned i = 0; i < lengthof(aliases); ++i) {
+			unsigned char before[16];
+			memcpy(before, aliases[i], sizeof(before));
+			UT_ASSERT(!cluster_cold_relmap_terminal_recheck_v1(terminal_start,
+				(ClusterColdRelmapTerminalCheckV1 *)aliases[i]));
+			UT_ASSERT_EQ(memcmp(before, aliases[i], sizeof(before)), 0);
+			UT_ASSERT(test_relmap_start_current(terminal_start));
+		}
+		UT_ASSERT(test_relmap_start_pending() && !terminal_pins.transferred);
+	} else UT_ASSERT(false);
+	terminal_done();
+}
+
+UT_TEST(test_terminal_original_start_missing_capture_refuses)
+{
+	ClusterColdRelmapTerminalCheckV1 *out = calloc(1, sizeof(*out));
+	terminal_setup(false);
+	if (terminal_bind_original_start()) {
+		UT_ASSERT(!cluster_cold_relmap_terminal_recheck_v1(terminal_start, out));
+		UT_ASSERT(out->count == 0 && !test_relmap_start_current(terminal_start));
+		UT_ASSERT(!terminal_pins.transferred && terminal_pins.count == 1);
+		UT_ASSERT_EQ(test_relmap_native_clog_stats().calls, 0);
+	} else UT_ASSERT(false);
+	free(out); terminal_done();
+}
+#endif
+
 int main(int argc, char **argv)
 {
 	test_program_path = argv[0]; setup_fixture();
+#ifdef TEST_TERMINAL_REAL_START
+	UT_PLAN(4);
+	UT_RUN(test_terminal_original_start_commit_abort_and_repeat);
+	UT_RUN(test_terminal_original_start_drift_keeps_debt);
+	UT_RUN(test_terminal_original_start_full_alias_guard);
+	UT_RUN(test_terminal_original_start_missing_capture_refuses);
+	UT_DONE(); return ut_failed_count != 0;
+#endif
 	if (argc > 1 && strcmp(argv[1], "handoff") == 0) {
 		UT_PLAN(2);
 		UT_RUN(test_terminal_capture_handoff_real_commit_abort);
