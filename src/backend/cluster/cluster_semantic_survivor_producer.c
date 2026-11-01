@@ -49,7 +49,8 @@ survivor_producer_context(ClusterSurvivorProducerOwner owner)
   || !survivor_producer_family(owner))
   return false;
  if (owner == CLUSTER_SURVIVOR_PRODUCER_BACKEND
-  && (MyBackendId == InvalidBackendId || MyProc->backendId != MyBackendId))
+  && (proc_exit_inprogress || MyBackendId == InvalidBackendId
+   || MyProc->backendId != MyBackendId))
   return false;
  if (owner == CLUSTER_SURVIVOR_PRODUCER_INPUT_JOBS
   && (proc_exit_inprogress || CurrentResourceOwner == NULL
@@ -93,7 +94,7 @@ cluster_semantic_survivor_producer_poll(ClusterSurvivorProducerOwner owner,
   return survivor_producer_unknown(out, CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE,
    "SURVIVOR_PRODUCER_EPOCH_CHANGED");
  proc = MyProc; backend = MyBackendType; aux = MyAuxProcType;
- resource = owner == CLUSTER_SURVIVOR_PRODUCER_INPUT_JOBS ? CurrentResourceOwner : NULL;
+ resource = owner == CLUSTER_SURVIVOR_PRODUCER_NATIVE ? NULL : CurrentResourceOwner;
  pid = MyProcPid; pgprocno = proc->pgprocno; backend_id = proc->backendId;
  generation = proc->cluster_grd_generation;
  switch (owner) {
@@ -131,6 +132,7 @@ cluster_semantic_survivor_producer_poll(ClusterSurvivorProducerOwner owner,
   || MyBackendType != backend || MyAuxProcType != aux || MyProcPid != pid
   || proc->pgprocno != pgprocno || proc->backendId != backend_id
   || proc->cluster_grd_generation != generation
+  || (owner == CLUSTER_SURVIVOR_PRODUCER_BACKEND && CurrentResourceOwner != resource)
   || (owner == CLUSTER_SURVIVOR_PRODUCER_INPUT_JOBS
    && (CurrentResourceOwner != resource || AuxProcessResourceOwner != resource)))
   return survivor_producer_unknown(out, CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED,
