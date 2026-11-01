@@ -21,6 +21,7 @@
 #ifndef CLUSTER_MULTIXACT_CURRENT_H
 #define CLUSTER_MULTIXACT_CURRENT_H
 
+#include "cluster/cluster_ctrc_origin_fullxid.h"
 #include "access/multixact.h"
 #include "access/tableam.h"
 #include "cluster/cluster_scn.h"
@@ -97,6 +98,8 @@ typedef struct ClusterCurrentMemberProof {
 	uint8 member_status;
 	uint8 state;
 	uint8 reserved8[4];
+	/* Separate V2 envelope; zero remains unqualified. */
+	uint8 origin_fullxid_v2[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 } ClusterCurrentMemberProof;
 
 
@@ -378,8 +381,8 @@ StaticAssertDecl(sizeof(ClusterCurrentMxMemberDesc) == 8,
 				 "ClusterCurrentMxMemberDesc must remain 8 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMemberProofKey) == 24,
 				 "ClusterCurrentMemberProofKey must remain 24 bytes");
-StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 48,
-				 "ClusterCurrentMemberProof must remain 48 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 192,
+				 "V6 ClusterCurrentMemberProof must remain 192 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMxSuccessorAlias) == 24,
 				 "ClusterCurrentMxSuccessorAlias must remain 24 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentUpdaterProof) == 72,
@@ -408,6 +411,11 @@ extern bool cluster_multixact_current_resolve_origin_member_proof(
 extern bool
 cluster_multixact_current_member_proof_bind_ctrc(ClusterCurrentMemberProof *proof,
 												 const struct ClusterCtrcTxnKeyV1 *ctrc_key);
+struct ClusterCtrcParticipantIdentity;
+extern bool cluster_multixact_current_member_proof_bind_origin_v2(
+	ClusterCurrentMemberProof *proof, const struct ClusterCtrcTxnKeyV1 *key,
+	const struct ClusterCtrcParticipantIdentity *receiver);
+
 extern ClusterUpdaterCandidateVerdict cluster_multixact_current_updater_candidate_verdict(
 	const ClusterTTStatusKey *candidate, TransactionId updater_xid, uint16 updater_origin_node,
 	uint32 current_epoch, ClusterTTStatusKey *current_binding,

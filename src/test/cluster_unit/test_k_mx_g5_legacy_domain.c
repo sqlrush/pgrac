@@ -72,7 +72,7 @@ UT_TEST(k_describe_valid_control)
 /* Removing exact version/magic checks must never admit a different domain. */
 UT_TEST(k_describe_rejects_other_domains)
 {
-	static const uint16 versions[] = {0, 4, 6, UINT16_MAX};
+	static const uint16 versions[] = {0, 4, 5, CLUSTER_CURRENT_MX_WIRE_VERSION + 1, UINT16_MAX};
 	ClusterCurrentMxDescribeReplyPage page;
 	Size i;
 
@@ -179,11 +179,11 @@ UT_TEST(k_proof_forward_rejects_other_domains_and_narrowing)
 	test_proof_request(&request, CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS, 2);
 	UT_ASSERT(cluster_multixact_current_wire_validate_proof_forward(
 		&request, sizeof(request), 3, 5, 9, &decoded));
-	for (fault = 0; fault < 9; fault++) {
+	for (fault = 0; fault < 10; fault++) {
 		test_proof_request(&request, CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS, 2);
 		switch (fault) {
 		case 0: request.trailer.version = 4; break;
-		case 1: request.trailer.version = 6; break;
+		case 1: request.trailer.version = 5; break;
 		case 2: request.trailer.magic ^= 1; break;
 		case 3: request.prefix.total_count = 257; break;
 		case 4: request.prefix.total_count = 65544; break;
@@ -191,6 +191,7 @@ UT_TEST(k_proof_forward_rejects_other_domains_and_narrowing)
 		case 6: request.prefix.reserved_b[0] = 1; break;
 		case 7: request.trailer.reserved16 = 1; break;
 		case 8: request.prefix.chunk_ordinal = 3; break;
+		case 9: request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION + 1; break;
 		}
 		memset(&decoded, 0xa5, sizeof(decoded));
 		UT_ASSERT(!cluster_multixact_current_wire_validate_proof_forward(
@@ -219,7 +220,8 @@ k_proof_page(ClusterCurrentMxProofForwardV2 *request,
 	page->header.entry_count = 2;
 	page->header.chunk_count_minus_one = 2;
 	page->header.requester_capability_generation = 41;
-	page->header.wire_length = 160;
+	page->header.wire_length = sizeof(page->header)
+		+ 2 * sizeof(ClusterCurrentMemberProof);
 	for (i = 0; i < 2; i++) {
 		ClusterCurrentMxMemberDesc member;
 
@@ -286,11 +288,11 @@ UT_TEST(k_proof_reply_binds_domain_lengths_and_lineage)
 	k_proof_page(&request, &page);
 	for (i = 0; i < lengthof(lengths); i++)
 		k_check_proof(&request, &page, lengths[i], CMX_RESOLVE_UNKNOWN);
-	for (fault = 0; fault < 13; fault++) {
+	for (fault = 0; fault < 14; fault++) {
 		k_proof_page(&request, &page);
 		switch (fault) {
 		case 0: page.header.version = 4; break;
-		case 1: page.header.version = 6; break;
+		case 1: page.header.version = 5; break;
 		case 2: page.header.magic ^= 1; break;
 		case 3: page.header.source_node_id++; break;
 		case 4: page.header.request_id++; break;
@@ -302,6 +304,7 @@ UT_TEST(k_proof_reply_binds_domain_lengths_and_lineage)
 		case 10: page.header.chunk_count_minus_one++; break;
 		case 11: page.header.wire_length--; break;
 		case 12: page.header.wire_length++; break;
+		case 13: page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION + 1; break;
 		}
 		k_check_proof(&request, &page, sizeof(page), CMX_RESOLVE_UNKNOWN);
 	}

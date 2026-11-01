@@ -385,6 +385,15 @@ wire_member_proof_valid(const ClusterCurrentMemberProof *proof,
 		|| proof->member_xid != ask->xid || proof->member_status != ask->member_status
 		|| proof->state > CCM_UNKNOWN)
 		return false;
+	/* Unknown nonzero envelopes cannot pass as current authority. A zero
+	 * legacy envelope remains unqualified and the new receiver refuses it. */
+	if (!bytes_are_zero(proof->origin_fullxid_v2, sizeof(proof->origin_fullxid_v2))
+		&& (proof->origin_fullxid_v2[0] != CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION
+			|| proof->origin_fullxid_v2[1] != 0
+			|| proof->origin_fullxid_v2[2] != CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES
+			|| proof->origin_fullxid_v2[3] != 0))
+		return false;
+
 
 	switch ((ClusterCurrentMemberState)proof->state) {
 	case CCM_ACTIVE:
@@ -398,10 +407,12 @@ wire_member_proof_valid(const ClusterCurrentMemberProof *proof,
 	case CCM_COMMITTED:
 		return ClusterCurrentMemberProofGetCtrcGrant(proof) == 0
 			   && memcmp(&proof->key, &zero_key, sizeof(zero_key)) == 0
+			   && bytes_are_zero(proof->origin_fullxid_v2, sizeof(proof->origin_fullxid_v2))
 			   && SCN_VALID(proof->commit_scn);
 	case CCM_ABORTED:
 		return ClusterCurrentMemberProofGetCtrcGrant(proof) == 0
 			   && memcmp(&proof->key, &zero_key, sizeof(zero_key)) == 0
+			   && bytes_are_zero(proof->origin_fullxid_v2, sizeof(proof->origin_fullxid_v2))
 			   && proof->commit_scn == InvalidScn;
 	case CCM_SELF:
 	case CCM_UNKNOWN:
