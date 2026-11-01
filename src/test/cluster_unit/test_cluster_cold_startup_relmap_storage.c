@@ -73,6 +73,24 @@ test_cold_relmap_storage_end(void)
 	cleanup();
 }
 
+/* Use the original writer/short-lock path to create this component's saved
+ * stage. The snapshot and both files remain the real consumer's inputs. */
+bool
+test_cold_relmap_storage_stage(ClusterColdRelmapInputV1 *input,
+	ClusterRelmapRetentionSnapshot *snapshot)
+{
+	bool ok;
+
+	LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+	ok = cluster_relmap_retention_prepare_capture(&writer_retention, &writer_key, snapshot)
+		== CLUSTER_RELMAP_RETENTION_OK;
+	LWLockRelease(&retention_lock);
+	return ok && cluster_relmap_authority_v2_write_pending(&input->staged.identity,
+		input->staged.pending_generation, &input->staged.pending_owner,
+		&input->staged.pending, input->retention, input->retention_lock)
+		&& cluster_relmap_authority_v2_check_staged(&input->staged);
+}
+
 void
 test_cold_relmap_storage_read_hook(void (*hook)(unsigned))
 {
