@@ -572,8 +572,11 @@ UT_TEST(mx_origin_provisional_key_is_only_an_exact_challenge)
 	}
 }
 
+#ifndef MX_OPERATION_ORIGIN_TEST_MAIN
+#define MX_OPERATION_ORIGIN_TEST_MAIN main
+#endif
 int
-main(void)
+MX_OPERATION_ORIGIN_TEST_MAIN(void)
 {
 	UT_PLAN(18);
 	UT_RUN(mx_origin_same_and_cross_segment_three_current_phases);

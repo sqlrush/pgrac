@@ -7508,6 +7508,7 @@ test_cluster_retained_remote: test_cluster_retained_remote.c test_cluster_retain
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_uba.o \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+CLUSTER_MX_HISTORY_WIRE_O = $(top_builddir)/src/backend/cluster/cluster_mx_history_wire.o
 CLUSTER_R4_RUNTIME_VIS_TEST_O = test_cluster_r4_runtime_visibility_exact.o
 CLUSTER_SAVEPOINT_READER_O = $(top_builddir)/src/backend/cluster/cluster_savepoint_reader.o
 CLUSTER_R4_RUNTIME_VIS_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
@@ -7571,7 +7572,7 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		test_cluster_current_mx_local_sample.inc \
 		test_cluster_undo_pending_product.o \
-		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_MX_HISTORY_WIRE_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) test_cluster_r4_multi_resolve_product.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_OPERATION_WORKER_TEST_O) \
@@ -7579,7 +7580,7 @@ test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
 		test_cluster_hot_bufpage_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		test_cluster_undo_pending_product.o \
-		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_MX_HISTORY_WIRE_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) test_cluster_r4_multi_resolve_product.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -7592,7 +7593,23 @@ test_cluster_mx_operation_origin: test_cluster_mx_operation_origin.c test_cluste
 		$(CLUSTER_SAVEPOINT_READER_O) test_cluster_hot_bufpage_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
 		test_cluster_undo_pending_product.o \
-		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_MX_HISTORY_WIRE_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) test_cluster_r4_multi_resolve_product.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Typed history reuses the real origin continuation and complete fixture.
+TESTS += test_cluster_mx_history_origin
+all: test_cluster_mx_history_origin
+
+test_cluster_mx_history_origin: test_cluster_mx_history_origin.c test_cluster_mx_operation_origin.c \
+		test_cluster_r4_tx_outcome $(top_builddir)/src/backend/cluster/cluster_mx_history_wire.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_OPERATION_WORKER_TEST_O) \
+		$(CLUSTER_SAVEPOINT_READER_O) test_cluster_hot_bufpage_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_cr_apply.o \
+		test_cluster_undo_pending_product.o \
+		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_MX_HISTORY_WIRE_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) test_cluster_r4_multi_resolve_product.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -13335,7 +13352,6 @@ $(CLUSTER_MULTIXACT_CURRENT_WIRE_O): \
         $(top_srcdir)/src/include/cluster/cluster_multixact_operation_wire.h \
         $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
 
-CLUSTER_MX_HISTORY_WIRE_O = $(top_builddir)/src/backend/cluster/cluster_mx_history_wire.o
 TESTS += test_cluster_mx_history_wire
 all: test_cluster_mx_history_wire
 

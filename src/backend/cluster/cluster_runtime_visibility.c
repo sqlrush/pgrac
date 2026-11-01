@@ -64,6 +64,7 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_savepoint_reader.h"
+#include "cluster/cluster_mx_history_record.h"
 #include "cluster/cluster_r4_operation.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_qvotec.h"
@@ -1867,13 +1868,18 @@ cluster_runtime_visibility_terminal_publish(const ClusterTxResolution *candidate
 }
 
 #define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC UINT32_C(0x52564f50)
+#define ORIGIN_PLAN_OPERATION 1
+#define ORIGIN_PLAN_HISTORY_V1_UNKNOWN 2
+#define ORIGIN_PLAN_HISTORY_V1_OWNER 3
+#define ORIGIN_PLAN_HISTORY_OPERATION 4
+#define ORIGIN_PLAN_HISTORY_CONTROL 5
 
 typedef struct ClusterRuntimeVisibilityOriginPlanData {
 	uint32 magic;
 	bool valid;
 	bool candidate_valid;
 	bool candidate_recycled_abort;
-	bool operation_plan;
+	uint8 operation_plan;
 	ClusterSavepointReaderIdentity operation;
 	ClusterTxResolveMode mode;
 	ClusterTxLocator locator;
@@ -1885,6 +1891,7 @@ typedef struct ClusterRuntimeVisibilityOriginPlanData {
 	ClusterUndoBlock0Generation data_generation;
 	uint32 data_block_no;
 	uint16 tt_slot_offset;
+	uint16 record_offset;
 	size_t record_length;
 	ClusterRuntimeVisibilityCanonicalDiagnostic canonical_diagnostic;
 	ClusterTxResolution candidate;
@@ -2624,7 +2631,8 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	/* Never admit a recycled/raw-xid fallback or another native parent as
 	 * the canonical owner of this independently qualified operation. */
 	if (plan_data->operation_plan
-		&& (generation.value != plan_data->operation.canonical_generation
+		&& ((plan_data->operation_plan != ORIGIN_PLAN_HISTORY_V1_UNKNOWN
+			 && generation.value != plan_data->operation.canonical_generation)
 			|| exact_slot.xid != plan_data->operation.canonical.xid
 			|| exact_slot.wrap != plan_data->operation.canonical.wrap
 			|| exact_slot.status < TT_SLOT_ACTIVE || exact_slot.status > TT_SLOT_ABORTED))
@@ -2895,8 +2903,8 @@ cluster_runtime_visibility_origin_plan_copy_operation_internal(
 	if (data == NULL || admission == NULL || guard == NULL || root == NULL || top_out == NULL
 		|| operation_out == NULL || data_out == NULL
 		|| data->magic != CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC || !data->valid
-		|| !data->operation_plan || !data->candidate_valid || data->candidate_recycled_abort
-		|| data->mode != mode
+		|| data->operation_plan != ORIGIN_PLAN_OPERATION || !data->candidate_valid
+		|| data->candidate_recycled_abort || data->mode != mode
 		|| !cluster_runtime_visibility_candidate_root_matches(&data->data_root, root)
 		|| !cluster_runtime_visibility_admission_current(mode, admission))
 		goto failed;
@@ -2966,7 +2974,7 @@ cluster_runtime_visibility_origin_plan_copy_peer_held(
 	 * absence cannot cause another acquisition or a raw-xid fallback. */
 	if (data == NULL || peer_out == NULL || top_out == NULL
 		|| data->magic != CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC || !data->valid
-		|| !data->operation_plan || !data->candidate_valid
+		|| data->operation_plan != ORIGIN_PLAN_OPERATION || !data->candidate_valid
 		|| !FullTransactionIdIsNormal(data->candidate.local_original_full_xid)
 		|| !FullTransactionIdEquals(data->candidate.local_original_full_xid,
 									data->operation.top_fxid)) {
@@ -2995,6 +3003,211 @@ cluster_runtime_visibility_origin_plan_copy_peer_held(
 
 #define CLUSTER_OPERATION_ORIGIN_READ_MAGIC UINT32_C(0x4f505244)
 
+/* History is a strategy of the original plan, not a second authority
+ * service. A V1 DATA capture intentionally has no original FullXid. */
+static bool
+cluster_runtime_visibility_history_scope_current(const ClusterMxHistoryRequest *request,
+												 ClusterTxResolveMode mode,
+												 const ClusterSemanticAdmissionToken *admission)
+{
+	return request != NULL && admission != NULL
+		   && (mode == CLUSTER_TX_RESOLVE_VISIBILITY || mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
+		   && !(request->flags & CLUSTER_MX_HISTORY_CANCEL)
+		   && request->feature_bit == admission->feature_bit
+		   && request->admission_generation == admission->record_generation
+		   && request->read_epoch == admission->formation_epoch
+		   && request->forward.epoch == admission->formation_epoch
+		   && request->forward.master_node == cluster_node_id
+		   && cluster_runtime_visibility_admission_current(mode, admission);
+}
+
+static bool
+cluster_runtime_visibility_history_plan(const ClusterRuntimeVisibilityOriginPlanData *data)
+{
+	return data != NULL && data->magic == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC
+		   && data->operation_plan >= ORIGIN_PLAN_HISTORY_V1_UNKNOWN
+		   && data->operation_plan <= ORIGIN_PLAN_HISTORY_CONTROL;
+}
+
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_history_held(
+	const ClusterMxHistoryRequest *request, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterRuntimeVisibilityOriginPlanData *data;
+	ClusterUndoBlock0Generation generation = { false, 0 }, final_generation = { false, 0 };
+	ClusterMxHistoryRecord record;
+	PGAlignedBlock page;
+	uint32 segment, block;
+	uint16 slot, row;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+
+	if (plan != NULL)
+		memset(plan, 0, sizeof(*plan));
+	if (plan == NULL || guard == NULL || root == NULL
+		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission)
+		|| !uba_decode_record(request->locator.uba, &segment, &block, &slot, &row)
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| uba_origin_node_id(request->locator.uba) != (NodeId)cluster_node_id)
+		goto failed;
+	data = cluster_runtime_visibility_origin_plan_data(plan);
+	data->data_logical.owner_instance = (uint8)(cluster_node_id + 1);
+	data->data_logical.segment_id = segment;
+	if (cluster_undo_block0_current_sample_generation(guard, root, &generation)
+			!= CLUSTER_UNDO_BLOCK0_OK
+		|| !generation.known || generation.value == UINT32_MAX
+		|| ((request->flags & CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION)
+			&& request->expected_data_generation != generation.value)
+		|| !cluster_runtime_visibility_origin_data_copy(segment, data->data_logical.owner_instance,
+														block, page.data, false)
+		|| !cluster_mx_history_record_capture(request, page.data, data->record_buf.data, &record)
+		|| cluster_undo_block0_current_sample_generation(guard, root, &final_generation)
+			   != CLUSTER_UNDO_BLOCK0_OK
+		|| !final_generation.known || generation.value != final_generation.value
+		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission))
+		goto failed;
+	data->operation = record.identity;
+	data->operation_plan
+		= record.record_class == CMXH_V1_TOP
+			  ? (record.canonical_generation_known ? ORIGIN_PLAN_HISTORY_V1_OWNER
+												   : ORIGIN_PLAN_HISTORY_V1_UNKNOWN)
+			  : (record.record_class == CMXH_OPERATION ? ORIGIN_PLAN_HISTORY_OPERATION
+													   : ORIGIN_PLAN_HISTORY_CONTROL);
+	data->locator = data->canonical_locator = request->locator;
+	data->locator.tt_wrap = data->canonical_locator.tt_wrap = record.identity.canonical.wrap;
+	data->magic = CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC;
+	data->valid = true;
+	data->mode = mode;
+	data->data_root = *root;
+	data->data_generation = generation;
+	data->data_block_no = block;
+	data->record_offset = record.record_offset;
+	data->record_length = record.record_length;
+	data->tt_slot_offset = slot;
+	data->tt_logical.segment_id = record.identity.canonical.segment_id;
+	data->tt_logical.owner_instance
+		= (uint8)((data->tt_logical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1);
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL;
+failed:
+	if (plan != NULL)
+		memset(plan, 0, sizeof(*plan));
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_sample_history_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterMxHistoryRequest *request,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolution *top_out, ClusterTxResolveReason *reason_out)
+{
+	ClusterRuntimeVisibilityOriginPlanData *data
+		= cluster_runtime_visibility_origin_plan_data(plan);
+	ClusterMxHistoryRecord record = { 0 };
+	ClusterSavepointReaderIdentity identity;
+	if (top_out != NULL)
+		memset(top_out, 0, sizeof(*top_out));
+	if (!cluster_runtime_visibility_history_plan(data) || top_out == NULL
+		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission)
+		|| !cluster_tx_locator_reply_matches(&request->locator, &data->locator))
+		goto failed;
+	if (!cluster_runtime_visibility_origin_plan_sample_canonical_held(plan, mode, admission, guard,
+																	  root, reason_out))
+		return false;
+	record.identity = data->operation;
+	record.record_class
+		= data->operation_plan <= ORIGIN_PLAN_HISTORY_V1_OWNER
+			  ? CMXH_V1_TOP
+			  : (data->operation_plan == ORIGIN_PLAN_HISTORY_OPERATION ? CMXH_OPERATION
+																	   : CMXH_ROLLBACK_CONTROL);
+	record.canonical_generation_known = data->operation_plan != ORIGIN_PLAN_HISTORY_V1_UNKNOWN;
+	if (!cluster_mx_history_record_bind_top(request, &record, &data->candidate, &identity)
+		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission))
+		goto failed;
+	data->operation = identity;
+	*top_out = data->candidate;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return true;
+failed:
+	if (cluster_runtime_visibility_history_plan(data))
+		data->candidate_valid = false;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	return false;
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_copy_history_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterMxHistoryRequest *request,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolution *top_out, ClusterMxHistoryRecord *record_out, uint32 *data_generation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out)
+{
+	ClusterRuntimeVisibilityOriginPlanData *data
+		= cluster_runtime_visibility_origin_plan_data(plan);
+	ClusterMxHistoryRecord first = { 0 }, record;
+	ClusterSavepointReaderIdentity identity;
+	ClusterUndoBlock0Generation generation = { false, 0 }, final_generation = { false, 0 };
+	ClusterUndoBlock0ResolvedRoot final_root;
+	PGAlignedBlock page, bytes;
+
+	if (top_out != NULL)
+		memset(top_out, 0, sizeof(*top_out));
+	if (record_out != NULL)
+		memset(record_out, 0, sizeof(*record_out));
+	if (data_generation_out != NULL)
+		*data_generation_out = 0;
+	if (!cluster_runtime_visibility_history_plan(data) || !data->valid || !data->candidate_valid
+		|| data->candidate_recycled_abort || data->mode != mode || guard == NULL || root == NULL
+		|| top_out == NULL || record_out == NULL || data_generation_out == NULL || data_out == NULL
+		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission)
+		|| !cluster_tx_locator_reply_matches(&request->locator, &data->locator)
+		|| !cluster_runtime_visibility_candidate_root_matches(&data->data_root, root))
+		goto failed;
+	first.record_offset = data->record_offset;
+	first.record_length = data->record_length;
+	if (cluster_undo_block0_current_sample_generation(guard, root, &generation)
+			!= CLUSTER_UNDO_BLOCK0_OK
+		|| !generation.known || generation.value != data->data_generation.value
+		|| !cluster_runtime_visibility_origin_data_copy(data->data_logical.segment_id,
+														data->data_logical.owner_instance,
+														data->data_block_no, page.data, false)
+		|| !cluster_mx_history_record_recheck(request, &first, data->record_buf.data,
+											  data->record_length, page.data, bytes.data, &record)
+		|| !cluster_mx_history_record_bind_top(request, &record, &data->candidate, &identity)
+		|| cluster_undo_block0_current_sample_generation(guard, root, &final_generation)
+			   != CLUSTER_UNDO_BLOCK0_OK
+		|| !final_generation.known || final_generation.value != generation.value
+		|| !cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, data->data_logical.owner_instance,
+			data->data_logical.segment_id, &final_root)
+		|| !cluster_runtime_visibility_candidate_root_matches(root, &final_root)
+		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission))
+		goto failed;
+	record.identity = identity;
+	record.canonical_generation_known = true;
+	*top_out = data->candidate;
+	*record_out = record;
+	*data_generation_out = generation.value;
+	memcpy(data_out, page.data, BLCKSZ);
+	data->valid = false;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return top_out->outcome;
+failed:
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	return CLUSTER_TX_UNKNOWN;
+}
+
 typedef enum ClusterOperationOriginPhase {
 	OPERATION_ORIGIN_ACQUIRE = 0,
 	OPERATION_ORIGIN_ACQUIRE_POLL,
@@ -3014,10 +3227,12 @@ typedef struct ClusterOperationOriginRead {
 	bool has_head;
 	bool has_retained;
 	bool has_mx_key;
+	bool has_history;
 	bool allow_readthrough;
 	bool wait_pending;
 	ClusterTxLocator locator;
 	ClusterSavepointOperationKey mx_key;
+	ClusterMxHistoryRequestWire history;
 	ClusterSavepointOperation expected;
 	ClusterItlSlotData head;
 	BufferTag tag;
@@ -3072,7 +3287,8 @@ cluster_runtime_visibility_operation_read_begin_internal(
 	const ClusterSavepointOperation *expected, const ClusterSavepointReaderIdentity *retained,
 	const ClusterItlSlotData *head, const BufferTag *tag, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolveReason *reason_out,
-	bool allow_readthrough, const ClusterSavepointOperationKey *mx_key)
+	bool allow_readthrough, const ClusterSavepointOperationKey *mx_key,
+	const ClusterMxHistoryRequestWire *history)
 {
 	ClusterOperationOriginRead *read = cluster_runtime_visibility_operation_read_data(state);
 	uint32 segment, block;
@@ -3080,7 +3296,10 @@ cluster_runtime_visibility_operation_read_begin_internal(
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
 	if (state == NULL || locator == NULL
-		|| (mx_key == NULL && expected == NULL && (head == NULL || tag == NULL))
+		|| (history == NULL && mx_key == NULL && expected == NULL && (head == NULL || tag == NULL))
+		|| (history != NULL
+			&& (mx_key != NULL || expected != NULL || retained != NULL || head != NULL
+				|| tag != NULL))
 		|| (mx_key != NULL && (expected != NULL || retained != NULL || head != NULL || tag != NULL))
 		|| admission == NULL || read->magic != 0 || (expected != NULL && retained != NULL)
 		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY && mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS))
@@ -3094,6 +3313,9 @@ cluster_runtime_visibility_operation_read_begin_internal(
 	memset(state, 0, sizeof(*state));
 	read->magic = CLUSTER_OPERATION_ORIGIN_READ_MAGIC;
 	read->locator = *locator;
+	read->has_history = history != NULL;
+	if (history != NULL)
+		read->history = *history;
 	read->has_mx_key = mx_key != NULL;
 	if (mx_key != NULL)
 		read->mx_key = *mx_key;
@@ -3133,7 +3355,7 @@ cluster_runtime_visibility_operation_origin_read_begin(
 	ClusterTxResolveReason *reason_out)
 {
 	return cluster_runtime_visibility_operation_read_begin_internal(
-		read, locator, expected, NULL, head, tag, mode, admission, reason_out, false, NULL);
+		read, locator, expected, NULL, head, tag, mode, admission, reason_out, false, NULL, NULL);
 }
 
 bool
@@ -3144,7 +3366,7 @@ cluster_runtime_visibility_mx_operation_origin_read_begin(
 {
 	return cluster_runtime_visibility_operation_read_begin_internal(
 		state, key != NULL ? &key->locator : NULL, NULL, NULL, NULL, NULL, mode, admission,
-		reason_out, false, key);
+		reason_out, false, key, NULL);
 }
 
 /* Retained canonical compare inputs, without a fabricated backend binding. */
@@ -3161,7 +3383,72 @@ cluster_runtime_visibility_operation_origin_read_begin_retained(
 		return false;
 	}
 	return cluster_runtime_visibility_operation_read_begin_internal(
-		read, locator, NULL, owner, head, tag, mode, admission, reason_out, false, NULL);
+		read, locator, NULL, owner, head, tag, mode, admission, reason_out, false, NULL, NULL);
+}
+
+static bool
+cluster_runtime_visibility_history_request_decode(const ClusterMxHistoryRequestWire *wire,
+												  ClusterTxResolveMode mode,
+												  const ClusterSemanticAdmissionToken *admission,
+												  ClusterMxHistoryRequest *request)
+{
+	/* Claimed source is only a codec comparison here. GCS owns authenticated
+	 * transport/capability/participant qualification before calling us. */
+	return wire != NULL && admission != NULL
+		   && cluster_mx_history_request_decode(
+			   wire, sizeof(*wire), (int32)ClusterR4WireReadU32(wire->bytes + 36), cluster_node_id,
+			   admission->formation_epoch, request)
+		   && cluster_runtime_visibility_history_scope_current(request, mode, admission);
+}
+
+bool
+cluster_runtime_visibility_history_origin_read_begin(ClusterRuntimeVisibilityOperationRead *state,
+													 const ClusterMxHistoryRequestWire *wire,
+													 ClusterTxResolveMode mode,
+													 const ClusterSemanticAdmissionToken *admission,
+													 ClusterTxResolveReason *reason_out)
+{
+	ClusterMxHistoryRequest request;
+	if (!cluster_runtime_visibility_history_request_decode(wire, mode, admission, &request)) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_PROTOCOL;
+		return false;
+	}
+	return cluster_runtime_visibility_operation_read_begin_internal(
+		state, &request.locator, NULL, NULL, NULL, NULL, mode, admission, reason_out, false, NULL,
+		wire);
+}
+
+/* Three held observations share the original acquire/release/cancel FSM. */
+static bool
+cluster_runtime_visibility_history_origin_observe(ClusterOperationOriginRead *read)
+{
+	ClusterMxHistoryRequest request;
+	ClusterMxHistoryRecord record;
+	uint32 generation;
+	if (!cluster_runtime_visibility_history_request_decode(&read->history, read->mode,
+														   &read->admission, &request)) {
+		read->reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		return false;
+	}
+	if (read->phase == 0) {
+		read->data_root = read->root;
+		return cluster_runtime_visibility_origin_plan_freeze_history_held(
+				   &request, read->mode, &read->admission, &read->guard, &read->root, &read->plan,
+				   &read->reason)
+				   == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
+			   && cluster_runtime_visibility_origin_plan_canonical_logical(&read->plan,
+																		   &read->tt_logical);
+	}
+	if (read->phase == 1)
+		return cluster_runtime_visibility_origin_plan_sample_history_held(
+			&read->plan, &request, read->mode, &read->admission, &read->guard, &read->root,
+			&read->top, &read->reason);
+	return read->phase == 2
+		   && cluster_runtime_visibility_origin_plan_copy_history_held(
+				  &read->plan, &request, read->mode, &read->admission, &read->guard, &read->root,
+				  &read->top, &record, &generation, read->page.data, &read->reason)
+				  != CLUSTER_TX_UNKNOWN;
 }
 
 /* These are the original held-only operations. No guard or DATA pin spans
@@ -3169,6 +3456,8 @@ cluster_runtime_visibility_operation_origin_read_begin_retained(
 static bool
 cluster_runtime_visibility_operation_origin_observe(ClusterOperationOriginRead *read)
 {
+	if (read->has_history)
+		return cluster_runtime_visibility_history_origin_observe(read);
 	if (read->phase == 0) {
 		bool frozen;
 
@@ -3322,8 +3611,8 @@ cluster_runtime_visibility_operation_origin_read_poll(ClusterRuntimeVisibilityOp
 		memset(top_out, 0, sizeof(*top_out));
 	if (operation_out != NULL)
 		memset(operation_out, 0, sizeof(*operation_out));
-	if (read == NULL || read->magic != CLUSTER_OPERATION_ORIGIN_READ_MAGIC || identity_out == NULL
-		|| top_out == NULL || operation_out == NULL || data_out == NULL)
+	if (read == NULL || read->magic != CLUSTER_OPERATION_ORIGIN_READ_MAGIC || read->has_history
+		|| identity_out == NULL || top_out == NULL || operation_out == NULL || data_out == NULL)
 		goto failed;
 	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
 							PointerGetDatum(state));
@@ -3348,6 +3637,74 @@ cluster_runtime_visibility_operation_origin_read_poll(ClusterRuntimeVisibilityOp
 		*reason_out = CLUSTER_TX_RESOLVE_NONE;
 	return step;
 
+failed:
+	cluster_runtime_visibility_operation_origin_read_cancel(state);
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED;
+}
+
+ClusterRuntimeVisibilityOperationStep
+cluster_runtime_visibility_history_origin_read_poll(ClusterRuntimeVisibilityOperationRead *state,
+													ClusterTxResolution *top_out,
+													ClusterMxHistoryRecord *record_out,
+													uint32 *data_generation_out,
+													char data_out[BLCKSZ],
+													ClusterTxResolveReason *reason_out)
+{
+	ClusterOperationOriginRead *read = cluster_runtime_visibility_operation_read_data(state);
+	ClusterRuntimeVisibilityOperationStep step;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterMxHistoryRequest request;
+	ClusterMxHistoryRecord record;
+	ClusterSavepointReaderIdentity identity;
+	PGAlignedBlock bytes;
+
+	if (top_out != NULL)
+		memset(top_out, 0, sizeof(*top_out));
+	if (record_out != NULL)
+		memset(record_out, 0, sizeof(*record_out));
+	if (data_generation_out != NULL)
+		*data_generation_out = 0;
+	if (read == NULL || read->magic != CLUSTER_OPERATION_ORIGIN_READ_MAGIC || !read->has_history
+		|| top_out == NULL || record_out == NULL || data_generation_out == NULL || data_out == NULL)
+		goto failed;
+	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
+							PointerGetDatum(state));
+	{
+		step = cluster_runtime_visibility_operation_read_advance(read);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
+								PointerGetDatum(state));
+	if (step == CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED) {
+		reason = read->reason == CLUSTER_TX_RESOLVE_NONE ? CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE
+														 : read->reason;
+		goto failed;
+	}
+	if (step == CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE) {
+		/* The page is the private final protected snapshot, not another DATA
+		 * fetch. Publish only after original final release/admission. */
+		if (!cluster_runtime_visibility_history_request_decode(&read->history, read->mode,
+															   &read->admission, &request)
+			|| !cluster_mx_history_record_capture(&request, read->page.data, bytes.data, &record)
+			|| !cluster_mx_history_record_bind_top(&request, &record, &read->top, &identity)
+			|| !cluster_runtime_visibility_history_scope_current(&request, read->mode,
+																 &read->admission)) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			goto failed;
+		}
+		record.identity = identity;
+		record.canonical_generation_known = true;
+		*record_out = record;
+		*top_out = read->top;
+		*data_generation_out
+			= cluster_runtime_visibility_origin_plan_data(&read->plan)->data_generation.value;
+		memcpy(data_out, read->page.data, BLCKSZ);
+		cluster_runtime_visibility_operation_origin_read_cancel(state);
+	}
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return step;
 failed:
 	cluster_runtime_visibility_operation_origin_read_cancel(state);
 	if (reason_out != NULL)
@@ -3433,7 +3790,7 @@ cluster_runtime_visibility_resolve_mx_operation_origin_admitted(
 	if (effect_out == NULL
 		|| !cluster_runtime_visibility_operation_read_begin_internal(
 			&state, key != NULL ? &key->locator : NULL, NULL, NULL, NULL, NULL, mode, admission,
-			&reason, true, key))
+			&reason, true, key, NULL))
 		goto done;
 	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
 							PointerGetDatum(&state));
@@ -3480,7 +3837,8 @@ cluster_runtime_visibility_resolve_operation_origin_internal(
 	if ((expected == NULL && identity_out == NULL) || top_out == NULL || operation_out == NULL
 		|| data_out == NULL
 		|| !cluster_runtime_visibility_operation_read_begin_internal(
-			&state, locator, expected, retained, head, tag, mode, admission, &reason, true, NULL))
+			&state, locator, expected, retained, head, tag, mode, admission, &reason, true, NULL,
+			NULL))
 		goto done;
 	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_operation_read_cleanup,
 							PointerGetDatum(&state));

@@ -40,6 +40,10 @@
 #include "utils/timestamp.h"
 
 #ifdef USE_PGRAC_CLUSTER
+typedef struct ClusterMxHistoryRequest ClusterMxHistoryRequest;
+typedef struct ClusterMxHistoryRequestWire ClusterMxHistoryRequestWire;
+typedef struct ClusterMxHistoryRecord ClusterMxHistoryRecord;
+
 /*
  * Forward declarations for the R4 exact durable-origin provider.  The exact
  * value domains and structures are defined by cluster_tx_resolve.h; keeping
@@ -288,6 +292,44 @@ extern ClusterRuntimeVisibilityOperationStep cluster_runtime_visibility_operatio
 	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out);
 extern void cluster_runtime_visibility_operation_origin_read_cancel(
 	ClusterRuntimeVisibilityOperationRead *read);
+
+/* Typed history strategy for the same three-current origin plan. request has
+ * passed the history codec and remains immutable across held calls, which
+ * stage private values only. The caller
+ * owns retention/admission, all releases and any LIVE CTRC touch under TT.
+ * No ordering, peer publication or retirement permission is conferred here.
+ * Canonical sampling requires independent original FullXid even for V1. */
+extern ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_history_held(
+	const ClusterMxHistoryRequest *request, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolveReason *reason_out);
+extern bool cluster_runtime_visibility_origin_plan_sample_history_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterMxHistoryRequest *request,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolution *top_out, ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_copy_history_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterMxHistoryRequest *request,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolution *top_out, ClusterMxHistoryRecord *record_out, uint32 *data_generation_out,
+	char data_out[BLCKSZ], ClusterTxResolveReason *reason_out);
+
+/* Exact wire/scope is copied before acquisition. Poll shares the original
+ * one-step FSM and cancellation/ERROR cleanup; it never waits or reads cold
+ * DATA. Pending/failure clear metadata and leave DATA unchanged. Completion
+ * consumes state only after final release and admission recheck. A local
+ * result is not a peer proof: GCS must still qualify and publish its reply. */
+extern bool cluster_runtime_visibility_history_origin_read_begin(
+	ClusterRuntimeVisibilityOperationRead *state, const ClusterMxHistoryRequestWire *request,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolveReason *reason_out);
+extern ClusterRuntimeVisibilityOperationStep cluster_runtime_visibility_history_origin_read_poll(
+	ClusterRuntimeVisibilityOperationRead *state, ClusterTxResolution *top_out,
+	ClusterMxHistoryRecord *record_out, uint32 *data_generation_out, char data_out[BLCKSZ],
+	ClusterTxResolveReason *reason_out);
 
 /* Exact MX compare inputs use the same original DATA/TT/fresh-DATA guard
  * lifecycle. The caller zeroes the address-stable state before begin and
