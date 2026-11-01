@@ -940,13 +940,202 @@ UT_TEST(test_other_S_holder_corrupt_receipt_cannot_release_native_fence)
 		UT_ASSERT_EQ(holder_pins, 0); complete_idle();
 	}
 }
+/* Keep local unwind separate from the immutable shared service. These
+ * scheduling cuts pause actual owners; they do not manufacture recovery. */
+static unsigned holder_lifecycle_domain, holder_lifecycle_changes;
+static bool holder_lifecycle_prepared;
+static bool
+holder_lifecycle_start(HolderFixture *f, unsigned role, const char *method, unsigned cut)
+{
+	PcmState source = role == 0 || role == 2 ? PCM_STATE_X : PCM_STATE_S;
+	PcmState target = role < 2 ? PCM_STATE_S : PCM_STATE_X;
+	printf("# Holder lifecycle: method=%s role=%u cut=%u\n", method, role, cut);
+	holder_lifecycle_changes = 0;
+	return holder_start_role(f, source, target, role == 4 ? 2 : 0);
+}
+static void holder_lifecycle_change(void)
+{
+	ResourceXReconfigToken token;
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), holder_lifecycle_prepared ? PCM_OWN_FLAG_REVOKING : 0);
+	holder_after_prepare = NULL; holder_lifecycle_changes++;
+	if (holder_lifecycle_domain == 0) ordinary_master_session++;
+	else if (holder_lifecycle_domain == 1) master_durable_admission = false;
+	else if (holder_lifecycle_domain == 2) holder_peer_current = false;
+	else if (holder_lifecycle_domain == 3)
+		UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	else {
+		UT_ASSERT_EQ(holder_lifecycle_domain, 4);
+		ordinary_unavailable = 1;
+	}
+}
+static void
+holder_lifecycle_unhanded(HolderFixture *f, const PGIOAlignedBlock *page,
+	const ClusterPcmResourceXMasterState *shared)
+{
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 901);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(f->master.state->holder_status.valid, RESOURCE_X_ACQUIRE_S_SOURCE_FORWARD);
+	UT_ASSERT(memcmp(shared, f->master.state, sizeof(*shared)) == 0);
+	UT_ASSERT(memcmp(page->data, disk_shared.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state) & (BM_VALID | BM_IO_IN_PROGRESS | BM_IO_ERROR), BM_VALID);
+	UT_ASSERT(!ResourceOwnerHasBufferIO(CurrentResourceOwner, 1));
+	holder_no_debt();
+}
+static void holder_lifecycle_domains(bool prepared)
+{
+	for (unsigned role = 0; role < 5; role++) for (unsigned domain = 0; domain < 4; domain++) {
+		HolderFixture f; PGIOAlignedBlock page;
+		ClusterPcmResourceXMasterState *shared = malloc(sizeof(*shared));
+		bool ok = holder_lifecycle_start(&f, role, prepared ? "prepared-domain" : "initial-domain", domain);
+		UT_ASSERT(ok && shared != NULL); if (!ok || shared == NULL) { free(shared); return; }
+		memcpy(shared, f.master.state, sizeof(*shared)); memcpy(page.data, disk_shared.data, BLCKSZ);
+		holder_lifecycle_domain = domain; holder_lifecycle_prepared = prepared;
+		if (prepared) holder_after_prepare = holder_lifecycle_change;
+		else holder_lifecycle_change();
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_STALE);
+		UT_ASSERT_EQ(holder_lifecycle_changes, 1);
+		UT_ASSERT_EQ(holder_io_enters, prepared ? 1 : 0);
+		holder_lifecycle_unhanded(&f, &page, shared); free(shared);
+	}
+}
+UT_TEST(test_holder_all_roles_domain_loss_before_native_prepare) { holder_lifecycle_domains(false); }
+UT_TEST(test_holder_all_roles_domain_loss_aborts_only_unhanded_prepare) { holder_lifecycle_domains(true); }
+UT_TEST(test_holder_all_roles_unknown_observation_waits_original_service_event)
+{
+	for (unsigned role = 0; role < 5; role++) for (unsigned cut = 0; cut < 2; cut++) {
+		HolderFixture f; PGIOAlignedBlock page; ResourceXSourceDrainWork next;
+		ClusterPcmResourceXMasterState *shared = malloc(sizeof(*shared));
+		bool ok = holder_lifecycle_start(&f, role, "unknown", cut);
+		UT_ASSERT(ok && shared != NULL); if (!ok || shared == NULL) { free(shared); return; }
+		memcpy(shared, f.master.state, sizeof(*shared)); memcpy(page.data, disk_shared.data, BLCKSZ);
+		holder_lifecycle_domain = 4; holder_lifecycle_prepared = cut != 0;
+		if (cut) holder_after_prepare = holder_lifecycle_change; else holder_lifecycle_change();
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(holder_lifecycle_changes, 1);
+		holder_lifecycle_unhanded(&f, &page, shared); free(shared);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work, RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(!holder_probe(&next));
+		cluster_pcm_lock_resource_x_source_drain_content_released();
+		ok = holder_probe(&next); UT_ASSERT(ok); if (!ok) return;
+		UT_ASSERT(memcmp(&next.request, &f.work.request, sizeof(next.request)) == 0);
+		UT_ASSERT(next.attempt_generation > f.work.attempt_generation); f.work = next;
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+		HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(!holder_probe(&next)); holder_no_debt();
+	}
+}
+UT_TEST(test_holder_all_roles_storage_ERROR_keeps_shared_service)
+{
+	for (unsigned role = 0; role < 5; role++) {
+		HolderFixture f; PGIOAlignedBlock page; volatile bool caught = false;
+		ClusterPcmResourceXMasterState *shared = malloc(sizeof(*shared));
+		bool ok = holder_lifecycle_start(&f, role, "storage-ERROR", 0);
+		UT_ASSERT(ok && shared != NULL); if (!ok || shared == NULL) { free(shared); return; }
+		memcpy(shared, f.master.state, sizeof(*shared)); memcpy(page.data, disk_shared.data, BLCKSZ);
+		if (role == 0 || role == 2) {
+			holder_write_error = true; pg_atomic_fetch_or_u32(&request_buf.state, BM_DIRTY);
+		} else disk_read_error = true;
+		PG_TRY(); { (void)holder_capture(&f); } PG_CATCH(); { caught = true; } PG_END_TRY();
+		UT_ASSERT(caught); holder_lifecycle_unhanded(&f, &page, shared); free(shared);
+		if (role == 0 || role == 2) UT_ASSERT((pg_atomic_read_u32(&request_buf.state) & BM_DIRTY) != 0);
+	}
+}
+UT_TEST(test_holder_all_roles_interrupted_native_publish_rejoins_once)
+{
+	for (unsigned role = 0; role < 5; role++) for (unsigned cut = 0; cut < 3; cut++) {
+		HolderFixture f; ClusterPcmOwnSnapshot prepared, finished; ClusterPcmOwnEntry native;
+		ResourceXDecodedFrame image; ResourceXAcquireSSourceState phase; int32 id;
+		ClusterPcmResourceXHolderImage pair; ResourceXSourceDrainWork next;
+		bool ok = holder_lifecycle_start(&f, role, "native-rejoin", cut); UT_ASSERT(ok); if (!ok) return;
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_s_source_snapshot_exact(&f.block, 0,
+			&id, &prepared, &image, &phase), RESOURCE_X_APPLY_APPLIED);
+		if (cut != 0) {
+			if (role < 2) {
+				ClusterPcmOwnResult own = role == 0
+					? cluster_bufmgr_pcm_own_finish_x_source(&request_buf, &prepared,
+						(const char *)image.body.acquire_image.original_image.page_bytes, &finished)
+					: cluster_bufmgr_pcm_own_finish_s_source(&request_buf, &prepared, &finished);
+				UT_ASSERT_EQ(own, CLUSTER_PCM_OWN_OK); if (own != CLUSTER_PCM_OWN_OK) return;
+			} else HOLDER_EQ(holder_retained_native(&f, &finished), RESOURCE_X_APPLY_APPLIED);
+			if (cut == 2) HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
+				&f.block, 0, id, &prepared, &finished), RESOURCE_X_APPLY_APPLIED);
+		}
+		HOLDER_EQ(holder_finish(&f), cut == 2 && role < 2 ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_APPLIED);
+		pair = f.master.state->holder_image; native = request_own;
+		HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(memcmp(&pair, &f.master.state->holder_image, sizeof(pair)) == 0);
+		UT_ASSERT(memcmp(&native, &request_own, sizeof(native)) == 0);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), role == 1 ? 901 : 902);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(!holder_probe(&next)); holder_no_debt();
+	}
+}
+UT_TEST(test_holder_all_roles_wrong_native_identity_retains_shared_pair)
+{
+	for (unsigned role = 0; role < 5; role++) for (unsigned cut = 0; cut < 2; cut++) {
+		HolderFixture f; ClusterPcmResourceXHolderImage image; ClusterPcmResourceXHolderStatus status;
+		PGIOAlignedBlock page; uint64 generation, token;
+		bool ok = holder_lifecycle_start(&f, role, "native-identity", cut); UT_ASSERT(ok); if (!ok) return;
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+		image = f.master.state->holder_image; status = f.master.state->holder_status;
+		memcpy(page.data, disk_shared.data, BLCKSZ);
+		if (cut) pg_atomic_fetch_add_u64(&request_own.reservation_token, 1);
+		else pg_atomic_fetch_add_u64(&request_own.generation, 1);
+		generation = cluster_pcm_own_gen_get(0); token = cluster_pcm_own_reservation_token_get(0);
+		HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), generation); UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), token);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+		UT_ASSERT(memcmp(&image, &f.master.state->holder_image, sizeof(image)) == 0);
+		UT_ASSERT(memcmp(&status, &f.master.state->holder_status, sizeof(status)) == 0);
+		UT_ASSERT(memcmp(page.data, disk_shared.data, BLCKSZ) == 0);
+		UT_ASSERT(holder_fuses > 0); UT_ASSERT_EQ(holder_pins, 0); complete_idle();
+	}
+}
+UT_TEST(test_holder_all_roles_frozen_callbacks_keep_native_and_semantic_debt)
+{
+	for (unsigned role = 0; role < 5; role++) for (unsigned late = 0; late < 2; late++) {
+		HolderFixture f; ResourceXIntentSlot staged[2]; ResourceXReconfigToken token;
+		ResourceXZeroResidualProof zero; ClusterPcmResourceXPiCarrier pi; ClusterPcmOwnEntry native;
+		ClusterPcmResourceXHolderImage image; ClusterPcmResourceXHolderStatus status; PGIOAlignedBlock page;
+		bool ok = holder_lifecycle_start(&f, role, "frozen-callback", late); UT_ASSERT(ok); if (!ok) return;
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED); HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
+		for (unsigned half = 0; half < 2; half++) {
+			ResourceXIntentSlot slot = *holder_slot(&f, half);
+			uint32 index = request_shared.rings[0].head;
+			fake_pcm_clock_us += 1000000;
+			UT_ASSERT_EQ(done_actual_lms_enqueue(0, &slot, half ? 83 : 61, UINT64_C(900000000)), CLUSTER_LMS_ENQUEUE_ADMITTED);
+			memcpy(&staged[half], request_shared.rings[0].ring[index].payload, sizeof(staged[half]));
+		}
+		if (!late) cluster_lms_outbound_resource_x_send_complete(&staged[1], true);
+		UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+		image = f.master.state->holder_image; status = f.master.state->holder_status;
+		pi = f.master.state->pi_carrier; native = request_own; memcpy(page.data, disk_shared.data, BLCKSZ);
+		cluster_lms_outbound_resource_x_send_complete(&staged[0], true);
+		if (late) cluster_lms_outbound_resource_x_send_complete(&staged[1], true);
+		UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged[0], true, ++fake_pcm_clock_us));
+		UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged[1], true, ++fake_pcm_clock_us));
+		UT_ASSERT_EQ(holder_slot(&f, false)->state, RESOURCE_X_INTENT_SLOT_EMPTY);
+		UT_ASSERT_EQ(holder_slot(&f, true)->state, RESOURCE_X_INTENT_SLOT_EMPTY);
+		UT_ASSERT(memcmp(&image, &f.master.state->holder_image, sizeof(image)) == 0);
+		UT_ASSERT(memcmp(&status, &f.master.state->holder_status, sizeof(status)) == 0);
+		UT_ASSERT(memcmp(&pi, &f.master.state->pi_carrier, sizeof(pi)) == 0);
+		UT_ASSERT(memcmp(&native, &request_own, sizeof(native)) == 0);
+		UT_ASSERT(memcmp(page.data, disk_shared.data, BLCKSZ) == 0);
+		UT_ASSERT(!cluster_resource_x_reconfig_zero_proof_exact(&token, &zero));
+		UT_ASSERT(!cluster_resource_x_reconfig_thaw_exact(&token)); holder_no_debt();
+	}
+}
 #if defined(NATIVE_HOLDER_WRITEBACK) || defined(NATIVE_MASTER_HOLDER_COMPOSITION)
 int holder_clean_fixture_main(void)
 #else
 int main(void)
 #endif
 {
-	UT_PLAN(33);
+	UT_PLAN(40);
 	UT_RUN(test_holder_capture_native_downgrade_and_original_pair);
 	UT_RUN(test_holder_real_busy_before_capture_keeps_one_work_until_release);
 	UT_RUN(test_holder_real_busy_after_capture_preserves_exact_native_fence_and_image);
@@ -980,6 +1169,13 @@ int main(void)
 	UT_RUN(test_other_S_holder_old_settlement_does_not_touch_reused_native_descriptor);
 	UT_RUN(test_other_S_holder_interruption_rejoins_only_original_native_receipt);
 	UT_RUN(test_other_S_holder_corrupt_receipt_cannot_release_native_fence);
+	UT_RUN(test_holder_all_roles_domain_loss_before_native_prepare);
+	UT_RUN(test_holder_all_roles_domain_loss_aborts_only_unhanded_prepare);
+	UT_RUN(test_holder_all_roles_unknown_observation_waits_original_service_event);
+	UT_RUN(test_holder_all_roles_storage_ERROR_keeps_shared_service);
+	UT_RUN(test_holder_all_roles_interrupted_native_publish_rejoins_once);
+	UT_RUN(test_holder_all_roles_wrong_native_identity_retains_shared_pair);
+	UT_RUN(test_holder_all_roles_frozen_callbacks_keep_native_and_semantic_debt);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
