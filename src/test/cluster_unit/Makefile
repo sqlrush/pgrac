@@ -9606,6 +9606,18 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
 
+# Independent survivor carrier syntax only; no live routing or authority.
+TESTS += test_cluster_survivor_v4
+all: test_cluster_survivor_v4
+
+test_cluster_survivor_v4: test_cluster_survivor_v4.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_survivor.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 TESTS += test_cluster_control_rebind
 all: test_cluster_control_rebind
 
