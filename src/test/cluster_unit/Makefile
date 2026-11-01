@@ -11785,6 +11785,28 @@ clean: clean-clog-storage-read
 clean-clog-storage-read:
 	rm -f test_cluster_clog_storage test_cluster_clog_storage.d
 
+# Whole framed-file sync/readback; actual SHA256 and temporary file I/O.
+TESTS += test_cluster_clog_sync
+all: test_cluster_clog_sync
+test_cluster_clog_sync: test_cluster_clog_sync.c test_cluster_clog_storage.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog_sync.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-storage-sync
+.PHONY: clean-clog-storage-sync
+clean-clog-storage-sync:
+	rm -f test_cluster_clog_sync test_cluster_clog_sync.d
+
 # Native-WAL-first existing-frame writes, with actual temporary-file I/O.
 TESTS += test_cluster_clog_write
 all: test_cluster_clog_write
