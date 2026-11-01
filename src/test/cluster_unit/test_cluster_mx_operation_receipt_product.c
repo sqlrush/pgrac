@@ -360,3 +360,22 @@ mx_history_full_owned_xmin(void)
 		(HeapTupleHeader)full_companion_result.scratch_page);
 	return HeapTupleHeaderGetRawXmin(full_companion_result.tuple.t_data);
 }
+
+void
+mx_history_lock_failure(HeapTuple tuple, TM_Result result, bool handled,
+	TM_FailureData *failure, ClusterHeapSuccessorProof *next)
+{
+	cluster_current_mx_lock_failure(tuple, result, handled, &receipt_result,
+		&authorize_operation, failure, next);
+}
+void
+mx_history_lock_successor_fault(unsigned fault)
+{
+	if (fault == 1) receipt_result.successor_proof.valid = false;
+	if (fault == 2) receipt_result.successor_proof.updater_xid++;
+	if (fault == 3) receipt_result.authoritative_updater++;
+	if (fault == 4) ItemPointerSetOffsetNumber(&receipt_result.successor_proof.tid, 3);
+	if (fault == 5) ItemPointerSetInvalid(&receipt_result.successor_proof.tid);
+	if (fault == 6) ItemPointerSet(&receipt_result.successor_proof.tid, 3, 1);
+	if (fault == 7) receipt_result.authoritative_updater = InvalidTransactionId;
+}

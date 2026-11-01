@@ -93,4 +93,7 @@ typedef struct MxFullReadout
 extern int mx_history_full_companion(Relation rel, Buffer buffer, Snapshot actual,
 	ItemPointer tid, bool first_call, bool *all_dead, MxFullReadout *out);
 extern TransactionId mx_history_full_owned_xmin(void);
+extern void mx_history_lock_failure(HeapTuple tuple, TM_Result result, bool handled,
+	TM_FailureData *failure, ClusterHeapSuccessorProof *next);
+extern void mx_history_lock_successor_fault(unsigned fault);
 #endif

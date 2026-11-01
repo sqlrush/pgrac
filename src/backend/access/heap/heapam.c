@@ -17288,6 +17288,57 @@ cluster_heap_rebind_locked_tuple(Relation relation, Buffer buffer,
 }
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+/* One native failure channel for both current-MX producer families. */
+static void
+cluster_current_mx_lock_failure(HeapTuple tuple, TM_Result result, bool handled,
+	const ClusterCurrentMxHeapResult *current, ClusterCurrentMxOperationState *operation,
+	TM_FailureData *tmfd, ClusterHeapSuccessorProof *next_successor)
+{
+	/* A typed UPDATED decision must not fall through TableAM's raw-xid
+	 * chain path because its separate B proof was absent or mixed. This
+	 * binds the already verified result; the destination still consumes the
+	 * complete ITL/TT key under its own PCM-X before touching the tuple. */
+	if (handled && result == TM_Updated
+		&& (!current->successor_proof.valid
+			|| !TransactionIdIsNormal(current->authoritative_updater)
+			|| current->successor_proof.updater_xid != current->authoritative_updater
+			|| !ItemPointerIsValid(&current->successor_proof.tid)
+			|| !ItemPointerIsValid(&tuple->t_data->t_ctid)
+			|| ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid)
+			|| ItemPointerGetBlockNumber(&current->successor_proof.tid)
+				!= ItemPointerGetBlockNumber(&tuple->t_data->t_ctid)
+			|| ItemPointerGetOffsetNumber(&current->successor_proof.tid)
+				!= ItemPointerGetOffsetNumber(&tuple->t_data->t_ctid)))
+	{
+		ItemPointerSetInvalid(&tmfd->ctid);
+		tmfd->xmax = InvalidTransactionId;
+		tmfd->cmax = InvalidCommandId;
+		if (next_successor != NULL)
+			memset(next_successor, 0, sizeof(*next_successor));
+		cluster_current_mx_failclosed(operation, CCMH_FAIL_HOT_PROOF,
+			"the tuple-lock UPDATED handoff lacks its exact successor proof");
+	}
+	tmfd->ctid = tuple->t_data->t_ctid;
+	if (handled)
+	{
+		tmfd->xmax = current->authoritative_updater;
+		if (next_successor != NULL
+			&& current->successor_proof.valid)
+			*next_successor = current->successor_proof;
+	}
+	else if (cluster_peer_mode_enabled()
+			 && (tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI))
+		tmfd->xmax = InvalidTransactionId;
+	else
+		tmfd->xmax = HeapTupleHeaderGetUpdateXid(tuple->t_data);
+	if (result == TM_SelfModified)
+		tmfd->cmax = HeapTupleHeaderGetCmax(tuple->t_data);
+	else
+		tmfd->cmax = InvalidCommandId;
+}
+#endif
+
 static void
 heap_lock_tuple_buffer(Relation relation, Buffer buffer, HeapTuple tuple,
 	TransactionId *creation_xmin)
@@ -18225,25 +18276,17 @@ failed:
 			   !(tuple->t_data->t_infomask & HEAP_XMAX_INVALID));
 		Assert(result != TM_Updated ||
 			   !ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid));
-		tmfd->ctid = tuple->t_data->t_ctid;
 #ifdef USE_PGRAC_CLUSTER
-		if (cluster_current_mx_handled)
-		{
-			tmfd->xmax = cluster_current_mx.authoritative_updater;
-			if (next_successor != NULL
-				&& cluster_current_mx.successor_proof.valid)
-				*next_successor = cluster_current_mx.successor_proof;
-		}
-		else if (cluster_peer_mode_enabled()
-				 && (tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI))
-			tmfd->xmax = InvalidTransactionId;
-		else
-#endif
+		cluster_current_mx_lock_failure(tuple, result, cluster_current_mx_handled,
+			&cluster_current_mx, &cluster_current_mx_operation, tmfd, next_successor);
+#else
+		tmfd->ctid = tuple->t_data->t_ctid;
 		tmfd->xmax = HeapTupleHeaderGetUpdateXid(tuple->t_data);
 		if (result == TM_SelfModified)
 			tmfd->cmax = HeapTupleHeaderGetCmax(tuple->t_data);
 		else
 			tmfd->cmax = InvalidCommandId;
+#endif
 		goto out_locked;
 	}
 
