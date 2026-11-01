@@ -1782,6 +1782,7 @@ UT_TEST(test_sinval_actual_main_rechecks_before_exit)
 static ClusterLmsSharedState lms_fixture;
 static ClusterLmsSharedState *cluster_lms_state = &lms_fixture;
 static unsigned lms_worker, lms_drains, lms_ticks, lms_closes, lms_polls;
+static void (*producer_observe_during_poll)(void);
 static int lms_scenario;
 static bool lms_data_enabled;
 static ClusterNormalStopPollResult lms_ic_observation, lms_cr_observation;
@@ -2011,6 +2012,8 @@ cluster_ic_normal_stop_poll(const char **domain, int *peer, uint32 *sequence, co
 	*peer = 1;
 	*sequence = 7;
 	*reason = "IC_FIXTURE";
+	if (producer_observe_during_poll != NULL)
+		producer_observe_during_poll();
 	return lms_ic_observation;
 }
 
@@ -6650,6 +6653,7 @@ UT_TEST(test_pre_front_buffer_observation_never_advances_cut)
 
 #include "test_cluster_native_producers_observe.inc"
 #include "test_cluster_native_actor_observe.inc"
+#include "test_cluster_service_producer_observe.inc"
 
 int
 main(void)
@@ -6660,7 +6664,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(180);
+	UT_PLAN(186);
 	UT_RUN(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
@@ -6841,6 +6845,12 @@ main(void)
 	UT_RUN(test_native_actor_observation_never_repairs_mismatched_or_full_depth);
 	UT_RUN(test_native_actor_return_does_not_complete_original_module_debt);
 	UT_RUN(test_native_actor_observation_needs_no_stop_storage_or_request);
+	UT_RUN(test_producer_observation_binds_real_lms_roles_and_signed_aux_identity);
+	UT_RUN(test_producer_active_outer_work_precedes_module_observation);
+	UT_RUN(test_producer_module_debt_is_neither_retired_nor_hidden_by_idle_actor);
+	UT_RUN(test_producer_identity_and_unlocked_context_are_required_before_poll);
+	UT_RUN(test_producer_identity_epoch_or_role_change_cannot_return_ready);
+	UT_RUN(test_producer_last_actor_work_and_invalid_module_keep_their_owners);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -1635,7 +1635,7 @@ test_cluster_normal_stop_lms.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.
 	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_normal_stop: test_cluster_normal_stop.c test_cluster_native_actor_observe.inc test_cluster_native_producers_observe.inc test_cluster_normal_stop_cleaner.inc test_cluster_normal_stop_sinval.inc test_cluster_normal_stop_lms.inc unit_test.h \
+test_cluster_normal_stop: test_cluster_normal_stop.c test_cluster_service_producer_observe.inc test_cluster_native_actor_observe.inc test_cluster_native_producers_observe.inc test_cluster_normal_stop_cleaner.inc test_cluster_normal_stop_sinval.inc test_cluster_normal_stop_lms.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_service_observe.c cluster_unit_service_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \

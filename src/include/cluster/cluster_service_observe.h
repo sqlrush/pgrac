@@ -36,6 +36,35 @@ typedef struct ClusterServiceActorObservation {
 	const char *reason;
 } ClusterServiceActorObservation;
 
+typedef struct ClusterServiceProducerIdentity {
+	int32 pid;
+	int32 pgprocno;
+	int32 backend_id;
+	uint32 actor_bit;
+	uint64 proc_generation;
+	uint64 epoch;
+} ClusterServiceProducerIdentity;
+
+typedef struct ClusterServiceProducerObservation {
+	ClusterServiceProducerIdentity identity;
+	ClusterServiceActorObservation actor;
+	ClusterServiceObservation responsibility;
+	const char *reason;
+} ClusterServiceProducerObservation;
+
+StaticAssertDecl(sizeof(ClusterServiceProducerIdentity) == 32, "native owner identity size");
+StaticAssertDecl(sizeof(ClusterServiceProducerObservation) <= 128, "native observation size");
+
+/* One actual native owner's point observation, at an unlocked boundary.
+ * Binds the existing actor bracket and original role fanout to its own
+ * PGPROC identity and epoch, rechecking after the module calls. An active
+ * outer bracket stays PENDING without inspecting private module work.
+ * LMON includes its four shared responsibilities. Signed auxiliary backend
+ * identity is preserved. No closure/admission/retirement is performed;
+ * READY cannot be retained as a producer cut or service permission. */
+extern ClusterNormalStopPollResult
+cluster_service_producer_observe(uint64 expected_epoch, ClusterServiceProducerObservation *out);
+
 /* Observe the original native actor's enter/leave bracket even online.
  * Only its actual matching Aux/BackendType may inspect this private copy.
  * Active outer work stays PENDING through nesting; mismatched binding is

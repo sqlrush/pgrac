@@ -4214,6 +4214,87 @@ cluster_service_actor_observe(ClusterServiceActorObservation *out)
 	return CLUSTER_NORMAL_STOP_READY;
 }
 
+/* Combine the original owner's point observations without publishing a cut.
+ * No module is observed while its outer actor work is active. The original
+ * owner remains responsible for every pending or invalid module result.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterNormalStopPollResult
+cluster_service_producer_observe(uint64 expected_epoch, ClusterServiceProducerObservation *out)
+{
+	ClusterNormalStopPollResult result;
+	PGPROC *owner;
+	BackendType backend;
+	AuxProcType aux;
+	bool held_lock = false;
+
+	if (out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	memset(out, 0, sizeof(*out));
+	out->reason = "NATIVE_PRODUCER_OWNER_OR_CONTEXT_INVALID";
+	if (expected_epoch == 0 || expected_epoch == UINT64_MAX || CritSectionCount != 0
+		|| MyProc == NULL || MyProcPid <= 0 || MyProc->pid != MyProcPid
+		|| MyProc->pgprocno < 0 || MyProc->backendId != InvalidBackendId
+		|| MyProc->cluster_grd_generation == 0 || MyProc->cluster_grd_generation == UINT64_MAX)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	ForEachLWLockHeldByMe(cl_native_observe_lock, &held_lock);
+	if (held_lock) {
+		out->reason = "NATIVE_PRODUCER_CALLER_LOCK_HELD";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	result = cluster_service_actor_observe(&out->actor);
+	if (result == CLUSTER_NORMAL_STOP_INVALID)
+		return result;
+	owner = MyProc;
+	backend = MyBackendType;
+	aux = MyAuxProcType;
+	out->identity.pid = owner->pid;
+	out->identity.pgprocno = owner->pgprocno;
+	out->identity.backend_id = owner->backendId;
+	out->identity.actor_bit = out->actor.actor_bit;
+	out->identity.proc_generation = owner->cluster_grd_generation;
+	out->identity.epoch = expected_epoch;
+	if (cluster_epoch_get_current() != expected_epoch) {
+		out->reason = "NATIVE_PRODUCER_EPOCH_CHANGED";
+		return CLUSTER_NORMAL_STOP_PENDING;
+	}
+	if (result != CLUSTER_NORMAL_STOP_READY) {
+		out->reason = out->actor.reason;
+		return result;
+	}
+	result = AmLmonProcess() ? cluster_lmon_service_observe(&out->responsibility)
+		: cluster_service_observe(&out->responsibility);
+	/* A real module contradiction keeps priority over surrounding drift. */
+	if (result == CLUSTER_NORMAL_STOP_INVALID) {
+		out->reason = out->responsibility.reason;
+		return result;
+	}
+	ForEachLWLockHeldByMe(cl_native_observe_lock, &held_lock);
+	if (held_lock || CritSectionCount != 0) {
+		out->reason = "NATIVE_PRODUCER_RETURN_CONTEXT_INVALID";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	if (MyProc != owner || MyBackendType != backend || MyAuxProcType != aux
+		|| !IsUnderPostmaster || !cluster_enabled || !cluster_shared_config
+		|| MyProcPid != out->identity.pid || owner->pid != out->identity.pid
+		|| owner->pgprocno != out->identity.pgprocno
+		|| owner->backendId != out->identity.backend_id
+		|| owner->cluster_grd_generation != out->identity.proc_generation
+		|| cluster_epoch_get_current() != expected_epoch) {
+		out->reason = "NATIVE_PRODUCER_IDENTITY_CHANGED";
+		return CLUSTER_NORMAL_STOP_PENDING;
+	}
+	{
+		ClusterNormalStopPollResult actor = cluster_service_actor_observe(&out->actor);
+		if (actor != CLUSTER_NORMAL_STOP_READY) {
+			out->reason = out->actor.reason;
+			return actor;
+		}
+	}
+	out->reason = result == CLUSTER_NORMAL_STOP_READY ? "NATIVE_PRODUCER_POINT_ONLY"
+		: out->responsibility.reason;
+	return result;
+}
+
 bool
 cluster_normal_stop_service_enter(void)
 {
