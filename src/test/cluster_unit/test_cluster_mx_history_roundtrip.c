@@ -427,6 +427,10 @@ UT_TEST(collector_independent_B_reaches_heap_follow_and_updated_decisions)
 
 #include "test_cluster_mx_history_heap_bridge.inc"
 
+#ifdef HISTORY_AUTHORIZE_FIXTURE
+int history_roundtrip_unused_main(void);
+#define main history_roundtrip_unused_main
+#endif
 int
 main(void)
 {

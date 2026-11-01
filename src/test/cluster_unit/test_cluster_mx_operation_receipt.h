@@ -24,6 +24,16 @@ typedef struct MxHeapReadout {
 } MxHeapReadout;
 struct ClusterR4CrOwnerChallenge;
 #include "cluster/cluster_mx_history.h"
+typedef struct MxAuthorizeState {
+	uint64 operation_id;
+	uint32 restarts;
+	bool active, finished;
+} MxAuthorizeState;
+void mx_history_authorize_reset(void);
+void mx_history_authorize_state(MxAuthorizeState *out);
+int mx_history_authorize(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	const ClusterSemanticAdmissionToken *admission, const ClusterCurrentMxRequestContext *requested,
+	MxHeapReadout *out);
 ClusterMxHistoryStep mx_history_collect(Relation rel, Buffer buffer, HeapTuple tuple,
 	Snapshot actual, const ClusterSemanticAdmissionToken *admission,
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 count,

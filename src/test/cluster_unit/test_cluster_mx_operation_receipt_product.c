@@ -3,6 +3,54 @@
 #include "../../backend/access/heap/heapam.c"
 #include "test_cluster_mx_operation_receipt.h"
 static ClusterCurrentMxHeapResult receipt_result;
+static ClusterCurrentMxOperationState authorize_operation;
+void
+mx_history_authorize_reset(void)
+{
+	memset(&authorize_operation, 0, sizeof(authorize_operation));
+}
+void
+mx_history_authorize_state(MxAuthorizeState *out)
+{
+	out->operation_id = authorize_operation.operation_id;
+	out->restarts = authorize_operation.restarts;
+	out->active = authorize_operation.active;
+	out->finished = authorize_operation.finished;
+}
+int
+mx_history_authorize(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	const ClusterSemanticAdmissionToken *admission, const ClusterCurrentMxRequestContext *requested,
+	MxHeapReadout *out)
+{
+	volatile int disposition = -1;
+	memset(out, 0, sizeof(*out));
+	memset(&receipt_result, 0xa5, sizeof(receipt_result));
+	PG_TRY();
+	{
+		disposition = cluster_current_mx_history_authorize(rel, buffer, tuple, actual, admission,
+			requested->current_member_xid, requested->action, requested->lock_mode,
+			requested->action == CCM_ACTION_UPDATE || requested->action == CCM_ACTION_DELETE,
+			requested->wait_policy, requested->wait_for_conflict, requested->follow_updates,
+			&receipt_result, &authorize_operation);
+	}
+	PG_FINALLY();
+	{
+		memcpy(out->retained.normalized, receipt_result.normalized, sizeof(out->retained.normalized));
+		memcpy(out->retained.proofs, receipt_result.proofs, sizeof(out->retained.proofs));
+		memcpy(out->retained.capabilities, receipt_result.proof_capability_generations,
+			sizeof(out->retained.capabilities));
+		out->retained.normalized_count = receipt_result.normalized_count;
+		out->retained.proof_count = receipt_result.proof_count;
+		out->retained.operation_id = receipt_result.operation_id;
+		out->retained.attempt_generation = receipt_result.attempt_generation;
+		out->result = receipt_result.result;
+		out->authoritative_updater = receipt_result.authoritative_updater;
+		out->follow_updated_chain = receipt_result.follow_updated_chain;
+		out->successor = receipt_result.successor_proof;
+	}
+	PG_END_TRY();
+	return disposition;
+}
 ClusterMxHistoryStep
 mx_history_collect(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
 	const ClusterSemanticAdmissionToken *admission, const ClusterCurrentMxKey *key,

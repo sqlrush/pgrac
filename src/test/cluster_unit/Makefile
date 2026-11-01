@@ -13508,13 +13508,13 @@ test_cluster_mx_operation_consumer: test_cluster_mx_operation_consumer.c \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PGPORT) -o $@
 
 # Collector results consumed through the actual dormant codecs and operation core.
-TESTS += test_cluster_mx_history_roundtrip
-all: test_cluster_mx_history_roundtrip
+TESTS += test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize
+all: test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize
 
-test_cluster_mx_history_roundtrip: test_cluster_mx_history_roundtrip.c test_cluster_mx_history_heap_bridge.inc \
+test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize: %: %.c test_cluster_mx_history_roundtrip.c test_cluster_mx_history_heap_bridge.inc \
 		$(top_srcdir)/src/backend/utils/time/combocid.c $(top_srcdir)/src/include/utils/combocid.h \
 		$(top_srcdir)/src/backend/storage/page/itemptr.c \
-		$(CLUSTER_ITL_O) $(CLUSTER_TX_RESOLVE_O) \
+		$(CLUSTER_ITL_O) $(CLUSTER_TX_RESOLVE_O) $(CLUSTER_MXID_STRIPE_O) $(CLUSTER_MULTIXACT_CURRENT_STATS_O) \
 		test_cluster_mx_operation_receipt_product.o test_cluster_mx_operation_receipt.h \
 		test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
 		test_cluster_mx_history_finish.inc test_cluster_mx_history_wait_capture.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
@@ -13541,6 +13541,7 @@ test_cluster_mx_history_roundtrip: test_cluster_mx_history_roundtrip.c test_clus
 		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
 		$(top_builddir)/src/common/psprintf_srv.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< test_cluster_mx_operation_receipt_product.o \
+		$(CLUSTER_MXID_STRIPE_O) $(CLUSTER_MULTIXACT_CURRENT_STATS_O) \
 		$(top_builddir)/src/backend/lib/pairingheap.o $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
 		$(top_builddir)/src/common/psprintf_srv.o \

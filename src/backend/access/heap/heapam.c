@@ -9545,8 +9545,71 @@ cluster_current_mx_compose_remote_single(
 	return CCMH_DECIDED;
 }
 
+/* Shared native TX wait: no history proof survives the mandatory restart. */
 static ClusterCurrentMxHeapDisposition
-cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
+cluster_current_mx_wait(Buffer buffer, const ClusterTTStatusKey *wait_key,
+	ClusterCurrentMxOperationState *operation)
+{
+	ClusterTxwResult txw;
+
+	cluster_multixact_current_stats_bump(CMX_STAT_WAIT);
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	PG_TRY();
+	{
+		txw = cluster_tx_enqueue_wait_current_mx(
+			wait_key, cluster_ges_request_timeout_ms,
+			&operation->wait_deadline_mono_us);
+	}
+	PG_CATCH();
+	{
+		cluster_multixact_current_stats_bump(
+			CMX_STAT_WAIT_INTERRUPTED);
+		cluster_current_mx_operation_finish(operation);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	switch (txw)
+	{
+		case CLUSTER_TXW_RESOLVED:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RESOLVED);
+			break;
+		case CLUSTER_TXW_DEAD_HOLDER:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_DEAD_HOLDER);
+			break;
+		case CLUSTER_TXW_RETRY:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RETRY);
+			break;
+		case CLUSTER_TXW_TIMEOUT:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_TIMEOUT);
+			cluster_current_mx_operation_finish(operation);
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+					 errmsg("timed out waiting for a current MultiXact member")));
+			break;
+		case CLUSTER_TXW_UNPROVABLE:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_INTERRUPTED);
+			cluster_current_mx_failclosed(
+				operation, CCMH_FAIL_WAIT,
+				"the exact current MultiXact TX wait could not be admitted");
+			break;
+		case CLUSTER_TXW_DEADLOCK:
+			cluster_multixact_current_stats_bump(CMX_STAT_DEADLOCK_VICTIM);
+			cluster_current_mx_operation_finish(operation);
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
+					 errmsg("deadlock detected"),
+					 errdetail("The current MultiXact TX wait was selected as the victim.")));
+			break;
+	}
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	cluster_current_mx_operation_restart(operation);
+	return CCMH_RESTART;
+}
+
+static ClusterCurrentMxHeapDisposition
+cluster_current_mx_authorize_scoped(Relation relation, Buffer buffer, HeapTuple tuple,
+							 bool history, Snapshot actual,
+							 const ClusterSemanticAdmissionToken *admission,
 							 TransactionId requester_xid,
 							 ClusterCurrentTupleAction action,
 							 LockTupleMode lock_mode, bool is_update,
@@ -9671,6 +9734,62 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			operation,
 			CCMH_FAIL_DESCRIBE,
 			"the immutable MultiXact descriptor could not be memoized");
+
+	if (history) {
+		ClusterMxHistoryStep step;
+
+		/* Only request options are caller claims. The bracket captures the
+		 * actual Snapshot, owner, command ID and post-relock tuple shape. */
+		memset(&ctx, 0, sizeof(ctx));
+		ctx.current_member_xid = requester_xid;
+		ctx.desired_status = get_mxact_status_for_lock(lock_mode, is_update);
+		ctx.lock_mode = lock_mode;
+		ctx.wait_policy = wait_policy;
+		ctx.action = (uint8)action;
+		ctx.follow_updates = follow_updates;
+		ctx.wait_for_conflict = wait_for_conflict;
+		step = cluster_current_mx_history_decide(relation, buffer, tuple,
+			actual, admission, &key, members, nmembers, &ctx, operation,
+			heap_result, &decision, &wait_key, &decision_trace);
+		if (step == CMXH_REQUALIFY) {
+			memset(heap_result, 0, sizeof(*heap_result));
+			heap_result->result = TM_BeingModified;
+			cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
+			cluster_current_mx_operation_restart(operation);
+			return CCMH_RESTART;
+		}
+		if (step != CMXH_COMPLETE || decision == CMDL_UNKNOWN)
+			cluster_current_mx_failclosed(operation, CCMH_FAIL_MEMBER_PROOF,
+				"the scoped history proof set was denied or incomplete");
+		switch (decision) {
+		case CMDL_CONTINUE:
+		case CMDL_INVISIBLE:
+		case CMDL_SELF_MODIFIED:
+		case CMDL_BEING_MODIFIED:
+		case CMDL_WOULD_BLOCK:
+		case CMDL_UPDATED:
+		case CMDL_DELETED:
+			cluster_current_mx_operation_finish(operation);
+			return CCMH_DECIDED;
+		case CMDL_FOLLOW_UPDATED:
+			/* The existing native follow caller owns final operation finish. */
+			return CCMH_DECIDED;
+		case CMDL_LOCK_NOT_AVAILABLE:
+			cluster_current_mx_operation_finish(operation);
+			ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("could not obtain lock on row in relation \"%s\"",
+					RelationGetRelationName(relation))));
+			break;
+		case CMDL_WAIT_MEMBER:
+			memset(heap_result, 0, sizeof(*heap_result));
+			heap_result->result = TM_BeingModified;
+			return cluster_current_mx_wait(buffer, &wait_key, operation);
+		case CMDL_UNKNOWN:
+			pg_unreachable();
+		}
+		pg_unreachable();
+	}
 
 	for (i = 0; i < nmembers; i++)
 		if (ISUPDATE_from_mxstatus(members[i].member_status)) {
@@ -9875,62 +9994,7 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			heap_result->result = TM_Ok;
 			return CCMH_DECIDED;
 		case CMDL_WAIT_MEMBER:
-		{
-			ClusterTxwResult txw;
-
-			cluster_multixact_current_stats_bump(CMX_STAT_WAIT);
-			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-			PG_TRY();
-			{
-				txw = cluster_tx_enqueue_wait_current_mx(
-					&wait_key, cluster_ges_request_timeout_ms,
-					&operation->wait_deadline_mono_us);
-			}
-			PG_CATCH();
-			{
-				cluster_multixact_current_stats_bump(
-					CMX_STAT_WAIT_INTERRUPTED);
-				cluster_current_mx_operation_finish(operation);
-				PG_RE_THROW();
-			}
-			PG_END_TRY();
-			switch (txw)
-			{
-				case CLUSTER_TXW_RESOLVED:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RESOLVED);
-					break;
-				case CLUSTER_TXW_DEAD_HOLDER:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_DEAD_HOLDER);
-					break;
-				case CLUSTER_TXW_RETRY:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RETRY);
-					break;
-				case CLUSTER_TXW_TIMEOUT:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_TIMEOUT);
-					cluster_current_mx_operation_finish(operation);
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
-							 errmsg("timed out waiting for a current MultiXact member")));
-					break;
-				case CLUSTER_TXW_UNPROVABLE:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_INTERRUPTED);
-					cluster_current_mx_failclosed(
-						operation, CCMH_FAIL_WAIT,
-						"the exact current MultiXact TX wait could not be admitted");
-					break;
-				case CLUSTER_TXW_DEADLOCK:
-					cluster_multixact_current_stats_bump(CMX_STAT_DEADLOCK_VICTIM);
-					cluster_current_mx_operation_finish(operation);
-					ereport(ERROR,
-							(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
-							 errmsg("deadlock detected"),
-							 errdetail("The current MultiXact TX wait was selected as the victim.")));
-					break;
-			}
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-			cluster_current_mx_operation_restart(operation);
-			return CCMH_RESTART;
-		}
+			return cluster_current_mx_wait(buffer, &wait_key, operation);
 		case CMDL_UNKNOWN:
 			ereport(LOG,
 					(errmsg_internal(
@@ -9972,6 +10036,47 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 	}
 
 	pg_unreachable();
+}
+
+static ClusterCurrentMxHeapDisposition
+cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
+	TransactionId requester_xid, ClusterCurrentTupleAction action,
+	LockTupleMode lock_mode, bool is_update, LockWaitPolicy wait_policy,
+	bool wait_for_conflict, bool follow_updates, ClusterCurrentMxHeapResult *heap_result,
+	ClusterCurrentMxOperationState *operation)
+{
+	return cluster_current_mx_authorize_scoped(relation, buffer, tuple, false, NULL, NULL,
+		requester_xid, action, lock_mode, is_update, wait_policy, wait_for_conflict,
+		follow_updates, heap_result, operation);
+}
+
+/* Selected only together with the complete operation-aware wire family.
+ * Keep an explicit mode: a missing Snapshot/token must never select legacy. */
+static ClusterCurrentMxHeapDisposition pg_attribute_unused()
+cluster_current_mx_history_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, const ClusterSemanticAdmissionToken *admission, TransactionId requester_xid,
+	ClusterCurrentTupleAction action, LockTupleMode lock_mode, bool is_update,
+	LockWaitPolicy wait_policy, bool wait_for_conflict, bool follow_updates,
+	ClusterCurrentMxHeapResult *heap_result, ClusterCurrentMxOperationState *operation)
+{
+	volatile ClusterCurrentMxHeapDisposition result = CCMH_NOT_APPLICABLE;
+
+	PG_TRY();
+	{
+		result = cluster_current_mx_authorize_scoped(relation, buffer, tuple, true, actual,
+			admission, requester_xid, action, lock_mode, is_update, wait_policy,
+			wait_for_conflict, follow_updates, heap_result, operation);
+	}
+	PG_CATCH();
+	{
+		/* The original native ERROR cleanup owns any dropped content lock. */
+		cluster_current_mx_operation_finish(operation);
+		memset(heap_result, 0, sizeof(*heap_result));
+		heap_result->result = TM_BeingModified;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
 }
 
 #ifdef USE_CLUSTER_UNIT

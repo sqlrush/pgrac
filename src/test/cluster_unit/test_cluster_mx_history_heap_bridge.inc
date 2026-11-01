@@ -11,9 +11,14 @@ BufferGetBlockNumber(Buffer buffer)
 }
 static unsigned bridge_unlocks, bridge_relocks, bridge_fault;
 static ComboCidKeyData bridge_combos[2];
+static void (*bridge_lock_override)(Buffer, int);
 void
 LockBuffer(Buffer buffer, int mode)
 {
+	if (bridge_lock_override != NULL) {
+		bridge_lock_override(buffer, mode);
+		return;
+	}
 	UT_ASSERT_EQ(buffer, 1);
 	if (mode == BUFFER_LOCK_UNLOCK) {
 		UT_ASSERT(content_locked);
