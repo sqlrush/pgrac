@@ -93,6 +93,7 @@ typedef struct SlruWriteSnapshot
 {
 	PGAlignedBlock page;
 	XLogRecPtr	flush_lsn;
+	ClusterClogPageIdentityV2 clog_page;
 } SlruWriteSnapshot;
 
 /*
@@ -183,7 +184,10 @@ SimpleLruShmemSize(int nslots, int nlsns)
 	sz += MAXALIGN(nslots * sizeof(LWLockPadded));	/* buffer_locks[] */
 
 	if (nlsns > 0)
+	{
 		sz += MAXALIGN(nslots * nlsns * sizeof(XLogRecPtr));	/* group_lsn[] */
+		sz += MAXALIGN(nslots * sizeof(ClusterClogPageIdentityV2));
+	}
 
 	return BUFFERALIGN(sz) + BLCKSZ * nslots;
 }
@@ -260,6 +264,10 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 		{
 			shared->group_lsn = (XLogRecPtr *) (ptr + offset);
 			offset += MAXALIGN(nslots * nlsns * sizeof(XLogRecPtr));
+			shared->clog_page_identity = (ClusterClogPageIdentityV2 *) (ptr + offset);
+			offset += MAXALIGN(nslots * sizeof(ClusterClogPageIdentityV2));
+			memset(shared->clog_page_identity, 0,
+				   nslots * sizeof(ClusterClogPageIdentityV2));
 		}
 
 		ptr += BUFFERALIGN(offset);
@@ -316,6 +324,11 @@ SimpleLruZeroPage(SlruCtl ctl, int pageno)
 	shared->page_status[slotno] = SLRU_PAGE_VALID;
 	shared->page_dirty[slotno] = true;
 	SlruRecentlyUsed(shared, slotno);
+
+	/* A raw zero or reuse never inherits a previous page birth. */
+	if (shared->clog_page_identity != NULL)
+		memset(&shared->clog_page_identity[slotno], 0,
+			   sizeof(ClusterClogPageIdentityV2));
 
 	/* Set the buffer to zeroes */
 	MemSet(shared->page_buffer[slotno], 0, BLCKSZ);
@@ -462,6 +475,11 @@ SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
 		shared->page_number[slotno] = pageno;
 		shared->page_status[slotno] = SLRU_PAGE_READ_IN_PROGRESS;
 		shared->page_dirty[slotno] = false;
+		/* Legacy payload reads have no persisted FullXid provenance. Clear
+		 * before dropping ControlLock, including read-error paths. */
+		if (shared->clog_page_identity != NULL)
+			memset(&shared->clog_page_identity[slotno], 0,
+				   sizeof(ClusterClogPageIdentityV2));
 
 		/* Acquire per-buffer lock (cannot deadlock, see notes at top) */
 		LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
@@ -546,6 +564,30 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno, TransactionId xid)
 	return SimpleLruReadPage(ctl, pageno, true, xid);
 }
 
+/* The caller holds ControlLock across this complete, by-value observation. */
+static void
+SlruCaptureWriteSnapshot(SlruCtl ctl, int slotno, SlruWriteSnapshot *snapshot)
+{
+	SlruShared	shared = ctl->shared;
+	int			lsnindex = slotno * shared->lsn_groups_per_page;
+
+	Assert(LWLockHeldByMe(shared->ControlLock));
+	memcpy(snapshot->page.data, shared->page_buffer[slotno], BLCKSZ);
+	memset(&snapshot->clog_page, 0, sizeof(snapshot->clog_page));
+	if (shared->clog_page_identity != NULL)
+		snapshot->clog_page = shared->clog_page_identity[slotno];
+	snapshot->flush_lsn = InvalidXLogRecPtr;
+	if (shared->group_lsn != NULL)
+	{
+		for (int i = 0; i < shared->lsn_groups_per_page; i++)
+			snapshot->flush_lsn = Max(snapshot->flush_lsn,
+									 shared->group_lsn[lsnindex + i]);
+	}
+	snapshot->clog_page.identity.page_lsn =
+		Max(snapshot->clog_page.identity.page_lsn, snapshot->flush_lsn);
+}
+
+
 /*
  * Write a page from a shared buffer, if necessary.
  * Does nothing if the specified slot is not dirty.
@@ -557,6 +599,7 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno, TransactionId xid)
  *
  * Control lock must be held at entry, and will be held at exit.
  */
+
 static void
 SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 {
@@ -593,16 +636,7 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	 */
 	if (ctl->sync_handler == SYNC_HANDLER_CLOG)
 	{
-		int			lsnindex = slotno * shared->lsn_groups_per_page;
-
-		memcpy(snapshot.page.data, shared->page_buffer[slotno], BLCKSZ);
-		snapshot.flush_lsn = InvalidXLogRecPtr;
-		if (shared->group_lsn != NULL)
-		{
-			for (int i = 0; i < shared->lsn_groups_per_page; i++)
-				snapshot.flush_lsn = Max(snapshot.flush_lsn,
-									 shared->group_lsn[lsnindex + i]);
-		}
+		SlruCaptureWriteSnapshot(ctl, slotno, &snapshot);
 		write_snapshot = &snapshot;
 	}
 

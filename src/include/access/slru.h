@@ -14,6 +14,7 @@
 #define SLRU_H
 
 #include "access/xlogdefs.h"
+#include "access/clog_file.h"
 #include "access/slrudefs.h"
 #include "storage/lwlock.h"
 #include "storage/sync.h"
@@ -63,6 +64,9 @@ typedef struct SlruSharedData
 	 * page.
 	 */
 	XLogRecPtr *group_lsn;
+	/* CLOG-only provenance, protected with page bytes by ControlLock.
+	 * Raw reads/zeroes leave it unknown until an original producer supplies it. */
+	ClusterClogPageIdentityV2 *clog_page_identity;
 	int			lsn_groups_per_page;
 
 	/*----------

@@ -921,10 +921,11 @@ CheckPointCLOG(void)
  * unless we're forced to write out a dirty clog or xlog page to make room
  * in shared memory.
  */
-void
-ExtendCLOG(TransactionId newestXact)
+static void
+ExtendCLOGInternal(TransactionId newestXact, FullTransactionId birth)
 {
 	int			pageno;
+	int			slotno;
 
 	/*
 	 * No work except at first XID of a page.  But beware: just after
@@ -938,10 +939,42 @@ ExtendCLOG(TransactionId newestXact)
 
 	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
 
-	/* Zero the page and make an XLOG entry about it */
-	ZeroCLOGPage(pageno, true);
+	/* Zero the page and make an XLOG entry about it. Raw-only callers leave
+	 * birth unknown; only the original allocator supplies a complete identity. */
+	slotno = ZeroCLOGPage(pageno, true);
+	if (FullTransactionIdIsValid(birth))
+	{
+		ClusterClogPageIdentityV2 *page = &XactCtl->shared->clog_page_identity[slotno];
+
+		page->identity.logical_page = pageno;
+		page->identity.page_generation = U64FromFullTransactionId(birth);
+		page->identity.birth_observed = true;
+		page->identity.birth_full_xid = birth;
+	}
 
 	LWLockRelease(XactSLRULock);
+}
+
+
+void
+ExtendCLOG(TransactionId newestXact)
+{
+	ExtendCLOGInternal(newestXact, InvalidFullTransactionId);
+}
+
+void
+ExtendCLOGFull(FullTransactionId newestXact)
+{
+	if (!FullTransactionIdIsValid(newestXact) ||
+		!TransactionIdIsNormal(XidFromFullTransactionId(newestXact)) ||
+		U64FromFullTransactionId(newestXact) == PG_UINT64_MAX ||
+		!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE) ||
+		XactCtl->shared == NULL || XactCtl->shared->clog_page_identity == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CLOG page birth requires the original allocator identity")));
+
+	ExtendCLOGInternal(XidFromFullTransactionId(newestXact), newestXact);
 }
 
 

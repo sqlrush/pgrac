@@ -63,6 +63,9 @@ static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
 static bool held, reservation, jump, advance_while_unlocked;
 static unsigned waits, extensions, early_extensions, lock_errors;
+static uint64 clog_full_first, clog_full_last;
+static unsigned clog_full_calls;
+void ExtendCLOGFull(FullTransactionId xid);
 static bool sampling, lifecycle;
 static LWLock *held_lock;
 static LWLockMode held_mode;
@@ -302,6 +305,13 @@ ExtendCLOG(TransactionId xid)
 	extended();
 }
 void
+ExtendCLOGFull(FullTransactionId xid)
+{
+	if (clog_full_calls++ == 0) clog_full_first = U64FromFullTransactionId(xid);
+	clog_full_last = U64FromFullTransactionId(xid);
+	extended();
+}
+void
 ExtendCommitTs(TransactionId xid)
 {
 	extended();
@@ -384,6 +394,8 @@ reset_allocator(void)
 	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = true;
 	cluster_node_id = 4;
 	waits = extensions = early_extensions = lock_errors = 0;
+	clog_full_calls = 0;
+	clog_full_first = clog_full_last = 0;
 	floor_full = limit_full = 0;
 	sampling = lifecycle = false;
 	held_lock = NULL;
@@ -871,10 +883,44 @@ UT_TEST(actual_stripe_future_keeps_prepared_fullxid_until_original_retirement)
 	assert_real_stripe_sample(FullTransactionIdFromU64(2084), 2084);
 }
 
+UT_TEST(actual_clog_birth_receives_original_epoch_across_wrap)
+{
+	FullTransactionId top, child;
+
+	reset_allocator();
+	cluster_enabled = cluster_shared_catalog = cluster_xid_striping = false;
+	variables.nextXid = FullTransactionIdFromEpochAndXid(7, UINT32_MAX);
+	top = GetNewTransactionId(false);
+	child = GetNewTransactionId(true);
+	UT_ASSERT_EQ(clog_full_calls, 2);
+	UT_ASSERT_EQ(clog_full_first, U64FromFullTransactionId(top));
+	UT_ASSERT_EQ(clog_full_last, U64FromFullTransactionId(child));
+	UT_ASSERT_EQ(EpochFromFullTransactionId(child), 8);
+	UT_ASSERT_EQ(XidFromFullTransactionId(child), FirstNormalTransactionId);
+	UT_ASSERT_EQ(extensions, 6);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
+UT_TEST(striped_gap_forwards_each_original_full_position_under_issuer_lock)
+{
+	FullTransactionId issued;
+
+	reset_allocator();
+	jump = true;
+	issued = GetNewTransactionId(false);
+	UT_ASSERT_EQ(U64FromFullTransactionId(issued), 4100);
+	UT_ASSERT_EQ(clog_full_first, 2052);
+	UT_ASSERT_EQ(clog_full_last, 4100);
+	UT_ASSERT_EQ(clog_full_calls, 2049);
+	UT_ASSERT_EQ(extensions, 3 * clog_full_calls);
+	UT_ASSERT_EQ(early_extensions, 0);
+	UT_ASSERT_EQ(lock_errors, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(no_storage_or_procarray_mutation_before_reservation);
 	UT_RUN(wait_rederives_native_counter_and_new_boot_floor);
 	UT_RUN(native_allocation_preserves_ordinary_counter);
@@ -889,6 +935,8 @@ main(void)
 	UT_RUN(actual_stripe_sample_keeps_assigned_top_through_children_and_raw_wrap);
 	UT_RUN(actual_stripe_source_refusal_cannot_erase_the_original_allocation);
 	UT_RUN(actual_stripe_future_keeps_prepared_fullxid_until_original_retirement);
+	UT_RUN(actual_clog_birth_receives_original_epoch_across_wrap);
+	UT_RUN(striped_gap_forwards_each_original_full_position_under_issuer_lock);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

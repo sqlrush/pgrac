@@ -50,6 +50,9 @@ extern void StartupCLOG(void);
 extern void TrimCLOG(void);
 extern void CheckPointCLOG(void);
 extern void ExtendCLOG(TransactionId newestXact);
+/* Original allocator only: XidGenLock EX held, actual finite normal FullXid.
+ * Records volatile page birth; raw-only legacy extension remains unqualified. */
+extern void ExtendCLOGFull(FullTransactionId newestXact);
 extern void TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid);
 
 extern int	clogsyncfiletag(const FileTag *ftag, char *path);

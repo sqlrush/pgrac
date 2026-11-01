@@ -391,18 +391,20 @@ retry_cluster_xid_reservation:
 	 * probes under XidGenLock. */
 	if (U64FromFullTransactionId(full_xid) > U64FromFullTransactionId(ShmemVariableCache->nextXid))
 	{
-		TransactionId gap_xid = XidFromFullTransactionId(ShmemVariableCache->nextXid);
+		FullTransactionId gap_full_xid = ShmemVariableCache->nextXid;
+		TransactionId gap_xid = XidFromFullTransactionId(gap_full_xid);
 
 		while (TransactionIdPrecedes(gap_xid, xid))
 		{
-			ExtendCLOG(gap_xid);
+			ExtendCLOGFull(gap_full_xid);
 			ExtendCommitTs(gap_xid);
 			ExtendSUBTRANS(gap_xid);
-			TransactionIdAdvance(gap_xid);
+			FullTransactionIdAdvance(&gap_full_xid);
+			gap_xid = XidFromFullTransactionId(gap_full_xid);
 		}
 	}
 #endif
-	ExtendCLOG(xid);
+	ExtendCLOGFull(full_xid);
 	ExtendCommitTs(xid);
 	ExtendSUBTRANS(xid);
 

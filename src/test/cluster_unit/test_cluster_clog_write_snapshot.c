@@ -29,6 +29,10 @@ static SlruPageStatus states[1];
 static bool dirty[1];
 static int numbers[1], ages[1];
 static XLogRecPtr lsns[2], flushed;
+static ClusterClogPageIdentityV2 identities[1];
+bool IsUnderPostmaster;
+static void *allocated_shared;
+static Size allocated_size;
 static bool control_held, io_held, inject_update, fail_write, short_write, fail_sync;
 static bool queue_full;
 static unsigned writes, flushes, closes, syncs, queues, stats_writes;
@@ -40,6 +44,20 @@ static size_t written_length;
 static int error_code;
 
 bool InRecovery;
+void LWLockInitialize(LWLock *lock pg_attribute_unused(), int id pg_attribute_unused()) {}
+int pgstat_get_slru_index(const char *name pg_attribute_unused()) { return 0; }
+void *ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *found)
+{
+	if (IsUnderPostmaster) { *found = true; return allocated_shared; }
+	*found = false; allocated_size = size;
+	allocated_shared = calloc(1, size);
+	if (allocated_shared == NULL) abort();
+	return allocated_shared;
+}
+void pgstat_count_slru_page_zeroed(int i pg_attribute_unused()) {}
+void pgstat_count_slru_page_hit(int i pg_attribute_unused()) {}
+void pgstat_count_slru_page_read(int i pg_attribute_unused()) {}
+void pgstat_count_slru_page_exists(int i pg_attribute_unused()) {}
 volatile uint32 CritSectionCount;
 volatile uint32 InterruptHoldoffCount;
 volatile sig_atomic_t InterruptPending;
@@ -228,6 +246,8 @@ reset(SyncRequestHandler handler)
 	shared.page_lru_count = ages;
 	shared.buffer_locks = locks;
 	shared.group_lsn = lsns;
+	memset(identities, 0, sizeof(identities));
+	shared.clog_page_identity = identities;
 	shared.lsn_groups_per_page = 2;
 	ctl.shared = &shared;
 	ctl.sync_handler = handler;
@@ -364,19 +384,150 @@ UT_TEST(clean_slot_does_not_flush_or_write)
 	UT_ASSERT(control_held && !io_held);
 }
 
+static bool
+page_precedes(int a, int b) { return a < b; }
+
+UT_TEST(clog_identity_is_private_in_same_control_lock_snapshot)
+{
+	SlruWriteSnapshot captured;
+	ClusterClogPageIdentityV2 before;
+	reset(SYNC_HANDLER_CLOG);
+	identities[0].identity.logical_page = 3;
+	identities[0].identity.page_generation = 77;
+	identities[0].identity.birth_full_xid = FullTransactionIdFromU64((UINT64CONST(7) << 32) + 3 * 32768);
+	identities[0].identity.birth_observed = true;
+	identities[0].identity.page_lsn = 15;
+	identities[0].image_lsn = 12;
+	before = identities[0];
+	SlruCaptureWriteSnapshot(&ctl, 0, &captured);
+	UT_ASSERT_EQ(captured.flush_lsn, 20);
+	UT_ASSERT_EQ(captured.clog_page.identity.page_lsn, 20);
+	UT_ASSERT_EQ(captured.clog_page.image_lsn, 12);
+	UT_ASSERT(memcmp(&before, identities, sizeof(before)) == 0);
+	memset(page.data, 0x42, BLCKSZ); lsns[0] = 40;
+	memset(identities, 0, sizeof(identities));
+	UT_ASSERT_EQ((unsigned char)captured.page.data[0], 0x41);
+	UT_ASSERT(captured.clog_page.identity.birth_observed);
+	UT_ASSERT_EQ(U64FromFullTransactionId(captured.clog_page.identity.birth_full_xid), U64FromFullTransactionId(before.identity.birth_full_xid));
+	UT_ASSERT_EQ(captured.clog_page.identity.page_generation, 77);
+	UT_ASSERT_EQ(captured.flush_lsn, 20);
+	UT_ASSERT_EQ(captured.clog_page.identity.page_lsn, 20);
+	/* Decoded watermark may exceed the native groups after reload. */
+	identities[0] = before; identities[0].identity.page_lsn = 50;
+	SlruCaptureWriteSnapshot(&ctl, 0, &captured);
+	UT_ASSERT_EQ(captured.clog_page.identity.page_lsn, 50);
+}
+
+UT_TEST(unknown_birth_is_never_reconstructed_from_current_group_lsn)
+{
+	SlruWriteSnapshot captured;
+	reset(SYNC_HANDLER_CLOG);
+	SlruCaptureWriteSnapshot(&ctl, 0, &captured);
+	UT_ASSERT(!captured.clog_page.identity.birth_observed);
+	UT_ASSERT_EQ(U64FromFullTransactionId(captured.clog_page.identity.birth_full_xid), 0);
+	shared.clog_page_identity = NULL;
+	memset(&captured, 0xff, sizeof(captured));
+	SlruCaptureWriteSnapshot(&ctl, 0, &captured);
+	UT_ASSERT(!captured.clog_page.identity.birth_observed);
+	UT_ASSERT_EQ(captured.clog_page.identity.page_generation, 0);
+	UT_ASSERT_EQ(captured.clog_page.image_lsn, 0);
+}
+
+UT_TEST(original_zero_and_raw_reload_clear_old_birth)
+{
+	int fd;
+	reset(SYNC_HANDLER_CLOG);
+	ctl.PagePrecedes = page_precedes;
+	identities[0].identity.birth_observed = true;
+	identities[0].identity.birth_full_xid = FullTransactionIdFromU64(3);
+	UT_ASSERT_EQ(SimpleLruZeroPage(&ctl, 3), 0);
+	UT_ASSERT(!identities[0].identity.birth_observed);
+	UT_ASSERT_EQ(U64FromFullTransactionId(identities[0].identity.birth_full_xid), 0);
+	UT_ASSERT_EQ(lsns[0], 0);
+	/* Native cache hit keeps original provenance, miss must clear it. */
+	identities[0].identity.birth_observed = true;
+	identities[0].identity.birth_full_xid = FullTransactionIdFromU64(123);
+	UT_ASSERT_EQ(SimpleLruReadPage(&ctl, 3, true, 0), 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(identities[0].identity.birth_full_xid), 123);
+	fd = open(filename, O_CREAT | O_RDWR, 0600);
+	if (fd < 0 || ftruncate(fd, 5 * BLCKSZ) != 0) { perror(filename); abort(); }
+	close(fd);
+	dirty[0] = false; shared.latest_page_number = 99;
+	UT_ASSERT_EQ(SimpleLruReadPage(&ctl, 4, true, 0), 0);
+	UT_ASSERT(!identities[0].identity.birth_observed);
+	UT_ASSERT_EQ(U64FromFullTransactionId(identities[0].identity.birth_full_xid), 0);
+	UT_ASSERT_EQ(identities[0].identity.page_generation, 0);
+	UT_ASSERT_EQ(lsns[0], 0);
+	UT_ASSERT(control_held && !io_held);
+}
+
+UT_TEST(raw_read_error_forgets_previous_birth_before_unlock)
+{
+	sigjmp_buf stack;
+	volatile bool caught = false;
+
+	reset(SYNC_HANDLER_CLOG);
+	ctl.PagePrecedes = page_precedes;
+	dirty[0] = false; shared.latest_page_number = 99;
+	identities[0].identity.birth_observed = true;
+	identities[0].identity.birth_full_xid = FullTransactionIdFromU64(123);
+	PG_exception_stack = &stack;
+	if (sigsetjmp(stack, 0) == 0) (void) SimpleLruReadPage(&ctl, 4, true, 0);
+	else caught = true;
+	PG_exception_stack = NULL;
+	UT_ASSERT(caught);
+	UT_ASSERT(!identities[0].identity.birth_observed);
+	UT_ASSERT_EQ(U64FromFullTransactionId(identities[0].identity.birth_full_xid), 0);
+	UT_ASSERT_EQ(states[0], SLRU_PAGE_EMPTY);
+	UT_ASSERT(control_held && !io_held && !dirty[0]);
+}
+
+UT_TEST(shmem_initializes_optional_identity_array_and_preserves_attachment)
+{
+	SlruCtlData initialized = {0}, attached = {0};
+	for (unsigned groups = 0; groups <= 2; groups += 2) {
+		IsUnderPostmaster = false;
+		SimpleLruInit(&initialized, "test", 3, groups, &control, directory, 0,
+			groups ? SYNC_HANDLER_CLOG : SYNC_HANDLER_NONE);
+		UT_ASSERT_EQ(allocated_size, SimpleLruShmemSize(3, groups));
+		UT_ASSERT_EQ(initialized.shared->num_slots, 3);
+		UT_ASSERT((initialized.shared->clog_page_identity != NULL) == (groups != 0));
+		if (groups && initialized.shared->clog_page_identity != NULL) {
+			ClusterClogPageIdentityV2 zero = {0};
+			for (unsigned i = 0; i < 3; i++)
+				UT_ASSERT(memcmp(&zero, &initialized.shared->clog_page_identity[i], sizeof(zero)) == 0);
+			UT_ASSERT((char *)(initialized.shared->clog_page_identity + 3) <= initialized.shared->page_buffer[0]);
+			initialized.shared->clog_page_identity[2].identity.birth_full_xid = FullTransactionIdFromU64(123);
+		} else UT_ASSERT(initialized.shared->clog_page_identity == NULL);
+		IsUnderPostmaster = true;
+		SimpleLruInit(&attached, "test", 3, groups, &control, directory, 0,
+			groups ? SYNC_HANDLER_CLOG : SYNC_HANDLER_NONE);
+		UT_ASSERT(attached.shared == initialized.shared);
+		if (groups && attached.shared->clog_page_identity != NULL)
+			UT_ASSERT_EQ(U64FromFullTransactionId(attached.shared->clog_page_identity[2].identity.birth_full_xid), 123);
+		free(allocated_shared); allocated_shared = NULL;
+	}
+	IsUnderPostmaster = false;
+}
+
 int
 main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-snapshot-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(6);
+	UT_PLAN(11);
 	UT_RUN(clog_snapshot_precedes_unlock_and_preserves_redirty);
 	UT_RUN(non_clog_keeps_original_live_buffer_path);
 	UT_RUN(failed_clog_write_restores_original_state_before_error);
 	UT_RUN(checkpoint_keeps_fd_and_redirty_after_snapshot);
 	UT_RUN(short_write_and_sync_failure_keep_retryable_dirty_page);
 	UT_RUN(clean_slot_does_not_flush_or_write);
+	UT_RUN(clog_identity_is_private_in_same_control_lock_snapshot);
+	UT_RUN(unknown_birth_is_never_reconstructed_from_current_group_lsn);
+	UT_RUN(original_zero_and_raw_reload_clear_old_birth);
+	UT_RUN(raw_read_error_forgets_previous_birth_before_unlock);
+	UT_RUN(shmem_initializes_optional_identity_array_and_preserves_attachment);
 	unlink(filename);
 	rmdir(directory);
 	UT_DONE();

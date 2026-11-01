@@ -833,6 +833,7 @@ test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $
 
 # Execute the actual bounded header provider and its single-entry consumer.
 TESTS += test_cluster_tt_exact_batch
+all: test_cluster_tt_exact_batch
 
 test_cluster_tt_exact_batch.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c Makefile
 	awk '/^(cluster_runtime_visibility_remote_exact_tt_batch|cluster_runtime_visibility_remote_exact_tt_proof)\(/ \
@@ -11315,7 +11316,9 @@ test_cluster_clog_file: test_cluster_clog_file.c unit_test.h \
 
 # CLOG page/WAL dependency snapshot through the complete native SLRU writer.
 test_cluster_clog_write_snapshot: test_cluster_clog_write_snapshot.c unit_test.h \
-		$(top_srcdir)/src/backend/access/transam/slru.c $(CLUSTER_UNIT_PORT_LIBS)
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_file.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
@@ -11403,3 +11406,14 @@ clean: clean-clog-storage-write
 .PHONY: clean-clog-storage-write
 clean-clog-storage-write:
 	rm -f test_cluster_clog_write test_cluster_clog_write.d
+
+# Original issuer/CLOG birth and cache provenance lifecycle.
+TESTS += test_cluster_clog_birth
+all: test_cluster_clog_birth
+test_cluster_clog_birth: test_cluster_clog_birth.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_file.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
