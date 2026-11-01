@@ -2482,16 +2482,23 @@ static void compute_new_xmax_infomask(TransactionId xmax, uint16 old_infomask,
 									  LockTupleMode mode, bool is_update,
 									  TransactionId *result_xmax, uint16 *result_infomask,
 									  uint16 *result_infomask2);
+#ifdef USE_PGRAC_CLUSTER
+struct ClusterCurrentMxLockScope;
+#endif
 static TM_Result heap_lock_updated_tuple(Relation rel,
 										 uint16 prior_infomask,
 										 TransactionId prior_rawxmax,
 										 const ItemPointerData *prior_ctid,
 										 TransactionId xid,
-										 LockTupleMode mode);
+										 LockTupleMode mode
+#ifdef USE_PGRAC_CLUSTER
+						 , struct ClusterCurrentMxLockScope *history_scope
+#endif
+						 );
 #ifdef USE_PGRAC_CLUSTER
 static TM_Result heap_lock_updated_tuple_authoritative(
 	Relation rel, const ClusterHeapSuccessorProof *successor,
-	TransactionId xid, LockTupleMode mode);
+	TransactionId xid, LockTupleMode mode, struct ClusterCurrentMxLockScope *history_scope);
 #endif
 static int	heap_log_freeze_plan(HeapTupleFreeze *tuples, int ntuples,
 								 xl_heap_freeze_plan *plans_out,
@@ -8834,7 +8841,8 @@ cluster_current_mx_result_consume_operations(
 		case CMDL_UNKNOWN:
 			goto unknown;
 	}
-	if (decision == CMDL_UPDATED || decision == CMDL_FOLLOW_UPDATED)
+	if (decision == CMDL_UPDATED || decision == CMDL_FOLLOW_UPDATED
+		|| (decision == CMDL_SELF_MODIFIED && ctx->tuple_shape == CCM_SHAPE_UPDATED))
 		cluster_current_mx_set_successor_proof(&heap_result->successor_proof,
 			successor_tid, heap_result->authoritative_updater,
 			&challenge->candidate_next_xmin_alias,
@@ -10452,6 +10460,33 @@ cluster_current_mx_history_authorize_caller(Relation relation, Buffer buffer, He
 	}
 	PG_END_TRY();
 	return result;
+}
+
+/* Recursive current-MX front door; NULL scope keeps the original guard. */
+static ClusterCurrentMxHeapDisposition
+cluster_current_mx_chain_authorize(ClusterCurrentMxLockScope *scope,
+	Relation relation, Buffer buffer, HeapTuple tuple, TransactionId requester,
+	LockTupleMode mode, ClusterCurrentMxHeapResult *current,
+	ClusterCurrentMxOperationState *operation)
+{
+	if (scope != NULL) {
+		ClusterCurrentMxHeapDisposition disposition;
+
+		memset(current, 0, sizeof(*current));
+		current->result = TM_BeingModified;
+		cluster_current_mx_lock_scope_require(scope);
+		disposition = cluster_current_mx_history_authorize(relation, buffer, tuple,
+			scope->actual, &scope->admission, requester, CCM_ACTION_LOCK, mode,
+			false, LockWaitBlock, true, true, current, operation);
+		cluster_current_mx_lock_scope_require(scope);
+		return disposition;
+	}
+	if (cluster_peer_mode_enabled()
+		&& !(tuple->t_data->t_infomask & HEAP_XMAX_INVALID)
+		&& (tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI))
+		cluster_current_mx_failclosed(operation, CCMH_FAIL_HOT_PROOF,
+			"a recursive update-chain hop carries an unproven current MultiXact");
+	return CCMH_NOT_APPLICABLE;
 }
 
 /* Dormant native read front door. The explicit statement Snapshot or current
@@ -17421,6 +17456,74 @@ heap_lock_tuple_buffer(Relation relation, Buffer buffer, HeapTuple tuple,
 }
 
 #ifdef USE_PGRAC_CLUSTER
+typedef struct ClusterCurrentMxChainState
+{
+	ClusterCurrentMxOperationState operation;
+	ClusterCurrentMxHeapResult current;
+	ClusterCurrentMxStampPlan plan;
+	ResourceXAuxiliaryAcquireContext vm_context;
+	bool handled;
+	bool edge_consumed;
+	bool next_ready;
+	ClusterHeapSuccessorProof next;
+	uint8 header[SizeofHeapTupleHeader] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+} ClusterCurrentMxChainState;
+
+/* LOCK_UPDATED preserves the forward link, cid and tuple ITL index. Its
+ * WAL record only changes xmax and the two xmax hint masks. */
+static bool
+cluster_current_mx_chain_plan_header(HeapTuple tuple, TransactionId xmax,
+	uint16 infomask, uint16 infomask2, uint8 output[SizeofHeapTupleHeader])
+{
+	HeapTupleHeader planned = (HeapTupleHeader)output;
+
+	if (tuple == NULL || tuple->t_data == NULL || output == NULL
+		|| !MultiXactIdIsValid((MultiXactId)xmax)
+		|| !(infomask & HEAP_XMAX_IS_MULTI)
+		|| (infomask & ~HEAP_XMAX_BITS) != 0
+		|| (infomask2 & ~HEAP_KEYS_UPDATED) != 0
+		|| (tuple->t_data->t_infomask & HEAP_MOVED) != 0)
+		return false;
+	memcpy(output, tuple->t_data, SizeofHeapTupleHeader);
+	HeapTupleHeaderSetXmax(planned, xmax);
+	planned->t_infomask &= ~HEAP_XMAX_BITS;
+	planned->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	planned->t_infomask |= infomask;
+	planned->t_infomask2 |= infomask2;
+	return true;
+}
+
+/* An edge consumes the complete already-validated B once. */
+static bool
+cluster_current_mx_chain_next(ClusterCurrentMxLockScope *scope, HeapTuple tuple,
+	const ClusterCurrentMxHeapResult *current, ClusterCurrentMxOperationState *operation,
+	bool *consumed, ClusterHeapSuccessorProof *next)
+{
+	memset(next, 0, sizeof(*next));
+	cluster_current_mx_lock_scope_require(scope);
+	if (tuple->t_data->t_infomask & HEAP_XMAX_INVALID
+		|| HeapTupleHeaderIndicatesMovedPartitions(tuple->t_data)
+		|| ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid)
+		|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask))
+		return false;
+	if (*consumed || !cluster_current_mx_lock_successor_valid(tuple, current))
+		cluster_current_mx_failclosed(operation, CCMH_FAIL_HOT_PROOF,
+			"the recursive update-chain edge lacks its exact unused successor proof");
+	*next = current->successor_proof;
+	*consumed = true;
+	return true;
+}
+static void
+cluster_current_mx_chain_missing(ClusterCurrentMxLockScope *scope,
+	const ClusterHeapSuccessorProof *expected)
+{
+	if (scope != NULL && expected != NULL && expected->valid) {
+		cluster_current_mx_lock_scope_require(scope);
+		cluster_current_mx_failclosed(NULL, CCMH_FAIL_HOT_PROOF,
+			"the proved recursive successor is absent from the physical fetch");
+	}
+}
+
 static void
 cluster_current_mx_lock_follow_capture(ClusterCurrentMxLockScope *scope,
 	Buffer buffer, HeapTuple tuple, const ClusterCurrentMxHeapResult *current,
@@ -17705,7 +17808,7 @@ l3:
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 					follow_result = heap_lock_updated_tuple_authoritative(
 						relation, &cluster_current_mx.successor_proof,
-						GetCurrentTransactionId(), mode);
+						GetCurrentTransactionId(), mode, history_scope);
 					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
 					if (history_scope != NULL) {
 						if (!cluster_current_mx_lock_follow_recheck(history_scope,
@@ -17730,6 +17833,8 @@ l3:
 						cluster_current_mx_operation_finish(
 							operation);
 						result = follow_result;
+						if (history_scope != NULL)
+							cluster_current_mx_handled = true;
 						goto failed;
 					}
 				}
@@ -17966,7 +18071,11 @@ l3:
 					res = heap_lock_updated_tuple(relation,
 												  infomask, xwait, &t_ctid,
 												  GetCurrentTransactionId(),
-												  mode);
+												  mode
+#ifdef USE_PGRAC_CLUSTER
+											 , history_scope
+#endif
+											 );
 					if (res != TM_Ok)
 					{
 						result = res;
@@ -18330,7 +18439,11 @@ l3:
 				res = heap_lock_updated_tuple(relation,
 											  infomask, xwait, &t_ctid,
 											  GetCurrentTransactionId(),
-											  mode);
+											  mode
+#ifdef USE_PGRAC_CLUSTER
+											 , history_scope
+#endif
+											 );
 				if (res != TM_Ok)
 				{
 					result = res;
@@ -19272,32 +19385,80 @@ cluster_heap_lock_tuple_owned(Relation relation, HeapTuple tuple,
 		follow_updates, buffer, tmfd, expected_successor, next_successor, storage, NULL);
 }
 
-/* Dormant statement-aware entry; native fetch and recursive SnapshotAny never
- * replace actual. Heap allocation keeps mutable state defined across ERROR. */
+ClusterCurrentMxLockScope *
+cluster_heap_lock_history_scope_begin(Snapshot actual)
+{
+	ClusterCurrentMxLockScope *scope = palloc0(sizeof(*scope));
+
+	PG_TRY();
+	{
+		cluster_current_mx_lock_scope_begin(scope, actual);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_lock_scope_end(scope);
+		pfree(scope);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return scope;
+}
+
+void
+cluster_heap_lock_history_scope_end(ClusterCurrentMxLockScope *scope)
+{
+	if (scope == NULL)
+		return;
+	cluster_current_mx_lock_scope_end(scope);
+	pfree(scope);
+}
+
+/* The enclosing TableAM or standalone wrapper owns scope cleanup. */
+TM_Result
+cluster_heap_lock_tuple_history_in_scope(Relation relation, HeapTuple tuple,
+	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
+	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,
+	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ],
+	ClusterCurrentMxLockScope *scope)
+{
+	TM_Result result;
+
+	if (scope == NULL)
+		cluster_current_mx_failclosed(NULL, CCMH_FAIL_MEMBER_PROOF,
+			"the tuple-lock history scope is absent");
+	cluster_current_mx_lock_scope_require(scope);
+	cluster_current_mx_operation_finish(&scope->operation);
+	result = heap_lock_tuple_internal(relation, tuple, cid, mode, wait_policy,
+		follow_updates, buffer, tmfd, expected_successor, next_successor, storage, scope);
+	cluster_current_mx_lock_scope_require(scope);
+	cluster_current_mx_operation_finish(&scope->operation);
+	return result;
+}
+
+/* Standalone entry owns the same bracket used by the whole TableAM walk. */
 TM_Result
 cluster_heap_lock_tuple_history_owned(Relation relation, HeapTuple tuple,
 	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
 	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,
 	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ], Snapshot actual)
 {
-	ClusterCurrentMxLockScope *scope = palloc0(sizeof(*scope));
+	ClusterCurrentMxLockScope *volatile scope = NULL;
 	volatile TM_Result result = TM_BeingModified;
 	volatile bool completed = false;
 
 	PG_TRY();
 	{
-		cluster_current_mx_lock_scope_begin(scope, actual);
-		result = heap_lock_tuple_internal(relation, tuple, cid, mode, wait_policy,
-			follow_updates, buffer, tmfd, expected_successor, next_successor, storage, scope);
-		cluster_current_mx_lock_scope_require(scope);
+		scope = cluster_heap_lock_history_scope_begin(actual);
+		result = cluster_heap_lock_tuple_history_in_scope(relation, tuple, cid, mode,
+			wait_policy, follow_updates, buffer, tmfd, expected_successor,
+			next_successor, storage, scope);
 		completed = true;
 	}
 	PG_FINALLY();
 	{
 		if (!completed && next_successor != NULL)
 			memset(next_successor, 0, sizeof(*next_successor));
-		cluster_current_mx_lock_scope_end(scope);
-		pfree(scope);
+		cluster_heap_lock_history_scope_end(scope);
 	}
 	PG_END_TRY();
 	return result;
@@ -19745,6 +19906,8 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 #ifdef USE_PGRAC_CLUSTER
 							, TransactionId canonical_xid
 							, const ClusterHeapSuccessorProof *initial_successor
+							, ClusterCurrentMxLockScope *history_scope
+							, ClusterCurrentMxChainState *history_state
 #endif
 							)
 {
@@ -19800,6 +19963,14 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 
 	for (;;)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		if (history_state != NULL) {
+			cluster_current_mx_operation_finish(&history_state->operation);
+			cluster_current_mx_stamp_cancel(&history_state->plan);
+			memset(&history_state->plan, 0, sizeof(history_state->plan));
+			cluster_current_mx_lock_scope_require(history_scope);
+		}
+#endif
 		creation_xmin = InvalidTransactionId;
 		new_infomask = 0;
 		new_xmax = InvalidTransactionId;
@@ -19835,6 +20006,9 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 			 * chain, and there's no further tuple to lock: return success to
 			 * caller.
 			 */
+#ifdef USE_PGRAC_CLUSTER
+			cluster_current_mx_chain_missing(history_scope, &expected_successor);
+#endif
 			result = TM_Ok;
 			goto out_unlocked;
 		}
@@ -19845,6 +20019,17 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 
 l4:
 		CHECK_FOR_INTERRUPTS();
+#ifdef USE_PGRAC_CLUSTER
+		if (history_state != NULL) {
+			cluster_current_mx_stamp_cancel(&history_state->plan);
+			history_state->handled = false;
+			history_state->edge_consumed = false;
+			history_state->next_ready = false;
+			memset(&history_state->next, 0, sizeof(history_state->next));
+			memset(&history_state->current, 0, sizeof(history_state->current));
+			cluster_current_mx_lock_scope_require(history_scope);
+		}
+#endif
 
 		/*
 		 * Before locking the buffer, pin the visibility map page if it
@@ -19894,7 +20079,11 @@ l4:
 		 * Check the tuple XMIN against prior XMAX, if any.  If we reached the
 		 * end of the chain, we're done, so return success.
 		 */
-		if (TransactionIdIsValid(priorXmax) &&
+		if (
+#ifdef USE_PGRAC_CLUSTER
+			!(history_scope != NULL && expected_successor.valid) &&
+#endif
+			TransactionIdIsValid(priorXmax) &&
 			!TransactionIdEquals(HeapTupleHeaderGetXmin(mytup.t_data),
 								 priorXmax))
 		{
@@ -19944,21 +20133,32 @@ l4:
 		xmax = HeapTupleHeaderGetRawXmax(mytup.t_data);
 
 #ifdef USE_PGRAC_CLUSTER
-		/*
-		 * The first successor may be consumed from the explicit full-key
-		 * handoff above.  A further current MultiXact on that successor is a
-		 * new authority operation; this recursive native walker has no heap
-		 * result channel for a second descriptor/proof set.  Fail closed
-		 * before any GetMultiXactIdMembers call instead of reducing that hop
-		 * to a raw updater xid.
-		 */
-		if (cluster_peer_mode_enabled()
-			&& !(old_infomask & HEAP_XMAX_INVALID)
-			&& (old_infomask & HEAP_XMAX_IS_MULTI))
-			cluster_current_mx_failclosed(
-				NULL,
-				CCMH_FAIL_HOT_PROOF,
-				"a recursive update-chain hop carries an unproven current MultiXact");
+		if (history_state != NULL) {
+			ClusterCurrentMxHeapDisposition disposition;
+
+			disposition = cluster_current_mx_chain_authorize(history_scope, rel, buf,
+				&mytup, xid, mode, &history_state->current, &history_state->operation);
+			if (disposition == CCMH_RESTART) {
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				goto l4;
+			}
+			if (disposition == CCMH_DECIDED) {
+				history_state->handled = true;
+				result = history_state->current.result;
+				if (result == TM_SelfModified)
+					goto next;
+				if (result == TM_Updated || result == TM_Deleted)
+					goto out_locked;
+				if (result != TM_Ok)
+					cluster_current_mx_failclosed(&history_state->operation,
+						CCMH_FAIL_RECOMPOSE, "the recursive history decision cannot publish a lock");
+				goto history_compute;
+			}
+		}
+		/* NULL scope retains the original current-MX guard. A scoped
+		 * current MX also cannot fall through on NOT_APPLICABLE. */
+		(void)cluster_current_mx_chain_authorize(NULL, rel, buf, &mytup,
+			xid, mode, NULL, NULL);
 
 		/*
 		 * PGRAC: spec-7.1a D5 -- the same foreign-class floor for the chain
@@ -20134,6 +20334,15 @@ l4:
 		}
 
 		/* compute the new Xmax and infomask values for the tuple ... */
+#ifdef USE_PGRAC_CLUSTER
+history_compute:
+		if (history_state != NULL && history_state->handled) {
+			if (!cluster_current_mx_stamp_hint_bits(&history_state->current,
+					xid, CCMH_STAMP_TEMP_LOCK, mode, &new_infomask, &new_infomask2))
+				cluster_current_mx_failclosed(&history_state->operation,
+					CCMH_FAIL_RECOMPOSE, "the recursive lock has no normalized member set");
+		} else
+#endif
 		compute_new_xmax_infomask(xmax, old_infomask, mytup.t_data->t_infomask2,
 								  xid, mode, false,
 								  &new_xmax, &new_infomask, &new_infomask2);
@@ -20146,13 +20355,17 @@ l4:
 		 */
 		cluster_chain_needs_itl = cluster_itl_lock_path_enabled(rel)
 			&& PageHasItl(BufferGetPage(buf));
+		if (history_state != NULL && history_state->handled && !cluster_chain_needs_itl)
+			cluster_current_mx_failclosed(&history_state->operation, CCMH_FAIL_RECOMPOSE,
+				"the recursive current-MX lock lacks its original ITL receipt path");
 		if (cluster_chain_needs_itl)
 		{
 			ClusterHeapPreparedUndoResult undo_result;
 			bool targets_invalidated;
 			bool content_unlocked = false;
 
-			if (new_infomask & HEAP_XMAX_IS_MULTI)
+			if ((new_infomask & HEAP_XMAX_IS_MULTI)
+				&& !(history_state != NULL && history_state->handled))
 			{
 				cluster_itl_bump_multixact_lock_reject_count();
 				ereport(ERROR,
@@ -20194,7 +20407,8 @@ l4:
 							 errmsg("cluster undo reservation failed before update-chain lock"),
 							 cluster_heap_undo_receipt_errdetail(false)));
 				cluster_chain_receipt_owned = true;
-				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+				if (history_scope == NULL)
+					heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
 				goto l4;
 			}
 
@@ -20232,7 +20446,8 @@ l4:
 										   cluster_node_id)));
 					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
 				}
-				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+				if (history_scope == NULL)
+					heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
 				goto l4;
 			}
 			if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -20246,12 +20461,44 @@ l4:
 								   cluster_node_id)));
 			}
 
+			if (history_state != NULL && history_state->handled) {
+				uint16 expected_mask = new_infomask;
+				uint16 expected_mask2 = new_infomask2;
+
+				if (!cluster_current_mx_stamp_prepare_existing(rel, buf, &mytup,
+						&history_state->current, xid, CCMH_STAMP_TEMP_LOCK, mode,
+						&history_state->plan, &new_xmax, &new_infomask, &new_infomask2)) {
+					cluster_current_mx_operation_restart(&history_state->operation);
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					goto l4;
+				}
+				if (new_infomask != expected_mask || new_infomask2 != expected_mask2)
+					cluster_current_mx_failclosed(&history_state->operation,
+						CCMH_FAIL_RECOMPOSE, "the recursive normalized lock hint plan changed");
+			}
+
 			if (PageIsAllVisible(BufferGetPage(buf))
 				&& BufferIsValid(vmbuffer)
 				&& (!cluster_page_versioned
 					|| cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer)))
 			{
-				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+				if (history_state != NULL && history_state->handled) {
+					bool pin_replaced = false;
+
+					if (!cluster_current_mx_stamp_lock_buffer(vmbuffer, false,
+							(ClusterBufferBarrierSiteId)0, &pin_replaced,
+							&history_state->plan, NULL, &history_state->vm_context, NULL)) {
+						cluster_current_mx_stamp_cancel(&history_state->plan);
+						cluster_current_mx_operation_restart(&history_state->operation);
+						LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+						if (pin_replaced)
+							vmbuffer = InvalidBuffer;
+						else
+							cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &history_state->vm_context);
+						goto l4;
+					}
+				} else
+					LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 				cluster_chain_vm_locked = true;
 			}
 
@@ -20272,6 +20519,8 @@ l4:
 
 			{
 				ClusterHeapPreparedUndoTargetPlan undo_plan;
+				ClusterHeapCurrentMxExactPublication mx_publication;
+				uint8 mx_count = 0;
 				ClusterUndoRecordTarget undo_target;
 				ClusterHeapNoRetryBoundaryResult boundary_result;
 				ClusterHeapPreparedUndoResult plan_result;
@@ -20279,6 +20528,7 @@ l4:
 				UBA undo_uba = InvalidUba_init;
 
 				MemSet(&undo_plan, 0, sizeof(undo_plan));
+				MemSet(&mx_publication, 0, sizeof(mx_publication));
 				MemSet(&undo_target, 0, sizeof(undo_target));
 				MemSet(&undo_payload, 0, sizeof(undo_payload));
 				undo_target.locator
@@ -20303,11 +20553,36 @@ l4:
 					boundary_result = CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY;
 				else if (plan_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
 					boundary_result = CLUSTER_HEAP_BOUNDARY_REFUSED;
-				else
-					boundary_result = cluster_heap_no_retry_boundary_apply(
-						rel, &cluster_chain_receipt, &undo_plan, 1,
-						&undo_target, &undo_payload, sizeof(undo_payload),
-						&undo_uba, NULL, 0);
+				else {
+					bool exact = true;
+
+					if (history_state != NULL && history_state->handled) {
+						if (!cluster_current_mx_chain_plan_header(&mytup, new_xmax,
+								new_infomask, new_infomask2, history_state->header))
+							cluster_current_mx_failclosed(&history_state->operation,
+								CCMH_FAIL_RECOMPOSE, "the recursive LOCK_UPDATED header is invalid");
+						{
+							HeapTupleData planned = mytup;
+
+							planned.t_data = (HeapTupleHeader)history_state->header;
+							(void)cluster_current_mx_chain_next(history_scope, &planned,
+								&history_state->current, &history_state->operation,
+								&history_state->edge_consumed, &history_state->next);
+							history_state->next_ready = true;
+						}
+						exact = cluster_current_mx_stamp_prepare_exact_publication(rel, buf,
+							ItemPointerGetOffsetNumber(&mytup.t_self),
+							PageGetItemId(BufferGetPage(buf), ItemPointerGetOffsetNumber(&mytup.t_self)),
+							history_state->header, &history_state->plan, &mx_publication);
+						mx_count = exact ? 1 : 0;
+					}
+					cluster_current_mx_lock_scope_require(history_scope);
+					boundary_result = !exact ? CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY
+						: cluster_heap_no_retry_boundary_apply(
+							rel, &cluster_chain_receipt, &undo_plan, 1,
+							&undo_target, &undo_payload, sizeof(undo_payload),
+							&undo_uba, mx_count != 0 ? &mx_publication : NULL, mx_count);
+				}
 
 				if (boundary_result
 					== CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY)
@@ -20318,6 +20593,10 @@ l4:
 					{
 						LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 						cluster_chain_vm_locked = false;
+					}
+					if (history_state != NULL) {
+						cluster_current_mx_stamp_cancel(&history_state->plan);
+						cluster_current_mx_operation_restart(&history_state->operation);
 					}
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 					requalified = cluster_undo_record_requalify_for_retry(
@@ -20330,7 +20609,8 @@ l4:
 												  cluster_undo_record_receipt_last_reason(),
 												  cluster_node_id)));
 					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
-					heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+					if (history_scope == NULL)
+						heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
 					goto l4;
 				}
 				if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)
@@ -20401,12 +20681,20 @@ l4:
 		}
 #endif
 
-		/* ... and set them */
-		HeapTupleHeaderSetXmax(mytup.t_data, new_xmax);
-		mytup.t_data->t_infomask &= ~HEAP_XMAX_BITS;
-		mytup.t_data->t_infomask2 &= ~HEAP_KEYS_UPDATED;
-		mytup.t_data->t_infomask |= new_infomask;
-		mytup.t_data->t_infomask2 |= new_infomask2;
+		/* ... and set them. Typed publication applies exactly the bytes
+		 * bound to its descriptor receipts; LOCK_UPDATED retains the edge. */
+#ifdef USE_PGRAC_CLUSTER
+		if (history_state != NULL && history_state->handled)
+			memcpy(mytup.t_data, history_state->header, SizeofHeapTupleHeader);
+		else
+#endif
+		{
+			HeapTupleHeaderSetXmax(mytup.t_data, new_xmax);
+			mytup.t_data->t_infomask &= ~HEAP_XMAX_BITS;
+			mytup.t_data->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+			mytup.t_data->t_infomask |= new_infomask;
+			mytup.t_data->t_infomask2 |= new_infomask2;
+		}
 
 #ifdef USE_PGRAC_CLUSTER
 		/*
@@ -20494,6 +20782,8 @@ l4:
 		END_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
+		if (history_state != NULL && history_state->handled)
+			cluster_current_mx_stamp_published(&history_state->plan);
 		if (cluster_chain_vm_locked)
 		{
 			LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
@@ -20536,6 +20826,25 @@ next:
 					 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
 							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 							   cluster_node_id)));
+		if (history_state != NULL && history_state->handled) {
+			/* SELF has no publication; every publishing hop already checked
+			 * its planned edge before APPLY. Consume that saved edge once. */
+			if (!history_state->next_ready) {
+				(void)cluster_current_mx_chain_next(history_scope, &mytup,
+					&history_state->current, &history_state->operation,
+					&history_state->edge_consumed, &history_state->next);
+				history_state->next_ready = true;
+			}
+			expected_successor = history_state->next;
+			if (!expected_successor.valid) {
+				result = TM_Ok;
+				goto out_locked;
+			}
+			priorXmax = expected_successor.updater_xid;
+			tupid = expected_successor.tid;
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
 #endif
 		/* if we find the end of update chain, we're done. */
 		if (mytup.t_data->t_infomask & HEAP_XMAX_INVALID ||
@@ -20591,6 +20900,40 @@ out_unlocked:
 	return result;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* One reusable per-walk state lives across setjmp; the enclosing scope owns
+ * Snapshot/admission, while this bracket owns recursive operations/receipts. */
+static TM_Result
+heap_lock_updated_tuple_rec_scoped(Relation rel, TransactionId prior_xmax,
+	const ItemPointerData *tid, TransactionId xid, LockTupleMode mode,
+	TransactionId canonical_xid, const ClusterHeapSuccessorProof *successor,
+	ClusterCurrentMxLockScope *scope)
+{
+	ClusterCurrentMxChainState *state;
+	volatile TM_Result result = TM_BeingModified;
+
+	if (scope == NULL)
+		return heap_lock_updated_tuple_rec(rel, prior_xmax, tid, xid, mode,
+			canonical_xid, successor, NULL, NULL);
+	state = palloc0(sizeof(*state));
+	PG_TRY();
+	{
+		cluster_current_mx_lock_scope_require(scope);
+		result = heap_lock_updated_tuple_rec(rel, prior_xmax, tid, xid, mode,
+			canonical_xid, successor, scope, state);
+		cluster_current_mx_lock_scope_require(scope);
+	}
+	PG_FINALLY();
+	{
+		cluster_current_mx_operation_finish(&state->operation);
+		cluster_current_mx_stamp_cancel(&state->plan);
+		pfree(state);
+	}
+	PG_END_TRY();
+	return result;
+}
+#endif
+
 /*
  * heap_lock_updated_tuple
  *		Follow update chain when locking an updated tuple, acquiring locks (row
@@ -20621,7 +20964,11 @@ heap_lock_updated_tuple(Relation rel,
 						uint16 prior_infomask,
 						TransactionId prior_raw_xmax,
 						const ItemPointerData *prior_ctid,
-						TransactionId xid, LockTupleMode mode)
+						TransactionId xid, LockTupleMode mode
+#ifdef USE_PGRAC_CLUSTER
+						, ClusterCurrentMxLockScope *history_scope
+#endif
+						)
 {
 	/*
 	 * If the tuple has moved into another partition (effectively a delete)
@@ -20675,12 +21022,12 @@ heap_lock_updated_tuple(Relation rel,
 
 		prior_xmax = (prior_infomask & HEAP_XMAX_IS_MULTI) ?
 			MultiXactIdGetUpdateXid(prior_raw_xmax, prior_infomask) : prior_raw_xmax;
-		return heap_lock_updated_tuple_rec(rel, prior_xmax, prior_ctid, xid, mode
 #ifdef USE_PGRAC_CLUSTER
-										   , canonical_xid
-										   , NULL
+		return heap_lock_updated_tuple_rec_scoped(rel, prior_xmax, prior_ctid,
+			xid, mode, canonical_xid, NULL, history_scope);
+#else
+		return heap_lock_updated_tuple_rec(rel, prior_xmax, prior_ctid, xid, mode);
 #endif
-										   );
 	}
 
 	/* nothing to lock */
@@ -20696,7 +21043,7 @@ heap_lock_updated_tuple(Relation rel,
 static TM_Result
 heap_lock_updated_tuple_authoritative(
 	Relation rel, const ClusterHeapSuccessorProof *successor,
-	TransactionId xid, LockTupleMode mode)
+	TransactionId xid, LockTupleMode mode, ClusterCurrentMxLockScope *history_scope)
 {
 	ClusterCanonicalTxnBinding canonical_binding = {0};
 	TransactionId canonical_xid;
@@ -20716,9 +21063,9 @@ heap_lock_updated_tuple_authoritative(
 				 errmsg("canonical ACTIVE publication failed before authoritative update-chain lock")));
 
 	MultiXactIdSetOldestMember();
-	return heap_lock_updated_tuple_rec(
+	return heap_lock_updated_tuple_rec_scoped(
 		rel, successor->updater_xid, &successor->tid, xid, mode,
-		canonical_xid, successor);
+		canonical_xid, successor, history_scope);
 }
 #endif
 

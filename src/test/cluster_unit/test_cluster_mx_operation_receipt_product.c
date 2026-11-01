@@ -443,3 +443,68 @@ void mx_history_lock_window_close(void)
 	cluster_current_mx_lock_scope_end(&window_scope);
 	authorize_operation = window_scope.operation;
 }
+
+static ClusterCurrentMxLockScope *recursive_scope;
+static bool recursive_edge_consumed;
+static ClusterCurrentMxOperationState recursive_operation;
+void
+mx_history_recursive_open(Snapshot actual)
+{
+	recursive_edge_consumed = false;
+	memset(&recursive_operation, 0, sizeof(recursive_operation));
+	recursive_scope = cluster_heap_lock_history_scope_begin(actual);
+}
+int
+mx_history_recursive_authorize(Relation rel, Buffer buffer, HeapTuple tuple,
+	bool history, TransactionId requester, LockTupleMode mode, MxHeapReadout *out)
+{
+	volatile int result = -1;
+
+	memset(out, 0, sizeof(*out));
+	memset(&receipt_result, 0, sizeof(receipt_result));
+	PG_TRY();
+	{
+		result = cluster_current_mx_chain_authorize(history ? recursive_scope : NULL,
+			rel, buffer, tuple, requester, mode, &receipt_result, &recursive_operation);
+	}
+	PG_FINALLY();
+	{
+		out->result = receipt_result.result;
+		out->authoritative_updater = receipt_result.authoritative_updater;
+		out->follow_updated_chain = receipt_result.follow_updated_chain;
+		out->successor = receipt_result.successor_proof;
+		out->retained.proof_count = receipt_result.proof_count;
+		out->retained.normalized_count = receipt_result.normalized_count;
+		out->retained.operation_id = receipt_result.operation_id;
+		authorize_operation = recursive_operation;
+	}
+	PG_END_TRY();
+	return result;
+}
+void
+mx_history_recursive_close(void)
+{
+	cluster_current_mx_operation_finish(&recursive_operation);
+	cluster_heap_lock_history_scope_end(recursive_scope);
+	recursive_scope = NULL;
+	authorize_operation = recursive_operation;
+}
+
+bool
+mx_history_recursive_next(HeapTuple tuple, ClusterHeapSuccessorProof *next)
+{
+	return cluster_current_mx_chain_next(recursive_scope, tuple, &receipt_result,
+		&recursive_operation, &recursive_edge_consumed, next);
+}
+void
+mx_history_recursive_missing(const ClusterHeapSuccessorProof *expected)
+{
+	cluster_current_mx_chain_missing(recursive_scope, expected);
+}
+
+bool
+mx_history_recursive_header(HeapTuple tuple, TransactionId xmax,
+	uint16 infomask, uint16 infomask2, uint8 output[SizeofHeapTupleHeader])
+{
+	return cluster_current_mx_chain_plan_header(tuple, xmax, infomask, infomask2, output);
+}

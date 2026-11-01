@@ -688,7 +688,7 @@ heapam_tuple_lock_internal(Relation relation, ItemPointer tid, Snapshot snapshot
 				  LockWaitPolicy wait_policy, uint8 flags,
 				  TM_FailureData *tmfd
 #ifdef USE_PGRAC_CLUSTER
-				  , bool history
+				  , ClusterCurrentMxLockScope *history_scope
 #endif
 				  )
 {
@@ -717,11 +717,11 @@ heapam_tuple_lock_internal(Relation relation, ItemPointer tid, Snapshot snapshot
 tuple_lock_retry:
 	tuple->t_self = *tid;
 #ifdef USE_PGRAC_CLUSTER
-	if (history)
-		result = cluster_heap_lock_tuple_history_owned(relation, tuple, cid, mode,
+	if (history_scope != NULL)
+		result = cluster_heap_lock_tuple_history_in_scope(relation, tuple, cid, mode,
 			wait_policy, follow_updates, &buffer, tmfd,
 			expected_successor.valid ? &expected_successor : NULL, &next_successor,
-			owned ? fetched_row.data : NULL, snapshot);
+			owned ? fetched_row.data : NULL, history_scope);
 	else
 #endif
 	result =
@@ -996,7 +996,7 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	return heapam_tuple_lock_internal(relation, tid, snapshot, slot, cid, mode,
 		wait_policy, flags, tmfd
 #ifdef USE_PGRAC_CLUSTER
-		, false
+		, NULL
 #endif
 		);
 }
@@ -1008,8 +1008,20 @@ heapam_tuple_lock_history(Relation relation, ItemPointer tid, Snapshot snapshot,
 	TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
 	LockWaitPolicy wait_policy, uint8 flags, TM_FailureData *tmfd)
 {
-	return heapam_tuple_lock_internal(relation, tid, snapshot, slot, cid, mode,
-		wait_policy, flags, tmfd, true);
+	ClusterCurrentMxLockScope *scope = cluster_heap_lock_history_scope_begin(snapshot);
+	volatile TM_Result result = TM_BeingModified;
+
+	PG_TRY();
+	{
+		result = heapam_tuple_lock_internal(relation, tid, snapshot, slot, cid, mode,
+			wait_policy, flags, tmfd, scope);
+	}
+	PG_FINALLY();
+	{
+		cluster_heap_lock_history_scope_end(scope);
+	}
+	PG_END_TRY();
+	return result;
 }
 #endif
 

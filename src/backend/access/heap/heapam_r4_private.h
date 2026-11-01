@@ -57,6 +57,13 @@ extern TM_Result cluster_heap_lock_tuple_owned(Relation relation, HeapTuple tupl
 	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
 	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,
 	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ]);
+typedef struct ClusterCurrentMxLockScope ClusterCurrentMxLockScope;
+extern ClusterCurrentMxLockScope *cluster_heap_lock_history_scope_begin(Snapshot actual);
+extern void cluster_heap_lock_history_scope_end(ClusterCurrentMxLockScope *scope);
+extern TM_Result cluster_heap_lock_tuple_history_in_scope(Relation relation, HeapTuple tuple,
+	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
+	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,
+	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ], ClusterCurrentMxLockScope *scope);
 extern TM_Result cluster_heap_lock_tuple_history_owned(Relation relation, HeapTuple tuple,
 	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
 	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,

@@ -302,3 +302,20 @@ UT_TEST(heap_typed_deleted_and_precheck_results_do_not_allocate_receipts)
 		heap_operation_no_receipts(&f.out);
 	}
 }
+
+UT_TEST(heap_typed_self_updated_retains_the_independent_successor)
+{
+	HeapOperationFixture f;
+	heap_operation_setup(&f);
+	heap_operation_updater(&f, MultiXactStatusNoKeyUpdate);
+	heap_operation_owner(&f);
+	f.ctx.tuple_cmax = f.ctx.curcid;
+	f.ctx.follow_updates = 1;
+	UT_ASSERT_EQ(heap_operation_consume(&f, true), CMDL_SELF_MODIFIED);
+	UT_ASSERT_EQ(f.out.result, TM_SelfModified);
+	UT_ASSERT(f.out.successor.valid);
+	UT_ASSERT_EQ(f.out.successor.updater_xid, test_operation_consumer_child);
+	if (f.out.successor.valid)
+		UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&f.out.successor.tid), 4);
+	heap_operation_no_receipts(&f.out);
+}

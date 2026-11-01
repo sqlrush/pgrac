@@ -258,7 +258,7 @@ UT_TEST(receipt_committed_live_updater_is_denied_not_silently_dropped)
 #endif
 int main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
 	UT_RUN(receipt_live_child_keeps_raw_member_and_canonical_top);
 	UT_RUN(receipt_discarded_member_has_no_receipt_or_rewritten_top);
 	UT_RUN(receipt_terminal_locker_has_no_retained_grant);
@@ -272,6 +272,7 @@ int main(void)
 	UT_RUN(heap_typed_continue_reaches_real_receipt_prepare);
 	UT_RUN(heap_typed_conflict_policies_keep_canonical_wait_and_no_receipts);
 	UT_RUN(heap_typed_exact_owner_maps_cid_without_retaining_self);
+	UT_RUN(heap_typed_self_updated_retains_the_independent_successor);
 	UT_RUN(heap_typed_raw_owner_collision_never_projects_self);
 	UT_RUN(heap_typed_committed_updater_maps_independent_B_to_successor);
 	UT_RUN(heap_typed_active_compatible_follow_retains_A_and_uses_B);

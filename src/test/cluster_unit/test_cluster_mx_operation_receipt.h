@@ -102,4 +102,12 @@ extern void mx_history_lock_window_check(void);
 extern void mx_history_lock_window_before(Buffer buffer, HeapTuple tuple);
 extern bool mx_history_lock_window_after(Buffer buffer, HeapTuple tuple);
 extern void mx_history_lock_window_close(void);
+extern void mx_history_recursive_open(Snapshot actual);
+extern int mx_history_recursive_authorize(Relation rel, Buffer buffer, HeapTuple tuple,
+	bool history, TransactionId requester, LockTupleMode mode, MxHeapReadout *out);
+extern void mx_history_recursive_close(void);
+extern bool mx_history_recursive_next(HeapTuple tuple, ClusterHeapSuccessorProof *next);
+extern void mx_history_recursive_missing(const ClusterHeapSuccessorProof *expected);
+extern bool mx_history_recursive_header(HeapTuple tuple, TransactionId xmax,
+	uint16 infomask, uint16 infomask2, uint8 output[SizeofHeapTupleHeader]);
 #endif
