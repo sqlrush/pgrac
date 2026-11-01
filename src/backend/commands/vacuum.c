@@ -2139,7 +2139,20 @@ vac_truncate_clog(TransactionId frozenXID,
 	}
 #endif
 
-	nextXID = ReadNextTransactionId();
+#ifdef USE_PGRAC_CLUSTER
+	if (shared_xid)
+	{
+		/*
+		 * Shared catalogue values can legitimately exceed this instance's
+		 * stored nextXid.  Compare them in the validated allocation window,
+		 * without replacing the real database minimum with that upper bound.
+		 */
+		nextXID = XidFromFullTransactionId(legal_next);
+		lastSaneFrozenXid = nextXID;
+	}
+	else
+#endif
+		nextXID = ReadNextTransactionId();
 
 	/* Restrict task to one backend in this instance; see SimpleLruTruncate(). */
 	LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);

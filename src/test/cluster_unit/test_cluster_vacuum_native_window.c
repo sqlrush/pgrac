@@ -500,6 +500,7 @@ UT_TEST(allocation_fence_retired_during_watermark_read_keeps_all_state)
 UT_TEST(missing_watermark_preserves_original_future_and_mx_refusals)
 {
 	reset();
+	cluster_shared_catalog = false;
 	watermark_ready = false;
 	legal_next = 400;
 	add_database(8, 300, 70, false);
@@ -652,6 +653,7 @@ UT_TEST(invalid_database_retains_original_skip)
 UT_TEST(original_future_and_mx_refusals_remain)
 {
 	reset();
+	cluster_shared_catalog = false;
 	legal_next = 400;
 	add_database(8, 300, 70, false);
 	vac_truncate_clog(100, 100, 400, 200);
@@ -684,10 +686,92 @@ UT_TEST(nontarget_modes_keep_native_entry)
 	}
 }
 
+UT_TEST(shared_catalogue_cut_can_exceed_local_next_and_caller_sanity)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		reset();
+		cache.nextXid = FullTransactionIdFromU64(100);
+		legal_next = 500;
+		watermark_override = true;
+		watermark_full = 250;
+		add_database(8, 300, 70, false);
+		add_database(9, 340, 85, false);
+		vac_truncate_clog(350, 100, i == 0 ? 100 : 500, 200);
+		expect_capped_dispatch(250, 300, 8, 70, 8);
+		UT_ASSERT_EQ(warnings, 0);
+		UT_ASSERT_EQ(rows_read, 2);
+		UT_ASSERT_EQ(fences, 1);
+		UT_ASSERT_EQ(watermark_samples, 1);
+	}
+}
+
+UT_TEST(shared_legal_cut_without_f_keeps_history_and_real_database_limits)
+{
+	reset();
+	cache.nextXid = FullTransactionIdFromU64(100);
+	legal_next = 500;
+	watermark_ready = false;
+	add_database(8, 300, 70, false);
+	vac_truncate_clog(350, 100, 100, 200);
+	expect_xid_history_kept(300, 8, 70, 8);
+	UT_ASSERT_EQ(warnings, 0);
+	UT_ASSERT_EQ(fences, 1);
+}
+
+UT_TEST(shared_legal_cut_spans_local_next_epoch_without_losing_old_minimum)
+{
+	reset();
+	cache.nextXid = FullTransactionIdFromU64(UINT64CONST(0x1ffffff00));
+	legal_next = UINT64CONST(0x200000200);
+	watermark_override = true;
+	watermark_full = UINT64CONST(0x1ffffff90);
+	add_database(8, 10, 70, false);
+	add_database(9, UINT32_C(0xffffffa0), 85, false);
+	vac_truncate_clog(50, 100, UINT32_C(0xffffff00), 200);
+	expect_capped_dispatch(UINT32_C(0xffffff90), UINT32_C(0xffffffa0), 9, 70, 8);
+	UT_ASSERT_EQ(warnings, 0);
+	UT_ASSERT_EQ(rows_read, 2);
+}
+
+UT_TEST(local_next_cannot_legalize_catalogue_value_beyond_shared_window)
+{
+	reset();
+	cache.nextXid = FullTransactionIdFromU64(800);
+	legal_next = 500;
+	add_database(8, 600, 70, false);
+	vac_truncate_clog(300, 100, 500, 200);
+	expect_kept();
+	UT_ASSERT_EQ(rows_read, 1);
+}
+
+UT_TEST(shared_advanced_catalogue_still_requires_current_allocation_fence)
+{
+	reset();
+	cache.nextXid = FullTransactionIdFromU64(100);
+	legal_next = 500;
+	revoke_on_scan_end = true;
+	add_database(8, 300, 70, false);
+	vac_truncate_clog(350, 100, 100, 200);
+	expect_kept();
+	UT_ASSERT_EQ(rows_read, 1);
+	UT_ASSERT_EQ(fences, 1);
+}
+
+UT_TEST(shared_advanced_xid_does_not_relax_independent_mx_sanity)
+{
+	reset();
+	cache.nextXid = FullTransactionIdFromU64(100);
+	legal_next = 500;
+	add_database(8, 300, 201, false);
+	vac_truncate_clog(350, 100, 100, 200);
+	expect_kept();
+	UT_ASSERT_EQ(rows_read, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(30);
 	UT_RUN(published_watermark_caps_only_xid_history_actions);
 	UT_RUN(published_watermark_cannot_raise_database_minimum);
 	UT_RUN(missing_watermark_keeps_xid_history_and_real_wrap_limits);
@@ -712,6 +796,12 @@ main(void)
 	UT_RUN(invalid_database_retains_original_skip);
 	UT_RUN(original_future_and_mx_refusals_remain);
 	UT_RUN(nontarget_modes_keep_native_entry);
+	UT_RUN(shared_catalogue_cut_can_exceed_local_next_and_caller_sanity);
+	UT_RUN(shared_legal_cut_without_f_keeps_history_and_real_database_limits);
+	UT_RUN(shared_legal_cut_spans_local_next_epoch_without_losing_old_minimum);
+	UT_RUN(local_next_cannot_legalize_catalogue_value_beyond_shared_window);
+	UT_RUN(shared_advanced_catalogue_still_requires_current_allocation_fence);
+	UT_RUN(shared_advanced_xid_does_not_relax_independent_mx_sanity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
