@@ -631,7 +631,15 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_retained_producer.inc \
-		test_cluster_relmap_managed_writer.inc \
+		test_cluster_relmap_managed_writer.inc test_cluster_relmap_native_borrow.inc \
+		test_cluster_relmap_native_cache.inc \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_wal.h \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
 		test_cluster_relmap_producer_stage.inc test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_producer_prepare.inc \
 		test_cluster_relmap_producer_terminal.inc \
@@ -666,6 +674,8 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
 		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_physical_pair.o \
 		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
@@ -15930,7 +15940,7 @@ cluster_control_bootstrap_read_test.o: $(top_srcdir)/src/backend/cluster/cluster
 TESTS += test_cluster_relmap_control
 all: test_cluster_relmap_control
 test_cluster_relmap_control_entries.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
-	awk '/^(RelationMapReadManagedV2|CheckPointRelationMapManagedV2|CheckPointRelationMapControlV2)\(/ { print "bool"; emit=1; n++ } /^CheckPointRelationMap\(/ { print "void"; emit=1; n++ } /^cluster_read_relmap_from_control\(/ { print "static void"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if (n != 5 || emit) exit 1 }' $< > $@.tmp
+	awk '/^(RelationMapReadManagedV2|CheckPointRelationMapManagedV2|CheckPointRelationMapControlV2)\(/ { print "bool"; emit=1; n++ } /^CheckPointRelationMap\(/ { print "void"; emit=1; n++ } /^cluster_read_relmap_from_(control|native)\(/ { print "static void"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if (n != 6 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_relmap_control_authority.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
@@ -15944,6 +15954,7 @@ test_cluster_relmap_control_authority.o: $(top_srcdir)/src/backend/cluster/clust
 test_cluster_relmap_control: test_cluster_relmap_control.c test_cluster_control_relmap_selection.c \
 		test_cluster_control_file_selection.c test_cluster_control_registry.c test_cluster_recovery_registry.c \
 		test_cluster_relmap_control_entries.inc test_cluster_relmap_control_authority.o \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_control.h \
 		$(top_srcdir)/src/include/utils/relmapper.h \
@@ -16077,3 +16088,39 @@ clean: clean-managed-relmap-scan
 .PHONY: clean-managed-relmap-scan
 clean-managed-relmap-scan:
 	rm -f test_cluster_recovery_managed_relmap_scan test_cluster_recovery_managed_relmap_scan.d
+
+# Original control selection and native shared-table custody.
+TESTS += test_cluster_control_native_files
+all: test_cluster_control_native_files
+test_cluster_control_native_files: test_cluster_control_native_files.c test_cluster_control_relmap_selection.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_control_native_files.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-native-files
+.PHONY: clean-control-native-files
+clean-control-native-files:
+	rm -f test_cluster_control_native_files test_cluster_control_native_files.d

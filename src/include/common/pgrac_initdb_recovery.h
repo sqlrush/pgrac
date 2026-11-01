@@ -7,6 +7,7 @@
 
 #define PGRAC_INITDB_RECOVERY_ENV "PGRAC_INITDB_RECOVERY_FD"
 #define PGRAC_INITDB_RECOVERY_MAGIC UINT32_C(0x50474952)
+#define PGRAC_INITDB_BOOT_FILES_V2 2
 
 typedef struct PgracInitdbRecoveryContext {
 	uint32 magic;
@@ -15,7 +16,20 @@ typedef struct PgracInitdbRecoveryContext {
 	PgracInitdbConfigContext config;
 	ClusterRecoveryFileIdentityV2 first;
 	uint64 data_device, data_inode, shared_device, shared_inode;
+	/* Complete original initial set: CLOG segment 0, then local seed UNDO 0.
+	 * Zero count is the older explicit relmap-only request, never full BOOT. */
+	uint64 boot_file_count;
+	ClusterRecoveryFileIdentityV2 boot_files[PGRAC_INITDB_BOOT_FILES_V2];
 } PgracInitdbRecoveryContext;
+
+extern bool pgrac_initdb_recovery_prepare_files_v2(
+	const ClusterRecoveryFileIdentityV2 *first,
+	const ClusterRecoveryFileIdentityV2 boot[PGRAC_INITDB_BOOT_FILES_V2],
+	const PgracInitdbConfigContext *config, int data_fd, int shared_fd,
+	PgracInitdbRecoveryContext *out);
+extern bool
+pgrac_initdb_recovery_boot_v2(const PgracInitdbRecoveryContext *,
+							  ClusterRecoveryFileIdentityV2 out[PGRAC_INITDB_BOOT_FILES_V2]);
 
 /* Original creator allocates first + next three creation generations before
  * shared file creation. first is global relmap; local object IDs are DB OIDs.
@@ -26,6 +40,7 @@ extern bool pgrac_initdb_recovery_prepare_v2(const ClusterRecoveryFileIdentityV2
 											 int shared_fd, PgracInitdbRecoveryContext *out);
 extern bool pgrac_initdb_recovery_relmaps_v2(const PgracInitdbRecoveryContext *,
 											 ClusterRecoveryFileIdentityV2 out[4]);
+extern bool pgrac_initdb_recovery_relay_v2(const PgracInitdbRecoveryContext *, int *out);
 /* Closed-writer pipe owns only its local request FD; no serving/format grant.
  * The original fork/exec path must expose this descriptor only to its child. */
 extern bool pgrac_initdb_recovery_pipe_v2(const PgracInitdbRecoveryContext *, int *out);

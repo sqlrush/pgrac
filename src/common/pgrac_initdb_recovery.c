@@ -7,6 +7,26 @@
 #include "common/pgrac_initdb_recovery.h"
 #ifdef WIN32
 bool
+pgrac_initdb_recovery_prepare_files_v2(const ClusterRecoveryFileIdentityV2 *a,
+									   const ClusterRecoveryFileIdentityV2 b[2],
+									   const PgracInitdbConfigContext *c, int d, int e,
+									   PgracInitdbRecoveryContext *out)
+{
+	return false;
+}
+bool
+pgrac_initdb_recovery_boot_v2(const PgracInitdbRecoveryContext *c,
+							  ClusterRecoveryFileIdentityV2 out[2])
+{
+	return false;
+}
+bool
+pgrac_initdb_recovery_relay_v2(const PgracInitdbRecoveryContext *c, int *out)
+{
+	return false;
+}
+
+bool
 pgrac_initdb_recovery_prepare_v2(const ClusterRecoveryFileIdentityV2 *id,
 								 const PgracInitdbConfigContext *c, int a, int b,
 								 PgracInitdbRecoveryContext *out)
@@ -151,6 +171,80 @@ pgrac_initdb_recovery_prepare_v2(const ClusterRecoveryFileIdentityV2 *first,
 }
 
 bool
+pgrac_initdb_recovery_boot_v2(const PgracInitdbRecoveryContext *ctx,
+							  ClusterRecoveryFileIdentityV2 out[2])
+{
+	ClusterRecoveryFileIdentityV2 relmaps[4], boot[2], expected;
+	uint8 encoded[128];
+	if (!ctx || !out || overlaps(ctx, sizeof(*ctx), out, sizeof(boot))
+		|| ctx->boot_file_count != PGRAC_INITDB_BOOT_FILES_V2
+		|| !pgrac_initdb_recovery_relmaps_v2(ctx, relmaps))
+		return false;
+	for (unsigned i = 0; i < 2; ++i) {
+		boot[i] = ctx->boot_files[i];
+		expected = ctx->first;
+		expected.kind = i ? CLUSTER_RECOVERY_FILE_UNDO_V2 : CLUSTER_RECOVERY_FILE_CLOG_V2;
+		expected.database_oid = expected.tablespace_oid = 0;
+		expected.object_id = 0;
+		/* Separate creator-allocated identities, beyond the entire relmap set.
+		 * The page's actual FullXid birth remains the original producer's input. */
+		expected.creation_generation = boot[i].creation_generation;
+		if (boot[i].creation_generation <= relmaps[3].creation_generation
+			|| (i && boot[i].creation_generation == boot[0].creation_generation)
+			|| !cluster_recovery_file_identity_encode_v2(&expected, encoded, sizeof(encoded))
+			|| !cluster_recovery_file_identity_matches_v2(encoded, sizeof(encoded), &boot[i]))
+			return false;
+	}
+	memcpy(out, boot, sizeof(boot));
+	return true;
+}
+
+static bool
+request_files_valid(const PgracInitdbRecoveryContext *ctx)
+{
+	static const ClusterRecoveryFileIdentityV2 empty[2] = { { 0 } };
+	ClusterRecoveryFileIdentityV2 boot[2];
+	return ctx->boot_file_count == 0 ? memcmp(ctx->boot_files, empty, sizeof(empty)) == 0
+									 : pgrac_initdb_recovery_boot_v2(ctx, boot);
+}
+
+bool
+pgrac_initdb_recovery_prepare_files_v2(const ClusterRecoveryFileIdentityV2 *first,
+									   const ClusterRecoveryFileIdentityV2 boot[2],
+									   const PgracInitdbConfigContext *config, int data_fd,
+									   int shared_fd, PgracInitdbRecoveryContext *out)
+{
+	PgracInitdbRecoveryContext ctx;
+	ClusterRecoveryFileIdentityV2 checked[2];
+	if (!first || !boot || !config || !out || overlaps(out, sizeof(*out), first, sizeof(*first))
+		|| overlaps(out, sizeof(*out), boot, sizeof(ctx.boot_files))
+		|| overlaps(out, sizeof(*out), config, sizeof(*config))
+		|| !pgrac_initdb_recovery_prepare_v2(first, config, data_fd, shared_fd, &ctx))
+		return false;
+	ctx.boot_file_count = 2;
+	memcpy(ctx.boot_files, boot, sizeof(ctx.boot_files));
+	if (!pgrac_initdb_recovery_boot_v2(&ctx, checked))
+		return false;
+	*out = ctx;
+	return true;
+}
+
+/* Forward only the already authenticated original request, through the same
+ * closed-writer mechanism. The immediate native child's parent is initdb. */
+bool
+pgrac_initdb_recovery_relay_v2(const PgracInitdbRecoveryContext *ctx, int *out)
+{
+	PgracInitdbRecoveryContext relay;
+	ClusterRecoveryFileIdentityV2 boot[2];
+	if (!ctx || !out || overlaps(ctx, sizeof(*ctx), out, sizeof(*out))
+		|| ctx->creator_pid != (uint64)getppid() || !pgrac_initdb_recovery_boot_v2(ctx, boot))
+		return false;
+	relay = *ctx;
+	relay.creator_pid = getpid();
+	return pgrac_initdb_recovery_pipe_v2(&relay, out);
+}
+
+bool
 pgrac_initdb_recovery_pipe_v2(const PgracInitdbRecoveryContext *ctx, int *out)
 {
 	ClusterRecoveryFileIdentityV2 ids[4];
@@ -158,7 +252,8 @@ pgrac_initdb_recovery_pipe_v2(const PgracInitdbRecoveryContext *ctx, int *out)
 	ssize_t n;
 	bool ok;
 	if (!out || !ctx || overlaps(out, sizeof(*out), ctx, sizeof(*ctx))
-		|| !pgrac_initdb_recovery_relmaps_v2(ctx, ids) || pipe(fds) != 0)
+		|| !pgrac_initdb_recovery_relmaps_v2(ctx, ids) || !request_files_valid(ctx)
+		|| pipe(fds) != 0)
 		return false;
 	do {
 		n = write(fds[1], ctx, sizeof(*ctx));
@@ -232,10 +327,11 @@ pgrac_initdb_recovery_read_v2(int fd, const PgracInitdbConfigContext *config, ui
 		|| !same_config(&ctx.config, config) || ctx.first.system_identifier != system
 		|| ctx.first.database_incarnation != incarnation
 		|| memcmp(ctx.first.storage_uuid, storage, 16) != 0
-		|| !pgrac_initdb_recovery_relmaps_v2(&ctx, ids) || !directory(data_fd, &data)
-		|| !directory(shared_fd, &shared) || ctx.data_device != data.st_dev
-		|| ctx.data_inode != data.st_ino || ctx.shared_device != shared.st_dev
-		|| ctx.shared_inode != shared.st_ino || ctx.creator_pid != (uint64)getppid())
+		|| !pgrac_initdb_recovery_relmaps_v2(&ctx, ids) || !request_files_valid(&ctx)
+		|| !directory(data_fd, &data) || !directory(shared_fd, &shared)
+		|| ctx.data_device != data.st_dev || ctx.data_inode != data.st_ino
+		|| ctx.shared_device != shared.st_dev || ctx.shared_inode != shared.st_ino
+		|| ctx.creator_pid != (uint64)getppid())
 		goto done;
 	ok = true;
 done:
