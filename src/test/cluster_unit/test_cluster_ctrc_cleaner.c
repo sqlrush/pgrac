@@ -238,7 +238,7 @@ static FullTransactionId native_future;
 static TransactionId native_completed_xid;
 static GlobalTransaction native_locked_gxact;
 static BackendId native_backend_id = 1;
-static bool native_postmaster_environment = true;
+static bool native_postmaster_environment pg_attribute_unused() = true;
 static LWLock *native_prepared_locks[2];
 static LWLockMode native_prepared_modes[2];
 static unsigned native_prepared_depth;
@@ -284,7 +284,7 @@ native_recovery_in_progress(void)
 {
 	return false;
 }
-static bool
+static bool pg_attribute_unused()
 native_lock_held_in_mode(LWLock *lock, LWLockMode mode)
 {
 	if (native_prepared_source_exit || native_reused_source_exit)
@@ -293,7 +293,7 @@ native_lock_held_in_mode(LWLock *lock, LWLockMode mode)
 				return true;
 	return native_lock_held && lock == native_held_lock && native_lock_mode == mode;
 }
-static bool
+static bool pg_attribute_unused()
 native_lock_is_held(LWLock *lock)
 {
 	return native_lock_held && lock == native_held_lock;
@@ -8194,6 +8194,263 @@ UT_TEST(test_capacity_fence_tracks_actual_origin_producers_only)
 	cluster_undo_capacity_fence_attach(NULL);
 }
 
+
+/* Keep executor headers after the product include so instr_time uses the
+ * fixture clock_gettime boundary established above. */
+#include "funcapi.h"
+
+/* The SQL row sink and allocation are leaves; shared snapshots, complete
+ * dump_ctrc and its numeric formatters below are the original product bodies. */
+static struct {
+	char key[128];
+	char value[128];
+} ctrc_display_rows[256];
+static char ctrc_display_formats[256][128];
+static unsigned ctrc_display_count, ctrc_display_format_count;
+
+char *
+psprintf(const char *format, ...)
+{
+	char *result;
+	va_list args;
+	int size;
+
+	UT_ASSERT(ctrc_display_format_count < lengthof(ctrc_display_formats));
+	if (ctrc_display_format_count >= lengthof(ctrc_display_formats))
+		return (char *)"";
+	result = ctrc_display_formats[ctrc_display_format_count++];
+	va_start(args, format);
+	size = vsnprintf(result, sizeof(ctrc_display_formats[0]), format, args);
+	va_end(args);
+	UT_ASSERT(size >= 0 && size < (int)sizeof(ctrc_display_formats[0]));
+	return result;
+}
+
+static void
+emit_row(ReturnSetInfo *rsinfo, const char *category, const char *key, const char *value)
+{
+	UT_ASSERT(rsinfo == NULL);
+	UT_ASSERT_STR_EQ(category, "ctrc");
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(ctrc_display_count < lengthof(ctrc_display_rows));
+	if (ctrc_display_count >= lengthof(ctrc_display_rows))
+		return;
+	UT_ASSERT(strlen(key) < sizeof(ctrc_display_rows[0].key));
+	UT_ASSERT(strlen(value) < sizeof(ctrc_display_rows[0].value));
+	snprintf(ctrc_display_rows[ctrc_display_count].key,
+			 sizeof(ctrc_display_rows[0].key), "%s", key);
+	snprintf(ctrc_display_rows[ctrc_display_count++].value,
+			 sizeof(ctrc_display_rows[0].value), "%s", value);
+}
+
+#include "test_cluster_ctrc_counter_display.inc"
+
+static void
+ctrc_display_dump(void)
+{
+	ctrc_display_count = ctrc_display_format_count = 0;
+	UT_ASSERT_EQ(held_count, 0);
+	dump_ctrc(NULL);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+static void
+ctrc_display_expect(const char *key, const char *expected)
+{
+	unsigned matches = 0;
+
+	for (unsigned i = 0; i < ctrc_display_count; i++)
+		if (strcmp(ctrc_display_rows[i].key, key) == 0) {
+			matches++;
+			if (expected != NULL)
+				UT_ASSERT_STR_EQ(ctrc_display_rows[i].value, expected);
+		}
+	UT_ASSERT_EQ(matches, expected != NULL ? 1 : 0);
+}
+
+static const char *const ctrc_display_reasons[] = {
+	"ctrc_phase_no_progress_by_reason.NONE",
+	"ctrc_phase_no_progress_by_reason.PREPARED_DRAIN",
+	"ctrc_phase_no_progress_by_reason.RESOURCE_X",
+	"ctrc_phase_no_progress_by_reason.PAGE_REVALIDATE",
+	"ctrc_phase_no_progress_by_reason.WAL_DURABILITY",
+	"ctrc_phase_no_progress_by_reason.PARTICIPANT_ACK",
+	"ctrc_phase_no_progress_by_reason.BLOCK0_CERTIFICATE",
+	"ctrc_phase_no_progress_by_reason.BLOCKED"
+};
+
+static void
+ctrc_display_availability(bool available, const char *origin)
+{
+	static const char *const flags[] = {
+		"ctrc_completion_stats_available", "ctrc_phase_no_progress_stats_available",
+		"ctrc_publisher_stats_available", "ctrc_unsettled_stats_available",
+		"ctrc_oldest_unsettled_age_stats_available"
+	};
+	static const char *const origins[] = {
+		"ctrc_completion_origin_node_id", "ctrc_phase_no_progress_origin_node_id",
+		"ctrc_publisher_origin_node_id", "ctrc_unsettled_origin_node_id"
+	};
+	static const char *const counts[] = {
+		"ctrc_real_completion_count", "ctrc_publisher_pending_count",
+		"ctrc_unsettled_count", "ctrc_oldest_unsettled_age_ms"
+	};
+
+	ctrc_display_dump();
+	for (unsigned i = 0; i < lengthof(flags); i++)
+		ctrc_display_expect(flags[i], available ? "true" : "false");
+	for (unsigned i = 0; i < lengthof(origins); i++)
+		ctrc_display_expect(origins[i], available ? origin : NULL);
+	for (unsigned i = 0; i < lengthof(counts); i++)
+		ctrc_display_expect(counts[i], available ? "0" : NULL);
+	for (unsigned i = 0; i < lengthof(ctrc_display_reasons); i++)
+		ctrc_display_expect(ctrc_display_reasons[i], available ? "0" : NULL);
+}
+
+UT_TEST(test_ctrc_display_preserves_unavailable_origins_and_available_zero)
+{
+	static const int invalid[] = { INT_MIN, -1, 16, 17, 127, 128, INT_MAX };
+	ClusterCtrcSharedHeader *saved;
+
+	reset_fixture();
+	for (int node = 0; node < 16; node++) {
+		char origin[8];
+
+		cluster_node_id = node;
+		snprintf(origin, sizeof(origin), "%d", node);
+		ctrc_display_availability(true, origin);
+	}
+	for (unsigned i = 0; i < lengthof(invalid); i++) {
+		cluster_node_id = invalid[i];
+		ctrc_display_availability(false, NULL);
+	}
+	cluster_node_id = 0;
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	ctrc_display_availability(false, NULL);
+	CtrcShared = saved;
+	CtrcShared->version--;
+	ctrc_display_availability(false, NULL);
+	CtrcShared->version++;
+	ctrc_display_availability(true, "0");
+}
+
+UT_TEST(test_ctrc_display_follows_real_completion_and_unsettled_retirement)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+
+	reset_fixture();
+	/* Same real shared producer as the lifecycle tests above. The physical
+	 * certificate durability/native boundary remains an explicit input. */
+	completion_prepare_original_origin(0, &dispatch);
+	test_now_us = UINT64_C(4000000);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "0");
+	ctrc_display_expect("ctrc_publisher_pending_count", "0");
+	ctrc_display_expect("ctrc_unsettled_count", "3");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", "3000");
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "0");
+	ctrc_display_expect("ctrc_unsettled_count", "1");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", "3000");
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id + 1, 0, result));
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "1");
+	ctrc_display_expect("ctrc_unsettled_count", "0");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", "0");
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "1");
+}
+
+UT_TEST(test_ctrc_display_keeps_publisher_until_real_shared_handoff)
+{
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcOriginEntry *entry;
+
+	reset_fixture();
+	entry = seed_origin(0, 0);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_publisher_pending_count", "0");
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(entry);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &certificate));
+	LWLockRelease(&CtrcShared->origin_lock);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_publisher_pending_count", "1");
+	ctrc_display_expect("ctrc_real_completion_count", "0");
+	ctrc_display_expect("ctrc_unsettled_count", "1");
+	UT_ASSERT(ctrc_origin_certificate_commit_shared(&certificate));
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_publisher_pending_count", "0");
+	ctrc_display_expect("ctrc_real_completion_count", "1");
+	ctrc_display_expect("ctrc_unsettled_count", "0");
+}
+
+UT_TEST(test_ctrc_display_uses_actual_pass_reasons_and_excludes_error_exit)
+{
+	bool caught = false;
+
+	reset_fixture();
+	UT_ASSERT(bind_test_worker(1));
+	for (int reason = 0; reason < 8; reason++) {
+		driver_final_reason = reason;
+		UT_ASSERT(!ctrc_fixture_run_pass());
+		ctrc_display_dump();
+		for (unsigned i = 0; i < lengthof(ctrc_display_reasons); i++)
+			ctrc_display_expect(ctrc_display_reasons[i], i <= (unsigned)reason ? "1" : "0");
+	}
+	driver_interrupt = true;
+	PG_TRY();
+	{
+		(void)ctrc_fixture_run_pass();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	driver_interrupt = false;
+	driver_final_reason = -1;
+	UT_ASSERT(caught);
+	ctrc_display_dump();
+	for (unsigned i = 0; i < lengthof(ctrc_display_reasons); i++)
+		ctrc_display_expect(ctrc_display_reasons[i], "1");
+}
+
+UT_TEST(test_ctrc_display_preserves_unsigned_counts_and_unknown_age)
+{
+	ClusterCtrcOriginEntry *entry;
+
+	reset_fixture();
+	pg_atomic_write_u64(&CtrcShared->real_completion_count, UINT64_MAX);
+	pg_atomic_write_u64(&CtrcShared->cleaner_no_progress[CTRC_CLEANER_REASON_NONE],
+						UINT64_C(9223372036854775809));
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "18446744073709551615");
+	ctrc_display_expect(ctrc_display_reasons[0], "9223372036854775809");
+	entry = seed_origin(0, 0);
+	/* Materialized malformed diagnostic metadata, not lifecycle authority. */
+	entry->diagnostic_born_us = 0;
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_unsettled_count", "1");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_stats_available", "false");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", NULL);
+	entry->diagnostic_born_us = UINT64_C(1000000);
+	test_now_us = 0;
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_oldest_unsettled_age_stats_available", "false");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", NULL);
+	test_now_us = UINT64_C(4000999);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_oldest_unsettled_age_stats_available", "true");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", "3000");
+}
+
 int
 main(void)
 {
@@ -8201,7 +8458,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(189);
+	UT_PLAN(194);
 	UT_RUN(test_capacity_fence_receipt_apply_cancel_and_reclaim_use_original_producers);
 	UT_RUN(test_capacity_fence_empty_selector_exception_retires_lazy_scope);
 	UT_RUN(test_capacity_fence_tracks_actual_origin_producers_only);
@@ -8396,6 +8653,11 @@ main(void)
 	UT_RUN(test_oldest_age_observes_each_domain_and_never_turns_missing_birth_into_zero);
 	UT_RUN(test_oldest_age_keeps_real_certificate_tail_and_zero_receipt_close);
 	UT_RUN(test_oldest_age_requires_original_snapshot_clock_and_layout);
+	UT_RUN(test_ctrc_display_preserves_unavailable_origins_and_available_zero);
+	UT_RUN(test_ctrc_display_follows_real_completion_and_unsettled_retirement);
+	UT_RUN(test_ctrc_display_keeps_publisher_until_real_shared_handoff);
+	UT_RUN(test_ctrc_display_uses_actual_pass_reasons_and_excludes_error_exit);
+	UT_RUN(test_ctrc_display_preserves_unsigned_counts_and_unknown_age);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

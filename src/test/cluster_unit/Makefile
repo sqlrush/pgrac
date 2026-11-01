@@ -11098,6 +11098,24 @@ test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_clean
 test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 	$(top_srcdir)/src/include/miscadmin.h
 
+# Use the complete CTRC display path with the existing real shared fixture.
+test_cluster_ctrc_counter_display.inc: $(top_srcdir)/src/backend/cluster/cluster_debug.c Makefile
+	awk '/^fmt_(int64|uint64)\(/ { print "static char *"; emit=1; formats++ } \
+	     /^dump_ctrc(_completion|_no_progress|_publisher|_unsettled)?\(/ \
+	     { print "static void"; emit=1; dumps++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (formats != 2 || dumps != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_horizon \
+		test_cluster_ctrc_dispatch test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence \
+		test_cluster_ctrc_allocator_gc test_cluster_undo_capacity_history: \
+		test_cluster_ctrc_counter_display.inc
+clean distclean maintainer-clean: clean-ctrc-counter-display
+.PHONY: clean-ctrc-counter-display
+clean-ctrc-counter-display:
+	rm -f test_cluster_ctrc_counter_display.inc test_cluster_ctrc_counter_display.inc.tmp
+
 # These fixtures use the real shared engine and PGPROC allocation identity.
 test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
 		test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: \
