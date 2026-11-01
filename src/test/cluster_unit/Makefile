@@ -617,8 +617,8 @@ TESTS += test_cluster_relmap_pending_side
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_pending_side,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_census_side
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_census_side,$(SIMPLE_TESTS))
-TESTS += test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal
-SIMPLE_TESTS := $(filter-out test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$(SIMPLE_TESTS))
 
 test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
@@ -5238,7 +5238,7 @@ $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o: \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
 		$(top_srcdir)/src/include/access/clog.h
 
-test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal: test_cluster_relmap_retained_owner.o \
+test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: test_cluster_relmap_retained_owner.o \
 		test_cluster_relmap_checkpoint_publisher.inc \
 		test_cluster_relmap_checkpoint_scope.inc \
 		test_cluster_relmap_checkpoint_pending.inc \
@@ -5272,7 +5272,7 @@ test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal: test_cluster
 test_cluster_relmap_retained_wal: test_cluster_relmap_native_owner.o \
 		test_cluster_relmap_native_storage.o test_cluster_relmap_native_pin.o
 
-test_cluster_cold_relmap_terminal: test_cluster_relmap_retained_wal.c \
+test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: test_cluster_relmap_retained_wal.c \
 		test_cluster_cold_relmap_terminal_product.o test_cluster_cold_recovery_plan_store_core.o \
 		test_cluster_cold_relmap_terminal_namespace.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
@@ -5286,6 +5286,94 @@ test_cluster_cold_relmap_terminal_product.o: test_cluster_cold_relmap_terminal_p
 		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
+
+
+# Original Start fixture under isolated providers; native storage remains
+# in the terminal component, not this owner bridge.
+test_cluster_cold_relmap_terminal_start: test_cluster_cold_relmap_terminal.c \
+		test_cluster_relmap_original_start.o test_cluster_relmap_start_ctrc_record.o
+
+test_cluster_cold_tx_start test_cluster_relmap_original_start.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
+
+test_cluster_relmap_original_start.o: test_cluster_relmap_original_start.c \
+		test_cluster_relmap_original_start.h \
+		test_cluster_relmap_original_start_namespace.h \
+		test_cluster_cold_tx_start.c \
+		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_plan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_epoch.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_tt_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+		test_cluster_cold_claim_service.inc \
+		test_cluster_cold_ctrc_census.inc \
+		test_cluster_cold_ctrc_census_hot.inc \
+		test_cluster_cold_ctrc_completed_readback.inc \
+		test_cluster_cold_ctrc_cross_page.inc \
+		test_cluster_cold_ctrc_final_local_empty.inc \
+		test_cluster_cold_ctrc_final_projection.inc \
+		test_cluster_cold_ctrc_first_wal.inc \
+		test_cluster_cold_ctrc_fpi_retirement.inc \
+		test_cluster_cold_ctrc_handoff.inc \
+		test_cluster_cold_ctrc_heap_refs.inc \
+		test_cluster_cold_ctrc_hot_refs.inc \
+		test_cluster_cold_ctrc_local_empty.inc \
+		test_cluster_cold_ctrc_native_directory.inc \
+		test_cluster_cold_ctrc_page_image.inc \
+		test_cluster_cold_ctrc_page_plan.inc \
+		test_cluster_cold_ctrc_page_prefix.inc \
+		test_cluster_cold_ctrc_page_sources.inc \
+		test_cluster_cold_ctrc_pending_readback.inc \
+		test_cluster_cold_ctrc_pending_storage.inc \
+		test_cluster_cold_ctrc_pending_window.inc \
+		test_cluster_cold_ctrc_plain_lock_refs.inc \
+		test_cluster_cold_ctrc_reference_terminals.inc \
+		test_cluster_cold_ctrc_reference_tuples.inc \
+		test_cluster_cold_ctrc_references.inc \
+		test_cluster_cold_ctrc_relmap_gate.inc \
+		test_cluster_cold_ctrc_replay_driver.inc \
+		test_cluster_cold_ctrc_replay_source.inc \
+		test_cluster_cold_ctrc_returned_fpi.inc \
+		test_cluster_cold_ctrc_source_request.inc \
+		test_cluster_cold_ctrc_terminals.inc \
+		test_cluster_cold_ctrc_unchanged_custody.inc \
+		test_cluster_cold_ctrc_unchanged_sync.inc \
+		test_cluster_cold_ctrc_untouched_pages.inc \
+		test_cluster_cold_ctrc_update_predecessors.inc \
+		test_cluster_cold_ctrc_wal_sources.inc \
+		test_cluster_cold_startup_relmap_storage.h \
+		test_cluster_cold_tx_claim_eor_boundary.inc \
+		test_cluster_cold_tx_consumer.inc \
+		test_cluster_cold_tx_ctrc_subject.inc \
+		test_cluster_cold_tx_finish_boundary.inc \
+		test_cluster_cold_tx_owner.inc \
+		test_cluster_cold_tx_relmap_handoff.inc \
+		test_cluster_cold_tx_start_boundary.inc \
+		test_cluster_cold_tx_writer.inc \
+		test_cluster_cold_tx_xid_maximum.inc \
+		test_cluster_startup_native_ctrc.h \
+		unit_test.h \
+		Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_relmap_start_ctrc_record.o: $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 # Original authority tuple checks with isolated lower fixture facilities.
 test_cluster_relmap_original_authority.o: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_authority.c \
@@ -5396,7 +5484,7 @@ test_cluster_recovery_scope_native_census_product.o: Makefile $(top_builddir)/sr
 
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_relmap_fold.inc test_cluster_recovery_relmap_history.inc
 
-test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_ctrc_native_fpi: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc test_cluster_control_recovered_owner.inc test_cluster_control_recovered_founder.inc test_cluster_control_recovered_history.inc \
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start test_cluster_ctrc_native_fpi: %: %.c test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc test_cluster_control_root_serving.inc test_cluster_control_recovered_owner.inc test_cluster_control_recovered_founder.inc test_cluster_control_recovered_history.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_census.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_census.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_inventory.c \
@@ -5436,16 +5524,17 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter test_cluster_control_root,$@),$(CONTROL_ROOT_TEST_CPPFLAGS)) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_native_census_product.o test_cluster_relmap_v2_codec_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_pending.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(if $(filter test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_scope_startup.o test_cluster_cold_recovery_io_core.o $(top_builddir)/src/backend/cluster/cluster_wal_restart_read.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)) \
-		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal,$@),test_cluster_relmap_retained_owner.o) \
-		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal,$@),test_cluster_cold_checkpoint_publisher.o) \
+		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_retained_owner.o) \
+		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_cold_checkpoint_publisher.o) \
 		$(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_owner.o) \
-		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
-		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal,$@),test_cluster_relmap_native_clog.o $(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_storage.o test_cluster_relmap_native_pin.o) test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o) \
-		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
-		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
+		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_retained_arb.o test_cluster_relmap_retained_authority.o) \
+		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_native_clog.o $(if $(filter test_cluster_relmap_retained_wal,$@),test_cluster_relmap_native_storage.o test_cluster_relmap_native_pin.o) test_cluster_relmap_original_scope.o test_cluster_relmap_original_authority.o) \
+		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),$(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o) \
+		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_retained_census.o test_cluster_relmap_pending_product.o test_cluster_relmap_pending_side_product.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_root_set.o \
-		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal,$@),test_cluster_relmap_observation_namespace.o,$(top_builddir)/src/backend/cluster/cluster_recovery_namespace.o) \
-		$(if $(filter test_cluster_cold_relmap_terminal,$@),test_cluster_cold_relmap_terminal_product.o test_cluster_cold_recovery_plan_store_core.o) \
+		$(if $(filter test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_observation_namespace.o,$(top_builddir)/src/backend/cluster/cluster_recovery_namespace.o) \
+		$(if $(filter test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start,$@),test_cluster_cold_relmap_terminal_product.o test_cluster_cold_recovery_plan_store_core.o) \
+		$(if $(filter test_cluster_cold_relmap_terminal_start,$@),test_cluster_relmap_original_start.o test_cluster_relmap_start_ctrc_record.o) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_wal_targets.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_record_hash.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_native_scan.o \
@@ -15567,7 +15656,8 @@ $(top_builddir)/src/backend/cluster/cluster_relmap_terminal_scan.o \
 .PHONY: clean-relmap-terminal
 clean: clean-relmap-terminal
 clean-relmap-terminal:
-	rm -f test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_product.o
+	rm -f test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_product.o \
+		test_cluster_cold_relmap_terminal_start test_cluster_relmap_original_start.o test_cluster_relmap_start_ctrc_record.o
 
 # Original checkpoint layout and complete immutable getter, without Startup I/O.
 test_cluster_cold_terminal_checkpoint.inc: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile

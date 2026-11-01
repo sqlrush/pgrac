@@ -11,6 +11,7 @@
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_ir.h"
@@ -473,6 +474,7 @@ static void actual_startup_eor_claim(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 #include "test_cluster_cold_tx_writer.inc"
+#ifndef TEST_CLUSTER_STARTUP_RELMAP_TERMINAL
 #include "test_cluster_relmap_native_clog.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
 #include "test_cluster_cold_terminal_checkpoint.inc"
@@ -503,6 +505,7 @@ bool test_start_unused_relmap_recheck(const struct ClusterRecoveryStartV1 *start
 #define cluster_cold_relmap_replay_recheck_v1 test_start_unused_relmap_recheck
 #include "../../backend/cluster/cluster_cold_recovery_relmap.c"
 #undef cluster_cold_relmap_replay_recheck_v1
+#endif
 #include "test_cluster_cold_tx_owner.inc"
 #include "test_cluster_cold_tx_xid_maximum.inc"
 #include "test_cluster_cold_tx_consumer.inc"
