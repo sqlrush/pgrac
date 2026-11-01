@@ -27,6 +27,8 @@ static unsigned syncs;
 static unsigned fail_sync;
 static bool corrupt_on_sync;
 static unsigned closes, fail_close;
+static RelMapFile *drift_map_on_sync;
+static ClusterRecoveryFileIdentityV2 *drift_identity_on_sync;
 
 static int
 test_file_close(int fd)
@@ -45,6 +47,10 @@ static int
 test_sync(int fd)
 {
 	++syncs;
+	if (syncs == 3) {
+		if (drift_map_on_sync) ++drift_map_on_sync->mappings[0].mapfilenumber;
+		if (drift_identity_on_sync) ++drift_identity_on_sync->creation_generation;
+	}
 	if (corrupt_on_sync && syncs == 3)
 	{
 		int other = openat(directory, "pgrac_relmap_authority", O_WRONLY);
@@ -96,6 +102,8 @@ prepare(void)
 	UT_ASSERT(directory >= 0);
 	syncs = fail_sync = closes = fail_close = 0;
 	corrupt_on_sync = false;
+	drift_map_on_sync = NULL;
+	drift_identity_on_sync = NULL;
 }
 
 static void
@@ -321,10 +329,12 @@ UT_TEST(assigned_format_matches_the_complete_big_endian_byte_table)
 	cleanup();
 }
 
+#include "test_cluster_relmap_file_replay_create.inc"
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(16);
 	UT_RUN(assigned_format_matches_the_complete_big_endian_byte_table);
 	UT_RUN(complete_envelope_preserves_inner_and_rejects_old_format);
 	UT_RUN(creation_identity_is_independent_of_map_generation);
@@ -334,6 +344,13 @@ main(void)
 	UT_RUN(missing_short_alias_or_foreign_copy_refuses);
 	UT_RUN(all_registration_fields_and_unknown_versions_refuse);
 	UT_RUN(overlapping_outputs_and_late_file_close_never_mutate_identity);
+	UT_RUN(replay_missing_pair_creates_exact_generation_one);
+	UT_RUN(replay_exact_pair_only_syncs_and_preserves_both_inodes);
+	UT_RUN(replay_partial_pairs_keep_the_missing_name_and_original_output);
+	UT_RUN(replay_changed_birth_map_generation_or_pending_never_rewrites);
+	UT_RUN(replay_sync_late_corruption_and_close_failure_keep_output);
+	UT_RUN(replay_alias_invalid_image_and_linked_names_refuse);
+	UT_RUN(replay_late_input_drift_cannot_publish_saved_output);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -302,6 +302,52 @@ UT_TEST(secondary_release_error_keeps_original_outer_cleanup_duty)
 	UT_ASSERT(!held_family_lock && !InterruptHoldoffCount);
 	copy_end(&c);
 }
+UT_TEST(replay_storage_preserves_original_reserved_creation_owner)
+{
+	ClusterControlNativeRelmapCreateV2 *c=NULL;
+	ClusterRelmapFilePairV2 source, pair;
+	ClusterControlNativeTableInfoV2 info;
+	copy_begin(); UT_ASSERT(reserve_copy(&c));
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+	UT_ASSERT(copy_original_read(&completed[1], &source));
+	UT_ASSERT(cluster_relmap_authority_managed_replay_create_v2(&c->expected,
+		&source.view.committed, &pair));
+	UT_ASSERT_EQ(pair.view.committed_generation, 1);
+	UT_ASSERT(cluster_relmap_authority_managed_replay_create_v2(&c->expected,
+		&source.view.committed, &pair));
+	UT_ASSERT_EQ(pair.view.committed.mappings[0].mapfilenumber, 40001);
+	LWLockRelease(RelationMappingLock);
+	UT_ASSERT(root_renames == 2 && !target_available() && !c->private_attempted
+		&& !c->private_copy_attempted && cf_held && copy_x && !InterruptHoldoffCount);
+	UT_ASSERT(cluster_control_native_files_info_v2(&info) && info.reservation_count == 3);
+	copy_end(&c);
+}
+UT_TEST(replay_storage_lock_refusal_and_late_failure_never_complete_control)
+{
+	ClusterControlNativeRelmapCreateV2 *c=NULL;
+	ClusterRelmapFilePairV2 source = {0}, pair, saved;
+	int d;
+	copy_begin(); UT_ASSERT(reserve_copy(&c));
+	memset(&pair, 0xa5, sizeof(pair)); saved = pair;
+	UT_ASSERT(!cluster_relmap_authority_managed_replay_create_v2(&c->expected,
+		&source.view.committed, &pair));
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+	UT_ASSERT(copy_original_read(&completed[1], &source));
+	copy_x = false;
+	UT_ASSERT(!cluster_relmap_authority_managed_replay_create_v2(&c->expected,
+		&source.view.committed, &pair));
+	copy_x = true;
+	d = target_dir();
+	UT_ASSERT(d >= 0 && faccessat(d, "pgrac_relmap_authority", F_OK, 0) != 0 && close(d) == 0);
+	copy_syncs = 0; fail_sync = 2;
+	UT_ASSERT(!cluster_relmap_authority_managed_replay_create_v2(&c->expected,
+		&source.view.committed, &pair));
+	UT_ASSERT(memcmp(&pair, &saved, sizeof(pair)) == 0);
+	LWLockRelease(RelationMappingLock);
+	UT_ASSERT(root_renames == 2 && !target_available() && cf_held && copy_x
+		&& !InterruptHoldoffCount && !c->private_attempted && !c->private_copy_attempted);
+	copy_end(&c);
+}
 int main(int argc,char **argv)
 {
 	(void)argc; (void)argv;
@@ -314,5 +360,7 @@ int main(int argc,char **argv)
 	UT_RUN(missing_source_copy_never_creates_target);
 	UT_RUN(error_under_mapping_lock_and_late_close_retain_debt);
 	UT_RUN(secondary_release_error_keeps_original_outer_cleanup_duty);
+	UT_RUN(replay_storage_preserves_original_reserved_creation_owner);
+	UT_RUN(replay_storage_lock_refusal_and_late_failure_never_complete_control);
 	UT_DONE(); return ut_failed_count!=0;
 }

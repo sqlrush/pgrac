@@ -15742,7 +15742,7 @@ clean-recovery-identity-codec:
 	rm -f test_cluster_recovery_file_identity test_cluster_recovery_file_identity.d
 
 # Managed envelope: real pair I/O, while control registration remains external.
-test_cluster_relmap_file: test_cluster_relmap_file.c unit_test.h \
+test_cluster_relmap_file: test_cluster_relmap_file.c test_cluster_relmap_file_replay_create.inc unit_test.h \
 		$(top_srcdir)/src/common/cluster_relmap_file_io.c \
 		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
