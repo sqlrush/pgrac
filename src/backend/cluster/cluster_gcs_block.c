@@ -6060,6 +6060,123 @@ cluster_gcs_current_mx_range_fetch_and_wait(ClusterMxRangeRequest *request,
 	return true;
 }
 
+/* A single full-width proof frame. No legacy proof service or CTRC touch is
+ * entered here. The original caller owns operation-wide reservation and all
+ * eventual canonical/grant checks; this slot only owns transport delivery. */
+bool
+cluster_gcs_current_mx_proofs_fetch_and_wait(int32 origin, ClusterMxProofRequest *request,
+	uint32 request_bytes, ClusterMxRangeResponse *response, uint32 *bytes,
+	ClusterMxProofTransportStats *stats)
+{
+	ClusterMxProofRequestView view;
+	ClusterMxRangeWireContext ctx = {0};
+	ClusterCurrentMxMemberDesc members[CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME] = {{0}};
+	ClusterMxRangeResponse candidate;
+	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterGcsBlockBackendBlock *blk;
+	PGAlignedBlock body;
+	BufferTag tag;
+	ClusterMxRangeRoute route;
+	uint64 request_id = 0;
+	uint32 generation = 0, body_bytes = 0, packed_bytes = 0, catalog;
+	bool received = false;
+	int worker;
+
+	if (bytes != NULL) *bytes = 0;
+	if (response != NULL) memset(response, 0, sizeof(*response));
+	if (request == NULL || response == NULL || bytes == NULL || stats == NULL
+		|| origin < 0 || origin >= CLUSTER_MAX_NODES || origin == cluster_node_id
+		|| gcs_block_backend_blocks == NULL || MyBackendId <= 0 || MyBackendId > MaxBackends
+		|| !cluster_gcs_block_family_on_data_plane())
+		return false;
+	catalog = GetControlFileCatalogVersion();
+	if (!cluster_sf_peer_foreign_mx_capability_sample_v1(origin,
+		CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1, catalog, &generation)
+		|| !cluster_mx_proof_request_decode(request, request_bytes, catalog,
+			CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, &view)
+		|| view.route.epoch != cluster_epoch_get_current() || view.route.requester_node != cluster_node_id
+		|| view.route.requester_backend != MyBackendId || view.peer_generation != generation
+		|| stats->attempts == UINT64_MAX || stats->enqueued == UINT64_MAX || stats->replies == UINT64_MAX
+		|| stats->request_bytes > UINT64_MAX - request_bytes
+		|| stats->reply_bytes > UINT64_MAX - sizeof(candidate))
+		return false;
+	for (uint32 i = 0; i < view.count; i++) {
+		if (cluster_xid_origin_slot(view.asks[i].xid) != origin)
+			return false;
+		members[i].xid = view.asks[i].xid;
+		members[i].member_status = view.asks[i].member_status;
+	}
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_try_reserve_current_mx_slot(&view.key, view.route.epoch,
+		origin, CLUSTER_MX_RANGE_RESPONSE_KIND, &request_id);
+	if (slot == NULL) return false;
+	blk = gcs_block_my_block();
+	PG_TRY();
+	{
+		ctx.request_id = request_id; ctx.epoch = view.route.epoch; ctx.key = view.key;
+		ctx.format_id = view.route.format_id; ctx.version = view.route.version; ctx.loaded_catalog = catalog;
+		ctx.peer_capabilities = CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES; ctx.peer_generation = generation;
+		ctx.requested_cap = view.count; ctx.source = &view.source; ctx.source_bytes = sizeof(view.source);
+		if (!cluster_mx_range_wire_encode_proof_asks(&ctx, view.total, view.first, members,
+			view.count, body.data, BLCKSZ, &body_bytes)
+			|| !cluster_mx_proof_request_pack(&ctx, cluster_node_id, MyBackendId, body.data, body_bytes,
+				request, sizeof(*request), &packed_bytes) || packed_bytes != request_bytes
+			|| !cluster_mx_range_transport_route(request, request_bytes, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &route, &tag))
+			goto proof_range_done;
+		view.route = request->route;
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		memcpy(slot->reply_block_data, request, request_bytes);
+		LWLockRelease(&blk->lock.lock);
+		worker = cluster_lms_shard_for_tag(&tag, cluster_lms_workers);
+		if (worker < 0) goto proof_range_done;
+		stats->attempts++;
+		if (!cluster_lms_outbound_enqueue_cap_bound(worker, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+			origin, request, request_bytes, CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, generation))
+			goto proof_range_done;
+		stats->enqueued++; stats->request_bytes += request_bytes;
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			bool stale;
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			received = slot->in_use && !slot->stale && slot->reply_received;
+			stale = !slot->in_use || slot->stale;
+			if (received) {
+				memcpy(&candidate.route, &slot->reply_header, sizeof(candidate.route));
+				memcpy(candidate.data.data, slot->reply_block_data, BLCKSZ);
+			}
+			LWLockRelease(&blk->lock.lock);
+			if (received || stale || view.route.epoch != cluster_epoch_get_current()
+				|| !cluster_sf_peer_foreign_mx_capability_matches_v1(origin,
+					CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1, catalog, generation))
+				break;
+			CHECK_FOR_INTERRUPTS();
+			/* Diagnostic wake, never a wait-duration transaction error. */
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, 100, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+		}
+	proof_range_done:;
+		ConditionVariableCancelSleep();
+	}
+	PG_CATCH();
+	{
+		ConditionVariableCancelSleep();
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	gcs_block_release_slot(slot);
+	if (!received) return false;
+	stats->replies++; stats->reply_bytes += candidate.route.wire_bytes;
+	if (view.route.epoch != cluster_epoch_get_current() || catalog != GetControlFileCatalogVersion()
+		|| !cluster_sf_peer_foreign_mx_capability_matches_v1(origin,
+			CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1, catalog, generation)
+		|| !cluster_mx_proof_response_matches(&view, &candidate, candidate.route.wire_bytes,
+			catalog, CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, origin))
+		return false;
+	memcpy(response, &candidate, candidate.route.wire_bytes);
+	*bytes = candidate.route.wire_bytes;
+	return true;
+}
+
 ClusterMxDescribeResult
 cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterCurrentMxKey *key,
 											   ClusterCurrentMxMemberDesc *members,
@@ -21880,6 +21997,20 @@ gcs_block_try_land_full_mx_reply(const ClusterICEnvelope *env, const void *paylo
 			&& !slot->reply_received && !slot->stale && slot->direct_state == GCS_BLOCK_DIRECT_UNARMED
 			&& !slot->direct_target_prepared && slot->request_epoch == route.epoch
 			&& slot->expected_master_node == (int32)env->source_node_id) {
+			ClusterMxRangeRoute staged;
+			memcpy(&staged, slot->reply_block_data, sizeof(staged));
+			if (staged.wire_bytes != sizeof(ClusterMxRangeRequest)) {
+				ClusterMxProofRequestView view;
+				/* The retained ASK is process-owned, not an incoming assertion
+				 * of peer capability. The sender rechecks its negotiated record
+				 * before publishing any returned bytes. */
+				if (!cluster_mx_proof_request_decode(slot->reply_block_data, staged.wire_bytes,
+					GetControlFileCatalogVersion(), CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, &view)
+					|| !cluster_mx_proof_response_matches(&view, payload, env->payload_length,
+						GetControlFileCatalogVersion(), CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES,
+						env->source_node_id))
+					break;
+			}
 			memcpy(&slot->reply_header, &route, sizeof(route));
 			memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
 			memcpy(slot->reply_block_data, (const char *)payload + sizeof(route), route.wire_bytes - sizeof(route));

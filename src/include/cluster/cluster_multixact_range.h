@@ -87,6 +87,29 @@ extern bool cluster_mx_proof_response_pack(const ClusterMxProofRequestView *requ
 	const ClusterMxRangeWireContext *ctx, ClusterMxCompositionReadStatus status,
 	const ClusterMxProofReply *reply, ClusterMxRangeResponse *response,
 	uint32 capacity, uint32 *bytes);
+/* Structural binding only. A valid UNKNOWN/RETRY is transported as such. */
+extern bool cluster_mx_proof_response_matches(const ClusterMxProofRequestView *request,
+	const void *wire, uint32 bytes, uint32 loaded_catalog, uint32 peer_capabilities,
+	uint16 expected_origin);
+
+typedef struct ClusterMxProofTransportStats {
+	uint64 attempts, enqueued, replies, request_bytes, reply_bytes;
+} ClusterMxProofTransportStats;
+
+/* One remote frame, using the original FULL_MX slot and exit cleanup. The
+ * caller splits contiguous windows by actual member origin before this call;
+ * the MXID/source origin need not be that origin. The stripe lookup is routing
+ * only, never FullXid/TT authority. Caller-sampled peer_generation must match
+ * that member origin's current negotiated record. Rewrites both request ids
+ * after reserving the slot. Counts actual enqueue attempts, successful queued
+ * bytes and returned frames; no implicit retry or elapsed-wait SQL error.
+ * false/ERROR leaves response zero and bytes=0. Even true supplies provisional
+ * bytes only: decode the result, retain the original operation/read scope and
+ * revalidate canonical proofs/grants/tuple/fence before consuming them.
+ * Local origins use their original owner, not a network round trip here. */
+extern bool cluster_gcs_current_mx_proofs_fetch_and_wait(int32 origin,
+	ClusterMxProofRequest *request, uint32 request_bytes, ClusterMxRangeResponse *response,
+	uint32 *bytes, ClusterMxProofTransportStats *stats);
 
 extern void cluster_mx_range_request_seal(ClusterMxRangeRequest *request);
 extern void cluster_mx_range_response_seal(ClusterMxRangeResponse *response, uint32 body_bytes);

@@ -671,6 +671,50 @@ cluster_mx_proof_response_pack(const ClusterMxProofRequestView *request,
 	return true;
 }
 
+bool
+cluster_mx_proof_response_matches(const ClusterMxProofRequestView *request,
+	const void *wire, uint32 bytes, uint32 loaded_catalog, uint32 peer_capabilities,
+	uint16 expected_origin)
+{
+	ClusterMxRangeRoute route;
+	ClusterMxRangeWireContext ctx = {0};
+	ClusterMxRangeWireHeader h;
+	ClusterCurrentMxMemberDesc members[CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME] = {{0}};
+	ClusterMxProofReply reply;
+	const char *body;
+	Size prefix;
+	uint32 body_bytes;
+
+	if (request == NULL || request->count == 0
+		|| request->count > CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME
+		|| expected_origin >= CLUSTER_MAX_NODES || !range_route_read(wire, bytes, &route)
+		|| route.kind != CLUSTER_MX_RANGE_RESPONSE_KIND
+		|| route.request_id != request->route.request_id || route.epoch != request->route.epoch
+		|| route.requester_node != request->route.requester_node
+		|| route.requester_backend != request->route.requester_backend)
+		return false;
+	ctx.request_id = route.request_id; ctx.epoch = route.epoch; ctx.key = request->key;
+	ctx.format_id = route.format_id; ctx.version = route.version;
+	ctx.loaded_catalog = loaded_catalog; ctx.peer_capabilities = peer_capabilities;
+	ctx.peer_generation = request->peer_generation; ctx.requested_cap = request->count;
+	ctx.source = &request->source; ctx.source_bytes = sizeof(request->source);
+	body = (const char *)wire + sizeof(route); body_bytes = bytes - sizeof(route);
+	if (!range_header_read(body, body_bytes, &ctx, &h, CLUSTER_MX_RANGE_PROOFS,
+		sizeof(ClusterMxFullMemberProof), &prefix) || h.result > MXCOMP_READ_UNKNOWN)
+		return false;
+	/* The public decoder intentionally maps malformed and valid UNKNOWN to
+	 * the same fail-closed verdict. Landing still needs their structural
+	 * distinction so malformed data cannot consume the one outstanding slot. */
+	if (h.result != MXCOMP_READ_OK)
+		return h.total == 0 && h.first == 0 && h.count == 0 && h.next == 0 && h.flags == 0;
+	for (uint32 i = 0; i < request->count; i++) {
+		members[i].xid = request->asks[i].xid;
+		members[i].member_status = request->asks[i].member_status;
+	}
+	return cluster_mx_range_wire_decode_proofs(body, body_bytes, &ctx, expected_origin,
+		request->total, request->first, members, request->count, &reply) == MXCOMP_READ_OK;
+}
+
 void
 cluster_mx_range_request_seal(ClusterMxRangeRequest *request)
 {
