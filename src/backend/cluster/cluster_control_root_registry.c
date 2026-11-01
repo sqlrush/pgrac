@@ -173,6 +173,8 @@ bool cluster_control_root_registry_read_selected_v4(int d, const uint8 *b, Size 
 {
 	return false;
 }
+bool cluster_control_root_registry_capture_v4(int d, const uint8 s[16], uint64 sys,
+	uint8 pair[133120], ControlRootImage *metadata) { return false; }
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -256,6 +258,71 @@ done:
 			ok = false;
 	free(old);
 	free(recheck);
+	free(bytes);
+	return ok;
+}
+
+bool
+cluster_control_root_registry_capture_v4(int dir, const uint8 storage[16], uint64 sys,
+										 uint8 pair[133120], ControlRootImage *metadata)
+{
+	static const char *const names[] = { "pgrac_control_root", "pgrac_control_root.bak" };
+	int fds[2] = { -1, -1 };
+	struct stat st[2], directory, after;
+	uint8 *bytes = NULL, *again = NULL;
+	ControlRootImage *logical = NULL, *backup = NULL;
+	bool ok = false;
+	if (!storage || !sys || !pair || !metadata
+		|| overlaps(pair, 133120, metadata, sizeof(*metadata))
+		|| overlaps(storage, 16, pair, 133120) || overlaps(storage, 16, metadata, sizeof(*metadata))
+		|| (!cluster_cf_held_is_clusterwide(ShareLock)
+			&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		|| fstat(dir, &directory) || !S_ISDIR(directory.st_mode) || directory.st_uid != geteuid()
+		|| (directory.st_mode & 0022))
+		return false;
+	bytes = malloc(133120);
+	again = malloc(66560);
+	logical = malloc(sizeof(*logical));
+	backup = malloc(sizeof(*backup));
+	if (!bytes || !again || !logical || !backup)
+		goto done;
+	for (int i = 0; i < 2; i++) {
+		fds[i] = openat(dir, names[i], O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY);
+		if (fds[i] < 0 || fstat(fds[i], &st[i]) || !current(dir, names[i], fds[i], &st[i])
+			|| !read_exact(fds[i], bytes + i * 66560))
+			goto done;
+	}
+	if ((st[0].st_dev == st[1].st_dev && st[0].st_ino == st[1].st_ino)
+		|| !decode(bytes, 66560, sys, storage, logical)
+		|| !decode(bytes + 66560, 66560, sys, storage, backup)
+		|| memcmp(bytes + 24, bytes + 66560 + 24, 48)
+		|| memcmp(bytes + 100, bytes + 66560 + 100, 96)
+		|| get_le(bytes + 66560, 16, 8) > get_le(bytes, 16, 8)
+		|| (get_le(bytes + 66560, 16, 8) == get_le(bytes, 16, 8)
+			&& memcmp(bytes, bytes + 66560, 66560)))
+		goto done;
+	for (int i = 0; i < 2; i++)
+		if (!read_exact(fds[i], again) || memcmp(bytes + i * 66560, again, 66560)
+			|| !current(dir, names[i], fds[i], &st[i]))
+			goto done;
+	ok = fstat(dir, &after) == 0 && same(&directory, &after)
+		 && (cluster_cf_held_is_clusterwide(ShareLock)
+			 || cluster_cf_held_is_clusterwide(ExclusiveLock));
+done:
+	for (int i = 0; i < 2; i++)
+		if (fds[i] >= 0 && close(fds[i]))
+			ok = false;
+	if (ok) {
+		memset(logical->bytes, 0, sizeof(logical->bytes));
+		logical->header.format_version = 4;
+		logical->header.source_feature_bitmap = get_le(bytes, 180, 8);
+		logical->header.target_feature_bitmap = get_le(bytes, 188, 8);
+		memcpy(pair, bytes, 133120);
+		*metadata = *logical;
+	}
+	free(backup);
+	free(logical);
+	free(again);
 	free(bytes);
 	return ok;
 }

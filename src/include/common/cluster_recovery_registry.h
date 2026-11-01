@@ -38,4 +38,19 @@ extern bool cluster_recovery_registry_create_v2(int global_directory,
 extern bool cluster_recovery_registry_read_v2(int global_directory,
 											  const ClusterRecoveryRegistryV2 *,
 											  const uint8 reference[128], Size byte_budget);
+/* Local decoded storage only. The complete canonical vectors are validated
+ * before returning a view. A selected reference must come independently from
+ * the original control owner; decoding or loading alone grants no authority.
+ * budget bounds complete wire bytes, not the active-pin capacity. Fresh *out
+ * must be NULL. Refusal preserves outputs; destroy invalidates before free. */
+typedef struct ClusterRecoveryRegistryDecodedV2 ClusterRecoveryRegistryDecodedV2;
+extern bool cluster_recovery_registry_decode_v2(const uint8 *bytes, Size length,
+												const uint8 reference[128], Size byte_budget,
+												ClusterRecoveryRegistryDecodedV2 **out);
+extern bool cluster_recovery_registry_load_selected_v2(int global_directory,
+													   const uint8 reference[128], Size byte_budget,
+													   ClusterRecoveryRegistryDecodedV2 **out);
+extern const ClusterRecoveryRegistryV2 *
+cluster_recovery_registry_view_v2(const ClusterRecoveryRegistryDecodedV2 *);
+extern void cluster_recovery_registry_destroy_v2(ClusterRecoveryRegistryDecodedV2 **);
 #endif

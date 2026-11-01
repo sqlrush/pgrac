@@ -351,6 +351,158 @@ bool cluster_recovery_registry_matches_v2(const uint8 *p, Size n,
 	return ok;
 }
 
+struct ClusterRecoveryRegistryDecodedV2 {
+	ClusterRecoveryRegistryV2 registry;
+	ClusterRecoveryCheckpointSourceV2 *sources;
+	ClusterRecoveryCheckpointFileV2 *files;
+	ClusterRecoveryCheckpointFileSourceV2 *intervals;
+};
+const ClusterRecoveryRegistryV2 *
+cluster_recovery_registry_view_v2(const ClusterRecoveryRegistryDecodedV2 *d)
+{
+	return d ? &d->registry : NULL;
+}
+void
+cluster_recovery_registry_destroy_v2(ClusterRecoveryRegistryDecodedV2 **owner)
+{
+	ClusterRecoveryRegistryDecodedV2 *d;
+	if (!owner || !(d = *owner))
+		return;
+	*owner = NULL;
+	free(d->intervals);
+	free(d->files);
+	free(d->sources);
+	memset(d, 0, sizeof(*d));
+	free(d);
+}
+static void
+decode_source(const uint8 *p, ClusterRecoveryCheckpointSourceV2 *s)
+{
+	ClusterControlRootIdentity *id = &s->source.claim.identity;
+	CheckPoint *c = &s->checkpoint;
+	id->system_identifier = get(p, 0, 8);
+	memcpy(id->storage_uuid, p + 8, 16);
+	memcpy(id->authority_uuid, p + 24, 16);
+	id->origin_thread_id = get(p, 40, 2);
+	id->origin_node_id = (int32)get(p, 44, 4);
+	id->thread_claim_created_at = get(p, 48, 8);
+	id->thread_claim_crc32c = get(p, 56, 4);
+	id->origin_owner_incarnation = get(p, 64, 8);
+	id->root_lineage_seq = get(p, 72, 8);
+	s->source.claim.database_incarnation = get(p, 80, 8);
+	s->source.claim.max_config_generation = get(p, 88, 8);
+	memcpy(s->source.claim.claim_sha256, p + 96, 32);
+	s->source.timeline = get(p, 128, 4);
+	c->redo = get(p, 136, 8);
+	c->ThisTimeLineID = get(p, 144, 4);
+	c->PrevTimeLineID = get(p, 148, 4);
+	c->fullPageWrites = p[152] != 0;
+	c->nextXid = FullTransactionIdFromU64(get(p, 160, 8));
+	c->nextOid = get(p, 168, 4);
+	c->nextMulti = get(p, 172, 4);
+	c->nextMultiOffset = get(p, 176, 4);
+	c->oldestXid = get(p, 180, 4);
+	c->oldestXidDB = get(p, 184, 4);
+	c->oldestMulti = get(p, 188, 4);
+	c->oldestMultiDB = get(p, 192, 4);
+	c->time = (int64)get(p, 200, 8);
+	c->oldestCommitTsXid = get(p, 208, 4);
+	c->newestCommitTsXid = get(p, 212, 4);
+	c->oldestActiveXid = get(p, 216, 4);
+	s->checkpoint_start = get(p, 224, 8);
+	s->checkpoint_end = get(p, 232, 8);
+	s->redo_start = get(p, 240, 8);
+	s->replay_end = get(p, 248, 8);
+	s->native_floor = FullTransactionIdFromU64(get(p, 256, 8));
+	s->post_flush_issued = FullTransactionIdFromU64(get(p, 264, 8));
+	s->next_full_xid = FullTransactionIdFromU64(get(p, 272, 8));
+	s->oldest_clog_xid = get(p, 280, 4);
+	s->local_bounds_observed = p[284] != 0;
+}
+bool
+cluster_recovery_registry_decode_v2(const uint8 *p, Size n, const uint8 ref[128], Size budget,
+									ClusterRecoveryRegistryDecodedV2 **out)
+{
+	ClusterRecoveryRegistryDecodedV2 *d = NULL;
+	ClusterRecoveryRegistryV2 *r;
+	uint64 ns, nf, ni, first = 0;
+	Size file = 256, interval;
+	bool ok = false;
+	if (!out || !p || !ref || n < 256 || n > budget || overlap(p, n, out, sizeof(*out))
+		|| overlap(ref, 128, out, sizeof(*out)) || *out
+		|| !cluster_recovery_registry_reference_valid_v2(ref) || get(ref, 48, 8) != n)
+		return false;
+	ns = get(p, 112, 8);
+	nf = get(p, 120, 8);
+	ni = get(p, 128, 8);
+	if (!ns || !nf || !ni || ns != get(ref, 56, 8) || nf != get(ref, 64, 8)
+		|| !extend(&file, ns, 288, n) || !(interval = file) || !extend(&interval, nf, 208, n)
+		|| ni != (n - interval) / 24 || (n - interval) % 24 || get(p, 136, 8) != 256
+		|| get(p, 144, 8) != file || get(p, 152, 8) != interval
+		|| ns > SIZE_MAX / sizeof(*d->sources) || nf > SIZE_MAX / sizeof(*d->files)
+		|| ni > SIZE_MAX / sizeof(*d->intervals))
+		return false;
+	d = calloc(1, sizeof(*d));
+	if (!d)
+		return false;
+	d->sources = calloc(ns, sizeof(*d->sources));
+	d->files = calloc(nf, sizeof(*d->files));
+	d->intervals = calloc(ni, sizeof(*d->intervals));
+	if (!d->sources || !d->files || !d->intervals)
+		goto done;
+	r = &d->registry;
+	r->system_identifier = get(p, 24, 8);
+	r->database_incarnation = get(p, 32, 8);
+	memcpy(r->storage_uuid, p + 40, 16);
+	memcpy(r->redo_branch_uuid, p + 56, 16);
+	r->redo_branch_generation = get(p, 72, 8);
+	r->coverage.control_generation = get(p, 80, 8);
+	r->coverage.registration_generation = get(p, 88, 8);
+	r->coverage.checkpoint_generation = get(p, 96, 8);
+	r->coverage.commit_generation = get(p, 104, 8);
+	r->coverage.sources = d->sources;
+	r->coverage.source_count = ns;
+	r->coverage.files = d->files;
+	r->coverage.file_count = nf;
+	for (uint64 i = 0; i < ns; i++)
+		decode_source(p + 256 + i * 288, &d->sources[i]);
+	for (uint64 i = 0; i < ni; i++) {
+		const uint8 *v = p + interval + i * 24;
+		d->intervals[i].source_index = get(v, 0, 8);
+		d->intervals[i].redo_start = get(v, 8, 8);
+		d->intervals[i].replay_end = get(v, 16, 8);
+	}
+	for (uint64 i = 0; i < nf; i++) {
+		ClusterRecoveryCheckpointFileV2 *f = &d->files[i];
+		const uint8 *q = p + file + i * 208;
+		uint64 count = get(q, 192, 8);
+		if (!cluster_recovery_file_identity_decode_v2(q, 128, &f->identity) || !count || count > ns
+			|| first > ni || count > ni - first || get(q, 200, 8) != first)
+			goto done;
+		f->synced_bytes = get(q, 128, 8);
+		f->first_page = get(q, 136, 8);
+		f->page_count = get(q, 144, 8);
+		f->copy_index = get(q, 152, 4);
+		f->copy_count = get(q, 156, 4);
+		memcpy(f->image_digest, q + 160, 32);
+		f->source_count = count;
+		f->sources = d->intervals + first;
+		first += count;
+	}
+	/* Original validator + complete re-encoding catches every reserved byte,
+	 * boolean, duplicate/copy/interval error, count, digest and CRC, not a prefix. */
+	ok = first == ni && cluster_recovery_registry_matches_v2(p, n, r, ref);
+	if (ok) {
+		memcpy(r->coverage.source_set_digest, p + 168, 32);
+		memcpy(r->coverage.file_set_digest, p + 200, 32);
+		*out = d;
+		d = NULL;
+	}
+done:
+	cluster_recovery_registry_destroy_v2(&d);
+	return ok;
+}
+
 #ifdef WIN32
 bool cluster_recovery_registry_create_v2(int d, const ClusterRecoveryRegistryV2 *r, Size b,
 										 uint8 ref[128])
@@ -359,6 +511,12 @@ bool cluster_recovery_registry_create_v2(int d, const ClusterRecoveryRegistryV2 
 }
 bool cluster_recovery_registry_read_v2(int d, const ClusterRecoveryRegistryV2 *r,
 									   const uint8 ref[128], Size b)
+{
+	return false;
+}
+bool
+cluster_recovery_registry_load_selected_v2(int d, const uint8 ref[128], Size b,
+										   ClusterRecoveryRegistryDecodedV2 **out)
 {
 	return false;
 }
@@ -496,5 +654,55 @@ bool cluster_recovery_registry_read_v2(int global, const ClusterRecoveryRegistry
 									   const uint8 ref[128], Size budget)
 {
 	return registry_io(global, r, budget, ref, NULL, false);
+}
+bool
+cluster_recovery_registry_load_selected_v2(int global, const uint8 ref[128], Size budget,
+										   ClusterRecoveryRegistryDecodedV2 **out)
+{
+	int dir = -1, fd = -1;
+	Size n;
+	bool ok = false;
+	uint8 *bytes = NULL, *again = NULL;
+	char name[56];
+	struct stat before, after;
+	ClusterRecoveryRegistryDecodedV2 *decoded = NULL;
+	if (!out || !ref || overlap(ref, 128, out, sizeof(*out)) || *out
+		|| !cluster_recovery_registry_reference_valid_v2(ref) || get(ref, 48, 8) > budget
+		|| get(ref, 48, 8) > PG_INT64_MAX || !directory_safe(global))
+		return false;
+	n = (Size)get(ref, 48, 8);
+	bytes = malloc(n);
+	again = malloc(n);
+	if (!bytes || !again)
+		goto done;
+	dir = openat(global, "pgrac_recovery_registry",
+				 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (dir < 0 || !current_directory(global, dir))
+		goto done;
+	registry_name(ref, name);
+	fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY);
+	if (fd < 0 || !current_file(dir, name, fd, n) || fstat(fd, &before)
+		|| !exact_io(fd, bytes, n, false) || !exact_io(fd, again, n, false)
+		|| memcmp(bytes, again, n) || !current_file(dir, name, fd, n) || fstat(fd, &after)
+		|| !same_stat(&before, &after) || !current_directory(global, dir)
+		|| !cluster_recovery_registry_decode_v2(bytes, n, ref, budget, &decoded))
+		goto done;
+	ok = true;
+done:
+	if (fd >= 0 && close(fd))
+		ok = false;
+	if (ok)
+		ok = fstatat(dir, name, &after, AT_SYMLINK_NOFOLLOW) == 0 && same_stat(&before, &after)
+			 && current_directory(global, dir);
+	if (dir >= 0 && close(dir))
+		ok = false;
+	if (ok) {
+		*out = decoded;
+		decoded = NULL;
+	}
+	cluster_recovery_registry_destroy_v2(&decoded);
+	free(again);
+	free(bytes);
+	return ok;
 }
 #endif

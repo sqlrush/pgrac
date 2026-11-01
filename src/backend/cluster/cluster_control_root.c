@@ -48,6 +48,8 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster_control_root_private.h"
+#include "cluster_control_root_registry_private.h"
+#include "cluster/cluster_control_file_identity.h"
 #include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster_recovery_anchor_private.h"
 #include "cluster/cluster_relmap_checkpoint.h"
@@ -13595,4 +13597,179 @@ cluster_control_root_discard_inactive(const ClusterControlRootFileToken *expecte
 	(void)expected_token;
 	(void)expected_round_sha256;
 	return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+}
+
+/* Control-selected inputs only. The original CF owner retains the lock across
+ * the consumer's I/O; this API neither admits a writer nor publishes a ROOT. */
+typedef struct ControlFileSelectionWorkV4 {
+	int directory;
+	ControlRootImage root;
+	ControlFileData common;
+	ClusterRecoveryRegistryDecodedV2 *decoded;
+	uint8 pair[133120], recheck[133120];
+	ClusterRecoveryFileIdentityV2 selected;
+	ClusterSharedConfigRef expected;
+	ClusterControlFileKeyV2 key;
+} ControlFileSelectionWorkV4;
+static ClusterControlRootResult
+control_file_dependencies_v4(const ClusterSharedConfigRef *expected, ControlFileSelectionWorkV4 *w)
+{
+	ClusterSharedConfigRef actual;
+	ClusterSharedConfigImage image;
+	ClusterControlRootResult result;
+	config_root_reference(&w->root, &actual);
+	if (memcmp(&actual, expected, sizeof(actual)))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = cluster_cf_control_image_read_locked(w->root.header.v2.control_image_generation,
+												  w->root.header.v2.control_image_sha256,
+												  expected->identity.system_identifier, &w->common);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	memset(&image, 0, sizeof(image));
+	result = cluster_shared_config_read_locked(cluster_shared_data_dir, &actual, &image);
+	cluster_shared_config_free(&image);
+	return result;
+}
+static bool
+control_file_key_matches_v4(const ClusterControlFileKeyV2 *k,
+							const ClusterRecoveryFileIdentityV2 *f)
+{
+	return k->kind == f->kind && k->origin == f->origin && k->database_oid == f->database_oid
+		   && k->tablespace_oid == f->tablespace_oid && k->object_id == f->object_id;
+}
+static ClusterControlRootResult
+control_file_select_v4(const ClusterSharedConfigRef *expected, const ClusterControlFileKeyV2 *key,
+					   Size budget, ControlFileSelectionWorkV4 *w)
+{
+	const ClusterRecoveryRegistryV2 *r;
+	bool found = false;
+	uint8 selected[128];
+	ClusterControlRootResult result;
+	if (!cluster_control_root_registry_capture_v4(w->directory, expected->identity.storage_uuid,
+												  expected->identity.system_identifier, w->pair,
+												  &w->root))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (w->root.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| (w->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+			&& w->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_CLOSED
+			&& w->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+			&& w->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING))
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	result = control_file_dependencies_v4(expected, w);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!cluster_recovery_registry_load_selected_v2(w->directory, w->pair + 512, budget,
+													&w->decoded))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	r = cluster_recovery_registry_view_v2(w->decoded);
+	if (r->system_identifier != expected->identity.system_identifier
+		|| r->database_incarnation != expected->identity.database_incarnation
+		|| memcmp(r->storage_uuid, expected->identity.storage_uuid, 16)
+		|| r->coverage.control_generation != w->root.header.file_txn_seq)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	for (uint64 i = 0; i < r->coverage.source_count; i++)
+		if (memcmp(r->coverage.sources[i].source.claim.identity.authority_uuid,
+				   w->root.header.authority_uuid, 16))
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	for (uint64 i = 0; i < r->coverage.file_count; i++) {
+		const ClusterRecoveryFileIdentityV2 *f = &r->coverage.files[i].identity;
+		uint8 bytes[128];
+		if (!control_file_key_matches_v4(key, f))
+			continue;
+		if (!cluster_recovery_file_identity_encode_v2(f, bytes, 128)
+			|| (found && memcmp(bytes, selected, 128)))
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		w->selected = *f;
+		memcpy(selected, bytes, 128);
+		found = true;
+	}
+	if (!found)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = storage_contract_check(expected->identity.storage_uuid, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (cluster_cf_contract_load(DataDir) != CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED)
+		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+	result = control_file_dependencies_v4(expected, w);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!cluster_control_root_registry_capture_v4(w->directory, expected->identity.storage_uuid,
+												  expected->identity.system_identifier, w->recheck,
+												  &w->root)
+		|| memcmp(w->pair, w->recheck, sizeof(w->pair)))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+ClusterControlRootResult
+cluster_control_root_file_identity_read_locked_v4(const ClusterSharedConfigRef *expected,
+												  const ClusterControlFileKeyV2 *key, Size budget,
+												  ClusterRecoveryFileIdentityV2 *out)
+{
+	ControlFileSelectionWorkV4 *w;
+	volatile ClusterControlRootResult result;
+	ClusterSharedConfigRef captured;
+	ClusterControlFileKeyV2 captured_key;
+	char path[MAXPGPATH];
+	int n;
+	if (!expected || !key || !out || !expected->identity.system_identifier
+		|| !expected->identity.database_incarnation || !expected->identity.generation
+		|| key->kind <= CLUSTER_RECOVERY_FILE_UNKNOWN_V2
+		|| key->kind > CLUSTER_RECOVERY_FILE_DEBT_V2 || key->origin >= 128 || budget < 256
+		|| history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out))
+		|| history_ranges_overlap(key, sizeof(*key), out, sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	captured = *expected;
+	captured_key = *key;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = storage_contract_check(captured.identity.storage_uuid, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (cluster_cf_contract_load(DataDir) != CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED)
+		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+	n = snprintf(path, sizeof(path), "%s/global", cluster_shared_data_dir);
+	if (n <= 0 || n >= sizeof(path))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	w = palloc0(sizeof(*w));
+	w->directory = -1;
+	w->expected = captured;
+	w->key = captured_key;
+	PG_TRY();
+	{
+		w->directory = OpenTransientFile(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		result = w->directory < 0 ? CLUSTER_CONTROL_ROOT_IO_ERROR
+								  : control_file_select_v4(&w->expected, &w->key, budget, w);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			struct stat held, named;
+			char current_path[MAXPGPATH];
+			int length = snprintf(current_path, sizeof(current_path), "%s/global",
+								  cluster_shared_data_dir);
+			if (length <= 0 || length >= sizeof(current_path) || strcmp(current_path, path)
+				|| fstat(w->directory, &held) || lstat(path, &named) || !S_ISDIR(named.st_mode)
+				|| held.st_dev != named.st_dev || held.st_ino != named.st_ino
+				|| memcmp(expected, &w->expected, sizeof(*expected))
+				|| memcmp(key, &w->key, sizeof(*key)))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_registry_destroy_v2(&w->decoded);
+		if (w->directory >= 0)
+			CloseTransientFile(w->directory);
+		pfree(w);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_recovery_registry_destroy_v2(&w->decoded);
+	if (w->directory >= 0 && CloseTransientFile(w->directory))
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = w->selected;
+	pfree(w);
+	return result;
 }

@@ -198,6 +198,7 @@ UT_TEST(test_selected_root_registry_real_files_and_late_change)
 	UT_ASSERT_EQ(close(dir), 0);
 	UT_ASSERT_EQ(rmdir(path), 0);
 }
+#ifndef TEST_CONTROL_FILE_SELECTION
 int main(void)
 {
 	UT_PLAN(3);
@@ -207,3 +208,5 @@ int main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+
+#endif

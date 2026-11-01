@@ -20,4 +20,11 @@ extern bool cluster_control_root_registry_read_selected_v4(int global_directory,
 														   const uint8 *expected, Size length,
 														   const ClusterRecoveryRegistryV2 *,
 														   Size byte_budget);
+/* Complete primary+backup capture for the existing control reader. No legacy
+ * bytes/token escape; metadata.bytes is empty and format_version stays 4.
+ * Both fixed paths are reread before local descriptors close. */
+extern bool cluster_control_root_registry_capture_v4(int global_directory,
+													 const uint8 storage_uuid[16],
+													 uint64 system_identifier, uint8 pair[133120],
+													 ControlRootImage *metadata);
 #endif
