@@ -2500,7 +2500,8 @@ test_cluster_abort_writer_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 test_cluster_pi_drop_storage: test_cluster_pi_drop_storage.c test_cluster_page_data.c
 test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
 test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: $(CLUSTER_KO_O)
-test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
+test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O)
+test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS += $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
@@ -5776,9 +5777,9 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 # PGRAC: real bounded discard/PI owners, not copies of their decisions.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_pcm_s_capture_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_resource_x_acquire_s_source_capture_owned\(/ { print "static ResourceXApplyResult"; emit=1; capture++ } \
+	awk '/^gcs_block_resource_x_acquire_s_source_capture_(owned|with_plan)\(/ { print "static ResourceXApplyResult"; emit=1; capture++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (capture != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (capture != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_s_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -11533,8 +11534,8 @@ test_cluster_native_holder_bufmgr.inc: $(top_srcdir)/src/backend/storage/buffer/
 	mv $@.tmp $@
 test_cluster_native_holder_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_acquire_s_(read_finish_owned|native_handoff_owned|source_finish_owned)\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
-	     /^gcs_block_resource_x_acquire_s_source_capture_owned\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
-	     emit { print } /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@.tmp
+	     /^gcs_block_resource_x_acquire_s_source_capture_(owned|with_plan)\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 clean distclean maintainer-clean: clean-native-holder
 .PHONY: clean-native-holder
@@ -11939,3 +11940,46 @@ clean distclean maintainer-clean: clean-native-local-source
 .PHONY: clean-native-local-source
 clean-native-local-source:
 	rm -f test_cluster_native_local_source
+
+# Original retained source -> bounded BG proof job -> exact carrier.
+TESTS += test_cluster_source_coverage
+all: test_cluster_source_coverage
+test_cluster_source_coverage: test_cluster_source_coverage.c test_cluster_resource_x_pi_replace \
+		test_cluster_source_coverage_replace.inc \
+		test_cluster_source_coverage_types.inc test_cluster_source_coverage_job.inc \
+		test_cluster_source_coverage_gcs.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) test_cluster_space_bufpage_product.o \
+		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(CLUSTER_VERSION_O) $(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_WAL_CLAIM_O) test_cluster_pi_replace_pcm.o \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_source_coverage_types.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
+	awk '/^#define WB_RETRY_US/ { emit=1 } /^static WritebackBatch \*wb_batch;/ { emit=0; next } emit { print }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_source_coverage_job.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
+	awk '/^wb_local_advance_locked\(/ { print "static bool"; emit=1; n++ } \
+	     /^wb_(server_finish|forget_server|resource_release)\(/ { print "static void"; emit=1; n++ } \
+	     /^wb_source_tick\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_pi_writeback_source_begin_v1\(/ { print "ClusterControlRootResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 6) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_source_coverage_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_acquire_s_source_capture_(owned|with_plan)\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
+	     /^cluster_gcs_block_resource_x_source_coverage_capture\(/ { print "ResourceXApplyResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-source-coverage
+.PHONY: clean-source-coverage
+clean-source-coverage:
+	rm -f test_cluster_source_coverage test_cluster_source_coverage_replace.inc \
+		test_cluster_source_coverage_replace.inc.tmp test_cluster_source_coverage_types.inc \
+		test_cluster_source_coverage_job.inc test_cluster_source_coverage_gcs.inc \
+		test_cluster_source_coverage_types.inc.tmp test_cluster_source_coverage_job.inc.tmp \
+		test_cluster_source_coverage_gcs.inc.tmp
+
+test_cluster_source_coverage_replace.inc: test_cluster_resource_x_pi_replace.c Makefile
+	awk '/^int$$/ { n++; exit } { print } END { if (n != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@

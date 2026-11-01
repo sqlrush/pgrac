@@ -346,9 +346,9 @@ UT_TEST(test_pi_malformed_carrier_is_invalid_in_original_stop_census)
 
 UT_TEST(test_pi_successor_waits_for_original_body_capacity)
 {
-	PiFixture f; ResourceXDecodedFrame request, block;
+	PiFixture f; ResourceXDecodedFrame request, block, retained;
 	ResourceXWireReject reject; uint8 bytes[RESOURCE_X_DECISION_V4_BYTES]; uint16 length;
-	ClusterPcmResourceXMasterState before;
+	ClusterPcmResourceXMasterState before, after;
 	if (!pi_start_master(&f, true, 2)) return;
 	request = pi_request(&f);
 	UT_ASSERT_EQ(clean_receive(&request), RESOURCE_X_APPLY_APPLIED);
@@ -365,8 +365,16 @@ UT_TEST(test_pi_successor_waits_for_original_body_capacity)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_prepare_exact(&block, 2, 7,
 		&f.source.prepared, f.source.page.data, &f.last, 83, 61), RESOURCE_X_APPLY_LOCAL_WAIT);
 	UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&block, 2, 83, 61), RESOURCE_X_APPLY_LOCAL_WAIT);
-	UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+	/* Native capture still waits. The new control-only service may park in
+	 * the original entry while the old body and both WAL owners stay exact. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&block, 2, 83, 61), RESOURCE_X_APPLY_APPLIED);
+	after = *f.source.m.state;
+	UT_ASSERT_EQ(after.holder_coverage_forward.valid, RESOURCE_X_HOLDER_SOURCE_FORWARD);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N,
+		after.holder_coverage_forward.payload, after.holder_coverage_forward.payload_bytes, &retained, &reject));
+	UT_ASSERT(memcmp(&retained, &block, sizeof(block)) == 0);
+	memset(&after.holder_coverage_forward, 0, sizeof(after.holder_coverage_forward));
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
 	pi_end();
 }
 

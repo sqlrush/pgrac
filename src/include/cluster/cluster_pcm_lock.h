@@ -2109,6 +2109,15 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_forward
 	uint64 r4_record_generation, uint32 authenticated_connection_generation);
 /* A claimed original FORWARD is atomically replaced by its real native
  * pair. APPLIED/DUPLICATE transfers native completion: never abort after it. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(
+	const ResourceXSourceDrainWork *work, ResourceXDecodedFrame *block);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_coverage_claim_exact(
+	const ResourceXSourceDrainWork *work, const ResourceXDecodedFrame *block, bool claimed, bool cancel);
+#define CLUSTER_PCM_SOURCE_COVERAGE_JOB_V1 1
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_covered_capture_exact(
+	const ResourceXSourceDrainWork *work, int32 buffer_id, const struct ClusterPcmOwnSnapshot *prepared,
+	const char page[BLCKSZ], const struct ClusterPageWalBindingV1 *wal,
+	uint32 requester_connection, uint32 master_connection, const struct RfPageOnlinePlanV1 *coverage);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(
 	const ResourceXSourceDrainWork *work, int32 buffer_id,
 	const struct ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],

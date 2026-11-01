@@ -795,10 +795,67 @@ UT_TEST(test_covered_dependency_does_not_relabel_the_carrier_WAL_source)
 	UT_ASSERT_EQ(replace_references, refs); replace_end(&f);
 }
 
+
+UT_TEST(test_ordinary_forward_retains_service_without_releasing_old_PI)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work;
+	ClusterPcmResourceXPiCarrier before; int refs;
+	if (!replace_start(&f, true)) { UT_ASSERT(false); return; }
+	before = f.old.source.m.state->pi_carrier; refs = replace_references;
+	ResourceXApplyResult result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(
+		&f.block, 2, 87, 61);
+	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&before, &f.old.source.m.state->pi_carrier, sizeof(before)) == 0);
+	UT_ASSERT_EQ(replace_references, refs);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		ResourceXDecodedFrame retained;
+		UT_ASSERT(replace_claim(&work));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_drain_snapshot_exact(
+			&work, &retained), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(memcmp(&retained.common, &f.block.common, sizeof(retained.common)) == 0);
+		UT_ASSERT(memcmp(&retained.body.acquire_decision, &f.block.body.acquire_decision,
+			sizeof(retained.body.acquire_decision)) == 0);
+	}
+	replace_end(&f);
+}
+
+
+UT_TEST(test_parked_forward_coverage_consumes_the_original_claim)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work, next;
+	int refs; ResourceXApplyResult result;
+	if (!replace_start(&f, true)) { UT_ASSERT(false); return; }
+	refs = replace_references;
+	result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 87, 61);
+	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+	if (result != RESOURCE_X_APPLY_APPLIED || !replace_claim(&work)) { replace_end(&f); return; }
+#ifdef CLUSTER_PCM_SOURCE_COVERAGE_JOB_V1
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_claim_exact(&work, &f.block, true, false), RESOURCE_X_APPLY_APPLIED);
+	result = cluster_pcm_lock_resource_x_acquire_s_source_covered_capture_exact(&work,
+		7, &f.prepared, f.page.data, &f.last, 83, 61, f.plan);
+#else
+	result = cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(&work,
+		7, &f.prepared, f.page.data, &f.last, 83, 61);
+#endif
+	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		UT_ASSERT_EQ(f.old.source.m.state->pi_carrier.pi_refs, 1);
+		UT_ASSERT_EQ(f.old.source.m.state->pi_carrier.transport_refs, 1);
+		UT_ASSERT_EQ(replace_references, refs);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work,
+			RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+		cluster_pcm_lock_resource_x_source_drain_content_released();
+		if (!replace_claim(&next)) UT_ASSERT(replace_claim(&next));
+		UT_ASSERT(resource_x_assertion_equal(&next.request.logical_assertion, &work.request.logical_assertion));
+		UT_ASSERT_EQ(next.attempt_generation, work.attempt_generation + 2);
+	}
+	replace_end(&f);
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(25);
 	UT_RUN(test_covered_successor_keeps_earliest_ref_and_original_lms_work);
 	UT_RUN(test_covered_pending_publication_keeps_transport_and_pi_separate);
 	UT_RUN(test_covered_replacement_waits_for_original_ack_callback);
@@ -822,5 +879,7 @@ main(void)
 	UT_RUN(test_foreign_dependency_cancel_releases_only_temporary_reference);
 	UT_RUN(test_foreign_scope_progress_after_coverage_refuses_handoff);
 	UT_RUN(test_covered_dependency_does_not_relabel_the_carrier_WAL_source);
+	UT_RUN(test_ordinary_forward_retains_service_without_releasing_old_PI);
+	UT_RUN(test_parked_forward_coverage_consumes_the_original_claim);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }

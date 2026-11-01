@@ -127,6 +127,10 @@ cluster_gcs_block_resource_x_bootstrap_tick(const ResourceXBootstrapWork *work);
 /* One bounded source-side callback; claims the existing continuous pin. */
 extern ResourceXApplyResult
 cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref);
+struct RfPageOnlinePlanV1;
+extern ResourceXApplyResult cluster_gcs_block_resource_x_source_coverage_capture(
+	const ResourceXSourceDrainWork *work, const ResourceXDecodedFrame *expected,
+	const struct RfPageOnlinePlanV1 *coverage);
 extern ResourceXApplyResult
 cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *work);
 

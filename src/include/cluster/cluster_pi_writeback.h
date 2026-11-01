@@ -187,6 +187,10 @@ extern bool cluster_pi_writeback_ack_current_v1(const ClusterPiDataFactV1 *fact,
  * receipt must already have exact DATA/ancestry proof in the caller's held
  * full input. Poll completes the batch; only exact acknowledged indices
  * may be imported. A partial reply never clears the omitted obligations. */
+/* Local original holder service; shares the existing bounded BG job slot. */
+#define CLUSTER_PI_SOURCE_COVERAGE_V1 1
+extern ClusterControlRootResult cluster_pi_writeback_source_begin_v1(
+	const ResourceXSourceDrainWork *work, const ResourceXDecodedFrame *forward);
 extern ClusterControlRootResult
 cluster_pi_writeback_begin_v1(const ClusterPageDataReceiptV1 *const *receipts, uint32 count,
 							  const ClusterWalSourceRef *peer, ClusterPiWritebackJobV1 **out);

@@ -19,6 +19,8 @@
 #undef gcs_block_resource_x_payload_candidate
 
 #include "cluster/cluster_itl.h"
+#include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "test_cluster_native_holder_itl.inc"
 static LWLock holder_mapping_lock;
 static bool holder_content_busy;

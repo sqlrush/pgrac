@@ -997,6 +997,21 @@ static bool wb_offer_complete_for_transport(uint32 slot, uint64 serial,
 #define cluster_pcm_lock_pi_structural_complete_v2 wb_structure_complete_for_schedule
 #define cluster_page_structural_receipt_free_v2 wb_structure_receipt_free_for_schedule
 #define cluster_page_structural_pi_ack_free_v2 wb_structure_ack_free_for_schedule
+/* Ordinary source jobs execute with actual PCM/PAGE owners in the separate
+ * source_coverage composition. These endpoint cases may not enter them. */
+ResourceXApplyResult cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(
+	const ResourceXSourceDrainWork *work, ResourceXDecodedFrame *block)
+{ (void)work; (void)block; UT_ASSERT(false); return RESOURCE_X_APPLY_INVALID; }
+ResourceXApplyResult cluster_pcm_lock_resource_x_source_coverage_claim_exact(
+	const ResourceXSourceDrainWork *work, const ResourceXDecodedFrame *block, bool claimed, bool cancel)
+{ (void)work; (void)block; (void)claimed; (void)cancel; UT_ASSERT(false); return RESOURCE_X_APPLY_INVALID; }
+ResourceXApplyResult cluster_pcm_lock_resource_x_source_drain_complete_exact(
+	const ResourceXSourceDrainWork *work, ResourceXApplyResult result)
+{ (void)work; (void)result; UT_ASSERT(false); return RESOURCE_X_APPLY_INVALID; }
+ResourceXApplyResult cluster_gcs_block_resource_x_source_coverage_capture(
+	const ResourceXSourceDrainWork *work, const ResourceXDecodedFrame *block, const RfPageOnlinePlanV1 *page)
+{ (void)work; (void)block; (void)page; UT_ASSERT(false); return RESOURCE_X_APPLY_INVALID; }
+void cluster_pcm_lock_resource_x_source_drain_content_released(void) { }
 #include "../../backend/cluster/cluster_pi_writeback.c"
 #undef cluster_page_structural_pi_fact_v2
 #undef cluster_ko_shared_structure_offer_next_v2

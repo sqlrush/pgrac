@@ -15711,6 +15711,17 @@ static int ready_enqueue_calls;
 static bool ready_endless_probe;
 static ResourceXIntentSlot ready_synthetic_slot;
 
+#ifndef PGRAC_TEST_REAL_SOURCE_COVERAGE
+ClusterControlRootResult
+cluster_pi_writeback_source_begin_v1(const ResourceXSourceDrainWork *work,
+	const ResourceXDecodedFrame *forward)
+{
+	(void)work; (void)forward;
+	UT_ASSERT(false); /* These fixtures do not authorize a coverage job. */
+	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+#endif
+
 static bool
 gcs_block_pcm_x_resource_x_peer_ready_exact(int32 node, uint32 *connection)
 {

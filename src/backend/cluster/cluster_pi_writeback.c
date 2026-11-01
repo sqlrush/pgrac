@@ -8,6 +8,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lmon.h"
@@ -38,6 +39,17 @@ StaticAssertDecl(CLUSTER_PI_WRITEBACK_MAX_BYTES_V2 == 22960, "bounded v2 writeba
 enum { WB_EMPTY, WB_QUEUED, WB_RUNNING, WB_REPLIED };
 enum { WB_BATCH_OFFER, WB_BATCH_DATA, WB_BATCH_STRUCTURE, WB_BATCH_KINDS };
 
+/* Local use of the same inbound owner; never a wire version. */
+#define WB_LOCAL_SOURCE 0
+
+typedef struct WritebackSourceRequest {
+	ResourceXSourceDrainWork work;
+	uint8 forward[RESOURCE_X_DECISION_V4_BYTES];
+	ClusterWalSourceRef source;
+} WritebackSourceRequest;
+StaticAssertDecl(sizeof(WritebackSourceRequest) <= sizeof(ClusterPiWritebackMessageV2),
+	"local source proof must fit the original writeback slot");
+
 typedef struct WritebackShared {
 	slock_t lock;
 	/* Invalidates a local READY sample before publishing a new notice or
@@ -64,11 +76,13 @@ typedef struct WritebackShared {
 	union {
 		ClusterPiWritebackMessageV1 inbound;
 		ClusterPiWritebackMessageV2 inbound_v2;
+		WritebackSourceRequest source_request;
 	};
 	union {
 		ClusterPiWritebackMessageV1 reply;
 		ClusterPiWritebackMessageV2 reply_v2;
 	};
+	TimestampTz source_started;
 	int32 bgwriter_procno;
 	int32 bgwriter_pid;
 	bool bgwriter_flush_quiesced;
@@ -105,6 +119,7 @@ struct ClusterPiWritebackNoticeV1 {
 	union {
 		ClusterPiWritebackMessageV1 request;
 		ClusterPiWritebackMessageV2 request_v2;
+		WritebackSourceRequest source_request;
 	};
 	ClusterWalInputsV1 *inputs;
 	ClusterThreadRecoveryFabricPlanV1 *plan;
@@ -1163,19 +1178,23 @@ wb_cancel(ClusterPiWritebackJobV1 *job)
 static void
 wb_forget_server(void)
 {
+	bool released = false;
 	if (wb_shared != NULL) {
 		SpinLockAcquire(&wb_shared->lock);
 		if (wb_shared->inbound_pid == MyProcPid) {
 			/* The physical call may already have retired a local PI. Keep
 			 * its exact original request with this BG owner until it can
 			 * produce and hand off a qualified reply on a fresh input scope. */
-			wb_shared->inbound_state = wb_shared->physical_started ? WB_QUEUED : WB_EMPTY;
+			wb_shared->inbound_state = wb_shared->physical_started
+				|| wb_shared->inbound_version == WB_LOCAL_SOURCE ? WB_QUEUED : WB_EMPTY;
 			wb_shared->inbound_pid = 0;
 			wb_shared->reply_pending = false;
+			released = wb_shared->inbound_state == WB_EMPTY;
 		}
 		SpinLockRelease(&wb_shared->lock);
 	}
 	wb_notice = NULL;
+	if (released) cluster_pcm_lock_resource_x_source_drain_content_released();
 }
 
 static void
@@ -1265,6 +1284,65 @@ wb_enqueue(const ClusterPiWritebackMessageV1 *m, const ClusterPiWritebackMessage
 	wb_active = job;
 	*out = job;
 	cluster_lmon_wakeup();
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_pi_writeback_source_begin_v1(const ResourceXSourceDrainWork *work,
+	const ResourceXDecodedFrame *forward)
+{
+	WritebackSourceRequest request = {0};
+	ResourceXApplyResult claimed;
+	ResourceXWireReject reject; uint16 length;
+	bool accepted = false, fresh = false;
+	TimestampTz started = GetCurrentTimestamp();
+	int32 procno = -1, pid = 0;
+	if (work == NULL || forward == NULL || MyBackendType != B_LMS || wb_shared == NULL
+		|| !cluster_enabled || !cluster_shared_config
+		|| !cluster_normal_stop_continuation_allowed()
+		|| !cluster_wal_thread_current_v2_ref(&request.source)
+		|| !cluster_wal_claim_v2_ref_valid(&request.source.claim) || request.source.timeline == 0
+		|| request.source.claim.identity.origin_node_id != cluster_node_id
+		|| request.source.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation())
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	request.work = *work;
+	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, forward, request.forward,
+		sizeof(request.forward), &length, &reject) || length != sizeof(request.forward))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	claimed = cluster_pcm_lock_resource_x_source_coverage_claim_exact(work, forward, true, false);
+	if (claimed != RESOURCE_X_APPLY_APPLIED && claimed != RESOURCE_X_APPLY_DUPLICATE) return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	SpinLockAcquire(&wb_shared->lock);
+	if (wb_shared->inbound_version == WB_LOCAL_SOURCE
+		&& (wb_shared->inbound_state == WB_QUEUED || wb_shared->inbound_state == WB_RUNNING)
+		&& memcmp(&request, &wb_shared->source_request, sizeof(request)) == 0)
+		accepted = true;
+	else if ((wb_shared->inbound_state == WB_EMPTY
+		|| (wb_shared->inbound_state == WB_REPLIED && !wb_shared->reply_pending))
+		&& wb_shared->inbound_revision != UINT64_MAX && wb_local_advance_locked()) {
+		wb_shared->source_request = request;
+		wb_shared->source_started = started;
+		wb_shared->inbound_version = WB_LOCAL_SOURCE;
+		wb_shared->inbound_revision++;
+		wb_shared->inbound_state = WB_QUEUED;
+		wb_shared->inbound_pid = 0;
+		wb_shared->physical_started = wb_shared->reply_pending = false;
+		accepted = fresh = true;
+	}
+	if (accepted) { procno = wb_shared->bgwriter_procno; pid = wb_shared->bgwriter_pid; }
+	SpinLockRelease(&wb_shared->lock);
+	if (!accepted) {
+		if (claimed == RESOURCE_X_APPLY_APPLIED)
+			(void)cluster_pcm_lock_resource_x_source_coverage_claim_exact(work, forward, false, false);
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	}
+	if (ProcGlobal != NULL && procno >= 0 && (uint32)procno < ProcGlobal->allProcCount
+		&& pid > 0 && ProcGlobal->allProcs[procno].pid == pid)
+		SetLatch(&ProcGlobal->allProcs[procno].procLatch);
+	if (fresh && cluster_trace_tx_identity)
+		elog(LOG, "PGRAC_SOURCE_COVERAGE phase=PARK node=%d requester=%d sequence=" UINT64_FORMAT
+			 " attempt=" UINT64_FORMAT " block=%u", cluster_node_id,
+			 work->request.logical_assertion.requester_node, work->request.assertion_sequence,
+			 work->attempt_generation, work->request.logical_assertion.resource.blockNum);
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -1795,6 +1873,7 @@ wb_server_finish(const void *reply)
 {
 	uint64 revision = wb_notice->revision;
 	uint32 version = wb_notice->version;
+	bool released = false;
 	cluster_thread_recovery_fabric_plan_destroy_v1(&wb_notice->plan);
 	cluster_wal_inputs_release_v1(&wb_notice->inputs);
 	pfree(wb_notice);
@@ -1813,8 +1892,10 @@ wb_server_finish(const void *reply)
 																 : WB_EMPTY;
 		wb_shared->inbound_pid = 0;
 		wb_shared->reply_pending = reply != NULL;
+		released = wb_shared->inbound_state == WB_EMPTY;
 	}
 	SpinLockRelease(&wb_shared->lock);
+	if (released) cluster_pcm_lock_resource_x_source_drain_content_released();
 	cluster_lmon_wakeup();
 }
 
@@ -1886,6 +1967,120 @@ wb_accept_structure_offers(void)
 	wb_server_finish(wb_reply_current_v2(&wb_notice->request_v2, &reply) ? &reply : NULL);
 }
 
+static bool
+wb_source_tick(void)
+{
+	WritebackSourceRequest request;
+	uint64 revision, records = 0;
+	TimestampTz started, now;
+	bool restart = false;
+	bool queued, claimed = false;
+	ClusterControlRootResult result;
+	ResourceXApplyResult applied;
+	ResourceXDecodedFrame current, forward;
+	ResourceXWireReject reject;
+	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_OK;
+	const RfPageOnlinePlanV1 *page;
+
+	SpinLockAcquire(&wb_shared->lock);
+	if (wb_shared->inbound_version != WB_LOCAL_SOURCE
+		|| (wb_shared->inbound_state != WB_QUEUED && wb_shared->inbound_state != WB_RUNNING)) {
+		SpinLockRelease(&wb_shared->lock); return false;
+	}
+	request = wb_shared->source_request;
+	started = wb_shared->source_started;
+	revision = wb_shared->inbound_revision;
+	queued = wb_shared->inbound_state == WB_QUEUED && wb_shared->inbound_pid == 0;
+	SpinLockRelease(&wb_shared->lock);
+	if (queued && wb_notice == NULL) {
+		ClusterPiWritebackNoticeV1 *notice = palloc0(sizeof(*notice));
+		notice->owner = CurrentResourceOwner; notice->pid = getpid();
+		notice->revision = revision; notice->version = WB_LOCAL_SOURCE;
+		notice->source_request = request;
+		SpinLockAcquire(&wb_shared->lock);
+		if (wb_shared->inbound_state == WB_QUEUED && wb_shared->inbound_pid == 0
+			&& wb_shared->inbound_version == WB_LOCAL_SOURCE && wb_shared->inbound_revision == revision) {
+			wb_notice = notice;
+			wb_shared->inbound_state = WB_RUNNING; wb_shared->inbound_pid = MyProcPid;
+			claimed = true;
+		}
+		SpinLockRelease(&wb_shared->lock);
+		if (!claimed) pfree(notice);
+	}
+	if (wb_notice == NULL || wb_notice->version != WB_LOCAL_SOURCE
+		|| wb_notice->revision != revision || wb_notice->pid != getpid()
+		|| wb_notice->owner != CurrentResourceOwner) return true;
+	if (!cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, request.forward,
+		sizeof(request.forward), &forward, &reject)) return true;
+	applied = cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(&request.work, &current);
+	if (applied != RESOURCE_X_APPLY_APPLIED || memcmp(&forward, &current, sizeof(current)) != 0)
+		goto cancel;
+	if (wb_notice->inputs == NULL) {
+		result = cluster_wal_inputs_begin_v1(request.source.claim.identity.storage_uuid,
+			request.source.claim.identity.system_identifier, &wb_notice->inputs);
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT || result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE) return true;
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) goto retry;
+	}
+	result = cluster_wal_inputs_resume_v1(wb_notice->inputs);
+	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE) goto wait;
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) goto retry;
+	if (wb_notice->plan == NULL) {
+		result = cluster_wal_inputs_contributions_v1(wb_notice->inputs, true,
+			&wb_notice->plan, &records, &detail);
+		wb_plan_rejected(result, detail, &request.work.request.logical_assertion.resource,
+			request.work.master_node, request.work.request.resource_formation,
+			request.source.claim.identity.origin_owner_incarnation);
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT) goto wait;
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) goto retry;
+	}
+	if (cluster_wal_inputs_revalidate_v1(wb_notice->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto retry;
+	page = cluster_thread_recovery_fabric_page_plan_v1(wb_notice->plan);
+	if (page == NULL) goto retry;
+	applied = cluster_gcs_block_resource_x_source_coverage_capture(&request.work, &forward, page);
+	if (applied == RESOURCE_X_APPLY_BAD_STATE || applied == RESOURCE_X_APPLY_LOCAL_WAIT) goto retry;
+	if (applied == RESOURCE_X_APPLY_STALE || applied == RESOURCE_X_APPLY_NOT_FOUND) goto cancel;
+	if (applied != RESOURCE_X_APPLY_APPLIED && applied != RESOURCE_X_APPLY_DUPLICATE) goto retry;
+	/* The pair now owns native completion. Release only the original job's
+	 * odd attempt; LMS finishes the exact reservation on its normal drain. */
+	(void)cluster_pcm_lock_resource_x_source_drain_complete_exact(&request.work, RESOURCE_X_APPLY_BAD_STATE);
+	goto done;
+wait:
+	if (wb_notice->inputs == NULL
+		|| cluster_wal_inputs_suspend_v1(wb_notice->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return true;
+retry:
+	restart = true;
+	goto done;
+cancel:
+	/* Only the exact local service is withdrawn. Its old PI body and both
+	 * WAL scopes remain owned; a late/next-generation result cannot match. */
+	(void)cluster_pcm_lock_resource_x_source_coverage_claim_exact(&request.work, &forward, false, true);
+done:
+	cluster_thread_recovery_fabric_plan_destroy_v1(&wb_notice->plan);
+	cluster_wal_inputs_release_v1(&wb_notice->inputs);
+	pfree(wb_notice); wb_notice = NULL;
+	SpinLockAcquire(&wb_shared->lock);
+	if (wb_shared->inbound_version == WB_LOCAL_SOURCE && wb_shared->inbound_revision == revision
+		&& wb_shared->inbound_pid == MyProcPid) {
+		wb_shared->inbound_state = restart ? WB_QUEUED : WB_EMPTY; wb_shared->inbound_pid = 0;
+		if (!restart) memset(&wb_shared->source_request, 0, sizeof(wb_shared->source_request));
+	}
+	SpinLockRelease(&wb_shared->lock);
+	if (!restart) {
+		cluster_pcm_lock_resource_x_source_drain_content_released();
+		if (cluster_trace_tx_identity) {
+			now = GetCurrentTimestamp();
+			elog(LOG, "PGRAC_SOURCE_COVERAGE phase=END node=%d requester=%d sequence=" UINT64_FORMAT
+				 " attempt=" UINT64_FORMAT " result=%d plan_us=" INT64_FORMAT,
+				 cluster_node_id, request.work.request.logical_assertion.requester_node,
+				 request.work.request.assertion_sequence, request.work.attempt_generation,
+				 (int)applied, now >= started ? now - started : (int64)-1);
+		}
+	}
+	return true;
+}
+
 bool
 cluster_pi_writeback_bgwriter_tick_v1(void)
 {
@@ -1905,6 +2100,10 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		|| !cluster_shared_config || !cluster_normal_stop_continuation_allowed())
 		return false;
 	wb_cleanup_register();
+	SpinLockAcquire(&wb_shared->lock);
+	if (MyProc != NULL) { wb_shared->bgwriter_procno = MyProc->pgprocno; wb_shared->bgwriter_pid = MyProcPid; }
+	SpinLockRelease(&wb_shared->lock);
+	if (wb_source_tick()) return true;
 	if (cluster_normal_stop_requested()) {
 		bool cancel_unstarted = false;
 		SpinLockAcquire(&wb_shared->lock);
@@ -2776,7 +2975,7 @@ wb_lmon_reply_v2(uint64 revision, const ClusterPiWritebackMessageV2 *request,
 {
 	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
 	Size length;
-	bool send = false;
+	bool send = false, released = false;
 	ClusterICSendResult sent;
 	if (!wb_reply_current_v2(request, reply)
 		|| !cluster_pi_writeback_encode_v2(reply, bytes, sizeof(bytes), &length))
@@ -2798,10 +2997,12 @@ wb_lmon_reply_v2(uint64 revision, const ClusterPiWritebackMessageV2 *request,
 	if (sent == CLUSTER_IC_SEND_DONE || sent == CLUSTER_IC_SEND_WOULD_BLOCK) {
 		SpinLockAcquire(&wb_shared->lock);
 		if (wb_shared->inbound_version == 2 && wb_shared->inbound_revision == revision
-			&& wb_shared->inbound_state == WB_REPLIED)
-			wb_shared->reply_pending = false;
+			&& wb_shared->inbound_state == WB_REPLIED && wb_shared->reply_pending) {
+			wb_shared->reply_pending = false; released = true;
+		}
 		SpinLockRelease(&wb_shared->lock);
 	}
+	if (released) cluster_pcm_lock_resource_x_source_drain_content_released();
 }
 
 void
@@ -2811,7 +3012,7 @@ cluster_pi_writeback_lmon_tick_v1(void)
 	ClusterPiWritebackMessageV2 request_v2, reply_v2, inbound_v2;
 	uint64 revision, inbound_revision;
 	uint32 inbound_version, outbound_version;
-	bool pending, replied;
+	bool pending, replied, released = false;
 	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
 	Size length;
 	TimestampTz now;
@@ -2821,7 +3022,8 @@ cluster_pi_writeback_lmon_tick_v1(void)
 	if (cluster_normal_stop_requested()) {
 		SpinLockAcquire(&wb_shared->lock);
 		if (wb_shared->inbound_state == WB_QUEUED && wb_shared->inbound_pid == 0
-			&& !wb_shared->physical_started && !wb_shared->reply_pending) {
+			&& !wb_shared->physical_started && !wb_shared->reply_pending
+			&& wb_shared->inbound_version != WB_LOCAL_SOURCE) {
 			wb_shared->inbound_state = WB_EMPTY;
 			wb_shared->reply_pending = false;
 			wb_shared->physical_started = false;
@@ -2880,12 +3082,15 @@ cluster_pi_writeback_lmon_tick_v1(void)
 			if (sent == CLUSTER_IC_SEND_DONE || sent == CLUSTER_IC_SEND_WOULD_BLOCK) {
 				SpinLockAcquire(&wb_shared->lock);
 				if (wb_shared->inbound_revision == inbound_revision
-					&& wb_shared->inbound_version == 1 && wb_shared->inbound_state == WB_REPLIED)
-					wb_shared->reply_pending = false;
+					&& wb_shared->inbound_version == 1 && wb_shared->inbound_state == WB_REPLIED
+					&& wb_shared->reply_pending) {
+					wb_shared->reply_pending = false; released = true;
+				}
 				SpinLockRelease(&wb_shared->lock);
 			}
 		}
 	}
+	if (released) cluster_pcm_lock_resource_x_source_drain_content_released();
 	wb_sent_revision = revision;
 	wb_sent_inbound = inbound_revision;
 	wb_sent_reply = replied;

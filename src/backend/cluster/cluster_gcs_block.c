@@ -53,6 +53,8 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_block_redeclare.h"
 #include "cluster/cluster_lms_shard.h" /* PGRAC: spec-7.3 D4 — tag->worker shard */
 #include "cluster/cluster_lmd.h"
@@ -14787,9 +14789,9 @@ cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *r
  * prepare remains reversible until the exact PCM transaction takes the pair.
  * No retry request, duplicate capture queue, or pin crosses that handoff. */
 static ResourceXApplyResult
-gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWork *work,
+gcs_block_resource_x_acquire_s_source_capture_with_plan(const ResourceXSourceDrainWork *work,
 	const ResourceXDecodedFrame *block, const ClusterSemanticAdmissionToken *admission,
-	const ResourceXGateSnapshot *gate)
+	const ResourceXGateSnapshot *gate, const RfPageOnlinePlanV1 *coverage)
 {
 	ClusterPcmOwnSnapshot current, prepared;
 	volatile ClusterPcmOwnSnapshot owned_prepared;
@@ -14836,6 +14838,16 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 	result = gcs_block_resource_x_target_peer_result_exact(admission,
 		block->common.logical_assertion.requester_node, requester_connection);
 	if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	if (coverage == NULL) {
+		ResourceXDecodedFrame retained;
+		result = cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(work, &retained);
+		if (result == RESOURCE_X_APPLY_APPLIED) {
+			ClusterControlRootResult queued = cluster_pi_writeback_source_begin_v1(work, &retained);
+			return queued == CLUSTER_CONTROL_ROOT_OK_PRIMARY || queued == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+				? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+		if (result != RESOURCE_X_APPLY_NOT_FOUND) return result;
+	}
 	own = cluster_bufmgr_pcm_own_snapshot_by_tag(&work->request.logical_assertion.resource, &buffer_id, &current);
 	if (own == CLUSTER_PCM_OWN_BUSY) return RESOURCE_X_APPLY_BAD_STATE;
 	if (own != CLUSTER_PCM_OWN_OK || buffer_id < 0 || buffer_id >= NBuffers)
@@ -14864,8 +14876,11 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 				result = gcs_block_resource_x_target_peer_result_exact(admission,
 					block->common.logical_assertion.requester_node, requester_connection);
 			if (result == RESOURCE_X_APPLY_APPLIED) {
-				result = cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(work,
-					buffer_id, &prepared, page.data, &wal, requester_connection, master_connection);
+				result = coverage != NULL
+					? cluster_pcm_lock_resource_x_acquire_s_source_covered_capture_exact(work,
+						buffer_id, &prepared, page.data, &wal, requester_connection, master_connection, coverage)
+					: cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(work,
+						buffer_id, &prepared, page.data, &wal, requester_connection, master_connection);
 				/* This nonthrowing assignment must precede any notification or
 				 * further observation after shared ownership was transferred. */
 				if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
@@ -14893,6 +14908,47 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 fail_closed:
 	gcs_block_resource_x_fail_closed_current();
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWork *work,
+	const ResourceXDecodedFrame *block, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXGateSnapshot *gate)
+{
+	return gcs_block_resource_x_acquire_s_source_capture_with_plan(work, block, admission, gate, NULL);
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_coverage_capture(const ResourceXSourceDrainWork *work,
+	const ResourceXDecodedFrame *expected, const RfPageOnlinePlanV1 *coverage)
+{
+	ClusterSemanticAdmissionToken admission = {0};
+	ResourceXGateSnapshot gate = {0};
+	ResourceXDecodedFrame block;
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	int32 master = -1; uint64 session = 0;
+	if (MyBackendType != B_BG_WRITER || work == NULL || expected == NULL || coverage == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_STALE;
+	PG_TRY();
+	{
+		PcmXSessionAuthResult sample = gcs_block_resource_x_gate_session_snapshot_result(
+			&work->request.logical_assertion.resource, &gate, &master, &session);
+		if (cluster_gcs_pcm_x_auth_result_retryable(sample)) result = RESOURCE_X_APPLY_BAD_STATE;
+		else if (sample == PCM_X_SESSION_AUTH_OK && master == work->master_node
+			&& session == work->request.master_session_incarnation) {
+			result = cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(work, &block);
+			if (result == RESOURCE_X_APPLY_APPLIED) {
+				if (memcmp(expected, &block, sizeof(block)) != 0) result = RESOURCE_X_APPLY_STALE;
+				else result = gcs_block_resource_x_acquire_s_source_capture_with_plan(work,
+					&block, &admission, &gate, coverage);
+			}
+		}
+	}
+	PG_FINALLY(); { cluster_semantic_activation_leave(&admission); } PG_END_TRY();
+	return result;
 }
 
 

@@ -24,6 +24,8 @@
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pi_write.h"
+#include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_page_online_plan.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wait_trace.h"
@@ -1565,6 +1567,17 @@ capture_master_sample(uint32 *connection)
 	*connection = 61; return true;
 }
 
+/* These original native-capture cases have no retained coverage job. The
+ * separate source-coverage composition exercises its real entry and job. */
+static ResourceXApplyResult
+capture_coverage_absent(const ResourceXSourceDrainWork *work, ResourceXDecodedFrame *frame)
+{ return RESOURCE_X_APPLY_NOT_FOUND; }
+static ResourceXApplyResult
+capture_coverage_unexpected(void)
+{ UT_ASSERT(false); return RESOURCE_X_APPLY_INVALID; }
+#define cluster_pcm_lock_resource_x_source_coverage_snapshot_exact capture_coverage_absent
+#define cluster_pcm_lock_resource_x_acquire_s_source_covered_capture_exact(...) capture_coverage_unexpected()
+#define cluster_pi_writeback_source_begin_v1(...) (capture_coverage_unexpected(), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT)
 #define cluster_semantic_activation_recheck(token) ((token)->entered)
 #define gcs_block_resource_x_gate_session_recheck_result(...) capture_domain_check()
 #define gcs_block_resource_x_target_peer_result_exact(...) RESOURCE_X_APPLY_APPLIED
@@ -1573,6 +1586,9 @@ capture_master_sample(uint32 *connection)
 #define gcs_block_resource_x_fail_closed_current() (source_finish_fuses++)
 #define GetBufferDescriptor(id) ((void)(id), transition_buf)
 #include "test_cluster_pcm_s_capture_consumer.inc"
+#undef cluster_pcm_lock_resource_x_source_coverage_snapshot_exact
+#undef cluster_pcm_lock_resource_x_acquire_s_source_covered_capture_exact
+#undef cluster_pi_writeback_source_begin_v1
 #undef GetBufferDescriptor
 #undef gcs_block_resource_x_fail_closed_current
 #undef gcs_block_pcm_x_resource_x_peer_ready_exact
