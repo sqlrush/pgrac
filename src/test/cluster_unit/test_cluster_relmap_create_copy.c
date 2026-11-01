@@ -548,6 +548,8 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 	copy_end(&c);
 }
 
+#include "test_cluster_relmap_create_replay.inc"
+
 int main(int argc,char **argv)
 {
 	(void)argc; (void)argv;
@@ -569,5 +571,9 @@ int main(int argc,char **argv)
 	UT_RUN(wal_error_at_each_native_stage_retains_original_creation_debt);
 	UT_RUN(flushed_record_late_owner_identity_or_batch_change_cannot_create);
 	UT_RUN(recovery_and_preexisting_authority_refusals_enter_no_creation_wal);
+	UT_RUN(creation_record_replays_missing_pair_before_original_control_confirmation);
+	UT_RUN(creation_record_exact_pair_replay_preserves_both_inodes_before_confirmation);
+	UT_RUN(creation_record_wrong_binding_or_end_never_enters_file_replay);
+	UT_RUN(creation_replay_partial_sync_and_late_control_failure_keep_original_debt);
 	UT_DONE(); return ut_failed_count!=0;
 }

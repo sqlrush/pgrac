@@ -16315,6 +16315,8 @@ test_cluster_relmap_create_copy: $(top_srcdir)/src/include/common/cluster_relmap
         $(top_srcdir)/src/include/storage/fd.h
 
 # Independent CREATE bytes are shared by the original copy consumer and replay.
+test_cluster_relmap_create_copy: test_cluster_relmap_create_replay.inc \
+        $(top_srcdir)/src/include/common/cryptohash.h
 test_cluster_relmap_create_copy test_cluster_relmap_control: \
         $(top_srcdir)/src/include/common/cluster_relmap_create.h \
         $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
