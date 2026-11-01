@@ -6402,6 +6402,7 @@ test_cluster_debug: test_cluster_debug.c unit_test.h $(CLUSTER_VERSION_O) \
 
 # Compose the unchanged capacity producer and real SRF; no snapshot stub.
 TESTS += test_cluster_capacity_counter_srf
+all: test_cluster_capacity_counter_srf
 test_cluster_capacity_counter_srf.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
 	awk 'BEGIN { pointer=0; functions=0; emit=0 } \
 	     /^static UndoCleanerSharedState \*undo_cleaner_state/ { print; pointer++ } \
