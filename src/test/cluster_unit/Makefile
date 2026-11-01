@@ -6400,6 +6400,27 @@ test_cluster_debug: test_cluster_debug.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Compose the unchanged capacity producer and real SRF; no snapshot stub.
+TESTS += test_cluster_capacity_counter_srf
+test_cluster_capacity_counter_srf.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk 'BEGIN { pointer=0; functions=0; emit=0 } \
+	     /^static UndoCleanerSharedState \*undo_cleaner_state/ { print; pointer++ } \
+	     /^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; functions++ } \
+	     /^cluster_undo_cleaner_note_tx_slot_recheck\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (pointer != 1 || functions != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_capacity_counter_srf: test_cluster_capacity_counter_srf.c test_cluster_debug.c \
+		test_cluster_capacity_counter_srf.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # test_cluster_xnode_profile links cluster_xnode_profile.o standalone (spec-5.59
 # D10).  The test defines the GUC variable itself (cluster_guc.o is not
 # linked) and stubs ShmemInitStruct / cluster_shmem_register_region; the
