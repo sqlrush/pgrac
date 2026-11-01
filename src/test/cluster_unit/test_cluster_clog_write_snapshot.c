@@ -145,6 +145,9 @@ LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_
 void
 XLogFlush(XLogRecPtr lsn)
 {
+#ifdef SLRU_FIXTURE_BIRTH_FLUSH
+	if (SLRU_FIXTURE_BIRTH_PENDING()) { SLRU_FIXTURE_BIRTH_FLUSH(lsn); return; }
+#endif
 	UT_ASSERT(!control_held && io_held);
 	UT_ASSERT_EQ(CritSectionCount, 1);
 	flushed = lsn;
@@ -209,7 +212,11 @@ bool
 errstart(int level, const char *domain pg_attribute_unused())
 {
 	UT_ASSERT(level >= ERROR);
+#ifdef SLRU_FIXTURE_ERROR_LOCKS
+	UT_ASSERT(SLRU_FIXTURE_ERROR_LOCKS());
+#else
 	UT_ASSERT(control_held && !io_held);
+#endif
 	return true;
 }
 bool

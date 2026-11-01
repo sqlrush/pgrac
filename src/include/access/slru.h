@@ -155,6 +155,9 @@ typedef SlruCtlData *SlruCtl;
 #ifdef USE_PGRAC_CLUSTER
 /* Installed only by the original CLOG owner. Other SLRUs do not link a CLOG
  * writer/reader merely by using the common raw cache implementation. */
+/* Original issuer only, with XidGenLock and ControlLock exclusive. Retains
+ * selected AVAILABLE custody through birth WAL and cache publication. */
+extern int SimpleLruNativeClogZeroV2(SlruCtl ctl, FullTransactionId birth);
 extern int SimpleLruNativeClogReadV2(SlruCtl ctl, int pageno, bool write_ok);
 extern void SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint);
 #endif

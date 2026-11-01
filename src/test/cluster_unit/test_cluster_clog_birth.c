@@ -13,6 +13,18 @@
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 
+#ifdef USE_PGRAC_CLUSTER
+bool cluster_enabled;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void pg_re_throw(void) { abort(); }
+ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void)
+{ return CLUSTER_NATIVE_FILES_UNKNOWN_V2; }
+int SimpleLruNativeClogZeroV2(SlruCtl ctl pg_attribute_unused(),
+							 FullTransactionId birth pg_attribute_unused())
+{ abort(); } /* This legacy fixture must never enter managed birth. */
+#endif
+
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
 static SlruSharedData shared;

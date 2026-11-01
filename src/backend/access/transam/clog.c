@@ -1244,6 +1244,21 @@ ExtendCLOGInternal(TransactionId newestXact, FullTransactionId birth)
 	pageno = TransactionIdToPage(newestXact);
 
 	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired())
+	{
+		PG_TRY();
+		{
+			(void) SimpleLruNativeClogZeroV2(XactCtl, birth);
+		}
+		PG_FINALLY();
+		{
+			LWLockRelease(XactSLRULock);
+		}
+		PG_END_TRY();
+		return;
+	}
+#endif
 
 	/* Zero the page and make an XLOG entry about it. Raw-only callers leave
 	 * birth unknown; only the original allocator supplies a complete identity. */

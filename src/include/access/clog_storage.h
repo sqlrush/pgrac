@@ -19,6 +19,13 @@ extern bool cluster_clog_storage_read_page_v2(int fd,
 									 ClusterClogPageIdentityV2 *page_out,
 									 void *payload_out, Size payload_length);
 
+/* Readonly whole-header/FD/target-slot probe for an existing selected segment.
+ * Partial or nonzero targets refuse. Success supplies neither page birth nor
+ * authority; the original owner must exclude concurrent target I/O. */
+extern bool cluster_clog_storage_page_unwritten_v2(int fd,
+									 const ClusterClogFileBindingV2 *expected,
+									 uint64 logical_page);
+
 /* Write a local frame. The original owner
  * holds file lifetime and page I/O serialization throughout, and supplies one
  * private control-lock snapshot of page identity, bytes and group-LSN maximum

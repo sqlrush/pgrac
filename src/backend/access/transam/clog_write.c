@@ -121,6 +121,24 @@ clog_write_page_unwritten(int fd, const ClusterClogFileBindingV2 *binding,
 	return clog_write_slot_unwritten(fd, after.st_size, offset);
 }
 
+/* Read only: empty bytes establish no birth or file ownership. */
+bool
+cluster_clog_storage_page_unwritten_v2(int fd,
+									 const ClusterClogFileBindingV2 *expected,
+									 uint64 logical_page)
+{
+	uint64 offset;
+
+	if (fd < 0 || expected == NULL || logical_page >= 131072 ||
+		logical_page / CLUSTER_CLOG_PAGES_PER_FILE != expected->segment ||
+		!cluster_clog_file_offset_v2(logical_page % CLUSTER_CLOG_PAGES_PER_FILE, &offset))
+	{
+		errno = EINVAL;
+		return false;
+	}
+	return clog_write_page_unwritten(fd, expected, offset);
+}
+
 bool
 cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expected,
 								  const ClusterClogPageIdentityV2 *page,

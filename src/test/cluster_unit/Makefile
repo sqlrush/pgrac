@@ -11723,6 +11723,37 @@ test_cluster_clog_birth: test_cluster_clog_birth.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
+# Actual original issuer/managed SLRU birth and first full-frame write.
+test_cluster_clog_native_birth.inc: $(top_srcdir)/src/backend/access/transam/clog.c Makefile
+	awk '/^#define (CLOG_(BITS_PER_XACT|XACTS_PER_BYTE|XACTS_PER_PAGE)|TransactionIdTo(Page|PgIndex))[ \t(]/ { print; constants++ } \
+	     /^CLOGNativeIORequired\(/ { print "static bool"; emit=1; found++ } \
+	     /^ZeroCLOGPage\(/ { print "static int"; emit=1; found++ } \
+	     /^(ExtendCLOGInternal|WriteZeroPageXlogRec)\(/ { print "static void"; emit=1; found++ } \
+	     /^ExtendCLOG(Full)?\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 6 || constants != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+TESTS += test_cluster_clog_native_birth
+all: test_cluster_clog_native_birth
+test_cluster_clog_native_birth: test_cluster_clog_native_birth.c \
+		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
+		test_cluster_clog_native_birth.inc unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog.h $(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-native-birth
+.PHONY: clean-clog-native-birth
+clean-clog-native-birth:
+	rm -f test_cluster_clog_native_birth test_cluster_clog_native_birth.d \
+		test_cluster_clog_native_birth.inc test_cluster_clog_native_birth.inc.tmp
+
 # Selected native CLOG header/full-frame recovery through a borrowed owner FD.
 TESTS += test_cluster_clog_replay
 all: test_cluster_clog_replay
