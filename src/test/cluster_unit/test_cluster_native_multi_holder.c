@@ -1,5 +1,5 @@
-/* Two or three real S holders and exact per-holder cleanup.
- * M0 owns an S/current; H2, optional H3 and R1 are independent processes. R1 either
+/* One, two or three S holders and exact per-holder cleanup.
+ * M0 owns an S/current; optional H2/H3 and R1 run independently. R1 either
  * starts N or retains S from a preceding complete ordinary read.
  * Author: SqlRush <sqlrush@gmail.com> */
 #define NATIVE_HOLDER_X_REQUESTER_COMPOSITION
@@ -11,8 +11,10 @@ enum MhFault {
 	MH_FAULT_CROPPED_MASK, MH_FAULT_CONFLICTING_RECEIPT, MH_FAULT_LATE_MASTER_ACK
 };
 static enum MhFault mh_fault;
-static bool mh_third_holder;
-static uint32 mh_required(void) { return mh_third_holder ? 13 : 5; }
+static bool mh_third_holder, mh_one_holder;
+static uint32 mh_required(void) { return mh_one_holder ? 1 : mh_third_holder ? 13 : 5; }
+static int mh_last_holder(void) { return mh_one_holder ? 1 : mh_third_holder ? 3 : 2; }
+static bool mh_cleanup_work(ResourceXAcquisitionRef *ref);
 static bool mh_resident(int mode) { return mode >= 5; }
 static bool mh_late_ack(int mode) { return mode == 3 || mh_fault == MH_FAULT_LATE_MASTER_ACK; }
 static bool mh_wire(ResourceXDecodedFrame *frame)
@@ -49,25 +51,39 @@ static bool mh_source_prepare(HolderFixture *f, const ResourceXDecodedFrame *req
 {
 	uint32 header;
 	holder_requester_node = request->common.logical_assertion.requester_node;
-	NM_REQUIRE(nm_master_admit(&f->master, request));
+	/* With no remote seed reader, use the same original clean-current
+	 * incumbent producer as nc_master. It admits this real request and
+	 * prepares the real source work; no other role's state is copied. */
+	if (mh_one_holder && !mh_resident(mode)) NM_REQUIRE(nc_holder_start(f, request, PCM_STATE_S));
+	else NM_REQUIRE(nm_master_admit(&f->master, request));
 	UT_ASSERT_EQ(f->master.plan.decision.required_holders_bitmap, mh_required());
 	UT_ASSERT_EQ(f->master.plan.decision.source_node, mh_resident(mode) ? 1 : 0);
 	UT_ASSERT_EQ(f->master.plan.decision.holders_bitmap, mh_required() | (mh_resident(mode) ? 2 : 0));
 	UT_ASSERT_EQ(f->master.plan.decision.source_kind, mh_resident(mode)
 		? RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT : RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT);
-	f->block = publish_decode(f->master.state->block_intents[0].payload, true);
-	NM_REQUIRE(nm_master_callback(&f->master.state->block_intents[0].slot, true));
-	NM_REQUIRE(cluster_pcm_lock_resource_x_gate_snapshot(&f->gate));
-	NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f->block, 0, 77, 61) == RESOURCE_X_APPLY_APPLIED);
-	NM_REQUIRE(holder_probe(&f->work));
+	if (!mh_one_holder || mh_resident(mode)) {
+		f->block = publish_decode(f->master.state->block_intents[0].payload, true);
+		NM_REQUIRE(nm_master_callback(&f->master.state->block_intents[0].slot, true));
+		NM_REQUIRE(cluster_pcm_lock_resource_x_gate_snapshot(&f->gate));
+		NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f->block, 0, 77, 61) == RESOURCE_X_APPLY_APPLIED);
+		NM_REQUIRE(holder_probe(&f->work));
+	}
 	header = request_header_lock(&request_buf);
 	cluster_pcm_own_snapshot_locked(&request_buf, &request_base); UnlockBufHdr(&request_buf, header);
+	if (mh_one_holder && (mode == 4 || mode == 8)) {
+		ResourceXSourceDrainWork resumed;
+		holder_content_busy = true; NM_REQUIRE(holder_capture(f) == RESOURCE_X_APPLY_BAD_STATE);
+		NM_REQUIRE(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f->work, RESOURCE_X_APPLY_BAD_STATE) == RESOURCE_X_APPLY_APPLIED);
+		NM_REQUIRE(!holder_probe(&resumed)); holder_content_busy = false;
+		cluster_pcm_lock_resource_x_source_drain_content_released(); NM_REQUIRE(holder_probe(&resumed));
+		UT_ASSERT(memcmp(&resumed.request, &f->work.request, sizeof(resumed.request)) == 0); f->work = resumed;
+	}
 	NM_REQUIRE(holder_capture(f) == RESOURCE_X_APPLY_APPLIED);
 	NM_REQUIRE(holder_finish(f) == RESOURCE_X_APPLY_APPLIED);
 	NM_REQUIRE(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f->work, RESOURCE_X_APPLY_APPLIED) == RESOURCE_X_APPLY_APPLIED);
 	return true;
 }
-static bool mh_local_cleanup(HolderFixture *f)
+static bool mh_local_cleanup(HolderFixture *f, const ResourceXIntentSlot *pending_image)
 {
 	ResourceXDecodedFrame release, ack; ResourceXIntentSlot offer, reply;
 	ResourceXMasterSnapshot snapshot; ClusterICEnvelope env = {0};
@@ -78,7 +94,14 @@ static bool mh_local_cleanup(HolderFixture *f)
 	NM_REQUIRE(nc_stage(&f->master.state->source_settlement.intent.slot, &offer));
 	env.msg_type = RESOURCE_X_MSG_BLOCK_TO_N; env.source_node_id = env.dest_node_id = 0;
 	env.epoch = 17; env.payload_length = release.payload_bytes;
-	NM_REQUIRE(gcs_block_resource_x_source_settlement_ingress(&env, &release, 61) == RESOURCE_X_APPLY_APPLIED);
+	if (pending_image != NULL) {
+		ResourceXAcquisitionRef ref;
+		NM_REQUIRE(gcs_block_resource_x_source_settlement_ingress(&env, &release, 61) == RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT_EQ(f->master.state->settlement_retry.pending, 1);
+		UT_ASSERT_EQ(f->master.state->holder_image_intent.state, RESOURCE_X_INTENT_SLOT_STAGED);
+		NM_REQUIRE(nc_callback(pending_image)); NM_REQUIRE(mh_cleanup_work(&ref));
+		NM_REQUIRE(cluster_gcs_block_resource_x_source_settlement_tick(&ref) == RESOURCE_X_APPLY_APPLIED);
+	} else NM_REQUIRE(gcs_block_resource_x_source_settlement_ingress(&env, &release, 61) == RESOURCE_X_APPLY_APPLIED);
 	NM_REQUIRE(nc_decode(f->master.state->holder_status_intent.payload, RESOURCE_X_MSG_BLOCKED_TO_N,
 		RESOURCE_X_SOURCE_COMPLETE_V11_BYTES, &ack));
 	NM_REQUIRE(nc_stage(&f->master.state->holder_status_intent.slot, &reply));
@@ -95,17 +118,23 @@ static bool mh_master(int requester, int holder, int other, int mode)
 	HolderFixture f = {0}; ResourceXDecodedFrame request, block, image, ack0, ack2, done, release, retired, consumed;
 	ResourceXIntentSlot image_send, forward, cleanup; ResourceXMasterSnapshot snapshot;
 	/* Actual ordinary reads install each remote S holder and its provenance. */
-	NM_REQUIRE(nc_master(holder, 0));
-	if (mh_third_holder) NM_REQUIRE(nc_master_service(other, 0, true));
-	if (mh_resident(mode)) NM_REQUIRE(nc_master_service(requester, 0, true));
+	if (!mh_one_holder) {
+		NM_REQUIRE(nc_master(holder, 0));
+		if (mh_third_holder) NM_REQUIRE(nc_master_service(other, 0, true));
+	}
+	if (mh_resident(mode)) {
+		if (mh_one_holder) NM_REQUIRE(nc_master(requester, 0));
+		else NM_REQUIRE(nc_master_service(requester, 0, true));
+	}
 	mh_sent = 0;
-	UT_ASSERT_EQ(pg_atomic_read_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->s_holders_bitmap), mh_required() | (mh_resident(mode) ? 2 : 0));
+	if (!mh_one_holder || mh_resident(mode))
+		UT_ASSERT_EQ(pg_atomic_read_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->s_holders_bitmap), mh_required() | (mh_resident(mode) ? 2 : 0));
 	NM_REQUIRE(nm_receive(requester, RESOURCE_X_MSG_ASSERT_X, &request));
 	UT_ASSERT_EQ(request.common.target_mode, PCM_STATE_X);
 	UT_ASSERT_EQ(request.common.observed_mode, mh_resident(mode) ? PCM_STATE_S : PCM_STATE_N);
 	UT_ASSERT_EQ(request.body.acquire_intent.path, RESOURCE_X_ACQUIRE_RESIDENT);
 	NM_REQUIRE(mh_source_prepare(&f, &request, mode));
-	for (int node = 2; node <= (mh_third_holder ? 3 : 2); node++) {
+	for (int node = 2; node <= mh_last_holder(); node++) {
 		block = publish_decode(f.master.state->block_intents[node].payload, true);
 		NM_REQUIRE(nc_stage(&f.master.state->block_intents[node].slot, &forward));
 		NM_REQUIRE(mh_send(node == 2 ? holder : other, RESOURCE_X_MSG_BLOCK_TO_N, &block));
@@ -129,22 +158,31 @@ static bool mh_master(int requester, int holder, int other, int mode)
 		NM_REQUIRE(mh_send(requester, RESOURCE_X_MSG_BLOCKED_TO_N, &image));
 		if (mode == 6 || mode == 7) NM_REQUIRE(mh_send(requester, RESOURCE_X_MSG_IMAGE_OR_GRANT, &grant));
 	} else NM_REQUIRE(mh_send(requester, RESOURCE_X_MSG_IMAGE_OR_GRANT, &image));
-	NM_REQUIRE(nc_callback(&image_send));
+	if (!mh_one_holder || mode != 2) NM_REQUIRE(nc_callback(&image_send));
 	NM_REQUIRE(nm_master_callback(&f.master.state->holder_status_intent.slot, true));
-	NM_REQUIRE(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack0, 0, &snapshot) == RESOURCE_X_APPLY_APPLIED);
+	if (!mh_one_holder || !mh_late_ack(mode))
+		NM_REQUIRE(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack0, 0, &snapshot) == RESOURCE_X_APPLY_APPLIED);
 	if (mh_late_ack(mode)) {
+		ClusterPcmResourceXSourceSettlement before = f.master.state->source_settlement;
 		NM_REQUIRE(nm_receive(requester, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &done));
 		NM_REQUIRE(nm_master_done(&done) == RESOURCE_X_APPLY_APPLIED);
 		if (mh_resident(mode))
 			NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.master.work) == RESOURCE_X_APPLY_LOCAL_WAIT);
 		else NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_source_done_snapshot_exact(&f.master.work, &release) == RESOURCE_X_APPLY_LOCAL_WAIT);
-		UT_ASSERT_EQ(f.master.state->requests[1].blocked_holders_bitmap, 1);
-		UT_ASSERT_EQ(f.master.state->acquire_ack_connections[2], 0);
+		UT_ASSERT_EQ(f.master.state->requests[1].blocked_holders_bitmap, mh_one_holder ? 0 : 1);
+		UT_ASSERT_EQ(f.master.state->acquire_ack_connections[mh_one_holder ? 0 : 2], 0);
+		if (mh_one_holder) {
+			UT_ASSERT(memcmp(&before, &f.master.state->source_settlement, sizeof(before)) == 0);
+			UT_ASSERT_EQ(f.master.state->source_settlement.intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+			UT_ASSERT_EQ(f.master.state->acquire_settled_holders_bitmap, 0);
+		}
 		UT_ASSERT(f.master.state->requests[1].phase != RESOURCE_X_MASTER_NONE);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->s_holders_bitmap), mh_required() | (mh_resident(mode) ? 2 : 0));
 		UT_ASSERT_EQ(((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->x_holder_node, -1);
 	}
-	for (int node = 2; node <= (mh_third_holder ? 3 : 2); node++) {
+	if (mh_one_holder && mh_late_ack(mode))
+		NM_REQUIRE(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack0, 0, &snapshot) == RESOURCE_X_APPLY_APPLIED);
+	for (int node = 2; node <= mh_last_holder(); node++) {
 		NM_REQUIRE(nm_receive(node == 2 ? holder : other, RESOURCE_X_MSG_BLOCKED_TO_N, &ack2)); auth_peer_boot = 101;
 		if (node == 2 && mh_fault == MH_FAULT_HOLDER_GENERATION) NM_REQUIRE(mh_master_reject_generation(&f, &ack2));
 		NM_REQUIRE(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack2, node, &snapshot) == RESOURCE_X_APPLY_APPLIED);
@@ -162,8 +200,8 @@ static bool mh_master(int requester, int holder, int other, int mode)
 		NM_REQUIRE(nm_receive(requester, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &done));
 		NM_REQUIRE(nm_master_done(&done) == RESOURCE_X_APPLY_APPLIED);
 	}
-	NM_REQUIRE(mh_local_cleanup(&f));
-	for (int node = 2; node <= (mh_third_holder ? 3 : 2); node++) {
+	NM_REQUIRE(mh_local_cleanup(&f, mh_one_holder && mode == 2 ? &image_send : NULL));
+	for (int node = 2; node <= mh_last_holder(); node++) {
 		NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.master.work) == RESOURCE_X_APPLY_LOCAL_WAIT);
 		NM_REQUIRE(nc_decode(f.master.state->source_settlement.intent.payload, RESOURCE_X_MSG_BLOCK_TO_N,
 			RESOURCE_X_SOURCE_COMPLETE_V11_BYTES, &release));
@@ -187,9 +225,9 @@ static bool mh_master(int requester, int holder, int other, int mode)
 	UT_ASSERT_EQ(f.master.state->source_settlement.intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
 	UT_ASSERT_EQ(f.master.state->pi_carrier.pi_refs, 0); UT_ASSERT_EQ(f.master.state->pi_carrier.transport_refs, 0);
 	UT_ASSERT_EQ(((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->x_holder_node, 1);
-	UT_ASSERT_EQ(mh_sent, (mh_resident(mode) ? 5 : 4) + (mh_third_holder ? 2 : 0));
+	UT_ASSERT_EQ(mh_sent, (mh_resident(mode) ? 3 : 2) + 2 * (mh_last_holder() - 1));
 	printf("# multi-holder mode=%d role=master socket_frames=%u holders=%d source=%s\n",
-		mode, mh_sent, mh_third_holder ? 3 : 2, mh_resident(mode) ? "requester-current" : "master-current");
+		mode, mh_sent, mh_last_holder(), mh_resident(mode) ? "requester-current" : "master-current");
 	holder_no_debt(); return true;
 }
 static bool mh_holder_state(const ResourceXAssertion *assertion, ClusterPcmResourceXMasterState **out)
@@ -431,7 +469,7 @@ static bool mh_local_join(void)
 	uint32 witnesses = 0;
 	for (unsigned n = 0; n < 4; n++) {
 		int part = orders[order][n], source = part >= 2 ? part : 0;
-		if (part == 3 && !mh_third_holder) continue;
+		if ((part == 3 && !mh_third_holder) || (part == 2 && mh_one_holder)) continue;
 		uint16 type = part == 0 ? RESOURCE_X_MSG_IMAGE_OR_GRANT : RESOURCE_X_MSG_BLOCKED_TO_N;
 		ResourceXDecodedFrame frame;
 		if (part == 2 && mh_fault == MH_FAULT_MISSING_WITNESS) { NM_REQUIRE(mh_park_witness()); return true; }
@@ -465,9 +503,9 @@ static void mh_deliver(void)
 	if (mh_resident(mh_mode)) { if (!mh_local_join()) pg_re_throw(); return; }
 	if (image_first) {
 		if (!nm_receive(mh_master_fd, RESOURCE_X_MSG_IMAGE_OR_GRANT, &nc_image) || !mh_accept(&nc_image, 0, &joined)) pg_re_throw();
-		UT_ASSERT((joined.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE) == 0);
+		UT_ASSERT_EQ((joined.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE) != 0, mh_one_holder);
 	}
-	for (int node = 2; node <= (mh_third_holder ? 3 : 2); node++) {
+	for (int node = 2; node <= mh_last_holder(); node++) {
 		if (node == 2 && mh_fault == MH_FAULT_MISSING_WITNESS) { if (!mh_park_witness()) pg_re_throw(); return; }
 		if (!nm_receive(node == 2 ? mh_holder_fd : mh_other_fd, RESOURCE_X_MSG_BLOCKED_TO_N, &witness)
 			|| (node == 2 && !mh_before_witness(&witness)) || !mh_accept(&witness, node, &joined)
@@ -482,7 +520,7 @@ static void mh_deliver(void)
 	if (!image_first && (!nm_receive(mh_master_fd, RESOURCE_X_MSG_IMAGE_OR_GRANT, &nc_image)
 		|| !mh_accept(&nc_image, 0, &joined))) pg_re_throw();
 	UT_ASSERT(joined.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE);
-	if (mh_mode == 4) {
+	if (mh_mode == 4 && !mh_one_holder) {
 		ClusterICEnvelope duplicate = {0};
 		duplicate.msg_type = RESOURCE_X_MSG_BLOCKED_TO_N; duplicate.source_node_id = mh_third_holder ? 3 : 2; duplicate.dest_node_id = 1;
 		duplicate.epoch = 17; duplicate.payload_length = witness.payload_bytes;
@@ -558,9 +596,9 @@ static bool mh_parent(int master, int holder, int other, int mode)
 }
 static void mh_run(int mode)
 {
-	/* Three independent roles always run; the four-node cases add H3.
+	/* R and the colocated M/holder always run; larger cases add H2/H3.
 	 * Close unused endpoints so a failed peer produces EOF, not a hang. */
-	int pairs[5][2], count = mh_third_holder ? 5 : 3;
+	int pairs[5][2], count = mh_one_holder ? 1 : mh_third_holder ? 5 : 3;
 	pid_t children[3] = {-1, -1, -1}; bool ok;
 	for (int n = 0; n < count; n++) {
 		int rc = socketpair(AF_UNIX, SOCK_STREAM, 0, pairs[n]); UT_ASSERT_EQ(rc, 0);
@@ -574,16 +612,16 @@ static void mh_run(int mode)
 #endif
 	}
 	/* pairs: R-M, M-H2, R-H2, M-H3, R-H3. */
-	for (int role = 0; role < (mh_third_holder ? 3 : 2); role++) {
+	for (int role = 0; role < mh_last_holder(); role++) {
 		fflush(NULL); children[role] = fork(); UT_ASSERT(children[role] >= 0);
 		if (children[role] == 0) {
 			int master = role == 0 ? pairs[0][1] : pairs[role == 1 ? 1 : 3][1];
-			int holder = role == 0 ? pairs[1][0] : pairs[role == 1 ? 2 : 4][1];
+			int holder = role == 0 ? (mh_one_holder ? -1 : pairs[1][0]) : pairs[role == 1 ? 2 : 4][1];
 			int other = role == 0 && mh_third_holder ? pairs[3][0] : -1;
 			for (int n = 0; n < count; n++) for (int k = 0; k < 2; k++)
 				if (pairs[n][k] != master && pairs[n][k] != holder && pairs[n][k] != other) close(pairs[n][k]);
 			ok = role == 0 ? mh_master(master, holder, other, mode) : mh_holder(master, holder, mode, role + 1);
-			close(master); close(holder); if (other >= 0) close(other);
+			close(master); if (holder >= 0) close(holder); if (other >= 0) close(other);
 			fflush(NULL); _exit(ok && !ut_current_failed ? 0 : 1);
 		}
 		if (children[role] < 0) {
@@ -594,9 +632,9 @@ static void mh_run(int mode)
 	}
 	for (int n = 0; n < count; n++) for (int k = 0; k < 2; k++)
 		if (!(k == 0 && (n == 0 || n == 2 || n == 4))) close(pairs[n][k]);
-	ok = mh_parent(pairs[0][0], pairs[2][0], mh_third_holder ? pairs[4][0] : -1, mode); UT_ASSERT(ok);
-	close(pairs[0][0]); close(pairs[2][0]); if (mh_third_holder) close(pairs[4][0]);
-	for (int n = 0; n < (mh_third_holder ? 3 : 2); n++) nm_wait_child(children[n]);
+	ok = mh_parent(pairs[0][0], mh_one_holder ? -1 : pairs[2][0], mh_third_holder ? pairs[4][0] : -1, mode); UT_ASSERT(ok);
+	close(pairs[0][0]); if (!mh_one_holder) close(pairs[2][0]); if (mh_third_holder) close(pairs[4][0]);
+	for (int n = 0; n < mh_last_holder(); n++) nm_wait_child(children[n]);
 }
 UT_TEST(test_multi_holder_image_first_then_X_writer) { mh_run(0); }
 UT_TEST(test_multi_holder_witness_first_then_X_writer) { mh_run(1); }
@@ -634,9 +672,22 @@ UT_TEST(test_three_holders_S_X_grant_first) { mh_run_three(5, MH_FAULT_NONE); }
 UT_TEST(test_three_holders_S_X_witnesses_first) { mh_run_three(6, MH_FAULT_NONE); }
 UT_TEST(test_three_holders_S_X_DONE_before_last_master_ACK) { mh_run_three(5, MH_FAULT_LATE_MASTER_ACK); }
 UT_TEST(test_three_holders_S_X_busy_keeps_original_service) { mh_run_three(8, MH_FAULT_NONE); }
+static void mh_run_one(int mode, enum MhFault fault)
+{
+	mh_one_holder = true; mh_fault = fault; mh_run(mode);
+	mh_one_holder = false; mh_fault = MH_FAULT_NONE;
+}
+UT_TEST(test_one_holder_N_X_image) { mh_run_one(0, MH_FAULT_NONE); }
+UT_TEST(test_one_holder_N_X_busy_keeps_original_service) { mh_run_one(4, MH_FAULT_NONE); }
+UT_TEST(test_one_holder_N_X_DONE_before_master_ACK) { mh_run_one(0, MH_FAULT_LATE_MASTER_ACK); }
+UT_TEST(test_one_holder_N_X_cleanup_waits_image_callback) { mh_run_one(2, MH_FAULT_NONE); }
+UT_TEST(test_one_holder_S_X_grant_first) { mh_run_one(5, MH_FAULT_NONE); }
+UT_TEST(test_one_holder_S_X_witness_first) { mh_run_one(6, MH_FAULT_NONE); }
+UT_TEST(test_one_holder_S_X_busy_keeps_original_service) { mh_run_one(8, MH_FAULT_NONE); }
+UT_TEST(test_one_holder_S_X_DONE_before_master_ACK) { mh_run_one(5, MH_FAULT_LATE_MASTER_ACK); }
 int main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(35);
 	UT_RUN(test_multi_holder_image_first_then_X_writer);
 	UT_RUN(test_multi_holder_witness_first_then_X_writer);
 	UT_RUN(test_multi_holder_cleanup_waits_witness_callback);
@@ -664,5 +715,13 @@ int main(void)
 	UT_RUN(test_three_holders_S_X_witnesses_first);
 	UT_RUN(test_three_holders_S_X_DONE_before_last_master_ACK);
 	UT_RUN(test_three_holders_S_X_busy_keeps_original_service);
+	UT_RUN(test_one_holder_N_X_image);
+	UT_RUN(test_one_holder_N_X_busy_keeps_original_service);
+	UT_RUN(test_one_holder_N_X_DONE_before_master_ACK);
+	UT_RUN(test_one_holder_N_X_cleanup_waits_image_callback);
+	UT_RUN(test_one_holder_S_X_grant_first);
+	UT_RUN(test_one_holder_S_X_witness_first);
+	UT_RUN(test_one_holder_S_X_busy_keeps_original_service);
+	UT_RUN(test_one_holder_S_X_DONE_before_master_ACK);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }
