@@ -461,10 +461,12 @@ UT_TEST(managed_missing_copy_and_unstaged_publish_never_repair_or_advance)
 	cleanup();
 }
 
+#include "test_cluster_relmap_managed_replay.inc"
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(24);
 	UT_RUN(original_path_reads_and_syncs_complete_registered_pair);
 	UT_RUN(checkpoint_late_lock_or_close_failure_keeps_output_private);
 	UT_RUN(old_format_and_wrong_registration_never_fall_back);
@@ -482,6 +484,13 @@ main(void)
 	UT_RUN(managed_local_database_uses_its_original_namespace_and_control_identity);
 	UT_RUN(managed_finish_lost_serialization_or_registration_keeps_debt);
 	UT_RUN(managed_missing_copy_and_unstaged_publish_never_repair_or_advance);
+	UT_RUN(managed_replay_rebuilds_actual_end_and_stages_exact_pair_once);
+	UT_RUN(managed_replay_refuses_old_wal_and_malformed_native_frame);
+	UT_RUN(managed_replay_requires_independent_binding_source_and_exact_custody);
+	UT_RUN(managed_replay_never_uses_current_pair_to_supply_wal_history);
+	UT_RUN(managed_replay_requires_original_serialization_and_sync);
+	UT_RUN(managed_replay_partial_failures_keep_debt_and_refuse_retry);
+	UT_RUN(managed_replay_rechecks_whole_original_input_before_each_install);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

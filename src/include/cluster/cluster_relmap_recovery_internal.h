@@ -12,6 +12,7 @@
 #ifndef CLUSTER_RELMAP_RECOVERY_INTERNAL_H
 #define CLUSTER_RELMAP_RECOVERY_INTERNAL_H
 #include "cluster/cluster_relmap_retention.h"
+#include "cluster/cluster_recovery_file_identity.h"
 
 /* One bounded allocation per segment; the coordinator reserves the complete
  * chain against its original plan budget before any file I/O. */
@@ -59,4 +60,22 @@ extern bool cluster_relmap_recovery_transfer(ClusterRelmapRecoveryPins *pins,
 	ClusterRelmapRetentionDirectory *const *targets, uint32 count);
 extern bool cluster_relmap_authority_v2_write_recovery_pending(
 	const ClusterRelmapV2Image *image, ClusterRelmapRecoveryPins *pins);
+
+struct ClusterWalSourceRef;
+struct XLogReaderState;
+/* Original declared replay position only. The episode retains its exact
+ * source/cut/fence, continuous IR/WALR and independent control selection,
+ * checking them before/after this call. Hold namespace X and MappingLock-X;
+ * neither is acquired here. Rebuild WAL_INTENT with the actual EndRecPtr and
+ * require the entire original declared image/custody. Old WAL lacks a durable
+ * file binding and refuses in this managed path, without consulting files to
+ * invent one. File creation origin is independent of the WAL writer origin.
+ * One attempt per original carrier entry, including false/ERROR; both copies
+ * must sync/read back and close before staged is recorded. Keep all debt and
+ * original failure polarity; no retry, terminal/COMPLETE/OPEN or pin release.
+ * This does not activate the native RM handler or the original merged driver. */
+extern bool cluster_relmap_authority_managed_replay_v2(
+	const ClusterRecoveryFileIdentityV2 *identity, const ClusterRelmapV2Image *image,
+	const struct ClusterWalSourceRef *source, struct XLogReaderState *reader,
+	ClusterRelmapRecoveryPins *pins);
 #endif

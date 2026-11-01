@@ -5890,7 +5890,10 @@ test_cluster_xid_authority: test_cluster_xid_authority.c unit_test.h \
 # The write-path activation (relmapper
 # hook, publish-then-invalidate, crash arbitration) is exercised by TAP.
 CLUSTER_RELMAP_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_relmap_authority.o \
-	$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+	$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+	test_cluster_relmap_pending_product.o \
+	$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+	$(CLUSTER_UNIT_CRYPTOHASH_O)
 test_cluster_relmap_consumer.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
 	awk '/^cluster_read_relmap_from_authority\(/ { print "static void"; emit=1; n++ } \
 	     emit { print } /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@.tmp
@@ -5901,7 +5904,7 @@ test_cluster_relmap_authority: test_cluster_relmap_authority.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RELMAP_AUTHORITY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter -lcrypto,$(LIBS)) -o $@
 
 # spec-5.6 Da2: test_cluster_cf_storage links cluster_cf_storage.o (migration
 # + symlink + storage rename-contract) plus cluster_cf_authority.o (the
@@ -14844,6 +14847,15 @@ test_cluster_initdb_relmap test_cluster_relmap_managed_storage test_cluster_relm
 		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
+test_cluster_relmap_managed_storage: test_cluster_relmap_managed_replay.inc \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_source.h \
+		$(top_srcdir)/src/include/utils/relmapper.h
+test_cluster_relmap_v2_storage_product.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_source.h \
+		$(top_srcdir)/src/include/utils/relmapper.h
 
 # Strict managed RELMAP diagnostics use the original backend/frontend descriptor.
 TESTS += test_cluster_relmap_desc

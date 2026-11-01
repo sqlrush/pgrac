@@ -41,9 +41,12 @@
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_relmap_recovery_internal.h"
+#include "cluster/cluster_wal_source.h"
 #include "miscadmin.h"
+#include "replication/origin.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
+#include "utils/relmapper.h"
 
 #define COMMITTED_SLOT_OFFSET CLUSTER_RELMAP_COMMITTED_OFFSET
 #define PENDING_SLOT_OFFSET CLUSTER_RELMAP_PENDING_OFFSET
@@ -670,10 +673,68 @@ cluster_relmap_authority_v2_read_rebuild_pending(
 }
 #endif
 
+/* Saved native frame/source are only inputs from the original coordinator;
+ * they never grant authority on their own. No callbacks, I/O or allocation. */
+typedef struct RelmapManagedReplayGuard {
+	const ClusterWalSourceRef *source;
+	ClusterWalSourceRef saved_source;
+	const XLogReaderState *reader;
+	XLogRecord header;
+	XLogRecPtr read_rec_ptr;
+	TransactionId top_xid;
+	ClusterRelmapRecoveryPins *pins;
+	ClusterRelmapV2Image image;
+} RelmapManagedReplayGuard;
+
+static bool
+relmap_managed_replay_current(const RelmapManagedReplayGuard *replay,
+	const ClusterRecoveryFileIdentityV2 *identity, const unsigned char *expected)
+{
+	const ClusterWalSourceRef *source = replay->source;
+	const XLogReaderState *reader = replay->reader;
+	const ClusterRelmapV2Image *image = &replay->image;
+	const ClusterRelmapV2Owner *owner = &image->pending_owner;
+	unsigned char rebuilt[CLUSTER_RELMAP_FILE_SIZE_V2];
+	TransactionId raw = (uint32)owner->top_full_xid;
+
+	return LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE)
+		&& memcmp(source, &replay->saved_source, sizeof(*source)) == 0
+		&& cluster_wal_claim_v2_ref_valid(&source->claim) && source->timeline != 0
+		&& source->claim.identity.system_identifier == identity->system_identifier
+		&& source->claim.database_incarnation == identity->database_incarnation
+		&& memcmp(source->claim.identity.storage_uuid, identity->storage_uuid, 16) == 0
+		&& source->claim.identity.origin_node_id == owner->node
+		&& source->claim.identity.origin_owner_incarnation == owner->admitted_incarnation
+		&& reader->system_identifier == identity->system_identifier
+		&& reader->cluster_expected_thread_id == source->claim.identity.origin_thread_id
+		&& reader->seg.ws_tli == source->timeline
+		&& reader->record != NULL && reader->ReadRecPtr != InvalidXLogRecPtr
+		&& reader->ReadRecPtr == replay->read_rec_ptr
+		&& reader->EndRecPtr > reader->ReadRecPtr && reader->EndRecPtr == owner->wal_end
+		&& reader->record->lsn == reader->ReadRecPtr
+		&& reader->record->next_lsn == reader->EndRecPtr
+		&& memcmp(&reader->record->header, &replay->header, sizeof(replay->header)) == 0
+		&& XLogRecGetTotalLen(reader) >= SizeOfXLogRecord + CLUSTER_RELMAP_FILE_SIZE_V2
+		&& XLogRecGetTotalLen(reader) <= reader->EndRecPtr - reader->ReadRecPtr
+		&& XLogRecGetRmid(reader) == RM_RELMAP_ID
+		&& XLogRecGetInfo(reader) == XLOG_RELMAP_UPDATE_V2
+		&& XLogRecGetXid(reader) == raw && XLogRecGetTopXid(reader) == replay->top_xid
+		&& (!TransactionIdIsValid(replay->top_xid) || replay->top_xid == raw)
+		&& XLogRecGetOrigin(reader) == InvalidRepOriginId
+		&& !XLogRecHasAnyBlockRefs(reader) && !XLogRecHasPageVersionEdge(reader)
+		&& XLogRecGetData(reader) != NULL
+		&& XLogRecGetDataLen(reader) == CLUSTER_RELMAP_FILE_SIZE_V2
+		&& cluster_relmap_wal_rebuild_pending_v2(XLogRecGetData(reader),
+			XLogRecGetDataLen(reader), identity, reader->EndRecPtr, rebuilt, sizeof(rebuilt))
+		&& memcmp(rebuilt, expected, sizeof(rebuilt)) == 0
+		&& cluster_relmap_recovery_check(replay->pins, image);
+}
+
 /* An optional registered-file guard leaves the original raw-v2 path intact. */
 typedef struct RelmapManagedWriteGuard {
 	const ClusterRecoveryFileIdentityV2 *identity;
 	const unsigned char *bytes;
+	const RelmapManagedReplayGuard *replay;
 } RelmapManagedWriteGuard;
 
 static bool
@@ -683,7 +744,9 @@ relmap_managed_write_current(const RelmapManagedWriteGuard *guard)
 	return guard == NULL || (enableFsync && cluster_relmap_authority_x_held()
 		&& LWLockHeldByMe(RelationMappingLock)
 		&& cluster_relmap_file_decode_v2(guard->bytes, CLUSTER_RELMAP_FILE_SIZE_V2,
-			guard->identity, &checked));
+			guard->identity, &checked)
+		&& (guard->replay == NULL
+			|| relmap_managed_replay_current(guard->replay, guard->identity, guard->bytes)));
 }
 
 static bool
@@ -943,7 +1006,7 @@ relmap_write_pending(const ClusterRelmapV2Namespace *expected,
 	ClusterRelmapRetentionResult retained;
 	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
 	ClusterRecoveryFileIdentityV2 bound;
-	RelmapManagedWriteGuard guard = {managed, bytes};
+	RelmapManagedWriteGuard guard = {managed, bytes, NULL};
 	bool ok = false;
 
 	/* No I/O can turn a disabled sync policy into durable stage permission. */
@@ -1049,6 +1112,53 @@ done:
 	return ok && cluster_relmap_recovery_stage_finish(pins, image);
 }
 
+bool
+cluster_relmap_authority_managed_replay_v2(const ClusterRecoveryFileIdentityV2 *identity,
+	const ClusterRelmapV2Image *image, const ClusterWalSourceRef *source,
+	XLogReaderState *reader, ClusterRelmapRecoveryPins *pins)
+{
+	RelmapV2Directory dirs;
+	RelmapV2Copy copies[2];
+	ClusterRelmapV2View view;
+	ClusterRecoveryFileIdentityV2 bound;
+	RelmapManagedReplayGuard replay;
+	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
+	RelmapManagedWriteGuard guard = {identity, bytes, &replay};
+	bool ok = false;
+
+	if (identity == NULL || image == NULL || source == NULL || reader == NULL
+		|| reader->record == NULL || !enableFsync || !cluster_relmap_authority_x_held()
+		|| !LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE))
+		return false;
+	bound = *identity;
+	replay.source = source;
+	replay.saved_source = *source;
+	replay.reader = reader;
+	replay.header = reader->record->header;
+	replay.read_rec_ptr = reader->ReadRecPtr;
+	replay.top_xid = XLogRecGetTopXid(reader);
+	replay.pins = pins;
+	replay.image = *image;
+	/* Consume only the original entry. A false/ERROR after this point cannot
+	 * be retried even when no file changed, nor turned into an ordinary pin. */
+	if (!cluster_relmap_recovery_stage_start(pins, &replay.image)
+		|| !cluster_relmap_file_encode_v2(&bound, &replay.image, bytes, sizeof(bytes))
+		|| !relmap_managed_write_current(&guard))
+		return false;
+	if (!relmap_v2_open_dirs(&replay.image.identity, &dirs)) goto done;
+	if (relmap_managed_load(&dirs, &bound, copies, &view) != CLUSTER_RELMAP_V2_PAIR_VALID
+		|| !view.pending_complete || view.has_pending
+		|| view.committed_generation != replay.image.committed_generation
+		|| memcmp(&view.committed, &replay.image.committed, sizeof(view.committed)) != 0
+		|| !relmap_managed_write_current(&guard))
+		goto done;
+	ok = relmap_managed_store_pair(&dirs, &bound, &guard, copies);
+done:
+	if (!relmap_v2_close_dirs(&dirs)) ok = false;
+	return ok && relmap_managed_write_current(&guard)
+		&& cluster_relmap_recovery_stage_finish(pins, &replay.image);
+}
+
 static ClusterRelmapV2ClearResult
 relmap_v2_finish(const ClusterRelmapV2Image *staged, bool publish,
 	const ClusterRecoveryFileIdentityV2 *managed)
@@ -1061,7 +1171,7 @@ relmap_v2_finish(const ClusterRelmapV2Image *staged, bool publish,
 	unsigned char original_bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
 	unsigned char final_bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
 	ClusterRecoveryFileIdentityV2 bound;
-	RelmapManagedWriteGuard guard = {managed, final_bytes};
+	RelmapManagedWriteGuard guard = {managed, final_bytes, NULL};
 	size_t length = managed ? CLUSTER_RELMAP_FILE_SIZE_V2 : CLUSTER_RELMAP_V2_FILE_SIZE;
 	bool ok = false;
 

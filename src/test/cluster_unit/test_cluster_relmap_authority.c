@@ -62,6 +62,9 @@ UT_DEFINE_GLOBALS();
 
 char *cluster_shared_data_dir = NULL;
 bool enableFsync = true;
+/* Dormant managed paths must link, but this legacy fixture never enters them. */
+static LWLockPadded authority_native_locks[NUM_INDIVIDUAL_LWLOCKS];
+LWLockPadded *MainLWLockArray = authority_native_locks;
 
 /* ---- Assert + ereport machinery ---- */
 void
@@ -130,6 +133,12 @@ LWLockRelease(LWLock *lock pg_attribute_unused())
 
 bool
 LWLockHeldByMe(LWLock *lock pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	abort();
 }
