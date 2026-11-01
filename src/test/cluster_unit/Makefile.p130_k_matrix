@@ -376,3 +376,53 @@ k-p130-h12: test_cluster_k_p130_h12
 clean-k-p130-h12:
 	rm -f test_cluster_k_p130_h12 test_cluster_k_p130_h12_current.inc test_cluster_k_p130_h12_current.inc.tmp \
 		test_cluster_k_p130_h12_output.inc test_cluster_k_p130_h12_output.inc.tmp
+
+.PHONY: k-p130-h13-deps k-p130-h13 clean-k-p130-h13
+k-p130-h13-deps:
+	$(MAKE) -C $(top_builddir)/src/common libpgcommon.a
+	$(MAKE) $(CLUSTER_WAL_CLAIM_O)
+	$(MAKE) test_cluster_native_holder_writeback test_cluster_pi_writeback
+
+test_cluster_k_p130_h13_native.inc: test_cluster_native_holder_writeback.c Makefile.p130_k_matrix
+	awk '/^int main\(void\)/ { stop=1; exit } { print } \
+	     END { if (stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# The original main uses a split return type; keep one line buffered so
+# the extracted prefix contains neither main nor its standalone int.
+test_cluster_k_p130_h13_data.inc: test_cluster_pi_writeback.c Makefile.p130_k_matrix
+	awk '/^main\(void\)/ { stop=1; exit } \
+	     { if (seen) print prev; prev=$$0; seen=1 } \
+	     END { if (stop != 1 || prev != "int") exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h13: test_cluster_k_p130_h13.c test_cluster_k_p130_h13_native.inc k-p130-h13-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H13_CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_k_p130_h13_data: test_cluster_k_p130_h13.c test_cluster_k_p130_h13_data.inc k-p130-h13-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H13_CPPFLAGS) -DK_P130_H13_DATA \
+		$< test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
+		$(PAGE_DATA_SPACE_OBJS) $(CLUSTER_KO_O) \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
+		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		-lcrypto $(filter -llz4 -lzstd,$(LIBS)) -lm -o $@
+
+k-p130-h13: test_cluster_k_p130_h13 test_cluster_k_p130_h13_data
+	./test_cluster_k_p130_h13
+	./test_cluster_k_p130_h13_data
+
+clean-k-p130-h13:
+	rm -f test_cluster_k_p130_h13 test_cluster_k_p130_h13_data \
+		test_cluster_k_p130_h13_native.inc test_cluster_k_p130_h13_native.inc.tmp \
+		test_cluster_k_p130_h13_data.inc test_cluster_k_p130_h13_data.inc.tmp
