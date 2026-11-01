@@ -9581,6 +9581,8 @@ test_cluster_ko_relation_scan test_cluster_ko_current_admission: %: %.c test_clu
 
 TESTS += test_cluster_ko_cancel test_cluster_ges_release test_cluster_grd_ko_cancel test_cluster_acquire_ko_cancel
 TESTS += test_cluster_ko_ready_owner test_cluster_ko_drop_io
+all: test_cluster_ko_cancel test_cluster_ges_release test_cluster_grd_ko_cancel test_cluster_acquire_ko_cancel \
+		test_cluster_ko_ready_owner test_cluster_ko_drop_io
 
 # Original S5 receipt -> LOCALLOCK registration -> KO binding reader.
 TESTS += test_cluster_ax_binding
@@ -9616,7 +9618,8 @@ test_cluster_ko_drop_io: test_cluster_ko_raw_io.inc
 test_cluster_ko_raw_consumers.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
 	awk '/^cluster_bufmgr_(read_storage_scn|refresh_block_from_storage|block_is_extension)_for_gcs\(/ { print "bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
-test_cluster_ko_drop_io: test_cluster_ko_raw_consumers.inc
+test_cluster_ko_drop_io: test_cluster_ko_raw_consumers.inc \
+		$(top_srcdir)/src/include/storage/checksum.h $(top_srcdir)/src/include/storage/checksum_impl.h
 
 # Original N/S source preparation and KO COMMIT reference, with physical
 # descriptor/IO boundaries explicit. Author: SqlRush <sqlrush@gmail.com>
