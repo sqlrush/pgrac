@@ -31,6 +31,13 @@ local_mailbox(void)
 	return c == NULL ? NULL : (ClusterSurvivorLocalMailbox *)c->reserved;
 }
 
+static bool
+local_reaped(ClusterSurvivorLocalMailbox *m, uint64 generation)
+{
+	/* Zero is the initial sentinel, never an observed child exit. */
+	return generation != 0 && pg_atomic_read_u64(&m->reaped_generation) == generation;
+}
+
 /* No PID search and no dereference of another process's private state. */
 static PGPROC *
 local_proc(int32 pid, int32 pgprocno, uint64 generation)
@@ -327,7 +334,7 @@ cluster_semantic_survivor_local_poll(ClusterSurvivorLocalReply *out)
 		cluster_semantic_survivor_local_invalidate();
 		if (LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_REPLIED
 			|| (LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_READING
-				&& pg_atomic_read_u64(&m->reaped_generation) == LOCAL_GENERATION(word)))
+				&& local_reaped(m, LOCAL_GENERATION(word))))
 			(void)pg_atomic_compare_exchange_u64(&m->word, &word,
 				LOCAL_WORD(LOCAL_GENERATION(word), CLUSTER_SURVIVOR_LOCAL_EMPTY));
 		return LOCAL_REFUSED;
@@ -339,8 +346,9 @@ cluster_semantic_survivor_local_poll(ClusterSurvivorLocalReply *out)
 		cluster_semantic_survivor_local_invalidate();
 		result = LOCAL_STALE;
 	}
-	if (LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_READING) {
-		if (pg_atomic_read_u64(&m->reaped_generation) != generation) return result == LOCAL_STALE ? result : LOCAL_PENDING;
+	if (LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_READING
+		|| LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_REQUESTED) {
+		if (!local_reaped(m, generation)) return result == LOCAL_STALE ? result : LOCAL_PENDING;
 		/* Only a real waitpid proves the old callback can no longer write. */
 		result = LOCAL_REFUSED;
 	} else if (LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_REPLIED) {
@@ -360,6 +368,12 @@ cluster_semantic_survivor_local_poll(ClusterSurvivorLocalReply *out)
 			} else if (r->result == LOCAL_STALE) result = LOCAL_STALE;
 		} else result = LOCAL_STALE;
 	} else return result == LOCAL_STALE ? result : LOCAL_PENDING;
+	/* The actual waitpid notification precedes later PGPROC cleanup. A
+	 * returned sample is no longer usable once that exact exit was seen. */
+	if (local_reaped(m, generation)) {
+		memset(out, 0, sizeof(*out));
+		result = LOCAL_REFUSED;
+	}
 	(void)pg_atomic_compare_exchange_u64(&m->word, &word,
 		LOCAL_WORD(generation, CLUSTER_SURVIVOR_LOCAL_EMPTY));
 	return result;
@@ -372,7 +386,7 @@ cluster_semantic_survivor_local_postmaster_reap(pid_t pid)
 	uint64 word;
 	if (m == NULL || IsUnderPostmaster || !IsPostmasterEnvironment || pid <= 0) return;
 	word = pg_atomic_read_u64(&m->word);
-	if (LOCAL_STATE(word) != CLUSTER_SURVIVOR_LOCAL_READING) return;
+	if (LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_EMPTY || LOCAL_GENERATION(word) == 0) return;
 	pg_read_barrier();
 	if (m->query.pid == pid) {
 		/* Sole postmaster writer; never reset on a new query or LMON restart. */

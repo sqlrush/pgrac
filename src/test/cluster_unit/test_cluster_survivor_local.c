@@ -117,6 +117,51 @@ static void local_reuse_after_publish(void)
  UT_ASSERT_EQ(cluster_semantic_survivor_local_begin(&t),PENDING);
  local_after_reuse=*fixture_mailbox();
 }
+/* The native reaper notifies immediately after waitpid, before later backend
+ * cleanup. Keep the old PGPROC visible to exercise exactly that interval. */
+static void
+local_exited_observation(bool publish)
+{
+ ClusterSurvivorLocalMailbox *m=fixture_mailbox();
+ ClusterSurvivorLocalTarget t=local_self_target();
+ ClusterSurvivorLocalReply r;
+ uint8 zero[sizeof(r)]={0};
+ int pipefd[2],status;pid_t pid;PGPROC *sender=MyProc;char byte=1;
+ uint64 generation;unsigned wakes;
+ UT_ASSERT_EQ(pipe(pipefd),0);fflush(NULL);pid=fork();UT_ASSERT(pid>=0);
+ if(pid==0) {
+  close(pipefd[1]);if(read(pipefd[0],&byte,1)!=1)_exit(9);close(pipefd[0]);
+  MyProc=&local_procs[6];MyProcPid=getpid();MyBackendType=B_LMON;MyAuxProcType=LmonProcess;
+  if(publish)local_call();
+  _exit(7);
+ }
+ close(pipefd[0]);local_procs[6]=*MyProc;local_procs[6].pid=pid;local_procs[6].pgprocno=6;
+ local_procs[6].cluster_grd_generation=21;
+ t.pid=pid;t.pgprocno=6;t.proc_generation=21;
+ UT_ASSERT_EQ(cluster_semantic_survivor_local_begin(&t),PENDING);
+ generation=pg_atomic_read_u64(&m->word)>>2;
+ UT_ASSERT_EQ(write(pipefd[1],&byte,1),1);close(pipefd[1]);
+ UT_ASSERT_EQ(waitpid(pid,&status,0),pid);UT_ASSERT(WIFEXITED(status));UT_ASSERT_EQ(WEXITSTATUS(status),7);
+ UT_ASSERT_EQ(pg_atomic_read_u64(&m->word)&3,publish?CLUSTER_SURVIVOR_LOCAL_REPLIED:CLUSTER_SURVIVOR_LOCAL_REQUESTED);
+ if(publish)UT_ASSERT_EQ(m->reply.payload_bytes,1128);
+ UT_ASSERT_EQ(local_procs[6].pid,pid);UT_ASSERT_EQ(local_procs[6].cluster_grd_generation,21);
+ wakes=local_wakes;
+ cluster_semantic_survivor_local_postmaster_reap(pid); /* An ordinary child caller cannot publish reap. */
+ UT_ASSERT_EQ(pg_atomic_read_u64(&m->reaped_generation),0);UT_ASSERT_EQ(local_wakes,wakes);
+ IsUnderPostmaster=false;IsPostmasterEnvironment=true;MyProc=NULL;
+ cluster_semantic_survivor_local_postmaster_reap(pid+1);
+ UT_ASSERT_EQ(pg_atomic_read_u64(&m->reaped_generation),0);UT_ASSERT_EQ(local_wakes,wakes);
+ cluster_semantic_survivor_local_postmaster_reap(pid);
+ MyProc=sender;IsUnderPostmaster=true;IsPostmasterEnvironment=false;
+ UT_ASSERT_EQ(pg_atomic_read_u64(&m->reaped_generation),generation);UT_ASSERT_EQ(local_wakes,wakes+1);
+ memset(&r,0xa5,sizeof(r));
+ UT_ASSERT_EQ(cluster_semantic_survivor_local_poll(&r),REFUSED);
+ UT_ASSERT_EQ(memcmp(&r,zero,sizeof(r)),0);
+ UT_ASSERT_EQ(pg_atomic_read_u64(&m->word)&3,CLUSTER_SURVIVOR_LOCAL_EMPTY);
+ /* Reaping retires only observation transport, not the old resource owner. */
+ UT_ASSERT_EQ(local_procs[6].pid,pid);UT_ASSERT_EQ(local_procs[6].cluster_grd_generation,21);
+ UT_ASSERT_EQ(local_control->header.native_closure,0);UT_ASSERT_EQ(local_control->header.ordinary_admission,0);
+}
 static void
 local_exercise(void)
 {
@@ -330,6 +375,18 @@ local_exercise(void)
   }
   break;
 
+ case 22: local_exited_observation(false); break;
+ case 23: local_exited_observation(true); break;
+ case 24:
+  /* Malformed zero query generation is not a real waitpid witness. */
+  pg_atomic_write_u64(&m->word,CLUSTER_SURVIVOR_LOCAL_READING);
+  pg_atomic_write_u64(&m->reaped_generation,0);
+  memset(&r,0xa5,sizeof(r));
+  UT_ASSERT_EQ(cluster_semantic_survivor_local_poll(&r),PENDING);
+  UT_ASSERT_EQ(r.payload_bytes,0);
+  UT_ASSERT_EQ(pg_atomic_read_u64(&m->word)&3,CLUSTER_SURVIVOR_LOCAL_READING);
+  break;
+
  }
  if(local_case==7)local_control->header.round_generation--;
  UT_ASSERT_EQ(memcmp(local_control,&candidate,60704),0);
@@ -371,10 +428,13 @@ UT_TEST(unassigned_query_bytes_cannot_supply_a_usable_sample) {run_local(18);}
 UT_TEST(unknown_local_header_cannot_supply_a_sample) {run_local(19);}
 UT_TEST(original_signal_slot_and_control_sizes_are_exact) {run_local(20);}
 UT_TEST(unconfirmed_scope_cannot_mix_rounds_or_claim_authority) {run_local(21);}
+UT_TEST(actual_reap_retires_unclaimed_query_before_pgproc_cleanup) {run_local(22);}
+UT_TEST(actual_reap_withdraws_published_sample_before_pgproc_cleanup) {run_local(23);}
+UT_TEST(zero_reap_sentinel_cannot_retire_a_reading_callback) {run_local(24);}
 #ifndef SURVIVOR_TARGET_FIXTURE
 int main(void)
 {
- UT_PLAN(22);
+ UT_PLAN(25);
  UT_RUN(original_lmon_latch_return_delivers_only_unconfirmed_native_observation);
  UT_RUN(real_query_is_single_target_and_busy_never_resignals);
  UT_RUN(all_128_actual_gate_cells_project_without_pointers_or_tail_changes);
@@ -397,6 +457,9 @@ int main(void)
  UT_RUN(unknown_local_header_cannot_supply_a_sample);
  UT_RUN(original_signal_slot_and_control_sizes_are_exact);
  UT_RUN(unconfirmed_scope_cannot_mix_rounds_or_claim_authority);
+ UT_RUN(actual_reap_retires_unclaimed_query_before_pgproc_cleanup);
+ UT_RUN(actual_reap_withdraws_published_sample_before_pgproc_cleanup);
+ UT_RUN(zero_reap_sentinel_cannot_retire_a_reading_callback);
  UT_DONE();return ut_failed_count?1:0;
 }
 
