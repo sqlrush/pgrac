@@ -51,6 +51,41 @@ mx_history_authorize(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actu
 	PG_END_TRY();
 	return disposition;
 }
+static ClusterHeapSuccessorProof hot_native_proof;
+static HeapHotCurrentMxSuccessorProof hot_full_proof;
+bool
+mx_history_hot(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	const ClusterSemanticAdmissionToken *admission, bool full, MxHotReadout *out)
+{
+	volatile bool result = false;
+	memset(out, 0xa5, sizeof(*out));
+	PG_TRY();
+	{
+		if (full)
+			result = heap_hot_current_mx_history_resolve_updater(rel, buffer, tuple, actual,
+				admission, &out->updater, &out->restart, &hot_full_proof, &authorize_operation);
+		else
+			result = cluster_current_mx_history_hot_updater_for_chain(rel, buffer, tuple, actual,
+				admission, &out->updater, &out->restart, &hot_native_proof, &authorize_operation);
+	}
+	PG_FINALLY();
+	{
+		memset(&out->successor, 0, sizeof(out->successor));
+		if (full && hot_full_proof.valid)
+			cluster_current_mx_set_successor_proof(&out->successor, &hot_full_proof.tid,
+				hot_full_proof.updater_xid, &hot_full_proof.alias, &hot_full_proof.locator);
+		else if (!full)
+			out->successor = hot_native_proof;
+	}
+	PG_END_TRY();
+	return result;
+}
+bool
+mx_history_hot_matches(Buffer buffer, HeapTuple candidate, bool full)
+{
+	return full ? heap_hot_current_mx_successor_matches(buffer, candidate, &hot_full_proof)
+		: cluster_current_mx_successor_key_matches(buffer, candidate, &hot_native_proof);
+}
 ClusterMxHistoryStep
 mx_history_collect(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
 	const ClusterSemanticAdmissionToken *admission, const ClusterCurrentMxKey *key,

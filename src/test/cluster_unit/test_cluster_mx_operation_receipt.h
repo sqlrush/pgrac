@@ -34,6 +34,14 @@ void mx_history_authorize_state(MxAuthorizeState *out);
 int mx_history_authorize(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
 	const ClusterSemanticAdmissionToken *admission, const ClusterCurrentMxRequestContext *requested,
 	MxHeapReadout *out);
+typedef struct MxHotReadout {
+	TransactionId updater;
+	bool restart;
+	ClusterHeapSuccessorProof successor;
+} MxHotReadout;
+bool mx_history_hot(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	const ClusterSemanticAdmissionToken *admission, bool full, MxHotReadout *out);
+bool mx_history_hot_matches(Buffer buffer, HeapTuple candidate, bool full);
 ClusterMxHistoryStep mx_history_collect(Relation rel, Buffer buffer, HeapTuple tuple,
 	Snapshot actual, const ClusterSemanticAdmissionToken *admission,
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 count,

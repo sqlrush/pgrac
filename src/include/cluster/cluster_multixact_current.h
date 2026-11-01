@@ -495,6 +495,14 @@ extern ClusterMxResolveResult cluster_multixact_current_validate_operation_proof
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
 	const struct ClusterSavepointOperationKey *keys,
 	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers);
+/* Read-only HOT continuation: whole typed set and committed LIVE updater,
+ * bound to the same exact successor challenge. Grants no mutation receipt. */
+extern bool cluster_multixact_current_validate_operation_updater(
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
+	const struct ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,
+	const ClusterCurrentUpdaterChallenge *challenge, const ClusterCurrentUpdaterProof *updater,
+	uint16 updater_origin_node_id);
 extern ClusterCurrentMxDecision cluster_multixact_current_decide_operations(
 	const ClusterCurrentMxMemberDesc *members, const struct ClusterSavepointOperationKey *keys,
 	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,

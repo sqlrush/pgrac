@@ -1975,6 +1975,29 @@ cluster_multixact_current_validate_operation_proof_set(
 	return CMX_RESOLVE_OK;
 }
 
+bool
+cluster_multixact_current_validate_operation_updater(
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
+	const ClusterSavepointOperationKey *keys, const ClusterCurrentMemberOperationProof *proofs,
+	uint16 nmembers, const ClusterCurrentUpdaterChallenge *challenge,
+	const ClusterCurrentUpdaterProof *updater, uint16 updater_origin_node_id)
+{
+	ClusterCurrentMemberProof base[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	uint8 effects[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+
+	if (cluster_multixact_current_validate_operation_proof_set(key, members, keys, proofs, nmembers)
+		!= CMX_RESOLVE_OK)
+		return false;
+	for (uint16 i = 0; i < nmembers; i++) {
+		base[i] = proofs[i].base;
+		effects[i] = proofs[i].flags == 0 ? CLUSTER_SAVEPOINT_EFFECT_LIVE : proofs[i].effect_state;
+	}
+	/* The complete typed set has already checked canonical top/child and
+	 * disposition. Do not downgrade it to the legacy raw-xid validator. */
+	return validate_updater_proof_state(key, members, base, nmembers, challenge, updater,
+		updater_origin_node_id, CCM_COMMITTED, effects);
+}
+
 ClusterCurrentMxDecision
 cluster_multixact_current_decide_operations(
 	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,

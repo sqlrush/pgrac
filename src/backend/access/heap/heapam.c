@@ -8986,10 +8986,11 @@ typedef struct ClusterCurrentMxHistoryBatch
 /* Complete capture -> unlock -> wait -> relock -> typed consume bracket.
  * Caller passes its actual live Snapshot, immutable descriptor and native
  * request options. Its input top/CID/shape values supply no authority. Normal
- * returns preserve the original EXCLUSIVE lock; ERROR uses native cleanup.
+ * returns preserve the original content lock; ERROR uses native cleanup.
  * Deployed callers remain unchanged until whole-family activation. */
 static ClusterMxHistoryStep pg_attribute_unused()
-cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tuple,
+cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTuple tuple,
+	bool read_only,
 	Snapshot actual, const ClusterSemanticAdmissionToken *admission,
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
 	const ClusterCurrentMxRequestContext *requested, const ClusterCurrentMxOperationState *operation,
@@ -9016,12 +9017,12 @@ cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tu
 	heap_result->result = TM_BeingModified;
 	if (CritSectionCount != 0 || relation == NULL || tuple == NULL || tuple->t_data == NULL
 		|| actual == NULL || key == NULL || members == NULL || nmembers == 0
-		|| nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS || requested == NULL
+		|| nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS || (!read_only && requested == NULL)
 		|| operation == NULL || operation->operation_id == 0 || operation->restarts == UINT32_MAX
 		|| decision == NULL || wait_key == NULL || buffer <= 0 || buffer > NBuffers
 		|| !BufferIsPinnedByMe(buffer) || TopTransactionContext == NULL
 		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
-			LW_EXCLUSIVE))
+			read_only ? LW_SHARED : LW_EXCLUSIVE))
 		return CMXH_UNKNOWN;
 	for (uint16 i = 0; i < nmembers; i++) {
 		if (ISUPDATE_from_mxstatus(members[i].member_status)) {
@@ -9051,9 +9052,11 @@ cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tu
 			have_challenge = updater >= 0
 				&& !HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask)
 				&& !ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid);
+			if (read_only && !have_challenge)
+				break;
 			batch->successor = tuple->t_data->t_ctid;
 			if (have_challenge && !cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
-					members[updater].xid, (uint16)updater, &batch->challenge, &batch->candidate, false))
+					members[updater].xid, (uint16)updater, &batch->challenge, &batch->candidate, read_only))
 				break;
 			if (have_challenge) {
 				if (!cluster_mx_history_capture_begin_with_updater(relation, buffer, tuple, actual,
@@ -9066,7 +9069,7 @@ cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tu
 				break;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			collected = cluster_mx_history_wait(batch->collector);
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(buffer, read_only ? BUFFER_LOCK_SHARE : BUFFER_LOCK_EXCLUSIVE);
 			if (collected != CMXH_COMPLETE) {
 				step = collected == CMXH_REQUALIFY ? CMXH_REQUALIFY : CMXH_UNKNOWN;
 				break;
@@ -9074,9 +9077,9 @@ cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tu
 			if (have_challenge) {
 				ClusterCurrentMxHeapFingerprint fresh;
 				if (!cluster_current_mx_hot_capture_still_exact(buffer, relation,
-						&batch->successor, &batch->candidate, false)
+						&batch->successor, &batch->candidate, read_only)
 					|| !cluster_current_mx_build_hot_challenge(relation, buffer, tuple,
-						members[updater].xid, (uint16)updater, &batch->fresh_challenge, &fresh, false)) {
+						members[updater].xid, (uint16)updater, &batch->fresh_challenge, &fresh, read_only)) {
 					step = CMXH_REQUALIFY;
 					break;
 				}
@@ -9087,6 +9090,26 @@ cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tu
 				&batch->updater);
 			if (collected != CMXH_COMPLETE) {
 				step = collected == CMXH_REQUALIFY ? CMXH_REQUALIFY : CMXH_UNKNOWN;
+				break;
+			}
+			if (read_only) {
+				int origin = cluster_xid_origin_slot(members[updater].xid);
+
+				if (origin < 0 || origin >= CLUSTER_MAX_NODES
+					|| !cluster_multixact_current_validate_operation_updater(key, members,
+						batch->keys, batch->proofs, nmembers, &batch->fresh_challenge,
+						&batch->updater, (uint16)origin))
+					break;
+				/* This is a read continuation only: no recompose, SELF/CID
+				 * decision, TX wait or mutation receipt is produced. */
+				heap_result->authoritative_updater = members[updater].xid;
+				cluster_current_mx_set_successor_proof(&heap_result->successor_proof,
+					&batch->successor, members[updater].xid,
+					&batch->fresh_challenge.candidate_next_xmin_alias,
+					&batch->updater.candidate_next_xmin_locator);
+				heap_result->result = TM_Updated;
+				*decision = CMDL_UPDATED;
+				step = CMXH_COMPLETE;
 				break;
 			}
 			batch->ctx = *requested;
@@ -9133,16 +9156,29 @@ cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tu
 	return step;
 }
 
+/* Writer entry keeps its original EXCLUSIVE/typed-DML contract. */
+static ClusterMxHistoryStep pg_attribute_unused()
+cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, const ClusterSemanticAdmissionToken *admission,
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *requested, const ClusterCurrentMxOperationState *operation,
+	ClusterCurrentMxHeapResult *heap_result, ClusterCurrentMxDecision *decision,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+{
+	return cluster_current_mx_history_collect_mode(relation, buffer, tuple, false, actual,
+		admission, key, members, nmembers, requested, operation, heap_result, decision, wait_key, trace);
+}
+
 /*
  * Resolve the updater needed by heap_get_latest_tid without touching local
- * pg_multixact storage for a foreign current MultiXact.  The caller holds the
- * buffer EXCLUSIVE with PCM-X.  Each RPC drops that content lock and this
- * helper returns with it EXCLUSIVE again; a changed tuple/page/ITL fingerprint
- * asks the caller to restart from the current TID.
+ * pg_multixact storage for a foreign current MultiXact. The caller holds
+ * content SHARE with current read authority. Each RPC returns under SHARE;
+ * a changed tuple/page/ITL fingerprint asks the caller to restart the TID.
  */
 static bool
-cluster_current_mx_hot_updater_for_chain(
+cluster_current_mx_hot_updater_for_chain_scoped(
 	Relation relation, Buffer buffer, HeapTuple tuple,
+	bool history, Snapshot actual, const ClusterSemanticAdmissionToken *admission,
 	TransactionId *updater_xid, bool *restart,
 	ClusterHeapSuccessorProof *successor_proof,
 	ClusterCurrentMxOperationState *operation)
@@ -9284,6 +9320,31 @@ cluster_current_mx_hot_updater_for_chain(
 			CCMH_FAIL_HOT_PROOF,
 			"the HOT chain updater origin is not derivable");
 
+	if (history) {
+		ClusterCurrentMxHeapResult result;
+		ClusterCurrentMxDecision decision;
+		ClusterTTStatusKey wait_key;
+		ClusterMxHistoryStep step;
+
+		step = cluster_current_mx_history_collect_mode(relation, buffer, tuple, true, actual,
+			admission, &key, members, nmembers, NULL, operation, &result, &decision, &wait_key, NULL);
+		if (step == CMXH_REQUALIFY) {
+			cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
+			cluster_current_mx_operation_restart(operation);
+			*restart = true;
+			return false;
+		}
+		if (step != CMXH_COMPLETE || decision != CMDL_UPDATED)
+			cluster_current_mx_failclosed(operation, CCMH_FAIL_HOT_PROOF,
+				"the scoped HOT history proof set was denied or incomplete");
+		*updater_xid = result.authoritative_updater;
+		if (successor_proof != NULL)
+			*successor_proof = result.successor_proof;
+		cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_HIT);
+		cluster_current_mx_operation_finish(operation);
+		return true;
+	}
+
 	memset(&challenge, 0, sizeof(challenge));
 	memset(&candidate_before, 0, sizeof(candidate_before));
 	candidate_tid = tuple->t_data->t_ctid;
@@ -9351,6 +9412,85 @@ cluster_current_mx_hot_updater_for_chain(
 			&updater_proof.candidate_next_xmin_locator);
 	cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_HIT);
 	cluster_current_mx_operation_finish(operation);
+	return true;
+}
+
+/* Existing native callers retain the legacy family until atomic activation. */
+static bool
+cluster_current_mx_hot_updater_for_chain(Relation relation, Buffer buffer, HeapTuple tuple,
+	TransactionId *updater_xid, bool *restart, ClusterHeapSuccessorProof *successor_proof,
+	ClusterCurrentMxOperationState *operation)
+{
+	return cluster_current_mx_hot_updater_for_chain_scoped(relation, buffer, tuple, false, NULL,
+		NULL, updater_xid, restart, successor_proof, operation);
+}
+
+/* Dormant complete-family read entry; no legacy fallback on missing scope. */
+static bool pg_attribute_unused()
+cluster_current_mx_history_hot_updater_for_chain(Relation relation, Buffer buffer,
+	HeapTuple tuple, Snapshot actual, const ClusterSemanticAdmissionToken *admission,
+	TransactionId *updater_xid, bool *restart, ClusterHeapSuccessorProof *successor,
+	ClusterCurrentMxOperationState *operation)
+{
+	volatile bool result = false;
+
+	*updater_xid = InvalidTransactionId;
+	*restart = false;
+	if (successor != NULL)
+		memset(successor, 0, sizeof(*successor));
+	/* Refuse invalid caller brackets before descriptor RPC/allocation. */
+	if (CritSectionCount != 0 || buffer <= 0 || buffer > NBuffers
+		|| !BufferIsPinnedByMe(buffer)
+		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
+			LW_SHARED))
+		cluster_current_mx_failclosed(operation, CCMH_FAIL_HOT_PROOF,
+			"the HOT history reader requires its original noncritical SHARE bracket");
+	PG_TRY();
+	{
+		result = cluster_current_mx_hot_updater_for_chain_scoped(relation, buffer, tuple, true,
+			actual, admission, updater_xid, restart, successor, operation);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_operation_finish(operation);
+		*updater_xid = InvalidTransactionId;
+		*restart = false;
+		if (successor != NULL)
+			memset(successor, 0, sizeof(*successor));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* The existing FULL HOT evaluator uses a separate native proof shape.
+ * Translate only the already verified successor; do not rerun history. */
+static bool pg_attribute_unused()
+heap_hot_current_mx_history_resolve_updater(Relation relation, Buffer buffer,
+	HeapTuple tuple, Snapshot actual, const ClusterSemanticAdmissionToken *admission,
+	TransactionId *updater_xid, bool *restart, HeapHotCurrentMxSuccessorProof *successor,
+	ClusterCurrentMxOperationState *operation)
+{
+	ClusterHeapSuccessorProof proof;
+
+	memset(successor, 0, sizeof(*successor));
+	if (!cluster_current_mx_history_hot_updater_for_chain(relation, buffer, tuple, actual,
+			admission, updater_xid, restart, &proof, operation))
+		return false;
+	successor->tid = proof.tid;
+	successor->updater_xid = proof.updater_xid;
+	successor->alias.origin_node_id = proof.origin_node_id;
+	successor->alias.undo_record_segment_id = proof.undo_record_segment_id;
+	successor->alias.tt_slot_id = proof.tt_slot_id;
+	successor->alias.cluster_epoch = proof.cluster_epoch;
+	successor->alias.local_xid = proof.updater_xid;
+	successor->locator.uba.raw[0] = proof.locator_uba_raw[0];
+	successor->locator.uba.raw[1] = proof.locator_uba_raw[1];
+	successor->locator.xid = proof.updater_xid;
+	successor->locator.tt_wrap = proof.locator_tt_wrap;
+	successor->locator.itl_kind = proof.locator_itl_kind;
+	successor->locator.itl_slot_index = proof.locator_itl_slot_index;
+	successor->valid = true;
 	return true;
 }
 
