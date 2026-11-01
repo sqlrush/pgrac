@@ -242,7 +242,7 @@ cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
 	ClusterTTDurableLocatorStats snapshot;
 	unsigned family;
 
-	if (TTDurableShared == NULL || out == NULL || cluster_node_id < 0)
+	if (TTDurableShared == NULL || out == NULL || !SCN_NODE_ID_VALID(cluster_node_id))
 		return false;
 	MemSet(&snapshot, 0, sizeof(snapshot));
 	snapshot.origin_node_id = cluster_node_id;
