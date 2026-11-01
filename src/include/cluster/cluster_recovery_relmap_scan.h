@@ -13,6 +13,8 @@
 #include "common/relmap.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_control_file_identity.h"
+#include "common/cluster_relmap_file.h"
 typedef struct ClusterRecoveryRelmapScan ClusterRecoveryRelmapScan;
 typedef enum ClusterRecoveryRelmapResult {
 	CLUSTER_RECOVERY_RELMAP_MORE = 0,
@@ -43,6 +45,11 @@ typedef struct ClusterRecoveryRelmapEntry {
 	uint32 target_index; /* UINT32_MAX: no candidate, never deletion proof */
 	const ClusterRecoveryRootEntry *target;
 	bool physical, extent_present;
+	/* Managed observations borrow the independently selected complete identity
+	 * and this copy's whole image; valid only until next step/destroy. */
+	const ClusterRecoveryFileIdentityV2 *file_identity;
+	const ClusterRelmapV2Image *managed_image;
+	bool pending;
 } ClusterRecoveryRelmapEntry;
 
 typedef struct ClusterRecoveryRelmapDiag {
@@ -59,7 +66,25 @@ cluster_recovery_relmap_scan_begin(ClusterRecoveryRootSet *roots, uint64 system_
 								   uint64 database_incarnation, const uint8 storage_uuid[16],
 								   size_t memory_budget, ClusterRecoveryRelmapScan **out);
 
-/* At most 128 metadata candidates, one original file read, or one mapping/
+/* Explicit managed companion. Borrow the SAME continuously held CF selection
+ * and OBSERVED roots; never acquire CF or reconstruct a registration from a
+ * file. Budget includes fixed scratch independent of namespace count. Every
+ * registered namespace must have both physical, compatible copies. Preserve
+ * each copy's committed/pending images separately, with all fork obligations.
+ * Raw files refuse in this mode. The raw entry refuses managed-sized authority
+ * files and never grants managed coverage. Fresh *out must be NULL and caller
+ * output must not alias the borrowed roots/selection. Failure/ERROR revokes
+ * roots but never destroys the borrowed selection or releases protection.
+ * Full original control rechecks bracket each file read and final drain;
+ * mapping ticks check only the original live reference, with no control I/O.
+ * Final whole ROOT/source/owner qualification remains the cold owner's duty. */
+extern ClusterRecoveryRelmapResult
+cluster_recovery_relmap_scan_begin_managed_v2(ClusterRecoveryRootSet *roots,
+	ClusterControlRelmapSelectionV2 *selection, size_t memory_budget,
+	ClusterRecoveryRelmapScan **out);
+
+/* At most 128 metadata candidates, one target file read (plus managed control
+ * rechecks described above), or one mapping/
  * exact bounded fork lookup per call. No new roots or revised baseline.
  * Every image is reread after its entries; all outputs remain provisional
  * until the cold owner's final whole ROOT/TT/WAL checks. Missing/short fork
