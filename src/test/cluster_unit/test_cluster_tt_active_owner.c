@@ -346,6 +346,7 @@ bool cluster_undo_cleaner_capacity_context_safe(void);
 void cluster_undo_cleaner_tx_slot_wait_begin(void);
 void cluster_undo_cleaner_tx_slot_wait_end(bool cancelled);
 
+#ifndef TT_ACTIVE_OWNER_EXTERNAL_CONTEXT
 bool
 cluster_undo_cleaner_capacity_context_safe(void)
 {
@@ -353,6 +354,7 @@ cluster_undo_cleaner_capacity_context_safe(void)
 	UT_ASSERT_EQ(modifier_enters, modifier_leaves);
 	return slot_wait_context_safe && !capacity_other_admission;
 }
+#endif
 
 /* The counter composition supplies the original cleaner scope functions. */
 #ifndef TT_ACTIVE_OWNER_EXTERNAL_WAIT_SCOPE

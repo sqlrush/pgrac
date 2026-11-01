@@ -14392,3 +14392,30 @@ clean distclean maintainer-clean: clean-native-slot-counters
 clean-native-slot-counters:
 	rm -f test_cluster_native_slot_counters test_cluster_native_slot_scope.inc \
 		test_cluster_native_slot_scope.inc.tmp
+
+# Resource safety through the selected-segment native wait caller.
+TESTS += test_cluster_native_slot_context
+all: test_cluster_native_slot_context
+
+test_cluster_native_slot_context.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^undo_cleaner_note_held_lwlock\(/ { print "static void"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_context_safe\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_undo_cleaner_capacity_context_safe\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_slot_context: test_cluster_native_slot_context.c \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
+		test_cluster_active_capacity_stats.inc test_cluster_native_slot_scope.inc \
+		test_cluster_undo_cleaner_holds.inc test_cluster_native_slot_context.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-native-slot-context
+.PHONY: clean-native-slot-context
+clean-native-slot-context:
+	rm -f test_cluster_native_slot_context test_cluster_native_slot_context.inc \
+		test_cluster_native_slot_context.inc.tmp
