@@ -7,6 +7,7 @@
 
 #define CLUSTER_MX_RANGE_REPLY 1
 #define CLUSTER_MX_RANGE_PROOF_ASKS 2
+#define CLUSTER_MX_RANGE_PROOFS 3
 #define CLUSTER_MX_RANGE_LAST 1
 #define CLUSTER_MX_RANGE_SKIPPED_ZERO 2
 #define CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME 7
@@ -65,5 +66,19 @@ extern bool cluster_mx_range_wire_encode_proof_asks(const ClusterMxRangeWireCont
 extern bool cluster_mx_range_wire_decode_proof_asks(const void *wire, uint32 bytes,
 	const ClusterMxRangeWireContext *ctx, ClusterMxRangeProofAsk *asks, uint32 asks_cap,
 	uint32 *count, uint32 *total);
+
+/* Structural/request binding only, never canonical freshness or a CTRC grant.
+ * ACTIVE carrier bytes must still pass the original receiver's V2 match. */
+extern bool cluster_mx_range_proof_entry_valid(const ClusterMxFullMemberProof *entry,
+											   uint32 ordinal, uint32 local,
+											   const ClusterCurrentMxMemberDesc *member);
+extern bool cluster_mx_range_wire_encode_proofs(const ClusterMxRangeWireContext *ctx,
+												ClusterMxCompositionReadStatus status,
+												const ClusterMxProofReply *reply, void *wire,
+												uint32 capacity, uint32 *bytes);
+extern ClusterMxCompositionReadStatus cluster_mx_range_wire_decode_proofs(
+	const void *wire, uint32 bytes, const ClusterMxRangeWireContext *ctx, uint16 expected_origin,
+	uint32 total, uint32 first, const ClusterCurrentMxMemberDesc *members, uint32 count,
+	ClusterMxProofReply *reply);
 
 #endif

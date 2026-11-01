@@ -26,6 +26,7 @@ static ClusterGcsBlockBackendBlock native_blocks[2];
 static PGAlignedBlock stats_memory;
 static unsigned gcs_locks, requests_sent, replies_sent, wakes, fault, data_worker;
 static uint64 previous_request_id;
+static ClusterMxRangeSource proof_source;
 static unsigned late_fault, late_at;
 static bool late_fired;
 static uint32 first_history[8];
@@ -87,6 +88,7 @@ ClusterICSendResult cluster_ic_send_envelope(uint8 type,int32 destination,
 	cluster_node_id=1;MyBackendId=1;
 	if(fault==6)copy.data.data[sizeof(ClusterMxRangeWireHeader)]^=1;
 	UT_ASSERT(gcs_block_try_land_full_mx_reply(&env,&copy));
+	memcpy(&proof_source, copy.data.data + sizeof(ClusterMxRangeWireHeader), sizeof(proof_source));
 	replies_sent++;cluster_node_id=0;MyBackendId=InvalidBackendId;
 	return CLUSTER_IC_SEND_DONE;
 }
@@ -309,13 +311,102 @@ static void caller_fresh_retry_starts_at_zero(void)
 	UT_ASSERT_EQ(stats.unknown_results,1);UT_ASSERT_EQ(stats.restart_requests,1);
 	UT_ASSERT_EQ(legacy_calls,0);cluster_multixact_current_describe_finish(&op);chain_clean();
 }
+static void
+caller_proof_windows_keep_original_owner(void)
+{
+	static ClusterMxCompositionReceive *op;
+	static ClusterMxCompositionReceiveStats stats;
+	for (unsigned mode = 0; mode < 4; mode++) {
+		ClusterCurrentMxKey key = { 0 };
+		ClusterMxFullMemberProof entries[7];
+		ClusterMxProofReply r = { 0 };
+		bool caught = false;
+		chain_seed(9, 1);
+		key.multixact_id = 1000;
+		key.cluster_epoch = 7;
+		memset(&stats, 0, sizeof(stats));
+		op = NULL;
+		UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag, &request_snapshot,
+														  &op, &stats));
+		r.source = &proof_source;
+		r.source_bytes = sizeof(proof_source);
+		r.total = 9;
+		r.count = 7;
+		r.next = 7;
+		r.proofs = entries;
+		r.proof_bytes = 7 * sizeof(*entries);
+		r.frame_bytes = 208 + r.proof_bytes;
+		for (unsigned i = 0; i < 7; i++) {
+			memset(&entries[i], 0, sizeof(entries[i]));
+			entries[i].member_ordinal = i;
+			entries[i].proof.member_status = MultiXactStatusForShare;
+			entries[i].proof.member_ordinal = i;
+			entries[i].proof.member_xid = 100 + i;
+			entries[i].proof.state = CCM_COMMITTED;
+			entries[i].proof.commit_scn = 1000 + i;
+		}
+		UT_ASSERT_EQ(cluster_multixact_current_proofs_accept(&op, MXCOMP_READ_OK, &r),
+					 MXCOMP_PARTIAL);
+		if (mode == 2) {
+			range_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, range_release_arg);
+			op = NULL;
+		} else {
+			r.first = 7;
+			r.count = 2;
+			r.next = 9;
+			r.last = true;
+			r.proof_bytes = 2 * sizeof(*entries);
+			r.frame_bytes = 208 + r.proof_bytes;
+			for (unsigned i = 0; i < 2; i++) {
+				memset(&entries[i], 0, sizeof(entries[i]));
+				entries[i].member_ordinal = 7 + i;
+				entries[i].proof.member_status = MultiXactStatusForShare;
+				entries[i].proof.member_ordinal = i;
+				entries[i].proof.member_xid = 107 + i;
+				entries[i].proof.state = CCM_COMMITTED;
+				entries[i].proof.commit_scn = 1007 + i;
+			}
+			if (mode == 0)
+				entries[1].proof.state = CCM_UNKNOWN;
+			if (mode == 1)
+				fail_at = allocations + 1;
+			PG_TRY();
+			{
+				UT_ASSERT_EQ(cluster_multixact_current_proofs_accept(&op, MXCOMP_READ_OK, &r),
+							 mode == 3 ? MXCOMP_COMPLETE : MXCOMP_UNKNOWN);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			fail_at = 0;
+			UT_ASSERT_EQ(caught, mode == 1);
+			if (mode == 3) {
+				uint32 n = 0;
+				UT_ASSERT_NOT_NULL(cluster_mx_composition_proofs(op, &n));
+				UT_ASSERT_EQ(n, 9);
+			} else
+				UT_ASSERT_NULL(op);
+			cluster_multixact_current_describe_finish(&op);
+		}
+		range_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, range_release_arg);
+		chain_clean();
+	}
+}
+
 int main(void)
 {
 	TopMemoryContext=AllocSetContextCreate(CurrentMemoryContext,"native caller",ALLOCSET_DEFAULT_SIZES);
 	CurrentMemoryContext=TopMemoryContext;
-	UT_PLAN(8);UT_RUN(caller_native_transport_sizes);UT_RUN(caller_native_transport_failure_cleanup);
+	UT_PLAN(9);
+	UT_RUN(caller_native_transport_sizes);
+	UT_RUN(caller_native_transport_failure_cleanup);
 	UT_RUN(scoped_outcomes_in_original_snapshot);UT_RUN(scoped_cancel_has_no_returned_outcome);
 	UT_RUN(caller_rejects_epoch_after_last_reply);UT_RUN(caller_rejects_control_change_after_last_reply);
-	UT_RUN(scoped_last_reply_refusal_has_one_outcome);UT_RUN(caller_fresh_retry_starts_at_zero);UT_DONE();
+	UT_RUN(scoped_last_reply_refusal_has_one_outcome);
+	UT_RUN(caller_fresh_retry_starts_at_zero);
+	UT_RUN(caller_proof_windows_keep_original_owner);
+	UT_DONE();
 	return ut_failed_count==0?0:1;
 }

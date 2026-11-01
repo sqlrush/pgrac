@@ -2,6 +2,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_multixact_composition.h"
+#include "cluster/cluster_multixact_range_wire.h"
 #include "common/hashfn.h"
 #include "utils/memutils.h"
 
@@ -63,7 +64,14 @@ struct ClusterMxCompositionReceive {
 	bool complete;
 	CompositionSeenDirectory *seen[COMPOSITION_SEEN_DIRECTORIES];
 	ClusterMxCompositionPage *head, *tail;
+	ClusterMxCompositionPage *proof_members;
+	ClusterMxCompositionProofPage *proof_head, *proof_tail;
+	uint32 proof_accepted;
+	bool proofs_complete;
 };
+
+StaticAssertDecl(sizeof(ClusterMxCompositionProofPage) < MaxAllocSize,
+	"proof pages must fit ordinary allocation limits");
 
 StaticAssertDecl(sizeof(ClusterMxCompositionPage) < MaxAllocSize,
 	"composition pages must fit ordinary allocation limits");
@@ -254,10 +262,86 @@ cluster_mx_composition_pages(const ClusterMxCompositionReceive *op, uint32 *tota
 	return op->head;
 }
 
+ClusterMxCompositionReceiveResult
+cluster_mx_composition_accept_proofs(ClusterMxCompositionReceive **op,
+									 ClusterMxCompositionReadStatus status,
+									 const ClusterMxProofReply *reply)
+{
+	ClusterMxCompositionReceive *r;
+	const ClusterMxCompositionPage *members;
+	bool valid = true;
+	if (op == NULL || *op == NULL)
+		return MXCOMP_UNKNOWN;
+	r = *op;
+	if (status != MXCOMP_READ_OK || reply == NULL || !r->complete || r->proofs_complete)
+		return composition_unknown(op, status == MXCOMP_READ_RETRY);
+	if (reply->source == NULL || reply->source_bytes != r->source_bytes
+		|| memcmp(reply->source, r->source, r->source_bytes) != 0 || reply->total != r->member_count
+		|| reply->first != r->proof_accepted || reply->count == 0
+		|| reply->count > CLUSTER_MX_PROOF_PAGE_MEMBERS
+		|| (uint64)reply->first + reply->count != reply->next || reply->next > r->member_count
+		|| reply->last != (reply->next == r->member_count) || reply->proofs == NULL
+		|| reply->proof_bytes != (uint64)reply->count * sizeof(*reply->proofs)
+		|| reply->frame_bytes > BLCKSZ
+		|| (uint64)reply->source_bytes + reply->proof_bytes > reply->frame_bytes)
+		return composition_unknown(op, false);
+	members = r->proof_members == NULL ? r->head : r->proof_members;
+	PG_TRY();
+	{
+		ClusterMxCompositionProofPage *page = MemoryContextAllocZero(r->context, sizeof(*page));
+		for (uint32 i = 0; i < reply->count; i++) {
+			uint32 ordinal = reply->first + i;
+			while (members != NULL && ordinal >= members->first + members->count)
+				members = members->next;
+			if (members == NULL || ordinal < members->first
+				|| !cluster_mx_range_proof_entry_valid(
+					&reply->proofs[i], ordinal, i, &members->members[ordinal - members->first])) {
+				valid = false;
+				break;
+			}
+			page->proofs[i] = reply->proofs[i];
+		}
+		if (valid) {
+			page->first = reply->first;
+			page->count = reply->count;
+			if (r->proof_tail != NULL)
+				r->proof_tail->next = page;
+			else
+				r->proof_head = page;
+			r->proof_tail = page;
+			r->proof_members = (ClusterMxCompositionPage *)members;
+			r->proof_accepted = reply->next;
+			r->proofs_complete = reply->last;
+			composition_count(&r->stats->accepted_proof_frames);
+		}
+	}
+	PG_CATCH();
+	{
+		(void)composition_unknown(op, false);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!valid)
+		return composition_unknown(op, false);
+	return r->proofs_complete ? MXCOMP_COMPLETE : MXCOMP_PARTIAL;
+}
+
+const ClusterMxCompositionProofPage *
+cluster_mx_composition_proofs(const ClusterMxCompositionReceive *op, uint32 *total)
+{
+	if (total != NULL)
+		*total = 0;
+	if (op == NULL || !op->proofs_complete || total == NULL)
+		return NULL;
+	*total = op->member_count;
+	return op->proof_head;
+}
+
 void
 cluster_mx_composition_finish(ClusterMxCompositionReceive **op)
 {
-	if (op != NULL && *op != NULL && !(*op)->complete)
+	if (op != NULL && *op != NULL
+		&& (!(*op)->complete || ((*op)->proof_head != NULL && !(*op)->proofs_complete)))
 		(void)composition_unknown(op, false);
 	else
 		composition_release(op);

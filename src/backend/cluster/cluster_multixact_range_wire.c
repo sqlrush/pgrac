@@ -304,6 +304,171 @@ cluster_mx_range_wire_decode_proof_asks(const void *wire, uint32 bytes,
 	return true;
 }
 
+static bool
+range_bytes_zero(const void *data, Size bytes)
+{
+	const uint8 *p = data;
+	for (Size i = 0; i < bytes; i++)
+		if (p[i] != 0)
+			return false;
+	return true;
+}
+
+bool
+cluster_mx_range_proof_entry_valid(const ClusterMxFullMemberProof *entry, uint32 ordinal,
+								   uint32 local, const ClusterCurrentMxMemberDesc *member)
+{
+	const ClusterCurrentMemberProof *p;
+	static const ClusterCurrentMemberProofKey zero_key;
+	ClusterTTStatusKey key;
+	uint32 generation;
+	uint16 wrap;
+	if (entry == NULL || member == NULL || local >= CLUSTER_MX_PROOF_PAGE_MEMBERS
+		|| entry->member_ordinal != ordinal || entry->origin_node_id >= CLUSTER_MAX_NODES
+		|| entry->reserved16 != 0 || !range_member_valid(member))
+		return false;
+	p = &entry->proof;
+	if (p->member_xid != member->xid || p->member_status != member->member_status
+		|| p->member_ordinal != local
+		|| !range_bytes_zero((const char *)p
+								 + offsetof(ClusterCurrentMemberProof, origin_fullxid_v2)
+								 + sizeof(p->origin_fullxid_v2),
+							 sizeof(*p) - offsetof(ClusterCurrentMemberProof, origin_fullxid_v2)
+								 - sizeof(p->origin_fullxid_v2)))
+		return false;
+	if (p->state == CCM_COMMITTED || p->state == CCM_ABORTED)
+		return memcmp(&p->key, &zero_key, sizeof(zero_key)) == 0
+			   && ClusterCurrentMemberProofGetCtrcGrant(p) == 0
+			   && range_bytes_zero(p->origin_fullxid_v2, sizeof(p->origin_fullxid_v2))
+			   && (p->state == CCM_COMMITTED ? SCN_VALID(p->commit_scn)
+											 : p->commit_scn == InvalidScn);
+	if (p->state != CCM_ACTIVE || p->commit_scn != InvalidScn
+		|| ClusterCurrentMemberProofGetCtrcGrant(p) == 0
+		|| !ClusterCurrentMemberProofGetStatusKey(p, &key, &generation, &wrap))
+		return false;
+	return key.origin_node_id == entry->origin_node_id && key.undo_segment_id != 0
+		   && key.tt_slot_id != 0 && key.cluster_epoch > 0 && TransactionIdIsNormal(key.local_xid)
+		   && (key.local_xid == member->xid
+			   || NormalTransactionIdPrecedes(key.local_xid, member->xid))
+		   && p->origin_fullxid_v2[0] == CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION
+		   && p->origin_fullxid_v2[1] == 0
+		   && p->origin_fullxid_v2[2] == CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES
+		   && p->origin_fullxid_v2[3] == 0;
+}
+
+static bool
+range_proof_window_valid(uint32 total, uint32 first, uint32 count, uint32 next, bool last)
+{
+	return total > 0 && total <= INT32_MAX && count > 0 && count <= CLUSTER_MX_PROOF_PAGE_MEMBERS
+		   && (uint64)first + count == next && next <= total && last == (next == total);
+}
+
+bool
+cluster_mx_range_wire_encode_proofs(const ClusterMxRangeWireContext *ctx,
+									ClusterMxCompositionReadStatus status,
+									const ClusterMxProofReply *reply, void *wire, uint32 capacity,
+									uint32 *bytes)
+{
+	ClusterMxRangeWireHeader h;
+	PGAlignedBlock frame;
+	Size body;
+	uint32 length, count = 0;
+	if (bytes != NULL)
+		*bytes = 0;
+	if (!range_context_valid(ctx) || wire == NULL || bytes == NULL || status < MXCOMP_READ_OK
+		|| status > MXCOMP_READ_UNKNOWN)
+		return false;
+	if (status == MXCOMP_READ_OK) {
+		if (reply == NULL || reply->source == NULL || reply->source_bytes != ctx->source_bytes
+			|| memcmp(reply->source, ctx->source, ctx->source_bytes) != 0
+			|| !range_proof_window_valid(reply->total, reply->first, reply->count, reply->next,
+										 reply->last)
+			|| reply->count > ctx->requested_cap || reply->proofs == NULL
+			|| reply->proof_bytes != (uint64)reply->count * sizeof(*reply->proofs))
+			return false;
+		count = reply->count;
+		for (uint32 i = 0; i < count; i++) {
+			const ClusterMxFullMemberProof *e = &reply->proofs[i];
+			ClusterCurrentMxMemberDesc member = { 0 };
+			member.xid = e->proof.member_xid;
+			member.member_status = e->proof.member_status;
+			if (!cluster_mx_range_proof_entry_valid(e, reply->first + i, i, &member)
+				|| (e->proof.state == CCM_ACTIVE && e->proof.key.cluster_epoch != ctx->epoch))
+				return false;
+		}
+	} else if (reply != NULL)
+		return false;
+	if (!range_frame_size(ctx->source_bytes, count, sizeof(ClusterMxFullMemberProof), &body,
+						  &length)
+		|| length > capacity)
+		return false;
+	range_header_init(&h, ctx, CLUSTER_MX_RANGE_PROOFS, length);
+	h.result = status;
+	if (count != 0) {
+		h.total = reply->total;
+		h.first = reply->first;
+		h.count = count;
+		h.next = reply->next;
+		h.flags = reply->last ? CLUSTER_MX_RANGE_LAST : 0;
+	}
+	range_frame_prefix(frame.data, body, &h, ctx);
+	if (count != 0)
+		memcpy(frame.data + body, reply->proofs, (Size)count * sizeof(*reply->proofs));
+	memcpy(wire, frame.data, length);
+	*bytes = length;
+	return true;
+}
+
+ClusterMxCompositionReadStatus
+cluster_mx_range_wire_decode_proofs(const void *wire, uint32 bytes,
+									const ClusterMxRangeWireContext *ctx, uint16 expected_origin,
+									uint32 total, uint32 first,
+									const ClusterCurrentMxMemberDesc *members, uint32 count,
+									ClusterMxProofReply *reply)
+{
+	ClusterMxRangeWireHeader h;
+	Size body;
+	if (reply == NULL)
+		return MXCOMP_READ_UNKNOWN;
+	memset(reply, 0, sizeof(*reply));
+	if (ctx == NULL || expected_origin >= CLUSTER_MAX_NODES || members == NULL || count == 0
+		|| count > CLUSTER_MX_PROOF_PAGE_MEMBERS || count > ctx->requested_cap
+		|| !range_header_read(wire, bytes, ctx, &h, CLUSTER_MX_RANGE_PROOFS,
+							  sizeof(ClusterMxFullMemberProof), &body)
+		|| h.result > MXCOMP_READ_UNKNOWN)
+		return MXCOMP_READ_UNKNOWN;
+	if (h.result != MXCOMP_READ_OK) {
+		if (h.total || h.first || h.count || h.next || h.flags)
+			return MXCOMP_READ_UNKNOWN;
+		return (ClusterMxCompositionReadStatus)h.result;
+	}
+	if (h.total != total || h.first != first || h.count != count
+		|| (h.flags & ~CLUSTER_MX_RANGE_LAST) != 0
+		|| !range_proof_window_valid(total, first, count, h.next,
+									 (h.flags & CLUSTER_MX_RANGE_LAST) != 0)
+		|| !range_members_valid(members, count))
+		return MXCOMP_READ_UNKNOWN;
+	for (uint32 i = 0; i < count; i++) {
+		ClusterMxFullMemberProof e;
+		memcpy(&e, (const char *)wire + body + (Size)i * sizeof(e), sizeof(e));
+		if (e.origin_node_id != expected_origin
+			|| !cluster_mx_range_proof_entry_valid(&e, first + i, i, &members[i])
+			|| (e.proof.state == CCM_ACTIVE && e.proof.key.cluster_epoch != ctx->epoch))
+			return MXCOMP_READ_UNKNOWN;
+	}
+	reply->source = (const char *)wire + sizeof(h);
+	reply->source_bytes = ctx->source_bytes;
+	reply->total = total;
+	reply->first = first;
+	reply->count = count;
+	reply->next = h.next;
+	reply->last = (h.flags & CLUSTER_MX_RANGE_LAST) != 0;
+	reply->proofs = (const ClusterMxFullMemberProof *)((const char *)wire + body);
+	reply->proof_bytes = (Size)count * sizeof(*reply->proofs);
+	reply->frame_bytes = bytes;
+	return MXCOMP_READ_OK;
+}
+
 static uint32
 range_checksum(const void *wire, uint32 bytes)
 {

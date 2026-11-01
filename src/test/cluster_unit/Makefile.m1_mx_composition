@@ -4,9 +4,9 @@ MX_RANGE_WIRE_O = $(top_builddir)/src/backend/cluster/cluster_multixact_range_wi
 
 $(MX_COMPOSITION_O): $(top_srcdir)/src/include/cluster/cluster_multixact_composition.h
 
-test_cluster_mx_composition: test_cluster_mx_composition.c unit_test.h $(MX_COMPOSITION_O) \
+test_cluster_mx_composition: test_cluster_mx_composition.c unit_test.h $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(MX_COMPOSITION_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 .PHONY: clean-m1-mx-composition

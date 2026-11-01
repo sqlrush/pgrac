@@ -77,6 +77,12 @@ extern bool cluster_multixact_current_describe_full(const ClusterCurrentMxKey *k
 	const BufferTag *target, const ClusterMxRangeSnapshot *snapshot,
 	ClusterMxCompositionReceive **op, ClusterMxCompositionReceiveStats *stats);
 extern void cluster_multixact_current_describe_finish(ClusterMxCompositionReceive **op);
+/* Keep the original ResourceOwner/directory borrow in sync on proof failure
+ * and ERROR. Registered operations must not use the raw G2 accept entry. */
+extern ClusterMxCompositionReceiveResult
+cluster_multixact_current_proofs_accept(ClusterMxCompositionReceive **op,
+										ClusterMxCompositionReadStatus status,
+										const ClusterMxProofReply *reply);
 extern ClusterMxDescribeResult cluster_multixact_current_describe_scoped(
 	const ClusterCurrentMxKey *key, const BufferTag *target, Snapshot snapshot,
 	ClusterCurrentMxMemberDesc *members, uint16 cap, uint16 *count, uint32 *total);

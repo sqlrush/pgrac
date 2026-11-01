@@ -214,6 +214,39 @@ cluster_multixact_current_describe_finish(ClusterMxCompositionReceive **op)
 	*op = NULL;
 }
 
+ClusterMxCompositionReceiveResult
+cluster_multixact_current_proofs_accept(ClusterMxCompositionReceive **op,
+										ClusterMxCompositionReadStatus status,
+										const ClusterMxProofReply *reply)
+{
+	RangeOwned *owned;
+	ClusterMxCompositionReceiveResult result = MXCOMP_UNKNOWN;
+	if (op == NULL || *op == NULL)
+		return MXCOMP_UNKNOWN;
+	for (owned = range_owned; owned != NULL; owned = owned->next)
+		if (owned->op == *op)
+			break;
+	if (owned == NULL) {
+		*op = NULL;
+		return MXCOMP_UNKNOWN;
+	}
+	PG_TRY();
+	{
+		result = cluster_mx_composition_accept_proofs(&owned->op, status, reply);
+	}
+	PG_CATCH();
+	{
+		*op = NULL;
+		range_owned_end(owned);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*op = owned->op;
+	if (result == MXCOMP_UNKNOWN)
+		range_owned_end(owned);
+	return result;
+}
+
 bool
 cluster_multixact_current_describe_full(const ClusterCurrentMxKey *key,
 	const BufferTag *target, const ClusterMxRangeSnapshot *snapshot,

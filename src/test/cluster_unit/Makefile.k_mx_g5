@@ -90,3 +90,10 @@ test_k_mx_g5_range_contract: test_k_mx_g5_range_contract.c \
 		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
 		$(K_MX_G5_CODEC_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# Full-width provisional proof windows use the original composition owner.
+test_k_mx_g5_proof_receive: test_k_mx_g5_proof_receive.c test_cluster_mx_composition.c \
+		unit_test.h $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@

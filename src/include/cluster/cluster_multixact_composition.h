@@ -16,6 +16,7 @@ typedef enum ClusterMxCompositionReceiveResult {
 
 typedef struct ClusterMxCompositionReceiveStats {
 	uint64 accepted_frames;
+	uint64 accepted_proof_frames;
 	uint64 unknown_results;
 	uint64 restart_requests;
 } ClusterMxCompositionReceiveStats;
@@ -65,6 +66,33 @@ typedef struct ClusterMxCompositionPage {
 	ClusterCurrentMxMemberDesc members[CLUSTER_MX_COMPOSITION_PAGE_MEMBERS];
 } ClusterMxCompositionPage;
 
+#define CLUSTER_MX_PROOF_PAGE_MEMBERS 7
+
+/* The canonical carrier's ordinal is frame-local (0..6). Global positions
+ * remain explicit uint32 values in this independent transport domain. */
+typedef struct ClusterMxFullMemberProof {
+	uint32 member_ordinal;
+	uint16 origin_node_id, reserved16;
+	ClusterCurrentMemberProof proof;
+} ClusterMxFullMemberProof;
+
+typedef struct ClusterMxProofReply {
+	const void *source;
+	Size source_bytes;
+	uint32 total, first, count, next;
+	bool last;
+	const ClusterMxFullMemberProof *proofs;
+	Size proof_bytes, frame_bytes;
+} ClusterMxProofReply;
+
+typedef struct ClusterMxCompositionProofPage {
+	struct ClusterMxCompositionProofPage *next;
+	uint32 first, count;
+	ClusterMxFullMemberProof proofs[CLUSTER_MX_PROOF_PAGE_MEMBERS];
+} ClusterMxCompositionProofPage;
+
+StaticAssertDecl(sizeof(ClusterMxFullMemberProof) == 200, "full proof entry size");
+
 typedef struct ClusterMxCompositionReceive ClusterMxCompositionReceive;
 
 /* source is the caller's complete, prevalidated semantic identity, never a
@@ -89,6 +117,16 @@ extern uint32 cluster_mx_composition_next(const ClusterMxCompositionReceive *op)
  */
 extern const ClusterMxCompositionPage *cluster_mx_composition_pages(
 	const ClusterMxCompositionReceive *op, uint32 *total);
+/* Raw operations only. Operations borrowed from describe_full must use its
+ * ResourceOwner-aware accept entry. These remain provisional.
+ * Original authenticated source, CTRC envelope,
+ * grant, tuple and fence requalification are still mandatory before use. */
+extern ClusterMxCompositionReceiveResult
+cluster_mx_composition_accept_proofs(ClusterMxCompositionReceive **op,
+									 ClusterMxCompositionReadStatus status,
+									 const ClusterMxProofReply *reply);
+extern const ClusterMxCompositionProofPage *
+cluster_mx_composition_proofs(const ClusterMxCompositionReceive *op, uint32 *total);
 extern void cluster_mx_composition_finish(ClusterMxCompositionReceive **op);
 
 #endif
