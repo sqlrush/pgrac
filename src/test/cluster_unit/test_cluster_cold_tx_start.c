@@ -11,6 +11,7 @@
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
+#include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_guc.h"
@@ -397,10 +398,12 @@ static void actual_startup_eor_claim(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 #include "test_cluster_cold_tx_writer.inc"
-/* Exercise the original saved-receipt readers, not a handoff status stub.
- * Mutation/I/O functions in this unit are not called; the Startup replay
- * component separately executes them with its original storage bridge. */
+/* Saved-receipt readers remain real. The physical recheck boundary is
+ * controlled here; the Startup storage component exercises its full body. */
+bool test_start_unused_relmap_recheck(const struct ClusterRecoveryStartV1 *start);
+#define cluster_cold_relmap_replay_recheck_v1 test_start_unused_relmap_recheck
 #include "../../backend/cluster/cluster_cold_recovery_relmap.c"
+#undef cluster_cold_relmap_replay_recheck_v1
 #include "test_cluster_cold_tx_owner.inc"
 #include "test_cluster_cold_tx_xid_maximum.inc"
 #include "test_cluster_cold_tx_consumer.inc"
@@ -420,6 +423,9 @@ static void actual_startup_tx_begin(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 static ClusterColdTypedV1 typed;
 static ClusterColdPlanV1 relmap_start_plan;
 static ColdRelmapInput relmap_start_entries[2];
+static unsigned relmap_observe_checks, relmap_observe_fault_at;
+static bool relmap_observe_allowed;
+static void (*relmap_observe_step)(void);
 static bool ctrc_census_ok, ctrc_census_drift;
 static unsigned ctrc_census_calls;
 static ClusterColdCtrcReleaseCensusV1 ctrc_census;
@@ -627,6 +633,9 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 static void reset(void)
 {
 	relmap_owner_check_step = NULL;
+	relmap_observe_checks = relmap_observe_fault_at = 0;
+	relmap_observe_allowed = false;
+	relmap_observe_step = NULL;
 	memset(&startup_first_floor, 0, sizeof(startup_first_floor));
 	startup_first_calls = 0; startup_first_available = true; startup_first_step = NULL;
 	ctrc_driver_acquires = ctrc_driver_authorizations = ctrc_driver_waits = 0;
@@ -2395,9 +2404,22 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_untouched_pages.inc"
 
 #include "test_cluster_cold_tx_relmap_handoff.inc"
+#include "test_cluster_cold_ctrc_relmap_gate.inc"
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CTRC_RELMAP_GATE") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_ctrc_relmap_gate_preserves_undeclared_path);
+		UT_RUN(test_ctrc_relmap_gate_rechecks_every_observation_without_completion);
+		UT_RUN(test_ctrc_relmap_gate_refuses_before_census_without_retry);
+		UT_RUN(test_ctrc_relmap_gate_late_refusal_retires_only_observation);
+		UT_RUN(test_ctrc_relmap_gate_error_revokes_same_episode);
+		UT_RUN(test_ctrc_relmap_gate_provider_cannot_rebind_owner);
+		UT_RUN(test_ctrc_relmap_gate_cannot_replace_original_terminals);
+		UT_RUN(test_ctrc_relmap_gate_withdraws_old_observation_during_recheck);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_RELMAP_START_HANDOFF") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(test_start_automatically_keeps_replayed_relmap_in_joint_obligation);
@@ -2722,14 +2744,22 @@ int main(void)
 		return ut_failed_count == 0 ? 0 : 1;
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
-	UT_PLAN(303);
+	UT_PLAN(311);
 	UT_RUN(test_startup_native_directory_empty_preserves_fpi_unchanged_and_zero_page);
 	UT_RUN(test_startup_native_directory_partial_lock_wait_repeats_same_fd_readback);
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(299);
+	UT_PLAN(307);
 #endif
+	UT_RUN(test_ctrc_relmap_gate_preserves_undeclared_path);
+	UT_RUN(test_ctrc_relmap_gate_rechecks_every_observation_without_completion);
+	UT_RUN(test_ctrc_relmap_gate_refuses_before_census_without_retry);
+	UT_RUN(test_ctrc_relmap_gate_late_refusal_retires_only_observation);
+	UT_RUN(test_ctrc_relmap_gate_error_revokes_same_episode);
+	UT_RUN(test_ctrc_relmap_gate_provider_cannot_rebind_owner);
+	UT_RUN(test_ctrc_relmap_gate_cannot_replace_original_terminals);
+	UT_RUN(test_ctrc_relmap_gate_withdraws_old_observation_during_recheck);
 	UT_RUN(test_start_automatically_keeps_replayed_relmap_in_joint_obligation);
 	UT_RUN(test_start_refuses_incomplete_or_failed_relmap_receipts);
 	UT_RUN(test_start_cannot_silently_drop_relmap_source_or_cut);

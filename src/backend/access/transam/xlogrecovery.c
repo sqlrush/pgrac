@@ -1201,11 +1201,27 @@ cluster_recovery_cold_observation_terminals_current(struct ClusterRecoveryStartV
 	return cluster_recovery_cold_observation_current(start);
 }
 
+/* Staging is one necessary input at this cut, never terminal qualification
+ * or a completion certificate. Every original observation, including a
+ * repeat, brackets its own census checks with the declared participant. */
+static bool
+cluster_recovery_cold_relmap_recheck(struct ClusterRecoveryStartV1 *start)
+{
+	if (!start->relmap_declared)
+		return true;
+	if (cluster_cold_relmap_replay_recheck_v1(start) && ClusterColdRecoveryRelmapCurrent(start))
+		return true;
+	ClusterColdRecoveryRelmapFail(start);
+	cluster_recovery_cold_observation_refuse(start, "relmap_staging", 0);
+	return false;
+}
+
 bool
 ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
 {
 	struct ClusterRecoveryStartV1 *state;
 	volatile bool candidate = false, observed = false;
+	bool repeated;
 	ClusterRecoveryCensusManifest confirmed;
 
 	if (start == NULL)
@@ -1222,9 +1238,18 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 		cluster_recovery_cold_observation_refuse(state, "owner", 0);
 		return false;
 	}
+	repeated = state->ctrc_observation_started;
+	if (state->relmap_declared) {
+		/* Withdraw a prior local observation before any participant callback.
+		 * Reentry must not borrow it while the physical pair is being checked. */
+		state->ctrc_observation_started = true;
+		state->ctrc_observation_complete = false;
+	}
 	PG_TRY();
 	{
-		if (state->ctrc_observation_started) {
+		if (!cluster_recovery_cold_relmap_recheck(state)) {
+			/* Keep original plan, FD, pins and persistent obligations. */
+		} else if (repeated) {
 			if (cluster_recovery_cold_observation_current(start)
 				&& cluster_recovery_census_manifest(state->ctrc_observation_census, &confirmed)
 				&& memcmp(&confirmed, &state->ctrc_observation_manifest, sizeof(confirmed)) == 0)
@@ -1360,7 +1385,7 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					&& (state->ctrc_references == NULL || state->ctrc_references == references)
 					&& cluster_recovery_census_page_wal_count_v1(state->ctrc_observation_census,
 						&page_wal_count)
-					&& (!state->ctrc_observation_complete
+					&& (!repeated
 						|| page_wal_count == state->ctrc_page_wal_count)
 					&& cluster_recovery_cold_observation_current(start)) {
 					/* PGRAC: a zero PAGE count cannot omit non-PAGE or empty
@@ -1368,8 +1393,9 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					if (cluster_recovery_census_wal_source_count_v1(state->ctrc_observation_census,
 							&wal_source_count)
 						&& wal_source_count != 0 && wal_source_count == confirmed.source_count
-						&& (!state->ctrc_observation_complete
+						&& (!repeated
 							|| wal_source_count == state->ctrc_wal_source_count)
+						&& cluster_recovery_cold_relmap_recheck(state)
 						&& cluster_recovery_cold_observation_current(start)) {
 						state->ctrc_references = references;
 						state->ctrc_pages = pages;
@@ -1387,6 +1413,8 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 	}
 	PG_CATCH();
 	{
+		if (state->relmap_declared)
+			ClusterColdRecoveryRelmapFail(start);
 		cluster_recovery_cold_observation_refuse(state, "error", 0);
 		cluster_recovery_cold_observation_close(state);
 		PG_RE_THROW();

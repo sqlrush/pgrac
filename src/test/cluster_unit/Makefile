@@ -14566,6 +14566,7 @@ test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_early_reten
 test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_handoff.inc
 test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_recheck.inc
 test_cluster_cold_tx_start: test_cluster_cold_tx_relmap_handoff.inc \
+		test_cluster_cold_ctrc_relmap_gate.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
