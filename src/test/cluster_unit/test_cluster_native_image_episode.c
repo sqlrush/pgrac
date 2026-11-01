@@ -255,7 +255,14 @@ UT_TEST(test_image_episode_ACK_and_real_callback_end_only_original_notice)
 	notice = im_notice(); slot = qn_stage();
 	UT_ASSERT_EQ(im_ack(notice), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&slot, true, ++fake_pcm_clock_us));
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose, RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.send.pending, 1);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&f.ticket,
+		true, Max(++fake_pcm_clock_us, f.ticket.last_attempt_us + 1)));
+	UT_ASSERT(!qn_probe(&slot));
 	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose, RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.has_acquire_intent, 0);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.resident_s_authorized, 1);
 	UT_ASSERT_EQ(complete_commits, 1); UT_ASSERT_EQ(disk_reads, 0);
 }
 UT_TEST(test_image_episode_bad_shape_cannot_publish_or_copy)
