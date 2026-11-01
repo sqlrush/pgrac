@@ -156,3 +156,47 @@ clean-k-p130-h03:
 		test_cluster_k_p130_h03_lock.inc test_cluster_k_p130_h03_lock.inc.tmp \
 		test_cluster_k_p130_h03_current.inc test_cluster_k_p130_h03_current.inc.tmp \
 		test_cluster_k_p130_h03_notice.inc test_cluster_k_p130_h03_notice.inc.tmp
+
+.PHONY: k-p130-h04-deps k-p130-h04 clean-k-p130-h04
+k-p130-h04-deps: k-p130-h03-deps
+	$(MAKE) test_cluster_resource_x_pi_handoff
+
+test_cluster_k_p130_h04_current.inc: test_cluster_k_p130_h03.c Makefile.p130_k_matrix
+	awk '/^UT_TEST/ { stop=1; exit } \
+	     /^\trl_start\(1, 2\);/ { sub(/rl_start\(1, 2\)/, "rl_start(2, 2)"); seeds++ } \
+	     /^#include "test_cluster_k_p130_h03_lock.inc"/ { \
+	       print "static bool h04_barrier(BufferTag tag);"; \
+	       print "#define cluster_gcs_block_resource_x_local_s_barrier_active h04_barrier"; \
+	       print; print "#undef cluster_gcs_block_resource_x_local_s_barrier_active"; gates++; next } \
+	     { print } END { if (seeds != 1 || gates != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h04_barrier.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile.p130_k_matrix
+	awk '/^cluster_gcs_block_resource_x_local_s_barrier_active\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ && emit { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h04: test_cluster_k_p130_h04.c test_cluster_k_p130_h04_current.inc \
+		test_cluster_k_p130_h04_barrier.inc \
+		test_cluster_k_p130_h03_request.inc \
+		test_cluster_k_p130_h03_fill.inc test_cluster_k_p130_h03_lock.inc \
+		test_cluster_k_p130_h03_current.inc test_cluster_k_p130_h03_notice.inc \
+		test_cluster_k_p130_h02_three.inc test_cluster_k_p130_h02_leaves.inc \
+		test_cluster_k_p130_h02_wal.inc test_cluster_k_p130_h01_drain.inc k-p130-h04-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H04_CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+k-p130-h04: test_cluster_k_p130_h04
+	./test_cluster_k_p130_h04
+
+clean-k-p130-h04:
+	rm -f test_cluster_k_p130_h04 test_cluster_k_p130_h04_current.inc \
+		test_cluster_k_p130_h04_current.inc.tmp test_cluster_k_p130_h04_barrier.inc \
+		test_cluster_k_p130_h04_barrier.inc.tmp
