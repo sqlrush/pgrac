@@ -288,6 +288,8 @@ static uint64 data_token;
 static uint64 database_incarnation[NROOTS + 1];
 static uint32 scan_space_offset;
 static bool scan_space_drop;
+static bool scan_create_frame; /* decoded metadata seam only, never decoder admission */
+static unsigned create_record_fence_error_after;
 static bool scan_space;					/* thread 2 extends relation 300 before its page record */
 static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
 static bool restart_ref_present;
@@ -498,6 +500,8 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ro
 bool
 cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
 {
+	if (create_record_fence_error_after && --create_record_fence_error_after == 0)
+		siglongjmp(*PG_exception_stack, 1);
 	/* Real revalidation also requires the pass-2 serial set. Pass 1
 	 * may compare exact ROOT inputs, but cannot use execution authority. */
 	return plan != NULL && fence_current && cluster_cold_replay_window_active_v1();
@@ -863,6 +867,12 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	record.components = &component;
 	if (startup_relmap_real_side)
 		record.scn = thread == 2 ? 10 : 30;
+	if (scan_create_frame) {
+		record.rmid = RM_RELMAP_ID;
+		record.info = CLUSTER_RELMAP_CREATE_WAL_INFO_V1;
+		record.component_count = 0;
+		record.components = NULL;
+	}
 	if (scan_relmap_input != NULL && scan_relmap_input->participant == participant) {
 		if (scan_relmap_require_early_binding && (side_plan == NULL || !side_plan->bound))
 			return CLUSTER_COLD_SIDE_OWNER_MISSING;

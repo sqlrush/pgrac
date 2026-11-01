@@ -10,6 +10,7 @@
  *-------------------------------------------------------------------------
  */
 #define TEST_CONTROL_CLOG_PREPARATION 1
+#define TEST_CONTROL_RECOVERY_CREATE 1
 #include "test_cluster_control_native_reservations.c"
 #undef main
 #include "cluster/cluster_relmap_control.h"
@@ -26,7 +27,7 @@ bool cluster_relmap_authority_x_held(void) { return copy_x; }
 bool enableFsync = true;
 volatile uint32 InterruptHoldoffCount;
 static unsigned copy_syncs, fail_sync, drift_sync, copy_closes, fail_close;
-static bool read_error, release_error;
+static bool read_error, release_error, release_error_after;
 static unsigned wal_begins, wal_registers, wal_inserts, wal_flushes;
 static unsigned wal_error_phase, wal_drift;
 static XLogRecPtr wal_result;
@@ -35,6 +36,8 @@ static bool wal_recovery, wal_watch_target, wal_bad_order;
 static unsigned char wal_bytes[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1];
 static ClusterControlNativeRelmapCreateV2 *wal_creator;
 static int target_dir(void);
+static bool recovery_sync_error, recovery_payload_drift;
+static XLogReaderState *recovery_crc_drift;
 
 static void wal_target_still_absent(void)
 {
@@ -78,6 +81,9 @@ static int copy_sync(int fd)
 	++copy_syncs;
 	if (wal_watch_target && wal_flushes!=1) wal_bad_order=true;
 	if (copy_syncs == drift_sync) ++cf_sequence;
+	if (recovery_payload_drift) { recovery_payload_drift=false; wal_bytes[64+128]^=1; }
+	if (recovery_crc_drift) { recovery_crc_drift->record->header.xl_crc^=1; recovery_crc_drift=NULL; }
+	if (recovery_sync_error) { InterruptHoldoffCount=0; pg_re_throw(); }
 	return copy_syncs == fail_sync ? -1 : fsync(fd);
 }
 static int copy_close(int fd)
@@ -120,6 +126,7 @@ void LWLockRelease(LWLock *lock)
 	if (release_error) { release_error=false; InterruptHoldoffCount=0; pg_re_throw(); }
 	held_family_lock = NULL;
 	--InterruptHoldoffCount;
+	if (release_error_after) { release_error_after=false; InterruptHoldoffCount=0; pg_re_throw(); }
 }
 void ExceptionalCondition(const char *condition, const char *file, int line)
 {
@@ -136,10 +143,12 @@ static void copy_begin(void)
 	InterruptHoldoffCount=0; held_family_lock=NULL;
 	copy_x = enableFsync = true;
 	copy_syncs = fail_sync = drift_sync = copy_closes = fail_close = 0;
-	read_error=release_error=false;
+	read_error=release_error=release_error_after=false;
 	wal_begins=wal_registers=wal_inserts=wal_flushes=0;
 	wal_error_phase=wal_drift=0; wal_result=UINT64_C(0x70000A8);
 	wal_recovery=wal_watch_target=wal_bad_order=false; wal_creator=NULL;
+	recovery_sync_error=recovery_payload_drift=false;
+	recovery_crc_drift=NULL;
 	wal_rmid=wal_info=0; memset(wal_bytes,0,sizeof(wal_bytes));
 	snprintf(path, sizeof(path), "%s/base", selection_path);
 	if (mkdir(path,0700)) abort();
@@ -492,8 +501,10 @@ static void creation_native_record(XLogReaderState *reader, DecodedXLogRecord *d
 	memset(reader,0,sizeof(*reader)); memset(decoded,0,sizeof(*decoded));
 	reader->ReadRecPtr=UINT64_C(0x7000000); reader->EndRecPtr=wal_result;
 	reader->record=decoded;
+	reader->system_identifier=11; reader->cluster_expected_thread_id=1; reader->seg.ws_tli=1;
 	decoded->size=sizeof(*decoded); decoded->lsn=reader->ReadRecPtr; decoded->next_lsn=reader->EndRecPtr;
 	decoded->header.xl_rmid=RM_RELMAP_ID; decoded->header.xl_info=CLUSTER_RELMAP_CREATE_WAL_INFO_V1;
+	decoded->header.xl_crc=0x98765432;
 	decoded->main_data=(char *)wal_bytes; decoded->main_data_len=sizeof(wal_bytes); decoded->max_block_id=-1;
 }
 UT_TEST(native_creation_input_uses_original_end_and_independent_reserved_batch)
@@ -549,6 +560,7 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 }
 
 #include "test_cluster_relmap_create_replay.inc"
+#include "test_cluster_relmap_recovery_create.inc"
 
 int main(int argc,char **argv)
 {
@@ -575,5 +587,14 @@ int main(int argc,char **argv)
 	UT_RUN(creation_record_exact_pair_replay_preserves_both_inodes_before_confirmation);
 	UT_RUN(creation_record_wrong_binding_or_end_never_enters_file_replay);
 	UT_RUN(creation_replay_partial_sync_and_late_control_failure_keep_original_debt);
+	UT_RUN(recovery_creation_installs_registered_pair_and_replays_available_without_replacement);
+	UT_RUN(recovery_creation_accepts_exact_unconfirmed_pair_without_overwrite);
+	UT_RUN(recovery_creation_wrong_binding_or_record_has_no_file_effect);
+	UT_RUN(recovery_creation_partial_pair_and_sync_failure_keep_debt_and_refuse_retry);
+	UT_RUN(recovery_creation_late_cf_or_payload_change_cannot_publish);
+	UT_RUN(recovery_creation_error_cleans_only_local_mapping_and_poisoned_authorization);
+	UT_RUN(recovery_creation_confirmation_error_preserves_durable_pair_and_debt);
+	UT_RUN(recovery_creation_original_lock_and_fsync_guards_precede_effects);
+	UT_RUN(recovery_creation_requires_the_original_sealed_native_frame);
 	UT_DONE(); return ut_failed_count!=0;
 }

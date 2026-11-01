@@ -38,6 +38,8 @@
 #include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_control_relmap_recovery.h"
+#include "cluster/cluster_relmap_create_format.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
 #include "utils/relmapper.h"
@@ -4204,9 +4206,20 @@ UT_TEST(test_prepare_ready_and_zero_budget_complete_every_phase)
 	}
 }
 
+#include "test_cluster_cold_relmap_create_record.inc"
+
 int
 main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CREATE_RECORD") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_recovery_create_record_borrows_original_whole_episode);
+		UT_RUN(test_recovery_create_record_refuses_positions_source_and_lost_protection);
+		UT_RUN(test_recovery_create_record_refuses_wrong_kind_or_history);
+		UT_RUN(test_recovery_create_record_profile_error_poison_is_sticky);
+		UT_RUN(test_recovery_create_record_final_fence_error_is_sticky);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_TERMINAL_EPISODE") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
@@ -4309,7 +4322,7 @@ main(void)
 		UT_RUN(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(208);
+	UT_PLAN(213);
 	UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
 	UT_RUN(test_terminal_original_episode_refuses_changed_whole_source_or_owner);
 	UT_RUN(test_pass2_source_drift_waits_for_post_ir_and_never_replays);
@@ -4521,6 +4534,11 @@ main(void)
 	UT_RUN(test_recovery_carrier_refuses_generation_or_source_drift);
 	UT_RUN(test_recovery_does_not_relax_unknown_or_building_ordinary_admission);
 	UT_RUN(test_recovery_transfer_preflights_all_targets_before_retiring_any_pin);
+	UT_RUN(test_recovery_create_record_borrows_original_whole_episode);
+	UT_RUN(test_recovery_create_record_refuses_positions_source_and_lost_protection);
+	UT_RUN(test_recovery_create_record_refuses_wrong_kind_or_history);
+	UT_RUN(test_recovery_create_record_profile_error_poison_is_sticky);
+	UT_RUN(test_recovery_create_record_final_fence_error_is_sticky);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

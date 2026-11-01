@@ -349,6 +349,7 @@ cluster_relmap_control_create_redo_input_v1(XLogReaderState *reader,
 typedef struct RelmapCreateWork
 {
 	ClusterControlRelmapSelectionV2 *selection;
+	ClusterControlRelmapRecoveryCreateV2 *recovery;
 	ClusterControlNativeFileBorrowV2 source, target;
 	ClusterRelmapFilePairV2 source_pair, target_pair;
 	ClusterRecoveryCheckpointFileSourceV2 *sources;
@@ -376,7 +377,7 @@ relmap_create_cleanup(RelmapCreateWork *w, bool error_cleanup)
 		if (!cluster_control_native_file_release_v2(&w->target))
 			elog(PANIC, "could not retire original relmap target borrow");
 	}
-	if (w->mapping) {
+	if (w->mapping && LWLockHeldByMe(RelationMappingLock)) {
 		/* errfinish(ERROR) resets the acquisition's interrupt count. Match
 		 * this retail release as LWLockReleaseAll does, while preserving
 		 * our separate cleanup holdoff. A second ERROR resets again and
@@ -385,6 +386,7 @@ relmap_create_cleanup(RelmapCreateWork *w, bool error_cleanup)
 		w->mapping = false;
 		LWLockRelease(RelationMappingLock);
 	}
+	cluster_control_relmap_recovery_create_destroy_v2(&w->recovery);
 	cluster_control_root_relmap_selection_destroy_v4(&w->selection);
 	if (w->hash) pg_cryptohash_free(w->hash);
 	if (w->sources) pfree(w->sources);
@@ -517,6 +519,129 @@ finished:;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	relmap_create_cleanup(w, false);
+	return ok;
+}
+
+/* The existing native scanner/frame identity, not merely an equal position
+ * or a valid inner RMC1 CRC. Original XLogReader owns native CRC validation. */
+static bool
+relmap_recovery_create_frame(const ClusterColdTypedV1 *typed, uint32 participant,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader)
+{
+	ClusterColdRecordFrameV1 frame;
+	uint32 count, matches = 0;
+	if (!typed->plan || typed->refusal != CLUSTER_COLD_OK || !reader->record
+		|| reader->cluster_record_crc_failed
+		|| reader->system_identifier != source->claim.identity.system_identifier
+		|| reader->cluster_expected_thread_id != source->claim.identity.origin_thread_id
+		|| reader->seg.ws_tli != source->timeline
+		|| !cluster_cold_plan_input_frame_count_v1(typed->plan, &count))
+		return false;
+	for (uint32 i = 0; i < count; ++i) {
+		if (!cluster_cold_plan_input_frame_v1(typed->plan, i, &frame)) return false;
+		if (frame.participant != participant || frame.read_rec_ptr != reader->ReadRecPtr
+			|| frame.end_rec_ptr != reader->EndRecPtr) continue;
+		if (frame.history || frame.page_components || frame.space_effects
+			|| frame.rmid != XLogRecGetRmid(reader) || frame.info != XLogRecGetInfo(reader)
+			|| frame.record_crc != reader->record->header.xl_crc
+			|| frame.source_xid != XLogRecGetXid(reader)
+			|| frame.source_top_xid != XLogRecGetTopXid(reader)) return false;
+		++matches;
+	}
+	return matches == 1;
+}
+
+bool
+cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint32 participant, const ClusterWalSourceRef *source,
+	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16])
+{
+	RelmapCreateWork *w;
+	ClusterControlRelmapFormatV2 format;
+	ClusterRecoveryCheckpointSourceV2 cut;
+	ClusterRelmapCreateReplayV1 reread;
+	volatile bool ok = false;
+
+	if (!typed || !fence || !source || !reader || !expected || !batch
+		|| !cluster_relmap_authority_x_held() || !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| CritSectionCount || !enableFsync || !RecoveryInProgress() || MyBackendType != B_STARTUP
+		|| LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(RelationMappingLock)
+		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactSLRULock)
+		|| LWLockHeldByMe(XactTruncationLock))
+		return false;
+	w = palloc0(sizeof(*w));
+	PG_TRY();
+	{
+		do {
+			uint64 count;
+			/* No runtime creator, current-file batch inference or new scope.
+			 * The original Startup owner independently authenticates the sealed
+			 * record and durable RESERVED/AVAILABLE registration before I/O. */
+			if (!cluster_relmap_control_create_redo_input_v1(reader, expected, batch, &w->creation)
+				|| !relmap_recovery_create_frame(typed, participant, source, reader)
+				|| cluster_control_relmap_recovery_create_begin_locked_v2(typed, fence, participant,
+					source, reader->ReadRecPtr, w->creation.actual_end, expected, batch, &w->recovery) != 0
+				|| cluster_control_root_relmap_format_locked_v2(
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &format) != 0
+				|| format.root_version != 4
+				|| cluster_control_root_relmap_selection_read_locked_v4(&format.config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &w->selection) != 0) break;
+			count = cluster_control_root_relmap_selection_source_count_v4(w->selection);
+			if (!count || count > CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2 / sizeof(*w->sources)) break;
+			w->sources = palloc0(count * sizeof(*w->sources));
+			for (uint64 i = 0; i < count; ++i) {
+				if (!cluster_control_root_relmap_selection_source_at_v4(w->selection, i, &cut)) goto done;
+				w->sources[i] = (ClusterRecoveryCheckpointFileSourceV2){i, cut.redo_start, cut.replay_end};
+			}
+			if (!cluster_control_relmap_recovery_create_current_v2(w->recovery)
+				|| !cluster_relmap_authority_x_held()) break;
+			LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+			w->mapping = true;
+			if (!cluster_control_relmap_recovery_create_current_v2(w->recovery)
+				|| !cluster_relmap_authority_managed_replay_create_v2(&w->creation.record.identity,
+					&w->creation.record.committed, &w->target_pair)
+				|| !cluster_control_relmap_recovery_create_current_v2(w->recovery)
+				|| !cluster_relmap_authority_x_held()) break;
+			for (unsigned i = 0; i < 2; ++i) {
+				ClusterRecoveryCheckpointFileV2 *r = &w->receipts[i];
+				r->identity = w->creation.record.identity;
+				r->synced_bytes = sizeof(w->target_pair.bytes[i]);
+				r->page_count = 1;
+				r->copy_index = i;
+				r->copy_count = 2;
+				r->source_count = count;
+				r->sources = w->sources;
+				w->hash = pg_cryptohash_create(PG_SHA256);
+				if (!w->hash || pg_cryptohash_init(w->hash) < 0
+					|| pg_cryptohash_update(w->hash, w->target_pair.bytes[i], sizeof(w->target_pair.bytes[i])) < 0
+					|| pg_cryptohash_final(w->hash, r->image_digest, sizeof(r->image_digest)) < 0) goto done;
+				pg_cryptohash_free(w->hash); w->hash = NULL;
+			}
+			/* Retain the acquired flag across a fallible release. Cleanup
+			 * checks actual ownership so an interrupt after unlock cannot
+			 * release another lock or decrement its holdoff twice. */
+			LWLockRelease(RelationMappingLock);
+			w->mapping = false;
+			if (!cluster_control_relmap_recovery_create_current_v2(w->recovery)
+				|| !cluster_relmap_authority_x_held() || !enableFsync
+				|| !cluster_relmap_control_create_redo_input_v1(reader, expected, batch, &reread)
+				|| !relmap_recovery_create_frame(typed, participant, source, reader)
+				|| memcmp(&reread, &w->creation, sizeof(reread))
+				|| cluster_control_root_relmap_selection_recheck_locked_v4(w->selection) != 0) break;
+			ok = cluster_control_relmap_recovery_create_confirm_locked_v2(w->recovery, w->receipts, 2) == 0
+				&& cluster_relmap_authority_x_held();
+		} while (0);
+done:;
+	}
+	PG_CATCH();
+	{
+		cluster_cold_typed_relmap_create_failed_v2(typed);
+		relmap_create_cleanup(w, true);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok) cluster_cold_typed_relmap_create_failed_v2(typed);
 	relmap_create_cleanup(w, false);
 	return ok;
 }

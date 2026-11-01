@@ -15,6 +15,7 @@
 
 #include "cluster/cluster_control_file_identity.h"
 #include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_control_relmap_recovery.h"
 #include "common/cluster_relmap_file.h"
 #include "common/cluster_relmap_create.h"
 #include "access/xlogreader.h"
@@ -64,6 +65,21 @@ extern bool cluster_relmap_control_copy_create_v2(ClusterControlNativeRelmapCrea
 extern bool cluster_relmap_control_create_redo_input_v1(XLogReaderState *,
 	const ClusterRecoveryFileIdentityV2 *, const uint8 batch_uuid[16],
 	ClusterRelmapCreateReplayV1 *out);
+
+/* Dormant original Startup executor. Caller retains SAME global relmap X,
+ * CF-X, complete IR/WALR/isolation and target file lifetime. Enter before
+ * MappingLock and the other native family locks. Strictly validate the current
+ * native record against independent expected/batch and the original sealed
+ * scanner frame CRC/XIDs/full source, then acquire the original
+ * recovery authorization before MappingLock. Replay missing or exact existing
+ * clean generation-one pairs only; confirm two real sync/full-read receipts
+ * after MappingLock release. An entered refusal/ERROR poisons that episode and
+ * keeps durable files, registration and all original protections/debt. No new
+ * WAL, role, scope/pin, retry, rmgr activation or OPEN qualification. AVAILABLE
+ * repeats still require the original persisted batch and exact pair receipts. */
+extern bool cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *, uint32 participant, const ClusterWalSourceRef *,
+	XLogReaderState *, const ClusterRecoveryFileIdentityV2 *, const uint8 batch_uuid[16]);
 
 /* Original checkpoint-local copies, never CF custody or a coverage grant.
  * The later original publisher reads a NEW selection under its own CF interval

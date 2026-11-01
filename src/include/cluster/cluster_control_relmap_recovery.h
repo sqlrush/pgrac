@@ -1,0 +1,48 @@
+/* Recovery creation borrows the original typed episode, never a runtime creator. */
+#ifndef CLUSTER_CONTROL_RELMAP_RECOVERY_H
+#define CLUSTER_CONTROL_RELMAP_RECOVERY_H
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_cold_recovery.h"
+
+typedef struct ClusterControlRelmapRecoveryCreateV2 ClusterControlRelmapRecoveryCreateV2;
+/* Same original CF-X, complete IR/WALR and isolated-source custody span begin,
+ * target I/O and confirm. Call before MappingLock; this never acquires CF.
+ * source and actual record positions must match the original sealed plan.
+ * expected/batch must independently match durable control registration.
+ * Fresh *out is NULL; refusal/ERROR never publishes an authorization.
+ * AVAILABLE requires the original batch retained in its coverage. */
+extern ClusterControlNativeResultV2 cluster_control_relmap_recovery_create_begin_locked_v2(
+	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint32 participant,
+	const ClusterWalSourceRef *, XLogRecPtr read_rec_ptr, XLogRecPtr end_rec_ptr,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch_uuid[16],
+	ClusterControlRelmapRecoveryCreateV2 **out);
+/* Local-only check under the original MappingLock/I/O lifetime; no ROOT I/O.
+ * A copy of the opaque carrier is never authority. */
+extern bool
+cluster_control_relmap_recovery_create_current_v2(ClusterControlRelmapRecoveryCreateV2 *);
+/* After original MappingLock release, consume exactly two complete real pair
+ * receipts once. Only the existing immutable registry writer changes RESERVED
+ * to AVAILABLE; no scope/pin is created or released. False/ERROR retains debt
+ * and revokes this original episode. Repeating an AVAILABLE record needs the
+ * exact durable batch plus unchanged complete receipts, never current-file
+ * backfill. A confirmation grants no recovery/OPEN/lifetime qualification. */
+extern ClusterControlNativeResultV2 cluster_control_relmap_recovery_create_confirm_locked_v2(
+	ClusterControlRelmapRecoveryCreateV2 *, const ClusterRecoveryCheckpointFileV2 *, uint64 count);
+/* Failure/destroy retire local metadata only; no cancellation or file removal.
+ * Destroy an unconfirmed authorization also fails the original episode. */
+extern void cluster_control_relmap_recovery_create_fail_v2(ClusterControlRelmapRecoveryCreateV2 *);
+extern void
+cluster_control_relmap_recovery_create_destroy_v2(ClusterControlRelmapRecoveryCreateV2 **);
+/* Original Startup owner checks, not caller-provided authority callbacks. */
+extern bool cluster_cold_typed_relmap_create_record_current_v2(ClusterColdTypedV1 *,
+															   struct ClusterRecoveryFencePlan *,
+															   uint32 participant,
+															   const ClusterWalSourceRef *,
+															   XLogRecPtr, XLogRecPtr);
+extern bool cluster_cold_typed_relmap_create_record_held_v2(ClusterColdTypedV1 *,
+															struct ClusterRecoveryFencePlan *,
+															uint32 participant,
+															const ClusterWalSourceRef *, XLogRecPtr,
+															XLogRecPtr);
+extern void cluster_cold_typed_relmap_create_failed_v2(ClusterColdTypedV1 *);
+#endif

@@ -16321,3 +16321,17 @@ test_cluster_relmap_create_copy test_cluster_relmap_control: \
         $(top_srcdir)/src/include/common/cluster_relmap_create.h \
         $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
         $(top_srcdir)/src/include/access/xlog.h $(top_srcdir)/src/include/access/xloginsert.h
+
+# Recovery authorization shares the original real ROOT/registry creator target.
+test_cluster_control_relmap_creation: test_cluster_control_relmap_recovery.inc $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h
+
+test_cluster_cold_recovery_startup: test_cluster_cold_relmap_create_record.inc $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+
+cluster_registry_common_test.o test_cluster_recovery_registry test_cluster_recovery_reservations: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h $(top_srcdir)/src/include/common/cluster_recovery_registry.h
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h
+
+test_cluster_relmap_create_copy: test_cluster_relmap_recovery_create.inc \
+        $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
