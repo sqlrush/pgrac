@@ -941,21 +941,35 @@ undo_buf_sync_headers(void)
 		uint32 segment_id = 0;
 		uint8 owner_instance = 0;
 		uint32 intents;
+		volatile bool synced = false;
 
 		intents = cluster_undo_block0_take_unsynced_headers(slotno, &segment_id, &owner_instance);
-		for (uint32 intent = 0; intents != 0 && intent < 32; intent++) {
-			if ((intents & (UINT32_C(1) << intent)) == 0
-				|| cluster_undo_smgr_fsync_header((ClusterUndoPathIntent)intent, segment_id,
-												  owner_instance))
-				continue;
-			cluster_undo_block0_return_unsynced_headers(slotno, intents);
-			ereport(
-				data_sync_elevel(ERROR),
-				(errcode_for_file_access(),
-				 errmsg("could not fsync undo segment %u header for checkpoint: %m", segment_id),
-				 errhint("The checkpoint cannot complete until the undo segment file is "
-						 "durable.")));
+		if (intents == 0)
+			continue;
+		PG_TRY();
+		{
+			for (uint32 intent = 0; intent < 32; intent++) {
+				if ((intents & (UINT32_C(1) << intent)) == 0
+					|| cluster_undo_smgr_fsync_header((ClusterUndoPathIntent)intent, segment_id,
+													  owner_instance))
+					continue;
+				ereport(
+					data_sync_elevel(ERROR),
+					(errcode_for_file_access(),
+					 errmsg("could not fsync undo segment %u header for checkpoint: %m", segment_id),
+					 errhint("The checkpoint cannot complete until the undo segment file is "
+							 "durable.")));
+			}
+			synced = true;
 		}
+		PG_FINALLY();
+		{
+			/* Direct ERRORs must preserve the taken debt too. OR it back so
+			 * writes recorded during this I/O remain pending independently. */
+			if (!synced)
+				cluster_undo_block0_return_unsynced_headers(slotno, intents);
+		}
+		PG_END_TRY();
 	}
 }
 
