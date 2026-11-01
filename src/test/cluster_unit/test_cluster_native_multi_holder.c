@@ -264,10 +264,11 @@ static bool mh_holder(int master, int requester, int mode, int node)
 	mh_sent = 0;
 	base = cluster_pcm_own_gen_get(0); UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
 	holder_pins = holder_fuses = 0; holder_content_busy = false; holder_after_prepare = NULL;
-	holder_peer_current = true; holder_write_error = false; holder_requester_connection = 61; holder_requester_node = 1;
+	holder_peer_current = true; holder_write_error = false; holder_requester_connection = 61;
 	holder_io_enters = holder_io_ends = holder_interrupt_repairs = holder_interrupt_releases = 0;
 	MyBackendType = B_LMS;
 	NM_REQUIRE(nm_receive(master, RESOURCE_X_MSG_BLOCK_TO_N, &block)); f.block = block;
+	holder_requester_node = block.common.logical_assertion.requester_node;
 	NM_REQUIRE(cluster_pcm_lock_resource_x_gate_snapshot(&f.gate));
 	NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&block, 0, 77, 61) == RESOURCE_X_APPLY_APPLIED);
 	NM_REQUIRE(holder_probe(&f.work));
