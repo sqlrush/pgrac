@@ -9208,9 +9208,10 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	if (!cluster_cold_typed_relmap_ready_v1(rep->typed, plan))
 		cluster_typed_replay_unpublished(thread,
 			"Declared relmap receipts or their original protection are incomplete", 0);
-	/* The real terminal reader needs the original replay scope, before its
-	 * IR release and the later installed writer exist. Keep only its typed
-	 * receipt/FD across that boundary; Start binds the successor once. */
+	/* Capture from the completed original episode before IR release and
+	 * before the later installed writer exists. Per-record native scopes
+	 * have ended; keep only the typed receipt/FD across this boundary.
+	 * Start binds the successor once. */
 	relmap_count = cluster_cold_typed_relmap_replay_count_v1(rep->typed);
 	if (relmap_count == UINT32_MAX
 		|| (relmap_count != 0 && !cluster_cold_relmap_terminal_capture_v1(rep->typed, plan)))

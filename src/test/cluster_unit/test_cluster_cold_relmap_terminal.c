@@ -8,6 +8,8 @@ int terminal_retained_fixture_main(int argc, char **argv);
 #include "cluster/cluster_recovery_plan.h"
 #include "test_cluster_cold_relmap_terminal_namespace.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
+#include "cluster/cluster_thread_recovery.h"
+#include "cluster/cluster_ir.h"
 #ifdef TEST_TERMINAL_REAL_START
 #include "test_cluster_relmap_original_start.h"
 static bool terminal_real_start;
@@ -48,6 +50,8 @@ static ClusterColdPlanV1 terminal_plan;
 static ColdRelmapInput terminal_input;
 static ClusterRelmapRecoveryPins terminal_pins;
 static ClusterRecoveryCheckpointOwnerV1 terminal_owner;
+static ClusterRecoverySerialGuard terminal_serial;
+static bool terminal_episode_complete, terminal_episode_drift, terminal_episode_error;
 static bool terminal_current, terminal_revoked, terminal_throw;
 static bool terminal_capture_throw_after_detach;
 static unsigned terminal_writer_calls, terminal_current_calls;
@@ -99,6 +103,7 @@ const ClusterColdTypedV1 *terminal_start_inputs(const struct ClusterRecoveryStar
 bool terminal_start_owner(const struct ClusterRecoveryStartV1 *start, ClusterRecoveryCheckpointOwnerV1 *out);
 bool terminal_installed_writer(ClusterWalWriterToken *writer, uint8 operation[16], uint64 *generation);
 bool terminal_sources_current(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence);
+bool test_terminal_saved_native(const ClusterColdPlanV1 *plan);
 bool terminal_side_input(const RfSideOnlinePlanV1 *side, const ClusterColdRelmapInputV1 *input);
 uint32 terminal_side_count(const RfSideOnlinePlanV1 *side, const ClusterWalSourceRef *source);
 void terminal_held_locks(void (*callback)(LWLock *, LWLockMode, void *), void *arg);
@@ -149,7 +154,8 @@ bool terminal_installed_writer(ClusterWalWriterToken *writer, uint8 operation[16
 }
 bool terminal_sources_current(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
 {
-	if (terminal_capture_throw_after_detach && terminal_last_native != NULL)
+	if (terminal_capture_throw_after_detach && terminal_last_native != NULL
+		&& test_terminal_saved_native(&terminal_plan))
 		siglongjmp(*PG_exception_stack, 1);
 	return typed == &terminal_typed && fence == terminal_fence && terminal_current
 		&& memcmp(&typed->sources[0], &prefix_base_expected.source, sizeof(ClusterWalSourceRef)) == 0;
@@ -170,6 +176,58 @@ uint32 terminal_side_count(const RfSideOnlinePlanV1 *side, const ClusterWalSourc
 void terminal_held_locks(void (*callback)(LWLock *, LWLockMode, void *), void *arg)
 {
 	(void)callback; (void)arg;
+}
+
+bool terminal_episode_authority(ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint32, ClusterThreadRecoveryAuthorityV1 *);
+bool terminal_episode_visit(ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint32, ClusterUndoRecoveryCheckpointVisitorV1, void *);
+
+/* The original typed/fence authority leaf is controlled; the underlying
+ * ROOT/token visitor, scanner, SIDE, CLOG and SLRU remain the real bodies. */
+bool terminal_episode_authority(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence,
+	uint32 participant, ClusterThreadRecoveryAuthorityV1 *out)
+{
+	if (terminal_episode_error) siglongjmp(*PG_exception_stack, 1);
+	if (terminal_episode_drift && test_relmap_native_clog_stats().calls != 0)
+		terminal_serial.lock_request.request_id++;
+	if (!terminal_episode_complete || participant != 0 || !terminal_sources_current(typed, fence)
+		|| !terminal_serial.held || terminal_serial.release_uncertain)
+		return false;
+	*out = cold_original_authority;
+	out->serial_guard = &terminal_serial;
+	return true;
+}
+typedef struct TerminalEpisodeVisit { ClusterUndoRecoveryCheckpointVisitorV1 visitor; void *arg; } TerminalEpisodeVisit;
+static bool terminal_episode_record(XLogReaderState *reader, void *arg)
+{
+	TerminalEpisodeVisit *work = arg;
+	ClusterWalRecoveryCheckpointV1 cp;
+	ClusterControlRootSnapshot root;
+	if (!terminal_checkpoint(&terminal_typed, 0, &root, &cp)) return false;
+	return work->visitor(&cp, &root, terminal_serial.lock_request.request_id, reader, work->arg);
+}
+bool terminal_episode_visit(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence,
+	uint32 participant, ClusterUndoRecoveryCheckpointVisitorV1 visitor, void *arg)
+{
+	ClusterThreadRecoveryAuthorityV1 authority;
+	ClusterWalTailObservation observed = {0};
+	TerminalEpisodeVisit work = {visitor, arg};
+	return terminal_episode_authority(typed, fence, participant, &authority)
+		&& cluster_control_root_recovery_visit(&execution_root, &execution_token,
+			terminal_episode_record, &work, &observed) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& observed.complete_end == execution_root.validated_tail_lsn_exclusive
+		&& terminal_episode_authority(typed, fence, participant, &authority);
+}
+bool cluster_clog_native_episode_read_v1(int origin, TransactionId xid, ClusterClogNativeBaseV1 *out,
+	ClusterClogNativeBaseHandleV1 **held, const ClusterRelmapTerminalEpisodeV1 *episode)
+{
+	prefix_base_reads++;
+	return test_relmap_native_clog_episode_read(origin, xid, out, PG_exception_stack, held, episode);
+}
+bool cluster_clog_native_episode_seal_v1(ClusterClogNativeBaseHandleV1 *held,
+	const ClusterRelmapTerminalEpisodeV1 *episode)
+{
+	terminal_last_native = held;
+	return test_relmap_native_clog_episode_seal(held, episode);
 }
 
 static void terminal_setup(bool aborted)
@@ -229,6 +287,12 @@ static void terminal_setup(bool aborted)
 	terminal_current = true; terminal_revoked = terminal_throw = false;
 	terminal_last_native = NULL; terminal_capture_throw_after_detach = false;
 	terminal_writer_calls = terminal_current_calls = 0;
+	memset(&terminal_serial, 0, sizeof(terminal_serial));
+	terminal_serial.held = true;
+	terminal_serial.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+	terminal_serial.lock_request.request_id = 23;
+	terminal_episode_complete = true;
+	terminal_episode_drift = terminal_episode_error = false;
 }
 
 static void terminal_leave(void)
@@ -585,11 +649,88 @@ UT_TEST(test_terminal_original_start_missing_capture_refuses)
 }
 #endif
 
+/* The complete replay episode still owns IR/WALR after the last record's
+ * native scope has left. Ordinary scanner permission must remain closed. */
+static void terminal_capture_after_record_scope(bool aborted)
+{
+	ClusterRelmapRecoveryHandle *old = NULL;
+	ClusterRelmapV2View view = {0};
+	bool captured;
+	terminal_setup(aborted);
+	view.committed = view.pending_committed = custody_image.committed;
+	view.committed_generation = view.pending_committed_generation = custody_image.committed_generation;
+	view.pending = custody_image.pending;
+	view.pending_generation = custody_image.pending_generation;
+	view.pending_owner = custody_image.pending_owner;
+	view.pending_complete = view.has_pending = true;
+	UT_ASSERT(cluster_relmap_recovery_prepare_cold_v1(&custody_image.identity, &view, &old));
+	UT_ASSERT(old != NULL);
+	cluster_relmap_recovery_handle_release_v1(&old);
+	cluster_undo_recovery_scope_leave_v1(&cold_original_scope);
+	UT_ASSERT_EQ(cold_original_id(), 0);
+	UT_ASSERT(!cluster_relmap_recovery_prepare_cold_v1(&custody_image.identity, &view, &old));
+	UT_ASSERT(old == NULL);
+	captured = cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence);
+	UT_ASSERT(captured);
+	if (captured) {
+		ClusterColdRelmapTerminalCheckV1 *out = calloc(1, sizeof(*out));
+		terminal_leave();
+		UT_ASSERT(cluster_cold_relmap_terminal_recheck_v1(terminal_start, out));
+		UT_ASSERT_EQ(out->count, 1);
+		UT_ASSERT_EQ(out->entries[0].status, aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED);
+		free(out);
+	}
+	UT_ASSERT(!terminal_pins.transferred && terminal_pins.count == 1);
+	UT_ASSERT(!cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+	terminal_done();
+}
+UT_TEST(test_terminal_episode_after_scope_commit) { terminal_capture_after_record_scope(false); }
+UT_TEST(test_terminal_episode_after_scope_abort) { terminal_capture_after_record_scope(true); }
+
+UT_TEST(test_terminal_episode_requires_completed_current_ir)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		terminal_setup(false);
+		cluster_undo_recovery_scope_leave_v1(&cold_original_scope);
+		if (fault == 0) terminal_episode_complete = false;
+		if (fault == 1) terminal_serial.held = false;
+		if (fault == 2) terminal_serial.release_uncertain = true;
+		UT_ASSERT(!cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+		UT_ASSERT(terminal_plan.relmap_failed && !terminal_pins.transferred && terminal_pins.count == 1);
+		UT_ASSERT_EQ(test_relmap_native_clog_stats().calls, 0);
+		UT_ASSERT(!cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+		terminal_done();
+	}
+}
+UT_TEST(test_terminal_episode_late_ir_or_error_keeps_debt)
+{
+	for (unsigned fault = 0; fault < 2; ++fault) {
+		bool threw = false;
+		terminal_setup(false);
+		cluster_undo_recovery_scope_leave_v1(&cold_original_scope);
+		terminal_episode_drift = fault == 0; terminal_episode_error = fault == 1;
+		PG_TRY();
+		{ UT_ASSERT(!cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence)); }
+		PG_CATCH();
+		{ threw = true; }
+		PG_END_TRY();
+		UT_ASSERT_EQ(threw, fault == 1);
+		UT_ASSERT(terminal_plan.relmap_failed && terminal_plan.relmap_terminal_attempted);
+		UT_ASSERT(!terminal_pins.transferred && terminal_pins.count == 1);
+		UT_ASSERT(!cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+		terminal_done();
+	}
+}
+
 int main(int argc, char **argv)
 {
 	test_program_path = argv[0]; setup_fixture();
 #ifdef TEST_TERMINAL_REAL_START
-	UT_PLAN(4);
+	UT_PLAN(8);
+	UT_RUN(test_terminal_episode_after_scope_commit);
+	UT_RUN(test_terminal_episode_after_scope_abort);
+	UT_RUN(test_terminal_episode_requires_completed_current_ir);
+	UT_RUN(test_terminal_episode_late_ir_or_error_keeps_debt);
 	UT_RUN(test_terminal_original_start_commit_abort_and_repeat);
 	UT_RUN(test_terminal_original_start_drift_keeps_debt);
 	UT_RUN(test_terminal_original_start_full_alias_guard);
@@ -602,7 +743,11 @@ int main(int argc, char **argv)
 		UT_RUN(test_terminal_start_extent_alias_before_providers);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(11);
+	UT_PLAN(15);
+	UT_RUN(test_terminal_episode_after_scope_commit);
+	UT_RUN(test_terminal_episode_after_scope_abort);
+	UT_RUN(test_terminal_episode_requires_completed_current_ir);
+	UT_RUN(test_terminal_episode_late_ir_or_error_keeps_debt);
 	UT_RUN(test_terminal_capture_handoff_real_commit_abort);
 	UT_RUN(test_terminal_missing_and_wrong_stage_refuse);
 	UT_RUN(test_terminal_drift_and_late_error_keep_original_debt);

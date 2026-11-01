@@ -15674,3 +15674,18 @@ clean: clean-cold-terminal-checkpoint
 clean-cold-terminal-checkpoint:
 	rm -f test_cluster_cold_terminal_checkpoint.inc test_cluster_cold_terminal_checkpoint.inc.tmp
 	rm -f test_cluster_cold_start_terminal_clog.o
+
+# The private terminal episode is shared by the original reader and participant.
+test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_product.o \
+ test_cluster_cold_relmap_terminal_start test_cluster_cold_relmap_executor.o \
+ test_cluster_cold_startup_relmap_executor.o test_cluster_cold_ctrc_relmap_executor.o \
+ test_cluster_cold_recovery_startup_core.o \
+ $(top_builddir)/src/backend/access/transam/clog.o \
+ $(top_builddir)/src/backend/cluster/cluster_cold_recovery_startup.o \
+ $(top_builddir)/src/backend/cluster/cluster_cold_recovery_relmap.o: \
+ $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
+
+test_cluster_relmap_retained_wal: $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
+
+test_cluster_cold_recovery_startup: test_cluster_cold_terminal_episode.inc \
+ $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h

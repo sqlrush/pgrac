@@ -99,6 +99,7 @@ test_relmap_native_clog_setup(const char *root, int origin, TransactionId xid, X
 	cluster_shared_data_dir = fixture_root;
 	cluster_node_id = origin == 0 ? 1 : 0;
 	fixture_origin = origin;
+	MyBackendType = B_STARTUP;
 	base_fixture = authority = true;
 	relmap_native_calls = relmap_native_fault = relmap_native_on_call = 0;
 	syncs = dirsyncs = writes = ut_current_failed = 0;
@@ -210,3 +211,15 @@ void test_relmap_native_clog_reopen_fault(ClusterClogNativeBaseHandleV1 *held, u
 	}
 	UT_ASSERT_EQ(OpenTransientFile(relmap_native_path, O_RDWR), fd);
 }
+
+bool test_relmap_native_clog_episode_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *out,
+	sigjmp_buf *outer_stack, ClusterClogNativeBaseHandleV1 **held, const ClusterRelmapTerminalEpisodeV1 *episode)
+{
+	relmap_native_calls++;
+	PG_exception_stack = outer_stack;
+	if (relmap_native_calls == relmap_native_on_call) relmap_native_apply_fault();
+	return cluster_clog_native_episode_read_v1(origin, xid, out, held, episode);
+}
+bool test_relmap_native_clog_episode_seal(ClusterClogNativeBaseHandleV1 *held,
+	const ClusterRelmapTerminalEpisodeV1 *episode)
+{ return cluster_clog_native_episode_seal_v1(held, episode); }

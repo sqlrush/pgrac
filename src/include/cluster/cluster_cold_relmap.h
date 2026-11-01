@@ -31,6 +31,9 @@ typedef struct ClusterColdRelmapTerminalCheckV1 {
 	ClusterColdRelmapTerminalEntryV1 entries[CLUSTER_COLD_RELMAP_MAX_INPUTS];
 } ClusterColdRelmapTerminalCheckV1;
 struct ClusterRecoveryStartV1;
+/* After complete replay and before publication, under the original
+ * typed/fence full-source IR/WALR episode. Per-record native scopes may
+ * have left. One attempt; failure retains original protection/debt. */
 extern bool cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence);
 extern bool cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
