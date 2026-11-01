@@ -20,6 +20,7 @@
 
 #include "cluster/cluster_savepoint_reader.h"
 #include "cluster/cluster_r4_operation.h"
+#include "cluster/cluster_mx_history_record.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -511,6 +512,275 @@ savepoint_reader_head_matches(const ClusterItlSlotData *head, const BufferTag *t
 		return role && request_role && entry->slot_index == locator->itl_slot_index
 			   && head->wrap == wrap && head->write_scn == entry->after_write_scn;
 	}
+	return false;
+}
+
+/* Decode an addressed history record, including non-page predecessors.
+ * GLOBAL_PREV deliberately has no ITL slot: validate its physical envelope
+ * here without relaxing the original ITL-only validator or inventing a head. */
+static bool
+history_record_decode(const ClusterMxHistoryRequest *request, const UndoRecordHeader *header,
+					  const char *body, size_t length, uint16 offset, ClusterMxHistoryRecord *out)
+{
+	ClusterMxHistoryRecord record = { 0 };
+	ClusterSavepointReaderIdentity *identity = &record.identity;
+	ClusterUndoRecordTarget target;
+	BufferTag tag;
+	uint32 segment, block;
+	uint16 tt, row;
+	bool owner;
+	NodeId origin;
+
+	if (request == NULL || header == NULL || body == NULL
+		|| length != sizeof(*header) + (size_t)header->payload_length || length > BLCKSZ
+		|| offset < sizeof(UndoBlockHeader) || offset > BLCKSZ - length
+		|| request->edge_kind < CMXH_ROOT || request->edge_kind > CMXH_PAGE_PRIOR
+		|| (request->flags
+			& ~(CLUSTER_MX_HISTORY_EXPECT_OWNER | CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION))
+			   != 0
+		|| !TransactionIdIsNormal(request->locator.xid)
+		|| !uba_decode_record(request->locator.uba, &segment, &block, &tt, &row)
+		|| (origin = uba_origin_node_id(request->locator.uba)) == InvalidNodeId
+		|| header->origin_node_id != origin || header->tt_slot_segment_id == 0
+		|| header->tt_slot_segment_id > PG_UINT16_MAX
+		|| (header->tt_slot_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != origin
+		|| header->tt_slot_id != (uint32)tt + 1 || header->tt_wrap_plus1 == 0
+		|| (uint32)header->tt_wrap_plus1 - 1 > TT_WRAP_MAX
+		|| (request->locator.tt_wrap != TT_WRAP_INVALID
+			&& request->locator.tt_wrap != header->tt_wrap_plus1 - 1)
+		|| !SCN_VALID(header->write_scn)
+		|| !savepoint_reader_prev_address_valid(request->locator.uba, header))
+		return false;
+	identity->canonical = (ClusterTTSlotPhysicalLocator){ .segment_id = header->tt_slot_segment_id,
+														  .xid = request->locator.xid,
+														  .slot_offset = tt,
+														  .wrap = header->tt_wrap_plus1 - 1 };
+	owner = (request->flags & CLUSTER_MX_HISTORY_EXPECT_OWNER) != 0;
+	if (owner
+		&& (request->expected_owner.reserved32 != 0
+			|| memcmp(&identity->canonical, &request->expected_owner, sizeof(identity->canonical))
+				   != 0
+			|| request->expected_owner_generation == PG_UINT32_MAX
+			|| !FullTransactionIdIsNormal(request->expected_top_fxid)
+			|| U64FromFullTransactionId(request->expected_top_fxid) == UINT64_MAX
+			|| XidFromFullTransactionId(request->expected_top_fxid) != identity->canonical.xid))
+		return false;
+
+	if (header->record_type == UNDO_RECORD_SAVEPOINT_ROLLBACK) {
+		if (!cluster_undo_record_decode_rollback_payload(header, body, header->payload_length,
+														 &record.control, &record.payload.operation)
+			|| record.control.phase == UNDO_SAVEPOINT_ROLLBACK_RESERVED)
+			return false;
+		record.record_class = CMXH_ROLLBACK_CONTROL;
+		record.payload.body_length = sizeof(record.control);
+	} else {
+		target = (ClusterUndoRecordTarget){ .locator = header->target_locator,
+											.forknum = header->target_fork,
+											.blockno = header->target_block,
+											.offnum = header->target_offset };
+		if (!savepoint_mx_target_valid(&target) || !(header->flags & UNDO_REC_FLAG_HAS_ITL_HISTORY))
+			return false;
+		if (header->flags & UNDO_REC_FLAG_HAS_OPERATION) {
+			if (!cluster_undo_record_decode_operation_payload(
+					header, body, header->payload_length, &record.payload.body_length,
+					&record.payload.history, &record.payload.operation))
+				return false;
+			record.record_class = CMXH_OPERATION;
+			record.effect = record.payload.operation.effect_state;
+		} else {
+			if (header->xid != identity->canonical.xid
+				|| !cluster_undo_record_decode_payload(header, body, header->payload_length,
+													   &record.payload.body_length,
+													   &record.payload.history))
+				return false;
+			record.record_class = CMXH_V1_TOP;
+			record.effect = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+			identity->command_id = InvalidCommandId;
+			identity->subid = TopSubTransactionId;
+			/* No epoch is discovered from a V1 raw xid or a caller's claim. */
+			record.canonical_generation_known = owner;
+			if (owner)
+				identity->canonical_generation = request->expected_owner_generation;
+		}
+		target = (ClusterUndoRecordTarget){ .locator = request->target_locator,
+											.forknum = request->target_fork,
+											.blockno = request->target_block,
+											.offnum = request->target_offset };
+		if (!savepoint_mx_target_valid(&target))
+			return false;
+		record.matches_target = savepoint_mx_target_matches(&target, header, body);
+	}
+	if (record.record_class != CMXH_V1_TOP) {
+		const UndoOperationTrailer *operation = &record.payload.operation;
+		identity->canonical_generation = operation->canonical_segment_generation;
+		identity->top_fxid = FullTransactionIdFromU64(operation->canonical_top_fxid);
+		identity->operation_fxid = FullTransactionIdFromU64(operation->operation_fxid);
+		identity->operation_sequence = operation->operation_sequence;
+		identity->command_id = operation->command_id;
+		identity->subid = operation->subid;
+		record.canonical_generation_known = true;
+		if (XidFromFullTransactionId(identity->top_fxid) != identity->canonical.xid
+			|| operation->canonical_top_fxid == UINT64_MAX
+			|| operation->operation_fxid == UINT64_MAX
+			|| (owner
+				&& (identity->canonical_generation != request->expected_owner_generation
+					|| !FullTransactionIdEquals(identity->top_fxid, request->expected_top_fxid))))
+			return false;
+	}
+	if (request->edge_kind == CMXH_GLOBAL_PREV) {
+		ClusterItlSlotData zero = { 0 };
+		if (!owner || request->locator.tt_wrap == TT_WRAP_INVALID || request->locator.itl_kind != 0
+			|| request->locator.itl_slot_index != 255 || request->edge_itl_slot != 255
+			|| memcmp(&request->edge, &zero, sizeof(zero)) != 0)
+			return false;
+	} else {
+		tag = (BufferTag){ .spcOid = request->target_locator.spcOid,
+						   .dbOid = request->target_locator.dbOid,
+						   .relNumber = request->target_locator.relNumber,
+						   .forkNum = request->target_fork,
+						   .blockNum = request->target_block };
+		if (record.record_class == CMXH_ROLLBACK_CONTROL || request->edge_itl_slot >= 8
+			|| request->locator.itl_slot_index != request->edge_itl_slot
+			|| request->edge.flags != request->locator.itl_kind
+			|| header->target_locator.spcOid != tag.spcOid
+			|| header->target_locator.dbOid != tag.dbOid
+			|| header->target_locator.relNumber != tag.relNumber
+			|| header->target_fork != tag.forkNum
+			|| !savepoint_reader_head_matches(&request->edge, &tag, &request->locator,
+											  &record.payload.history))
+			return false;
+	}
+	record.header = *header;
+	record.record_offset = offset;
+	record.record_length = length;
+	*out = record;
+	return true;
+}
+
+bool
+cluster_mx_history_record_capture(const ClusterMxHistoryRequest *request, const char page[BLCKSZ],
+								  char record_out[BLCKSZ], ClusterMxHistoryRecord *out)
+{
+	UndoRecordHeader header;
+	UndoSlotDirEntry slot;
+	ClusterMxHistoryRecord record;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (record_out != NULL)
+		memset(record_out, 0, BLCKSZ);
+	if (request == NULL || page == NULL || record_out == NULL || out == NULL
+		|| !savepoint_reader_record(&request->locator, page, &header, &slot)
+		|| !history_record_decode(request, &header, page + slot.record_offset + sizeof(header),
+								  slot.record_length, slot.record_offset, &record))
+		return false;
+	memcpy(record_out, page + slot.record_offset, slot.record_length);
+	*out = record;
+	return true;
+}
+
+bool
+cluster_mx_history_record_bind_top(const ClusterMxHistoryRequest *request,
+								   const ClusterMxHistoryRecord *record,
+								   const ClusterTxResolution *top,
+								   ClusterSavepointReaderIdentity *out)
+{
+	ClusterSavepointReaderIdentity identity;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (request == NULL || record == NULL || top == NULL || out == NULL
+		|| record->record_class < CMXH_V1_TOP || record->record_class > CMXH_ROLLBACK_CONTROL
+		|| !top->local_canonical_valid || top->local_canonical.reserved32 != 0
+		|| top->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+		|| !savepoint_mx_outcome_valid(top->outcome, top->commit_scn)
+		|| !cluster_tx_locator_reply_matches(&request->locator, &top->locator_echo)
+		|| top->locator_echo.tt_wrap != record->identity.canonical.wrap
+		|| memcmp(&top->local_canonical, &record->identity.canonical, sizeof(top->local_canonical))
+			   != 0
+		|| top->local_canonical_generation == PG_UINT32_MAX
+		|| (record->canonical_generation_known
+			&& top->local_canonical_generation != record->identity.canonical_generation)
+		|| !FullTransactionIdIsNormal(top->local_original_full_xid)
+		|| U64FromFullTransactionId(top->local_original_full_xid) == UINT64_MAX
+		|| XidFromFullTransactionId(top->local_original_full_xid) != top->top_xid
+		|| top->top_xid != record->identity.canonical.xid
+		|| (record->record_class != CMXH_V1_TOP
+			&& !FullTransactionIdEquals(top->local_original_full_xid, record->identity.top_fxid))
+		|| ((request->flags & CLUSTER_MX_HISTORY_EXPECT_OWNER)
+			&& !FullTransactionIdEquals(top->local_original_full_xid, request->expected_top_fxid)))
+		return false;
+	identity = record->identity;
+	identity.canonical_generation = top->local_canonical_generation;
+	identity.top_fxid = top->local_original_full_xid;
+	if (record->record_class == CMXH_V1_TOP)
+		identity.operation_fxid = identity.top_fxid;
+	*out = identity;
+	return true;
+}
+
+bool
+cluster_mx_history_record_recheck(const ClusterMxHistoryRequest *request,
+								  const ClusterMxHistoryRecord *first, const char *first_bytes,
+								  size_t first_length, const char fresh[BLCKSZ],
+								  char record_out[BLCKSZ], ClusterMxHistoryRecord *out)
+{
+	ClusterMxHistoryRecord old, next;
+	UndoRecordHeader header;
+	size_t effect;
+	bool matches = false;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (record_out != NULL)
+		memset(record_out, 0, BLCKSZ);
+	if (first == NULL || first_bytes == NULL || out == NULL || record_out == NULL
+		|| first_length < sizeof(header) || first_length > BLCKSZ
+		|| first_length != first->record_length)
+		return false;
+	memcpy(&header, first_bytes, sizeof(header));
+	if (!history_record_decode(request, &header, first_bytes + sizeof(header), first_length,
+							   first->record_offset, &old)
+		|| !cluster_mx_history_record_capture(request, fresh, record_out, &next)
+		|| next.record_offset != first->record_offset || next.record_length != first_length
+		|| next.record_class != old.record_class)
+		goto failed;
+	if (old.record_class == CMXH_OPERATION) {
+		effect = first_length - sizeof(UndoOperationTrailer)
+				 + offsetof(UndoOperationTrailer, effect_state);
+		matches = (old.effect == CLUSTER_SAVEPOINT_EFFECT_LIVE || old.effect == next.effect)
+				  && memcmp(first_bytes, record_out, effect) == 0
+				  && memcmp(first_bytes + effect + 1, record_out + effect + 1,
+							first_length - effect - 1)
+						 == 0;
+	} else if (old.record_class == CMXH_ROLLBACK_CONTROL) {
+		UndoSavepointRollbackPayload a = old.control, b = next.control;
+		bool progress
+			= b.phase >= a.phase
+			  && ((b.visited_count > a.visited_count
+				   && b.last_effect_wal_lsn > a.last_effect_wal_lsn
+				   && !cluster_undo_record_uba_equal(a.next_uba, b.next_uba))
+				  || (b.visited_count == a.visited_count
+					  && cluster_undo_record_uba_equal(a.next_uba, b.next_uba)
+					  && a.last_effect_wal_lsn == b.last_effect_wal_lsn))
+			  && (a.phase != UNDO_SAVEPOINT_ROLLBACK_COMPLETE || memcmp(&a, &b, sizeof(a)) == 0);
+		/* Compare immutable identity after isolating exactly the FSM fields. */
+		a.phase = b.phase;
+		a.next_uba = b.next_uba;
+		a.visited_count = b.visited_count;
+		a.last_effect_wal_lsn = b.last_effect_wal_lsn;
+		matches = progress && memcmp(&a, &b, sizeof(a)) == 0
+				  && memcmp(first_bytes, record_out, sizeof(header)) == 0
+				  && memcmp(first_bytes + sizeof(header) + sizeof(a),
+							record_out + sizeof(header) + sizeof(a), sizeof(UndoOperationTrailer))
+						 == 0;
+	} else
+		matches = memcmp(first_bytes, record_out, first_length) == 0;
+	if (!matches)
+		goto failed;
+	*out = next;
+	return true;
+
+failed:
+	memset(record_out, 0, BLCKSZ);
 	return false;
 }
 

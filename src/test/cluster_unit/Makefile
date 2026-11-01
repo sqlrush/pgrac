@@ -10609,6 +10609,20 @@ test_cluster_cr: test_cluster_cr.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Pure history decoding and fresh-record comparison on real undo bytes.
+TESTS += test_cluster_mx_history_record
+all: test_cluster_mx_history_record
+
+test_cluster_mx_history_record: test_cluster_mx_history_record.c test_cluster_savepoint_reader.c \
+		unit_test.h $(top_srcdir)/src/include/cluster/cluster_mx_history_record.h \
+		$(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_SAVEPOINT_READER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_SAVEPOINT_READER_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 # Native current/CR mapping with shared allocation and hash storage stubs.
 CLUSTER_BUFFER_MAPPING_O = $(top_builddir)/src/backend/storage/buffer/buf_table.o
 test_cluster_buffer_mapping: test_cluster_buffer_mapping.c unit_test.h \
@@ -13283,6 +13297,8 @@ TESTS += test_cluster_mx_operation_core test_cluster_mx_operation_origin
 all: test_cluster_mx_operation_core test_cluster_mx_operation_origin
 
 $(CLUSTER_SAVEPOINT_READER_O): $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history_record.h \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h \
         $(top_srcdir)/src/include/cluster/cluster_undo_record_api.h
 $(CLUSTER_MULTIXACT_CURRENT_O): $(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
         $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
