@@ -1144,6 +1144,7 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 
 #include "test_cluster_snapshot_return.inc"
 #include "test_cluster_backend_return.inc"
+#define SURVIVOR_LOCAL_BACKEND_ROUTE
 #include "test_cluster_survivor_producer_backend.inc"
 
 #include "test_cluster_survivor_buffer_fixture.h"
@@ -1151,6 +1152,7 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 #include "test_cluster_survivor_return_context.inc"
 #include "test_cluster_survivor_xact_return.inc"
 #include "test_cluster_survivor_backend_interrupt_fixture.h"
+#include "test_cluster_survivor_backend_route_fixture.h"
 int
 main(void)
 {
@@ -1175,7 +1177,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(139);
+	UT_PLAN(148);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1315,6 +1317,15 @@ main(void)
 	UT_RUN(local_observation_preserves_original_timeout_priority);
 	UT_RUN(local_observation_defers_during_cancel_holdoff_and_uses_original_reentry);
 	UT_RUN(local_observation_keeps_original_interrupt_and_critical_holdoffs);
+	UT_RUN(backend_route_returns_original_snapshot_and_observes_its_actual_release);
+	UT_RUN(backend_route_refuses_changed_generation_and_backend_id_before_notification);
+	UT_RUN(backend_route_requires_matching_original_status_identity);
+	UT_RUN(backend_route_notification_failure_cannot_publish_a_sample);
+	UT_RUN(backend_route_cancel_preserves_query_until_original_return);
+	UT_RUN(backend_route_holdoff_uses_original_interrupt_reentry);
+	UT_RUN(backend_route_gate_change_withdraws_published_sample);
+	UT_RUN(backend_route_episode_change_withdraws_published_sample);
+	UT_RUN(backend_route_target_replacement_withdraws_published_sample);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

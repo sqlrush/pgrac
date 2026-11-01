@@ -1,24 +1,28 @@
-/* Owner-side projection only: raw untrusted query inputs, not LMON query
- * construction, process delivery, allocation or a receipt. Actual original
- * backend/input producer bodies run in their existing native-source fixture.
- * The standalone local fixture covers real begin/poll and native transport. */
+/* Owner-side projection uses raw untrusted query inputs by default. The
+ * optional backend route adds original query construction and dispatch;
+ * process allocation and OS delivery remain host boundaries. Actual
+ * backend/input producer bodies run in their native-source fixtures. */
 #include "storage/procsignal.h"
 #include "cluster/cluster_semantic_survivor_candidate.h"
 #include "cluster/cluster_semantic_survivor_local.h"
 static ClusterSurvivorControl survivor_local_owner_storage;
 ClusterSurvivorControl *cluster_semantic_survivor_shared_control(void)
 { return &survivor_local_owner_storage; }
-/* These fixtures never issue LMON queries. Reaching its scope API is a test
- * error, never a replacement positive scope or receipt. */
+bool IsPostmasterEnvironment;
+int MaxBackends=100;
+#ifdef SURVIVOR_LOCAL_BACKEND_ROUTE
+#include "test_cluster_survivor_backend_route_native.h"
+#else
+/* Owner-only fixtures never issue LMON queries. Reaching its scope API is
+ * a test error, never a replacement positive scope or receipt. */
 bool cluster_semantic_survivor_candidate_scope(ClusterSurvivorControl *c,
  ClusterSurvivorProducerScope *scope,uint8 basis[32])
 { (void)c;(void)scope;(void)basis;abort(); }
-bool IsPostmasterEnvironment;
-int MaxBackends=100;
 int SendProcSignal(pid_t pid,ProcSignalReason reason,BackendId id)
 { (void)pid;(void)reason;(void)id;abort(); }
 #ifndef SURVIVOR_LOCAL_INPUT_FIXTURE
 void SetLatch(Latch *latch) { (void)latch;abort(); }
+#endif
 #endif
 #pragma push_macro("proc")
 #undef proc

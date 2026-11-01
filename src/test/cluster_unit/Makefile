@@ -13814,3 +13814,14 @@ test_cluster_survivor_backend_interrupts.inc: $(top_srcdir)/src/backend/tcop/pos
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_snapshot_admission: test_cluster_survivor_backend_interrupt_fixture.h test_cluster_survivor_backend_interrupts.inc
+
+# Complete backend observation route uses original metadata and signal bodies.
+test_cluster_snapshot_admission: test_cluster_survivor_backend_route_native.h \
+ test_cluster_survivor_backend_route_fixture.h test_cluster_survivor_pgsa.inc \
+ test_cluster_survivor_signal_types.inc test_cluster_survivor_signal.inc \
+ test_cluster_survivor_signal_fixture.h test_cluster_survivor_status_identity.inc \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_targets.c \
+ $(top_builddir)/src/common/libpgcommon_srv.a
+test_cluster_snapshot_admission: CLUSTER_UNIT_PORT_LIBS += $(top_builddir)/src/common/libpgcommon_srv.a
