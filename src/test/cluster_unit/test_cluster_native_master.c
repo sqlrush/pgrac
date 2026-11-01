@@ -68,7 +68,7 @@ static bool nm_receive(int fd, uint16 type, ResourceXDecodedFrame *frame)
 		&& cluster_resource_x_wire_decode(type, bytes, header[1], frame, &reject);
 }
 #define NM_REQUIRE(condition) do { bool ok_ = (condition); UT_ASSERT(ok_); if (!ok_) { printf("# Required: %s\n", #condition); return false; } } while (0)
-static bool nm_master_admit(PublishFixture *f, const ResourceXDecodedFrame *request)
+static bool nm_master_enqueue(PublishFixture *f, const ResourceXDecodedFrame *request)
 {
 	ClusterPcmResourceXMasterRequest canonical = {0};
 	unsigned matches = 0; Size offset;
@@ -92,6 +92,11 @@ static bool nm_master_admit(PublishFixture *f, const ResourceXDecodedFrame *requ
 			f->state = (void *)(memory + n - offset); matches++;
 		}
 	NM_REQUIRE(matches == 1);
+	return true;
+}
+static bool nm_master_admit(PublishFixture *f, const ResourceXDecodedFrame *request)
+{
+	NM_REQUIRE(nm_master_enqueue(f, request));
 	publish_apply(f);
 	return true;
 }

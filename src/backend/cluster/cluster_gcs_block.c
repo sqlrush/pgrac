@@ -10579,25 +10579,70 @@ static ResourceXApplyResult gcs_block_resource_x_target_peer_result_exact(
 	const ClusterSemanticAdmissionToken *admission, int32 peer_node, uint32 connection);
 
 static ResourceXApplyResult
-gcs_block_first_fill_current(ClusterGcsFirstFill *fill)
+gcs_block_acquire_domain_current(const ClusterSemanticAdmissionToken *admission,
+	const BufferTag *tag, const ResourceXGateSnapshot *gate, int32 master_node,
+	uint64 master_session, uint32 requester_connection, uint32 master_connection)
 {
 	ResourceXApplyResult result;
 	uint32 requester = 0, master = 0;
 
-	if (!cluster_semantic_activation_recheck(&fill->admission))
+	if (!cluster_semantic_activation_recheck(admission))
 		return RESOURCE_X_APPLY_STALE;
 	result = gcs_block_resource_x_gate_session_recheck_result(
-		&fill->prepared.common.logical_assertion.resource, &fill->gate,
-		fill->master_node, fill->master_session);
+		tag, gate, master_node, master_session);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
-	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(fill->master_node, &requester)
-		|| !gcs_block_pcm_x_resource_x_peer_ready_exact(fill->master_node, &master))
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(master_node, &requester)
+		|| !gcs_block_pcm_x_resource_x_peer_ready_exact(master_node, &master))
 		return RESOURCE_X_APPLY_BAD_STATE; /* Observation unavailable: retain E. */
-	if (requester != fill->requester_connection || master != fill->master_connection)
+	if (requester != requester_connection || master != master_connection)
 		return RESOURCE_X_APPLY_STALE;
 	return gcs_block_resource_x_target_peer_result_exact(
-		&fill->admission, fill->master_node, master);
+		admission, master_node, master);
+}
+
+static ResourceXApplyResult
+gcs_block_first_fill_current(ClusterGcsFirstFill *fill)
+{
+	return gcs_block_acquire_domain_current(&fill->admission,
+		&fill->prepared.common.logical_assertion.resource, &fill->gate,
+		fill->master_node, fill->master_session, fill->requester_connection,
+		fill->master_connection);
+}
+
+/* Physical execution outlives the foreground's passive wait. Revalidate its
+ * original domain before each new publication; no request, grant or native
+ * completion is produced here. Call only outside content/header/entry locks.
+ * Unavailable observations are local waiting, never expiry of this episode. */
+ResourceXApplyResult
+cluster_gcs_block_acquire_domain_recheck_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	ResourceXGateSnapshot gate;
+	ResourceXApplyResult result;
+
+	if (observation == NULL || admission == NULL || !admission->entered
+		|| observation->request.resource_formation == 0
+		|| observation->request.resource_formation == UINT64_MAX
+		|| observation->r4_record_generation != admission->record_generation
+		|| observation->request.sender_connection_generation == 0
+		|| observation->master_ingress_connection_generation == 0)
+		return RESOURCE_X_APPLY_INVALID;
+	for (;;) {
+		if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+			|| gate.phase != RESOURCE_X_GATE_OPEN
+			|| gate.formation != observation->request.resource_formation)
+			return RESOURCE_X_APPLY_STALE;
+		result = gcs_block_acquire_domain_current(admission,
+			&observation->request.logical_assertion.resource, &gate,
+			observation->master_node, observation->request.master_session_incarnation,
+			observation->request.sender_connection_generation,
+			observation->master_ingress_connection_generation);
+		if (result != RESOURCE_X_APPLY_BAD_STATE)
+			return result;
+		gcs_block_resource_x_observation_pause();
+	}
 }
 
 ResourceXApplyResult

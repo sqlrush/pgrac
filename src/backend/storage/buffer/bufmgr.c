@@ -17989,7 +17989,9 @@ cluster_bufmgr_acquire_read_context(BufferDesc *buf, const ClusterPcmOwnSnapshot
 		&& BufferTagsEqual(&base->tag, &execution->observation.request.logical_assertion.resource)
 		&& cluster_bufmgr_acquire_execution_context_io(buf, episode, admission, owner, input_io)
 		&& ResourceOwnerHasBufferIO(owner, BufferDescriptorGetBuffer(buf)) == input_io
-		&& cluster_gcs_lookup_master(base->tag) == execution->observation.master_node;
+		&& cluster_gcs_lookup_master(base->tag) == execution->observation.master_node
+		&& cluster_gcs_block_acquire_domain_recheck_exact(&execution->observation, admission)
+			== RESOURCE_X_APPLY_APPLIED;
 }
 
 static void

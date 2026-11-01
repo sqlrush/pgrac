@@ -109,6 +109,11 @@ extern ResourceXApplyResult cluster_gcs_block_resident_read_begin(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 token, ClusterGcsFirstFill *fill);
 extern ResourceXApplyResult cluster_gcs_block_first_fill_wait(ClusterGcsFirstFill *fill);
 extern void cluster_gcs_block_first_fill_end(ClusterGcsFirstFill *fill);
+/* Same episode's physical owner, outside content/header/entry locks.
+ * Unavailable authentication observations wait locally; no new REQUEST. */
+extern ResourceXApplyResult cluster_gcs_block_acquire_domain_recheck_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ClusterSemanticAdmissionToken *admission);
 
 /* One bounded, local requester-delivery callback on the existing LMS loop.
  * No wire ownership or foreground success is implied by this result. */

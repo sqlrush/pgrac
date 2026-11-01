@@ -103,6 +103,22 @@ complete_content_acquire(LWLock *lock, LWLockMode mode)
 		complete_on_content();
 	return ok;
 }
+#ifndef NATIVE_FIRST_FILL_COMPOSITION
+/* This physical-only component fixes the authenticated GCS domain as a
+ * provider leaf. Ordinary compositions below include the actual GCS body
+ * and vary its session/connection availability and invalidation instead. */
+ResourceXApplyResult
+cluster_gcs_block_acquire_domain_recheck_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	return observation != NULL && admission != NULL
+		&& memcmp(observation, &input_observation, sizeof(*observation)) == 0
+		&& cluster_semantic_activation_recheck(admission)
+		? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE;
+}
+#endif
 #define LockBufHdr stage_header_lock
 #define LWLockAcquire complete_content_acquire
 #define cluster_pcm_own_delivery_read_commit_exact complete_read_commit

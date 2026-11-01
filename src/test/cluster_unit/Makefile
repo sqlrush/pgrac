@@ -11800,6 +11800,25 @@ test_cluster_native_s_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufm
 clean-native-s-x-cancel-master:
 	rm -f test_cluster_native_s_x_cancel_master test_cluster_native_s_release.inc test_cluster_native_s_release.inc.tmp
 
+# Real prior S and independent master across ordinary acquisition domain loss.
+TESTS += test_cluster_native_s_x_domain
+all: test_cluster_native_s_x_domain
+test_cluster_native_s_x_domain: test_cluster_native_s_x_domain.c \
+		test_cluster_native_s_x_cancel_master test_cluster_native_master_fixture.inc \
+		test_cluster_native_resident_x_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-s-x-domain
+.PHONY: clean-native-s-x-domain
+clean-native-s-x-domain:
+	rm -f test_cluster_native_s_x_domain
+
 # Actual invalidation followed by a new ordinary SHARE on the same descriptor.
 TESTS += test_cluster_native_s_read_successor
 all: test_cluster_native_s_read_successor
