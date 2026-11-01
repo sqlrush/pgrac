@@ -234,3 +234,8 @@ cluster_recovery_registry.o cluster_recovery_registry_srv.o cluster_recovery_reg
 	$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 	$(srcdir)/sha2_int.h
+
+cluster_recovery_registry.o cluster_recovery_registry_srv.o cluster_recovery_registry_shlib.o: \
+	$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_registry_reservation_format.h \
+	$(top_srcdir)/src/include/catalog/catversion.h
