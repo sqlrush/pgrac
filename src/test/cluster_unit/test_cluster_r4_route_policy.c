@@ -403,6 +403,11 @@ cluster_multixact_current_member_proof_bind_ctrc(ClusterCurrentMemberProof *proo
 
 static bool mx_origin_sample_enabled;
 static int mx_v6_origin_override = -1;
+static bool mx_exact_enabled;
+static int mx_exact_fault, mx_exact_stage, mx_exact_b_freezes;
+static bool mx_exact_initial_live = true;
+static uint8 mx_exact_final_effect = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+static ClusterSavepointOperationKey mx_exact_key;
 static int mx_v6_samples;
 static bool mx_v6_enqueue_reply(const void *, uint16, uint32);
 static ClusterTTStatus mx_origin_sample_status;
@@ -464,7 +469,7 @@ cluster_ctrc_origin_grant_publishable(const ClusterCtrcTxnKeyV1 *key pg_attribut
 										  pg_attribute_unused(),
 									  uint32 grant_generation pg_attribute_unused())
 {
-	return false;
+	return mx_exact_enabled && mx_exact_fault != 8 && grant_generation == 71;
 }
 
 bool
@@ -502,6 +507,10 @@ cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key pg_attribute_unus
 								ClusterCtrcProofClass proof_class pg_attribute_unused(),
 								uint32 *grant_out pg_attribute_unused())
 {
+	if (mx_exact_enabled && mx_exact_fault != 9) {
+		*grant_out = 71;
+		return CLUSTER_CTRC_TOUCH_RECORDED;
+	}
 	return CLUSTER_CTRC_TOUCH_REFUSED;
 }
 
@@ -645,11 +654,12 @@ cluster_runtime_visibility_origin_plan_canonical_physical(
 
 		memcpy(&data, plan->opaque + 8, sizeof(data));
 		memset(locator_out, 0, sizeof(*locator_out));
-		locator_out->segment_id = 5;
+		locator_out->segment_id = mx_exact_enabled
+			? cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 2 : 5;
 		locator_out->xid = data.xid;
-		locator_out->slot_offset = 3;
-		locator_out->wrap = 7;
-		*same_segment_out = true;
+		locator_out->slot_offset = mx_exact_enabled && mx_exact_stage < 3 ? 2 : 3;
+		locator_out->wrap = mx_exact_enabled && mx_exact_stage < 3 ? 3 : 7;
+		*same_segment_out = !mx_exact_enabled;
 		return true;
 	}
 	return false;
@@ -737,7 +747,8 @@ cluster_undo_block0_current_sample_generation(ClusterUndoBlock0CurrentGuard *gua
 		siglongjmp(*PG_exception_stack, 1);
 	}
 	if (!origin_generation_sample_enabled || guard == NULL || root == NULL
-		|| root->root_id != UINT64_C(0x8000) || observed == NULL)
+		|| (root->root_id != UINT64_C(0x8000)
+			&& !(mx_exact_enabled && root->root_id == UINT64_C(0x8001))) || observed == NULL)
 		return CLUSTER_UNDO_BLOCK0_NOT_FOUND;
 	observed->known = origin_generation_sample_known;
 	observed->value = origin_generation_sample_value;
@@ -2317,11 +2328,14 @@ cluster_semantic_activation_resolve_shared_undo_root(const ClusterSemanticAdmiss
 {
 	if (token == NULL || !token->entered || out == NULL
 		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
-		|| owner_instance != (uint32)UT_MASTER_NODE + 1 || (segment_id != 5 && segment_id != 6))
+		|| owner_instance != (uint32)UT_MASTER_NODE + 1 || (segment_id != 5 && segment_id != 6
+			&& !(mx_exact_enabled && (segment_id == UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1
+				|| segment_id == UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 2))))
 		return false;
 	memset(out, 0, sizeof(*out));
 	out->intent = intent;
-	out->root_id = UINT64_C(0x8000) + segment_id - 5;
+	out->root_id = UINT64_C(0x8000) + segment_id
+		- (segment_id > 256 ? UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 : 5);
 	out->root_generation = UINT64_C(3);
 	return true;
 }
@@ -2334,11 +2348,14 @@ cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 	route_seam.terminal_census_root_calls++;
 	if (token == NULL || !token->entered || out == NULL
 		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
-		|| owner_instance != (uint32)UT_MASTER_NODE + 1 || (segment_id != 5 && segment_id != 6))
+		|| owner_instance != (uint32)UT_MASTER_NODE + 1 || (segment_id != 5 && segment_id != 6
+			&& !(mx_exact_enabled && (segment_id == UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1
+				|| segment_id == UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 2))))
 		return false;
 	memset(out, 0, sizeof(*out));
 	out->intent = intent;
-	out->root_id = UINT64_C(0x8000) + segment_id - 5;
+	out->root_id = UINT64_C(0x8000) + segment_id
+		- (segment_id > 256 ? UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 : 5);
 	out->root_generation = UINT64_C(3);
 	return true;
 }
@@ -2361,7 +2378,9 @@ cluster_undo_block0_current_acquire_begin_admitted(const ClusterUndoBlock0Logica
 	if (failure != NULL)
 		*failure = CLUSTER_UNDO_BLOCK0_OK;
 	if (key == NULL || key->owner_instance != (uint8)(UT_MASTER_NODE + 1)
-		|| (key->segment_id != 5 && key->segment_id != 6) || mode != CLUSTER_UNDO_BLOCK0_SCUR
+		|| (key->segment_id != 5 && key->segment_id != 6
+			&& !(mx_exact_enabled && (key->segment_id == UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1
+				|| key->segment_id == UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 2))) || mode != CLUSTER_UNDO_BLOCK0_SCUR
 		|| admission == NULL || !admission->entered || guard == NULL)
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	if (mx_origin_sample_enabled)
@@ -2524,6 +2543,18 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
 {
 	route_seam.candidate_resolve_calls++;
+	if (mx_exact_enabled) {
+		UT_ASSERT_EQ(mx_exact_stage, 3);
+		UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 3);
+		mx_exact_b_freezes++;
+		if (mx_exact_fault == 7)
+			return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+		memset(plan, 0, sizeof(*plan));
+		plan->opaque[0] = 1;
+		memcpy(plan->opaque + 8, locator, sizeof(*locator));
+		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL;
+	}
+
 	if (mx_origin_sample_enabled && expected_generation == NULL
 		&& mode == CLUSTER_TX_RESOLVE_VISIBILITY && locator != NULL && admission != NULL
 		&& admission->entered && guard != NULL && root != NULL && root->root_id == UINT64_C(0x8000)
@@ -2558,7 +2589,8 @@ cluster_runtime_visibility_origin_plan_canonical_logical(
 	if (plan == NULL || logical_out == NULL || plan->opaque[0] != 1)
 		return false;
 	logical_out->owner_instance = (uint8)(UT_MASTER_NODE + 1);
-	logical_out->segment_id = 6;
+	logical_out->segment_id = mx_exact_enabled
+		? UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 2 : 6;
 	return true;
 }
 
@@ -2590,8 +2622,12 @@ cluster_runtime_visibility_origin_plan_recheck_data_held(
 
 	route_seam.candidate_data_recheck_calls++;
 	if (plan == NULL || plan->opaque[0] != 1 || plan->opaque[1] != 1
-		|| mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS || admission == NULL || !admission->entered
+		|| (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
+			&& !(mx_exact_enabled && mode == CLUSTER_TX_RESOLVE_VISIBILITY))
+		|| admission == NULL || !admission->entered
 		|| guard == NULL || root == NULL || root->root_id != UINT64_C(0x8000))
+		return CLUSTER_TX_UNKNOWN;
+	if (mx_exact_enabled && mx_exact_fault == 10)
 		return CLUSTER_TX_UNKNOWN;
 	memcpy(&locator, plan->opaque + 8, sizeof(locator));
 	return route_test_fill_origin_resolution(&locator, admission, out, reason_out);
@@ -4226,6 +4262,124 @@ ClusterMxDescribeResult route_actual_validate_describe_reply(const void *, uint3
 #undef cluster_multixact_current_wire_validate_proof_reply_frame
 #undef cluster_multixact_current_wire_validate_describe_reply
 
+/* External runtime leaves only; exact reader/canonical provenance has its
+ * own real-runtime tests. These counters qualify transport sequencing. */
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_mx_operation_held(
+	const ClusterSavepointOperationKey *key, ClusterTxResolveMode mode pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveReason *reason pg_attribute_unused())
+{
+	if (!mx_exact_enabled || mx_exact_fault == 1)
+		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+	UT_ASSERT(mx_exact_stage == 0 || mx_exact_stage == 3);
+	UT_ASSERT_EQ(mx_origin_guard_held, 1);
+	mx_exact_key = *key;
+	mx_exact_stage = 1;
+	memset(plan, 0, sizeof(*plan));
+	plan->opaque[0] = 1;
+	memcpy(plan->opaque + 8, &key->locator, sizeof(key->locator));
+	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_sample_mx_operation_held(
+	ClusterRuntimeVisibilityOriginPlan *plan pg_attribute_unused(),
+	const ClusterSavepointOperationKey *key pg_attribute_unused(),
+	ClusterTxResolveMode mode pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(), bool *live,
+	ClusterTxResolveReason *reason pg_attribute_unused())
+{
+	UT_ASSERT_EQ(mx_exact_stage, 1);
+	UT_ASSERT_EQ(mx_origin_guard_held, 1);
+	mx_exact_stage = 2;
+	*live = mx_exact_initial_live;
+	return mx_exact_fault != 2;
+}
+
+static void
+mx_exact_fill_top(ClusterTxResolution *top)
+{
+	memset(top, 0, sizeof(*top));
+	top->outcome = mx_origin_sample_status == CLUSTER_TT_STATUS_IN_PROGRESS
+		? CLUSTER_TX_IN_PROGRESS : CLUSTER_TX_COMMITTED;
+	top->commit_scn = top->outcome == CLUSTER_TX_COMMITTED ? 101 : InvalidScn;
+	top->local_canonical = (ClusterTTSlotPhysicalLocator){
+		.segment_id = UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 2,
+		.xid = mx_exact_key.locator.xid, .slot_offset = 2, .wrap = 3 };
+	top->local_canonical_generation = 9;
+	top->local_canonical_valid = true;
+	top->local_original_full_xid = mx_exact_key.top_fxid;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_mx_sampled_top(
+	const ClusterRuntimeVisibilityOriginPlan *plan pg_attribute_unused(),
+	ClusterTxResolution *top, bool *physical_active)
+{
+	mx_exact_fill_top(top);
+	*physical_active = mx_origin_physical_active;
+	return mx_exact_fault != 3;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_copy_mx_operation_held(
+	ClusterRuntimeVisibilityOriginPlan *plan pg_attribute_unused(),
+	const ClusterSavepointOperationKey *key, ClusterTxResolveMode mode pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(), ClusterTxResolution *top,
+	ClusterSavepointEffectProof *effect, ClusterTxResolveReason *reason pg_attribute_unused())
+{
+	UT_ASSERT_EQ(mx_exact_stage, 2);
+	UT_ASSERT_EQ(mx_origin_guard_held, 1);
+	mx_exact_stage = 3;
+	mx_exact_fill_top(top);
+	memset(effect, 0, sizeof(*effect));
+	effect->key = *key;
+	effect->identity.canonical = top->local_canonical;
+	effect->identity.canonical_generation = top->local_canonical_generation;
+	effect->top_outcome = top->outcome;
+	effect->top_commit_scn = top->commit_scn;
+	effect->effect_state = mx_exact_final_effect;
+	return mx_exact_fault != 4;
+}
+
+bool
+cluster_multixact_current_resolve_operation_member_proof(const ClusterCurrentMxMemberDesc *member,
+	uint16 ordinal, const ClusterTTStatusKey *key, const ClusterTTStatusResult *result,
+	const ClusterSavepointEffectProof *effect, ClusterCurrentMemberOperationProof *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->base.key = (ClusterCurrentMemberProofKey){ .origin_node_id = key->origin_node_id,
+		.undo_segment_id = key->undo_segment_id, .tt_slot_id = key->tt_slot_id,
+		.cluster_epoch = key->cluster_epoch, .local_xid = key->local_xid };
+	ClusterCurrentMemberProofSetCtrcBinding(&out->base, 9, 3);
+	out->base.member_xid = member->xid;
+	out->base.member_ordinal = ordinal;
+	out->base.member_status = member->member_status;
+	out->base.state = result->status == CLUSTER_TT_STATUS_IN_PROGRESS ? CCM_ACTIVE : CCM_COMMITTED;
+	out->base.commit_scn = result->commit_scn;
+	out->format_version = 2;
+	out->flags = CLUSTER_CURRENT_OPERATION_PROOF_EXACT;
+	out->effect_state = effect->effect_state;
+	out->operation_uba = effect->key.locator.uba;
+	out->top_fxid = effect->key.top_fxid;
+	out->operation_fxid = effect->key.operation_fxid;
+	return true;
+}
+
+bool
+cluster_multixact_current_operation_member_proof_bind_ctrc(
+	ClusterCurrentMemberOperationProof *proof, const ClusterCtrcTxnKeyV1 *key)
+{
+	return cluster_multixact_current_member_proof_bind_ctrc(&proof->base, key);
+}
+
 static void
 init_current_mx_v6_request(ClusterCurrentMxOperationForwardV6 *wire, ClusterICEnvelope *env)
 {
@@ -4427,6 +4581,258 @@ UT_TEST(test_current_mx_v6_exact_request_never_uses_raw_sampler)
 				 CMX_RESOLVE_UNKNOWN);
 	UT_ASSERT_EQ(mx_origin_guard_held, 0);
 	mx_origin_sample_enabled = false;
+	cluster_node_id = saved;
+}
+
+UT_TEST(test_current_mx_v6_exact_origin_qualifies_before_reply)
+{
+	ClusterCurrentMxOperationForwardV6 request;
+	ClusterCurrentMxOperationAsk ask;
+	ClusterICEnvelope env;
+	int saved = cluster_node_id;
+	cluster_node_id = UT_MASTER_NODE;
+	route_seam_reset();
+	mx_origin_sample_enabled = true;
+	mx_origin_sample_status = CLUSTER_TT_STATUS_COMMITTED;
+	mx_v6_samples = 0;
+	mx_exact_enabled = true;
+	mx_exact_stage = mx_exact_fault = 0;
+	mx_exact_final_effect = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	init_current_mx_v6_request(&request, &env);
+	UT_ASSERT(cluster_multixact_operation_wire_get_ask(&request, 0, &ask));
+	ask.operation = (ClusterSavepointOperationKey){
+		.locator = { .uba = uba_encode(cluster_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+									  2, 2, 0), .xid = 500, .tt_wrap = 3,
+					 .itl_kind = ITL_FLAG_ACTIVE },
+		.target = { .locator = { 1663, 42, 123 }, .forknum = MAIN_FORKNUM,
+					.blockno = 17, .offnum = 7 },
+		.top_fxid = FullTransactionIdFromEpochAndXid(2, 500),
+		.operation_fxid = FullTransactionIdFromEpochAndXid(2, ask.member.xid)
+	};
+	operation_wire_write_ask(request.body, &ask.member, &ask.operation);
+	UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+	for (int drain = 0; drain < 8; ++drain)
+		cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(route_seam.raw_send_calls, 1);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	UT_ASSERT_EQ(mx_v6_samples, 0);
+	UT_ASSERT_EQ(mx_exact_stage, 3);
+	UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, 3);
+	UT_ASSERT_EQ(((ClusterCurrentMxProofReplyHeader *)route_seam.raw_send_page)->result,
+				 CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(mx_origin_guard_held, 0);
+	mx_origin_sample_enabled = false;
+	mx_exact_enabled = false;
+	cluster_node_id = saved;
+}
+
+static void
+mx_exact_request(ClusterCurrentMxOperationForwardV6 *request, ClusterICEnvelope *env,
+	bool updater)
+{
+	ClusterCurrentMxOperationAsk ask;
+	route_seam_reset();
+	mx_origin_sample_enabled = mx_exact_enabled = true;
+	mx_origin_sample_status = CLUSTER_TT_STATUS_COMMITTED;
+	mx_exact_stage = mx_exact_fault = mx_exact_b_freezes = 0;
+	mx_exact_initial_live = true;
+	mx_exact_final_effect = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	origin_generation_sample_enabled = true;
+	init_current_mx_v6_request(request, env);
+	UT_ASSERT(cluster_multixact_operation_wire_get_ask(request, 0, &ask));
+	ask.operation = (ClusterSavepointOperationKey){
+		.locator = { .uba = uba_encode(UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+			2, 2, 0), .xid = 500, .tt_wrap = 3, .itl_kind = ITL_FLAG_ACTIVE },
+		.target = { .locator = {1663,42,123}, .forknum = MAIN_FORKNUM,
+			.blockno = 17, .offnum = 7 },
+		.top_fxid = FullTransactionIdFromEpochAndXid(2, 500),
+		.operation_fxid = FullTransactionIdFromEpochAndXid(2, ask.member.xid)
+	};
+	if (updater) {
+		ClusterCurrentMxUpdaterChallengeWire challenge = {0};
+		challenge.updater_xid = ask.member.xid;
+		challenge.member_status = ask.member.member_status = MultiXactStatusNoKeyUpdate;
+		challenge.candidate_next_xmin_alias = (ClusterCurrentMxSuccessorAlias){
+			.origin_node_id = UT_MASTER_NODE,
+			.undo_record_segment_id = UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+			.tt_slot_id = 4, .local_xid = ask.member.xid, .cluster_epoch = UT_FORMATION_EPOCH };
+		challenge.candidate_next_xmin_locator = (ClusterTxLocator){
+			.uba = uba_encode(challenge.candidate_next_xmin_alias.undo_record_segment_id, 4, 3, 1),
+			.xid = ask.member.xid, .tt_wrap = TT_WRAP_INVALID, .itl_kind = ITL_FLAG_ACTIVE };
+		request->prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE;
+		memset(request->body, 0, sizeof(request->body));
+		memcpy(request->body, &challenge, sizeof(challenge));
+	}
+	operation_wire_write_ask(request->body + (updater ? 56 : 0), &ask.member, &ask.operation);
+}
+
+static void
+mx_exact_drain(void)
+{
+	for (int drain = 0; drain < 16; ++drain)
+		cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(mx_origin_guard_held, 0);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	UT_ASSERT_EQ(route_seam.raw_send_calls, 1);
+}
+
+UT_TEST(test_current_mx_v6_exact_updater_a_before_independent_b)
+{
+	int saved = cluster_node_id;
+	for (int fault = 0; fault < 11; ++fault) {
+		ClusterCurrentMxOperationForwardV6 request;
+		ClusterCurrentMemberOperationProof proof[7];
+		ClusterCurrentUpdaterProof updater;
+		ClusterMxResolveResult result;
+		ClusterICEnvelope env;
+		uint16 count;
+		uint32 capability;
+		if (fault == 5 || fault == 6 || fault == 8 || fault == 9)
+			continue;
+		cluster_node_id = UT_MASTER_NODE;
+		mx_exact_request(&request, &env, true);
+		mx_exact_fault = fault;
+		mx_v6_samples = 0;
+		UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+		mx_exact_drain();
+		UT_ASSERT(cluster_multixact_operation_wire_validate_reply(route_seam.raw_send_page,
+			BLCKSZ, UT_MASTER_NODE, UT_FORMATION_EPOCH, &request, &result,
+			proof, lengthof(proof), &count, &updater, &capability));
+		UT_ASSERT_EQ(result, fault == 0 ? CMX_RESOLVE_OK : CMX_RESOLVE_UNKNOWN);
+		UT_ASSERT_EQ(count, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(updater.verdict, fault == 0 ? CUCP_MATCH : CUCP_UNKNOWN);
+		UT_ASSERT_EQ(mx_exact_b_freezes, fault == 0 || fault == 7 || fault == 10 ? 1 : 0);
+		if (fault == 0) {
+			UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, 6);
+			UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 6);
+			UT_ASSERT_EQ(mx_v6_samples, 1); /* only B's original top sampler */
+			UT_ASSERT_EQ(proof[0].flags, CLUSTER_CURRENT_OPERATION_PROOF_EXACT);
+		}
+		mx_origin_sample_enabled = mx_exact_enabled = false;
+	}
+	cluster_node_id = saved;
+}
+
+UT_TEST(test_current_mx_v6_exact_active_discard_and_grant_polarity)
+{
+	int saved = cluster_node_id;
+	for (int variant = 0; variant < 7; ++variant) {
+		ClusterCurrentMxOperationForwardV6 request;
+		ClusterCurrentMemberOperationProof proof[7];
+		ClusterCurrentUpdaterProof updater;
+		ClusterMxResolveResult result;
+		ClusterICEnvelope env;
+		uint16 count;
+		uint32 capability;
+		cluster_node_id = UT_MASTER_NODE;
+		mx_exact_request(&request, &env, false);
+		mx_origin_sample_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		mx_origin_physical_active = variant != 2 && variant != 6;
+		mx_exact_initial_live = variant != 6;
+		mx_exact_final_effect = variant == 1 || variant == 6 ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED
+			: CLUSTER_SAVEPOINT_EFFECT_LIVE;
+		mx_exact_fault = variant == 3 ? 8 : variant == 4 ? 9 : 0;
+		mx_origin_release_failed = variant == 5;
+		UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+		mx_exact_drain();
+		UT_ASSERT(cluster_multixact_operation_wire_validate_reply(route_seam.raw_send_page,
+			BLCKSZ, UT_MASTER_NODE, UT_FORMATION_EPOCH, &request, &result,
+			proof, lengthof(proof), &count, &updater, &capability));
+		UT_ASSERT_EQ(result, variant < 2 || variant == 6 ? CMX_RESOLVE_OK
+			: variant == 2 || variant == 3 ? CMX_RESOLVE_RETRY : CMX_RESOLVE_UNKNOWN);
+		UT_ASSERT_EQ(count, variant < 2 || variant == 6 ? 1 : 0);
+		if (variant < 2 || variant == 6) {
+			UT_ASSERT_EQ(proof[0].base.state, CCM_ACTIVE);
+			UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proof[0].base), variant == 0 ? 71 : 0);
+		}
+		mx_origin_sample_enabled = mx_exact_enabled = false;
+	}
+	cluster_node_id = saved;
+}
+
+UT_TEST(test_current_mx_v6_exact_release_and_conflict_do_not_publish_a_only)
+{
+	int saved = cluster_node_id;
+	for (int conflict = 0; conflict < 2; ++conflict) {
+		ClusterCurrentMxOperationForwardV6 request;
+		ClusterICEnvelope env;
+		ClusterCurrentMxProofReplyHeader *header;
+		cluster_node_id = UT_MASTER_NODE;
+		mx_exact_request(&request, &env, true);
+		mx_origin_release_pending = true;
+		UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+		cluster_gcs_block_test_r4_tx_origin_drain();
+		UT_ASSERT_EQ(mx_exact_stage, 1);
+		UT_ASSERT_EQ(mx_exact_b_freezes, 0);
+		UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+		UT_ASSERT_EQ(mx_origin_guard_held, 1);
+		UT_ASSERT_EQ(mx_origin_release_poll_calls, 1);
+		if (conflict) {
+			ClusterCurrentMxOperationAsk ask;
+			UT_ASSERT(cluster_multixact_operation_wire_get_ask(&request, 0, &ask));
+			ask.operation.target.offnum++;
+			operation_wire_write_ask(request.body + 56, &ask.member, &ask.operation);
+			UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+		}
+		mx_origin_release_pending = false;
+		mx_exact_drain();
+		header = (void *)route_seam.raw_send_page;
+		UT_ASSERT_EQ(header->result, conflict ? CMX_RESOLVE_UNKNOWN : CMX_RESOLVE_OK);
+		UT_ASSERT_EQ(header->entry_count, conflict ? 0 : 1);
+		UT_ASSERT_EQ(mx_exact_b_freezes, conflict ? 0 : 1);
+		UT_ASSERT_EQ(mx_origin_release_poll_calls, 2);
+		mx_origin_sample_enabled = mx_exact_enabled = false;
+	}
+	cluster_node_id = saved;
+}
+
+UT_TEST(test_current_mx_v6_exact_and_top_cohort_keeps_every_ordinal)
+{
+	int saved = cluster_node_id;
+	for (int layout = 0; layout < 3; ++layout) {
+		ClusterCurrentMxOperationForwardV6 request;
+		ClusterCurrentMxOperationAsk first;
+		ClusterCurrentMemberOperationProof proof[7];
+		ClusterCurrentUpdaterProof updater;
+		ClusterMxResolveResult result;
+		ClusterICEnvelope env;
+		uint16 count;
+		uint32 capability;
+		int exact_count = 0;
+		cluster_node_id = UT_MASTER_NODE;
+		mx_exact_request(&request, &env, false);
+		UT_ASSERT(cluster_multixact_operation_wire_get_ask(&request, 0, &first));
+		memset(request.body, 0, sizeof(request.body));
+		request.prefix.total_count = request.prefix.entry_count = 7;
+		for (int i = 0; i < 7; ++i) {
+			ClusterCurrentMxOperationAsk ask = first;
+			bool exact = layout == 0 || (layout == 1 ? i % 2 == 0 : i % 2 != 0);
+			ask.member.xid += i;
+			ask.member.member_ordinal = i;
+			ask.operation.locator.uba = uba_encode(UT_MASTER_NODE * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1,
+				2 + i, 2, 0);
+			ask.operation.operation_fxid = FullTransactionIdFromEpochAndXid(2, ask.member.xid);
+			operation_wire_write_ask(request.body + i * 96, &ask.member, exact ? &ask.operation : NULL);
+			exact_count += exact;
+		}
+		mx_v6_samples = 0;
+		UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+		mx_exact_drain();
+		UT_ASSERT(cluster_multixact_operation_wire_validate_reply(route_seam.raw_send_page,
+			BLCKSZ, UT_MASTER_NODE, UT_FORMATION_EPOCH, &request, &result,
+			proof, lengthof(proof), &count, &updater, &capability));
+		UT_ASSERT_EQ(result, CMX_RESOLVE_OK);
+		UT_ASSERT_EQ(count, 7);
+		UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, exact_count * 3 + 7 - exact_count);
+		UT_ASSERT_EQ(mx_v6_samples, 7 - exact_count);
+		for (int i = 0; i < 7; ++i) {
+			bool exact = layout == 0 || (layout == 1 ? i % 2 == 0 : i % 2 != 0);
+			UT_ASSERT_EQ(proof[i].base.member_ordinal, i);
+			UT_ASSERT_EQ(proof[i].base.member_xid, first.member.xid + i);
+			UT_ASSERT_EQ(proof[i].flags, exact ? CLUSTER_CURRENT_OPERATION_PROOF_EXACT : 0);
+		}
+		mx_origin_sample_enabled = mx_exact_enabled = false;
+	}
 	cluster_node_id = saved;
 }
 
@@ -8917,6 +9323,11 @@ main(int argc, char **argv)
 	UT_RUN(test_current_mx_v6_requester_landing_and_rejection);
 	UT_RUN(test_current_mx_v6_origin_positive_conflict_and_release);
 	UT_RUN(test_current_mx_v6_exact_request_never_uses_raw_sampler);
+	UT_RUN(test_current_mx_v6_exact_origin_qualifies_before_reply);
+	UT_RUN(test_current_mx_v6_exact_updater_a_before_independent_b);
+	UT_RUN(test_current_mx_v6_exact_active_discard_and_grant_polarity);
+	UT_RUN(test_current_mx_v6_exact_release_and_conflict_do_not_publish_a_only);
+	UT_RUN(test_current_mx_v6_exact_and_top_cohort_keeps_every_ordinal);
 	UT_RUN(test_current_mx_v6_wait_error_cancels_cv_and_clears_slot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

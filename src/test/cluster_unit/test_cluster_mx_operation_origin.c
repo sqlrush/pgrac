@@ -698,6 +698,34 @@ UT_TEST(mx_held_unaligned_tail_and_final_effect)
 	}
 }
 
+UT_TEST(mx_held_sampled_top_is_provisional_and_does_not_resample)
+{
+	MxOriginFixture f;
+	ClusterTxResolution top, zero = {0};
+	bool live, active = true;
+	int copies, samples;
+	mx_held_init(&f, false);
+	memset(&top, 0xa5, sizeof(top));
+	UT_ASSERT(!cluster_runtime_visibility_origin_plan_mx_sampled_top(&f.origin.plan, &top, &active));
+	UT_ASSERT_EQ(memcmp(&top, &zero, sizeof(top)), 0);
+	UT_ASSERT(!active);
+	UT_ASSERT(mx_held_freeze(&f));
+	UT_ASSERT(!cluster_runtime_visibility_origin_plan_mx_sampled_top(&f.origin.plan, &top, &active));
+	UT_ASSERT(mx_held_sample(&f, &live));
+	copies = test_candidate_block0_copy_calls;
+	samples = test_candidate_sample_calls;
+	UT_ASSERT(cluster_runtime_visibility_origin_plan_mx_sampled_top(&f.origin.plan, &top, &active));
+	UT_ASSERT(FullTransactionIdEquals(top.local_original_full_xid, f.key.top_fxid));
+	UT_ASSERT_EQ(top.outcome, CLUSTER_TX_COMMITTED);
+	UT_ASSERT(!active);
+	UT_ASSERT_EQ(test_candidate_block0_copy_calls, copies);
+	UT_ASSERT_EQ(test_candidate_sample_calls, samples);
+	UT_ASSERT(mx_held_copy(&f));
+	UT_ASSERT(!cluster_runtime_visibility_origin_plan_mx_sampled_top(&f.origin.plan, &top, &active));
+	UT_ASSERT_EQ(memcmp(&top, &zero, sizeof(top)), 0);
+	UT_ASSERT(!active);
+}
+
 UT_TEST(mx_held_null_key_clears_plan_and_reason)
 {
 	MxOriginFixture f;
@@ -824,6 +852,7 @@ MX_OPERATION_ORIGIN_TEST_MAIN(void)
 	UT_RUN(mx_origin_provisional_key_is_only_an_exact_challenge);
 	UT_RUN(mx_held_unaligned_tail_and_final_effect);
 	UT_RUN(mx_held_null_key_clears_plan_and_reason);
+	UT_RUN(mx_held_sampled_top_is_provisional_and_does_not_resample);
 	UT_RUN(mx_held_original_full_xid_is_independent);
 	UT_RUN(mx_held_bad_or_cold_freeze_has_no_io);
 	UT_RUN(mx_held_fresh_copy_rejects_drift_and_pre_sample);

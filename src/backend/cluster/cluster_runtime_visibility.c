@@ -3917,6 +3917,31 @@ cluster_runtime_visibility_origin_plan_sample_mx_operation_held(
 }
 
 bool
+cluster_runtime_visibility_origin_plan_mx_sampled_top(
+	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolution *top,
+	bool *physical_active)
+{
+	const ClusterRuntimeVisibilityOriginPlanData *data
+		= cluster_runtime_visibility_origin_plan_data_const(plan);
+	if (top != NULL)
+		memset(top, 0, sizeof(*top));
+	if (physical_active != NULL)
+		*physical_active = false;
+	if (data == NULL || top == NULL || physical_active == NULL
+		|| data->magic != CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC || !data->valid
+		|| data->operation_plan != ORIGIN_PLAN_OPERATION || !data->candidate_valid
+		|| !FullTransactionIdIsNormal(data->candidate.local_original_full_xid)
+		|| !FullTransactionIdEquals(data->candidate.local_original_full_xid,
+			data->operation.top_fxid))
+		return false;
+	*top = data->candidate;
+	*physical_active = data->canonical_diagnostic.slot_status == TT_SLOT_ACTIVE
+		&& data->canonical_diagnostic.slot_commit_scn == InvalidScn
+		&& data->candidate.outcome == CLUSTER_TX_IN_PROGRESS;
+	return true;
+}
+
+bool
 cluster_runtime_visibility_origin_plan_copy_mx_operation_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterSavepointOperationKey *key,
 	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,

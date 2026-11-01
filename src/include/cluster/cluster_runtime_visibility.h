@@ -375,6 +375,11 @@ extern bool cluster_runtime_visibility_origin_plan_sample_mx_operation_held(
 	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
 	bool *live, ClusterTxResolveReason *reason);
+/* Provisional copy of the already sampled TT candidate, for a conservative
+ * CTRC touch under the same held guard. No lookup or final effect authority. */
+extern bool cluster_runtime_visibility_origin_plan_mx_sampled_top(
+	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolution *top,
+	bool *physical_active);
 extern bool cluster_runtime_visibility_origin_plan_copy_mx_operation_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterSavepointOperationKey *key,
 	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,

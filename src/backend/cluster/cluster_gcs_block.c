@@ -225,6 +225,11 @@ typedef struct GcsBlockR4TxOriginContext {
 	};
 	bool final_released, request_conflict;
 	bool current_mx_operation_wire;
+	bool current_mx_exact, current_mx_exact_b, current_mx_exact_ready;
+	uint16 current_mx_exact_index;
+	ClusterCurrentMemberOperationProof current_mx_operation_proofs[7];
+	ClusterCtrcTxnKeyV1 current_mx_saved_a_ctrc_key, current_mx_updater_ctrc_key;
+	uint32 current_mx_updater_grant;
 	ClusterR4OperationContextWire operation_context;
 	ClusterR4PeerOperationProof peer_operation;
 	GcsBlockR4TxOriginDomain domain;
@@ -10334,6 +10339,74 @@ gcs_block_current_mx_ctrc_key(const GcsBlockR4TxOriginContext *context, uint16 i
 	return true;
 }
 
+/* V6 owns these compare inputs for the lifetime of one original context.
+ * Each exact DATA record uses the original three-phase guard lifecycle. */
+static bool
+gcs_block_current_mx_exact_record(const GcsBlockR4TxOriginContext *context)
+{
+	ClusterCurrentMxOperationAsk ask;
+	return context->current_mx_exact && !context->current_mx_exact_b
+		&& cluster_multixact_operation_wire_get_ask(&context->current_mx_operation_request,
+			context->current_mx_exact_index, &ask) && ask.exact;
+}
+
+static bool
+gcs_block_current_mx_exact_begin(GcsBlockR4TxOriginContext *context, bool successor)
+{
+	ClusterCurrentMxOperationAsk ask;
+	uint32 segment, block;
+	uint16 slot, row;
+	ClusterUndoBlock0LogicalKey logical = { 0 };
+	ClusterUndoBlock0ResolvedRoot root;
+	context->canonical_sampled = false;
+	context->current_mx_exact_ready = false;
+	context->final_released = false;
+	memset(&context->origin_plan, 0, sizeof(context->origin_plan));
+	if (!gcs_block_current_mx_requester_identity_current(context) || context->request_conflict)
+		return false;
+	if (successor) {
+		context->current_mx_exact_b = true;
+		context->current_mx_saved_a_ctrc_key = context->current_mx_ctrc_keys[0];
+		context->locator = context->current_mx_request.trailer.body.updater.challenge
+			.candidate_next_xmin_locator;
+		context->current_mx_locator_count = 0;
+		context->current_mx_sampled_bitmap = 0;
+	} else {
+		uint16 i = context->current_mx_exact_index;
+		if (!cluster_multixact_operation_wire_get_ask(&context->current_mx_operation_request,
+				i, &ask))
+			return false;
+		if (!ask.exact) {
+			bool current_owner;
+			ClusterTTDurableLocate durable;
+			if (!gcs_block_current_mx_origin_locate_physical(ask.member.xid,
+					&context->current_mx_locators[i], &current_owner, &durable))
+				return false;
+			context->current_mx_locator_count = i + 1;
+			logical.owner_instance = (uint8)(cluster_node_id + 1);
+			logical.segment_id = context->current_mx_locators[i].segment_id;
+			if (!gcs_block_r4_tx_origin_resolve_root_current(context, &logical, &root))
+				return false;
+			context->tt_logical = logical;
+			context->tt_root = root;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN;
+			return true;
+		}
+		context->locator = ask.operation.locator;
+	}
+	if (!uba_decode_record(context->locator.uba, &segment, &block, &slot, &row) || block == 0
+		|| uba_origin_node_id(context->locator.uba) != (NodeId)cluster_node_id)
+		return false;
+	logical.owner_instance = (uint8)(cluster_node_id + 1);
+	logical.segment_id = segment;
+	if (!gcs_block_r4_tx_origin_resolve_root_current(context, &logical, &root))
+		return false;
+	context->logical = logical;
+	context->root = root;
+	context->phase = GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN;
+	return true;
+}
+
 static bool
 gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env, const void *payload)
 {
@@ -10486,10 +10559,10 @@ gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env, const void 
 	free_context->outcome = CLUSTER_TX_UNKNOWN;
 	free_context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 
-	/* Exact contexts must never reach the legacy raw/top sampler. Their
-	 * effect and successor strategies are connected before activation. */
 	if (has_exact) {
-		free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SAMPLE;
+		free_context->current_mx_exact = true;
+		if (!gcs_block_current_mx_exact_begin(free_context, false))
+			free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_LOCATOR;
 		return true;
 	}
 	if (request.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
@@ -10835,10 +10908,15 @@ gcs_block_current_mx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 	 * ACTIVE/SELF grant. */
 	for (i = 0; context->current_mx_result == CMX_RESOLVE_OK && i < context->current_mx_proof_count;
 		 i++) {
-		const ClusterCurrentMemberProof *proof = &context->current_mx_proofs[i];
+		const ClusterCurrentMemberProof *proof = context->current_mx_exact
+			? &context->current_mx_operation_proofs[i].base : &context->current_mx_proofs[i];
 		uint32 grant = ClusterCurrentMemberProofGetCtrcGrant(proof);
 
 		if ((proof->state == CCM_ACTIVE || proof->state == CCM_SELF)
+			&& (!context->current_mx_exact
+				|| context->current_mx_operation_proofs[i].effect_state
+					== CLUSTER_SAVEPOINT_EFFECT_LIVE
+				|| context->current_mx_operation_proofs[i].flags == 0)
 			&& !cluster_ctrc_origin_grant_publishable(&context->current_mx_ctrc_keys[i],
 													  &context->current_mx_requester_identity,
 													  grant)) {
@@ -10847,6 +10925,13 @@ gcs_block_current_mx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 			context->current_mx_proof_count = 0;
 			context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
 		}
+	}
+	if (context->current_mx_exact && context->current_mx_result == CMX_RESOLVE_OK
+		&& context->current_mx_updater_grant != 0
+		&& !cluster_ctrc_origin_grant_publishable(&context->current_mx_updater_ctrc_key,
+			&context->current_mx_requester_identity, context->current_mx_updater_grant)) {
+		context->current_mx_result = CMX_RESOLVE_RETRY;
+		context->current_mx_proof_count = 0;
 	}
 	memset(context->reply_frame, 0, sizeof(context->reply_frame));
 	header = (GcsBlockReplyHeader *)context->reply_frame;
@@ -10860,8 +10945,12 @@ gcs_block_current_mx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 		ClusterCurrentMemberOperationProof proofs[7] = { 0 };
 		ClusterCurrentMxOperationReplyPageV6 *operation_page = (void *)page;
 		for (i = 0; i < context->current_mx_proof_count; ++i) {
-			proofs[i].base = context->current_mx_proofs[i];
-			proofs[i].format_version = 2;
+			if (context->current_mx_exact)
+				proofs[i] = context->current_mx_operation_proofs[i];
+			else {
+				proofs[i].base = context->current_mx_proofs[i];
+				proofs[i].format_version = 2;
+			}
 		}
 		built = cluster_cr_server_current_mx_build_operation_proof_page(
 			(uint16)cluster_node_id, &context->current_mx_operation_request,
@@ -11020,6 +11109,113 @@ typedef enum GcsBlockCurrentMxAdvance {
 	GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT
 } GcsBlockCurrentMxAdvance;
 
+static bool
+gcs_block_current_mx_exact_held(GcsBlockR4TxOriginContext *context)
+{
+	uint16 i = context->current_mx_exact_index;
+	ClusterCurrentMxOperationAsk ask;
+	ClusterTxResolution top;
+	ClusterSavepointEffectProof effect;
+	ClusterTTStatusKey key = { 0 };
+	ClusterTTStatusResult result = { 0 };
+	ClusterUndoBlock0Generation generation = { false, 0 }, final_generation = { false, 0 };
+	ClusterUndoBlock0ResolvedRoot final_root;
+	bool live, physical_active, same_segment;
+	uint32 grant = 0;
+	ClusterCtrcTouchResult touched;
+	if (!cluster_multixact_operation_wire_get_ask(&context->current_mx_operation_request,
+			i, &ask) || !ask.exact || context->current_mx_exact_b)
+		return false;
+	switch (context->phase) {
+	case GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE:
+		if (cluster_runtime_visibility_origin_plan_freeze_mx_operation_held(&ask.operation,
+				context->resolve_mode, &context->admission, &context->guard, &context->root,
+				&context->origin_plan, &context->reason)
+				!= CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
+			|| !cluster_runtime_visibility_origin_plan_canonical_physical(&context->origin_plan,
+				&context->current_mx_locators[i], &same_segment)
+			|| !cluster_runtime_visibility_origin_plan_canonical_logical(&context->origin_plan,
+				&context->tt_logical)
+			|| !gcs_block_r4_tx_origin_resolve_root_current(context, &context->tt_logical,
+				&context->tt_root))
+			return false;
+		context->current_mx_locator_count = i + 1;
+		return true;
+	case GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE:
+		if (!cluster_runtime_visibility_origin_plan_sample_mx_operation_held(
+				&context->origin_plan, &ask.operation, context->resolve_mode, &context->admission,
+				&context->guard, &context->tt_root, &live, &context->reason)
+			|| !cluster_runtime_visibility_origin_plan_mx_sampled_top(&context->origin_plan,
+				&top, &physical_active))
+			return false;
+		if (live && top.outcome == CLUSTER_TX_IN_PROGRESS) {
+			if (!physical_active) {
+				context->current_mx_result = CMX_RESOLVE_RETRY;
+				return false;
+			}
+			if (cluster_undo_block0_current_sample_generation(&context->guard, &context->tt_root,
+					&generation) != CLUSTER_UNDO_BLOCK0_OK
+				|| !generation.known || generation.value != top.local_canonical_generation
+				|| !gcs_block_current_mx_ctrc_key(context, i, &generation,
+					&context->current_mx_ctrc_keys[i]))
+				return false;
+			touched = cluster_ctrc_origin_touch_exact(&context->current_mx_ctrc_keys[i],
+				&context->current_mx_requester_identity, CTRC_PROOF_ACTIVE, &grant);
+			if ((touched != CLUSTER_CTRC_TOUCH_RECORDED && touched != CLUSTER_CTRC_TOUCH_DUPLICATE)
+				|| grant == 0
+				|| cluster_undo_block0_current_sample_generation(&context->guard, &context->tt_root,
+					&final_generation) != CLUSTER_UNDO_BLOCK0_OK
+				|| !final_generation.known || final_generation.value != generation.value
+				|| !gcs_block_r4_tx_origin_resolve_root_current(context, &context->tt_logical,
+					&final_root) || !cluster_undo_block0_root_matches(&context->tt_root, &final_root)
+				|| !gcs_block_r4_tx_origin_admission_current(context)
+				|| cluster_qvotec_get_self_incarnation()
+					!= context->current_mx_ctrc_keys[i].origin_boot_incarnation)
+				return false;
+		}
+		ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], grant);
+		return true;
+	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK:
+		if (!cluster_runtime_visibility_origin_plan_copy_mx_operation_held(&context->origin_plan,
+				&ask.operation, context->resolve_mode, &context->admission, &context->guard,
+				&context->recheck_root, &top, &effect, &context->reason))
+			return false;
+		key.origin_node_id = (uint16)cluster_node_id;
+		key.undo_segment_id = top.local_canonical.segment_id;
+		key.tt_slot_id = cluster_tt_slot_offset_to_id(top.local_canonical.slot_offset);
+		key.local_xid = top.local_canonical.xid;
+		key.cluster_epoch = (uint32)context->admission.formation_epoch;
+		result.status = top.outcome == CLUSTER_TX_IN_PROGRESS ? CLUSTER_TT_STATUS_IN_PROGRESS
+			: top.outcome == CLUSTER_TX_COMMITTED ? CLUSTER_TT_STATUS_COMMITTED
+			: top.outcome == CLUSTER_TX_ABORTED ? CLUSTER_TT_STATUS_ABORTED
+			: CLUSTER_TT_STATUS_UNKNOWN;
+		result.status_epoch = key.cluster_epoch;
+		result.authoritative = true;
+		result.commit_scn = top.commit_scn;
+		{
+			ClusterCurrentMxMemberDesc member = { .xid = ask.member.xid,
+				.member_status = ask.member.member_status };
+			if (!cluster_multixact_current_resolve_operation_member_proof(&member,
+					ask.member.member_ordinal, &key, &result, &effect,
+					&context->current_mx_operation_proofs[i]))
+				return false;
+		}
+		if (effect.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE
+			&& top.outcome == CLUSTER_TX_IN_PROGRESS) {
+			grant = ClusterCurrentMemberProofGetCtrcGrant(&context->current_mx_proofs[i]);
+			if (grant == 0 || !cluster_multixact_current_operation_member_proof_bind_ctrc(
+					&context->current_mx_operation_proofs[i], &context->current_mx_ctrc_keys[i]))
+				return false;
+			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_operation_proofs[i].base,
+				grant);
+		}
+		context->current_mx_exact_ready = true;
+		return true;
+	default:
+		return false;
+	}
+}
+
 static GcsBlockCurrentMxAdvance
 gcs_block_current_mx_origin_updater_provenance_advance(GcsBlockR4TxOriginContext *context)
 {
@@ -11144,12 +11340,56 @@ gcs_block_current_mx_origin_advance(GcsBlockR4TxOriginContext *context)
 }
 
 static GcsBlockR4TxOriginPhase
+gcs_block_current_mx_exact_after_release(GcsBlockR4TxOriginContext *context)
+{
+	uint16 i = context->current_mx_exact_index;
+	ClusterCurrentMxOperationAsk ask;
+	if (!context->canonical_sampled || context->request_conflict
+		|| !gcs_block_current_mx_requester_identity_current(context))
+		return GCS_BLOCK_R4_TX_ORIGIN_SEND;
+	if (context->current_mx_exact_b) {
+		if (gcs_block_current_mx_origin_advance(context) != GCS_BLOCK_CURRENT_MX_ADVANCE_COMPLETE)
+			return GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		context->current_mx_updater_grant = ClusterCurrentMemberProofGetCtrcGrant(
+			&context->current_mx_proofs[0]);
+		context->current_mx_updater_ctrc_key = context->current_mx_ctrc_keys[0];
+		context->current_mx_ctrc_keys[0] = context->current_mx_saved_a_ctrc_key;
+		return GCS_BLOCK_R4_TX_ORIGIN_SEND;
+	}
+	if (!cluster_multixact_operation_wire_get_ask(&context->current_mx_operation_request,
+			i, &ask))
+		return GCS_BLOCK_R4_TX_ORIGIN_SEND;
+	if (ask.exact) {
+		if (!context->final_released || !context->current_mx_exact_ready)
+			return GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		context->current_mx_sampled_bitmap |= (uint8)(1U << i);
+	} else {
+		context->current_mx_operation_proofs[i].base = context->current_mx_proofs[i];
+		context->current_mx_operation_proofs[i].format_version = 2;
+	}
+	if (context->current_mx_request.prefix.body_kind
+			== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
+		/* A is complete and released before B obtains any guard. */
+		return gcs_block_current_mx_exact_begin(context, true) ? context->phase
+			: GCS_BLOCK_R4_TX_ORIGIN_SEND;
+	}
+	if (++context->current_mx_exact_index < context->current_mx_request.prefix.entry_count)
+		return gcs_block_current_mx_exact_begin(context, false) ? context->phase
+			: GCS_BLOCK_R4_TX_ORIGIN_SEND;
+	context->current_mx_proof_count = context->current_mx_request.prefix.entry_count;
+	context->current_mx_result = CMX_RESOLVE_OK;
+	return GCS_BLOCK_R4_TX_ORIGIN_SEND;
+}
+
+static GcsBlockR4TxOriginPhase
 gcs_block_current_mx_origin_after_release(GcsBlockR4TxOriginContext *context)
 {
 	GcsBlockCurrentMxAdvance advance;
 
 	if (context == NULL || !context->canonical_sampled)
 		return GCS_BLOCK_R4_TX_ORIGIN_SEND;
+	if (context->current_mx_exact)
+		return gcs_block_current_mx_exact_after_release(context);
 	advance = gcs_block_current_mx_origin_advance(context);
 	if (advance == GCS_BLOCK_CURRENT_MX_ADVANCE_COMPLETE)
 		cluster_ctrc_test_barrier_wait(CTRC_TEST_BARRIER_ACTIVE_PROOF_READY);
@@ -11295,6 +11535,12 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context, volatile bool *c
 			break;
 		}
 		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+			if (context->current_mx_exact && !context->current_mx_exact_b) {
+				context->phase = gcs_block_current_mx_exact_held(context)
+					? GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_BEGIN
+					: GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+				break;
+			}
 			current_mx_advance = gcs_block_current_mx_origin_updater_provenance_advance(context);
 			if (current_mx_advance == GCS_BLOCK_CURRENT_MX_ADVANCE_COMPLETE)
 				context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
@@ -11451,6 +11697,14 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context, volatile bool *c
 		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_MX_HISTORY)
 			context->canonical_sampled = gcs_block_mx_history_origin_sample_held(context, &history);
 		else if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+				 && context->current_mx_exact && !context->current_mx_exact_b) {
+			ClusterCurrentMxOperationAsk ask;
+			context->canonical_sampled = cluster_multixact_operation_wire_get_ask(
+				&context->current_mx_operation_request, context->current_mx_exact_index, &ask)
+				&& (ask.exact ? gcs_block_current_mx_exact_held(context)
+					: gcs_block_current_mx_origin_sample_held(context));
+		}
+		else if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
 				 && context->current_mx_request.prefix.body_kind
 						== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
 			context->canonical_sampled
@@ -11474,8 +11728,9 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context, volatile bool *c
 			context->guard_active = false;
 			memset(&context->guard, 0, sizeof(context->guard));
 			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-				&& context->current_mx_request.prefix.body_kind
-					   == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
+				&& (context->current_mx_request.prefix.body_kind
+					   == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE
+					|| gcs_block_current_mx_exact_record(context)))
 				context->phase = context->canonical_sampled
 									 ? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
 									 : GCS_BLOCK_R4_TX_ORIGIN_SEND;
@@ -11508,8 +11763,9 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context, volatile bool *c
 			context->guard_active = false;
 			memset(&context->guard, 0, sizeof(context->guard));
 			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-				&& context->current_mx_request.prefix.body_kind
-					   == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
+				&& (context->current_mx_request.prefix.body_kind
+					   == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE
+					|| gcs_block_current_mx_exact_record(context)))
 				context->phase = context->canonical_sampled
 									 ? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
 									 : GCS_BLOCK_R4_TX_ORIGIN_SEND;
@@ -11591,8 +11847,12 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context, volatile bool *c
 				break;
 			}
 			gcs_block_mx_history_origin_copy_held(context, &history);
-		} else if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
-			(void)gcs_block_current_mx_origin_updater_provenance_advance(context);
+		} else if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+			if (context->current_mx_exact && !context->current_mx_exact_b)
+				(void)gcs_block_current_mx_exact_held(context);
+			else
+				(void)gcs_block_current_mx_origin_updater_provenance_advance(context);
+		}
 		else if (context->undo_data_fetch)
 			gcs_block_r4_undo_origin_copy_held(context, &context->recheck_root);
 		else
