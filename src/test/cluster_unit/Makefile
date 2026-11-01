@@ -13511,7 +13511,9 @@ test_cluster_mx_operation_consumer: test_cluster_mx_operation_consumer.c \
 TESTS += test_cluster_mx_history_roundtrip
 all: test_cluster_mx_history_roundtrip
 
-test_cluster_mx_history_roundtrip: test_cluster_mx_history_roundtrip.c test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
+test_cluster_mx_history_roundtrip: test_cluster_mx_history_roundtrip.c \
+		test_cluster_mx_operation_receipt_product.o test_cluster_mx_operation_receipt.h \
+		test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
 		test_cluster_mx_history_finish.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
 		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
 		test_cluster_mx_history_admission.inc $(top_builddir)/src/backend/storage/lmgr/lock.o \
@@ -13535,7 +13537,7 @@ test_cluster_mx_history_roundtrip: test_cluster_mx_history_roundtrip.c test_clus
 		$(top_builddir)/src/backend/lib/pairingheap.o \
 		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
 		$(top_builddir)/src/common/psprintf_srv.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< test_cluster_mx_operation_receipt_product.o \
 		$(top_builddir)/src/backend/lib/pairingheap.o $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
 		$(top_builddir)/src/common/psprintf_srv.o \

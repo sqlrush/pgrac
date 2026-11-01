@@ -25,6 +25,7 @@ typedef struct HistoryCollectorDriver {
 	ClusterMxHistoryRequestWire request;
 	ClusterSavepointOperationKey *keys;
 	ClusterCurrentMemberOperationProof *proofs;
+	uint32 *capabilities;
 	ClusterCurrentUpdaterProof updater;
 	bool prepared, submitted, complete, members_ready, updater_ready, members_delivered;
 } HistoryCollectorDriver;
@@ -531,7 +532,7 @@ cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
 	ClusterMxHistoryStep step = cluster_mx_history_collect_poll(collector);
 	HistoryCollectorDriver *driver;
 	uint16 n;
-	Size key_bytes;
+	Size key_bytes, proof_bytes;
 
 	if (step != CMXH_COMPLETE)
 		return step;
@@ -540,13 +541,15 @@ cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
 		return CMXH_COMPLETE;
 	n = collector->capture->nmembers;
 	key_bytes = MAXALIGN(n * sizeof(*driver->keys));
-	driver->keys = MemoryContextAllocExtended(
-		TopTransactionContext, key_bytes + n * sizeof(*driver->proofs), MCXT_ALLOC_NO_OOM);
+	proof_bytes = MAXALIGN(n * sizeof(*driver->proofs));
+	driver->keys = MemoryContextAllocExtended(TopTransactionContext,
+		key_bytes + proof_bytes + n * sizeof(*driver->capabilities), MCXT_ALLOC_NO_OOM);
 	if (driver->keys == NULL)
 		goto failed;
 	driver->proofs = (ClusterCurrentMemberOperationProof *)((char *)driver->keys + key_bytes);
-	if (!cluster_mx_history_assemble_members(collector->capture, driver->graph, driver->keys,
-											 driver->proofs, n))
+	driver->capabilities = (uint32 *)((char *)driver->proofs + proof_bytes);
+	if (!cluster_mx_history_assemble_members_with_capabilities(collector->capture, driver->graph,
+			driver->keys, driver->proofs, driver->capabilities, n))
 		goto failed;
 	if (collector->has_updater) {
 		step
@@ -587,7 +590,8 @@ static ClusterMxHistoryStep
 history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer, HeapTuple tuple,
 			   const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members,
 			   uint16 nmembers, ClusterSavepointOperationKey *keys,
-			   ClusterCurrentMemberOperationProof *proofs, uint16 capacity,
+			   ClusterCurrentMemberOperationProof *proofs, uint32 *capabilities,
+			   bool require_capabilities, uint16 capacity,
 			   const ClusterCurrentUpdaterChallenge *fresh_challenge,
 			   ClusterCurrentUpdaterProof *updater)
 {
@@ -599,6 +603,8 @@ history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer
 		updater->verdict = CUCP_UNKNOWN;
 	}
 	history_finish_unknown(keys, proofs, capacity);
+	if (capabilities != NULL && capacity <= CLUSTER_CURRENT_MX_MAX_MEMBERS)
+		memset(capabilities, 0, capacity * sizeof(*capabilities));
 	if (collector == NULL || collector->capture == NULL)
 		return CMXH_UNKNOWN;
 	driver = collector->driver;
@@ -606,7 +612,7 @@ history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer
 		return CMXH_UNKNOWN;
 	n = collector->capture->nmembers;
 	if (CritSectionCount != 0 || capacity > CLUSTER_CURRENT_MX_MAX_MEMBERS || capacity < n
-		|| keys == NULL || proofs == NULL
+		|| keys == NULL || proofs == NULL || (require_capabilities && capabilities == NULL)
 		|| (collector->has_updater && (updater == NULL || fresh_challenge == NULL))
 		|| (!collector->has_updater && fresh_challenge != NULL)) {
 		cluster_mx_history_cancel(collector);
@@ -625,6 +631,8 @@ history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer
 		return CMXH_REQUALIFY;
 	memcpy(keys, driver->keys, n * sizeof(*keys));
 	memcpy(proofs, driver->proofs, n * sizeof(*proofs));
+	if (capabilities != NULL)
+		memcpy(capabilities, driver->capabilities, n * sizeof(*capabilities));
 	if (collector->has_updater)
 		*updater = driver->updater;
 	memset(&driver->updater, 0, sizeof(driver->updater));
@@ -635,6 +643,7 @@ history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer
 	pfree(driver->keys);
 	driver->keys = NULL;
 	driver->proofs = NULL;
+	driver->capabilities = NULL;
 	/* Keep capture/Snapshot until the last consumer calls cancel. Even an
 	 * otherwise unregistered Snapshot may have this sole native reference. */
 	return CMXH_COMPLETE;
@@ -677,7 +686,7 @@ cluster_mx_history_recheck_and_finish(ClusterMxHistoryCollector *collector, Rela
 									  ClusterCurrentMemberOperationProof *proofs, uint16 capacity)
 {
 	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
-						  capacity, NULL, NULL);
+						  NULL, false, capacity, NULL, NULL);
 }
 
 ClusterMxHistoryStep
@@ -688,6 +697,19 @@ cluster_mx_history_recheck_and_finish_with_updater(
 	const ClusterCurrentUpdaterChallenge *fresh_challenge, ClusterCurrentUpdaterProof *updater)
 {
 	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
-						  capacity, fresh_challenge, updater);
+						  NULL, false, capacity, fresh_challenge, updater);
+}
+
+/* A receipt consumer cannot silently omit the original capability batch. */
+ClusterMxHistoryStep
+cluster_mx_history_recheck_and_finish_for_receipts(
+	ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer, HeapTuple tuple,
+	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs,
+	uint32 *capabilities, uint16 capacity,
+	const ClusterCurrentUpdaterChallenge *fresh_challenge, ClusterCurrentUpdaterProof *updater)
+{
+	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
+		capabilities, true, capacity, fresh_challenge, updater);
 }
 #endif

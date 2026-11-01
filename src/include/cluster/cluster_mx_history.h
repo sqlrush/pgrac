@@ -99,6 +99,18 @@ extern ClusterMxHistoryStep cluster_mx_history_recheck_and_finish_with_updater(
 	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
 	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs, uint16 capacity,
 	const ClusterCurrentUpdaterChallenge *fresh_challenge, ClusterCurrentUpdaterProof *updater);
+/* Receipt consumers receive the original qualified request capability for
+ * each selected member in the same consume-once batch as keys/A/B. Never
+ * reconstruct this generation from a proof or a fresh backend sample.
+ * capabilities has capacity entries; non-success clears all bounded entries.
+ * A NULL capability output invalidates the attempt. The original grant and
+ * final heap/scope checks remain mandatory; no deployed gate is enabled. */
+extern ClusterMxHistoryStep cluster_mx_history_recheck_and_finish_for_receipts(
+	ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer, HeapTuple tuple,
+	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs,
+	uint32 *capabilities, uint16 capacity,
+	const ClusterCurrentUpdaterChallenge *fresh_challenge, ClusterCurrentUpdaterProof *updater);
 /* Full original heap relock comparison before borrowing completed private
  * graph views. The caller retains that lock; cancellation expires the view. */
 extern bool cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *collector,

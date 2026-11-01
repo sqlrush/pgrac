@@ -262,11 +262,10 @@ history_member_same_identity(const ClusterMxHistoryNodeView *a, const ClusterMxH
 		   && a->peer->canonical_generation == b->peer->canonical_generation;
 }
 
-bool
-cluster_mx_history_assemble_members(const ClusterMxHistoryCapture *c,
-									const ClusterMxHistoryGraph *g,
-									ClusterSavepointOperationKey *keys,
-									ClusterCurrentMemberOperationProof *proofs, uint16 capacity)
+static bool
+history_assemble_members(const ClusterMxHistoryCapture *c,
+	const ClusterMxHistoryGraph *g, ClusterSavepointOperationKey *keys,
+	ClusterCurrentMemberOperationProof *proofs, uint32 *capabilities, uint16 capacity)
 {
 	/* Fixed hash/selection storage is bounded by the immutable 256-member
 	 * descriptor; record count remains dynamic with no depth truncation. */
@@ -278,6 +277,8 @@ cluster_mx_history_assemble_members(const ClusterMxHistoryCapture *c,
 	if (capacity > CLUSTER_CURRENT_MX_MAX_MEMBERS)
 		return false;
 	history_members_reset(keys, proofs, capacity);
+	if (capabilities != NULL)
+		memset(capabilities, 0, capacity * sizeof(*capabilities));
 	if (keys == NULL || proofs == NULL || !history_members_capture_valid(c)
 		|| capacity < c->nmembers || n == 0 || n > MaxAllocSize / sizeof(*order))
 		return false;
@@ -326,14 +327,42 @@ cluster_mx_history_assemble_members(const ClusterMxHistoryCapture *c,
 			|| !history_member_key(c, &v, &keys[i])
 			|| !history_member_assemble_peer(c, &v, i, &keys[i], &proofs[i]))
 			goto done;
+		/* This is the selected record's original qualified request,
+		 * not the peer/origin generation or an unrelated B request. */
+		if (capabilities != NULL)
+			capabilities[i] = v.request->requester_capability_generation;
 	}
 	ok = true;
 done:
 	if (order != NULL)
 		pfree(order);
-	if (!ok)
+	if (!ok) {
 		history_members_reset(keys, proofs, capacity);
+		if (capabilities != NULL)
+			memset(capabilities, 0, capacity * sizeof(*capabilities));
+	}
 	return ok;
+}
+
+bool
+cluster_mx_history_assemble_members(const ClusterMxHistoryCapture *c,
+	const ClusterMxHistoryGraph *g, ClusterSavepointOperationKey *keys,
+	ClusterCurrentMemberOperationProof *proofs, uint16 capacity)
+{
+	return history_assemble_members(c, g, keys, proofs, NULL, capacity);
+}
+
+bool
+cluster_mx_history_assemble_members_with_capabilities(const ClusterMxHistoryCapture *c,
+	const ClusterMxHistoryGraph *g, ClusterSavepointOperationKey *keys,
+	ClusterCurrentMemberOperationProof *proofs, uint32 *capabilities, uint16 capacity)
+{
+	if (capabilities == NULL) {
+		if (capacity <= CLUSTER_CURRENT_MX_MAX_MEMBERS)
+			history_members_reset(keys, proofs, capacity);
+		return false;
+	}
+	return history_assemble_members(c, g, keys, proofs, capabilities, capacity);
 }
 
 /* Reuse an original ordered peer proof, not a raw writer/echo. The successor

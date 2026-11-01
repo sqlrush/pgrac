@@ -20,6 +20,14 @@ extern bool cluster_mx_history_assemble_members(const ClusterMxHistoryCapture *c
 												ClusterSavepointOperationKey *keys,
 												ClusterCurrentMemberOperationProof *proofs,
 												uint16 capacity);
+/* Same selection, plus the original qualified request capability of each
+ * selected record. It is not a new grant or origin capability. The required
+ * capabilities array has capacity entries, reset with keys/proofs on failure;
+ * all outputs must be distinct and cannot overlap graph/capture inputs. */
+extern bool cluster_mx_history_assemble_members_with_capabilities(
+	const ClusterMxHistoryCapture *capture, const ClusterMxHistoryGraph *graph,
+	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs,
+	uint32 *capabilities, uint16 capacity);
 /* proofs must be the complete assemble_members output from this same graph.
  * COMPLETE reuses independently qualified B bytes from the completed graph;
  * PENDING means that exact address is absent and requires the original B

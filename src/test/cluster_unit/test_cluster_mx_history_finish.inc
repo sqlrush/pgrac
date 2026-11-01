@@ -6,7 +6,7 @@
 static ClusterSavepointOperationKey finish_keys[256];
 static ClusterCurrentMemberOperationProof finish_proofs[256];
 static unsigned finish_requests, finish_reads, finish_cancels;
-static bool finish_pending;
+static bool finish_pending, finish_distinct_capabilities;
 static TransactionId finish_top;
 static ClusterTxOutcome finish_outcome;
 static bool finish_all_discarded, finish_successor_in_graph, finish_successor_fxid_drift;
@@ -35,7 +35,8 @@ finish_prepare(const ClusterMxHistoryRequest *input, ClusterMxHistoryRequestWire
 										  .requester_backend_id = MyBackendId,
 										  .master_node = uba_origin_node_id(r.locator.uba),
 										  .transition_id = PCM_TRANS_N_TO_S };
-	r.requester_capability_generation = 12;
+	r.requester_capability_generation = finish_distinct_capabilities
+		? (block == 7 ? 21 : block == 8 ? 34 : 55) : 12;
 	r.origin_capability_generation = 43;
 	return cluster_mx_history_request_encode(&r, out) ? CMXH_COMPLETE : CMXH_UNKNOWN;
 }
@@ -173,7 +174,7 @@ finish_sources(void)
 	poll_input = finish_landing_input;
 	cancel_input = finish_cancel_input;
 	finish_requests = finish_reads = finish_cancels = 0;
-	finish_pending = false;
+	finish_pending = finish_distinct_capabilities = false;
 	finish_top = 100;
 	finish_outcome = CLUSTER_TX_COMMITTED;
 	finish_all_discarded = false;

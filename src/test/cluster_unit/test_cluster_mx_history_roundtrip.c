@@ -7,6 +7,7 @@
 #include "test_cluster_mx_history_capture.c"
 #include "cluster/cluster_multixact_operation_wire.h"
 #include "cluster/cluster_xid_stripe_boot.h"
+#include "test_cluster_mx_operation_receipt.h"
 
 /* Only activation/nextXid leaves are controlled. The linked stripe arithmetic
  * derives raw child/top origins; no origin or proof verifier is stubbed. */
@@ -187,14 +188,165 @@ UT_TEST(original_relock_gate_prevents_wire_publication)
 	clean(c, s);
 }
 
+static ClusterMxHistoryStep
+receipt_finish(ClusterMxHistoryCollector *c, uint32 *capabilities, uint16 capacity,
+	const ClusterCurrentUpdaterChallenge *challenge, ClusterCurrentUpdaterProof *updater)
+{
+	content_locked = true;
+	return cluster_mx_history_recheck_and_finish_for_receipts(c, &relation, 1, &tuple,
+		&mxkey, members, 2, finish_keys, finish_proofs, capabilities, capacity, challenge, updater);
+}
+UT_TEST(collector_original_capabilities_reach_real_heap_retainer)
+{
+	static const ClusterTxOutcome outcomes[] = {
+		CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_COMMITTED, CLUSTER_TX_ABORTED };
+	for (unsigned state = 0; state < lengthof(outcomes); ++state)
+		for (unsigned discarded = 0; discarded < 2; ++discarded) {
+			Snapshot s = roundtrip_setup(outcomes[state], discarded);
+			ClusterMxHistoryCollector *c = NULL;
+			MxReceiptReadout retained;
+			uint32 capabilities[3] = { 99, 99, 99 };
+			bool live = outcomes[state] == CLUSTER_TX_IN_PROGRESS && !discarded;
+			finish_distinct_capabilities = true;
+			UT_ASSERT(begin(s, &c));
+			UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+			UT_ASSERT_EQ(receipt_finish(c, capabilities, 3, NULL, NULL), CMXH_COMPLETE);
+			UT_ASSERT_EQ(capabilities[0], 21);
+			UT_ASSERT_EQ(capabilities[1], 34);
+			UT_ASSERT_EQ(capabilities[2], 0);
+			UT_ASSERT(mx_receipt_retain(&mxkey, members, finish_keys, finish_proofs,
+				capabilities, 2, 145, MultiXactStatusForKeyShare, 900, 4, &retained));
+			UT_ASSERT_EQ(retained.proof_count, live ? 1 : 0);
+			UT_ASSERT_EQ(retained.normalized_count, live ? 2 : 1);
+			UT_ASSERT_EQ(retained.operation_id, 900);
+			UT_ASSERT_EQ(retained.attempt_generation, 5);
+			if (live) {
+				UT_ASSERT_EQ(retained.proofs[0].member_xid, 96);
+				UT_ASSERT_EQ(retained.proofs[0].key.local_xid, 80);
+				UT_ASSERT_EQ(retained.capabilities[0], 21);
+			}
+			UT_ASSERT_EQ(finish_reads, 2);
+			UT_ASSERT_EQ(finish_requests, 2);
+			UT_ASSERT_EQ(remembered, 2);
+			clean(c, s);
+		}
+}
+UT_TEST(collector_receipt_delivery_is_once_and_keeps_snapshot)
+{
+	Snapshot s = roundtrip_setup(CLUSTER_TX_IN_PROGRESS, false);
+	ClusterMxHistoryCollector *c = NULL;
+	uint32 capabilities[3] = { 99, 99, 99 };
+	UT_ASSERT(begin(s, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	UT_ASSERT_EQ(receipt_finish(c, capabilities, 3, NULL, NULL), CMXH_COMPLETE);
+	UT_ASSERT_EQ(capabilities[0], 12);
+	UT_ASSERT_EQ(capabilities[1], 12);
+	UT_ASSERT_EQ(receipt_finish(c, capabilities, 3, NULL, NULL), CMXH_UNKNOWN);
+	UT_ASSERT_EQ(capabilities[0] | capabilities[1] | capabilities[2], 0);
+	finish_unknown(3);
+	UT_ASSERT_EQ(remembered, 2);
+	UT_ASSERT_EQ(finish_reads, 2);
+	clean(c, s);
+}
+UT_TEST(collector_receipt_pending_has_no_partial_capability)
+{
+	Snapshot s = roundtrip_setup(CLUSTER_TX_IN_PROGRESS, false);
+	ClusterMxHistoryCollector *c = NULL;
+	uint32 capabilities[3] = { 99, 99, 99 };
+	UT_ASSERT(begin(s, &c));
+	UT_ASSERT_EQ(receipt_finish(c, capabilities, 3, NULL, NULL), CMXH_PENDING);
+	UT_ASSERT_EQ(capabilities[0] | capabilities[1] | capabilities[2], 0);
+	finish_unknown(3);
+	UT_ASSERT_EQ(finish_reads, 0);
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	UT_ASSERT_EQ(receipt_finish(c, capabilities, 3, NULL, NULL), CMXH_COMPLETE);
+	UT_ASSERT_EQ(capabilities[0], 12);
+	UT_ASSERT_EQ(remembered, 2);
+	clean(c, s);
+}
+UT_TEST(collector_receipt_relock_drift_clears_entire_batch)
+{
+	Snapshot s = roundtrip_setup(CLUSTER_TX_IN_PROGRESS, false);
+	ClusterMxHistoryCollector *c = NULL;
+	uint32 capabilities[3] = { 99, 99, 99 };
+	UT_ASSERT(begin(s, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	pcm_source.generation++;
+	UT_ASSERT_EQ(receipt_finish(c, capabilities, 3, NULL, NULL), CMXH_REQUALIFY);
+	UT_ASSERT_EQ(capabilities[0] | capabilities[1] | capabilities[2], 0);
+	finish_unknown(3);
+	UT_ASSERT_EQ(remembered, 1);
+	clean(c, s);
+}
+UT_TEST(collector_receipt_capability_output_is_required_and_bounded)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		Snapshot s = roundtrip_setup(CLUSTER_TX_IN_PROGRESS, false);
+		ClusterMxHistoryCollector *c = NULL;
+		uint32 capabilities[3] = { 99, 99, 99 };
+		uint16 capacity = fault == 1 ? 1 : fault == 2 ? 257 : 3;
+		UT_ASSERT(begin(s, &c));
+		UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+		UT_ASSERT_EQ(receipt_finish(c, fault == 0 ? NULL : capabilities, capacity, NULL, NULL),
+			CMXH_UNKNOWN);
+		if (fault == 1) { UT_ASSERT_EQ(capabilities[0], 0); UT_ASSERT_EQ(capabilities[1], 99); }
+		else UT_ASSERT_EQ(capabilities[0], 99);
+		UT_ASSERT_EQ(remembered, 1);
+		clean(c, s);
+	}
+}
+UT_TEST(collector_receipt_batch_keeps_A_capability_separate_from_B)
+{
+	Snapshot s = roundtrip_setup(CLUSTER_TX_IN_PROGRESS, false);
+	ClusterMxHistoryCollector *c = NULL;
+	ClusterCurrentUpdaterChallenge challenge = updater_challenge(6);
+	ClusterCurrentUpdaterProof updater;
+	uint32 capabilities[3] = { 99, 99, 99 };
+	finish_successor_in_graph = finish_distinct_capabilities = true;
+	UT_ASSERT(updater_begin(s, &challenge, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	UT_ASSERT_EQ(receipt_finish(c, capabilities, 3, &challenge, &updater), CMXH_COMPLETE);
+	UT_ASSERT_EQ(updater.verdict, CUCP_MATCH);
+	UT_ASSERT_EQ(capabilities[0], 21); /* Not B's independent request generation 55. */
+	UT_ASSERT_EQ(capabilities[1], 34);
+	UT_ASSERT_EQ(finish_reads, 3);
+	UT_ASSERT_EQ(finish_requests, 3);
+	UT_ASSERT_EQ(remembered, 2);
+	clean(c, s);
+}
+UT_TEST(collector_receipt_B_challenge_drift_invalidates_all_outputs)
+{
+	Snapshot s = roundtrip_setup(CLUSTER_TX_IN_PROGRESS, false);
+	ClusterMxHistoryCollector *c = NULL;
+	ClusterCurrentUpdaterChallenge challenge = updater_challenge(7);
+	ClusterCurrentUpdaterProof updater;
+	uint32 capabilities[3] = { 99, 99, 99 };
+	UT_ASSERT(updater_begin(s, &challenge, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	challenge.candidate_next_xmin_locator.itl_slot_index++;
+	UT_ASSERT_EQ(receipt_finish(c, capabilities, 3, &challenge, &updater), CMXH_REQUALIFY);
+	UT_ASSERT_EQ(updater.verdict, CUCP_UNKNOWN);
+	UT_ASSERT_EQ(capabilities[0] | capabilities[1] | capabilities[2], 0);
+	finish_unknown(3);
+	UT_ASSERT_EQ(remembered, 1);
+	clean(c, s);
+}
+
 int
 main(void)
 {
 	history_fixture_init();
-	UT_PLAN(3);
+	UT_PLAN(10);
 	UT_RUN(collector_wire_and_consumers_preserve_disposition);
 	UT_RUN(late_grant_corruption_rejects_whole_collector_batch);
 	UT_RUN(original_relock_gate_prevents_wire_publication);
+	UT_RUN(collector_original_capabilities_reach_real_heap_retainer);
+	UT_RUN(collector_receipt_delivery_is_once_and_keeps_snapshot);
+	UT_RUN(collector_receipt_pending_has_no_partial_capability);
+	UT_RUN(collector_receipt_relock_drift_clears_entire_batch);
+	UT_RUN(collector_receipt_capability_output_is_required_and_bounded);
+	UT_RUN(collector_receipt_batch_keeps_A_capability_separate_from_B);
+	UT_RUN(collector_receipt_B_challenge_drift_invalidates_all_outputs);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
