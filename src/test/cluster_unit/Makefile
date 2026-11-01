@@ -7631,6 +7631,7 @@ test_cluster_sf_dep: test_cluster_sf_dep.c unit_test.h $(top_srcdir)/src/backend
 CLUSTER_R4_GCS_BLOCK_TEST_O = test_cluster_r4_gcs_block_product.o
 $(CLUSTER_R4_GCS_BLOCK_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c \
 		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
+		$(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h \
 		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
 		-DCLUSTER_R4_ROUTE_POLICY_UNIT -ffunction-sections -fdata-sections \
@@ -7669,7 +7670,7 @@ test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
 		$(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_PCM_OWN_O) \
-		$(CLUSTER_RUNTIME_VIS_POLICY_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -8222,7 +8223,8 @@ test_cluster_control_transport: test_cluster_control_transport.c test_cluster_ic
 # (admitted frame never resubmitted, refused frame retained in per-peer
 # order, blocked peer never head-of-line blocks the batch).
 CLUSTER_LMS_OUTBOUND_O = $(top_builddir)/src/backend/cluster/cluster_lms_outbound.o
-cluster_lms_outbound_test.o: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c
+cluster_lms_outbound_test.o: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_LMS_OUTBOUND_UNIT_TEST -c $< -o $@
 
 # Run the real refusal producers and decoder against the real outbound ring.
@@ -8243,6 +8245,7 @@ test_cluster_r4_refusal_handoff.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 	mv $@.tmp $@
 
 test_cluster_lms_outbound: test_cluster_lms_outbound.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h \
 		test_cluster_r4_refusal_handoff.inc $(CLUSTER_VERSION_O) cluster_lms_outbound_test.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) cluster_lms_outbound_test.o \
@@ -13330,3 +13333,23 @@ test_cluster_mx_history_wire: test_cluster_mx_history_wire.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_MX_HISTORY_WIRE_O) \
         $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
         $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# The history landing exercises the registered production handler and original
+# requester table. Only transport, scheduling and admission are fixture seams.
+TESTS += test_cluster_mx_history_backend
+all: test_cluster_mx_history_backend
+test_cluster_r4_route_policy: $(CLUSTER_MX_HISTORY_WIRE_O)
+
+test_cluster_mx_history_backend: test_cluster_mx_history_backend.c \
+        test_cluster_r4_route_policy.c unit_test.h \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h \
+        test_cluster_r4_forward_ingress_boundaries.inc \
+        test_cluster_current_mx_reply_builder.inc test_cluster_pcm_snapshot_owner.inc \
+        test_cluster_gcs_read_rearm_owner.inc $(CLUSTER_VERSION_O) \
+        $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_PCM_OWN_O) \
+        $(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+        $(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_PCM_OWN_O) \
+        $(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+        $(CLUSTER_UNIT_PORT_LIBS) -o $@

@@ -1367,9 +1367,19 @@ route_test_capability_generation(int32 peer_id)
 	return 0;
 }
 
+static uint64 route_history_stream_generation = 101;
+
+uint64
+cluster_ic_tier1_resource_x_stream_generation(int32 peer pg_attribute_unused(),
+											  int channel pg_attribute_unused())
+{
+	return route_history_stream_generation;
+}
+
 static void
 route_seam_reset(void)
 {
+	route_history_stream_generation = 101;
 	stop_new_read_allowed = true;
 	stop_new_read_calls = 0;
 	mx_origin_sample_enabled = false;

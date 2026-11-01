@@ -35,6 +35,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "utils/resowner.h"
 
 #include <unistd.h>
 
@@ -60,6 +61,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_membership.h" /* spec-5.16 D3b — is_member master-side gate */
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_mx_history_wire.h"
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_reconfig.h"		/* QVOTEC-observed live peer incarnation */
@@ -143,11 +145,12 @@
 /* D4 keeps the legacy acquisition reply table and the R4 synchronous-CR
  * reply table logically disjoint even though their physical 8240-byte frames
  * share one C decoder.  The byte value is stored in existing slot padding;
- * no shared-memory size or subsequent field offset changes. */
+ * original field offsets stay fixed; history appends its explicit sidecar. */
 typedef enum ClusterGcsBlockReplyDomain {
 	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE = 0,
 	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR = 1,
-	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX = 2
+	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX = 2,
+	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY = 3
 } ClusterGcsBlockReplyDomain;
 
 /* M4 Candidate-2 remote origin work is process-local and bounded.  The
@@ -306,6 +309,15 @@ typedef struct GcsFirstFillReceipt {
 	bool progress_waiter;
 } GcsFirstFillReceipt;
 
+/* One history attempt per original slot; DATA reuses reply_block_data. */
+typedef struct GcsMxHistorySlot {
+	ClusterMxHistoryRequestWire request;
+	ClusterMxHistoryPeerWire peer;
+	uint8 auth[16];
+	uint8 valid, submitted, reply_valid, poisoned, zero[4];
+} GcsMxHistorySlot;
+StaticAssertDecl(sizeof(GcsMxHistorySlot) == 584, "history slot sidecar size");
+
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
 	uint8 reply_domain;
@@ -360,20 +372,27 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	ClusterR4CrOwnerChallenge r4_requester_owner;
 	bool r4_cr_owner_bound;
 	SCN r4_read_scn;
-	uint64 r4_activation_generation;
+	/* The closed domains never coexist: R4 owns activation, history owns the
+	 * exact original DATA stream. This native union changes no old offset. */
+	union {
+		uint64 r4_activation_generation;
+		uint64 history_stream_generation;
+	};
 	ClusterR4ProjectionScratch r4_projection;
+	GcsMxHistorySlot history;
 } ClusterGcsBlockOutstandingSlot;
 
 StaticAssertDecl(CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE == 0
 					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR == 1
-					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX == 2,
-				 "GCS block reply domain must remain the closed 0/1/2 set");
+					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX == 2
+					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY == 3,
+				 "GCS block reply domain must remain the closed 0/1/2/3 set");
 StaticAssertDecl(offsetof(ClusterGcsBlockOutstandingSlot, reply_domain) == 1,
 				 "GCS block reply domain must consume byte-1 slot padding");
 StaticAssertDecl(offsetof(ClusterGcsBlockOutstandingSlot, request_id) == 8,
 				 "GCS block slot request_id offset must remain 8");
 StaticAssertDecl(sizeof(ClusterGcsBlockOutstandingSlot)
-					 == 8736 + MAXALIGN(sizeof(GcsFirstFillReceipt)) + 3848,
+					 == 8736 + MAXALIGN(sizeof(GcsFirstFillReceipt)) + 3848 + 584,
 				 "GCS receipt must append to the original requester-slot layout");
 
 typedef struct ClusterGcsBlockBackendBlock {
@@ -386,6 +405,7 @@ typedef struct ClusterGcsBlockBackendBlock {
 static void
 gcs_block_slot_clear_current_mx_expectation(ClusterGcsBlockOutstandingSlot *slot)
 {
+	memset(&slot->history, 0, sizeof(slot->history));
 	slot->expected_reply_status = 0;
 	slot->expected_current_mx_key_valid = false;
 	memset(&slot->expected_current_mx_key, 0, sizeof(slot->expected_current_mx_key));
@@ -397,7 +417,7 @@ static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
 static ClusterGcsUndoVerdictPathCounters gcs_undo_verdict_path_counters;
 
 /*
- * Count only live requester slots whose closed domain is R4_CR.  LMON uses
+ * Count live R4_CR and history requester slots. LMON uses
  * this read-only census after admission and transport close; an unavailable
  * table is deliberately nonzero so missing startup state cannot prove zero.
  */
@@ -418,7 +438,9 @@ cluster_gcs_block_r4_requester_count(void)
 		for (slot_id = 0; slot_id < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; slot_id++) {
 			const ClusterGcsBlockOutstandingSlot *slot = &blk->slots[slot_id];
 
-			if (slot->in_use && slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR)
+			if (slot->in_use
+				&& (slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
+					|| slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY))
 				count++;
 		}
 		LWLockRelease(&blk->lock.lock);
@@ -1274,6 +1296,8 @@ gcs_block_try_reserve_current_mx_slot(const ClusterCurrentMxKey *key, uint64 req
 static void
 gcs_block_clear_slot_locked(ClusterGcsBlockOutstandingSlot *slot)
 {
+	if (slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY)
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
 	slot->in_use = false;
 	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
 	slot->reply_received = false;
@@ -3789,6 +3813,8 @@ gcs_first_fill_source_exit(void)
 	LWLockRelease(&blk->lock.lock);
 }
 
+static void gcs_mx_history_cancel_all(void);
+
 static void
 gcs_read_source_backend_exit(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
 {
@@ -3801,6 +3827,7 @@ gcs_read_source_backend_exit(int code pg_attribute_unused(), Datum arg pg_attrib
 			memset(attempt, 0, sizeof(*attempt));
 		}
 	}
+	gcs_mx_history_cancel_all();
 	gcs_first_fill_source_exit();
 }
 
@@ -3813,6 +3840,439 @@ cluster_gcs_block_read_source_init_backend(void)
 		before_shmem_exit(gcs_read_source_backend_exit, (Datum)0);
 		gcs_read_source_exit_registered = true;
 	}
+}
+
+/* History uses the original request-id allocator, slot locks and DATA FIFO.
+ * No caller result, shared buffer or local TT field is published by a codec. */
+static bool gcs_history_resource_registered;
+
+static bool
+gcs_mx_history_decode(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryRequest *r,
+					  bool backend)
+{
+	return wire != NULL
+		   && cluster_mx_history_request_decode(wire, sizeof(*wire), cluster_node_id,
+												(int32)ClusterR4WireReadU32(wire->bytes + 44),
+												ClusterR4WireReadU64(wire->bytes + 8), r)
+		   && !(r->flags & CLUSTER_MX_HISTORY_CANCEL)
+		   && (!backend
+			   || (r->forward.requester_backend_id == MyBackendId
+				   && r->backend_incarnation == (uint64)MyStartTimestamp));
+}
+
+static uint64
+gcs_mx_history_stream(const ClusterMxHistoryRequest *r)
+{
+	return cluster_ic_tier1_resource_x_stream_generation(
+		r->forward.master_node, cluster_lms_shard_for_tag(&r->forward.tag, cluster_lms_workers));
+}
+
+static bool
+gcs_mx_history_scope(const ClusterMxHistoryRequest *r)
+{
+	ClusterSemanticAdmissionToken token;
+	uint32 local = 0, peer = 0;
+	bool optional = false;
+	volatile bool valid = false;
+
+	if (cluster_semantic_activation_enter(r->feature_bit, CLUSTER_SEMANTIC_TARGET_SIDE, &token)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	PG_TRY();
+	{
+		valid = token.record_generation == r->admission_generation
+				&& token.formation_epoch == r->read_epoch
+				&& gcs_block_r4_local_capability_generation(&token, R4_CR_REQUIRED_HELLO_CAPS, 0,
+															&optional, &local)
+				&& local == r->requester_capability_generation
+				&& cluster_sf_peer_capability_family_sample(
+					r->forward.master_node, R4_CR_REQUIRED_HELLO_CAPS, 0, &optional, &peer)
+				&& peer == r->origin_capability_generation
+				&& cluster_semantic_activation_peer_open_matches(&token, r->forward.master_node,
+																 R4_CR_REQUIRED_HELLO_CAPS, peer)
+				&& cluster_semantic_activation_recheck(&token);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&token);
+	}
+	PG_END_TRY();
+	return valid;
+}
+
+/* The caller holds the original backend lock. Match the full capture, not
+ * just the reusable slot index or raw request-id. */
+static ClusterGcsBlockOutstandingSlot *
+gcs_mx_history_find(ClusterGcsBlockBackendBlock *blk, const ClusterMxHistoryRequestWire *wire)
+{
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[i];
+		if (slot->in_use && slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY
+			&& slot->history.valid
+			&& cluster_mx_history_request_same(&slot->history.request, wire, false))
+			return slot;
+	}
+	return NULL;
+}
+
+static void
+gcs_mx_history_resource_release(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
+								void *arg pg_attribute_unused())
+{
+	/* A child abort invalidates the collector's read scope conservatively.
+	 * Subcommit leaves it intact; the collector still owns exact cancellation. */
+	if (phase == RESOURCE_RELEASE_BEFORE_LOCKS && (!isCommit || isTopLevel))
+		gcs_mx_history_cancel_all();
+}
+
+bool
+cluster_gcs_block_mx_history_prepare(const ClusterMxHistoryRequest *request,
+									 ClusterMxHistoryRequestWire *out)
+{
+	ClusterMxHistoryRequest candidate;
+	ClusterMxHistoryRequestWire wire;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot = NULL;
+	uint64 sequence;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (request == NULL || request->forward.request_id != 0 || gcs_block_backend_blocks == NULL
+		|| MyBackendId <= 0 || MyBackendId > MaxBackends || !gcs_read_source_exit_registered)
+		return false;
+	candidate = *request;
+	candidate.forward.request_id = 1; /* validate before allocating the real ID */
+	if (!cluster_mx_history_request_encode(&candidate, &wire)
+		|| !gcs_mx_history_decode(&wire, &candidate, true) || !gcs_mx_history_scope(&candidate))
+		return false;
+	if (!gcs_history_resource_registered) {
+		RegisterResourceReleaseCallback(gcs_mx_history_resource_release, NULL);
+		gcs_history_resource_registered = true;
+	}
+	blk = gcs_block_my_block();
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++)
+		if (!blk->slots[i].in_use) {
+			slot = &blk->slots[i];
+			break;
+		}
+	sequence = blk->next_request_id;
+	if (slot == NULL || sequence == 0 || sequence > GCS_REQID_REQUESTER_SEQ_MASK) {
+		LWLockRelease(&blk->lock.lock);
+		return false;
+	}
+	candidate.forward.request_id = gcs_reqid_requester(cluster_node_id, MyBackendId - 1, sequence);
+	if (!cluster_mx_history_request_encode(&candidate, &wire)) {
+		LWLockRelease(&blk->lock.lock);
+		return false;
+	}
+	blk->next_request_id++;
+	gcs_block_clear_slot_locked(slot);
+	memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+	memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+	slot->in_use = true;
+	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY;
+	slot->request_id = candidate.forward.request_id;
+	slot->transition_id = PCM_TRANS_N_TO_S;
+	slot->tag = candidate.forward.tag;
+	slot->master_node = slot->expected_master_node = candidate.forward.master_node;
+	slot->request_epoch = candidate.read_epoch;
+	slot->expected_reply_status = CLUSTER_MX_HISTORY_REPLY_STATUS;
+	slot->reply_undo_trailer_valid = false;
+	slot->reply_undo_tt_generation = slot->reply_undo_authority_scn = 0;
+	slot->history.request = wire;
+	slot->history.valid = 1;
+	*out = wire;
+#ifdef USE_CLUSTER_UNIT
+	cluster_gcs_block_test_requester_slot = slot;
+#endif
+	LWLockRelease(&blk->lock.lock);
+	return true;
+}
+
+bool
+cluster_gcs_block_mx_history_submit(const ClusterMxHistoryRequestWire *wire)
+{
+	ClusterMxHistoryRequest r;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint64 stream;
+	bool sent;
+
+	if (gcs_block_backend_blocks == NULL || MyBackendId <= 0 || MyBackendId > MaxBackends
+		|| !gcs_mx_history_decode(wire, &r, true) || !gcs_mx_history_scope(&r))
+		return false;
+	blk = gcs_block_my_block();
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	slot = gcs_mx_history_find(blk, wire);
+	if (slot == NULL || slot->stale) {
+		LWLockRelease(&blk->lock.lock);
+		return false;
+	}
+	if (slot->history.submitted) {
+		bool current = slot->history_stream_generation != 0
+					   && slot->history_stream_generation == gcs_mx_history_stream(&r);
+		if (!current) {
+			slot->stale = true;
+			ConditionVariableBroadcast(&slot->reply_cv);
+		}
+		LWLockRelease(&blk->lock.lock);
+		return current;
+	}
+	stream = gcs_mx_history_stream(&r);
+	if (stream == 0) {
+		LWLockRelease(&blk->lock.lock);
+		return false; /* first DATA HELLO is local backpressure, not an error */
+	}
+	slot->history_stream_generation = stream;
+	slot->history.submitted = 1;
+	LWLockRelease(&blk->lock.lock);
+	/* Publication precedes transport. Never hold the slot lock across enqueue. */
+	sent = cluster_lms_outbound_enqueue_cap_bound(
+		cluster_lms_shard_for_tag(&r.forward.tag, cluster_lms_workers),
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, r.forward.master_node, wire, sizeof(*wire),
+		R4_CR_REQUIRED_HELLO_CAPS, r.origin_capability_generation);
+	if (!sent) {
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot = gcs_mx_history_find(blk, wire);
+		if (slot != NULL) {
+			slot->history.submitted = 0;
+			slot->history_stream_generation = 0;
+		}
+		LWLockRelease(&blk->lock.lock);
+	}
+	return sent;
+}
+
+void
+cluster_gcs_block_mx_history_cancel(const ClusterMxHistoryRequestWire *wire)
+{
+	ClusterMxHistoryRequest r;
+	ClusterMxHistoryRequestWire cancel;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot;
+	bool submitted = false;
+
+	if (gcs_block_backend_blocks == NULL || MyBackendId <= 0 || MyBackendId > MaxBackends
+		|| !gcs_mx_history_decode(wire, &r, true))
+		return;
+	blk = gcs_block_my_block();
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	slot = gcs_mx_history_find(blk, wire);
+	if (slot != NULL) {
+		submitted = slot->history.submitted != 0;
+		gcs_block_clear_slot_locked(slot); /* close delivery before best-effort CANCEL */
+		ConditionVariableBroadcast(&blk->capacity_cv);
+	}
+	LWLockRelease(&blk->lock.lock);
+	if (submitted && cluster_mx_history_request_cancel(wire, &cancel))
+		(void)cluster_lms_outbound_enqueue_cap_bound(
+			cluster_lms_shard_for_tag(&r.forward.tag, cluster_lms_workers),
+			PGRAC_IC_MSG_GCS_BLOCK_FORWARD, r.forward.master_node, &cancel, sizeof(cancel),
+			R4_CR_REQUIRED_HELLO_CAPS, r.origin_capability_generation);
+}
+
+static void
+gcs_mx_history_cancel_all(void)
+{
+	ClusterGcsBlockBackendBlock *blk;
+	if (gcs_block_backend_blocks == NULL || MyBackendId <= 0 || MyBackendId > MaxBackends)
+		return;
+	blk = gcs_block_my_block();
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		ClusterMxHistoryRequestWire wire;
+		bool live;
+		LWLockAcquire(&blk->lock.lock, LW_SHARED);
+		live = blk->slots[i].in_use
+			   && blk->slots[i].reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY
+			   && blk->slots[i].history.valid;
+		if (live)
+			wire = blk->slots[i].history.request;
+		LWLockRelease(&blk->lock.lock);
+		if (live)
+			cluster_gcs_block_mx_history_cancel(&wire);
+	}
+}
+
+ClusterMxHistoryStep
+cluster_gcs_block_mx_history_poll(const ClusterMxHistoryRequestWire *wire,
+								  ClusterMxHistoryPeerResult *out)
+{
+	ClusterMxHistoryRequest r;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterMxHistoryStep step = CMXH_UNKNOWN;
+
+	if (out == NULL)
+		return CMXH_UNKNOWN;
+	memset(out, 0, sizeof(*out));
+	if (gcs_block_backend_blocks == NULL || MyBackendId <= 0 || MyBackendId > MaxBackends
+		|| !gcs_mx_history_decode(wire, &r, true))
+		return CMXH_UNKNOWN;
+	if (!gcs_mx_history_scope(&r)) {
+		cluster_gcs_block_mx_history_cancel(wire);
+		return CMXH_REQUALIFY;
+	}
+	blk = gcs_block_my_block();
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	slot = gcs_mx_history_find(blk, wire);
+	if (slot != NULL) {
+		if (slot->stale
+			|| (slot->history.submitted
+				&& (slot->history_stream_generation == 0
+					|| slot->history_stream_generation != gcs_mx_history_stream(&r))))
+			step = CMXH_REQUALIFY;
+		else if (!slot->reply_received)
+			step = CMXH_PENDING;
+		else if (slot->reply_header.status == GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED)
+			step = CMXH_REQUALIFY;
+		else if (!slot->history.poisoned && slot->history.reply_valid) {
+			out->request = slot->history.request;
+			memcpy(out->data, slot->reply_block_data, sizeof(out->data));
+			memcpy(out->auth, slot->history.auth, sizeof(out->auth));
+			out->peer = slot->history.peer;
+			out->admitted = 1;
+			step = CMXH_COMPLETE;
+		}
+		if (step != CMXH_PENDING && step != CMXH_REQUALIFY) {
+			gcs_block_clear_slot_locked(slot);
+			ConditionVariableBroadcast(&blk->capacity_cv);
+		}
+	}
+	LWLockRelease(&blk->lock.lock);
+	if (step == CMXH_REQUALIFY)
+		cluster_gcs_block_mx_history_cancel(wire);
+	return step;
+}
+
+void
+cluster_gcs_block_mx_history_send_failed(const void *payload, uint16 length, int32 origin)
+{
+	const ClusterMxHistoryRequestWire *wire = payload;
+	ClusterMxHistoryRequest r;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot;
+
+	if (length != sizeof(*wire) || gcs_block_backend_blocks == NULL
+		|| !gcs_mx_history_decode(wire, &r, false) || r.forward.master_node != origin
+		|| r.forward.requester_backend_id <= 0 || r.forward.requester_backend_id > MaxBackends)
+		return;
+	blk = &gcs_block_backend_blocks[r.forward.requester_backend_id - 1];
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	slot = gcs_mx_history_find(blk, wire);
+	if (slot != NULL && slot->history.submitted) {
+		slot->stale = true;
+		ConditionVariableBroadcast(&slot->reply_cv);
+	}
+	LWLockRelease(&blk->lock.lock);
+}
+
+static void
+gcs_mx_history_drop(void)
+{
+	if (ClusterGcsBlock != NULL)
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
+}
+
+/* Status 31 is always consumed here. Original negative statuses are consumed
+ * only for an exact history-domain slot; other families retain their owners. */
+static bool
+gcs_mx_history_land(const ClusterICEnvelope *env, const void *payload)
+{
+	const uint8 *b = payload;
+	ClusterMxHistoryRequestWire expected;
+	ClusterMxHistoryRequest r;
+	ClusterMxHistoryPeerResult result;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot;
+	uint8 status, decoded_status = 0;
+	uint64 id;
+	int32 backend;
+	bool found = false, valid;
+
+	if (env == NULL || b == NULL || env->payload_length < 48)
+		return false;
+	status = b[37];
+	if (status != CLUSTER_MX_HISTORY_REPLY_STATUS && status != GCS_BLOCK_REPLY_R4_DENIED
+		&& status != GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED)
+		return false;
+	backend = (int32)ClusterR4WireReadU32(b + 32);
+	id = ClusterR4WireReadU64(b);
+	if (gcs_block_backend_blocks == NULL || backend <= 0 || backend > MaxBackends) {
+		if (status == CLUSTER_MX_HISTORY_REPLY_STATUS)
+			gcs_mx_history_drop();
+		return status == CLUSTER_MX_HISTORY_REPLY_STATUS;
+	}
+	blk = &gcs_block_backend_blocks[backend - 1];
+	LWLockAcquire(&blk->lock.lock, LW_SHARED);
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		slot = &blk->slots[i];
+		if (slot->in_use && slot->request_id == id
+			&& slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY
+			&& slot->history.valid && slot->history.submitted) {
+			expected = slot->history.request;
+			found = true;
+			break;
+		}
+	}
+	LWLockRelease(&blk->lock.lock);
+	if (!found) {
+		if (status == CLUSTER_MX_HISTORY_REPLY_STATUS)
+			gcs_mx_history_drop();
+		return status == CLUSTER_MX_HISTORY_REPLY_STATUS;
+	}
+	if (!gcs_mx_history_decode(&expected, &r, false)
+		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
+		|| env->source_node_id != (uint32)r.forward.master_node
+		|| env->dest_node_id != (uint32)cluster_node_id || env->epoch != r.read_epoch
+		|| !gcs_mx_history_scope(&r)) {
+		gcs_mx_history_drop();
+		return true;
+	}
+	/* An old capture is a late packet, not a conflict in the current capture. */
+	if (status == CLUSTER_MX_HISTORY_REPLY_STATUS && env->payload_length == 8816
+		&& memcmp(b + 48, &expected, sizeof(expected)) != 0) {
+		gcs_mx_history_drop();
+		return true;
+	}
+	valid = cluster_mx_history_reply_decode(payload, env->payload_length, r.forward.master_node,
+											&expected, &decoded_status, &result);
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	slot = gcs_mx_history_find(blk, &expected);
+	if (slot != NULL && !slot->stale && slot->history.submitted
+		&& slot->history_stream_generation != 0
+		&& slot->history_stream_generation == gcs_mx_history_stream(&r)) {
+		if (valid && slot->reply_received && !slot->history.poisoned
+			&& slot->reply_header.status == decoded_status
+			&& (decoded_status != CLUSTER_MX_HISTORY_REPLY_STATUS
+				|| (slot->history.reply_valid
+					&& memcmp(slot->reply_block_data, result.data, sizeof(result.data)) == 0
+					&& memcmp(slot->history.auth, result.auth, sizeof(result.auth)) == 0
+					&& memcmp(&slot->history.peer, &result.peer, sizeof(result.peer)) == 0))) {
+			LWLockRelease(&blk->lock.lock);
+			return true;
+		}
+		if (!valid || slot->reply_received || slot->history.poisoned) {
+			gcs_mx_history_drop();
+			slot->history.poisoned = 1;
+			slot->history.reply_valid = 0;
+			memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+			memset(slot->history.auth, 0, sizeof(slot->history.auth));
+			memset(&slot->history.peer, 0, sizeof(slot->history.peer));
+			decoded_status = GCS_BLOCK_REPLY_R4_DENIED;
+		} else if (decoded_status == CLUSTER_MX_HISTORY_REPLY_STATUS) {
+			memcpy(slot->reply_block_data, result.data, sizeof(result.data));
+			memcpy(slot->history.auth, result.auth, sizeof(result.auth));
+			slot->history.peer = result.peer;
+			slot->history.reply_valid = 1;
+		}
+		slot->reply_header.status = decoded_status;
+		slot->reply_received = true;
+		ConditionVariableBroadcast(&slot->reply_cv);
+	}
+	LWLockRelease(&blk->lock.lock);
+	return true;
 }
 
 static bool
@@ -22389,6 +22849,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		return;
 	if (gcs_block_try_land_ctrc_reply(env, payload))
 		return;
+	if (gcs_mx_history_land(env, payload))
+		return;
 	if (gcs_block_try_land_current_mx_reply(env, payload))
 		return;
 	if (gcs_block_try_land_r4_terminal_reply(env, payload))
@@ -25563,6 +26025,7 @@ cluster_gcs_block_normal_stop_poll(bool post_checkpoint, int *backend_out, int *
 	uint32 expected, acked, busy;
 	bool invalid;
 	BufferTag zero_tag = { 0 };
+	static const GcsMxHistorySlot zero_history;
 	int backend;
 
 	if (backend_out == NULL || slot_out == NULL || reason_out == NULL)
@@ -25583,7 +26046,7 @@ cluster_gcs_block_normal_stop_poll(bool post_checkpoint, int *backend_out, int *
 		LWLockAcquire(&blk->lock.lock, LW_SHARED);
 		for (int index = 0; index < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; index++) {
 			const ClusterGcsBlockOutstandingSlot *slot = &blk->slots[index];
-			invalid = slot->reply_domain > CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX
+			invalid = slot->reply_domain > CLUSTER_GCS_BLOCK_REPLY_DOMAIN_MX_HISTORY
 					  || slot->direct_state < GCS_BLOCK_DIRECT_UNARMED
 					  || slot->direct_state > GCS_BLOCK_DIRECT_ABORTED;
 			if (slot->in_use)
@@ -25598,7 +26061,9 @@ cluster_gcs_block_normal_stop_poll(bool post_checkpoint, int *backend_out, int *
 						   || slot->direct_target_lkey != 0
 						   || slot->direct_abort_reason != GCS_BLOCK_DIRECT_ABORT_NONE
 						   || slot->expected_current_mx_key_valid
-						   || slot->expected_current_mx_proof_valid;
+						   || slot->expected_current_mx_proof_valid || slot->history.valid
+						   || slot->history.submitted
+						   || memcmp(&slot->history, &zero_history, sizeof(zero_history)) != 0;
 			if (invalid || (slot->in_use && result == CLUSTER_NORMAL_STOP_READY)) {
 				result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
 				*backend_out = backend;

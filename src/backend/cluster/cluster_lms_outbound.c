@@ -41,6 +41,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_membership.h"
+#include "cluster/cluster_mx_history_wire.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -1003,6 +1004,19 @@ cluster_lms_outbound_enqueue_r4_refusal_cap_bound(int worker_id, uint32 dest_nod
 		worker_id, dest_node_id, header, false, required_capability, connection_generation, owner);
 }
 
+/* Notify only the exact history family. The GCS owner revalidates all 424
+ * bytes before marking its original slot stale; this is not a wire reply. */
+static void
+lms_outbound_history_discard(const ClusterLmsOutboundSlot *slot)
+{
+	if (slot->kind == (uint8)CLUSTER_LMS_OUTBOUND_FRAME
+		&& slot->msg_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+		&& slot->payload_len == CLUSTER_MX_HISTORY_REQUEST_BYTES && slot->payload[64] == 4
+		&& slot->payload[65] == CLUSTER_MX_HISTORY_KIND)
+		cluster_gcs_block_mx_history_send_failed(slot->payload, slot->payload_len,
+												 (int32)slot->dest_node_id);
+}
+
 /* A missing first DATA stream leaves the logical request owned by this ring.
  * Once a stream has been sampled, even an unadmitted frame cannot be rebound
  * across its loss/replacement. A changed membership cut also invalidates any
@@ -1327,8 +1341,10 @@ cluster_lms_outbound_drain_send(int worker_id)
 			}
 		}
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_FRAME
-			&& !lms_outbound_frame_current(&slot, worker_id))
+			&& !lms_outbound_frame_current(&slot, worker_id)) {
+			lms_outbound_history_discard(&slot);
 			continue;
+		}
 
 		/* A peer that refused a frame this batch keeps its later frames
 		 * queued BEHIND the refused one (per-peer order). */
@@ -1436,6 +1452,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 			cluster_lms_obs_note_outbound_not_admitted(worker_id);
 			break;
 		case CLUSTER_IC_SEND_HARD_ERROR:
+			lms_outbound_history_discard(&slot);
 			/* The remote-S status is the sole retained proof after the exact
 			 * local downgrade, so even a hard transport error keeps its ring
 			 * owner.  Generic requests retain their original self-heal rule. */

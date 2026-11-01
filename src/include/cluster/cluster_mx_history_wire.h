@@ -112,6 +112,28 @@ typedef struct ClusterMxHistoryPeerResult {
 	uint8 admitted, consumed, zero[6];
 } ClusterMxHistoryPeerResult;
 
+typedef enum ClusterMxHistoryStep {
+	CMXH_UNKNOWN = 0,
+	CMXH_PENDING = 1,
+	CMXH_COMPLETE = 2,
+	CMXH_REQUALIFY = 3
+} ClusterMxHistoryStep;
+
+/* Prepare reserves an original requester slot and allocates its original
+ * request ID. The input ID must be zero. Call outside temporary ERROR-cleanup
+ * brackets, after backend buffer-access initialization. Queue backpressure
+ * preserves this exact attempt; poll has no SQL deadline. */
+extern bool cluster_gcs_block_mx_history_prepare(const ClusterMxHistoryRequest *request,
+												 ClusterMxHistoryRequestWire *out);
+extern bool cluster_gcs_block_mx_history_submit(const ClusterMxHistoryRequestWire *request);
+extern ClusterMxHistoryStep
+cluster_gcs_block_mx_history_poll(const ClusterMxHistoryRequestWire *request,
+								  ClusterMxHistoryPeerResult *out);
+extern void cluster_gcs_block_mx_history_cancel(const ClusterMxHistoryRequestWire *request);
+/* Original DATA-ring disposal notification; no wire message or new authority. */
+extern void cluster_gcs_block_mx_history_send_failed(const void *payload, uint16 length,
+													 int32 origin);
+
 StaticAssertDecl(sizeof(ClusterMxHistoryPeerResult) == 8776, "private history result size");
 StaticAssertDecl(offsetof(ClusterMxHistoryPeerResult, data) == 424, "history DATA offset");
 StaticAssertDecl(offsetof(ClusterMxHistoryPeerResult, peer) == 8632, "history peer offset");

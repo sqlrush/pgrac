@@ -50,6 +50,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_mx_history_wire.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_tier1.h"
@@ -2874,6 +2875,62 @@ UT_TEST(test_owner_refusal_echo_is_bound_and_old_or_changed_owner_is_rejected)
 																 R4_CR_REQUIRED_HELLO_CAPS, 42));
 }
 
+static unsigned ut_history_failed;
+static uint8 ut_history_failed_payload[424];
+void
+cluster_gcs_block_mx_history_send_failed(const void *payload, uint16 length, int32 origin)
+{
+	UT_ASSERT_EQ(length, 424);
+	UT_ASSERT_EQ(origin, UT_PEER_X);
+	memcpy(ut_history_failed_payload, payload, 424);
+	ut_history_failed++;
+}
+
+UT_TEST(test_history_carrier_disposal_notifies_exact_requester)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		uint8 request[424] = { 0 };
+		ut_captured_region->init_fn();
+		ut_reset_log();
+		ut_history_failed = 0;
+		request[0] = 0x71;
+		request[64] = 4;
+		request[65] = 5;
+		UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X,
+											   request, sizeof(request)));
+		if (fault == 0)
+			ut_data_stream[UT_PEER_X]++;
+		else if (fault == 1)
+			ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
+		else {
+			ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+			UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+			UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
+			UT_ASSERT_EQ(ut_history_failed, 0);
+			ut_member_cut++;
+		}
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+		UT_ASSERT_EQ(ut_history_failed, 1);
+		UT_ASSERT(memcmp(request, ut_history_failed_payload, 424) == 0);
+	}
+}
+UT_TEST(test_history_disposal_does_not_claim_other_frame_families)
+{
+	uint8 request[424] = { 0 };
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_history_failed = 0;
+	request[64] = 4;
+	request[65] = 4;
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, request,
+										   sizeof(request)));
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_history_failed, 0);
+}
+
 UT_TEST(test_history_and_operation_carriers_preserve_all_bytes)
 {
 	uint8 data[768];
@@ -2914,7 +2971,7 @@ UT_TEST(test_large_carrier_refusal_keeps_private_copy_and_exact_capacity)
 int
 main(void)
 {
-	UT_PLAN(64);
+	UT_PLAN(66);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2981,6 +3038,8 @@ main(void)
 	UT_RUN(test_foreground_capacity_wait_resumes_after_native_drain);
 	UT_RUN(test_capacity_wait_membership_and_cancel_remove_subscription);
 
+	UT_RUN(test_history_carrier_disposal_notifies_exact_requester);
+	UT_RUN(test_history_disposal_does_not_claim_other_frame_families);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
