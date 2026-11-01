@@ -23,12 +23,34 @@ typedef struct ClusterMxCompositionReceiveStats {
 typedef struct ClusterMxCompositionReply {
 	const void *source;
 	Size source_bytes;
-	uint32 total, first, count, next;
+	uint32 total, first, count, next; /* total/first/next are physical positions. */
 	uint32 cap; /* Local request bound, never a peer-supplied permission. */
 	bool last;
+	bool skipped_zero;
 	const ClusterCurrentMxMemberDesc *members;
 	Size member_bytes, frame_bytes;
 } ClusterMxCompositionReply;
+
+/* Native portion of source identity, never a wire/capability or a substitute
+ * for the original caller's service/storage/H scope and final checks. */
+typedef struct ClusterMxCompositionNativeSource {
+	uint64 epoch;
+	int32 origin_node;
+	MultiXactId multi, oldest_multi;
+	MultiXactOffset oldest_offset, start;
+	uint32 span;
+} ClusterMxCompositionNativeSource;
+
+typedef struct ClusterMxCompositionNativeChunk {
+	ClusterMxCompositionNativeSource source;
+	uint32 first, next, count;
+	bool last, skipped_zero;
+	ClusterCurrentMxMemberDesc members[CLUSTER_MX_COMPOSITION_PAGE_MEMBERS];
+} ClusterMxCompositionNativeChunk;
+
+extern ClusterMxCompositionReadStatus cluster_mx_composition_read_native(
+	MultiXactId multi, const ClusterMxCompositionNativeSource *expected,
+	uint32 first, uint32 cap, ClusterMxCompositionNativeChunk *out);
 
 typedef struct ClusterMxCompositionPage {
 	struct ClusterMxCompositionPage *next;
@@ -42,10 +64,14 @@ typedef struct ClusterMxCompositionReceive ClusterMxCompositionReceive;
  * hash or raw MXID. Exact bytes are owned/copied; no wire layout is defined
  * here. G1 retention and G5 decoder/capability checks remain caller duties.
  * stats must outlive the operation, starts caller-zeroed and survives failure.
+ * total is physical span L; start must be bound inside the same source.
+ * next() advances physically, while pages().first and output total are logical.
+ * A zero-only physical tail is accepted only as the one verified slot-0 skip.
  * Only operation-local memory is acquired, under CurrentMemoryContext.
  */
 extern bool cluster_mx_composition_begin(ClusterMxCompositionReceive **op,
-	const void *source, Size source_bytes, uint32 total, ClusterMxCompositionReceiveStats *stats);
+	const void *source, Size source_bytes, uint32 total, MultiXactOffset start,
+	ClusterMxCompositionReceiveStats *stats);
 extern ClusterMxCompositionReceiveResult cluster_mx_composition_accept(
 	ClusterMxCompositionReceive **op, ClusterMxCompositionReadStatus status,
 	const ClusterMxCompositionReply *reply);

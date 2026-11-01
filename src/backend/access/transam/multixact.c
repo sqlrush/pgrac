@@ -142,6 +142,8 @@
 #include "cluster/cluster_multixact.h"		/* overlay install + types */
 #include "cluster/cluster_multixact_current.h" /* requester-local proven create cap */
 #include "cluster/cluster_xid_stripe_boot.h"   /* PGRAC: existing activation observation */
+#include "cluster/cluster_multixact_composition.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_xid_authority.h"	   /* PGRAC: retained native-empty input */
 #include "cluster/cluster_mxid_stripe.h"	/* PGRAC: spec-7.1 D3-a striped candidate */
 #include "cluster/cluster_side_projection.h"
@@ -2055,6 +2057,164 @@ GetMultiXactIdMembersWithOffset(MultiXactId multi, MultiXactMember **members,
 	return GetMultiXactIdMembersInternal(multi, members, from_pgupgrade, isLockOnly,
 										 start_offset_out, false);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* The caller retains its original admitted service/snapshot/H scope. This
+ * source is the native portion of that identity, not visibility authority. */
+static bool
+mx_composition_range_retained(const ClusterMxCompositionNativeSource *source)
+{
+	uint32 live_span = MultiXactState->nextOffset - MultiXactState->oldestOffset;
+	uint32 start_distance = source->start - MultiXactState->oldestOffset;
+
+	return cluster_storage_mode_enabled() && source->epoch != 0
+		&& MultiXactState->finishedStartup && MultiXactState->oldestOffsetKnown
+		&& source->epoch == cluster_epoch_get_current()
+		&& source->origin_node == cluster_node_id
+		&& source->oldest_multi == MultiXactState->oldestMultiXactId
+		&& source->oldest_offset == MultiXactState->oldestOffset
+		&& !MultiXactIdPrecedes(source->multi, MultiXactState->oldestMultiXactId)
+		&& MultiXactIdPrecedes(source->multi, MultiXactState->nextMXact)
+		&& start_distance <= live_span && source->span <= live_span - start_distance;
+}
+
+ClusterMxCompositionReadStatus
+cluster_mx_composition_read_native(MultiXactId multi,
+	const ClusterMxCompositionNativeSource *expected, uint32 first, uint32 cap,
+	ClusterMxCompositionNativeChunk *out)
+{
+	ClusterMxCompositionNativeChunk chunk = {0};
+	ClusterMxCompositionNativeSource expected_source;
+	ClusterMxCompositionReadStatus result = MXCOMP_READ_UNKNOWN;
+	volatile bool gen_held = false, offset_held = false, member_held = false;
+
+	if (out == NULL)
+		return MXCOMP_READ_UNKNOWN;
+	/* Preserve the request when callers reuse the previous output buffer. */
+	if (expected != NULL) {
+		memcpy(&expected_source, expected, sizeof(expected_source));
+		expected = &expected_source;
+	}
+	memset(out, 0, sizeof(*out));
+	if (!cluster_storage_mode_enabled() || !MultiXactIdIsValid(multi) || cap == 0 || cap > CLUSTER_MX_COMPOSITION_PAGE_MEMBERS
+		|| (first != 0 && expected == NULL)
+		|| (expected != NULL && expected->multi != multi)
+		|| (cluster_peer_mode_enabled() && !cluster_mxid_is_mine(multi)))
+		return MXCOMP_READ_UNKNOWN;
+
+	MultiXactIdSetOldestVisible();
+	LWLockAcquire(MultiXactTruncationLock, LW_SHARED);
+	PG_TRY();
+	{
+		do {
+			MultiXactId next_multi, following;
+			MultiXactOffset next_offset, end, offset;
+			uint32 physical_count;
+			int page, slot, following_page;
+			MultiXactOffset *offsets;
+
+			LWLockAcquire(MultiXactGenLock, LW_SHARED); gen_held = true;
+			chunk.source.epoch = cluster_epoch_get_current();
+			chunk.source.origin_node = cluster_node_id;
+			chunk.source.multi = multi;
+			chunk.source.oldest_multi = MultiXactState->oldestMultiXactId;
+			chunk.source.oldest_offset = MultiXactState->oldestOffset;
+			next_multi = MultiXactState->nextMXact;
+			next_offset = MultiXactState->nextOffset;
+			if (!MultiXactState->finishedStartup || !MultiXactState->oldestOffsetKnown
+				|| MultiXactIdPrecedes(multi, chunk.source.oldest_multi)
+				|| !MultiXactIdPrecedes(multi, next_multi)) {
+				LWLockRelease(MultiXactGenLock); gen_held = false;
+				break;
+			}
+			LWLockRelease(MultiXactGenLock); gen_held = false;
+
+			LWLockAcquire(MultiXactOffsetSLRULock, LW_EXCLUSIVE); offset_held = true;
+			page = MultiXactIdToOffsetPage(multi);
+			slot = SimpleLruReadPage(MultiXactOffsetCtl, page, true, multi);
+			offsets = (MultiXactOffset *)MultiXactOffsetCtl->shared->page_buffer[slot];
+			chunk.source.start = offsets[MultiXactIdToOffsetEntry(multi)];
+			following = multi + 1;
+			if (following < FirstMultiXactId) following = FirstMultiXactId;
+			if (next_multi == multi + 1)
+				end = next_offset; /* Original latest-descriptor endpoint may be zero. */
+			else {
+				following_page = MultiXactIdToOffsetPage(following);
+				if (following_page != page)
+					slot = SimpleLruReadPage(MultiXactOffsetCtl, following_page, true, following);
+				offsets = (MultiXactOffset *)MultiXactOffsetCtl->shared->page_buffer[slot];
+				end = offsets[MultiXactIdToOffsetEntry(following)];
+				if (end == 0) {
+					result = MXCOMP_READ_RETRY;
+					LWLockRelease(MultiXactOffsetSLRULock); offset_held = false;
+					break;
+				}
+			}
+			LWLockRelease(MultiXactOffsetSLRULock); offset_held = false;
+			if (chunk.source.start == 0) { result = MXCOMP_READ_RETRY; break; }
+			chunk.source.span = end - chunk.source.start;
+			if (chunk.source.span == 0 || (uint64)chunk.source.span > (uint64)INT32_MAX + 1
+				|| first >= chunk.source.span
+				|| ((uint64)chunk.source.span == (uint64)INT32_MAX + 1
+					&& (uint32)(0 - chunk.source.start) >= chunk.source.span)
+				|| (expected != NULL && memcmp(expected, &chunk.source, sizeof(*expected)) != 0))
+				break;
+			LWLockAcquire(MultiXactGenLock, LW_SHARED); gen_held = true;
+			if (!mx_composition_range_retained(&chunk.source)) {
+				LWLockRelease(MultiXactGenLock); gen_held = false;
+				break;
+			}
+			LWLockRelease(MultiXactGenLock); gen_held = false;
+
+			offset = chunk.source.start + first;
+			physical_count = Min(cap, chunk.source.span - first);
+			physical_count = Min(physical_count, MULTIXACT_MEMBERS_PER_PAGE - offset % MULTIXACT_MEMBERS_PER_PAGE);
+			physical_count = Min((uint64)physical_count, (uint64)UINT32_MAX - offset + 1);
+			chunk.first = first;
+			chunk.next = first + physical_count;
+			chunk.last = chunk.next == chunk.source.span;
+			LWLockAcquire(MultiXactMemberSLRULock, LW_EXCLUSIVE); member_held = true;
+			slot = SimpleLruReadPage(MultiXactMemberCtl, MXOffsetToMemberPage(offset), true, multi);
+			for (uint32 i = 0; i < physical_count; i++, offset++) {
+				char *bytes = MultiXactMemberCtl->shared->page_buffer[slot];
+				TransactionId xid;
+				uint32 flags;
+				memcpy(&xid, bytes + MXOffsetToMemberOffset(offset), sizeof(xid));
+				if (xid == InvalidTransactionId && offset == 0) {
+					chunk.skipped_zero = true;
+					continue;
+				}
+				memcpy(&flags, bytes + MXOffsetToFlagsOffset(offset), sizeof(flags));
+				flags = (flags >> MXOffsetToFlagsBitShift(offset)) & MXACT_MEMBER_XACT_BITMASK;
+				if (!TransactionIdIsNormal(xid) || flags > MaxMultiXactStatus)
+					break;
+				chunk.members[chunk.count].xid = xid;
+				chunk.members[chunk.count++].member_status = flags;
+			}
+			LWLockRelease(MultiXactMemberSLRULock); member_held = false;
+			if (chunk.count + (chunk.skipped_zero ? 1 : 0) != physical_count)
+				break;
+			LWLockAcquire(MultiXactGenLock, LW_SHARED); gen_held = true;
+			if (mx_composition_range_retained(&chunk.source))
+				result = MXCOMP_READ_OK;
+			LWLockRelease(MultiXactGenLock); gen_held = false;
+		} while (0);
+	}
+	PG_CATCH();
+	{
+		if (member_held) LWLockRelease(MultiXactMemberSLRULock);
+		if (offset_held) LWLockRelease(MultiXactOffsetSLRULock);
+		if (gen_held) LWLockRelease(MultiXactGenLock);
+		LWLockRelease(MultiXactTruncationLock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	LWLockRelease(MultiXactTruncationLock);
+	if (result == MXCOMP_READ_OK)
+		memcpy(out, &chunk, sizeof(chunk));
+	return result;
+}
+#endif
 
 /*
  * mxactMemberComparator

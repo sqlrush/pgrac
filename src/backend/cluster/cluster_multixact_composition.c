@@ -57,7 +57,9 @@ struct ClusterMxCompositionReceive {
 	ClusterMxCompositionReceiveStats *stats;
 	void *source;
 	Size source_bytes;
-	uint32 total, accepted, updaters;
+	uint32 total, accepted, member_count, updaters;
+	MultiXactOffset start;
+	bool skipped_zero;
 	bool complete;
 	CompositionSeenDirectory *seen[COMPOSITION_SEEN_DIRECTORIES];
 	ClusterMxCompositionPage *head, *tail;
@@ -112,7 +114,7 @@ composition_unknown(ClusterMxCompositionReceive **op, bool restart)
 
 bool
 cluster_mx_composition_begin(ClusterMxCompositionReceive **op, const void *source,
-	Size source_bytes, uint32 total, ClusterMxCompositionReceiveStats *stats)
+	Size source_bytes, uint32 total, MultiXactOffset start, ClusterMxCompositionReceiveStats *stats)
 {
 	MemoryContext context;
 
@@ -121,7 +123,9 @@ cluster_mx_composition_begin(ClusterMxCompositionReceive **op, const void *sourc
 		return false;
 	}
 	if (op == NULL || source == NULL || source_bytes == 0 || source_bytes > BLCKSZ
-		|| total == 0 || total > INT32_MAX || stats == NULL) {
+		|| total == 0 || (uint64)total > (uint64)INT32_MAX + 1 || start == 0
+		|| ((uint64)total == (uint64)INT32_MAX + 1 && (uint32)(0 - start) >= total)
+		|| stats == NULL) {
 		if (stats != NULL)
 			composition_count(&stats->unknown_results);
 		return false;
@@ -137,6 +141,7 @@ cluster_mx_composition_begin(ClusterMxCompositionReceive **op, const void *sourc
 		memcpy(created->source, source, source_bytes);
 		created->source_bytes = source_bytes;
 		created->total = total;
+		created->start = start;
 		(void)composition_receive_partition(created, 0);
 		*op = created;
 	}
@@ -162,12 +167,19 @@ cluster_mx_composition_accept(ClusterMxCompositionReceive **op, ClusterMxComposi
 	receive = *op;
 	if (status != MXCOMP_READ_OK || reply == NULL || receive->complete)
 		return composition_unknown(op, status == MXCOMP_READ_RETRY);
-	if (reply->source == NULL || reply->members == NULL
+	if (reply->source == NULL || (reply->count != 0 && reply->members == NULL)
 		|| reply->source_bytes != receive->source_bytes || reply->total != receive->total
-		|| reply->first != receive->accepted || reply->count == 0
+		|| reply->first != receive->accepted || reply->next <= reply->first
 		|| reply->cap == 0 || reply->cap > CLUSTER_MX_COMPOSITION_PAGE_MEMBERS
-		|| reply->count > reply->cap
-		|| (uint64)reply->first + reply->count != reply->next
+		|| (uint64)reply->count + (reply->skipped_zero ? 1 : 0) > reply->cap
+		|| (uint64)reply->first + reply->count + (reply->skipped_zero ? 1 : 0) != reply->next
+		|| (reply->skipped_zero && (receive->skipped_zero
+			|| (uint32)(0 - receive->start) < reply->first
+			|| (uint32)(0 - receive->start) >= reply->next))
+		|| (uint64)receive->member_count + reply->count > INT32_MAX
+		|| (reply->last && ((uint64)receive->member_count + reply->count == 0
+			|| (uint64)receive->member_count + reply->count
+				!= (uint64)receive->total - (receive->skipped_zero || reply->skipped_zero ? 1 : 0)))
 		|| reply->next > receive->total || reply->last != (reply->next == receive->total)
 		|| reply->member_bytes != (uint64)reply->count * sizeof(*reply->members)
 		|| reply->frame_bytes > BLCKSZ
@@ -177,7 +189,8 @@ cluster_mx_composition_accept(ClusterMxCompositionReceive **op, ClusterMxComposi
 
 	PG_TRY();
 	{
-		ClusterMxCompositionPage *page = MemoryContextAllocZero(receive->context, sizeof(*page));
+		ClusterMxCompositionPage *page = reply->count == 0 ? NULL
+			: MemoryContextAllocZero(receive->context, sizeof(*page));
 		uint32 updaters = receive->updaters;
 		for (uint32 i = 0; i < reply->count; i++) {
 			const ClusterCurrentMxMemberDesc *member = &reply->members[i];
@@ -196,13 +209,17 @@ cluster_mx_composition_accept(ClusterMxCompositionReceive **op, ClusterMxComposi
 			page->members[i] = *member;
 		}
 		if (valid) {
-			page->first = reply->first;
-			page->count = reply->count;
-			if (receive->tail != NULL)
-				receive->tail->next = page;
-			else
-				receive->head = page;
-			receive->tail = page;
+			if (page != NULL) {
+				page->first = receive->member_count;
+				page->count = reply->count;
+				if (receive->tail != NULL)
+					receive->tail->next = page;
+				else
+					receive->head = page;
+				receive->tail = page;
+			}
+			receive->member_count += reply->count;
+			receive->skipped_zero |= reply->skipped_zero;
 			receive->accepted = reply->next;
 			receive->updaters = updaters;
 			receive->complete = reply->last;
@@ -233,7 +250,7 @@ cluster_mx_composition_pages(const ClusterMxCompositionReceive *op, uint32 *tota
 		*total = 0;
 	if (op == NULL || !op->complete || total == NULL)
 		return NULL;
-	*total = op->total;
+	*total = op->member_count;
 	return op->head;
 }
 

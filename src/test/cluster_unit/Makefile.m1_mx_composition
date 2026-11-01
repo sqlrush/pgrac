@@ -10,4 +10,11 @@ test_cluster_mx_composition: test_cluster_mx_composition.c unit_test.h $(MX_COMP
 
 .PHONY: clean-m1-mx-composition
 clean-m1-mx-composition:
-	rm -f test_cluster_mx_composition
+	rm -f test_cluster_mx_composition test_cluster_mx_native_range
+
+test_cluster_mx_native_range: test_cluster_mx_native_range.c test_cluster_mx_composition.c \
+		unit_test.h $(top_srcdir)/src/backend/access/transam/multixact.c $(MX_COMPOSITION_O) \
+		$(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(MX_COMPOSITION_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@

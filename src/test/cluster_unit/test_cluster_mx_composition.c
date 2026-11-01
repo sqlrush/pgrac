@@ -12,8 +12,8 @@ ErrorContextCallback *error_context_stack;
 MemoryContext CurrentMemoryContext = (MemoryContext) 1;
 static unsigned allocations, fail_at, live_contexts, live_blocks;
 static Size allocation_ceiling = MaxAllocSize;
-typedef struct Block { struct Block *next; void *ptr; } Block;
-typedef struct Arena { struct Arena *next; Block *blocks; } Arena;
+typedef struct CompositionTestBlock { struct CompositionTestBlock *next; void *ptr; } CompositionTestBlock;
+typedef struct Arena { struct Arena *next; CompositionTestBlock *blocks; } Arena;
 static Arena *arenas;
 
 void pg_re_throw(void) { if (PG_exception_stack) siglongjmp(*PG_exception_stack, 1); abort(); }
@@ -39,7 +39,7 @@ void *
 MemoryContextAllocZero(MemoryContext context, Size size)
 {
 	Arena *a = (Arena *)context;
-	Block *b;
+	CompositionTestBlock *b;
 	if (++allocations == fail_at) pg_re_throw();
 	if (size > allocation_ceiling) pg_re_throw();
 	b = malloc(sizeof(*b)); if (!b) abort();
@@ -54,9 +54,9 @@ void
 pfree(void *ptr)
 {
 	for (Arena *a = arenas; a; a = a->next)
-		for (Block **b = &a->blocks; *b; b = &(*b)->next)
+		for (CompositionTestBlock **b = &a->blocks; *b; b = &(*b)->next)
 			if ((*b)->ptr == ptr) {
-				Block *old = *b; *b = old->next;
+				CompositionTestBlock *old = *b; *b = old->next;
 				free(old->ptr); free(old); live_blocks--; return;
 			}
 	abort();
@@ -71,7 +71,7 @@ MemoryContextDelete(MemoryContext context)
 	if (!*link) abort();
 	*link = a->next;
 	while (a->blocks) {
-		Block *b = a->blocks; a->blocks = b->next;
+		CompositionTestBlock *b = a->blocks; a->blocks = b->next;
 		free(b->ptr); free(b); live_blocks--;
 	}
 	free(a); live_contexts--;
@@ -83,7 +83,7 @@ static ClusterMxCompositionReceive *
 begin(uint32 total, ClusterMxCompositionReceiveStats *stats)
 {
 	ClusterMxCompositionReceive *op = NULL;
-	UT_ASSERT(cluster_mx_composition_begin(&op, source, sizeof(source), total, stats));
+	UT_ASSERT(cluster_mx_composition_begin(&op, source, sizeof(source), total, 1, stats));
 	return op;
 }
 
@@ -178,7 +178,7 @@ UT_TEST(test_adversarial_hash_collisions_remain_within_small_allocations)
 	UT_ASSERT_EQ(n,40);
 	allocation_ceiling=4096;
 	PG_TRY(); {
-		(void)cluster_mx_composition_begin((ClusterMxCompositionReceive **)&op,source,sizeof(source),40,&stats);
+		(void)cluster_mx_composition_begin((ClusterMxCompositionReceive **)&op,source,sizeof(source),40,1,&stats);
 		UT_ASSERT_EQ(cluster_mx_composition_accept((ClusterMxCompositionReceive **)&op,MXCOMP_READ_OK,&r),MXCOMP_COMPLETE);
 	}
 	PG_CATCH(); { caught=true; }
@@ -294,7 +294,7 @@ UT_TEST(test_explicit_restart_from_zero_preserves_diagnostics)
 	r=reply(4,0,2,m); (void)cluster_mx_composition_accept(&op,MXCOMP_READ_OK,&r);
 	(void)cluster_mx_composition_accept(&op,MXCOMP_READ_RETRY,NULL);
 	check_discarded(op);
-	UT_ASSERT(cluster_mx_composition_begin(&op,source,sizeof(source),4,&stats));
+	UT_ASSERT(cluster_mx_composition_begin(&op,source,sizeof(source),4,1,&stats));
 	UT_ASSERT_EQ(cluster_mx_composition_next(op),0);
 	r=reply(4,0,2,m); (void)cluster_mx_composition_accept(&op,MXCOMP_READ_OK,&r);
 	r=reply(4,2,2,m); UT_ASSERT_EQ(cluster_mx_composition_accept(&op,MXCOMP_READ_OK,&r),MXCOMP_COMPLETE);
@@ -309,7 +309,7 @@ UT_TEST(test_source_snapshot_is_owned_and_finish_is_idempotent)
 	ClusterCurrentMxMemberDesc m[2]; ClusterMxCompositionReply r=reply(2,0,2,m);
 	uint8 mutable_source[sizeof(source)];
 	memcpy(mutable_source,source,sizeof(source));
-	UT_ASSERT(cluster_mx_composition_begin(&op,mutable_source,sizeof(source),2,&stats));
+	UT_ASSERT(cluster_mx_composition_begin(&op,mutable_source,sizeof(source),2,1,&stats));
 	if(!op) return;
 	memset(mutable_source,0xa5,sizeof(mutable_source));
 	UT_ASSERT_EQ(cluster_mx_composition_accept(&op,MXCOMP_READ_OK,&r),MXCOMP_COMPLETE);
@@ -326,9 +326,9 @@ UT_TEST(test_missing_tail_and_active_rebegin_discard_without_hidden_retry)
 	r=reply(4,0,2,m); (void)cluster_mx_composition_accept(&op,MXCOMP_READ_OK,&r);
 	cluster_mx_composition_finish(&op); cluster_mx_composition_finish(&op);
 	check_discarded(op); UT_ASSERT_EQ(stats.unknown_results,1);
-	UT_ASSERT(cluster_mx_composition_begin(&op,source,sizeof(source),4,&stats));
+	UT_ASSERT(cluster_mx_composition_begin(&op,source,sizeof(source),4,1,&stats));
 	r=reply(4,0,2,m); (void)cluster_mx_composition_accept(&op,MXCOMP_READ_OK,&r);
-	UT_ASSERT(!cluster_mx_composition_begin(&op,source,sizeof(source),4,&stats));
+	UT_ASSERT(!cluster_mx_composition_begin(&op,source,sizeof(source),4,1,&stats));
 	check_discarded(op); UT_ASSERT_EQ(stats.unknown_results,2);
 	UT_ASSERT_EQ(stats.restart_requests,0); UT_ASSERT_EQ(stats.accepted_frames,2);
 }
@@ -338,11 +338,11 @@ UT_TEST(test_invalid_total_source_and_large_native_domain)
 	const uint32 totals[]={0,UINT32_MAX,(uint32)INT32_MAX+1};
 	for(unsigned i=0;i<lengthof(totals);i++) {
 		ClusterMxCompositionReceiveStats stats={0}; ClusterMxCompositionReceive *op=NULL;
-		UT_ASSERT(!cluster_mx_composition_begin(&op,source,sizeof(source),totals[i],&stats)); check_discarded(op);
+		UT_ASSERT(!cluster_mx_composition_begin(&op,source,sizeof(source),totals[i],1,&stats)); check_discarded(op);
 	}
 	for(int bad=0;bad<3;bad++) {
 		ClusterMxCompositionReceiveStats stats={0}; ClusterMxCompositionReceive *op=NULL;
-		UT_ASSERT(!cluster_mx_composition_begin(&op,bad==0?NULL:source,bad==1?0:BLCKSZ+1,2,&stats)); check_discarded(op);
+		UT_ASSERT(!cluster_mx_composition_begin(&op,bad==0?NULL:source,bad==1?0:BLCKSZ+1,2,1,&stats)); check_discarded(op);
 	}
 	{
 		ClusterMxCompositionReceiveStats stats={0}; ClusterMxCompositionReceive *op=begin(INT32_MAX,&stats);
@@ -358,7 +358,7 @@ UT_TEST(test_begin_allocation_errors_leave_no_handle_or_memory)
 		ClusterMxCompositionReceive *volatile op=NULL; volatile bool caught=false;
 		memset(&stats,0,sizeof(stats));
 		fail_at=allocations+i;
-		PG_TRY(); { (void)cluster_mx_composition_begin((ClusterMxCompositionReceive **)&op,source,sizeof(source),257,&stats); }
+		PG_TRY(); { (void)cluster_mx_composition_begin((ClusterMxCompositionReceive **)&op,source,sizeof(source),257,1,&stats); }
 		PG_CATCH(); { caught=true; }
 		PG_END_TRY(); fail_at=0;
 		UT_ASSERT(caught); check_discarded(op);
