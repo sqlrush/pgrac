@@ -14211,12 +14211,19 @@ test_cluster_pcm_pending_ack_ingress.inc: $(top_srcdir)/src/backend/cluster/clus
 	     END { if (checksum != 1 || handler != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc test_cluster_pcm_pending_ack_ingress.inc Makefile
+test_cluster_pcm_vm_revoke.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_invalidate_execute\(/ { print "static bool"; emit=1; handler++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (handler != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_read_grant: test_cluster_pcm_first_fill_master.inc test_cluster_pcm_pending_ack_ingress.inc test_cluster_pcm_vm_revoke.inc Makefile
 
 clean: clean-pending-ack-ingress
 .PHONY: clean-pending-ack-ingress
 clean-pending-ack-ingress:
 	rm -f test_cluster_pcm_pending_ack_ingress.inc test_cluster_pcm_pending_ack_ingress.inc.tmp
+	rm -f test_cluster_pcm_vm_revoke.inc test_cluster_pcm_vm_revoke.inc.tmp
 
 TESTS += test_cluster_first_fill_wait
 all: test_cluster_first_fill_wait

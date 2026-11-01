@@ -209,6 +209,7 @@ static struct {
 	pg_atomic_uint64 block_forward_sent_count;
 	pg_atomic_uint64 stale_reply_drop_count, pi_durable_note_apply_count;
 	pg_atomic_uint64 invalidate_busy_received_count, pi_watermark_advance_count;
+	pg_atomic_uint64 invalidate_busy_sent_count;
 	pg_atomic_uint64 block_invalidate_ack_received_count;
 	pg_atomic_uint64 invalidate_broadcast_request_id;
 	uint64 invalidate_broadcast_epoch;
@@ -770,6 +771,244 @@ read_ack_pending(bool consumed)
 			&read_ack_writer.common.logical_assertion, &queued) == RESOURCE_X_APPLY_APPLIED
 		&& queued.phase == RESOURCE_X_MASTER_QUEUED && queued.is_head
 		&& read_ack_no_legacy_effects();
+}
+
+/* Holder and master are separate roles even in this serial fixture. The
+ * physical drop/receipt lookups are controlled; wire construction, full ACK
+ * ingress, native PCM queue and notification retirement are original code.
+ * Transport acceptance stores a copy, and never implies master delivery. */
+static PcmLockMode read_vm_state;
+static int read_vm_receipt, read_vm_drop_result;
+static bool read_vm_closed, read_vm_pending, read_vm_aborted, read_vm_wire_ready;
+static int read_vm_node = 1;
+static unsigned read_vm_receipts, read_vm_deliveries, read_vm_drops, read_vm_transitions;
+static unsigned read_vm_sends, read_vm_admitted, read_vm_states, read_vm_closures;
+static GcsBlockInvalidateAckPayload read_vm_ack;
+static ClusterICSendResult read_vm_send_result;
+
+static int
+read_vm_drop(BufferTag tag, PcmLockMode mode, XLogRecPtr *lsn, SCN *scn)
+{
+	UT_ASSERT(BufferTagsEqual(&tag, &read_request.tag));
+	UT_ASSERT_EQ(mode, read_vm_state);
+	UT_ASSERT(!read_vm_wire_ready);
+	read_vm_drops++;
+	if (read_vm_drop_result == CLUSTER_BUFMGR_GCS_DROP_DROPPED) {
+		read_vm_state = PCM_LOCK_MODE_N;
+		*lsn = 700;
+		*scn = 900;
+	} else if (read_vm_drop_result == CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT)
+		read_vm_state = PCM_LOCK_MODE_N;
+	return read_vm_drop_result;
+}
+
+static ClusterICSendResult
+read_vm_send(uint8 type, int32 dest, const void *payload, uint32 bytes)
+{
+	UT_ASSERT_EQ(type, PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK);
+	UT_ASSERT_EQ(dest, read_invalidate.master_node);
+	UT_ASSERT_EQ(bytes, sizeof(read_vm_ack));
+	UT_ASSERT(!read_vm_wire_ready);
+	read_vm_ack = *(const GcsBlockInvalidateAckPayload *)payload;
+	read_vm_sends++;
+	if (read_vm_send_result == CLUSTER_IC_SEND_DONE || read_vm_send_result == CLUSTER_IC_SEND_WOULD_BLOCK) {
+		read_vm_admitted++;
+		read_vm_wire_ready = true;
+	}
+	return read_vm_send_result;
+}
+
+#define ClusterGcsBlock (&read_wire_counters)
+#define cluster_epoch_get_current() read_epoch
+#define cluster_node_id read_vm_node
+#define gcs_first_fill_receipt_revoke(inv) ((void)(inv), ++read_vm_receipts, read_vm_receipt)
+#define gcs_block_pending_s_delivery_closed(inv) ((void)(inv), ++read_vm_closures, read_vm_closed)
+#define cluster_bufmgr_block_pcm_state(tag) ((void)(tag), ++read_vm_states, read_vm_state)
+#define cluster_bufmgr_block_grant_pending(tag) ((void)(tag), read_vm_pending)
+#define cluster_bufmgr_pending_s_aborted(tag) ((void)(tag), read_vm_aborted)
+#define cluster_bufmgr_invalidate_block_for_gcs read_vm_drop
+#define cluster_bufmgr_block_is_pi(tag) ((void)(tag), false)
+#define cluster_pcm_lock_apply_gcs_transition(tag, trans, node) \
+	((void)(tag), (void)(trans), (void)(node), ++read_vm_transitions, false)
+#define cluster_sf_peer_supports_gcs_inval_busy(master) ((void)(master), true)
+#define cluster_pcm_note_invalidate_parked_grant_pending() ((void)0)
+#define gcs_block_wake_local_pending_s_request(inv) ((void)(inv), false)
+#define gcs_block_observe_grant_pending_invalidate(inv, woke) ((void)(inv), (void)(woke))
+#define cluster_gcs_block_note_send_outcome(family, result) ((void)(family), (void)(result))
+#define cluster_ic_send_envelope read_vm_send
+#define cluster_grd_outbound_enqueue_backend_msg(type, dest, payload, bytes) \
+	((void)(type), (void)(dest), (void)(payload), (void)(bytes), abort(), false)
+#ifndef PCM_VM_REVOKE_FIXTURE
+#define PCM_VM_REVOKE_FIXTURE "test_cluster_pcm_vm_revoke.inc"
+#endif
+#include PCM_VM_REVOKE_FIXTURE
+#undef cluster_grd_outbound_enqueue_backend_msg
+#undef cluster_ic_send_envelope
+#undef cluster_gcs_block_note_send_outcome
+#undef gcs_block_observe_grant_pending_invalidate
+#undef gcs_block_wake_local_pending_s_request
+#undef cluster_pcm_note_invalidate_parked_grant_pending
+#undef cluster_sf_peer_supports_gcs_inval_busy
+#undef cluster_pcm_lock_apply_gcs_transition
+#undef cluster_bufmgr_block_is_pi
+#undef cluster_bufmgr_invalidate_block_for_gcs
+#undef cluster_bufmgr_pending_s_aborted
+#undef cluster_bufmgr_block_grant_pending
+#undef cluster_bufmgr_block_pcm_state
+#undef gcs_block_pending_s_delivery_closed
+#undef gcs_first_fill_receipt_revoke
+#undef cluster_node_id
+#undef cluster_epoch_get_current
+#undef ClusterGcsBlock
+
+static void
+read_vm_prepare(void)
+{
+	read_ack_prepare(1, false);
+	read_vm_node = 1;
+	read_vm_state = PCM_LOCK_MODE_S;
+	read_vm_receipt = 0;
+	read_vm_drop_result = CLUSTER_BUFMGR_GCS_DROP_DROPPED;
+	read_vm_closed = true;
+	read_vm_pending = read_vm_aborted = read_vm_wire_ready = false;
+	read_vm_receipts = read_vm_deliveries = read_vm_drops = read_vm_transitions = 0;
+	read_vm_sends = read_vm_admitted = read_vm_states = read_vm_closures = 0;
+	memset(&read_vm_ack, 0, sizeof(read_vm_ack));
+	read_vm_send_result = CLUSTER_IC_SEND_DONE;
+}
+
+static void
+read_vm_deliver(void)
+{
+	ClusterICEnvelope env = read_ack_env;
+
+	UT_ASSERT(read_vm_wire_ready);
+	UT_ASSERT_EQ(read_vm_ack.checksum, gcs_block_compute_invalidate_ack_checksum(&read_vm_ack));
+	env.source_node_id = read_vm_node;
+	env.payload_length = sizeof(read_vm_ack);
+	cluster_gcs_handle_block_invalidate_ack_envelope(&env, &read_vm_ack);
+	read_vm_wire_ready = false;
+	read_vm_deliveries++;
+}
+
+UT_TEST(vm_revoke_roundtrip_orders_drop_ack_delivery_and_notice)
+{
+	for (int absent = 0; absent < 2; absent++) {
+		ClusterPcmReadGrantKey decoded = {0};
+		ClusterPcmReadGrant grant;
+		ResourceXMasterSnapshot queued;
+
+		read_vm_prepare();
+		if (absent) read_vm_drop_result = CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT;
+		UT_ASSERT(gcs_block_invalidate_execute(&read_invalidate));
+		UT_ASSERT_EQ(read_vm_drops, 1);
+		UT_ASSERT_EQ(read_vm_transitions, absent ? 0 : 1);
+		UT_ASSERT_EQ(read_vm_state, PCM_LOCK_MODE_N);
+		UT_ASSERT_EQ(read_vm_sends, 1);
+		UT_ASSERT_EQ(read_vm_ack.ack_status, absent ? 2 : 0);
+		UT_ASSERT_EQ(GcsBlockInvalidateAckPayloadGetPageScn(&read_vm_ack), absent ? 0 : 900);
+		UT_ASSERT(GcsBlockInvalidateAckPayloadPendingSKey(&read_vm_ack, &decoded));
+		UT_ASSERT_EQ(memcmp(&decoded, &read_ack_grant.key, sizeof(decoded)), 0);
+		UT_ASSERT(read_ack_pending(false));
+		read_vm_deliver();
+		UT_ASSERT(read_ack_pending(true));
+		read_master_time += 10000;
+		cluster_gcs_block_pending_s_tick();
+		UT_ASSERT(read_ack_pending(true));
+		UT_ASSERT_EQ(read_notices, 1);
+		read_notice_result = CLUSTER_IC_SEND_DONE;
+		read_master_time += 10000;
+		cluster_gcs_block_pending_s_tick();
+		UT_ASSERT(!cluster_pcm_lock_read_grant_blocker_snapshot(read_request.tag, 1, &grant));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+			&read_ack_writer.common.logical_assertion, &queued), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(queued.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+		UT_ASSERT_EQ(queued.incompatible_holders_bitmap, 4);
+		UT_ASSERT(read_ack_no_legacy_effects());
+	}
+}
+
+UT_TEST(vm_revoke_unproven_holder_never_certifies_a_drop)
+{
+	for (int why = 0; why < 7; why++) {
+		PcmAuthoritySnapshot before, after;
+
+		read_vm_prepare();
+		UT_ASSERT(cluster_pcm_lock_authority_snapshot(read_request.tag, &before));
+		if (why == 0) read_vm_receipt = 1; /* Original retained continuation owns it. */
+		if (why == 1) read_vm_receipt = -1;
+		if (why == 2) read_vm_closed = false;
+		if (why == 3) read_vm_pending = true;
+		if (why == 4) { read_vm_state = PCM_LOCK_MODE_N; read_vm_pending = true; }
+		if (why == 5) read_vm_drop_result = CLUSTER_BUFMGR_GCS_DROP_PINNED;
+		if (why == 6) read_vm_drop_result = CLUSTER_BUFMGR_GCS_DROP_STALE;
+		UT_ASSERT(gcs_block_invalidate_execute(&read_invalidate));
+		UT_ASSERT_EQ(read_vm_sends, why == 0 ? 0 : 1);
+		UT_ASSERT_EQ(read_vm_drops, why >= 5 ? 1 : 0);
+		UT_ASSERT_EQ(read_vm_transitions, 0);
+		if (read_vm_wire_ready) {
+			UT_ASSERT_EQ(read_vm_ack.ack_status, GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY);
+			read_vm_deliver();
+		}
+		UT_ASSERT(read_ack_pending(false));
+		UT_ASSERT(cluster_pcm_lock_authority_snapshot(read_request.tag, &after));
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	}
+}
+
+UT_TEST(vm_revoke_failed_send_retries_from_original_master_without_new_drop)
+{
+	for (int admission = 0; admission < 3; admission++) {
+		read_vm_prepare();
+		read_vm_send_result = admission == 0 ? CLUSTER_IC_SEND_NOT_ADMITTED :
+			admission == 1 ? CLUSTER_IC_SEND_WOULD_BLOCK : CLUSTER_IC_SEND_DONE;
+		UT_ASSERT(gcs_block_invalidate_execute(&read_invalidate));
+		UT_ASSERT_EQ(read_vm_drops, 1);
+		UT_ASSERT(read_ack_pending(false));
+		if (admission == 0) {
+			UT_ASSERT(!read_vm_wire_ready);
+			for (int retry = 0; retry < 3; retry++) {
+				ClusterPcmReadGrantKey key;
+				GcsBlockInvalidateAckPayload echo = {0};
+
+				read_master_time += 10000;
+				cluster_gcs_block_pending_s_tick();
+				UT_ASSERT_EQ(read_revokes, retry + 2);
+				echo.tag = read_invalidate.tag;
+				echo.request_id = read_invalidate.request_id;
+				echo.sender_node = read_vm_node;
+				GcsBlockInvalidateAckPayloadEchoPendingS(&echo, &read_invalidate);
+				UT_ASSERT(GcsBlockInvalidateAckPayloadPendingSKey(&echo, &key));
+				UT_ASSERT_EQ(memcmp(&key, &read_ack_grant.key, sizeof(key)), 0);
+				if (retry == 2) read_vm_send_result = CLUSTER_IC_SEND_WOULD_BLOCK;
+				UT_ASSERT(gcs_block_invalidate_execute(&read_invalidate));
+				UT_ASSERT_EQ(read_vm_ack.ack_status, 2);
+				UT_ASSERT_EQ(read_vm_drops, 1);
+				UT_ASSERT(read_ack_pending(false));
+			}
+		}
+		UT_ASSERT_EQ(read_vm_admitted, 1);
+		UT_ASSERT(read_vm_wire_ready);
+		UT_ASSERT_EQ(read_vm_deliveries, 0);
+		read_vm_deliver();
+		UT_ASSERT_EQ(read_vm_deliveries, 1);
+		UT_ASSERT(read_ack_pending(true));
+	}
+}
+
+UT_TEST(vm_revoke_stale_transport_epoch_does_not_drop_or_consume)
+{
+	GcsBlockInvalidatePayload inv;
+
+	read_vm_prepare();
+	inv = read_invalidate;
+	inv.epoch++;
+	UT_ASSERT(gcs_block_invalidate_execute(&inv));
+	UT_ASSERT_EQ(read_vm_receipts + read_vm_closures + read_vm_states + read_vm_drops, 0);
+	UT_ASSERT_EQ(read_vm_ack.ack_status, 1);
+	UT_ASSERT_EQ(read_vm_state, PCM_LOCK_MODE_S);
+	read_vm_deliver();
+	UT_ASSERT(read_ack_pending(false));
 }
 
 UT_TEST(vm_full_ack_keeps_writer_queued_until_original_notice_handoff)
@@ -2141,7 +2380,7 @@ UT_TEST(master_handed_off_service_ends_only_on_proved_holder_death_or_new_incarn
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(59);
 	UT_RUN(master_handed_off_service_ends_only_on_proved_holder_death_or_new_incarnation);
 	UT_RUN(return_from_a_different_holder_incarnation_cannot_reset_service);
 	UT_RUN(returned_service_observes_a_native_release_and_reacquire_of_same_holder);
@@ -2197,6 +2436,10 @@ main(void)
 	UT_RUN(vm_full_ack_requires_original_consumer_and_authenticated_master);
 	UT_RUN(vm_full_ack_rejects_wrong_exact_key_noncanonical_shape_and_status);
 	UT_RUN(vm_old_pending_ack_cannot_clear_a_confirmed_same_node_successor);
+	UT_RUN(vm_revoke_roundtrip_orders_drop_ack_delivery_and_notice);
+	UT_RUN(vm_revoke_unproven_holder_never_certifies_a_drop);
+	UT_RUN(vm_revoke_failed_send_retries_from_original_master_without_new_drop);
+	UT_RUN(vm_revoke_stale_transport_epoch_does_not_drop_or_consume);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
