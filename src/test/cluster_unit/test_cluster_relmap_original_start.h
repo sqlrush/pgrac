@@ -17,4 +17,6 @@ extern bool test_relmap_start_distinct(const struct ClusterRecoveryStartV1 *star
 extern bool test_relmap_start_pending(void);
 extern void test_relmap_start_fault(unsigned fault);
 extern bool test_relmap_start_done(void);
+extern bool test_relmap_start_staging(const struct ClusterRecoveryStartV1 *start);
+extern bool test_relmap_start_physical_recheck(const struct ClusterRecoveryStartV1 *start);
 #endif

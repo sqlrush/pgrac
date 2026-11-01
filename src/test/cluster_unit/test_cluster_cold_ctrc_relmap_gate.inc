@@ -19,6 +19,9 @@ cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start
 	relmap_observe_checks++;
 	observation_event('M');
 	if (relmap_observe_step != NULL) relmap_observe_step();
+#ifdef TEST_CLUSTER_STARTUP_RELMAP_TERMINAL
+	if (terminal_staging_active) return test_relmap_start_physical_recheck(start);
+#endif
 #ifdef TEST_CLUSTER_STARTUP_RELMAP_FILES
 	if (relmap_files_active) return test_start_unused_relmap_recheck(start);
 #endif
