@@ -90,6 +90,7 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/procarray.h"
@@ -3027,6 +3028,133 @@ cluster_runtime_visibility_history_plan(const ClusterRuntimeVisibilityOriginPlan
 	return data != NULL && data->magic == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC
 		   && data->operation_plan >= ORIGIN_PLAN_HISTORY_V1_UNKNOWN
 		   && data->operation_plan <= ORIGIN_PLAN_HISTORY_CONTROL;
+}
+
+static ClusterHistoryColdStats history_cold_stats;
+StaticAssertDecl(sizeof(ClusterHistoryColdStats) == 128, "history cold observation size");
+static const uint64 history_cold_bounds_us[CLUSTER_HISTORY_COLD_HIST_BUCKETS]
+	= { 10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 1000000, UINT64_MAX };
+
+ClusterHistoryDataStep
+cluster_runtime_visibility_history_prepare_data_held(const ClusterMxHistoryRequest *request,
+													 ClusterTxResolveMode mode,
+													 const ClusterSemanticAdmissionToken *admission,
+													 ClusterUndoBlock0CurrentGuard *guard,
+													 const ClusterUndoBlock0ResolvedRoot *root,
+													 volatile bool *cold_read_available)
+{
+	ClusterUndoBlock0Generation generation = { false, 0 }, final_generation = { false, 0 };
+	ClusterUndoBlock0ResolvedRoot current_root;
+	ClusterUndoBufPin pin;
+	volatile ClusterUndoBufReadObservation observation = { false, 0 };
+	volatile bool pool_ok = false;
+	PGAlignedBlock page;
+	instr_time start, elapsed;
+	uint32 segment, block;
+	uint16 slot, row;
+	uint8 owner;
+
+	if (CritSectionCount != 0 || cold_read_available == NULL || guard == NULL || root == NULL
+		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission)
+		|| !uba_decode_record(request->locator.uba, &segment, &block, &slot, &row)
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| uba_origin_node_id(request->locator.uba) != (NodeId)cluster_node_id)
+		return CLUSTER_HISTORY_DATA_FAILED;
+	owner = (uint8)(cluster_node_id + 1);
+	if (!cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment, &current_root)
+		|| !cluster_runtime_visibility_candidate_root_matches(root, &current_root)
+		|| cluster_undo_block0_current_sample_generation(guard, root, &generation)
+			   != CLUSTER_UNDO_BLOCK0_OK
+		|| !generation.known || generation.value == UINT32_MAX
+		|| ((request->flags & CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION)
+			&& request->expected_data_generation != generation.value))
+		return CLUSTER_HISTORY_DATA_FAILED;
+	if (cluster_undo_buf_copy_resident(segment, owner, block, page.data))
+		return CLUSTER_HISTORY_DATA_READY;
+	if (!*cold_read_available)
+		return CLUSTER_HISTORY_DATA_DEFERRED;
+	/* Consume before the call: ERROR and cache races cannot reset the budget. */
+	*cold_read_available = false;
+	INSTR_TIME_SET_CURRENT(start);
+	PG_TRY();
+	{
+		char *bytes = cluster_undo_buf_pin_observed(segment, owner, block, CLUSTER_UNDO_BUF_SHARED,
+													&pin, &observation);
+		if (bytes != NULL) {
+			cluster_undo_buf_unpin(&pin);
+			pool_ok = true;
+		}
+	}
+	PG_FINALLY();
+	{
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, start);
+		history_cold_stats.drain_ns += Max(INT64CONST(0), INSTR_TIME_GET_NANOSEC(elapsed));
+		if (observation.read_started) {
+			uint64 us = observation.read_ns / 1000 + (observation.read_ns % 1000 != 0);
+			history_cold_stats.reads++;
+			history_cold_stats.read_failures += !pool_ok;
+			history_cold_stats.read_ns += observation.read_ns;
+			history_cold_stats.max_read_ns
+				= Max(history_cold_stats.max_read_ns, observation.read_ns);
+			for (int i = 0; i < CLUSTER_HISTORY_COLD_HIST_BUCKETS; i++)
+				if (us <= history_cold_bounds_us[i]) {
+					history_cold_stats.histogram[i]++;
+					break;
+				}
+		}
+	}
+	PG_END_TRY();
+	if (!pool_ok
+		|| cluster_undo_block0_current_sample_generation(guard, root, &final_generation)
+			   != CLUSTER_UNDO_BLOCK0_OK
+		|| !final_generation.known || final_generation.value != generation.value
+		|| !cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment, &current_root)
+		|| !cluster_runtime_visibility_candidate_root_matches(root, &current_root)
+		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission))
+		return CLUSTER_HISTORY_DATA_FAILED;
+	return CLUSTER_HISTORY_DATA_READY;
+}
+
+void
+cluster_runtime_visibility_history_cold_snapshot(ClusterHistoryColdStats *out)
+{
+	if (out != NULL)
+		*out = history_cold_stats;
+}
+
+static uint64
+history_cold_quantile_upper_us(unsigned percent)
+{
+	uint64 rank = (history_cold_stats.reads / 100) * percent
+				  + ((history_cold_stats.reads % 100) * percent + 99) / 100;
+	uint64 count = 0;
+	uint64 max_us
+		= history_cold_stats.max_read_ns / 1000 + (history_cold_stats.max_read_ns % 1000 != 0);
+	if (rank == 0)
+		return 0;
+	for (int i = 0; i < CLUSTER_HISTORY_COLD_HIST_BUCKETS; i++) {
+		count += history_cold_stats.histogram[i];
+		if (count >= rank)
+			return Min(history_cold_bounds_us[i], max_us);
+	}
+	return max_us;
+}
+
+void
+cluster_runtime_visibility_history_cold_dump(char *out, Size capacity)
+{
+	if (out == NULL || capacity == 0)
+		return;
+	snprintf(out, capacity,
+			 "reads=" UINT64_FORMAT " read_failures=" UINT64_FORMAT " read_ns=" UINT64_FORMAT
+			 " drain_ns=" UINT64_FORMAT " p50_le_us=" UINT64_FORMAT " p99_le_us=" UINT64_FORMAT
+			 " max_read_ns=" UINT64_FORMAT,
+			 history_cold_stats.reads, history_cold_stats.read_failures, history_cold_stats.read_ns,
+			 history_cold_stats.drain_ns, history_cold_quantile_upper_us(50),
+			 history_cold_quantile_upper_us(99), history_cold_stats.max_read_ns);
 }
 
 ClusterRuntimeVisibilityOriginStep

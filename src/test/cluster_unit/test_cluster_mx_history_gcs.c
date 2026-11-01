@@ -8,6 +8,7 @@ int history_backend_fixture_main(void);
 #define cluster_ic_dispatch_defer history_fixture_defer
 #define cluster_lms_shard_for_tag history_fixture_shard
 #define cluster_ic_tier1_resource_x_stream_generation history_fixture_stream
+#define cluster_runtime_visibility_history_prepare_data_held history_fixture_prepare_data
 #include "test_cluster_mx_history_backend.c"
 #undef cluster_semantic_activation_resolve_shared_undo_root
 #undef cluster_undo_block0_current_acquire_begin_admitted
@@ -15,6 +16,32 @@ int history_backend_fixture_main(void);
 #undef cluster_ic_dispatch_defer
 #undef cluster_lms_shard_for_tag
 #undef cluster_ic_tier1_resource_x_stream_generation
+#undef cluster_runtime_visibility_history_prepare_data_held
+
+static bool history_force_cold;
+static int history_cold_attempts;
+static uint32 history_last_cold_request;
+ClusterHistoryDataStep cluster_runtime_visibility_history_prepare_data_held(
+	const ClusterMxHistoryRequest *, ClusterTxResolveMode, const ClusterSemanticAdmissionToken *,
+	ClusterUndoBlock0CurrentGuard *, const ClusterUndoBlock0ResolvedRoot *, volatile bool *);
+ClusterHistoryDataStep
+cluster_runtime_visibility_history_prepare_data_held(const ClusterMxHistoryRequest *request,
+													 ClusterTxResolveMode mode,
+													 const ClusterSemanticAdmissionToken *admission,
+													 ClusterUndoBlock0CurrentGuard *guard,
+													 const ClusterUndoBlock0ResolvedRoot *root,
+													 volatile bool *available)
+{
+	if (!history_force_cold)
+		return history_fixture_prepare_data(request, mode, admission, guard, root, available);
+	if (!*available)
+		return CLUSTER_HISTORY_DATA_DEFERRED;
+	*available = false;
+	history_cold_attempts++;
+	history_last_cold_request = request->forward.request_id;
+	/* Loading is not proof: the unchanged fixture's record freeze refuses. */
+	return CLUSTER_HISTORY_DATA_READY;
+}
 
 static int history_stream_worker;
 int cluster_lms_shard_for_tag(const BufferTag *, int);
@@ -333,10 +360,38 @@ UT_TEST(history_origin_ingress_error_releases_untransferred_admission)
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
 }
+UT_TEST(history_origin_cold_budget_is_per_drain_and_rotates)
+{
+	ClusterMxHistoryRequest request;
+	ClusterMxHistoryRequestWire wire;
+	uint32 first;
+	history_origin_prepare();
+	UT_ASSERT(cluster_mx_history_request_decode(&history_origin_request, 424, 2, 1, 9, &request));
+	for (int i = 0; i < 3; i++) {
+		request.forward.request_id = 51 + i;
+		UT_ASSERT(cluster_mx_history_request_encode(&request, &wire));
+		cluster_gcs_handle_block_forward_envelope(&history_env, &wire);
+	}
+	UT_ASSERT_EQ(history_cold_attempts, 0); /* ingress never reads */
+	history_force_cold = true;
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(history_cold_attempts, 1);
+	first = history_last_cold_request;
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(history_cold_attempts, 2);
+	UT_ASSERT(history_last_cold_request != first);
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(history_cold_attempts, 3);
+	history_force_cold = false;
+	history_origin_drain();
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	UT_ASSERT_EQ(history_sent_header.status, GCS_BLOCK_REPLY_R4_DENIED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(history_origin_accepts_exact_once_and_refuses_unproven_data);
 	UT_RUN(history_origin_cancel_before_acquire_is_idempotent);
 	UT_RUN(history_origin_cancel_waits_for_pending_release);
@@ -350,6 +405,7 @@ main(void)
 	UT_RUN(history_origin_admission_drift_waits_for_release);
 	UT_RUN(history_origin_same_numeric_key_keeps_legacy_domain);
 	UT_RUN(history_origin_ingress_error_releases_untransferred_admission);
+	UT_RUN(history_origin_cold_budget_is_per_drain_and_rotates);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

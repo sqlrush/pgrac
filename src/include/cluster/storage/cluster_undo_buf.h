@@ -90,6 +90,16 @@ extern void cluster_undo_buf_register_region(void);
 extern char *cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no,
 								  ClusterUndoBufMode mode, ClusterUndoBufPin *pin);
 
+/* Optional observation of this call's actual read, excluding another
+ * process's fill or a cache hit. Remains readable across an ERROR. */
+typedef struct ClusterUndoBufReadObservation {
+	bool read_started;
+	uint64 read_ns;
+} ClusterUndoBufReadObservation;
+extern char *cluster_undo_buf_pin_observed(uint32 segment_id, uint8 owner, uint32 block_no,
+										   ClusterUndoBufMode mode, ClusterUndoBufPin *pin,
+										   volatile ClusterUndoBufReadObservation *observation);
+
 /*
  * Copy one already-resident DATA block without filling the pool.  This is the
  * Spec 8.4 kind-4 origin boundary: a miss, an in-progress fill, block 0, or a

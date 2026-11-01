@@ -60,6 +60,7 @@
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -579,11 +580,16 @@ cluster_undo_buf_invalidate_segment(uint32 segment_id, uint8 owner)
 
 
 char *
-cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUndoBufMode mode,
-					 ClusterUndoBufPin *pin)
+cluster_undo_buf_pin_observed(uint32 segment_id, uint8 owner, uint32 block_no,
+							  ClusterUndoBufMode mode, ClusterUndoBufPin *pin,
+							  volatile ClusterUndoBufReadObservation *observation)
 {
 	int slotno = -1;
 
+	if (observation != NULL) {
+		observation->read_started = false;
+		observation->read_ns = 0;
+	}
 	pin->slot = -1;
 
 	/* block 0 (header + durable TT) is NOT poolable;  pool may be disabled. */
@@ -670,6 +676,7 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 		}
 		{
 			UndoBufSlot *s = &UndoBufSlots[slotno];
+			volatile bool read_ok = false;
 
 			if (s->valid) {
 				/*
@@ -705,16 +712,49 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 			LWLockAcquire(&s->content_lock, LW_EXCLUSIVE); /* block waiters */
 			LWLockRelease(&UndoBufPool->map_lock);
 
-			/* Disk read OUTSIDE the map_lock. */
-			if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id,
-											  owner, block_no, SLOT_DATA(slotno))) {
+			/* Disk read OUTSIDE the map_lock. The optional observation
+			 * measures only our read, not lookup/another process's fill. */
+			if (observation == NULL)
+				read_ok
+					= cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id,
+												   owner, block_no, SLOT_DATA(slotno));
+			else {
+				instr_time start, elapsed;
+				INSTR_TIME_SET_CURRENT(start);
+				observation->read_started = true;
+				PG_TRY();
+				{
+					read_ok = cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner),
+														   segment_id, owner, block_no,
+														   SLOT_DATA(slotno));
+				}
+				PG_FINALLY();
+				{
+					INSTR_TIME_SET_CURRENT(elapsed);
+					INSTR_TIME_SUBTRACT(elapsed, start);
+					observation->read_ns = Max(INT64CONST(0), INSTR_TIME_GET_NANOSEC(elapsed));
+					/* ERROR must retire the same reservation as a false read. */
+					if (!read_ok) {
+						LWLockRelease(&s->content_lock);
+						LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
+						s->io_in_progress = false;
+						s->valid = false;
+						pg_atomic_write_u32(&s->pincount, 0);
+						LWLockRelease(&UndoBufPool->map_lock);
+					}
+				}
+				PG_END_TRY();
+			}
+			if (!read_ok) {
 				/* Fill failed — release reservation + report. */
-				LWLockRelease(&s->content_lock);
-				LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
-				s->io_in_progress = false;
-				s->valid = false;
-				pg_atomic_write_u32(&s->pincount, 0);
-				LWLockRelease(&UndoBufPool->map_lock);
+				if (observation == NULL) {
+					LWLockRelease(&s->content_lock);
+					LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
+					s->io_in_progress = false;
+					s->valid = false;
+					pg_atomic_write_u32(&s->pincount, 0);
+					LWLockRelease(&UndoBufPool->map_lock);
+				}
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 								errmsg("cluster undo buffer read failed seg=%u owner=%u block=%u",
 									   segment_id, owner, block_no)));
@@ -739,6 +779,13 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 	pin->block_no = block_no;
 	pin->mode = mode;
 	return SLOT_DATA(slotno);
+}
+
+char *
+cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUndoBufMode mode,
+					 ClusterUndoBufPin *pin)
+{
+	return cluster_undo_buf_pin_observed(segment_id, owner, block_no, mode, pin, NULL);
 }
 
 

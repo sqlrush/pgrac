@@ -309,6 +309,8 @@ struct ErrorContextCallback *error_context_stack = NULL;
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
 
@@ -332,6 +334,8 @@ void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	if (undo_test_trap_error)
 		siglongjmp(undo_test_error_jump, 1);
 	abort(); /* no U1-U6 test reaches an error */
@@ -367,6 +371,7 @@ volatile uint32 CritSectionCount = 0;
 
 /* ----- smgr stubs:  capture writes, replay reads with a per-block marker ----- */
 static int smgr_read_calls = 0;
+static int smgr_read_fault;
 static int smgr_write_calls = 0;
 static int smgr_fsync_write_calls = 0; /* spec-4.8ab D2: write-back flush (do_fsync) */
 static bool smgr_last_write_fsync = true;
@@ -381,6 +386,10 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
 {
 	smgr_read_calls++;
+	if (smgr_read_fault == 1)
+		return false;
+	if (smgr_read_fault == 2)
+		pg_re_throw();
 	memset(buf, 0, BLCKSZ);
 	buf[0] = (char)block_no; /* marker so we can tell which block was read */
 	return true;
@@ -459,6 +468,7 @@ fresh_pool(void)
 		shmem_buf = NULL;
 	}
 	smgr_read_calls = smgr_write_calls = smgr_fsync_write_calls = 0;
+	smgr_read_fault = 0;
 	smgr_last_write_fsync = true;
 	undo_test_flushed_lsn = InvalidXLogRecPtr;
 	undo_test_trap_error = false;
@@ -1040,6 +1050,62 @@ UT_TEST(test_undo_buf_remote_evidence_hold_under_peers)
 }
 
 
+UT_TEST(test_observed_pool_reads_exclude_hits_and_unpoolable)
+{
+	ClusterUndoBufPin pin;
+	volatile ClusterUndoBufReadObservation observation;
+	char *image;
+	fresh_pool();
+	image = cluster_undo_buf_pin_observed(1, 0, 5, CLUSTER_UNDO_BUF_SHARED, &pin, &observation);
+	UT_ASSERT_NOT_NULL(image);
+	UT_ASSERT(observation.read_started);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	cluster_undo_buf_unpin(&pin);
+	image = cluster_undo_buf_pin_observed(1, 0, 5, CLUSTER_UNDO_BUF_SHARED, &pin, &observation);
+	UT_ASSERT_NOT_NULL(image);
+	UT_ASSERT(!observation.read_started);
+	UT_ASSERT_EQ(observation.read_ns, 0);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	cluster_undo_buf_unpin(&pin);
+	UT_ASSERT_NULL(
+		cluster_undo_buf_pin_observed(1, 0, 0, CLUSTER_UNDO_BUF_SHARED, &pin, &observation));
+	UT_ASSERT(!observation.read_started);
+	UT_ASSERT_EQ(observation.read_ns, 0);
+}
+
+UT_TEST(test_observed_pool_failed_read_releases_reservation_before_error)
+{
+	for (int fault = 1; fault <= 2; fault++) {
+		ClusterUndoBufPin pins[4];
+		volatile ClusterUndoBufReadObservation observation;
+		volatile bool caught = false;
+		fresh_pool();
+		smgr_read_fault = fault;
+		PG_TRY();
+		{
+			(void)cluster_undo_buf_pin_observed(1, 0, 5, CLUSTER_UNDO_BUF_SHARED, &pins[0],
+												&observation);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(observation.read_started);
+		UT_ASSERT_EQ(pins[0].slot, -1);
+		smgr_read_fault = 0;
+		/* All four original slots must remain usable, including the failed
+		 * address. A leaked reservation/fill would wait or exhaust the pool. */
+		for (int i = 0; i < 4; i++)
+			UT_ASSERT_NOT_NULL(cluster_undo_buf_pin_observed(1, 0, 5 + i, CLUSTER_UNDO_BUF_SHARED,
+															 &pins[i], &observation));
+		UT_ASSERT_EQ(smgr_read_calls, 5);
+		for (int i = 0; i < 4; i++)
+			cluster_undo_buf_unpin(&pins[i]);
+	}
+}
+
 int
 main(void)
 {
@@ -1061,5 +1127,8 @@ main(void)
 	UT_RUN(test_undo_buf_writeback_verdict_three_state);
 	UT_RUN(test_undo_buf_remote_evidence_hold_under_peers);
 	UT_RUN(test_undo_buf_dirty_evict_flushes_before_reuse);
+	UT_RUN(test_observed_pool_reads_exclude_hits_and_unpoolable);
+	UT_RUN(test_observed_pool_failed_read_releases_reservation_before_error);
 	UT_DONE();
+	return ut_failed_count ? 1 : 0;
 }

@@ -2425,6 +2425,29 @@ route_test_fill_origin_resolution(const ClusterTxLocator *locator,
 
 /* This route fixture supplies no history DATA/FullXid authority. The real
  * held history provider has its own original-current integration tests. */
+ClusterHistoryDataStep
+cluster_runtime_visibility_history_prepare_data_held(
+	const ClusterMxHistoryRequest *request pg_attribute_unused(),
+	ClusterTxResolveMode mode pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
+	volatile bool *available pg_attribute_unused())
+{
+	return CLUSTER_HISTORY_DATA_FAILED;
+}
+void
+cluster_runtime_visibility_history_cold_snapshot(ClusterHistoryColdStats *out)
+{
+	memset(out, 0, sizeof(*out));
+}
+void
+cluster_runtime_visibility_history_cold_dump(char *out, Size capacity)
+{
+	if (capacity > 0)
+		out[0] = '\0';
+}
+
 ClusterRuntimeVisibilityOriginStep
 cluster_runtime_visibility_origin_plan_freeze_history_held(
 	const ClusterMxHistoryRequest *request pg_attribute_unused(),

@@ -293,6 +293,32 @@ extern ClusterRuntimeVisibilityOperationStep cluster_runtime_visibility_operatio
 extern void cluster_runtime_visibility_operation_origin_read_cancel(
 	ClusterRuntimeVisibilityOperationRead *read);
 
+typedef enum ClusterHistoryDataStep {
+	CLUSTER_HISTORY_DATA_FAILED,
+	CLUSTER_HISTORY_DATA_READY,
+	CLUSTER_HISTORY_DATA_DEFERRED
+} ClusterHistoryDataStep;
+
+/* Only the admitted origin LMS history drain may enable this pre-load.
+ * A resident hit leaves the per-drain budget intact; a miss consumes it
+ * before calling the original pool, including ERROR/cache-race cases.
+ * DEFERRED retains the held guard and publishes nothing. No new current.
+ * The original freeze/copy must still qualify the resulting DATA bytes. */
+extern ClusterHistoryDataStep cluster_runtime_visibility_history_prepare_data_held(
+	const ClusterMxHistoryRequest *request, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, volatile bool *cold_read_available);
+
+#define CLUSTER_HISTORY_COLD_HIST_BUCKETS 11
+typedef struct ClusterHistoryColdStats {
+	uint64 reads, read_failures, read_ns, drain_ns, max_read_ns;
+	uint64 histogram[CLUSTER_HISTORY_COLD_HIST_BUCKETS];
+} ClusterHistoryColdStats;
+/* Process-local lifetime totals. Quantiles in dump are bucket upper bounds;
+ * maximum and cumulative nanoseconds are measured, not bucket estimates. */
+extern void cluster_runtime_visibility_history_cold_snapshot(ClusterHistoryColdStats *out);
+extern void cluster_runtime_visibility_history_cold_dump(char *out, Size capacity);
+
 /* Typed history strategy for the same three-current origin plan. request has
  * passed the history codec and remains immutable across held calls, which
  * stage private values only. The caller

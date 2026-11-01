@@ -10849,7 +10849,7 @@ gcs_block_r4_tx_origin_worker_current(const GcsBlockR4TxOriginContext *context)
 }
 
 static void
-gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context, volatile bool *cold_read_available)
 {
 	ClusterUndoBlock0CurrentStep step;
 	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_OK;
@@ -10925,6 +10925,16 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 	case GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE:
 		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_MX_HISTORY) {
 			ClusterMxHistoryRecord record;
+			ClusterHistoryDataStep loaded = cluster_runtime_visibility_history_prepare_data_held(
+				&history, context->resolve_mode, &context->admission, &context->guard,
+				&context->root, cold_read_available);
+			if (loaded == CLUSTER_HISTORY_DATA_DEFERRED)
+				break;
+			if (loaded != CLUSTER_HISTORY_DATA_READY) {
+				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+				break;
+			}
 			origin_step = cluster_runtime_visibility_origin_plan_freeze_history_held(
 				&history, context->resolve_mode, &context->admission, &context->guard,
 				&context->root, &context->origin_plan, &record, &context->reason);
@@ -11220,9 +11230,20 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 		}
 		break;
 	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK:
-		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_MX_HISTORY)
+		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_MX_HISTORY) {
+			ClusterHistoryDataStep loaded = cluster_runtime_visibility_history_prepare_data_held(
+				&history, context->resolve_mode, &context->admission, &context->guard,
+				&context->recheck_root, cold_read_available);
+			if (loaded == CLUSTER_HISTORY_DATA_DEFERRED)
+				break;
+			if (loaded != CLUSTER_HISTORY_DATA_READY) {
+				context->outcome = CLUSTER_TX_UNKNOWN;
+				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+				break;
+			}
 			gcs_block_mx_history_origin_copy_held(context, &history);
-		else if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+		} else if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
 			(void)gcs_block_current_mx_origin_updater_provenance_advance(context);
 		else if (context->undo_data_fetch)
 			gcs_block_r4_undo_origin_copy_held(context, &context->recheck_root);
@@ -11353,17 +11374,27 @@ void
 cluster_gcs_block_r4_tx_resolve_drain(void)
 {
 	static ClusterUpdateTraceInterval trace_intervals[GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS];
+	static unsigned next_start;
+	static uint64 last_dump_reads;
+	static uint64 last_dump_drain_ns;
+	static TimestampTz last_dump_at;
+	unsigned start = next_start;
+	volatile bool cold_read_available = true;
+	ClusterHistoryColdStats stats;
 	int i;
 
-	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
-		GcsBlockR4TxOriginContext *context = &gcs_block_r4_tx_origin_contexts[i];
+	for (unsigned ordinal = 0; ordinal < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; ordinal++) {
+		GcsBlockR4TxOriginContext *context;
 		int step_budget;
+		i = (start + ordinal) % GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS;
+		context = &gcs_block_r4_tx_origin_contexts[i];
 
 		if (!context->in_use)
 			continue;
 		for (step_budget = 0; step_budget < GCS_BLOCK_R4_TX_ORIGIN_STEP_BUDGET; step_budget++) {
 			GcsBlockR4TxOriginPhase phase_before = context->phase;
 			MemoryContext saved_context = CurrentMemoryContext;
+			bool budget_before = cold_read_available;
 
 			if (unlikely(cluster_update_trace_enabled)) {
 				ClusterUpdateTraceEvent event = { 0 };
@@ -11394,7 +11425,7 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 
 			PG_TRY();
 			{
-				gcs_block_r4_tx_origin_step(context);
+				gcs_block_r4_tx_origin_step(context, &cold_read_available);
 			}
 			PG_CATCH();
 			{
@@ -11414,6 +11445,8 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 					gcs_block_r4_tx_origin_context_clear(context, true);
 			}
 			PG_END_TRY();
+			if (budget_before && !cold_read_available)
+				next_start = (i + 1) % GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS;
 			if (unlikely(trace_intervals[i].active))
 				cluster_update_trace_interval_leave_at(
 					&trace_intervals[i], !context->in_use || context->phase != phase_before,
@@ -11423,6 +11456,22 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 				context->failure_phase = phase_before;
 			if (!context->in_use || context->phase == phase_before)
 				break;
+		}
+	}
+	/* Process-local dump from the LMS that actually read. An SQL backend's
+	 * private zero counters must never stand in for this origin's totals.
+	 * Throttle output, including a changed final sample on a later idle drain. */
+	cluster_runtime_visibility_history_cold_snapshot(&stats);
+	if (stats.reads != last_dump_reads || stats.drain_ns != last_dump_drain_ns) {
+		TimestampTz now = GetCurrentTimestamp();
+		if (last_dump_at == 0 || now - last_dump_at >= INT64CONST(1000000)) {
+			char detail[384];
+			cluster_runtime_visibility_history_cold_dump(detail, sizeof(detail));
+			elog(LOG, "history cold-read dump node=%d pid=%d %s", cluster_node_id, MyProcPid,
+				 detail);
+			last_dump_reads = stats.reads;
+			last_dump_drain_ns = stats.drain_ns;
+			last_dump_at = now;
 		}
 	}
 }

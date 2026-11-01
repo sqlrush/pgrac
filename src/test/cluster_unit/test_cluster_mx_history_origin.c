@@ -19,6 +19,30 @@ typedef struct HistoryOriginFixture {
 
 static HistoryOriginFixture *history_observed;
 static int history_action, history_release;
+static bool history_cold_cache_race;
+static int history_cold_fault;
+
+/* Only the disk/cache scheduling leaf is controlled. All held qualification,
+ * record decoding, generation fences and cancellation remain production. */
+char *
+cluster_undo_buf_pin_observed(uint32 segment, uint8 owner, uint32 block, ClusterUndoBufMode mode,
+							  ClusterUndoBufPin *pin,
+							  volatile ClusterUndoBufReadObservation *observation)
+{
+	char *bytes;
+	observation->read_started = !history_cold_cache_race && !test_candidate_data_pool_disabled;
+	observation->read_ns = observation->read_started ? 123000 : 0;
+	bytes = cluster_undo_buf_pin(segment, owner, block, mode, pin);
+	if (history_cold_fault == 1)
+		test_candidate_data_generation++;
+	if (history_cold_fault == 2)
+		test_admission_revoked = true;
+	if (history_cold_fault == 3) {
+		test_candidate_root_drift = true;
+		test_regular_root_resolve_calls = 2;
+	}
+	return bytes;
+}
 
 static bool
 history_is_zero(const void *p, size_t n)
@@ -632,10 +656,213 @@ UT_TEST(history_origin_bad_wire_scope_and_poll_arguments)
 	}
 }
 
+static void
+history_cold_acquire(HistoryOriginFixture *f)
+{
+	ClusterUndoBlock0LogicalKey key = { .segment_id = TEST_RECORD_SEGMENT, .owner_instance = 1 };
+	ClusterUndoBlock0Result failure;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin_admitted(
+					 &key, CLUSTER_UNDO_BLOCK0_SCUR, 0, &f->base.origin.admission,
+					 &f->base.origin.guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+}
+
+static ClusterHistoryDataStep
+history_cold_load(HistoryOriginFixture *f, bool *available)
+{
+	return cluster_runtime_visibility_history_prepare_data_held(
+		&f->request, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &f->base.origin.admission,
+		&f->base.origin.guard, &f->base.origin.data_root, available);
+}
+
+UT_TEST(history_cold_loads_under_same_guard_and_preserves_record_gates)
+{
+	HistoryOriginFixture f;
+	ClusterHistoryColdStats before, after;
+	bool available = true;
+	history_origin_init(&f, false);
+	history_cold_cache_race = false;
+	history_cold_acquire(&f);
+	test_candidate_cold_copy_mask = 1;
+	cluster_runtime_visibility_history_cold_snapshot(&before);
+	UT_ASSERT_EQ(history_cold_load(&f, &available), CLUSTER_HISTORY_DATA_READY);
+	UT_ASSERT(!available);
+	UT_ASSERT_EQ(test_candidate_data_pin_calls, 1);
+	UT_ASSERT_EQ(test_candidate_data_unpin_calls, 1);
+	UT_ASSERT_EQ(test_operation_pin_depth, 0);
+	UT_ASSERT_EQ(test_candidate_held_count, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+	cluster_runtime_visibility_history_cold_snapshot(&after);
+	UT_ASSERT_EQ(after.reads - before.reads, 1);
+	UT_ASSERT_EQ(after.read_ns - before.read_ns, 123000);
+	UT_ASSERT_EQ(after.read_failures, before.read_failures);
+	/* Loaded bytes remain untrusted until the original decoder. */
+	history_header()->xid++;
+	UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_history_held(
+					 &f.request, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &f.base.origin.admission,
+					 &f.base.origin.guard, &f.base.origin.data_root, &f.base.origin.plan, &f.record,
+					 &f.base.origin.reason),
+				 CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED);
+	UT_ASSERT(history_is_zero(&f.record, sizeof(f.record)));
+	cluster_undo_block0_current_cancel(&f.base.origin.guard);
+}
+
+UT_TEST(history_cold_budget_defers_miss_but_allows_warm)
+{
+	HistoryOriginFixture f;
+	bool available = false;
+	history_origin_init(&f, false);
+	history_cold_acquire(&f);
+	UT_ASSERT_EQ(history_cold_load(&f, &available), CLUSTER_HISTORY_DATA_READY);
+	UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+	/* Force the next resident lookup to miss, without changing the guard. */
+	test_candidate_data_copy_calls = 0;
+	test_candidate_cold_copy_mask = 1;
+	UT_ASSERT_EQ(history_cold_load(&f, &available), CLUSTER_HISTORY_DATA_DEFERRED);
+	UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+	UT_ASSERT_EQ(test_candidate_held_count, 1);
+	cluster_undo_block0_current_cancel(&f.base.origin.guard);
+}
+
+UT_TEST(history_cold_rejects_wrong_scope_namespace_and_generation_before_io)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		HistoryOriginFixture f;
+		bool available = true;
+		history_origin_init(&f, false);
+		history_cold_acquire(&f);
+		test_candidate_cold_copy_mask = 1;
+		if (fault == 0)
+			f.request.forward.master_node = 1;
+		if (fault == 1)
+			f.base.origin.data_root.root_id++;
+		if (fault == 2)
+			test_admission_revoked = true;
+		if (fault == 3) {
+			f.request.flags |= CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION;
+			f.request.expected_data_generation = 18;
+		}
+		if (fault == 4)
+			CritSectionCount = 1;
+		UT_ASSERT_EQ(history_cold_load(&f, &available), CLUSTER_HISTORY_DATA_FAILED);
+		CritSectionCount = 0;
+		UT_ASSERT(available);
+		UT_ASSERT_EQ(test_candidate_data_pin_calls, 0);
+		cluster_undo_block0_current_cancel(&f.base.origin.guard);
+	}
+}
+
+UT_TEST(history_cold_error_and_disabled_pool_preserve_unknown_and_account_reads)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		HistoryOriginFixture f;
+		ClusterHistoryColdStats before, after;
+		volatile bool caught = false;
+		bool available = true;
+		history_origin_init(&f, false);
+		history_cold_cache_race = fault == 2;
+		history_cold_acquire(&f);
+		test_candidate_cold_copy_mask = 1;
+		test_candidate_data_io_throw = fault == 0;
+		test_candidate_data_pool_disabled = fault == 1;
+		cluster_runtime_visibility_history_cold_snapshot(&before);
+		PG_TRY();
+		{
+			UT_ASSERT_EQ(history_cold_load(&f, &available),
+						 fault == 2 ? CLUSTER_HISTORY_DATA_READY : CLUSTER_HISTORY_DATA_FAILED);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		cluster_runtime_visibility_history_cold_snapshot(&after);
+		UT_ASSERT_EQ(caught, fault == 0);
+		UT_ASSERT_EQ(after.reads - before.reads, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(after.read_failures - before.read_failures, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(test_operation_pin_depth, 0);
+		UT_ASSERT_EQ(test_candidate_held_count, 1);
+		cluster_undo_block0_current_cancel(&f.base.origin.guard);
+	}
+	history_cold_cache_race = false;
+}
+
+UT_TEST(history_cold_post_io_drift_never_becomes_proof)
+{
+	for (int fault = 1; fault <= 3; fault++) {
+		HistoryOriginFixture f;
+		bool available = true;
+		history_origin_init(&f, false);
+		history_cold_acquire(&f);
+		test_candidate_cold_copy_mask = 1;
+		history_cold_fault = fault;
+		UT_ASSERT_EQ(history_cold_load(&f, &available), CLUSTER_HISTORY_DATA_FAILED);
+		UT_ASSERT_EQ(test_candidate_data_pin_calls, 1);
+		UT_ASSERT_EQ(test_candidate_data_unpin_calls, 1);
+		UT_ASSERT_EQ(test_operation_pin_depth, 0);
+		UT_ASSERT(history_is_zero(&f.record, sizeof(f.record)));
+		cluster_undo_block0_current_cancel(&f.base.origin.guard);
+	}
+	history_cold_fault = 0;
+}
+
+UT_TEST(history_cold_first_and_fresh_data_use_only_original_three_currents)
+{
+	HistoryOriginFixture f;
+	ClusterUndoBlock0LogicalKey tt = { .segment_id = TEST_TT_SEGMENT, .owner_instance = 1 };
+	ClusterUndoBlock0Result failure;
+	bool available = true;
+	char dump[384];
+	history_origin_init(&f, false);
+	test_operation_release_observer = NULL;
+	history_cold_acquire(&f);
+	test_candidate_cold_copy_mask = 1;
+	UT_ASSERT_EQ(history_cold_load(&f, &available), CLUSTER_HISTORY_DATA_READY);
+	UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_history_held(
+					 &f.request, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &f.base.origin.admission,
+					 &f.base.origin.guard, &f.base.origin.data_root, &f.base.origin.plan, &f.record,
+					 &f.base.origin.reason),
+				 CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL);
+	UT_ASSERT_EQ(cluster_undo_block0_current_release_begin(&f.base.origin.guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin_admitted(&tt, CLUSTER_UNDO_BLOCK0_SCUR,
+																	0, &f.base.origin.admission,
+																	&f.base.origin.guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	UT_ASSERT(cluster_runtime_visibility_origin_plan_sample_history_held(
+		&f.base.origin.plan, &f.request, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+		&f.base.origin.admission, &f.base.origin.guard, &f.base.origin.tt_root, &f.top,
+		&f.base.origin.reason));
+	UT_ASSERT_EQ(cluster_undo_block0_current_release_begin(&f.base.origin.guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
+	operation_plan_effect(CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	history_cold_acquire(&f);
+	available = true; /* a later drain */
+	test_candidate_data_copy_calls = 0;
+	UT_ASSERT_EQ(history_cold_load(&f, &available), CLUSTER_HISTORY_DATA_READY);
+	UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_copy_history_held(
+					 &f.base.origin.plan, &f.request, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+					 &f.base.origin.admission, &f.base.origin.guard, &f.base.origin.data_root,
+					 &f.top, &f.record, &f.data_generation, f.output.data, &f.base.origin.reason),
+				 CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(f.record.effect, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	UT_ASSERT_EQ(cluster_undo_block0_current_release_begin(&f.base.origin.guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+	UT_ASSERT_EQ(test_candidate_release_calls, 3);
+	UT_ASSERT_EQ(test_candidate_data_pin_calls, 2);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	cluster_runtime_visibility_history_cold_dump(dump, sizeof(dump));
+	UT_ASSERT(strstr(dump, "p50_le_us=123") != NULL);
+	UT_ASSERT(strstr(dump, "p99_le_us=123") != NULL);
+	UT_ASSERT(strstr(dump, "max_read_ns=123000") != NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(21);
 	UT_RUN(history_origin_root_three_phases_same_and_cross_segment);
 	UT_RUN(history_origin_global_and_v1_keep_exact_identity);
 	UT_RUN(history_origin_control_returns_fresh_snapshot);
@@ -651,6 +878,12 @@ main(void)
 	UT_RUN(history_origin_held_plan_never_falls_back_to_untyped_copy);
 	UT_RUN(history_origin_current_failures_cancel_each_phase);
 	UT_RUN(history_origin_bad_wire_scope_and_poll_arguments);
+	UT_RUN(history_cold_loads_under_same_guard_and_preserves_record_gates);
+	UT_RUN(history_cold_budget_defers_miss_but_allows_warm);
+	UT_RUN(history_cold_rejects_wrong_scope_namespace_and_generation_before_io);
+	UT_RUN(history_cold_error_and_disabled_pool_preserve_unknown_and_account_reads);
+	UT_RUN(history_cold_post_io_drift_never_becomes_proof);
+	UT_RUN(history_cold_first_and_fresh_data_use_only_original_three_currents);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
