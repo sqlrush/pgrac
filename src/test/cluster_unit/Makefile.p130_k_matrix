@@ -277,3 +277,67 @@ k-p130-h07: test_cluster_k_p130_h07
 
 clean-k-p130-h07:
 	rm -f test_cluster_k_p130_h07
+
+.PHONY: k-p130-h08-deps k-p130-h08 clean-k-p130-h08
+k-p130-h08-deps:
+	$(MAKE) -C $(top_builddir)/src/backend generated-headers
+	$(MAKE) -C $(top_builddir)/src/port libpgport_srv.a
+	$(MAKE) -C $(top_builddir)/src/common libpgcommon_srv.a
+	$(MAKE) cluster_catalog_trace_test.o
+	$(MAKE) test_cluster_native_resident_x test_cluster_native_master test_cluster_native_resident_lock
+
+test_cluster_k_p130_h08_writer.inc: test_cluster_native_resident_x.c Makefile.p130_k_matrix
+	awk '/^UT_TEST/ { stop=1; exit } \
+	     /if \(\+\+wc_waits > 8 \|\| rx_cancel_wait\) pg_re_throw\(\);/ { print; print "\th08_wait_event();"; waits++; next } \
+	     /^#include "test_cluster_native_resident_x_driver.inc"/ { \
+	       print "#define cluster_bufmgr_first_fill_error h08_error"; \
+	       print "#define LWLockConditionalAcquire h08_conditional"; \
+	       print "#define cluster_pcm_own_revoke_to_grant_handoff_exact h08_handoff"; \
+	       print; print "#undef cluster_pcm_own_revoke_to_grant_handoff_exact"; \
+	       print "#undef LWLockConditionalAcquire"; \
+	       print "#undef cluster_bufmgr_first_fill_error"; drivers++; next } \
+	     { print } END { if (stop != 1 || waits != 1 || drivers != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h08_master.inc: test_cluster_native_master.c Makefile.p130_k_matrix
+	awk '/^#include "test_cluster_resource_x_master_done_ingress.inc"/ { emit=1; starts++ } \
+	     /^UT_TEST/ { stop=1; exit } emit { print } \
+	     END { if (starts != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h08_reserve.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile.p130_k_matrix
+	awk '/^cluster_pcm_own_begin_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; begin++ } \
+	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; abort++ } \
+	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; wait++ } \
+	     emit { print } /^}/ { emit=0 } END { if (begin != 1 || abort != 1 || wait != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h08_reader.inc: test_cluster_native_resident_lock.c Makefile.p130_k_matrix
+	awk '/^#include "test_cluster_native_resident_fill_fixture.inc"/ { includes++; next } \
+	     /^#include "test_cluster_native_resident_lock_reserve.inc"/ { \
+	       print "#include \"test_cluster_k_p130_h08_reserve.inc\""; reserves++; next } \
+	     /^UT_TEST/ { stop=1; exit } { print } \
+	     END { if (includes != 1 || reserves != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h08: test_cluster_k_p130_h08.c test_cluster_k_p130_h08_writer.inc \
+		test_cluster_k_p130_h08_master.inc test_cluster_k_p130_h08_reader.inc \
+		test_cluster_k_p130_h08_reserve.inc test_cluster_k_p130_h01_drain.inc \
+		test_cluster_k_p130_h02_leaves.inc k-p130-h08-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H08_CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+k-p130-h08: test_cluster_k_p130_h08
+	./test_cluster_k_p130_h08
+
+clean-k-p130-h08:
+	rm -f test_cluster_k_p130_h08 test_cluster_k_p130_h08_writer.inc test_cluster_k_p130_h08_writer.inc.tmp \
+		test_cluster_k_p130_h08_master.inc test_cluster_k_p130_h08_master.inc.tmp \
+		test_cluster_k_p130_h08_reader.inc test_cluster_k_p130_h08_reader.inc.tmp \
+		test_cluster_k_p130_h08_reserve.inc test_cluster_k_p130_h08_reserve.inc.tmp
