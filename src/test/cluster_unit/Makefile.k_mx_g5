@@ -97,3 +97,17 @@ test_k_mx_g5_proof_receive: test_k_mx_g5_proof_receive.c test_cluster_mx_composi
 		$(top_builddir)/src/port/libpgport_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# Intentional acceptance RED until the original full consumer is connected.
+# This is manually selected and never masks a failure in the default suite.
+test_k_mx_g5_full_consumer_red: test_k_mx_g5_full_consumer_red.c \
+		test_cluster_multixact_current.c unit_test.h \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		-DHEAPAM_CURRENT_MX_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DMULTIXACT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/transam/multixact.c"' \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a -o $@
