@@ -13825,3 +13825,9 @@ test_cluster_snapshot_admission: test_cluster_survivor_backend_route_native.h \
  $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_targets.c \
  $(top_builddir)/src/common/libpgcommon_srv.a
 test_cluster_snapshot_admission: CLUSTER_UNIT_PORT_LIBS += $(top_builddir)/src/common/libpgcommon_srv.a
+
+# Existing target cursor and generation source through real backend replies.
+test_cluster_snapshot_admission: test_cluster_survivor_backend_census_fixture.h \
+ test_cluster_survivor_generation.inc \
+ $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_targets.h \
+ $(top_srcdir)/src/include/cluster/cluster_grd.h

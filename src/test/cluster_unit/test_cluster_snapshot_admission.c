@@ -1153,6 +1153,7 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 #include "test_cluster_survivor_xact_return.inc"
 #include "test_cluster_survivor_backend_interrupt_fixture.h"
 #include "test_cluster_survivor_backend_route_fixture.h"
+#include "test_cluster_survivor_backend_census_fixture.h"
 int
 main(void)
 {
@@ -1177,7 +1178,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(148);
+	UT_PLAN(158);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1326,6 +1327,16 @@ main(void)
 	UT_RUN(backend_route_gate_change_withdraws_published_sample);
 	UT_RUN(backend_route_episode_change_withdraws_published_sample);
 	UT_RUN(backend_route_target_replacement_withdraws_published_sample);
+	UT_RUN(backend_census_observes_original_callback_without_retiring_snapshot);
+	UT_RUN(backend_census_requires_original_gate_close_before_query);
+	UT_RUN(backend_census_waits_for_original_cancel_return_before_advancing);
+	UT_RUN(backend_census_failed_notification_cannot_count_as_observation);
+	UT_RUN(backend_census_unknown_status_is_not_queried_or_rescanned_in_same_round);
+	UT_RUN(backend_census_reasks_replaced_target_only_after_original_callback_returns);
+	UT_RUN(backend_census_new_round_waits_for_original_claimed_callback_to_return);
+	UT_RUN(backend_census_gate_drift_withdraws_original_returned_observation);
+	UT_RUN(backend_census_keeps_next_native_owner_pending_after_backend_observation);
+	UT_RUN(backend_census_real_reap_retires_transport_without_snapshot_return);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
