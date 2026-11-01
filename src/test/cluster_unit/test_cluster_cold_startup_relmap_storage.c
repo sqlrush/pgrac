@@ -250,3 +250,17 @@ test_cold_relmap_storage_unlock(LWLock *lock)
 {
 	LWLockRelease(lock);
 }
+
+LWLock *
+test_cold_relmap_storage_publication_lock(bool enter)
+{
+	if (enter) LWLockAcquire(&retention_lock, LW_EXCLUSIVE);
+	else LWLockRelease(&retention_lock);
+	return &retention_lock;
+}
+
+bool
+test_cold_relmap_storage_held_mode(LWLock *lock, LWLockMode mode)
+{
+	return mode == LW_EXCLUSIVE && lock == &retention_lock && LWLockHeldByMe(lock);
+}

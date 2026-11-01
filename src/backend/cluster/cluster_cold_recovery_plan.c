@@ -58,8 +58,10 @@ cold_relmap_inputs_valid(const ClusterColdPlanV1 *plan,
 		const ClusterRelmapV2Owner *owner = &image->pending_owner;
 		const ClusterWalSourceRef *source = &in->source;
 
-		if (in->participant >= plan->participant_count || in->retention == NULL
-			|| in->retention_lock == NULL
+		if (in->participant >= plan->participant_count
+			|| (plan->relmap_recovery == NULL
+				? in->retention == NULL || in->retention_lock == NULL
+				: in->retention != NULL || in->retention_lock != NULL)
 			|| !cold_relmap_cut_equal(&in->cut,
 				&plan->participants[plan->canonical[in->participant]].cut)
 			|| in->frame.participant != in->participant || in->frame.history
@@ -1030,6 +1032,13 @@ cluster_cold_plan_max_scn_v1(const ClusterColdPlanV1 *plan)
 	return plan_valid(plan) ? plan->max_scn : 0;
 }
 
+bool
+cluster_cold_plan_relmap_recovery_held_v1(const ClusterColdPlanV1 *plan)
+{
+	return plan_valid(plan) && plan->relmap_recovery != NULL
+		&& plan->relmap_recovery->count != 0 && !plan->relmap_recovery->transferred;
+}
+
 void
 cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 {
@@ -1041,6 +1050,12 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 	plan = *plan_address;
 	if (plan->magic != CLUSTER_COLD_PLAN_MAGIC)
 		return;
+	/* Untransferred recovery debt outlives failed cleanup. */
+	if (plan->relmap_recovery != NULL && plan->relmap_recovery->count != 0
+		&& !plan->relmap_recovery->transferred)
+		return;
+	if (plan->relmap_recovery != NULL)
+		cold_free(plan->relmap_recovery);
 	plan->magic = 0;
 	if (plan->schedule != NULL)
 		cold_free(plan->schedule);

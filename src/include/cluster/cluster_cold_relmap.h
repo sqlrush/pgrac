@@ -17,9 +17,27 @@
 #include "common/cluster_relmap_v2.h"
 
 #define CLUSTER_COLD_RELMAP_MAX_INPUTS 64
+/* Original Startup-only recovery path. No ordinary directory/lock may be
+ * supplied. Full original source set must be passed, not a replay prefix.
+ * A failed attempt retains its private carrier until joint transfer or exit. */
+struct ClusterColdRelmapWalV1;
+extern bool cluster_cold_plan_relmap_recovery_held_v1(const ClusterColdPlanV1 *plan);
+extern ClusterColdDetailV1 cluster_cold_plan_relmap_from_recovery_wal_v1(
+	ClusterColdPlanV1 *plan, const ClusterWalSourceRef *sources, uint32 source_count,
+	uint32 replay_count, const struct ClusterColdRelmapWalV1 *wal, uint32 count);
+extern ClusterColdTypedV1 *cluster_cold_typed_prepare_relmap_recovery_wal_v1(
+	struct ClusterRecoveryFencePlan *fence, uint16 own_thread, XLogRecPtr own_redo,
+	const struct ClusterColdRelmapWalV1 *inputs, uint32 count);
 struct ClusterRelmapRetentionDirectory;
 struct LWLock;
 struct ClusterRecoveryStartV1;
+/* A original joint publisher, at its nofail publication point under the
+ * EXCLUSIVE joint publication lock and critical section. Every qualification
+ * and physical/current recheck must already have succeeded. Does not publish
+ * COMPLETE; success only copies all pins then allows original-context cleanup. */
+extern bool cluster_cold_typed_relmap_recovery_transfer_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRelmapRetentionDirectory *const *targets, uint32 count,
+	struct LWLock *publication_lock);
 
 /* Original pending custody, not a way to infer FullXid/era from raw WAL.
  * The original owner supplies its exact retained pin and image. Declaration
