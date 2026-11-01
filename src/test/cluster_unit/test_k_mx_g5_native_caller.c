@@ -14,7 +14,11 @@ bool LWLockAcquire(LWLock *lock, LWLockMode mode);
 void LWLockRelease(LWLock *lock);
 bool cluster_gcs_current_mx_range_fetch_and_wait(ClusterMxRangeRequest *request,
 	ClusterMxRangeResponse *response,uint32 *bytes);
+bool k_real_range_fetch_and_wait(ClusterMxRangeRequest *request,
+	ClusterMxRangeResponse *response,uint32 *bytes);
+#define cluster_gcs_current_mx_range_fetch_and_wait k_real_range_fetch_and_wait
 #include "../../backend/cluster/cluster_gcs_block.c"
+#undef cluster_gcs_current_mx_range_fetch_and_wait
 
 ProcessingMode Mode=NormalProcessing;
 int cluster_lms_workers=4;
@@ -22,6 +26,10 @@ static ClusterGcsBlockBackendBlock native_blocks[2];
 static PGAlignedBlock stats_memory;
 static unsigned gcs_locks, requests_sent, replies_sent, wakes, fault, data_worker;
 static uint64 previous_request_id;
+static unsigned late_fault, late_at;
+static bool late_fired;
+static uint32 first_history[8];
+static uint64 request_history[8];
 
 void *ShmemInitStruct(const char *name,Size size,bool *found)
 {
@@ -89,11 +97,15 @@ bool cluster_lms_outbound_enqueue_cap_bound(int worker,uint8 type,uint32 destina
 	ClusterICEnvelope env={0};const ClusterMxRangeRequest *request=payload;
 	int saved_node=cluster_node_id;BackendId saved_backend=MyBackendId;
 	UT_ASSERT_EQ(gcs_locks,0);UT_ASSERT_EQ(type,PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
-	UT_ASSERT_EQ(destination,0);UT_ASSERT_EQ(generation,11);
+	UT_ASSERT_EQ(destination,0);UT_ASSERT_EQ(generation,connection_generation);
 	UT_ASSERT_EQ(capabilities,CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES);
 	UT_ASSERT_EQ(worker,cluster_gcs_block_payload_shard(type,payload,bytes,cluster_lms_workers));
 	UT_ASSERT(request->route.request_id!=previous_request_id);previous_request_id=request->route.request_id;
 	requests_sent++;data_worker=worker;
+	if(requests_sent<=lengthof(first_history)) {
+		first_history[requests_sent-1]=request->first;
+		request_history[requests_sent-1]=request->route.request_id;
+	}
 	if(fault==1 && requests_sent==2)ko_revision++;
 	if(fault==2 && requests_sent==2)service_boot++;
 	if(fault==3 && requests_sent==2)native_epoch++;
@@ -110,12 +122,29 @@ bool cluster_lms_outbound_enqueue_cap_bound(int worker,uint8 type,uint32 destina
 	return true;
 }
 
+bool cluster_gcs_current_mx_range_fetch_and_wait(ClusterMxRangeRequest *request,
+	ClusterMxRangeResponse *response,uint32 *bytes)
+{
+	bool result=k_real_range_fetch_and_wait(request,response,bytes);
+	/* The real transport has finished all its own checks and retired the
+	 * slot. This scheduling boundary never changes its result or output. */
+	if(result && late_fault && requests_sent==late_at) {
+		UT_ASSERT_EQ(replies_sent,requests_sent);late_fired=true;
+		if(late_fault==1)native_epoch++;
+		if(late_fault==2)connection_generation++;
+		if(late_fault==3)capability_ok=false;
+	}
+	return result;
+}
+
 static void chain_seed(uint32 count,uint32 start)
 {
 	service_seed(count,start);memset(native_blocks,0,sizeof(native_blocks));
 	gcs_block_backend_blocks=native_blocks;
 	native_blocks[0].next_request_id=1;native_blocks[1].next_request_id=1;
 	gcs_locks=requests_sent=replies_sent=wakes=fault=0;previous_request_id=0;
+	late_fault=late_at=0;late_fired=false;memset(first_history,0,sizeof(first_history));
+	memset(request_history,0,sizeof(request_history));
 	cluster_multixact_current_stats_shmem_init();
 }
 static void chain_clean(void)
@@ -206,11 +235,87 @@ static void scoped_cancel_has_no_returned_outcome(void)
 		InterruptPending=false;chain_clean();
 	}
 }
+static void expect_last_reply_refusal(unsigned mode)
+{
+	uint32 sizes[]={2,257};
+	for(unsigned i=0;i<lengthof(sizes);i++) {
+		ClusterCurrentMxKey key={0};ClusterMxCompositionReceive *op=NULL;
+		ClusterMxCompositionReceiveStats stats={0};
+		chain_seed(sizes[i],1);key.multixact_id=1000;key.cluster_epoch=7;
+		late_fault=mode;late_at=i+1;
+		UT_ASSERT(!cluster_multixact_current_describe_full(&key,&request_tag,&request_snapshot,&op,&stats));
+		UT_ASSERT(late_fired);UT_ASSERT_NULL(op);
+		UT_ASSERT_EQ(requests_sent,i+1);UT_ASSERT_EQ(replies_sent,i+1);
+		UT_ASSERT_EQ(stats.accepted_frames,i+1);
+		UT_ASSERT_EQ(stats.unknown_results,1);UT_ASSERT_EQ(stats.restart_requests,1);
+		UT_ASSERT_EQ(legacy_calls,0);
+		/* Keep a faulty success from leaking into the next test case. */
+		cluster_multixact_current_describe_finish(&op);chain_clean();
+	}
+}
+static void caller_rejects_epoch_after_last_reply(void)
+{
+	expect_last_reply_refusal(1);
+}
+static void caller_rejects_control_change_after_last_reply(void)
+{
+	expect_last_reply_refusal(2);expect_last_reply_refusal(3);
+}
+static void scoped_last_reply_refusal_has_one_outcome(void)
+{
+	for(unsigned mode=1;mode<=3;mode++)for(unsigned i=0;i<2;i++) {
+		ClusterCurrentMxKey key={0};SnapshotData snapshot={0};
+		ClusterCurrentMxMemberDesc members[256];ClusterCurrentMxStatsSnapshot observed;
+		uint16 count=99;uint32 total=99;
+		chain_seed(i==0?2:257,1);key.multixact_id=1000;key.cluster_epoch=7;
+		late_fault=mode;late_at=i+1;snapshot.snapshot_type=SNAPSHOT_ANY;
+		memset(members,0xa5,sizeof(members));
+		UT_ASSERT_EQ(cluster_multixact_current_describe_scoped(&key,&request_tag,&snapshot,
+			members,256,&count,&total),CMX_DESC_UNKNOWN);
+		UT_ASSERT(late_fired);UT_ASSERT_EQ(count,0);UT_ASSERT_EQ(total,0);
+		for(unsigned j=0;j<sizeof(members);j++)UT_ASSERT_EQ(((uint8 *)members)[j],0);
+		UT_ASSERT_EQ(requests_sent,i+1);UT_ASSERT_EQ(replies_sent,i+1);
+		UT_ASSERT(cluster_multixact_current_stats_snapshot(1,7,&observed));
+		UT_ASSERT_EQ(observed.counters[CMX_STAT_DESCRIBE_REMOTE_ASK],1);
+		UT_ASSERT_EQ(observed.counters[CMX_STAT_DESCRIBE_REMOTE_UNKNOWN],1);
+		UT_ASSERT_EQ(observed.counters[CMX_STAT_DESCRIBE_REMOTE_HIT],0);
+		UT_ASSERT_EQ(observed.counters[CMX_STAT_DESCRIBE_REMOTE_SUPPORTED_LIMIT],0);
+		UT_ASSERT_EQ(observed.counters[CMX_STAT_DESCRIBE_REMOTE_TIMEOUT],0);
+		UT_ASSERT_EQ(legacy_calls,0);chain_clean();
+	}
+}
+static void caller_fresh_retry_starts_at_zero(void)
+{
+	ClusterCurrentMxKey key={0};ClusterMxCompositionReceive *op=NULL;
+	ClusterMxCompositionReceiveStats stats={0};
+	const ClusterMxCompositionPage *page;uint32 total=0,seen=0;
+	chain_seed(257,1);key.multixact_id=1000;key.cluster_epoch=7;
+	late_fault=2;late_at=2;
+	UT_ASSERT(!cluster_multixact_current_describe_full(&key,&request_tag,&request_snapshot,&op,&stats));
+	UT_ASSERT(late_fired);UT_ASSERT_NULL(op);UT_ASSERT_EQ(connection_generation,12);
+	cluster_multixact_current_describe_finish(&op);chain_clean();
+	late_fault=0;
+	UT_ASSERT(cluster_multixact_current_describe_full(&key,&request_tag,&request_snapshot,&op,&stats));
+	UT_ASSERT_EQ(requests_sent,4);UT_ASSERT_EQ(replies_sent,4);
+	UT_ASSERT_EQ(first_history[0],0);UT_ASSERT_EQ(first_history[1],256);
+	UT_ASSERT_EQ(first_history[2],0);UT_ASSERT_EQ(first_history[3],256);
+	for(unsigned i=0;i<4;i++) {
+		UT_ASSERT(request_history[i]!=0);
+		for(unsigned j=0;j<i;j++)UT_ASSERT(request_history[i]!=request_history[j]);
+	}
+	page=cluster_mx_composition_pages(op,&total);UT_ASSERT_EQ(total,257);
+	for(;page;page=page->next)for(unsigned j=0;j<page->count;j++,seen++)UT_ASSERT_EQ(page->members[j].xid,100+seen);
+	UT_ASSERT_EQ(seen,257);UT_ASSERT_EQ(stats.accepted_frames,4);
+	UT_ASSERT_EQ(stats.unknown_results,1);UT_ASSERT_EQ(stats.restart_requests,1);
+	UT_ASSERT_EQ(legacy_calls,0);cluster_multixact_current_describe_finish(&op);chain_clean();
+}
 int main(void)
 {
 	TopMemoryContext=AllocSetContextCreate(CurrentMemoryContext,"native caller",ALLOCSET_DEFAULT_SIZES);
 	CurrentMemoryContext=TopMemoryContext;
-	UT_PLAN(4);UT_RUN(caller_native_transport_sizes);UT_RUN(caller_native_transport_failure_cleanup);
-	UT_RUN(scoped_outcomes_in_original_snapshot);UT_RUN(scoped_cancel_has_no_returned_outcome);UT_DONE();
+	UT_PLAN(8);UT_RUN(caller_native_transport_sizes);UT_RUN(caller_native_transport_failure_cleanup);
+	UT_RUN(scoped_outcomes_in_original_snapshot);UT_RUN(scoped_cancel_has_no_returned_outcome);
+	UT_RUN(caller_rejects_epoch_after_last_reply);UT_RUN(caller_rejects_control_change_after_last_reply);
+	UT_RUN(scoped_last_reply_refusal_has_one_outcome);UT_RUN(caller_fresh_retry_starts_at_zero);UT_DONE();
 	return ut_failed_count==0?0:1;
 }
