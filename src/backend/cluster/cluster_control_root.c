@@ -12,6 +12,8 @@
  */
 #include "postgres.h"
 
+#ifdef USE_PGRAC_CLUSTER
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -15284,3 +15286,5 @@ cluster_control_native_files_complete_relmap_create_locked_v2(
 	PG_END_TRY();
 	return result;
 }
+
+#endif /* USE_PGRAC_CLUSTER */
