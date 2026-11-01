@@ -1002,8 +1002,12 @@ operation_wire_proof_valid(const ClusterCurrentMemberOperationProof *p,
 		return false;
 	switch (p->base.state) {
 	case CCM_ACTIVE:
+		/* A discarded child does not abort its still-active top, and does
+		 * not authorize LIVE tuple use. Keep this identical to the operation
+		 * consumer and peer-history assembler's grant polarity. */
 		return p->base.commit_scn == InvalidScn
-			   && ClusterCurrentMemberProofGetCtrcGrant(&p->base) != 0;
+			   && ((ClusterCurrentMemberProofGetCtrcGrant(&p->base) != 0)
+				   == (p->effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE));
 	case CCM_COMMITTED:
 		return SCN_VALID(p->base.commit_scn)
 			   && ClusterCurrentMemberProofGetCtrcGrant(&p->base) == 0;

@@ -108,7 +108,7 @@ ow_proof(const OperationWireFixture *f, unsigned index, uint8 state, uint8 effec
 			.binding_version = 1
 		};
 	}
-	if (state == CCM_ACTIVE)
+	if (state == CCM_ACTIVE && (p.flags == 0 || effect == CLUSTER_SAVEPOINT_EFFECT_LIVE))
 		ClusterCurrentMemberProofSetCtrcGrant(&p.base, 47);
 	return p;
 }
@@ -825,10 +825,35 @@ UT_TEST(top_only_extra_context_and_invalid_wrap_are_refused)
 	UT_ASSERT(ow_zero(&ask, sizeof(ask)));
 }
 
+UT_TEST(discarded_active_has_no_live_grant)
+{
+	OperationWireFixture f;
+	ClusterCurrentMemberOperationProof proof;
+	ClusterCurrentMxOperationReplyPageV6 page;
+	ow_init(&f, 1);
+	UT_ASSERT(ow_build(&f, 1, NULL));
+	proof = ow_proof(&f, 0, CCM_ACTIVE, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	ClusterCurrentMemberProofSetCtrcGrant(&proof.base, 0);
+	UT_ASSERT(ow_page(&f, &proof, &page));
+}
+
+UT_TEST(discarded_active_cannot_carry_live_grant)
+{
+	OperationWireFixture f;
+	ClusterCurrentMemberOperationProof proof;
+	ClusterCurrentMxOperationReplyPageV6 page;
+	ow_init(&f, 1);
+	UT_ASSERT(ow_build(&f, 1, NULL));
+	proof = ow_proof(&f, 0, CCM_ACTIVE, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
+	ClusterCurrentMemberProofSetCtrcGrant(&proof.base, 47);
+	UT_ASSERT(!ow_page(&f, &proof, &page));
+	UT_ASSERT(ow_zero(&page, sizeof(page)));
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(25);
 	UT_RUN(request_exact_literal_layout);
 	UT_RUN(request_top_only_has_zero_context);
 	UT_RUN(updater_request_carries_challenge_and_exact_entry);
@@ -852,6 +877,8 @@ main(void)
 	UT_RUN(reply_unaligned_length_capacity_and_old_family_separation);
 	UT_RUN(seven_proofs_round_trip_without_padding_leak);
 	UT_RUN(top_only_extra_context_and_invalid_wrap_are_refused);
+	UT_RUN(discarded_active_has_no_live_grant);
+	UT_RUN(discarded_active_cannot_carry_live_grant);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

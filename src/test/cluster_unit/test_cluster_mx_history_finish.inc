@@ -7,6 +7,9 @@ static ClusterSavepointOperationKey finish_keys[256];
 static ClusterCurrentMemberOperationProof finish_proofs[256];
 static unsigned finish_requests, finish_reads, finish_cancels;
 static bool finish_pending;
+static TransactionId finish_top;
+static ClusterTxOutcome finish_outcome;
+static bool finish_all_discarded;
 
 static uint32
 finish_crc(const void *data, size_t n)
@@ -71,7 +74,7 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	h.record_type = UNDO_RECORD_INSERT;
 	h.flags
 		= UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_HAS_OPERATION | UNDO_REC_FLAG_FIRST_IN_TX;
-	h.xid = 101 + index;
+	h.xid = members[index].xid;
 	h.origin_node_id = 0;
 	h.tt_slot_segment_id = 1;
 	h.tt_slot_id = 4;
@@ -90,8 +93,9 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 												.after_write_scn = h.write_scn };
 	op.version = UNDO_OPERATION_TRAILER_VERSION;
 	op.length = sizeof(op);
-	op.effect_state = index ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED : CLUSTER_SAVEPOINT_EFFECT_LIVE;
-	op.canonical_top_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 100));
+	op.effect_state = index || finish_all_discarded ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED
+													  : CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	op.canonical_top_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, finish_top));
 	op.operation_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, h.xid));
 	op.operation_sequence = index + 1;
 	op.command_id = 4;
@@ -111,17 +115,21 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	memcpy(out->data + BLCKSZ - sizeof(dir), &dir, sizeof(dir));
 	peer.flags = CLUSTER_MX_HISTORY_ORDERED;
 	peer.record_class = CMXH_OPERATION;
-	peer.outcome = CLUSTER_TX_COMMITTED;
+	peer.outcome = finish_outcome;
 	peer.effect = op.effect_state;
 	peer.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
-	peer.canonical = (ClusterTTSlotPhysicalLocator){ 1, 100, 3, 0, 0 };
+	peer.canonical = (ClusterTTSlotPhysicalLocator){ 1, finish_top, 3, 0, 0 };
 	peer.top_fxid = FullTransactionIdFromU64(op.canonical_top_fxid);
 	peer.operation_fxid = FullTransactionIdFromU64(op.operation_fxid);
 	peer.operation_sequence = index + 1;
 	peer.record = r.locator.uba;
 	peer.data_crc = finish_crc(out->data, BLCKSZ);
 	peer.data_lsn = bh.block_lsn;
-	peer.commit_scn = 90;
+	peer.commit_scn = finish_outcome == CLUSTER_TX_COMMITTED ? 90 : InvalidScn;
+	if (finish_outcome == CLUSTER_TX_IN_PROGRESS && op.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE) {
+		peer.flags |= CLUSTER_MX_HISTORY_HAS_GRANT;
+		peer.ctrc_grant = 47;
+	}
 	peer.formation_epoch = 7;
 	peer.admission_generation = r.admission_generation;
 	if (!cluster_mx_history_peer_encode(&peer, &out->peer))
@@ -154,6 +162,9 @@ finish_sources(void)
 	cancel_input = finish_cancel_input;
 	finish_requests = finish_reads = finish_cancels = 0;
 	finish_pending = false;
+	finish_top = 100;
+	finish_outcome = CLUSTER_TX_COMMITTED;
+	finish_all_discarded = false;
 	memset(finish_keys, 0xa5, sizeof(finish_keys));
 	memset(finish_proofs, 0xa5, sizeof(finish_proofs));
 }

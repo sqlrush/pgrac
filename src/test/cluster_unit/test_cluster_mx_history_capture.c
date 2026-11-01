@@ -747,8 +747,8 @@ collector_never_waits_under_content_lock_or_without_pin(void)
 }
 #include "test_cluster_mx_history_finish.inc"
 
-int
-main(void)
+static void
+history_fixture_init(void)
 {
 	MyProc = &proc;
 	proc.pid = 1234;
@@ -765,6 +765,16 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
+}
+
+#ifdef HISTORY_ROUNDTRIP_FIXTURE
+int roundtrip_unused_capture_main(void);
+#define main roundtrip_unused_capture_main
+#endif
+int
+main(void)
+{
+	history_fixture_init();
 	UT_PLAN(29);
 	UT_RUN(real_capture_and_relock);
 	UT_RUN(snapshot_own_reference_keeps_original_floor);
@@ -799,3 +809,7 @@ main(void)
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
+
+#ifdef HISTORY_ROUNDTRIP_FIXTURE
+#undef main
+#endif

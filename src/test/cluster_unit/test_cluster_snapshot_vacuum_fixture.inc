@@ -57,7 +57,8 @@ static bool vacuum_no_tables;
 static unsigned vacuum_class_read, vacuum_class_count;
 static unsigned vacuum_sample_seen_at_scan;
 static bool vacuum_revoke_on_scan_end;
-static TransactionId vacuum_next_xid;
+/* ReadNextFullTransactionId input also supports epoch-bearing integrations. */
+static uint64 vacuum_next_xid;
 static TransactionId vacuum_oldest_xid;
 static TransactionId vacuum_inplace_frozenxid;
 static VariableCacheData vacuum_cache;

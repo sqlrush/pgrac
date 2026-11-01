@@ -13496,3 +13496,47 @@ test_cluster_mx_operation_consumer: test_cluster_mx_operation_consumer.c \
 		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PGPORT) -o $@
+
+# Collector results consumed through the actual dormant codecs and operation core.
+TESTS += test_cluster_mx_history_roundtrip
+all: test_cluster_mx_history_roundtrip
+
+test_cluster_mx_history_roundtrip: test_cluster_mx_history_roundtrip.c test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
+		test_cluster_mx_history_finish.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
+		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
+		test_cluster_mx_history_admission.inc $(top_builddir)/src/backend/storage/lmgr/lock.o \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(top_srcdir)/src/include/cluster/cluster_mx_history.h \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history.o \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_graph.o \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_member.o \
+		$(CLUSTER_CR_APPLY_O) $(CLUSTER_SAVEPOINT_READER_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
+		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
+		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
+		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
+		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h $(CLUSTER_UNDO_RETENTION_O) \
+		$(srcdir)/test_cluster_snapshot_vacuum_fixture.inc test_cluster_snapshot_admission_vacuum.inc \
+		test_cluster_snapshot_admission_horizon.inc test_cluster_snapshot_admission_refresh.inc \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/backend/utils/time/snapmgr.c $(top_srcdir)/src/include/utils/snapmgr.h \
+		$(top_builddir)/src/backend/lib/pairingheap.o \
+		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
+		$(top_builddir)/src/common/psprintf_srv.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/backend/lib/pairingheap.o $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNDO_RETENTION_O) \
+		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
+		$(top_builddir)/src/common/psprintf_srv.o \
+		$(top_builddir)/src/backend/storage/lmgr/lock.o \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) $(top_builddir)/src/backend/cluster/cluster_mx_history.o \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_graph.o \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_member.o \
+		$(CLUSTER_CR_APPLY_O) $(CLUSTER_SAVEPOINT_READER_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+
+$(top_builddir)/src/backend/storage/lmgr/lock.o:
+	$(MAKE) -C $(top_builddir)/src/backend/storage/lmgr lock.o
