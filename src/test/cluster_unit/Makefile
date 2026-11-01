@@ -974,7 +974,7 @@ test_cluster_config_members: test_cluster_config_members.c unit_test.h \
 
 # PGRAC: actual native-owner adapter with explicit process/transport fixtures.
 # Author: SqlRush <sqlrush@gmail.com>
-test_cluster_service_observe: test_cluster_service_observe.c unit_test.h \
+test_cluster_service_observe: test_cluster_service_observe.c test_cluster_lmon_service_observe.inc unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_service_observe.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/backend/cluster/cluster_service_observe.o $(CLUSTER_UNIT_PORT_LIBS) -o $@

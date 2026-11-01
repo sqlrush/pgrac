@@ -38,4 +38,13 @@ extern ClusterNormalStopPollResult cluster_service_observe(ClusterServiceObserva
 extern ClusterNormalStopPollResult
 cluster_service_normal_stop_observe(ClusterServiceObservation *out);
 
+/* Original online LMON, with shared configuration, at its unlocked idle
+ * boundary. Also inspect the four original PI/WAL-cut/writeback/KO shared
+ * owners used by its shutdown wrapper. Observe every owner, retaining the
+ * first highest-priority cause; unknown results are INVALID. This never
+ * changes the original online/stop entries, seals a producer or retires an
+ * owner. The caller must retain/revalidate its own identity and closure;
+ * READY remains only a point observation, not QUIESCED or service proof. */
+extern ClusterNormalStopPollResult cluster_lmon_service_observe(ClusterServiceObservation *out);
+
 #endif /* CLUSTER_SERVICE_OBSERVE_H */
