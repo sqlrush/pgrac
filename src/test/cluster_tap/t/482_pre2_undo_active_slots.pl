@@ -302,6 +302,34 @@ sub data_ledger
 	}
 }
 
+sub run_full_preflight_cancellations
+{
+	my ($name, $owners, $chosen, $waiter, $before) = @_;
+	my @cases = (
+		['zero_update', 'UPDATE g_empty_undo SET value=999 WHERE false;'],
+		['empty_copy', "COPY g_empty_undo FROM STDIN;\n\\.\n"],
+		['conflict_nothing', 'INSERT INTO g_empty_undo VALUES(1,999) ON CONFLICT(id) DO NOTHING;'],
+		['zero_row_lock', 'SELECT * FROM g_empty_undo WHERE false FOR UPDATE;'],
+		['statement_trigger_error', 'UPDATE g_empty_trigger SET value=999 WHERE false;']);
+	for my $case (@cases)
+	{
+		my $label = "$name-full-$case->[0]";
+		my $old_counters = counters();
+		$waiter->{transaction} = 1;
+		$waiter->{xid} = 0 + $waiter->{client}->query_safe('BEGIN; SELECT pg_current_xact_id()::text');
+		$waiter->{pending} = 1;
+		my $sent = $waiter->{client}->query_until(qr/G_SLOT_SENT\r?\n/,
+			"\\echo G_SLOT_SENT\n$case->[1]\n\\echo G_SLOT_SQLSTATE :SQLSTATE\n");
+		save_json("$label-sent", {output => $sent, pid => $waiter->{pid}, xid => $waiter->{xid}});
+		my $wait_activity = wait_witness($label, $waiter);
+		judge("$label-blocked", {stage => 'blocked', before => $before, after => census($owners),
+			counters_before => $old_counters, counters_after => counters(),
+			waiter_pid => $waiter->{pid}, waiter_xid => $waiter->{xid}, activity => $wait_activity,
+			locks => lock_rows($waiter->{pid}, $chosen->{pid})});
+		cancel_waiter($label, $owners, $waiter, $before, $old_counters);
+	}
+}
+
 sub run_case
 {
 	my ($mode, $trial) = @_;
@@ -327,6 +355,12 @@ sub run_case
 	die 'the selected slot has no actual owner session' unless defined($chosen);
 	my $old_counters = counters();
 	my $waiter = open_session("g_slot_${mode}_waiter");
+	if ($mode eq 'cancel')
+	{
+		# Reuse this cohort and backend; every cancelled preflight keeps all48 owners.
+		run_full_preflight_cancellations($name, \@owners, $chosen, $waiter, $before);
+		$old_counters = counters();
+	}
 	$waiter->{trial} = $trial;
 	$waiter->{transaction} = 1;
 	$waiter->{xid} = 0 + $waiter->{client}->query_safe('BEGIN; SELECT pg_current_xact_id()::text');
