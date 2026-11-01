@@ -4015,6 +4015,7 @@ static unsigned postcommit_deletes, postcommit_phases;
 static unsigned postcommit_cleanup_mask;
 static unsigned postcommit_native_count = 1;
 static bool (*postcommit_storage_consumer)(RelFileLocator);
+static void prepare_v3_postcommit(bool drop);
 
 static void
 CallXactCallbacks(XactEvent event)
@@ -4388,7 +4389,9 @@ UT_TEST(test_native_commit_missing_observation_retains_recovery_instead_of_panic
 
 UT_TEST(test_native_committed_drop_suppresses_real_per_fork_tail)
 {
-	prepare_postcommit(true);
+	uint32 slot;
+
+	prepare_v3_postcommit(true);
 	native_commit_active = true;
 	run_native_postcommit();
 	UT_ASSERT_EQ(native_fork_unlinks, 0);
@@ -4397,7 +4400,30 @@ UT_TEST(test_native_committed_drop_suppresses_real_per_fork_tail)
 	UT_ASSERT_EQ(completion_allocations, 0);
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
-	UT_ASSERT(storage.contexts[0].structure_drop_pending);
+	slot = structure_owned_slot();
+	UT_ASSERT(storage.contexts[slot].structure_drop_pending);
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_drop_retains_legacy_owner_without_v3_predelete_authority)
+{
+	const char *reason;
+
+	prepare_postcommit(true);
+	native_commit_active = true;
+	run_native_postcommit();
+	UT_ASSERT_EQ(native_fork_unlinks, 0);
+	UT_ASSERT_EQ(native_fork_closes, MAX_FORKNUM + 1);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(native_allocated, 1);
+	UT_ASSERT(storage.native_recovery_required);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "KO_SHARED_COMMITTED_RECOVERY_REQUIRED") == 0);
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		UT_ASSERT(!storage.contexts[i].structure_owned);
+
 	native_fixture_shared_memory_end();
 }
 
@@ -4528,20 +4554,28 @@ UT_TEST(test_native_drop_buffer_gate_rejects_early_wrong_owner_and_failed_cleanu
 
 UT_TEST(test_native_drop_waits_for_original_local_buffer_cleanup)
 {
-	prepare_postcommit(true);
+	uint32 slot;
+	int physical_calls;
+
+	prepare_v3_postcommit(true);
+	physical_calls = flush_count + sync_count + drop_count;
 	native_commit_active = true;
 	cluster_ko_shared_native_commit_v2();
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PENDING);
 	UT_ASSERT_EQ(storage.native_waiting, 1);
-	UT_ASSERT(!storage.contexts[0].used);
-	UT_ASSERT_EQ(flush_count + sync_count + drop_count, 0);
+	UT_ASSERT(storage.contexts[postcommit_owner->slot].used
+			  && storage.contexts[postcommit_owner->slot].v3);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		UT_ASSERT(!storage.contexts[i].structure_owned);
+	UT_ASSERT_EQ(flush_count + sync_count + drop_count, physical_calls);
 	if (!ut_current_failed) {
 		MyBackendType = B_BACKEND;
 		run_native_postcommit();
 		MyBackendType = B_CHECKPOINTER;
 		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
-		UT_ASSERT(storage.contexts[0].structure_drop_pending);
+		slot = structure_owned_slot();
+		UT_ASSERT(storage.contexts[slot].structure_drop_pending);
 	}
 	native_fixture_shared_memory_end();
 }
@@ -4550,7 +4584,8 @@ UT_TEST(test_native_commit_transfers_before_callbacks_and_local_cleanup)
 {
 	for (unsigned drop = 0; drop < 2; drop++) {
 		const char *reason;
-		prepare_postcommit(drop);
+		uint32 slot;
+		prepare_v3_postcommit(drop);
 		if (!drop)
 			UT_ASSERT(cluster_ko_shared_observe_truncate_v2(postcommit_owner));
 		native_commit_active = true;
@@ -4561,9 +4596,10 @@ UT_TEST(test_native_commit_transfers_before_callbacks_and_local_cleanup)
 		UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
 		MyBackendType = B_CHECKPOINTER;
 		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
-		UT_ASSERT_EQ(storage.contexts[0].structure_drop_pending, drop);
+		slot = structure_owned_slot();
+		UT_ASSERT_EQ(storage.contexts[slot].structure_drop_pending, drop);
 		UT_ASSERT(
-			memcmp(&storage.contexts[0].terminal, &postcommit_binding, sizeof(postcommit_binding))
+			memcmp(&storage.contexts[slot].terminal, &postcommit_binding, sizeof(postcommit_binding))
 			== 0);
 		UT_ASSERT_EQ(native_allocated, 0);
 	}
@@ -9407,6 +9443,30 @@ v3_structure_record(bool drop, uint64 old_token, ClusterPageWalBindingV1 *bindin
 	UT_ASSERT(cluster_page_wal_binding_shape_v1(binding));
 }
 
+/* Native DROP success requires the original v3 AX, DATA closure and READY
+ * proof. Keep the legacy producer above for its own explicit refusal cases. */
+static void
+prepare_v3_postcommit(bool drop)
+{
+	ClusterKoCompletionV2 *claimed = NULL;
+
+	postcommit_owner = v3_native_structure_owner(drop
+		? CLUSTER_KO_SHARED_V3_OPERATION_DROP : CLUSTER_KO_SHARED_V3_OPERATION_TRUNCATE);
+	postcommit_drop = drop;
+	postcommit_error = postcommit_scope_changed = false;
+	postcommit_callback_error = postcommit_buffer_error = false;
+	postcommit_native_count = 1;
+	postcommit_storage_consumer = NULL;
+	postcommit_deletes = postcommit_phases = 0;
+	native_fork_unlinks = native_fork_closes = native_smgr_invalidations = 0;
+	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity,
+		drop ? CLUSTER_SPACE_WAL_TOMBSTONE : CLUSTER_SPACE_WAL_TRUNCATE, &claimed));
+	UT_ASSERT(claimed == postcommit_owner);
+	v3_structure_record(drop, space_identity.operation, &postcommit_binding, postcommit_wal);
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(postcommit_owner, &postcommit_binding,
+		postcommit_wal, sizeof(postcommit_wal)));
+}
+
 UT_TEST(test_v3_observation_requires_original_operation_token_and_live_ax)
 {
 	for (unsigned fault = 0; fault < 4; fault++) {
@@ -9909,7 +9969,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(229);
+	UT_PLAN(230);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_create_reference_outlives_exact_space_children_and_blocks_ready);
 	UT_RUN(test_create_capacity_reserves_progress_for_every_accepted_constructor);
@@ -9991,6 +10051,7 @@ main(void)
 	UT_RUN(test_native_commit_accepts_portal_and_background_transaction_owner);
 	UT_RUN(test_native_commit_missing_observation_retains_recovery_instead_of_panicking);
 	UT_RUN(test_native_committed_drop_suppresses_real_per_fork_tail);
+	UT_RUN(test_native_drop_retains_legacy_owner_without_v3_predelete_authority);
 	UT_RUN(test_native_drop_suppression_does_not_change_other_storage_paths);
 	UT_RUN(test_native_stale_head_leaves_execution_but_keeps_failure_visible);
 	UT_RUN(test_native_stale_head_does_not_hide_later_current_work);
