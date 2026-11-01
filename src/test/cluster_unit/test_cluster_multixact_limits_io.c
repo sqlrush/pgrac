@@ -11,7 +11,8 @@
  * NOTES
  *    PGRAC test; only shmem, locks, original authority and fault delivery are
  *    fixtures. Native creation, cache, member readback, SLRU and redo execute;
- *    backend memory contexts and WAL transport remain fixture boundaries.
+ *    checkpoint cursors, Startup/Trim and continuation execute too; catalog,
+ *    pg_control, process lifetime and WAL transport remain fixture boundaries.
  *    This is not a cluster fencing or native startup qualification.
  *-------------------------------------------------------------------------
  */
@@ -74,6 +75,7 @@ static int error_level;
 static bool empty_input;
 AuxProcType MyAuxProcType = StartupProcess;
 bool IsUnderPostmaster;
+bool IsBinaryUpgrade;
 BackendType MyBackendType;
 volatile uint32 CritSectionCount;
 volatile sig_atomic_t InterruptPending;
@@ -548,6 +550,7 @@ local_reset(void)
 		fixture_locks[i].held = false;
 	CritSectionCount = 0;
 	InRecovery = false;
+	MyBackendType = B_BACKEND;
 	expect_error = fail_open = fail_sync = fail_dirsync = false;
 	writes = reads = syncs = dirsyncs = wal_records = wal_flushes = 0;
 	capture_allocation = false;
@@ -771,6 +774,220 @@ UT_TEST(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members)
 		local_check_members(cases[c].first, 500, 100, 116);
 		local_check_members(cases[c].second, 502, 200, 216);
 		local_check_members(cases[c].third, 504, 300, 316);
+		UT_ASSERT_EQ(transient_fds, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
+typedef struct LocalMultiCheckpoint {
+	MultiXactId next, oldest;
+	MultiXactOffset offset;
+	Oid database;
+} LocalMultiCheckpoint;
+
+static void
+local_read_page(SlruCtl ctl, int page, char *data)
+{
+	int slot = SimpleLruReadPage_ReadOnly(ctl, page, 0);
+
+	memcpy(data, ctl->shared->page_buffer[slot], BLCKSZ);
+	LWLockRelease(ctl->shared->ControlLock);
+}
+
+static void
+local_restart_cursors(const LocalMultiCheckpoint *checkpoint)
+{
+	/* This is the checkpoint/catalog input boundary, not a postmaster restart.
+	 * Discard both caches and derived limits so the original startup consumer
+	 * must requalify the retained physical offsets instead of reusing them. */
+	AtEOXact_MultiXact();
+	local_discard_cache();
+	memset(&local_state, 0, sizeof(local_state));
+	local_state.oldestMultiXactId = checkpoint->oldest;
+	local_state.oldestMultiXactDB = checkpoint->database;
+	MultiXactSetNextMXact(checkpoint->next, checkpoint->offset);
+	MyBackendType = B_STARTUP;
+	StartupMultiXact();
+}
+
+static bool
+local_trim_refuses(void)
+{
+	bool refused = false;
+
+	error_level = 0;
+	expect_error = true;
+	PG_TRY();
+	{
+		TrimMultiXact();
+	}
+	PG_CATCH();
+	{
+		refused = true;
+	}
+	PG_END_TRY();
+	expect_error = false;
+	return refused;
+}
+
+UT_TEST(physical_checkpoint_startup_preserves_retained_bytes_and_continues)
+{
+	static const struct {
+		int slot;
+		bool wrap;
+		MultiXactId first, second, third;
+	} cases[] = {{0, false, 262160, 262176, 262192},
+				 {1, false, 262145, 262161, 262177},
+				 {0, true, 32, 48, 64}, {1, true, 17, 33, 49}};
+
+	for (unsigned c = 0; c < lengthof(cases); c++) {
+		MultiXactMember members[2]
+			= {{116, MultiXactStatusForShare}, {100, MultiXactStatusForKeyShare}};
+		LocalMultiCheckpoint checkpoint;
+		PGAlignedBlock old_page, member_page = {0}, offsets, retained_members, after;
+		MultiXactId id = 0;
+		bool wrap = cases[c].wrap;
+		int old_pageno = wrap ? MultiXactIdToOffsetPage(MaxMultiXactId) : 0;
+		int new_pageno = wrap ? 0 : 128;
+		int slot;
+		unsigned saved_writes, saved_wal;
+
+		local_reset();
+		local_state.nextMXact = wrap ? UINT32_MAX - 31 : 33;
+		local_state.oldestMultiXactId = wrap ? 17 : 262145;
+		local_state.nextOffset = 500;
+		local_state.multiVacLimit = local_state.oldestMultiXactId + 1000;
+		local_state.multiWarnLimit = local_state.oldestMultiXactId + 2000;
+		cluster_node_id = cases[c].slot;
+		cluster_mxid_stripe_latch_runtime(true, cases[c].slot, wrap ? UINT32_MAX - 63 : 32);
+		memset(old_page.data, 0x72, BLCKSZ);
+		member_page.data[BLCKSZ - 1] = 0x6b;
+		local_page(MultiXactOffsetCtl, old_pageno, old_page.data, BLCKSZ);
+		local_page(MultiXactMemberCtl, 0, member_page.data, BLCKSZ);
+		capture_allocation = true;
+		UT_ASSERT(local_allocate_and_record(&id, members));
+		UT_ASSERT_EQ(id, cases[c].first);
+		members[0].xid = 200;
+		members[1].xid = 216;
+		UT_ASSERT(local_allocate_and_record(&id, members));
+		UT_ASSERT_EQ(id, cases[c].second);
+		/* Opaque retained suffix bytes must survive startup. These markers
+		 * are not issued IDs, members, or authority to read a foreign ID. */
+		LWLockAcquire(MultiXactOffsetSLRULock, LW_EXCLUSIVE);
+		slot = SimpleLruReadPage(MultiXactOffsetCtl, new_pageno, true, 0);
+		((MultiXactOffset *)MultiXactOffsetCtl->shared->page_buffer[slot])
+			[MULTIXACT_OFFSETS_PER_PAGE - 1] = 771;
+		MultiXactOffsetCtl->shared->page_dirty[slot] = true;
+		LWLockRelease(MultiXactOffsetSLRULock);
+		MultiXactGetCheckptMulti(true, &checkpoint.next, &checkpoint.offset,
+								&checkpoint.oldest, &checkpoint.database);
+		UT_ASSERT_EQ(checkpoint.next, cases[c].second + 1);
+		UT_ASSERT_EQ(checkpoint.offset, 504);
+		CheckPointMultiXact();
+		local_discard_cache();
+		local_read_page(MultiXactOffsetCtl, new_pageno, offsets.data);
+		local_read_page(MultiXactMemberCtl, 0, retained_members.data);
+		saved_writes = writes;
+		saved_wal = wal_records;
+		local_restart_cursors(&checkpoint);
+		UT_ASSERT(!local_state.finishedStartup && !local_state.oldestOffsetKnown);
+		UT_ASSERT_EQ(MultiXactOffsetCtl->shared->latest_page_number, new_pageno);
+		UT_ASSERT_EQ(MultiXactMemberCtl->shared->latest_page_number, 0);
+		UT_ASSERT(!local_trim_refuses());
+		UT_ASSERT(local_state.finishedStartup && local_state.oldestOffsetKnown);
+		UT_ASSERT_EQ(local_state.oldestOffset, 500);
+		UT_ASSERT_EQ(local_state.nextMXact, checkpoint.next);
+		UT_ASSERT_EQ(local_state.nextOffset, checkpoint.offset);
+		/* A flush before discard exposes even accidental dirty-page trims. */
+		CheckPointMultiXact();
+		UT_ASSERT_EQ(writes, saved_writes);
+		UT_ASSERT_EQ(wal_records, saved_wal);
+		local_discard_cache();
+		local_read_page(MultiXactOffsetCtl, new_pageno, after.data);
+		UT_ASSERT_EQ(memcmp(offsets.data, after.data, BLCKSZ), 0);
+		local_read_page(MultiXactMemberCtl, 0, after.data);
+		UT_ASSERT_EQ(memcmp(retained_members.data, after.data, BLCKSZ), 0);
+		local_read_page(MultiXactOffsetCtl, old_pageno, after.data);
+		UT_ASSERT_EQ(memcmp(old_page.data, after.data, BLCKSZ), 0);
+		local_check_members(cases[c].first, 500, 100, 116);
+		local_check_members(cases[c].second, 502, 200, 216);
+		MyBackendType = B_BACKEND;
+		members[0].xid = 300;
+		members[1].xid = 316;
+		UT_ASSERT(local_allocate_and_record(&id, members));
+		UT_ASSERT_EQ(id, cases[c].third);
+		UT_ASSERT_EQ(local_state.nextOffset, 506);
+		UT_ASSERT_EQ(wal_records, saved_wal + 1);
+		CheckPointMultiXact();
+		local_discard_cache();
+		local_check_members(cases[c].first, 500, 100, 116);
+		local_check_members(cases[c].second, 502, 200, 216);
+		local_check_members(cases[c].third, 504, 300, 316);
+		UT_ASSERT_EQ(transient_fds, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
+UT_TEST(physical_checkpoint_startup_refuses_contradiction_before_mutation)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		MultiXactMember members[2]
+			= {{116, MultiXactStatusForShare}, {100, MultiXactStatusForKeyShare}};
+		LocalMultiCheckpoint checkpoint;
+		PGAlignedBlock page = {0}, offsets, retained_members, after;
+		MultiXactId id = 0;
+		unsigned saved_writes, saved_wal;
+		int slot;
+
+		local_reset();
+		local_state.nextMXact = local_state.oldestMultiXactId = 33;
+		local_state.nextOffset = 500;
+		local_state.multiVacLimit = 1033;
+		local_state.multiWarnLimit = 2033;
+		local_page(MultiXactOffsetCtl, 0, page.data, BLCKSZ);
+		local_page(MultiXactMemberCtl, 0, page.data, BLCKSZ);
+		capture_allocation = true;
+		UT_ASSERT(local_allocate_and_record(&id, members));
+		UT_ASSERT_EQ(id, 48);
+		MultiXactGetCheckptMulti(true, &checkpoint.next, &checkpoint.offset,
+								&checkpoint.oldest, &checkpoint.database);
+		UT_ASSERT_EQ(checkpoint.next, 49);
+		UT_ASSERT_EQ(checkpoint.offset, 502);
+		if (fault < 2) {
+			LWLockAcquire(MultiXactOffsetSLRULock, LW_EXCLUSIVE);
+			slot = SimpleLruReadPage(MultiXactOffsetCtl, 0, true, 0);
+			((MultiXactOffset *)MultiXactOffsetCtl->shared->page_buffer[slot])[49]
+				= fault == 0 ? 0 : 503;
+			MultiXactOffsetCtl->shared->page_dirty[slot] = true;
+			LWLockRelease(MultiXactOffsetSLRULock);
+		}
+		CheckPointMultiXact();
+		local_discard_cache();
+		local_read_page(MultiXactOffsetCtl, 0, offsets.data);
+		local_read_page(MultiXactMemberCtl, 0, retained_members.data);
+		local_restart_cursors(&checkpoint);
+		if (fault == 2)
+			MyBackendType = B_BACKEND;
+		else if (fault == 3)
+			InRecovery = true;
+		else if (fault == 4)
+			local_state.oldestMultiXactId = InvalidMultiXactId;
+		saved_writes = writes;
+		saved_wal = wal_records;
+		/* FATAL is caught for inspection only; production startup exits. */
+		UT_ASSERT(local_trim_refuses());
+		UT_ASSERT_EQ(error_level, FATAL);
+		UT_ASSERT(!local_state.finishedStartup && !local_state.oldestOffsetKnown);
+		UT_ASSERT_EQ(local_state.nextMXact, checkpoint.next);
+		UT_ASSERT_EQ(local_state.nextOffset, checkpoint.offset);
+		CheckPointMultiXact();
+		UT_ASSERT_EQ(writes, saved_writes);
+		UT_ASSERT_EQ(wal_records, saved_wal);
+		local_discard_cache();
+		local_read_page(MultiXactOffsetCtl, 0, after.data);
+		UT_ASSERT_EQ(memcmp(offsets.data, after.data, BLCKSZ), 0);
+		local_read_page(MultiXactMemberCtl, 0, after.data);
+		UT_ASSERT_EQ(memcmp(retained_members.data, after.data, BLCKSZ), 0);
 		UT_ASSERT_EQ(transient_fds, 0);
 		UT_ASSERT_EQ(CritSectionCount, 0);
 	}
@@ -1030,7 +1247,7 @@ main(void)
 		SimpleLruInit(ctl, family ? "members" : "offsets", 4, 0, lock, path,
 					  LWTRANCHE_MULTIXACTOFFSET_BUFFER, SYNC_HANDLER_NONE);
 	}
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(native_empty_boot_reads_real_authority_and_original_backup);
 	UT_RUN(physical_exact_page_missing_short_and_zero_keep_original_refusal);
 	UT_RUN(physical_runtime_limit_preserves_live_member_page);
@@ -1038,6 +1255,8 @@ main(void)
 	UT_RUN(physical_unknown_old_endpoint_never_deletes_live_members);
 	UT_RUN(original_authority_reader_qualifies_native_prefix_without_writes);
 	UT_RUN(physical_catchup_keeps_old_pages_and_replays_native_offsets_and_members);
+	UT_RUN(physical_checkpoint_startup_preserves_retained_bytes_and_continues);
+	UT_RUN(physical_checkpoint_startup_refuses_contradiction_before_mutation);
 	local_reset();
 	UT_ASSERT_EQ(rmdir(MultiXactOffsetCtl->Dir), 0);
 	UT_ASSERT_EQ(rmdir(MultiXactMemberCtl->Dir), 0);
