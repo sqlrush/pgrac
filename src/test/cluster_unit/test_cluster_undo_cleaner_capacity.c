@@ -16,7 +16,14 @@
 #include "lib/ilist.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "test_cluster_capacity_pool_compat.h"
+#include "libpq/pqsignal.h"
+static pqsigfunc cleaner_main_signal(int signum, pqsigfunc handler);
+static int cleaner_main_sigmask(int how, const sigset_t *set, sigset_t *old);
+#define pqsignal cleaner_main_signal
+#define sigprocmask cleaner_main_sigmask
 #include "../../backend/cluster/cluster_undo_cleaner.c"
+#undef sigprocmask
+#undef pqsignal
 
 static struct {
 	Buffer buffer;
@@ -154,6 +161,24 @@ static unsigned test_source_steps;
 static ClusterSemanticActiveSampleFence test_sample_source, test_first_source, test_last_source;
 static bool test_change_admission_after_n;
 static bool test_census_busy, test_census_invalid;
+/* Main/pass composition controls external scheduling, never product decisions. */
+static bool cleaner_main_running, cleaner_main_stop;
+static unsigned cleaner_main_progress_limit, cleaner_main_progress_events;
+static unsigned cleaner_main_waits, cleaner_main_wait_limit, cleaner_main_bindings;
+static long cleaner_main_timeouts[4];
+static TimestampTz cleaner_main_clock;
+static sigjmp_buf cleaner_main_exit;
+static pg_on_exit_callback cleaner_main_exit_callback;
+static int cleaner_main_exit_code;
+static bool cleaner_main_first_scan_empty;
+AuxProcType MyAuxProcType;
+Latch *MyLatch;
+sigset_t UnBlockSig;
+volatile sig_atomic_t ConfigReloadPending;
+volatile sig_atomic_t ShutdownRequestPending;
+int cluster_undo_cleaner_interval_ms = 30000;
+int cluster_injection_armed_count;
+
 static VariableCacheData native_variables;
 VariableCache ShmemVariableCache = &native_variables;
 static PROC_HDR native_procs;
@@ -197,6 +222,20 @@ bool
 cluster_ctrc_cleaner_run_pass(void)
 {
 	test_ctrc_passes++;
+	if (cleaner_main_running) {
+		if (test_ctrc_passes == 1)
+			cleaner_main_first_scan_empty
+				= undo_cleaner_active_scan.status == CTRC_ACTIVE_SCAN_NOT_STARTED
+				  && !undo_cleaner_active_scan_pending;
+		if (test_ctrc_passes <= cleaner_main_progress_limit) {
+			cleaner_main_progress_events++;
+			return true;
+		}
+		/* Keep a broken fast-continue mutation finite without granting exit. */
+		if (test_ctrc_passes > cleaner_main_progress_limit + cleaner_main_wait_limit + 2)
+			ShutdownRequestPending = true;
+		return false;
+	}
 	return test_ctrc_progress;
 }
 
@@ -558,7 +597,7 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *found)
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 123456;
+	return cleaner_main_running ? cleaner_main_clock : 123456;
 }
 
 SCN
@@ -2631,10 +2670,253 @@ UT_TEST(test_capacity_retention_counts_known_bits_only_on_original_refusal)
 	}
 }
 
+
+/* Execute the original complete Main and run_pass together. Native stop
+ * authority, mandatory CTRC internals, OS signals/latch/time remain leaves.
+ * No wait here sleeps, and protocol_closed=true is not shutdown evidence. */
+static pqsigfunc
+cleaner_main_signal(int signum pg_attribute_unused(), pqsigfunc handler)
+{
+	return handler;
+}
+
+static int
+cleaner_main_sigmask(int how pg_attribute_unused(), const sigset_t *set pg_attribute_unused(),
+					 sigset_t *old pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+init_ps_display(const char *fixed_part pg_attribute_unused())
+{}
+void
+ProcessConfigFile(GucContext context pg_attribute_unused())
+{
+	abort(); /* No reload is requested by these cases. */
+}
+void
+SignalHandlerForConfigReload(SIGNAL_ARGS)
+{
+	(void)postgres_signal_arg;
+}
+void
+SignalHandlerForShutdownRequest(SIGNAL_ARGS)
+{
+	(void)postgres_signal_arg;
+}
+void
+cluster_injection_run(const char *name pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_ctrc_cleaner_bind_worker(unsigned worker)
+{
+	UT_ASSERT(cleaner_main_running);
+	UT_ASSERT_EQ(worker, ClusterUndoCleanerWorkerIdForType(MyAuxProcType));
+	cleaner_main_bindings++;
+	return worker < CLUSTER_UNDO_CLEANER_WORKER_TYPES;
+}
+uint64
+cluster_ctrc_cleaner_local_passes(void)
+{
+	return test_ctrc_passes;
+}
+uint64
+cluster_ctrc_cleaner_local_progress(void)
+{
+	return cleaner_main_progress_events;
+}
+bool
+cluster_normal_stop_requested(void)
+{
+	return cleaner_main_running && cleaner_main_stop;
+}
+bool
+cluster_normal_stop_protocol_closed(void)
+{
+	return true; /* Separate real authority tests live in normal_stop. */
+}
+bool
+cluster_normal_stop_cleaner_park_requested(void)
+{
+	return false;
+}
+bool
+cluster_normal_stop_cleaner_park(void)
+{
+	abort();
+}
+ClusterNormalStopFailure
+cluster_normal_stop_failure(void)
+{
+	return CLUSTER_NORMAL_STOP_FAILURE_NONE;
+}
+void
+cluster_normal_stop_fail(ClusterNormalStopFailure failure pg_attribute_unused())
+{
+	abort();
+}
+void
+before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	UT_ASSERT(cleaner_main_exit_callback == NULL && arg == 0);
+	cleaner_main_exit_callback = callback;
+}
+void
+proc_exit(int code)
+{
+	pg_on_exit_callback callback = cleaner_main_exit_callback;
+
+	cleaner_main_exit_callback = NULL;
+	cleaner_main_exit_code = code;
+	if (callback != NULL)
+		callback(code, 0);
+	siglongjmp(cleaner_main_exit, 1);
+}
+void
+ResetLatch(Latch *latch)
+{
+	UT_ASSERT(latch == MyLatch);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+}
+int
+WaitLatch(Latch *latch, int events, long timeout, uint32 event)
+{
+	UT_ASSERT(cleaner_main_running && latch == MyLatch);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	UT_ASSERT_EQ(test_modifier_entries, test_modifier_leaves);
+	UT_ASSERT_EQ(event, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);
+	UT_ASSERT((events & (WL_LATCH_SET | WL_EXIT_ON_PM_DEATH))
+			  == (WL_LATCH_SET | WL_EXIT_ON_PM_DEATH));
+	if (cleaner_main_waits >= lengthof(cleaner_main_timeouts))
+		abort();
+	cleaner_main_timeouts[cleaner_main_waits++] = timeout;
+	if (timeout > 0) {
+		UT_ASSERT(events & WL_TIMEOUT);
+		cleaner_main_clock += timeout * INT64CONST(1000);
+	} else
+		UT_ASSERT_EQ(timeout, -1);
+	if (cleaner_main_waits >= cleaner_main_wait_limit)
+		ShutdownRequestPending = true;
+	return timeout > 0 ? WL_TIMEOUT : WL_LATCH_SET;
+}
+
+static void
+run_composed_cleaner_main(unsigned worker, unsigned progress, unsigned waits, bool stop)
+{
+	cleaner_main_running = true;
+	cleaner_main_stop = stop;
+	cleaner_main_progress_limit = progress;
+	cleaner_main_progress_events = cleaner_main_waits = cleaner_main_bindings = 0;
+	cleaner_main_wait_limit = waits;
+	cleaner_main_clock = 123456;
+	cleaner_main_exit_code = -1;
+	cleaner_main_exit_callback = NULL;
+	cleaner_main_first_scan_empty = false;
+	MemSet(cleaner_main_timeouts, 0, sizeof(cleaner_main_timeouts));
+	MyAuxProcType = ClusterUndoCleanerTypeForWorker(worker);
+	MyLatch = &MyProc->procLatch;
+	IsUnderPostmaster = true;
+	ShutdownRequestPending = ConfigReloadPending = false;
+	if (sigsetjmp(cleaner_main_exit, 0) == 0)
+		UndoCleanerMain();
+	cleaner_main_running = false;
+	UT_ASSERT_EQ(cleaner_main_exit_code, 0);
+	UT_ASSERT_EQ(cleaner_main_bindings, 1);
+	UT_ASSERT_EQ(cleaner_main_waits, waits);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	UT_ASSERT_EQ(test_modifier_entries, test_modifier_leaves);
+	UT_ASSERT_EQ(undo_cleaner_state->workers[worker].status, UNDO_CLEANER_EXITED);
+	UT_ASSERT(undo_cleaner_state->workers[worker].latch == NULL);
+	UT_ASSERT_EQ(undo_cleaner_state->workers[worker].local_completed_passes, test_ctrc_passes);
+	UT_ASSERT_EQ(undo_cleaner_state->workers[worker].local_progress_events, progress);
+}
+
+UT_TEST(test_composed_main_drains_mandatory_progress_before_sleep_for_every_worker)
+{
+	for (unsigned worker = 0; worker < CLUSTER_UNDO_CLEANER_WORKER_TYPES; worker++) {
+		reset_wait_fixture();
+		test_maintenance_cut = true;
+		cluster_undo_cleaner_interval_ms = 30000;
+		run_composed_cleaner_main(worker, 2, 1, true);
+		UT_ASSERT_EQ(test_ctrc_passes, 3);
+		UT_ASSERT_EQ(cleaner_main_timeouts[0], 200);
+		UT_ASSERT_EQ(test_modifier_entries, 0);
+		UT_ASSERT_EQ(test_gc_passes, 0);
+		UT_ASSERT_EQ(test_census_steps, 0);
+		UT_ASSERT_EQ(undo_cleaner_state->workers[worker].main_loop_iters, 3);
+	}
+}
+
+UT_TEST(test_composed_main_pending_stop_retries_mandatory_without_optional_gc)
+{
+	static const int intervals[] = { 0, 30000, 60000, 50 };
+
+	for (unsigned worker = 0; worker < CLUSTER_UNDO_CLEANER_WORKER_TYPES; worker += 7)
+		for (unsigned i = 0; i < lengthof(intervals); i++) {
+			reset_wait_fixture();
+			test_maintenance_cut = true;
+			cluster_undo_cleaner_interval_ms = intervals[i];
+			run_composed_cleaner_main(worker, 0, 2, true);
+			UT_ASSERT_EQ(test_ctrc_passes, 2);
+			for (unsigned w = 0; w < 2; w++)
+				UT_ASSERT_EQ(cleaner_main_timeouts[w], intervals[i] == 50 ? 50 : 200);
+			UT_ASSERT_EQ(test_modifier_entries, 0);
+			UT_ASSERT_EQ(test_gc_passes, 0);
+			UT_ASSERT_EQ(test_census_steps, 0);
+		}
+	cluster_undo_cleaner_interval_ms = 30000;
+}
+
+UT_TEST(test_composed_main_census_wake_keeps_mandatory_and_original_gc_deadline)
+{
+	for (int complete = 0; complete < 2; complete++) {
+		reset_wait_fixture();
+		test_gc_complete = complete != 0;
+		cluster_undo_cleaner_interval_ms = 30000;
+		run_composed_cleaner_main(0, 0, 2, false);
+		UT_ASSERT_EQ(test_ctrc_passes, 2);
+		UT_ASSERT_EQ(test_census_begins, 1);
+		UT_ASSERT_EQ(test_census_steps, 2);
+		UT_ASSERT_EQ(test_gc_passes, 1);
+		UT_ASSERT_EQ(test_modifier_entries, 1);
+		UT_ASSERT_EQ(cleaner_main_timeouts[0], 10);
+		UT_ASSERT_EQ(cleaner_main_timeouts[1], (complete ? 30000 : 2000) - 10);
+		UT_ASSERT_EQ(undo_cleaner_state->workers[0].active_census.status, CTRC_ACTIVE_SCAN_COMPLETE);
+	}
+}
+
+UT_TEST(test_composed_main_same_pid_respawn_restarts_original_owner_without_old_scan)
+{
+	reset_wait_fixture();
+	for (unsigned incarnation = 2; incarnation <= 3; incarnation++) {
+		test_ctrc_passes = 0;
+		test_maintenance_cut = true;
+		undo_cleaner_active_scan.status = CTRC_ACTIVE_SCAN_INCOMPLETE;
+		undo_cleaner_active_scan.next_index = 64;
+		undo_cleaner_active_scan_pending = true;
+		undo_cleaner_state->active_sample.scan.status = CTRC_ACTIVE_SCAN_COMPLETE;
+		run_composed_cleaner_main(0, 1, 1, true);
+		UT_ASSERT(cleaner_main_first_scan_empty);
+		UT_ASSERT_EQ(test_ctrc_passes, 2);
+		UT_ASSERT_EQ(undo_cleaner_state->workers[0].incarnation_generation, incarnation);
+		UT_ASSERT_EQ(undo_cleaner_state->workers[0].pid, 123);
+		UT_ASSERT_EQ(undo_cleaner_state->workers[0].main_loop_iters, 2);
+		UT_ASSERT_EQ(undo_cleaner_state->active_sample.scan.status, CTRC_ACTIVE_SCAN_NOT_STARTED);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(62);
+	UT_RUN(test_composed_main_drains_mandatory_progress_before_sleep_for_every_worker);
+	UT_RUN(test_composed_main_pending_stop_retries_mandatory_without_optional_gc);
+	UT_RUN(test_composed_main_census_wake_keeps_mandatory_and_original_gc_deadline);
+	UT_RUN(test_composed_main_same_pid_respawn_restarts_original_owner_without_old_scan);
 	UT_RUN(test_capacity_refusal_producer_and_legacy_reads_do_not_lock_or_truncate);
 	UT_RUN(test_capacity_retention_snapshot_preserves_zero_unsigned_and_unavailable);
 	UT_RUN(test_capacity_retention_counts_known_bits_only_on_original_refusal);
