@@ -6253,7 +6253,15 @@ test_cluster_lmon_stop_service.inc: $(top_srcdir)/src/backend/cluster/cluster_cl
 	     emit { print } /^}/ { emit=0 } END { if (count != 13) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_lmon_producer_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
+		$(top_srcdir)/src/include/cluster/cluster_service_observe.h
+	awk '/^cl_native_observe_lock\(/ { print "static void"; emit=1; count++ } \
+	     /^cluster_service_(actor|producer)_observe\(/ { print "ClusterNormalStopPollResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_lmon: test_cluster_lmon.c unit_test.h test_cluster_lmon_stop_service.inc \
+		test_cluster_lmon_producer_observe.inc test_cluster_lmon_producer_pause.inc \
 		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_grd_outbound.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O)
