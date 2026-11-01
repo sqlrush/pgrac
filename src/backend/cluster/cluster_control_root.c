@@ -14150,3 +14150,85 @@ cluster_control_root_relmap_selection_reference_v4(ClusterControlRelmapSelection
 	*out = value;
 	return true;
 }
+
+/* The complete original control composition selects the format. File size is
+ * only a decoder discriminator; it never makes an unknown file legacy. */
+ClusterControlRootResult
+cluster_control_root_relmap_format_locked_v2(Size budget, ClusterControlRelmapFormatV2 *out)
+{
+	ControlFileSelectionWorkV4 *w;
+	ClusterControlRelmapSelectionV2 *selection = NULL;
+	ClusterControlRelmapFormatV2 value = {0};
+	ClusterControlRelmapReferenceV2 reference;
+	ClusterControlRootFileToken token;
+	volatile ClusterControlRootResult result;
+	struct stat st;
+	uint8 uuid[16];
+	uint64 system = GetSystemIdentifier();
+	char path[MAXPGPATH];
+	if (!out || budget < 256 || CritSectionCount || LWLockHeldByMe(ControlFileLock) ||
+		LWLockHeldByMe(RelationMappingLock))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ShareLock) &&
+		!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!system || !current_storage_uuid(uuid) ||
+		!build_control_path(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH) ||
+		lstat(path, &st) || !S_ISREG(st.st_mode))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	w = palloc0(sizeof(*w));
+	w->directory = -1;
+	PG_TRY();
+	{
+		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		if (st.st_size == 66560) {
+			int n = snprintf(path, sizeof(path), "%s/global", cluster_shared_data_dir);
+			if (n > 0 && n < sizeof(path))
+				w->directory = OpenTransientFile(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			if (w->directory >= 0 && cluster_control_root_registry_capture_v4(
+					w->directory, uuid, system, w->pair, &w->root)) {
+				config_root_reference(&w->root, &value.config);
+				result = cluster_control_root_relmap_selection_read_locked_v4(
+					&value.config, budget, &selection);
+				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+					if (!cluster_control_root_relmap_selection_reference_v4(selection, &reference) ||
+						!control_root_sha256(w->pair, sizeof(w->pair), value.root_sha256) ||
+						memcmp(value.root_sha256, reference.root_pair_sha256, 32))
+						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+					else value.root_version = 4;
+				}
+			}
+		} else if (st.st_size == CLUSTER_CONTROL_ROOT_FILE_BYTES) {
+			result = read_control_version(uuid, system, &w->root, &w->common, &token, 3);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ||
+				result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+				if (w->root.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE ||
+					!control_root_sha256(w->root.bytes, sizeof(w->root.bytes), value.root_sha256))
+					result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+				else {
+					config_root_reference(&w->root, &value.config);
+					value.root_version = 3;
+					result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_control_root_relmap_selection_destroy_v4(&selection);
+		if (w->directory >= 0) CloseTransientFile(w->directory);
+		pfree(w);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_control_root_relmap_selection_destroy_v4(&selection);
+	if (w->directory >= 0 && CloseTransientFile(w->directory))
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	pfree(w);
+	if (!cluster_cf_held_is_clusterwide(ShareLock) &&
+		!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) *out = value;
+	return result;
+}

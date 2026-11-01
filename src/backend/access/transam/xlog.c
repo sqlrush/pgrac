@@ -242,6 +242,9 @@
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/relmapper.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_relmap_control.h"
+#endif
 #include "utils/pg_rusage.h"
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
@@ -854,7 +857,11 @@ static void CreateEndOfRecoveryRecord(void);
 static XLogRecPtr CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn,
 												  XLogRecPtr pagePtr,
 												  TimeLineID newTLI);
-static void CheckPointGuts(XLogRecPtr checkPointRedo, int flags);
+static void CheckPointGuts(XLogRecPtr checkPointRedo, int flags
+#ifdef USE_PGRAC_CLUSTER
+	, ClusterRelmapCheckpointReceiptV2 **relmap_receipt
+#endif
+);
 static void KeepLogSeg(XLogRecPtr recptr, XLogRecPtr slotsMinLSN,
 					   XLogSegNo *logSegNo);
 static XLogRecPtr XLogGetReplicationSlotMinimumLSN(void);
@@ -9990,6 +9997,7 @@ CreateCheckPoint(int flags)
 	ControlFileData v3_checkpoint;
 	struct ClusterRecoveryCheckpointScopeV1 *recovery_checkpoint_scope = NULL;
 	ClusterRelmapCheckpointSampleV1 native_window = { 0 };
+	ClusterRelmapCheckpointReceiptV2 *relmap_receipt = NULL;
 	uint8 native_window_bytes[160] = { 0 };
 #endif
 
@@ -10463,7 +10471,11 @@ CreateCheckPoint(int flags)
 		cluster_wal_retained_cut_before_sync_v1(checkPoint.redo);
 #endif
 
-	CheckPointGuts(checkPoint.redo, flags);
+	CheckPointGuts(checkPoint.redo, flags
+#ifdef USE_PGRAC_CLUSTER
+		, &relmap_receipt
+#endif
+	);
 
 	vxids = GetVirtualXIDsDelayingChkpt(&nvxids, DELAY_CHKPT_COMPLETE);
 	if (nvxids > 0)
@@ -10639,6 +10651,13 @@ CreateCheckPoint(int flags)
 	if (cluster_shared_config)
 		(void)cluster_relmap_recovery_checkpoint_window_finish(
 			&native_window, &checkPoint, ProcLastRecPtr, recptr, native_window_bytes);
+	/* A relmap pair receipt is only one family. Until the original v4
+	 * publisher conjoins every file family/source/cut, never feed it to v3. */
+	if (relmap_receipt != NULL) {
+		cluster_relmap_checkpoint_destroy_v2(&relmap_receipt);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			errmsg("complete managed file-family checkpoint coverage is unproven")));
+	}
 	if (cluster_shared_config)
 		ClusterCheckpointV3Publish(&v3_checkpoint, recptr, native_window_bytes,
 								   recovery_checkpoint_scope);
@@ -11036,9 +11055,20 @@ CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn, XLogRecPtr pagePtr,
  * recovery restartpoints.
  */
 static void
-CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
+CheckPointGuts(XLogRecPtr checkPointRedo, int flags
+#ifdef USE_PGRAC_CLUSTER
+	, ClusterRelmapCheckpointReceiptV2 **relmap_receipt
+#endif
+)
 {
-	CheckPointRelationMap();
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && MyBackendType == B_CHECKPOINTER) {
+		if (!CheckPointRelationMapControlV2(relmap_receipt))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				errmsg("could not retain complete checkpoint relation map input")));
+	} else
+#endif
+		CheckPointRelationMap();
 	CheckPointReplicationSlots();
 	CheckPointSnapBuild();
 	CheckPointLogicalRewriteHeap();
@@ -11209,6 +11239,9 @@ CreateRestartPoint(int flags)
 	XLogSegNo	_logSegNo;
 	TimestampTz xtime;
 	XLogRecPtr	slotsMinReqLSN;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterRelmapCheckpointReceiptV2 *relmap_receipt = NULL;
+#endif
 
 	/* Concurrent checkpoint/restartpoint cannot happen */
 	Assert(!IsUnderPostmaster || MyBackendType == B_CHECKPOINTER);
@@ -11314,7 +11347,18 @@ CreateRestartPoint(int flags)
 	/* Update the process title */
 	update_checkpoint_display(flags, true, false);
 
-	CheckPointGuts(lastCheckPoint.redo, flags);
+	CheckPointGuts(lastCheckPoint.redo, flags
+#ifdef USE_PGRAC_CLUSTER
+		, &relmap_receipt
+#endif
+	);
+#ifdef USE_PGRAC_CLUSTER
+	if (relmap_receipt != NULL) {
+		cluster_relmap_checkpoint_destroy_v2(&relmap_receipt);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			errmsg("complete managed file-family restartpoint coverage is unproven")));
+	}
+#endif
 
 	/*
 	 * Remember the prior checkpoint's redo ptr for

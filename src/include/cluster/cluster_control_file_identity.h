@@ -76,4 +76,14 @@ extern ClusterControlRootResult cluster_control_root_relmap_selection_complete_l
  * local decoded storage and its own directory FD, before original owner exit.
  * Loss/reacquisition of CF invalidates the selection; it cannot be revived. */
 extern void cluster_control_root_relmap_selection_destroy_v4(ClusterControlRelmapSelectionV2 **);
+/* Complete control-owned format observation, not a mode flag or admission.
+ * Borrow existing CF-S/X. Native storage/system identity is independent of the
+ * target. Unknown/corrupt/incomplete ROOT refuses, never legacy fallback. */
+typedef struct ClusterControlRelmapFormatV2 {
+	uint32 root_version;
+	ClusterSharedConfigRef config;
+	uint8 root_sha256[32];
+} ClusterControlRelmapFormatV2;
+extern ClusterControlRootResult cluster_control_root_relmap_format_locked_v2(
+	Size registry_budget, ClusterControlRelmapFormatV2 *out);
 #endif

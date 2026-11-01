@@ -170,7 +170,7 @@ CreateDatabaseUsingWalLog(Oid src_dboid, Oid dst_dboid,
 	CreateDirAndVersionFile(dstpath, dst_dboid, dst_tsid, false);
 
 	/* Copy relmap file from source database to the destination database. */
-	RelationMapCopy(dst_dboid, dst_tsid, srcpath, dstpath);
+	RelationMapCopy(dst_dboid, dst_tsid, srcpath, dstpath, src_dboid, src_tsid);
 
 	/* Get list of relfilelocators to copy from the source database. */
 	rlocatorlist = ScanSourceDatabasePgClass(src_tsid, src_dboid, srcpath);
@@ -267,7 +267,7 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 
 	/* Get pg_class relfilenumber. */
 	relfilenumber = RelationMapOidToFilenumberForDatabase(srcpath,
-														  RelationRelationId);
+														  RelationRelationId, dbid, tbid);
 
 	/* Don't read data into shared_buffers without holding a relation lock. */
 	relid.dbId = dbid;
@@ -425,7 +425,7 @@ ScanSourceDatabasePgClassTuple(HeapTupleData *tuple, Oid tbid, Oid dbid,
 		relfilenumber = classForm->relfilenode;
 	else
 		relfilenumber = RelationMapOidToFilenumberForDatabase(srcpath,
-															  classForm->oid);
+															  classForm->oid, dbid, tbid);
 
 	/* We must have a valid relfilenumber. */
 	if (!RelFileNumberIsValid(relfilenumber))
