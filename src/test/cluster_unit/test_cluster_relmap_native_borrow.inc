@@ -21,6 +21,24 @@ static ClusterRecoveryFileIdentityV2 borrow_table_files[3];
 static uint64 borrow_table_count;
 static ClusterControlRelmapReferenceV2 borrow_table_reference;
 static bool borrow_publishing;
+#include "cluster/cluster_control_registry_batch.h"
+#include "test_cluster_relmap_native_root_identity.inc"
+/* This existing writer fixture selects only its AVAILABLE vector. */
+uint64
+cluster_control_root_registry_reservation_count_v4(ClusterControlRelmapSelectionV2 *s)
+{
+	UT_ASSERT(s && managed_cf && !local_held && borrow_publishing);
+	return 0;
+}
+bool
+cluster_control_root_registry_reservation_at_v4(ClusterControlRelmapSelectionV2 *s,
+											 uint64 index, ClusterRecoveryFileReservationV1 *out)
+{
+	(void)s;
+	(void)index;
+	(void)out;
+	abort();
+}
 const PgracInitdbRecoveryContext *
 cluster_wal_thread_initdb_recovery_context(void)
 {

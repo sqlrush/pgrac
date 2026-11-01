@@ -3,6 +3,8 @@
 #include "cluster_control_root_registry_private.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "port/pg_crc32c.h"
+#include "common/cluster_recovery_reservations.h"
+#include "catalog/catversion.h"
 
 static uint64 get_le(const uint8 *p, Size at, unsigned width)
 {
@@ -67,7 +69,8 @@ static bool decode(const uint8 *p, Size n, uint64 sysid, const uint8 storage[16]
 		get_le(p, 72, 2) != 4 || get_le(p, 74, 2) != 4 || !zero(p + 376, 136) ||
 		!zero(p + 640, 380) || get_le(p, 1020, 4) != root_crc(p, 1020) ||
 		get_le(p, 96, 4) != root_crc(p + 1024, 65536) ||
-		!cluster_recovery_registry_reference_valid_v2(p + 512) ||
+		(!cluster_recovery_registry_reference_valid_v2(p + 512) &&
+		 !cluster_recovery_registry_reference_valid_v3(p + 512, CATALOG_VERSION_NO)) ||
 		get_be(p + 512, 16, 8) != get_le(p, 16, 8))
 		return false;
 	target = get_le(p, 188, 8);
@@ -349,3 +352,39 @@ done:
 	return ok;
 }
 #endif
+
+/* Preserve the old coverage codec. The container reference replaces only the
+ * existing registry slot, after both canonical vectors have been validated. */
+bool
+cluster_control_root_reservations_encode_v4(const ControlRootImage *candidate,
+											const ClusterRecoveryRegistryV3 *r,
+											const uint8 ref[128], uint8 *out, Size n)
+{
+	uint8 *registry = NULL, *root = NULL, expected[128];
+	Size length;
+	bool ok = false;
+	if (!candidate || !r || !ref || !out || n != 66560 || overlaps(r, sizeof(*r), out, n)
+		|| r->reservation_count > SIZE_MAX / sizeof(*r->reservations)
+		|| overlaps(r->reservations, r->reservation_count * sizeof(*r->reservations), out, n)
+		|| !output_distinct(&r->available, out, n)
+		|| overlaps(candidate, sizeof(*candidate), out, n) || overlaps(ref, 128, out, n)
+		|| !cluster_recovery_registry_size_v3(r, SIZE_MAX, &length))
+		return false;
+	registry = malloc(length);
+	root = malloc(n);
+	if (!registry || !root)
+		goto done;
+	if (!cluster_recovery_registry_encode_v3(r, registry, length, expected)
+		|| memcmp(ref, expected, 128)
+		|| !cluster_control_root_registry_encode_v4(candidate, &r->available, registry + 128, root,
+													n))
+		goto done;
+	memcpy(root + 512, ref, 128);
+	put_le(root, 1020, root_crc(root, 1020), 4);
+	memcpy(out, root, n);
+	ok = true;
+done:
+	free(root);
+	free(registry);
+	return ok;
+}

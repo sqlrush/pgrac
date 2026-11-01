@@ -19012,3 +19012,118 @@ clean distclean maintainer-clean: clean-l1b-tail-bounds
 
 # The native maintenance link consumes this shared test support object.
 test_cluster_vacuum_native_window test_cluster_subtrans_watermark: cluster_catalog_trace_test.o
+
+# Complete registry coverage plus independent identity-only reservations.
+TESTS += test_cluster_recovery_reservations
+all: test_cluster_recovery_reservations
+test_cluster_recovery_reservations: test_cluster_recovery_reservations.c test_cluster_recovery_registry.c unit_test.h test_cluster_registry_io.c \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
+		$(srcdir)/test_cluster_registry_io.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-recovery-reservations
+.PHONY: clean-recovery-reservations
+clean-recovery-reservations:
+	rm -f test_cluster_recovery_reservations test_cluster_recovery_reservations.d
+
+# Every direct include of the registry also consumes the new format header.
+test_cluster_recovery_reservations test_cluster_recovery_registry test_cluster_control_registry test_cluster_control_file_selection test_cluster_control_relmap_selection test_cluster_control_native_files cluster_registry_common_test.o: \
+	$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_registry_reservation_format.h \
+	$(top_srcdir)/src/include/catalog/catversion.h
+
+test_cluster_recovery_reservations: $(top_srcdir)/src/common/sha2_int.h
+
+TESTS += test_cluster_control_registry_batches
+all: test_cluster_control_registry_batches
+test_cluster_control_registry_batches: test_cluster_control_registry_batches.c test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-registry-batches
+.PHONY: clean-control-registry-batches
+clean-control-registry-batches:
+	rm -f test_cluster_control_registry_batches test_cluster_control_registry_batches.d
+
+cluster_control_registry_original.o cluster_registry_common_test.o test_cluster_control_registry_batches: \
+	$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_registry_reservation_format.h \
+	$(top_srcdir)/src/include/cluster/cluster_control_registry_batch.h
+test_cluster_control_registry_batches: test_cluster_control_relmap_selection.c \
+	test_cluster_control_file_selection.c \
+	$(top_srcdir)/src/backend/cluster/cluster_recovery_anchor_private.h
+
+# Full persistent reservation projection and original creator borrowing.
+TESTS += test_cluster_control_native_reservations
+all: test_cluster_control_native_reservations
+test_cluster_control_native_reservations: test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_control_native_reservations.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-native-reservations
+.PHONY: clean-control-native-reservations
+clean-control-native-reservations:
+	rm -f test_cluster_control_native_reservations test_cluster_control_native_reservations.d
+
+
+# Direct native-table consumers also use the selected reservation vector.
+test_cluster_control_native_files test_cluster_control_native_reservations: \
+ $(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+ $(top_srcdir)/src/include/cluster/cluster_control_registry_batch.h \
+ $(top_srcdir)/src/include/cluster/cluster_recovery_registry_reservation_format.h
+
+# The existing AVAILABLE-only writer fixture reuses the original identity check.
+test_cluster_relmap_native_root_identity.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	@awk '/^cluster_control_root_identity_equal\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 1) exit 1 }' $< > $@
+test_cluster_relmap_xid_order: test_cluster_relmap_native_root_identity.inc \
+	$(top_srcdir)/src/include/cluster/cluster_control_registry_batch.h
+.PHONY: clean-relmap-native-root-identity
+clean-relmap-native-root-identity:
+	rm -f test_cluster_relmap_native_root_identity.inc
+clean distclean maintainer-clean: clean-relmap-native-root-identity

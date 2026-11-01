@@ -2,12 +2,14 @@
 #ifndef CLUSTER_CONTROL_NATIVE_FILES_H
 #define CLUSTER_CONTROL_NATIVE_FILES_H
 #include "cluster/cluster_control_file_identity.h"
+#include "common/cluster_recovery_reservations.h"
 #include "common/pgrac_initdb_recovery.h"
 
 #define CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2 ((Size)1048576)
 /* Registry file entries occupy at least 208 canonical bytes. Full inventories
  * above this startup reservation refuse; they are never truncated to 64 pins. */
 #define CLUSTER_NATIVE_FILES_CAPACITY_V2 ((1048576 - 256) / 208)
+#define CLUSTER_NATIVE_RESERVATIONS_CAPACITY_V2 ((1048576 - 256) / 256)
 
 typedef enum ClusterControlNativeModeV2 {
 	CLUSTER_NATIVE_FILES_UNKNOWN_V2 = 0,
@@ -40,6 +42,7 @@ typedef struct ClusterControlNativeFileBorrowV2 {
 typedef struct ClusterControlNativeTableInfoV2 {
 	ClusterControlNativeModeV2 mode;
 	uint64 table_generation, startup_generation, count, capacity, borrowed;
+	uint64 reservation_count;
 	Size registry_byte_budget, shared_bytes;
 	ClusterControlRelmapReferenceV2 control;
 	/* Only CREATION: the authenticated original batch, not CF/ROOT authority.
@@ -58,7 +61,8 @@ extern bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2
  * multiple origins have distinct results; refusal leaves fresh unchanged and
  * takes no borrow. The current MANAGED producer installs only full coverage
  * identities; UNKNOWN and the unpublished CREATION batch are NOT_AVAILABLE.
- * RESERVED/inactive identities must never enter that available vector.
+ * RESERVED identities are retained in a separate complete vector, never in
+ * that available vector. An address with only RESERVED returns NOT_AVAILABLE.
  * Same address/process-bound borrow, current and release as acquire_v2; no CF,
  * I/O, allocation or family-lock acquisition. Caller retains original locks
  * and file-lifetime duty through cleanup. Zero-initialize fresh. */
@@ -69,8 +73,21 @@ extern bool cluster_control_native_file_current_v2(const ClusterControlNativeFil
 /* Release remains possible after a failed current check; clears only a valid
  * local borrow. False leaves the original duty intact. No CF/IO/reselection. */
 extern bool cluster_control_native_file_release_v2(ClusterControlNativeFileBorrowV2 *);
+/* Exact creator-only RESERVED borrow, BEFORE family locks, under the SAME
+ * original CF-X. Select/verify original ROOT/claim/anchor/creator and complete
+ * expected/batch against the installed full table. No CF acquisition, new
+ * owner/scope/FD/pin or file permission. Keep the original creator/file duty;
+ * current/release then use the existing local borrow counter without CF/I/O.
+ * COMPLETE/cancel must not discard that original duty. Fresh zero out only;
+ * false/ERROR takes no borrow and leaves out unchanged. Never falls back to an
+ * AVAILABLE row. Ordinary acquire/address APIs still refuse RESERVED. */
+extern ClusterControlNativeResultV2 cluster_control_native_file_reserved_acquire_locked_v2(
+	const ClusterSharedConfigRef *, Size registry_byte_budget, uint64 startup_generation,
+	const uint8 batch_uuid[16], const ClusterRecoveryFileIdentityV2 *expected,
+	ClusterControlNativeFileBorrowV2 *fresh);
 /* Complete gap check before lease/WAL/allocator side effects. Inclusive range;
- * includes the caller's two successor segments. No CF or registration here. */
+ * includes the caller's two successor segments. Presence includes persistent
+ * RESERVED, without granting creator authority or I/O. No CF or registration here. */
 extern ClusterControlNativeResultV2 cluster_control_native_files_clog_range_v2(uint16 origin,
 																			   uint64 first_segment,
 																			   uint64 last_segment);
@@ -79,12 +96,15 @@ extern ClusterControlNativeResultV2 cluster_control_native_files_clog_range_v2(u
  * comes from the original OPEN/Start, not a page/counter. Only identical rows or
  * distinct additions are supported: removal/reidentity refuses until the
  * original cross-instance stop/drain transition is connected. Live borrows
- * prevent a changed table; no waiting under family locks. Refusal preserves
+ * prevent a changed table. RESERVED removal/reidentity still refuses until the
+ * original stop/drain is connected; same-identity completion is permitted.
+ * No waiting under family locks. Refusal preserves
  * old table, original CF/FD/pins/debt. Does not publish ROOT or activate v2. */
 extern ClusterControlNativeResultV2 cluster_control_native_files_publish_locked_v2(
 	const ClusterSharedConfigRef *, Size registry_byte_budget, uint64 startup_generation);
 /* Validate the requested complete range against independently PERSISTENT
- * registration, then publish the complete selected inventory. Missing identity
+ * registration (AVAILABLE or RESERVED), then publish the complete selected
+ * inventory. OK requires complete presence. Missing identity
  * returns NEEDS_REGISTRATION before any table mutation; it does not invent
  * synced bytes/page birth/coverage or infer identity from a file. Actual control
  * reservation publication must precede this entry. */

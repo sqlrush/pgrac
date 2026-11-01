@@ -3,6 +3,7 @@
 #define CLUSTER_CONTROL_ROOT_REGISTRY_PRIVATE_H
 #include "cluster_control_root_private.h"
 #include "common/cluster_recovery_registry.h"
+#include "common/cluster_recovery_reservations.h"
 /* Pure pre-CF observation. Original fields are validated in private scratch;
  * metadata.bytes is empty and format_version remains 4. No token or grant. */
 extern bool cluster_control_root_registry_decode_v4(const uint8 *, Size,
@@ -31,4 +32,6 @@ extern bool cluster_control_root_registry_capture_v4(int global_directory,
 													 const uint8 storage_uuid[16],
 													 uint64 system_identifier, uint8 pair[133120],
 													 ControlRootImage *metadata);
+extern bool cluster_control_root_reservations_encode_v4(const ControlRootImage *,
+ const ClusterRecoveryRegistryV3 *, const uint8 reference[128], uint8 *, Size);
 #endif

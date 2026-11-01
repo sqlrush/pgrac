@@ -5,6 +5,7 @@
 #include "postgres.h"
 #endif
 #include "common/cluster_recovery_registry.h"
+#include "common/cluster_recovery_reservations.h"
 #include "sha2_int.h"
 #include "port/pg_crc32c.h"
 
@@ -703,6 +704,337 @@ done:
 	cluster_recovery_registry_destroy_v2(&decoded);
 	free(again);
 	free(bytes);
+	return ok;
+}
+#endif
+
+/* V3 embeds the unchanged complete coverage codec and adds a disjoint vector. */
+static bool reservation_key_equal(const ClusterRecoveryFileIdentityV2 *a,
+								  const ClusterRecoveryFileIdentityV2 *b)
+{
+	return a->kind == b->kind && a->origin == b->origin &&
+		a->database_oid == b->database_oid && a->tablespace_oid == b->tablespace_oid &&
+		a->object_id == b->object_id;
+}
+static bool dimensions_v3(const ClusterRecoveryRegistryV3 *r, Size budget, Size *n, Size *coverage)
+{
+	Size size = 256, old;
+	if (!r || (r->reservation_count && !r->reservations) ||
+		r->reservation_count > SIZE_MAX / sizeof(*r->reservations) || budget < size ||
+		!cluster_recovery_registry_size_v2(&r->available, budget - size, &old) ||
+		!extend(&size, old, 1, budget) ||
+		!extend(&size, r->reservation_count, 256, budget))
+		return false;
+	*n = size;
+	*coverage = old;
+	return true;
+}
+static bool valid_v3(const ClusterRecoveryRegistryV3 *r, Size budget, Size *n, Size *coverage)
+{
+	const ClusterRecoveryRegistryV2 *a;
+	uint8 bytes[128], prior[128];
+	if (!dimensions_v3(r, budget, n, coverage) ||
+		!cluster_recovery_registry_reservation_format_registered_v1(
+			CLUSTER_RECOVERY_REGISTRY_RESERVATION_FORMAT_ID_V1,
+			CLUSTER_RECOVERY_REGISTRY_WITH_RESERVATIONS_VERSION,
+			CLUSTER_RECOVERY_REGISTRY_RESERVATION_RECORD_VERSION_V1, r->catalog_version))
+		return false;
+	a = &r->available;
+	/* Multiple physical copies may share one identity, never two identities
+	 * at the same logical address in one available vector. */
+	for (uint64 i = 0; i < a->coverage.file_count; i++)
+		for (uint64 j = 0; j < i; j++)
+			if (reservation_key_equal(&a->coverage.files[i].identity, &a->coverage.files[j].identity) &&
+				(!cluster_recovery_file_identity_encode_v2(&a->coverage.files[i].identity, bytes, 128) ||
+				 !cluster_recovery_file_identity_encode_v2(&a->coverage.files[j].identity, prior, 128) ||
+				 memcmp(bytes, prior, 128)))
+				return false;
+	for (uint64 i = 0; i < r->reservation_count; i++) {
+		const ClusterRecoveryFileReservationV1 *v = &r->reservations[i];
+		const ClusterRecoveryFileIdentityV2 *id = &v->expected;
+		const ClusterControlRootIdentity *owner = &v->creation_owner;
+		if (!cluster_recovery_file_identity_encode_v2(id, bytes, 128) ||
+			id->system_identifier != a->system_identifier ||
+			id->database_incarnation != a->database_incarnation ||
+			memcmp(id->storage_uuid, a->storage_uuid, 16) ||
+			memcmp(id->redo_branch_uuid, a->redo_branch_uuid, 16) ||
+			id->redo_branch_generation != a->redo_branch_generation ||
+			id->registration_generation > a->coverage.registration_generation ||
+			!nonzero(v->batch_uuid, 16) || !counter(v->owner_generation) ||
+			v->state != CLUSTER_RECOVERY_FILE_RESERVED_V1 ||
+			owner->system_identifier != a->system_identifier ||
+			memcmp(owner->storage_uuid, a->storage_uuid, 16) ||
+			!nonzero(owner->authority_uuid, 16) || owner->origin_node_id < 0 ||
+			owner->origin_node_id >= 128 || owner->origin_thread_id != owner->origin_node_id + 1 ||
+			owner->reserved42 || owner->reserved60 || owner->thread_claim_created_at == 0 ||
+			!counter(owner->origin_owner_incarnation) || !counter(owner->root_lineage_seq))
+			return false;
+		for (uint64 j = 0; j < i; j++)
+			if (reservation_key_equal(id, &r->reservations[j].expected))
+				return false;
+		for (uint64 j = 0; j < a->coverage.file_count; j++)
+			if (reservation_key_equal(id, &a->coverage.files[j].identity))
+				return false;
+	}
+	return true;
+}
+static bool aliases_v3(const ClusterRecoveryRegistryV3 *r, const void *p, Size n)
+{
+	return overlap(r, sizeof(*r), p, n) || aliases(&r->available, p, n) ||
+		overlap(r->reservations, (Size)r->reservation_count * sizeof(*r->reservations), p, n);
+}
+bool cluster_recovery_registry_size_v3(const ClusterRecoveryRegistryV3 *r, Size budget, Size *length)
+{
+	Size n, coverage;
+	if (!length || !valid_v3(r, budget, &n, &coverage) || aliases_v3(r, length, sizeof(*length)))
+		return false;
+	*length = n;
+	return true;
+}
+static bool build_v3(const ClusterRecoveryRegistryV3 *r, uint8 *p, Size n, uint8 ref[128])
+{
+	Size size, coverage;
+	if (!valid_v3(r, n, &size, &coverage) || n != size)
+		return false;
+	memset(p, 0, n);
+	memcpy(p, "PRCREG3\0", 8);
+	put(p, 8, CLUSTER_RECOVERY_REGISTRY_RESERVATION_FORMAT_ID_V1, 4);
+	put(p, 12, CLUSTER_RECOVERY_REGISTRY_WITH_RESERVATIONS_VERSION, 4);
+	put(p, 16, 256, 4); put(p, 20, r->catalog_version, 4);
+	put(p, 24, n, 8); put(p, 32, 256, 8); put(p, 40, coverage, 8);
+	put(p, 48, 256 + coverage, 8); put(p, 56, r->reservation_count, 8);
+	put(p, 64, CLUSTER_RECOVERY_REGISTRY_RESERVATION_RECORD_VERSION_V1, 4);
+	put(p, 68, 256, 4);
+	if (!cluster_recovery_registry_encode_v2(&r->available, p + 256, coverage, p + 128))
+		return false;
+	for (uint64 i = 0; i < r->reservation_count; i++) {
+		const ClusterRecoveryFileReservationV1 *v = &r->reservations[i];
+		uint8 *record = p + 256 + coverage + (Size)i * 256;
+		ClusterRecoveryCheckpointSourceV2 owner;
+		uint8 encoded_owner[288];
+		memset(&owner, 0, sizeof(owner));
+		owner.source.claim.identity = v->creation_owner;
+		source_bytes(&owner, encoded_owner);
+		if (!cluster_recovery_file_identity_encode_v2(&v->expected, record, 128))
+			return false;
+		memcpy(record + 128, v->batch_uuid, 16);
+		memcpy(record + 144, encoded_owner, 80);
+		put(record, 224, v->owner_generation, 8);
+		put(record, 232, v->state, 4);
+		put(record, 236, CLUSTER_RECOVERY_REGISTRY_RESERVATION_RECORD_VERSION_V1, 4);
+	}
+	put(p, 72, crc(p + 256, n - 256), 4);
+	put(p, 76, crc(p, 256), 4);
+	memcpy(ref, p + 128, 128);
+	memcpy(ref, "PRCREF3\0", 8);
+	put(ref, 8, CLUSTER_RECOVERY_REGISTRY_RESERVATION_FORMAT_ID_V1, 4);
+	put(ref, 12, CLUSTER_RECOVERY_REGISTRY_WITH_RESERVATIONS_VERSION, 4);
+	put(ref, 48, n, 8);
+	sha(p, n, ref + 72);
+	put(ref, 104, 0, 4);
+	put(ref, 108, CLUSTER_RECOVERY_REGISTRY_RESERVATION_RECORD_VERSION_V1, 4);
+	put(ref, 112, r->reservation_count, 8);
+	put(ref, 120, r->catalog_version, 4);
+	put(ref, 104, crc(ref, 128), 4);
+	return true;
+}
+bool cluster_recovery_registry_encode_v3(const ClusterRecoveryRegistryV3 *r, uint8 *p, Size n,
+											uint8 ref[128])
+{
+	uint8 *bytes, reference[128];
+	Size size, coverage;
+	bool ok;
+	if (!p || !ref || !valid_v3(r, n, &size, &coverage) || size != n ||
+		aliases_v3(r, p, n) || aliases_v3(r, ref, 128) || overlap(p, n, ref, 128))
+		return false;
+	bytes = malloc(n);
+	if (!bytes) return false;
+	ok = build_v3(r, bytes, n, reference);
+	if (ok) { memcpy(p, bytes, n); memcpy(ref, reference, 128); }
+	free(bytes);
+	return ok;
+}
+bool cluster_recovery_registry_reference_valid_v3(const uint8 ref[128], uint32 catalog)
+{
+	uint8 tmp[128];
+	Size minimum = 512;
+	uint64 n;
+	if (!ref || memcmp(ref, "PRCREF3\0", 8) || nonzero(ref + 124, 4) ||
+		!nonzero(ref + 72, 32) || get(ref, 120, 4) != catalog ||
+		!cluster_recovery_registry_reservation_format_registered_v1(get(ref, 8, 4),
+			get(ref, 12, 4), get(ref, 108, 4), catalog))
+		return false;
+	for (int i = 16; i < 48; i += 8)
+		if (!counter(get(ref, i, 8))) return false;
+	n = get(ref, 48, 8);
+	if (n > SIZE_MAX || !get(ref, 56, 8) || !get(ref, 64, 8) ||
+		!extend(&minimum, get(ref, 56, 8), 288, (Size)n) ||
+		!extend(&minimum, get(ref, 64, 8), 232, (Size)n) ||
+		!extend(&minimum, get(ref, 112, 8), 256, (Size)n))
+		return false;
+	memcpy(tmp, ref, 128); memset(tmp + 104, 0, 4);
+	return get(ref, 104, 4) == crc(tmp, 128);
+}
+bool cluster_recovery_registry_matches_v3(const uint8 *p, Size n,
+											const ClusterRecoveryRegistryV3 *r, const uint8 ref[128])
+{
+	uint8 *expected, reference[128];
+	Size size, coverage;
+	bool ok;
+	if (!p || !valid_v3(r, n, &size, &coverage) || size != n ||
+		!cluster_recovery_registry_reference_valid_v3(ref, r->catalog_version) ||
+		aliases_v3(r, p, n) || aliases_v3(r, ref, 128) || overlap(p, n, ref, 128))
+		return false;
+	expected = malloc(n);
+	if (!expected) return false;
+	ok = build_v3(r, expected, n, reference) && !memcmp(p, expected, n) && !memcmp(ref, reference, 128);
+	free(expected);
+	return ok;
+}
+struct ClusterRecoveryRegistryDecodedV3 {
+	ClusterRecoveryRegistryV3 registry;
+	ClusterRecoveryRegistryDecodedV2 *coverage;
+	ClusterRecoveryFileReservationV1 *reservations;
+};
+const ClusterRecoveryRegistryV3 *
+cluster_recovery_registry_view_v3(const ClusterRecoveryRegistryDecodedV3 *d)
+{
+	return d ? &d->registry : NULL;
+}
+void cluster_recovery_registry_destroy_v3(ClusterRecoveryRegistryDecodedV3 **owner)
+{
+	ClusterRecoveryRegistryDecodedV3 *d;
+	if (!owner || !(d = *owner)) return;
+	*owner = NULL;
+	cluster_recovery_registry_destroy_v2(&d->coverage);
+	free(d->reservations);
+	free(d);
+}
+bool cluster_recovery_registry_decode_v3(const uint8 *p, Size n, const uint8 ref[128],
+										 uint32 catalog, Size budget, ClusterRecoveryRegistryDecodedV3 **out)
+{
+	ClusterRecoveryRegistryDecodedV3 *d = NULL;
+	uint64 old, count;
+	Size size;
+	bool ok = false;
+	if (!p || !out || !ref || overlap(p, n, out, sizeof(*out)) ||
+		overlap(ref, 128, out, sizeof(*out)) || overlap(p, n, ref, 128) || *out ||
+		n < 512 || n > budget || !cluster_recovery_registry_reference_valid_v3(ref, catalog) ||
+		get(ref, 48, 8) != n || get(p, 24, 8) != n || get(p, 32, 8) != 256)
+		return false;
+	old = get(p, 40, 8); count = get(p, 56, 8); size = 256;
+	if (old < 256 || !extend(&size, old, 1, n) || get(p, 48, 8) != size ||
+		count > SIZE_MAX / sizeof(ClusterRecoveryFileReservationV1) ||
+		!extend(&size, count, 256, n) || size != n)
+		return false;
+	d = calloc(1, sizeof(*d));
+	if (!d) return false;
+	if (!cluster_recovery_registry_decode_v2(p + 256, (Size)old, p + 128, budget, &d->coverage))
+		goto done;
+	d->registry.available = *cluster_recovery_registry_view_v2(d->coverage);
+	d->registry.catalog_version = catalog;
+	d->registry.reservation_count = count;
+	if (count && !(d->reservations = calloc((Size)count, sizeof(*d->reservations)))) goto done;
+	d->registry.reservations = d->reservations;
+	for (uint64 i = 0; i < count; i++) {
+		const uint8 *record = p + 256 + (Size)old + (Size)i * 256;
+		ClusterRecoveryFileReservationV1 *v = &d->reservations[i];
+		ClusterRecoveryCheckpointSourceV2 owner = {0};
+		uint8 encoded_owner[288] = {0};
+		if (!cluster_recovery_file_identity_decode_v2(record, 128, &v->expected)) goto done;
+		memcpy(v->batch_uuid, record + 128, 16);
+		memcpy(encoded_owner, record + 144, 80);
+		decode_source(encoded_owner, &owner);
+		v->creation_owner = owner.source.claim.identity;
+		v->owner_generation = get(record, 224, 8);
+		v->state = get(record, 232, 4);
+	}
+	ok = cluster_recovery_registry_matches_v3(p, n, &d->registry, ref);
+	if (ok) { *out = d; d = NULL; }
+done:
+	cluster_recovery_registry_destroy_v3(&d);
+	return ok;
+}
+
+#ifdef WIN32
+bool cluster_recovery_registry_create_v3(int dir, const ClusterRecoveryRegistryV3 *r, Size b,
+											uint8 ref[128]) { return false; }
+bool cluster_recovery_registry_load_selected_v3(int dir, const uint8 ref[128], uint32 c, Size b,
+													  ClusterRecoveryRegistryDecodedV3 **out) { return false; }
+#else
+static void registry_name_v3(const uint8 ref[128], char name[56])
+{
+	registry_name(ref, name);
+	name[strlen(name) - 1] = '3';
+}
+bool cluster_recovery_registry_create_v3(int global, const ClusterRecoveryRegistryV3 *r, Size budget,
+											uint8 output[128])
+{
+	int dir = -1, fd = -1;
+	Size n;
+	uint8 *bytes = NULL, *readback = NULL, ref[128];
+	char name[56];
+	bool ok = false;
+	struct stat before, after;
+	if (!output || !cluster_recovery_registry_size_v3(r, budget, &n) || n > PG_INT64_MAX ||
+		aliases_v3(r, output, 128) || !directory_safe(global)) return false;
+	bytes = malloc(n); readback = malloc(n);
+	if (!bytes || !readback || !build_v3(r, bytes, n, ref)) goto done;
+	if (mkdirat(global, "pgrac_recovery_registry", 0700) != 0 && errno != EEXIST) goto done;
+	dir = openat(global, "pgrac_recovery_registry", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (dir < 0 || !current_directory(global, dir)) goto done;
+	registry_name_v3(ref, name);
+	fd = openat(dir, name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY, 0600);
+	if (fd < 0 || !exact_io(fd, bytes, n, true) || registry_sync(fd) ||
+		registry_sync(dir) || registry_sync(global) || !current_file(dir, name, fd, n) ||
+		fstat(fd, &before)) goto done;
+	for (int pass = 0; pass < 2; pass++)
+		if (!exact_io(fd, readback, n, false) || memcmp(bytes, readback, n) ||
+			!current_file(dir, name, fd, n) || fstat(fd, &after) || !same_stat(&before, &after)) goto done;
+	ok = current_directory(global, dir) && cluster_recovery_registry_matches_v3(readback, n, r, ref);
+done:
+	if (fd >= 0 && close(fd)) ok = false;
+	if (ok) ok = fstatat(dir, name, &after, AT_SYMLINK_NOFOLLOW) == 0 && same_stat(&before, &after) &&
+		current_directory(global, dir) && cluster_recovery_registry_matches_v3(readback, n, r, ref);
+	if (dir >= 0 && close(dir)) ok = false;
+	if (ok) memcpy(output, ref, 128);
+	free(readback); free(bytes);
+	return ok;
+}
+bool cluster_recovery_registry_load_selected_v3(int global, const uint8 ref[128], uint32 catalog,
+													  Size budget, ClusterRecoveryRegistryDecodedV3 **out)
+{
+	int dir = -1, fd = -1;
+	Size n;
+	bool ok = false;
+	uint8 *bytes = NULL, *again = NULL;
+	char name[56];
+	struct stat before, after;
+	ClusterRecoveryRegistryDecodedV3 *d = NULL;
+	if (!out || !ref || overlap(ref, 128, out, sizeof(*out)) || *out ||
+		!cluster_recovery_registry_reference_valid_v3(ref, catalog) ||
+		get(ref, 48, 8) > budget || get(ref, 48, 8) > PG_INT64_MAX || !directory_safe(global)) return false;
+	n = (Size)get(ref, 48, 8);
+	bytes = malloc(n); again = malloc(n);
+	if (!bytes || !again) goto done;
+	dir = openat(global, "pgrac_recovery_registry", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (dir < 0 || !current_directory(global, dir)) goto done;
+	registry_name_v3(ref, name);
+	fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY);
+	if (fd < 0 || !current_file(dir, name, fd, n) || fstat(fd, &before) ||
+		!exact_io(fd, bytes, n, false) || !exact_io(fd, again, n, false) || memcmp(bytes, again, n) ||
+		!current_file(dir, name, fd, n) || fstat(fd, &after) || !same_stat(&before, &after) ||
+		!current_directory(global, dir) ||
+		!cluster_recovery_registry_decode_v3(bytes, n, ref, catalog, budget, &d)) goto done;
+	ok = true;
+done:
+	if (fd >= 0 && close(fd)) ok = false;
+	if (ok) ok = fstatat(dir, name, &after, AT_SYMLINK_NOFOLLOW) == 0 && same_stat(&before, &after) &&
+		current_directory(global, dir);
+	if (dir >= 0 && close(dir)) ok = false;
+	if (ok) { *out = d; d = NULL; }
+	cluster_recovery_registry_destroy_v3(&d);
+	free(again); free(bytes);
 	return ok;
 }
 #endif

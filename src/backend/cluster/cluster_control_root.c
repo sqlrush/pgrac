@@ -51,6 +51,7 @@
 #include "cluster_control_root_private.h"
 #include "cluster_control_root_registry_private.h"
 #include "cluster/cluster_control_file_identity.h"
+#include "cluster/cluster_control_registry_batch.h"
 #include "cluster/cluster_relmap_checkpoint.h"
 #include "cluster_recovery_anchor_private.h"
 #include "cluster/cluster_relmap_checkpoint.h"
@@ -4522,7 +4523,7 @@ fsync_parent_global(void)
 }
 
 static bool
-write_durable_image(const char *final_path, const uint8 *bytes)
+write_durable_image_size(const char *final_path, const uint8 *bytes, Size length)
 {
 	uint8 random_bytes[8];
 	char temp_path[MAXPGPATH];
@@ -4535,7 +4536,8 @@ write_durable_image(const char *final_path, const uint8 *bytes)
 	bool renamed = false;
 	bool ok = false;
 
-	if (!regular_or_absent_nosymlink(final_path, true) || !pg_strong_random(random_bytes, 8))
+	if ((length != CLUSTER_CONTROL_ROOT_FILE_BYTES && length != 66560)
+		|| !regular_or_absent_nosymlink(final_path, true) || !pg_strong_random(random_bytes, 8))
 		return false;
 	for (i = 0; i < 8; i++)
 		snprintf(suffix + i * 2, 3, "%02x", random_bytes[i]);
@@ -4551,8 +4553,8 @@ write_durable_image(const char *final_path, const uint8 *bytes)
 	if (fd < 0)
 		return false;
 	created = true;
-	while (done < CLUSTER_CONTROL_ROOT_FILE_BYTES) {
-		ssize_t n = write(fd, bytes + done, CLUSTER_CONTROL_ROOT_FILE_BYTES - done);
+	while (done < length) {
+		ssize_t n = write(fd, bytes + done, length - done);
 
 		if (n <= 0)
 			goto cleanup;
@@ -4574,11 +4576,28 @@ write_durable_image(const char *final_path, const uint8 *bytes)
 	if (!fsync_parent_global())
 		goto cleanup_closed;
 	{
-		uint8 *readback = palloc(CLUSTER_CONTROL_ROOT_FILE_BYTES);
-		ClusterControlRootResult result = read_exact_file(final_path, readback);
-
-		ok = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			 && memcmp(readback, bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) == 0;
+		uint8 *readback = palloc(length);
+		if (length == CLUSTER_CONTROL_ROOT_FILE_BYTES) {
+			ClusterControlRootResult result = read_exact_file(final_path, readback);
+			ok = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !memcmp(readback, bytes, length);
+		} else {
+			int held = OpenTransientFile(final_path, O_RDONLY | O_NOFOLLOW | PG_BINARY);
+			struct stat st;
+			Size read = 0;
+			bool closed;
+			while (held >= 0 && read < length) {
+				ssize_t n = pread(held, readback + read, length - read, read);
+				if (n < 0 && errno == EINTR)
+					continue;
+				if (n <= 0)
+					break;
+				read += n;
+			}
+			ok = held >= 0 && read == length && fstat(held, &st) == 0 && S_ISREG(st.st_mode)
+				 && st.st_size == length && !memcmp(readback, bytes, length);
+			closed = held >= 0 && CloseTransientFile(held) == 0;
+			ok = ok && closed;
+		}
 		pfree(readback);
 	}
 	return ok;
@@ -4590,6 +4609,12 @@ cleanup_closed:
 	if (created && !renamed)
 		(void)unlink(temp_path);
 	return false;
+}
+
+static bool
+write_durable_image(const char *final_path, const uint8 *bytes)
+{
+	return write_durable_image_size(final_path, bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES);
 }
 
 static bool
@@ -13607,11 +13632,46 @@ typedef struct ControlFileSelectionWorkV4 {
 	ControlRootImage root;
 	ControlFileData common;
 	ClusterRecoveryRegistryDecodedV2 *decoded;
+	ClusterRecoveryRegistryDecodedV3 *reservations;
 	uint8 pair[133120], recheck[133120];
 	ClusterRecoveryFileIdentityV2 selected;
 	ClusterSharedConfigRef expected;
 	ClusterControlFileKeyV2 key;
 } ControlFileSelectionWorkV4;
+static const ClusterRecoveryRegistryV2 *
+control_file_registry_v4(const ControlFileSelectionWorkV4 *w)
+{
+	const ClusterRecoveryRegistryV3 *r = cluster_recovery_registry_view_v3(w->reservations);
+	return r ? &r->available : cluster_recovery_registry_view_v2(w->decoded);
+}
+static void
+control_file_registry_destroy_v4(ControlFileSelectionWorkV4 *w)
+{
+	cluster_recovery_registry_destroy_v3(&w->reservations);
+	cluster_recovery_registry_destroy_v2(&w->decoded);
+}
+static bool
+control_file_registry_load_v4(ControlFileSelectionWorkV4 *w, Size budget)
+{
+	if (cluster_recovery_registry_reference_valid_v2(w->pair + 512))
+		return cluster_recovery_registry_load_selected_v2(w->directory, w->pair + 512, budget,
+														  &w->decoded);
+	return cluster_recovery_registry_load_selected_v3(
+		w->directory, w->pair + 512, w->common.catalog_version_no, budget, &w->reservations);
+}
+static bool
+control_file_registry_read_v4(ControlFileSelectionWorkV4 *w, Size budget)
+{
+	ClusterRecoveryRegistryDecodedV3 *fresh = NULL;
+	bool ok;
+	if (!w->reservations)
+		return cluster_recovery_registry_read_v2(w->directory, control_file_registry_v4(w),
+												 w->pair + 512, budget);
+	ok = cluster_recovery_registry_load_selected_v3(w->directory, w->pair + 512,
+													w->common.catalog_version_no, budget, &fresh);
+	cluster_recovery_registry_destroy_v3(&fresh);
+	return ok;
+}
 static ClusterControlRootResult
 control_file_dependencies_v4(const ClusterSharedConfigRef *expected, ControlFileSelectionWorkV4 *w)
 {
@@ -13659,10 +13719,9 @@ control_file_select_v4(const ClusterSharedConfigRef *expected, const ClusterCont
 	result = control_file_dependencies_v4(expected, w);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!cluster_recovery_registry_load_selected_v2(w->directory, w->pair + 512, budget,
-													&w->decoded))
+	if (!control_file_registry_load_v4(w, budget))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	r = cluster_recovery_registry_view_v2(w->decoded);
+	r = control_file_registry_v4(w);
 	if (r->system_identifier != expected->identity.system_identifier
 		|| r->database_incarnation != expected->identity.database_incarnation
 		|| memcmp(r->storage_uuid, expected->identity.storage_uuid, 16)
@@ -13756,14 +13815,14 @@ cluster_control_root_file_identity_read_locked_v4(const ClusterSharedConfigRef *
 	}
 	PG_CATCH();
 	{
-		cluster_recovery_registry_destroy_v2(&w->decoded);
+		control_file_registry_destroy_v4(w);
 		if (w->directory >= 0)
 			CloseTransientFile(w->directory);
 		pfree(w);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	cluster_recovery_registry_destroy_v2(&w->decoded);
+	control_file_registry_destroy_v4(w);
 	if (w->directory >= 0 && CloseTransientFile(w->directory))
 		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	if (!cluster_cf_held_is_clusterwide(ShareLock)
@@ -13784,6 +13843,7 @@ struct ClusterControlRelmapSelectionV2 {
 	uint64 cf_sequence;
 	char path[MAXPGPATH];
 	bool failed;
+	bool mutation_attempted;
 };
 
 static bool control_relmap_live_v4(ClusterControlRelmapSelectionV2 *s)
@@ -13816,28 +13876,28 @@ static bool control_relmap_first_v4(const ClusterRecoveryCheckpointCoverageV2 *c
 	return true;
 }
 
-static bool control_relmap_inventory_v4(ClusterControlRelmapSelectionV2 *s)
+static bool
+control_relmap_inventory_contents_v4(const ClusterRecoveryRegistryV2 *r, ControlRootImage *root,
+									 const ClusterSharedConfigRef *expected, uint64 *count)
 {
-	const ClusterRecoveryRegistryV2 *r = cluster_recovery_registry_view_v2(s->work.decoded);
 	const ClusterRecoveryCheckpointCoverageV2 *c = &r->coverage;
-	ControlRootImage *root = &s->work.root;
-	uint64 selected[2] = {0, 0};
+	uint64 selected[2] = { 0, 0 };
 	bool shared = false;
-	if (r->system_identifier != s->work.expected.identity.system_identifier ||
-		r->database_incarnation != s->work.expected.identity.database_incarnation ||
-		memcmp(r->storage_uuid, s->work.expected.identity.storage_uuid, 16) ||
-		c->control_generation != root->header.file_txn_seq)
+	if (r->system_identifier != expected->identity.system_identifier
+		|| r->database_incarnation != expected->identity.database_incarnation
+		|| memcmp(r->storage_uuid, expected->identity.storage_uuid, 16)
+		|| c->control_generation != root->header.file_txn_seq)
 		return false;
 	for (uint64 i = 0; i < c->source_count; i++) {
 		const ClusterWalSourceRef *source = &c->sources[i].source;
 		unsigned node = source->claim.identity.origin_node_id;
-		if (node >= 128 || !root->present[node] ||
-			!(root->header.v2.configured[node / 64] & (UINT64_C(1) << (node % 64))) ||
-			memcmp(source->claim.identity.authority_uuid, root->header.authority_uuid, 16))
+		if (node >= 128 || !root->present[node]
+			|| !(root->header.v2.configured[node / 64] & (UINT64_C(1) << (node % 64)))
+			|| memcmp(source->claim.identity.authority_uuid, root->header.authority_uuid, 16))
 			return false;
 		if (cluster_control_root_identity_equal(&source->claim.identity,
-												&root->records[node].identity) &&
-			!memcmp(source->claim.claim_sha256, root->refs[node].claim_sha256, 32))
+												&root->records[node].identity)
+			&& !memcmp(source->claim.claim_sha256, root->refs[node].claim_sha256, 32))
 			selected[node / 64] |= UINT64_C(1) << (node % 64);
 	}
 	if (memcmp(selected, root->header.v2.configured, sizeof(selected)))
@@ -13847,11 +13907,11 @@ static bool control_relmap_inventory_v4(ClusterControlRelmapSelectionV2 *s)
 		uint8 bytes[128];
 		if (f->identity.kind != CLUSTER_RECOVERY_FILE_RELMAP_V2)
 			continue;
-		if (f->copy_count != 2 || f->first_page || f->page_count != 1 || f->synced_bytes != 2304 ||
-			!OidIsValid(f->identity.tablespace_oid) || !root->present[f->identity.origin] ||
-			!(root->header.v2.configured[f->identity.origin / 64] &
-			  (UINT64_C(1) << (f->identity.origin % 64))) ||
-			!cluster_recovery_file_identity_encode_v2(&f->identity, bytes, sizeof(bytes)))
+		if (f->copy_count != 2 || f->first_page || f->page_count != 1 || f->synced_bytes != 2304
+			|| !OidIsValid(f->identity.tablespace_oid) || !root->present[f->identity.origin]
+			|| !(root->header.v2.configured[f->identity.origin / 64]
+				 & (UINT64_C(1) << (f->identity.origin % 64)))
+			|| !cluster_recovery_file_identity_encode_v2(&f->identity, bytes, sizeof(bytes)))
 			return false;
 		if (!OidIsValid(f->identity.database_oid)) {
 			if (f->identity.tablespace_oid != GLOBALTABLESPACE_OID || f->identity.object_id)
@@ -13860,25 +13920,38 @@ static bool control_relmap_inventory_v4(ClusterControlRelmapSelectionV2 *s)
 		} else if (f->identity.tablespace_oid == GLOBALTABLESPACE_OID)
 			return false;
 		for (uint64 j = 0; j < i; j++)
-			if (control_relmap_address_v4(&f->identity, &c->files[j].identity) &&
-				!cluster_recovery_file_identity_matches_v2(bytes, sizeof(bytes),
-														   &c->files[j].identity))
+			if (control_relmap_address_v4(&f->identity, &c->files[j].identity)
+				&& !cluster_recovery_file_identity_matches_v2(bytes, sizeof(bytes),
+															  &c->files[j].identity))
 				return false;
 		if (control_relmap_first_v4(c, i))
-			s->count++;
+			(*count)++;
 	}
-	return shared && s->count != 0;
+	return shared && *count != 0;
 }
 
-static bool control_relmap_distinct_v4(const ClusterControlRelmapSelectionV2 *s, const void *out,
-									   Size n)
+static bool
+control_relmap_inventory_v4(ClusterControlRelmapSelectionV2 *s)
 {
-	const ClusterRecoveryRegistryV2 *r = cluster_recovery_registry_view_v2(s->work.decoded);
+	return control_relmap_inventory_contents_v4(control_file_registry_v4(&s->work), &s->work.root,
+												&s->work.expected, &s->count);
+}
+
+static bool
+control_relmap_distinct_v4(const ClusterControlRelmapSelectionV2 *s, const void *out, Size n)
+{
+	const ClusterRecoveryRegistryV2 *r = control_file_registry_v4(&s->work);
 	const ClusterRecoveryCheckpointCoverageV2 *c = &r->coverage;
-	if (!out || history_ranges_overlap(s, sizeof(*s), out, n) ||
-		history_ranges_overlap(r, sizeof(*r), out, n) ||
-		history_ranges_overlap(c->sources, c->source_count * sizeof(*c->sources), out, n) ||
-		history_ranges_overlap(c->files, c->file_count * sizeof(*c->files), out, n))
+	const ClusterRecoveryRegistryV3 *v3 = cluster_recovery_registry_view_v3(s->work.reservations);
+	if (v3
+		&& (history_ranges_overlap(v3, sizeof(*v3), out, n)
+			|| history_ranges_overlap(v3->reservations,
+									  v3->reservation_count * sizeof(*v3->reservations), out, n)))
+		return false;
+	if (!out || history_ranges_overlap(s, sizeof(*s), out, n)
+		|| history_ranges_overlap(r, sizeof(*r), out, n)
+		|| history_ranges_overlap(c->sources, c->source_count * sizeof(*c->sources), out, n)
+		|| history_ranges_overlap(c->files, c->file_count * sizeof(*c->files), out, n))
 		return false;
 	for (uint64 i = 0; i < c->file_count; i++)
 		if (history_ranges_overlap(c->files[i].sources,
@@ -13906,7 +13979,7 @@ cluster_control_root_relmap_selection_destroy_v4(ClusterControlRelmapSelectionV2
 		return;
 	*out = NULL;
 	s->failed = true;
-	cluster_recovery_registry_destroy_v2(&s->work.decoded);
+	control_file_registry_destroy_v4(&s->work);
 	if (s->work.directory >= 0)
 		CloseTransientFile(s->work.directory);
 	pfree(s);
@@ -13933,9 +14006,7 @@ cluster_control_root_relmap_selection_recheck_locked_v4(ClusterControlRelmapSele
 			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 				result = control_file_dependencies_v4(&s->work.expected, &s->work);
 			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
-				!cluster_recovery_registry_read_v2(
-					s->work.directory, cluster_recovery_registry_view_v2(s->work.decoded),
-					s->work.pair + 512, s->budget))
+				!control_file_registry_read_v4(&s->work, s->budget))
 				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
 				(!cluster_control_root_registry_capture_v4(
@@ -14020,8 +14091,7 @@ cluster_control_root_relmap_selection_read_locked_v4(
 				 r->header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING)) {
 				result = control_file_dependencies_v4(&captured, &s->work);
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-					if (!cluster_recovery_registry_load_selected_v2(
-							s->work.directory, s->work.pair + 512, budget, &s->work.decoded))
+					if (!control_file_registry_load_v4(&s->work, budget))
 						result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 					else if (!control_relmap_inventory_v4(s))
 						result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
@@ -14035,7 +14105,7 @@ cluster_control_root_relmap_selection_read_locked_v4(
 	}
 	PG_CATCH();
 	{
-		cluster_recovery_registry_destroy_v2(&s->work.decoded);
+		control_file_registry_destroy_v4(&s->work);
 		if (s->work.directory >= 0)
 			CloseTransientFile(s->work.directory);
 		pfree(s);
@@ -14045,7 +14115,7 @@ cluster_control_root_relmap_selection_read_locked_v4(
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = s;
 	else {
-		cluster_recovery_registry_destroy_v2(&s->work.decoded);
+		control_file_registry_destroy_v4(&s->work);
 		if (s->work.directory >= 0)
 			CloseTransientFile(s->work.directory);
 		pfree(s);
@@ -14068,7 +14138,7 @@ cluster_control_root_relmap_selection_at_v4(ClusterControlRelmapSelectionV2 *s, 
 	if (!control_relmap_live_v4(s) || at >= s->count ||
 		!control_relmap_distinct_v4(s, out, sizeof(*out)))
 		return false;
-	c = &cluster_recovery_registry_view_v2(s->work.decoded)->coverage;
+	c = &control_file_registry_v4(&s->work)->coverage;
 	for (uint64 i = 0; i < c->file_count; i++)
 		if (control_relmap_first_v4(c, i) && index++ == at) {
 			*out = c->files[i].identity;
@@ -14098,7 +14168,7 @@ uint64
 cluster_control_root_relmap_selection_source_count_v4(ClusterControlRelmapSelectionV2 *s)
 {
 	return control_relmap_live_v4(s)
-			   ? cluster_recovery_registry_view_v2(s->work.decoded)->coverage.source_count
+			   ? control_file_registry_v4(&s->work)->coverage.source_count
 			   : 0;
 }
 
@@ -14111,7 +14181,7 @@ cluster_control_root_relmap_selection_source_at_v4(ClusterControlRelmapSelection
 		at >= cluster_control_root_relmap_selection_source_count_v4(s) ||
 		!control_relmap_distinct_v4(s, out, sizeof(*out)))
 		return false;
-	*out = cluster_recovery_registry_view_v2(s->work.decoded)->coverage.sources[at];
+	*out = control_file_registry_v4(&s->work)->coverage.sources[at];
 	return true;
 }
 
@@ -14150,7 +14220,7 @@ cluster_control_root_relmap_selection_reference_v4(ClusterControlRelmapSelection
 	memset(&value, 0, sizeof(value));
 	value.config = s->work.expected;
 	value.logical_count = s->count;
-	value.source_count = cluster_recovery_registry_view_v2(s->work.decoded)->coverage.source_count;
+	value.source_count = control_file_registry_v4(&s->work)->coverage.source_count;
 	memcpy(value.registry_reference, s->work.pair + 512, sizeof(value.registry_reference));
 	if (!control_root_sha256(s->work.pair, sizeof(s->work.pair), value.root_pair_sha256)) {
 		s->failed = true;
@@ -14255,11 +14325,400 @@ cluster_control_root_native_files_copy_v4(ClusterControlRelmapSelectionV2 *s,
 		!control_relmap_distinct_v4(s, count, sizeof(*count)) ||
 		history_ranges_overlap(out, capacity * sizeof(*out), count, sizeof(*count)))
 		return false;
-	c = &cluster_recovery_registry_view_v2(s->work.decoded)->coverage;
+	c = &control_file_registry_v4(&s->work)->coverage;
 	if (!c->file_count || c->file_count > capacity)
 		return false;
 	for (uint64 i = 0; i < c->file_count; i++)
 		out[i] = c->files[i].identity;
 	*count = c->file_count;
 	return true;
+}
+
+/* Runtime batch updates retain the original CF-X owner and physical writer. */
+static ClusterControlRootResult
+control_registry_owner_v4(ClusterControlRelmapSelectionV2 *s, uint64 epoch, uint64 incarnation,
+						  bool admitted)
+{
+	ControlRootImage *r = &s->work.root;
+	ClusterRecoveryAnchorRefV2 anchor = { 0 };
+	ClusterWalThreadClaimRefV2 claim_ref = { 0 };
+	ClusterWalThreadClaimV2 claim;
+	ControlFileData thread;
+	ClusterControlRootResult result;
+	int node = cluster_node_id;
+	if (!control_relmap_live_v4(s) || !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = runtime_v2_owner_check(epoch, incarnation, admitted);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!r->present[node] || r->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| r->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| !(r->header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64)))
+		|| r->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (r->records[node].identity.origin_node_id != node
+		|| r->records[node].identity.origin_thread_id != node + 1
+		|| r->records[node].identity.origin_owner_incarnation != incarnation)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	for (int i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; i++)
+		if (r->startup[i].generation)
+			return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	/* Same physical claim/anchor and original native state as the original
+  * config publisher. Metadata is ROOTv4 throughout; no v3 token is minted. */
+	claim_ref.identity = r->records[node].identity;
+	claim_ref.database_incarnation = r->header.v2.database_incarnation;
+	claim_ref.max_config_generation = r->header.v2.config_generation;
+	memcpy(claim_ref.claim_sha256, r->refs[node].claim_sha256, 32);
+	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &claim_ref, &claim);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	anchor.identity = claim_ref.identity;
+	anchor.database_incarnation = claim_ref.database_incarnation;
+	anchor.max_config_generation = claim_ref.max_config_generation;
+	anchor.anchor_generation = r->refs[node].anchor_generation;
+	memcpy(anchor.anchor_sha256, r->refs[node].anchor_sha256, 32);
+	memcpy(anchor.claim_sha256, claim_ref.claim_sha256, 32);
+	result = cluster_recovery_anchor_v2_read_locked(&anchor, &s->work.common, &thread);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_recovery_anchor_v2_thread_state(&anchor, &r->records[node], &thread);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (thread.state != DB_IN_PRODUCTION)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	return runtime_v2_owner_check(epoch, incarnation, admitted);
+}
+static bool
+control_registry_identity_v4(const ClusterRecoveryFileIdentityV2 *a,
+							 const ClusterRecoveryFileIdentityV2 *b)
+{
+	uint8 bytes[128];
+	return cluster_recovery_file_identity_encode_v2(a, bytes, sizeof(bytes))
+		   && cluster_recovery_file_identity_matches_v2(bytes, sizeof(bytes), b);
+}
+uint64
+cluster_control_root_registry_reservation_count_v4(ClusterControlRelmapSelectionV2 *s)
+{
+	const ClusterRecoveryRegistryV3 *r;
+	if (!control_relmap_live_v4(s))
+		return 0;
+	r = cluster_recovery_registry_view_v3(s->work.reservations);
+	return r ? r->reservation_count : 0;
+}
+bool
+cluster_control_root_registry_reservation_at_v4(ClusterControlRelmapSelectionV2 *s, uint64 at,
+												ClusterRecoveryFileReservationV1 *out)
+{
+	const ClusterRecoveryRegistryV3 *r;
+	if (!control_relmap_live_v4(s) || !control_relmap_distinct_v4(s, out, sizeof(*out)))
+		return false;
+	r = cluster_recovery_registry_view_v3(s->work.reservations);
+	if (!r || at >= r->reservation_count)
+		return false;
+	*out = r->reservations[at];
+	return true;
+}
+bool
+cluster_control_root_reserved_file_locked_v4(ClusterControlRelmapSelectionV2 *s,
+											 const uint8 batch[16],
+											 const ClusterRecoveryFileIdentityV2 *expected,
+											 ClusterRecoveryFileIdentityV2 *out)
+{
+	const ClusterRecoveryRegistryV3 *r;
+	ClusterRecoveryFileIdentityV2 value;
+	uint64 epoch = cluster_epoch_get_current(), incarnation = cluster_qvotec_get_self_incarnation();
+	bool found = false;
+	if (!batch || !expected || !control_relmap_live_v4(s)
+		|| !control_relmap_distinct_v4(s, out, sizeof(*out))
+		|| history_ranges_overlap(batch, 16, out, sizeof(*out))
+		|| history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out))
+		|| control_registry_owner_v4(s, epoch, incarnation, false) != 0)
+		return false;
+	r = cluster_recovery_registry_view_v3(s->work.reservations);
+	if (!r)
+		return false;
+	for (uint64 i = 0; i < r->reservation_count; i++) {
+		const ClusterRecoveryFileReservationV1 *v = &r->reservations[i];
+		if (!memcmp(v->batch_uuid, batch, 16) && v->owner_generation == epoch
+			&& cluster_control_root_identity_equal(&v->creation_owner,
+												   &s->work.root.records[cluster_node_id].identity)
+			&& control_registry_identity_v4(&v->expected, expected)) {
+			value = v->expected;
+			found = true;
+		}
+	}
+	if (!found || cluster_control_root_relmap_selection_recheck_locked_v4(s) != 0
+		|| control_registry_owner_v4(s, epoch, incarnation, false) != 0)
+		return false;
+	*out = value;
+	return true;
+}
+typedef struct ControlRegistryBatchWorkV4 {
+	ClusterRecoveryFileReservationV1 *reservations;
+	ClusterRecoveryCheckpointFileV2 *files;
+	ClusterRecoveryRegistryDecodedV3 *frozen;
+	ClusterRecoveryRegistryDecodedV3 *verified;
+	ControlRootImage candidate;
+	uint8 root[66560], reference[128];
+	uint8 *encoded;
+} ControlRegistryBatchWorkV4;
+
+static bool
+control_registry_batch_build_v4(ClusterControlRelmapSelectionV2 *s,
+								const ClusterControlRegistryBatchV4 *change,
+								ControlRegistryBatchWorkV4 *w, uint64 epoch)
+{
+	const ClusterRecoveryRegistryV3 *old = cluster_recovery_registry_view_v3(s->work.reservations);
+	const ClusterRecoveryRegistryV2 *available = control_file_registry_v4(&s->work);
+	const ClusterRecoveryCheckpointCoverageV2 *c = &available->coverage;
+	const ClusterControlRootIdentity *owner = &s->work.root.records[cluster_node_id].identity;
+	ClusterRecoveryRegistryV3 next = { 0 };
+	uint64 count = old ? old->reservation_count : 0, matched = 0, retained = 0;
+	uint64 total, files;
+	Size length;
+	bool reserve = change->operation == CLUSTER_CONTROL_REGISTRY_RESERVE_V4;
+	bool complete = change->operation == CLUSTER_CONTROL_REGISTRY_COMPLETE_V4;
+	if (bytes_are_zero(change->batch_uuid, 16) || c->control_generation >= UINT64_MAX - 1
+		|| c->registration_generation >= UINT64_MAX - 1
+		|| s->work.common.catalog_version_no != CATALOG_VERSION_NO
+		|| (reserve && (!change->identity_count || !change->identities || change->receipt_count))
+		|| (!reserve && (change->identity_count || change->identities))
+		|| (complete && (!change->receipt_count || !change->receipts))
+		|| (!complete && (change->receipt_count || change->receipts))
+		|| (!reserve && !complete && change->operation != CLUSTER_CONTROL_REGISTRY_CANCEL_V4))
+		return false;
+	for (uint64 i = 0; i < count; i++)
+		if (!memcmp(old->reservations[i].batch_uuid, change->batch_uuid, 16)) {
+			const ClusterRecoveryFileReservationV1 *v = &old->reservations[i];
+			if (reserve || v->owner_generation != epoch
+				|| !cluster_control_root_identity_equal(&v->creation_owner, owner))
+				return false;
+			matched++;
+		}
+	if (!reserve && !matched)
+		return false;
+	if (change->identity_count > UINT64_MAX - count
+		|| change->receipt_count > UINT64_MAX - c->file_count)
+		return false;
+	total = count - matched + change->identity_count;
+	files = c->file_count + change->receipt_count;
+	/* Complete byte budget precedes vector allocation; nested intervals retain
+  * the original canonical validator. These are not active-pin slot counts. */
+	if (total > s->budget / sizeof(*w->reservations) || files > s->budget / sizeof(*w->files))
+		return false;
+	w->reservations = palloc0(Max((Size)1, total * sizeof(*w->reservations)));
+	w->files = palloc0(Max((Size)1, files * sizeof(*w->files)));
+	for (uint64 i = 0; i < count; i++)
+		if (memcmp(old->reservations[i].batch_uuid, change->batch_uuid, 16))
+			w->reservations[retained++] = old->reservations[i];
+	for (uint64 i = 0; i < change->identity_count; i++) {
+		ClusterRecoveryFileReservationV1 *v = &w->reservations[retained++];
+		v->expected = change->identities[i];
+		if (v->expected.registration_generation != c->registration_generation + 1)
+			return false;
+		memcpy(v->batch_uuid, change->batch_uuid, 16);
+		v->creation_owner = *owner;
+		v->owner_generation = epoch;
+		v->state = CLUSTER_RECOVERY_FILE_RESERVED_V1;
+	}
+	memcpy(w->files, c->files, c->file_count * sizeof(*w->files));
+	for (uint64 i = 0; i < change->receipt_count; i++) {
+		const ClusterRecoveryCheckpointFileV2 *f = &change->receipts[i];
+		bool found = false;
+		for (uint64 j = 0; j < count; j++)
+			if (!memcmp(old->reservations[j].batch_uuid, change->batch_uuid, 16)
+				&& control_registry_identity_v4(&old->reservations[j].expected, &f->identity))
+				found = true;
+		if (!found || f->copy_count != (f->identity.kind == CLUSTER_RECOVERY_FILE_RELMAP_V2 ? 2 : 1)
+			|| f->source_count != c->source_count)
+			return false;
+		for (uint64 j = 0; j < f->source_count; j++)
+			if (f->sources[j].source_index >= c->source_count
+				|| f->sources[j].redo_start != c->sources[f->sources[j].source_index].redo_start
+				|| f->sources[j].replay_end != c->sources[f->sources[j].source_index].replay_end)
+				return false;
+		w->files[c->file_count + i] = *f;
+	}
+	/* No missing logical file can be hidden by extra copies of another file. */
+	if (complete)
+		for (uint64 j = 0; j < count; j++)
+			if (!memcmp(old->reservations[j].batch_uuid, change->batch_uuid, 16)) {
+				uint64 copies = 0;
+				for (uint64 i = 0; i < change->receipt_count; i++)
+					if (control_registry_identity_v4(&old->reservations[j].expected,
+													 &change->receipts[i].identity))
+						copies++;
+				if (copies
+					!= (old->reservations[j].expected.kind == CLUSTER_RECOVERY_FILE_RELMAP_V2 ? 2
+																							  : 1))
+					return false;
+			}
+	next.available = *available;
+	next.available.coverage.control_generation++;
+	next.available.coverage.registration_generation++;
+	next.available.coverage.files = w->files;
+	next.available.coverage.file_count = files;
+	next.catalog_version = s->work.common.catalog_version_no;
+	next.reservations = w->reservations;
+	next.reservation_count = total;
+	if (!cluster_recovery_registry_size_v3(&next, s->budget, &length))
+		return false;
+	w->encoded = palloc(length);
+	if (!cluster_recovery_registry_encode_v3(&next, w->encoded, length, w->reference)
+		|| !cluster_recovery_registry_decode_v3(w->encoded, length, w->reference,
+												s->work.common.catalog_version_no, s->budget,
+												&w->frozen))
+		return false;
+	w->candidate = s->work.root;
+	w->candidate.header.file_txn_seq++;
+	w->candidate.header.published_at_usec = GetCurrentTimestamp();
+	/* Original v3 validator runs only in private scratch; physical candidate is v4. */
+	w->candidate.header.format_version = 3;
+	w->candidate.header.source_feature_bitmap &= ~CLUSTER_RECOVERY_CONTROL_ROOT_FEATURE;
+	w->candidate.header.target_feature_bitmap &= ~CLUSTER_RECOVERY_CONTROL_ROOT_FEATURE;
+	{
+		uint64 logical_count = 0;
+		const ClusterRecoveryRegistryV3 *frozen = cluster_recovery_registry_view_v3(w->frozen);
+		if (!control_relmap_inventory_contents_v4(&frozen->available, &w->candidate,
+												  &s->work.expected, &logical_count))
+			return false;
+		return cluster_control_root_reservations_encode_v4(&w->candidate, frozen, w->reference,
+														   w->root, sizeof(w->root));
+	}
+}
+static ClusterControlRootResult
+control_registry_batch_publish_v4(ClusterControlRelmapSelectionV2 *s,
+								  const ClusterControlRegistryBatchV4 *change,
+								  ControlRegistryBatchWorkV4 *w, uint64 epoch, uint64 incarnation)
+{
+	const ClusterRecoveryRegistryV3 *next;
+	ClusterControlRootResult result;
+	char primary[MAXPGPATH], backup[MAXPGPATH];
+	uint8 reference[128];
+	result = cluster_control_root_relmap_selection_recheck_locked_v4(s);
+	if (result != 0)
+		return result;
+	result = control_registry_owner_v4(s, epoch, incarnation, false);
+	if (result != 0)
+		return result;
+	if (!control_registry_batch_build_v4(s, change, w, epoch))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	next = cluster_recovery_registry_view_v3(w->frozen);
+	if (!cluster_recovery_registry_create_v3(s->work.directory, next, s->budget, reference)
+		|| memcmp(reference, w->reference, sizeof(reference)))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = cluster_control_root_relmap_selection_recheck_locked_v4(s);
+	if (result != 0)
+		return result;
+	result = control_registry_owner_v4(s, epoch, incarnation, true);
+	if (result != 0)
+		return result;
+	if (!build_control_path(primary, sizeof(primary), CLUSTER_CONTROL_ROOT_REL_PATH)
+		|| !build_control_path(backup, sizeof(backup), CLUSTER_CONTROL_ROOT_BAK_REL_PATH))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	/* Same original backup-old -> primary-new writer. There is no rollback.
+  * Recheck the exact physical cut between the two durable replacements. */
+	if (!write_durable_image_size(backup, s->work.pair, 66560))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (!cluster_control_root_registry_capture_v4(
+			s->work.directory, s->work.expected.identity.storage_uuid,
+			s->work.expected.identity.system_identifier, s->work.recheck, &s->work.root)
+		|| memcmp(s->work.recheck, s->work.pair, 66560)
+		|| memcmp(s->work.recheck + 66560, s->work.pair, 66560))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = control_registry_owner_v4(s, epoch, incarnation, true);
+	if (result != 0)
+		return result;
+	if (!write_durable_image_size(primary, w->root, sizeof(w->root)))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (!cluster_control_root_registry_capture_v4(
+			s->work.directory, s->work.expected.identity.storage_uuid,
+			s->work.expected.identity.system_identifier, s->work.recheck, &s->work.root)
+		|| memcmp(s->work.recheck, w->root, 66560)
+		|| memcmp(s->work.recheck + 66560, s->work.pair, 66560))
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	result = control_file_dependencies_v4(&s->work.expected, &s->work);
+	if (result != 0)
+		return result;
+	result = control_registry_owner_v4(s, epoch, incarnation, true);
+	if (result != 0)
+		return result;
+	if (!cluster_recovery_registry_load_selected_v3(s->work.directory, w->reference,
+													s->work.common.catalog_version_no, s->budget,
+													&w->verified))
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	/* Revisit both roots after the final native/common and immutable registry reads. */
+	if (!cluster_control_root_registry_capture_v4(
+			s->work.directory, s->work.expected.identity.storage_uuid,
+			s->work.expected.identity.system_identifier, s->work.recheck, &s->work.root)
+		|| memcmp(s->work.recheck, w->root, 66560)
+		|| memcmp(s->work.recheck + 66560, s->work.pair, 66560) || !control_relmap_live_v4(s))
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	return runtime_v2_owner_check(epoch, incarnation, true);
+}
+ClusterControlRootResult
+cluster_control_root_registry_batch_locked_v4(ClusterControlRelmapSelectionV2 *s,
+											  const ClusterControlRegistryBatchV4 *change,
+											  uint8 out[128])
+{
+	ControlRegistryBatchWorkV4 *w;
+	ClusterControlRegistryBatchV4 captured;
+	volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	uint64 epoch, incarnation;
+	if (!control_relmap_live_v4(s) || !change
+		|| !control_relmap_distinct_v4(s, change, sizeof(*change))
+		|| !control_relmap_distinct_v4(s, out, 128)
+		|| history_ranges_overlap(change, sizeof(*change), out, 128))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	captured = *change;
+	if (captured.identity_count > s->budget / sizeof(*captured.identities)
+		|| captured.receipt_count > s->budget / sizeof(*captured.receipts)
+		|| captured.identity_count > SIZE_MAX / sizeof(*captured.identities)
+		|| captured.receipt_count > SIZE_MAX / sizeof(*captured.receipts)
+		|| history_ranges_overlap(captured.identities,
+								  captured.identity_count * sizeof(*captured.identities), out, 128)
+		|| history_ranges_overlap(captured.receipts,
+								  captured.receipt_count * sizeof(*captured.receipts), out, 128)
+		|| (captured.receipt_count && !captured.receipts))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	for (uint64 i = 0; i < captured.receipt_count; i++)
+		if (captured.receipts[i].source_count > SIZE_MAX / sizeof(*captured.receipts[i].sources)
+			|| (captured.receipts[i].source_count && !captured.receipts[i].sources)
+			|| history_ranges_overlap(captured.receipts[i].sources,
+									  captured.receipts[i].source_count
+										  * sizeof(*captured.receipts[i].sources),
+									  out, 128))
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (CritSectionCount || LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(RelationMappingLock))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (s->mutation_attempted) {
+		s->failed = true;
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	epoch = cluster_epoch_get_current();
+	incarnation = cluster_qvotec_get_self_incarnation();
+	w = palloc0(sizeof(*w));
+	s->mutation_attempted = true;
+	PG_TRY();
+	{
+		result = control_registry_batch_publish_v4(s, &captured, w, epoch, incarnation);
+		if (result == 0)
+			memcpy(out, w->reference, 128);
+	}
+	PG_FINALLY();
+	{
+		s->failed = true;
+		cluster_recovery_registry_destroy_v3(&w->verified);
+		cluster_recovery_registry_destroy_v3(&w->frozen);
+		if (w->encoded)
+			pfree(w->encoded);
+		if (w->files)
+			pfree(w->files);
+		if (w->reservations)
+			pfree(w->reservations);
+		pfree(w);
+	}
+	PG_END_TRY();
+	return result;
 }
