@@ -13596,7 +13596,22 @@ test_cluster_recovery_native_scan: $(top_srcdir)/src/include/access/twophase_rmg
 
 test_cluster_recovery_native_scan: test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_effects.inc
 
-test_cluster_recovery_native_scan: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_effects.inc
+test_cluster_recovery_native_scan: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_effects.inc test_cluster_recovery_relmap_create_fixture.h test_cluster_recovery_relmap_create_effects.inc
+
+# Native creation and ROOT fixtures reuse the canonical RMC1 codec. Keep the
+# archive before its original port dependencies; no duplicated decoder/stub.
+RECOVERY_RELMAP_CODEC_TESTS = test_cluster_recovery_native_scan \
+		test_cluster_recovery_root_set test_cluster_recovery_slru_scan \
+		test_cluster_recovery_relmap_scan test_cluster_recovery_relation_scan \
+		test_cluster_recovery_undo_store test_cluster_recovery_native_roots \
+		test_cluster_recovery_wal_targets test_cluster_recovery_final_namespace \
+		test_cluster_recovery_managed_relmap_scan test_cluster_relmap_retention_census \
+		test_cluster_relmap_census_side
+test_cluster_recovery_native_scan test_cluster_recovery_root_set test_cluster_recovery_slru_scan \
+		test_cluster_recovery_native_roots test_cluster_recovery_final_namespace: CLUSTER_UNIT_PORT_LIBS := $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+$(RECOVERY_RELMAP_CODEC_TESTS): $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
 
 test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c test_cluster_recovery_undo_effects.inc test_cluster_recovery_multixact_effects.inc test_cluster_recovery_slru_effects.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_scan.c \
@@ -13627,7 +13642,7 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-test_cluster_recovery_wal_targets: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_targets.inc
+test_cluster_recovery_wal_targets: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_targets.inc test_cluster_recovery_relmap_create_fixture.h test_cluster_recovery_relmap_create_targets.inc
 
 test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
 		test_cluster_recovery_undo_targets.inc test_cluster_recovery_multixact_targets.inc \

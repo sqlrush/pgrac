@@ -163,6 +163,7 @@ targets_native(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 			break;
 		diag->native_effects++;
 		if (effect.kind == CLUSTER_RECOVERY_NATIVE_CREATE
+			|| effect.kind == CLUSTER_RECOVERY_NATIVE_RELMAP_CREATE
 			|| effect.kind == CLUSTER_RECOVERY_NATIVE_RELATION_DROP) {
 			diag->roots_result = cluster_recovery_root_set_add_native(roots, &effect);
 			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)

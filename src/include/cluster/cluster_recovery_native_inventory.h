@@ -676,7 +676,7 @@ cluster_recovery_native_record_effects_valid_v1(const ClusterRecoveryNativeRecor
 	for (size_t i = 0; i < view->effect_count; i++) {
 		const ClusterRecoveryNativeEffect *effect = &view->effects[i];
 		if (effect->kind < CLUSTER_RECOVERY_NATIVE_TERMINAL
-			|| effect->kind > CLUSTER_RECOVERY_NATIVE_PREPARE_END
+			|| effect->kind > CLUSTER_RECOVERY_NATIVE_RELMAP_CREATE
 			|| effect->record != view->primary.record || effect->bytes == NULL || effect->length == 0
 			|| view->owner_families[i] == 0
 			|| view->owner_families[i] != cluster_recovery_native_effect_owner_families_v1(effect))

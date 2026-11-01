@@ -61,7 +61,7 @@ UT_TEST(test_native_owner_routes_keep_native_slru_and_unknown_duties_distinct)
 		UT_ASSERT_EQ(cluster_recovery_native_effect_owner_families_v1(&effect), shape < 2 ? 1 : 2);
 		effect.kind = 0;
 		UT_ASSERT_EQ(cluster_recovery_native_effect_owner_families_v1(&effect), 0);
-		effect.kind = CLUSTER_RECOVERY_NATIVE_PREPARE_END + 1;
+		effect.kind = CLUSTER_RECOVERY_NATIVE_RELMAP_CREATE + 1;
 		UT_ASSERT_EQ(cluster_recovery_native_effect_owner_families_v1(&effect), 0);
 		cluster_recovery_native_scan_destroy(scan);
 	}

@@ -19,6 +19,7 @@
 #include "catalog/storage_xlog.h"
 #include "catalog/pg_tablespace_d.h"
 #include "common/relmap.h"
+#include "common/cluster_relmap_create.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_recovery_native_scan.h"
 #include "cluster/cluster_side_undo.h"
@@ -143,12 +144,34 @@ native_array_size(uint32 length, size_t base, int count, size_t item_size)
  * bytes. Only active entries are emitted separately. This validates the
  * original representation, not authority generations, publish or RESET. */
 static ClusterRecoveryNativeResult
+native_relmap_create(ClusterRecoveryNativeScan *scan)
+{
+	ClusterRelmapCreateWalV1 creation;
+	const ClusterWalSourceRef *source = &scan->record.source;
+
+	if (!cluster_relmap_create_decode_v1(scan->payload, scan->record.payload_length, &creation)
+		|| creation.identity.system_identifier != source->claim.identity.system_identifier
+		|| creation.identity.database_incarnation != source->claim.database_incarnation
+		|| memcmp(creation.identity.storage_uuid, source->claim.identity.storage_uuid, 16) != 0)
+		return CLUSTER_RECOVERY_NATIVE_SHAPE;
+	/* Retain the whole original creation record, never synthesize an UPDATE
+	 * or pending owner from its clean image. Registration remains independent. */
+	scan->primary = CLUSTER_RECOVERY_NATIVE_RELMAP_CREATE;
+	scan->record.database = creation.identity.database_oid;
+	scan->record.tablespace = creation.identity.tablespace_oid;
+	scan->record.nmappings = creation.committed.num_mappings;
+	return CLUSTER_RECOVERY_NATIVE_MORE;
+}
+
+static ClusterRecoveryNativeResult
 native_relmap(ClusterRecoveryNativeScan *scan, uint8 opcode)
 {
 	xl_relmap_update update;
 	RelMapFile map;
 	pg_crc32c crc;
 
+	if (opcode == CLUSTER_RELMAP_CREATE_WAL_INFO_V1)
+		return native_relmap_create(scan);
 	if (opcode != XLOG_RELMAP_UPDATE)
 		return CLUSTER_RECOVERY_NATIVE_UNSUPPORTED;
 	if (scan->record.payload_length != MinSizeOfRelmapUpdate + sizeof(map))

@@ -587,6 +587,7 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 #include "test_cluster_recovery_multixact_effects.inc"
 #include "test_cluster_recovery_slru_effects.inc"
 #include "test_cluster_recovery_relmap_effects.inc"
+#include "test_cluster_recovery_relmap_create_effects.inc"
 #include "test_cluster_recovery_prepare_effects.inc"
 #include "test_cluster_recovery_compound_scan.inc"
 #include "test_cluster_recovery_owner_scan.inc"
@@ -594,7 +595,7 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(54);
 	UT_RUN(test_native_owner_routes_complete_commit_and_zero_message_init_duties);
 	UT_RUN(test_native_owner_routes_preserve_prepared_undo_and_complete_mx_array_duties);
 	UT_RUN(test_native_owner_routes_keep_native_slru_and_unknown_duties_distinct);
@@ -646,6 +647,9 @@ main(void)
 	UT_RUN(test_compound_snapshot_retains_commit_prepare_and_undo_after_drain);
 	UT_RUN(test_compound_snapshot_capacity_and_changed_source_never_export_prefix);
 	UT_RUN(test_compound_snapshot_zero_message_flags_remain_a_complete_obligation);
+	UT_RUN(test_creation_scan_owns_whole_identity_batch_and_image);
+	UT_RUN(test_creation_scan_refuses_malformed_and_foreign_complete_records);
+	UT_RUN(test_creation_scan_budget_and_valid_byte_change_are_sticky);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
