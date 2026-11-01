@@ -5,6 +5,8 @@
 #define cluster_test_pcm_clock_gettime cluster_publish_fixture_clock_gettime
 #ifdef NATIVE_HOLDER_X_REQUESTER_COMPOSITION
 #include "test_cluster_native_resident_x_fixture.inc"
+#elif defined(NATIVE_HOLDER_RESIDENT_READER_COMPOSITION)
+#include "test_cluster_native_resident_lock_fixture.inc"
 #else
 #include "test_cluster_native_first_fill_fixture.inc"
 #endif

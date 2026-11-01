@@ -62,9 +62,10 @@ static bool nt_master(int requester, int holder, int mode)
 	UT_ASSERT_EQ(f.state->source_settlement.intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
 	UT_ASSERT_EQ(f.state->bootstrap_receipts[1].highest_attempt_floor, request.common.assertion_sequence);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->s_holders_bitmap),
-		nt_target_mode == PCM_STATE_X ? 0 : 6);
+		nt_target_mode == PCM_STATE_X ? 0 : done.common.outcome == RESOURCE_X_OUTCOME_OK ? 6 : 4);
 	if (nt_target_mode == PCM_STATE_X)
-		UT_ASSERT_EQ(((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->x_holder_node, 1);
+		UT_ASSERT_EQ(((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->x_holder_node,
+			done.common.outcome == RESOURCE_X_OUTCOME_OK ? 1 : -1);
 	UT_ASSERT_EQ(fake_lwlock_depth, 0); return true;
 }
 static bool nt_holder_state(const ResourceXDecodedFrame *image, ClusterPcmResourceXMasterState **out)
