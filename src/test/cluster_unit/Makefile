@@ -15876,3 +15876,32 @@ clean: clean-initdb-registry-publish
 .PHONY: clean-initdb-registry-publish
 clean-initdb-registry-publish:
 	rm -f test_cluster_initdb_registry_publish test_cluster_initdb_registry_publish.d test_cluster_initdb_registry_publish.inc test_cluster_initdb_registry_publish.inc.tmp
+
+# Complete original control-selected relmap inventory; no live activation.
+TESTS += test_cluster_control_relmap_selection
+all: test_cluster_control_relmap_selection
+test_cluster_control_relmap_selection: test_cluster_control_relmap_selection.c test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-relmap-selection
+.PHONY: clean-control-relmap-selection
+clean-control-relmap-selection:
+	rm -f test_cluster_control_relmap_selection test_cluster_control_relmap_selection.d

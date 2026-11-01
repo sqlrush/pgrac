@@ -379,6 +379,7 @@ UT_TEST(test_complete_decoded_vector_exceeds_active_pin_capacity)
 	UT_ASSERT(!cluster_recovery_registry_decode_v2(bytes, n, ref, n - 1, &decoded));
 	free(bytes);
 }
+#ifndef TEST_CONTROL_RELMAP_SELECTION
 int
 main(void)
 {
@@ -396,3 +397,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#endif
