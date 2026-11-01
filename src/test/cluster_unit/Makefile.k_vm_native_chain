@@ -1,0 +1,7 @@
+# Offline judge only. Native SQL is manually selected after CC's Rule29 gate.
+K_VM_NATIVE_PYTHON ?= python3
+K_VM_NATIVE_TESTDIR := $(dir $(lastword $(MAKEFILE_LIST)))../cluster_tap/pre2
+
+.PHONY: k-vm-native-chain-judge
+k-vm-native-chain-judge:
+	$(K_VM_NATIVE_PYTHON) -B $(K_VM_NATIVE_TESTDIR)/test_k_vm_native_chain.py
