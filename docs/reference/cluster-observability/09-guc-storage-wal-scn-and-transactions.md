@@ -477,9 +477,9 @@ SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WH
 | 单位 | 毫秒（名称约定） |
 | 内置短说明（与 `pg_settings.short_desc` 对应） | Undo Cleaner pass interval in milliseconds. |
 
-工作原理与调节影响：定义 undo / `cleaner` / `interval` / `ms` 的运行周期。调小反应更快但增加 CPU、网络或 I/O 频率；调大降低开销但延长发现/处理延迟。
+工作原理与调节影响：设置主动 undo 段和事务槽维护的基本间隔。`0` 取消周期性维护唤醒，保留压力唤醒；已有的清偿、未完成扫描和正常停机职责仍按各自条件继续或重试。无法证明回收所需的集群保留边界时，也可能按原重试节奏提前唤醒。调小可缩短周期性维护的等待，但可能增加 CPU 和 I/O 开销。
 
-依赖与保护：无额外配置钩子；组合约束仍可能在启动或运行入口检查。
+依赖与保护：该值不是前台语句或锁等待的超时，也不保证在指定时间内完成清理。`0` 不等于关闭 cleaner；清理仍须满足原有回收条件。
 
 观察入口：`pg_cluster_state 的 undo/scn/xid_stripe/tt_* 分类`。
 
@@ -501,7 +501,7 @@ SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WH
 
 工作原理与调节影响：控制主动 undo/TT 清理。`cluster.shared_config=on` 时必须保持 `on`；COMMON 配置的创建、变更、启动和 reload 均拒绝 `off`。非 shared 配置允许关闭，进程仍驻留，清理 pass 不执行。
 
-依赖与保护：GUC check hook 拒绝在 shared 配置下关闭；启动及共享配置应用还会检查最终值，不能依靠参数加载顺序绕过约束。
+依赖与保护：GUC check hook 拒绝在 shared 配置下关闭；启动及共享配置应用还会检查最终值，不能依靠参数加载顺序绕过约束。开启 cleaner 不表示已有可复用容量；将 `cluster.undo_cleaner_interval_ms` 设为 `0` 也不会关闭必需清偿。
 
 观察入口：`pg_cluster_state 的 undo/scn/xid_stripe/tt_* 分类`。
 
@@ -521,9 +521,9 @@ SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WH
 | 单位 | — |
 | 内置短说明（与 `pg_settings.short_desc` 对应） | Max own-instance undo segments scanned per cleaner pass. |
 
-工作原理与调节影响：设置 undo / `cleaner` / `batch` / `segments`。具体行为以本参数内置说明及关联状态视图为准。
+工作原理与调节影响：控制每轮主动维护对本实例旧 undo 段的扫描批量。批量额度用完且确有回收进展时，可以连续执行下一轮，无须等待完整的维护间隔；仅扫描到保留中的对象不算回收进展。调大可能增加单轮维护的 CPU 和 I/O 开销。
 
-依赖与保护：无额外配置钩子；组合约束仍可能在启动或运行入口检查。
+依赖与保护：该值不是每轮保证回收的段数，也不是整个 cleaner 的工作量或时间上限。它不改变段池容量上限，也不放宽回收条件；增大批量不能解除仍然有效的保留限制。
 
 观察入口：`pg_cluster_state 的 undo/scn/xid_stripe/tt_* 分类`。
 
