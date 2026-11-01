@@ -164,6 +164,8 @@ typedef struct ClusterControlNativeRelmapCreateV2 {
 	uintptr_t private_self;
 	int private_pid;
 	bool private_attempted;
+	/* Native copy consumer locks this before its first fallible operation. */
+	bool private_copy_attempted;
 } ClusterControlNativeRelmapCreateV2;
 extern ClusterControlNativeResultV2 cluster_control_native_files_reserve_relmap_create_locked_v2(
 	Oid target_database, Oid target_tablespace, ClusterControlNativeRelmapCreateV2 **fresh);

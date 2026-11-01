@@ -14,6 +14,7 @@
 #define CLUSTER_RELMAP_CONTROL_H
 
 #include "cluster/cluster_control_file_identity.h"
+#include "cluster/cluster_control_native_files.h"
 #include "common/cluster_relmap_file.h"
 
 typedef struct ClusterRelmapCheckpointReceiptV2 ClusterRelmapCheckpointReceiptV2;
@@ -35,6 +36,20 @@ extern bool cluster_relmap_control_read_v2(const ClusterSharedConfigRef *expecte
 extern bool cluster_relmap_control_checkpoint_v2(const ClusterSharedConfigRef *expected,
 	Size registry_byte_budget, Size receipt_byte_budget,
 	ClusterRelmapCheckpointReceiptV2 **fresh);
+
+/* Original CREATE DATABASE owner companion, not an activation entry. Caller
+ * retains SAME global relmap X -> CF-X plus target creation/file duty. Enter
+ * before MappingLock/ControlFile/XidGen/SLRU/truncation locks. Source must be a
+ * unique AVAILABLE default-tablespace database; target is the exact independent
+ * reserved carrier. Locks the carrier's local copy attempt before any fallible
+ * work. No retry after false/ERROR; partial files/reservation remain debt.
+ * Creates clean generation-one target copies, syncs/full-rereads, then retires
+ * only native borrows under continuous original protection and calls the
+ * original one-shot control completion. No WAL, whole-database admission,
+ * retention release or OPEN grant. Original live shared CREATE DATABASE still
+ * refuses until its complete native caller/WAL contract is connected. */
+extern bool cluster_relmap_control_copy_create_v2(ClusterControlNativeRelmapCreateV2 *,
+	Oid source_database, Oid source_tablespace);
 
 /* Original checkpoint-local copies, never CF custody or a coverage grant.
  * The later original publisher reads a NEW selection under its own CF interval
