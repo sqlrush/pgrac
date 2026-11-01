@@ -55,6 +55,8 @@ OBJS_COMMON = \
 	cluster_catalog_verify.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_recovery_file_identity.o \
+	cluster_relmap_file.o \
+	cluster_relmap_file_io.o \
 	cluster_relmap_init.o \
 	cluster_relmap_v2.o \
 	cluster_space_identity.o \
@@ -221,3 +223,15 @@ clean distclean:
 
 maintainer-clean: distclean
 	rm -f kwlist_d.h
+
+# The managed envelope consumes the shared identity carrier in every variant.
+cluster_relmap_file.o cluster_relmap_file_srv.o cluster_relmap_file_shlib.o \
+cluster_relmap_file_io.o cluster_relmap_file_io_srv.o cluster_relmap_file_io_shlib.o: \
+	$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+	$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
+cluster_recovery_file_identity.o cluster_recovery_file_identity_srv.o cluster_recovery_file_identity_shlib.o: \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h

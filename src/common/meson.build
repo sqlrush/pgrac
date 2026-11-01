@@ -10,6 +10,8 @@ common_sources = files(
   'cluster_catalog_verify.c',
   'cluster_hw_snapshot_codec.c',
   'cluster_recovery_file_identity.c',
+  'cluster_relmap_file.c',
+  'cluster_relmap_file_io.c',
   'cluster_relmap_init.c',
   'cluster_relmap_v2.c',
   'cluster_space_identity.c',

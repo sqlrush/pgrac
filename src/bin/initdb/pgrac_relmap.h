@@ -3,6 +3,8 @@
 #ifndef PGRAC_INITDB_RELMAP_H
 #define PGRAC_INITDB_RELMAP_H
 
+#include "cluster/cluster_recovery_file_identity.h"
+
 /* Only the original creator, after its successful post-bootstrap child exit
  * and synced shutdown checkpoint. Both directory FDs remain caller-owned.
  * Preflight all four native maps, then create new authorities without adopting
@@ -18,5 +20,11 @@ extern bool pgrac_initdb_relmap_create(int source_fd, int shared_fd);
  */
 extern bool pgrac_initdb_relmap_v2_create(int source_fd, int shared_fd,
 									   uint64 system_identifier, uint64 database_incarnation);
+
+/* Same original creator and no-adoption contract; control must allocate every
+ * complete identity before the first file is created. This does not publish
+ * control registration or activate managed readers. */
+extern bool pgrac_initdb_relmap_managed_create(int source_fd, int shared_fd,
+								 const ClusterRecoveryFileIdentityV2 identities[4]);
 
 #endif

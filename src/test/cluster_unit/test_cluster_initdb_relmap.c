@@ -442,11 +442,96 @@ UT_TEST(v2_final_directory_sync_failure_refuses)
 	}
 }
 
+static void
+managed_identities(ClusterRecoveryFileIdentityV2 ids[4])
+{
+	memset(ids, 0, 4 * sizeof(*ids));
+	for (unsigned i = 0; i < 4; ++i)
+	{
+		ids[i].kind = CLUSTER_RECOVERY_FILE_RELMAP_V2;
+		ids[i].format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+		ids[i].format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+		ids[i].system_identifier = 91;
+		ids[i].database_incarnation = 27;
+		ids[i].storage_uuid[0] = 1;
+		ids[i].redo_branch_uuid[0] = 2;
+		ids[i].redo_branch_generation = 3;
+		ids[i].redo_timeline = 4;
+		ids[i].database_oid = map_databases[i];
+		ids[i].tablespace_oid = i == 0 ? 1664 : 1663;
+		ids[i].object_id = 20 + i;
+		ids[i].creation_generation = 103 + i;
+		ids[i].registration_generation = 19;
+	}
+}
+
+UT_TEST(managed_creator_requires_outer_file_identity)
+{
+	ClusterRecoveryFileIdentityV2 ids[4];
+	managed_identities(ids);
+	prepare();
+	UT_ASSERT(pgrac_initdb_relmap_managed_create(source_fd, shared_fd, ids));
+	UT_ASSERT_EQ(writes, 8);
+	for (unsigned i = 0; i < 4; ++i)
+	{
+		int dir = openat(shared_fd, paths[i], O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+		ClusterRelmapFilePairV2 pair;
+		UT_ASSERT(dir >= 0 && cluster_relmap_file_pair_read_v2(dir, &ids[i], &pair));
+		UT_ASSERT_EQ(sizeof(pair.bytes[0]), 2304);
+		UT_ASSERT_EQ(pair.view.committed_generation, 1);
+		UT_ASSERT(!pair.view.has_pending && pair.view.pending_complete);
+		UT_ASSERT(close(dir) == 0);
+	}
+	UT_ASSERT(!pgrac_initdb_relmap_managed_create(source_fd, shared_fd, ids));
+	UT_ASSERT_EQ(writes, 8);
+	cleanup();
+}
+
+UT_TEST(managed_last_bad_registration_refuses_before_creation)
+{
+	ClusterRecoveryFileIdentityV2 ids[4];
+	managed_identities(ids);
+	prepare();
+	++ids[3].system_identifier;
+	UT_ASSERT(!pgrac_initdb_relmap_managed_create(source_fd, shared_fd, ids));
+	UT_ASSERT_EQ(writes, 0);
+	managed_identities(ids);
+	ids[3].storage_uuid[15] = 1;
+	UT_ASSERT(!pgrac_initdb_relmap_managed_create(source_fd, shared_fd, ids));
+	UT_ASSERT_EQ(writes, 0);
+	managed_identities(ids);
+	++ids[3].registration_generation;
+	UT_ASSERT(!pgrac_initdb_relmap_managed_create(source_fd, shared_fd, ids));
+	UT_ASSERT_EQ(writes, 0);
+	cleanup();
+}
+
+UT_TEST(managed_creator_io_and_final_copy_failures_preserve_partial_files)
+{
+	ClusterRecoveryFileIdentityV2 ids[4];
+	const enum Fault failures[] = {WRITE_FAIL, SHORT_WRITE, FILE_SYNC_FAIL,
+		DIR_SYNC_FAIL, READBACK_SHORT, READBACK_CORRUPT, CLOSE_FAIL,
+		TAMPER_EARLIER_COPY, REPLACE_EARLIER_COPY, REPLACE_TARGET, CHANGE_SOURCE};
+	managed_identities(ids);
+	for (unsigned i = 0; i < lengthof(failures); ++i)
+	{
+		unsigned before;
+		prepare();
+		fault = failures[i];
+		UT_ASSERT(!pgrac_initdb_relmap_managed_create(source_fd, shared_fd, ids));
+		before = writes;
+		fault = NONE;
+		UT_ASSERT(!pgrac_initdb_relmap_managed_create(source_fd, shared_fd, ids));
+		UT_ASSERT_EQ(writes, before);
+		cleanup();
+	}
+}
+
 int
 main(int argc, char **argv)
 {
 	pg_logging_init(argv[0]);
-	UT_PLAN(23);
+	UT_PLAN(26);
 	UT_RUN(real_files_equal_pure_images_and_sources_unchanged);
 	UT_RUN(last_input_corrupt_refuses_before_any_write);
 	UT_RUN(source_file_alias_refuses);
@@ -470,6 +555,9 @@ main(int argc, char **argv)
 	UT_RUN(v2_both_copies_io_errors_refuse_and_partial_retry_refuses);
 	UT_RUN(v2_final_read_rejects_earlier_copy_and_source_changes);
 	UT_RUN(v2_final_directory_sync_failure_refuses);
+	UT_RUN(managed_creator_requires_outer_file_identity);
+	UT_RUN(managed_last_bad_registration_refuses_before_creation);
+	UT_RUN(managed_creator_io_and_final_copy_failures_preserve_partial_files);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
