@@ -10219,6 +10219,88 @@ cluster_current_mx_history_authorize(Relation relation, Buffer buffer, HeapTuple
 	return result;
 }
 
+/* Container membership and original retention evidence precede descriptor
+ * dispatch. This evaluation scope does not manufacture a native reference. */
+static bool
+cluster_current_mx_caller_snapshot(Snapshot actual, uint64 *identity)
+{
+	ClusterSnapshotReadScopeV1 scope;
+	volatile bool valid = false;
+
+	cluster_snapshot_read_enter_v1(&scope, actual);
+	PG_TRY();
+	{
+		valid = cluster_snapshot_cr_identity_v1(actual, identity);
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&scope);
+	}
+	PG_END_TRY();
+	return valid;
+}
+
+/* Dormant native caller front door, selected only with the complete family.
+ * Explicit actual is the caller's retained statement Snapshot. NULL selects
+ * only the current ActiveSnapshot, never crosscheck, oldest registered or a
+ * newly acquired Snapshot. The caller keeps its original reference; the
+ * collector owns its separate registration across history unlocks. */
+static ClusterCurrentMxHeapDisposition pg_attribute_unused()
+cluster_current_mx_history_authorize_caller(Relation relation, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, TransactionId requester_xid, ClusterCurrentTupleAction action,
+	LockTupleMode lock_mode, bool is_update, LockWaitPolicy wait_policy,
+	bool wait_for_conflict, bool follow_updates, ClusterCurrentMxHeapResult *heap_result,
+	ClusterCurrentMxOperationState *operation)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSnapshotReadScopeV1 scope;
+	uint64 identity = 0;
+	volatile ClusterCurrentMxHeapDisposition result = CCMH_NOT_APPLICABLE;
+
+	memset(heap_result, 0, sizeof(*heap_result));
+	heap_result->result = TM_BeingModified;
+	if (actual == NULL && ActiveSnapshotSet())
+		actual = GetActiveSnapshot();
+	if (CritSectionCount != 0 || CurrentResourceOwner == NULL
+		|| !cluster_current_mx_caller_snapshot(actual, &identity)) {
+		cluster_current_mx_failclosed(operation, CCMH_FAIL_MEMBER_PROOF,
+			"the caller has no exact retained statement Snapshot");
+		return CCMH_NOT_APPLICABLE;
+	}
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+			CLUSTER_SEMANTIC_TARGET_SIDE, &admission) != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		cluster_current_mx_failclosed(operation, CCMH_FAIL_MEMBER_PROOF,
+			"the caller history admission is closed");
+		return CCMH_NOT_APPLICABLE;
+	}
+	/* Both objects are initialized before setjmp and remain unchanged until
+	 * FINALLY; ERROR cannot leak admission debt or the evaluator stack. */
+	cluster_snapshot_read_enter_v1(&scope, actual);
+	PG_TRY();
+	{
+		uint64 live_identity = 0;
+
+		result = cluster_current_mx_history_authorize(relation, buffer, tuple, actual,
+			&admission, requester_xid, action, lock_mode, is_update, wait_policy,
+			wait_for_conflict, follow_updates, heap_result, operation);
+		if (!cluster_semantic_activation_recheck(&admission)
+			|| !cluster_snapshot_cr_identity_v1(actual, &live_identity)
+			|| live_identity != identity) {
+			memset(heap_result, 0, sizeof(*heap_result));
+			heap_result->result = TM_BeingModified;
+			cluster_current_mx_failclosed(operation, CCMH_FAIL_MEMBER_PROOF,
+				"the caller read scope changed before history consumption");
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&scope);
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+	return result;
+}
+
 #ifdef USE_CLUSTER_UNIT
 bool
 cluster_heap_test_current_mx_epoch_supported(uint64 epoch)

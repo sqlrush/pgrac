@@ -47,6 +47,8 @@ void mx_history_authorize_state(MxAuthorizeState *out);
 int mx_history_authorize(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
 	const ClusterSemanticAdmissionToken *admission, const ClusterCurrentMxRequestContext *requested,
 	MxHeapReadout *out);
+int mx_history_authorize_caller(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	const ClusterCurrentMxRequestContext *requested, MxHeapReadout *out);
 typedef struct MxHotReadout {
 	TransactionId updater;
 	bool restart;

@@ -279,6 +279,10 @@ UT_TEST(authorize_legacy_applicability_gate_is_preserved)
 int history_hot_unused_authorize_main(void);
 #define main history_hot_unused_authorize_main
 #endif
+#ifdef HISTORY_CALLER_FIXTURE
+int history_caller_unused_authorize_main(void);
+#define main history_caller_unused_authorize_main
+#endif
 int main(void)
 {
 	history_fixture_init(); UT_PLAN(10);

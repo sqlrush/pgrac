@@ -13508,10 +13508,10 @@ test_cluster_mx_operation_consumer: test_cluster_mx_operation_consumer.c \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PGPORT) -o $@
 
 # Collector results consumed through the actual dormant codecs and operation core.
-TESTS += test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot
-all: test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot
+TESTS += test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot test_cluster_mx_history_caller
+all: test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot test_cluster_mx_history_caller
 
-test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot: %: %.c \
+test_cluster_mx_history_roundtrip test_cluster_mx_history_authorize test_cluster_mx_history_hot test_cluster_mx_history_caller: %: %.c \
 		test_cluster_mx_history_authorize.c test_cluster_mx_history_roundtrip.c test_cluster_mx_history_heap_bridge.inc \
 		$(top_srcdir)/src/backend/utils/time/combocid.c $(top_srcdir)/src/include/utils/combocid.h \
 		$(top_srcdir)/src/backend/storage/page/itemptr.c \
