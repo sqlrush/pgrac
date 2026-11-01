@@ -4740,7 +4740,7 @@ test_cluster_stage5_5_cr_acceptance: test_cluster_stage5_5_cr_acceptance.c unit_
 # and stubs ShmemInitStruct / LWLock* / cluster_undo_smgr_{read,write}_block
 # locally (single-threaded pool-logic test).
 CLUSTER_UNDO_BUF_O = $(top_builddir)/src/backend/cluster/storage/cluster_undo_buf.o
-test_cluster_undo_buf: test_cluster_undo_buf.c unit_test.h $(CLUSTER_UNDO_BUF_O) \
+test_cluster_undo_buf: test_cluster_undo_buf.c unit_test.h cluster_unit_no_native_files.h $(CLUSTER_UNDO_BUF_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
 		$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0.o \
 		$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_resident.o
@@ -8056,6 +8056,7 @@ test_cluster_tt_startup_local_owner.inc: $(top_srcdir)/src/backend/access/transa
 	mv $@.tmp $@
 
 test_cluster_tt_startup_local: test_cluster_tt_startup_local.c test_cluster_undo_block0.c \
+		cluster_unit_no_native_files.h \
 		unit_test.h test_cluster_tt_startup_local_owner.inc $(CLUSTER_TT_DURABLE_O) \
 		$(top_builddir)/src/backend/cluster/cluster_tt_recovery.o \
 		$(top_builddir)/src/backend/cluster/cluster_version.o \
@@ -8354,7 +8355,7 @@ CLUSTER_UNDO_BLOCK0_CURRENT_O = \
 	$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_current.o
 CLUSTER_UNDO_BLOCK0_RESIDENT_O = \
 	$(top_builddir)/src/backend/cluster/storage/cluster_undo_block0_resident.o
-test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
+test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h cluster_unit_no_native_files.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) test_cluster_undo_segment_init_backend.o
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
@@ -8362,6 +8363,35 @@ test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) test_cluster_undo_segment_init_backend.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(PTHREAD_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+# Exercise the original resident CU and its exact pin/ResourceOwner paths.
+test_cluster_undo_native_tt_resident: test_cluster_undo_native_tt_resident.c \
+		test_cluster_undo_block0.c cluster_unit_no_native_files.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0_resident.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_root_descriptor.c \
+		$(top_srcdir)/src/backend/cluster/cluster_version.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_block0.h
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0_resident.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_block0.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_root_descriptor.c \
+		$(top_srcdir)/src/backend/cluster/cluster_version.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(PTHREAD_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+TESTS += test_cluster_undo_native_tt_resident
+all: test_cluster_undo_native_tt_resident
+clean: clean-native-tt-resident
+.PHONY: clean-native-tt-resident
+clean-native-tt-resident:
+	rm -f test_cluster_undo_native_tt_resident test_cluster_undo_native_tt_resident.d
 
 # Spec 8.4A Candidate-2: the fixture includes the exact current owner source
 # so it can pin private key/phase invariants without exporting test-only ABI.
@@ -8490,6 +8520,7 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		test_cluster_terminal_peer.inc \
 		test_cluster_stop_membership_observation.inc \
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \
+		test_cluster_tt_startup_local_owner.inc \
 		test_cluster_normal_cold_prepare.inc test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		cluster_r4_open_route_test_stubs.h $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \

@@ -9,6 +9,15 @@
 #include "cluster/cluster_hw_snapshot.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
+#include "access/xlogrecovery.h"
+
+/* Original private Startup owner, not a replacement success stub. */
+bool cluster_tt_recovery_resolve_active = true;
+bool IsPostmasterEnvironment = true;
+static int LocalXLogInsertAllowed = 1;
+bool
+HotStandbyActive(void)
+{ return false; }
 
 static int startup_prepared_input;
 static unsigned startup_tt_capture_calls, startup_confirm_calls;
@@ -85,6 +94,8 @@ cluster_hw_startup_complete(const char **failure)
 		startup_fatal_level = (level);                                                             \
 		pg_re_throw();                                                                             \
 	} while (0)
+
+#include "test_cluster_tt_startup_local_owner.inc"
 
 static void
 startup_actual_capture(bool wasShutdown, XLogRecPtr location, XLogRecPtr redo, uint64 next_xid,
@@ -195,7 +206,7 @@ UT_TEST(test_normal_actual_postjobs_exclude_shared_legacy_page_rollback)
 			cluster_shared_config = shared != 0;
 			pg_atomic_write_u32(&NormalStartCompletion->state, state);
 			startup_actual_postjobs();
-			UT_ASSERT_EQ(startup_resolve_calls, state == 3 ? 0 : 1);
+			UT_ASSERT_EQ(startup_resolve_calls, shared || state == 3 ? 0 : 1);
 			UT_ASSERT_EQ(startup_old_scn_calls, state == 3 ? 0 : 1);
 			/* The shared page-version contract never enters this WAL-free
 		 * DELETE cleanout, including SOURCE_ZERO and EXISTING_OTHER. */

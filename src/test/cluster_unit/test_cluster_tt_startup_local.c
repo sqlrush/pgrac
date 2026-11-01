@@ -7,6 +7,7 @@ int block0_fixture_main(void);
 #define cluster_undo_smgr_write_block startup_base_write
 #define XLogFlush startup_base_flush
 #define errfinish startup_base_errfinish
+#define CLUSTER_UNIT_NATIVE_GUC_PROVIDED
 #include "test_cluster_undo_block0.c"
 #undef errfinish
 #undef XLogFlush
@@ -322,10 +323,14 @@ UT_TEST(test_startup_tt40_resident_state_refuses_before_wal)
 
 	startup_seed(true);
 	memcpy(before.data, smgr_image, BLCKSZ);
+	/* Seed the existing non-managed resident prerequisite. The actual Startup
+	 * attempt below is cluster-enabled and must still reject any residency. */
+	cluster_enabled = false;
 	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	cluster_undo_block0_unpin(&pin);
+	cluster_enabled = true;
 	UT_ASSERT(startup_attempt(false));
 	UT_ASSERT_EQ(startup_v2_wal + startup_v1_wal, 0);
 	UT_ASSERT_EQ(smgr_write_calls + startup_raw_writes, 0);

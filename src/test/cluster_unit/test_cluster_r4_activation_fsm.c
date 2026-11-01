@@ -8858,17 +8858,20 @@ ut_cold_setup(uint32 frames)
 	cold_reset_count = cold_observe_count = 0;
 	cold_observed_scn = InvalidScn;
 	test_normal_guard_owned = false;
+	UT_ASSERT_EQ(cold_native_borrows, 0);
+	memset(cold_native_present, 0, sizeof(cold_native_present));
 }
 
 static void
 ut_cold_file(int index, uint8 status)
 {
 	PGAlignedBlock page;
-	UndoSegmentHeaderData *h = (UndoSegmentHeaderData *)page.data;
+	UndoSegmentHeaderDataV2 *h = (UndoSegmentHeaderDataV2 *)page.data;
+	ClusterRecoveryFileIdentityV2 *identity = &cold_native_files[index];
 	char path[MAXPGPATH];
 	uint32 segment = cluster_node_id * 256 + index + 1;
 	int fd;
-	memset(&page, 0, sizeof(page));
+	UT_ASSERT(cluster_undo_segment_make_header_v2_bytes(segment, cluster_node_id + 1, page.data));
 	h->pd_flags = PD_UNDO_SEG_HEADER;
 	h->pd_lower = SizeOfPageHeaderData;
 	h->pd_upper = h->pd_special = BLCKSZ;
@@ -8882,11 +8885,25 @@ ut_cold_file(int index, uint8 status)
 	if (status != TT_SLOT_UNUSED) {
 		h->tt_slots[0].status = status;
 		h->tt_slots[0].xid = 1000 + index;
+		h->tt_slots[0].original_full_xid = (UINT64CONST(1) << 32) | (1000 + index);
 		h->tt_slots[0].wrap = 1;
 		h->tt_slots[0].first_undo_block = uba_encode(segment, 1, 0, 64);
 		if (status == TT_SLOT_COMMITTED)
 			h->tt_slots[0].commit_scn = 100 + index;
 	}
+	memset(identity, 0, sizeof(*identity));
+	identity->kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+	identity->format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+	identity->format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+	identity->system_identifier = test_system_identifier;
+	identity->database_incarnation = 1; identity->storage_uuid[0] = 1;
+	identity->redo_branch_uuid[0] = 2; identity->redo_branch_generation = 1;
+	identity->redo_timeline = 1; identity->creation_generation = index + 1;
+	identity->registration_generation = 1; identity->origin = cluster_node_id;
+	identity->object_id = segment;
+	UT_ASSERT(cluster_tt_file_reference_prepare_v2(page.data, BLCKSZ, identity));
+	UT_ASSERT(cluster_undo_segment_header_seal(page.data));
+	cold_native_present[index] = true;
 	UT_ASSERT_EQ(cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RUNTIME_SHARED, cluster_node_id + 1,
 										   segment, path, sizeof(path)),
 				 0);
@@ -8905,6 +8922,7 @@ ut_cold_cleanup(void)
 	struct dirent *entry;
 	UT_ASSERT(!cluster_undo_block0_backend_has_resources());
 	UT_ASSERT(!test_normal_guard_owned);
+	UT_ASSERT_EQ(cold_native_borrows, 0);
 	cluster_undo_block0_shmem_detach();
 	free(cold_region);
 	cold_region = NULL;
@@ -9052,7 +9070,7 @@ UT_TEST(test_normal_census_refuses_active_invalid_short_and_wrong_owner_without_
 	int fault;
 	for (fault = 0; fault < 9; fault++) {
 		PGAlignedBlock page;
-		UndoSegmentHeaderData *h = (UndoSegmentHeaderData *)page.data;
+		UndoSegmentHeaderDataV2 *h = (UndoSegmentHeaderDataV2 *)page.data;
 		char path[MAXPGPATH];
 		int fd;
 		ut_cold_setup(2);
@@ -9665,7 +9683,7 @@ UT_TEST(test_normal_start_actual_loader_precedes_local_ack_and_first_resident_co
 		UT_ASSERT_EQ(
 			cluster_undo_block0_copy_resident(&key, &root, &generation, &proof, page.data, NULL),
 			CLUSTER_UNDO_BLOCK0_OK);
-		UT_ASSERT_EQ(((UndoSegmentHeaderData *)page.data)->tt_slots[0].status, TT_SLOT_ABORTED);
+		UT_ASSERT_EQ(((UndoSegmentHeaderDataV2 *)page.data)->tt_slots[0].status, TT_SLOT_ABORTED);
 		UT_ASSERT_EQ(cold_read_count[255], 1); /* no first-reader I/O/prewarm */
 	}
 	cluster_semantic_activation_leave(&token);

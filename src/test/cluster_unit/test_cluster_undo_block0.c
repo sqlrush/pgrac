@@ -38,6 +38,10 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
+#ifndef UNDO_RESIDENT_NATIVE_TEST
+#include "cluster_unit_no_native_files.h"
+#endif
+
 #undef printf
 #undef fprintf
 #undef snprintf

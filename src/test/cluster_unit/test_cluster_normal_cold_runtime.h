@@ -13,6 +13,55 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "test_cluster_normal_cold_scn.inc"
+#include "access/clog_file.h"
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_undo_segment_init.h"
+
+/* Finite selected control inventory, independent of the test files. Actual
+ * resident pin/reference/cleanup decisions are not replaced here. */
+static ClusterRecoveryFileIdentityV2 cold_native_files[256];
+static bool cold_native_present[256];
+static unsigned cold_native_borrows;
+
+ClusterControlNativeModeV2
+cluster_control_native_files_mode_v2(void)
+{ return CLUSTER_NATIVE_FILES_MANAGED_V2; }
+
+bool
+cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
+	ClusterControlNativeFileBorrowV2 *borrow)
+{
+	uint64 first = (uint64)cluster_node_id * 256 + 1;
+	unsigned index;
+	if (key == NULL || borrow == NULL || borrow->private_self != 0 ||
+		key->kind != CLUSTER_RECOVERY_FILE_UNDO_V2 || key->origin != cluster_node_id ||
+		key->database_oid != 0 || key->tablespace_oid != 0 ||
+		key->object_id < first || key->object_id >= first + 256)
+		return false;
+	index = key->object_id - first;
+	if (!cold_native_present[index]) return false;
+	borrow->expected = cold_native_files[index];
+	borrow->private_self = (uintptr_t)borrow;
+	borrow->private_index = index;
+	borrow->table_generation = 41; borrow->startup_generation = 1;
+	cold_native_borrows++;
+	return true;
+}
+bool
+cluster_control_native_file_current_v2(const ClusterControlNativeFileBorrowV2 *borrow)
+{
+	return borrow != NULL && borrow->private_self == (uintptr_t)borrow &&
+		borrow->private_index < 256 && cold_native_present[borrow->private_index] &&
+		memcmp(&borrow->expected, &cold_native_files[borrow->private_index],
+			sizeof(borrow->expected)) == 0;
+}
+bool
+cluster_control_native_file_release_v2(ClusterControlNativeFileBorrowV2 *borrow)
+{
+	if (borrow == NULL || borrow->private_self != (uintptr_t)borrow || cold_native_borrows == 0)
+		return false;
+	cold_native_borrows--; memset(borrow, 0, sizeof(*borrow)); return true;
+}
 
 static char cold_root_path[MAXPGPATH];
 static void *cold_region;

@@ -180,6 +180,10 @@ extern ClusterUndoBlock0Result cluster_undo_block0_admit_runtime(
 	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *root,
 	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0FrameToken *token,
 	ClusterUndoBlock0Pin *pin, char **page);
+/* Selected native files: the original process-local ResourceOwner retains an
+ * address-bound full file identity through fill/reservation/content lock and
+ * downgrade. Unpin/release/error cleanup return it; idle residency does not
+ * pin the selected table. This adds neither file nor recovery authority. */
 extern ClusterUndoBlock0Result cluster_undo_block0_reserve(
 	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
 	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin);

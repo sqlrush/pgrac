@@ -52,6 +52,7 @@
 #include "storage/shmem.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "cluster_unit_no_native_files.h"
 
 #undef printf
 #undef fprintf
@@ -68,6 +69,17 @@
 
 
 UT_DEFINE_GLOBALS();
+
+/* This DATA-pool fixture never owns the unrelated private Startup context.
+ * Link its resident dependency without manufacturing that authority. */
+bool
+cluster_tt_startup_local_context_valid(const ClusterTTStartupLocalContext *context,
+	uint8 owner_instance)
+{
+	(void)context;
+	(void)owner_instance;
+	abort();
+}
 
 /*
  * Self-node stub: cluster_undo_buf.o now derives the undo path intent via the
