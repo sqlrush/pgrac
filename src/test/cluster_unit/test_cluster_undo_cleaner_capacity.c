@@ -13,6 +13,11 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#ifndef CAPACITY_REFUSAL_TEST_GUC_DEFINED
+#define CAPACITY_REFUSAL_TEST_GUC_DEFINED
+bool cluster_trace_undo_capacity_refusal = false;
+#endif
 #include "lib/ilist.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "test_cluster_capacity_pool_compat.h"

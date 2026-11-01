@@ -9,6 +9,11 @@ int durable_fixture_main(int argc, char **argv);
 #define main durable_fixture_main
 #include "test_cluster_tt_durable.c"
 #undef main
+
+#ifndef CAPACITY_REFUSAL_TEST_GUC_DEFINED
+#define CAPACITY_REFUSAL_TEST_GUC_DEFINED
+bool cluster_trace_undo_capacity_refusal = false;
+#endif
 #include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/cluster_undo_cleaner.h"
 #include "storage/lock.h"
@@ -457,6 +462,12 @@ VirtualXactLock(VirtualTransactionId owner, bool wait)
 }
 
 #ifndef TT_ACTIVE_OWNER_EXTERNAL_CAPACITY_WAIT
+const char *
+cluster_undo_cleaner_capacity_refusal_detail(uint32 segment pg_attribute_unused(),
+	TransactionId top_xid pg_attribute_unused(), bool active_slot_pending pg_attribute_unused())
+{
+	return NULL;
+}
 bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment, ClusterCtrcTxnKeyV1 *key)
 {

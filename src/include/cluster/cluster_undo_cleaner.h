@@ -290,6 +290,10 @@ extern bool cluster_undo_cleaner_capacity_owner_snapshot(unsigned worker_id,
 														 uint64 *worker_generation);
 extern bool cluster_undo_cleaner_wait_for_capacity(uint32 segment_id,
 												   ClusterCtrcTxnKeyV1 *continuation);
+/* One-shot process-local log detail; NULL when disabled/unavailable. */
+#define CLUSTER_UNDO_CAPACITY_DIAGNOSTIC_V1 1
+extern const char *cluster_undo_cleaner_capacity_refusal_detail(
+	uint32 segment_id, TransactionId top_xid, bool active_slot_pending);
 /* The native transaction lock wait uses exactly the original capacity
  * context predicate. These diagnostics never establish a reusable slot. */
 extern bool cluster_undo_cleaner_capacity_context_safe(void);

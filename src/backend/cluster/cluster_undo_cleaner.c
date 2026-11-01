@@ -83,6 +83,7 @@
 #include "cluster/cluster_xid_stripe_boot.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster_undo_capacity_diagnostic.h"
 
 
 /*
@@ -613,6 +614,12 @@ undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *fl
 		if (memcmp(&observation.key, &empty, sizeof(empty)) == 0) {
 			if (!undo_cleaner_capacity_segment_worker(segment_id, floor->epoch, &observation,
 													  worker)) {
+				undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){
+					.site = "pool_segment_route", .segment = segment_id, .key = &prior,
+					.floor = floor, .observation = &observation,
+					.known = D_BIT(D_PROOF) | D_BIT(D_REASON) | D_BIT(D_HANDLED) | D_BIT(D_FLOOR),
+					.values = { [D_PROOF] = CLUSTER_CTRC_CAPACITY_REFUSE,
+						[D_REASON] = reason, [D_HANDLED] = 0, [D_FLOOR] = 1 } });
 				MemSet(continuation, 0, sizeof(*continuation));
 				return CLUSTER_CTRC_CAPACITY_REFUSE;
 			}
@@ -625,6 +632,11 @@ undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *fl
 		MemSet(continuation, 0, sizeof(*continuation));
 		return CLUSTER_CTRC_CAPACITY_RETRY;
 	}
+	undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){
+		.site = "pool_probe", .segment = segment_id, .key = &prior,
+		.floor = floor, .observation = &observation,
+		.known = D_BIT(D_PROOF) | D_BIT(D_REASON) | D_BIT(D_HANDLED) | D_BIT(D_FLOOR),
+		.values = { [D_PROOF] = proof, [D_REASON] = reason, [D_HANDLED] = 0, [D_FLOOR] = 1 } });
 	return proof;
 }
 
@@ -713,20 +725,51 @@ undo_cleaner_capacity_history_probe(uint32 segment_id, ClusterCtrcTxnKeyV1 *cont
 	for (;;) {
 		ClusterCapacityObservationV1 observation;
 		ClusterCapacityReasonV1 reason;
+		int enabled = -1, storage = -1, context = -1;
+		int protector = -1, advance = -1, current = -1;
+		uint64 probe_epoch = 0, route_epoch = 0;
+		bool probe_epoch_known = false, route_epoch_known = false;
+
+#define HISTORY_REFUSE(site_, observation_) \
+	do { \
+		undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){ \
+			.site = (site_), .segment = segment_id, .key = continuation, \
+			.history = producer && status == CLUSTER_HEAP_FREEZE_COHORT_READY ? &history : NULL, \
+			.first = have_first ? &first : NULL, .pass = &pass, \
+			.first_change = first_change, .observation = (observation_), \
+			.probe_epoch = probe_epoch, .route_epoch = route_epoch, \
+			.probe_epoch_known = probe_epoch_known, .route_epoch_known = route_epoch_known, \
+			.known = D_BIT(D_ENABLED) | D_BIT(D_HANDLED) | D_BIT(D_PROOF) \
+				| D_BIT(D_PRODUCER) | D_BIT(D_STATUS) | D_BIT(D_HAVE_FIRST) \
+				| ((observation_) != NULL ? D_BIT(D_REASON) : 0) \
+				| (storage >= 0 ? D_BIT(D_STORAGE) : 0) \
+				| (context >= 0 ? D_BIT(D_CONTEXT) : 0) \
+				| (protector >= 0 ? D_BIT(D_PROTECTOR) : 0) \
+				| (advance >= 0 ? D_BIT(D_ADVANCE) : 0) \
+				| (current >= 0 ? D_BIT(D_CURRENT) : 0), \
+			.values = { [D_ENABLED] = enabled, [D_STORAGE] = storage, [D_CONTEXT] = context, \
+				[D_HANDLED] = 1, [D_PROOF] = CLUSTER_CTRC_CAPACITY_REFUSE, \
+				[D_PRODUCER] = producer, [D_STATUS] = status, [D_HAVE_FIRST] = have_first, \
+				[D_REASON] = (observation_) != NULL ? reason : 0, \
+				[D_PROTECTOR] = protector, [D_ADVANCE] = advance, [D_CURRENT] = current } }); \
+		return CLUSTER_CTRC_CAPACITY_REFUSE; \
+	} while (0)
 
 		CHECK_FOR_INTERRUPTS();
-		if (!cluster_undo_cleaner_enabled || !cluster_storage_mode_enabled()
-			|| !undo_cleaner_capacity_context_safe() || !producer)
-			return CLUSTER_CTRC_CAPACITY_REFUSE;
+		if (!(enabled = cluster_undo_cleaner_enabled) || !(storage = cluster_storage_mode_enabled())
+			|| !(context = undo_cleaner_capacity_context_safe()) || !producer)
+			HISTORY_REFUSE("history_context", NULL);
 		if (status != CLUSTER_HEAP_FREEZE_COHORT_READY) {
 			if (status != CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE
 				&& status != CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH
 				&& status != CLUSTER_HEAP_FREEZE_COHORT_H_STALE)
-				return CLUSTER_CTRC_CAPACITY_REFUSE;
+				HISTORY_REFUSE("history_status", NULL);
 			MemSet(&pass, 0, sizeof(pass));
 			have_first = false;
-			if (!undo_cleaner_capacity_report_wait())
-				return CLUSTER_CTRC_CAPACITY_REFUSE;
+			if (!undo_cleaner_capacity_report_wait()) {
+				context = 0;
+				HISTORY_REFUSE("history_report_context", NULL);
+			}
 			status = cluster_undo_capacity_history_observe(&history, &producer);
 			continue;
 		}
@@ -740,8 +783,9 @@ undo_cleaner_capacity_history_probe(uint32 segment_id, ClusterCtrcTxnKeyV1 *cont
 		for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
 			owner_generations[i] = undo_cleaner_capacity_owner_generation_locked(i);
 		LWLockRelease(&undo_cleaner_state->lwlock);
+		probe_epoch_known = true;
 		reason = cluster_ctrc_capacity_probe_history_v1(segment_id, history.horizon_scn,
-														cluster_epoch_get_current(), continuation,
+														(probe_epoch = cluster_epoch_get_current()), continuation,
 														&pass, &observation);
 		undo_cleaner_capacity_note_retention(reason, &observation);
 		if (reason == CLUSTER_CAPACITY_SUPPLY_RECHECK) {
@@ -751,29 +795,32 @@ undo_cleaner_capacity_history_probe(uint32 segment_id, ClusterCtrcTxnKeyV1 *cont
 		if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
 			if (observation.key.segment_id != 0)
 				*worker = (observation.key.segment_id - 1) % CLUSTER_UNDO_CLEANER_WORKER_TYPES;
-			else if (!undo_cleaner_capacity_segment_worker(segment_id, cluster_epoch_get_current(),
-														   &observation, worker))
-				return CLUSTER_CTRC_CAPACITY_REFUSE;
+			else {
+				route_epoch_known = true;
+				if (!undo_cleaner_capacity_segment_worker(segment_id,
+							(route_epoch = cluster_epoch_get_current()), &observation, worker))
+					HISTORY_REFUSE("history_segment_route", &observation);
+			}
 			*continuation = observation.key;
 			return CLUSTER_CTRC_CAPACITY_WAIT;
 		}
 		if (!pass.complete) {
 			if (pass.incomplete && pass.progress)
 				continue;
-			return CLUSTER_CTRC_CAPACITY_REFUSE;
+			HISTORY_REFUSE("history_incomplete", &observation);
 		}
 		if (!pass.history_only)
-			return CLUSTER_CTRC_CAPACITY_REFUSE;
+			HISTORY_REFUSE("history_not_only", &observation);
 		if (cluster_undo_capacity_history_current(&history) != CLUSTER_HEAP_FREEZE_COHORT_READY) {
 			MemSet(&pass, 0, sizeof(pass));
 			have_first = false;
 			status = cluster_undo_capacity_history_observe(&history, &producer);
 			continue;
 		}
-		if (undo_cleaner_capacity_real_protector(&history)) {
-			if (have_first && undo_cleaner_capacity_reports_advance(&first, &history)
-				&& cluster_undo_capacity_change_current(first_change))
-				return CLUSTER_CTRC_CAPACITY_REFUSE; /* original protected-history refusal */
+		if ((protector = undo_cleaner_capacity_real_protector(&history))) {
+			if (have_first && (advance = undo_cleaner_capacity_reports_advance(&first, &history))
+				&& (current = cluster_undo_capacity_change_current(first_change)))
+				HISTORY_REFUSE("protected_history", &observation);
 			if (!have_first) {
 				first = history;
 				first_change = pass.change_sequence;
@@ -781,11 +828,14 @@ undo_cleaner_capacity_history_probe(uint32 segment_id, ClusterCtrcTxnKeyV1 *cont
 			}
 		} else
 			have_first = false;
-		if (!undo_cleaner_capacity_report_wait())
-			return CLUSTER_CTRC_CAPACITY_REFUSE;
+		if (!undo_cleaner_capacity_report_wait()) {
+			context = 0;
+			HISTORY_REFUSE("history_report_context", &observation);
+		}
 		MemSet(&pass, 0, sizeof(pass));
 		status = cluster_undo_capacity_history_observe(&history, &producer);
 	}
+#undef HISTORY_REFUSE
 }
 
 bool
@@ -795,9 +845,16 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 	volatile bool completed = false;
 	uint32 previous_wait_event = *my_wait_event_info;
 
-	if (undo_cleaner_state == NULL || continuation == NULL)
+	undo_capacity_refusal.valid = false;
+	if (undo_cleaner_state == NULL || continuation == NULL) {
+		undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){
+			.site = "unavailable", .segment = segment_id, .key = continuation });
 		return false;
+	}
 	if (!undo_cleaner_capacity_context_safe()) {
+		undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){
+			.site = "entry_context", .segment = segment_id, .key = continuation,
+			.known = D_BIT(D_CONTEXT), .values = { [D_CONTEXT] = 0 } });
 		cluster_undo_cleaner_note_capacity_refusal(true);
 		pgstat_report_wait_start(previous_wait_event);
 		return false;
@@ -810,18 +867,27 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		uint64 owner_generations[CLUSTER_UNDO_CLEANER_WORKER_TYPES] = { 0 };
 		unsigned worker = 0;
 		bool history_handled = false;
+		int enabled, storage = -1, context = -1;
 
 		CHECK_FOR_INTERRUPTS();
-		if (cluster_undo_cleaner_enabled && cluster_storage_mode_enabled()) {
+		if ((enabled = cluster_undo_cleaner_enabled) && (storage = cluster_storage_mode_enabled())) {
 			proof = undo_cleaner_capacity_history_probe(segment_id, continuation, owner_generations,
 														&worker, &history_handled);
-			if (!history_handled && undo_cleaner_capacity_floor(&floor))
-				proof = undo_cleaner_capacity_probe(segment_id, &floor, continuation,
-													owner_generations, &worker);
+			if (!history_handled) {
+				if (undo_cleaner_capacity_floor(&floor))
+					proof = undo_cleaner_capacity_probe(segment_id, &floor, continuation,
+														owner_generations, &worker);
+				else
+					undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){
+						.site = "floor", .segment = segment_id, .key = continuation,
+						.known = D_BIT(D_FLOOR) | D_BIT(D_HANDLED),
+						.values = { [D_FLOOR] = 0, [D_HANDLED] = 0 } });
+			}
 		}
 		if (proof == CLUSTER_CTRC_CAPACITY_RETRY)
 			retry = true;
-		else if (proof == CLUSTER_CTRC_CAPACITY_WAIT && undo_cleaner_capacity_context_safe()) {
+		else if (proof == CLUSTER_CTRC_CAPACITY_WAIT
+				 && (context = undo_cleaner_capacity_context_safe())) {
 			bool supplied;
 			bool owner_changed;
 			uint64 coordinator_generation;
@@ -839,6 +905,16 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 			else if (!supplied)
 				cluster_undo_cleaner_note_capacity_refusal(false);
 			LWLockRelease(&undo_cleaner_state->lwlock);
+			if (!supplied)
+				undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){
+					.site = "owner_unavailable", .segment = segment_id, .key = continuation,
+					.owners = owner_generations, .coordinator_generation = coordinator_generation,
+					.worker_generation = worker_generation,
+					.known = D_BIT(D_PROOF) | D_BIT(D_CONTEXT) | D_BIT(D_WORKER)
+						| D_BIT(D_SUPPLIED) | D_BIT(D_OWNER_CHANGED) | D_BIT(D_HANDLED),
+					.values = { [D_PROOF] = proof, [D_CONTEXT] = context, [D_WORKER] = worker,
+						[D_SUPPLIED] = supplied, [D_OWNER_CHANGED] = owner_changed,
+						[D_HANDLED] = history_handled } });
 			if (owner_changed) {
 				/* Re-enter the original allocator/proof under the new owner;
 				 * this old key must not bridge a worker incarnation change. */
@@ -857,6 +933,14 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 				retry = true;
 			}
 		} else {
+			undo_capacity_refusal_capture(&(UndoCapacityRefusalInput){
+				.site = proof == CLUSTER_CTRC_CAPACITY_WAIT ? "wait_context" : "controller_refuse",
+				.segment = segment_id, .key = continuation,
+				.known = D_BIT(D_ENABLED) | D_BIT(D_PROOF) | D_BIT(D_HANDLED)
+					| (storage >= 0 ? D_BIT(D_STORAGE) : 0)
+					| (context >= 0 ? D_BIT(D_CONTEXT) : 0),
+				.values = { [D_ENABLED] = enabled, [D_STORAGE] = storage, [D_CONTEXT] = context,
+					[D_PROOF] = proof, [D_HANDLED] = history_handled } });
 			cluster_undo_cleaner_note_capacity_refusal(proof == CLUSTER_CTRC_CAPACITY_WAIT);
 		}
 		completed = true;

@@ -11,6 +11,7 @@
 #include "test_cluster_empty_undo_preflight.c"
 #include "cluster/cluster_heap_horizon.h"
 
+int MyProcPid = 123;
 bool cluster_undo_cleaner_enabled = true;
 int cluster_lmon_main_loop_interval = 2000;
 static bool bind_subscribed, bind_recheck_first, bind_drift, bind_no_owner;
@@ -697,6 +698,10 @@ UT_TEST(test_capacity_reentry_unflushed_commit_unstages_before_original_abort)
 	}
 }
 
+#ifdef UNDO_CAPACITY_BIND_FIXTURE_MAIN
+int UNDO_CAPACITY_BIND_FIXTURE_MAIN(void);
+#define main UNDO_CAPACITY_BIND_FIXTURE_MAIN
+#endif
 int
 main(void)
 {
@@ -715,3 +720,7 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+
+#ifdef UNDO_CAPACITY_BIND_FIXTURE_MAIN
+#undef main
+#endif

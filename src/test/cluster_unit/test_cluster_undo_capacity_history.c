@@ -441,6 +441,10 @@ UT_TEST(test_actual_history_writer_change_cannot_bridge_complete_pass)
 	history_finish(2);
 }
 
+#ifdef UNDO_CAPACITY_HISTORY_FIXTURE_MAIN
+int UNDO_CAPACITY_HISTORY_FIXTURE_MAIN(void);
+#define main UNDO_CAPACITY_HISTORY_FIXTURE_MAIN
+#endif
 int
 main(void)
 {
@@ -462,3 +466,7 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+
+#ifdef UNDO_CAPACITY_HISTORY_FIXTURE_MAIN
+#undef main
+#endif

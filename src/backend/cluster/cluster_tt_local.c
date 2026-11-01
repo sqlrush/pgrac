@@ -396,7 +396,7 @@ cluster_tt_local_active_full_error(uint32 segment_id)
 }
 
 static void
-cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap)
+cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap, const char *capacity_detail)
 {
 	/* S3 forensics step 1/1a — the errdetail separates "cleaner
 	 * stopped reclaiming" (cleaner status/iters/liveness stale,
@@ -426,7 +426,7 @@ cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap)
 			 " tt_rollover_fail_activate=" UINT64_FORMAT
 			 " record_extent_hard_cap_fail=" UINT64_FORMAT
 			 " segments_max_per_instance=%d cleaner_status=%s"
-			 " cleaner_loop_iters=" INT64_FORMAT " cleaner_tick_age_ms=%ld.",
+			 " cleaner_loop_iters=" INT64_FORMAT " cleaner_tick_age_ms=%ld.%s%s",
 			 cluster_node_id, cluster_tt_slot_retention_horizon_scn(),
 			 (uint64)cluster_scn_current(), cluster_tt_slot_retain_skip_count(),
 			 cluster_tt_slot_retention_recycle_count(),
@@ -437,7 +437,8 @@ cluster_tt_local_rollover_error(uint32 seg, bool at_hard_cap)
 			 cluster_undo_tt_rollover_fail_activate_count(),
 			 cluster_undo_segment_hard_cap_fail_count(), cluster_undo_segments_max_per_instance,
 			 cluster_undo_cleaner_status_to_string(cluster_undo_cleaner_status()),
-			 cluster_undo_cleaner_main_loop_iters(), cleaner_tick_age_ms),
+			 cluster_undo_cleaner_main_loop_iters(), cleaner_tick_age_ms,
+			 capacity_detail != NULL ? "\n" : "", capacity_detail != NULL ? capacity_detail : ""),
 		 errhint(at_hard_cap ? "A long-running reader is retaining committed undo; end it, "
 							   "or raise cluster.undo_segments_max_per_instance."
 							 : "Inspect the preceding undo lifecycle stage/predicate for "
@@ -564,7 +565,7 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 						*out_tt_slot_id = 0;
 						return CLUSTER_TT_LOCAL_NEED_CAPACITY;
 					}
-					cluster_tt_local_rollover_error(seg, at_hard_cap);
+					cluster_tt_local_rollover_error(seg, at_hard_cap, NULL);
 				}
 			}
 		}
@@ -1161,7 +1162,8 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 			 * predicate still refuses pins, locks and any other admission. */
 			if (cluster_undo_cleaner_wait_for_capacity(segment_id, &capacity_continuation))
 				continue;
-			cluster_tt_local_rollover_error(segment_id, true);
+			cluster_tt_local_rollover_error(segment_id, true,
+				cluster_undo_cleaner_capacity_refusal_detail(segment_id, top_xid, active_slot_pending));
 		}
 		if (reserve_result == CLUSTER_TT_LOCAL_UNAVAILABLE)
 			return false;

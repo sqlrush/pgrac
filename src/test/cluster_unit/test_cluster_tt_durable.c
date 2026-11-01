@@ -193,11 +193,13 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
+#ifndef TT_DURABLE_EXTERNAL_ERROR_DETAIL
 int
 errdetail(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
+#endif
 int
 errhint(const char *fmt pg_attribute_unused(), ...)
 {

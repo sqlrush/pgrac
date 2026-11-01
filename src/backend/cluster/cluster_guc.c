@@ -120,6 +120,7 @@ bool cluster_trace_gcs_capacity = false;
 bool cluster_trace_block_io = false;
 bool cluster_trace_cleanup = false;
 bool cluster_trace_normal_stop = false;
+bool cluster_trace_undo_capacity_refusal = false;
 char *cluster_trace_visibility_relids = NULL;
 bool cluster_trace_visibility_enabled = false;
 ClusterVisibilityTraceFilter cluster_trace_visibility_filter = { 0 };
@@ -1767,6 +1768,11 @@ cluster_init_guc(void)
 		gettext_noop("Log passive producer ACK and retained DROP progress during normal stop."),
 		gettext_noop("Correlate peer-local owner records by formation, origin, batch and locator."),
 		&cluster_trace_normal_stop, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable(
+		"cluster.trace_undo_capacity_refusal",
+		gettext_noop("Include one passive capacity refusal snapshot in the original error log."),
+		gettext_noop("Unexecuted predicates remain unknown; no additional observation is performed."),
+		&cluster_trace_undo_capacity_refusal, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable(
 		"cluster.trace_control_config",
 		gettext_noop("Log CF configuration, acquisition and holder observations."),
