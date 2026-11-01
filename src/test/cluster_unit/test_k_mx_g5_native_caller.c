@@ -40,6 +40,7 @@ static uint64 request_history[8];
 static unsigned proof_allocation_fault;
 static bool proof_allocation_fired, proof_catalog_error;
 static uint32 proof_catalog_delta;
+static unsigned proof_request_checks, proof_request_drift_at;
 
 static void
 proof_drift(unsigned kind)
@@ -73,6 +74,8 @@ MemoryContextAllocZero(MemoryContext context, Size size)
 uint32
 GetControlFileCatalogVersion(void)
 {
+	if (proof_request_drift_at && ++proof_request_checks == proof_request_drift_at)
+		proof_catalog_delta++;
 	if (proof_catalog_error)
 		pg_re_throw();
 	return k_proof_original_catalog() + proof_catalog_delta;
@@ -195,6 +198,7 @@ static void chain_seed(uint32 count,uint32 start)
 	memset(request_history,0,sizeof(request_history));
 	proof_allocation_fault = proof_catalog_delta = 0;
 	proof_allocation_fired = proof_catalog_error = false;
+	proof_request_checks = proof_request_drift_at = 0;
 	cluster_multixact_current_stats_shmem_init();
 }
 static void chain_clean(void)
@@ -576,11 +580,223 @@ caller_proof_scope_stable_and_explicit_retry(void)
 	}
 }
 
-int main(void)
+/* The existing native/GCS/inline/G2 chain supplies the source and operation.
+ * ASK generation itself sends no DATA and performs no CTRC proof-touch. */
+static ClusterMxRangeWireContext
+proof_request_context(void)
+{
+	ClusterMxRangeWireContext c = {0};
+	c.request_id = 901; c.epoch = 7; c.key.multixact_id = 1000; c.key.cluster_epoch = 7;
+	c.format_id = CLUSTER_FOREIGN_MX_FORMAT_ID_V1;
+	c.version = CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1;
+	c.loaded_catalog = 202611010; c.peer_generation = connection_generation;
+	c.peer_capabilities = CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES;
+	c.requested_cap = 7; c.source = &proof_source; c.source_bytes = sizeof(proof_source);
+	return c;
+}
+
+static void
+caller_full_proof_asks_follow_accepted_windows(void)
+{
+	const uint32 sizes[] = {2, 256, 257, 65537};
+	for (unsigned k = 0; k < lengthof(sizes); k++) {
+		ClusterCurrentMxKey key = {0}; ClusterMxCompositionReceive *op = NULL;
+		ClusterMxCompositionReceiveStats stats = {0}; ClusterMxRangeWireContext c;
+		unsigned network, allocated; uint32 first = 0;
+		chain_seed(sizes[k], MULTIXACT_MEMBERS_PER_PAGE - 1);
+		key.multixact_id = 1000; key.cluster_epoch = 7;
+		UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag, &request_snapshot, &op, &stats));
+		c = proof_request_context(); network = requests_sent;
+		while (first < sizes[k]) {
+			PGAlignedBlock frame, duplicate;
+			ClusterMxRangeProofAsk asks[7]; ClusterMxRangeWireHeader header;
+			ClusterMxFullMemberProof entries[7]; ClusterMxProofReply r;
+			uint32 bytes = 99, copied = 99, count = 99, total = 99;
+			bool encoded;
+			allocated = allocations;
+			encoded = cluster_multixact_current_proofs_request(&op, &c, frame.data, BLCKSZ, &bytes);
+			UT_ASSERT(encoded);
+			if (!encoded) break;
+			UT_ASSERT_EQ(allocations, allocated);
+			encoded = cluster_mx_range_wire_decode_proof_asks(frame.data, bytes, &c, asks, 7, &count, &total);
+			UT_ASSERT(encoded);
+			if (!encoded) break;
+			UT_ASSERT_EQ(total, sizes[k]); UT_ASSERT_EQ(count, Min(sizes[k] - first, 7));
+			memcpy(&header, frame.data, sizeof(header));
+			UT_ASSERT_EQ(header.first, first); UT_ASSERT_EQ(header.next, first + count);
+			for (uint32 i = 0; i < count; i++) {
+				UT_ASSERT_EQ(asks[i].member_ordinal, first + i);
+				UT_ASSERT_EQ(asks[i].xid, 100 + first + i);
+				UT_ASSERT_EQ(asks[i].member_status, MultiXactStatusForShare);
+			}
+			/* Encoding is not progress. Only complete proof acceptance advances. */
+			UT_ASSERT(cluster_multixact_current_proofs_request(&op, &c, duplicate.data, BLCKSZ, &copied));
+			UT_ASSERT_EQ(copied, bytes); UT_ASSERT_EQ(memcmp(frame.data, duplicate.data, bytes), 0);
+			UT_ASSERT_EQ(stats.accepted_proof_frames, first / 7);
+			r = proof_window(sizes[k], first, entries);
+			UT_ASSERT_EQ(cluster_multixact_current_proofs_accept(&op, MXCOMP_READ_OK, &r),
+				r.last ? MXCOMP_COMPLETE : MXCOMP_PARTIAL);
+			first += count; c.request_id++;
+		}
+		UT_ASSERT_EQ(requests_sent, network); UT_ASSERT_EQ(replies_sent, network);
+		UT_ASSERT_EQ(first, sizes[k]);
+		UT_ASSERT_EQ(stats.accepted_proof_frames, (sizes[k] + 6) / 7);
+		UT_ASSERT_EQ(stats.unknown_results, 0);
+		cluster_multixact_current_describe_finish(&op); chain_clean();
+	}
+}
+
+static void
+caller_proof_ask_context_is_bound_to_original_operation(void)
+{
+	for (unsigned mode = 0; mode < 12; mode++) {
+		ClusterCurrentMxKey key = {0}; ClusterMxCompositionReceive *op = NULL;
+		ClusterMxCompositionReceiveStats stats = {0}; ClusterMxRangeWireContext c;
+		ClusterMxRangeSource changed; PGAlignedBlock out, unchanged; uint32 bytes = 99;
+		chain_seed(257, 1); key.multixact_id = 1000; key.cluster_epoch = 7;
+		UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag, &request_snapshot, &op, &stats));
+		c = proof_request_context(); changed = proof_source;
+		switch (mode) {
+		case 0: changed.admission_revision++; c.source = &changed; break;
+		case 1: changed.snapshot.curcid++; c.source = &changed; break;
+		case 2: changed.native.oldest_multi++; c.source = &changed; break;
+		case 3: c.source_bytes--; break;
+		case 4: c.key.multixact_id++; break;
+		case 5: c.loaded_catalog++; break;
+		case 6: c.peer_generation++; break;
+		case 7: c.peer_capabilities &= ~CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES; break;
+		case 8: c.epoch++; c.key.cluster_epoch++; break;
+		case 9: c.requested_cap = 0; break;
+		case 10: c.requested_cap = 8; break;
+		case 11: c.request_id = 0; break;
+		}
+		memset(out.data, 0xa5, BLCKSZ); unchanged = out;
+		UT_ASSERT(!cluster_multixact_current_proofs_request(&op, &c, out.data, BLCKSZ, &bytes));
+		UT_ASSERT_NULL(op); UT_ASSERT_EQ(bytes, 0); UT_ASSERT_EQ(memcmp(out.data, unchanged.data, BLCKSZ), 0);
+		UT_ASSERT_EQ(stats.unknown_results, 1); UT_ASSERT_EQ(stats.restart_requests, 1);
+		UT_ASSERT_EQ(requests_sent, 2); UT_ASSERT_EQ(replies_sent, 2);
+		cluster_multixact_current_describe_finish(&op); chain_clean();
+	}
+}
+
+static void
+caller_proof_ask_scope_drift_discards_without_sending(void)
+{
+	for (unsigned kind = 1; kind <= 5; kind++) {
+		ClusterCurrentMxKey key = {0}; ClusterMxCompositionReceive *op = NULL;
+		ClusterMxCompositionReceiveStats stats = {0}; ClusterMxRangeWireContext c;
+		PGAlignedBlock frame; uint32 bytes = 99;
+		chain_seed(2, 1); key.multixact_id = 1000; key.cluster_epoch = 7;
+		UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag, &request_snapshot, &op, &stats));
+		c = proof_request_context(); proof_drift(kind); memset(frame.data, 0xa5, BLCKSZ);
+		UT_ASSERT(!cluster_multixact_current_proofs_request(&op, &c, frame.data, BLCKSZ, &bytes));
+		UT_ASSERT_NULL(op); UT_ASSERT_EQ(bytes, 0); UT_ASSERT_EQ((uint8)frame.data[0], 0xa5);
+		UT_ASSERT_EQ(requests_sent, 1); UT_ASSERT_EQ(stats.unknown_results, 1);
+		UT_ASSERT_EQ(stats.restart_requests, 1);
+		cluster_multixact_current_describe_finish(&op); chain_clean();
+	}
+}
+
+static void
+caller_proof_ask_late_scope_check_keeps_output_atomic(void)
+{
+	ClusterCurrentMxKey key = {0}; ClusterMxCompositionReceive *op = NULL;
+	ClusterMxCompositionReceiveStats stats = {0}; ClusterMxRangeWireContext c;
+	PGAlignedBlock out, unchanged; uint32 bytes = 99;
+	chain_seed(2, 1); key.multixact_id = 1000; key.cluster_epoch = 7;
+	UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag, &request_snapshot, &op, &stats));
+	c = proof_request_context(); proof_request_drift_at = 2;
+	memset(out.data, 0xa5, BLCKSZ); unchanged = out;
+	UT_ASSERT(!cluster_multixact_current_proofs_request(&op, &c, out.data, BLCKSZ, &bytes));
+	UT_ASSERT_EQ(proof_request_checks, 2); UT_ASSERT_NULL(op); UT_ASSERT_EQ(bytes, 0);
+	UT_ASSERT_EQ(memcmp(out.data, unchanged.data, BLCKSZ), 0);
+	UT_ASSERT_EQ(stats.unknown_results, 1); UT_ASSERT_EQ(stats.restart_requests, 1);
+	UT_ASSERT_EQ(requests_sent, 1);
+	cluster_multixact_current_describe_finish(&op); chain_clean();
+}
+
+static void
+caller_proof_ask_error_and_owner_release_cleanup(void)
+{
+	static ClusterMxCompositionReceive *op;
+	static ClusterMxCompositionReceiveStats stats;
+	static uint32 bytes;
+	for (unsigned mode = 0; mode < 2; mode++) {
+		ClusterCurrentMxKey key = {0}; ClusterMxRangeWireContext c;
+		PGAlignedBlock frame; bool caught = false;
+		chain_seed(2, 1); key.multixact_id = 1000; key.cluster_epoch = 7;
+		bytes = 99;
+		op = NULL; memset(&stats, 0, sizeof(stats));
+		UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag, &request_snapshot, &op, &stats));
+		c = proof_request_context(); memset(frame.data, 0xa5, BLCKSZ);
+		if (mode == 0) proof_catalog_error = true;
+		else {
+			UT_ASSERT(cluster_multixact_current_proofs_request(&op, &c, frame.data, BLCKSZ, &bytes));
+			range_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, range_release_arg);
+			op = NULL; /* The released borrowed pointer must never be dereferenced. */
+		}
+		PG_TRY(); {
+			UT_ASSERT(!cluster_multixact_current_proofs_request(&op, &c, frame.data, BLCKSZ, &bytes));
+		} PG_CATCH(); { caught = true; } PG_END_TRY();
+		proof_catalog_error = false;
+		UT_ASSERT_EQ(caught, mode == 0); UT_ASSERT_NULL(op); UT_ASSERT_EQ(bytes, 0);
+		range_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, range_release_arg);
+		UT_ASSERT_EQ(requests_sent, 1); chain_clean();
+	}
+}
+
+static void
+raw_proof_ask_requires_complete_set_and_positive_capacity(void)
+{
+	ClusterMxCompositionReceiveStats stats = {0}; ClusterMxCompositionReceive *op;
+	ClusterCurrentMxMemberDesc members[256]; ClusterMxCompositionReply r;
+	ClusterMxRangeWireContext c; PGAlignedBlock out, unchanged; uint32 bytes = 99;
+	chain_seed(2, 1); op = begin(2, &stats); c = proof_request_context();
+	c.source = source; c.source_bytes = sizeof(source);
+	memset(out.data, 0xa5, BLCKSZ); unchanged = out;
+	UT_ASSERT(!cluster_mx_composition_encode_proof_asks(op, &c, out.data, BLCKSZ, &bytes));
+	UT_ASSERT_EQ(bytes, 0); UT_ASSERT_EQ(memcmp(out.data, unchanged.data, BLCKSZ), 0);
+	r = reply(2, 0, 2, members);
+	UT_ASSERT_EQ(cluster_mx_composition_accept(&op, MXCOMP_READ_OK, &r), MXCOMP_COMPLETE);
+	UT_ASSERT(!cluster_mx_composition_encode_proof_asks(op, &c, out.data, 1, &bytes));
+	UT_ASSERT_EQ(bytes, 0); UT_ASSERT_EQ(memcmp(out.data, unchanged.data, BLCKSZ), 0);
+	UT_ASSERT(cluster_mx_composition_encode_proof_asks(op, &c, out.data, BLCKSZ, &bytes));
+	UT_ASSERT_EQ(bytes, 168); /* 80 header +64 exact source +2*12 asks. */
+	cluster_mx_composition_finish(&op); chain_clean();
+}
+
+static void
+caller_proof_asks_skip_native_zero_slot_and_stop_after_complete(void)
+{
+	ClusterCurrentMxKey key = {0}; ClusterMxCompositionReceive *op = NULL;
+	ClusterMxCompositionReceiveStats stats = {0}; ClusterMxRangeWireContext c;
+	ClusterMxRangeProofAsk asks[7]; ClusterMxFullMemberProof entries[7];
+	PGAlignedBlock frame; uint32 bytes = 99, count = 99, total = 99;
+	ClusterMxProofReply r;
+	chain_seed(2, UINT32_MAX - 1); key.multixact_id = 1000; key.cluster_epoch = 7;
+	UT_ASSERT(cluster_multixact_current_describe_full(&key, &request_tag, &request_snapshot, &op, &stats));
+	UT_ASSERT_EQ(proof_source.native.span, 3); c = proof_request_context(); c.requested_cap = 1;
+	UT_ASSERT(cluster_multixact_current_proofs_request(&op, &c, frame.data, BLCKSZ, &bytes));
+	UT_ASSERT(cluster_mx_range_wire_decode_proof_asks(frame.data, bytes, &c, asks, 7, &count, &total));
+	UT_ASSERT_EQ(total, 2); UT_ASSERT_EQ(count, 1); UT_ASSERT_EQ(asks[0].member_ordinal, 0);
+	UT_ASSERT_EQ(asks[0].xid, 100);
+	/* Accept both real members in one original proof window. */
+	r = proof_window(2, 0, entries);
+	UT_ASSERT_EQ(cluster_multixact_current_proofs_accept(&op, MXCOMP_READ_OK, &r), MXCOMP_COMPLETE);
+	memset(frame.data, 0xa5, BLCKSZ);
+	UT_ASSERT(!cluster_multixact_current_proofs_request(&op, &c, frame.data, BLCKSZ, &bytes));
+	UT_ASSERT_NULL(op); UT_ASSERT_EQ(bytes, 0); UT_ASSERT_EQ((uint8)frame.data[0], 0xa5);
+	cluster_multixact_current_describe_finish(&op); chain_clean();
+}
+
+#ifndef K_MX_NATIVE_CALLER_MAIN
+#define K_MX_NATIVE_CALLER_MAIN main
+#endif
+int K_MX_NATIVE_CALLER_MAIN(void)
 {
 	TopMemoryContext=AllocSetContextCreate(CurrentMemoryContext,"native caller",ALLOCSET_DEFAULT_SIZES);
 	CurrentMemoryContext=TopMemoryContext;
-	UT_PLAN(13);
+	UT_PLAN(20);
 	UT_RUN(caller_native_transport_sizes);
 	UT_RUN(caller_native_transport_failure_cleanup);
 	UT_RUN(scoped_outcomes_in_original_snapshot);UT_RUN(scoped_cancel_has_no_returned_outcome);
@@ -588,6 +804,13 @@ int main(void)
 	UT_RUN(scoped_last_reply_refusal_has_one_outcome);
 	UT_RUN(caller_fresh_retry_starts_at_zero);
 	UT_RUN(caller_proof_windows_keep_original_owner);
+	UT_RUN(caller_full_proof_asks_follow_accepted_windows);
+	UT_RUN(caller_proof_ask_context_is_bound_to_original_operation);
+	UT_RUN(caller_proof_ask_scope_drift_discards_without_sending);
+	UT_RUN(caller_proof_ask_late_scope_check_keeps_output_atomic);
+	UT_RUN(caller_proof_ask_error_and_owner_release_cleanup);
+	UT_RUN(raw_proof_ask_requires_complete_set_and_positive_capacity);
+	UT_RUN(caller_proof_asks_skip_native_zero_slot_and_stop_after_complete);
 	UT_RUN(caller_proof_scope_drift_before_window);
 	UT_RUN(caller_proof_scope_drift_after_window);
 	UT_RUN(caller_proof_scope_provider_error_cleanup);

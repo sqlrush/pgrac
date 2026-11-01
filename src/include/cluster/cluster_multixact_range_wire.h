@@ -61,6 +61,16 @@ extern ClusterMxCompositionReadStatus cluster_mx_range_wire_decode_reply(
 extern bool cluster_mx_range_wire_encode_proof_asks(const ClusterMxRangeWireContext *ctx,
 	uint32 total, uint32 first, const ClusterCurrentMxMemberDesc *members, uint32 count,
 	void *wire, uint32 capacity, uint32 *bytes);
+/* Encode the next unaccepted proof window of the complete original operation.
+ * Source bytes must match exactly. requested_cap is in 1..7; positions and N
+ * are logical uint32, independently of the native physical slot-0 skip.
+ * This does not advance, allocate, send or touch proofs. Only accept_proofs
+ * advances the window. Failure leaves wire unchanged and bytes zero. Raw
+ * operations only: describe_full borrowers use the ResourceOwner-aware
+ * cluster_multixact_current_proofs_request entry.
+ */
+extern bool cluster_mx_composition_encode_proof_asks(const ClusterMxCompositionReceive *op,
+	const ClusterMxRangeWireContext *ctx, void *wire, uint32 capacity, uint32 *bytes);
 /* asks_cap must be in 1..7. Failure zeroes asks/count/total, with no partial
  * proof request. These are requests, never canonical TT proofs or grants. */
 extern bool cluster_mx_range_wire_decode_proof_asks(const void *wire, uint32 bytes,

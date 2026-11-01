@@ -228,6 +228,57 @@ cluster_multixact_current_describe_finish(ClusterMxCompositionReceive **op)
 	*op = NULL;
 }
 
+bool
+cluster_multixact_current_proofs_request(ClusterMxCompositionReceive **op,
+	const ClusterMxRangeWireContext *ctx, void *wire, uint32 capacity, uint32 *bytes)
+{
+	RangeOwned *owned;
+	PGAlignedBlock candidate;
+	uint32 encoded_bytes = 0;
+	bool ok = false;
+
+	if (bytes != NULL)
+		*bytes = 0;
+	if (op == NULL || *op == NULL)
+		return false;
+	for (owned = range_owned; owned != NULL; owned = owned->next)
+		if (owned->op == *op)
+			break;
+	if (owned == NULL) {
+		*op = NULL;
+		return false;
+	}
+	PG_TRY();
+	{
+		if (ctx != NULL && wire != NULL && bytes != NULL
+			&& memcmp(&ctx->key, &owned->key, sizeof(owned->key)) == 0
+			&& ctx->epoch == owned->key.cluster_epoch
+			&& ctx->loaded_catalog == owned->loaded_catalog
+			&& ctx->peer_generation == owned->peer_generation
+			&& range_owned_current(owned)
+			&& cluster_mx_composition_encode_proof_asks(owned->op, ctx, candidate.data,
+				Min(capacity, BLCKSZ), &encoded_bytes)
+			&& range_owned_current(owned)) {
+			memcpy(wire, candidate.data, encoded_bytes);
+			*bytes = encoded_bytes;
+			ok = true;
+		}
+		if (!ok)
+			(void)cluster_mx_composition_accept_proofs(&owned->op, MXCOMP_READ_RETRY, NULL);
+	}
+	PG_CATCH();
+	{
+		*op = NULL;
+		range_owned_end(owned);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*op = owned->op;
+	if (!ok)
+		range_owned_end(owned);
+	return ok;
+}
+
 ClusterMxCompositionReceiveResult
 cluster_multixact_current_proofs_accept(ClusterMxCompositionReceive **op,
 										ClusterMxCompositionReadStatus status,

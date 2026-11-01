@@ -77,6 +77,16 @@ extern bool cluster_multixact_current_describe_full(const ClusterCurrentMxKey *k
 	const BufferTag *target, const ClusterMxRangeSnapshot *snapshot,
 	ClusterMxCompositionReceive **op, ClusterMxCompositionReceiveStats *stats);
 extern void cluster_multixact_current_describe_finish(ClusterMxCompositionReceive **op);
+/* Same original owner and qualification as describe_full/proofs_accept. Encode
+ * only the next unaccepted window, without sending or entering CTRC touch.
+ * Context key/catalog/peer generation and exact source must match the original
+ * operation; scope is rechecked before and after encoding. Failure retires the
+ * operation, leaves wire unchanged and bytes zero; ERROR cleans up and rethrows.
+ * The future transport must route/split by real member origin and account for
+ * every attempt; this entry does not choose origin or reserve G4 capacity.
+ */
+extern bool cluster_multixact_current_proofs_request(ClusterMxCompositionReceive **op,
+	const ClusterMxRangeWireContext *ctx, void *wire, uint32 capacity, uint32 *bytes);
 /* Keep the original ResourceOwner/directory borrow in sync on proof failure
  * and ERROR, rechecking requester epoch/storage/CONTROL before and after each
  * provisional window. This does not validate member grants or tuple fences.

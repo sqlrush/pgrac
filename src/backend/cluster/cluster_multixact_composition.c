@@ -262,6 +262,39 @@ cluster_mx_composition_pages(const ClusterMxCompositionReceive *op, uint32 *tota
 	return op->head;
 }
 
+bool
+cluster_mx_composition_encode_proof_asks(const ClusterMxCompositionReceive *op,
+	const ClusterMxRangeWireContext *ctx, void *wire, uint32 capacity, uint32 *bytes)
+{
+	ClusterCurrentMxMemberDesc members[CLUSTER_MX_PROOF_PAGE_MEMBERS];
+	const ClusterMxCompositionPage *page;
+	uint32 count;
+
+	if (bytes != NULL)
+		*bytes = 0;
+	if (op == NULL || !op->complete || op->proofs_complete || ctx == NULL
+		|| ctx->source == NULL || ctx->source_bytes != op->source_bytes
+		|| memcmp(ctx->source, op->source, op->source_bytes) != 0
+		|| ctx->requested_cap == 0 || ctx->requested_cap > CLUSTER_MX_PROOF_PAGE_MEMBERS
+		|| op->proof_accepted >= op->member_count)
+		return false;
+	count = Min(ctx->requested_cap, op->member_count - op->proof_accepted);
+	page = op->proof_members == NULL ? op->head : op->proof_members;
+	for (uint32 i = 0; i < count; i++) {
+		uint32 ordinal = op->proof_accepted + i;
+		while (page != NULL && page->count > 0
+			&& page->count <= CLUSTER_MX_COMPOSITION_PAGE_MEMBERS
+			&& (uint64)ordinal >= (uint64)page->first + page->count)
+			page = page->next;
+		if (page == NULL || page->count == 0 || page->count > CLUSTER_MX_COMPOSITION_PAGE_MEMBERS
+			|| ordinal < page->first || (uint64)ordinal >= (uint64)page->first + page->count)
+			return false;
+		members[i] = page->members[ordinal - page->first];
+	}
+	return cluster_mx_range_wire_encode_proof_asks(ctx, op->member_count,
+		op->proof_accepted, members, count, wire, capacity, bytes);
+}
+
 ClusterMxCompositionReceiveResult
 cluster_mx_composition_accept_proofs(ClusterMxCompositionReceive **op,
 									 ClusterMxCompositionReadStatus status,

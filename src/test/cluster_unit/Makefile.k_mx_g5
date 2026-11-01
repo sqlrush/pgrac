@@ -87,6 +87,17 @@ test_k_mx_g5_native_caller: test_k_mx_g5_native_caller.c test_k_mx_g5_service.c 
 		$(K_MX_NATIVE_CALLER_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a -o $@
 
+# Intentional service acceptance RED, manually selected until full proof dispatch.
+test_k_mx_g5_proof_holder_red: test_k_mx_g5_proof_holder_red.c \
+		test_k_mx_g5_native_caller.c test_k_mx_g5_service.c test_cluster_mx_native_range.c \
+		test_cluster_mx_composition.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/multixact.c \
+		$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c \
+		$(K_MX_NATIVE_CALLER_O) $(MX_RANGE_WIRE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(K_MX_NATIVE_CALLER_O) $(MX_RANGE_WIRE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a -o $@
+
 # Original bounded heap consumer; no proof or HELLO activation.
 K_MX_HEAP_RECHECK_O ?= test_k_mx_g5_heap_recheck_product.o
 $(K_MX_HEAP_RECHECK_O): $(top_srcdir)/src/backend/access/heap/heapam.c \
