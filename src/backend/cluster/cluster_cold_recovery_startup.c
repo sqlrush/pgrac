@@ -44,6 +44,7 @@
 #include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -1443,6 +1444,7 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	if (typed_address == NULL || *typed_address == NULL)
 		return;
 	typed = *typed_address;
+	cold_relmap_terminal_cleanup(typed->plan);
 	/* Keep the complete original context and ownership until joint transfer. */
 	if (cluster_cold_plan_relmap_recovery_held_v1(typed->plan))
 		return;

@@ -205,6 +205,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_terminal_ref_census.h"
@@ -1053,7 +1054,8 @@ ClusterColdRecoveryStartOutputDistinct(const struct ClusterRecoveryStartV1 *star
 	/* Keep the opaque extent at its owner. No dereference, writer validation
 	 * or authority is implied by this storage-only check. */
 	return start != NULL && start == cluster_recovery_cold_start && out != NULL && bytes != 0
-		&& (a <= b ? b - a >= bytes : a - b >= sizeof(*start));
+		&& (a <= b ? b - a >= bytes : a - b >= sizeof(*start))
+		&& cold_relmap_output_distinct(start->inputs, out, bytes);
 }
 
 bool

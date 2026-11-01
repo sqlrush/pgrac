@@ -21,4 +21,11 @@ extern void test_relmap_native_clog_authorize(bool (*check)(int));
 extern void test_relmap_native_clog_fault(unsigned fault, unsigned on_call);
 extern TestRelmapNativeClogStats test_relmap_native_clog_stats(void);
 extern TestRelmapNativeClogStats test_relmap_native_clog_done(void);
+
+extern bool test_relmap_native_clog_seal(ClusterClogNativeBaseHandleV1 *held);
+extern bool test_relmap_native_clog_current(ClusterClogNativeBaseHandleV1 *held);
+extern void test_relmap_native_clog_mutate(bool begin);
+
+extern void test_relmap_native_clog_reopen_same_fd(ClusterClogNativeBaseHandleV1 *held, bool cleanup);
+extern void test_relmap_native_clog_reopen_fault(ClusterClogNativeBaseHandleV1 *held, unsigned fault);
 #endif
