@@ -1410,6 +1410,54 @@ TrimCLOG(void)
 /*
  * Perform a checkpoint --- either during shutdown, or on-the-fly
  */
+#ifdef USE_PGRAC_CLUSTER
+static void
+CLOGCheckpointNative(void)
+{
+	ClusterControlNativeInventoryV2 *volatile inventory = NULL;
+	uint64 completed = 0;
+
+	PG_TRY();
+	{
+		if (cluster_node_id < 0 || cluster_node_id > PG_UINT16_MAX ||
+			cluster_control_native_files_inventory_v2(CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2,
+				(ClusterControlNativeInventoryV2 **) &inventory) != CLUSTER_NATIVE_FILES_OK_V2 ||
+			!cluster_control_native_files_inventory_current_v2(inventory))
+			ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CLOG checkpoint requires its complete selected native inventory")));
+		/* Preserve the original dirty-slot/WAL/re-dirty write protocol. */
+		SimpleLruWriteAll(XactCtl, true);
+		for (uint64 i = 0; i < inventory->info.count; i++)
+		{
+			const ClusterRecoveryFileIdentityV2 *expected = &inventory->files[i];
+			ClusterClogFileSyncV2 observed;
+
+			if (expected->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 ||
+				expected->origin != (uint16) cluster_node_id) continue;
+			if (!cluster_control_native_files_inventory_current_v2(inventory) ||
+				!SimpleLruNativeClogSyncFileV2(XactCtl, expected, &observed) ||
+				!cluster_control_native_files_inventory_current_v2(inventory))
+				ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("CLOG checkpoint file synchronization is unproven")));
+			completed++;
+		}
+		if (!completed || !cluster_control_native_files_inventory_current_v2(inventory))
+			ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CLOG checkpoint native inventory changed or has no local files")));
+		/* The original checkpoint owner must still conjoin full source/cut
+		 * and every file family before publishing control coverage. */
+	}
+	PG_FINALLY();
+	{
+		cluster_control_native_inventory_destroy_v2((ClusterControlNativeInventoryV2 **) &inventory);
+	}
+	PG_END_TRY();
+}
+#endif
+
 void
 CheckPointCLOG(void)
 {
@@ -1419,6 +1467,12 @@ CheckPointCLOG(void)
 	 * checkpoint.
 	 */
 	TRACE_POSTGRESQL_CLOG_CHECKPOINT_START(true);
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired() &&
+		cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_CREATION_V2)
+		CLOGCheckpointNative();
+	else
+#endif
 	SimpleLruWriteAll(XactCtl, true);
 	TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE(true);
 }

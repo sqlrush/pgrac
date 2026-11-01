@@ -16,7 +16,11 @@ int managed_io_open(const char *path, int flags);
 /* The original CLOG lock is the same finite lock exercised by the real SLRU. */
 #undef XactSLRULock
 #define XactSLRULock (&control)
+#ifdef CLOG_NATIVE_IO_PRODUCT
+#include CLOG_NATIVE_IO_PRODUCT
+#else
 #include "../../backend/access/transam/clog.c"
+#endif
 
 static unsigned native_borrows, native_acquires, native_releases, native_opens;
 static bool native_open_throw, native_open_drift;
