@@ -117,6 +117,104 @@ class Run15Observation(unittest.TestCase):
         self.assertEqual((self.sql_calls, self.debug_calls), ([], []))
         self.assertTrue(all(t['ended'] for t in observer.targets.values()))
 
+    def endpoint_inputs(self):
+        return (self.f.run / 'testdata/node0/pgdata/postmaster.pid',
+                self.f.proc / '1011/stat')
+
+    def endpoint_refusal(self):
+        (self.f.run / 'm2-context-8.json').unlink()
+        observer = self.observer()
+        observer.step(); self.f.now = 80; observer.step()
+        self.assertEqual((self.sql_calls, self.debug_calls), ([], []))
+        self.assertTrue(observer.targets[4]['ended'])
+        rows = (observer.out / 'case-4-timeline.jsonl').read_text().splitlines()
+        self.assertEqual(len(rows), 1)
+        row = json.loads(rows[0])
+        self.assertEqual(row['status'], 'IDENTITY_UNKNOWN')
+        self.assertEqual(row['error'], 'producer and original postmaster endpoint disagree')
+        self.assertFalse(row['atomic_graph'])
+        self.assertIn('endpoint', row, 'endpoint refusal must retain its compared inputs')
+        return row['endpoint']
+
+    def test_valid_endpoint_retains_the_exact_bytes_used_by_its_checks(self):
+        observer = self.observer(); observer.step()
+        endpoint = observer.timeline[0]['endpoint']
+        self.assertIn('postmaster_pidfile', endpoint, 'successful checks must retain their input bytes')
+        pidfile, stat = self.endpoint_inputs()
+        self.assertEqual(endpoint['postmaster_pidfile']['text'], pidfile.read_text())
+        self.assertEqual(endpoint['postmaster_pidfile']['sha256'], legacy.digest(pidfile.read_bytes()))
+        self.assertEqual(endpoint['producer_stat']['text'], stat.read_text())
+        self.assertEqual(endpoint['producer_stat']['sha256'], legacy.digest(stat.read_bytes()))
+        self.assertEqual(endpoint['expected'], dict(data_dir=str(pidfile.parent),
+                                                   port='18000', host='/tmp/run15-socket'))
+        self.assertTrue(all(endpoint['checks'].values()))
+        self.assertEqual(endpoint['failed_predicates'], [])
+        self.assertEqual(endpoint['unknown_predicates'], [])
+        self.assertFalse(endpoint['atomic'])
+        self.assertFalse(endpoint['diagnostic_authority'])
+
+    def test_parent_refusal_records_both_compared_pids_without_running_probes(self):
+        _, stat = self.endpoint_inputs()
+        stat.write_text(stat.read_text().replace(') S 42 ', ') S 999 ', 1))
+        evidence = self.endpoint_refusal()
+        self.assertEqual(evidence['failed_predicates'], ['producer_parent_matches'])
+        self.assertEqual(evidence['observed']['producer_parent_pid'], 999)
+        self.assertEqual(evidence['observed']['postmaster_pid'], '42')
+        self.assertEqual(evidence['producer_stat']['text'], stat.read_text())
+
+    def test_data_directory_refusal_preserves_the_unmodified_path(self):
+        pidfile, _ = self.endpoint_inputs()
+        lines = pidfile.read_text().splitlines()
+        lines[1] = '/other/pgdata'
+        pidfile.write_text('\n'.join(lines) + '\n')
+        evidence = self.endpoint_refusal()
+        self.assertEqual(evidence['failed_predicates'], ['data_directory_matches'])
+        self.assertEqual(evidence['observed']['data_dir'], '/other/pgdata')
+        self.assertEqual(evidence['expected']['data_dir'], str(pidfile.parent))
+
+    def test_port_refusal_preserves_the_observed_port_text(self):
+        pidfile, _ = self.endpoint_inputs()
+        pidfile.write_text(pidfile.read_text().replace('\n18000\n', '\n18001\n'))
+        evidence = self.endpoint_refusal()
+        self.assertEqual(evidence['failed_predicates'], ['port_matches'])
+        self.assertEqual(evidence['observed']['port'], '18001')
+        self.assertEqual(evidence['expected']['port'], '18000')
+
+    def test_socket_refusal_preserves_the_unmodified_directory(self):
+        pidfile, _ = self.endpoint_inputs()
+        pidfile.write_text(pidfile.read_text().replace('/tmp/run15-socket', '/tmp/other-socket'))
+        evidence = self.endpoint_refusal()
+        self.assertEqual(evidence['failed_predicates'], ['socket_directory_matches'])
+        self.assertEqual(evidence['observed']['host'], '/tmp/other-socket')
+        self.assertEqual(evidence['expected']['host'], '/tmp/run15-socket')
+
+    def test_short_pidfile_marks_unavailable_fields_unknown_without_guessing(self):
+        pidfile, _ = self.endpoint_inputs()
+        pidfile.write_text(f'42\n{pidfile.parent}\n')
+        evidence = self.endpoint_refusal()
+        self.assertEqual(evidence['failed_predicates'], ['pidfile_complete'])
+        self.assertEqual(evidence['unknown_predicates'], ['port_matches', 'socket_directory_matches'])
+        self.assertIsNone(evidence['observed']['port'])
+        self.assertIsNone(evidence['observed']['host'])
+
+    def test_invalid_postmaster_pid_does_not_manufacture_a_parent_match(self):
+        pidfile, _ = self.endpoint_inputs()
+        pidfile.write_text(pidfile.read_text().replace('42\n', 'not-a-pid\n', 1))
+        evidence = self.endpoint_refusal()
+        self.assertEqual(evidence['failed_predicates'], ['postmaster_pid_valid'])
+        self.assertEqual(evidence['unknown_predicates'], ['producer_parent_matches'])
+        self.assertEqual(evidence['observed']['postmaster_pid'], 'not-a-pid')
+
+    def test_invalid_producer_parent_does_not_hide_other_endpoint_mismatches(self):
+        pidfile, stat = self.endpoint_inputs()
+        stat.write_text(stat.read_text().replace(') S 42 ', ') S unknown ', 1))
+        pidfile.write_text(pidfile.read_text().replace('\n18000\n', '\n18001\n'))
+        evidence = self.endpoint_refusal()
+        self.assertEqual(evidence['failed_predicates'], ['port_matches', 'producer_parent_valid'])
+        self.assertEqual(evidence['unknown_predicates'], ['producer_parent_matches'])
+        self.assertIsNone(evidence['observed']['producer_parent_pid'])
+        self.assertIn(') S unknown ', evidence['producer_stat']['text'])
+
     def test_missing_second_point_preserves_the_first_point_evidence(self):
         observer = self.observer(); observer.step()
         self.f.now = 30; observer.step()
