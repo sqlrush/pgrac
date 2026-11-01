@@ -43,6 +43,7 @@ my $client = q{
   $statement_timeout = $1 if $line =~ /^SET statement_timeout=(\d+)/;
   print "$statement_timeout\n" if $line =~ /^SHOW statement_timeout/;
   print "ready\n" if $line =~ /^SELECT ready/;
+  print "$$\n" if $line =~ /^SELECT child_pid/;
  }
 };
 my (@requested, @children);
@@ -60,14 +61,20 @@ my (@requested, @children);
 }
 END {
  for my $s (@children) {
-  eval { $s->{run}->kill_kill(grace => 0) } if $s->{run}->is_running;
+  eval { $s->{run}->kill_kill(grace => 0) };
  }
+}
+sub client_pid {
+ my ($s) = @_;
+ my $pid = $s->query_safe('SELECT child_pid');
+ die 'pipe child did not report its process identity' unless $pid =~ /^\d+$/ && $pid > 1;
+ return 0 + $pid;
 }
 my $node = bless {}, 'CanonicalClientNode';
 subtest 'prepared pair outlives one client interval and still exits cleanly' => sub {
  my $cell = {number => 7};
  my @pair = map { session($node, $cell) } 1..2;
- my @pids = map { $_->{run}->pid } @pair;
+ my @pids = map { client_pid($_) } @pair;
  sleep(4);
  my @errors;
  for my $s (@pair) {
@@ -86,7 +93,7 @@ subtest 'prepared pair outlives one client interval and still exits cleanly' => 
 subtest 'an unresponsive query still expires' => sub {
  my $cell = {number => 8};
  my $s = session($node, $cell);
- my $pid = $s->{run}->pid;
+ my $pid = client_pid($s);
  my $begin = clock_gettime(CLOCK_MONOTONIC);
  my $ok = eval { $s->query_safe('SELECT stall'); 1 };
  my $error = $@;
