@@ -24,4 +24,17 @@ extern bool test_relmap_physical_v2_write_pending(const ClusterRelmapV2Namespace
 	const ClusterRelmapV2Owner *, const RelMapFile *, ClusterRelmapRetentionDirectory *, LWLock *);
 extern ClusterRelmapV2ClearResult test_relmap_physical_v2_publish(const ClusterRelmapV2Image *);
 extern ClusterRelmapV2ClearResult test_relmap_physical_v2_discard_pending(const ClusterRelmapV2Image *);
+extern bool test_relmap_physical_managed_read_v2(const ClusterRecoveryFileIdentityV2 *,
+												 ClusterRelmapFilePairV2 *);
+extern bool test_relmap_physical_managed_write_pending_v2(const ClusterRecoveryFileIdentityV2 *,
+														  uint64, const ClusterRelmapV2Owner *,
+														  const RelMapFile *,
+														  ClusterRelmapRetentionDirectory *,
+														  LWLock *);
+extern ClusterRelmapV2ClearResult
+test_relmap_physical_managed_publish_v2(const ClusterRecoveryFileIdentityV2 *,
+										const ClusterRelmapV2Image *);
+extern ClusterRelmapV2ClearResult
+test_relmap_physical_managed_discard_pending_v2(const ClusterRecoveryFileIdentityV2 *,
+												const ClusterRelmapV2Image *);
 #endif

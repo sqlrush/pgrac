@@ -234,3 +234,8 @@ cluster_recovery_registry.o cluster_recovery_registry_srv.o cluster_recovery_reg
 	$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 	$(srcdir)/sha2_int.h
+
+# Both installable images and WAL intents consume the assigned inner state.
+cluster_relmap_v2.o cluster_relmap_v2_srv.o cluster_relmap_v2_shlib.o: \
+	$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h

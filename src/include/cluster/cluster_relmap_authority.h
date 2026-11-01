@@ -353,6 +353,24 @@ cluster_relmap_authority_v2_publish(const ClusterRelmapV2Image *staged);
 extern ClusterRelmapV2ClearResult
 cluster_relmap_authority_v2_discard_pending(const ClusterRelmapV2Image *staged);
 
+/* Registered-file mutation family. The original owner supplies the exact
+ * control identity and holds BOTH namespace X and RelationMappingLock for the
+ * entire call. Stage uses the same original retention pin and unlocked I/O
+ * contract as v2_write_pending. No creation, format conversion or repair.
+ * Finish accepts only the exact original stage and its legal clean cuts;
+ * CLEARED_POSTREAD is a storage observation, not terminal proof or pin release.
+ * False/UNKNOWN may follow a durable partial replacement: retain all original
+ * obligations and failure polarity. Registration changes or lost locks refuse
+ * before the next replacement; neither API activates the live writer. */
+extern bool cluster_relmap_authority_managed_write_pending_v2(
+	const ClusterRecoveryFileIdentityV2 *identity, uint64 generation,
+	const ClusterRelmapV2Owner *owner, const RelMapFile *pending,
+	struct ClusterRelmapRetentionDirectory *retention, struct LWLock *retention_lock);
+extern ClusterRelmapV2ClearResult cluster_relmap_authority_managed_publish_v2(
+	const ClusterRecoveryFileIdentityV2 *identity, const ClusterRelmapV2Image *staged);
+extern ClusterRelmapV2ClearResult cluster_relmap_authority_managed_discard_pending_v2(
+	const ClusterRecoveryFileIdentityV2 *identity, const ClusterRelmapV2Image *staged);
+
 /* Registered-file facades for the original cache/checkpoint owner. The caller
  * holds RelationMappingLock throughout; no registration is inferred from the
  * current file. A successful pair is an observation, not whole-set coverage.

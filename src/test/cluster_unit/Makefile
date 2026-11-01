@@ -631,6 +631,7 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_retained_producer.inc \
+		test_cluster_relmap_managed_writer.inc \
 		test_cluster_relmap_producer_stage.inc test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_producer_prepare.inc \
 		test_cluster_relmap_producer_terminal.inc \
@@ -661,15 +662,15 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
-		test_cluster_relmap_v2_codec_product.o \
+		test_cluster_relmap_v2_codec_product.o test_cluster_relmap_file_writer.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_physical_pair.o \
 		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
+		test_cluster_relmap_v2_codec_product.o test_cluster_relmap_file_writer.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -15968,3 +15969,12 @@ clean: clean-relmap-control
 .PHONY: clean-relmap-control
 clean-relmap-control:
 	rm -f test_cluster_relmap_control test_cluster_relmap_control.d test_cluster_relmap_control_authority.o test_cluster_relmap_control_authority.d test_cluster_relmap_control_entries.inc test_cluster_relmap_control_entries.inc.tmp
+
+# Current envelope codec must precede reusable support archives.
+test_cluster_relmap_file_writer.o: $(top_srcdir)/src/common/cluster_relmap_file.c \
+        $(top_srcdir)/src/include/common/cluster_relmap_file.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
+clean-relmap-writer:
+	rm -f test_cluster_relmap_file_writer.o
+clean: clean-relmap-writer
+.PHONY: clean-relmap-writer

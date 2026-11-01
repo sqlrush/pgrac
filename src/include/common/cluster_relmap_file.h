@@ -35,6 +35,31 @@ extern bool cluster_relmap_file_decode_v2(const void *bytes, size_t length,
 										const ClusterRecoveryFileIdentityV2 *expected,
 										ClusterRelmapV2Image *image);
 
+/* Parse saved installable file bytes without importing an expected binding.
+ * This exposes an observed identity only; it grants no registration, custody,
+ * replay permission, terminal state or checkpoint coverage. Both outputs stay
+ * unchanged on failure and must not overlap each other or the input. Runtime
+ * owners must still use decode_v2 with their independently selected identity. */
+extern bool cluster_relmap_file_observe_v2(const void *bytes, size_t length,
+								ClusterRecoveryFileIdentityV2 *identity,
+								ClusterRelmapV2Image *image);
+
+/* The WAL codec accepts only WAL_INTENT, with complete pending owner/image
+ * and wal_end zero. File codecs reject it. Rebuild binds the independently
+ * selected identity and actual XLogInsert end / redo EndRecPtr, producing
+ * exactly the strict file bytes; it performs no I/O or authority check.
+ * The original owner must validate the complete source and retain custody.
+ * All outputs remain unchanged on refusal and may not overlap inputs. */
+extern bool cluster_relmap_wal_encode_intent_v2(const ClusterRecoveryFileIdentityV2 *identity,
+										const ClusterRelmapV2Image *image,
+										void *output, size_t length);
+extern bool cluster_relmap_wal_observe_intent_v2(const void *bytes, size_t length,
+										ClusterRecoveryFileIdentityV2 *identity,
+										ClusterRelmapV2Image *image);
+extern bool cluster_relmap_wal_rebuild_pending_v2(const void *bytes, size_t length,
+										const ClusterRecoveryFileIdentityV2 *expected,
+										uint64 actual_end, void *output, size_t output_length);
+
 /* The directory descriptor is borrowed from the original path owner; it is
  * never closed here. That owner serializes map updates and rechecks its path
  * and original registration before publishing any returned observation.

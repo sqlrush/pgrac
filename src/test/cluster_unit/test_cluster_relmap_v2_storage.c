@@ -58,6 +58,7 @@ static bool mapping_held;
 static bool drop_relmap_x_on_read;
 static bool cancel_on_read, invalidate_on_read, cancel_on_write;
 static unsigned int io_under_retention_lock, writes_without_pin;
+static XLogRecPtr stage_expected_wal_end;
 static unsigned int retention_acquires, retention_releases;
 static ClusterRelmapRetentionDirectory writer_retention;
 static ClusterRelmapRetentionDirectory *stage_directory = &writer_retention;
@@ -76,6 +77,11 @@ static const ClusterRelmapV2Owner owner = { 3, UINT64CONST(0x200000123), 0, 101,
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (lock == RelationMappingLock) {
+		if (mode != LW_EXCLUSIVE || mapping_held || retention_held) abort();
+		mapping_held = true;
+		return true;
+	}
 	if ((lock != &retention_lock && lock != runtime_test_lock)
 		|| mode != LW_EXCLUSIVE || retention_held)
 		abort();
@@ -88,6 +94,11 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (lock == RelationMappingLock) {
+		if (!mapping_held || retention_held) abort();
+		mapping_held = false;
+		return;
+	}
 	if (lock != held_retention_lock || !retention_held)
 		abort();
 	retention_held = false;
@@ -234,7 +245,7 @@ relmap_test_write(int fd, const void *bytes, size_t len)
 	if (observing_stage) {
 		const ClusterRelmapRetentionPin *pin = &stage_directory->pins[stage_pin_index];
 
-		if (!pin->occupied || !pin->may_be_staged || pin->wal_end != owner.wal_end)
+		if (!pin->occupied || !pin->may_be_staged || pin->wal_end != stage_expected_wal_end)
 			writes_without_pin++;
 		if (cancel_on_write) {
 			cancel_on_write = false;
@@ -399,6 +410,7 @@ reset_io(void)
 	drop_relmap_x_on_read = false;
 	cancel_on_read = invalidate_on_read = cancel_on_write = false;
 	io_under_retention_lock = writes_without_pin = 0;
+	stage_expected_wal_end = owner.wal_end;
 	retention_acquires = retention_releases = 0;
 	cancelled = CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
 }
