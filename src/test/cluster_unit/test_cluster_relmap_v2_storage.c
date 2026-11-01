@@ -58,6 +58,7 @@ static bool mapping_held;
 static bool drop_relmap_x_on_read;
 static bool cancel_on_read, invalidate_on_read, cancel_on_write;
 static unsigned int io_under_retention_lock, writes_without_pin;
+static XLogRecPtr stage_expected_wal_end;
 static unsigned int retention_acquires, retention_releases;
 static ClusterRelmapRetentionDirectory writer_retention;
 static ClusterRelmapRetentionDirectory *stage_directory = &writer_retention;
@@ -234,7 +235,7 @@ relmap_test_write(int fd, const void *bytes, size_t len)
 	if (observing_stage) {
 		const ClusterRelmapRetentionPin *pin = &stage_directory->pins[stage_pin_index];
 
-		if (!pin->occupied || !pin->may_be_staged || pin->wal_end != owner.wal_end)
+		if (!pin->occupied || !pin->may_be_staged || pin->wal_end != stage_expected_wal_end)
 			writes_without_pin++;
 		if (cancel_on_write) {
 			cancel_on_write = false;
@@ -399,6 +400,7 @@ reset_io(void)
 	drop_relmap_x_on_read = false;
 	cancel_on_read = invalidate_on_read = cancel_on_write = false;
 	io_under_retention_lock = writes_without_pin = 0;
+	stage_expected_wal_end = owner.wal_end;
 	retention_acquires = retention_releases = 0;
 	cancelled = CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
 }

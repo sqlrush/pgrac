@@ -830,7 +830,7 @@ test_cluster_relmap_publish_clog_bridge.o: test_cluster_relmap_publish_clog_brid
 test_cluster_relmap_publish_clog: test_cluster_relmap_publish_clog_bridge.o \
 		test_cluster_relmap_publish_clog.h
 
-test_cluster_relmap_v2_storage test_cluster_relmap_managed_storage test_cluster_relmap_publish_native test_cluster_relmap_publish_clog: %: %.c unit_test.h \
+test_cluster_relmap_v2_storage test_cluster_relmap_managed_storage test_cluster_relmap_managed_insert test_cluster_relmap_publish_native test_cluster_relmap_publish_clog: %: %.c unit_test.h \
 		test_cluster_relmap_v2_storage.c test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_staged_observation.inc \
 		test_cluster_relmap_runtime_storage.inc \
@@ -7039,7 +7039,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
-	rm -f test_cluster_relmap_v2_storage_product.o test_cluster_relmap_managed_storage test_cluster_relmap_file
+	rm -f test_cluster_relmap_v2_storage_product.o test_cluster_relmap_managed_storage test_cluster_relmap_managed_insert test_cluster_relmap_file
 	rm -f test_cluster_relmap_publish_clog_bridge.o
 	rm -f test_cluster_relmap_retained_owner.o
 	rm -f $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_DECODE_O) $(CLUSTER_COLD_STARTUP_O) test_cluster_cold_recovery_io_core.o
@@ -14825,6 +14825,11 @@ test_cluster_cold_recovery_startup: test_cluster_cold_terminal_episode.inc \
  $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
 
 # Managed envelope: real pair I/O, while control registration remains external.
+TESTS += test_cluster_relmap_managed_insert
+all: test_cluster_relmap_managed_insert
+test_cluster_relmap_managed_insert: $(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
 test_cluster_relmap_file: test_cluster_relmap_file.c test_cluster_relmap_wal_intent.inc unit_test.h \
 		$(top_srcdir)/src/common/cluster_relmap_file_io.c \
 		$(top_srcdir)/src/include/common/cluster_relmap_file.h \

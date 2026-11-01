@@ -265,6 +265,91 @@ cluster_relmap_retention_runtime_insert_pending_v2(const ClusterRelmapOwnerSampl
 	return end;
 }
 
+/* Spec: 2026-11-01-pre2-e1-format-closure-v1.2-path-c.md */
+XLogRecPtr
+cluster_relmap_retention_runtime_insert_managed_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *registered_identity, const ClusterRelmapV2Image *intent)
+{
+	ClusterRelmapOwnerSampleV2 original;
+	ClusterRecoveryFileIdentityV2 bound;
+	ClusterRelmapV2Image image;
+	ClusterRelmapFilePairV2 pair;
+	ClusterRelmapRetentionKey key = {0};
+	ClusterRelmapRetentionDirectory *directory;
+	ClusterRelmapRetentionResult result;
+	unsigned char wal[CLUSTER_RELMAP_FILE_SIZE_V2];
+	unsigned char pending[CLUSTER_RELMAP_FILE_SIZE_V2];
+	XLogRecPtr end;
+
+	if (sample == NULL || registered_identity == NULL || intent == NULL || !enableFsync)
+		return InvalidXLogRecPtr;
+	/* Keep the originally selected values across native and storage calls. */
+	original = *sample;
+	bound = *registered_identity;
+	image = *intent;
+	if (!LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE)
+		|| LWLockHeldByMe(XidGenLock)
+		|| relmap_runtime_producer_key(&original, &image.identity,
+			image.pending_generation, false, &key) != CLUSTER_RELMAP_RETENTION_OK
+		|| U64FromFullTransactionId(GetCurrentFullTransactionIdIfAny()) != key.top_full_xid
+		|| bound.tablespace_oid != (image.identity.shared ? GLOBALTABLESPACE_OID : MyDatabaseTableSpace)
+		|| memcmp(bound.storage_uuid, original.writer.ref.claim.identity.storage_uuid, 16) != 0
+		|| image.pending_owner.node != original.owner.node
+		|| image.pending_owner.top_full_xid != original.owner.top_full_xid
+		|| image.pending_owner.membership_epoch != original.owner.membership_epoch
+		|| image.pending_owner.admitted_incarnation != original.owner.admitted_incarnation
+		|| image.pending_owner.boot_incarnation != original.owner.boot_incarnation
+		|| !cluster_relmap_wal_encode_intent_v2(&bound, &image, wal, sizeof(wal)))
+		return InvalidXLogRecPtr;
+
+	directory = &relmap_runtime_shmem->directories[key.origin];
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = cluster_relmap_retention_prepare_check(directory, &key);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	if (result != CLUSTER_RELMAP_RETENTION_OK
+		|| !cluster_relmap_authority_managed_read_v2(&bound, &pair)
+		|| !pair.view.pending_complete || pair.view.has_pending
+		|| pair.view.committed_generation != image.committed_generation
+		|| memcmp(&pair.view.committed, &image.committed, sizeof(RelMapFile)) != 0)
+		return InvalidXLogRecPtr;
+	/* Base I/O cannot turn a canceled/changed preparation into WAL permission. */
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = cluster_relmap_retention_prepare_check(directory, &key);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	if (result != CLUSTER_RELMAP_RETENTION_OK
+		|| !LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE)
+		|| !cluster_relmap_owner_matches_v2(&original))
+		return InvalidXLogRecPtr;
+
+	START_CRIT_SECTION();
+	XLogBeginInsert();
+	XLogRegisterData((char *) wal, sizeof(wal));
+	end = XLogInsert(RM_RELMAP_ID, XLOG_RELMAP_UPDATE_V2);
+	if (end != InvalidXLogRecPtr)
+		XLogFlush(end);
+	END_CRIT_SECTION();
+	if (end == InvalidXLogRecPtr || !cluster_relmap_owner_matches_v2(&original)
+		|| !LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE)
+		|| !cluster_relmap_wal_rebuild_pending_v2(wal, sizeof(wal), &bound,
+			end, pending, sizeof(pending)))
+		return InvalidXLogRecPtr;
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = cluster_relmap_retention_prepare_check(directory, &key);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	image.pending_owner.wal_end = end;
+	if (result != CLUSTER_RELMAP_RETENTION_OK
+		|| !cluster_relmap_authority_managed_write_pending_v2(&bound, image.pending_generation,
+			&image.pending_owner, &image.pending, directory, &relmap_runtime_shmem->lock)
+		|| !cluster_relmap_owner_matches_v2(&original)
+		|| !cluster_relmap_authority_managed_read_v2(&bound, &pair)
+		|| memcmp(pair.bytes[0], pending, sizeof(pending)) != 0
+		|| memcmp(pair.bytes[1], pending, sizeof(pending)) != 0
+		|| !LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE)
+		|| !cluster_relmap_retention_runtime_check_staged_v2(&original, &image))
+		return InvalidXLogRecPtr;
+	return end;
+}
+
 bool
 cluster_relmap_retention_runtime_write_pending_v2(const ClusterRelmapOwnerSampleV2 *sample,
 	const ClusterRelmapV2Namespace *identity, uint64 generation, XLogRecPtr wal_end,

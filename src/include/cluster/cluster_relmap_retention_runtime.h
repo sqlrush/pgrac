@@ -57,6 +57,26 @@ extern XLogRecPtr cluster_relmap_retention_runtime_insert_pending_v2(
 	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Namespace *identity,
 	uint64 generation, const RelMapFile *pending);
 
+/* Registered-file producer, retaining the original owner/global X and local
+ * MappingLock(X) throughout. The caller independently selects and keeps the
+ * exact control registration; file contents never supply that binding. Full
+ * intent includes the unchanged committed base and this update's pending map,
+ * with the captured owner and zero wal_end. The file creation origin may
+ * differ from the current writer origin.
+ *
+ * Validate the complete clean pair and original unstaged pin before inserting
+ * one UPDATE_V2 intent, flush its actual returned end, rebuild strict pending
+ * bytes, and use the original retained managed writer. Success requires both
+ * final copies equal that exact reconstruction plus original source/pin/lock
+ * revalidation. No current-file identity adoption, repair or retry. Invalid
+ * end/ERROR may follow durable WAL or partial files; preserve all original
+ * obligations and failure polarity. Critical ERROR propagates/fail-stops.
+ * No live dispatch, registration, completion or retention release is added. */
+extern XLogRecPtr cluster_relmap_retention_runtime_insert_managed_v2(
+	const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *registered_identity,
+	const ClusterRelmapV2Image *intent);
+
 /* Dormant original-producer stage after its original relmap WAL insert/flush.
  * The caller supplies that exact durable record end, which this adapter does
  * not independently authenticate. The original relmap X must remain held;
