@@ -49,17 +49,9 @@
 #include "catalog/pg_tablespace_d.h"
 
 ClusterColdDetailV1
-cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
+cold_relmap_inputs_valid(const ClusterColdPlanV1 *plan,
 	const ClusterColdRelmapInputV1 *inputs, uint32 count)
 {
-	Size bytes;
-
-	if (!plan_valid(plan) || inputs == NULL || count == 0
-		|| count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
-		return CLUSTER_COLD_INVALID_ARGUMENT;
-	if (plan->phase != COLD_PHASE_FEEDING || plan->input_frame_count != 0
-		|| plan->relmap_inputs != NULL)
-		return CLUSTER_COLD_STATE;
 	for (uint32 i = 0; i < count; ++i) {
 		const ClusterColdRelmapInputV1 *in = &inputs[i];
 		const ClusterRelmapV2Image *image = &in->staged;
@@ -105,6 +97,25 @@ cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
 				&& inputs[k].staged.identity.shared == image->identity.shared)
 				return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 	}
+	return CLUSTER_COLD_OK;
+}
+
+ClusterColdDetailV1
+cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
+	const ClusterColdRelmapInputV1 *inputs, uint32 count)
+{
+	Size bytes;
+	ClusterColdDetailV1 detail;
+
+	if (!plan_valid(plan) || inputs == NULL || count == 0
+		|| count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	if (plan->phase != COLD_PHASE_FEEDING || plan->input_frame_count != 0
+		|| plan->relmap_inputs != NULL)
+		return CLUSTER_COLD_STATE;
+	detail = cold_relmap_inputs_valid(plan, inputs, count);
+	if (detail != CLUSTER_COLD_OK)
+		return detail;
 	bytes = (Size)count * sizeof(ColdRelmapInput);
 	if (!cold_plan_reserve(plan, bytes))
 		return CLUSTER_COLD_CAPACITY;

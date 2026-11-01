@@ -19,6 +19,7 @@
 #define CLUSTER_COLD_RELMAP_MAX_INPUTS 64
 struct ClusterRelmapRetentionDirectory;
 struct LWLock;
+struct ClusterRecoveryStartV1;
 
 /* Original pending custody, not a way to infer FullXid/era from raw WAL.
  * The original owner supplies its exact retained pin and image. Declaration
@@ -34,6 +35,66 @@ typedef struct ClusterColdRelmapInputV1 {
 	struct ClusterRelmapRetentionDirectory *retention;
 	struct LWLock *retention_lock;
 } ClusterColdRelmapInputV1;
+
+/* Original owner pin plus a complete decoded WAL record. The owner supplies
+ * its actual FullXid/era and pin generation, never an epoch inferred from WAL.
+ * owner.wal_end must be zero: the producer takes the actual record end.
+ * All pointers are borrowed through prepare; the resulting declaration owns
+ * copied values and retains only the original directory/lock pointers. */
+typedef struct ClusterColdRelmapWalV1 {
+	uint32 participant;
+	ClusterRelmapV2Namespace identity;
+	uint64 generation;
+	ClusterRelmapV2Owner owner;
+	struct ClusterRelmapRetentionDirectory *retention;
+	struct LWLock *retention_lock;
+	struct XLogReaderState *reader;
+} ClusterColdRelmapWalV1;
+
+/* Saved pass-2 input, not a current physical/pin/terminal certificate. Values
+ * are copied; directory/lock stay borrowed from this exact original plan.
+ * They must not outlive the original Start and its reverse cleanup. */
+typedef struct ClusterColdRelmapReplayReceiptV1 {
+	uint32 count, index;
+	ClusterColdRelmapInputV1 input;
+} ClusterColdRelmapReplayReceiptV1;
+
+/* Local immutable receipt checks only, including the complete batch and
+ * original selected source/cut. UINT32_MAX means invalid/incomplete; zero
+ * means no declared participant. No replay-window check, I/O, acquire,
+ * cancellation, source revalidation or new lifetime/retention grant. */
+extern uint32 cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed);
+extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_replay_input_v1(
+	const ClusterColdTypedV1 *typed, uint32 index);
+
+/* Recheck the complete saved staging batch under the same declared Start,
+ * after pass-2's window has ended. Requires Startup, no critical section or
+ * caller-held LWLocks and the original namespace X. Whole-batch saved values,
+ * SIDE and original pins precede file I/O; both complete physical copies and
+ * the same inputs/pins/Start are checked before returning. Scratch uses the
+ * original plan budget. Entered refusal/ERROR revokes the original episode
+ * and keeps its plan, FD, pins and debt; no retry, rewrite or cleanup follows.
+ * Success is a current staging observation only, not terminal/era/lifetime
+ * qualification, a reusable certificate, COMPLETE or a release permission. */
+extern bool cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start);
+
+/* Explicit original-source adapter before pass-1. Whole-batch validation of
+ * exact unstaged pins precedes any mutation. Recheck and arm every original
+ * pin with the actual WAL end before the first clean-pair I/O, outside the
+ * retention lock. This conservatively prevents cancellation even when no
+ * physical pending was written. Partial arm, later failure and plan destruction
+ * retain those original pins/debt; no rollback or automatic retry follows.
+ * Sources must be the original selected replay generations; the Startup
+ * entry below brackets this call with original ROOT/fence revalidation.
+ * Entered failure/ERROR poisons the plan, keeps all original pins/debt and
+ * permits no retry. No retention qualification, COMPLETE or activation. */
+extern ClusterColdDetailV1 cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 replay_count,
+	const ClusterColdRelmapWalV1 *inputs, uint32 count);
+
+extern ClusterColdTypedV1 *cluster_cold_typed_prepare_relmap_wal_v1(
+	struct ClusterRecoveryFencePlan *fence, uint16 own_thread, XLogRecPtr own_redo,
+	const ClusterColdRelmapWalV1 *inputs, uint32 count);
 
 extern ClusterColdDetailV1 cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
 	const ClusterColdRelmapInputV1 *inputs, uint32 count);

@@ -108,6 +108,8 @@ struct ClusterWalInputsV1 {
 	uint8 storage_uuid[16];
 	ClusterControlRootFileToken token;
 	ClusterWalReadPinV1 *pin;
+	ClusterWalReadPinOwnerV1 borrowed_owner; /* original Start owns its WALR */
+	uint64 generation; /* scope incarnation, independent of continuous WALR */
 	ResourceOwner owner;
 	pid_t pid;
 	bool stale;
@@ -273,15 +275,17 @@ cluster_wal_inputs_scope_job_forget_v1(ClusterWalInputsJobV1 *job)
 static ClusterRecoveryTxRetentionV1 active_tx_retention;
 /* A separate purpose locator; borrowing this never makes census a C0 scope. */
 static ClusterRecoveryTxRetentionV1 active_ctrc_retention;
+static uint64 inputs_scope_generation;
 
 /* Scope retirement clears this locator before freeing either allocation.
- * The captured pin incarnation excludes a same-address replacement. This is
+ * The captured scope incarnation excludes a same-address replacement. This is
  * an allocation-lifetime check only; actual authority still requires current
  * native holders. It may be used when proof loss requires debt revocation. */
 static bool
 inputs_ctrc_replays_scope_same(const ClusterRecoveryTxRetentionV1 *original)
 {
 	return original->scope != NULL && original->scope == active_ctrc_retention.scope
+		&& original->scope_generation == active_ctrc_retention.scope_generation
 		&& original->serial == active_ctrc_retention.serial
 		&& memcmp(&original->input_owner, &active_ctrc_retention.input_owner,
 			sizeof(original->input_owner)) == 0;
@@ -383,13 +387,28 @@ inputs_prepare_current(const ClusterWalInputsV1 *inputs)
 }
 
 static bool
+inputs_pin_covers(ClusterWalInputsV1 *inputs, uint16 thread)
+{
+	if (inputs->purpose == WAL_INPUTS_TX_CLOSURE || inputs->purpose == WAL_INPUTS_CTRC_CENSUS) {
+		const struct ClusterRecoveryStartV1 *start = inputs->purpose == WAL_INPUTS_TX_CLOSURE
+			? inputs->tx.start : inputs->ctrc.start;
+		ClusterWalReadPinOwnerV1 current = ClusterColdRecoveryTxInputOwnerV1(start);
+
+		return inputs->pin == NULL && current.recovery_pin != NULL
+			&& memcmp(&current, &inputs->borrowed_owner, sizeof(current)) == 0
+			&& cluster_wal_read_pin_owner_covers_v1(&inputs->borrowed_owner, thread);
+	}
+	return cluster_wal_read_pin_covers_v1(inputs->pin, thread);
+}
+
+static bool
 inputs_current(ClusterWalInputsV1 *inputs)
 {
 	return cluster_enabled && cluster_shared_config && inputs_owned(inputs)
 		   && inputs_scope_role(inputs) && !inputs->stale && inputs_prepare_current(inputs)
 		   && inputs->thread_count > 0 && !inputs->suspended
 		   && inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
-		   && cluster_wal_read_pin_covers_v1(inputs->pin, inputs->threads[0]);
+		   && inputs_pin_covers(inputs, inputs->threads[0]);
 }
 
 /* Private selection/claim proof, never a public accessor's current test.
@@ -749,8 +768,16 @@ inputs_cf_wait_capture(WalInputsCfWait *original, ClusterWalInputsV1 *inputs, bo
 	if (inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS)
 		memcpy(original->threads, inputs->threads,
 			   (Size)inputs->thread_count * sizeof(inputs->threads[0]));
-	if (inputs->pin != NULL && CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
-		original->pin_current = cluster_wal_read_pin_owner_v1(inputs->pin, &original->pin_owner);
+	if (CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock)) {
+		if (inputs->purpose == WAL_INPUTS_TX_CLOSURE || inputs->purpose == WAL_INPUTS_CTRC_CENSUS) {
+			/* Borrow the same original Start WALR through the CF wait.  No
+			 * read-pin replacement, acquisition or retirement is permitted. */
+			original->pin_owner = inputs->borrowed_owner;
+			original->pin_current = original->pin_owner.recovery_pin != NULL
+				&& cluster_wal_read_pin_owner_current_v1(&original->pin_owner);
+		} else if (inputs->pin != NULL)
+			original->pin_current = cluster_wal_read_pin_owner_v1(inputs->pin, &original->pin_owner);
+	}
 }
 
 static bool
@@ -782,6 +809,18 @@ inputs_cf_wait_current(const WalInputsCfWait *original, ClusterWalInputsV1 *inpu
 		|| memcmp(&inputs->ctrc, &original->ctrc, sizeof(original->ctrc)) != 0
 		|| !inputs_owned(inputs) || !inputs_scope_role(inputs))
 		return false;
+	if (original->purpose == WAL_INPUTS_TX_CLOSURE || original->purpose == WAL_INPUTS_CTRC_CENSUS) {
+		const struct ClusterRecoveryStartV1 *start = original->purpose == WAL_INPUTS_TX_CLOSURE
+			? original->tx.start : original->ctrc.start;
+		ClusterWalReadPinOwnerV1 current = ClusterColdRecoveryTxInputOwnerV1(start);
+
+		return original->pin == NULL && original->pin_current
+			&& original->pin_owner.pin == NULL && original->pin_owner.recovery_pin != NULL
+			&& memcmp(&current, &original->pin_owner, sizeof(current)) == 0
+			&& memcmp(&inputs->borrowed_owner, &original->pin_owner, sizeof(current)) == 0
+			&& cluster_wal_read_pin_owner_current_v1(&original->pin_owner)
+			&& (original->first ? original->thread_count == 0 : inputs_current(inputs));
+	}
 	if (original->pin != NULL)
 		return !original->first && original->pin_current && original->pin_owner.pin == original->pin
 			   && cluster_wal_read_pin_owner_current_v1(&original->pin_owner)
@@ -1015,7 +1054,7 @@ inputs_collect(ClusterWalInputsV1 *inputs, WalInputsWork *work)
 			continue;
 		if (!inputs_prepare_current(inputs))
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-		if (!cluster_wal_read_pin_covers_v1(inputs->pin, node + 1))
+		if (!inputs_pin_covers(inputs, node + 1))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		result = cluster_wal_origin_inputs_read_locked(&work->root, node, &work->origin);
 		if (!inputs_prepare_current(inputs))
@@ -2064,6 +2103,7 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 	const ClusterColdTypedV1 *typed = NULL;
 	uint64 generation = 0, serial = 0;
 	ClusterRecoveryCheckpointOwnerV1 ctrc_owner;
+	ClusterWalReadPinOwnerV1 borrowed_owner = {0};
 
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -2094,6 +2134,17 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 	}
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (purpose == WAL_INPUTS_TX_CLOSURE || purpose == WAL_INPUTS_CTRC_CENSUS) {
+		/* Preserve original single-scope exclusivity even though we no longer
+		 * allocate a read pin. Never fall back to a replacement grant. */
+		if (active_tx_retention.scope != NULL || active_ctrc_retention.scope != NULL
+			|| inputs_scope_generation == UINT64_MAX)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		borrowed_owner = ClusterColdRecoveryTxInputOwnerV1(start);
+		if (borrowed_owner.recovery_pin == NULL
+			|| !cluster_wal_read_pin_owner_current_v1(&borrowed_owner))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
 	inputs = palloc0(sizeof(*inputs));
 	inputs->ctrc.namespace_fd = -1;
 	inputs->pid = getpid();
@@ -2101,6 +2152,9 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 	inputs->purpose = purpose;
 	inputs->prepare_deadline_set = deadline != NULL;
 	inputs->prepare_deadline_ns = deadline != NULL ? *deadline : 0;
+	inputs->borrowed_owner = borrowed_owner;
+	if (borrowed_owner.recovery_pin != NULL)
+		inputs->generation = ++inputs_scope_generation;
 	if (purpose == WAL_INPUTS_CTRC_CENSUS) {
 		inputs->ctrc.start = start;
 		inputs->ctrc.inputs = typed;
@@ -2150,15 +2204,23 @@ inputs_begin(const uint8 storage_uuid[16], uint64 system_identifier, WalInputsPu
 		}
 		inputs_unlock(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-			pinned = deadline != NULL
-						 ? cluster_wal_read_pin_acquire_deadline_v1(
-							   inputs->threads, inputs->thread_count, &inputs->pin, *deadline)
-						 : cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count,
-														   &inputs->pin);
-			if (pinned != CLUSTER_WAL_PIN_OK)
-				result = pinned == CLUSTER_WAL_PIN_RELEASE_UNCERTAIN
+			if (purpose == WAL_INPUTS_TX_CLOSURE || purpose == WAL_INPUTS_CTRC_CENSUS) {
+				for (uint16 i = 0; i < inputs->thread_count; i++)
+					if (!inputs_pin_covers(inputs, inputs->threads[i])) {
+						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+						break;
+					}
+			} else {
+				pinned = deadline != NULL
+							 ? cluster_wal_read_pin_acquire_deadline_v1(
+								   inputs->threads, inputs->thread_count, &inputs->pin, *deadline)
+							 : cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count,
+															   &inputs->pin);
+				if (pinned != CLUSTER_WAL_PIN_OK)
+					result = pinned == CLUSTER_WAL_PIN_RELEASE_UNCERTAIN
 							 ? CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN
 							 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+			}
 		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = inputs_root(inputs, work, false);
@@ -2236,14 +2298,16 @@ cluster_wal_inputs_begin_tx_closure_v1(const struct ClusterRecoveryStartV1 *star
 						  WAL_INPUTS_TX_CLOSURE, start, subject, NULL, out, NULL);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!cluster_wal_read_pin_owner_v1((*out)->pin, &owner)) {
+	owner = (*out)->borrowed_owner;
+	if (!cluster_wal_read_pin_owner_current_v1(&owner)) {
 		cluster_wal_inputs_release_v1(out);
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
-	/* Native read-pin exclusivity makes this the original single live scope.
+	/* Original Start custody supplies the single live scope's retention.
 	 * Publishing this locator supplies no IR: ir_ready is still false. */
 	memset(&active_tx_retention, 0, sizeof(active_tx_retention));
 	active_tx_retention.scope = *out;
+	active_tx_retention.scope_generation = (*out)->generation;
 	active_tx_retention.serial = &(*out)->tx.ir;
 	active_tx_retention.input_owner = owner;
 	return result;
@@ -2267,15 +2331,17 @@ cluster_wal_inputs_begin_ctrc_census_v1(const struct ClusterRecoveryStartV1 *sta
 						  WAL_INPUTS_CTRC_CENSUS, start, NULL, work, out, NULL);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!cluster_wal_read_pin_owner_v1((*out)->pin, &owner)) {
+	owner = (*out)->borrowed_owner;
+	if (!cluster_wal_read_pin_owner_current_v1(&owner)) {
 		cluster_wal_inputs_release_v1(out);
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
-	/* The native read pin permits one original live scope. Keep its locator
+	/* The original retained WALR permits one live scope. Keep its locator
 	 * outside borrowed allocations; this supplies neither a prepared IR nor
 	 * any right to use the separate C0-only source API. */
 	memset(&active_ctrc_retention, 0, sizeof(active_ctrc_retention));
 	active_ctrc_retention.scope = *out;
+	active_ctrc_retention.scope_generation = (*out)->generation;
 	active_ctrc_retention.serial = &(*out)->tx.ir;
 	active_ctrc_retention.input_owner = owner;
 	return result;
@@ -3052,9 +3118,10 @@ static bool
 inputs_tx_retention_locator(const ClusterRecoveryTxRetentionV1 *view)
 {
 	return view->scope != NULL && view->scope == active_tx_retention.scope
+		&& view->scope_generation == active_tx_retention.scope_generation
 		&& view->serial == active_tx_retention.serial
-		&& view->input_owner.pin == active_tx_retention.input_owner.pin
-		&& view->input_owner.generation == active_tx_retention.input_owner.generation
+		&& memcmp(&view->input_owner, &active_tx_retention.input_owner,
+			sizeof(view->input_owner)) == 0
 		&& cluster_wal_read_pin_owner_current_v1(&view->input_owner);
 }
 
@@ -3074,7 +3141,8 @@ cluster_wal_inputs_tx_retention_current_v1(const ClusterRecoveryTxRetentionV1 *v
 		return false;
 	inputs = original.scope;
 	if (!inputs_owned(inputs) || inputs->purpose != WAL_INPUTS_TX_CLOSURE
-		|| inputs->pin != original.input_owner.pin || original.serial != &inputs->tx.ir
+		|| memcmp(&inputs->borrowed_owner, &original.input_owner, sizeof(inputs->borrowed_owner)) != 0
+		|| original.serial != &inputs->tx.ir
 		|| !ClusterColdRecoveryTxC0Candidate(inputs->tx.start, inputs->tx.subject, &candidate)
 		|| !cluster_wal_inputs_tx_abort_authorized_v1(inputs, &candidate.record))
 		return false;
@@ -3176,9 +3244,10 @@ static bool
 inputs_ctrc_retention_locator_current(const ClusterRecoveryTxRetentionV1 *view)
 {
 	return view->scope != NULL && view->scope == active_ctrc_retention.scope
+		&& view->scope_generation == active_ctrc_retention.scope_generation
 		&& view->serial == active_ctrc_retention.serial
-		&& view->input_owner.pin == active_ctrc_retention.input_owner.pin
-		&& view->input_owner.generation == active_ctrc_retention.input_owner.generation
+		&& memcmp(&view->input_owner, &active_ctrc_retention.input_owner,
+			sizeof(view->input_owner)) == 0
 		&& cluster_wal_read_pin_owner_current_v1(&view->input_owner);
 }
 
@@ -3349,6 +3418,7 @@ static bool
 inputs_ctrc_replays_locator_current(const ClusterRecoveryCtrcReplaySetSourceV1 *source)
 {
 	return source->scope != NULL && source->scope == active_ctrc_retention.scope
+		&& source->scope_generation == active_ctrc_retention.scope_generation
 		&& memcmp(&source->input_owner, &active_ctrc_retention.input_owner,
 			sizeof(source->input_owner)) == 0
 		&& cluster_wal_read_pin_owner_current_v1(&source->input_owner);
@@ -3365,6 +3435,7 @@ inputs_ctrc_replays_source(ClusterWalInputsV1 *inputs, uint32 index,
 	if (inputs == NULL || inputs != active_ctrc_retention.scope)
 		return false;
 	source.scope = inputs;
+	source.scope_generation = inputs->generation;
 	memcpy(&source.input_owner, &active_ctrc_retention.input_owner, sizeof(source.input_owner));
 	if (!inputs_ctrc_replays_locator_current(&source)
 		|| !cluster_wal_inputs_ctrc_replays_authorized_v1(inputs)
@@ -3548,10 +3619,10 @@ cluster_wal_inputs_ctrc_writer_retained_v1(
 	if (memcmp(&fixed, &original.scope->ctrc.owner.writer, sizeof(fixed)) != 0)
 		return false;
 	thread = fixed.ref.claim.identity.origin_thread_id;
-	return cluster_wal_read_pin_covers_v1(original.input_owner.pin, thread)
+	return cluster_wal_read_pin_owner_covers_v1(&original.input_owner, thread)
 		&& cluster_wal_inputs_ctrc_replays_source_current_v1(&original)
 		&& inputs_ctrc_replays_locator_current(&original)
-		&& cluster_wal_read_pin_covers_v1(original.input_owner.pin, thread)
+		&& cluster_wal_read_pin_owner_covers_v1(&original.input_owner, thread)
 		&& memcmp(source, &original, sizeof(original)) == 0
 		&& memcmp(writer, &fixed, sizeof(fixed)) == 0;
 }
@@ -3562,6 +3633,7 @@ static bool
 inputs_relmap_locator_current(const ClusterRecoveryRelmapSourceV1 *source)
 {
 	return source->scope != NULL && source->scope == active_ctrc_retention.scope
+		&& source->scope_generation == active_ctrc_retention.scope_generation
 		&& memcmp(&source->input_owner, &active_ctrc_retention.input_owner,
 			sizeof(source->input_owner)) == 0
 		&& cluster_wal_read_pin_owner_current_v1(&source->input_owner);
@@ -3608,6 +3680,7 @@ inputs_relmap_source(ClusterWalInputsV1 *inputs, uint32 index,
 		|| !inputs_ctrc_replays_request(inputs, replay_index, &request, &replay))
 		return false;
 	source.scope = inputs;
+	source.scope_generation = inputs->generation;
 	memcpy(&source.input_owner, &active_ctrc_retention.input_owner, sizeof(source.input_owner));
 	source.work_generation = inputs->ctrc.work_generation;
 	source.ir_request_id = plan->replay[replay_index].ir.lock_request.request_id;
@@ -3661,6 +3734,7 @@ cluster_wal_inputs_relmap_source_fail_v1(const ClusterRecoveryRelmapSourceV1 *so
 	 * sufficient to revoke its original Start even after native/owner drift. */
 	if (source != NULL && source->scope != NULL
 		&& source->scope == active_ctrc_retention.scope
+		&& source->scope_generation == active_ctrc_retention.scope_generation
 		&& memcmp(&source->input_owner, &active_ctrc_retention.input_owner,
 			sizeof(source->input_owner)) == 0)
 		ClusterColdRecoveryRelmapFail(source->scope->ctrc.start);
@@ -4438,7 +4512,8 @@ cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs)
 	if (!inputs_current(inputs))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	inputs_tx_serial_release(inputs);
-	if (cluster_wal_read_pin_release_v1(&inputs->pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
+	if (inputs->pin != NULL
+		&& cluster_wal_read_pin_release_v1(&inputs->pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
 		elog(FATAL, "could not suspend WAL input retention owner");
 	inputs->suspended = true;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -4499,8 +4574,11 @@ cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs)
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	PG_TRY();
 	{
-		pinned
-			= cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count, &inputs->pin);
+		if (inputs->purpose == WAL_INPUTS_TX_CLOSURE || inputs->purpose == WAL_INPUTS_CTRC_CENSUS)
+			pinned = inputs_pin_covers(inputs, inputs->threads[0])
+				? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
+		else
+			pinned = cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count, &inputs->pin);
 		if (pinned != CLUSTER_WAL_PIN_OK)
 			result = pinned == CLUSTER_WAL_PIN_RELEASE_UNCERTAIN
 						 ? CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN

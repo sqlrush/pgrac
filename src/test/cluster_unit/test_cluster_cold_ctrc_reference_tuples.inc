@@ -10,6 +10,10 @@
 #include "access/htup_details.h"
 
 static unsigned reference_tuple_calls, reference_tuple_fault;
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+static bool reference_tuple_native;
+static void (*reference_tuple_after_native)(void);
+#endif
 static char reference_tuple_bytes[2][64];
 
 /* The declaration also permits the genuine untouched-parent consumer RED. */
@@ -19,6 +23,13 @@ bool
 cluster_ctrc_recovery_heap_tuple_itl_references_v1(
 	const ClusterItlSlotData *slots, const char *bytes, Size length)
 {
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (reference_tuple_native) {
+		bool valid = test_startup_native_ctrc_tuple(slots, bytes, length);
+		if (reference_tuple_after_native != NULL) reference_tuple_after_native();
+		return valid;
+	}
+#endif
 	reference_tuple_calls++;
 	UT_ASSERT(slots != NULL && bytes != NULL && length == 64);
 	UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);

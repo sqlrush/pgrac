@@ -159,7 +159,7 @@ UT_TEST(test_ctrc_namespace_initial_root_error_closes_fd_and_retains_scope_debt)
 	UT_ASSERT_EQ(fd, -1);
 	UT_ASSERT_EQ(fcntl(next_fd, F_GETFD), -1);
 	UT_ASSERT_EQ(errno, EBADF);
-	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT(inputs_recovery_held && test_actual_cf == NoLock);
 	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
 	cluster_wal_inputs_release_v1(&inputs);
 	UT_ASSERT(!inputs_pin_held);

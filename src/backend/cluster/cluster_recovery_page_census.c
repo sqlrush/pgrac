@@ -17,6 +17,7 @@ struct ClusterRecoveryPageCensus {
 	ClusterRecoveryHeapScan *heap;
 	ClusterRecoveryGraphLookup *lookup;
 	ClusterRecoveryHeapEntry pending;
+	const char *page; /* original history version, borrowed until next inverse */
 	uint64 version;
 	bool inverse;
 	ClusterRecoveryPageCensusResult status;
@@ -175,11 +176,13 @@ cluster_recovery_page_census_next(ClusterRecoveryPageCensus *census,
 				return page_census_history_result(census, accepted);
 			census->version++;
 			census->inverse = false;
+			census->page = NULL;
 			return CLUSTER_RECOVERY_PAGE_MORE;
 		}
 		out->version = census->version;
 		out->entry = census->pending;
 		out->transaction = record;
+		out->page = census->page;
 		return CLUSTER_RECOVERY_PAGE_ENTRY;
 	}
 	if (census->heap != NULL) {
@@ -217,6 +220,7 @@ cluster_recovery_page_census_next(ClusterRecoveryPageCensus *census,
 		}
 		out->version = census->version;
 		out->entry = entry;
+		out->page = census->page;
 		return CLUSTER_RECOVERY_PAGE_ENTRY;
 	}
 	{
@@ -231,6 +235,7 @@ cluster_recovery_page_census_next(ClusterRecoveryPageCensus *census,
 				return page_census_fail(census, heap == CLUSTER_RECOVERY_HEAP_CAPACITY
 													? CLUSTER_RECOVERY_PAGE_CAPACITY
 													: CLUSTER_RECOVERY_PAGE_CORRUPT);
+			census->page = event.page;
 			return CLUSTER_RECOVERY_PAGE_MORE;
 		}
 		if (result == CLUSTER_RECOVERY_HISTORY_NEED_RECORD) {

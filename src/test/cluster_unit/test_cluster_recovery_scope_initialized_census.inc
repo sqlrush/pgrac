@@ -198,7 +198,7 @@ scope_initialized_end(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistory 
 {
 	cluster_recovery_relmap_history_destroy_v1(history);
 	for (unsigned i = 0; i < 2; ++i) if (fds[i] >= 0) UT_ASSERT_EQ(fcntl(fds[i], F_GETFD), -1);
-	UT_ASSERT(ctrc_set_held == 2 && inputs_pin_held && fcntl(scope_native_fd, F_GETFD) >= 0);
+	UT_ASSERT(ctrc_set_held == 2 && (inputs_recovery_held && !inputs_pin_held) && fcntl(scope_native_fd, F_GETFD) >= 0);
 	for (uint32 p = 0; p < tx_inputs_typed.participant_count; ++p)
 		rf_side_online_plan_destroy_v1(&tx_inputs_typed.side_plans[p]);
 	scope_native_finish(inputs); /* The original scope retires its census before IR/WALR. */
@@ -223,7 +223,7 @@ UT_TEST(test_scope_initialized_census_shares_complete_original_episode)
 		CLUSTER_RELMAP_CENSUS_DRAINED);
 	UT_ASSERT_EQ(ctrc_set_calls, calls);
 	UT_ASSERT_EQ(scope_native_legacy_calls | ctrc_set_release_calls | relmap_failed, 0);
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2);
+	UT_ASSERT((inputs_recovery_held && !inputs_pin_held) && ctrc_set_held == 2);
 	UT_ASSERT(scope_initialized_read(history, &pending, fds));
 	scope_initialized_end(&inputs, &history, fds);
 	UT_ASSERT_EQ(scope_native_destroyed, 1);
@@ -240,7 +240,7 @@ UT_TEST(test_scope_initialized_census_unknown_birth_preserves_custody)
 	scope_initialized_begin(&inputs, &history, &pending, false);
 	UT_ASSERT(scope_native_prepare(inputs, &census));
 	UT_ASSERT(!scope_initialized_read(history, &pending, fds));
-	UT_ASSERT(history->failed && relmap_failed > 0 && ctrc_set_held == 2 && inputs_pin_held);
+	UT_ASSERT(history->failed && relmap_failed > 0 && ctrc_set_held == 2 && (inputs_recovery_held && !inputs_pin_held));
 	UT_ASSERT_NE(cluster_relmap_retention_census_next((ClusterRelmapRetentionCensus *)census),
 		CLUSTER_RELMAP_CENSUS_DRAINED);
 	UT_ASSERT_EQ(scope_native_destroyed | ctrc_set_release_calls, 0);
@@ -264,7 +264,7 @@ UT_TEST(test_scope_initialized_census_pair_refusal_keeps_native_custody)
 		UT_ASSERT(census == NULL && relmap_failed > 0);
 		UT_ASSERT(!scope_initialized_read(history, &pending, fds));
 		for (unsigned i = 0; i < 2; ++i) UT_ASSERT(fcntl(fds[i], F_GETFD) >= 0);
-		UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && ctrc_set_release_calls == 0);
+		UT_ASSERT((inputs_recovery_held && !inputs_pin_held) && ctrc_set_held == 2 && ctrc_set_release_calls == 0);
 		scope_initialized_end(&inputs, &history, fds);
 	}
 }
@@ -296,7 +296,7 @@ UT_TEST(test_scope_initialized_census_late_original_owner_loss_invalidates_both)
 		UT_ASSERT_NE(cluster_relmap_retention_census_next((ClusterRelmapRetentionCensus *)census),
 			CLUSTER_RELMAP_CENSUS_DRAINED);
 		for (unsigned i = 0; i < 2; ++i) UT_ASSERT(fcntl(fds[i], F_GETFD) >= 0);
-		UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && ctrc_set_release_calls == 0);
+		UT_ASSERT((inputs_recovery_held && !inputs_pin_held) && ctrc_set_held == 2 && ctrc_set_release_calls == 0);
 		scope_initialized_end(&inputs, &history, fds);
 	}
 }
@@ -319,6 +319,6 @@ UT_TEST(test_scope_initialized_census_observations_do_not_grant_completion)
 	UT_ASSERT_EQ(memcmp(&committed, &zero, sizeof(zero)), 0);
 	UT_ASSERT(!scope_native_prepare(inputs, &again) && again == NULL);
 	UT_ASSERT_EQ(ctrc_set_release_calls | scope_native_legacy_calls, 0);
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && relmap_failed == 0);
+	UT_ASSERT((inputs_recovery_held && !inputs_pin_held) && ctrc_set_held == 2 && relmap_failed == 0);
 	scope_initialized_end(&inputs, &history, fds);
 }

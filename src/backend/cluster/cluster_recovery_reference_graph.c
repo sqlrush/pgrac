@@ -436,6 +436,29 @@ cluster_recovery_reference_graph_at(const ClusterRecoveryReferenceGraph *graph, 
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
 }
 
+ClusterRecoveryGraphResult
+cluster_recovery_reference_graph_recheck_at(ClusterRecoveryReferenceGraph *graph, uint32 index)
+{
+	RecoveryRecordNode *node;
+	ClusterRecoveryGraphResult result;
+	uint32 generation;
+
+	if (!cluster_recovery_reference_graph_observed(graph) || index > graph->count)
+		return graph != NULL && graph->status > CLUSTER_RECOVERY_GRAPH_DRAINED
+			? graph->status : CLUSTER_RECOVERY_GRAPH_INVALID;
+	if (index == graph->count) return CLUSTER_RECOVERY_GRAPH_DRAINED;
+	node = &graph->nodes[index];
+	if (node->state != RECOVERY_NODE_DONE)
+		return recovery_graph_fail(graph, CLUSTER_RECOVERY_GRAPH_INVALID);
+	result = recovery_graph_read_node(graph, node, &generation);
+	if (result != CLUSTER_RECOVERY_GRAPH_MORE) return result;
+	if (!cluster_recovery_reference_graph_observed(graph)
+		|| generation != node->record_generation
+		|| !recovery_graph_record_equal(&node->record, &graph->scratch))
+		return recovery_graph_fail(graph, CLUSTER_RECOVERY_GRAPH_CHANGED);
+	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
 /* Use the edges resolved by the original walk, not a second traversal or
  * a caller-provided root list. Native UBA128 and both physical generations
  * stay in the original records; these indexes are only local adjacency. */
@@ -480,6 +503,37 @@ cluster_recovery_reference_graph_dependency_at(const ClusterRecoveryReferenceGra
 	}
 	*out = current;
 	return CLUSTER_RECOVERY_GRAPH_RECORD;
+}
+
+/* Join native stored heads to the original observed nodes, without adding
+ * roots or doing another walk. The probe bound is the original table size. */
+ClusterRecoveryGraphResult
+cluster_recovery_reference_graph_dependency_find(const ClusterRecoveryReferenceGraph *graph,
+	const ClusterRecoveryTxnKey *transaction, UBA address, ClusterRecoveryGraphDependency *out)
+{
+	uint32 bucket;
+
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (out == NULL || !cluster_recovery_reference_graph_observed(graph)
+		|| !recovery_graph_key_valid(transaction)
+		|| !recovery_graph_address_matches(transaction, address)
+		|| graph->buckets == NULL || graph->bucket_count == 0
+		|| (graph->bucket_count & (graph->bucket_count - 1)) != 0
+		|| graph->count > graph->capacity || graph->root_count > graph->count)
+		return CLUSTER_RECOVERY_GRAPH_INVALID;
+	bucket = recovery_graph_bucket(transaction, address, graph->bucket_count - 1);
+	for (uint32 probes = 0; probes < graph->bucket_count; probes++) {
+		uint32 entry = graph->buckets[bucket];
+		const RecoveryRecordNode *node;
+
+		if (entry == 0 || entry > graph->count) return CLUSTER_RECOVERY_GRAPH_INVALID;
+		node = &graph->nodes[entry - 1];
+		if (recovery_graph_key_equal(transaction, &node->transaction)
+			&& cluster_undo_record_uba_equal(address, node->address))
+			return cluster_recovery_reference_graph_dependency_at(graph, entry - 1, out);
+		bucket = (bucket + 1) & (graph->bucket_count - 1);
+	}
+	return CLUSTER_RECOVERY_GRAPH_INVALID;
 }
 
 ClusterRecoveryGraphLookupResult

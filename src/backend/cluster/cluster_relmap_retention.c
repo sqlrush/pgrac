@@ -357,6 +357,101 @@ cluster_relmap_retention_prepare_check(const ClusterRelmapRetentionDirectory *di
 	return CLUSTER_RELMAP_RETENTION_CONFLICT;
 }
 
+/* Examine every slot: accepting the first key would hide a duplicate owner
+ * or a conflicting pin in the same namespace. Never change either pin. */
+static ClusterRelmapRetentionResult
+prepare_pin(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterRelmapRetentionKey *key, const ClusterRelmapRetentionPin **selected)
+{
+	ClusterRelmapRetentionResult result = check_key(directory, key);
+
+	*selected = NULL;
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		return result;
+	for (int i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; ++i) {
+		const ClusterRelmapRetentionPin *pin = &directory->pins[i];
+		if (!pin->occupied || !same_namespace(&pin->key.identity, &key->identity))
+			continue;
+		if (*selected != NULL || !same_key(&pin->key, key)
+			|| (pin->has_tt_binding && (!valid_binding(directory, &pin->binding)
+				|| pin->binding.xid != (uint32)key->top_full_xid)))
+			return CLUSTER_RELMAP_RETENTION_CONFLICT;
+		*selected = pin;
+	}
+	return *selected != NULL ? CLUSTER_RELMAP_RETENTION_OK : CLUSTER_RELMAP_RETENTION_CONFLICT;
+}
+
+static bool
+snapshot_overlaps(const void *a, Size a_size, const void *b, Size b_size)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+
+	if (a == NULL || b == NULL)
+		return false;
+	return x <= y ? y - x < a_size : x - y < b_size;
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_prepare_capture(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterRelmapRetentionKey *key, ClusterRelmapRetentionSnapshot *snapshot)
+{
+	const ClusterRelmapRetentionPin *pin;
+	ClusterRelmapRetentionResult result;
+
+	/* Refuse aliases before clearing even a failed output. */
+	if (snapshot == NULL
+		|| snapshot_overlaps(snapshot, sizeof(*snapshot), directory, sizeof(*directory))
+		|| snapshot_overlaps(snapshot, sizeof(*snapshot), key, sizeof(*key)))
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	memset(snapshot, 0, sizeof(*snapshot));
+	if (directory == NULL || directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	result = prepare_pin(directory, key, &pin);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		return result;
+	if (pin->may_be_staged || pin->wal_end != 0)
+		return CLUSTER_RELMAP_RETENTION_RETAINED;
+	snapshot->pin = *pin;
+	snapshot->generation = directory->generation;
+	snapshot->native_floor = directory->native_floor;
+	snapshot->last_issued = directory->last_issued;
+	snapshot->truncate_serial = directory->truncate_serial;
+	snapshot->inflight = directory->inflight;
+	return CLUSTER_RELMAP_RETENTION_OK;
+}
+
+ClusterRelmapRetentionResult
+cluster_relmap_retention_prepare_matches(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterRelmapRetentionKey *key, const ClusterRelmapRetentionSnapshot *snapshot,
+	bool staged, uint64 wal_end)
+{
+	const ClusterRelmapRetentionPin *pin;
+	ClusterRelmapRetentionResult result;
+
+	if (snapshot == NULL || key == NULL || !snapshot->pin.occupied
+		|| snapshot->pin.may_be_staged || snapshot->pin.wal_end != 0
+		|| !same_key(&snapshot->pin.key, key) || staged != (wal_end != 0))
+		return CLUSTER_RELMAP_RETENTION_INVALID;
+	if (directory == NULL || directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE)
+		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	if (snapshot->generation != directory->generation
+		|| snapshot->native_floor != directory->native_floor
+		|| snapshot->last_issued != directory->last_issued
+		|| snapshot->truncate_serial != directory->truncate_serial
+		|| snapshot->inflight.generation != directory->inflight.generation
+		|| snapshot->inflight.serial != directory->inflight.serial
+		|| snapshot->inflight.cutoff != directory->inflight.cutoff)
+		return CLUSTER_RELMAP_RETENTION_CONFLICT;
+	result = prepare_pin(directory, key, &pin);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		return result;
+	if (pin->has_tt_binding != snapshot->pin.has_tt_binding
+		|| (pin->has_tt_binding && !same_binding(&pin->binding, &snapshot->pin.binding))
+		|| pin->may_be_staged != staged || pin->wal_end != wal_end)
+		return CLUSTER_RELMAP_RETENTION_CONFLICT;
+	return CLUSTER_RELMAP_RETENTION_OK;
+}
+
 ClusterRelmapRetentionResult
 cluster_relmap_retention_stage_start(ClusterRelmapRetentionDirectory *directory,
 	const ClusterRelmapRetentionKey *key, uint64 wal_end)

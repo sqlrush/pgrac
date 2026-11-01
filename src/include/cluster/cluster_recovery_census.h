@@ -216,6 +216,26 @@ typedef struct ClusterRecoveryCensusPagesV1 {
 extern const ClusterRecoveryCensusPagesV1 *cluster_recovery_census_pages_v1(
 	ClusterRecoveryCensus *census);
 
+/* Complete bytes from each original physical page and each inverse history
+ * version. page_index addresses the original physical PAGE collection;
+ * version is its inverse ordinal. No fragments, new reads or rebuilt images.
+ * Opt-in begin reserves all image capacity within its total budget. A readonly
+ * view exists only after the original complete manifest, lives until census
+ * failure/destruction, and grants no owner, discharge or completion rights. */
+typedef struct ClusterRecoveryCensusImageV1 {
+	uint32 page_index;
+	uint64 version;
+	PGAlignedBlock bytes;
+} ClusterRecoveryCensusImageV1;
+
+typedef struct ClusterRecoveryCensusImagesV1 {
+	uint32 count;
+	ClusterRecoveryCensusImageV1 entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterRecoveryCensusImagesV1;
+
+extern const ClusterRecoveryCensusImagesV1 *cluster_recovery_census_images_v1(
+	ClusterRecoveryCensus *census);
+
 /* Current bytes from the same original physical relation object. This is
  * only a by-value observation; the initial page/root baselines never change. */
 typedef struct ClusterRecoveryCensusPageDigestV1 {
@@ -286,6 +306,23 @@ typedef struct ClusterRecoveryCensusTxRecordV1 {
 extern ClusterRecoveryCensusTxRecordV1
 cluster_recovery_census_tx_record_v1(ClusterRecoveryCensus *census, uint32 index);
 
+/* Entire original saved native WAL record set after DRAINED, with complete
+ * payloads and source positions. Same complete manifest/current, pre-lock,
+ * borrowed lifetime and entered failure/ERROR contract as tx_record_v1.
+ * Complete end is observed with index==count and empty primary. Does not
+ * consume the original effect cursor, qualify owners or discharge debt. */
+extern ClusterRecoveryNativeRecordObservationV1 cluster_recovery_census_native_record_v1(
+	ClusterRecoveryCensus *census, uint64 index);
+
+/* Final physical TX_RECORD check through the SAME original undo namespace,
+ * bracketed by complete saved manifest/source/current checks. No new graph,
+ * scope, baseline or progress. RECORD matches one original node, count is
+ * DRAINED, PENDING keeps the same index. Entered failure/ERROR invalidates the
+ * original census; the input owner retains its FD/IR/WALR/pins/debt. Caller
+ * holds no LWLock/critical section. Not semantic closure or release authority. */
+extern ClusterRecoveryGraphResult cluster_recovery_census_tx_recheck_v1(
+	ClusterRecoveryCensus *census, uint32 index);
+
 /* Original complete TX roots and resolved predecessor edges, indexed in the
  * same original second-read forest. observed with value.index==value.count
  * is complete end; invalid/prefix/refused results are all zero. This view
@@ -298,6 +335,25 @@ typedef struct ClusterRecoveryCensusTxDependencyV1 {
 } ClusterRecoveryCensusTxDependencyV1;
 extern ClusterRecoveryCensusTxDependencyV1
 cluster_recovery_census_tx_dependency_v1(ClusterRecoveryCensus *census, uint32 index);
+
+/* Enumerate EVERY original PAGE/history reference and join each non-FREE
+ * ITL to its exact original TX forest node/dependency indexes. FREE ITLs and
+ * all raw tuple/MX/HOT/line-pointer items remain present with no TX edge;
+ * absence of that edge is not proof that their obligations are discharged.
+ * This is an ITL stored-head edge, never a PAGE_VERSION inverse edge.
+ * reference borrows original immutable census bytes; transaction records
+ * borrow the same observed forest. Complete end has index==count and NULL
+ * reference; invalid/prefix/refused output is entirely zero. Same pre-PAGE,
+ * original manifest/source, sticky false/ERROR and lifetime contract as TX
+ * views. No native read/pass/allocation, owner proof, retention or completion. */
+typedef struct ClusterRecoveryCensusTxReferenceV1 {
+	bool observed;
+	uint32 count, index;
+	const ClusterRecoveryCensusReferenceV1 *reference;
+	ClusterRecoveryGraphDependency transaction;
+} ClusterRecoveryCensusTxReferenceV1;
+extern ClusterRecoveryCensusTxReferenceV1
+cluster_recovery_census_tx_reference_v1(ClusterRecoveryCensus *census, uint32 index);
 
 /* Borrow the original live cold inputs and their ROOT-selected isolated
  * namespace fd. The caller holds isolation, retention and these owners for
@@ -317,6 +373,14 @@ extern ClusterRecoveryCensusResult cluster_recovery_census_begin(ClusterWalInput
  * The original caller must still hold isolation/retention/freeze. This is an
  * observation component, not a service driver, semantic seal or write grant. */
 extern ClusterRecoveryCensusResult cluster_recovery_census_begin_ctrc(
+	ClusterWalInputsV1 *inputs, size_t memory_budget, ClusterRecoveryCensus **out);
+
+/* Same original factories, with a separate bounded reservation for complete
+ * page/version bytes. Legacy factories retain the original metadata-only mode.
+ * All original source/namespace/isolation/retention premises still apply. */
+extern ClusterRecoveryCensusResult cluster_recovery_census_begin_images_v1(
+	ClusterWalInputsV1 *inputs, int root_fd, size_t memory_budget, ClusterRecoveryCensus **out);
+extern ClusterRecoveryCensusResult cluster_recovery_census_begin_ctrc_images_v1(
 	ClusterWalInputsV1 *inputs, size_t memory_budget, ClusterRecoveryCensus **out);
 
 /* Run the existing ROOT/WAL union, all TT slots, physical PAGE/history root

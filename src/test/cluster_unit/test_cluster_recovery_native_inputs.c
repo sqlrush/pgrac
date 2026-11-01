@@ -58,16 +58,27 @@ static ClusterRecoveryRootsResult census_current_read(ClusterRecoveryRootSet *ro
 static void census_namespace_interrupts(void);
 static ClusterRecoveryGraphResult census_tx_test_at(const ClusterRecoveryReferenceGraph *graph,
 	uint32 index, ClusterRecoveryGraphRecord *out);
+static ClusterRecoveryGraphResult census_tx_test_recheck_at(ClusterRecoveryReferenceGraph *, uint32);
 static ClusterRecoveryGraphResult census_dependency_test_at(const ClusterRecoveryReferenceGraph *,
  uint32,ClusterRecoveryGraphDependency *);
 #define cluster_recovery_reference_graph_dependency_at census_dependency_test_at
 #define cluster_recovery_reference_graph_at census_tx_test_at
+#define cluster_recovery_reference_graph_recheck_at census_tx_test_recheck_at
 #define HandleStartupProcInterrupts census_namespace_interrupts
 #define cluster_recovery_root_set_read_current_relation census_current_read
+static ClusterRecoveryGraphResult census_ref_test_find(const ClusterRecoveryReferenceGraph *,
+ const ClusterRecoveryTxnKey *,UBA,ClusterRecoveryGraphDependency *);
+#define cluster_recovery_reference_graph_dependency_find census_ref_test_find
+static ClusterRecoveryNativeRecordObservationV1 census_native_test_record(
+ ClusterRecoveryNativeInventory *, uint64);
+#define cluster_recovery_native_inventory_record_v1 census_native_test_record
 #include "../../backend/cluster/cluster_recovery_census.c"
+#undef cluster_recovery_native_inventory_record_v1
+#undef cluster_recovery_reference_graph_dependency_find
 #undef cluster_recovery_root_set_read_current_relation
 #undef HandleStartupProcInterrupts
 #undef cluster_recovery_reference_graph_at
+#undef cluster_recovery_reference_graph_recheck_at
 #undef cluster_recovery_reference_graph_dependency_at
 
 static ClusterWalSourceRef inventory_fault_source;
@@ -1060,6 +1071,16 @@ UT_TEST(test_ctrc_inventory_keeps_original_local_cut_and_native_terminal_bytes)
 #include "test_cluster_recovery_relmap_fold.inc"
 #include "test_cluster_recovery_relmap_history.inc"
 
+/* These legacy episode assertions name the former independent read pin.
+ * The same Start now borrows its original recovery retention: require that
+ * actual original pin to remain held AND that no new read pin was acquired.
+ * Only this immutable episode-fixture block uses the alias. */
+static bool
+episode_original_retention_held(void)
+{
+	return inputs_recovery_held && !inputs_pin_held;
+}
+#define inputs_pin_held episode_original_retention_held()
 #include "test_cluster_recovery_episode_history.inc"
 #define relmap_history_fixture episode_pending_relmap_history_fixture
 #include "test_cluster_recovery_episode_pending.inc"
@@ -1142,8 +1163,12 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_episode_page_history.inc"
 #include "test_cluster_recovery_episode_page_sources.inc"
 #include "test_cluster_recovery_consumed_native_redo.inc"
+#include "test_cluster_recovery_native_callback.inc"
+#include "test_cluster_recovery_initialized_replay.inc"
 #include "test_cluster_recovery_episode_generation_xid.inc"
 #include "test_cluster_recovery_clog_full_roots.inc"
+
+#undef inputs_pin_held
 
 #include "test_cluster_recovery_census_current_pages.inc"
 #include "test_cluster_recovery_scope_census.inc"
@@ -1156,18 +1181,83 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_scope_replayed_census.inc"
 #include "test_cluster_recovery_scope_handoff.inc"
 #endif
+#include "test_cluster_recovery_census_images.inc"
 #include "test_cluster_recovery_census_namespace.inc"
 #include "test_cluster_recovery_census_tx_records.inc"
+#include "test_cluster_recovery_census_native_records.inc"
+#include "test_cluster_recovery_compound_obligations.inc"
 #include "test_cluster_recovery_census_tx_dependencies.inc"
+#include "test_cluster_recovery_census_tx_reference_edges.inc"
+#include "test_cluster_recovery_census_tx_recheck.inc"
 
+#include "test_cluster_recovery_owner_routes.inc"
+
+#include "test_cluster_recovery_raw_records.inc"
+
+#include "test_cluster_recovery_page_raw.inc"
 
 int
 main(int argc, char **argv)
 {
+
 	(void)argc;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_PAGE_RAW") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
+		UT_RUN(test_page_raw_borrowed_byte_change_revokes_whole_inventory_without_rebase);
+		UT_RUN(test_page_raw_complete_copy_is_charged_before_any_prefix_publication);
+		UT_RUN(test_page_raw_original_census_keeps_all_sources_and_rejects_changed_whole_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_INITIALIZED_REPLAY") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_episode_initialized_replay_joins_complete_native_and_foreign_initialization);
+		UT_RUN(test_episode_initialized_replay_missing_or_wrong_foreign_birth_keeps_all_fds);
+		UT_RUN(test_episode_initialized_replay_sync_error_does_not_supply_consumption);
+		UT_RUN(test_episode_initialized_replay_lost_birth_cannot_rebase_held_pages);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_NATIVE_CALLBACK") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_episode_native_callback_consumes_only_after_sync_and_reads_whole_pages);
+		UT_RUN(test_episode_native_callback_sync_failures_keep_attempt_fd_and_debt);
+		UT_RUN(test_episode_native_callback_late_source_and_frame_changes_keep_one_attempt);
+		UT_RUN(test_episode_native_callback_does_not_replace_foreign_cold_consumption);
+		UT_RUN(test_episode_native_callback_cannot_replace_earlier_held_observation);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_RAW_RECORDS") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_reader_raw_record_readahead_release_seek_and_crc_failure_revoke);
+		UT_RUN(test_reader_raw_record_page_and_segment_continuations_exclude_page_headers);
+		UT_RUN(test_census_raw_records_preserve_full_file_bytes_after_both_passes);
+		UT_RUN(test_census_raw_records_missing_length_bytes_hash_and_end_refuse_whole_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_OWNER_ROUTES") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_census_owner_routes_keep_every_component_and_original_custody);
+		UT_RUN(test_census_owner_routes_missing_wrong_extra_and_nonempty_end_revoke_whole_group);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_RECHECK") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_census_tx_final_recheck_accepts_original_complete_files_and_empty_end);
+		UT_RUN(test_census_tx_final_recheck_detects_same_inode_late_predecessor_rewrite);
+		UT_RUN(test_census_tx_final_recheck_does_not_enter_under_locks_or_stale_source);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_REFERENCE_EDGES") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_census_tx_references_join_all_original_current_and_history_items);
+		UT_RUN(test_census_tx_references_prefix_empty_lock_and_range_are_distinct);
+		UT_RUN(test_census_tx_references_late_source_graph_generation_and_error_are_sticky);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CENSUS_TX_DEPENDENCIES") != NULL) {
 		UT_PLAN(3);
 		UT_RUN(test_census_tx_dependencies_construct_original_roots_and_cross_relation_edge);
@@ -1563,7 +1653,46 @@ main(int argc, char **argv)
 		UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(282);
+	if (getenv("PGRAC_PRE2_TEST_COMPOUND_OBLIGATIONS") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_census_compound_groups_keep_all_components_without_cursor_or_io);
+		UT_RUN(test_census_compound_groups_refuse_partial_mixed_and_nonempty_end);
+		UT_RUN(test_inventory_compound_groups_charge_the_original_budget_without_prefix);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CENSUS_NATIVE_RECORDS") != NULL) {
+		UT_PLAN(4);
+	UT_RUN(test_census_native_records_keep_entire_payload_source_and_drained_cursor);
+	UT_RUN(test_census_native_records_prefix_locks_and_range_do_not_enter);
+	UT_RUN(test_census_native_records_late_current_shape_and_error_are_sticky);
+	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(319);
+	UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
+	UT_RUN(test_page_raw_borrowed_byte_change_revokes_whole_inventory_without_rebase);
+	UT_RUN(test_page_raw_complete_copy_is_charged_before_any_prefix_publication);
+	UT_RUN(test_page_raw_original_census_keeps_all_sources_and_rejects_changed_whole_view);
+	UT_RUN(test_reader_raw_record_readahead_release_seek_and_crc_failure_revoke);
+	UT_RUN(test_reader_raw_record_page_and_segment_continuations_exclude_page_headers);
+	UT_RUN(test_census_raw_records_preserve_full_file_bytes_after_both_passes);
+	UT_RUN(test_census_raw_records_missing_length_bytes_hash_and_end_refuse_whole_view);
+	UT_RUN(test_census_owner_routes_keep_every_component_and_original_custody);
+	UT_RUN(test_census_owner_routes_missing_wrong_extra_and_nonempty_end_revoke_whole_group);
+	UT_RUN(test_census_compound_groups_keep_all_components_without_cursor_or_io);
+	UT_RUN(test_census_compound_groups_refuse_partial_mixed_and_nonempty_end);
+	UT_RUN(test_inventory_compound_groups_charge_the_original_budget_without_prefix);
+	UT_RUN(test_census_native_records_keep_entire_payload_source_and_drained_cursor);
+	UT_RUN(test_census_native_records_prefix_locks_and_range_do_not_enter);
+	UT_RUN(test_census_native_records_late_current_shape_and_error_are_sticky);
+	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
+
+	UT_RUN(test_census_tx_final_recheck_accepts_original_complete_files_and_empty_end);
+	UT_RUN(test_census_tx_final_recheck_detects_same_inode_late_predecessor_rewrite);
+	UT_RUN(test_census_tx_final_recheck_does_not_enter_under_locks_or_stale_source);
+	UT_RUN(test_census_tx_references_join_all_original_current_and_history_items);
+	UT_RUN(test_census_tx_references_prefix_empty_lock_and_range_are_distinct);
+	UT_RUN(test_census_tx_references_late_source_graph_generation_and_error_are_sticky);
 	UT_RUN(test_census_tx_dependencies_construct_original_roots_and_cross_relation_edge);
 	UT_RUN(test_census_tx_dependencies_prefix_lock_and_range_do_not_enter);
 	UT_RUN(test_census_tx_dependencies_late_source_count_error_revoke_whole_forest);
@@ -1611,6 +1740,15 @@ main(int argc, char **argv)
 	UT_RUN(test_episode_page_history_refuses_postbirth_zero_and_truncate);
 	UT_RUN(test_episode_page_history_uses_each_sources_whole_page_halfspace);
 	UT_RUN(test_episode_page_history_preserves_prebirth_legacy_input);
+	UT_RUN(test_episode_native_callback_consumes_only_after_sync_and_reads_whole_pages);
+	UT_RUN(test_episode_native_callback_sync_failures_keep_attempt_fd_and_debt);
+	UT_RUN(test_episode_native_callback_late_source_and_frame_changes_keep_one_attempt);
+	UT_RUN(test_episode_native_callback_does_not_replace_foreign_cold_consumption);
+	UT_RUN(test_episode_native_callback_cannot_replace_earlier_held_observation);
+	UT_RUN(test_episode_initialized_replay_joins_complete_native_and_foreign_initialization);
+	UT_RUN(test_episode_initialized_replay_missing_or_wrong_foreign_birth_keeps_all_fds);
+	UT_RUN(test_episode_initialized_replay_sync_error_does_not_supply_consumption);
+	UT_RUN(test_episode_initialized_replay_lost_birth_cannot_rebase_held_pages);
 	UT_RUN(test_episode_consumed_native_redo_reaches_original_sync_and_whole_page);
 	UT_RUN(test_episode_consumed_native_dirty_status_is_not_a_disk_commit);
 	UT_RUN(test_episode_consumed_native_redo_cannot_rebase_an_earlier_held_page);
@@ -1849,6 +1987,11 @@ main(int argc, char **argv)
 	UT_RUN(test_census_references_complete_empty_is_not_prefix_or_lost_scope);
 	UT_RUN(test_census_references_reject_modified_metadata_tuple_and_rebound_pointer);
 	UT_RUN(test_census_references_bound_metadata_and_tuple_storage_before_publication);
+	UT_RUN(test_census_images_retain_all_physical_and_inverse_full_bytes);
+	UT_RUN(test_census_images_old_mode_prefix_and_caller_locks_never_enter);
+	UT_RUN(test_census_images_changed_full_bytes_identity_or_source_revoke_whole_view);
+	UT_RUN(test_census_images_capacity_failure_never_exports_a_prefix);
+	UT_RUN(test_census_images_manifest_error_retains_original_input_custody);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

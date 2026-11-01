@@ -14,11 +14,42 @@
  */
 #include "postgres.h"
 #include "test_cluster_recovery_scope_startup.h"
+/* The old receipt-only cases use a controlled sealed-plan leaf.  Keep
+ * that boundary local to this bridge, and compare complete frozen cuts.
+ * Real plans, including the missing-declaration regression, use the original
+ * plan readers without interception. */
+static uint32 scope_startup_plan_count(const ClusterColdPlanV1 *plan);
+static bool scope_startup_plan_matches(const ClusterColdPlanV1 *plan, uint32 index,
+	const ClusterColdParticipantV1 *participant);
+#define cluster_cold_plan_participant_count_v1 scope_startup_plan_count
+#define cluster_cold_plan_participant_matches_v1 scope_startup_plan_matches
 #include "../../backend/cluster/cluster_cold_recovery_startup.c"
+#undef cluster_cold_plan_participant_count_v1
+#undef cluster_cold_plan_participant_matches_v1
 
 /* This fixture has exactly the founder and one foreign failed origin. */
 static ColdRoot scope_startup_roots[2];
 static uint32 scope_startup_count;
+static const ClusterColdPlanV1 *scope_startup_controlled_plan;
+static ClusterColdParticipantV1 scope_startup_cuts[2];
+
+static uint32
+scope_startup_plan_count(const ClusterColdPlanV1 *plan)
+{
+	if (scope_startup_controlled_plan != NULL && plan == scope_startup_controlled_plan)
+		return scope_startup_count;
+	return cluster_cold_plan_participant_count_v1(plan);
+}
+
+static bool
+scope_startup_plan_matches(const ClusterColdPlanV1 *plan, uint32 index,
+	const ClusterColdParticipantV1 *participant)
+{
+	if (scope_startup_controlled_plan != NULL && plan == scope_startup_controlled_plan)
+		return participant != NULL && index < scope_startup_count
+			&& memcmp(participant, &scope_startup_cuts[index], sizeof(*participant)) == 0;
+	return cluster_cold_plan_participant_matches_v1(plan, index, participant);
+}
 
 bool
 test_scope_startup_sources_current(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence)
@@ -50,6 +81,7 @@ test_scope_startup_attach_cold(ClusterColdTypedV1 *typed, const ClusterWalInputV
 				&root->root, &root->token) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| memcmp(&root->root, &selected->checkpoint, sizeof(root->root)) != 0)
 			return false;
+		root->source = selected->source;
 		root->checkpoint_start = selected->checkpoint_start;
 		root->native_checkpoint = selected->native_checkpoint;
 		memcpy(root->native_window, selected->native_window, sizeof(root->native_window));
@@ -60,6 +92,10 @@ test_scope_startup_attach_cold(ClusterColdTypedV1 *typed, const ClusterWalInputV
 	memcpy(typed->observer.storage_uuid, typed->sources[0].claim.identity.storage_uuid, 16);
 	typed->observer.database_incarnation = typed->sources[0].claim.database_incarnation;
 	scope_startup_count = typed->participant_count;
+	if (typed->plan == (ClusterColdPlanV1 *)typed) {
+		memcpy(scope_startup_cuts, typed->participants, sizeof(scope_startup_cuts));
+		scope_startup_controlled_plan = typed->plan;
+	}
 	cluster_cold_replay_window_enter_v1();
 	return true;
 }
@@ -119,6 +155,7 @@ test_scope_startup_attach(ClusterColdTypedV1 *typed,
 				&root->root, &root->token) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| memcmp(&root->root, &selected->checkpoint, sizeof(root->root)) != 0)
 			return false;
+		root->source = selected->source;
 		root->checkpoint_start = selected->checkpoint_start;
 		root->native_checkpoint = selected->native_checkpoint;
 		memcpy(root->native_window, selected->native_window, sizeof(root->native_window));
@@ -129,6 +166,10 @@ test_scope_startup_attach(ClusterColdTypedV1 *typed,
 	memcpy(typed->observer.storage_uuid, typed->sources[0].claim.identity.storage_uuid, 16);
 	typed->observer.database_incarnation = typed->sources[0].claim.database_incarnation;
 	scope_startup_count = typed->participant_count;
+	if (typed->plan == (ClusterColdPlanV1 *)typed) {
+		memcpy(scope_startup_cuts, typed->participants, sizeof(scope_startup_cuts));
+		scope_startup_controlled_plan = typed->plan;
+	}
 	cluster_cold_replay_window_enter_v1();
 	return true;
 }
@@ -153,4 +194,6 @@ test_scope_startup_detach(ClusterColdTypedV1 *typed)
 	typed->replay_roots = NULL;
 	typed->replay_root_count = 0;
 	scope_startup_count = 0;
+	scope_startup_controlled_plan = NULL;
+	memset(scope_startup_cuts, 0, sizeof(scope_startup_cuts));
 }

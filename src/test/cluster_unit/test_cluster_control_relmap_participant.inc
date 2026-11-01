@@ -106,7 +106,7 @@ UT_TEST(test_relmap_native_input_reads_original_checkpoint_end_and_window)
 	UT_ASSERT_EQ(native.window.allocation_next, 100);
 	UT_ASSERT_EQ(native.window.epoch, 17); UT_ASSERT_EQ(native.window.boot_incarnation, 31);
 	UT_ASSERT_EQ(ctrc_set_calls, calls); UT_ASSERT_EQ(ctrc_set_held, 2);
-	UT_ASSERT_EQ(relmap_failed, 0); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(relmap_failed, 0); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
 
@@ -137,7 +137,7 @@ UT_TEST(test_relmap_source_loss_of_sibling_holder_never_renews_old_input)
 	UT_ASSERT(!cluster_wal_inputs_relmap_source_current_v1(&source));
 	relmap_sibling->release_uncertain = false;
 	UT_ASSERT(!cluster_wal_inputs_relmap_source_current_v1(&source));
-	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
 
@@ -148,7 +148,7 @@ UT_TEST(test_relmap_native_input_refuses_self_consistent_wrong_checkpoint_end)
 	UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), 0);
 	native = cluster_wal_inputs_relmap_native_v1(inputs, 0);
 	UT_ASSERT(v2_zero(&native, sizeof(native))); UT_ASSERT_EQ(relmap_failed, 1);
-	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
 
@@ -162,7 +162,7 @@ UT_TEST(test_relmap_legacy_native_input_revokes_whole_declared_episode)
 	native = cluster_wal_inputs_relmap_native_v1(inputs, 1);
 	UT_ASSERT(v2_zero(&native, sizeof(native))); UT_ASSERT_EQ(relmap_failed, 1);
 	UT_ASSERT(!cluster_wal_inputs_relmap_source_current_v1(&first));
-	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
 
@@ -182,7 +182,7 @@ UT_TEST(test_relmap_native_physical_refusal_retains_all_original_holders)
 	UT_ASSERT_EQ(close(fd), 0);
 	native = cluster_wal_inputs_relmap_native_v1(inputs, 0);
 	UT_ASSERT(v2_zero(&native, sizeof(native))); UT_ASSERT_EQ(relmap_failed, 1);
-	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
 
@@ -196,7 +196,7 @@ UT_TEST(test_relmap_native_error_revokes_without_releasing_original_owners)
 	PG_CATCH(); { caught = true; } PG_END_TRY();
 	test_throw_root_read = false;
 	UT_ASSERT(caught); UT_ASSERT_EQ(relmap_failed, 1);
-	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
 
@@ -286,7 +286,7 @@ UT_TEST(test_relmap_native_input_refuses_caller_cf_or_critical_without_revocatio
 	UT_ASSERT(v2_zero(&native, sizeof(native))); UT_ASSERT_EQ(relmap_failed, 0);
 	UT_ASSERT_EQ(test_cf_lock_calls, calls);
 	UT_ASSERT_EQ(cluster_wal_inputs_relmap_count_v1(inputs), 2);
-	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
 
@@ -314,7 +314,7 @@ UT_TEST(test_relmap_source_whole_root_recheck_retains_original_holder_debt)
 	PG_TRY(); { (void)cluster_wal_inputs_relmap_source_revalidate_v1(&source); }
 	PG_CATCH(); { caught = true; } PG_END_TRY();
 	test_throw_root_read = false;
-	UT_ASSERT(caught); UT_ASSERT_EQ(relmap_failed, 1); UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT(caught); UT_ASSERT_EQ(relmap_failed, 1); UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 }
 
@@ -332,7 +332,7 @@ UT_TEST(test_relmap_source_failure_is_original_incarnation_only_and_owner_sticky
 	CurrentResourceOwner = owner;
 	UT_ASSERT_EQ(relmap_failed, 1);
 	UT_ASSERT(!cluster_wal_inputs_relmap_source_current_v1(&source));
-	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	ctrc_set_finish(&inputs); relmap_declared = false;
 	/* The released value cannot revoke a later native incarnation. */
 	relmap_participant_fixture(&inputs, false); relmap_declared = true;

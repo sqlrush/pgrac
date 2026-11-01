@@ -1495,7 +1495,8 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 
 static ClusterColdTypedV1 *
 cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
-	XLogRecPtr own_redo, const ClusterColdRelmapInputV1 *relmap, uint32 relmap_count)
+	XLogRecPtr own_redo, const ClusterColdRelmapInputV1 *relmap, uint32 relmap_count,
+	const ClusterColdRelmapWalV1 *relmap_wal, uint32 wal_count)
 {
 	MemoryContext context;
 	MemoryContext old_context;
@@ -1543,7 +1544,32 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 		cold_refuse(typed, detail, "plan creation refused: %s", cold_detail_name(detail));
 		goto done;
 	}
-	if (relmap_count != 0) {
+	if (wal_count != 0) {
+		PG_TRY();
+		{
+			/* Pass-1 source ownership: exact original ROOT tokens and the
+			 * original fence generation order, never a pass-2 serial grant. */
+			detail = cold_sources_match(typed, fence, deadline)
+				? cluster_cold_plan_relmap_from_wal_v1(typed->plan, typed->sources,
+					typed->replay_count, relmap_wal, wal_count)
+				: CLUSTER_COLD_SOURCE_GAP;
+			if (detail == CLUSTER_COLD_OK && !cold_sources_match(typed, fence, deadline))
+				detail = CLUSTER_COLD_SOURCE_GAP;
+		}
+		PG_CATCH();
+		{
+			cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "relmap declaration producer failed");
+			cluster_cold_plan_relmap_invalidate_v1(typed->plan);
+			MemoryContextSwitchTo(old_context);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (detail != CLUSTER_COLD_OK) {
+			cold_refuse(typed, detail, "relmap declaration producer refused");
+			cluster_cold_plan_relmap_invalidate_v1(typed->plan);
+			goto done;
+		}
+	} else if (relmap_count != 0) {
 		detail = cluster_cold_plan_relmap_declare_v1(typed->plan, relmap, relmap_count);
 		if (detail != CLUSTER_COLD_OK) {
 			cold_refuse(typed, detail, "declared relmap input refused");
@@ -1573,7 +1599,7 @@ done:
 ClusterColdTypedV1 *
 cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread, XLogRecPtr own_redo)
 {
-	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0);
+	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, NULL, 0);
 }
 
 ClusterColdTypedV1 *
@@ -1583,7 +1609,16 @@ cluster_cold_typed_prepare_relmap_v1(ClusterRecoveryFencePlan *fence, uint16 own
 	/* Invalid declaration never falls back to the ordinary undeclared mode. */
 	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
 		return NULL;
-	return cold_typed_prepare(fence, own_thread, own_redo, inputs, count);
+	return cold_typed_prepare(fence, own_thread, own_redo, inputs, count, NULL, 0);
+}
+
+ClusterColdTypedV1 *
+cluster_cold_typed_prepare_relmap_wal_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread,
+	XLogRecPtr own_redo, const ClusterColdRelmapWalV1 *inputs, uint32 count)
+{
+	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+		return NULL;
+	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, inputs, count);
 }
 
 void
@@ -1596,18 +1631,22 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	typed = *typed_address;
 	if (typed->inputs != NULL)
 		cluster_wal_inputs_release_v1(&typed->inputs);
+	cold_side_destroy(typed);
+	cluster_cold_tt_base_destroy_v1(typed);
+	if (typed->plan != NULL)
+		cluster_cold_plan_destroy_v1(&typed->plan);
+	if (typed->replay_roots != NULL) {
+		pfree(typed->replay_roots);
+		typed->replay_roots = NULL;
+	}
 	if (typed->tx_fence != NULL) {
+		if (!cluster_recovery_merge_fence_plan_release_serial(typed->tx_fence))
+			elog(FATAL, "could not release original cold input retention owner");
 		cluster_recovery_merge_fence_plan_destroy(&typed->tx_fence);
 		if (typed->tx_fence != NULL)
 			elog(FATAL, "could not release original cold transaction fence owner");
 	}
 	*typed_address = NULL;
-	cold_side_destroy(typed);
-	cluster_cold_tt_base_destroy_v1(typed);
-	if (typed->plan != NULL)
-		cluster_cold_plan_destroy_v1(&typed->plan);
-	if (typed->replay_roots != NULL)
-		pfree(typed->replay_roots);
 	MemoryContextDelete(typed->context);
 }
 

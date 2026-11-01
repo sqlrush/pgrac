@@ -50,7 +50,7 @@ cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census)
 	/* Moving dependent cleanup past ANY original holder/fd release breaks
 	 * these independent original observations, not just a callback count. */
 	UT_ASSERT_EQ(ctrc_set_held, 2);
-	UT_ASSERT(inputs_pin_held);
+	UT_ASSERT(inputs_recovery_held && !inputs_pin_held);
 	UT_ASSERT(fcntl(scope_census_fd, F_GETFD) >= 0);
 	free(census);
 	scope_census_live = NULL;
@@ -120,7 +120,7 @@ UT_TEST(test_scope_census_borrowed_result_retires_before_all_original_protection
 	UT_ASSERT_EQ(scope_census_destroys, 1);
 	UT_ASSERT(scope_census_live == NULL);
 	UT_ASSERT_EQ(ctrc_set_held, 0);
-	UT_ASSERT(!inputs_pin_held);
+	UT_ASSERT(inputs_recovery_held && !inputs_pin_held);
 	UT_ASSERT_EQ(fcntl(scope_census_fd, F_GETFD), -1);
 	scope_census_finish(&inputs);
 }
@@ -140,7 +140,7 @@ UT_TEST(test_scope_census_partial_error_and_final_drift_keep_original_debt)
 		UT_ASSERT(borrowed == NULL);
 		UT_ASSERT_EQ(scope_census_destroys, 1);
 		UT_ASSERT_EQ(relmap_failed, 1);
-		UT_ASSERT(ctrc_set_held == 2 && inputs_pin_held);
+		UT_ASSERT(ctrc_set_held == 2 && inputs_recovery_held && !inputs_pin_held);
 		UT_ASSERT(fcntl(scope_census_fd, F_GETFD) >= 0);
 		UT_ASSERT(!scope_census_prepare(inputs, &borrowed));
 		UT_ASSERT_EQ(scope_census_calls, 1);
@@ -185,7 +185,7 @@ UT_TEST(test_scope_census_first_owner_error_is_once_and_retains_original_holders
 	UT_ASSERT_EQ(relmap_failed, 1);
 	UT_ASSERT_EQ(scope_census_calls, 0);
 	UT_ASSERT(!scope_census_prepare(inputs, &borrowed));
-	UT_ASSERT(ctrc_set_held == 2 && inputs_pin_held);
+	UT_ASSERT(ctrc_set_held == 2 && inputs_recovery_held && !inputs_pin_held);
 	scope_census_finish(&inputs);
 }
 

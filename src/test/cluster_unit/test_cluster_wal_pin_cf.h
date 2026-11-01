@@ -5,6 +5,7 @@
 #define CLUSTER_WAL_PIN_MAGIC UINT32_C(0x57414c50)
 #include "test_cluster_wal_pin_cf_types.inc"
 
+static uint64 recovery_pin_generation;
 static ClusterWalRetentionPin *active_pin;
 static ClusterWalReadPinV1 *active_read_pin;
 static ClusterWalRootPublishGuard *active_root_publish_guard;
@@ -229,6 +230,7 @@ pin_cf_fixture(bool preflight, bool pending)
 		walr_share_request_init(2, &pin_cf_reader.request);
 		pin_cf_reader.held = true;
 		pin_cf_existing.magic = CLUSTER_WAL_PIN_MAGIC;
+		pin_cf_existing.generation = ++recovery_pin_generation;
 		pin_cf_existing.owner_pid = MyProcPid;
 		pin_cf_existing.owner = CurrentResourceOwner;
 		pin_cf_existing.nthreads = 1;

@@ -43,10 +43,17 @@ extern bool test_episode_native_clog_full_apply(const ClusterRecoveryRelmapSourc
 extern bool test_episode_native_clog_cold_full_apply(const ClusterWalSourceRef *source,
 	const xl_clog_zeropage_full *birth, bool (*current)(void *), void *arg);
 /* Original replay callback, with faults after redo and before physical finish. */
+/* Execute the complete original native callback. Faults occur only after
+ * original redo, before its synchronous completion/readback. */
 typedef struct TestEpisodeClogReplayStats {
 	unsigned redos, touches, file_syncs, directory_syncs;
 	bool returned;
 } TestEpisodeClogReplayStats;
+extern void test_episode_native_clog_replay_timeline(XLogReaderState *reader,
+	TimeLineID timeline, unsigned sync_fault, TestEpisodeClogReplayStats *stats);
 extern void test_episode_native_clog_replay(XLogReaderState *reader,
+	const ClusterRecoveryRelmapSourceV1 *source, unsigned sync_fault,
+	TestEpisodeClogReplayStats *stats);
+extern void test_episode_native_clog_replay_record(XLogReaderState *reader,
 	TimeLineID timeline, unsigned sync_fault, TestEpisodeClogReplayStats *stats);
 #endif

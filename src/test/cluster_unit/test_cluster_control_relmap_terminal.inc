@@ -136,7 +136,7 @@ UT_TEST(test_relmap_episode_terminal_uses_original_generation_not_input_order)
 		UT_ASSERT(cluster_wal_inputs_relmap_terminal_matches_v1(&source, &frame.reader));
 	}
 	UT_ASSERT_EQ(ctrc_set_calls, calls); UT_ASSERT_EQ(ctrc_set_held, 2);
-	UT_ASSERT_EQ(relmap_failed, 0); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(relmap_failed, 0); UT_ASSERT(inputs_recovery_held);
 	relmap_episode_terminal_finish(&inputs);
 }
 
@@ -151,7 +151,7 @@ UT_TEST(test_relmap_episode_terminal_refuses_partial_unsealed_or_wrong_original_
 		relmap_declared = true; UT_ASSERT_EQ(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), 0);
 		source = cluster_wal_inputs_relmap_source_v1(inputs, 0);
 		UT_ASSERT_EQ(cluster_wal_inputs_relmap_terminal_count_v1(&source), UINT32_MAX);
-		UT_ASSERT_EQ(relmap_failed, 1); UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+		UT_ASSERT_EQ(relmap_failed, 1); UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 		relmap_episode_terminal_finish(&inputs);
 	}
 }
@@ -167,7 +167,7 @@ UT_TEST(test_relmap_episode_terminal_wrong_native_bytes_revoke_without_cleanup)
 	UT_ASSERT(cluster_wal_inputs_relmap_terminal_matches_v1(&source, &frame.reader));
 	frame.payload[0] ^= 1;
 	UT_ASSERT(!cluster_wal_inputs_relmap_terminal_matches_v1(&source, &frame.reader));
-	UT_ASSERT_EQ(relmap_failed, 1); UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(relmap_failed, 1); UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	UT_ASSERT_EQ(rf_side_online_plan_native_terminal_count_v1(tx_inputs_typed.side_plans[0], &source.selected.source), 1);
 	UT_ASSERT_EQ(cluster_wal_inputs_relmap_terminal_count_v1(&source), UINT32_MAX);
 	relmap_episode_terminal_finish(&inputs);
@@ -195,7 +195,7 @@ UT_TEST(test_relmap_episode_terminal_preconditions_keep_original_episode)
 	UT_ASSERT_EQ(cluster_wal_inputs_relmap_terminal_count_v1(&source), UINT32_MAX);
 	relmap_sibling->release_uncertain = false;
 	UT_ASSERT(!cluster_wal_inputs_relmap_source_current_v1(&source));
-	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+	UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 	relmap_episode_terminal_finish(&inputs);
 }
 
@@ -228,7 +228,7 @@ UT_TEST(test_relmap_episode_terminal_first_owner_error_is_sticky)
 		test_capture_error_level = false;
 		UT_ASSERT(caught); UT_ASSERT_EQ(relmap_failed, 1);
 		UT_ASSERT(!cluster_wal_inputs_relmap_source_current_v1(&source));
-		UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_pin_held);
+		UT_ASSERT_EQ(ctrc_set_held, 2); UT_ASSERT(inputs_recovery_held);
 		UT_ASSERT_EQ(rf_side_online_plan_native_terminal_count_v1(tx_inputs_typed.side_plans[0], &source.selected.source), 1);
 		relmap_episode_terminal_finish(&inputs);
 	}

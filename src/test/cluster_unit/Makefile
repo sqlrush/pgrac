@@ -889,6 +889,8 @@ test_cluster_relmap_v2: test_cluster_relmap_v2.c unit_test.h \
 test_cluster_cold_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -1830,14 +1832,14 @@ test_cluster_inputs_cf.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs
 	     /^struct ClusterWalInputsV1 / { types=1; declarations++ } \
 	     /^typedef struct WalInputsCfWait / { types=1; helpers++ } \
 	     types { print; if (/^}/) types=0; next } \
-	     /^inputs_(io_role|owned|scope_role|current)\(/ { print "static bool"; emit=1; predicates++ } \
+	     /^inputs_(io_role|owned|scope_role|pin_covers|current)\(/ { print "static bool"; emit=1; predicates++ } \
 	     /^inputs_unlock\(/ { print "static void"; emit=1; cleanup++ } \
 	     /^inputs_root\(/ { print "static ClusterControlRootResult"; emit=1; consumers++ } \
 	     /^(inputs_cf_wait_current|inputs_prepare_current)\(/ { print "static bool"; emit=1; checks++ } \
 	     /^inputs_prepare_budget\(/ { print "static int"; emit=1; budgets++ } \
 	     /^inputs_cf_wait(_capture)?\(/ { print "static void"; emit=1; waiters++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (declarations != 7 || helpers > 1 || checks != 2 || budgets != 1 || waiters > 2 || predicates != 4 || cleanup != 1 || consumers != 1 || types || emit) exit 1 }' $< > $@.tmp
+	     END { if (declarations != 7 || helpers > 1 || checks != 2 || budgets != 1 || waiters > 2 || predicates != 5 || cleanup != 1 || consumers != 1 || types || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # The actual no-pin checkpoint caller, including its original cleanup paths.
@@ -2342,6 +2344,7 @@ cluster_thread_recovery_finalize_test.o: \
 
 test_cluster_thread_recovery_authority: \
 		test_cluster_thread_recovery_authority.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		$(CLUSTER_THREAD_RECOVERY_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
 		$(CLUSTER_THREAD_RECOVERY_AUTHORITY_O) \
@@ -5186,6 +5189,7 @@ test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: t
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_initialized_pages.inc
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_multipage_init.inc
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_episode_native_bounds.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_initialized_replay.inc
 
 # The original allocator and native CLOG producer lend only test observations.
 test_cluster_recovery_episode_allocator.o: test_cluster_recovery_episode_allocator.c \
@@ -5488,7 +5492,9 @@ test_cluster_cold_relmap: $(CLUSTER_COLD_PLAN_O)
 $(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_startup_plan_core.o \
 		test_cluster_cold_recovery_refail_plan_core.o test_cluster_cold_recovery_replay_plan_core.o \
 		test_cluster_cold_recovery_startup_core.o test_cluster_recovery_scope_startup.o: \
-		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h
 
 RETAINED_RECORD_OBJS = $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
@@ -7254,7 +7260,9 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_cold_history_scn.inc test_cluster_cold_history_scn.inc.tmp
 	rm -f test_cluster_clog_native_counter.inc test_cluster_clog_native_counter.inc.tmp
+	rm -f test_cluster_ctrc_projector.inc test_cluster_ctrc_projector.inc.tmp
 	rm -f test_cluster_clog_native_advance_next.inc test_cluster_clog_native_advance_next.inc.tmp
 	rm -f test_cluster_clog_native_horizon.inc test_cluster_clog_native_horizon.inc.tmp
 	rm -f test_cluster_cold_native_side.o
@@ -13060,6 +13068,10 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c test_cl
 		test_cluster_cold_startup_relmap.inc \
 		$(COLD_NATIVE_SIDE_OBJS) $(CLUSTER_UNIT_CRYPTOHASH_O) $(COLD_STARTUP_RELMAP_OBJS) test_cluster_cold_native_side.h \
 		test_cluster_cold_startup_relmap_replay.inc test_cluster_cold_startup_relmap_storage.h \
+		test_cluster_cold_startup_relmap_producer.inc \
+		test_cluster_cold_startup_relmap_pin_custody.inc \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		test_cluster_cold_native_storage.inc test_cluster_recovery_episode_clog.o \
 		test_cluster_recovery_episode_clog.h \
 		test_cluster_cold_native_clog_consumed.inc \
@@ -13918,6 +13930,17 @@ test_cluster_cold_tx_owner.inc: $(top_srcdir)/src/backend/access/transam/xlogrec
 	     emit { print } END { if (count != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_cold_history_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	awk '/^scn_time_cmp\(SCN a, SCN b\)$$/ { emit=1; print "int"; count++ } \
+	     emit { print } emit && /^}$$/ { emit=0; done++ } \
+	     END { if (count != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_tx_start: test_cluster_cold_history_scn.inc test_cluster_cold_ctrc_history_horizon.inc \
+	$(top_srcdir)/src/backend/cluster/cluster_undo_horizon.c \
+	$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_retention.h $(top_srcdir)/src/include/cluster/cluster_cr.h
+
 test_cluster_cold_tx_writer.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ClusterStartupInstalled(Recovery)?WriterV1\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
@@ -13974,14 +13997,16 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_replay_source.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_replay_driver.inc
 test_cluster_cold_tx_start: $(top_srcdir)/src/include/cluster/cluster_recovery_census.h
 
+# The original owner-effect path always compares full physical PAGE identity.
+# Keep its original stable-page support when optional native bridges are disabled.
+STARTUP_PAGE_STABLE_TEST_O = test_cluster_page_data_stable.o
 ifeq ($(enable_pgrac_cluster),yes)
 STARTUP_NATIVE_CTRC_TEST_O = test_cluster_startup_native_ctrc.o
 STARTUP_NATIVE_FIRST_TEST_O = test_cluster_startup_first_wal.o
-STARTUP_NATIVE_FIRST_SUPPORT_O = test_cluster_page_data_stable.o
 STARTUP_NATIVE_CTRC_TEST_CPPFLAGS = -DTEST_CLUSTER_STARTUP_NATIVE_CTRC -DTEST_CLUSTER_STARTUP_NATIVE_FIRST
 endif
 
-test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc $(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_NATIVE_FIRST_SUPPORT_O) \
+test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc $(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_PAGE_STABLE_TEST_O) \
 		test_cluster_cold_tx_claim_eor_boundary.inc test_cluster_cold_claim_service.inc \
 		test_cluster_cold_tx_finish_boundary.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_recovery.h \
@@ -14005,7 +14030,7 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(STARTUP_NATIVE_CTRC_TEST_CPPFLAGS) -ffunction-sections -fdata-sections $< \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
-		$(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_NATIVE_FIRST_SUPPORT_O) \
+		$(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_PAGE_STABLE_TEST_O) \
         $(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
         $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -14946,6 +14971,7 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_fpi_retirement.inc
 # Full protected completed-page images for the original recovery owner.
 test_cluster_ctrc_native_fpi: test_cluster_ctrc_native_image.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_image.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_owner.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_projection.inc
 
 # Final native heap reference bindings and original Startup consumer.
@@ -14962,7 +14988,7 @@ test_cluster_clog_recovery test_cluster_side_native_clog.o \
         $(top_srcdir)/src/include/access/slru.h
 
 # Complete original relation/history references stay with the original census.
-test_cluster_recovery_native_inputs: test_cluster_recovery_reference_inputs.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_reference_inputs.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_references.inc
 
 # Rebuild integrated native CLOG consumers when their included fixture or layout changes.
@@ -15309,12 +15335,22 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_recovery_io_core.o: \
 		$(top_srcdir)/src/include/utils/relmapper.h
 
 # Original Startup declaration, sealed SIDE and dual-copy storage in one component.
+test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_early_retention.inc
+test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_handoff.inc
+test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_recheck.inc
+test_cluster_cold_tx_start: test_cluster_cold_tx_relmap_handoff.inc \
+		test_cluster_cold_ctrc_relmap_gate.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
+
 test_cluster_cold_startup_relmap_storage.o: test_cluster_cold_startup_relmap_storage.c \
 		test_cluster_cold_startup_relmap_storage.h test_cluster_cold_startup_relmap_storage_namespace.h \
 		test_cluster_relmap_v2_storage.c test_cluster_relmap_runtime_storage.inc \
 		test_cluster_relmap_recovery_arbitration.inc test_cluster_relmap_owner_conversion.inc \
 		test_cluster_relmap_staged_observation.inc unit_test.h \
-		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_cold_startup_relmap_authority.o: test_cluster_cold_startup_relmap_authority.c \
@@ -15328,14 +15364,23 @@ test_cluster_cold_startup_relmap_authority.o: test_cluster_cold_startup_relmap_a
 
 test_cluster_cold_startup_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
 		test_cluster_cold_native_side_namespace.h test_cluster_cold_startup_relmap_storage_namespace.h \
+		$(top_srcdir)/src/include/access/xlogrecovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
 		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT \
 		-include $(srcdir)/test_cluster_cold_native_side_namespace.h \
-		-DLWLockAcquire=startup_relmap_storage_LWLockAcquire \
+		-DLWLockAcquire=test_cold_relmap_storage_acquire \
 		-DLWLockRelease=startup_relmap_storage_LWLockRelease \
 		-DLWLockHeldByMe=startup_relmap_storage_LWLockHeldByMe \
+		-DenableFsync=startup_relmap_storage_enableFsync \
+		-Dcluster_relmap_authority_x_held=startup_relmap_storage_cluster_relmap_authority_x_held \
+		-DForEachLWLockHeldByMe=test_cold_relmap_storage_each_lock \
+		-DClusterColdRecoveryRelmapCurrent=test_cold_relmap_start_current \
+		-DClusterColdRecoveryTxInputs=test_cold_relmap_start_inputs \
+		-DClusterColdRecoveryRelmapFail=test_cold_relmap_start_fail \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
 .PHONY: clean-startup-relmap-replay
@@ -15361,7 +15406,7 @@ clean-final-namespace:
 
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_namespace.inc
 
-test_cluster_recovery_native_inputs: test_cluster_recovery_census_namespace.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_census_namespace.inc
 
 # Original native first-record owner; separate provider namespace, no product variant.
 test_cluster_startup_first_wal.o: test_cluster_startup_first_wal.c \
@@ -15401,3 +15446,76 @@ test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_records.inc
 test_cluster_recovery_reference_graph: test_cluster_recovery_tx_dependencies.inc
 test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_census_tx_dependencies.inc
 test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_dependencies.inc
+
+# Original PAGE/history-to-TX edges.
+test_cluster_recovery_reference_graph: test_cluster_recovery_tx_reference_edges.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_census_tx_reference_edges.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_reference_edges.inc
+
+# Final Startup checks the complete original native TX forest.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_tx_forest_terminals.inc
+
+# Final Startup retains the original pass-2 effects input across PAGE drain.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_effects_receipt.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_effects_lifetime.inc
+
+test_cluster_recovery_reference_graph: test_cluster_recovery_tx_recheck.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_census_tx_recheck.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_final_tx_recheck.inc
+
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_census_native_records.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_native_records.inc
+
+test_cluster_recovery_native_scan: test_cluster_recovery_compound_scan.inc test_cluster_recovery_owner_scan.inc
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_compound_obligations.inc test_cluster_recovery_owner_routes.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_compound_obligations.inc test_cluster_cold_ctrc_owner_routes.inc
+
+# Complete original native WAL snapshot fixtures.
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_raw_records.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_raw_records.inc
+
+xlogreader_fs.o: $(top_srcdir)/src/include/access/xlogreader.h
+
+# Original native callback through the same episode consumption and held pages.
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_native_callback.inc
+
+# Complete original PAGE-owner round, including final non-PAGE checks.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_round.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_continuation.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_completion.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_inventory.inc
+
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_page_raw.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_page_raw.inc
+
+# Complete original reference/PAGE-owner adjacency.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_references.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_owner_scopes.inc
+
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: test_cluster_recovery_census_images.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_images.inc
+
+# The relation wrapper owns the complete expanded reference output.
+$(top_builddir)/src/backend/cluster/cluster_recovery_relation_census.o: 	$(top_srcdir)/src/include/cluster/cluster_recovery_page_census.h
+
+# Exact current ITL references use the original owner graph fixture.
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_graph.inc
+
+# Reuse the complete original pure native ITL projector in this owner fixture.
+test_cluster_ctrc_projector.inc: $(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c Makefile
+	awk '/^(ctrc_itl_terminal_projection|ctrc_itl_image_overlaps|ctrc_itl_image_slot|ctrc_recovery_itl_tuples_valid|cluster_ctrc_recovery_itl_cleanout_image_v1)\(/ { print previous; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; complete++ } { previous=$$0 } \
+	     END { if (found != 5 || complete != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_projected_graph.inc test_cluster_ctrc_projector.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_graph_contribution.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_tuple_graph.inc
+
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_hot_graph.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_reference_coverage.inc
+test_cluster_cold_tx_start: test_cluster_cold_ctrc_redirect_graph.inc

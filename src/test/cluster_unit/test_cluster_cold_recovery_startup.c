@@ -4067,23 +4067,29 @@ UT_TEST(test_original_typed_owner_retires_fence_after_dependent_read_scope)
 	ClusterColdTypedV1 *typed;
 	static char original_fence;
 	unsigned before;
+	unsigned released;
 
 	fixture();
 	typed = prepare(0x800);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
 	before = tx_fences_destroyed;
+	released = tx_fences_released;
 	typed->tx_fence = (ClusterRecoveryFencePlan *)&original_fence;
 	typed->inputs = (ClusterWalInputsV1 *)&census_scope;
 	tx_fence_expected_census_releases = census_releases + 1;
 	tx_fence_census_release_observer = &census_releases;
+	tx_fence_cleanup_observer = typed;
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT(typed == NULL);
 	UT_ASSERT_EQ(tx_fences_destroyed, before + 1);
+	UT_ASSERT_EQ(tx_fences_released, released + 1);
 	UT_ASSERT_EQ(census_releases, tx_fence_expected_census_releases);
 	UT_ASSERT_EQ(contexts_alive, 0);
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT_EQ(tx_fences_destroyed, before + 1);
+	UT_ASSERT_EQ(tx_fences_released, released + 1);
 	tx_fence_census_release_observer = NULL;
+	tx_fence_cleanup_observer = NULL;
 }
 
 UT_TEST(test_full_clog_dispatch_uses_only_original_projection_identity)
@@ -4130,6 +4136,11 @@ UT_TEST(test_full_clog_truncate_dispatch_uses_original_projection_identity)
 #include "test_cluster_cold_native_storage.inc"
 #include "test_cluster_cold_startup_relmap.inc"
 #include "test_cluster_cold_startup_relmap_replay.inc"
+#include "test_cluster_cold_startup_relmap_producer.inc"
+#include "test_cluster_cold_startup_relmap_pin_custody.inc"
+#include "test_cluster_cold_startup_relmap_early_retention.inc"
+#include "test_cluster_cold_startup_relmap_handoff.inc"
+#include "test_cluster_cold_startup_relmap_recheck.inc"
 
 UT_TEST(test_prepare_all_phases_use_the_same_original_deadline)
 {
@@ -4231,16 +4242,64 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(175);
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_PRODUCER") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_startup_relmap_produces_declaration_from_original_pin_and_wal);
+		UT_RUN(test_relmap_producer_preflights_whole_batch_and_budget_before_io);
+		UT_RUN(test_relmap_producer_late_record_or_pin_error_is_sticky);
+		UT_RUN(test_startup_relmap_producer_rechecks_sources_before_pass_one);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_PIN_CUSTODY") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_relmap_pin_snapshot_refuses_drift_during_baseline_read);
+		UT_RUN(test_relmap_pin_snapshot_enumerates_duplicate_slots_before_io);
+		UT_RUN(test_relmap_pin_snapshot_survives_startup_declaration_until_replay);
+		UT_RUN(test_relmap_pin_snapshot_refuses_drift_after_durable_pair_write);
+		UT_RUN(test_relmap_pin_snapshot_rechecks_receipt_and_duplicate_without_writes);
+		UT_RUN(test_relmap_pin_snapshot_allows_only_original_stage_transition);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_EARLY_RETENTION") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_relmap_original_pin_cannot_cancel_at_first_baseline_read);
+		UT_RUN(test_relmap_entire_pin_batch_is_armed_before_any_baseline_io);
+		UT_RUN(test_relmap_later_preflight_refusal_does_not_arm_any_pin);
+		UT_RUN(test_relmap_partial_batch_arm_error_keeps_already_armed_pin);
+		UT_RUN(test_relmap_late_producer_refusal_or_error_keeps_armed_debt);
+		UT_RUN(test_relmap_early_pin_hold_survives_startup_replay_and_destruction);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_HANDOFF") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_relmap_saved_receipt_carries_actual_replay_without_new_io);
+		UT_RUN(test_relmap_saved_receipt_refuses_partial_failed_or_other_source_batch);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_RECHECK") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_relmap_start_recheck_reads_staged_pair_after_replay_window);
+		UT_RUN(test_relmap_start_recheck_preflights_original_receipt_and_side_before_io);
+		UT_RUN(test_relmap_start_recheck_original_pin_drift_refuses_before_io);
+		UT_RUN(test_relmap_start_recheck_requires_both_complete_physical_copies);
+		UT_RUN(test_relmap_start_recheck_late_input_owner_or_pin_change_stays_failed);
+		UT_RUN(test_relmap_start_recheck_first_owner_pin_and_read_error_revoke);
+		UT_RUN(test_relmap_start_recheck_caller_preconditions_do_not_consume_receipts);
+		UT_RUN(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(201);
 	UT_RUN(test_pass2_source_drift_waits_for_post_ir_and_never_replays);
 	UT_RUN(test_pass2_current_and_sync_do_not_read_root);
-
 	UT_RUN(test_prepare_all_phases_use_the_same_original_deadline);
 	UT_RUN(test_prepare_ready_and_zero_budget_complete_every_phase);
-
 	UT_RUN(test_commit_reuses_complete_physical_union_without_replaying_the_census);
 	UT_RUN(test_commit_refuses_changed_local_input_identity_before_owner_entry);
 	UT_RUN(test_commit_owner_refusal_is_sticky_and_discards_provisional_history);
+
 	UT_RUN(test_full_clog_truncate_dispatch_uses_original_projection_identity);
 	UT_RUN(test_full_clog_dispatch_uses_only_original_projection_identity);
 	UT_RUN(test_execution_refusal_preserves_the_first_census_failure);
@@ -4411,6 +4470,32 @@ main(void)
 	UT_RUN(test_startup_relmap_missing_or_changed_carrier_refuses_before_files);
 	UT_RUN(test_startup_relmap_partial_write_and_late_error_retain_original_debt);
 	UT_RUN(test_startup_relmap_final_receipt_rechecks_original_source_and_side);
+	UT_RUN(test_startup_relmap_produces_declaration_from_original_pin_and_wal);
+	UT_RUN(test_relmap_producer_preflights_whole_batch_and_budget_before_io);
+	UT_RUN(test_relmap_producer_late_record_or_pin_error_is_sticky);
+	UT_RUN(test_startup_relmap_producer_rechecks_sources_before_pass_one);
+	UT_RUN(test_relmap_pin_snapshot_refuses_drift_during_baseline_read);
+	UT_RUN(test_relmap_pin_snapshot_enumerates_duplicate_slots_before_io);
+	UT_RUN(test_relmap_pin_snapshot_survives_startup_declaration_until_replay);
+	UT_RUN(test_relmap_pin_snapshot_refuses_drift_after_durable_pair_write);
+	UT_RUN(test_relmap_pin_snapshot_rechecks_receipt_and_duplicate_without_writes);
+	UT_RUN(test_relmap_pin_snapshot_allows_only_original_stage_transition);
+	UT_RUN(test_relmap_original_pin_cannot_cancel_at_first_baseline_read);
+	UT_RUN(test_relmap_entire_pin_batch_is_armed_before_any_baseline_io);
+	UT_RUN(test_relmap_later_preflight_refusal_does_not_arm_any_pin);
+	UT_RUN(test_relmap_partial_batch_arm_error_keeps_already_armed_pin);
+	UT_RUN(test_relmap_late_producer_refusal_or_error_keeps_armed_debt);
+	UT_RUN(test_relmap_early_pin_hold_survives_startup_replay_and_destruction);
+	UT_RUN(test_relmap_saved_receipt_carries_actual_replay_without_new_io);
+	UT_RUN(test_relmap_saved_receipt_refuses_partial_failed_or_other_source_batch);
+	UT_RUN(test_relmap_start_recheck_reads_staged_pair_after_replay_window);
+	UT_RUN(test_relmap_start_recheck_preflights_original_receipt_and_side_before_io);
+	UT_RUN(test_relmap_start_recheck_original_pin_drift_refuses_before_io);
+	UT_RUN(test_relmap_start_recheck_requires_both_complete_physical_copies);
+	UT_RUN(test_relmap_start_recheck_late_input_owner_or_pin_change_stays_failed);
+	UT_RUN(test_relmap_start_recheck_first_owner_pin_and_read_error_revoke);
+	UT_RUN(test_relmap_start_recheck_caller_preconditions_do_not_consume_receipts);
+	UT_RUN(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

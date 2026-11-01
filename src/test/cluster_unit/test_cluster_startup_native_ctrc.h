@@ -19,4 +19,6 @@ extern ClusterCtrcItlCleanoutApplyResult test_startup_native_ctrc_project(
 	const char *before, char *after);
 extern bool test_startup_native_ctrc_heap(const char *image);
 extern bool test_startup_native_ctrc_hot(const char *image, BlockNumber block);
+extern bool test_startup_native_ctrc_tuple(
+	const ClusterItlSlotData *slots, const char *bytes, Size length);
 #endif

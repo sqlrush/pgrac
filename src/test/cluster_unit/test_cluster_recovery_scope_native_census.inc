@@ -64,7 +64,7 @@ cluster_relmap_retention_census_destroy(ClusterRelmapRetentionCensus *census)
 {
 	if (census != NULL) {
 		UT_ASSERT_EQ(ctrc_set_held, 2);
-		UT_ASSERT(inputs_pin_held);
+		UT_ASSERT((inputs_recovery_held && !inputs_pin_held));
 		UT_ASSERT(fcntl(scope_native_fd, F_GETFD) >= 0);
 		scope_native_destroyed++;
 	}
@@ -358,7 +358,7 @@ UT_TEST(test_scope_native_census_uses_original_episode_and_retires_before_holder
 	UT_ASSERT_EQ(scope_native_legacy_calls, 0);
 	UT_ASSERT_EQ(relmap_failed, 0);
 	UT_ASSERT_EQ(ctrc_set_held, 2);
-	UT_ASSERT(inputs_pin_held);
+	UT_ASSERT((inputs_recovery_held && !inputs_pin_held));
 	UT_ASSERT_EQ(scope_native_destroyed, 0);
 	scope_native_finish(&inputs);
 	UT_ASSERT_EQ(scope_native_destroyed, 1);
@@ -378,7 +378,7 @@ UT_TEST(test_scope_native_census_missing_corrupt_pending_pairs_keep_original_deb
 		UT_ASSERT(!scope_native_prepare(inputs, &borrowed));
 		UT_ASSERT(borrowed == NULL);
 		UT_ASSERT(relmap_failed > 0);
-		UT_ASSERT(ctrc_set_held == 2 && inputs_pin_held);
+		UT_ASSERT(ctrc_set_held == 2 && (inputs_recovery_held && !inputs_pin_held));
 		UT_ASSERT(fcntl(scope_native_fd, F_GETFD) >= 0);
 		UT_ASSERT(!scope_native_prepare(inputs, &borrowed));
 		scope_native_finish(&inputs);
@@ -410,7 +410,7 @@ UT_TEST(test_scope_native_census_late_source_loss_and_error_do_not_replace_custo
 			UT_ASSERT_EQ(caught, fault == 1);
 			UT_ASSERT(relmap_failed > 0);
 			UT_ASSERT_EQ(scope_native_destroyed, 0);
-			UT_ASSERT(ctrc_set_held == 2 && inputs_pin_held);
+			UT_ASSERT(ctrc_set_held == 2 && (inputs_recovery_held && !inputs_pin_held));
 		}
 		scope_native_finish(&inputs);
 		UT_ASSERT_EQ(scope_native_destroyed, 1);
@@ -447,7 +447,7 @@ UT_TEST(test_scope_native_census_keeps_real_history_in_original_two_origin_scope
 	UT_ASSERT(borrowed != NULL);
 	UT_ASSERT_EQ(ctrc_set_calls, 2);
 	UT_ASSERT_EQ(ctrc_set_held, 2);
-	UT_ASSERT(inputs_pin_held);
+	UT_ASSERT((inputs_recovery_held && !inputs_pin_held));
 	UT_ASSERT_EQ(relmap_failed, 0);
 	UT_ASSERT_EQ(scope_native_legacy_calls, 0);
 	scope_native_finish(&inputs);
@@ -466,7 +466,7 @@ UT_TEST(test_scope_native_census_refuses_uncovered_and_missing_real_history_wind
 		UT_ASSERT(borrowed == NULL);
 		UT_ASSERT(relmap_failed > 0);
 		UT_ASSERT_EQ(ctrc_set_held, 2);
-		UT_ASSERT(inputs_pin_held);
+		UT_ASSERT((inputs_recovery_held && !inputs_pin_held));
 		UT_ASSERT(fcntl(scope_native_fd, F_GETFD) >= 0);
 		scope_native_finish(&inputs);
 	}

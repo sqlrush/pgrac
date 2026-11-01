@@ -19,6 +19,7 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "common/cluster_relmap_v2.h"
 #include "cluster/cluster_relmap_checkpoint.h"
+#include "common/cryptohash.h"
 
 typedef enum ClusterRecoveryNativeInventoryResult {
 	CLUSTER_RECOVERY_NATIVE_INVENTORY_OBSERVED = 0,
@@ -214,13 +215,18 @@ extern bool cluster_recovery_native_inventory_source_at_v1(
 
 /* Full decoded PageVersion-bearing input, not a contribution-graph verdict.
  * reader owns no files/callbacks and borrows this inventory's immutable copy.
- * All components, payloads and original source generations are retained. */
+ * All components, payloads and original source generations are retained.
+ * raw_record borrows the same inventory's complete original validated WAL
+ * bytes, including framing and CRC; the copied reader owns no raw buffer. */
 typedef struct ClusterRecoveryPageWalV1 {
 	ClusterWalSourceRef source;
 	RfContributorStreamCutV1 cut;
 	uint32 source_index;
 	uint64 ordinal;
 	const XLogReaderState *reader;
+	const uint8 *raw_record;
+	uint32 raw_length;
+	uint8 raw_record_sha256[32];
 } ClusterRecoveryPageWalV1;
 
 /* Complete two-pass observations only. Count zero is a complete empty set,
@@ -583,6 +589,105 @@ cluster_recovery_native_inventory_recheck(ClusterWalInputsV1 *inputs,
 extern ClusterRecoveryNativeInventoryResult
 cluster_recovery_native_inventory_next(ClusterRecoveryNativeInventory *inventory,
 									   ClusterRecoveryNativeEffect *out);
+/* Complete saved native records, independent of every effect/fold cursor.
+ * Includes all original payload arrays, not just effects naming the query or
+ * a PAGE. source_index is the original physical source order; record_ordinal
+ * is the position within that source's complete WAL transcript. Other WAL
+ * families remain separate obligations in the original manifest.
+ *
+ * observed with index==count and an empty primary is complete end, including
+ * count zero. Invalid/incomplete/refused/range results are all zero. Pointers
+ * borrow the original inventory lifetime and must not be modified. No file
+ * I/O, physical reread, progress or authority is supplied. Full-hash validation
+ * uses fixed-size cryptographic scratch; the caller
+ * must bracket use with the original complete source/current checks. Indexed
+ * access walks the saved list and never rewinds or consumes an old cursor. */
+typedef struct ClusterRecoveryNativeRecordObservationV1 {
+	bool observed;
+	uint64 index, count, record_ordinal;
+	uint32 source_index, source_count;
+	ClusterRecoveryNativeEffect primary;
+	/* Complete primary and compound components in original decoder order.
+	 * Immutable borrowed descriptors and bytes; never a discharge verdict. */
+	const ClusterRecoveryNativeEffect *effects;
+	size_t effect_count;
+	/* One immutable mask per original effect, indexed identically. Each bit
+	 * is an unresolved fixed owner-family duty, not an executor/completion
+	 * result, qualified base, raw-record reference or semantic graph seal. */
+	const uint16 *owner_families;
+	/* Complete original validated WAL record, including framing and CRC.
+	 * Immutable borrowed bytes share the original inventory lifetime. */
+	const uint8 *raw_record;
+	uint32 raw_length;
+	uint8 raw_record_sha256[32];
+} ClusterRecoveryNativeRecordObservationV1;
+/* Plain full-record SHA, including the original framing and final CRC. */
+static inline bool
+cluster_recovery_native_raw_sha256_v1(const uint8 *raw, uint32 length, uint8 out[32])
+{
+	pg_cryptohash_ctx *hash = pg_cryptohash_create(PG_SHA256);
+	bool ok;
+
+	if (hash == NULL) return false;
+	ok = pg_cryptohash_init(hash) == 0 && pg_cryptohash_update(hash, raw, length) == 0
+		&& pg_cryptohash_final(hash, out, 32) == 0;
+	pg_cryptohash_free(hash);
+	return ok;
+}
+/* Validate the complete borrowed envelope, not source/current authority. */
+static inline bool
+cluster_recovery_page_wal_raw_valid_v1(const ClusterRecoveryPageWalV1 *view)
+{
+	const XLogReaderState *reader = view->reader;
+	uint8 digest[32];
+
+	return reader != NULL && reader->record != NULL && view->raw_record != NULL
+		&& reader->record->has_page_version_edge
+		&& reader->ReadRecPtr == reader->record->lsn
+		&& reader->EndRecPtr == reader->record->next_lsn
+		&& reader->EndRecPtr > reader->ReadRecPtr
+		&& view->raw_length >= SizeOfXLogRecord
+		&& view->raw_length == reader->record->header.xl_tot_len
+		&& memcmp(view->raw_record, &reader->record->header, SizeOfXLogRecord) == 0
+		&& cluster_recovery_native_raw_sha256_v1(view->raw_record, view->raw_length, digest)
+		&& memcmp(digest, view->raw_record_sha256, sizeof(digest)) == 0;
+}
+/* A complete decoder-owned group is published as one value. Upper layers
+ * check its envelope before exposing borrowed components; execution and
+ * original source/current qualification are separate duties. */
+static inline bool
+cluster_recovery_native_record_effects_valid_v1(const ClusterRecoveryNativeRecordObservationV1 *view,
+	uint64 limit)
+{
+	uint8 digest[32] = {0};
+
+	if (view->index == view->count) return view->effects == NULL && view->effect_count == 0
+		&& view->owner_families == NULL && view->raw_record == NULL && view->raw_length == 0
+		&& memcmp(view->raw_record_sha256, digest, 32) == 0;
+	if (view->primary.record == NULL || view->raw_record == NULL
+		|| view->raw_length < SizeOfXLogRecord
+		|| view->raw_length != view->primary.record->header.xl_tot_len
+		|| memcmp(view->raw_record, &view->primary.record->header, SizeOfXLogRecord) != 0
+		|| !cluster_recovery_native_raw_sha256_v1(view->raw_record, view->raw_length, digest)
+		|| memcmp(digest, view->raw_record_sha256, 32) != 0) return false;
+	if (view->effects == NULL || view->owner_families == NULL
+		|| view->effect_count == 0 || view->effect_count > limit)
+		return false;
+	for (size_t i = 0; i < view->effect_count; i++) {
+		const ClusterRecoveryNativeEffect *effect = &view->effects[i];
+		if (effect->kind < CLUSTER_RECOVERY_NATIVE_TERMINAL
+			|| effect->kind > CLUSTER_RECOVERY_NATIVE_PREPARE_END
+			|| effect->record != view->primary.record || effect->bytes == NULL || effect->length == 0
+			|| view->owner_families[i] == 0
+			|| view->owner_families[i] != cluster_recovery_native_effect_owner_families_v1(effect))
+			return false;
+	}
+	return view->effects[0].kind == view->primary.kind && view->effects[0].ordinal == 0
+		&& view->effects[0].bytes == view->primary.bytes
+		&& view->effects[0].length == view->primary.length;
+}
+extern ClusterRecoveryNativeRecordObservationV1 cluster_recovery_native_inventory_record_v1(
+	ClusterRecoveryNativeInventory *inventory, uint64 index);
 /* Join each retained SET_HEAD with its last preceding TT_BIND in the same
  * source/cut, with no intervening segment lifecycle change. Missing or
  * overwritten identity refuses; current TT generations are never guessed.

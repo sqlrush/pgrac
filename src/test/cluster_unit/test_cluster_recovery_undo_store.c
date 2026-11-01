@@ -644,7 +644,7 @@ UT_TEST(test_read_and_final_recheck_failures_poison_already_borrowed_graph)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(31);
 	UT_RUN(test_page_root_binding_keeps_canonical_and_physical_generations_distinct);
 	UT_RUN(test_page_root_reused_or_unknown_binding_remains_unresolved);
 	UT_RUN(test_page_roots_find_inverse_only_transaction_before_graph_walk);
@@ -675,6 +675,7 @@ main(void)
 	UT_RUN(test_whole_relation_lifecycle_failure_stays_revoked);
 	UT_RUN(test_whole_relation_arguments_and_owned_budget);
 	UT_RUN(test_whole_relation_many_nonrelation_roots_remain_stepwise);
+	UT_RUN(test_page_reference_retains_complete_current_and_inverse_versions);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

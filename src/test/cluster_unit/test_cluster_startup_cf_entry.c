@@ -1883,7 +1883,16 @@ cluster_wal_inputs_job_scope_matches_v1(ClusterWalInputsJobV1 *job pg_attribute_
 #define cluster_cf_lock claim_actual_cf_lock
 #define cluster_cf_lock_deadline_v1 claim_actual_cf_lock_deadline
 #define clock_gettime cf_budget_clock_gettime
+/* Same original input consumer; TX/CTRC now borrow the original Start WALR.
+ * The pin and Start owners remain explicit controlled fixture leaves. */
+static ClusterWalReadPinOwnerV1
+cf_inputs_start_owner(const struct ClusterRecoveryStartV1 *start);
+static bool cf_inputs_borrowed_cover(const ClusterWalReadPinOwnerV1 *owner, uint16 thread);
+#define ClusterColdRecoveryTxInputOwnerV1 cf_inputs_start_owner
+#define cluster_wal_read_pin_owner_covers_v1 cf_inputs_borrowed_cover
 #include "test_cluster_inputs_cf.inc"
+#undef cluster_wal_read_pin_owner_covers_v1
+#undef ClusterColdRecoveryTxInputOwnerV1
 #undef clock_gettime
 #undef cluster_cf_lock_deadline_v1
 #undef cluster_cf_lock
@@ -1901,12 +1910,32 @@ static struct {
 static char input_start_object, input_pin_object;
 #define INPUT_START ((const struct ClusterRecoveryStartV1 *)&input_start_object)
 #define INPUT_PIN ((ClusterWalReadPinV1 *)&input_pin_object)
+#define INPUT_RECOVERY_PIN ((ClusterWalRetentionPin *)&input_pin_object)
 static ClusterControlRootFileToken input_token;
 static ClusterRecoveryCheckpointOwnerV1 input_checkpoint_owner;
 static uint64 input_generation, input_serial, input_pin_generation;
 static unsigned input_reads;
 static void (*input_read_hook)(void);
 static bool input_start_current, input_pin_current, input_first;
+
+static ClusterWalReadPinOwnerV1
+cf_inputs_start_owner(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterWalReadPinOwnerV1 out = {0};
+	if (input_start_current && input_pin_current && start == INPUT_START) {
+		out.recovery_pin = INPUT_RECOVERY_PIN;
+		out.recovery_generation = input_pin_generation;
+	}
+	return out;
+}
+
+static bool
+cf_inputs_borrowed_cover(const ClusterWalReadPinOwnerV1 *owner, uint16 thread)
+{
+	ClusterWalReadPinOwnerV1 current = cf_inputs_start_owner(INPUT_START);
+	return owner != NULL && current.recovery_pin != NULL
+		&& memcmp(owner, &current, sizeof(current)) == 0 && (thread == 1 || thread == 3);
+}
 
 bool
 RecoveryInProgress(void)
@@ -1966,6 +1995,8 @@ cluster_wal_read_pin_owner_v1(ClusterWalReadPinV1 *pin, ClusterWalReadPinOwnerV1
 bool
 cluster_wal_read_pin_owner_current_v1(const ClusterWalReadPinOwnerV1 *owner)
 {
+	if (owner->recovery_pin != NULL)
+		return cf_inputs_borrowed_cover(owner, 1);
 	return owner->generation == input_pin_generation
 		   && cluster_wal_read_pin_covers_v1(owner->pin, 1);
 }
@@ -2030,6 +2061,10 @@ input_fixture(unsigned phase)
 						  : phase < 5 ? WAL_INPUTS_TX_CLOSURE
 									  : WAL_INPUTS_CTRC_CENSUS;
 	InRecovery = phase < 3;
+	if (phase >= 3) {
+		input_scope.pin = NULL;
+		input_scope.borrowed_owner = cf_inputs_start_owner(INPUT_START);
+	}
 	input_typed.census_root_captured = true;
 	input_typed.census_root = input_token;
 	if (phase == 3 || phase == 4) {
@@ -2223,8 +2258,9 @@ UT_TEST(startup_input_cf_wait_rejects_changed_actor_scope_pin_and_request)
 			int pid = MyProcPid;
 
 			input_fixture(phase);
-			if ((input_fault == 25 || input_fault == 27 || input_fault == 28)
-				&& input_scope.pin == NULL) {
+			if ((input_fault == 25 && input_scope.thread_count == 0)
+				|| ((input_fault == 27 || input_fault == 28)
+					&& input_scope.pin == NULL && input_scope.borrowed_owner.recovery_pin == NULL)) {
 				cold_cleanup();
 				continue;
 			}
@@ -6548,6 +6584,20 @@ main(void)
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
+	if (getenv("PGRAC_PRE2_TEST_INPUT_BORROWED_CF") != NULL) {
+		UT_ASSERT(lock_owner_creator());
+		UT_PLAN(8);
+		UT_RUN(startup_input_cf_wait_keeps_initial_scratch_and_retained_scopes);
+		UT_RUN(startup_input_cf_wait_rejects_changed_actor_scope_pin_and_request);
+		UT_RUN(startup_input_cf_wait_cannot_adopt_changed_tx_or_ctrc_start);
+		UT_RUN(startup_input_cf_new_grant_rechecks_scope_before_root_io);
+		UT_RUN(startup_input_cf_receipt_and_wake_rules_preserve_progress);
+		UT_RUN(startup_input_cf_untyped_hard_and_preexisting_owners_are_not_retried);
+		UT_RUN(startup_input_cf_original_cancel_keeps_the_original_cleanup_owner);
+		UT_RUN(ordinary_input_cf_timeout_keeps_its_original_release_behavior);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_TYPED_PASS2") != NULL) {
 		UT_PLAN(7);
 		UT_RUN(committed_ir_source_check_never_enters_cf);

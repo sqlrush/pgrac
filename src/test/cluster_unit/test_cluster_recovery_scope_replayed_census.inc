@@ -40,7 +40,7 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *fe
 		return fence == (ClusterRecoveryFencePlan *)&tx_inputs_typed
 			&& RecoveryInProgress() && !inputs_pin_held && ctrc_set_held == 0;
 	if (!scope_replay_startup || fence != (ClusterRecoveryFencePlan *)&tx_inputs_typed
-		|| scope_startup_inputs == NULL || ctrc_set_held != 2 || !inputs_pin_held)
+		|| scope_startup_inputs == NULL || ctrc_set_held != 2 || !inputs_recovery_held || inputs_pin_held)
 		return false;
 	for (unsigned i = 0; i < 2; ++i)
 		if (scope_startup_sources[i].scope != scope_startup_inputs
@@ -81,7 +81,7 @@ scope_replay_native(XLogReaderState *reader, void *arg)
 
 	UT_ASSERT(consumed_current(source));
 	++scope_replay_calls;
-	test_episode_native_clog_replay(reader, source->selected.source.timeline,
+	test_episode_native_clog_replay_timeline(reader, source->selected.source.timeline,
 		scope_replay_fault <= 2 ? scope_replay_fault : 0, &scope_replay_stats);
 	if (scope_replay_fault == 3) ++source->work_generation;
 }
@@ -240,7 +240,7 @@ scope_replay_refused(ClusterWalInputsV1 *inputs, ClusterRecoveryRelmapHistory *h
 	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
 	UT_ASSERT(history->failed && relmap_failed > 0);
 	UT_ASSERT(!scope_native_prepare(inputs, &census) && census == NULL);
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2 && ctrc_set_release_calls == 0);
+	UT_ASSERT(inputs_recovery_held && !inputs_pin_held && ctrc_set_held == 2 && ctrc_set_release_calls == 0);
 	for (unsigned i = 0; i < 2; ++i) if (fds[i] >= 0) UT_ASSERT(fcntl(fds[i], F_GETFD) >= 0);
 	UT_ASSERT(!cluster_recovery_relmap_history_pending_initialized_pages_v1(history, pending, &out, &diag));
 	UT_ASSERT_EQ(scope_replay_calls, calls);
@@ -377,7 +377,7 @@ scope_startup_end(ClusterWalInputsV1 **inputs, ClusterRecoveryRelmapHistory **hi
 	const int fds[2])
 {
 	UT_ASSERT(!cluster_cold_typed_clog_native_record_current_v1(0, NULL));
-	UT_ASSERT(ctrc_set_held == 2 && inputs_pin_held && scope_startup_inputs == *inputs);
+	UT_ASSERT(ctrc_set_held == 2 && inputs_recovery_held && !inputs_pin_held && scope_startup_inputs == *inputs);
 	test_scope_startup_detach(&tx_inputs_typed);
 	scope_initialized_end(inputs, history, fds);
 	scope_startup_inputs = NULL;
@@ -420,7 +420,7 @@ UT_TEST(test_scope_startup_required_inputs_cannot_borrow_complete_ir_set)
 	scope_native_capture_hook = scope_startup_required;
 	scope_native_setup(&inputs);
 	scope_native_capture_hook = NULL;
-	UT_ASSERT(inputs != NULL && inputs_pin_held);
+	UT_ASSERT(inputs != NULL && inputs_recovery_held && !inputs_pin_held);
 	UT_ASSERT_EQ(scope_native_acquire_result, CLUSTER_CONTROL_ROOT_STALE_TOKEN);
 	UT_ASSERT_EQ(ctrc_set_calls | ctrc_set_held | ctrc_set_release_calls, 0);
 	/* Native checkpoint observations accept these exact failed generations;
@@ -441,8 +441,8 @@ UT_TEST(test_scope_startup_required_inputs_cannot_borrow_complete_ir_set)
 	}
 	UT_ASSERT_NE(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(ctrc_set_calls | ctrc_set_held | ctrc_set_release_calls, 0);
-	UT_ASSERT(inputs_pin_held);
+	UT_ASSERT(inputs_recovery_held && !inputs_pin_held);
 	ctrc_set_finish(&inputs);
 	relmap_declared = false;
-	UT_ASSERT(inputs == NULL && !inputs_pin_held);
+	UT_ASSERT(inputs == NULL && inputs_recovery_held && !inputs_pin_held);
 }

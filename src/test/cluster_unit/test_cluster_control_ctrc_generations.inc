@@ -178,7 +178,7 @@ UT_TEST(test_ctrc_generations_reject_omitted_duplicate_or_mixed_generation)
 			built = ctrc_generation_build(&f);
 		}
 		UT_ASSERT(built.detail != RF_PAGE_PROOF_DETAIL_OK && built.proof == NULL);
-		UT_ASSERT(inputs_pin_held && ctrc_set_held == 1); ctrc_set_finish(&f.inputs);
+		UT_ASSERT(inputs_recovery_held && ctrc_set_held == 1); ctrc_set_finish(&f.inputs);
 	}
 }
 
@@ -223,7 +223,7 @@ UT_TEST(test_ctrc_generations_promote_original_page_without_new_ir)
 		&target.page_identity, &target.expected_result));
 	rf_page_authority_ctrc_replays_destroy_v1(&page.authority);
 	rf_page_stable_base_proof_destroy_v1(&built.proof);
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 1); ctrc_set_finish(&f.inputs);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 1); ctrc_set_finish(&f.inputs);
 }
 
 UT_TEST(test_ctrc_generations_cf_wait_and_retirement_keep_original_debt)
@@ -302,7 +302,7 @@ UT_TEST(test_ctrc_generations_local_open_requires_original_fixed_native_cut)
 		source.generation_begin, source.generation_end));
 	inputs_native_writer.epoch++;
 	UT_ASSERT(!cluster_wal_inputs_ctrc_replays_source_current_v1(&fixed));
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 2); ctrc_set_finish(&inputs);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 2); ctrc_set_finish(&inputs);
 	test_checkpoint_mode = false;
 }
 
@@ -358,5 +358,5 @@ UT_TEST(test_ctrc_generations_initializer_terminal_never_bypasses_original_ir)
 	UT_ASSERT(cluster_wal_inputs_ctrc_replays_acquire_v1(inputs) != 0);
 	source = cluster_wal_inputs_ctrc_generation_v1(inputs, terminal);
 	UT_ASSERT(v2_zero(&source, sizeof(source)));
-	UT_ASSERT(inputs_pin_held && ctrc_set_held == 0); ctrc_set_finish(&inputs);
+	UT_ASSERT(inputs_recovery_held && ctrc_set_held == 0); ctrc_set_finish(&inputs);
 }

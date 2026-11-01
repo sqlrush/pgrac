@@ -245,7 +245,20 @@ typedef struct ClusterWalReadPinV1 ClusterWalReadPinV1;
 typedef struct ClusterWalReadPinOwnerV1 {
 	ClusterWalReadPinV1 *pin;
 	uint64 generation;
+	/* Alternative borrowed custody of the ORIGINAL sealed recovery pin.
+	 * Exactly one kind is populated; this never allocates a read pin. */
+	ClusterWalRetentionPin *recovery_pin;
+	uint64 recovery_generation;
 } ClusterWalReadPinOwnerV1;
+/* Retention only, after original IR release. Original owner cleans up only
+ * after all borrowed scopes retire. No allocation/acquisition/ROOT I/O. */
+extern ClusterWalReadPinOwnerV1
+cluster_wal_retention_pin_owner_v1(ClusterWalRetentionPin *pin);
+/* Original owner transfers cleanup custody across cache completion. Only a
+ * sealed pin with confirmed IR release and all original native holders may
+ * enter this state. On ResourceOwner error it remains debt, never renewed. */
+extern ClusterWalReadPinOwnerV1
+cluster_wal_retention_pin_handoff_v1(ClusterWalRetentionPin *pin);
 extern bool cluster_wal_read_pin_owner_v1(ClusterWalReadPinV1 *pin,
 	ClusterWalReadPinOwnerV1 *out);
 /* All original grants must still be usable, including read-only inputs.
@@ -253,6 +266,8 @@ extern bool cluster_wal_read_pin_owner_v1(ClusterWalReadPinV1 *pin,
  * The snapshot producer preserves output on refusal, including whole native
  * allocation aliases; it supplies neither IR nor publication authority. */
 extern bool cluster_wal_read_pin_owner_current_v1(const ClusterWalReadPinOwnerV1 *owner);
+extern bool cluster_wal_read_pin_owner_covers_v1(const ClusterWalReadPinOwnerV1 *owner,
+	uint16 thread_id);
 
 typedef struct ClusterWalRetentionPinThreadRequest {
 	const ClusterWalRetentionInterval *intervals;
@@ -436,6 +451,10 @@ cluster_wal_retention_root_source_equal_v1(const ClusterControlRootSnapshot *lef
 /* Zero IO, using only original sealed WALR and confirmed IR release. */
 extern bool cluster_wal_retention_pin_sealed_current_v1(ClusterWalRetentionPin *pin);
 
+/* By-value last observed ROOT identity in the original sealed pin, after
+ * confirmed IR release. No ROOT read, acquire or publication authority. */
+extern ClusterControlRootReadToken
+cluster_wal_retention_pin_root_read_v1(ClusterWalRetentionPin *pin, uint16 thread_id);
 extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(
 	ClusterWalRetentionPin *pin, const ClusterControlRootSnapshot *expected_snapshot,
 	const ClusterControlRootReadToken *expected_token,

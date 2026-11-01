@@ -19,7 +19,7 @@ XLogFlush(XLogRecPtr end)
 {
 	UT_ASSERT_EQ(MyBackendType, B_STARTUP);
 	UT_ASSERT(!RecoveryInProgress() && CritSectionCount == 0 && !ShutdownRequestPending);
-	UT_ASSERT(inputs_pin_held && inputs_pin_current && test_actual_cf == NoLock);
+	UT_ASSERT(inputs_recovery_held && inputs_pin_current && test_actual_cf == NoLock);
 	UT_ASSERT(ClusterColdRecoveryTxCurrent(tx_inputs_start));
 	UT_ASSERT_EQ(memcmp(&ctrc_inputs_owner.writer, &inputs_native_writer,
 		sizeof(inputs_native_writer)), 0);
@@ -315,7 +315,7 @@ UT_TEST(test_ctrc_local_cut_flush_drift_error_and_short_flush_preserve_debt)
 		UT_ASSERT_EQ(records, 0);
 		UT_ASSERT_EQ(work.census.begins + work.census.records + work.census.ends, 0);
 		UT_ASSERT_EQ(ctrc_local_flushes, 1);
-		UT_ASSERT(inputs_pin_held);
+		UT_ASSERT(inputs_recovery_held);
 		if (fault == 7) {
 			/* WAIT preserves this same frozen end; no moving resample. */
 			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
@@ -356,7 +356,7 @@ UT_TEST(test_ctrc_local_cut_record_and_final_owner_checks_refuse_drift)
 		UT_ASSERT_EQ(records, 0);
 		UT_ASSERT(work.local_records > 0);
 		UT_ASSERT_NE(cluster_wal_inputs_revalidate_v1(inputs), 0);
-		UT_ASSERT(inputs_pin_held);
+		UT_ASSERT(inputs_recovery_held);
 		ctrc_local_done(&inputs);
 	}
 }
@@ -388,7 +388,7 @@ UT_TEST(test_ctrc_local_cut_damage_never_shortens_the_confirmed_native_end)
 		UT_ASSERT_NE(ctrc_local_scan(inputs, &work, &records), 0);
 		UT_ASSERT_EQ(records, 0);
 		UT_ASSERT_NE(cluster_wal_inputs_revalidate_v1(inputs), 0);
-		UT_ASSERT(inputs_pin_held);
+		UT_ASSERT(inputs_recovery_held);
 		ctrc_local_done(&inputs);
 	}
 }

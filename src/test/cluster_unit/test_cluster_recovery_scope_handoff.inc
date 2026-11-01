@@ -46,7 +46,7 @@ scope_handoff_native(XLogReaderState *reader, void *arg)
 	UT_ASSERT(!inputs_pin_held && ctrc_set_held == 0);
 	UT_ASSERT(cluster_cold_typed_clog_native_record_current_v1(0, reader));
 	++scope_replay_calls;
-	test_episode_native_clog_replay(reader, tx_inputs_typed.sources[0].timeline,
+	test_episode_native_clog_replay_timeline(reader, tx_inputs_typed.sources[0].timeline,
 		scope_handoff_fault <= 2 ? scope_handoff_fault : 0, &scope_replay_stats);
 	if (scope_handoff_fault == 3)
 		++tx_inputs_typed.sources[0].claim.max_config_generation;
@@ -130,7 +130,11 @@ scope_handoff_before_done(ClusterWalInputsV1 **original, ControlRootImage *root)
 	episode_clog_side_plans(*original);
 	for (unsigned i = 0; i < 2; ++i)
 		scope_handoff_plans[i] = tx_inputs_typed.side_plans[i];
+	UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(*original), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_wal_inputs_root_token_v1(*original, &tx_inputs_typed.census_root),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	cluster_wal_inputs_release_v1(original);
+	tx_inputs_typed.census_root_captured = true;
 	UT_ASSERT(!inputs_pin_held);
 	/* Installed original plan/fence and ROOT publication are fixture leaves.
 	 * No post-EOR owner exists while the real native owner is executing. */

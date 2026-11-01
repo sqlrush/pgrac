@@ -371,7 +371,7 @@ static void episode_callback_apply(XLogReaderState *reader, XLogRecord *header,
 #undef cluster_typed_replay_apply_native
 
 void
-test_episode_native_clog_replay(XLogReaderState *reader, TimeLineID timeline,
+test_episode_native_clog_replay_timeline(XLogReaderState *reader, TimeLineID timeline,
 	unsigned sync_fault, TestEpisodeClogReplayStats *stats)
 {
 	ClusterColdTypedReplay replay = { .apply_foreign = false, .replayTLI = timeline };
@@ -390,6 +390,81 @@ test_episode_native_clog_replay(XLogReaderState *reader, TimeLineID timeline,
 	InRecovery = expect_error = true;
 	/* The original fixture dispatches AdvanceOldestClogXid to its extracted
 	 * native body only while executing an actual truncation record. */
+	if ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == CLOG_TRUNCATE_FULL)
+		fixture_native_truncate = true;
+	PG_TRY(); {
+		episode_clog_original_native_callback(reader, &replay);
+		stats->returned = true;
+	} PG_FINALLY(); {
+		InRecovery = old_recovery;
+		expect_error = old_error;
+		fail_sync = old_sync; fail_dirsync = old_dirsync;
+		fixture_native_truncate = old_truncate;
+		stats->file_syncs = syncs - file_syncs;
+		stats->directory_syncs = dirsyncs - directory_syncs;
+		episode_callback_stats = NULL;
+		episode_clog_unlocked();
+	} PG_END_TRY();
+}
+
+void
+test_episode_native_clog_replay(XLogReaderState *reader,
+	const ClusterRecoveryRelmapSourceV1 *source, unsigned sync_fault,
+	TestEpisodeClogReplayStats *stats)
+{
+	ClusterColdTypedReplay replay = { .apply_foreign = false };
+	bool old_recovery = InRecovery, old_error = expect_error;
+	bool old_sync = fail_sync, old_dirsync = fail_dirsync;
+	unsigned file_syncs = syncs, directory_syncs = dirsyncs;
+
+	UT_ASSERT(sync_fault <= 2 && stats != NULL && episode_callback_stats == NULL);
+	UT_ASSERT(source != NULL && episode_full_source == NULL
+		&& cluster_wal_inputs_relmap_source_current_v1(source));
+	replay.replayTLI = source->selected.source.timeline;
+	memset(stats, 0, sizeof(*stats));
+	episode_callback_stats = stats;
+	episode_callback_scn = reader->record->header.xl_scn;
+	episode_callback_timeline = replay.replayTLI;
+	episode_callback_fault = sync_fault;
+	episode_callback_foreign = false;
+	/* Use A's existing source-scoped fixture authority for this call only. */
+	episode_full_source = source;
+	InRecovery = expect_error = true;
+	PG_TRY(); {
+		episode_clog_original_native_callback(reader, &replay);
+		stats->returned = true;
+	} PG_FINALLY(); {
+		episode_full_source = NULL;
+		InRecovery = old_recovery;
+		expect_error = old_error;
+		fail_sync = old_sync; fail_dirsync = old_dirsync;
+		stats->file_syncs = syncs - file_syncs;
+		stats->directory_syncs = dirsyncs - directory_syncs;
+		episode_callback_stats = NULL;
+		episode_clog_unlocked();
+	} PG_END_TRY();
+}
+
+void
+test_episode_native_clog_replay_record(XLogReaderState *reader, TimeLineID timeline,
+	unsigned sync_fault, TestEpisodeClogReplayStats *stats)
+{
+	ClusterColdTypedReplay replay = { .apply_foreign = false, .replayTLI = timeline };
+	bool old_recovery = InRecovery, old_error = expect_error;
+	bool old_sync = fail_sync, old_dirsync = fail_dirsync;
+	bool old_truncate = fixture_native_truncate;
+	unsigned file_syncs = syncs, directory_syncs = dirsyncs;
+
+	UT_ASSERT(sync_fault <= 2 && stats != NULL && episode_callback_stats == NULL);
+	UT_ASSERT(episode_native_record_only && episode_full_source == NULL);
+	memset(stats, 0, sizeof(*stats));
+	episode_callback_stats = stats;
+	episode_callback_scn = reader->record->header.xl_scn;
+	episode_callback_timeline = timeline;
+	episode_callback_fault = sync_fault;
+	episode_callback_foreign = false;
+	InRecovery = expect_error = true;
+	/* Select the original native horizon provider only for this record. */
 	if ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == CLOG_TRUNCATE_FULL)
 		fixture_native_truncate = true;
 	PG_TRY(); {

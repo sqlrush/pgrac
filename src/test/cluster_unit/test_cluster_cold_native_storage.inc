@@ -140,7 +140,7 @@ native_storage_redo(XLogReaderState *reader, void *arg)
 
 	UT_ASSERT(arg == &native_storage.calls);
 	++native_storage.calls;
-	test_episode_native_clog_replay(native_storage.fault == 3 ? &copy : reader, 1,
+	test_episode_native_clog_replay_timeline(native_storage.fault == 3 ? &copy : reader, 1,
 		native_storage.fault <= 2 ? native_storage.fault : 0, &native_storage.stats);
 	if (native_storage.fault == 4) ++tokens[3].file_txn_seq;
 }
@@ -224,7 +224,7 @@ UT_TEST(test_source_native_clog_rejects_unowned_and_substituted_reader)
 		native_storage_begin(truncate);
 		/* The complete original callback cannot finish outside its owner. */
 		PG_TRY(); {
-			test_episode_native_clog_replay(&native_storage.reader, 1, 0, &native_storage.stats);
+			test_episode_native_clog_replay_timeline(&native_storage.reader, 1, 0, &native_storage.stats);
 		} PG_CATCH(); { unowned_error = true; } PG_END_TRY();
 		UT_ASSERT(unowned_error);
 		UT_ASSERT(!native_storage.stats.returned);

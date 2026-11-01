@@ -34,6 +34,26 @@ static union {
 		+ 24 * sizeof(ClusterRecoveryCensusReferenceV1)];
 } observation_references_storage[2];
 static unsigned observation_reference_fault, observation_reference_calls;
+static union {
+	uint64 align;
+	uint8 bytes[offsetof(ClusterRecoveryCensusImagesV1, entries)
+		+ 3 * sizeof(ClusterRecoveryCensusImageV1)];
+} observation_images_storage[2];
+static unsigned observation_image_fault, observation_image_calls, observation_image_begins;
+
+const ClusterRecoveryCensusImagesV1 *
+cluster_recovery_census_images_v1(ClusterRecoveryCensus *cursor)
+{
+	if (cursor != (ClusterRecoveryCensus *)&observation_cursor_object
+		|| !observation_cursor_live || !observation_scope_live || observation_steps < 3) abort();
+	observation_image_calls++;
+	if (observation_image_fault == 1) return NULL;
+	if (observation_image_fault == 3) pg_re_throw();
+	if (observation_image_fault == 4) owner_boot++;
+	return (const ClusterRecoveryCensusImagesV1 *)observation_images_storage[
+		observation_image_fault == 2 ? 1 : 0].bytes;
+}
+
 
 const ClusterRecoveryCensusReferencesV1 *
 cluster_recovery_census_references_v1(ClusterRecoveryCensus *cursor)
@@ -50,8 +70,11 @@ cluster_recovery_census_references_v1(ClusterRecoveryCensus *cursor)
 
 static unsigned observation_page_fault;
 static unsigned observation_page_wal_fault;
+static void (*owner_graph_wal_view)(uint32, ClusterRecoveryPageWalV1 *);
 static uint32 observation_page_wal_count;
 static XLogReaderState observation_page_wal_readers[2];
+static DecodedXLogRecord observation_page_wal_records[2];
+static uint8 observation_page_wal_raw[2][SizeOfXLogRecord + 4];
 static unsigned observation_wal_source_fault;
 static uint32 observation_wal_source_count;
 static ClusterRecoveryWalSourceObservationV1 observation_wal_sources[3];
@@ -106,6 +129,18 @@ cluster_recovery_census_page_wal_at_v1(ClusterRecoveryCensus *cursor, uint32 ind
 	if (observation_page_wal_fault == 5) pg_re_throw();
 	out->source_index = index; out->ordinal = index + 4;
 	out->reader = &observation_page_wal_readers[index];
+	out->raw_record = observation_page_wal_raw[index];
+	out->raw_length = sizeof(observation_page_wal_raw[index]);
+	if (!cluster_recovery_native_raw_sha256_v1(out->raw_record, out->raw_length,
+		out->raw_record_sha256)) abort();
+	if (owner_graph_wal_view != NULL) owner_graph_wal_view(index, out);
+	if (observation_page_wal_fault == 6) out->raw_record = NULL;
+	if (observation_page_wal_fault == 7) out->raw_length--;
+	if (observation_page_wal_fault == 8) out->raw_length++;
+	if (observation_page_wal_fault == 9) out->raw_record_sha256[31] ^= 1;
+	if (observation_page_wal_fault == 10) observation_page_wal_raw[index][0] ^= 1;
+	if (observation_page_wal_fault == 11) observation_page_wal_readers[index].EndRecPtr++;
+	if (observation_page_wal_fault == 12) out->reader = NULL;
 	return true;
 }
 
@@ -123,6 +158,7 @@ cluster_recovery_census_pages_v1(ClusterRecoveryCensus *cursor)
 static void
 observation_fixture_reset(void)
 {
+	start_tx_forest_fixture_reset();
 	if (observation_scope_live || observation_cursor_live) abort();
 	observation_scope_begins = observation_census_begins = observation_steps = 0;
 	observation_manifests = observation_census_destroys = observation_scope_releases = 0;
@@ -130,6 +166,8 @@ observation_fixture_reset(void)
 	observation_physical_count = observation_fail_allocation = 0;
 	observation_release_error = observation_early_read = false;
 	observation_reference_fault = observation_reference_calls = 0;
+	observation_image_fault = observation_image_calls = observation_image_begins = 0;
+	memset(observation_images_storage, 0, sizeof(observation_images_storage));
 	memset(observation_references_storage, 0, sizeof(observation_references_storage));
 	observation_page_fault = 0;
 	observation_page_wal_fault = 0;
@@ -152,6 +190,22 @@ observation_fixture_reset(void)
 	observation_wal_sources[0].observed.records = 37;
 	memset(observation_wal_sources[0].transcript_sha256, 9, 32);
 	memset(observation_page_wal_readers, 0, sizeof(observation_page_wal_readers));
+	/* Controlled upper leaf: native file/CRC ownership is tested separately. */
+	memset(observation_page_wal_records, 0, sizeof(observation_page_wal_records));
+	memset(observation_page_wal_raw, 0, sizeof(observation_page_wal_raw));
+	for (unsigned i = 0; i < 2; i++) {
+		DecodedXLogRecord *record = &observation_page_wal_records[i];
+		record->header.xl_tot_len = sizeof(observation_page_wal_raw[i]);
+		record->header.xl_xid = 4195136 + i;
+		record->header.xl_crc = 1234 + i;
+		record->has_page_version_edge = true;
+		record->lsn = 8192 + i * 128; record->next_lsn = record->lsn + record->header.xl_tot_len;
+		observation_page_wal_readers[i].record = record;
+		observation_page_wal_readers[i].ReadRecPtr = record->lsn;
+		observation_page_wal_readers[i].EndRecPtr = record->next_lsn;
+		memcpy(observation_page_wal_raw[i], &record->header, SizeOfXLogRecord);
+		memcpy(observation_page_wal_raw[i] + SizeOfXLogRecord, "page", 4);
+	}
 	memset(observation_pages_storage, 0, sizeof(observation_pages_storage));
 	observation_pages.count = 2;
 	observation_pages.entries[0].forknum = MAIN_FORKNUM;
@@ -195,12 +249,22 @@ cluster_recovery_census_begin_ctrc(ClusterWalInputsV1 *inputs, size_t memory_bud
 {
 	if (inputs != (ClusterWalInputsV1 *)&observation_scope_object || !observation_scope_live
 		|| observation_cursor_live || memory_budget == 0) abort();
+	/* An explicitly empty original work has an empty controlled forest. */
+	if (native_ctrc_work.counts.subject_count == 0) observation_manifest.tx_record_count = 0;
 	observation_census_begins++;
 	observation_event('B');
 	if (observation_fault == 2) return CLUSTER_RECOVERY_CENSUS_CAPACITY;
 	observation_cursor_live = true;
 	*out = (ClusterRecoveryCensus *)&observation_cursor_object;
 	return CLUSTER_RECOVERY_CENSUS_MORE;
+}
+
+ClusterRecoveryCensusResult
+cluster_recovery_census_begin_ctrc_images_v1(ClusterWalInputsV1 *inputs, size_t memory_budget,
+	ClusterRecoveryCensus **out)
+{
+	observation_image_begins++;
+	return cluster_recovery_census_begin_ctrc(inputs, memory_budget, out);
 }
 
 ClusterRecoveryCensusResult

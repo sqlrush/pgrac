@@ -25,6 +25,7 @@
 #include "storage/bufpage.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_recovery_stamp.h"
 struct ClusterRecoveryStartV1;
 struct ClusterColdCtrcWorkV1;
@@ -321,6 +322,151 @@ typedef struct RfPageCtrcReadbackImageV1 {
 	RfPageProofDetailV1 detail;
 	PGAlignedBlock image;
 } RfPageCtrcReadbackImageV1;
+
+/* Original Start's PAGE-owner result, produced only after its completed
+ * operation and SAME descriptors pass the protected whole-page readback.
+ * These are the frozen family/outcome/rule values, not caller-selectable
+ * policies. replay_source_index is the original complete ROOT/input index
+ * of the replay tail, not the new FPI's writer or record source. The
+ * target indexes describe this immutable PAGE plan, not persistent IDs.
+ * original operation supplies a SEPARATE full writer and actual FPI
+ * coordinates (all zero for unchanged pages). Coordinates alone are not a
+ * canonical WAL reference without raw bytes. No FD, pointer, PID or local
+ * clock is part of this value.
+ *
+ * This proves this PAGE owner's exact synced after-image only. Complete
+ * G_ref/G_owner, native/base/lifetime qualification, first/pin/history and
+ * companion discharge, and the original joint COMPLETE-to-OPEN remain due.
+ * It is not an independent completion certificate. Keep the original Start,
+ * work, full source set and custody live; revalidate them before graph use.
+ * Refusal clears every field except detail. */
+typedef struct RfPageCtrcOwnerProofV1 {
+	RfPageProofDetailV1 detail;
+	uint16 owner_family; /* frozen row 10: PAGE/VM/FSM/retained WAL */
+	uint16 outcome;      /* 1: APPLIED_AND_DURABLE for this exact PAGE */
+	uint16 rule;         /* 1: TYPED_EFFECT_DURABLE; 6: EXACT_ALREADY_APPLIED */
+	uint32 target_index, target_count;
+	uint32 replay_source_index, replay_source_count;
+	ClusterSpaceIdentity space;
+	BlockNumber blockno;
+	RfPageVersionV1 before;
+	ClusterWalWriterToken writer; /* actual recovery FPI writer; not replay source */
+	XLogRecPtr record_start, record_end;
+	PGAlignedBlock image;
+} RfPageCtrcOwnerProofV1;
+
+/* One PAGE owner's canonical atom3 bytes, coupled by value to its actual
+ * protected after-image. This is not a graph node or release certificate.
+ * The graph producer still binds the exact transaction/complete effect scope
+ * and all other required witnesses, owners, base and lifetime qualifications. */
+typedef struct RfPageCtrcOwnerCompletionV1 {
+	RfPageCtrcOwnerProofV1 owner;
+	Size length;
+	uint8 completion[MAXPGPATH + 96];
+} RfPageCtrcOwnerCompletionV1;
+
+/* Complete original PAGE target set, not a completed G_owner or release.
+ * Each entry owns exact canonical atom2/atom3 bytes from its actual reader. */
+typedef struct RfPageCtrcOwnerEvidenceV1 {
+	RfPageCtrcOwnerCompletionV1 completed;
+	Size evidence_length;
+	uint8 evidence[BLCKSZ + MAXPGPATH + 96];
+} RfPageCtrcOwnerEvidenceV1;
+
+typedef struct RfPageCtrcOwnersV1 {
+	RfPageProofDetailV1 detail;
+	uint32 count;
+	RfPageCtrcOwnerEvidenceV1 *entries;
+} RfPageCtrcOwnersV1;
+
+/* Every original reference remains present, in original order. An owner
+ * index names only the actual current PAGE containing a non-FREE ITL;
+ * UINT32_MAX retains an unmatched, historical, FREE or tuple obligation.
+ * This adjacency input is not transaction-effect coverage or discharge. */
+typedef struct RfPageCtrcOwnerReferenceV1 {
+	uint32 reference_index;
+	uint32 owner_index;
+} RfPageCtrcOwnerReferenceV1;
+
+struct ClusterRecoveryCensusReferencesV1;
+typedef struct RfPageCtrcOwnerReferencesV1 {
+	RfPageProofDetailV1 detail;
+	RfPageCtrcOwnersV1 owners;
+	const struct ClusterRecoveryCensusReferencesV1 *references;
+	uint32 count;
+	RfPageCtrcOwnerReferenceV1 *entries;
+} RfPageCtrcOwnerReferencesV1;
+
+#define CLUSTER_PAGE_CTRC_OWNER_GRAPH_V1 1
+typedef struct RfPageCtrcOwnerGraphEntryV1 {
+	uint32 reference_index, owner_index;
+	Size key_length, evidence_length;
+	const uint8 *key, *evidence;
+	/* Optional current ITL kind1 key and complete actual after-image atom2.
+	 * NULL/zero retains an unresolved field, never a zero-reference proof. */
+	Size reference_key_length, reference_evidence_length;
+	const uint8 *reference_key, *reference_evidence;
+	/* Zero in the observation API. Projected mode: kind4 for one proven
+	 * current ITL, kind2 for every tuple field referencing its original ITL.
+ * Tuple/redirect keys and evidence live in contribution, not the singular
+ * fields above; a redirect references its proven same-page target xmin.
+	 * Count zero preserves the WHOLE unresolved original census entry. */
+	uint16 reference_edge_kind;
+	uint16 reference_field_count;
+} RfPageCtrcOwnerGraphEntryV1;
+
+/* Complete reference order, with canonical PAGE owner contributions only for
+ * matched current non-FREE ITLs. Unmatched entries have no key/evidence.
+ * A byte-exact current ITL also exposes its canonical DATA field key, with
+ * full T from the twice-checked original forest member and the SAME owner's
+ * complete after-image witness. Evidence borrows related.owners.entries;
+ * keys belong to entries. Keep both original result allocations alive.
+ * Changed/moved/invalid fields and historical/FREE references retain NULL
+ * reference fields, including when a PAGE owner key is available.
+ * The observation API creates no discharged_by edge. The explicit projected
+ * API additionally executes the original terminal projection and marks kind4
+ * for that current ITL. Current tuple xmin/xmax/plain-lock fields require ALL
+ * same-page/version ITLs with original full T and a byte-exact native whole
+ * projection. Every field is selected together or the WHOLE tuple remains
+ * unresolved. Current HOT pages require complete items/slots and original
+ * whole-page projection/topology before connecting exact xmax -> xmin fields;
+ * the pair must retain the same canonical T and actual DATA identity.
+ * Current redirects preserve exact line-pointer keys and reference the same
+ * complete page's proven target xmin. Missing target identity, MX/history
+ * and other no-storage obligations remain unresolved. Neither
+ * API supplies a complete graph, history/first/pin retirement or D0 verdict. */
+typedef struct RfPageCtrcOwnerGraphV1 {
+	RfPageProofDetailV1 detail;
+	RfPageCtrcOwnerReferencesV1 related;
+	uint32 count;
+	RfPageCtrcOwnerGraphEntryV1 *entries;
+	/* Projected mode only: current-reference roots and their actual PAGE
+	 * owners/edges. Arrays belong to entries; evidence also borrows related.
+	 * Duplicate canonical roots occur once. All original entries remain in
+	 * count, including unresolved_count entries absent from this contribution.
+	 * An empty contribution is zero, never a complete/zero-reference proof. */
+	ClusterRecoveryCTRCGraphV2 contribution;
+	uint32 unresolved_count;
+} RfPageCtrcOwnerGraphV1;
+
+typedef enum RfPageCtrcReferenceClassV1 {
+	RF_PAGE_CTRC_REFERENCE_UNRESOLVED = 0,
+	RF_PAGE_CTRC_REFERENCE_GRAPH,
+	RF_PAGE_CTRC_REFERENCE_NO_CURRENT_TX
+} RfPageCtrcReferenceClassV1;
+
+/* Explicit current PAGE coverage, separate from the unchanged graph API.
+ * NO_CURRENT_TX requires complete original slots/items and the same actual
+ * PAGE after-image under native projection. History and unknown fields stay
+ * unresolved; pages without that complete match increment uncovered_page_count.
+ * Neither zero count proves full G_ref, owner completion or retention transfer.
+ * Free classes plus all three graph allocations, before the original Start. */
+typedef struct RfPageCtrcReferenceCoverageV1 {
+	RfPageProofDetailV1 detail;
+	RfPageCtrcOwnerGraphV1 graph;
+	uint32 count, no_reference_count, unresolved_count, uncovered_page_count;
+	uint8 *classes;
+} RfPageCtrcReferenceCoverageV1;
 
 extern RfPageCtrcReadbackImageV1 rf_page_recovery_ctrc_replays_completed_image_v1(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,

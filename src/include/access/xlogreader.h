@@ -363,6 +363,11 @@ struct XLogReaderState
 	 * classification without matching translated error text.  This is not
 	 * proof of EOF: the caller must still check its known input bounds. */
 	bool		cluster_record_crc_failed;
+
+	/* Borrowed original bytes, tagged only after native CRC/framing decode.
+	 * Readahead invalidates the previous record's raw view. */
+	const XLogRecord *cluster_raw_record;
+	const DecodedXLogRecord *cluster_raw_decoded;
 };
 
 /*
@@ -413,6 +418,12 @@ extern struct XLogRecord *XLogReadRecord(XLogReaderState *state,
  * caller's original reader/owner contracts. No allocation or target I/O. */
 extern const uint8 *XLogReaderGetClusterD0RawRecord(const XLogReaderState *state);
 #endif
+
+/* Exact validated header-through-xl_tot_len bytes for the current record.
+ * NULL unless it is the last record decoded and currently returned. Copy
+ * before any decode/readahead/reposition; page headers/padding are excluded.
+ * This borrowed view supplies no source or recovery authority. */
+extern const XLogRecord *XLogReaderCurrentRawRecord(const XLogReaderState *state);
 
 /* Consume the next record or error. */
 extern DecodedXLogRecord *XLogNextRecord(XLogReaderState *state,

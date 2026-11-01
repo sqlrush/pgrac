@@ -157,6 +157,13 @@ extern bool ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *st
 extern bool ClusterColdRecoveryRelmapDeclare(const struct ClusterRecoveryStartV1 *start);
 extern bool ClusterColdRecoveryRelmapCurrent(const struct ClusterRecoveryStartV1 *start);
 extern void ClusterColdRecoveryRelmapFail(const struct ClusterRecoveryStartV1 *start);
+struct ClusterColdRelmapReplayReceiptV1;
+/* Original Start only; copied replay input, zero on refusal. The returned
+ * count covers the whole saved batch. Borrowed retention pointers expire
+ * with Start. This does not validate physical sources or grant era/lifetime,
+ * terminal, COMPLETE or release authority. No caller completion setter. */
+extern struct ClusterColdRelmapReplayReceiptV1 ClusterColdRecoveryRelmapReplayInput(
+	const struct ClusterRecoveryStartV1 *start, uint32 index);
 struct ClusterRecoveryCheckpointOwnerV1;
 /* Original recovered INSTALL only; ordinary CLEAN/first creation cannot
  * provide this checkpoint input. The output clears on refusal. */
@@ -185,6 +192,11 @@ extern bool ClusterColdRecoveryTxTopProofCurrent(
 
 extern const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start);
+struct ClusterWalReadPinOwnerV1;
+/* Same original episode's continuous WALR, borrowed by value. No new pin,
+ * scope or recovery permission; retire borrowers before original cleanup. */
+extern struct ClusterWalReadPinOwnerV1
+ClusterColdRecoveryTxInputOwnerV1(const struct ClusterRecoveryStartV1 *start);
 
 /* Check the entire original opaque Start extent without exposing its layout.
  * Storage separation only; this grants no input/current/write authority. */
@@ -264,6 +276,100 @@ extern bool ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1
 struct RfPageCtrcReadbackImageV1;
 extern struct RfPageCtrcReadbackImageV1 ClusterColdRecoveryCtrcPageImage(
 	const struct ClusterRecoveryStartV1 *start, uint32 target_index);
+/* Execute the original completed/unchanged PAGE owner predicates and bind
+ * its full readback to the exact original target/source, after PAGE/proof
+ * cleanup and complete Start/result/FD revalidation. No supplied rule or
+ * success flag. The original clearing preflight consumes this proof; it
+ * does not clear first/pin/history/companion debt or grant joint completion.
+ * Same local WAIT, sticky failure/ERROR, custody and lifetime as PageImage. */
+struct RfPageCtrcOwnerProofV1;
+extern struct RfPageCtrcOwnerProofV1 ClusterColdRecoveryCtrcPageOwnerProof(
+	const struct ClusterRecoveryStartV1 *start, uint32 target_index);
+/* Original PAGE owner -> canonical completion bytes. Accept exactly one
+ * complete canonical atom2 for the SAME native MAIN path/block and full page.
+ * Its logical origin is the original replay generation's origin; native
+ * relation file generation is the explicit no-U64-generation value zero,
+ * not a qualified base/era. Snapshot the entire bounded witness before the
+ * original owner read; derive outcome/rule only from that actual operation.
+ * memory_budget bounds additional temporary witness/path/ID storage.
+ * Return only by value. Inputs remain immutable; normal/ERROR frees private
+ * scratch, preserving native custody and sticky refusal. Caller must retain
+ * and revalidate the original Start and this contribution before graph use.
+ * No complete owner scope/graph, D0 admission, release or joint success. */
+struct RfPageCtrcOwnerCompletionV1;
+extern struct RfPageCtrcOwnerCompletionV1 ClusterColdRecoveryCtrcPageOwnerCompletion(
+	const struct ClusterRecoveryStartV1 *start, uint32 target_index,
+	const uint8 *raw_evidence, Size evidence_length, Size memory_budget);
+/* Produce all original nonempty PAGE targets as one immutable local inventory.
+ * No supplied witness, target subset, outcome or rule. Budget the entire
+ * output/snapshot/codec peak before first PAGE; WAIT/false/ERROR publishes no
+ * prefix and retains original FD/all IR-WALR/pins debt. entries is local-only:
+ * pfree it before original Start/scope/ResourceOwner ends, never close its FDs.
+ * Original current/graph/source/owner/base/lifetime checks remain mandatory
+ * before consuming these bytes. No zero-target/no-effect or joint grant. */
+struct RfPageCtrcOwnersV1;
+extern struct RfPageCtrcOwnersV1 ClusterColdRecoveryCtrcPageOwners(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
+/* Complete original references joined to the complete actual PAGE inventory.
+ * Validate the full original TX-reference membership, retain every other
+ * obligation and publish only after the complete saved set is unchanged.
+ * Budget the entire additional peak before PAGE. On success pfree entries
+ * and owners.entries before the original Start/scope/ResourceOwner ends;
+ * references borrows that original lifetime. On refusal all fields except
+ * detail are zero. Original failed-reader cleanup/debt policy remains;
+ * no prefix, new FD release, graph/D0 or joint success grant. */
+struct RfPageCtrcOwnerReferencesV1;
+extern struct RfPageCtrcOwnerReferencesV1 ClusterColdRecoveryCtrcPageOwnerReferences(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
+
+/* Original complete PAGE owner/reference inventory plus full transaction and
+ * sealed contributor scope. Canonical owner keys use original ROOT source
+ * indexes and original decoded page-class/component ordinals; evidence joins
+ * the actual whole DATA readback and its original completion predicate.
+ * No caller-supplied subset, transaction, witness or success flag. Historical,
+ * FREE, tuple and unmatched references remain separate obligations. This does
+ * not establish full G_ref/non-PAGE/base/lifetime coverage or authorize D0.
+ * On success pfree entries, related.entries and related.owners.entries before
+ * the original Start/scope ends. Do not close their original backing FDs.
+ * Full simultaneous budget precedes PAGE; WAIT/refusal/ERROR publish no prefix
+ * and preserve original FD/allIR-WALR/pins-debt. */
+struct RfPageCtrcOwnerGraphV1;
+extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageOwnerGraph(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
+/* Explicit current-field projection contribution. Revalidate the entire original
+ * canonical terminal vector before/after the same actual PAGE owners, then
+ * use the original pure ITL projector to check the same field's final bytes.
+ * Only exact DATA/plain-lock terminal projections supply kind4 to that PAGE
+ * owner. Current tuple xmin/xmax/plain-lock fields use the complete same-page
+ * original ITL set's full identities, exact item/payload snapshot and original
+ * whole native projector; kind2 references those proven ITLs. All fields of a
+ * tuple contribute together. Current HOT pages additionally require EVERY
+ * original item and all eight slots to reproduce the actual whole after-image
+ * under the original native topology; exact same-page xmax -> xmin links use
+ * the same full canonical T. Actual current redirects retain their own physical
+ * line-pointer offset/ordinal and reference only that complete page's proven
+ * target xmin; a missing canonical target retains the redirect obligation.
+ * A missing/changed member leaves its page's tuple
+ * contributions unresolved. Historical/FREE/MX/unmatched references remain
+ * unresolved. Complete tuple bytes and all output arrays are budgeted before
+ * the first PAGE and rechecked with original source/terminal identity at return.
+ * Return canonical nodes/edges and unique current-reference roots in the
+ * contribution, alongside the complete original entry order and unresolved
+ * count. Its arrays share entries' lifetime; no caller subset is accepted.
+ * The ordinary observation API above stays unchanged. Same whole budget,
+ * output/lifetime/WAIT/ERROR contract; no first/pin/history retirement, full
+ * G_ref/G_owner coverage, D0 admission or joint completion is provided. */
+extern struct RfPageCtrcOwnerGraphV1 ClusterColdRecoveryCtrcPageProjectedGraph(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
+/* Complete current PAGE slot/item coverage around the original graph factory.
+ * Native FREE, no-storage unused/dead and exact frozen/invalid-xmax tuples
+ * may have no current transaction reference. Missing/duplicate/current-byte
+ * mismatches and unmapped physical pages cannot disappear from coverage.
+ * History, other owners, first/pin debt and full graph/joint completion remain
+ * separate duties. Old APIs retain their unresolved counts and semantics. */
+struct RfPageCtrcReferenceCoverageV1;
+extern struct RfPageCtrcReferenceCoverageV1 ClusterColdRecoveryCtrcPageReferenceCoverage(
+	const struct ClusterRecoveryStartV1 *start, Size memory_budget);
 struct RfPageCtrcFpiInsertV1;
 struct ClusterSharedFsPageV1;
 /* Local immutable membership only: the ORIGINAL retained result address and
@@ -319,6 +425,14 @@ struct ClusterRecoveryCensusReferencesV1;
 extern const struct ClusterRecoveryCensusReferencesV1 *ClusterColdRecoveryCtrcReferences(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
 
+/* Complete original physical/history page versions under this same Start.
+ * The original census reserves and owns every full image; callers only borrow
+ * its complete immutable collection before PAGE/content locks. No image is
+ * reconstructed from references and no graph/discharge right is supplied. */
+struct ClusterRecoveryCensusImagesV1;
+extern const struct ClusterRecoveryCensusImagesV1 *ClusterColdRecoveryCtrcImages(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work);
+
 /* Original complete TX forest through this SAME Start/work/accepted-TX and
  * full simultaneous IR/WALR observation. The by-value wrapper never accepts a
  * caller graph or source. Includes non-root predecessors, complete native
@@ -334,6 +448,16 @@ extern struct ClusterRecoveryCensusTxRecordV1 ClusterColdRecoveryCtrcTxRecord(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	uint32 index);
 
+/* Complete original native WAL records through the same Start/work and full
+ * simultaneous IR/WALR observation. Keeps complete payloads/source positions,
+ * including nontransaction/query records; other WAL remains in the manifest.
+ * Same pre-PAGE/current, borrowed lifetime and sticky cleanup as TxRecord.
+ * observed/index==count/empty primary is complete end, not discharge or OPEN. */
+struct ClusterRecoveryNativeRecordObservationV1;
+extern struct ClusterRecoveryNativeRecordObservationV1 ClusterColdRecoveryCtrcNativeRecord(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	uint64 index);
+
 /* Exact roots and resolved TX predecessor edges of this SAME complete
  * original Start/work/accepted-TX/full simultaneous ALL IR-WALR observation.
  * Same pre-PAGE checks, borrowed lifetime, whole-output failure and original
@@ -341,6 +465,17 @@ extern struct ClusterRecoveryCensusTxRecordV1 ClusterColdRecoveryCtrcTxRecord(
  * this is native adjacency, not a semantic owner proof or COMPLETE authority. */
 struct ClusterRecoveryCensusTxDependencyV1;
 extern struct ClusterRecoveryCensusTxDependencyV1 ClusterColdRecoveryCtrcTxDependency(
+	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
+	uint32 index);
+
+/* Same original Start/work/accepted-TX/full simultaneous ALL IR-WALR.
+ * Complete PAGE/history emissions remain borrowed from this original Start;
+ * non-FREE ITL stored heads resolve to this SAME observed TX dependency index.
+ * Raw tuple/MX/HOT obligations remain explicit. Same pre-PAGE/current and
+ * sticky cleanup contract as TxDependency; no independent semantic graph,
+ * terminal/owner proof, discharge, retention transfer or COMPLETE right. */
+struct ClusterRecoveryCensusTxReferenceV1;
+extern struct ClusterRecoveryCensusTxReferenceV1 ClusterColdRecoveryCtrcTxReference(
 	const struct ClusterRecoveryStartV1 *start, const struct ClusterColdCtrcWorkV1 *work,
 	uint32 index);
 

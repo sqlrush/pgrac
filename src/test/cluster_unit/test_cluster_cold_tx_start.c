@@ -10,6 +10,8 @@
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_plan_internal.h"
+#include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_guc.h"
@@ -19,6 +21,9 @@
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_undo_retention.h"
+#include "cluster/cluster_cr.h"
 #include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -87,6 +92,7 @@ cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source,
 
 static bool tx_fence_current, tx_fence_subject_current;
 static unsigned tx_fence_checks;
+static void (*relmap_owner_check_step)(void);
 static void (*ctrc_request_step)(void);
 static bool invalidate_fence_in_pre, invalidate_fence_on_flush;
 static union {
@@ -102,6 +108,17 @@ cluster_recovery_merge_fence_plan_tx_current_v1(struct ClusterRecoveryFencePlan 
 	(void)plan;
 	tx_fence_checks++;
 	return tx_fence_current && (source == NULL || tx_fence_subject_current);
+}
+
+ClusterWalReadPinOwnerV1
+cluster_recovery_merge_fence_plan_tx_owner_v1(struct ClusterRecoveryFencePlan *plan)
+{
+	ClusterWalReadPinOwnerV1 owner = {0};
+	if (cluster_recovery_merge_fence_plan_tx_current_v1(plan, NULL)) {
+		owner.recovery_pin = (ClusterWalRetentionPin *)&tx_fence_object;
+		owner.recovery_generation = 11;
+	}
+	return owner;
 }
 
 bool
@@ -164,6 +181,7 @@ static ClusterRecoveryUndoEntry observation_physical[4];
 static unsigned observation_physical_count, observation_fail_allocation;
 static bool observation_release_error, observation_early_read;
 static void observation_fixture_reset(void);
+static void start_tx_forest_fixture_reset(void);
 static void page_graph_fixture_reset(void);
 static void page_prefix_fixture_reset(void);
 static void page_source_fixture_reset(void);
@@ -207,6 +225,54 @@ static bool ctrc_driver_waiting, ctrc_driver_false_authorization, ctrc_driver_er
 static ClusterControlRootResult ctrc_driver_result;
 static void (*ctrc_driver_acquire_step)(void), (*ctrc_driver_authorize_step)(void);
 static void (*ctrc_driver_wait_step)(void);
+/* Real original floor fold; only report transport/local ProcArray sampling
+ * and scheduling are leaves. No horizon or completion producer is replaced. */
+bool cluster_undo_retention_horizon_enabled = true;
+int cluster_lmon_main_loop_interval = 1000;
+static SCN history_local_floor = 1000000;
+static ClusterUndoHorizonReportView history_views[CLUSTER_MAX_NODES];
+static uint8 history_required[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+static bool history_members_ok = true, history_fence, history_disabled;
+static bool history_probe, history_expect_wait;
+static int history_view_count = CLUSTER_MAX_NODES;
+static uint64 history_epoch = 4;
+static unsigned history_samples;
+static void (*history_sample_step)(void);
+
+SCN cluster_undo_retention_horizon(void) { return history_local_floor; }
+bool cluster_cr_native_prehistory_disabled(void) { return history_disabled; }
+TimestampTz GetCurrentTimestamp(void) { return INT64CONST(10000000); }
+bool cluster_undo_horizon_epoch_fence_tripped(uint64 epoch)
+{
+	UT_ASSERT_EQ(epoch, history_epoch); return history_fence;
+}
+bool cluster_undo_horizon_required_members(uint8 *required, uint64 *epoch)
+{
+	memcpy(required, history_required, sizeof(history_required)); *epoch = history_epoch;
+	return history_members_ok;
+}
+int cluster_undo_horizon_sample_views(ClusterUndoHorizonReportView *views, int capacity)
+{
+	UT_ASSERT_EQ(capacity, CLUSTER_MAX_NODES);
+	if (history_probe) {
+		history_samples++;
+		UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);
+		UT_ASSERT(observation_scope_live && observation_cursor_live);
+		if (history_sample_step != NULL) history_sample_step();
+	}
+	memcpy(views, history_views, sizeof(history_views)); return history_view_count;
+}
+static void
+history_fixture_reset(void)
+{
+	cluster_undo_retention_horizon_enabled = true; history_local_floor = 1000000;
+	memset(history_views, 0, sizeof(history_views)); memset(history_required, 0, sizeof(history_required));
+	history_members_ok = true; history_fence = history_disabled = false;
+	history_probe = history_expect_wait = false; history_view_count = CLUSTER_MAX_NODES;
+	history_epoch = 4; history_samples = 0; history_sample_step = NULL;
+}
+#include "test_cluster_cold_history_scn.inc"
+#include "../../backend/cluster/cluster_undo_horizon.c"
 static const struct ClusterRecoveryStartV1 *destroy_probe;
 static ClusterRecoveryPlanShmem window_region;
 static bool found_window_region;
@@ -259,7 +325,11 @@ bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 	return true;
 }
 
-uint64 cluster_qvotec_get_self_incarnation(void) { return owner_boot; }
+uint64 cluster_qvotec_get_self_incarnation(void)
+{
+	if (relmap_owner_check_step != NULL) relmap_owner_check_step();
+	return owner_boot;
+}
 ClusterControlRootResult
 cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
 {
@@ -403,6 +473,12 @@ static void actual_startup_eor_claim(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 #include "test_cluster_cold_tx_writer.inc"
+/* Saved-receipt readers remain real. The physical recheck boundary is
+ * controlled here; the Startup storage component exercises its full body. */
+bool test_start_unused_relmap_recheck(const struct ClusterRecoveryStartV1 *start);
+#define cluster_cold_relmap_replay_recheck_v1 test_start_unused_relmap_recheck
+#include "../../backend/cluster/cluster_cold_recovery_relmap.c"
+#undef cluster_cold_relmap_replay_recheck_v1
 #include "test_cluster_cold_tx_owner.inc"
 #include "test_cluster_cold_tx_xid_maximum.inc"
 #include "test_cluster_cold_tx_consumer.inc"
@@ -420,6 +496,11 @@ static void actual_startup_tx_begin(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 }
 
 static ClusterColdTypedV1 typed;
+static ClusterColdPlanV1 relmap_start_plan;
+static ColdRelmapInput relmap_start_entries[2];
+static unsigned relmap_observe_checks, relmap_observe_fault_at;
+static bool relmap_observe_allowed;
+static void (*relmap_observe_step)(void);
 static bool ctrc_census_ok, ctrc_census_drift;
 static unsigned ctrc_census_calls;
 static ClusterColdCtrcReleaseCensusV1 ctrc_census;
@@ -626,6 +707,11 @@ bool cluster_undo_smgr_recovery_abort_write_v1(ClusterUndoSmgrRecoveryStampV1 st
 
 static void reset(void)
 {
+	history_fixture_reset();
+	relmap_owner_check_step = NULL;
+	relmap_observe_checks = relmap_observe_fault_at = 0;
+	relmap_observe_allowed = false;
+	relmap_observe_step = NULL;
 	memset(&startup_first_floor, 0, sizeof(startup_first_floor));
 	startup_first_calls = 0; startup_first_available = true; startup_first_step = NULL;
 	ctrc_driver_acquires = ctrc_driver_authorizations = ctrc_driver_waits = 0;
@@ -668,7 +754,12 @@ static void reset(void)
 	memset(&clusterStartupWriter, 0, sizeof(clusterStartupWriter));
 	memset(&observed_writer, 0, sizeof(observed_writer));
 	typed.tx_fence = (struct ClusterRecoveryFencePlan *)&tx_fence_object;
-	typed.plan = (ClusterColdPlanV1 *)&typed;
+	memset(&relmap_start_plan, 0, sizeof(relmap_start_plan));
+	memset(relmap_start_entries, 0, sizeof(relmap_start_entries));
+	relmap_start_plan.magic = CLUSTER_COLD_PLAN_MAGIC;
+	relmap_start_plan.phase = COLD_PHASE_SEALED;
+	typed.plan = &relmap_start_plan;
+	typed.effects_receipt.plan = typed.plan; /* Sealed before the first C0 use. */
 	typed.top_tx_census = &census;
 	census.plan = typed.plan;
 	typed.participant_count = 1;
@@ -915,6 +1006,30 @@ UT_TEST(test_process_cleanup_revokes_start_before_destroying_original_inputs)
 	UT_ASSERT(cluster_recovery_cold_inputs == NULL);
 	UT_ASSERT(!ClusterBeginColdRecoveryTx(&info));
 }
+
+#if defined(TEST_CLUSTER_STARTUP_NATIVE_CTRC) && defined(TEST_CLUSTER_STARTUP_NATIVE_FIRST)
+UT_TEST(test_start_borrows_only_its_original_completed_retention_owner)
+{
+	ClusterWalReadPinOwnerV1 owner, refused;
+	const struct ClusterRecoveryStartV1 *original;
+	reset(); retain();
+	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	original = info.cluster_tx_start;
+	owner = ClusterColdRecoveryTxInputOwnerV1(original);
+	UT_ASSERT(owner.pin == NULL && owner.generation == 0);
+	UT_ASSERT(owner.recovery_pin == (ClusterWalRetentionPin *)&tx_fence_object);
+	UT_ASSERT_EQ(owner.recovery_generation, 11);
+	refused = ClusterColdRecoveryTxInputOwnerV1((const struct ClusterRecoveryStartV1 *)&owner);
+	UT_ASSERT(refused.recovery_pin == NULL);
+	tx_fence_current = false;
+	refused = ClusterColdRecoveryTxInputOwnerV1(original);
+	UT_ASSERT(refused.recovery_pin == NULL);
+	UT_ASSERT(cluster_recovery_cold_inputs != NULL); /* refusal does not release */
+	cluster_recovery_cold_inputs_cleanup(1, (Datum)0);
+	refused = ClusterColdRecoveryTxInputOwnerV1(original);
+	UT_ASSERT(refused.recovery_pin == NULL);
+}
+#endif
 
 static void active_subject(void)
 {
@@ -1824,7 +1939,8 @@ WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event_info)
 	UT_ASSERT(latch == MyLatch);
 	UT_ASSERT_EQ(events, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH);
 	UT_ASSERT_EQ(timeout, 100);
-	if (ctrc_driver_waiting) {
+	if (ctrc_driver_waiting || (history_probe && history_expect_wait
+		&& wait_event_info == WAIT_EVENT_CLUSTER_THREAD_RECOVERY)) {
 		UT_ASSERT_EQ(wait_event_info, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
 		UT_ASSERT(observation_cursor_live && observation_scope_live);
 		UT_ASSERT_EQ(ctrc_driver_lwlocks, 0);
@@ -2370,13 +2486,18 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_completed_readback.inc"
 #include "test_cluster_cold_ctrc_unchanged_custody.inc"
 #include "test_cluster_cold_ctrc_page_image.inc"
+#include "test_cluster_cold_ctrc_page_owner.inc"
 #include "test_cluster_cold_ctrc_final_projection.inc"
 #include "test_cluster_cold_ctrc_heap_refs.inc"
 #include "test_cluster_cold_ctrc_hot_refs.inc"
 
 #include "test_cluster_cold_ctrc_references.inc"
+#include "test_cluster_cold_ctrc_images.inc"
 #include "test_cluster_cold_ctrc_tx_records.inc"
+#include "test_cluster_cold_ctrc_native_records.inc"
+#include "test_cluster_cold_ctrc_compound_obligations.inc"
 #include "test_cluster_cold_ctrc_tx_dependencies.inc"
+#include "test_cluster_cold_ctrc_tx_reference_edges.inc"
 #include "test_cluster_cold_ctrc_reference_terminals.inc"
 #include "test_cluster_cold_ctrc_reference_tuples.inc"
 #include "test_cluster_cold_ctrc_census_hot.inc"
@@ -2397,8 +2518,232 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_ctrc_native_first.inc"
 #endif
 
+#include "test_cluster_cold_ctrc_tx_forest_terminals.inc"
+
+#include "test_cluster_cold_ctrc_effects_receipt.inc"
+#include "test_cluster_cold_ctrc_effects_lifetime.inc"
+#include "test_cluster_cold_ctrc_final_tx_recheck.inc"
+#include "test_cluster_cold_ctrc_history_horizon.inc"
+
+#include "test_cluster_cold_ctrc_owner_routes.inc"
+
+#include "test_cluster_cold_ctrc_raw_records.inc"
+
+#include "test_cluster_cold_ctrc_owner_round.inc"
+#include "test_cluster_cold_ctrc_owner_continuation.inc"
+#include "test_cluster_cold_ctrc_owner_completion.inc"
+#include "test_cluster_cold_ctrc_owner_inventory.inc"
+#include "test_cluster_cold_ctrc_owner_references.inc"
+#include "test_cluster_cold_ctrc_owner_scopes.inc"
+#include "test_cluster_cold_ctrc_reference_graph.inc"
+#include "test_cluster_cold_ctrc_projected_graph.inc"
+#include "test_cluster_cold_ctrc_graph_contribution.inc"
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+#include "test_cluster_cold_ctrc_tuple_graph.inc"
+#include "test_cluster_cold_ctrc_hot_graph.inc"
+#include "test_cluster_cold_ctrc_reference_coverage.inc"
+#include "test_cluster_cold_ctrc_redirect_graph.inc"
+#endif
+
+#include "test_cluster_cold_ctrc_page_raw.inc"
+
+#include "test_cluster_cold_tx_relmap_handoff.inc"
+#include "test_cluster_cold_ctrc_relmap_gate.inc"
+
 int main(void)
 {
+#ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
+	if (getenv("PGRAC_PRE2_TEST_REDIRECT_GRAPH") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_start_redirect_graph_keeps_actual_line_pointer_and_full_target_identity);
+		UT_RUN(test_start_redirect_graph_coverage_resolves_topology_without_erasing_free_slots);
+		UT_RUN(test_start_redirect_graph_missing_history_duplicate_and_changed_identity_stay_open);
+		UT_RUN(test_start_redirect_graph_late_change_wait_error_keep_whole_output_and_original_debt);
+		UT_RUN(test_start_redirect_graph_observation_and_pre_page_capacity_keep_original_contract);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_REFERENCE_COVERAGE") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
+		UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
+		UT_RUN(test_start_reference_coverage_missing_duplicate_history_and_changed_members_remain);
+		UT_RUN(test_start_reference_coverage_does_not_erase_redirect_history_or_tuple_duties);
+		UT_RUN(test_start_reference_coverage_late_change_wait_error_and_whole_budget_keep_debt);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_HOT_GRAPH") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_start_hot_graph_binds_complete_native_current_chains);
+		UT_RUN(test_start_hot_graph_missing_or_changed_member_keeps_entire_chain);
+		UT_RUN(test_start_hot_graph_late_change_wait_error_preserves_whole_debt);
+		UT_RUN(test_start_hot_graph_budget_observation_and_history_keep_original_gates);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_TUPLE_GRAPH") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_start_tuple_graph_uses_complete_native_tuple_and_original_itl_identity);
+		UT_RUN(test_start_tuple_graph_missing_ambiguous_and_unproved_itls_keep_whole_item);
+		UT_RUN(test_start_tuple_graph_rejects_changed_bytes_layout_and_unsupported_fields);
+		UT_RUN(test_start_tuple_graph_late_payload_and_wait_error_publish_no_prefix);
+		UT_RUN(test_start_tuple_graph_whole_tuple_budget_precedes_page);
+		UT_RUN(test_start_tuple_graph_observation_and_history_remain_unresolved);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+#endif
+	if (getenv("PGRAC_PRE2_TEST_PAGE_GRAPH_CONTRIBUTION") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
+		UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
+		UT_RUN(test_start_page_contribution_deduplicates_roots_without_dropping_original_entries);
+		UT_RUN(test_start_page_contribution_wait_error_and_late_drift_publish_no_prefix);
+		UT_RUN(test_start_page_contribution_whole_budget_and_oom_precede_first_page);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_PROJECTED_GRAPH") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_start_projected_graph_binds_real_data_and_lock_terminal_projection);
+		UT_RUN(test_start_projected_graph_rejects_changed_terminal_or_unrelated_itl_bytes);
+		UT_RUN(test_start_projected_graph_requires_full_canonical_identity_and_keeps_other_duties);
+		UT_RUN(test_start_projected_graph_ordinary_mode_never_claims_discharge);
+		UT_RUN(test_start_projected_graph_late_terminal_wait_error_preserve_whole_output_and_debt);
+		UT_RUN(test_start_projected_graph_reserves_whole_terminal_vector_before_page);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_START_PAGE_RAW") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_start_page_raw_preserves_original_whole_bytes_and_pending_service);
+		UT_RUN(test_start_page_raw_missing_changed_and_wrong_end_revoke_whole_observation);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_REFERENCE_GRAPH") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_start_reference_graph_uses_actual_itl_offset_full_identity_and_same_owner_bytes);
+		UT_RUN(test_start_reference_graph_does_not_borrow_equal_xid_or_another_physical_slot);
+		UT_RUN(test_start_reference_graph_preserves_history_free_tuple_and_invalid_layout_as_unresolved);
+		UT_RUN(test_start_reference_graph_retains_whole_page_bytes_and_distinct_field_keys);
+		UT_RUN(test_start_reference_graph_late_refusal_wait_error_and_budget_publish_no_prefix);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_OWNER_SCOPES") != NULL) {
+		UT_PLAN(7);
+	UT_RUN(test_start_page_owner_scopes_bind_full_transaction_effects_and_completion);
+	UT_RUN(test_start_page_owner_scopes_preserve_unmatched_and_other_transaction_duties);
+	UT_RUN(test_start_page_owner_scopes_refuse_incomplete_source_record_or_component);
+	UT_RUN(test_start_page_owner_scopes_refuse_late_input_changes_without_rebasing);
+	UT_RUN(test_start_page_owner_scopes_wait_error_keep_original_debt_and_whole_output);
+	UT_RUN(test_start_page_owner_scopes_capacity_and_oom_precede_page);
+	UT_RUN(test_start_page_owner_scopes_use_original_root_order_not_physical_order);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_OWNER_REFERENCES") != NULL) {
+		UT_PLAN(6);
+	UT_RUN(test_start_page_owner_references_keep_full_original_order_and_distinct_duties);
+	UT_RUN(test_start_page_owner_references_retain_unmatched_and_complete_empty_views);
+	UT_RUN(test_start_page_owner_references_preflight_full_member_mapping_and_shape);
+	UT_RUN(test_start_page_owner_references_reject_late_full_identity_or_set_drift);
+	UT_RUN(test_start_page_owner_references_wait_and_error_publish_no_prefix_or_release);
+	UT_RUN(test_start_page_owner_references_whole_budget_and_oom_precede_page);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_OWNER_INVENTORY") != NULL) {
+		UT_PLAN(6);
+	UT_RUN(test_startup_owner_inventory_builds_complete_actual_page_witnesses);
+	UT_RUN(test_startup_owner_inventory_later_target_cannot_replace_first_operation);
+	UT_RUN(test_startup_owner_inventory_wait_publishes_no_prefix_and_restarts_first);
+	UT_RUN(test_startup_owner_inventory_error_frees_only_local_output_and_keeps_debt);
+	UT_RUN(test_startup_owner_inventory_preflights_every_target_without_partial_reads);
+	UT_RUN(test_startup_owner_inventory_budget_and_oom_refuse_before_first_page);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_OWNER_COMPLETION") != NULL) {
+		UT_PLAN(6);
+	UT_RUN(test_startup_owner_completion_uses_actual_rule_and_complete_native_witness);
+	UT_RUN(test_startup_owner_completion_rejects_incomplete_or_wrong_object_witness);
+	UT_RUN(test_startup_owner_completion_wait_and_late_drift_never_encode_success);
+	UT_RUN(test_startup_owner_completion_error_keeps_native_duty_and_private_cleanup);
+	UT_RUN(test_startup_owner_completion_budget_and_bad_handle_refuse_before_native_read);
+	UT_RUN(test_startup_owner_completion_changed_input_during_read_cannot_replace_snapshot);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_OWNER_CONTINUATION") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_owner_continuation_stable_directory_and_h_wait_keep_same_operations);
+		UT_RUN(test_startup_owner_continuation_directory_wait_cannot_replace_original_sample);
+		UT_RUN(test_startup_owner_continuation_h_wait_cannot_replace_original_sample);
+		UT_RUN(test_startup_owner_continuation_last_directory_callback_cannot_change_sample);
+		UT_RUN(test_startup_owner_continuation_last_h_sample_cannot_change_sample);
+		UT_RUN(test_startup_owner_continuation_directory_and_h_errors_keep_original_custody);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_OWNER_ROUND") != NULL) {
+		UT_PLAN(7);
+	UT_RUN(test_startup_owner_round_keeps_complete_fpi_and_unchanged_set);
+	UT_RUN(test_startup_owner_round_later_target_cannot_change_earlier_operation);
+	UT_RUN(test_startup_owner_round_final_nonpage_check_cannot_change_completed_set);
+	UT_RUN(test_startup_owner_round_wait_restarts_first_target_without_new_operation);
+	UT_RUN(test_startup_owner_round_wait_cannot_rebase_changed_first_operation);
+	UT_RUN(test_startup_owner_round_late_error_keeps_original_cleanup);
+	UT_RUN(test_startup_owner_round_reserves_complete_snapshot_before_first_page);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+
+	if (getenv("PGRAC_PRE2_TEST_START_RAW_RECORDS") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
+		UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+
+	if (getenv("PGRAC_PRE2_TEST_START_OWNER_ROUTES") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_start_owner_routes_keep_distinct_mx_duties_without_accepting_completion);
+		UT_RUN(test_start_owner_routes_refuse_missing_unknown_partial_extra_and_nonempty_end);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+
+	if (getenv("PGRAC_PRE2_TEST_START_HISTORY_HORIZON") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_history_uses_original_finite_cohort_floor);
+		UT_RUN(test_startup_history_missing_equal_stale_reports_wait_without_rebase);
+		UT_RUN(test_startup_history_wait_repeats_physical_checks_and_keeps_debt);
+		UT_RUN(test_startup_history_sampling_error_and_late_terminal_refuse);
+		UT_RUN(test_startup_history_requalifies_after_independent_service);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_START_FINAL_TX_RECHECK") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_startup_final_tx_rechecks_complete_forest_before_and_after_service);
+		UT_RUN(test_startup_final_tx_late_record_error_owner_and_end_retain_original_debt);
+		UT_RUN(test_startup_final_tx_drift_during_service_cannot_retire_inputs);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_START_EFFECTS_LIFETIME") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_effects_lifetime_stable_input_survives_complete_handoff);
+		UT_RUN(test_startup_effects_lifetime_first_validation_cannot_rebase_before_page);
+		UT_RUN(test_startup_effects_lifetime_service_wait_cannot_replace_input);
+		UT_RUN(test_startup_effects_lifetime_repeated_page_call_keeps_original_input);
+		UT_RUN(test_startup_effects_lifetime_final_owner_cannot_accept_changed_input);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_START_EFFECTS_RECEIPT") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_effects_receipt_keeps_fpi_unchanged_and_zero_page_input);
+		UT_RUN(test_startup_effects_receipt_late_unready_refuses_service_and_retry);
+		UT_RUN(test_startup_effects_receipt_complete_value_cannot_change_after_page_checks);
+		UT_RUN(test_startup_effects_receipt_local_wait_cannot_rebase_original_input);
+		UT_RUN(test_startup_effects_receipt_error_keeps_original_cleanup_debt);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_START_TX_FOREST_TERMINALS") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_startup_tx_forest_covers_complete_native_records_and_empty_end);
+		UT_RUN(test_startup_tx_forest_nonroot_full_identity_requires_canonical_terminal);
+		UT_RUN(test_startup_tx_forest_incomplete_record_or_end_refuses_service);
+		UT_RUN(test_startup_tx_forest_late_current_and_error_keep_original_debt);
+		UT_RUN(test_startup_tx_forest_zero_page_still_checks_all_native_transactions);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_IMAGES") != NULL) {
 		UT_PLAN(4);
@@ -2440,6 +2785,29 @@ int main(void)
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
 
+	if (getenv("PGRAC_PRE2_TEST_CTRC_RELMAP_GATE") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_ctrc_relmap_gate_preserves_undeclared_path);
+		UT_RUN(test_ctrc_relmap_gate_rechecks_every_observation_without_completion);
+		UT_RUN(test_ctrc_relmap_gate_refuses_before_census_without_retry);
+		UT_RUN(test_ctrc_relmap_gate_late_refusal_retires_only_observation);
+		UT_RUN(test_ctrc_relmap_gate_error_revokes_same_episode);
+		UT_RUN(test_ctrc_relmap_gate_provider_cannot_rebind_owner);
+		UT_RUN(test_ctrc_relmap_gate_cannot_replace_original_terminals);
+		UT_RUN(test_ctrc_relmap_gate_withdraws_old_observation_during_recheck);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_RELMAP_START_HANDOFF") != NULL) {
+		UT_PLAN(7);
+		UT_RUN(test_start_automatically_keeps_replayed_relmap_in_joint_obligation);
+		UT_RUN(test_start_refuses_incomplete_or_failed_relmap_receipts);
+		UT_RUN(test_start_cannot_silently_drop_relmap_source_or_cut);
+		UT_RUN(test_start_relmap_receipt_is_complete_by_value_and_bound_to_original_owner);
+		UT_RUN(test_start_relmap_receipt_drift_or_owner_error_revokes_without_destruction);
+		UT_RUN(test_start_relmap_registration_refusal_or_error_keeps_original_inputs);
+		UT_RUN(test_start_relmap_registration_rechecks_saved_batch_after_providers);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_UNTOUCHED_PAGES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_startup_untouched_pages_complete_saved_set_including_zero_page_wal);
@@ -2557,6 +2925,16 @@ int main(void)
 		UT_RUN(test_startup_final_projection_wait_reuses_same_fd_without_new_wal);
 		UT_RUN(test_startup_final_projection_repeat_does_not_cache_success);
 		UT_RUN(test_startup_final_projection_budget_is_reserved_before_first_page);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_PAGE_OWNER") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_startup_page_owner_uses_original_completed_operation_and_full_image);
+		UT_RUN(test_startup_page_owner_missing_pending_or_unsupported_target_has_no_proof);
+		UT_RUN(test_startup_page_owner_late_cleanup_drift_publishes_no_metadata_or_bytes);
+		UT_RUN(test_startup_page_owner_wait_rechecks_without_cached_rule_or_new_wal);
+		UT_RUN(test_startup_page_owner_false_or_error_preserves_all_original_custody);
+		UT_RUN(test_startup_page_owner_scratch_is_reserved_before_first_page);
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_PAGE_IMAGE") != NULL) {
@@ -2752,6 +3130,14 @@ int main(void)
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;
 	}
+	if (getenv("PGRAC_PRE2_TEST_START_TX_REFERENCE_EDGES") != NULL) {
+		UT_PLAN(4);
+		UT_RUN(test_start_tx_references_preserve_exact_member_itl_free_tuple_and_end);
+		UT_RUN(test_start_tx_references_preconditions_do_not_enter);
+		UT_RUN(test_start_tx_references_late_owner_source_shape_and_pointer_are_sticky);
+		UT_RUN(test_start_tx_references_error_retains_original_debt_and_reverse_cleanup);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_START_TX_DEPENDENCIES") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_start_tx_dependencies_keep_exact_original_roots_edge_and_empty_end);
@@ -2768,12 +3154,55 @@ int main(void)
 		UT_RUN(test_start_tx_records_error_cleans_original_observation_in_order);
 		UT_DONE(); return ut_failed_count != 0;
 	}
+	if (getenv("PGRAC_PRE2_TEST_START_COMPOUND_OBLIGATIONS") != NULL) {
+		UT_PLAN(2);
+		UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
+		UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_RECORDS") != NULL) {
+		UT_PLAN(3);
+	UT_RUN(test_start_native_records_complete_unfiltered_input_and_empty_end);
+	UT_RUN(test_start_native_records_preconditions_do_not_enter_or_replace_owner);
+	UT_RUN(test_start_native_records_late_shape_source_owner_and_error_revoke_whole_view);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(322);
+	UT_PLAN(460);
+	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
+	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
+	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
+
+	UT_RUN(test_start_owner_routes_keep_distinct_mx_duties_without_accepting_completion);
+	UT_RUN(test_start_owner_routes_refuse_missing_unknown_partial_extra_and_nonempty_end);
+
+	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
+	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(318);
+	UT_PLAN(449);
 #endif
+	UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
+	UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
+	UT_RUN(test_start_reference_coverage_missing_duplicate_history_and_changed_members_remain);
+	UT_RUN(test_start_reference_coverage_does_not_erase_redirect_history_or_tuple_duties);
+	UT_RUN(test_start_reference_coverage_late_change_wait_error_and_whole_budget_keep_debt);
+	UT_RUN(test_start_redirect_graph_keeps_actual_line_pointer_and_full_target_identity);
+	UT_RUN(test_start_redirect_graph_coverage_resolves_topology_without_erasing_free_slots);
+	UT_RUN(test_start_redirect_graph_missing_history_duplicate_and_changed_identity_stay_open);
+	UT_RUN(test_start_redirect_graph_late_change_wait_error_keep_whole_output_and_original_debt);
+	UT_RUN(test_start_redirect_graph_observation_and_pre_page_capacity_keep_original_contract);
+	UT_RUN(test_start_hot_graph_binds_complete_native_current_chains);
+	UT_RUN(test_start_hot_graph_missing_or_changed_member_keeps_entire_chain);
+	UT_RUN(test_start_hot_graph_late_change_wait_error_preserves_whole_debt);
+	UT_RUN(test_start_hot_graph_budget_observation_and_history_keep_original_gates);
+	UT_RUN(test_start_tuple_graph_uses_complete_native_tuple_and_original_itl_identity);
+	UT_RUN(test_start_tuple_graph_missing_ambiguous_and_unproved_itls_keep_whole_item);
+	UT_RUN(test_start_tuple_graph_rejects_changed_bytes_layout_and_unsupported_fields);
+	UT_RUN(test_start_tuple_graph_late_payload_and_wait_error_publish_no_prefix);
+	UT_RUN(test_start_tuple_graph_whole_tuple_budget_precedes_page);
+	UT_RUN(test_start_tuple_graph_observation_and_history_remain_unresolved);
+
 	UT_RUN(test_startup_native_images_accept_only_unchanged_complete_terminal_page);
 	UT_RUN(test_startup_native_images_reject_unresolved_ambiguous_and_mx_itls);
 	UT_RUN(test_startup_native_images_reject_dangling_tuple_hot_and_residual_locks);
@@ -2783,8 +3212,94 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(310);
+	UT_PLAN(421);
 #endif
+	UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
+	UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
+	UT_RUN(test_start_page_contribution_deduplicates_roots_without_dropping_original_entries);
+	UT_RUN(test_start_page_contribution_wait_error_and_late_drift_publish_no_prefix);
+	UT_RUN(test_start_page_contribution_whole_budget_and_oom_precede_first_page);
+	UT_RUN(test_start_projected_graph_binds_real_data_and_lock_terminal_projection);
+	UT_RUN(test_start_projected_graph_rejects_changed_terminal_or_unrelated_itl_bytes);
+	UT_RUN(test_start_projected_graph_requires_full_canonical_identity_and_keeps_other_duties);
+	UT_RUN(test_start_projected_graph_ordinary_mode_never_claims_discharge);
+	UT_RUN(test_start_projected_graph_late_terminal_wait_error_preserve_whole_output_and_debt);
+	UT_RUN(test_start_projected_graph_reserves_whole_terminal_vector_before_page);
+	UT_RUN(test_start_reference_graph_uses_actual_itl_offset_full_identity_and_same_owner_bytes);
+	UT_RUN(test_start_reference_graph_does_not_borrow_equal_xid_or_another_physical_slot);
+	UT_RUN(test_start_reference_graph_preserves_history_free_tuple_and_invalid_layout_as_unresolved);
+	UT_RUN(test_start_reference_graph_retains_whole_page_bytes_and_distinct_field_keys);
+	UT_RUN(test_start_reference_graph_late_refusal_wait_error_and_budget_publish_no_prefix);
+	UT_RUN(test_start_page_owner_scopes_bind_full_transaction_effects_and_completion);
+	UT_RUN(test_start_page_owner_scopes_preserve_unmatched_and_other_transaction_duties);
+	UT_RUN(test_start_page_owner_scopes_refuse_incomplete_source_record_or_component);
+	UT_RUN(test_start_page_owner_scopes_refuse_late_input_changes_without_rebasing);
+	UT_RUN(test_start_page_owner_scopes_wait_error_keep_original_debt_and_whole_output);
+	UT_RUN(test_start_page_owner_scopes_capacity_and_oom_precede_page);
+	UT_RUN(test_start_page_owner_scopes_use_original_root_order_not_physical_order);
+	UT_RUN(test_start_page_owner_references_keep_full_original_order_and_distinct_duties);
+	UT_RUN(test_start_page_owner_references_retain_unmatched_and_complete_empty_views);
+	UT_RUN(test_start_page_owner_references_preflight_full_member_mapping_and_shape);
+	UT_RUN(test_start_page_owner_references_reject_late_full_identity_or_set_drift);
+	UT_RUN(test_start_page_owner_references_wait_and_error_publish_no_prefix_or_release);
+	UT_RUN(test_start_page_owner_references_whole_budget_and_oom_precede_page);
+	UT_RUN(test_startup_owner_continuation_stable_directory_and_h_wait_keep_same_operations);
+	UT_RUN(test_startup_owner_continuation_directory_wait_cannot_replace_original_sample);
+	UT_RUN(test_startup_owner_continuation_h_wait_cannot_replace_original_sample);
+	UT_RUN(test_startup_owner_continuation_last_directory_callback_cannot_change_sample);
+	UT_RUN(test_startup_owner_continuation_last_h_sample_cannot_change_sample);
+	UT_RUN(test_startup_owner_continuation_directory_and_h_errors_keep_original_custody);
+	UT_RUN(test_start_page_raw_preserves_original_whole_bytes_and_pending_service);
+	UT_RUN(test_start_page_raw_missing_changed_and_wrong_end_revoke_whole_observation);
+	UT_RUN(test_startup_owner_inventory_builds_complete_actual_page_witnesses);
+	UT_RUN(test_startup_owner_inventory_later_target_cannot_replace_first_operation);
+	UT_RUN(test_startup_owner_inventory_wait_publishes_no_prefix_and_restarts_first);
+	UT_RUN(test_startup_owner_inventory_error_frees_only_local_output_and_keeps_debt);
+	UT_RUN(test_startup_owner_inventory_preflights_every_target_without_partial_reads);
+	UT_RUN(test_startup_owner_inventory_budget_and_oom_refuse_before_first_page);
+	UT_RUN(test_startup_owner_completion_uses_actual_rule_and_complete_native_witness);
+	UT_RUN(test_startup_owner_completion_rejects_incomplete_or_wrong_object_witness);
+	UT_RUN(test_startup_owner_completion_wait_and_late_drift_never_encode_success);
+	UT_RUN(test_startup_owner_completion_error_keeps_native_duty_and_private_cleanup);
+	UT_RUN(test_startup_owner_completion_budget_and_bad_handle_refuse_before_native_read);
+	UT_RUN(test_startup_owner_completion_changed_input_during_read_cannot_replace_snapshot);
+	UT_RUN(test_startup_owner_round_keeps_complete_fpi_and_unchanged_set);
+	UT_RUN(test_startup_owner_round_later_target_cannot_change_earlier_operation);
+	UT_RUN(test_startup_owner_round_final_nonpage_check_cannot_change_completed_set);
+	UT_RUN(test_startup_owner_round_wait_restarts_first_target_without_new_operation);
+	UT_RUN(test_startup_owner_round_wait_cannot_rebase_changed_first_operation);
+	UT_RUN(test_startup_owner_round_late_error_keeps_original_cleanup);
+	UT_RUN(test_startup_owner_round_reserves_complete_snapshot_before_first_page);
+	UT_RUN(test_start_native_records_complete_unfiltered_input_and_empty_end);
+	UT_RUN(test_start_native_records_preconditions_do_not_enter_or_replace_owner);
+	UT_RUN(test_start_native_records_late_shape_source_owner_and_error_revoke_whole_view);
+	UT_RUN(test_startup_history_uses_original_finite_cohort_floor);
+	UT_RUN(test_startup_history_missing_equal_stale_reports_wait_without_rebase);
+	UT_RUN(test_startup_history_wait_repeats_physical_checks_and_keeps_debt);
+	UT_RUN(test_startup_history_sampling_error_and_late_terminal_refuse);
+	UT_RUN(test_startup_history_requalifies_after_independent_service);
+	UT_RUN(test_startup_final_tx_rechecks_complete_forest_before_and_after_service);
+	UT_RUN(test_startup_final_tx_late_record_error_owner_and_end_retain_original_debt);
+	UT_RUN(test_startup_final_tx_drift_during_service_cannot_retire_inputs);
+	UT_RUN(test_startup_effects_lifetime_stable_input_survives_complete_handoff);
+	UT_RUN(test_startup_effects_lifetime_first_validation_cannot_rebase_before_page);
+	UT_RUN(test_startup_effects_lifetime_service_wait_cannot_replace_input);
+	UT_RUN(test_startup_effects_lifetime_repeated_page_call_keeps_original_input);
+	UT_RUN(test_startup_effects_lifetime_final_owner_cannot_accept_changed_input);
+	UT_RUN(test_startup_effects_receipt_keeps_fpi_unchanged_and_zero_page_input);
+	UT_RUN(test_startup_effects_receipt_late_unready_refuses_service_and_retry);
+	UT_RUN(test_startup_effects_receipt_complete_value_cannot_change_after_page_checks);
+	UT_RUN(test_startup_effects_receipt_local_wait_cannot_rebase_original_input);
+	UT_RUN(test_startup_effects_receipt_error_keeps_original_cleanup_debt);
+	UT_RUN(test_startup_tx_forest_covers_complete_native_records_and_empty_end);
+	UT_RUN(test_startup_tx_forest_nonroot_full_identity_requires_canonical_terminal);
+	UT_RUN(test_startup_tx_forest_incomplete_record_or_end_refuses_service);
+	UT_RUN(test_startup_tx_forest_late_current_and_error_keep_original_debt);
+	UT_RUN(test_startup_tx_forest_zero_page_still_checks_all_native_transactions);
+	UT_RUN(test_start_tx_references_preserve_exact_member_itl_free_tuple_and_end);
+	UT_RUN(test_start_tx_references_preconditions_do_not_enter);
+	UT_RUN(test_start_tx_references_late_owner_source_shape_and_pointer_are_sticky);
+	UT_RUN(test_start_tx_references_error_retains_original_debt_and_reverse_cleanup);
 	UT_RUN(test_start_tx_dependencies_keep_exact_original_roots_edge_and_empty_end);
 	UT_RUN(test_start_tx_dependencies_do_not_enter_with_other_work_lock_or_range);
 	UT_RUN(test_start_tx_dependencies_bad_shape_late_owner_and_source_are_sticky);
@@ -2809,6 +3324,21 @@ int main(void)
 	UT_RUN(test_startup_post_service_rechecks_untouched_census_before_handoff);
 	UT_RUN(test_startup_post_service_first_directory_owner_and_cancel_keep_debt);
 	UT_RUN(test_startup_post_service_local_wait_reuses_exact_results_and_fds);
+	UT_RUN(test_ctrc_relmap_gate_preserves_undeclared_path);
+	UT_RUN(test_ctrc_relmap_gate_rechecks_every_observation_without_completion);
+	UT_RUN(test_ctrc_relmap_gate_refuses_before_census_without_retry);
+	UT_RUN(test_ctrc_relmap_gate_late_refusal_retires_only_observation);
+	UT_RUN(test_ctrc_relmap_gate_error_revokes_same_episode);
+	UT_RUN(test_ctrc_relmap_gate_provider_cannot_rebind_owner);
+	UT_RUN(test_ctrc_relmap_gate_cannot_replace_original_terminals);
+	UT_RUN(test_ctrc_relmap_gate_withdraws_old_observation_during_recheck);
+	UT_RUN(test_start_automatically_keeps_replayed_relmap_in_joint_obligation);
+	UT_RUN(test_start_refuses_incomplete_or_failed_relmap_receipts);
+	UT_RUN(test_start_cannot_silently_drop_relmap_source_or_cut);
+	UT_RUN(test_start_relmap_receipt_is_complete_by_value_and_bound_to_original_owner);
+	UT_RUN(test_start_relmap_receipt_drift_or_owner_error_revokes_without_destruction);
+	UT_RUN(test_start_relmap_registration_refusal_or_error_keeps_original_inputs);
+	UT_RUN(test_start_relmap_registration_rechecks_saved_batch_after_providers);
 	UT_RUN(test_startup_untouched_pages_complete_saved_set_including_zero_page_wal);
 	UT_RUN(test_startup_untouched_last_page_drift_or_absence_keeps_original_debt);
 	UT_RUN(test_startup_untouched_late_owner_loss_or_error_preserves_same_fd);
@@ -2877,6 +3407,12 @@ int main(void)
 	UT_RUN(test_startup_page_image_discards_bytes_after_page_cleanup_drift);
 	UT_RUN(test_startup_page_image_wait_has_no_cached_success_or_new_wal);
 	UT_RUN(test_startup_page_image_refusal_and_error_keep_original_cleanup_debt);
+	UT_RUN(test_startup_page_owner_uses_original_completed_operation_and_full_image);
+	UT_RUN(test_startup_page_owner_missing_pending_or_unsupported_target_has_no_proof);
+	UT_RUN(test_startup_page_owner_late_cleanup_drift_publishes_no_metadata_or_bytes);
+	UT_RUN(test_startup_page_owner_wait_rechecks_without_cached_rule_or_new_wal);
+	UT_RUN(test_startup_page_owner_false_or_error_preserves_all_original_custody);
+	UT_RUN(test_startup_page_owner_scratch_is_reserved_before_first_page);
 
 	UT_RUN(test_startup_unchanged_targets_keep_fds_and_full_readback_before_service);
 	UT_RUN(test_startup_unchanged_readback_refusal_or_error_keeps_original_cleanup);
@@ -3115,6 +3651,10 @@ int main(void)
 	UT_RUN(test_ctrc_references_cannot_rebind_same_start_to_another_complete_view);
 	UT_RUN(test_ctrc_references_error_uses_original_failure_and_reverse_cleanup);
 	UT_RUN(test_ctrc_references_after_getter_owner_drift_refuses_without_new_scope);
+	UT_RUN(test_start_images_borrow_full_original_versions_and_complete_empty_view);
+	UT_RUN(test_start_images_preconditions_never_enter_or_start_a_replacement);
+	UT_RUN(test_start_images_missing_or_rebound_collection_revokes_same_observation);
+	UT_RUN(test_start_images_error_or_late_owner_drift_preserve_original_cleanup);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

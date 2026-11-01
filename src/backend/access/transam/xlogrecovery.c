@@ -207,9 +207,13 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_recovery_census.h"
+#include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_page_install_ctrc.h"
 #include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_cr.h"
+#include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_undo_retention.h"
 #include "cluster/storage/cluster_shared_fs_page.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_writer.h"
@@ -737,6 +741,8 @@ struct ClusterRecoveryStartV1 {
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
 	bool revoked;
+	bool effects_fixed;
+	ClusterColdEffectsReceiptV1 effects_receipt;
 	bool relmap_declared;
 	bool ctrc_observation_started, ctrc_observation_complete;
 	bool ctrc_page_plan_started;
@@ -754,6 +760,7 @@ struct ClusterRecoveryStartV1 {
 	ClusterRecoveryCensusManifest ctrc_observation_manifest;
 	ClusterColdCtrcPhysicalV1 *ctrc_physical;
 	const ClusterRecoveryCensusReferencesV1 *ctrc_references;
+	const ClusterRecoveryCensusImagesV1 *ctrc_images;
 	const ClusterRecoveryCensusPagesV1 *ctrc_pages; /* PGRAC: original census owns this view */
 	uint32 ctrc_page_wal_count; /* PGRAC: full original PAGE WAL observation */
 	uint32 ctrc_wal_source_count; /* PGRAC: full original source coverage */
@@ -795,6 +802,7 @@ cluster_recovery_cold_observation_close(struct ClusterRecoveryStartV1 *start)
 	rf_page_online_plan_destroy_v1(&start->ctrc_page_plan);
 	if (page_sources != NULL) pfree(page_sources);
 	start->ctrc_references = NULL;
+	start->ctrc_images = NULL;
 	start->ctrc_pages = NULL;
 	start->ctrc_page_wal_count = 0;
 	start->ctrc_wal_source_count = 0;
@@ -858,8 +866,8 @@ cluster_recovery_cold_inputs_cleanup(int code, Datum arg)
 	cluster_cold_typed_destroy_v1(&cluster_recovery_cold_inputs);
 }
 
-/* Keep original inputs and their original formation/isolation proof owners
- * across EOR, never a live read scope or the old execution guards/pin.
+/* Keep original inputs, formation/isolation owners and continuous WALR
+ * across EOR. Original IR is already released; no live read scope survives.
  * Later mutation still needs fresh source, serial and writer authorization. */
 static void
 cluster_recovery_cold_inputs_retain(ClusterColdTypedV1 **typed)
@@ -938,14 +946,28 @@ ClusterColdRecoveryTxCurrent(const struct ClusterRecoveryStartV1 *start)
 		|| start->inputs != cluster_recovery_cold_inputs || start->inputs == NULL
 		|| start->inputs->inputs != NULL || start->inputs->plan == NULL
 		|| start->tx_fence == NULL || start->tx_fence != start->inputs->tx_fence
+		|| !cluster_recovery_merge_fence_plan_tx_current_v1(start->tx_fence, NULL)
 		|| start->census != start->inputs->top_tx_census || start->census == NULL
 		|| start->census->plan != start->inputs->plan
 		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
 		return false;
-	return start->install_generation == install_generation
+	if (!(start->install_generation == install_generation
 		&& cluster_recovery_cold_writer_same(&start->writer, &writer)
 		&& memcmp(start->operation_uuid, operation_uuid, 16) == 0
-		&& cluster_recovery_cold_pending_page_current(start);
+		&& cluster_recovery_cold_pending_page_current(start)))
+		return false;
+	/* Once first consumed, the original effects input belongs to this whole
+	 * Start, including independent service waits and final owner handoff.
+	 * Keep this check local: nowait/lock-held callers must not revoke the
+	 * shared checkpoint slot or retire any original resource here. */
+	if (start->effects_fixed
+		&& (!cluster_cold_typed_effects_ready_v1(start->inputs)
+			|| memcmp(&start->effects_receipt, &start->inputs->effects_receipt,
+				sizeof(start->effects_receipt)) != 0)) {
+		cluster_recovery_cold_start->revoked = true;
+		return false;
+	}
+	return true;
 }
 
 bool
@@ -998,10 +1020,61 @@ ClusterColdRecoveryRelmapFail(const struct ClusterRecoveryStartV1 *start)
 	/* Dependents, IR and WALR remain for the original reverse cleanup. */
 }
 
+struct ClusterColdRelmapReplayReceiptV1
+ClusterColdRecoveryRelmapReplayInput(const struct ClusterRecoveryStartV1 *start, uint32 index)
+{
+	ClusterColdRelmapReplayReceiptV1 value = {0}, empty = {0};
+
+	if (start == NULL || start != cluster_recovery_cold_start || !start->relmap_declared)
+		return empty;
+	/* The first current provider can throw too. Revoke the matching episode
+	 * on entered failure; never close its original plan, pins or dependents. */
+	PG_TRY();
+	{
+		uint32 count = cluster_cold_typed_relmap_replay_count_v1(start->inputs);
+
+		if (!ClusterColdRecoveryRelmapCurrent(start) || count == UINT32_MAX)
+			ClusterColdRecoveryRelmapFail(start);
+		else if (index < count) {
+			ClusterColdRelmapReplayReceiptV1 confirmed;
+
+			value = cluster_cold_typed_relmap_replay_input_v1(start->inputs, index);
+			if (!ClusterColdRecoveryRelmapCurrent(start)) {
+				value = empty;
+				ClusterColdRecoveryRelmapFail(start);
+			} else {
+				confirmed = cluster_cold_typed_relmap_replay_input_v1(start->inputs, index);
+				if (value.count != count || memcmp(&value, &confirmed, sizeof(value)) != 0) {
+					value = empty;
+					ClusterColdRecoveryRelmapFail(start);
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		ClusterColdRecoveryRelmapFail(start);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return value;
+}
+
 const struct ClusterColdTypedV1 *
 ClusterColdRecoveryTxInputs(const struct ClusterRecoveryStartV1 *start)
 {
 	return ClusterColdRecoveryTxCurrent(start) ? start->inputs : NULL;
+}
+
+ClusterWalReadPinOwnerV1
+ClusterColdRecoveryTxInputOwnerV1(const struct ClusterRecoveryStartV1 *start)
+{
+	ClusterWalReadPinOwnerV1 owner, empty = {0};
+
+	if (!ClusterColdRecoveryTxCurrent(start))
+		return empty;
+	owner = cluster_recovery_merge_fence_plan_tx_owner_v1(start->tx_fence);
+	return ClusterColdRecoveryTxCurrent(start) ? owner : empty;
 }
 
 bool
@@ -1161,11 +1234,27 @@ cluster_recovery_cold_observation_terminals_current(struct ClusterRecoveryStartV
 	return cluster_recovery_cold_observation_current(start);
 }
 
+/* Staging is one necessary input at this cut, never terminal qualification
+ * or a completion certificate. Every original observation, including a
+ * repeat, brackets its own census checks with the declared participant. */
+static bool
+cluster_recovery_cold_relmap_recheck(struct ClusterRecoveryStartV1 *start)
+{
+	if (!start->relmap_declared)
+		return true;
+	if (cluster_cold_relmap_replay_recheck_v1(start) && ClusterColdRecoveryRelmapCurrent(start))
+		return true;
+	ClusterColdRecoveryRelmapFail(start);
+	cluster_recovery_cold_observation_refuse(start, "relmap_staging", 0);
+	return false;
+}
+
 bool
 ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
 {
 	struct ClusterRecoveryStartV1 *state;
 	volatile bool candidate = false, observed = false;
+	bool repeated;
 	ClusterRecoveryCensusManifest confirmed;
 
 	if (start == NULL)
@@ -1182,9 +1271,18 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 		cluster_recovery_cold_observation_refuse(state, "owner", 0);
 		return false;
 	}
+	repeated = state->ctrc_observation_started;
+	if (state->relmap_declared) {
+		/* Withdraw a prior local observation before any participant callback.
+		 * Reentry must not borrow it while the physical pair is being checked. */
+		state->ctrc_observation_started = true;
+		state->ctrc_observation_complete = false;
+	}
 	PG_TRY();
 	{
-		if (state->ctrc_observation_started) {
+		if (!cluster_recovery_cold_relmap_recheck(state)) {
+			/* Keep original plan, FD, pins and persistent obligations. */
+		} else if (repeated) {
 			if (cluster_recovery_cold_observation_current(start)
 				&& cluster_recovery_census_manifest(state->ctrc_observation_census, &confirmed)
 				&& memcmp(&confirmed, &state->ctrc_observation_manifest, sizeof(confirmed)) == 0)
@@ -1255,7 +1353,7 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					cluster_recovery_cold_observation_refuse(state, "scope_begin", (int)scope_result);
 					break;
 				}
-				result = cluster_recovery_census_begin_ctrc(state->ctrc_observation_inputs,
+				result = cluster_recovery_census_begin_ctrc_images_v1(state->ctrc_observation_inputs,
 					memory_budget - bytes - physical_bytes, &state->ctrc_observation_census);
 				if (result != CLUSTER_RECOVERY_CENSUS_MORE) {
 					cluster_recovery_cold_observation_refuse(state, "census_begin", (int)result);
@@ -1310,17 +1408,20 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					cluster_recovery_census_pages_v1(state->ctrc_observation_census);
 				const ClusterRecoveryCensusReferencesV1 *references =
 					cluster_recovery_census_references_v1(state->ctrc_observation_census);
+				const ClusterRecoveryCensusImagesV1 *images =
+					cluster_recovery_census_images_v1(state->ctrc_observation_census);
 				uint32 page_wal_count = 0, wal_source_count = 0;
 
 				/* PGRAC: retain the complete original PAGE view only after all
 				 * original terminals. A repeat cannot replace that borrowed view. */
-				if (pages != NULL && references != NULL
+				if (pages != NULL && references != NULL && images != NULL
 					&& cluster_recovery_cold_observation_current(start)
 					&& (state->ctrc_pages == NULL || state->ctrc_pages == pages)
 					&& (state->ctrc_references == NULL || state->ctrc_references == references)
+					&& (state->ctrc_images == NULL || state->ctrc_images == images)
 					&& cluster_recovery_census_page_wal_count_v1(state->ctrc_observation_census,
 						&page_wal_count)
-					&& (!state->ctrc_observation_complete
+					&& (!repeated
 						|| page_wal_count == state->ctrc_page_wal_count)
 					&& cluster_recovery_cold_observation_current(start)) {
 					/* PGRAC: a zero PAGE count cannot omit non-PAGE or empty
@@ -1328,10 +1429,12 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					if (cluster_recovery_census_wal_source_count_v1(state->ctrc_observation_census,
 							&wal_source_count)
 						&& wal_source_count != 0 && wal_source_count == confirmed.source_count
-						&& (!state->ctrc_observation_complete
+						&& (!repeated
 							|| wal_source_count == state->ctrc_wal_source_count)
+						&& cluster_recovery_cold_relmap_recheck(state)
 						&& cluster_recovery_cold_observation_current(start)) {
 						state->ctrc_references = references;
+						state->ctrc_images = images;
 						state->ctrc_pages = pages;
 						state->ctrc_page_wal_count = page_wal_count;
 						state->ctrc_wal_source_count = wal_source_count;
@@ -1347,6 +1450,8 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 	}
 	PG_CATCH();
 	{
+		if (state->relmap_declared)
+			ClusterColdRecoveryRelmapFail(start);
 		cluster_recovery_cold_observation_refuse(state, "error", 0);
 		cluster_recovery_cold_observation_close(state);
 		PG_RE_THROW();
@@ -1963,13 +2068,21 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 		/* Completed raw handles outlive each native step. Reserve the full
 		 * preparation peak for every fixed target as well, before PAGE;
 		 * the active step keeps its existing independent peak check. */
-		if (work->counts.subject_count > (MaxAllocSize - 2 * sizeof(PGAlignedBlock))
+		if (work->counts.subject_count > (MaxAllocSize - 2 * sizeof(PGAlignedBlock)
+				- sizeof(RfPageCtrcOwnerProofV1))
 				/ sizeof(ClusterColdTtSlotInputV1)) {
 			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
 			return false;
 		}
 		projection_bytes = (Size)work->counts.subject_count * sizeof(ClusterColdTtSlotInputV1)
-			+ 2 * sizeof(PGAlignedBlock);
+			+ 2 * sizeof(PGAlignedBlock) + sizeof(RfPageCtrcOwnerProofV1);
+		/* The final owner round holds a complete operation/FD sample across
+		 * every PAGE and non-PAGE callback. Charge its peak before any write. */
+		if ((Size)count * sizeof(ClusterColdCtrcPageCompletedV1) > MaxAllocSize - projection_bytes) {
+			cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_CAPACITY);
+			return false;
+		}
+		projection_bytes += (Size)count * sizeof(ClusterColdCtrcPageCompletedV1);
 		if (budget <= bytes || projection_bytes >= budget - bytes || storage_bytes == 0
 			|| storage_bytes > (budget - bytes - projection_bytes) / count
 			|| budget - bytes - projection_bytes <= (Size)count * storage_bytes) {
@@ -1984,8 +2097,8 @@ ClusterColdRecoveryCtrcPageAdvance(const struct ClusterRecoveryStartV1 *start,
 		}
 		progress->budget = budget;
 		progress->allocation_bytes = bytes;
-		/* The final original-subject snapshot and both whole-page images
-		 * share this budget, reserved before the first PAGE/FPI as well. */
+		/* The final subject snapshot, readback/projector images and complete
+		 * owner-proof value share this budget before the first PAGE/FPI. */
 		progress->reserved_bytes = bytes + (Size)count * storage_bytes + projection_bytes;
 		progress->plan = state->ctrc_page_plan;
 		progress->sources = state->ctrc_page_sources;
@@ -2260,6 +2373,234 @@ ClusterColdRecoveryCtrcPageImage(const struct ClusterRecoveryStartV1 *start, uin
 	return result;
 }
 
+/* The original protected reader executes the completion predicates; this
+ * adapter accepts no caller outcome, rule, image or operation copy. Capture
+ * only immutable plan/result metadata after that reader has dropped PAGE/
+ * proof and rechecked the entire original Start and retained raw FD vector.
+ * No callback, native read, allocation or shared mutation follows publication.
+ * This is the PAGE owner's contribution, not complete graph/retention proof. */
+RfPageCtrcOwnerProofV1
+ClusterColdRecoveryCtrcPageOwnerProof(const struct ClusterRecoveryStartV1 *start, uint32 index)
+{
+	RfPageCtrcOwnerProofV1 result = {0};
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	const ClusterColdCtrcPageProgressV1 *entered;
+
+	result.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != state || !cluster_recovery_cold_ctrc_replays_actor()) return result;
+	entered = state->ctrc_page_progress;
+	if (entered == NULL || entered->pending || entered->next_target != entered->target_count
+		|| index >= entered->target_count || entered->completed[index].storage == NULL)
+		return result;
+	PG_TRY();
+	{
+		RfPageCtrcReadbackImageV1 readback = ClusterColdRecoveryCtrcPageImage(start, index);
+		ClusterColdCtrcPageProgressV1 *progress;
+		RfPageOnlineTargetViewV1 target;
+		ClusterRecoveryCensusPageV1 physical;
+		uint32 source_index;
+
+		result.detail = readback.detail;
+		if (readback.detail == RF_PAGE_PROOF_DETAIL_OK) {
+			/* PageImage's successful final current check is the last yielding
+			 * operation. Re-locate its saved objects before reading metadata. */
+			result.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+			progress = start == cluster_recovery_cold_start ? state->ctrc_page_progress : NULL;
+			if (progress != NULL && !progress->pending
+				&& progress->next_target == progress->target_count && index < progress->target_count
+				&& progress->completed[index].storage != NULL
+				&& progress->plan == state->ctrc_page_plan && progress->sources == state->ctrc_page_sources
+				&& progress->source_count == state->ctrc_page_source_count
+				&& rf_page_online_plan_target_v1(state->ctrc_page_plan, index, &target)
+				&& !target.history_only && target.page_identity.forknum == MAIN_FORKNUM
+				&& cluster_recovery_cold_page_target(start, &target, &physical) && physical.heap
+				&& cluster_recovery_cold_page_tail(start, &target, &source_index)) {
+				const ClusterColdCtrcPageCompletedV1 *completed = &progress->completed[index];
+				const ClusterRecoveryCtrcReplaySetSourceV1 *source = &progress->sources[source_index];
+				uint16 rule = 0;
+
+				if (completed->result.phase == RF_PAGE_CTRC_STEP_FPI_DURABLE
+					&& completed->result.inserted.wal_flushed
+					&& completed->result.inserted.record_start < completed->result.inserted.record_end
+					&& memcmp(&completed->result.inserted.image.identity,
+						&physical.reservation.identity, sizeof(result.space)) == 0
+					&& completed->result.inserted.image.block_number == physical.blockno
+					&& memcmp(&completed->result.inserted.image.version.before,
+						&target.expected_result, sizeof(result.before)) == 0)
+					rule = 1; /* Original typed install/sync/exact after readback. */
+				else if (completed->result.phase == RF_PAGE_CTRC_STEP_UNCHANGED_SYNCED
+					&& completed->unchanged.ready && completed->unchanged.blockno == physical.blockno
+					&& memcmp(&completed->unchanged.space, &physical.reservation.identity,
+						sizeof(result.space)) == 0
+					&& memcmp(&completed->unchanged.before, &target.expected_result,
+						sizeof(result.before)) == 0)
+					rule = 6; /* Original exact already-applied gate and native sync. */
+				if (rule != 0 && source->scope == state->ctrc_observation_inputs
+					&& source->generation_count == state->ctrc_wal_source_count
+					&& source->generation_index < source->generation_count) {
+					result.owner_family = 10; result.outcome = 1; result.rule = rule;
+					result.target_index = index; result.target_count = progress->target_count;
+					result.replay_source_index = source->generation_index;
+					result.replay_source_count = source->generation_count;
+					result.space = physical.reservation.identity; result.blockno = physical.blockno;
+					result.before = target.expected_result;
+					if (rule == 1) {
+						result.writer = completed->result.inserted.window.owner.writer;
+						result.record_start = completed->result.inserted.record_start;
+						result.record_end = completed->result.inserted.record_end;
+					}
+					result.image = readback.image;
+					result.detail = RF_PAGE_PROOF_DETAIL_OK;
+				}
+			}
+		}
+		if (result.detail != RF_PAGE_PROOF_DETAIL_OK) {
+			RfPageProofDetailV1 detail = result.detail;
+			MemSet(&result, 0, sizeof(result)); result.detail = detail;
+			if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK)
+				cluster_recovery_cold_page_plan_refuse(state, detail);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+/* A single complete DATA atom for the actual owner-read MAIN object. Native
+ * relation files have no U64 generation: zero is explicit absence, never a
+ * replacement for the SPACE identity/base/lifetime obligations. The logical
+ * origin is the original replay generation, not the new FPI writer. */
+static bool
+cluster_recovery_cold_page_completion_atom(const struct ClusterRecoveryStartV1 *start,
+	const RfPageCtrcOwnerProofV1 *proof, const uint8 *evidence, Size length)
+{
+	const uint8 *atom = evidence + 16, *id = atom + 10;
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source = NULL;
+	uint64 path_length;
+	Size id_length;
+	char *base;
+	char path[MAXPGPATH];
+	int written;
+
+	if (length < BLCKSZ + 96 || cluster_undo_tt_ctrc_get_u64_le(evidence) != 1
+		|| cluster_undo_tt_ctrc_get_u16_le(atom) != 2)
+		return false;
+	path_length = cluster_undo_tt_ctrc_get_u64_le(id + 22);
+	if (path_length == 0 || path_length >= MAXPGPATH) return false;
+	id_length = 46 + (Size)path_length;
+	if (length != 50 + id_length + BLCKSZ
+		|| cluster_undo_tt_ctrc_get_u64_le(evidence + 8) != length - 16
+		|| cluster_undo_tt_ctrc_get_u64_le(atom + 2) != id_length + 16
+		|| cluster_undo_tt_ctrc_get_u64_le(id) != proof->space.key.system_identifier
+		|| cluster_undo_tt_ctrc_get_u64_le(id + 8) != proof->space.key.database_incarnation
+		|| cluster_undo_tt_ctrc_get_u32_le(id + 18) != CLUSTER_RECOVERY_FILE_RELATION
+		|| cluster_undo_tt_ctrc_get_u64_le(id + 30 + path_length) != 0
+		|| cluster_undo_tt_ctrc_get_u64_le(id + 38 + path_length) != proof->blockno
+		|| cluster_undo_tt_ctrc_get_u64_le(id + id_length)
+			!= (uint64)(proof->blockno % RELSEG_SIZE) * BLCKSZ
+		|| cluster_undo_tt_ctrc_get_u64_le(id + id_length + 8) != BLCKSZ
+		|| cluster_undo_tt_ctrc_get_u64_le(id + id_length + 16) != BLCKSZ
+		|| memcmp(id + id_length + 24, proof->image.data, BLCKSZ) != 0)
+		return false;
+	for (uint32 i = 0; i < start->ctrc_page_source_count; i++) {
+		const ClusterRecoveryCtrcReplaySetSourceV1 *candidate = &start->ctrc_page_sources[i];
+		if (candidate->generation_index == proof->replay_source_index) {
+			if (source != NULL) return false;
+			source = candidate;
+		}
+	}
+	if (source == NULL || source->generation_count != proof->replay_source_count
+		|| cluster_undo_tt_ctrc_get_u16_le(id + 16)
+			!= source->generation.source.claim.identity.origin_node_id)
+		return false;
+	base = relpathperm(proof->space.key.locator, MAIN_FORKNUM);
+	written = proof->blockno < RELSEG_SIZE
+		? snprintf(path, sizeof(path), "%s", base)
+		: snprintf(path, sizeof(path), "%s.%u", base, proof->blockno / RELSEG_SIZE);
+	pfree(base);
+	return written > 0 && written < (int)sizeof(path) && (uint64)written == path_length
+		&& memcmp(id + 30, path, path_length) == 0;
+}
+
+/* Couple the existing canonical completion codec to the real original PAGE
+ * owner, rather than letting a graph caller choose a rule or a done flag.
+ * Freeze all supplied bytes before that owner yields; only local pure codecs
+ * follow its final full current check. No graph admission or D0 is added. */
+RfPageCtrcOwnerCompletionV1
+ClusterColdRecoveryCtrcPageOwnerCompletion(const struct ClusterRecoveryStartV1 *start,
+	uint32 index, const uint8 *raw_evidence, Size evidence_length, Size memory_budget)
+{
+	RfPageCtrcOwnerCompletionV1 out = {0};
+	uint8 *volatile evidence = NULL;
+	uint8 ids[MAXPGPATH + 92];
+	Size ids_length = 0;
+	bool encoded = false;
+
+	out.owner.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| !cluster_recovery_cold_ctrc_replays_actor() || raw_evidence == NULL
+		|| evidence_length < BLCKSZ + 96 || evidence_length > BLCKSZ + MAXPGPATH + 96)
+		return out;
+	/* Include both by-value owner/result frames, the complete witness copy,
+	 * path/base scratch and the original codec's bounded temporary ID copy.
+	 * Account before entering PAGE; no caller buffer is borrowed across I/O. */
+	if (memory_budget < evidence_length + sizeof(out) + sizeof(RfPageCtrcOwnerProofV1)
+		+ 2 * sizeof(ids) + 2 * MAXPGPATH) {
+		out.owner.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		return out;
+	}
+	PG_TRY();
+	{
+		RfPageCtrcOwnerProofV1 actual;
+
+		evidence = MemoryContextAllocExtended(TopMemoryContext, evidence_length,
+			MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		if (evidence == NULL)
+			out.owner.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		else {
+			memcpy(evidence, raw_evidence, evidence_length);
+			actual = ClusterColdRecoveryCtrcPageOwnerProof(start, index);
+			out.owner.detail = actual.detail;
+			if (actual.detail == RF_PAGE_PROOF_DETAIL_OK) {
+				if (actual.owner_family == 10 && actual.outcome == 1
+					&& (actual.rule == 1 || actual.rule == 6)
+					&& memcmp(evidence, raw_evidence, evidence_length) == 0
+					&& cluster_recovery_cold_page_completion_atom(start, &actual, evidence, evidence_length)
+					&& cluster_recovery_ctrc_witness_ids_from_evidence_v2(evidence,
+						evidence_length, ids, sizeof(ids), &ids_length)
+					&& ids_length <= sizeof(out.completion) - 4
+					&& cluster_recovery_ctrc_owner_completion_bytes_v2(actual.outcome, actual.rule,
+						ids, ids_length, evidence, evidence_length, out.completion, ids_length + 4)) {
+					out.owner = actual;
+					out.length = ids_length + 4;
+					encoded = true;
+				} else
+					out.owner.detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (evidence != NULL) pfree((void *)evidence);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start,
+			RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (evidence != NULL) pfree((void *)evidence);
+	if (!encoded) {
+		RfPageProofDetailV1 detail = out.owner.detail;
+		MemSet(&out, 0, sizeof(out)); out.owner.detail = detail;
+		if (detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK && detail != RF_PAGE_PROOF_DETAIL_OOM)
+			cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, detail);
+	}
+	return out;
+}
+
 /* Native physical TT is input only. Re-run every original canonical terminal
  * factory against the accepted TX result; never derive one from a page xid,
  * slot wrap, count, empty receipt directory or already-projected bytes. */
@@ -2523,6 +2864,70 @@ cluster_recovery_cold_page_reference_cross_page(const ClusterRecoveryCensusPages
 	return true;
 }
 
+/* PGRAC: every fully reread TX node, including non-root predecessors, must
+ * have its original canonical terminal. PAGE heads alone do not cover the
+ * forest. Physical record generation is independent of TT generation.
+ * This identity/terminal check grants no effect, owner or retention release. */
+static bool
+cluster_recovery_cold_page_tx_terminals(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress)
+{
+	ClusterRecoveryTxResultObservationV1 accepted, confirmed;
+	const ClusterColdCtrcPhysicalV1 *physical;
+	uint32 count;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		|| start->inputs == NULL
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)) return false;
+	physical = start->ctrc_physical;
+	if (physical == NULL || physical->count != work->counts.subject_count) return false;
+	count = start->ctrc_observation_manifest.tx_record_count;
+	for (uint32 index = 0;; index++) {
+		ClusterRecoveryCensusTxRecordV1 record = ClusterColdRecoveryCtrcTxRecord(start, work, index);
+		const ClusterRecoveryTxnKey *transaction = &record.value.transaction;
+		ClusterRecoveryUndoEntry observed;
+		ClusterColdTtSlotInputV1 terminal;
+		uint32 subject = 0;
+		unsigned matches = 0;
+
+		if (!record.observed || record.count != count
+			|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_physical != physical
+			|| physical->count != work->counts.subject_count) return false;
+		if (index == count) {
+			if (record.value.record != NULL) return false;
+			break;
+		}
+		if (record.value.record == NULL
+			|| transaction->system_identifier != start->inputs->system_identifier
+			|| transaction->database_incarnation != start->inputs->observer.database_incarnation)
+			return false;
+		for (uint32 i = 0; i < work->counts.subject_count; i++) {
+			const ClusterColdTtSlotKeyV1 *key = &work->entries[i].key;
+
+			if ((uint32)transaction->origin_node_id + 1 == key->owner_instance
+				&& transaction->segment_id == key->segment_id
+				&& transaction->segment_generation == key->segment_generation
+				&& transaction->slot_offset == key->slot_offset
+				&& transaction->slot_wrap == key->slot_wrap && transaction->xid == key->xid) {
+				subject = i;
+				matches++;
+			}
+		}
+		if (matches != 1) return false;
+		observed = physical->entries[subject];
+		if (!cluster_recovery_ctrc_terminal_subject_v1(start, work, subject, &observed, &terminal)
+			|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_physical != physical || physical->count != work->counts.subject_count
+			|| memcmp(&physical->entries[subject], &observed, sizeof(observed)) != 0)
+			return false;
+	}
+	return cluster_recovery_ctrc_terminal_result_v1(start, work, &confirmed)
+		&& memcmp(&accepted, &confirmed, sizeof(accepted)) == 0
+		&& cluster_recovery_cold_page_advance_current(start, work, scope, progress);
+}
+
 /* PGRAC: consume the complete original relation/history view, including
  * pages absent from PAGE WAL. Match the graph's full canonical identity,
  * never a raw xid or a current slot chosen for an older generation. The
@@ -2537,6 +2942,8 @@ cluster_recovery_cold_page_reference_terminals(const struct ClusterRecoveryStart
 	const ClusterRecoveryCensusPagesV1 *pages;
 
 	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	/* PGRAC: include the complete original TX forest before PAGE references. */
+	if (!cluster_recovery_cold_page_tx_terminals(start, work, scope, progress)) return false;
 	references = ClusterColdRecoveryCtrcReferences(start, work);
 	if (references == NULL
 		|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
@@ -2684,38 +3091,1546 @@ cluster_recovery_cold_page_census_recheck(const struct ClusterRecoveryStartV1 *s
 		&& start->ctrc_pages == pages && pages->count == count;
 }
 
+/* Re-read every original TX node, including non-root/shared predecessors,
+ * after PAGE work and after the independent service wait. Original native
+ * namespace/manifest checks retain the same physical generation and bytes;
+ * a saved-forest accessor alone cannot detect later storage changes. */
 static bool
-cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start)
+cluster_recovery_cold_page_tx_recheck(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress)
+{
+	uint32 count = start->ctrc_observation_manifest.tx_record_count;
+	uint32 index = 0;
+
+	for (;;) {
+		ClusterRecoveryGraphResult result;
+
+		ResetLatch(MyLatch);
+		HandleStartupProcInterrupts();
+		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+		result = cluster_recovery_census_tx_recheck_v1(start->ctrc_observation_census, index);
+		if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_observation_manifest.tx_record_count != count) return false;
+		if (index == count) return result == CLUSTER_RECOVERY_GRAPH_DRAINED;
+		if (result == CLUSTER_RECOVERY_GRAPH_RECORD) { index++; continue; }
+		if (result != CLUSTER_RECOVERY_GRAPH_PENDING) return false;
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+			100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+	}
+}
+
+static bool
+cluster_recovery_cold_page_completed_same(const ClusterColdCtrcPageProgressV1 *progress,
+	const ClusterColdCtrcPageCompletedV1 *completed, uint32 count)
+{
+	return progress != NULL && completed != NULL && !progress->pending
+		&& progress->target_count == count && progress->next_target == count
+		&& memcmp(progress->completed, completed,
+			(Size)count * sizeof(ClusterColdCtrcPageCompletedV1)) == 0;
+}
+
+/* Original complete PAGE target inventory. This creates local canonical
+ * inputs only; the original graph producer still establishes exact T/effect
+ * scope and all independent owners, base, lifetime and final current duties. */
+static bool
+cluster_recovery_cold_page_owner_evidence(const struct ClusterRecoveryStartV1 *start,
+	RfPageCtrcOwnerEvidenceV1 *entry)
+{
+	const RfPageCtrcOwnerProofV1 *proof = &entry->completed.owner;
+	const ClusterRecoveryCtrcReplaySetSourceV1 *source = NULL;
+	uint8 *atom = entry->evidence + 16, *id = atom + 10;
+	uint8 ids[MAXPGPATH + 92];
+	Size ids_length = 0, id_length, path_length;
+	char path[MAXPGPATH], *base;
+	int written;
+
+	for (uint32 i = 0; i < start->ctrc_page_source_count; i++) {
+		const ClusterRecoveryCtrcReplaySetSourceV1 *candidate = &start->ctrc_page_sources[i];
+		if (candidate->generation_index != proof->replay_source_index) continue;
+		if (source != NULL) return false;
+		source = candidate;
+	}
+	if (source == NULL || source->generation_count != proof->replay_source_count) return false;
+	base = relpathperm(proof->space.key.locator, MAIN_FORKNUM);
+	written = proof->blockno < RELSEG_SIZE
+		? snprintf(path, sizeof(path), "%s", base)
+		: snprintf(path, sizeof(path), "%s.%u", base, proof->blockno / RELSEG_SIZE);
+	pfree(base);
+	if (written <= 0 || written >= (int)sizeof(path)) return false;
+	path_length = (Size)written;
+	id_length = 46 + path_length;
+	entry->evidence_length = 50 + id_length + BLCKSZ;
+	cluster_undo_tt_ctrc_put_u64_le(entry->evidence, 1);
+	cluster_undo_tt_ctrc_put_u64_le(entry->evidence + 8, entry->evidence_length - 16);
+	cluster_undo_tt_ctrc_put_u16_le(atom, 2);
+	cluster_undo_tt_ctrc_put_u64_le(atom + 2, id_length + 16);
+	cluster_undo_tt_ctrc_put_u64_le(id, proof->space.key.system_identifier);
+	cluster_undo_tt_ctrc_put_u64_le(id + 8, proof->space.key.database_incarnation);
+	cluster_undo_tt_ctrc_put_u16_le(id + 16, source->generation.source.claim.identity.origin_node_id);
+	cluster_undo_tt_ctrc_put_u32_le(id + 18, CLUSTER_RECOVERY_FILE_RELATION);
+	cluster_undo_tt_ctrc_put_u64_le(id + 22, path_length);
+	memcpy(id + 30, path, path_length);
+	/* Explicit native no-generation value, never a qualified era/base. */
+	cluster_undo_tt_ctrc_put_u64_le(id + 30 + path_length, 0);
+	cluster_undo_tt_ctrc_put_u64_le(id + 38 + path_length, proof->blockno);
+	cluster_undo_tt_ctrc_put_u64_le(id + id_length,
+		(uint64)(proof->blockno % RELSEG_SIZE) * BLCKSZ);
+	cluster_undo_tt_ctrc_put_u64_le(id + id_length + 8, BLCKSZ);
+	cluster_undo_tt_ctrc_put_u64_le(id + id_length + 16, BLCKSZ);
+	memcpy(id + id_length + 24, proof->image.data, BLCKSZ);
+	if (!cluster_recovery_cold_page_completion_atom(start, proof, entry->evidence, entry->evidence_length)
+		|| !cluster_recovery_ctrc_witness_ids_from_evidence_v2(entry->evidence,
+			entry->evidence_length, ids, sizeof(ids), &ids_length)
+		|| ids_length > sizeof(entry->completed.completion) - 4
+		|| !cluster_recovery_ctrc_owner_completion_bytes_v2(proof->outcome, proof->rule,
+			ids, ids_length, entry->evidence, entry->evidence_length,
+			entry->completed.completion, ids_length + 4)) return false;
+	entry->completed.length = ids_length + 4;
+	return true;
+}
+
+static bool
+cluster_recovery_cold_page_owners_same(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	const ClusterColdCtrcPageProgressV1 *progress,
+	const ClusterColdCtrcPageCompletedV1 *fixed, uint32 count)
+{
+	return cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		&& cluster_recovery_cold_page_completed_same(progress, fixed, count)
+		&& rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == count;
+}
+
+RfPageCtrcOwnersV1
+ClusterColdRecoveryCtrcPageOwners(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	RfPageCtrcOwnersV1 out = {0};
+	RfPageCtrcOwnerEvidenceV1 *volatile entries = NULL;
+	const ClusterColdCtrcPageProgressV1 *progress;
+	const ClusterColdCtrcWorkV1 *work;
+	ClusterWalInputsV1 *scope;
+	ClusterColdCtrcPageCompletedV1 *fixed;
+	Size entry_bytes, bytes;
+	const Size scratch = sizeof(out) + 2 * sizeof(RfPageCtrcOwnerProofV1)
+		+ 2 * (MAXPGPATH + 92) + 2 * MAXPGPATH;
+	uint32 count;
+	bool ready = false;
+
+	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| !cluster_recovery_cold_ctrc_replays_actor()) return out;
+	progress = start->ctrc_page_progress;
+	if (progress == NULL || progress->pending || progress->target_count == 0
+		|| progress->next_target != progress->target_count) return out;
+	count = progress->target_count;
+	work = start->ctrc_observation_work; scope = start->ctrc_observation_inputs;
+	/* Reserve whole output, alignment, complete operation/FD/baseline snapshot
+	 * and owner/codec/path peak before the first PAGE or yielding current call. */
+	if (count > (MaxAllocSize - scratch - MAXIMUM_ALIGNOF)
+		/ (sizeof(*entries) + sizeof(*fixed))) {
+		out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+	}
+	entry_bytes = MAXALIGN((Size)count * sizeof(*entries));
+	bytes = entry_bytes + (Size)count * sizeof(*fixed);
+	if (memory_budget < bytes + scratch) {
+		out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+	}
+	PG_TRY();
+	{
+		entries = MemoryContextAllocExtended(TopMemoryContext, bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		out.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		if (entries != NULL) {
+			bool preflight;
+
+			fixed = (ClusterColdCtrcPageCompletedV1 *)((char *)entries + entry_bytes);
+			memcpy(fixed, progress->completed, (Size)count * sizeof(*fixed));
+			preflight = cluster_recovery_cold_page_owners_same(start, work, scope, progress, fixed, count);
+			out.detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			for (uint32 i = 0; preflight && i < count; i++) {
+				RfPageOnlineTargetViewV1 target;
+				ClusterRecoveryCensusPageV1 physical;
+
+				preflight = fixed[i].storage != NULL
+					&& rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &target)
+					&& !target.history_only && target.page_identity.forknum == MAIN_FORKNUM
+					&& cluster_recovery_cold_page_target(start, &target, &physical) && physical.heap;
+			}
+			if (preflight) {
+				uint32 i;
+				for (i = 0; i < count; i++) {
+					RfPageCtrcOwnerProofV1 actual;
+
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					if (!cluster_recovery_cold_page_owners_same(start, work, scope, progress, fixed, count)) break;
+					actual = ClusterColdRecoveryCtrcPageOwnerProof(start, i);
+					out.detail = actual.detail;
+					if (actual.detail != RF_PAGE_PROOF_DETAIL_OK) break;
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					if (!cluster_recovery_cold_page_owners_same(start, work, scope, progress, fixed, count)) break;
+					out.detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+					if (actual.owner_family != 10 || actual.outcome != 1
+						|| (actual.rule != 1 && actual.rule != 6)
+						|| actual.target_index != i || actual.target_count != count) break;
+					entries[i].completed.owner = actual;
+					if (!cluster_recovery_cold_page_owner_evidence(start, &entries[i])) break;
+				}
+				out.detail = i == count ? RF_PAGE_PROOF_DETAIL_ROOT_STALE : out.detail;
+				ready = i == count
+					&& cluster_recovery_cold_page_owners_same(start, work, scope, progress, fixed, count);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (entries != NULL) pfree((void *)entries);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ready) {
+		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.count = count; out.entries = entries;
+	} else {
+		if (entries != NULL) pfree((void *)entries);
+		if (out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK && out.detail != RF_PAGE_PROOF_DETAIL_OOM)
+			cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
+	}
+	return out;
+}
+
+/* Freeze the complete original reference/page/operation sets before any
+ * yielding reader. The returned links never replace the original TX forest
+ * or turn historical/unmatched references into completed PAGE obligations. */
+typedef struct ClusterColdCtrcPageReferenceSnapshotV1 {
+	const ClusterRecoveryCensusReferencesV1 *references;
+	const ClusterRecoveryCensusPagesV1 *pages;
+	const ClusterColdCtrcPageProgressV1 *progress;
+	const ClusterColdCtrcWorkV1 *work;
+	ClusterWalInputsV1 *scope;
+	ClusterRecoveryCensusReferenceV1 *fixed_references;
+	ClusterRecoveryCensusPageV1 *fixed_pages;
+	ClusterColdCtrcPageCompletedV1 *fixed_completed;
+	uint32 reference_count, page_count, owner_count;
+} ClusterColdCtrcPageReferenceSnapshotV1;
+
+static bool
+cluster_recovery_cold_page_reference_reserve(Size *bytes, uint32 count,
+	Size width, Size *offset)
+{
+	if (*bytes > MaxAllocSize - MAXIMUM_ALIGNOF) return false;
+	*offset = MAXALIGN(*bytes);
+	if (count > (MaxAllocSize - *offset) / width) return false;
+	*bytes = *offset + (Size)count * width;
+	return true;
+}
+
+static bool
+cluster_recovery_cold_page_references_same(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved)
+{
+	return cluster_recovery_cold_page_owners_same(start, saved->work, saved->scope,
+			saved->progress, saved->fixed_completed, saved->owner_count)
+		&& start->ctrc_references == saved->references && start->ctrc_pages == saved->pages
+		&& saved->references->count == saved->reference_count && saved->pages->count == saved->page_count
+		&& memcmp(saved->references->entries, saved->fixed_references,
+			(Size)saved->reference_count * sizeof(*saved->fixed_references)) == 0
+		&& memcmp(saved->pages->entries, saved->fixed_pages,
+			(Size)saved->page_count * sizeof(*saved->fixed_pages)) == 0;
+}
+
+/* Both passes use the original full-key/record/forest membership factory,
+ * including its complete empty end. No raw-xid or positional TX join. */
+static bool
+cluster_recovery_cold_page_reference_members(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved)
+{
+	uint32 i = 0;
+
+	for (;;) {
+		ClusterRecoveryCensusTxReferenceV1 member;
+
+		if (!cluster_recovery_cold_page_references_same(start, saved)) return false;
+		member = ClusterColdRecoveryCtrcTxReference(start, saved->work, i);
+		if (!member.observed || member.index != i || member.count != saved->reference_count
+			|| !cluster_recovery_cold_page_references_same(start, saved)) return false;
+		if (i == saved->reference_count) return member.reference == NULL;
+		if (member.reference != &saved->references->entries[i]) return false;
+		i++;
+	}
+}
+
+RfPageCtrcOwnerReferencesV1
+ClusterColdRecoveryCtrcPageOwnerReferences(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget)
+{
+	RfPageCtrcOwnerReferencesV1 out = {0};
+	RfPageCtrcOwnersV1 volatile owners = {0};
+	RfPageCtrcOwnerReferenceV1 *volatile entries = NULL;
+	ClusterColdCtrcPageReferenceSnapshotV1 saved = {0};
+	Size bytes = 0, entry_offset, reference_offset, page_offset, completed_offset, map_offset;
+	Size owner_bytes, owner_scratch, scratch = sizeof(saved) + sizeof(out) + sizeof(owners)
+		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryCensusPageV1)
+		+ sizeof(ClusterRecoveryCensusTxReferenceV1);
+	uint32 *mapping;
+	bool ready = false;
+
+	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| !cluster_recovery_cold_ctrc_replays_actor() || !start->ctrc_observation_complete
+		|| start->ctrc_references == NULL || start->ctrc_pages == NULL
+		|| start->ctrc_page_progress == NULL || start->ctrc_page_progress->pending
+		|| start->ctrc_page_progress->target_count == 0
+		|| start->ctrc_page_progress->next_target != start->ctrc_page_progress->target_count) return out;
+	saved.references = start->ctrc_references; saved.pages = start->ctrc_pages;
+	saved.progress = start->ctrc_page_progress; saved.work = start->ctrc_observation_work;
+	saved.scope = start->ctrc_observation_inputs;
+	saved.reference_count = saved.references->count; saved.page_count = saved.pages->count;
+	saved.owner_count = saved.progress->target_count;
+	out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+	/* Include the unchanged PageOwners factory's entire output/snapshot/codec
+	 * reservation as well as this adapter's complete simultaneous peak. */
+	owner_scratch = sizeof(RfPageCtrcOwnersV1) + 2 * sizeof(RfPageCtrcOwnerProofV1)
+		+ 2 * (MAXPGPATH + 92) + 2 * MAXPGPATH;
+	if (saved.owner_count > (MaxAllocSize - owner_scratch - MAXIMUM_ALIGNOF)
+		/ (sizeof(RfPageCtrcOwnerEvidenceV1) + sizeof(ClusterColdCtrcPageCompletedV1))) return out;
+	owner_bytes = MAXALIGN((Size)saved.owner_count * sizeof(RfPageCtrcOwnerEvidenceV1))
+		+ (Size)saved.owner_count * sizeof(ClusterColdCtrcPageCompletedV1) + owner_scratch;
+	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(saved.reference_count, 1),
+			sizeof(*entries), &entry_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved.reference_count,
+			sizeof(*saved.fixed_references), &reference_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved.page_count,
+			sizeof(*saved.fixed_pages), &page_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved.owner_count,
+			sizeof(*saved.fixed_completed), &completed_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved.owner_count,
+			sizeof(*mapping), &map_offset)
+		|| memory_budget < bytes || memory_budget - bytes < scratch
+		|| memory_budget - bytes - scratch < owner_bytes) return out;
+	Assert(entry_offset == 0);
+	PG_TRY();
+	{
+		entries = MemoryContextAllocExtended(TopMemoryContext, bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		out.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		if (entries != NULL) {
+			bool preflight;
+
+			saved.fixed_references = (ClusterRecoveryCensusReferenceV1 *)((char *)entries + reference_offset);
+			saved.fixed_pages = (ClusterRecoveryCensusPageV1 *)((char *)entries + page_offset);
+			saved.fixed_completed = (ClusterColdCtrcPageCompletedV1 *)((char *)entries + completed_offset);
+			mapping = (uint32 *)((char *)entries + map_offset);
+			memcpy(saved.fixed_references, saved.references->entries,
+				(Size)saved.reference_count * sizeof(*saved.fixed_references));
+			memcpy(saved.fixed_pages, saved.pages->entries, (Size)saved.page_count * sizeof(*saved.fixed_pages));
+			memcpy(saved.fixed_completed, saved.progress->completed,
+				(Size)saved.owner_count * sizeof(*saved.fixed_completed));
+			preflight = cluster_recovery_cold_page_references_same(start, &saved);
+			out.detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			for (uint32 i = 0; preflight && i < saved.owner_count; i++) {
+				RfPageOnlineTargetViewV1 target;
+				ClusterRecoveryCensusPageV1 physical;
+				uint32 j;
+
+				preflight = rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &target)
+					&& !target.history_only && target.page_identity.forknum == MAIN_FORKNUM
+					&& cluster_recovery_cold_page_target(start, &target, &physical) && physical.heap;
+				if (!preflight) break;
+				for (j = 0; j < saved.page_count; j++)
+					if (memcmp(&physical, &saved.fixed_pages[j], sizeof(physical)) == 0) break;
+				preflight = j < saved.page_count;
+				mapping[i] = j;
+				for (uint32 k = 0; preflight && k < i; k++) preflight = mapping[k] != j;
+			}
+			for (uint32 i = 0; preflight && i < saved.reference_count; i++) {
+				const ClusterRecoveryCensusReferenceV1 *ref = &saved.fixed_references[i];
+
+				preflight = ref->page_index < saved.page_count
+					&& saved.fixed_pages[ref->page_index].heap
+					&& (ref->entry.kind == CLUSTER_RECOVERY_HEAP_ITL || ref->entry.kind == CLUSTER_RECOVERY_HEAP_ITEM);
+				if (!preflight) break;
+				entries[i].reference_index = i; entries[i].owner_index = UINT32_MAX;
+				if (ref->entry.kind != CLUSTER_RECOVERY_HEAP_ITL || ref->entry.itl.flags == ITL_FLAG_FREE) continue;
+				preflight = ref->transaction.transaction.system_identifier
+						== saved.fixed_pages[ref->page_index].reservation.identity.key.system_identifier
+					&& ref->transaction.transaction.database_incarnation
+						== saved.fixed_pages[ref->page_index].reservation.identity.key.database_incarnation
+					&& ref->transaction.transaction.xid == ref->entry.itl.xid;
+				if (ref->version != 0) continue;
+				for (uint32 j = 0; j < saved.owner_count; j++)
+					if (ref->page_index == mapping[j]) entries[i].owner_index = j;
+			}
+			if (preflight && cluster_recovery_cold_page_reference_members(start, &saved)) {
+				owners = ClusterColdRecoveryCtrcPageOwners(start, memory_budget - bytes - scratch);
+				out.detail = owners.detail;
+				if (owners.detail == RF_PAGE_PROOF_DETAIL_OK) {
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					ready = owners.count == saved.owner_count && owners.entries != NULL
+						&& cluster_recovery_cold_page_reference_members(start, &saved)
+						&& cluster_recovery_cold_page_references_same(start, &saved);
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (owners.entries != NULL) pfree(owners.entries);
+		if (entries != NULL) pfree((void *)entries);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ready) {
+		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.owners = owners;
+		out.references = saved.references; out.count = saved.reference_count; out.entries = entries;
+	} else {
+		if (owners.entries != NULL) pfree(owners.entries);
+		if (entries != NULL) pfree((void *)entries);
+		if (out.detail != RF_PAGE_PROOF_DETAIL_OOM && out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK)
+			cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
+	}
+	return out;
+}
+
+/* Local scope of one complete original PAGE contribution chain. */
+typedef struct ClusterColdCtrcPageOwnerScopeV1 {
+	RfPageOnlineTargetViewV1 target;
+	RfContributorVectorV1 contributors;
+	RfPageStableEdgeInputV1 *edges;
+	ClusterRecoveryCTRCOwnerEffectV2 *effects;
+	uint32 *source_indexes;
+	uint32 edge_count, source_count;
+} ClusterColdCtrcPageOwnerScopeV1;
+
+/* Join an original sealed edge to exactly one complete original WAL record.
+ * Other components of a compound record remain their own owner duties. */
+static bool
+cluster_recovery_cold_page_owner_effect(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageOwnerScopeV1 *scope, uint32 index,
+	const ClusterRecoveryCtrcReplaySetSourceV1 *sources,
+	const ClusterRecoveryWalSourceObservationV1 *observed, uint32 source_count,
+	uint32 wal_count, ClusterRecoveryCTRCOwnerEffectV2 *out)
+{
+	const RfPageStableEdgeInputV1 *edge = &scope->edges[index];
+	const RfPageReplayRecordIdentityV1 *id = &edge->record_identity;
+	uint32 matches = 0;
+
+	memset(out, 0, sizeof(*out));
+	if (!edge->record_complete || !edge->opcode_supported || !edge->side_complete
+		|| !edge->image_integrity_ok || edge->participant_index >= source_count
+		|| edge->edge.page_class != RF_PAGE_CLASS_ORDINARY
+		|| !rf_page_identity_equal_v1(&edge->page_identity, &scope->target.page_identity)
+		|| id->reserved_zero != 0 || id->reserved_zero2 != 0) return false;
+	for (uint32 i = 0; i < wal_count; i++) {
+		ClusterRecoveryPageWalV1 wal;
+		const DecodedXLogRecord *record;
+		const ClusterWalSourceRef *source;
+		const DecodedBkpBlock *block;
+		uint32 components = 0, blocks = 0;
+
+		if (!cluster_recovery_census_page_wal_at_v1(start->ctrc_observation_census, i, &wal)
+			|| !cluster_recovery_page_wal_raw_valid_v1(&wal) || wal.source_index >= source_count
+			|| wal.ordinal == 0
+			|| memcmp(&wal.source, &observed[wal.source_index].source, sizeof(wal.source)) != 0
+			|| memcmp(&wal.cut, &observed[wal.source_index].cut, sizeof(wal.cut)) != 0) return false;
+		record = wal.reader->record; source = &wal.source;
+		if (wal.source_index != edge->participant_index
+			|| wal.reader->ReadRecPtr != id->read_rec_ptr || wal.reader->EndRecPtr != id->end_rec_ptr)
+			continue;
+		if (++matches != 1 || id->system_identifier != source->claim.identity.system_identifier
+			|| memcmp(id->storage_uuid, source->claim.identity.storage_uuid, 16) != 0
+			|| id->origin_thread != source->claim.identity.origin_thread_id
+			|| id->timeline_id != source->timeline || id->record_crc != record->header.xl_crc
+			|| id->rmid != record->header.xl_rmid || id->info != record->header.xl_info
+			|| record->max_block_id < 0 || record->max_block_id > XLR_MAX_BLOCK_ID
+			|| record->page_version_edge.entry_count != edge->component_count
+			|| edge->component_count == 0 || edge->component_count > RF_PAGE_STABLE_MAX_COMPONENTS
+			|| record->page_version_edge.result_token != edge->result_token
+			|| edge->edge.block_id > record->max_block_id) return false;
+		for (uint32 b = 0; b <= (uint32)record->max_block_id; b++)
+			if (record->blocks[b].in_use) blocks++;
+		if (blocks != edge->component_count) return false;
+		for (uint32 c = 0; c < record->page_version_edge.entry_count; c++) {
+			const RfPageVersionEdgeEntryV1 *component = &record->page_version_edge.entries[c];
+			if (component->block_id > record->max_block_id
+				|| !record->blocks[component->block_id].in_use
+				|| component->component_ordinal != record->blocks[component->block_id].component_ordinal)
+				return false;
+			for (uint32 prior = 0; prior < c; prior++)
+				if (record->page_version_edge.entries[prior].block_id == component->block_id
+					|| record->page_version_edge.entries[prior].component_ordinal == component->component_ordinal)
+					return false;
+			if (memcmp(component, &edge->edge, sizeof(*component)) == 0) components++;
+		}
+		block = &record->blocks[edge->edge.block_id];
+		if (components != 1 || !block->in_use || block->forknum != MAIN_FORKNUM
+			|| block->rlocator.spcOid != scope->target.page_identity.locator.spcOid
+			|| block->rlocator.dbOid != scope->target.page_identity.locator.dbOid
+			|| block->rlocator.relNumber != scope->target.page_identity.locator.relNumber
+			|| block->blkno != scope->target.page_identity.blockno
+			|| sources[wal.source_index].generation_index >= source_count) return false;
+		out->record.source_index = sources[wal.source_index].generation_index;
+		out->record.start = wal.reader->ReadRecPtr; out->record.end = wal.reader->EndRecPtr;
+		out->record.raw_length = wal.raw_length;
+		memcpy(out->record.raw_record_sha256, wal.raw_record_sha256, 32);
+		out->component_kind = edge->edge.page_class;
+		out->component_ordinal = edge->edge.component_ordinal;
+	}
+	return matches == 1;
+}
+
+static bool
+cluster_recovery_cold_page_owner_scopes_current(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	const ClusterColdCtrcPageOwnerScopeV1 *owners, uint32 owner_count,
+	const ClusterRecoveryCtrcReplaySetSourceV1 *sources,
+	const ClusterRecoveryWalSourceObservationV1 *observed, uint32 source_count, uint32 wal_count,
+	const ClusterRecoveryCensusReferencesV1 *references,
+	const ClusterRecoveryCensusReferenceV1 *fixed_references, uint32 reference_count)
+{
+	if (!cluster_recovery_cold_page_sources_current(start, work, scope, start->ctrc_page_plan,
+			start->ctrc_page_sources, source_count)
+		|| start->ctrc_page_source_count != source_count || start->ctrc_page_wal_count != wal_count
+		|| rf_page_online_plan_target_count_v1(start->ctrc_page_plan) != owner_count
+		|| memcmp(sources, start->ctrc_page_sources, (Size)source_count * sizeof(*sources)) != 0
+		|| start->ctrc_references != references || references->count != reference_count
+		|| memcmp(fixed_references, references->entries, (Size)reference_count * sizeof(*fixed_references)) != 0)
+		return false;
+	for (uint32 i = 0; i < source_count; i++) {
+		ClusterRecoveryWalSourceObservationV1 actual;
+		if (!cluster_recovery_census_wal_source_at_v1(start->ctrc_observation_census, i, &actual)
+			|| memcmp(&actual, &observed[i], sizeof(actual)) != 0) return false;
+	}
+	for (uint32 i = 0; i < owner_count; i++) {
+		RfPageOnlineTargetViewV1 actual;
+		const ClusterColdCtrcPageOwnerScopeV1 *saved = &owners[i];
+		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &actual)
+			|| memcmp(&actual, &saved->target, sizeof(actual)) != 0
+			|| actual.contributors == NULL
+			|| memcmp(actual.contributors, &saved->contributors, sizeof(saved->contributors)) != 0
+			|| saved->contributors.participant_count != source_count
+			|| saved->contributors.cuts == NULL || saved->contributors.edges == NULL
+			|| memcmp(saved->edges, actual.contributors->edges, (Size)saved->edge_count * sizeof(*saved->edges)) != 0)
+			return false;
+		for (uint32 s = 0; s < source_count; s++)
+			if (memcmp(&saved->contributors.cuts[s], &observed[s].cut, sizeof(observed[s].cut)) != 0)
+				return false;
+		for (uint32 e = 0; e < saved->edge_count; e++) {
+			ClusterRecoveryCTRCOwnerEffectV2 effect;
+			if (!cluster_recovery_cold_page_owner_effect(start, saved, e, sources, observed,
+				source_count, wal_count, &effect) || memcmp(&effect, &saved->effects[e], sizeof(effect)) != 0)
+				return false;
+		}
+	}
+	return cluster_recovery_cold_page_sources_current(start, work, scope, start->ctrc_page_plan,
+		start->ctrc_page_sources, source_count);
+}
+
+/* Verify one current field's original terminal projection, not a synthetic
+ * persistent before-image. Restore only that saved ITL into private scratch,
+ * invoke the original native projector, and require the WHOLE actual owner
+ * after-image back. This scratch never becomes DATA/base evidence. Its UBA,
+ * wrap, SCNs and first-change bytes cannot be replaced by another slot or T.
+ * Other tuple/HOT/history and owner effects remain separate obligations. */
+static bool
+cluster_recovery_cold_page_projected_reference(const ClusterRecoveryCensusReferenceV1 *reference,
+	const RfPageCtrcOwnerEvidenceV1 *proof, const ClusterColdTtSlotInputV1 *subjects, uint32 count)
+{
+	const ClusterRecoveryTxnKey *t = &reference->transaction.transaction;
+	const ClusterColdTtSlotInputV1 *subject = NULL;
+	const PageHeaderData *header = (const PageHeaderData *)proof->completed.owner.image.data;
+	const ClusterSpaceIdentityKey *space = &proof->completed.owner.space.key;
+	PGAlignedBlock scratch;
+	ClusterCtrcItlCleanoutApplyResult result;
+	uint8 itl_class;
+
+	if (reference->version != 0 || reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITL
+		|| reference->entry.index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| t->system_identifier != space->system_identifier
+		|| t->database_incarnation != space->database_incarnation
+		|| header->pd_special != BLCKSZ - MAXALIGN(CLUSTER_ITL_SPECIAL_SIZE)) return false;
+	switch (reference->entry.itl.flags) {
+		case ITL_FLAG_ACTIVE: case ITL_FLAG_COMMITTED: case ITL_FLAG_ABORTED:
+		case ITL_FLAG_NEEDS_CLEANOUT: itl_class = 1; break;
+		case ITL_FLAG_LOCK_ONLY_ACTIVE: case ITL_FLAG_LOCK_ONLY_COMMITTED:
+		case ITL_FLAG_LOCK_ONLY_ABORTED: itl_class = 2; break;
+		default: return false;
+	}
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterColdTtSlotKeyV1 *key = &subjects[i].key;
+		if (key->owner_instance == 0 || (uint32)t->origin_node_id + 1 != key->owner_instance
+			|| t->segment_id != key->segment_id || t->segment_generation != key->segment_generation
+			|| t->slot_offset != key->slot_offset || t->slot_wrap != key->slot_wrap || t->xid != key->xid)
+			continue;
+		if (subject != NULL) return false;
+		subject = &subjects[i];
+	}
+	if (subject == NULL) return false;
+	scratch = proof->completed.owner.image;
+	memcpy(scratch.data + header->pd_special + (Size)reference->entry.index * sizeof(ClusterItlSlotData),
+		&reference->entry.itl, sizeof(reference->entry.itl));
+	result = cluster_ctrc_recovery_itl_cleanout_image_v1(subject, reference->entry.index,
+		reference->entry.itl.wrap, itl_class, scratch.data, scratch.data);
+	return (result == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN || result == CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL)
+		&& memcmp(scratch.data, proof->completed.owner.image.data, BLCKSZ) == 0;
+}
+
+/* The observation mode requires the complete ITL unchanged at the same
+ * field. The explicit projected mode first executes the native predicate
+ * above against the original canonical terminal and actual owner image.
+ * Reuse that image's DATA atom: inverse ordinals are not file generations,
+ * and a different before-image must not borrow this after-image witness.
+ * Missing/moved/changed fields remain explicit unresolved entries. */
+static void
+cluster_recovery_cold_page_reference_key(const ClusterRecoveryCensusReferenceV1 *reference,
+	const RfPageCtrcOwnerEvidenceV1 *proof, bool projected, uint8 *key, RfPageCtrcOwnerGraphEntryV1 *entry)
+{
+	const PageHeaderData *header = (const PageHeaderData *)proof->completed.owner.image.data;
+	const uint8 *id = proof->evidence + 26;
+	Size id_length, field;
+
+	if (reference->version != 0 || reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITL
+		|| reference->entry.itl.flags == ITL_FLAG_FREE
+		|| reference->entry.itl.flags > ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
+		|| reference->entry.index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| PageGetPageSize((Page)header) != BLCKSZ
+		|| PageGetPageLayoutVersion((Page)header) != PG_PAGE_LAYOUT_VERSION
+		|| !PageHasItl((Page)header) || (header->pd_flags & ~PD_VALID_FLAG_BITS) != 0
+		|| (header->pd_flags & (PD_UNDO_SEG_HEADER | PD_SPACE_METADATA)) != 0
+		|| header->pd_special != BLCKSZ - MAXALIGN(CLUSTER_ITL_SPECIAL_SIZE)
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
+		return;
+	field = header->pd_special + (Size)reference->entry.index * sizeof(ClusterItlSlotData);
+	if (!projected && memcmp((const uint8 *)header + field, &reference->entry.itl, sizeof(reference->entry.itl)) != 0)
+		return;
+	/* Both envelopes were produced by the original owner codecs above; T34
+	 * comes from the full original forest/effect scope, never from raw xid. */
+	id_length = cluster_undo_tt_ctrc_get_u64_le(proof->evidence + 18) - 16;
+	memcpy(key, entry->key + 10, 34);
+	cluster_undo_tt_ctrc_put_u16_le(key + 34, 1);
+	cluster_undo_tt_ctrc_put_u64_le(key + 36, id_length);
+	memcpy(key + 44, id, id_length);
+	cluster_undo_tt_ctrc_put_u64_le(key + 44 + id_length, field + offsetof(ClusterItlSlotData, xid));
+	cluster_undo_tt_ctrc_put_u64_le(key + 52 + id_length, reference->entry.index);
+	entry->reference_key = key; entry->reference_key_length = 60 + id_length;
+	entry->reference_evidence = proof->evidence; entry->reference_evidence_length = proof->evidence_length;
+}
+
+/* The census owns packed tuple bytes separately from its reference structs.
+ * Preserve both the original pointer identity and its complete private bytes
+ * across PAGE/terminal calls that can yield. Never rebase onto a fresh tuple. */
+static bool
+cluster_recovery_cold_page_tuple_bytes_current(const ClusterRecoveryCensusReferencesV1 *references,
+	const ClusterRecoveryCensusReferenceV1 *fixed, uint32 count, const Size *offsets, const char *bytes)
+{
+	if (references->count != count) return false;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterRecoveryHeapEntry *saved = &fixed[i].entry, *current = &references->entries[i].entry;
+		if (saved->kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (current->kind != saved->kind || current->tuple_bytes != saved->tuple_bytes
+			|| current->tuple_length != saved->tuple_length
+			|| (saved->tuple_length != 0
+				&& memcmp(current->tuple_bytes, bytes + offsets[i], saved->tuple_length) != 0)) return false;
+	}
+	return true;
+}
+
+/* A HOT page is one complete native topology. Restore EVERY original item
+ * and all eight slots before projection; one tuple mixed into an after-image
+ * cannot prove its neighbours. The complete actual after-image remains the
+ * DATA witness, never this private scratch. Ordinary non-HOT inputs retain
+ * their existing per-tuple contract. */
+static bool
+cluster_recovery_cold_page_hot_projection(const ClusterRecoveryCensusReferenceV1 *references,
+	uint32 count, uint32 index, const Size *tuple_offsets, const char *tuple_bytes,
+	const ClusterItlSlotData *slots, const RfPageCtrcOwnerEvidenceV1 *proof,
+	const ClusterColdTtSlotInputV1 *terminals, uint32 terminal_count, PGAlignedBlock *scratch, bool complete)
+{
+	const ClusterRecoveryCensusReferenceV1 *reference = &references[index];
+	Page page = (Page)proof->completed.owner.image.data;
+	PageHeader header = (PageHeader)page;
+	uint8 seen[MaxHeapTuplesPerPage] = {0};
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	bool hot = false;
+	ClusterCtrcItlCleanoutApplyResult result;
+
+	/* Missing references cannot erase topology in the actual owner image.
+	 * Inspect that complete PAGE as well as the supplied current members. */
+	if (maxoff > MaxHeapTuplesPerPage) return false;
+	for (OffsetNumber i = FirstOffsetNumber; i <= maxoff; i++) {
+		ItemId item = PageGetItemId(page, i);
+		Size offset = ItemIdGetOffset(item), length = ItemIdGetLength(item);
+		HeapTupleHeaderData h;
+		if (ItemIdIsRedirected(item)) { hot = true; continue; }
+		if (!ItemIdIsNormal(item)) continue;
+		if (offset < header->pd_upper || offset > header->pd_special
+			|| length < SizeofHeapTupleHeader || length > header->pd_special - offset) return false;
+		memcpy(&h, page + offset, SizeofHeapTupleHeader);
+		if ((h.t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) != 0) hot = true;
+	}
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *candidate = &references[i];
+		HeapTupleHeaderData h;
+		if (candidate->page_index != reference->page_index || candidate->version != 0
+			|| candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (ItemIdIsRedirected(&candidate->entry.item)) { hot = true; continue; }
+		if (candidate->entry.tuple_length < SizeofHeapTupleHeader) continue;
+		memcpy(&h, tuple_bytes + tuple_offsets[i], SizeofHeapTupleHeader);
+		if ((h.t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) != 0) hot = true;
+	}
+	if (!hot && !complete) return true;
+	*scratch = proof->completed.owner.image;
+	memcpy(scratch->data + header->pd_special, slots,
+		CLUSTER_ITL_INITRANS_DEFAULT * sizeof(*slots));
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *candidate = &references[i];
+		const ClusterRecoveryHeapEntry *entry = &candidate->entry;
+		Size offset;
+		if (candidate->page_index != reference->page_index || candidate->version != 0
+			|| entry->kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (entry->index < FirstOffsetNumber || entry->index > maxoff
+			|| seen[entry->index - 1] != 0
+			|| memcmp(&entry->item, PageGetItemId(page, entry->index), sizeof(entry->item)) != 0)
+			return false;
+		seen[entry->index - 1] = 1;
+		if (!ItemIdHasStorage(&entry->item)) {
+			if (entry->tuple_length != 0 || entry->tuple_bytes != NULL) return false;
+			continue;
+		}
+		offset = ItemIdGetOffset(&entry->item);
+		if (!ItemIdIsNormal(&entry->item) || offset < header->pd_upper || offset > header->pd_special
+			|| entry->tuple_length != ItemIdGetLength(&entry->item)
+			|| entry->tuple_length > header->pd_special - offset
+			|| !cluster_ctrc_recovery_heap_tuple_itl_references_v1(slots,
+				tuple_bytes + tuple_offsets[i], entry->tuple_length)) return false;
+		memcpy(scratch->data + offset, tuple_bytes + tuple_offsets[i], entry->tuple_length);
+	}
+	for (OffsetNumber i = 0; i < maxoff; i++) if (seen[i] == 0) return false;
+	result = cluster_ctrc_recovery_itl_page_image_v1(terminals, terminal_count,
+		scratch->data, scratch->data);
+	return (result == CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN || result == CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL)
+		&& memcmp(scratch->data, proof->completed.owner.image.data, BLCKSZ) == 0
+		&& cluster_ctrc_recovery_heap_hot_references_v1(scratch->data, proof->completed.owner.blockno);
+}
+
+/* A current tuple has no independent canonical T in the census. Resolve its
+ * fields ONLY through the complete original same-page/version ITLs, each
+ * already joined to a full forest T and actual PAGE owner above. Replaying
+ * all those original slots and this complete tuple into private scratch must
+ * reproduce the WHOLE actual after-image. Scratch is never DATA/base evidence.
+ * Select every field before publishing any; history/MX remain unresolved. */
+static uint16
+cluster_recovery_cold_page_tuple_fields(const ClusterRecoveryCensusReferenceV1 *references,
+	uint32 reference_count, uint32 index, const Size *tuple_offsets, const char *tuple_bytes,
+	const RfPageCtrcOwnerGraphEntryV1 *entries,
+	const volatile RfPageCtrcOwnerReferencesV1 *related, const ClusterColdTtSlotInputV1 *terminals,
+	uint32 terminal_count, uint32 fields[2], Size offsets[2])
+{
+	const ClusterRecoveryCensusReferenceV1 *reference = &references[index];
+	const ClusterRecoveryHeapEntry *entry = &reference->entry;
+	const char *bytes = tuple_bytes + tuple_offsets[index];
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint32 indexes[CLUSTER_ITL_INITRANS_DEFAULT], seen = 0, owner = UINT32_MAX;
+	HeapTupleHeaderData header;
+	HeapTupleHeader tuple = &header;
+	const RfPageCtrcOwnerEvidenceV1 *proof;
+	const PageHeaderData *page;
+	PGAlignedBlock scratch;
+	ClusterCtrcItlCleanoutApplyResult result;
+	uint16 count = 0;
+	Size offset;
+
+	if (reference->version != 0 || entry->kind != CLUSTER_RECOVERY_HEAP_ITEM
+		|| entry->index < FirstOffsetNumber || !ItemIdIsNormal(&entry->item)
+		|| entry->tuple_length < SizeofHeapTupleHeader || entry->tuple_length > BLCKSZ
+		|| entry->tuple_length != ItemIdGetLength(&entry->item)) return 0;
+	for (uint32 i = 0; i < reference_count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *candidate = &references[i];
+		uint32 slot;
+		if (candidate->page_index != reference->page_index || candidate->version != reference->version
+			|| candidate->entry.kind != CLUSTER_RECOVERY_HEAP_ITL) continue;
+		slot = candidate->entry.index;
+		if (slot >= CLUSTER_ITL_INITRANS_DEFAULT || (seen & (UINT32_C(1) << slot)) != 0) return 0;
+		seen |= UINT32_C(1) << slot; slots[slot] = candidate->entry.itl; indexes[slot] = i;
+		if (slots[slot].flags == ITL_FLAG_FREE) continue;
+		if (entries[i].reference_edge_kind != 4 || entries[i].reference_field_count != 1
+			|| entries[i].owner_index >= related->owners.count) return 0;
+		if (owner == UINT32_MAX) owner = entries[i].owner_index;
+		else if (owner != entries[i].owner_index) return 0;
+	}
+	if (seen != (UINT32_C(1) << CLUSTER_ITL_INITRANS_DEFAULT) - 1 || owner == UINT32_MAX
+		|| !cluster_ctrc_recovery_heap_tuple_itl_references_v1(slots, bytes, entry->tuple_length)) return 0;
+	memcpy(&header, bytes, SizeofHeapTupleHeader);
+	if ((tuple->t_infomask & HEAP_MOVED) != 0) return 0;
+	if (!HeapTupleHeaderXminFrozen(tuple) && HeapTupleHeaderGetRawXmin(tuple) != BootstrapTransactionId
+		&& HeapTupleHeaderGetRawXmin(tuple) != FrozenTransactionId) {
+		uint32 selected = UINT32_MAX;
+		for (uint32 slot = 0; slot < CLUSTER_ITL_INITRANS_DEFAULT; slot++) {
+			if (slots[slot].xid != HeapTupleHeaderGetRawXmin(tuple)
+				|| slots[slot].flags == ITL_FLAG_FREE || ITL_FLAG_IS_LOCK_ONLY(slots[slot].flags)) continue;
+			if (selected != UINT32_MAX) return 0;
+			selected = slot;
+		}
+		if (selected == UINT32_MAX) return 0;
+		fields[count] = indexes[selected]; offsets[count++] = offsetof(HeapTupleHeaderData, t_choice.t_heap.t_xmin);
+	}
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) == 0) {
+		uint32 selected = UINT32_MAX;
+		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0) return 0;
+		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)) {
+			for (uint32 slot = 0; slot < CLUSTER_ITL_INITRANS_DEFAULT; slot++) {
+				if (slots[slot].xid != HeapTupleHeaderGetRawXmax(tuple) || !ITL_FLAG_IS_LOCK_ONLY(slots[slot].flags)) continue;
+				if (selected != UINT32_MAX) return 0;
+				selected = slot;
+			}
+		} else if (tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT) selected = tuple->t_itl_slot_idx;
+		if (selected == UINT32_MAX) return 0;
+		fields[count] = indexes[selected]; offsets[count++] = offsetof(HeapTupleHeaderData, t_choice.t_heap.t_xmax);
+	}
+	if (count == 0) return 0;
+	proof = &related->owners.entries[owner]; page = (const PageHeaderData *)proof->completed.owner.image.data;
+	if (!cluster_recovery_cold_page_hot_projection(references, reference_count, index,
+		tuple_offsets, tuple_bytes, slots, proof, terminals, terminal_count, &scratch, false)) return 0;
+	offset = ItemIdGetOffset(&entry->item);
+	if (entry->index > PageGetMaxOffsetNumber((Page)page)
+		|| memcmp(&entry->item, PageGetItemId((Page)page, entry->index), sizeof(entry->item)) != 0
+		|| offset < page->pd_upper || offset > page->pd_special
+		|| entry->tuple_length > page->pd_special - offset) return 0;
+	scratch = proof->completed.owner.image;
+	memcpy(scratch.data + page->pd_special, slots, sizeof(slots));
+	memcpy(scratch.data + offset, bytes, entry->tuple_length);
+	result = cluster_ctrc_recovery_itl_page_image_v1(terminals, terminal_count, scratch.data, scratch.data);
+	if ((result != CLUSTER_CTRC_ITL_CLEANOUT_REWRITTEN && result != CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL)
+		|| memcmp(scratch.data, proof->completed.owner.image.data, BLCKSZ) != 0) return 0;
+	for (uint16 f = 0; f < count; f++) offsets[f] += offset;
+	return count;
+}
+
+static RfPageCtrcOwnerGraphV1
+cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *start, Size memory_budget, bool projected)
+{
+	RfPageCtrcOwnerGraphV1 out = {0};
+	RfPageCtrcOwnerReferencesV1 volatile related = {0};
+	RfPageCtrcOwnerGraphEntryV1 *volatile entries = NULL;
+	ClusterColdCtrcPageOwnerScopeV1 *owners;
+	ClusterRecoveryCtrcReplaySetSourceV1 *sources;
+	ClusterRecoveryWalSourceObservationV1 *observed;
+	ClusterRecoveryCensusReferenceV1 *fixed_references;
+	ClusterColdTtSlotInputV1 *terminals;
+	ClusterRecoveryCTRCGraphNodeV2 *nodes;
+	ClusterRecoveryCTRCGraphEdgeV2 *edges;
+	size_t *roots, *reference_nodes, *tuple_nodes;
+	Size *tuple_offsets;
+	char *tuple_bytes;
+	ClusterRecoveryCTRCGraphV2 contribution = {0};
+	ClusterRecoveryTxResultObservationV1 accepted = {0};
+	const ClusterRecoveryCensusReferencesV1 *references;
+	const ClusterColdCtrcWorkV1 *work;
+	ClusterWalInputsV1 *scope;
+	Size bytes = 0, entry_offset, owner_offset, source_offset, observed_offset, reference_offset;
+	Size edge_offset, effect_offset, indexes_offset, data_offset, terminal_offset, key_capacity, stride, scratch;
+	Size graph_node_offset = 0, graph_edge_offset = 0, graph_root_offset = 0;
+	Size tuple_offsets_offset = 0, tuple_bytes_offset = 0, tuple_key_offset = 0, reference_node_offset = 0;
+	Size tuple_node_offset = 0;
+	Size tuple_length = 0;
+	const Size reference_capacity = MAXPGPATH + 105;
+	uint32 reference_count, owner_count, source_count, wal_count, terminal_count, edge_count = 0, max_edges = 0;
+	uint32 unresolved_count = 0;
+	bool ready = false;
+
+	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !start->ctrc_observation_complete || start->ctrc_references == NULL
+		|| start->ctrc_page_progress == NULL || start->ctrc_page_progress->pending
+		|| start->ctrc_page_progress->next_target != start->ctrc_page_progress->target_count
+		|| start->ctrc_page_plan == NULL || start->ctrc_page_sources == NULL) return out;
+	references = start->ctrc_references; reference_count = references->count;
+	owner_count = start->ctrc_page_progress->target_count; source_count = start->ctrc_page_source_count;
+	wal_count = start->ctrc_page_wal_count; work = start->ctrc_observation_work; scope = start->ctrc_observation_inputs;
+	if (work == NULL) return out;
+	terminal_count = projected ? work->counts.subject_count : 0;
+	out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+	if (owner_count == 0 || source_count == 0 || source_count > RF_PAGE_STABLE_MAX_PARTICIPANTS) goto refused;
+	if (projected && reference_count > UINT32_MAX / 3) {
+		out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+	}
+	if (projected) {
+		for (uint32 i = 0; i < reference_count; i++) {
+			const ClusterRecoveryHeapEntry *entry = &references->entries[i].entry;
+			if (entry->kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+			if (entry->tuple_length > BLCKSZ || (entry->tuple_length == 0) != (entry->tuple_bytes == NULL)) goto refused;
+			if (entry->tuple_length > MaxAllocSize - tuple_length) {
+				out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+			}
+			tuple_length += entry->tuple_length;
+		}
+	}
+	for (uint32 i = 0; i < owner_count; i++) {
+		RfPageOnlineTargetViewV1 target;
+		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &target)
+			|| target.contributors == NULL || target.contributors->edges == NULL
+			|| target.contributors->edge_count == 0) goto refused;
+		if (target.contributors->edge_count > UINT32_MAX - edge_count) {
+			out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY; return out;
+		}
+		edge_count += target.contributors->edge_count;
+		max_edges = Max(max_edges, target.contributors->edge_count);
+	}
+	/* Reserve complete scope/evidence output and codec scratch before the
+	 * unchanged reference/owner factory performs its own whole PAGE preflight. */
+	out.detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+	if (owner_count > UINT32_MAX / source_count
+		|| max_edges > (MaxAllocSize - 60 - 4 * source_count) / 62) return out;
+	key_capacity = 60 + (Size)4 * source_count + (Size)62 * max_edges;
+	if (key_capacity > (MaxAllocSize - sizeof(((RfPageCtrcOwnerEvidenceV1 *)0)->evidence)
+		- sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) - 26 - reference_capacity) / 2) return out;
+	stride = 2 * key_capacity + sizeof(((RfPageCtrcOwnerEvidenceV1 *)0)->evidence)
+		+ sizeof(((RfPageCtrcOwnerCompletionV1 *)0)->completion) + 26 + reference_capacity;
+	scratch = key_capacity + sizeof(out) + sizeof(related) + sizeof(ClusterRecoveryCTRCOwnerScopeV2)
+		+ sizeof(ClusterRecoveryPageWalV1) + sizeof(ClusterRecoveryCTRCOwnerEffectV2)
+		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryWalSourceObservationV1) + 128
+		+ sizeof(accepted) + (projected ? 5 * BLCKSZ + sizeof(ClusterRecoveryCensusReferenceV1)
+			+ 2 * sizeof(HeapTupleHeaderData) + MaxHeapTuplesPerPage
+			+ CLUSTER_ITL_INITRANS_DEFAULT * (sizeof(ClusterItlSlotData) + sizeof(uint32)) : 0);
+	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(reference_count, 1), sizeof(*entries), &entry_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count, sizeof(*owners), &owner_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, source_count, sizeof(*sources), &source_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, source_count, sizeof(*observed), &observed_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*fixed_references), &reference_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, edge_count, sizeof(RfPageStableEdgeInputV1), &edge_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, edge_count, sizeof(ClusterRecoveryCTRCOwnerEffectV2), &effect_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count * source_count, sizeof(uint32), &indexes_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, stride, &data_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, terminal_count, sizeof(*terminals), &terminal_offset)
+		|| (projected && (!cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*nodes), &graph_node_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 3 * reference_count, sizeof(*edges), &graph_edge_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*roots), &graph_root_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*reference_nodes), &reference_node_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*tuple_nodes), &tuple_node_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, sizeof(*tuple_offsets), &tuple_offsets_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, tuple_length, 1, &tuple_bytes_offset)
+			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, reference_capacity, &tuple_key_offset)))
+		|| memory_budget < bytes || memory_budget - bytes < scratch) return out;
+	Assert(entry_offset == 0);
+	PG_TRY();
+	{
+		entries = MemoryContextAllocExtended(TopMemoryContext, bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+		out.detail = RF_PAGE_PROOF_DETAIL_OOM;
+		if (entries != NULL) {
+			uint32 position = 0;
+			bool valid = true;
+			owners = (ClusterColdCtrcPageOwnerScopeV1 *)((char *)entries + owner_offset);
+			sources = (ClusterRecoveryCtrcReplaySetSourceV1 *)((char *)entries + source_offset);
+			observed = (ClusterRecoveryWalSourceObservationV1 *)((char *)entries + observed_offset);
+			fixed_references = (ClusterRecoveryCensusReferenceV1 *)((char *)entries + reference_offset);
+			terminals = (ClusterColdTtSlotInputV1 *)((char *)entries + terminal_offset);
+			memcpy(sources, start->ctrc_page_sources, (Size)source_count * sizeof(*sources));
+			memcpy(fixed_references, references->entries, (Size)reference_count * sizeof(*fixed_references));
+			tuple_offsets = (Size *)((char *)entries + tuple_offsets_offset);
+			tuple_bytes = (char *)entries + tuple_bytes_offset;
+			if (projected) {
+				Size position = 0;
+				for (uint32 i = 0; i < reference_count; i++) {
+					const ClusterRecoveryHeapEntry *entry = &fixed_references[i].entry;
+					tuple_offsets[i] = position;
+					if (entry->kind == CLUSTER_RECOVERY_HEAP_ITEM && entry->tuple_length != 0) {
+						memcpy(tuple_bytes + position, entry->tuple_bytes, entry->tuple_length);
+						position += entry->tuple_length;
+					}
+				}
+				Assert(position == tuple_length);
+			}
+			for (uint32 i = 0; valid && i < source_count; i++)
+				valid = cluster_recovery_census_wal_source_at_v1(start->ctrc_observation_census, i, &observed[i])
+					&& observed[i].source_index == i;
+			for (uint32 i = 0; valid && i < owner_count; i++) {
+				ClusterColdCtrcPageOwnerScopeV1 *saved = &owners[i];
+				valid = rf_page_online_plan_target_v1(start->ctrc_page_plan, i, &saved->target);
+				if (!valid) break;
+				saved->contributors = *saved->target.contributors;
+				saved->edge_count = saved->contributors.edge_count;
+				if (saved->edge_count == 0 || saved->edge_count > edge_count - position) { valid = false; break; }
+				saved->edges = (RfPageStableEdgeInputV1 *)((char *)entries + edge_offset) + position;
+				saved->effects = (ClusterRecoveryCTRCOwnerEffectV2 *)((char *)entries + effect_offset) + position;
+				saved->source_indexes = (uint32 *)((char *)entries + indexes_offset) + (Size)i * source_count;
+				memcpy(saved->edges, saved->contributors.edges, (Size)saved->edge_count * sizeof(*saved->edges));
+				for (uint32 e = 0; valid && e < saved->edge_count; e++) {
+					uint32 source, j;
+					valid = cluster_recovery_cold_page_owner_effect(start, saved, e, sources, observed,
+						source_count, wal_count, &saved->effects[e]);
+					if (!valid) break;
+					for (uint32 prior = 0; valid && prior < e; prior++)
+						valid = memcmp(&saved->effects[prior], &saved->effects[e], sizeof(saved->effects[e])) != 0;
+					if (!valid) break;
+					source = saved->effects[e].record.source_index;
+					for (j = 0; j < saved->source_count; j++) if (saved->source_indexes[j] == source) break;
+					if (j == saved->source_count) saved->source_indexes[saved->source_count++] = source;
+				}
+				position += saved->edge_count;
+			}
+			out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+			valid = valid && position == edge_count
+				&& cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
+					sources, observed, source_count, wal_count, references, fixed_references, reference_count);
+			if (valid && projected)
+				valid = work->counts.subject_count == terminal_count
+					&& cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)
+					&& cluster_recovery_cold_page_projection_subjects(start, work, scope, start->ctrc_page_progress,
+						terminals, &accepted, true);
+			if (valid) {
+				related = ClusterColdRecoveryCtrcPageOwnerReferences(start, memory_budget - bytes - scratch);
+				out.detail = related.detail;
+				valid = related.detail == RF_PAGE_PROOF_DETAIL_OK;
+				if (valid) {
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					valid = related.count == reference_count && related.references == references
+						&& related.owners.count == owner_count
+						&& cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
+							sources, observed, source_count, wal_count, references, fixed_references, reference_count)
+						&& (!projected || cluster_recovery_cold_page_tuple_bytes_current(references,
+							fixed_references, reference_count, tuple_offsets, tuple_bytes));
+				}
+				for (uint32 i = 0; valid && i < reference_count; i++) {
+					RfPageCtrcOwnerGraphEntryV1 *entry = &entries[i];
+					const RfPageCtrcOwnerEvidenceV1 *proof;
+					ClusterColdCtrcPageOwnerScopeV1 *saved;
+					ClusterRecoveryCTRCOwnerScopeV2 encoded;
+					uint8 *key, *evidence, *atom;
+					entry->reference_index = i; entry->owner_index = related.entries[i].owner_index;
+					if (entry->owner_index == UINT32_MAX) continue;
+					if (entry->owner_index >= owner_count) { valid = false; break; }
+					saved = &owners[entry->owner_index]; proof = &related.owners.entries[entry->owner_index];
+					encoded = (ClusterRecoveryCTRCOwnerScopeV2){.transaction = fixed_references[i].transaction.transaction,
+						.owner_family = proof->completed.owner.owner_family, .source_indexes = saved->source_indexes,
+						.source_count = saved->source_count, .effects = saved->effects, .effect_count = saved->edge_count};
+					entry->key_length = 60 + (Size)4 * saved->source_count + (Size)62 * saved->edge_count;
+					key = (uint8 *)entries + data_offset + (Size)i * stride; evidence = key + key_capacity;
+					valid = proof->evidence_length <= sizeof(proof->evidence) && proof->evidence_length >= 8
+						&& cluster_undo_tt_ctrc_get_u64_le(proof->evidence) == 1
+						&& proof->completed.length <= sizeof(proof->completed.completion)
+						&& cluster_recovery_ctrc_owner_key_v2(&encoded, key, entry->key_length);
+					if (!valid) break;
+					memcpy(evidence, proof->evidence, proof->evidence_length);
+					cluster_undo_tt_ctrc_put_u64_le(evidence, 2);
+					cluster_undo_tt_ctrc_put_u64_le(evidence + proof->evidence_length,
+						18 + entry->key_length + proof->completed.length);
+					atom = evidence + proof->evidence_length + 8;
+					cluster_undo_tt_ctrc_put_u16_le(atom, 3);
+					cluster_undo_tt_ctrc_put_u64_le(atom + 2, entry->key_length);
+					memcpy(atom + 10, key, entry->key_length);
+					cluster_undo_tt_ctrc_put_u64_le(atom + 10 + entry->key_length, proof->completed.length);
+					memcpy(atom + 18 + entry->key_length, proof->completed.completion, proof->completed.length);
+					entry->key = key; entry->evidence = evidence;
+					entry->evidence_length = proof->evidence_length + 26 + entry->key_length + proof->completed.length;
+					if (!projected || cluster_recovery_cold_page_projected_reference(&fixed_references[i], proof,
+						terminals, terminal_count)) {
+						cluster_recovery_cold_page_reference_key(&fixed_references[i], proof, projected,
+							key + stride - reference_capacity, entry);
+						if (projected && entry->reference_key != NULL) {
+							entry->reference_edge_kind = 4; entry->reference_field_count = 1;
+						}
+					}
+				}
+				if (valid && projected) {
+					nodes = (ClusterRecoveryCTRCGraphNodeV2 *)((char *)entries + graph_node_offset);
+					edges = (ClusterRecoveryCTRCGraphEdgeV2 *)((char *)entries + graph_edge_offset);
+					roots = (size_t *)((char *)entries + graph_root_offset);
+					reference_nodes = (size_t *)((char *)entries + reference_node_offset);
+					tuple_nodes = (size_t *)((char *)entries + tuple_node_offset);
+					for (Size i = 0; i < (Size)2 * reference_count; i++) tuple_nodes[i] = SIZE_MAX;
+					for (uint32 i = 0; valid && i < reference_count; i++) {
+						const RfPageCtrcOwnerGraphEntryV1 *entry = &entries[i];
+						size_t n = contribution.node_count, r;
+						ClusterRecoveryCTRCGraphBytesV2 evidence = {entry->evidence, entry->evidence_length};
+						if (entry->reference_edge_kind != 4) { unresolved_count++; continue; }
+						valid = n <= (Size)2 * reference_count - 2
+							&& contribution.edge_count < reference_count && contribution.root_count < reference_count
+							&& entry->reference_key != NULL && entry->reference_key_length != 0
+							&& entry->reference_evidence != NULL && entry->reference_evidence_length != 0
+							&& cluster_recovery_ctrc_owner_graph_node_v2(entry->key, entry->key_length, &evidence, &nodes[n + 1]);
+						if (!valid) break;
+						nodes[n] = (ClusterRecoveryCTRCGraphNodeV2){1,
+							{entry->reference_key, entry->reference_key_length},
+							{entry->reference_evidence, entry->reference_evidence_length}};
+						edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){4, n, n + 1};
+						/* Keep every original reference entry and contribution. Only
+						 * the canonical coverage root set is unique. Conflicting
+						 * evidence remains visible to the original graph consumer. */
+						for (r = 0; r < contribution.root_count; r++) {
+							const ClusterRecoveryCTRCGraphBytesV2 *key = &nodes[roots[r]].key;
+							if (key->length == entry->reference_key_length
+								&& memcmp(key->data, entry->reference_key, key->length) == 0) break;
+						}
+						if (r == contribution.root_count) roots[contribution.root_count++] = n;
+						reference_nodes[i] = n;
+						contribution.node_count += 2;
+					}
+					for (uint32 i = 0; valid && i < reference_count; i++) {
+						uint32 fields[2]; Size offsets[2]; uint16 count;
+						const ClusterRecoveryCensusReferenceV1 *reference = &fixed_references[i];
+						if (reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+						count = cluster_recovery_cold_page_tuple_fields(fixed_references, reference_count, i,
+							tuple_offsets, tuple_bytes, entries, &related, terminals, terminal_count, fields, offsets);
+						if (count == 0) continue;
+						valid = contribution.node_count <= (Size)2 * reference_count - count
+							&& contribution.edge_count <= (Size)2 * reference_count - count
+							&& contribution.root_count <= (Size)2 * reference_count - count;
+						for (uint16 f = 0; valid && f < count; f++) {
+							const RfPageCtrcOwnerGraphEntryV1 *itl = &entries[fields[f]];
+							uint8 *key = (uint8 *)entries + tuple_key_offset + ((Size)2 * i + f) * reference_capacity;
+							Size length = itl->reference_key_length; size_t n = contribution.node_count, r;
+							/* Reuse the original full-T and actual DATA-id envelope;
+							 * replace only the precise tuple field offset/ordinal. */
+							memcpy(key, itl->reference_key, length);
+							cluster_undo_tt_ctrc_put_u64_le(key + length - 16, offsets[f]);
+							cluster_undo_tt_ctrc_put_u64_le(key + length - 8, reference->entry.index);
+							nodes[n] = (ClusterRecoveryCTRCGraphNodeV2){1, {key, length},
+								{itl->reference_evidence, itl->reference_evidence_length}};
+							tuple_nodes[(Size)2 * i + (offsets[f] - ItemIdGetOffset(&reference->entry.item)
+								== offsetof(HeapTupleHeaderData, t_choice.t_heap.t_xmax))] = n;
+							edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){2, n, reference_nodes[fields[f]]};
+							for (r = 0; r < contribution.root_count; r++) {
+								const ClusterRecoveryCTRCGraphBytesV2 *prior = &nodes[roots[r]].key;
+								if (prior->length == length && memcmp(prior->data, key, length) == 0) break;
+							}
+							if (r == contribution.root_count) roots[contribution.root_count++] = n;
+							contribution.node_count++;
+						}
+						if (valid) {
+							entries[i].reference_edge_kind = 2; entries[i].reference_field_count = count;
+							unresolved_count--;
+						}
+					}
+					/* A native redirect names a line pointer, not another raw xid.
+					 * Its target tuple already required the complete original page
+					 * projection/topology above. Reuse ONLY that target's canonical
+					 * xmin and whole PAGE witness, keeping the redirect's own exact
+					 * physical offset/ordinal. No target xmin node means unresolved. */
+					for (uint32 i = 0; valid && i < reference_count; i++) {
+						const ClusterRecoveryCensusReferenceV1 *reference = &fixed_references[i];
+						const ClusterRecoveryHeapEntry *item = &reference->entry;
+						uint32 target = UINT32_MAX;
+						size_t to, n = contribution.node_count, r;
+						uint8 *key;
+						Size length;
+						if (reference->version != 0 || item->kind != CLUSTER_RECOVERY_HEAP_ITEM
+							|| !ItemIdIsRedirected(&item->item) || ItemIdHasStorage(&item->item)
+							|| item->tuple_length != 0 || item->tuple_bytes != NULL) continue;
+						for (uint32 j = 0; j < reference_count; j++) {
+							const ClusterRecoveryCensusReferenceV1 *next = &fixed_references[j];
+							if (next->version != 0 || next->page_index != reference->page_index
+								|| next->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+								|| next->entry.index != ItemIdGetRedirect(&item->item)) continue;
+							if (target != UINT32_MAX) { target = UINT32_MAX; break; }
+							target = j;
+						}
+						if (target == UINT32_MAX || (to = tuple_nodes[(Size)2 * target]) == SIZE_MAX) continue;
+						length = nodes[to].key.length;
+						valid = item->index >= FirstOffsetNumber && item->index <= MaxHeapTuplesPerPage
+							&& length >= 16 && length <= reference_capacity
+							&& contribution.node_count < (Size)2 * reference_count
+							&& contribution.edge_count < (Size)3 * reference_count
+							&& contribution.root_count < (Size)2 * reference_count;
+						if (!valid) break;
+						key = (uint8 *)entries + tuple_key_offset + (Size)2 * i * reference_capacity;
+						memcpy(key, nodes[to].key.data, length);
+						cluster_undo_tt_ctrc_put_u64_le(key + length - 16,
+							SizeOfPageHeaderData + (Size)(item->index - FirstOffsetNumber) * sizeof(ItemIdData));
+						cluster_undo_tt_ctrc_put_u64_le(key + length - 8, item->index);
+						nodes[n] = (ClusterRecoveryCTRCGraphNodeV2){1, {key, length}, nodes[to].evidence};
+						edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){2, n, to};
+						for (r = 0; r < contribution.root_count; r++) {
+							const ClusterRecoveryCTRCGraphBytesV2 *prior = &nodes[roots[r]].key;
+							if (prior->length == length && memcmp(prior->data, key, length) == 0) break;
+						}
+						if (r == contribution.root_count) roots[contribution.root_count++] = n;
+						contribution.node_count++;
+						entries[i].reference_edge_kind = 2; entries[i].reference_field_count = 1;
+						unresolved_count--;
+					}
+					/* Native HOT topology names the actual current tuple pair.
+					 * Retain its exact xmax -> xmin dependency only after BOTH
+					 * whole-page field contributions and full canonical T agree. */
+					for (uint32 i = 0; valid && i < reference_count; i++) {
+						const ClusterRecoveryCensusReferenceV1 *reference = &fixed_references[i];
+						HeapTupleHeaderData h; size_t from = tuple_nodes[(Size)2 * i + 1], to = SIZE_MAX;
+						if (reference->version != 0 || reference->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+							|| reference->entry.tuple_length < SizeofHeapTupleHeader || from == SIZE_MAX) continue;
+						memcpy(&h, tuple_bytes + tuple_offsets[i], SizeofHeapTupleHeader);
+						if (!HeapTupleHeaderIsHotUpdated(&h)) continue;
+						for (uint32 j = 0; j < reference_count; j++) {
+							const ClusterRecoveryCensusReferenceV1 *next = &fixed_references[j];
+							if (next->version != 0 || next->page_index != reference->page_index
+								|| next->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM
+								|| next->entry.index != ItemPointerGetOffsetNumberNoCheck(&h.t_ctid)) continue;
+							if (to != SIZE_MAX) { valid = false; break; }
+							to = tuple_nodes[(Size)2 * j];
+						}
+						valid = valid && to != SIZE_MAX && nodes[from].key.length == nodes[to].key.length
+							&& memcmp(nodes[from].key.data, nodes[to].key.data, nodes[from].key.length - 16) == 0
+							&& contribution.edge_count < (Size)3 * reference_count;
+						if (valid) edges[contribution.edge_count++] = (ClusterRecoveryCTRCGraphEdgeV2){2, from, to};
+					}
+					if (contribution.node_count != 0) {
+						contribution.nodes = nodes; contribution.edges = edges; contribution.roots = roots;
+					}
+				}
+				if (valid && projected)
+					valid = work->counts.subject_count == terminal_count
+						&& cluster_recovery_cold_page_projection_subjects(start, work, scope, start->ctrc_page_progress,
+							terminals, &accepted, false);
+				ready = valid && cluster_recovery_cold_page_owner_scopes_current(start, work, scope, owners, owner_count,
+					sources, observed, source_count, wal_count, references, fixed_references, reference_count)
+					&& (!projected || cluster_recovery_cold_page_tuple_bytes_current(references,
+						fixed_references, reference_count, tuple_offsets, tuple_bytes));
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (related.entries != NULL) pfree(related.entries);
+		if (related.owners.entries != NULL) pfree(related.owners.entries);
+		if (entries != NULL) pfree((void *)entries);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ready) {
+		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.related = related; out.count = reference_count; out.entries = entries;
+		out.contribution = contribution; out.unresolved_count = unresolved_count;
+		return out;
+	}
+	if (related.entries != NULL) pfree(related.entries);
+	if (related.owners.entries != NULL) pfree(related.owners.entries);
+	if (entries != NULL) pfree((void *)entries);
+refused:
+	if (out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK && out.detail != RF_PAGE_PROOF_DETAIL_OOM)
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
+	return out;
+}
+
+RfPageCtrcOwnerGraphV1
+ClusterColdRecoveryCtrcPageOwnerGraph(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	return cluster_recovery_cold_page_owner_graph(start, memory_budget, false);
+}
+
+RfPageCtrcOwnerGraphV1
+ClusterColdRecoveryCtrcPageProjectedGraph(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	return cluster_recovery_cold_page_owner_graph(start, memory_budget, true);
+}
+
+/* Local snapshots borrow the original Start and PAGE ownership; their one
+ * allocation remains independently budgeted alongside all graph allocations. */
+typedef struct ClusterColdCtrcPageCoverageV1 {
+	ClusterColdCtrcPageReferenceSnapshotV1 saved;
+	Size *tuple_offsets;
+	char *tuple_bytes;
+	ClusterColdTtSlotInputV1 *terminals;
+	ClusterRecoveryTxResultObservationV1 accepted;
+	uint32 terminal_count;
+	uint32 *mapping;
+} ClusterColdCtrcPageCoverageV1;
+
+static bool
+cluster_recovery_cold_page_coverage_current(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageCoverageV1 *snapshot, bool capture)
+{
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved = &snapshot->saved;
+
+	return cluster_recovery_cold_page_references_same(start, saved)
+		&& cluster_recovery_cold_page_tuple_bytes_current(saved->references, saved->fixed_references,
+			saved->reference_count, snapshot->tuple_offsets, snapshot->tuple_bytes)
+		&& saved->work->counts.subject_count == snapshot->terminal_count
+		&& cluster_recovery_cold_page_projection_subjects(start, saved->work, saved->scope,
+			start->ctrc_page_progress, snapshot->terminals, &snapshot->accepted, capture);
+}
+
+/* This stronger opt-in check does not change the old per-field graph API.
+ * EVERY current slot/item must reconstruct the SAME whole actual PAGE, even
+ * when none of its entries contributes a transaction edge. */
+static bool
+cluster_recovery_cold_page_coverage_complete(const ClusterColdCtrcPageCoverageV1 *snapshot,
+	uint32 page_index, const volatile RfPageCtrcOwnerGraphV1 *graph)
+{
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved = &snapshot->saved;
+	uint32 owner = snapshot->mapping[page_index], seen = 0, first = UINT32_MAX;
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	const RfPageCtrcOwnerEvidenceV1 *proof;
+	PGAlignedBlock scratch;
+
+	if (owner >= graph->related.owners.count) return false;
+	proof = &graph->related.owners.entries[owner];
+	if (!cluster_ctrc_recovery_heap_itl_references_v1(proof->completed.owner.image.data)) return false;
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		const ClusterRecoveryCensusReferenceV1 *r = &saved->fixed_references[i];
+		uint32 index = r->entry.index;
+		if (r->page_index != page_index || r->version != 0) continue;
+		if (r->entry.kind == CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		if (r->entry.kind != CLUSTER_RECOVERY_HEAP_ITL || index >= CLUSTER_ITL_INITRANS_DEFAULT
+			|| (seen & (UINT32_C(1) << index)) != 0) return false;
+		seen |= UINT32_C(1) << index; slots[index] = r->entry.itl; first = i;
+		if (slots[index].flags != ITL_FLAG_FREE
+			&& (graph->entries[i].owner_index != owner || graph->entries[i].reference_edge_kind != 4
+				|| graph->entries[i].reference_field_count != 1)) return false;
+	}
+	return seen == (UINT32_C(1) << CLUSTER_ITL_INITRANS_DEFAULT) - 1
+		&& cluster_recovery_cold_page_hot_projection(saved->fixed_references, saved->reference_count,
+			first, snapshot->tuple_offsets, snapshot->tuple_bytes, slots, proof,
+			snapshot->terminals, snapshot->terminal_count, &scratch, true);
+}
+
+/* Native FREE and tuple predicates run on the complete page above. No-storage
+ * redirects still carry topology. A frozen tuple's allocated slot, moved or
+ * HOT flags remain outside this narrow absence rule; invalid xmax retains its
+ * original native precedence over stale raw xmax/MX bits. */
+static bool
+cluster_recovery_cold_page_no_current_tx(const ClusterRecoveryCensusReferenceV1 *r,
+	const char *tuple_bytes)
+{
+	HeapTupleHeaderData h;
+
+	if (r->version != 0) return false;
+	if (r->entry.kind == CLUSTER_RECOVERY_HEAP_ITL) return r->entry.itl.flags == ITL_FLAG_FREE;
+	if (r->entry.kind != CLUSTER_RECOVERY_HEAP_ITEM) return false;
+	if (!ItemIdHasStorage(&r->entry.item))
+		return !ItemIdIsRedirected(&r->entry.item)
+			&& (ItemIdIsDead(&r->entry.item) || !ItemIdIsUsed(&r->entry.item));
+	if (!ItemIdIsNormal(&r->entry.item) || r->entry.tuple_length < SizeofHeapTupleHeader) return false;
+	memcpy(&h, tuple_bytes, SizeofHeapTupleHeader);
+	return (HeapTupleHeaderXminFrozen(&h) || HeapTupleHeaderGetRawXmin(&h) == FrozenTransactionId
+			|| HeapTupleHeaderGetRawXmin(&h) == BootstrapTransactionId)
+		&& (h.t_infomask & HEAP_XMAX_INVALID) != 0 && (h.t_infomask & HEAP_MOVED) == 0
+		&& h.t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
+		&& (h.t_infomask2 & (HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE)) == 0;
+}
+
+/* Reserve and freeze the entire original coverage vector before the first
+ * yielding PAGE call. classes starts this allocation, including private
+ * snapshots; caller frees it alongside the unchanged graph result. */
+static uint8 *
+cluster_recovery_cold_page_coverage_snapshot(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget, Size *charged, ClusterColdCtrcPageCoverageV1 *snapshot, RfPageProofDetailV1 *detail)
+{
+	ClusterColdCtrcPageReferenceSnapshotV1 *saved = &snapshot->saved;
+	Size bytes = 0, classes_offset, references_offset, pages_offset, completed_offset, mapping_offset;
+	Size offsets_offset, payload_offset, terminals_offset, payload = 0, position = 0;
+	uint8 *allocation;
+
+	*detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (start == NULL || start != cluster_recovery_cold_start || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !start->ctrc_observation_complete || start->ctrc_references == NULL || start->ctrc_pages == NULL
+		|| start->ctrc_observation_work == NULL || start->ctrc_page_progress == NULL
+		|| start->ctrc_page_progress->pending || start->ctrc_page_plan == NULL) return NULL;
+	saved->references = start->ctrc_references; saved->pages = start->ctrc_pages;
+	saved->progress = start->ctrc_page_progress; saved->work = start->ctrc_observation_work;
+	saved->scope = start->ctrc_observation_inputs;
+	saved->reference_count = saved->references->count; saved->page_count = saved->pages->count;
+	saved->owner_count = saved->progress->target_count; snapshot->terminal_count = saved->work->counts.subject_count;
+	*detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+	if (!cluster_recovery_cold_page_reference_reserve(&bytes, Max(saved->reference_count, 1), 1, &classes_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->reference_count, sizeof(*saved->fixed_references), &references_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->page_count, sizeof(*saved->fixed_pages), &pages_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->owner_count, sizeof(*saved->fixed_completed), &completed_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->page_count, sizeof(*snapshot->mapping), &mapping_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, saved->reference_count, sizeof(Size), &offsets_offset)
+		|| !cluster_recovery_cold_page_reference_reserve(&bytes, snapshot->terminal_count, sizeof(*snapshot->terminals), &terminals_offset)
+		|| memory_budget < bytes) return NULL;
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		const ClusterRecoveryHeapEntry *entry = &saved->references->entries[i].entry;
+		if (entry->kind != CLUSTER_RECOVERY_HEAP_ITEM) continue;
+		*detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+		if (entry->tuple_length > BLCKSZ || (entry->tuple_length == 0) != (entry->tuple_bytes == NULL)) return NULL;
+		*detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		if (entry->tuple_length > MaxAllocSize - payload) return NULL;
+		payload += entry->tuple_length;
+	}
+	if (!cluster_recovery_cold_page_reference_reserve(&bytes, payload, 1, &payload_offset)
+		|| bytes > MaxAllocSize - *charged || memory_budget < bytes + *charged) return NULL;
+	*charged += bytes;
+	Assert(classes_offset == 0);
+	*detail = RF_PAGE_PROOF_DETAIL_OOM;
+	allocation = MemoryContextAllocExtended(TopMemoryContext, bytes, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+	if (allocation == NULL) return NULL;
+	saved->fixed_references = (ClusterRecoveryCensusReferenceV1 *)(allocation + references_offset);
+	saved->fixed_pages = (ClusterRecoveryCensusPageV1 *)(allocation + pages_offset);
+	saved->fixed_completed = (ClusterColdCtrcPageCompletedV1 *)(allocation + completed_offset);
+	snapshot->mapping = (uint32 *)(allocation + mapping_offset);
+	snapshot->tuple_offsets = (Size *)(allocation + offsets_offset);
+	snapshot->terminals = (ClusterColdTtSlotInputV1 *)(allocation + terminals_offset);
+	snapshot->tuple_bytes = (char *)allocation + payload_offset;
+	memcpy(saved->fixed_references, saved->references->entries, (Size)saved->reference_count * sizeof(*saved->fixed_references));
+	memcpy(saved->fixed_pages, saved->pages->entries, (Size)saved->page_count * sizeof(*saved->fixed_pages));
+	memcpy(saved->fixed_completed, saved->progress->completed, (Size)saved->owner_count * sizeof(*saved->fixed_completed));
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		const ClusterRecoveryHeapEntry *entry = &saved->fixed_references[i].entry;
+		snapshot->tuple_offsets[i] = position;
+		if (entry->kind == CLUSTER_RECOVERY_HEAP_ITEM && entry->tuple_length != 0) {
+			memcpy(snapshot->tuple_bytes + position, entry->tuple_bytes, entry->tuple_length);
+			position += entry->tuple_length;
+		}
+	}
+	return allocation;
+}
+
+/* Preserve every original reference, and separately count physical pages for
+ * which missing metadata cannot be represented by a reference entry at all. */
+static uint32
+cluster_recovery_cold_page_coverage_classes(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdCtrcPageCoverageV1 *snapshot, const volatile RfPageCtrcOwnerGraphV1 *graph,
+	uint8 *classes, uint32 *absent, uint32 *unresolved)
+{
+	const ClusterColdCtrcPageReferenceSnapshotV1 *saved = &snapshot->saved;
+	uint32 uncovered = 0;
+
+	for (uint32 p = 0; p < saved->page_count; p++) snapshot->mapping[p] = UINT32_MAX;
+	for (uint32 o = 0; o < saved->owner_count; o++) {
+		RfPageOnlineTargetViewV1 target;
+		ClusterRecoveryCensusPageV1 page;
+		if (!rf_page_online_plan_target_v1(start->ctrc_page_plan, o, &target)
+			|| !cluster_recovery_cold_page_target(start, &target, &page)) continue;
+		for (uint32 p = 0; p < saved->page_count; p++)
+			if (memcmp(&page, &saved->fixed_pages[p], sizeof(page)) == 0)
+				snapshot->mapping[p] = snapshot->mapping[p] == UINT32_MAX ? o : UINT32_MAX - 1;
+	}
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		const RfPageCtrcOwnerGraphEntryV1 *entry = &graph->entries[i];
+		if (saved->fixed_references[i].version == 0
+			&& (entry->reference_edge_kind == 2 || entry->reference_edge_kind == 4)
+			&& entry->reference_field_count != 0) classes[i] = RF_PAGE_CTRC_REFERENCE_GRAPH;
+	}
+	for (uint32 p = 0; p < saved->page_count; p++) {
+		if (!cluster_recovery_cold_page_coverage_complete(snapshot, p, graph)) { uncovered++; continue; }
+		for (uint32 i = 0; i < saved->reference_count; i++) {
+			const ClusterRecoveryCensusReferenceV1 *r = &saved->fixed_references[i];
+			if (r->page_index == p && classes[i] == RF_PAGE_CTRC_REFERENCE_UNRESOLVED
+				&& cluster_recovery_cold_page_no_current_tx(r, snapshot->tuple_bytes + snapshot->tuple_offsets[i]))
+				classes[i] = RF_PAGE_CTRC_REFERENCE_NO_CURRENT_TX;
+		}
+	}
+	for (uint32 i = 0; i < saved->reference_count; i++) {
+		if (classes[i] == RF_PAGE_CTRC_REFERENCE_NO_CURRENT_TX) (*absent)++;
+		if (classes[i] == RF_PAGE_CTRC_REFERENCE_UNRESOLVED) (*unresolved)++;
+	}
+	return uncovered;
+}
+
+RfPageCtrcReferenceCoverageV1
+ClusterColdRecoveryCtrcPageReferenceCoverage(const struct ClusterRecoveryStartV1 *start, Size memory_budget)
+{
+	RfPageCtrcReferenceCoverageV1 out = {0};
+	RfPageCtrcOwnerGraphV1 volatile graph = {0};
+	ClusterColdCtrcPageCoverageV1 snapshot = {0};
+	uint8 *volatile classes = NULL;
+	/* Include nested original page/batch/slot projectors and HOT scratch. */
+	Size charged = sizeof(out) + sizeof(graph) + sizeof(snapshot) + 5 * BLCKSZ
+		+ sizeof(RfPageOnlineTargetViewV1) + sizeof(ClusterRecoveryCensusPageV1)
+		+ CLUSTER_ITL_INITRANS_DEFAULT * sizeof(ClusterItlSlotData) + MaxHeapTuplesPerPage;
+	uint32 absent = 0, unresolved = 0, uncovered = 0;
+	bool ready = false;
+
+	PG_TRY();
+	{
+		classes = cluster_recovery_cold_page_coverage_snapshot(start, memory_budget, &charged, &snapshot, &out.detail);
+		if (classes != NULL) {
+			out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+			if (cluster_recovery_ctrc_terminal_result_v1(start, snapshot.saved.work, &snapshot.accepted)
+				&& cluster_recovery_cold_page_coverage_current(start, &snapshot, true)) {
+				graph = ClusterColdRecoveryCtrcPageProjectedGraph(start, memory_budget - charged);
+				out.detail = graph.detail;
+				if (graph.detail == RF_PAGE_PROOF_DETAIL_OK) {
+					out.detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+					if (graph.count == snapshot.saved.reference_count
+						&& graph.related.owners.count == snapshot.saved.owner_count
+						&& cluster_recovery_cold_page_coverage_current(start, &snapshot, false)) {
+						uncovered = cluster_recovery_cold_page_coverage_classes(start, &snapshot, &graph,
+							classes, &absent, &unresolved);
+						ready = cluster_recovery_cold_page_coverage_current(start, &snapshot, false);
+					}
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		if (graph.related.owners.entries != NULL) pfree(graph.related.owners.entries);
+		if (graph.related.entries != NULL) pfree(graph.related.entries);
+		if (graph.entries != NULL) pfree(graph.entries);
+		if (classes != NULL) pfree((void *)classes);
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ready) {
+		out.detail = RF_PAGE_PROOF_DETAIL_OK; out.graph = graph; out.count = snapshot.saved.reference_count;
+		out.classes = classes; out.no_reference_count = absent; out.unresolved_count = unresolved;
+		out.uncovered_page_count = uncovered;
+		return out;
+	}
+	if (graph.related.owners.entries != NULL) pfree(graph.related.owners.entries);
+	if (graph.related.entries != NULL) pfree(graph.related.entries);
+	if (graph.entries != NULL) pfree(graph.entries);
+	if (classes != NULL) pfree((void *)classes);
+	if (out.detail != RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT && out.detail != RF_PAGE_PROOF_DETAIL_WOULD_BLOCK
+		&& out.detail != RF_PAGE_PROOF_DETAIL_OOM)
+		cluster_recovery_cold_page_plan_refuse(cluster_recovery_cold_start, out.detail);
+	return out;
+}
+
+static bool
+cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcPageCompletedV1 *fixed, uint32 fixed_count)
 {
 	const ClusterColdCtrcWorkV1 *work = start->ctrc_observation_work;
 	ClusterWalInputsV1 *scope = start->ctrc_observation_inputs;
 	ClusterColdCtrcPageProgressV1 *progress = start->ctrc_page_progress;
 	ClusterRecoveryTxResultObservationV1 accepted;
 	ClusterColdTtSlotInputV1 *volatile subjects = NULL;
+	ClusterColdCtrcPageCompletedV1 *volatile owned_completed = NULL;
+	const ClusterColdCtrcPageCompletedV1 *completed = fixed;
 	volatile bool ready = false;
-	Size bytes;
+	Size bytes, completed_bytes;
+	uint32 count;
 
-	if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)) return false;
+	if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)
+		|| !cluster_recovery_cold_page_tx_recheck(start, work, scope, progress)) return false;
 	if (progress == NULL)
-		return rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+		return fixed == NULL && fixed_count == 0
+			&& rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
 			&& cluster_recovery_cold_page_census_recheck(start, work, scope, progress)
 			&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
 			&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
-	if (work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
+	count = rf_page_online_plan_target_count_v1(start->ctrc_page_plan);
+	if (progress->target_count != count || progress->pending || progress->next_target != count
+		|| count > MaxAllocSize / sizeof(*completed)
+		|| (fixed == NULL ? fixed_count != 0 : fixed_count != count)
+		|| work->counts.subject_count > MaxAllocSize / sizeof(*subjects)
 		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)) return false;
 	bytes = (Size)work->counts.subject_count * sizeof(*subjects);
+	completed_bytes = (Size)count * sizeof(*completed);
 	PG_TRY();
 	{
 		uint32 index = 0;
 
+		/* Drain lends its one budgeted sample through the whole directory/H
+		 * continuation. A standalone recheck keeps its original local sample. */
+		if (completed == NULL) {
+			owned_completed = MemoryContextAllocExtended(TopMemoryContext, completed_bytes,
+				MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+			if (owned_completed != NULL)
+				memcpy(owned_completed, progress->completed, completed_bytes);
+			completed = owned_completed;
+		}
 		if (bytes != 0)
 			subjects = MemoryContextAllocExtended(TopMemoryContext, bytes,
 				MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
-		if ((bytes == 0 || subjects != NULL)
+		if (completed != NULL && (bytes == 0 || subjects != NULL)
 			&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
-				progress, subjects, &accepted, true)) {
+				progress, subjects, &accepted, true)
+			&& cluster_recovery_cold_page_completed_same(progress, completed, count)) {
 			for (;;) {
-				RfPageCtrcReadbackImageV1 observed;
+				RfPageCtrcOwnerProofV1 observed;
 				PGAlignedBlock projected;
 				RfPageOnlineTargetViewV1 target;
 
@@ -2723,20 +4638,29 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 				HandleStartupProcInterrupts();
 				if (!cluster_recovery_cold_page_projection_subjects(start, work, scope,
 						progress, subjects, &accepted, false)
-					|| progress->pending || progress->next_target != progress->target_count) break;
-				if (index == progress->target_count) { ready = true; break; }
+					|| !cluster_recovery_cold_page_completed_same(progress, completed, count)) break;
+				if (index == count) { ready = true; break; }
 				/* No saved baseline qualifies history/non-heap duties. Their
 				 * independent graph/owner obligations remain unchanged. */
 				if (progress->completed[index].storage == NULL) { index++; continue; }
-				observed = ClusterColdRecoveryCtrcPageImage(start, index);
+				observed = ClusterColdRecoveryCtrcPageOwnerProof(start, index);
 				if (observed.detail == RF_PAGE_PROOF_DETAIL_WOULD_BLOCK) {
 					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+					/* Keep the original sample; a local wait cannot refresh it
+					 * or preserve a prefix of the previous physical checks. */
+					if (!cluster_recovery_cold_page_first_empty(start, work, scope, progress)
+						|| !cluster_recovery_cold_page_tx_recheck(start, work, scope, progress)
+						|| !cluster_recovery_cold_page_completed_same(progress, completed, count)) break;
+					index = 0;
 					continue;
 				}
 				/* PAGE/proof are already destroyed. Projection is a read-only
 				 * assertion of the final native result, never another write. */
 				if (observed.detail != RF_PAGE_PROOF_DETAIL_OK
+					|| observed.owner_family != 10 || observed.outcome != 1
+					|| (observed.rule != 1 && observed.rule != 6)
+					|| observed.target_index != index || observed.target_count != progress->target_count
 					|| cluster_ctrc_recovery_itl_page_image_v1(subjects, work->counts.subject_count,
 						observed.image.data, projected.data) != CLUSTER_CTRC_ITL_CLEANOUT_ALREADY_TERMINAL
 					|| memcmp(&observed.image, &projected, sizeof(projected)) != 0
@@ -2754,22 +4678,107 @@ cluster_recovery_cold_page_completed_recheck(const struct ClusterRecoveryStartV1
 					&& cluster_recovery_cold_page_reference_terminals(start, work, scope, progress)
 					&& cluster_recovery_cold_page_projection_subjects(start, work, scope,
 						progress, subjects, &accepted, false)
-					&& cluster_recovery_cold_page_first_empty(start, work, scope, progress);
+					&& cluster_recovery_cold_page_first_empty(start, work, scope, progress)
+					&& cluster_recovery_cold_page_completed_same(progress, completed, count);
 		}
 	}
 	PG_FINALLY();
 	{
 		if (subjects != NULL) pfree((void *)subjects);
+		if (owned_completed != NULL) pfree((void *)owned_completed);
 	}
 	PG_END_TRY();
 	return ready;
 }
 
+/* The immutable original work and physical observations remain the terminal
+ * factory's inputs. Only unreleased COMMITTED history needs the finite H
+ * below; a terminal stamp or an empty volatile directory cannot supply it. */
+static bool
+cluster_recovery_cold_page_history_scn(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress, SCN *maximum)
+{
+	const ClusterColdCtrcPhysicalV1 *physical;
+	SCN latest = InvalidScn;
+
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	physical = start->ctrc_physical;
+	if (physical == NULL || physical->count != work->counts.subject_count) return false;
+	for (uint32 i = 0; i < work->counts.subject_count; i++) {
+		ClusterRecoveryUndoEntry observed = physical->entries[i];
+		ClusterColdTtSlotInputV1 terminal;
+
+		if (!cluster_recovery_ctrc_terminal_subject_v1(start, work, i, &observed, &terminal)
+			|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+			|| start->ctrc_physical != physical
+			|| memcmp(&observed, &physical->entries[i], sizeof(observed)) != 0) return false;
+		if ((terminal.slot.flags & TT_SLOT_FLAG_CTRC_RELEASE_PROVEN) != 0) continue;
+		if (terminal.slot.status == TT_SLOT_ABORTED && !SCN_VALID(terminal.slot.commit_scn)) continue;
+		if (terminal.slot.status != TT_SLOT_COMMITTED || !SCN_VALID(terminal.slot.commit_scn)
+			|| terminal.slot.commit_scn == CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED) return false;
+		if (!SCN_VALID(latest) || scn_time_cmp(terminal.slot.commit_scn, latest) > 0)
+			latest = terminal.slot.commit_scn;
+	}
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	*maximum = latest;
+	return true;
+}
+
+/* Original cleaner-side H sampling/fold, inside the same Start/source and
+ * canonical-terminal bracket. Missing/stale/equal/infinite reports are WAIT,
+ * never a terminal failure or local-only fallback. No supplied floor, saved
+ * infinity or new release proof. Caller repeats ALL physical checks on WAIT. */
+static bool
+cluster_recovery_cold_page_history_ready(const struct ClusterRecoveryStartV1 *start,
+	const ClusterColdCtrcWorkV1 *work, ClusterWalInputsV1 *scope,
+	ClusterColdCtrcPageProgressV1 *progress, bool *ready)
+{
+	ClusterUndoHorizonReportView views[CLUSTER_MAX_NODES];
+	ClusterUndoHorizonFloor floor;
+	ClusterUndoHorizonStallReason reason;
+	ClusterRecoveryTxResultObservationV1 accepted, confirmed;
+	uint8 required[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	SCN maximum, after, local_floor;
+	uint64 epoch;
+	int32 blame;
+	int nviews;
+	bool observed = false;
+
+	*ready = false;
+	if (!cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+		|| !cluster_recovery_ctrc_terminal_result_v1(start, work, &accepted)
+		|| !cluster_recovery_cold_page_history_scn(start, work, scope, progress, &maximum)) return false;
+	if (!SCN_VALID(maximum)) observed = true;
+	else if (cluster_undo_retention_horizon_enabled && !cluster_cr_native_prehistory_disabled()) {
+		local_floor = cluster_undo_retention_horizon();
+		nviews = cluster_undo_horizon_sample_views(views, CLUSTER_MAX_NODES);
+		if (nviews == CLUSTER_MAX_NODES
+			&& cluster_undo_horizon_required_members(required, &epoch) && epoch == start->writer.epoch
+			&& cluster_undo_horizon_cluster_floor(local_floor, views, nviews, required,
+				cluster_node_id, epoch, (uint64)GetCurrentTimestamp(),
+				(uint32)cluster_lmon_main_loop_interval, &floor, &reason, &blame)
+				== CLUSTER_UNDO_HORIZON_FOLD_OK
+			&& floor.epoch == epoch && SCN_VALID(floor.scn)
+			&& floor.scn != CLUSTER_UNDO_HORIZON_REPORT_UNCONSTRAINED
+			&& scn_time_cmp(maximum, floor.scn) < 0
+			&& !cluster_undo_horizon_epoch_fence_tripped(epoch)
+			&& cluster_undo_retention_horizon_enabled && !cluster_cr_native_prehistory_disabled())
+			observed = true;
+	}
+	if (!cluster_recovery_cold_page_history_scn(start, work, scope, progress, &after)
+		|| maximum != after || !cluster_recovery_ctrc_terminal_result_v1(start, work, &confirmed)
+		|| memcmp(&accepted, &confirmed, sizeof(accepted)) != 0
+		|| !cluster_recovery_cold_page_advance_current(start, work, scope, progress)) return false;
+	*ready = observed;
+	return true;
+}
+
 /* Finish each exact bufferless FPI operation through the original protected
  * readback/current/local-debt path. Keep its full value and same raw FD for
  * the remaining fixed graph and independent joint service, not a new owner. */
-bool
-ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
+static bool
+cluster_recovery_cold_page_drain(const struct ClusterRecoveryStartV1 *start,
 	Size memory_budget)
 {
 	struct ClusterRecoveryStartV1 *state;
@@ -2825,35 +4834,102 @@ ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
 			progress->pending = false;
 			progress->next_target++;
 		}
-		while (ready) {
-			const ClusterColdCtrcWorkV1 *work;
-			ClusterWalInputsV1 *scope;
-			ClusterColdCtrcPageProgressV1 *progress;
-			ClusterCtrcLocalEmptyV1 empty;
+		if (ready) {
+			const ClusterColdCtrcWorkV1 *work = state->ctrc_observation_work;
+			ClusterWalInputsV1 *scope = state->ctrc_observation_inputs;
+			ClusterColdCtrcPageProgressV1 *progress = state->ctrc_page_progress;
+			uint32 count = rf_page_online_plan_target_count_v1(start->ctrc_page_plan);
+			ClusterColdCtrcPageCompletedV1 *volatile completed = NULL;
 
-			if (start != cluster_recovery_cold_start) { ready = false; break; }
-			work = state->ctrc_observation_work;
-			scope = state->ctrc_observation_inputs;
-			progress = state->ctrc_page_progress;
-			ResetLatch(MyLatch);
-			ready = cluster_recovery_cold_page_completed_recheck(start);
-			if (!ready) break;
-			/* F4-cleared, unchanged and zero-PAGE paths still owe the
-			 * original whole local directory check. EMPTY is an instant
-			 * observation, not first/pin/history discharge or completion. */
-			empty = cluster_ctrc_recovery_local_empty_v1();
-			ready = cluster_recovery_cold_page_advance_current(start, work, scope, progress)
-				&& (progress == NULL
-					? rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
-					: !progress->pending && progress->next_target == progress->target_count);
-			if (!ready || empty == CLUSTER_CTRC_LOCAL_EMPTY) break;
-			if (empty != CLUSTER_CTRC_LOCAL_WAIT) { ready = false; break; }
-			/* No partial directory locks survive the native probe. Keep
-			 * the same FDs/IR/WALR and redo the entire original readback
-			 * after each local wait; elapsed time is not a refusal. */
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-				100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
-			HandleStartupProcInterrupts();
+			PG_TRY();
+			{
+				/* Reuse the one full sample charged before the first PAGE.
+				 * A directory/H wait cannot replace the operations it sampled. */
+				if (progress == NULL) ready = count == 0;
+				else if (count == 0 || count > MaxAllocSize / sizeof(*completed)
+					|| progress->target_count != count || progress->pending
+					|| progress->next_target != count) ready = false;
+				else {
+					Size bytes = (Size)count * sizeof(*completed);
+
+					completed = MemoryContextAllocExtended(TopMemoryContext, bytes,
+						MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+					ready = completed != NULL;
+					if (ready) memcpy(completed, progress->completed, bytes);
+				}
+				while (ready) {
+					ClusterCtrcLocalEmptyV1 empty;
+					bool history_ready = false;
+
+					if (start != cluster_recovery_cold_start
+						|| state->ctrc_page_progress != progress) { ready = false; break; }
+					ResetLatch(MyLatch);
+					ready = cluster_recovery_cold_page_completed_recheck(start, completed, count);
+					if (!ready) break;
+					/* F4-cleared, unchanged and zero-PAGE paths still owe the
+					 * original whole local directory check. EMPTY is an instant
+					 * observation, not first/pin/history discharge or completion. */
+					empty = cluster_ctrc_recovery_local_empty_v1();
+					ready = cluster_recovery_cold_page_advance_current(start, work, scope, progress)
+						&& state->ctrc_page_progress == progress
+						&& (progress == NULL
+							? rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+							: cluster_recovery_cold_page_completed_same(progress, completed, count));
+					if (!ready) break;
+					if (empty == CLUSTER_CTRC_LOCAL_EMPTY) {
+						ready = cluster_recovery_cold_page_history_ready(start, work, scope, progress,
+							&history_ready)
+							&& state->ctrc_page_progress == progress
+							&& (progress == NULL
+								? rf_page_online_plan_target_count_v1(start->ctrc_page_plan) == 0
+								: cluster_recovery_cold_page_completed_same(progress, completed, count));
+						if (!ready || history_ready) break;
+					} else if (empty != CLUSTER_CTRC_LOCAL_WAIT) { ready = false; break; }
+					/* No partial directory locks survive the native probe. Keep
+					 * the same FDs/IR/WALR and redo the entire original readback
+					 * against the fixed sample after each directory/H wait. */
+					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						100L, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+					HandleStartupProcInterrupts();
+				}
+			}
+			PG_FINALLY();
+			{
+				if (completed != NULL) pfree((void *)completed);
+			}
+			PG_END_TRY();
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_INTERNAL);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ready) cluster_recovery_cold_page_plan_refuse(state, RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	return ready;
+}
+
+
+/* PGRAC: keep the original pass-2 input fixed across PAGE drain and local
+ * waits. Route coverage is an input to the final handoff, not durability or
+ * independent completion authority. The original typed owner still owns it. */
+bool
+ClusterColdRecoveryCtrcPageDrain(const struct ClusterRecoveryStartV1 *start,
+	Size memory_budget)
+{
+	struct ClusterRecoveryStartV1 *state;
+	bool ready = false;
+
+	if (start == NULL) return true;
+	if (!cluster_recovery_cold_ctrc_replays_actor() || start != cluster_recovery_cold_start)
+		return false;
+	state = cluster_recovery_cold_start;
+	PG_TRY();
+	{
+		if (ClusterColdRecoveryTxEffectsCurrent(start)) {
+			ready = cluster_recovery_cold_page_drain(start, memory_budget)
+				&& ClusterColdRecoveryTxEffectsCurrent(start);
 		}
 	}
 	PG_CATCH();
@@ -2910,6 +4986,21 @@ ClusterColdRecoveryCtrcReferences(const struct ClusterRecoveryStartV1 *start,
 	return ClusterColdRecoveryCtrcObserve(start, 0) ? start->ctrc_references : NULL;
 }
 
+const ClusterRecoveryCensusImagesV1 *
+ClusterColdRecoveryCtrcImages(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work)
+{
+	bool held = false;
+
+	if (start == NULL || start != cluster_recovery_cold_start || CritSectionCount != 0
+		|| ShutdownRequestPending || !start->ctrc_observation_complete
+		|| work != start->ctrc_observation_work)
+		return NULL;
+	ForEachLWLockHeldByMe(cluster_recovery_cold_ctrc_lock_held, &held);
+	if (held) return NULL;
+	return ClusterColdRecoveryCtrcObserve(start, 0) ? start->ctrc_images : NULL;
+}
+
 /* Bind the original forest's borrowed records to this exact complete Start.
  * Stable TX dependencies alone cannot retire reference or owner obligations. */
 ClusterRecoveryCensusTxRecordV1
@@ -2942,6 +5033,88 @@ ClusterColdRecoveryCtrcTxRecord(const struct ClusterRecoveryStartV1 *start,
 	PG_CATCH();
 	{
 		cluster_recovery_cold_observation_refuse(state, "tx_record_error", 0);
+		cluster_recovery_cold_observation_close(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
+/* Match original value fields; C structure padding is not source identity. */
+static bool
+cluster_recovery_cold_native_record_source_matches(const ClusterRecoveryNativeRecord *record,
+	const ClusterRecoveryWalSourceObservationV1 *source)
+{
+	const ClusterWalSourceRef *a = &record->source, *b = &source->source;
+	const RfContributorStreamCutV1 *x = &record->cut, *y = &source->cut;
+	const ClusterControlRootIdentity *left = &a->claim.identity, *right = &b->claim.identity;
+
+	return left->system_identifier == right->system_identifier
+		&& memcmp(left->storage_uuid, right->storage_uuid, 16) == 0
+		&& memcmp(left->authority_uuid, right->authority_uuid, 16) == 0
+		&& left->origin_thread_id == right->origin_thread_id
+		&& left->reserved42 == 0 && right->reserved42 == 0
+		&& left->origin_node_id == right->origin_node_id
+		&& left->thread_claim_created_at == right->thread_claim_created_at
+		&& left->thread_claim_crc32c == right->thread_claim_crc32c
+		&& left->reserved60 == 0 && right->reserved60 == 0
+		&& left->origin_owner_incarnation == right->origin_owner_incarnation
+		&& left->root_lineage_seq == right->root_lineage_seq
+		&& a->claim.database_incarnation == b->claim.database_incarnation
+		&& a->claim.max_config_generation == b->claim.max_config_generation
+		&& memcmp(a->claim.claim_sha256, b->claim.claim_sha256, 32) == 0
+		&& a->timeline == b->timeline
+		&& x->failed_thread == y->failed_thread && x->flags == y->flags
+		&& x->timeline_id == y->timeline_id && x->scan_begin_inclusive == y->scan_begin_inclusive
+		&& x->scan_end_exclusive == y->scan_end_exclusive
+		&& x->contributor_count == y->contributor_count && x->component_count == y->component_count
+		&& x->origin_owner_incarnation == y->origin_owner_incarnation;
+}
+
+ClusterRecoveryNativeRecordObservationV1
+ClusterColdRecoveryCtrcNativeRecord(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint64 index)
+{
+	ClusterRecoveryNativeRecordObservationV1 out = {0};
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	ClusterRecoveryNativeEffect empty = {0};
+	bool held = false;
+
+	if (start == NULL || start != state || CritSectionCount != 0 || ShutdownRequestPending
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| index > start->ctrc_observation_manifest.native_effect_count) return out;
+	ForEachLWLockHeldByMe(cluster_recovery_cold_ctrc_lock_held, &held);
+	if (held || !ClusterColdRecoveryCtrcObserve(start, 0)) return out;
+	PG_TRY();
+	{
+		ClusterRecoveryNativeRecordObservationV1 current = cluster_recovery_census_native_record_v1(
+			state->ctrc_observation_census, index);
+		ClusterRecoveryWalSourceObservationV1 source;
+		bool ok = current.observed && current.index == index && index <= current.count
+			&& cluster_recovery_native_record_effects_valid_v1(&current,
+				state->ctrc_observation_manifest.native_effect_count)
+			&& current.count <= state->ctrc_observation_manifest.native_effect_count
+			&& current.source_count == state->ctrc_observation_manifest.source_count;
+
+		if (ok && index == current.count)
+			ok = current.source_index == 0 && current.record_ordinal == 0
+				&& memcmp(&current.primary, &empty, sizeof(empty)) == 0;
+		else if (ok)
+			ok = current.primary.record != NULL && current.primary.kind != 0
+				&& current.source_index < current.source_count
+				&& cluster_recovery_census_wal_source_at_v1(state->ctrc_observation_census,
+					current.source_index, &source)
+				&& source.source_index == current.source_index
+				&& cluster_recovery_cold_native_record_source_matches(current.primary.record, &source);
+		if (ok && ClusterColdRecoveryCtrcObserve(start, 0)) out = current;
+		else {
+			cluster_recovery_cold_observation_refuse(state, "native_record", 0);
+			cluster_recovery_cold_observation_close(state);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_observation_refuse(state, "native_record_error", 0);
 		cluster_recovery_cold_observation_close(state);
 		PG_RE_THROW();
 	}
@@ -2987,6 +5160,68 @@ ClusterColdRecoveryCtrcTxDependency(const struct ClusterRecoveryStartV1 *start,
 	PG_CATCH();
 	{
 		cluster_recovery_cold_observation_refuse(state, "tx_dependency_error", 0);
+		cluster_recovery_cold_observation_close(state);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return out;
+}
+
+ClusterRecoveryCensusTxReferenceV1
+ClusterColdRecoveryCtrcTxReference(const struct ClusterRecoveryStartV1 *start,
+	const struct ClusterColdCtrcWorkV1 *work, uint32 index)
+{
+	ClusterRecoveryCensusTxReferenceV1 out = {0};
+	struct ClusterRecoveryStartV1 *state = cluster_recovery_cold_start;
+	bool held = false;
+
+	if (start == NULL || start != state || CritSectionCount != 0 || ShutdownRequestPending
+		|| !start->ctrc_observation_complete || work != start->ctrc_observation_work
+		|| start->ctrc_references == NULL || index > start->ctrc_references->count) return out;
+	ForEachLWLockHeldByMe(cluster_recovery_cold_ctrc_lock_held, &held);
+	if (held || !ClusterColdRecoveryCtrcObserve(start, 0)) return out;
+	PG_TRY();
+	{
+		ClusterRecoveryCensusTxReferenceV1 current = cluster_recovery_census_tx_reference_v1(
+			state->ctrc_observation_census, index);
+		const ClusterRecoveryGraphDependency *dependency = &current.transaction;
+		ClusterRecoveryGraphDependency empty = {0};
+		bool ok = current.observed && current.index == index
+			&& current.count == state->ctrc_references->count;
+
+		if (ok && index == current.count)
+			ok = current.reference == NULL && memcmp(dependency, &empty, sizeof(empty)) == 0;
+		else if (ok) {
+			const ClusterRecoveryCensusReferenceV1 *reference = &state->ctrc_references->entries[index];
+
+			ok = current.reference == reference
+				&& (reference->entry.kind == CLUSTER_RECOVERY_HEAP_ITL
+					|| reference->entry.kind == CLUSTER_RECOVERY_HEAP_ITEM);
+			if (ok && reference->entry.kind == CLUSTER_RECOVERY_HEAP_ITL
+				&& reference->entry.itl.flags != ITL_FLAG_FREE)
+				ok = dependency->value.record != NULL
+					&& dependency->value.record == reference->transaction.record
+					&& dependency->value.record_segment_generation == reference->transaction.record_segment_generation
+					&& memcmp(&dependency->value.transaction, &reference->transaction.transaction,
+						sizeof(dependency->value.transaction)) == 0
+					&& dependency->count == state->ctrc_observation_manifest.tx_record_count
+					&& dependency->index < dependency->count && dependency->root_count <= dependency->count
+					&& dependency->root == (dependency->index < dependency->root_count)
+					&& (dependency->predecessor.record == NULL
+						|| (dependency->predecessor_index < dependency->count
+							&& dependency->predecessor_index != dependency->index));
+			else if (ok) ok = reference->transaction.record == NULL
+				&& memcmp(dependency, &empty, sizeof(empty)) == 0;
+		}
+		if (ok && ClusterColdRecoveryCtrcObserve(start, 0)) out = current;
+		else {
+			cluster_recovery_cold_observation_refuse(state, "tx_reference", 0);
+			cluster_recovery_cold_observation_close(state);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_cold_observation_refuse(state, "tx_reference_error", 0);
 		cluster_recovery_cold_observation_close(state);
 		PG_RE_THROW();
 	}
@@ -3066,7 +5301,8 @@ ClusterColdRecoveryCtrcPageWalAt(const struct ClusterRecoveryStartV1 *start,
 	PG_TRY();
 	{
 		ok = cluster_recovery_census_page_wal_at_v1(state->ctrc_observation_census, index, out);
-		if (!ok || !cluster_recovery_cold_observation_current(start)) {
+		if (!ok || !cluster_recovery_cold_observation_current(start)
+			|| !cluster_recovery_page_wal_raw_valid_v1(out)) {
 			memset(out, 0, sizeof(*out)); ok = false;
 			cluster_recovery_cold_observation_refuse(state, "page_wal", 0);
 			cluster_recovery_cold_observation_close(state);
@@ -3348,7 +5584,14 @@ ClusterColdRecoveryTxEffectsCurrent(const struct ClusterRecoveryStartV1 *start)
 
 	/* The receipt is independently sealed to the original plan/result.  Do
 	 * not infer completeness from a caller bit or from a proven loser. */
-	return typed != NULL && cluster_cold_typed_effects_ready_v1(typed);
+	if (typed == NULL || !cluster_cold_typed_effects_ready_v1(typed))
+		return false;
+	if (!start->effects_fixed) {
+		memcpy(&cluster_recovery_cold_start->effects_receipt,
+			&typed->effects_receipt, sizeof(typed->effects_receipt));
+		cluster_recovery_cold_start->effects_fixed = true;
+	}
+	return true;
 }
 
 bool
@@ -3565,6 +5808,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	ClusterWalWriterToken writer;
 	uint8 operation_uuid[16];
 	uint64 owner_boot, install_generation, claim_owner;
+	uint32 relmap_count;
 
 	if (info == NULL)
 		return false;
@@ -3583,6 +5827,11 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		|| CurrentResourceOwner == NULL || MyProcPid <= 0
 		|| cluster_recovery_cold_generation == PG_UINT64_MAX
 		|| !ClusterStartupInstalledRecoveryWriterV1(&writer, operation_uuid, &install_generation))
+		return false;
+	/* The original replay participant must not depend on a later optional
+	 * Declare call. This is saved input only, never physical qualification. */
+	relmap_count = cluster_cold_typed_relmap_replay_count_v1(cluster_recovery_cold_inputs);
+	if (relmap_count == UINT32_MAX)
 		return false;
 	/* Original retained recovery is still serialized by its exact creator.
 	 * This full file check runs before target protection, not in Current. */
@@ -3613,11 +5862,39 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	start->writer = writer;
 	memcpy(start->operation_uuid, operation_uuid, 16);
 	cluster_recovery_cold_start = start;
-	if (!ClusterColdRecoveryTxCurrent(start)
-		|| !cluster_recovery_checkpoint_register_v1(start)) {
-		cluster_recovery_cold_start = NULL;
-		pfree(start);
-		return false;
+	if (relmap_count == 0) {
+		if (!ClusterColdRecoveryTxCurrent(start)
+			|| !cluster_recovery_checkpoint_register_v1(start)) {
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			return false;
+		}
+	} else {
+		volatile bool declared = false;
+
+		PG_TRY();
+		{
+			declared = ClusterColdRecoveryTxCurrent(start)
+				&& cluster_recovery_checkpoint_register_v1(start)
+				&& ClusterColdRecoveryRelmapDeclare(start)
+				&& relmap_count == cluster_cold_typed_relmap_replay_count_v1(start->inputs);
+		}
+		PG_CATCH();
+		{
+			cluster_recovery_cold_inputs->refusal = CLUSTER_COLD_SOURCE_GAP;
+			cluster_recovery_checkpoint_revoke_v1(start);
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (!declared) {
+			cluster_recovery_cold_inputs->refusal = CLUSTER_COLD_SOURCE_GAP;
+			cluster_recovery_checkpoint_revoke_v1(start);
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			return false;
+		}
 	}
 	info->cluster_tx_start = start;
 	return true;
@@ -6972,10 +9249,8 @@ cluster_typed_replay_finish(ClusterColdTypedReplay *rep, const ClusterColdReplay
 	cluster_typed_replay_publish(rep, result);
 	if (*rep->fence_plan != NULL)
 	{
-		if (!cluster_recovery_merge_fence_plan_release_serial(*rep->fence_plan))
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-					 errmsg("cold recovery serialization release was not confirmed")));
+		/* COMPLETE already confirmed original IR release. Transfer that same
+		 * owner and its still-held WALR; never release/reacquire retention. */
 		if (rep->typed->tx_fence != NULL
 			|| !cluster_recovery_merge_fence_plan_tx_current_v1(*rep->fence_plan, NULL))
 			cluster_typed_replay_unpublished(

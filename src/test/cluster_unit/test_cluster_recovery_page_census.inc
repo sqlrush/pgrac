@@ -379,3 +379,39 @@ UT_TEST(test_final_whole_namespace_change_revokes_completed_page_census)
 	cluster_recovery_root_set_destroy(roots);
 	remove_root(fd);
 }
+
+UT_TEST(test_page_reference_retains_complete_current_and_inverse_versions)
+{
+	int fd = census_files(0);
+	ClusterRecoveryRootSet *roots = store_roots(fd);
+	ClusterRecoveryUndoStore *store = NULL;
+	ClusterRecoveryReferenceGraph *graph = census_graph(roots, &store);
+	ClusterRecoveryRelationPage page;
+	ClusterRecoveryRelationScan *scan = census_relation(roots, &page);
+	ClusterRecoveryPageCensus *cursor = NULL;
+	ClusterRecoveryPageReference ref;
+	ClusterRecoveryPageCensusResult result = CLUSTER_RECOVERY_PAGE_INVALID;
+	PGAlignedBlock versions[2], before;
+	unsigned seen[2] = {0};
+	memcpy(before.data, page.page, BLCKSZ);
+	UT_ASSERT_EQ(cluster_recovery_page_census_begin(&page, graph, 128 * 1024, &cursor), 0);
+	for (unsigned i = 0; cursor != NULL && i < 200; i++) {
+		result = cluster_recovery_page_census_next(cursor, &ref);
+		if (result == CLUSTER_RECOVERY_PAGE_ENTRY) {
+			UT_ASSERT(ref.page != NULL && ref.version < 2);
+			if (ref.page == NULL || ref.version >= 2) continue;
+			if (seen[ref.version]++ == 0) memcpy(versions[ref.version].data, ref.page, BLCKSZ);
+			UT_ASSERT(memcmp(versions[ref.version].data, ref.page, BLCKSZ) == 0);
+			if (ref.version == 0) UT_ASSERT(memcmp(before.data, ref.page, BLCKSZ) == 0);
+		} else if (result != CLUSTER_RECOVERY_PAGE_MORE) break;
+	}
+	UT_ASSERT_EQ(result, CLUSTER_RECOVERY_PAGE_DRAINED);
+	UT_ASSERT_EQ(seen[0], 9); UT_ASSERT_EQ(seen[1], 9);
+	UT_ASSERT(ref.page == NULL);
+	UT_ASSERT(memcmp(before.data, page.page, BLCKSZ) == 0);
+	cluster_recovery_page_census_destroy(cursor);
+	cluster_recovery_relation_destroy(scan);
+	cluster_recovery_undo_store_destroy(store);
+	cluster_recovery_root_set_destroy(roots);
+	remove_root(fd);
+}

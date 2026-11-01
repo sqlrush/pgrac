@@ -588,11 +588,16 @@ UT_TEST(test_second_pass_binds_all_source_and_record_bytes)
 #include "test_cluster_recovery_slru_effects.inc"
 #include "test_cluster_recovery_relmap_effects.inc"
 #include "test_cluster_recovery_prepare_effects.inc"
+#include "test_cluster_recovery_compound_scan.inc"
+#include "test_cluster_recovery_owner_scan.inc"
 
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(51);
+	UT_RUN(test_native_owner_routes_complete_commit_and_zero_message_init_duties);
+	UT_RUN(test_native_owner_routes_preserve_prepared_undo_and_complete_mx_array_duties);
+	UT_RUN(test_native_owner_routes_keep_native_slru_and_unknown_duties_distinct);
 	UT_RUN(test_commit_keeps_every_effect_and_owned_source);
 	UT_RUN(test_abort_keeps_deletions_stats_and_subxact_membership);
 	UT_RUN(test_assignment_retains_real_top_membership);
@@ -638,6 +643,9 @@ main(void)
 	UT_RUN(test_prepare_repeated_resources_have_no_projection_cap);
 	UT_RUN(test_native_clog_full_truncate_keeps_exact_cutoff_image);
 	UT_RUN(test_native_clog_full_truncate_refuses_raw_alias_and_incomplete_image);
+	UT_RUN(test_compound_snapshot_retains_commit_prepare_and_undo_after_drain);
+	UT_RUN(test_compound_snapshot_capacity_and_changed_source_never_export_prefix);
+	UT_RUN(test_compound_snapshot_zero_message_flags_remain_a_complete_obligation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
