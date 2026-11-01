@@ -13401,11 +13401,13 @@ test_cluster_mx_history_admission.inc: $(top_srcdir)/src/backend/cluster/cluster
 	     END { if (count != 1 || emit) exit 1 }' $< > $@
 
 test_cluster_mx_history_capture: test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
+		test_cluster_mx_history_finish.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
 		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
 		test_cluster_mx_history_admission.inc $(CLUSTER_MULTIXACT_CURRENT_O) \
 		$(top_srcdir)/src/include/cluster/cluster_mx_history.h \
 		$(top_builddir)/src/backend/cluster/cluster_mx_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_mx_history_graph.o \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_member.o \
 		$(CLUSTER_CR_APPLY_O) $(CLUSTER_SAVEPOINT_READER_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
 		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
@@ -13427,6 +13429,7 @@ test_cluster_mx_history_capture: test_cluster_mx_history_capture.c test_cluster_
 		$(top_builddir)/src/common/psprintf_srv.o \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(top_builddir)/src/backend/cluster/cluster_mx_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_mx_history_graph.o \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_member.o \
 		$(CLUSTER_CR_APPLY_O) $(CLUSTER_SAVEPOINT_READER_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
 		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@

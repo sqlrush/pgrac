@@ -12,33 +12,47 @@ int snapshot_fixture_unused_main(void);
 #include "storage/ipc.h"
 #include "test_cluster_active_sample_types.inc"
 
-/* Transport is unavailable in this native snapshot fixture. It never returns
- * a fabricated reserved request, landing, member proof or grant. The separate
- * graph test drives the actual routed factory/queue/landing. */
+/* Transport is normally unavailable. New delivery tests control the external
+ * routed-request/landing boundary; they do not prove real TT/CTRC or the GCS
+ * registered landing (covered separately by the real graph/route tests). */
 BackendId MyBackendId = 1;
 static unsigned route_attempts;
+static ClusterMxHistoryStep (*prepare_input)(const ClusterMxHistoryRequest *,
+											 ClusterMxHistoryRequestWire *);
+static bool (*submit_input)(const ClusterMxHistoryRequestWire *);
+static ClusterMxHistoryStep (*poll_input)(const ClusterMxHistoryRequestWire *,
+										  ClusterMxHistoryPeerResult *);
+static void (*cancel_input)(const ClusterMxHistoryRequestWire *);
 ClusterMxHistoryStep
 cluster_gcs_block_mx_history_prepare_routed(const ClusterMxHistoryRequest *r,
 											ClusterMxHistoryRequestWire *out)
 {
 	route_attempts++;
 	memset(out, 0, sizeof(*out));
-	return CMXH_PENDING;
+	return prepare_input ? prepare_input(r, out) : CMXH_PENDING;
 }
 bool
 cluster_gcs_block_mx_history_submit(const ClusterMxHistoryRequestWire *r)
 {
+	if (submit_input)
+		return submit_input(r);
 	abort();
 }
 ClusterMxHistoryStep
 cluster_gcs_block_mx_history_poll(const ClusterMxHistoryRequestWire *r,
 								  ClusterMxHistoryPeerResult *out)
 {
+	if (poll_input)
+		return poll_input(r, out);
 	abort();
 }
 void
 cluster_gcs_block_mx_history_cancel(const ClusterMxHistoryRequestWire *r)
 {
+	if (cancel_input) {
+		cancel_input(r);
+		return;
+	}
 	abort();
 }
 static ClusterSemanticActivationShmem history_gate;
@@ -84,12 +98,13 @@ static ClusterCurrentMxKey mxkey = { 0, 0, 99, 7, 0 };
 static ClusterCurrentMxMemberDesc members[2]
 	= { { 101, MultiXactStatusForShare, { 0 } }, { 102, MultiXactStatusForKeyShare, { 0 } } };
 static ClusterSemanticAdmissionToken admission;
-static unsigned canonical_reads, owner_reads;
+static unsigned canonical_reads, owner_reads, allocation_calls, fail_allocation;
 
 void *
 MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
 {
-	if (oom)
+	allocation_calls++;
+	if (oom || (fail_allocation && allocation_calls == fail_allocation))
 		return NULL;
 	return MemoryContextAlloc(context, size);
 }
@@ -196,7 +211,11 @@ setup(void)
 	top_source = InvalidFullTransactionId;
 	publication_source = CLUSTER_CANONICAL_TXN_NONE;
 	memset(&canonical_source, 0, sizeof(canonical_source));
-	canonical_reads = owner_reads = 0;
+	canonical_reads = owner_reads = allocation_calls = fail_allocation = 0;
+	prepare_input = NULL;
+	submit_input = NULL;
+	poll_input = NULL;
+	cancel_input = NULL;
 	serving = pinned = content_locked = exclusive = true;
 	oom = false;
 	CritSectionCount = 0;
@@ -726,6 +745,8 @@ collector_never_waits_under_content_lock_or_without_pin(void)
 		clean(c, s);
 	}
 }
+#include "test_cluster_mx_history_finish.inc"
+
 int
 main(void)
 {
@@ -744,7 +765,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(17);
+	UT_PLAN(29);
 	UT_RUN(real_capture_and_relock);
 	UT_RUN(snapshot_own_reference_keeps_original_floor);
 	UT_RUN(original_scope_restored_and_older_floor_preserved);
@@ -762,6 +783,18 @@ main(void)
 	UT_RUN(collector_empty_graph_requires_full_relock);
 	UT_RUN(collector_pending_holds_snapshot_and_owner_cleanup);
 	UT_RUN(collector_never_waits_under_content_lock_or_without_pin);
+	UT_RUN(finish_complete_set_once_and_retention);
+	UT_RUN(finish_sole_snapshot_reference_lasts_through_consume);
+	UT_RUN(finish_full_heap_recheck_discards_results);
+	UT_RUN(finish_before_ready_is_pending);
+	UT_RUN(member_poll_never_waits_with_heap_lock_or_critical_section);
+	UT_RUN(member_ready_scope_drift_cancels);
+	UT_RUN(member_result_allocation_failure_is_whole_unknown);
+	UT_RUN(member_missing_support_is_not_complete);
+	UT_RUN(member_ready_owner_cleanup);
+	UT_RUN(member_transport_pending_and_cancel_order);
+	UT_RUN(finish_capacity_boundaries);
+	UT_RUN(finish_read_image_requires_new_bracket);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

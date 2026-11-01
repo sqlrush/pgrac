@@ -5,7 +5,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "cluster/cluster_mx_history_graph.h"
+#include "cluster/cluster_mx_history_member.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xact.h"
 #include "cluster/cluster_conf.h"
@@ -20,7 +20,9 @@
 typedef struct HistoryCollectorDriver {
 	ClusterMxHistoryGraph *graph;
 	ClusterMxHistoryRequestWire request;
-	bool prepared, submitted, complete;
+	ClusterSavepointOperationKey *keys;
+	ClusterCurrentMemberOperationProof *proofs;
+	bool prepared, submitted, complete, members_ready, members_delivered;
 } HistoryCollectorDriver;
 
 struct ClusterMxHistoryCollector {
@@ -195,6 +197,8 @@ cluster_mx_history_cancel(ClusterMxHistoryCollector *collector)
 		if (driver->prepared)
 			cluster_gcs_block_mx_history_cancel(&driver->request);
 		cluster_mx_history_graph_destroy(driver->graph);
+		if (driver->keys != NULL)
+			pfree(driver->keys);
 		pfree(driver);
 	}
 	snapshot = collector->snapshot;
@@ -360,12 +364,15 @@ cluster_mx_history_collect_poll(ClusterMxHistoryCollector *collector)
 	bool needs_read;
 	BufferDesc *desc;
 
+	/* Delivery has consumed the graph. Keep its native retention lease until
+	 * the caller explicitly cancels after consuming the copied results. */
+	if (collector != NULL && collector->driver != NULL && collector->driver->members_delivered)
+		return CMXH_UNKNOWN;
 	if (CritSectionCount != 0)
 		goto failed;
 	if (!cluster_mx_history_capture_read(collector, &capture))
 		return CMXH_UNKNOWN;
-	if (capture.buffer <= 0 || capture.buffer > NBuffers
-		|| !BufferIsPinnedByMe(capture.buffer))
+	if (capture.buffer <= 0 || capture.buffer > NBuffers || !BufferIsPinnedByMe(capture.buffer))
 		goto failed;
 	desc = GetBufferDescriptor(capture.buffer - 1);
 	if (LWLockHeldByMeInMode(BufferDescriptorGetContentLock(desc), LW_EXCLUSIVE)
@@ -431,12 +438,101 @@ cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *collector, R
 	if (out == NULL)
 		return false;
 	*out = NULL;
-	if (collector == NULL || collector->driver == NULL || !collector->driver->complete)
+	if (collector == NULL || collector->driver == NULL || !collector->driver->complete
+		|| collector->driver->graph == NULL || collector->driver->members_delivered)
 		return false;
 	if (!cluster_mx_history_capture_recheck(collector, rel, buffer, tuple, mxkey, members,
 											nmembers))
 		return false;
 	*out = collector->driver->graph;
 	return true;
+}
+ClusterMxHistoryStep
+cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
+{
+	ClusterMxHistoryStep step = cluster_mx_history_collect_poll(collector);
+	HistoryCollectorDriver *driver;
+	uint16 n;
+	Size key_bytes;
+
+	if (step != CMXH_COMPLETE)
+		return step;
+	driver = collector->driver;
+	if (driver->members_ready)
+		return CMXH_COMPLETE;
+	n = collector->capture->nmembers;
+	key_bytes = MAXALIGN(n * sizeof(*driver->keys));
+	driver->keys = MemoryContextAllocExtended(
+		TopTransactionContext, key_bytes + n * sizeof(*driver->proofs), MCXT_ALLOC_NO_OOM);
+	if (driver->keys == NULL)
+		goto failed;
+	driver->proofs = (ClusterCurrentMemberOperationProof *)((char *)driver->keys + key_bytes);
+	if (!cluster_mx_history_assemble_members(collector->capture, driver->graph, driver->keys,
+											 driver->proofs, n))
+		goto failed;
+	driver->members_ready = true;
+	return CMXH_COMPLETE;
+failed:
+	cluster_mx_history_cancel(collector);
+	return CMXH_UNKNOWN;
+}
+
+static void
+history_finish_unknown(ClusterSavepointOperationKey *keys,
+					   ClusterCurrentMemberOperationProof *proofs, uint16 capacity)
+{
+	if (capacity > CLUSTER_CURRENT_MX_MAX_MEMBERS)
+		return;
+	if (keys != NULL)
+		memset(keys, 0, capacity * sizeof(*keys));
+	if (proofs != NULL) {
+		memset(proofs, 0, capacity * sizeof(*proofs));
+		for (uint16 i = 0; i < capacity; ++i) {
+			proofs[i].base.state = CCM_UNKNOWN;
+			proofs[i].format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
+		}
+	}
+}
+
+ClusterMxHistoryStep
+cluster_mx_history_recheck_and_finish(ClusterMxHistoryCollector *collector, Relation rel,
+									  Buffer buffer, HeapTuple tuple,
+									  const ClusterCurrentMxKey *mxkey,
+									  const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+									  ClusterSavepointOperationKey *keys,
+									  ClusterCurrentMemberOperationProof *proofs, uint16 capacity)
+{
+	HistoryCollectorDriver *driver;
+	uint16 n;
+
+	history_finish_unknown(keys, proofs, capacity);
+	if (collector == NULL || collector->capture == NULL)
+		return CMXH_UNKNOWN;
+	driver = collector->driver;
+	if (driver != NULL && driver->members_delivered)
+		return CMXH_UNKNOWN;
+	n = collector->capture->nmembers;
+	if (CritSectionCount != 0 || capacity > CLUSTER_CURRENT_MX_MAX_MEMBERS || capacity < n
+		|| keys == NULL || proofs == NULL) {
+		cluster_mx_history_cancel(collector);
+		return CMXH_UNKNOWN;
+	}
+	if (driver == NULL || !driver->members_ready)
+		return CMXH_PENDING;
+	if (!cluster_mx_history_capture_recheck(collector, rel, buffer, tuple, mxkey, members,
+											nmembers))
+		return CMXH_REQUALIFY;
+	memcpy(keys, driver->keys, n * sizeof(*keys));
+	memcpy(proofs, driver->proofs, n * sizeof(*proofs));
+	driver->members_delivered = true;
+	driver->members_ready = false;
+	cluster_mx_history_graph_destroy(driver->graph);
+	driver->graph = NULL;
+	pfree(driver->keys);
+	driver->keys = NULL;
+	driver->proofs = NULL;
+	/* Keep capture/Snapshot until the last consumer calls cancel. Even an
+	 * otherwise unregistered Snapshot may have this sole native reference. */
+	return CMXH_COMPLETE;
 }
 #endif

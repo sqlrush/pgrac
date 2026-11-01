@@ -63,6 +63,21 @@ typedef struct ClusterMxHistoryGraph ClusterMxHistoryGraph;
 /* Outside heap content locks: one bounded graph/transport step. COMPLETE
  * means traversal only, never assembled member or SQL authority. */
 extern ClusterMxHistoryStep cluster_mx_history_collect_poll(ClusterMxHistoryCollector *collector);
+/* Outside heap content locks. COMPLETE means all member results are staged,
+ * not delivered or authorized for SQL. No per-member transport is repeated. */
+extern ClusterMxHistoryStep cluster_mx_history_poll(ClusterMxHistoryCollector *collector);
+/* Original heap lock held: recheck actual Relation/MX/heap/scope before one
+ * complete-set copy. Outputs have capacity entries and must not overlap any
+ * input. capacity<=256 is reset to UNKNOWN on non-success; larger capacities
+ * are rejected without writes. REQUALIFY cancels a changed capture.
+ * Successful delivery retains its Snapshot reference until the caller has
+ * consumed the results and calls cancel (or original owner cleanup runs).
+ * This does not replace proof-set/recompose/before-mutation grant checks. */
+extern ClusterMxHistoryStep cluster_mx_history_recheck_and_finish(
+	ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer, HeapTuple tuple,
+	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs,
+	uint16 capacity);
 /* Full original heap relock comparison before borrowing completed private
  * graph views. The caller retains that lock; cancellation expires the view. */
 extern bool cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *collector,
