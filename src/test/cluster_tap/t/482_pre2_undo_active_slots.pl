@@ -657,12 +657,21 @@ sub run_full_preflight_resumes
 my $execution = eval {
 	$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('undo_active_slots', nodes => 4,
 		blackbox => 1, required_operations => [], extra_conf => ['autovacuum=off',
+			# Leave maintenance opportunities within the unchanged 30s idle budget.
+			'cluster.undo_cleaner_interval_ms=1000',
 			'log_error_verbosity=verbose', q{log_line_prefix='%m [%p] '}]);
 	$cluster->start_cluster;
 	@nodes = $cluster->nodes;
 	$writer = $nodes[0];
 	is(scalar(@nodes), 4, 'original PRE2 formation admits four normal members');
+	my @cleaner_intervals = map {
+		$_->safe_psql('postgres', 'SHOW cluster.undo_cleaner_interval_ms', timeout => 10)
+	} @nodes;
+	is_deeply(\@cleaner_intervals, [('1000') x 4],
+		'all four members use the explicit terminal-cleanup cadence')
+	  or die 'terminal-cleanup cadence was not applied to every member';
 	save_json('formation', {open => [map { $cluster->observe('open_observation', {node => $_}) } 0 .. 3],
+		cleaner_interval_ms => \@cleaner_intervals,
 		producer_node => 0, peer_readers => [1, 2, 3]});
 	for my $suffix (qw(snapshot binding))
 	{
