@@ -55,6 +55,7 @@ OBJS_COMMON = \
 	cluster_catalog_verify.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_recovery_file_identity.o \
+	cluster_recovery_registry.o \
 	cluster_relmap_file.o \
 	cluster_relmap_file_io.o \
 	cluster_relmap_init.o \
@@ -91,6 +92,7 @@ OBJS_COMMON = \
 	relpath.o \
 	rmtree.o \
 	saslprep.o \
+	sha2.o \
 	scram-common.o \
 	string.o \
 	stringinfo.o \
@@ -109,8 +111,7 @@ OBJS_COMMON += \
 	cryptohash.o \
 	hmac.o \
 	md5.o \
-	sha1.o \
-	sha2.o
+	sha1.o
 endif
 
 # A few files are currently only built for frontend, not server
@@ -131,16 +132,7 @@ OBJS_FRONTEND = \
 OBJS_SHLIB = $(OBJS_FRONTEND_SHLIB:%.o=%_shlib.o)
 OBJS_SRV = $(OBJS_COMMON:%.o=%_srv.o)
 
-# PGRAC: CTRC certificates use the allocation-free, stack-based SHA-256
-# implementation while holding shared-state locks.  OpenSSL remains the
-# provider for pg_cryptohash; keep the existing certificate implementation
-# available in the cluster server archive as well.  The non-SSL branch above
-# already includes sha2.o, and disable-cluster keeps the upstream object set.
-ifeq ($(enable_pgrac_cluster),yes)
-ifeq ($(with_ssl),openssl)
-OBJS_SRV += sha2_srv.o
-endif
-endif
+# Registry and CTRC codecs use the allocation-free SHA-256 core in all archives.
 
 # where to find gen_keywordlist.pl and subsidiary files
 TOOLSDIR = $(top_srcdir)/src/tools
@@ -235,3 +227,9 @@ cluster_relmap_file_io.o cluster_relmap_file_io_srv.o cluster_relmap_file_io_shl
 cluster_recovery_file_identity.o cluster_recovery_file_identity_srv.o cluster_recovery_file_identity_shlib.o: \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
+cluster_recovery_registry.o cluster_recovery_registry_srv.o cluster_recovery_registry_shlib.o: \
+	$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+	$(srcdir)/sha2_int.h
