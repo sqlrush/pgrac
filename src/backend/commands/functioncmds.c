@@ -12,6 +12,10 @@
  * IDENTIFICATION
  *	  src/backend/commands/functioncmds.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native routine, cast and transform changes before catalog work.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  * DESCRIPTION
  *	  These routines take the parse tree and pick out the
  *	  appropriate arguments/flags, and pass the results to the
@@ -36,6 +40,9 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/table.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "access/xact.h"
+#endif
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -47,6 +54,10 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/alter.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
@@ -1009,6 +1020,38 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before their first catalog query or lock. */
+static void
+PreflightClusterSharedFunctionWrite(Node *stmt, bool alter)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *action = alter ? "alteration" : "creation";
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	command = CreateCommandName(stmt);
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog %s does not support subtransactions", action)));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+}
+#endif
+
 /*
  * CreateFunction
  *	 Execute a CREATE FUNCTION (or CREATE PROCEDURE) utility statement.
@@ -1052,6 +1095,10 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	Form_pg_language languageStruct;
 	List	   *as_clause;
 	char		parallel;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFunctionWrite((Node *)stmt, false);
+#endif
 
 	/* Convert list of names to a name and namespace */
 	namespaceId = QualifiedNameGetCreationNamespace(stmt->funcname,
@@ -1365,6 +1412,10 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 	DefElem    *parallel_item = NULL;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFunctionWrite((Node *)stmt, true);
+#endif
+
 	rel = table_open(ProcedureRelationId, RowExclusiveLock);
 
 	funcOid = LookupFuncWithArgs(stmt->objtype, stmt->func, false);
@@ -1535,6 +1586,10 @@ CreateCast(CreateCastStmt *stmt)
 	HeapTuple	tuple;
 	AclResult	aclresult;
 	ObjectAddress myself;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFunctionWrite((Node *)stmt, false);
+#endif
 
 	sourcetypeid = typenameTypeId(NULL, stmt->sourcetype);
 	targettypeid = typenameTypeId(NULL, stmt->targettype);
@@ -1820,6 +1875,10 @@ CreateTransform(CreateTransformStmt *stmt)
 				referenced;
 	ObjectAddresses *addrs;
 	bool		is_replace;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFunctionWrite((Node *)stmt, false);
+#endif
 
 	/*
 	 * Get the type

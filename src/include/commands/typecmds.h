@@ -36,6 +36,8 @@ extern ObjectAddress AlterDomainDefault(List *names, Node *defaultRaw);
 extern ObjectAddress AlterDomainNotNull(List *names, bool notNull);
 extern ObjectAddress AlterDomainAddConstraint(List *names, Node *newConstraint,
 											  ObjectAddress *constrAddr);
+extern ObjectAddress AlterDomainAddConstraintInternal(List *names, Node *newConstraint,
+													  ObjectAddress *constrAddr);
 extern ObjectAddress AlterDomainValidateConstraint(List *names, const char *constrName);
 extern ObjectAddress AlterDomainDropConstraint(List *names, const char *constrName,
 											   DropBehavior behavior, bool missing_ok);

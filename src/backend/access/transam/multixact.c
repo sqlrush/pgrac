@@ -441,6 +441,9 @@ static bool MultiXactOffsetPagePrecedes(int page1, int page2);
 static bool MultiXactMemberPagePrecedes(int page1, int page2);
 static bool MultiXactOffsetPrecedes(MultiXactOffset offset1, MultiXactOffset offset2);
 static void ExtendMultiXactOffset(MultiXactId multi);
+#ifdef USE_PGRAC_CLUSTER
+static void ExtendMultiXactOffsets(MultiXactId multi, int stripe_slot);
+#endif
 static void ExtendMultiXactMember(MultiXactOffset offset, int nmembers);
 static bool MultiXactOffsetWouldWrap(MultiXactOffset boundary, MultiXactOffset start,
 									 uint32 distance);
@@ -1364,6 +1367,9 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 		 */
 		if (MultiXactIdPrecedes(result, floor_mxid))
 			result = floor_mxid;
+		if (cluster_shared_config
+			&& MultiXactIdPrecedes(result, MultiXactState->oldestMultiXactId))
+			result = MultiXactState->oldestMultiXactId;
 		result = cluster_mxid_next_striped(result, mxid_stripe_slot);
 
 		/*
@@ -1506,6 +1512,9 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 
 			if (MultiXactIdPrecedes(result, floor_mxid))
 				result = floor_mxid;
+			if (cluster_shared_config
+				&& MultiXactIdPrecedes(result, MultiXactState->oldestMultiXactId))
+				result = MultiXactState->oldestMultiXactId;
 			result = cluster_mxid_next_striped(result, mxid_stripe_slot);
 			if (cluster_mxid_halfspace_exceeded(result, floor_mxid)) {
 				ClusterMultiXactSourceResult source_result;
@@ -1543,13 +1552,26 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 								  && mxid_stripe_slot == cluster_mxid_allocation_slot()
 								  && mxid_floor_snapshot == cluster_mxid_stripe_floor()
 								  && !cluster_mxid_stripe_poisoned());
+		/* The known member limit already qualifies the native-empty First
+		 * prefix. Other inputs must remain in the same activation half-space;
+		 * signed comparisons alone could reinterpret an exhausted cursor. */
+		bool boundary_current = MultiXactIdIsValid(lower)
+			&& (!cluster_xid_striping
+				|| ((lower == FirstMultiXactId
+					 || !cluster_mxid_halfspace_exceeded(lower, mxid_floor_snapshot))
+					&& (MultiXactState->nextMXact == FirstMultiXactId
+						|| !cluster_mxid_halfspace_exceeded(
+							MultiXactState->nextMXact < FirstMultiXactId
+								? FirstMultiXactId : MultiXactState->nextMXact,
+							mxid_floor_snapshot))));
 
-		if (!stripe_current || !known || MultiXactIdPrecedes(result, lower)) {
+		if (!stripe_current || !known || !boundary_current || MultiXactIdPrecedes(result, lower)) {
 			LWLockRelease(MultiXactGenLock);
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg(!stripe_current ? "shared MultiXact allocation stripe is not proven"
 							: !known ? "shared MultiXact member retention limit is not proven"
+							: !boundary_current ? "shared MultiXact allocation boundary is not proven"
 									 : "shared MultiXact allocation frontier is behind the "
 									   "retained lower bound"),
 					 errdetail("candidate=%u oldest=%u slot=%d", result, lower, mxid_stripe_slot),
@@ -1560,50 +1582,14 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 	}
 
 	/*
-	 * PGRAC: spec-7.1 D3-a -- a striped candidate skips multixact
-	 * positions, and ExtendMultiXactOffset() only zeroes an offsets
-	 * SLRU page when handed its FIRST multixact.  An offsets page holds
-	 * 2048 entries, divisible by the stride, so a page's first
-	 * multixact always belongs to congruence class 0 -- any other
-	 * class stepping across a page boundary would skip page-first
-	 * forever and die on the missing page (the varsup.c spec-6.15 D5e
-	 * gap-walk lesson; the multixact Extend path is walked and
-	 * verified independently per IN-8-approve, NOT assumed covered by
-	 * the CLOG fix).  Walk every skipped position up to and including
-	 * the candidate; with striping off (or the candidate equal to
-	 * nextMXact) the block is a no-op and the vanilla call below is
-	 * the only probe.  Ordinary in-class step cost is at most STRIDE
-	 * no-op probes under MultiXactGenLock.
+	 * Keep native extension ordering outside shared mode. Shared allocation
+	 * must first prove that its member reservation will not overrun the ring.
 	 */
-	if (mxid_stripe_slot >= 0 && result != MultiXactState->nextMXact) {
-		MultiXactId gap = MultiXactState->nextMXact;
-
-		/*
-		 * Start PAST nextMXact: the previous allocation's
-		 * ExtendMultiXactOffset(prev + 1 == nextMXact) already covered
-		 * it, and re-handing a page-first position to Extend would
-		 * re-zero a live page and wipe the previous multixact's
-		 * next-offset end marker (permanent zero: the skipped position
-		 * is never recorded, so nothing would ever rewrite it).
-		 */
-		gap++;
-		if (gap < FirstMultiXactId)
-			gap = FirstMultiXactId;
-		while (MultiXactIdPrecedes(gap, result)) {
-			ExtendMultiXactOffset(gap);
-			gap++;
-			if (gap < FirstMultiXactId)
-				gap = FirstMultiXactId;
-		}
-		ExtendMultiXactOffset(result);
-	}
-#endif
-
-	/*
-	 * Make sure there is room for the next MXID in the file.  Assigning this
-	 * MXID sets the next MXID's offset already.
-	 */
+	if (!cluster_shared_config)
+		ExtendMultiXactOffsets(result, mxid_stripe_slot);
+#else
 	ExtendMultiXactOffset(result + 1);
+#endif
 
 	/*
 	 * Reserve the members space, similarly to above.  Also, be careful not to
@@ -1638,6 +1624,13 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 #define OFFSET_WARN_SEGMENTS 20
 	if (MultiXactState->oldestOffsetKnown
 		&& MultiXactOffsetWouldWrap(MultiXactState->offsetStopLimit, nextOffset, nmembers)) {
+		MultiXactOffset offsetStopLimit = MultiXactState->offsetStopLimit;
+		Oid oldestMultiXactDB = MultiXactState->oldestMultiXactDB;
+
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config)
+			LWLockRelease(MultiXactGenLock);
+#endif
 		/* see comment in the corresponding offsets wraparound case */
 		SendPostmasterSignal(PMSIGNAL_START_AUTOVAC_LAUNCHER);
 
@@ -1649,12 +1642,12 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 							  "remaining space is only enough for %u member.",
 							  "This command would create a multixact with %u members, but the "
 							  "remaining space is only enough for %u members.",
-							  MultiXactState->offsetStopLimit - nextOffset - 1, nmembers,
-							  MultiXactState->offsetStopLimit - nextOffset - 1),
+							  offsetStopLimit - nextOffset - 1, nmembers,
+							  offsetStopLimit - nextOffset - 1),
 			 errhint(
 				 "Execute a database-wide VACUUM in database with OID %u with reduced "
 				 "vacuum_multixact_freeze_min_age and vacuum_multixact_freeze_table_age settings.",
-				 MultiXactState->oldestMultiXactDB)));
+				 oldestMultiXactDB)));
 	}
 
 	/*
@@ -1694,6 +1687,10 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 					 "vacuum_multixact_freeze_min_age and vacuum_multixact_freeze_table_age "
 					 "settings.")));
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+		ExtendMultiXactOffsets(result, mxid_stripe_slot);
+#endif
 	ExtendMultiXactMember(nextOffset, nmembers);
 
 	/*
@@ -3040,6 +3037,41 @@ ExtendMultiXactOffset(MultiXactId multi)
 
 	LWLockRelease(MultiXactOffsetSLRULock);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Extend only new, unissued offsets pages. The page containing nextMXact
+ * already holds the previous allocation's end marker and must not be zeroed.
+ * A retained lower bound ahead of nextMXact skips pages already truncated. */
+static void
+ExtendMultiXactOffsets(MultiXactId multi, int stripe_slot)
+{
+	if (stripe_slot >= 0 && multi != MultiXactState->nextMXact) {
+		MultiXactId next = MultiXactState->nextMXact;
+		MultiXactId gap;
+		MultiXactId page_first;
+
+		if (next < FirstMultiXactId)
+			next = FirstMultiXactId;
+		gap = next;
+		if (cluster_shared_config && MultiXactIdPrecedes(gap, MultiXactState->oldestMultiXactId))
+			gap = MultiXactState->oldestMultiXactId;
+		page_first = gap - MultiXactIdToOffsetEntry(gap);
+		if (MultiXactIdToOffsetPage(gap) == MultiXactIdToOffsetPage(next))
+			page_first += MULTIXACT_OFFSETS_PER_PAGE;
+		if (page_first < FirstMultiXactId)
+			page_first = FirstMultiXactId;
+		while (MultiXactIdPrecedes(page_first, multi) || page_first == multi) {
+			ExtendMultiXactOffset(page_first);
+			page_first = (page_first - MultiXactIdToOffsetEntry(page_first))
+				+ MULTIXACT_OFFSETS_PER_PAGE;
+			if (page_first < FirstMultiXactId)
+				page_first = FirstMultiXactId;
+		}
+	}
+	/* Recording this ID also sets the next ID's offset, including wrap. */
+	ExtendMultiXactOffset(multi + 1);
+}
+#endif
 
 /*
  * Make sure that MultiXactMember has room for the members of a newly-

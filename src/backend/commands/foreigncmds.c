@@ -9,6 +9,10 @@
  * IDENTIFICATION
  *	  src/backend/commands/foreigncmds.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight shared foreign catalog commands before catalog access.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -27,6 +31,11 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/defrem.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
@@ -291,6 +300,30 @@ AlterForeignDataWrapperOwner(const char *name, Oid newOwnerId)
 	ObjectAddress address;
 	Form_pg_foreign_data_wrapper form;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER FOREIGN DATA WRAPPER");
+		PreventCommandIfParallelMode("ALTER FOREIGN DATA WRAPPER");
+		PreventCommandDuringRecovery("ALTER FOREIGN DATA WRAPPER");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
+
 
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
@@ -431,6 +464,30 @@ AlterForeignServerOwner(const char *name, Oid newOwnerId)
 	ObjectAddress address;
 	Form_pg_foreign_server form;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER SERVER");
+		PreventCommandIfParallelMode("ALTER SERVER");
+		PreventCommandDuringRecovery("ALTER SERVER");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
+
 	rel = table_open(ForeignServerRelationId, RowExclusiveLock);
 
 	tup = SearchSysCacheCopy1(FOREIGNSERVERNAME, CStringGetDatum(name));
@@ -562,6 +619,38 @@ parse_func_options(ParseState *pstate, List *func_options,
 	}
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before their first catalog lock. */
+static void
+PreflightClusterSharedFdwWrite(Node *stmt, bool alter)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *action = alter ? "alteration" : "creation";
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	command = CreateCommandName(stmt);
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog %s does not support subtransactions", action)));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+}
+#endif
+
 /*
  * Create a foreign-data wrapper
  */
@@ -581,6 +670,10 @@ CreateForeignDataWrapper(ParseState *pstate, CreateFdwStmt *stmt)
 	Oid			ownerId;
 	ObjectAddress myself;
 	ObjectAddress referenced;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, false);
+#endif
 
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
@@ -698,6 +791,10 @@ AlterForeignDataWrapper(ParseState *pstate, AlterFdwStmt *stmt)
 	Oid			fdwhandler;
 	Oid			fdwvalidator;
 	ObjectAddress myself;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, true);
+#endif
 
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
@@ -860,6 +957,10 @@ CreateForeignServer(CreateForeignServerStmt *stmt)
 	ObjectAddress referenced;
 	ForeignDataWrapper *fdw;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, false);
+#endif
+
 	rel = table_open(ForeignServerRelationId, RowExclusiveLock);
 
 	/* For now the owner cannot be specified on create. Use effective user ID. */
@@ -993,6 +1094,10 @@ AlterForeignServer(AlterForeignServerStmt *stmt)
 	Form_pg_foreign_server srvForm;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, true);
+#endif
+
 	rel = table_open(ForeignServerRelationId, RowExclusiveLock);
 
 	tp = SearchSysCacheCopy1(FOREIGNSERVERNAME,
@@ -1123,6 +1228,10 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 	ForeignDataWrapper *fdw;
 	RoleSpec   *role = (RoleSpec *) stmt->user;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, false);
+#endif
+
 	rel = table_open(UserMappingRelationId, RowExclusiveLock);
 
 	if (role->roletype == ROLESPEC_PUBLIC)
@@ -1247,6 +1356,10 @@ AlterUserMapping(AlterUserMappingStmt *stmt)
 	ObjectAddress address;
 	RoleSpec   *role = (RoleSpec *) stmt->user;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, true);
+#endif
+
 	rel = table_open(UserMappingRelationId, RowExclusiveLock);
 
 	if (role->roletype == ROLESPEC_PUBLIC)
@@ -1340,6 +1453,10 @@ RemoveUserMapping(DropUserMappingStmt *stmt)
 	ForeignServer *srv;
 	RoleSpec   *role = (RoleSpec *) stmt->user;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedFdwWrite((Node *)stmt, true);
+#endif
+
 	if (role->roletype == ROLESPEC_PUBLIC)
 		useId = ACL_ID_PUBLIC;
 	else
@@ -1426,6 +1543,12 @@ CreateForeignTable(CreateForeignTableStmt *stmt, Oid relid)
 	ForeignDataWrapper *fdw;
 	ForeignServer *server;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedUtilitySupport((Node *)stmt, false);
+	CheckClusterIndexSupport((Node *)stmt);
+	PreflightClusterSharedFdwWrite((Node *)stmt, false);
+#endif
+
 	/*
 	 * Advance command counter to ensure the pg_attribute tuple is visible;
 	 * the tuple might be updated to add constraints in previous step.
@@ -1500,6 +1623,32 @@ ImportForeignSchema(ImportForeignSchemaStmt *stmt)
 	AclResult	aclresult;
 	List	   *cmd_list;
 	ListCell   *lc;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Direct callers also need the original full top binding before catalog
+	 * lookups or the external FDW callback. Utility callers reuse that binding.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("IMPORT FOREIGN SCHEMA");
+		PreventCommandIfParallelMode("IMPORT FOREIGN SCHEMA");
+		PreventCommandDuringRecovery("IMPORT FOREIGN SCHEMA");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog creation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+	}
+#endif
 
 	/* Check that the foreign server exists and that we have USAGE on it */
 	server = GetForeignServerByName(stmt->server_name, false);

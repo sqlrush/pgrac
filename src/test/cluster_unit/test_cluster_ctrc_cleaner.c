@@ -35,6 +35,7 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/spin.h"
+#include "cluster/cluster_undo_capacity.h"
 #include "test_cluster_pgproc_active_types.inc"
 
 static int observe_busy_kind;
@@ -91,6 +92,32 @@ static void test_pool_upgrade(void);
 
 #ifndef TEST_CLUSTER_STARTUP_CTRC
 UT_DEFINE_GLOBALS();
+#endif
+
+#ifndef CLUSTER_CTRC_COMPLETION_STATS_V1
+typedef struct ClusterCtrcCompletionStats {
+	int32 origin_node_id;
+	uint64 real_completion_count;
+} ClusterCtrcCompletionStats;
+
+static bool
+cluster_ctrc_completion_stats_snapshot(ClusterCtrcCompletionStats *out pg_attribute_unused())
+{
+	return false;
+}
+#endif
+
+#ifndef CLUSTER_CTRC_NO_PROGRESS_STATS_V1
+typedef struct ClusterCtrcNoProgressStats {
+	int32 origin_node_id;
+	uint64 by_reason[CTRC_CLEANER_REASON_COUNT];
+} ClusterCtrcNoProgressStats;
+
+static bool
+cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out pg_attribute_unused())
+{
+	return false;
+}
 #endif
 #include "cluster/cluster_undo_cleaner.h"
 
@@ -217,7 +244,7 @@ static FullTransactionId native_future;
 static TransactionId native_completed_xid;
 static GlobalTransaction native_locked_gxact;
 static BackendId native_backend_id = 1;
-static bool native_postmaster_environment = true;
+static bool native_postmaster_environment pg_attribute_unused() = true;
 static LWLock *native_prepared_locks[2];
 static LWLockMode native_prepared_modes[2];
 static unsigned native_prepared_depth;
@@ -816,11 +843,13 @@ cluster_conf_declared_node_count_early(void)
 	return 4;
 }
 
+static bool test_shmem_attach;
+
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *found)
 {
-	*found = false;
-	return calloc(1, size);
+	*found = test_shmem_attach;
+	return *found ? CtrcShared : calloc(1, size);
 }
 
 void
@@ -947,6 +976,7 @@ reset_fixture(void)
 	config_read_hook = NULL;
 	if (held_count != 0 || allocated != 0)
 		abort();
+	test_shmem_attach = false;
 	free(CtrcShared);
 	CtrcShared = NULL;
 	cluster_ctrc_shmem_init();
@@ -4053,6 +4083,7 @@ UT_TEST(test_ack_batch_final_count_summary_and_identity_faults_are_isolated)
  * and finally cleanup. Only physical I/O/network leaves are fixture inputs. */
 static bool driver_other_progress;
 static bool driver_interrupt;
+static int driver_final_reason = -1;
 
 static bool
 driver_no_receipt(void)
@@ -4087,6 +4118,8 @@ driver_dispatch_boundary(const ClusterCtrcCloseDispatch *dispatches pg_attribute
 		cluster_ctrc_stat_bump(CTRC_STAT_SEMANTIC_PROGRESS);
 	if (driver_interrupt)
 		pg_re_throw();
+	if (driver_final_reason >= 0)
+		cluster_ctrc_cleaner_reason_set((ClusterCtrcCleanerReason)driver_final_reason);
 	origin_dispatch_returned = true;
 }
 
@@ -7744,6 +7777,1206 @@ UT_TEST(test_cleaner_observation_unsafe_gap_and_log_error_do_not_leak_scope)
 	UT_ASSERT_EQ(held_count, 0);
 }
 
+/* Missing counters, global-progress confusion, ERROR counting and reading
+ * worker0 instead of the executing worker must all fail these tests. */
+UT_TEST(test_no_progress_counts_only_normally_completed_local_passes)
+{
+	ClusterCtrcNoProgressStats stats = { 0 };
+	bool caught = false;
+
+	reset_fixture();
+	driver_other_progress = true;
+	driver_interrupt = false;
+	driver_final_reason = -1;
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], 0);
+	UT_ASSERT(bind_test_worker(0));
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], 1);
+	UT_ASSERT_EQ(CtrcLocalProgress, 0);
+	UT_ASSERT_EQ(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS), 1);
+	seed_origin(0, 0);
+	UT_ASSERT(ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], 1);
+	driver_interrupt = true;
+	PG_TRY();
+	{
+		(void)ctrc_fixture_run_pass();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(CtrcLocalProgress, 1);
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], 1);
+	UT_ASSERT_EQ(CtrcLocalPasses, 2);
+	UT_ASSERT_EQ(CtrcBatch.active, false);
+	UT_ASSERT_EQ(held_count, 0);
+	driver_interrupt = driver_other_progress = false;
+}
+
+UT_TEST(test_no_progress_uses_executing_workers_original_final_reason)
+{
+	ClusterCtrcNoProgressStats stats = { 0 };
+
+	reset_fixture();
+	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_RESOURCE_X);
+	UT_ASSERT(bind_test_worker(1));
+	for (int reason = 0; reason < CTRC_CLEANER_REASON_COUNT; reason++) {
+		driver_final_reason = reason;
+		UT_ASSERT(!ctrc_fixture_run_pass());
+		UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+		for (int i = 0; i < CTRC_CLEANER_REASON_COUNT; i++)
+			UT_ASSERT_EQ(stats.by_reason[i], i <= reason ? 1 : 0);
+		UT_ASSERT_EQ(cluster_ctrc_cleaner_reason_get(), CTRC_CLEANER_REASON_RESOURCE_X);
+	}
+	driver_final_reason = CTRC_CLEANER_REASON_PARTICIPANT_ACK;
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_PARTICIPANT_ACK], 2);
+	driver_final_reason = -1;
+}
+
+UT_TEST(test_no_progress_snapshot_preserves_unavailable_zero_and_attach_lifetime)
+{
+	ClusterCtrcNoProgressStats stats, before;
+	ClusterCtrcSharedHeader *saved;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	cluster_node_id = 3;
+	memset(&stats, 0xa5, sizeof(stats));
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.origin_node_id, 3);
+	for (int i = 0; i < CTRC_CLEANER_REASON_COUNT; i++)
+		UT_ASSERT_EQ(stats.by_reason[i], 0);
+#ifdef CLUSTER_CTRC_NO_PROGRESS_STATS_V1
+	pg_atomic_write_u64(&CtrcShared->cleaner_no_progress[CTRC_CLEANER_REASON_NONE], UINT64_MAX);
+	pg_atomic_write_u64(&CtrcShared->cleaner_no_progress[CTRC_CLEANER_REASON_BLOCKED],
+						UINT64_C(9223372036854775809));
+#endif
+	test_shmem_attach = true;
+	cluster_ctrc_shmem_init();
+	test_shmem_attach = false;
+	UT_ASSERT(cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_NONE], UINT64_MAX);
+	UT_ASSERT_EQ(stats.by_reason[CTRC_CLEANER_REASON_BLOCKED], UINT64_C(9223372036854775809));
+	memset(&stats, 0xa5, sizeof(stats));
+	memcpy(&before, &stats, sizeof(before));
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(NULL));
+	cluster_node_id = -1;
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	cluster_node_id = CLUSTER_CTRC_MAX_PARTICIPANTS;
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	cluster_node_id = 0;
+	UT_ASSERT(bind_test_worker(0));
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	CtrcShared = saved;
+	CtrcShared->magic = 0;
+	UT_ASSERT(!cluster_ctrc_no_progress_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	CtrcShared->magic = CLUSTER_CTRC_SHMEM_MAGIC;
+	cluster_node_id = saved_node;
+}
+
+/* The original physical block0 durability boundary is assumed here, as in
+ * the existing shared notification tests; no disk durability is certified. */
+static void
+completion_prepare_original_origin(unsigned index, ClusterCtrcCloseDispatch *dispatch)
+{
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcOriginEntry *origin;
+	uint64 participant_index, receipt_index;
+
+	UT_ASSERT(seed_frozen_certificate(index, dispatch, &participant_index, &receipt_index));
+	origin = &ctrc_origin_entries()[index];
+	UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, 0, 501 + index));
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(
+		501 + index, &ctrc_participant_ack_entries()[participant_index]));
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(origin);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(index, &certificate));
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(ctrc_origin_certificate_commit_shared(&certificate));
+	UT_ASSERT(cluster_ctrc_origin_arm_certificate_entry(origin, 0, dispatch->request_id));
+}
+
+UT_TEST(test_completion_count_requires_final_origin_notification_and_is_not_progress)
+{
+	ClusterCtrcCompletionStats stats = { 0 };
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+
+	reset_fixture();
+	completion_prepare_original_origin(0, &dispatch);
+	UT_ASSERT(cluster_ctrc_stat_get(CTRC_STAT_SEMANTIC_PROGRESS) > 0);
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 0);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].state, CTRC_ORIGIN_RELEASE_PROVEN);
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 0);
+	UT_ASSERT(
+		!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id + 1, 0, result));
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 0);
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 1);
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_origin_entries()[0], sizeof(ClusterCtrcOriginEntry)));
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_completion_count_covers_original_batch_and_zero_touch_retirement_once)
+{
+	ClusterCtrcCompletionStats stats = { 0 };
+	ClusterCtrcCloseDispatch dispatches[2];
+	ClusterCtrcSealReplyResult results[2];
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcOriginEntry *empty_touch;
+
+	reset_fixture();
+	for (unsigned i = 0; i < 2; i++)
+		completion_prepare_original_origin(i, &dispatches[i]);
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(dispatches, 2, results));
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 0);
+	UT_ASSERT(cluster_ctrc_origin_note_local_certificate_batch_shared(dispatches, results, 2));
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 2);
+	UT_ASSERT(cluster_ctrc_origin_note_local_certificate_batch_shared(dispatches, results, 2));
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 2);
+	empty_touch = seed_origin(2, 0);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(empty_touch);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(2, &certificate));
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(ctrc_origin_certificate_commit_shared(&certificate));
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 3);
+	UT_ASSERT(!ctrc_origin_certificate_commit_shared(&certificate));
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(!ctrc_origin_release_reclaim_locked(2));
+	UT_ASSERT(!ctrc_origin_release_reclaim_locked(CtrcShared->origin_key_entries));
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, 3);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_completion_snapshot_preserves_unavailable_zero_origin_and_attach_counts)
+{
+	ClusterCtrcCompletionStats stats, before;
+	ClusterCtrcSharedHeader *saved;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	cluster_node_id = 3;
+	memset(&stats, 0xa5, sizeof(stats));
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.origin_node_id, 3);
+	UT_ASSERT_EQ(stats.real_completion_count, 0);
+#ifdef CLUSTER_CTRC_COMPLETION_STATS_V1
+	pg_atomic_write_u64(&CtrcShared->real_completion_count, UINT64_MAX);
+#endif
+	test_shmem_attach = true;
+	cluster_ctrc_shmem_init();
+	test_shmem_attach = false;
+	UT_ASSERT(cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT_EQ(stats.real_completion_count, UINT64_MAX);
+	memset(&stats, 0xa5, sizeof(stats));
+	memcpy(&before, &stats, sizeof(stats));
+	UT_ASSERT(!cluster_ctrc_completion_stats_snapshot(NULL));
+	cluster_node_id = -1;
+	UT_ASSERT(!cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	cluster_node_id = CLUSTER_CTRC_MAX_PARTICIPANTS;
+	UT_ASSERT(!cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	cluster_node_id = 0;
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	UT_ASSERT(!cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	CtrcShared = saved;
+	CtrcShared->magic = 0;
+	UT_ASSERT(!cluster_ctrc_completion_stats_snapshot(&stats));
+	UT_ASSERT(memcmp(&stats, &before, sizeof(stats)) == 0);
+	CtrcShared->magic = CLUSTER_CTRC_SHMEM_MAGIC;
+	cluster_node_id = saved_node;
+}
+
+/* On the parent, still execute the original real snapshot; absent new
+ * diagnostic fields mean unavailable rather than a fabricated count. */
+static bool
+publisher_read_actual_snapshot(uint64 *count, int32 *origin)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+
+	if (!cluster_ctrc_debug_snapshot(&snapshot))
+		return false;
+#ifdef CLUSTER_CTRC_PUBLISHER_STATS_V1
+	if (snapshot.publisher_stats_available) {
+		*count = snapshot.publisher_pending_count;
+		*origin = snapshot.publisher_origin_node_id;
+		return true;
+	}
+#endif
+	return false;
+}
+
+UT_TEST(test_publisher_gauge_observes_original_certifying_until_shared_handoff)
+{
+	ClusterCtrcOriginEntry *first, *second;
+	ClusterCtrcOriginEntry before;
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcDebugSnapshot old;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+
+	reset_fixture();
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(origin, 0);
+	first = seed_origin(0, 0);
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(first);
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	/* RELEASE_PROVEN still awaits notifications, but its original shared
+	 * publication handoff has completed. Disk durability is a boundary. */
+	completion_prepare_original_origin(1, &dispatch);
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&old));
+	UT_ASSERT_EQ(old.origin_release_proven, 1);
+	second = seed_origin(2, 0);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(second);
+	LWLockRelease(&CtrcShared->origin_lock);
+	before = *second;
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT(memcmp(second, &before, sizeof(before)) == 0);
+	first->state = CTRC_ORIGIN_BLOCKED;
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(2, &certificate));
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(ctrc_origin_certificate_commit_shared(&certificate));
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&old));
+	UT_ASSERT_EQ(old.origin_release_proven, 1);
+	UT_ASSERT_EQ(old.origin_blocked, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_publisher_gauge_availability_preserves_original_snapshot_contract)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+	ClusterCtrcSharedHeader *saved;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	printf("# publisher_snapshot_bytes=%zu\n", sizeof(ClusterCtrcDebugSnapshot));
+	cluster_node_id = 3;
+	UT_ASSERT(publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(origin, 3);
+	for (int i = 0; i < 2; i++) {
+		cluster_node_id = i == 0 ? -1 : CLUSTER_CTRC_MAX_PARTICIPANTS;
+		count = UINT64_MAX;
+		origin = -1;
+		UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+		UT_ASSERT(!publisher_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, UINT64_MAX);
+		UT_ASSERT_EQ(origin, -1);
+	}
+	cluster_node_id = 0;
+	pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_COUNT);
+	UT_ASSERT(!publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, UINT64_MAX);
+	UT_ASSERT_EQ(origin, -1);
+	pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	UT_ASSERT(!publisher_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, UINT64_MAX);
+	UT_ASSERT_EQ(origin, -1);
+	CtrcShared = saved;
+	cluster_node_id = saved_node;
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+static bool
+unsettled_read_actual_snapshot(uint64 *count, int32 *origin)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+
+	if (!cluster_ctrc_debug_snapshot(&snapshot))
+		return false;
+#ifdef CLUSTER_CTRC_UNSETTLED_STATS_V1
+	if (snapshot.unsettled_stats_available) {
+		*count = snapshot.unsettled_count;
+		*origin = snapshot.unsettled_origin_node_id;
+		return true;
+	}
+#endif
+	return false;
+}
+
+UT_TEST(test_unsettled_gauge_keeps_shared_responsibilities_until_original_retirement)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+	ClusterCtrcOriginEntry before;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+
+	reset_fixture();
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	/* Uses the original shared handoff and ACK-frozen receipt producer;
+	 * the independent physical block0 durability boundary is assumed. */
+	completion_prepare_original_origin(0, &dispatch);
+	before = ctrc_origin_entries()[0];
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 3);
+	UT_ASSERT_EQ(origin, 0);
+	UT_ASSERT(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)) == 0);
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].state, CTRC_ORIGIN_RELEASE_PROVEN);
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_unsettled_gauge_retains_reservations_phases_and_opaque_occupancy)
+{
+	static const uint8 origin_states[] = { CTRC_ORIGIN_OPEN,	   CTRC_ORIGIN_SEALING,
+										   CTRC_ORIGIN_SEALED,	   CTRC_ORIGIN_CLEANING,
+										   CTRC_ORIGIN_CERTIFYING, CTRC_ORIGIN_RELEASE_PROVEN,
+										   CTRC_ORIGIN_BLOCKED,	   UINT8_MAX,
+										   CTRC_ORIGIN_EMPTY };
+	static const uint8 participant_states[]
+		= { CTRC_PARTICIPANT_OPEN,		CTRC_PARTICIPANT_CLOSED_DRAINING,
+			CTRC_PARTICIPANT_ACK_READY, CTRC_PARTICIPANT_ACK_FROZEN,
+			CTRC_PARTICIPANT_BLOCKED,	UINT8_MAX };
+	static const uint32 receipt_states[] = { CTRC_RECEIPT_PREPARED,	   CTRC_RECEIPT_APPLIED,
+											 CTRC_RECEIPT_CLEANED,	   CTRC_RECEIPT_CANCELLED,
+											 CTRC_RECEIPT_ACK_FROZEN,  CTRC_RECEIPT_BLOCKED,
+											 CTRC_RECEIPT_RETARGETING, UINT32_MAX };
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginEntry *entry;
+	ClusterCtrcParticipantEntry *participant;
+	ClusterCtrcReceipt *receipt;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+
+	reset_fixture();
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(test_top_full));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT_EQ(ctrc_origin_entries()[0].state, CTRC_ORIGIN_EMPTY);
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	entry = seed_origin(0, 0);
+	for (unsigned i = 0; i < lengthof(origin_states); i++) {
+		entry->state = origin_states[i];
+		UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, 1);
+	}
+	MemSet(entry, 0, sizeof(*entry));
+	participant = &ctrc_participant_entries()[0];
+	for (unsigned i = 0; i < lengthof(participant_states); i++) {
+		participant->state = participant_states[i];
+		UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, 1);
+	}
+	participant->state = CTRC_PARTICIPANT_EMPTY;
+	participant->key.xid = FirstNormalTransactionId;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	MemSet(participant, 0, sizeof(*participant));
+	receipt = &ctrc_receipt_entries()[0];
+	for (unsigned i = 0; i < lengthof(receipt_states); i++) {
+		receipt->state = receipt_states[i];
+		UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, 1);
+	}
+	receipt->state = CTRC_RECEIPT_FREE;
+	ctrc_receipt_probe_states()[0] = CTRC_RECEIPT_PROBE_OCCUPIED;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	ctrc_receipt_probe_states()[0] = UINT8_MAX;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 1);
+	ctrc_receipt_probe_states()[0] = CTRC_RECEIPT_PROBE_TOMBSTONE;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	ctrc_receipt_probe_states()[0] = CTRC_RECEIPT_PROBE_EMPTY;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_unsettled_gauge_availability_requires_original_snapshot_success)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+	ClusterCtrcSharedHeader *saved;
+	uint64 count = UINT64_MAX;
+	int32 origin = -1;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	printf("# unsettled_snapshot_bytes=%zu shared_header=%zu shared_region=" UINT64_FORMAT "\n",
+		   sizeof(snapshot), sizeof(*CtrcShared), CtrcShared->total_bytes);
+	cluster_node_id = 3;
+	UT_ASSERT(unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(origin, 3);
+	for (int i = 0; i < 2; i++) {
+		cluster_node_id = i == 0 ? -1 : CLUSTER_CTRC_MAX_PARTICIPANTS;
+		count = UINT64_MAX;
+		origin = -1;
+		UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+		UT_ASSERT(!unsettled_read_actual_snapshot(&count, &origin));
+		UT_ASSERT_EQ(count, UINT64_MAX);
+		UT_ASSERT_EQ(origin, -1);
+	}
+	cluster_node_id = 0;
+	pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_COUNT);
+	UT_ASSERT(!unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, UINT64_MAX);
+	UT_ASSERT_EQ(origin, -1);
+	pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	UT_ASSERT(!unsettled_read_actual_snapshot(&count, &origin));
+	UT_ASSERT_EQ(count, UINT64_MAX);
+	UT_ASSERT_EQ(origin, -1);
+	CtrcShared = saved;
+	cluster_node_id = saved_node;
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+/* The parent still executes its real snapshot. Missing age metadata is
+ * unavailable; it is never synthesized from a pending-worker hint. */
+static bool
+oldest_read_actual_snapshot(uint64 *age, uint64 *count, int32 *origin)
+{
+	ClusterCtrcDebugSnapshot snapshot;
+
+	if (!cluster_ctrc_debug_snapshot(&snapshot))
+		return false;
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+	if (snapshot.unsettled_stats_available && snapshot.oldest_unsettled_age_available) {
+		*age = snapshot.oldest_unsettled_age_ms;
+		*count = snapshot.unsettled_count;
+		*origin = snapshot.unsettled_origin_node_id;
+		return true;
+	}
+#endif
+	return false;
+}
+
+UT_TEST(test_oldest_age_keeps_reservation_start_until_cancel_or_original_retirement)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation, duplicate;
+	ClusterCtrcOriginEntry before;
+	uint64 age = UINT64_MAX, count = UINT64_MAX;
+	uint32 grant;
+	int32 origin = -1;
+
+	reset_fixture();
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 0);
+	UT_ASSERT_EQ(count, 0);
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(test_top_full));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	test_now_us = UINT64_C(4000999);
+	before = ctrc_origin_entries()[0];
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 3000);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(origin, 0);
+	UT_ASSERT_EQ(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)), 0);
+	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 0);
+	UT_ASSERT_EQ(count, 0);
+
+	test_now_us = UINT64_C(6000000);
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	test_now_us = UINT64_C(7000000);
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	test_now_us = UINT64_C(9000000);
+	before = ctrc_origin_entries()[0];
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &duplicate),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN);
+	UT_ASSERT_EQ(memcmp(&before, &ctrc_origin_entries()[0], sizeof(before)), 0);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 3000);
+	ctrc_origin_entries()[0].state = CTRC_ORIGIN_BLOCKED;
+	test_now_us = UINT64_C(10000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 4000);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_oldest_age_observes_each_domain_and_never_turns_missing_birth_into_zero)
+{
+	ClusterCtrcOriginEntry *entry;
+	ClusterCtrcReceiptHandle receipt, duplicate;
+	ClusterCtrcDebugSnapshot snapshot;
+	uint64 age = UINT64_MAX, count = UINT64_MAX;
+	int32 origin = -1;
+
+	reset_fixture();
+	entry = seed_origin(0, 1);
+	test_now_us = UINT64_C(3000000);
+	UT_ASSERT_EQ(prepare_fixture_receipt(entry, 801, &receipt), CLUSTER_CTRC_PREPARE_READY);
+	test_now_us = UINT64_C(5000000);
+	UT_ASSERT_EQ(prepare_fixture_receipt(entry, 801, &duplicate), CLUSTER_CTRC_PREPARE_DUPLICATE);
+	test_now_us = UINT64_C(8000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 7000);
+	UT_ASSERT_EQ(count, 3);
+	/* Materialized per-domain observation inputs, not legal lifecycle steps
+ * or an orphan-reclamation proof. The real retirement path is below. */
+	MemSet(entry, 0, sizeof(*entry));
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 5000);
+	UT_ASSERT_EQ(count, 2);
+	MemSet(receipt.participant, 0, sizeof(*receipt.participant));
+	receipt.receipt->state = CTRC_RECEIPT_BLOCKED;
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 5000);
+	UT_ASSERT_EQ(count, 1);
+
+	for (unsigned domain = 0; domain < 3; domain++) {
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+		uint64 *born;
+#endif
+
+		reset_fixture();
+		entry = seed_origin(0, 1);
+		UT_ASSERT_EQ(prepare_fixture_receipt(entry, 802, &receipt), CLUSTER_CTRC_PREPARE_READY);
+		test_now_us = UINT64_C(8000000);
+		UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+		born = domain == 0	 ? &entry->diagnostic_born_us
+			   : domain == 1 ? &receipt.participant->diagnostic_born_us
+							 : &receipt.receipt->diagnostic_born_us;
+
+		*born = 0;
+#endif
+		age = count = UINT64_MAX;
+		origin = -1;
+		UT_ASSERT(!oldest_read_actual_snapshot(&age, &count, &origin));
+		UT_ASSERT_EQ(age, UINT64_MAX);
+		UT_ASSERT_EQ(count, UINT64_MAX);
+		UT_ASSERT_EQ(origin, -1);
+		UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+		UT_ASSERT(snapshot.unsettled_stats_available);
+		UT_ASSERT_EQ(snapshot.unsettled_count, 3);
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+		*born = UINT64_C(9000000);
+#endif
+		UT_ASSERT(!oldest_read_actual_snapshot(&age, &count, &origin));
+		UT_ASSERT_EQ(age, UINT64_MAX);
+	}
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_oldest_age_keeps_real_certificate_tail_and_zero_receipt_close)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+	ClusterCtrcOriginEntry model;
+	uint64 age = UINT64_MAX, count = UINT64_MAX, participant_index;
+	int32 origin = -1;
+
+	reset_fixture();
+	completion_prepare_original_origin(0, &dispatch);
+	test_now_us = UINT64_C(7000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 6000);
+	UT_ASSERT_EQ(count, 3);
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	test_now_us = UINT64_C(8000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 7000);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 0);
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+
+	reset_fixture();
+	model = *seed_origin(1, 1);
+	MemSet(&ctrc_origin_entries()[1], 0, sizeof(model));
+	UT_ASSERT(ctrc_participant_index(&model.key, 0, &participant_index));
+	test_now_us = UINT64_C(3000000);
+	/* Invoke the real empty-participant CLOSE producer under its original
+ * lock. The incoming wire/admission and remote origin are boundaries. */
+	ctrc_participant_locks_acquire(ctrc_participant_lock_mask(participant_index));
+	UT_ASSERT_EQ(cluster_ctrc_participant_close_or_tombstone(
+					 &ctrc_participant_entries()[participant_index], &model.key, &model.touched[0],
+					 model.grant_generation, model.seal_generation),
+				 CLUSTER_CTRC_CLOSE_ACK_READY);
+	ctrc_participant_locks_release(ctrc_participant_lock_mask(participant_index));
+	test_now_us = UINT64_C(9000000);
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 6000);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(test_oldest_age_requires_original_snapshot_clock_and_layout)
+{
+	ClusterCtrcSharedHeader *saved;
+	ClusterCtrcDebugSnapshot snapshot;
+	uint64 age = UINT64_MAX, count = UINT64_MAX;
+	int32 origin = -1;
+	int saved_node = cluster_node_id;
+
+	reset_fixture();
+	cluster_node_id = 3;
+	UT_ASSERT(oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT_EQ(age, 0);
+	UT_ASSERT_EQ(count, 0);
+	UT_ASSERT_EQ(origin, 3);
+	printf("# age_layout origin=%zu participant=%zu receipt=%zu snapshot=%zu region=" UINT64_FORMAT
+		   "\n",
+		   sizeof(ClusterCtrcOriginEntry), sizeof(ClusterCtrcParticipantEntry),
+		   sizeof(ClusterCtrcReceipt), sizeof(snapshot), CtrcShared->total_bytes);
+	for (unsigned fault = 0; fault < 7; fault++) {
+		age = count = UINT64_MAX;
+		origin = -1;
+		saved = CtrcShared;
+		if (fault == 0)
+			cluster_node_id = -1;
+		else if (fault == 1)
+			cluster_node_id = CLUSTER_CTRC_MAX_PARTICIPANTS;
+		else if (fault == 2)
+			CtrcShared = NULL;
+		else if (fault == 3)
+			CtrcShared->version--;
+		else if (fault == 4)
+			CtrcShared->total_bytes--;
+		else if (fault == 5)
+			pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_COUNT);
+		else
+			test_now_us = 0;
+		UT_ASSERT(!oldest_read_actual_snapshot(&age, &count, &origin));
+		UT_ASSERT_EQ(age, UINT64_MAX);
+		UT_ASSERT_EQ(count, UINT64_MAX);
+		UT_ASSERT_EQ(origin, -1);
+		CtrcShared = saved;
+		if (fault == 3)
+			CtrcShared->version++;
+		if (fault == 4)
+			CtrcShared->total_bytes++;
+		pg_atomic_write_u32(&CtrcShared->test_barrier_phase, CTRC_TEST_BARRIER_NONE);
+		cluster_node_id = 3;
+		test_now_us = UINT64_C(1000000);
+	}
+	cluster_node_id = 0;
+	test_now_us = 0;
+	(void)seed_origin(0, 0);
+	test_now_us = UINT64_C(8000000);
+	UT_ASSERT(!oldest_read_actual_snapshot(&age, &count, &origin));
+	UT_ASSERT(cluster_ctrc_debug_snapshot(&snapshot));
+	UT_ASSERT(snapshot.unsettled_stats_available);
+	UT_ASSERT_EQ(snapshot.unsettled_count, 1);
+	cluster_node_id = saved_node;
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+static ClusterUndoCapacityChangeFence *capacity_test_fence;
+static unsigned capacity_test_wakeups;
+
+static void
+capacity_test_wakeup_observer(void)
+{
+	uint64 sequence;
+
+	UT_ASSERT_EQ(pg_atomic_read_u64(&capacity_test_fence->inflight_writers), 1);
+	UT_ASSERT(!cluster_undo_capacity_change_sample(&sequence));
+	capacity_test_wakeups++;
+}
+
+UT_TEST(test_capacity_fence_receipt_apply_cancel_and_reclaim_use_original_producers)
+{
+	ClusterUndoCapacityChangeFence fence;
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcTargetV1 target;
+	ClusterCtrcApplyToken token;
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult reply;
+	uint64 sequence, participant_index, receipt_index;
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 81, &handle), CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.change_sequence), sequence + 2);
+	target = handle.receipt->target;
+	target.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	target.itl_xid = origin->key.xid;
+	target.itl_class = 1;
+	target.itl_slot_wrap = 1;
+	target.uba[0] = 1;
+	target.planned_predecessor_sha256[0] = 1;
+	target.planned_successor_sha256[0] = 2;
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+				 CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.change_sequence), sequence + 2);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT_EQ(cluster_ctrc_receipt_apply_shared(&handle, &target, &token),
+				 CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&handle));
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	cluster_undo_capacity_fence_attach(NULL);
+
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	UT_ASSERT_EQ(prepare_fixture_receipt(origin, 81, &handle), CLUSTER_CTRC_PREPARE_READY);
+	cluster_undo_capacity_fence_attach(&fence);
+	capacity_test_fence = &fence;
+	capacity_test_wakeups = 0;
+	wakeup_hook = capacity_test_wakeup_observer;
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_receipt_cancel_shared(&handle));
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(capacity_test_wakeups, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(!cluster_ctrc_receipt_cancel_shared(&handle));
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	wakeup_hook = NULL;
+	cluster_undo_capacity_fence_attach(NULL);
+
+	reset_fixture();
+	UT_ASSERT(seed_frozen_certificate(0, &dispatch, &participant_index, &receipt_index));
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &reply));
+	UT_ASSERT_EQ(reply, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.change_sequence), sequence + 2);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_participant_entries()[participant_index],
+							  sizeof(ClusterCtrcParticipantEntry)));
+	UT_ASSERT(ctrc_bytes_zero(&ctrc_receipt_entries()[receipt_index], sizeof(ClusterCtrcReceipt)));
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
+UT_TEST(test_capacity_fence_empty_selector_exception_retires_lazy_scope)
+{
+	ClusterUndoCapacityChangeFence fence;
+	ClusterCtrcTxnKeyV1 key;
+	uint64 sequence;
+	volatile bool caught = false;
+
+	reset_fixture();
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	InterruptPending = 1;
+	PG_TRY();
+	{
+		(void)cluster_ctrc_origin_next_open_shared(&key);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	InterruptPending = 0;
+	UT_ASSERT(caught);
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	UT_ASSERT_EQ(held_count, 0);
+	/* Attach asserts no leaked process-local scope after siglongjmp. */
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
+/* The production reservation/OPEN/CANCEL producers invalidate the same fence
+ * sampled by capacity readers. Empty selectors and private preflight copies
+ * must leave an otherwise current observation intact. */
+UT_TEST(test_capacity_fence_tracks_actual_origin_producers_only)
+{
+	ClusterUndoCapacityChangeFence fence;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcOriginEntry private_origin = { 0 };
+	uint64 sequence;
+	uint32 grant;
+
+	reset_fixture();
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(test_top_full));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_origin_open_reserved(&reservation, &grant));
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	/* A raw private entry is never a shared producer, even nested inside an
+	 * actual outer writer's lazy scope. */
+	{
+		bool entered = cluster_undo_capacity_write_scope_begin();
+		UT_ASSERT_EQ(cluster_ctrc_origin_open_active(&private_origin, &key, 7),
+					 CLUSTER_CTRC_ORIGIN_OPENED);
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	cluster_undo_capacity_fence_attach(NULL);
+
+	reset_fixture();
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(!cluster_ctrc_origin_next_open_shared(&key));
+	UT_ASSERT(cluster_undo_capacity_change_current(sequence));
+	key = fresh_origin_key();
+	test_my_proc.xid = key.xid;
+	test_top_full = FullTransactionIdFromEpochAndXid(7, key.xid);
+	pg_atomic_write_u64(&test_my_proc.cluster_top_full_xid_atomic,
+						U64FromFullTransactionId(test_top_full));
+	UT_ASSERT_EQ(cluster_ctrc_origin_reserve_active(&key, &reservation),
+				 CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	UT_ASSERT(cluster_ctrc_origin_cancel_pre_bind(&reservation));
+	UT_ASSERT(!cluster_undo_capacity_change_current(sequence));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&fence.inflight_writers), 0);
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
+
+/* Keep executor headers after the product include so instr_time uses the
+ * fixture clock_gettime boundary established above. */
+#include "funcapi.h"
+
+/* The SQL row sink and allocation are leaves; shared snapshots, complete
+ * dump_ctrc and its numeric formatters below are the original product bodies. */
+static struct {
+	char key[128];
+	char value[128];
+} ctrc_display_rows[256];
+static char ctrc_display_formats[256][128];
+static unsigned ctrc_display_count, ctrc_display_format_count;
+
+char *
+psprintf(const char *format, ...)
+{
+	char *result;
+	va_list args;
+	int size;
+
+	UT_ASSERT(ctrc_display_format_count < lengthof(ctrc_display_formats));
+	if (ctrc_display_format_count >= lengthof(ctrc_display_formats))
+		return (char *)"";
+	result = ctrc_display_formats[ctrc_display_format_count++];
+	va_start(args, format);
+	size = vsnprintf(result, sizeof(ctrc_display_formats[0]), format, args);
+	va_end(args);
+	UT_ASSERT(size >= 0 && size < (int)sizeof(ctrc_display_formats[0]));
+	return result;
+}
+
+static void
+emit_row(ReturnSetInfo *rsinfo, const char *category, const char *key, const char *value)
+{
+	UT_ASSERT(rsinfo == NULL);
+	UT_ASSERT_STR_EQ(category, "ctrc");
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(ctrc_display_count < lengthof(ctrc_display_rows));
+	if (ctrc_display_count >= lengthof(ctrc_display_rows))
+		return;
+	UT_ASSERT(strlen(key) < sizeof(ctrc_display_rows[0].key));
+	UT_ASSERT(strlen(value) < sizeof(ctrc_display_rows[0].value));
+	snprintf(ctrc_display_rows[ctrc_display_count].key,
+			 sizeof(ctrc_display_rows[0].key), "%s", key);
+	snprintf(ctrc_display_rows[ctrc_display_count++].value,
+			 sizeof(ctrc_display_rows[0].value), "%s", value);
+}
+
+#include "test_cluster_ctrc_counter_display.inc"
+
+static void
+ctrc_display_dump(void)
+{
+	ctrc_display_count = ctrc_display_format_count = 0;
+	UT_ASSERT_EQ(held_count, 0);
+	dump_ctrc(NULL);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+static void
+ctrc_display_expect(const char *key, const char *expected)
+{
+	unsigned matches = 0;
+
+	for (unsigned i = 0; i < ctrc_display_count; i++)
+		if (strcmp(ctrc_display_rows[i].key, key) == 0) {
+			matches++;
+			if (expected != NULL)
+				UT_ASSERT_STR_EQ(ctrc_display_rows[i].value, expected);
+		}
+	UT_ASSERT_EQ(matches, expected != NULL ? 1 : 0);
+}
+
+static const char *const ctrc_display_reasons[] = {
+	"ctrc_phase_no_progress_by_reason.NONE",
+	"ctrc_phase_no_progress_by_reason.PREPARED_DRAIN",
+	"ctrc_phase_no_progress_by_reason.RESOURCE_X",
+	"ctrc_phase_no_progress_by_reason.PAGE_REVALIDATE",
+	"ctrc_phase_no_progress_by_reason.WAL_DURABILITY",
+	"ctrc_phase_no_progress_by_reason.PARTICIPANT_ACK",
+	"ctrc_phase_no_progress_by_reason.BLOCK0_CERTIFICATE",
+	"ctrc_phase_no_progress_by_reason.BLOCKED"
+};
+
+static void
+ctrc_display_availability(bool available, const char *origin)
+{
+	static const char *const flags[] = {
+		"ctrc_completion_stats_available", "ctrc_phase_no_progress_stats_available",
+		"ctrc_publisher_stats_available", "ctrc_unsettled_stats_available",
+		"ctrc_oldest_unsettled_age_stats_available"
+	};
+	static const char *const origins[] = {
+		"ctrc_completion_origin_node_id", "ctrc_phase_no_progress_origin_node_id",
+		"ctrc_publisher_origin_node_id", "ctrc_unsettled_origin_node_id"
+	};
+	static const char *const counts[] = {
+		"ctrc_real_completion_count", "ctrc_publisher_pending_count",
+		"ctrc_unsettled_count", "ctrc_oldest_unsettled_age_ms"
+	};
+
+	ctrc_display_dump();
+	for (unsigned i = 0; i < lengthof(flags); i++)
+		ctrc_display_expect(flags[i], available ? "true" : "false");
+	for (unsigned i = 0; i < lengthof(origins); i++)
+		ctrc_display_expect(origins[i], available ? origin : NULL);
+	for (unsigned i = 0; i < lengthof(counts); i++)
+		ctrc_display_expect(counts[i], available ? "0" : NULL);
+	for (unsigned i = 0; i < lengthof(ctrc_display_reasons); i++)
+		ctrc_display_expect(ctrc_display_reasons[i], available ? "0" : NULL);
+}
+
+UT_TEST(test_ctrc_display_preserves_unavailable_origins_and_available_zero)
+{
+	static const int invalid[] = { INT_MIN, -1, 16, 17, 127, 128, INT_MAX };
+	ClusterCtrcSharedHeader *saved;
+
+	reset_fixture();
+	for (int node = 0; node < 16; node++) {
+		char origin[8];
+
+		cluster_node_id = node;
+		snprintf(origin, sizeof(origin), "%d", node);
+		ctrc_display_availability(true, origin);
+	}
+	for (unsigned i = 0; i < lengthof(invalid); i++) {
+		cluster_node_id = invalid[i];
+		ctrc_display_availability(false, NULL);
+	}
+	cluster_node_id = 0;
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	ctrc_display_availability(false, NULL);
+	CtrcShared = saved;
+	CtrcShared->version--;
+	ctrc_display_availability(false, NULL);
+	CtrcShared->version++;
+	ctrc_display_availability(true, "0");
+}
+
+UT_TEST(test_ctrc_display_follows_real_completion_and_unsettled_retirement)
+{
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+
+	reset_fixture();
+	/* Same real shared producer as the lifecycle tests above. The physical
+	 * certificate durability/native boundary remains an explicit input. */
+	completion_prepare_original_origin(0, &dispatch);
+	test_now_us = UINT64_C(4000000);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "0");
+	ctrc_display_expect("ctrc_publisher_pending_count", "0");
+	ctrc_display_expect("ctrc_unsettled_count", "3");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", "3000");
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "0");
+	ctrc_display_expect("ctrc_unsettled_count", "1");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", "3000");
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id + 1, 0, result));
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "1");
+	ctrc_display_expect("ctrc_unsettled_count", "0");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", "0");
+	UT_ASSERT(!cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "1");
+}
+
+UT_TEST(test_ctrc_display_keeps_publisher_until_real_shared_handoff)
+{
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcOriginEntry *entry;
+
+	reset_fixture();
+	entry = seed_origin(0, 0);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_publisher_pending_count", "0");
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(entry);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &certificate));
+	LWLockRelease(&CtrcShared->origin_lock);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_publisher_pending_count", "1");
+	ctrc_display_expect("ctrc_real_completion_count", "0");
+	ctrc_display_expect("ctrc_unsettled_count", "1");
+	UT_ASSERT(ctrc_origin_certificate_commit_shared(&certificate));
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_publisher_pending_count", "0");
+	ctrc_display_expect("ctrc_real_completion_count", "1");
+	ctrc_display_expect("ctrc_unsettled_count", "0");
+}
+
+UT_TEST(test_ctrc_display_uses_actual_pass_reasons_and_excludes_error_exit)
+{
+	bool caught = false;
+
+	reset_fixture();
+	UT_ASSERT(bind_test_worker(1));
+	for (int reason = 0; reason < 8; reason++) {
+		driver_final_reason = reason;
+		UT_ASSERT(!ctrc_fixture_run_pass());
+		ctrc_display_dump();
+		for (unsigned i = 0; i < lengthof(ctrc_display_reasons); i++)
+			ctrc_display_expect(ctrc_display_reasons[i], i <= (unsigned)reason ? "1" : "0");
+	}
+	driver_interrupt = true;
+	PG_TRY();
+	{
+		(void)ctrc_fixture_run_pass();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	driver_interrupt = false;
+	driver_final_reason = -1;
+	UT_ASSERT(caught);
+	ctrc_display_dump();
+	for (unsigned i = 0; i < lengthof(ctrc_display_reasons); i++)
+		ctrc_display_expect(ctrc_display_reasons[i], "1");
+}
+
+UT_TEST(test_ctrc_display_preserves_unsigned_counts_and_unknown_age)
+{
+	ClusterCtrcOriginEntry *entry;
+
+	reset_fixture();
+	pg_atomic_write_u64(&CtrcShared->real_completion_count, UINT64_MAX);
+	pg_atomic_write_u64(&CtrcShared->cleaner_no_progress[CTRC_CLEANER_REASON_NONE],
+						UINT64_C(9223372036854775809));
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_real_completion_count", "18446744073709551615");
+	ctrc_display_expect(ctrc_display_reasons[0], "9223372036854775809");
+	entry = seed_origin(0, 0);
+	/* Materialized malformed diagnostic metadata, not lifecycle authority. */
+	entry->diagnostic_born_us = 0;
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_unsettled_count", "1");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_stats_available", "false");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", NULL);
+	entry->diagnostic_born_us = UINT64_C(1000000);
+	test_now_us = 0;
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_oldest_unsettled_age_stats_available", "false");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", NULL);
+	test_now_us = UINT64_C(4000999);
+	ctrc_display_dump();
+	ctrc_display_expect("ctrc_oldest_unsettled_age_stats_available", "true");
+	ctrc_display_expect("ctrc_oldest_unsettled_age_ms", "3000");
+}
+
 int
 main(void)
 {
@@ -7751,7 +8984,10 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(185);
+	UT_PLAN(208);
+	UT_RUN(test_capacity_fence_receipt_apply_cancel_and_reclaim_use_original_producers);
+	UT_RUN(test_capacity_fence_empty_selector_exception_retires_lazy_scope);
+	UT_RUN(test_capacity_fence_tracks_actual_origin_producers_only);
 	UT_RUN(test_bounded_pool_selectors_observe_work_after_intervening_unlock);
 	UT_RUN(test_empty_bounded_pool_scan_keeps_round_robin_position);
 	UT_RUN(test_empty_pool_selectors_cancel_without_retaining_shared_locks);
@@ -7942,6 +9178,26 @@ main(void)
 	UT_RUN(test_actual_worker_active_pass_restarts_after_original_lease_refusal);
 	UT_RUN(test_actual_worker_active_pass_restarts_after_original_source_refusal);
 	UT_RUN(test_actual_worker_active_pass_does_not_sample_native_without_source);
+	UT_RUN(test_no_progress_counts_only_normally_completed_local_passes);
+	UT_RUN(test_no_progress_uses_executing_workers_original_final_reason);
+	UT_RUN(test_no_progress_snapshot_preserves_unavailable_zero_and_attach_lifetime);
+	UT_RUN(test_completion_count_requires_final_origin_notification_and_is_not_progress);
+	UT_RUN(test_completion_count_covers_original_batch_and_zero_touch_retirement_once);
+	UT_RUN(test_completion_snapshot_preserves_unavailable_zero_origin_and_attach_counts);
+	UT_RUN(test_publisher_gauge_observes_original_certifying_until_shared_handoff);
+	UT_RUN(test_publisher_gauge_availability_preserves_original_snapshot_contract);
+	UT_RUN(test_unsettled_gauge_keeps_shared_responsibilities_until_original_retirement);
+	UT_RUN(test_unsettled_gauge_retains_reservations_phases_and_opaque_occupancy);
+	UT_RUN(test_unsettled_gauge_availability_requires_original_snapshot_success);
+	UT_RUN(test_oldest_age_keeps_reservation_start_until_cancel_or_original_retirement);
+	UT_RUN(test_oldest_age_observes_each_domain_and_never_turns_missing_birth_into_zero);
+	UT_RUN(test_oldest_age_keeps_real_certificate_tail_and_zero_receipt_close);
+	UT_RUN(test_oldest_age_requires_original_snapshot_clock_and_layout);
+	UT_RUN(test_ctrc_display_preserves_unavailable_origins_and_available_zero);
+	UT_RUN(test_ctrc_display_follows_real_completion_and_unsettled_retirement);
+	UT_RUN(test_ctrc_display_keeps_publisher_until_real_shared_handoff);
+	UT_RUN(test_ctrc_display_uses_actual_pass_reasons_and_excludes_error_exit);
+	UT_RUN(test_ctrc_display_preserves_unsigned_counts_and_unknown_age);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

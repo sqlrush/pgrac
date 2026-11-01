@@ -9,11 +9,18 @@
  * IDENTIFICATION
  *	  src/backend/commands/proclang.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native language creation before role or handler catalog work.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include "access/table.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "access/xact.h"
+#endif
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -22,10 +29,17 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/defrem.h"
 #include "commands/proclang.h"
 #include "miscadmin.h"
 #include "parser/parse_func.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -58,6 +72,30 @@ CreateProceduralLanguage(CreatePLangStmt *stmt)
 	ObjectAddress myself,
 				referenced;
 	ObjectAddresses *addrs;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Direct callers must bind before role or handler catalog work. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("CREATE LANGUAGE");
+		PreventCommandIfParallelMode("CREATE LANGUAGE");
+		PreventCommandDuringRecovery("CREATE LANGUAGE");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog creation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+	}
+#endif
 
 	/*
 	 * Check permission

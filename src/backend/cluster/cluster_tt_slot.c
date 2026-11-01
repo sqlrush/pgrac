@@ -43,6 +43,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 
 #include "access/transam.h"
 #include "cluster/cluster_clean_leave.h"
@@ -304,8 +305,28 @@ done:
  * (segment_id, lock) fields on first use.  Caller must NOT hold the
  * lock (this function will take it briefly for init when needed).
  */
+static ClusterTTSlotAllocPerSegment *cluster_tt_slot_get_or_init_capacity_body(uint32 segment_id);
+
 static ClusterTTSlotAllocPerSegment *
 cluster_tt_slot_get_or_init(uint32 segment_id)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	ClusterTTSlotAllocPerSegment *result;
+
+	PG_TRY();
+	{
+		result = cluster_tt_slot_get_or_init_capacity_body(segment_id);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ClusterTTSlotAllocPerSegment *
+cluster_tt_slot_get_or_init_capacity_body(uint32 segment_id)
 {
 	int node_id;
 	ClusterTTSlotAllocPerSegment *seg;
@@ -336,6 +357,7 @@ cluster_tt_slot_get_or_init(uint32 segment_id)
 		LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
 		if (seg->segment_id == 0) {
 			Assert(seg->binding_generation == 0);
+			cluster_undo_capacity_write_mark();
 			seg->binding_generation = 1;
 			seg->segment_id = segment_id;
 		}
@@ -482,6 +504,7 @@ cluster_tt_slot_startup_committed_bound(TransactionId xid)
 static void
 tt_slot_entry_recycle_locked(ClusterTTSlotAllocEntry *e, TransactionId new_owner)
 {
+	cluster_undo_capacity_write_mark();
 	e->xid = new_owner;
 	e->status = TransactionIdIsValid(new_owner) ? CTS_ACTIVE : CTS_FREE;
 	e->commit_scn = InvalidScn;
@@ -554,6 +577,7 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
 	if (free_idx >= 0) {
 		ClusterTTSlotAllocEntry *e = &seg->slots[free_idx];
 
+		cluster_undo_capacity_write_mark();
 		memset(&seg->origins[free_idx], 0, sizeof(seg->origins[free_idx]));
 		e->xid = top_xid;
 		e->status = CTS_ACTIVE;
@@ -617,8 +641,31 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
  *	SHARED) BEFORE seg->lock is acquired, so seg->lock is never held while
  *	ProcArrayLock is taken.
  */
+static uint16 cluster_tt_slot_alloc_ext_capacity_body(uint32 segment_id, TransactionId top_xid,
+													  bool *out_retained_pressure);
+
 uint16
 cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_retained_pressure)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	uint16 result;
+
+	PG_TRY();
+	{
+		result
+			= cluster_tt_slot_alloc_ext_capacity_body(segment_id, top_xid, out_retained_pressure);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static uint16
+cluster_tt_slot_alloc_ext_capacity_body(uint32 segment_id, TransactionId top_xid,
+										bool *out_retained_pressure)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool gate_enabled;
@@ -664,10 +711,37 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
  * keeps its strict mismatch ERROR contract for callers that name a non-current
  * segment unexpectedly.
  */
+static uint16 cluster_tt_slot_alloc_current_exact_capacity_body(
+	int node_id, uint32 expected_segment_id, TransactionId top_xid, bool *out_retained_pressure,
+	bool *out_current_drift, uint16 *out_wrap);
+
 uint16
 cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id, TransactionId top_xid,
 									bool *out_retained_pressure, bool *out_current_drift,
 									uint16 *out_wrap)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	uint16 result;
+
+	PG_TRY();
+	{
+		result = cluster_tt_slot_alloc_current_exact_capacity_body(node_id, expected_segment_id,
+																   top_xid, out_retained_pressure,
+																   out_current_drift, out_wrap);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static uint16
+cluster_tt_slot_alloc_current_exact_capacity_body(int node_id, uint32 expected_segment_id,
+												  TransactionId top_xid,
+												  bool *out_retained_pressure,
+												  bool *out_current_drift, uint16 *out_wrap)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool gate_enabled;
@@ -739,9 +813,31 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id, Tra
  *	current segment), NOT crash residue — they are simply skipped and
  *	NOT counted as stale (HC6 stale accounting is durable-side only).
  */
+static bool cluster_tt_slot_gc_current_pass_capacity_body(SCN horizon, uint64 expected_epoch,
+														  ClusterUndoCleanerPassStats *stats);
+
 bool
 cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 								ClusterUndoCleanerPassStats *stats)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = cluster_tt_slot_gc_current_pass_capacity_body(horizon, expected_epoch, stats);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_tt_slot_gc_current_pass_capacity_body(SCN horizon, uint64 expected_epoch,
+											  ClusterUndoCleanerPassStats *stats)
 {
 	uint32 segment_id;
 	ClusterTTSlotAllocPerSegment *seg;
@@ -878,8 +974,26 @@ cluster_tt_slot_alloc(uint32 segment_id, TransactionId top_xid)
  *	Idempotent: freeing an already-FREE slot is a no-op (defensive
  *	against double-callback in xact cleanup).
  */
+static void cluster_tt_slot_free_capacity_body(uint32 segment_id, uint16 slot_offset);
+
 void
 cluster_tt_slot_free(uint32 segment_id, uint16 slot_offset)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_tt_slot_free_capacity_body(segment_id, slot_offset);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_tt_slot_free_capacity_body(uint32 segment_id, uint16 slot_offset)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	ClusterTTSlotAllocEntry *e;
@@ -893,6 +1007,7 @@ cluster_tt_slot_free(uint32 segment_id, uint16 slot_offset)
 
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
 	e = &seg->slots[slot_offset];
+	cluster_undo_capacity_write_mark();
 	memset(&seg->origins[slot_offset], 0, sizeof(seg->origins[slot_offset]));
 	e->status = CTS_FREE;
 	e->xid = InvalidTransactionId;
@@ -948,9 +1063,32 @@ cluster_tt_slot_pernode_structural(uint32 segment_id, const char *fn)
  *	longer matches), this is a no-op -- the old segment's commit_scn is already
  *	durable in its header and its retention is tracked at segment granularity.
  */
+static void cluster_tt_slot_mark_committed_capacity_body(uint32 segment_id, uint16 slot_offset,
+														 TransactionId xid, uint16 expected_wrap,
+														 SCN commit_scn);
+
 void
 cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 							   uint16 expected_wrap, SCN commit_scn)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_tt_slot_mark_committed_capacity_body(segment_id, slot_offset, xid, expected_wrap,
+													 commit_scn);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_tt_slot_mark_committed_capacity_body(uint32 segment_id, uint16 slot_offset,
+											 TransactionId xid, uint16 expected_wrap,
+											 SCN commit_scn)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool transitioned = false;
@@ -976,6 +1114,7 @@ cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, Transactio
 
 		if (expected_wrap != TT_WRAP_INVALID && e->status == CTS_ACTIVE && e->xid == xid
 			&& e->wrap == expected_wrap) {
+			cluster_undo_capacity_write_mark();
 			e->status = CTS_COMMITTED;
 			e->commit_scn = commit_scn;
 			transitioned = true;
@@ -996,9 +1135,29 @@ cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, Transactio
  *	evidence until an exact release owner exists.  Same defensive xid/wrap
  *	ownership + rolled-away (D2b) guards as mark_committed.
  */
+static void cluster_tt_slot_mark_aborted_capacity_body(uint32 segment_id, uint16 slot_offset,
+													   TransactionId xid, uint16 expected_wrap);
+
 void
 cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 							 uint16 expected_wrap)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_tt_slot_mark_aborted_capacity_body(segment_id, slot_offset, xid, expected_wrap);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_tt_slot_mark_aborted_capacity_body(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										   uint16 expected_wrap)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool transitioned = false;
@@ -1016,6 +1175,7 @@ cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionI
 
 		if (expected_wrap != TT_WRAP_INVALID && e->status == CTS_ACTIVE && e->xid == xid
 			&& e->wrap == expected_wrap) {
+			cluster_undo_capacity_write_mark();
 			e->status = CTS_ABORTED;
 			e->commit_scn = InvalidScn;
 			transitioned = true;
@@ -1073,8 +1233,30 @@ tt_slot_origin_segment(const ClusterCtrcTxnKeyV1 *key)
 /* The successful original ACTIVE publisher hands off an already protected
  * reservation.  Sample the original source before taking the allocator lock:
  * no origin/allocator lock nesting and no new mutation/retention authority. */
+static bool cluster_tt_slot_origin_identity_retain_capacity_body(
+	const ClusterCtrcOriginReservation *reservation);
+
 bool
 cluster_tt_slot_origin_identity_retain(const ClusterCtrcOriginReservation *reservation)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = cluster_tt_slot_origin_identity_retain_capacity_body(reservation);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_tt_slot_origin_identity_retain_capacity_body(
+	const ClusterCtrcOriginReservation *reservation)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	ClusterTTSlotOriginIdentity *identity;
@@ -1102,6 +1284,7 @@ cluster_tt_slot_origin_identity_retain(const ClusterCtrcOriginReservation *reser
 		&& entry->commit_scn == InvalidScn && entry->xid == reservation->key.xid
 		&& entry->wrap == reservation->key.slot_wrap) {
 		if (identity->binding_generation == 0) {
+			cluster_undo_capacity_write_mark();
 			identity->key = reservation->key;
 			identity->original_full_xid = full;
 			identity->binding_generation = seg->binding_generation;
@@ -1322,8 +1505,27 @@ cluster_tt_slot_current_snapshot(int node_id, ClusterTTSlotCurrentSnapshot *out)
  *	the old segment is drained and the caller may transition it to
  *	SEGMENT_COMMITTED for retention reclaim (spec-3.13).
  */
+static void cluster_tt_slot_rollover_capacity_body(int node_id, uint32 new_segment_id,
+												   bool *out_old_had_active);
+
 void
 cluster_tt_slot_rollover(int node_id, uint32 new_segment_id, bool *out_old_had_active)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_tt_slot_rollover_capacity_body(node_id, new_segment_id, out_old_had_active);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_tt_slot_rollover_capacity_body(int node_id, uint32 new_segment_id, bool *out_old_had_active)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool old_had_active = false;
@@ -1362,6 +1564,7 @@ cluster_tt_slot_rollover(int node_id, uint32 new_segment_id, bool *out_old_had_a
 			break;
 		}
 	}
+	cluster_undo_capacity_write_mark();
 	seg->binding_generation++;
 	seg->segment_id = new_segment_id;
 	memset(seg->slots, 0, sizeof(seg->slots)); /* all CTS_FREE, wrap 0, commit_scn 0 */
@@ -1526,8 +1729,30 @@ cluster_tt_slot_wrap_retired_count(void)
  *	tuple (C-P2: recover may replay).
  * ============================================================ */
 
+static bool cluster_tt_slot_protect_capacity_body(uint32 segment_id, uint16 slot_offset,
+												  uint16 wrap, TransactionId xid);
+
 bool
 cluster_tt_slot_protect(uint32 segment_id, uint16 slot_offset, uint16 wrap, TransactionId xid)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = cluster_tt_slot_protect_capacity_body(segment_id, slot_offset, wrap, xid);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_tt_slot_protect_capacity_body(uint32 segment_id, uint16 slot_offset, uint16 wrap,
+									  TransactionId xid)
 {
 	uint32 i;
 	bool ok = false;
@@ -1549,6 +1774,7 @@ cluster_tt_slot_protect(uint32 segment_id, uint16 slot_offset, uint16 wrap, Tran
 	if (ClusterTTSlotShm->protected_count < CLUSTER_TT_PROTECTED_MAX) {
 		uint32 n = ClusterTTSlotShm->protected_count;
 
+		cluster_undo_capacity_write_mark();
 		ClusterTTSlotShm->protected_slots[n].segment_id = segment_id;
 		ClusterTTSlotShm->protected_slots[n].slot_offset = slot_offset;
 		ClusterTTSlotShm->protected_slots[n].wrap = wrap;
@@ -1561,8 +1787,28 @@ cluster_tt_slot_protect(uint32 segment_id, uint16 slot_offset, uint16 wrap, Tran
 	return ok;
 }
 
+static uint32 cluster_tt_slot_unprotect_xid_capacity_body(TransactionId xid);
+
 uint32
 cluster_tt_slot_unprotect_xid(TransactionId xid)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	uint32 result;
+
+	PG_TRY();
+	{
+		result = cluster_tt_slot_unprotect_xid_capacity_body(xid);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static uint32
+cluster_tt_slot_unprotect_xid_capacity_body(TransactionId xid)
 {
 	uint32 i;
 	uint32 removed = 0;
@@ -1576,6 +1822,7 @@ cluster_tt_slot_unprotect_xid(TransactionId xid)
 		if (ClusterTTSlotShm->protected_slots[i].xid == xid) {
 			uint32 last = ClusterTTSlotShm->protected_count - 1;
 
+			cluster_undo_capacity_write_mark();
 			ClusterTTSlotShm->protected_slots[i] = ClusterTTSlotShm->protected_slots[last];
 			ClusterTTSlotShm->protected_count = last;
 			removed++;
@@ -1649,8 +1896,26 @@ cluster_tt_slot_shmem_register(void)
  *	Used by cluster_unit harness to set a clean baseline between cases.
  *	Production code MUST NOT call this.
  */
+static void cluster_tt_slot_reset_all_capacity_body(void);
+
 void
 cluster_tt_slot_reset_all(void)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_tt_slot_reset_all_capacity_body();
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_tt_slot_reset_all_capacity_body(void)
 {
 	int n;
 
@@ -1661,6 +1926,7 @@ cluster_tt_slot_reset_all(void)
 		ClusterTTSlotAllocPerSegment *seg = &ClusterTTSlotShm->per_node[n];
 
 		LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
+		cluster_undo_capacity_write_mark();
 		seg->segment_id = 0;
 		seg->binding_generation = 0;
 		memset(seg->slots, 0, sizeof(seg->slots));
@@ -1678,8 +1944,28 @@ cluster_tt_slot_reset_all(void)
  *	COMMITTED/ABORTED status happen via spec-3.4c eager cleanout (not
  *	yet wired).
  */
+static void cluster_tt_slot_test_force_status_capacity_body(uint32 segment_id, uint16 slot_offset,
+															uint8 new_status);
+
 void
 cluster_tt_slot_test_force_status(uint32 segment_id, uint16 slot_offset, uint8 new_status)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_tt_slot_test_force_status_capacity_body(segment_id, slot_offset, new_status);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_tt_slot_test_force_status_capacity_body(uint32 segment_id, uint16 slot_offset,
+												uint8 new_status)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 
@@ -1695,6 +1981,7 @@ cluster_tt_slot_test_force_status(uint32 segment_id, uint16 slot_offset, uint8 n
 	seg = cluster_tt_slot_get_or_init(segment_id);
 
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
+	cluster_undo_capacity_write_mark();
 	seg->slots[slot_offset].status = new_status;
 	LWLockRelease(&seg->lock);
 }

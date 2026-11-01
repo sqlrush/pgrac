@@ -3,6 +3,10 @@
  * matview.c
  *	  materialized view support
  *
+ * PGRAC:
+ *    Preserve the shared refresh scope before relation access.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -27,6 +31,9 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 #include "commands/cluster.h"
 #include "commands/matview.h"
 #include "commands/tablecmds.h"
@@ -155,6 +162,13 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 	int			save_sec_context;
 	int			save_nestlevel;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("materialized views is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+#endif
 
 	/* Determine strength of lock needed. */
 	concurrent = stmt->concurrent;

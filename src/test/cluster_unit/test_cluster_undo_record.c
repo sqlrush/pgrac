@@ -1359,6 +1359,27 @@ UT_TEST(test_prev_uba_preserved)
 
 
 /* ---- R1-A O4: real full-pool observer and record publication ---- */
+UT_TEST(test_capacity_presence_distinguishes_absence_io_and_owner)
+{
+	char path[MAXPGPATH];
+	if (!undo_test_fixture_begin())
+		return;
+	UT_ASSERT_EQ(cluster_undo_segment_capacity_presence(1, 19), CLUSTER_UNDO_BLOCK0_NOT_FOUND);
+	UT_ASSERT(undo_test_write_header(19, SEGMENT_ALLOCATED));
+	UT_ASSERT_EQ(cluster_undo_segment_capacity_presence(1, 19), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_segment_capacity_presence(2, 257),
+				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(cluster_undo_segment_capacity_presence(0, 1),
+				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(cluster_undo_segment_capacity_presence(1, 257),
+				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	undo_test_segment_path(20, path, sizeof(path));
+	UT_ASSERT_EQ(symlink(path, path), 0);
+	UT_ASSERT_EQ(cluster_undo_segment_capacity_presence(1, 20), CLUSTER_UNDO_BLOCK0_IO_ERROR);
+	UT_ASSERT_EQ(unlink(path), 0);
+	undo_test_fixture_end();
+}
+
 UT_TEST(test_undo_pool_observer_scans_all_256_slots_across_gaps)
 {
 	ClusterUndoPoolObservation observation;
@@ -4101,6 +4122,28 @@ undo_stop_fixture_done(void)
 	MaxBackends = 1;
 }
 
+UT_TEST(test_capacity_original_record_active_writer_registration)
+{
+	ClusterUndoCapacityChangeFence fence;
+	uint64 before;
+	undo_stop_fixture_ready();
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	cluster_undo_active_write_register(scn_encode(0, 71));
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	cluster_undo_active_write_register(scn_encode(0, 71));
+	UT_ASSERT(cluster_undo_capacity_change_current(before));
+	cluster_undo_active_write_unregister();
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	cluster_undo_active_write_unregister();
+	UT_ASSERT(cluster_undo_capacity_change_current(before));
+	cluster_undo_capacity_fence_attach(NULL);
+	undo_stop_fixture_done();
+}
+
 UT_TEST(test_a148_undo_stop_original_active_writer_requires_original_commit_release)
 {
 	int backend;
@@ -4903,7 +4946,7 @@ UT_TEST(test_receipt_consumer_later_apply_error_cannot_reuse_earlier_result)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(113);
+	UT_PLAN(115);
 	UT_RUN(test_lifecycle_activation_refusal_reports_original_current_stage);
 	UT_RUN(test_receipt_lifecycle_reports_original_shared_path_without_replay);
 	UT_RUN(test_receipt_lifecycle_begin_unknown_and_cancel_do_not_borrow_shared_path);
@@ -4925,6 +4968,7 @@ main(int argc, char **argv)
 	UT_RUN(test_abort_prepared_after_lock_release_is_idempotent);
 	UT_RUN(test_abort_prepared_cancel_failure_and_borrowed_owner_do_not_panic);
 	UT_RUN(test_abort_attempted_or_applied_retains_debt_and_panics);
+	UT_RUN(test_capacity_original_record_active_writer_registration);
 	UT_RUN(test_a148_undo_stop_original_active_writer_requires_original_commit_release);
 	UT_RUN(test_a148_undo_stop_all_slots_and_late_invalid_do_not_clear_debt);
 	UT_RUN(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer);
@@ -4955,6 +4999,7 @@ main(int argc, char **argv)
 	UT_RUN(test_block_magic_init);
 	UT_RUN(test_record_type_flags_bytes);
 	UT_RUN(test_prev_uba_preserved);
+	UT_RUN(test_capacity_presence_distinguishes_absence_io_and_owner);
 	UT_RUN(test_undo_pool_observer_scans_all_256_slots_across_gaps);
 	UT_RUN(test_undo_pool_observer_rejects_invalid_owner_and_null_output);
 	UT_RUN(test_undo_pool_observer_distinguishes_io_failure_and_invalid_header);

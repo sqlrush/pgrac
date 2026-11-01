@@ -87,7 +87,38 @@ ProcessUtility_hook_type ProcessUtility_hook = NULL;
  * Internal btree rebuilds (for example TRUNCATE) do not use a ReindexStmt.
  * Author: SqlRush <sqlrush@gmail.com> */
 static void
-CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
+CheckClusterSharedStorageDrop(Node *statement, bool isTopLevel)
+{
+	if (!cluster_storage_mode_enabled())
+		return;
+	/* Resolve the original roots and complete dependency closure before
+	 * ddl_command_start can run. The final deletion pass rechecks its own
+	 * closure because a trigger may change dependencies in this transaction. */
+	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
+		&& IsA(statement, DropStmt)) {
+		DropStmt *drop = (DropStmt *)statement;
+
+		switch (drop->removeType) {
+		case OBJECT_TABLE:
+		case OBJECT_INDEX:
+		case OBJECT_SEQUENCE:
+		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
+		case OBJECT_FOREIGN_TABLE:
+			CheckRelationsStorageDrop(drop, isTopLevel);
+			break;
+		default:
+			CheckObjectsStorageDrop(drop, isTopLevel);
+			break;
+		}
+	}
+	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
+		&& IsA(statement, DropOwnedStmt))
+		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement, isTopLevel);
+}
+
+static void
+CheckClusterSharedUtilitySupportInternal(Node *statement, bool isTopLevel, bool check_storage)
 {
 	const char *unsupported = NULL;
 	ObjectType object_type = OBJECT_TABLE;
@@ -120,6 +151,15 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 		case T_CreateTableSpaceStmt:
 		case T_DropTableSpaceStmt:
 			unsupported = "CREATE/DROP TABLESPACE";
+			break;
+		case T_AlterTableSpaceOptionsStmt:
+			if (((AlterTableSpaceOptionsStmt *)statement)->tablespacename != NULL
+				&& strcmp(((AlterTableSpaceOptionsStmt *)statement)->tablespacename, "pg_undo")
+					   == 0)
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("pg_undo cannot be altered"),
+								errhint("pg_undo is managed by the cluster runtime; "
+										"Stage 1.22 does not support modifying its options.")));
 			break;
 		case T_CreateExtensionStmt:
 			unsupported = "CREATE EXTENSION";
@@ -162,12 +202,19 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 			}
 			break;
 		case T_CreateStmt:
+		case T_CreateForeignTableStmt:
 			if (((CreateStmt *) statement)->relation != NULL
 				&& ((CreateStmt *) statement)->relation->relpersistence == RELPERSISTENCE_UNLOGGED)
 				unsupported = "UNLOGGED tables";
 			else if (((CreateStmt *) statement)->inhRelations != NIL)
 				/* CREATE ... INHERITS / PARTITION OF also attaches a child. */
 				unsupported = "partition and inheritance attachment";
+			break;
+		case T_CreateSeqStmt:
+			if (cluster_shared_catalog && ((CreateSeqStmt *)statement)->sequence != NULL
+				&& ((CreateSeqStmt *)statement)->sequence->relpersistence
+					   == RELPERSISTENCE_UNLOGGED)
+				unsupported = "UNLOGGED sequences";
 			break;
 		case T_CreateTableAsStmt:
 			{
@@ -186,7 +233,7 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 				unsupported = "materialized views";
 			else
 				foreach(lc, ((AlterTableStmt *) statement)->cmds)
-					CheckClusterSharedUtilitySupport((Node *) lfirst(lc), false);
+					CheckClusterSharedUtilitySupportInternal((Node *) lfirst(lc), false, check_storage);
 			break;
 		case T_AlterTableCmd:
 			if (((AlterTableCmd *) statement)->subtype == AT_SetUnLogged)
@@ -212,15 +259,28 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 				|| ((RenameStmt *) statement)->relationType == OBJECT_MATVIEW)
 				unsupported = "materialized views";
 			break;
+		case T_AlterObjectDependsStmt:
+			object_type = ((AlterObjectDependsStmt *)statement)->objectType;
+			break;
 		case T_AlterObjectSchemaStmt:
 			object_type = ((AlterObjectSchemaStmt *) statement)->objectType;
 			break;
+		case T_SecLabelStmt:
+			object_type = ((SecLabelStmt *)statement)->objtype;
+			break;
 		case T_AlterOwnerStmt:
 			object_type = ((AlterOwnerStmt *) statement)->objectType;
+			if (object_type == OBJECT_TABLESPACE && ((AlterOwnerStmt *)statement)->object != NULL
+				&& IsA(((AlterOwnerStmt *)statement)->object, String)
+				&& strcmp(strVal(((AlterOwnerStmt *)statement)->object), "pg_undo") == 0)
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("pg_undo cannot be altered"),
+								errhint("pg_undo is a hard-coded system tablespace; "
+										"owner changes are not supported.")));
 			break;
 		case T_CreateSchemaStmt:
 			foreach(lc, ((CreateSchemaStmt *) statement)->schemaElts)
-				CheckClusterSharedUtilitySupport((Node *) lfirst(lc), false);
+				CheckClusterSharedUtilitySupportInternal((Node *) lfirst(lc), false, check_storage);
 			break;
 		default:
 			break;
@@ -251,39 +311,21 @@ CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
 				 errmsg("%s is not supported in shared mode", unsupported),
 				 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
 storage_preflight:
-	if (!cluster_storage_mode_enabled())
-		return;
-	/* Resolve the original roots and complete dependency closure before
-	 * ddl_command_start can run. The final deletion pass rechecks its own
-	 * closure because a trigger may change dependencies in this transaction. */
-	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
-		&& IsA(statement, DropStmt)) {
-		DropStmt *drop = (DropStmt *)statement;
-
-		switch (drop->removeType) {
-		case OBJECT_TABLE:
-		case OBJECT_INDEX:
-		case OBJECT_SEQUENCE:
-		case OBJECT_VIEW:
-		case OBJECT_MATVIEW:
-		case OBJECT_FOREIGN_TABLE:
-			CheckRelationsStorageDrop(drop, isTopLevel);
-			break;
-		default:
-			CheckObjectsStorageDrop(drop, isTopLevel);
-			break;
-		}
-	}
-	if ((cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
-		&& IsA(statement, DropOwnedStmt))
-		CheckOwnedObjectsStorageDrop((DropOwnedStmt *)statement, isTopLevel);
+	if (check_storage)
+		CheckClusterSharedStorageDrop(statement, isTopLevel);
 }
 
-/* PGRAC: complete the original top binding before CREATE or TRUNCATE reaches
+void
+CheckClusterSharedUtilitySupport(Node *statement, bool isTopLevel)
+{
+	CheckClusterSharedUtilitySupportInternal(statement, isTopLevel, true);
+}
+
+/* PGRAC: complete the original top binding before these catalog writes reach
  * triggers, catalog relations or DDL locks. Other utility callers keep their
  * existing paths. Author: SqlRush <sqlrush@gmail.com> */
 static void
-PreflightClusterSharedCatalogWrite(Node *statement)
+PreflightClusterSharedCatalogWrite(Node *statement, bool isTopLevel)
 {
 	ClusterCanonicalTxnBinding binding;
 	TransactionId current_xid;
@@ -291,10 +333,91 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 
 	if (!cluster_shared_catalog || !cluster_storage_mode_enabled()
 		|| (!IsA(statement, CreateStmt) && !IsA(statement, CreateTableAsStmt)
+			&& !IsA(statement, CreateSchemaStmt) && !IsA(statement, CreateSeqStmt)
+			&& !IsA(statement, IndexStmt) && !IsA(statement, ViewStmt)
+			&& !IsA(statement, RenameStmt) && !IsA(statement, AlterObjectSchemaStmt)
+			&& !IsA(statement, GrantStmt) && !IsA(statement, GrantRoleStmt)
+			&& !IsA(statement, AlterDefaultPrivilegesStmt) && !IsA(statement, CreateFunctionStmt)
+			&& !IsA(statement, AlterFunctionStmt) && !IsA(statement, CreateTrigStmt)
+			&& !IsA(statement, RuleStmt) && !IsA(statement, CreatePolicyStmt)
+			&& !IsA(statement, AlterPolicyStmt) && !IsA(statement, CommentStmt)
+			&& !IsA(statement, AlterStatsStmt) && !IsA(statement, CreateEventTrigStmt)
+			&& !IsA(statement, AlterEventTrigStmt) && !IsA(statement, AlterCollationStmt)
+			&& !IsA(statement, AlterSeqStmt) && !IsA(statement, AlterTSDictionaryStmt)
+			&& !IsA(statement, AlterTSConfigurationStmt) && !IsA(statement, DefineStmt)
+			&& !IsA(statement, CreateRoleStmt) && !IsA(statement, AlterRoleStmt)
+			&& !IsA(statement, AlterRoleSetStmt) && !IsA(statement, DropRoleStmt)
+			&& !IsA(statement, AlterDatabaseSetStmt)
+			&& !IsA(statement, AlterDatabaseRefreshCollStmt) && !IsA(statement, CreateStatsStmt)
+			&& !IsA(statement, CreatePLangStmt) && !IsA(statement, CreateConversionStmt)
+			&& !IsA(statement, CreateCastStmt) && !IsA(statement, CreateTransformStmt)
+			&& !IsA(statement, CreateAmStmt) && !IsA(statement, CreateFdwStmt)
+			&& !IsA(statement, AlterFdwStmt) && !IsA(statement, CreateForeignServerStmt)
+			&& !IsA(statement, AlterForeignServerStmt) && !IsA(statement, CreateUserMappingStmt)
+			&& !IsA(statement, AlterUserMappingStmt) && !IsA(statement, DropUserMappingStmt)
+			&& !IsA(statement, CreatePublicationStmt) && !IsA(statement, AlterPublicationStmt)
+			&& !IsA(statement, AlterSubscriptionStmt) && !IsA(statement, DropSubscriptionStmt)
+			&& !IsA(statement, AlterObjectDependsStmt) && !IsA(statement, ReassignOwnedStmt)
+			&& !IsA(statement, CreateForeignTableStmt) && !IsA(statement, AlterOwnerStmt)
+			&& !IsA(statement, AlterDatabaseStmt) && !IsA(statement, AlterTableSpaceOptionsStmt)
+			&& !IsA(statement, SecLabelStmt) && !IsA(statement, AlterTableStmt)
+			&& !IsA(statement, ImportForeignSchemaStmt)
+			&& !IsA(statement, AlterExtensionContentsStmt) && !IsA(statement, AlterExtensionStmt)
+			&& !IsA(statement, DropOwnedStmt) && !IsA(statement, DropStmt)
 			&& !IsA(statement, TruncateStmt)))
 		return;
 
-	action = IsA(statement, TruncateStmt) ? "truncation" : "creation";
+	/* Dynamic ALTER and DROP classification takes DDL locks. Finish context
+	 * checks even when recovery is the only active restriction. */
+	if (IsA(statement, AlterTableStmt))
+		PreventCommandDuringRecovery("ALTER TABLE");
+	else if (IsA(statement, DropStmt) || IsA(statement, DropOwnedStmt))
+		PreventCommandDuringRecovery("DROP");
+
+	if (IsA(statement, AlterDatabaseStmt)) {
+		ListCell *lc;
+
+		/* Keep database moves on their original transaction-restriction path. */
+		foreach (lc, ((AlterDatabaseStmt *)statement)->options) {
+			DefElem *option = (DefElem *)lfirst(lc);
+
+			if (strcmp(option->defname, "tablespace") == 0)
+				return;
+		}
+	}
+
+	if (IsA(statement, CreateStatsStmt)) {
+		CreateStatsStmt *stats = (CreateStatsStmt *)statement;
+
+		/* Leave unsupported FROM forms on their original rejection paths. */
+		if (list_length(stats->relations) != 1 || !IsA(linitial(stats->relations), RangeVar))
+			return;
+	}
+
+	if (IsA(statement, TruncateStmt))
+		action = "truncation";
+	else if (IsA(statement, RenameStmt) || IsA(statement, AlterObjectSchemaStmt)
+			 || IsA(statement, GrantStmt) || IsA(statement, GrantRoleStmt)
+			 || IsA(statement, AlterDefaultPrivilegesStmt) || IsA(statement, AlterFunctionStmt)
+			 || IsA(statement, AlterPolicyStmt) || IsA(statement, CommentStmt)
+			 || IsA(statement, AlterStatsStmt) || IsA(statement, AlterEventTrigStmt)
+			 || IsA(statement, AlterCollationStmt) || IsA(statement, AlterSeqStmt)
+			 || IsA(statement, AlterTSDictionaryStmt) || IsA(statement, AlterTSConfigurationStmt)
+			 || IsA(statement, AlterRoleStmt) || IsA(statement, AlterRoleSetStmt)
+			 || IsA(statement, DropRoleStmt) || IsA(statement, AlterDatabaseSetStmt)
+			 || IsA(statement, AlterDatabaseRefreshCollStmt) || IsA(statement, AlterFdwStmt)
+			 || IsA(statement, AlterForeignServerStmt) || IsA(statement, AlterUserMappingStmt)
+			 || IsA(statement, DropUserMappingStmt) || IsA(statement, AlterPublicationStmt)
+			 || IsA(statement, AlterSubscriptionStmt) || IsA(statement, DropSubscriptionStmt)
+			 || IsA(statement, AlterObjectDependsStmt) || IsA(statement, ReassignOwnedStmt)
+			 || IsA(statement, AlterOwnerStmt) || IsA(statement, AlterDatabaseStmt)
+			 || IsA(statement, AlterTableSpaceOptionsStmt) || IsA(statement, SecLabelStmt)
+			 || IsA(statement, AlterTableStmt) || IsA(statement, AlterExtensionContentsStmt)
+			 || IsA(statement, AlterExtensionStmt) || IsA(statement, DropOwnedStmt)
+			 || IsA(statement, DropStmt))
+		action = "alteration";
+	else
+		action = "creation";
 	if (IsSubTransaction())
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("shared catalog %s does not support subtransactions", action)));
@@ -308,6 +431,47 @@ PreflightClusterSharedCatalogWrite(Node *statement)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
 }
+
+/* Complete the original early DROP preflight before native deletion work. */
+void
+PreflightClusterSharedCatalogDrop(Node *statement, bool isTopLevel)
+{
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled()
+		|| cluster_interconnect_tier != CLUSTER_IC_TIER_1 || IsInTransactionBlock(isTopLevel))
+		return;
+
+	CheckClusterSharedUtilitySupport(statement, isTopLevel);
+	CheckClusterIndexSupport(statement);
+	PreventCommandIfReadOnly("DROP");
+	PreventCommandIfParallelMode("DROP");
+	PreventCommandDuringRecovery("DROP");
+	PreflightClusterSharedCatalogWrite(statement, isTopLevel);
+}
+
+/* Dynamic native callers may already hold DDL locks. Their unlocked upper
+ * utility path binds first; this native entry keeps its original boundary. */
+void
+PreflightClusterSharedCatalogAlterTable(AlterTableStmt *stmt)
+{
+	ListCell *lc;
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+	CheckClusterSharedUtilitySupport((Node *)stmt, false);
+	CheckClusterIndexSupport((Node *)stmt);
+	foreach (lc, stmt->cmds) {
+		AlterTableCmd *cmd = (AlterTableCmd *)lfirst(lc);
+
+		if (cmd->subtype == AT_AddColumn || cmd->subtype == AT_AlterColumnType
+			|| cmd->subtype == AT_SetAccessMethod || cmd->subtype == AT_SetLogged)
+			return;
+	}
+	PreventCommandIfReadOnly("ALTER TABLE");
+	PreventCommandIfParallelMode("ALTER TABLE");
+	PreventCommandDuringRecovery("ALTER TABLE");
+	PreflightClusterSharedCatalogWrite((Node *)stmt, false);
+}
+
 #endif
 
 /* local function declarations */
@@ -839,10 +1003,14 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: reject unsupported index AMs/constraints before event triggers.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	CheckClusterSharedUtilitySupport(parsetree, isTopLevel);
+	/* Only the unlocked upper DROP path defers its storage closure. Native
+	 * callers keep the exported support check and its original lock boundary. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()
+		&& (IsA(parsetree, DropStmt) || IsA(parsetree, DropOwnedStmt)))
+		CheckClusterSharedUtilitySupportInternal(parsetree, isTopLevel, false);
+	else
+		CheckClusterSharedUtilitySupport(parsetree, isTopLevel);
 	CheckClusterIndexSupport(parsetree);
-	if (IsA(parsetree, AlterTableStmt))
-		CheckClusterSharedAlterTable((AlterTableStmt *) parsetree, queryString);
 #endif
 
 	/* Prohibit read/write commands in read-only states. */
@@ -861,7 +1029,16 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	}
 
 #ifdef USE_PGRAC_CLUSTER
-	PreflightClusterSharedCatalogWrite(parsetree);
+	PreflightClusterSharedCatalogWrite(parsetree, isTopLevel);
+	/* The full original binding precedes the first storage/dependency lock.
+	 * Keep the original closure and its final deletion-pass recheck. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()
+		&& (IsA(parsetree, DropStmt) || IsA(parsetree, DropOwnedStmt)))
+		CheckClusterSharedStorageDrop(parsetree, isTopLevel);
+	/* Classify dynamic rewrites only after the original binding is complete,
+	 * so a full selected segment never waits while holding this DDL lock. */
+	if (IsA(parsetree, AlterTableStmt))
+		CheckClusterSharedAlterTable((AlterTableStmt *) parsetree, queryString);
 #endif
 
 	pstate = make_parsestate(NULL);

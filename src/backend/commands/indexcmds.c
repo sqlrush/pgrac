@@ -74,6 +74,8 @@
 /* PGRAC: shared mode supports only builtin btree and no concurrent builds.
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
 
 static void
 CheckClusterIndexAccessMethodName(const char *name)
@@ -122,22 +124,17 @@ CheckClusterIndexSupport(Node *statement)
 	{
 		foreach(lc, ((ColumnDef *) statement)->constraints)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
-	}
-	else if (IsA(statement, CreateStmt))
-	{
+	} else if (IsA(statement, CreateStmt) || IsA(statement, CreateForeignTableStmt)) {
 		CreateStmt *create = (CreateStmt *) statement;
 
 		foreach(lc, create->tableElts)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
 		foreach(lc, create->constraints)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
-	}
-	else if (IsA(statement, AlterTableStmt))
-	{
+	} else if (IsA(statement, AlterTableStmt)) {
 		foreach(lc, ((AlterTableStmt *) statement)->cmds)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
-	}
-	else if (IsA(statement, AlterTableCmd))
+	} else if (IsA(statement, AlterTableCmd))
 		CheckClusterIndexSupport(((AlterTableCmd *) statement)->def);
 	else if (IsA(statement, CreateSchemaStmt))
 	{
@@ -676,6 +673,28 @@ DefineIndex(Oid relationId,
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: also cover callers outside ProcessUtility, before any mutation. */
 	CheckClusterIndexSupport((Node *) stmt);
+	/* Bind before GUC or catalog work; bootstrap keeps its original
+	 * initialization path without a transaction binding. */
+	if (!IsBootstrapProcessingMode() && cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("CREATE INDEX");
+		PreventCommandIfParallelMode("CREATE INDEX");
+		PreventCommandDuringRecovery("CREATE INDEX");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog creation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+	}
 #endif
 	root_save_nestlevel = NewGUCNestLevel();
 

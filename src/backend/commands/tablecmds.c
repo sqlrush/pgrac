@@ -51,6 +51,8 @@
 #include "catalog/pg_trigger.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 Q12 shared-catalog SET UNLOGGED refusal */
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_ts.h" /* PGRAC: spec-5.7 TT (§3.3) placement TT(S) guard */
 #include "cluster/storage/cluster_smgr.h"
@@ -710,6 +712,37 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	LOCKMODE	parentLockmode;
 	const char *accessMethod = NULL;
 	Oid			accessMethodId = InvalidOid;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Native table creation must bind before its first namespace lock.
+	 * Other relation kinds retain their existing caller preflight. */
+	if (relkind == RELKIND_RELATION || relkind == RELKIND_FOREIGN_TABLE) {
+		CheckClusterSharedUtilitySupport((Node *)stmt, false);
+		CheckClusterIndexSupport((Node *)stmt);
+		if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+			ClusterCanonicalTxnBinding binding;
+			TransactionId current_xid;
+
+			PreventCommandIfReadOnly("CREATE TABLE");
+			PreventCommandIfParallelMode("CREATE TABLE");
+			PreventCommandDuringRecovery("CREATE TABLE");
+			if (IsSubTransaction())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("shared catalog creation does not support subtransactions")));
+			current_xid = GetCurrentTransactionIdIfAny();
+			if (TransactionIdIsValid(current_xid)
+				&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+				ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+								errmsg("shared catalog top-level transaction identity mismatch")));
+			if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+		}
+	}
+#endif
 
 	/*
 	 * Truncate relname to appropriate length (probably a waste of time, as
@@ -1542,6 +1575,10 @@ RemoveRelationsInternal(DropStmt *drop, bool check_storage_only, bool isTopLevel
 void
 RemoveRelations(DropStmt *drop, bool isTopLevel)
 {
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogDrop((Node *)drop, isTopLevel);
+#endif
+
 	RemoveRelationsInternal(drop, false, isTopLevel);
 }
 
@@ -1723,6 +1760,31 @@ ExecuteTruncate(TruncateStmt *stmt, bool isTopLevel)
 	List	   *relids = NIL;
 	List	   *relids_logged = NIL;
 	ListCell   *cell;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Complete the original binding before any target query or table lock. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("TRUNCATE TABLE");
+		PreventCommandIfParallelMode("TRUNCATE TABLE");
+		PreventCommandDuringRecovery("TRUNCATE TABLE");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog truncation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog truncation")));
+	}
+#endif
 
 	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations
@@ -3786,6 +3848,65 @@ renameatt(RenameStmt *stmt)
 	AttrNumber	attnum;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	ObjectType object_type = stmt->renameType;
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *unsupported = NULL;
+
+	/* Direct callers must check shared scope and bind before relation locks. */
+	if (cluster_shared_config || cluster_shared_catalog) {
+		if (stmt->relationType == OBJECT_TYPE || object_type == OBJECT_DOMCONSTRAINT)
+			object_type = OBJECT_TYPE;
+		if (stmt->renameType == OBJECT_MATVIEW || stmt->relationType == OBJECT_MATVIEW)
+			unsupported = "materialized views";
+		switch (object_type) {
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
+			break;
+		default:
+			break;
+		}
+		if (unsupported != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported in shared mode", unsupported),
+					 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	}
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		command = CreateCommandName((Node *)stmt);
+		PreventCommandIfReadOnly(command);
+		PreventCommandIfParallelMode(command);
+		PreventCommandDuringRecovery(command);
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
+
 	/* lock level taken here should match renameatt_internal */
 	relid = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock,
 									 stmt->missing_ok ? RVR_MISSING_OK : 0,
@@ -3929,6 +4050,65 @@ RenameConstraint(RenameStmt *stmt)
 	Oid			relid = InvalidOid;
 	Oid			typid = InvalidOid;
 
+#ifdef USE_PGRAC_CLUSTER
+	ObjectType object_type = stmt->renameType;
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *unsupported = NULL;
+
+	/* Direct callers must check shared scope and bind before constraint lookup. */
+	if (cluster_shared_config || cluster_shared_catalog) {
+		if (stmt->relationType == OBJECT_TYPE || object_type == OBJECT_DOMCONSTRAINT)
+			object_type = OBJECT_TYPE;
+		if (stmt->renameType == OBJECT_MATVIEW || stmt->relationType == OBJECT_MATVIEW)
+			unsupported = "materialized views";
+		switch (object_type) {
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
+			break;
+		default:
+			break;
+		}
+		if (unsupported != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported in shared mode", unsupported),
+					 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	}
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		command = CreateCommandName((Node *)stmt);
+		PreventCommandIfReadOnly(command);
+		PreventCommandIfParallelMode(command);
+		PreventCommandDuringRecovery(command);
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
+
 	if (stmt->renameType == OBJECT_DOMCONSTRAINT)
 	{
 		Relation	rel;
@@ -3979,6 +4159,65 @@ RenameRelation(RenameStmt *stmt)
 	bool		is_index_stmt = stmt->renameType == OBJECT_INDEX;
 	Oid			relid;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	ObjectType object_type = stmt->renameType;
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *unsupported = NULL;
+
+	/* Direct callers must check shared scope and bind before relation locks. */
+	if (cluster_shared_config || cluster_shared_catalog) {
+		if (stmt->relationType == OBJECT_TYPE || object_type == OBJECT_DOMCONSTRAINT)
+			object_type = OBJECT_TYPE;
+		if (stmt->renameType == OBJECT_MATVIEW || stmt->relationType == OBJECT_MATVIEW)
+			unsupported = "materialized views";
+		switch (object_type) {
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
+			break;
+		default:
+			break;
+		}
+		if (unsupported != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported in shared mode", unsupported),
+					 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	}
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		command = CreateCommandName((Node *)stmt);
+		PreventCommandIfReadOnly(command);
+		PreventCommandIfParallelMode(command);
+		PreventCommandDuringRecovery(command);
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	/*
 	 * Grab an exclusive lock on the target table, index, sequence, view,
@@ -4245,6 +4484,10 @@ CheckAlterTableIsSafe(Relation rel)
 Oid
 AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode)
 {
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogAlterTable(stmt);
+#endif
+
 	return RangeVarGetRelidExtended(stmt->relation, lockmode,
 									stmt->missing_ok ? RVR_MISSING_OK : 0,
 									RangeVarCallbackForAlterRelation,
@@ -4498,6 +4741,8 @@ AlterTable(AlterTableStmt *stmt, LOCKMODE lockmode,
 	Relation	rel;
 
 #ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedCatalogAlterTable(stmt);
+
 	/* PGRAC: ddl_command_start has run since the utility preflight.  It may
 	 * change coercion context (notably TimeZone) even though the relation is
 	 * locked.  Recheck before preparing any catalog or sequence commands. */
@@ -5429,10 +5674,8 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
 			break;
 		case AT_ReAddDomainConstraint:	/* Re-add pre-existing domain check
 										 * constraint */
-			address =
-				AlterDomainAddConstraint(((AlterDomainStmt *) cmd->def)->typeName,
-										 ((AlterDomainStmt *) cmd->def)->def,
-										 NULL);
+			address = AlterDomainAddConstraintInternal(((AlterDomainStmt *)cmd->def)->typeName,
+													   ((AlterDomainStmt *)cmd->def)->def, NULL);
 			break;
 		case AT_ReAddComment:	/* Re-add existing comment */
 			address = CommentObject((CommentStmt *) cmd->def);
@@ -15215,7 +15458,16 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 	HeapTuple	tuple;
 	Oid			orig_tablespaceoid;
 	Oid			new_tablespaceoid;
-	List	   *role_oids = roleSpecsToIds(stmt->roles);
+	List *role_oids;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("ALTER TABLE SET TABLESPACE is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+#endif
+
+	role_oids = roleSpecsToIds(stmt->roles);
 
 	/* Ensure we were not asked to move something we can't */
 	if (stmt->objtype != OBJECT_TABLE && stmt->objtype != OBJECT_INDEX &&
@@ -17109,6 +17361,60 @@ AlterTableNamespace(AlterObjectSchemaStmt *stmt, Oid *oldschema)
 	RangeVar   *newrv;
 	ObjectAddresses *objsMoved;
 	ObjectAddress myself;
+
+#ifdef USE_PGRAC_CLUSTER
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *command;
+	const char *unsupported = NULL;
+
+	/* Direct callers must check shared scope and bind before namespace lookup. */
+	if (cluster_shared_config || cluster_shared_catalog) {
+		switch (stmt->objectType) {
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
+			break;
+		default:
+			break;
+		}
+		if (unsupported != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported in shared mode", unsupported),
+					 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	}
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		command = CreateCommandName((Node *)stmt);
+		PreventCommandIfReadOnly(command);
+		PreventCommandIfParallelMode(command);
+		PreventCommandDuringRecovery(command);
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	relid = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock,
 									 stmt->missing_ok ? RVR_MISSING_OK : 0,

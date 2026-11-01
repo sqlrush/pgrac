@@ -586,7 +586,11 @@ cluster_ctrc_stat_get(ClusterCtrcStatId stat pg_attribute_unused())
 const char *
 cluster_ctrc_cleaner_reason_name(ClusterCtrcCleanerReason reason)
 {
-	return reason == CTRC_CLEANER_REASON_NONE ? "NONE" : "BLOCKED";
+	static const char *const names[]
+		= { "NONE",			  "PREPARED_DRAIN",	 "RESOURCE_X",		   "PAGE_REVALIDATE",
+			"WAL_DURABILITY", "PARTICIPANT_ACK", "BLOCK0_CERTIFICATE", "BLOCKED" };
+
+	return reason >= 0 && reason < CTRC_CLEANER_REASON_COUNT ? names[reason] : NULL;
 }
 
 ClusterCtrcCleanerReason
@@ -595,10 +599,66 @@ cluster_ctrc_cleaner_reason_get(void)
 	return CTRC_CLEANER_REASON_NONE;
 }
 
+static bool no_progress_stats_available;
+static bool ctrc_debug_snapshot_available = true;
+static bool completion_stats_available;
+static bool completion_stats_zero;
+
+#ifdef CLUSTER_CTRC_COMPLETION_STATS_V1
+bool
+cluster_ctrc_completion_stats_snapshot(ClusterCtrcCompletionStats *out)
+{
+	if (!completion_stats_available || out == NULL)
+		return false;
+	out->origin_node_id = 3;
+	out->real_completion_count = completion_stats_zero ? 0 : UINT64_MAX;
+	return true;
+}
+#endif
+
+
+#ifdef CLUSTER_CTRC_NO_PROGRESS_STATS_V1
+bool
+cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out)
+{
+	static const uint64 counts[]
+		= { 0, UINT64_MAX, UINT64_C(9223372036854775809), 3, 5, 7, 11, 13 };
+
+	if (!no_progress_stats_available || out == NULL)
+		return false;
+	out->origin_node_id = 3;
+	memcpy(out->by_reason, counts, sizeof(counts));
+	return true;
+}
+#endif
+
+static bool publisher_stats_available;
+static bool publisher_stats_zero;
+static bool unsettled_stats_available;
+static bool unsettled_stats_zero;
+static bool oldest_age_available;
+static uint64 oldest_age_value;
+
 bool
 cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot)
 {
+	if (!ctrc_debug_snapshot_available)
+		return false;
 	MemSet(snapshot, 0, sizeof(*snapshot));
+#ifdef CLUSTER_CTRC_PUBLISHER_STATS_V1
+	snapshot->publisher_stats_available = publisher_stats_available;
+	snapshot->publisher_origin_node_id = 3;
+	snapshot->publisher_pending_count = publisher_stats_zero ? 0 : UINT64_MAX;
+#endif
+#ifdef CLUSTER_CTRC_UNSETTLED_STATS_V1
+	snapshot->unsettled_stats_available = unsettled_stats_available;
+	snapshot->unsettled_origin_node_id = 3;
+	snapshot->unsettled_count = unsettled_stats_zero ? 0 : UINT64_MAX;
+#endif
+#ifdef CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1
+	snapshot->oldest_unsettled_age_available = oldest_age_available;
+	snapshot->oldest_unsettled_age_ms = oldest_age_value;
+#endif
 	return true;
 }
 /* spec-6.14 D5 stub: dump_catalog reads the shared relmap authority header;
@@ -2989,6 +3049,40 @@ cluster_tt_durable_redo_apply_count(void)
 {
 	return 0;
 }
+static bool locator_stats_available;
+
+#ifdef CLUSTER_TT_DURABLE_LOCATOR_STATS_V1
+bool
+cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out)
+{
+	if (!locator_stats_available || out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->origin_node_id = 3;
+	out->fallback_count = UINT64_MAX;
+	out->found_count = UINT64_C(9223372036854775809);
+	out->missing_count = 3;
+	out->ambiguous_count = 5;
+	out->unavailable_count = 7;
+#ifdef CLUSTER_TT_DURABLE_LOCATOR_FAMILY_STATS_V1
+	{
+		static const uint64 values[4][5] = { { UINT64_MAX, UINT64_C(9223372036854775809), 3, 5, 7 },
+											 { 11, 13, 17, 19, 23 },
+											 { 29, 31, 37, 41, 43 },
+											 { 47, 53, 59, 61, 67 } };
+		for (unsigned i = 0; i < 4; i++) {
+			out->families[i].fallback_count = values[i][0];
+			out->families[i].found_count = values[i][1];
+			out->families[i].missing_count = values[i][2];
+			out->families[i].ambiguous_count = values[i][3];
+			out->families[i].unavailable_count = values[i][4];
+		}
+	}
+#endif
+	return true;
+}
+#endif
+
 /* spec-6.2: terminal authority counters share the durable-TT stat region in
  * the backend; this standalone dump unit stubs the accessors. */
 uint64
@@ -3458,6 +3552,9 @@ cluster_undo_cleaner_main_loop_iters(void)
 
 /* Cross-module monitoring accessors; no cleaner is started by this fixture. */
 static bool capacity_stats_available = true;
+static uint64 capacity_retention_counts[9];
+static uint64 capacity_native_rechecks;
+static uint64 capacity_pool_rechecks = UINT64_C(9223372036854775809);
 
 bool
 cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
@@ -3468,10 +3565,16 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 	out->origin_node_id = 3;
 	out->active_full_wait_count = 42;
 	out->pool_wait_count = UINT64_MAX;
-	out->wakeup_recheck_count = UINT64_C(9223372036854775809);
+	out->wakeup_recheck_count = capacity_pool_rechecks;
+#ifdef CLUSTER_UNDO_CAPACITY_NATIVE_RECHECK_STATS_V1
+	out->native_wakeup_recheck_count = capacity_native_rechecks;
+#endif
 	out->cancel_count = 17;
 	out->refused_context_count = 19;
 	out->refused_proof_count = 23;
+#ifdef CLUSTER_UNDO_CAPACITY_RETAIN_STATS_V1
+	memcpy(out->retain_by_reason, capacity_retention_counts, sizeof(capacity_retention_counts));
+#endif
 	return true;
 }
 
@@ -5754,6 +5857,39 @@ UT_TEST(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters)
 	}
 }
 
+UT_TEST(test_debug_locator_stats_preserve_availability_and_unsigned_results)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const keys[] = { "old_tt_locator_origin_node_id",
+										"old_tt_locator_fallback_count",
+										"old_tt_locator_fallback_result.found",
+										"old_tt_locator_fallback_result.missing",
+										"old_tt_locator_fallback_result.ambiguous",
+										"old_tt_locator_fallback_result.scan_unavailable" };
+	static const char *const values[]
+		= { "3", "18446744073709551615", "9223372036854775809", "3", "5", "7" };
+
+	for (int available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		locator_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("undo", "old_tt_locator_stats_available"), 1);
+		if (captured_dump_count("undo", "old_tt_locator_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "old_tt_locator_stats_available"),
+							 available ? "true" : "false");
+		for (unsigned i = 0; i < lengthof(keys); i++) {
+			UT_ASSERT_EQ(captured_dump_count("undo", keys[i]), available);
+			if (available && captured_dump_count("undo", keys[i]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("undo", keys[i]), values[i]);
+		}
+	}
+	locator_stats_available = false;
+}
+
 UT_TEST(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -5791,6 +5927,87 @@ UT_TEST(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap
 				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", keys[i]), values[i]);
 		}
 	}
+}
+
+
+UT_TEST(test_debug_capacity_wakeup_sums_native_and_cv_without_changing_cv_alias)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const struct {
+		uint64 pool, native;
+		const char *total, *legacy;
+	} cases[] = { { 5, 7, "12", "5" },
+				  { 0, UINT64_C(9223372036854775809), "9223372036854775809", "0" },
+				  { UINT64_C(9223372036854775809), 7, "9223372036854775816",
+					"9223372036854775809" } };
+
+	for (unsigned i = 0; i < lengthof(cases); i++) {
+		capacity_pool_rechecks = cases[i].pool;
+		capacity_native_rechecks = cases[i].native;
+		for (int available = 0; available < 2; available++) {
+			memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+			memset(&rsinfo, 0, sizeof(rsinfo));
+			captured_dump_row_count = captured_formatted_value_count = 0;
+			fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+			capacity_stats_available = available != 0;
+			(void)cluster_dump_state(fcinfo);
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "tt_capacity_stats_available"), 1);
+			UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", "tt_capacity_stats_available"),
+							 available ? "true" : "false");
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "tt_capacity_wakeup_recheck_count"),
+						 available);
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "capacity_wait_repolled"), available);
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "tt_capacity_origin_node_id"), available);
+			if (available) {
+				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", "tt_capacity_wakeup_recheck_count"),
+								 cases[i].total);
+				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", "capacity_wait_repolled"),
+								 cases[i].legacy);
+				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", "tt_capacity_origin_node_id"), "3");
+			}
+		}
+	}
+	capacity_native_rechecks = 0;
+	capacity_pool_rechecks = UINT64_C(9223372036854775809);
+	capacity_stats_available = true;
+}
+
+UT_TEST(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const keys[]
+		= { "undo_retain_by_reason.active_or_prepared",	 "undo_retain_by_reason.record_writer",
+			"undo_retain_by_reason.seal_or_drain",		 "undo_retain_by_reason.horizon_missing",
+			"undo_retain_by_reason.history_pin",		 "undo_retain_by_reason.reference_pending",
+			"undo_retain_by_reason.release_not_durable", "undo_retain_by_reason.publisher_pending",
+			"undo_retain_by_reason.identity_or_io" };
+	static const uint64 counts[]
+		= { UINT64_MAX, UINT64_C(9223372036854775809), 3, 5, 7, 11, 13, 17, 19 };
+	static const char *const values[]
+		= { "18446744073709551615", "9223372036854775809", "3", "5", "7", "11", "13", "17", "19" };
+
+	for (unsigned mode = 0; mode < 3; mode++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		capacity_stats_available = mode != 0;
+		memset(capacity_retention_counts, 0, sizeof(capacity_retention_counts));
+		if (mode == 2)
+			memcpy(capacity_retention_counts, counts, sizeof(counts));
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("undo_cleaner", "tt_capacity_stats_available"), 1);
+		for (unsigned bit = 0; bit < lengthof(keys); bit++) {
+			UT_ASSERT_EQ(captured_dump_count("undo_cleaner", keys[bit]), mode == 0 ? 0 : 1);
+			if (mode != 0 && captured_dump_count("undo_cleaner", keys[bit]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("undo_cleaner", keys[bit]),
+								 mode == 2 ? values[bit] : "0");
+		}
+	}
+	capacity_stats_available = true;
+	memset(capacity_retention_counts, 0, sizeof(capacity_retention_counts));
 }
 
 UT_TEST(test_debug_dump_exposes_retained_rollover_counts_without_fake_zero)
@@ -6455,10 +6672,223 @@ UT_TEST(test_debug_phase_symbol_present)
 }
 
 
+UT_TEST(test_debug_no_progress_counts_keep_availability_reason_and_unsigned_origin)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const keys[] = { "ctrc_phase_no_progress_origin_node_id",
+										"ctrc_phase_no_progress_by_reason.NONE",
+										"ctrc_phase_no_progress_by_reason.PREPARED_DRAIN",
+										"ctrc_phase_no_progress_by_reason.RESOURCE_X",
+										"ctrc_phase_no_progress_by_reason.PAGE_REVALIDATE",
+										"ctrc_phase_no_progress_by_reason.WAL_DURABILITY",
+										"ctrc_phase_no_progress_by_reason.PARTICIPANT_ACK",
+										"ctrc_phase_no_progress_by_reason.BLOCK0_CERTIFICATE",
+										"ctrc_phase_no_progress_by_reason.BLOCKED" };
+	static const char *const values[]
+		= { "3", "0", "18446744073709551615", "9223372036854775809", "3", "5", "7", "11", "13" };
+
+	for (int mode = 0; mode < 3; mode++) {
+		bool available = mode != 0;
+
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		no_progress_stats_available = available;
+		ctrc_debug_snapshot_available = mode != 2;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_phase_no_progress_stats_available"), 1);
+		if (captured_dump_count("ctrc", "ctrc_phase_no_progress_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_phase_no_progress_stats_available"),
+							 available ? "true" : "false");
+		for (unsigned i = 0; i < lengthof(keys); i++) {
+			UT_ASSERT_EQ(captured_dump_count("ctrc", keys[i]), available);
+			if (available && captured_dump_count("ctrc", keys[i]) == 1)
+				UT_ASSERT_STR_EQ(captured_dump_value("ctrc", keys[i]), values[i]);
+		}
+	}
+	no_progress_stats_available = false;
+	ctrc_debug_snapshot_available = true;
+}
+
+UT_TEST(test_debug_completion_count_preserves_availability_zero_unsigned_and_origin)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	for (int mode = 0; mode < 4; mode++) {
+		bool available = mode != 0;
+
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		completion_stats_available = available;
+		completion_stats_zero = mode == 1;
+		ctrc_debug_snapshot_available = mode != 3;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_completion_stats_available"), 1);
+		if (captured_dump_count("ctrc", "ctrc_completion_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_completion_stats_available"),
+							 available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_completion_origin_node_id"), available);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_real_completion_count"), available);
+		if (available && captured_dump_count("ctrc", "ctrc_real_completion_count") == 1) {
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_completion_origin_node_id"), "3");
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_real_completion_count"),
+							 mode == 1 ? "0" : "18446744073709551615");
+		}
+	}
+	completion_stats_available = completion_stats_zero = false;
+	ctrc_debug_snapshot_available = true;
+}
+
+UT_TEST(test_debug_publisher_gauge_preserves_availability_zero_unsigned_and_origin)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	for (int mode = 0; mode < 4; mode++) {
+		bool available = mode == 1 || mode == 2;
+
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		publisher_stats_available = mode != 0;
+		publisher_stats_zero = mode == 1;
+		ctrc_debug_snapshot_available = mode != 3;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_publisher_stats_available"), 1);
+		if (captured_dump_count("ctrc", "ctrc_publisher_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_publisher_stats_available"),
+							 available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_publisher_origin_node_id"), available);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_publisher_pending_count"), available);
+		if (available && captured_dump_count("ctrc", "ctrc_publisher_pending_count") == 1) {
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_publisher_origin_node_id"), "3");
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_publisher_pending_count"),
+							 mode == 1 ? "0" : "18446744073709551615");
+		}
+	}
+	publisher_stats_available = publisher_stats_zero = false;
+	ctrc_debug_snapshot_available = true;
+}
+
+UT_TEST(test_debug_unsettled_gauge_preserves_availability_zero_unsigned_and_origin)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	for (int mode = 0; mode < 4; mode++) {
+		bool available = mode == 1 || mode == 2;
+
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		unsettled_stats_available = mode != 0;
+		unsettled_stats_zero = mode == 1;
+		ctrc_debug_snapshot_available = mode != 3;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_unsettled_stats_available"), 1);
+		if (captured_dump_count("ctrc", "ctrc_unsettled_stats_available") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_unsettled_stats_available"),
+							 available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_unsettled_origin_node_id"), available);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_unsettled_count"), available);
+		if (available && captured_dump_count("ctrc", "ctrc_unsettled_count") == 1) {
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_unsettled_origin_node_id"), "3");
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_unsettled_count"),
+							 mode == 1 ? "0" : "18446744073709551615");
+		}
+	}
+	unsettled_stats_available = unsettled_stats_zero = false;
+	ctrc_debug_snapshot_available = true;
+}
+
+UT_TEST(test_debug_oldest_age_requires_snapshot_and_independent_age_availability)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	for (unsigned mode = 0; mode < 5; mode++) {
+		bool available = mode == 1 || mode == 2;
+
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		unsettled_stats_available = mode != 4;
+		oldest_age_available = mode != 0;
+		oldest_age_value = mode == 1 ? 0 : UINT64_MAX;
+		ctrc_debug_snapshot_available = mode != 3;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_oldest_unsettled_age_stats_available"), 1);
+		if (captured_dump_count("ctrc", "ctrc_oldest_unsettled_age_stats_available") == 1)
+			UT_ASSERT_STR_EQ(
+				captured_dump_value("ctrc", "ctrc_oldest_unsettled_age_stats_available"),
+				available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_oldest_unsettled_age_ms"), available);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", "ctrc_unsettled_origin_node_id"),
+					 mode != 3 && mode != 4);
+		if (available && captured_dump_count("ctrc", "ctrc_oldest_unsettled_age_ms") == 1)
+			UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "ctrc_oldest_unsettled_age_ms"),
+							 mode == 1 ? "0" : "18446744073709551615");
+	}
+	oldest_age_available = unsettled_stats_available = false;
+	oldest_age_value = 0;
+	ctrc_debug_snapshot_available = true;
+}
+
+UT_TEST(test_debug_locator_families_keep_availability_origin_and_unsigned_values)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	static const char *const families[]
+		= { "runtime_active", "runtime_terminal", "mx_current_origin", "mx_projection" };
+	static const char *const suffixes[]
+		= { "fallback_count", "fallback_result.found", "fallback_result.missing",
+			"fallback_result.ambiguous", "fallback_result.scan_unavailable" };
+	static const char *const expected[4][5]
+		= { { "18446744073709551615", "9223372036854775809", "3", "5", "7" },
+			{ "11", "13", "17", "19", "23" },
+			{ "29", "31", "37", "41", "43" },
+			{ "47", "53", "59", "61", "67" } };
+
+	for (int available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		locator_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("undo", "old_tt_locator_stats_available"), 1);
+		UT_ASSERT_STR_EQ(captured_dump_value("undo", "old_tt_locator_stats_available"),
+						 available ? "true" : "false");
+		UT_ASSERT_EQ(captured_dump_count("undo", "old_tt_locator_origin_node_id"), available);
+		if (available)
+			UT_ASSERT_STR_EQ(captured_dump_value("undo", "old_tt_locator_origin_node_id"), "3");
+		for (unsigned i = 0; i < 4; i++) {
+			for (unsigned j = 0; j < 5; j++) {
+				char key[128];
+
+				snprintf(key, sizeof(key), "old_tt_locator_family.%s.%s", families[i], suffixes[j]);
+				UT_ASSERT_EQ(captured_dump_count("undo", key), available);
+				if (available && captured_dump_count("undo", key) == 1)
+					UT_ASSERT_STR_EQ(captured_dump_value("undo", key), expected[i][j]);
+			}
+		}
+	}
+	locator_stats_available = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(36);
+	UT_RUN(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
 	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
@@ -6474,6 +6904,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
 	UT_RUN(test_debug_dump_exposes_retained_rollover_counts_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_capacity_counts_without_fake_zero_or_signed_wrap);
+	UT_RUN(test_debug_capacity_wakeup_sums_native_and_cv_without_changing_cv_alias);
 	UT_RUN(test_debug_dump_exposes_tt_and_itl_reason_counters_without_fake_zero);
 	UT_RUN(test_debug_dump_exposes_closed_ctrc_observability);
 	UT_RUN(test_debug_inject_get_count_callable);
@@ -6486,6 +6917,13 @@ main(void)
 	UT_RUN(test_debug_links_against_pgstat_module);
 	UT_RUN(test_debug_links_against_conf_module);
 	UT_RUN(test_debug_phase_symbol_present);
+	UT_RUN(test_debug_locator_stats_preserve_availability_and_unsigned_results);
+	UT_RUN(test_debug_no_progress_counts_keep_availability_reason_and_unsigned_origin);
+	UT_RUN(test_debug_completion_count_preserves_availability_zero_unsigned_and_origin);
+	UT_RUN(test_debug_publisher_gauge_preserves_availability_zero_unsigned_and_origin);
+	UT_RUN(test_debug_unsettled_gauge_preserves_availability_zero_unsigned_and_origin);
+	UT_RUN(test_debug_oldest_age_requires_snapshot_and_independent_age_availability);
+	UT_RUN(test_debug_locator_families_keep_availability_origin_and_unsigned_values);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

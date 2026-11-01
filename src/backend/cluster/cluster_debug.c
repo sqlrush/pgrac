@@ -978,6 +978,17 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "undo_cleaner", "tt_capacity_stats_available",
 			 capacity_available ? "true" : "false");
 	if (capacity_available) {
+		static const char *const retain_keys[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT] = {
+			"undo_retain_by_reason.active_or_prepared",	 "undo_retain_by_reason.record_writer",
+			"undo_retain_by_reason.seal_or_drain",		 "undo_retain_by_reason.horizon_missing",
+			"undo_retain_by_reason.history_pin",		 "undo_retain_by_reason.reference_pending",
+			"undo_retain_by_reason.release_not_durable", "undo_retain_by_reason.publisher_pending",
+			"undo_retain_by_reason.identity_or_io"
+		};
+
+		for (unsigned bit = 0; bit < lengthof(retain_keys); bit++)
+			emit_row(rsinfo, "undo_cleaner", retain_keys[bit],
+					 fmt_uint64(capacity.retain_by_reason[bit]));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_origin_node_id",
 				 fmt_int32(capacity.origin_node_id));
 		emit_row(rsinfo, "undo_cleaner", "tt_slot_active_full_wait_count",
@@ -985,14 +996,14 @@ dump_undo_cleaner(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_pool_wait_count",
 				 fmt_uint64(capacity.pool_wait_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_wakeup_recheck_count",
-				 fmt_uint64(capacity.wakeup_recheck_count));
+				 fmt_uint64(capacity.wakeup_recheck_count + capacity.native_wakeup_recheck_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_cancel_count",
 				 fmt_uint64(capacity.cancel_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_refuse_by_reason.context",
 				 fmt_uint64(capacity.refused_context_count));
 		emit_row(rsinfo, "undo_cleaner", "tt_capacity_refuse_by_reason.proof",
 				 fmt_uint64(capacity.refused_proof_count));
-		/* Keep the original names as aliases of the same available sample. */
+		/* Preserve the original names and CV-only repoll scope in this sample. */
 		emit_row(rsinfo, "undo_cleaner", "capacity_wait_entered",
 				 fmt_uint64(capacity.pool_wait_count));
 		emit_row(rsinfo, "undo_cleaner", "capacity_wait_repolled",
@@ -3329,6 +3340,55 @@ dump_undo(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "undo", "tt_durable_redo_apply_count",
 			 fmt_int64((int64)cluster_tt_durable_redo_apply_count()));
 
+	{
+		ClusterTTDurableLocatorStats stats;
+		bool available = cluster_tt_durable_locator_stats_snapshot(&stats);
+
+		emit_row(rsinfo, "undo", "old_tt_locator_stats_available", available ? "true" : "false");
+		if (available) {
+			emit_row(rsinfo, "undo", "old_tt_locator_origin_node_id",
+					 fmt_int64(stats.origin_node_id));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_count",
+					 fmt_uint64(stats.fallback_count));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.found",
+					 fmt_uint64(stats.found_count));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.missing",
+					 fmt_uint64(stats.missing_count));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.ambiguous",
+					 fmt_uint64(stats.ambiguous_count));
+			emit_row(rsinfo, "undo", "old_tt_locator_fallback_result.scan_unavailable",
+					 fmt_uint64(stats.unavailable_count));
+			{
+				static const char *const names[CLUSTER_TT_LOCATOR_FAMILY_COUNT]
+					= { "runtime_active", "runtime_terminal", "mx_current_origin",
+						"mx_projection" };
+				for (unsigned family = 0; family < CLUSTER_TT_LOCATOR_FAMILY_COUNT; family++) {
+					const ClusterTTDurableLocatorFamilyStats *row = &stats.families[family];
+
+					emit_row(rsinfo, "undo",
+							 psprintf("old_tt_locator_family.%s.fallback_count", names[family]),
+							 fmt_uint64(row->fallback_count));
+					emit_row(
+						rsinfo, "undo",
+						psprintf("old_tt_locator_family.%s.fallback_result.found", names[family]),
+						fmt_uint64(row->found_count));
+					emit_row(
+						rsinfo, "undo",
+						psprintf("old_tt_locator_family.%s.fallback_result.missing", names[family]),
+						fmt_uint64(row->missing_count));
+					emit_row(rsinfo, "undo",
+							 psprintf("old_tt_locator_family.%s.fallback_result.ambiguous",
+									  names[family]),
+							 fmt_uint64(row->ambiguous_count));
+					emit_row(rsinfo, "undo",
+							 psprintf("old_tt_locator_family.%s.fallback_result.scan_unavailable",
+									  names[family]),
+							 fmt_uint64(row->unavailable_count));
+				}
+			}
+		}
+	}
+
 	/* spec-3.12 D5: own-instance retention horizon observability. */
 	emit_row(rsinfo, "undo", "retention_horizon_scn",
 			 fmt_int64((int64)cluster_tt_slot_retention_horizon_scn()));
@@ -4574,9 +4634,75 @@ dump_multixact_current(ReturnSetInfo *rsinfo)
 }
 
 static void
+dump_ctrc_completion(ReturnSetInfo *rsinfo)
+{
+	ClusterCtrcCompletionStats stats;
+	bool available = cluster_ctrc_completion_stats_snapshot(&stats);
+
+	emit_row(rsinfo, "ctrc", "ctrc_completion_stats_available", available ? "true" : "false");
+	if (!available)
+		return;
+	emit_row(rsinfo, "ctrc", "ctrc_completion_origin_node_id", fmt_int64(stats.origin_node_id));
+	emit_row(rsinfo, "ctrc", "ctrc_real_completion_count", fmt_uint64(stats.real_completion_count));
+}
+
+static void
+dump_ctrc_no_progress(ReturnSetInfo *rsinfo)
+{
+	ClusterCtrcNoProgressStats stats;
+	bool available = cluster_ctrc_no_progress_stats_snapshot(&stats);
+
+	emit_row(rsinfo, "ctrc", "ctrc_phase_no_progress_stats_available",
+			 available ? "true" : "false");
+	if (!available)
+		return;
+	emit_row(rsinfo, "ctrc", "ctrc_phase_no_progress_origin_node_id",
+			 fmt_int64(stats.origin_node_id));
+	for (int i = 0; i < CTRC_CLEANER_REASON_COUNT; i++)
+		emit_row(rsinfo, "ctrc",
+				 psprintf("ctrc_phase_no_progress_by_reason.%s",
+						  cluster_ctrc_cleaner_reason_name((ClusterCtrcCleanerReason)i)),
+				 fmt_uint64(stats.by_reason[i]));
+}
+
+static void
+dump_ctrc_publisher(ReturnSetInfo *rsinfo, const ClusterCtrcDebugSnapshot *snapshot)
+{
+	bool available = snapshot != NULL && snapshot->publisher_stats_available;
+
+	emit_row(rsinfo, "ctrc", "ctrc_publisher_stats_available", available ? "true" : "false");
+	if (!available)
+		return;
+	emit_row(rsinfo, "ctrc", "ctrc_publisher_origin_node_id",
+			 fmt_int64(snapshot->publisher_origin_node_id));
+	emit_row(rsinfo, "ctrc", "ctrc_publisher_pending_count",
+			 fmt_uint64(snapshot->publisher_pending_count));
+}
+
+static void
+dump_ctrc_unsettled(ReturnSetInfo *rsinfo, const ClusterCtrcDebugSnapshot *snapshot)
+{
+	bool available = snapshot != NULL && snapshot->unsettled_stats_available;
+	bool age_available = available && snapshot->oldest_unsettled_age_available;
+
+	emit_row(rsinfo, "ctrc", "ctrc_unsettled_stats_available", available ? "true" : "false");
+	emit_row(rsinfo, "ctrc", "ctrc_oldest_unsettled_age_stats_available",
+			 age_available ? "true" : "false");
+	if (!available)
+		return;
+	emit_row(rsinfo, "ctrc", "ctrc_unsettled_origin_node_id",
+			 fmt_int64(snapshot->unsettled_origin_node_id));
+	emit_row(rsinfo, "ctrc", "ctrc_unsettled_count", fmt_uint64(snapshot->unsettled_count));
+	if (age_available)
+		emit_row(rsinfo, "ctrc", "ctrc_oldest_unsettled_age_ms",
+				 fmt_uint64(snapshot->oldest_unsettled_age_ms));
+}
+
+static void
 dump_ctrc(ReturnSetInfo *rsinfo)
 {
 	ClusterCtrcDebugSnapshot snapshot;
+	bool snapshot_available;
 	ClusterCtrcCleanerReason reason;
 	const char *reason_name;
 	int i;
@@ -4585,8 +4711,13 @@ dump_ctrc(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "ctrc", cluster_ctrc_stat_name((ClusterCtrcStatId)i),
 				 fmt_int64((int64)cluster_ctrc_stat_get((ClusterCtrcStatId)i)));
 
+	dump_ctrc_completion(rsinfo);
+	dump_ctrc_no_progress(rsinfo);
 	MemSet(&snapshot, 0, sizeof(snapshot));
-	if (!cluster_ctrc_debug_snapshot(&snapshot))
+	snapshot_available = cluster_ctrc_debug_snapshot(&snapshot);
+	dump_ctrc_publisher(rsinfo, snapshot_available ? &snapshot : NULL);
+	dump_ctrc_unsettled(rsinfo, snapshot_available ? &snapshot : NULL);
+	if (!snapshot_available)
 		return;
 	reason = cluster_ctrc_cleaner_reason_get();
 	reason_name = cluster_ctrc_cleaner_reason_name(reason);

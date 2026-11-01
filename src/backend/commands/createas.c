@@ -13,6 +13,10 @@
  * we must return a tuples-processed count in the QueryCompletion.  (We no
  * longer do that for CTAS ... WITH NO DATA, however.)
  *
+ * PGRAC modifications:
+ *    Preflight shared catalog creation before relation lookup.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -33,6 +37,11 @@
 #include "access/xlog.h"
 #include "catalog/namespace.h"
 #include "catalog/toasting.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/createas.h"
 #include "commands/matview.h"
 #include "commands/prepare.h"
@@ -45,6 +54,9 @@
 #include "rewrite/rewriteHandler.h"
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -238,6 +250,44 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 	List	   *rewritten;
 	PlannedStmt *plan;
 	QueryDesc  *queryDesc;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_shared_catalog) {
+		const char *unsupported = NULL;
+
+		if (stmt->objtype == OBJECT_MATVIEW)
+			unsupported = "materialized views";
+		else if (into != NULL && into->rel != NULL
+				 && into->rel->relpersistence == RELPERSISTENCE_UNLOGGED)
+			unsupported = "UNLOGGED tables";
+		if (unsupported != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s is not supported in shared mode", unsupported),
+					 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	}
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+		const char *cmdname = stmt->is_select_into ? "SELECT INTO" : "CREATE TABLE AS";
+
+		PreventCommandIfReadOnly(cmdname);
+		PreventCommandIfParallelMode(cmdname);
+		PreventCommandDuringRecovery(cmdname);
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog creation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+	}
+#endif
 
 	/* Check if the relation exists or not */
 	if (CreateTableAsRelExists(stmt))

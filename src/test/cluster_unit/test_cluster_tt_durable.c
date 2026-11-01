@@ -37,6 +37,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 
 #include <string.h>
 
@@ -44,6 +45,8 @@
 #include "access/xlog.h"
 #include "storage/bufpage.h"
 #include "storage/proc.h"
+#include "storage/shmem.h"
+#include "port/atomics.h"
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_scn.h"
@@ -444,10 +447,19 @@ cluster_undo_block0_current_prove_strict_empty_exclusive(
 	return g_current_empty_result;
 }
 
+static char g_canned_block[BLCKSZ];
+static bool g_capacity_apply_observe;
+static ClusterUndoCapacityChangeFence g_capacity_apply_fence;
+
 void
 cluster_undo_block0_unpin(ClusterUndoBlock0Pin *pin)
 {
 	if (pin != NULL && pin->slot >= 0) {
+		if (g_capacity_apply_observe) {
+			uint64 sequence;
+			UT_ASSERT(!cluster_undo_capacity_change_sample(&sequence));
+			UT_ASSERT_EQ(memcmp(g_current_resident, g_canned_block, BLCKSZ), 0);
+		}
 		g_current_unpin_calls++;
 		pin->slot = -1;
 	}
@@ -553,7 +565,7 @@ static bool g_read_hdr_second_enabled = false;
 static int g_read_hdr_calls = 0;
 static int g_read_hdr_fail_on_call = 0;
 
-static char g_canned_block[BLCKSZ];		  /* returned by read_block for segment 1 */
+/* g_canned_block is declared above the resident-pin callbacks. */
 static bool g_sealed_header_io;
 static uint32 g_canned_block_segment = 1; /* which segment_id the canned block answers */
 static bool g_read_block_ok = true;
@@ -945,6 +957,10 @@ cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent, uint
 									  uint32 len)
 {
 	UT_ASSERT_EQ(fd, 77);
+	if (g_capacity_apply_observe) {
+		uint64 sequence;
+		UT_ASSERT(!cluster_undo_capacity_change_sample(&sequence));
+	}
 	if (!XLogRecPtrIsInvalid(g_write_requires_flush) && g_flush_ptr < g_write_requires_flush)
 		g_write_before_flush = true;
 	return cluster_undo_smgr_write_header_bytes(intent, segment_id, owner_instance, offset, buf,
@@ -2333,7 +2349,16 @@ UT_TEST(test_commit_stage_then_apply_publishes_identical_durable_and_resident_su
 	owner = cluster_tt_slot_durable_commit_stage(1, 4, 7, 100, 5, scn_encode(1, 42), &admission,
 												 &successor);
 	UT_ASSERT(cluster_tt_slot_durable_commit_staged(1, 7, 100, 5));
+	cluster_undo_capacity_fence_init(&g_capacity_apply_fence);
+	cluster_undo_capacity_fence_attach(&g_capacity_apply_fence);
+	g_capacity_apply_observe = true;
 	apply_after_flush((XLogRecPtr)0x5000);
+	g_capacity_apply_observe = false;
+	{
+		uint64 sequence;
+		UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	}
+	cluster_undo_capacity_fence_attach(NULL);
 
 	UT_ASSERT_EQ(owner, 1);
 	UT_ASSERT(admission.entered);
@@ -2735,7 +2760,16 @@ UT_TEST(test_prepared_commit_stage_emits_and_writes_only_when_told)
 	UT_ASSERT_EQ(g_tt_wal_order[0], 'c');
 	UT_ASSERT_EQ(g_write_hdr_calls, 0);
 
+	cluster_undo_capacity_fence_init(&g_capacity_apply_fence);
+	cluster_undo_capacity_fence_attach(&g_capacity_apply_fence);
+	g_capacity_apply_observe = true;
 	cluster_tt_slot_durable_prepared_apply(&stage);
+	g_capacity_apply_observe = false;
+	{
+		uint64 sequence;
+		UT_ASSERT(cluster_undo_capacity_change_sample(&sequence));
+	}
+	cluster_undo_capacity_fence_attach(NULL);
 	UT_ASSERT_EQ(g_write_hdr_calls, 1);
 	UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_COMMITTED);
 	UT_ASSERT_EQ(g_last_written_slot.xid, 100);
@@ -3848,10 +3882,252 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 }
 
 
+static PGAlignedBlock locator_stats_memory;
+static bool locator_stats_found;
+
+static void *
+locator_stats_shmem_init(const char *name, Size size, bool *found)
+{
+	UT_ASSERT_STR_EQ(name, "ClusterTTDurableShared");
+	UT_ASSERT(size <= sizeof(locator_stats_memory));
+	*found = locator_stats_found;
+	locator_stats_found = true;
+	return locator_stats_memory.data;
+}
+
+#define ShmemInitStruct locator_stats_shmem_init
+#include "test_cluster_tt_locator_stats.inc"
+#undef ShmemInitStruct
+
+#ifdef CLUSTER_TT_DURABLE_LOCATOR_STATS_V1
+typedef ClusterTTDurableLocatorStats TestLocatorStats;
+#else
+/* The old product has no metric API. Report absence, never fake a count. */
+typedef struct TestLocatorStats {
+	int32 origin_node_id;
+	uint64 fallback_count;
+	uint64 found_count;
+	uint64 missing_count;
+	uint64 ambiguous_count;
+	uint64 unavailable_count;
+} TestLocatorStats;
+#endif
+
+static bool
+locator_snapshot(TestLocatorStats *out)
+{
+#ifdef CLUSTER_TT_DURABLE_LOCATOR_STATS_V1
+	return cluster_tt_durable_locator_stats_snapshot(out);
+#else
+	(void)out;
+	return false;
+#endif
+}
+
+static void
+reset_locator_stats(void)
+{
+	TTDurableShared = NULL;
+	locator_stats_found = false;
+	memset(&locator_stats_memory, 0xa5, sizeof(locator_stats_memory));
+	cluster_node_id = 0;
+	cluster_tt_durable_shmem_init();
+	g_read_block_ok = true;
+	g_canned_block_segment = 1;
+	g_unreadable_existing_segment = 0;
+	g_read_block_absent_once_segment = 0;
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+}
+
+static TestLocatorStats
+read_locator_stats(void)
+{
+	TestLocatorStats stats = { 0 };
+
+	UT_ASSERT(locator_snapshot(&stats));
+	return stats;
+}
+
+UT_TEST(test_locator_stats_unavailable_preserves_output)
+{
+	TestLocatorStats stats;
+	TestLocatorStats before;
+
+	memset(&stats, 0xa5, sizeof(stats));
+	memcpy(&before, &stats, sizeof(before));
+	TTDurableShared = NULL;
+	UT_ASSERT(!locator_snapshot(&stats));
+	UT_ASSERT(memcmp(&before, &stats, sizeof(stats)) == 0);
+	UT_ASSERT(!locator_snapshot(NULL));
+	reset_locator_stats();
+	cluster_node_id = -1;
+	UT_ASSERT(!locator_snapshot(&stats));
+	UT_ASSERT(memcmp(&before, &stats, sizeof(stats)) == 0);
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_locator_stats_available_zero_is_distinct)
+{
+	TestLocatorStats stats;
+
+	reset_locator_stats();
+	stats = read_locator_stats();
+	UT_ASSERT_EQ(stats.origin_node_id, 0);
+	UT_ASSERT_EQ(stats.fallback_count, 0);
+	UT_ASSERT_EQ(stats.found_count, 0);
+	UT_ASSERT_EQ(stats.missing_count, 0);
+	UT_ASSERT_EQ(stats.ambiguous_count, 0);
+	UT_ASSERT_EQ(stats.unavailable_count, 0);
+	UT_ASSERT(!locator_snapshot(NULL));
+}
+
+UT_TEST(test_actual_locator_counts_each_original_result)
+{
+	uint16 seg = 0xffff;
+	uint16 slot = 0xffff;
+	uint16 wrap = 0xffff;
+	uint8 status = TT_SLOT_INVALID;
+	TestLocatorStats stats;
+
+	reset_locator_stats();
+	seed_block_slot(6, TT_SLOT_ACTIVE, 12345, InvalidScn);
+	UT_ASSERT_EQ(
+		cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, &seg, &slot, &wrap, &status),
+		CLUSTER_TT_DURABLE_LOCATE_FOUND);
+	UT_ASSERT_EQ(seg, 1);
+	UT_ASSERT_EQ(slot, 6);
+	UT_ASSERT_EQ(status, TT_SLOT_ACTIVE);
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seg = slot = wrap = 0xffff;
+	status = TT_SLOT_INVALID;
+	UT_ASSERT_EQ(
+		cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, &seg, &slot, &wrap, &status),
+		CLUSTER_TT_DURABLE_LOCATE_MISSING);
+	seed_block_slot(3, TT_SLOT_ACTIVE, 12345, InvalidScn);
+	seed_block_slot(9, TT_SLOT_ABORTED, 12345, InvalidScn);
+	UT_ASSERT_EQ(
+		cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, &seg, &slot, &wrap, &status),
+		CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS);
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	g_unreadable_existing_segment = 2;
+	UT_ASSERT_EQ(
+		cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, &seg, &slot, &wrap, &status),
+		CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE);
+	UT_ASSERT_EQ(
+		cluster_tt_slot_durable_locate_any_by_xid_origin(-1, 12345, &seg, &slot, &wrap, &status),
+		CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(0, InvalidTransactionId, &seg,
+																  &slot, &wrap, &status),
+				 CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE);
+	UT_ASSERT_EQ(seg, 0xffff);
+	UT_ASSERT_EQ(slot, 0xffff);
+	UT_ASSERT_EQ(wrap, 0xffff);
+	UT_ASSERT_EQ(status, TT_SLOT_INVALID);
+	stats = read_locator_stats();
+	UT_ASSERT_EQ(stats.fallback_count, 6);
+	UT_ASSERT_EQ(stats.found_count, 1);
+	UT_ASSERT_EQ(stats.missing_count, 1);
+	UT_ASSERT_EQ(stats.ambiguous_count, 1);
+	UT_ASSERT_EQ(stats.unavailable_count, 3);
+	g_unreadable_existing_segment = 0;
+}
+
+UT_TEST(test_repeated_locator_identities_do_not_count_scn_queries)
+{
+	const uint8 states[] = { TT_SLOT_ACTIVE, TT_SLOT_COMMITTED, TT_SLOT_ABORTED };
+	TestLocatorStats stats;
+	SCN got = InvalidScn;
+
+	reset_locator_stats();
+	for (unsigned i = 0; i < lengthof(states); i++) {
+		memset(g_canned_block, 0, sizeof(g_canned_block));
+		seed_block_slot(3, states[i], 12345, scn_encode(1, 77));
+		for (unsigned repeat = 0; repeat < 2; repeat++) {
+			uint8 status = TT_SLOT_INVALID;
+
+			UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, NULL, NULL,
+																		  NULL, &status),
+						 CLUSTER_TT_DURABLE_LOCATE_FOUND);
+			UT_ASSERT_EQ(status, states[i]);
+		}
+	}
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
+	UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(0, 12345, CLUSTER_TT_WRAP_ANY, &got,
+															   NULL, NULL, NULL),
+				 CLUSTER_TT_DURABLE_RESOLVED_SCN);
+	UT_ASSERT_EQ(got, scn_encode(1, 77));
+	stats = read_locator_stats();
+	UT_ASSERT_EQ(stats.fallback_count, 6);
+	UT_ASSERT_EQ(stats.found_count, 6);
+	UT_ASSERT_EQ(stats.missing_count, 0);
+	UT_ASSERT_EQ(stats.ambiguous_count, 0);
+	UT_ASSERT_EQ(stats.unavailable_count, 0);
+}
+
+UT_TEST(test_locator_stats_attach_keeps_existing_counts)
+{
+	TestLocatorStats stats;
+
+	reset_locator_stats();
+	UT_ASSERT_EQ(cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, NULL, NULL, NULL, NULL),
+				 CLUSTER_TT_DURABLE_LOCATE_MISSING);
+	pg_atomic_write_u64(&TTDurableShared->durable_commit_count, 71);
+	TTDurableShared = NULL;
+	cluster_tt_durable_shmem_init();
+	stats = read_locator_stats();
+	UT_ASSERT_EQ(stats.fallback_count, 1);
+	UT_ASSERT_EQ(stats.missing_count, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&TTDurableShared->durable_commit_count), 71);
+}
+
+UT_TEST(test_locator_snapshot_preserves_unsigned_counts)
+{
+	TestLocatorStats stats;
+
+	reset_locator_stats();
+#ifdef CLUSTER_TT_DURABLE_LOCATOR_STATS_V1
+	pg_atomic_write_u64(&TTDurableShared->locator_fallback_count, UINT64_MAX);
+	pg_atomic_write_u64(&TTDurableShared->locator_found_count, UINT64_C(9223372036854775809));
+	pg_atomic_write_u64(&TTDurableShared->locator_missing_count, 3);
+	pg_atomic_write_u64(&TTDurableShared->locator_ambiguous_count, 5);
+	pg_atomic_write_u64(&TTDurableShared->locator_unavailable_count, 7);
+#endif
+	for (int origin = 0; origin < 128; origin++) {
+		cluster_node_id = origin;
+		stats = read_locator_stats();
+		UT_ASSERT_EQ(stats.origin_node_id, origin);
+		UT_ASSERT(stats.fallback_count == UINT64_MAX);
+		UT_ASSERT(stats.found_count == UINT64_C(9223372036854775809));
+		UT_ASSERT_EQ(stats.missing_count, 3);
+		UT_ASSERT_EQ(stats.ambiguous_count, 5);
+		UT_ASSERT_EQ(stats.unavailable_count, 7);
+	}
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_locator_stats_invalid_origin_does_not_publish_or_replace_output)
+{
+	static const int invalid_origins[] = { INT_MIN, -1, 128, 129, INT_MAX };
+	TestLocatorStats stats;
+	TestLocatorStats before;
+
+	reset_locator_stats();
+	for (unsigned i = 0; i < lengthof(invalid_origins); i++) {
+		cluster_node_id = invalid_origins[i];
+		memset(&stats, 0xa5, sizeof(stats));
+		memcpy(&before, &stats, sizeof(before));
+		UT_ASSERT(!locator_snapshot(&stats));
+		UT_ASSERT(memcmp(&before, &stats, sizeof(stats)) == 0);
+	}
+	cluster_node_id = 0;
+}
+
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(116);
+	UT_PLAN(123);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3981,6 +4257,14 @@ main(int argc, char **argv)
 	UT_RUN(test_revert_delete_already_clear_skip_done);
 	UT_RUN(test_revert_delete_identity_match_apply);
 	UT_RUN(test_revert_delete_identity_mismatch_failclosed);
+
+	UT_RUN(test_locator_stats_unavailable_preserves_output);
+	UT_RUN(test_locator_stats_available_zero_is_distinct);
+	UT_RUN(test_actual_locator_counts_each_original_result);
+	UT_RUN(test_repeated_locator_identities_do_not_count_scn_queries);
+	UT_RUN(test_locator_stats_attach_keeps_existing_counts);
+	UT_RUN(test_locator_snapshot_preserves_unsigned_counts);
+	UT_RUN(test_locator_stats_invalid_origin_does_not_publish_or_replace_output);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

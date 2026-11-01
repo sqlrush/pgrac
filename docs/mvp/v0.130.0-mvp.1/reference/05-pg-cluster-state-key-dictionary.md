@@ -1209,7 +1209,9 @@ Author: SqlRush <sqlrush@gmail.com>
 | `capacity_wait_entered` | 查询节点的文本投影；与同分类状态和日志联合解释 |
 | `capacity_wait_refused_context` | 查询节点的文本投影；与同分类状态和日志联合解释 |
 | `capacity_wait_refused_proof` | 查询节点的文本投影；与同分类状态和日志联合解释 |
-| `capacity_wait_repolled` | 查询节点的文本投影；与同分类状态和日志联合解释 |
+| `capacity_wait_repolled` | 查询节点本次 postmaster 生命周期内的容量 CV 重查次数（uint64）；不包含 native 事务槽等待返回。仅在 `tt_capacity_stats_available=true` 时有值 |
+| `tt_capacity_wakeup_recheck_count` | 查询节点本次 postmaster 生命周期内的容量 CV 重查次数，加上 native 事务槽等待正常返回后的重查次数（uint64）；不代表实际睡眠、槽分配成功或供给数量。仅在 `tt_capacity_stats_available=true` 时有值 |
+| `tt_capacity_stats_available` | 容量统计是否可读；为 false 时不输出容量计数，不能将缺失值当成 0 |
 | `undo_cleaner_last_liveness_tick_at` | 查询节点的文本投影；与同分类状态和日志联合解释 |
 | `undo_cleaner_main_loop_iters` | 查询节点的文本投影；与同分类状态和日志联合解释 |
 | `undo_cleaner_pid` | 查询节点的文本投影；与同分类状态和日志联合解释 |

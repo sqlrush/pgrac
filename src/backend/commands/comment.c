@@ -9,6 +9,10 @@
  * IDENTIFICATION
  *	  src/backend/commands/comment.c
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native comments before catalog lookups and locks.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 
@@ -18,13 +22,19 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_shdescription.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/comment.h"
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
@@ -41,6 +51,32 @@ CommentObject(CommentStmt *stmt)
 {
 	Relation	relation;
 	ObjectAddress address = InvalidObjectAddress;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: direct callers bind before lookup; utility callers reuse the
+	 * original top binding. Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("COMMENT");
+		PreventCommandIfParallelMode("COMMENT");
+		PreventCommandDuringRecovery("COMMENT");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	/*
 	 * When loading a dump, we may see a COMMENT ON DATABASE for the old name

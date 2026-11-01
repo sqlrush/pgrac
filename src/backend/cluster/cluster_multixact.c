@@ -670,8 +670,9 @@ cluster_multixact_projection_build_members(uint32 cluster_epoch,
 		member_origin = cluster_xid_origin_slot(native_members[i].xid);
 		if (member_origin < 0 || member_origin >= (1 << 7))
 			return false;
-		locate = cluster_tt_slot_durable_locate_any_by_xid_origin(
-			member_origin, native_members[i].xid, &segment, &slot, &wrap, &tt_status);
+		locate = cluster_tt_slot_durable_locate_any_by_xid_origin_profiled(
+			CLUSTER_TT_LOCATOR_MX_PROJECTION, member_origin, native_members[i].xid, &segment, &slot,
+			&wrap, &tt_status);
 		if (locate != CLUSTER_TT_DURABLE_LOCATE_FOUND) {
 			/* Lock-only members never affect tuple visibility.  A complete
 			 * zero-match is exact negative TT evidence; updater members still

@@ -70,6 +70,7 @@
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "cluster/cluster_scn.h" /* SCN (pass-stats horizon plumbing) */
+#include "cluster/cluster_undo_capacity.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_xid_stripe_boot.h"
@@ -101,16 +102,24 @@ typedef struct ClusterUndoCleanerActiveSample {
 	pid_t worker_pid;
 } ClusterUndoCleanerActiveSample;
 
+/* Bit positions match ClusterUndoRetainReason; these are observations only. */
+#define CLUSTER_UNDO_CAPACITY_RETAIN_STATS_V1 1
+#define CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT 9
+#define CLUSTER_UNDO_CAPACITY_NATIVE_RECHECK_STATS_V1 1
+
 /* Postmaster-lifetime diagnostics for this origin's existing capacity wait.
  * Counts do not prove pool coverage, owner progress, or reusable capacity. */
 typedef struct ClusterUndoCapacityStats {
 	int32 origin_node_id;
 	uint64 active_full_wait_count;
 	uint64 pool_wait_count;
-	uint64 wakeup_recheck_count;
+	uint64 wakeup_recheck_count; /* Original pool CV repolls only. */
 	uint64 cancel_count;
+	/* Original full-pool and selected-slot gate refusals, counted per attempt. */
 	uint64 refused_context_count;
 	uint64 refused_proof_count;
+	uint64 retain_by_reason[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT];
+	uint64 native_wakeup_recheck_count;
 } ClusterUndoCapacityStats;
 
 
@@ -149,6 +158,7 @@ typedef struct UndoCleanerWorkerState {
 } UndoCleanerWorkerState;
 
 typedef struct UndoCleanerSharedState {
+	ClusterUndoCapacityChangeFence capacity_change;
 	LWLock lwlock;
 	bool shutdown_requested;
 	UndoCleanerWorkerState workers[CLUSTER_UNDO_CLEANER_WORKER_TYPES];
@@ -158,9 +168,12 @@ typedef struct UndoCleanerSharedState {
 	uint64 active_full_wait_count;
 	uint64 capacity_wait_entered;
 	uint64 capacity_wait_repolled;
-	uint64 capacity_wait_refused_context;
-	uint64 capacity_wait_refused_proof;
+	/* Refusal can occur in an unsafe lock context; counting takes no LWLock. */
+	pg_atomic_uint64 capacity_wait_refused_context;
+	pg_atomic_uint64 capacity_wait_refused_proof;
 	pg_atomic_uint64 capacity_wait_cancelled;
+	pg_atomic_uint64 active_full_wakeup_recheck_count;
+	uint64 retain_by_reason[CLUSTER_UNDO_CAPACITY_RETAIN_REASON_COUNT];
 
 	/*
 	 * D6 pass counters (spec-3.13 step 8 fills; zero-init).  Updated by
@@ -187,6 +200,9 @@ typedef struct UndoCleanerSharedState {
 	 */
 	uint32 scan_resume_seg;
 } UndoCleanerSharedState;
+
+StaticAssertDecl(offsetof(UndoCleanerSharedState, capacity_change) == 0,
+				 "capacity counters must retain shared-memory atomic alignment");
 
 /* Postmaster-owned PID inventory. Zero is an unoccupied slot, never a
  * reaped process identity. A normal reap frees exactly one respawn slot. */
@@ -260,6 +276,10 @@ extern bool cluster_undo_cleaner_worker_snapshot(unsigned worker_id, UndoCleaner
 /* False leaves output untouched. Independent counters are not an authority
  * snapshot or a conservation equation across in-flight callers. */
 extern bool cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out);
+/* Original pool/native-slot refusal only; does not decide whether to wait. */
+extern void cluster_undo_cleaner_note_capacity_refusal(bool unsafe_context);
+/* A normal native wait return requests recheck; it does not grant a slot. */
+extern void cluster_undo_cleaner_note_tx_slot_recheck(void);
 extern bool cluster_undo_cleaner_active_sample(ClusterUndoCleanerActiveSample *out);
 extern bool
 cluster_undo_cleaner_active_sample_current(const ClusterUndoCleanerActiveSample *expected);

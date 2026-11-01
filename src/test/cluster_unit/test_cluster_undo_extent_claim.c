@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_extent.h"
 #include "cluster/cluster_undo_record_api.h"
@@ -31,6 +32,7 @@ static ClusterUndoRecordShared state;
 static ClusterUndoRecordShared *UndoRecordShared = &state;
 static ClusterUndoSegmentExtendPlan plan;
 static bool cursor_locked, lifecycle_locked;
+static bool capacity_track, capacity_throw_after_physical;
 static bool select_ok, mutation_ok, generation_mismatch;
 static bool drift_on_provision, drift_on_seal, drift_on_range;
 static unsigned selections, provisions, reuses, seals, activations, tail_inits, ranges;
@@ -62,15 +64,21 @@ LWLockRelease(LWLock *lock)
 {
 	if (lock == &state.lifecycle_lock.lock && lifecycle_locked && cursor_locked)
 		lifecycle_locked = false;
-	else if (lock == &state.cursor_lock.lock && cursor_locked && !lifecycle_locked)
+	else if (lock == &state.cursor_lock.lock && cursor_locked && !lifecycle_locked) {
+		if (capacity_track) {
+			uint64 sequence;
+			UT_ASSERT(!cluster_undo_capacity_change_sample(&sequence));
+		}
 		cursor_locked = false;
-	else
+	} else
 		abort();
 }
 
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
 void
@@ -203,6 +211,10 @@ bool
 cluster_undo_segment_mark_block_range_used(uint32 seg, uint8 owner, uint32 block, uint32 n)
 {
 	check_io(owner);
+	if (capacity_throw_after_physical) {
+		cluster_undo_capacity_write_mark();
+		siglongjmp(*PG_exception_stack, 1);
+	}
 	ranges++;
 	range_segment = seg;
 	range_start = block;
@@ -354,10 +366,48 @@ UT_TEST(test_failed_selection_does_not_bind_cursor)
 	}
 }
 
+UT_TEST(test_capacity_actual_claim_publication_and_error_retirement)
+{
+	ClusterUndoCapacityChangeFence fence;
+	ClusterUndoExtent ext;
+	uint64 before;
+	volatile bool caught = false;
+	reset_fixture(false);
+	first_free = 5;
+	cluster_undo_capacity_fence_init(&fence);
+	cluster_undo_capacity_fence_attach(&fence);
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	capacity_track = true;
+	UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), CLAIM_OK);
+	capacity_track = false;
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	reset_fixture(false);
+	first_free = 5;
+	capacity_throw_after_physical = true;
+	PG_TRY();
+	{
+		(void)claim_undo_extent(&ext, 1, 1, 100);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	capacity_throw_after_physical = false;
+	/* The original PG error owner releases LWLocks externally. */
+	cursor_locked = lifecycle_locked = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(!cluster_undo_capacity_change_current(before));
+	UT_ASSERT(cluster_undo_capacity_change_sample(&before));
+	cluster_undo_capacity_fence_attach(NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
+	UT_RUN(test_capacity_actual_claim_publication_and_error_retirement);
 	UT_RUN(test_cold_full_segment_claims_existing_successor);
 	UT_RUN(test_cold_full_segment_provisions_once);
 	UT_RUN(test_cold_full_segment_reuses_exact_candidate_once);

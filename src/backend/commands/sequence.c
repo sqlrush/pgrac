@@ -3,6 +3,9 @@
  * sequence.c
  *	  PostgreSQL sequences support code.
  *
+ * PGRAC modifications:
+ *    Preflight native sequence alteration before relation lookup acquires locks.
+ *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -50,8 +53,12 @@
 #include "cluster/cluster_space_storage.h" /* PGRAC: exact sequence page versions */
 #include "cluster/storage/cluster_smgr.h"	 /* spec-5.4 — shared-storage activation gate */
 #include "cluster/cluster_mode.h"			 /* spec-2.41 D4 — cluster_storage_mode_enabled */
+#include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_scn.h"				 /* spec-2.41 D4 — cluster_scn_advance / SCN */
 #include "utils/timestamp.h"				 /* spec-5.4 — refill-wait deadline */
+#endif
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
 #endif
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -488,7 +495,7 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 	FormData_pg_sequence_data seqdataform;
 	bool		need_seq_rewrite;
 	List	   *owned_by;
-	CreateStmt *stmt = makeNode(CreateStmt);
+	CreateStmt *stmt;
 	Oid			seqoid;
 	ObjectAddress address;
 	Relation	rel;
@@ -499,6 +506,36 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 	Datum		pgs_values[Natts_pg_sequence];
 	bool		pgs_nulls[Natts_pg_sequence];
 	int			i;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && seq->sequence != NULL
+		&& seq->sequence->relpersistence == RELPERSISTENCE_UNLOGGED)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("UNLOGGED sequences is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("CREATE SEQUENCE");
+		PreventCommandIfParallelMode("CREATE SEQUENCE");
+		PreventCommandDuringRecovery("CREATE SEQUENCE");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog creation does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog creation")));
+	}
+#endif
+
+	stmt = makeNode(CreateStmt);
 
 	/*
 	 * If if_not_exists was given and a relation with the same name already
@@ -945,6 +982,30 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	Relation	rel;
 	HeapTuple	seqtuple;
 	HeapTuple	newdatatuple;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ALTER SEQUENCE");
+		PreventCommandIfParallelMode("ALTER SEQUENCE");
+		PreventCommandDuringRecovery("ALTER SEQUENCE");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	/* Open and lock sequence, and check for ownership along the way. */
 	relid = RangeVarGetRelidExtended(stmt->sequence,

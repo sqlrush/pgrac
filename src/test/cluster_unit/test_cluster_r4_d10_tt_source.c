@@ -455,6 +455,8 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 	return CLUSTER_TT_DURABLE_LOCATE_FOUND;
 }
 
+#include "test_cluster_tt_locator_family.inc"
+
 bool
 cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid, ClusterTTSlotCurrentOwner *out)
 {

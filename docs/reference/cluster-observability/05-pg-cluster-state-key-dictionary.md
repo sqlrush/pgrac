@@ -239,6 +239,39 @@
 | `undo_cleaner_last_liveness_tick_at` | 时间戳文本或 `(unset)` | undo / `cleaner` / 最近 / `liveness` / `tick`的时间戳。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `undo_cleaner_main_loop_iters` | 十进制整数文本 | undo / `cleaner` / `main` / `loop` / `iters`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 
+容量诊断的 `tt_capacity_stats_available` 表示本实例统计快照是否可用。为 `false` 时不输出下面的来源与计数，不能当作零；为 `true` 时，`tt_capacity_origin_node_id` 标识来源，计数以无符号十进制文本输出。计数在 postmaster 重启后归零，cleaner worker 重启不清零。
+
+| key | 含义 |
+|---|---|
+| `tt_capacity_stats_available` | `true` / `false`；本实例容量统计是否可读。 |
+| `tt_capacity_origin_node_id` | 统计的本实例来源节点号；只在统计可用时输出。 |
+| `tt_slot_active_full_wait_count` | 事务槽 native 等待路径的进入次数；包含 owner 已结束、无需实际睡眠的尝试。 |
+| `tt_capacity_pool_wait_count` | 容量 CV 等待路径的进入次数；不表示实际睡眠或成功获得容量。 |
+| `tt_capacity_wakeup_recheck_count` | 容量 CV 正常返回后的重查次数，加上 native 事务槽等待正常返回后的重查次数；ERROR 和等待前的身份漂移不计为 native 正常返回。 |
+| `tt_capacity_cancel_count` | 原容量等待路径因 `57014` 退出的次数，含已开始的 native 槽等待；`55P03`、`40P01`、`53R60` 等其他错误不计为取消。 |
+| `tt_capacity_refuse_by_reason.context` | 原安全执行上下文检查不通过的次数。 |
+| `tt_capacity_refuse_by_reason.proof` | 原等待所需证据或 owner 无法确认的拒绝次数。 |
+| `capacity_wait_entered` | 原名称；与 `tt_capacity_pool_wait_count` 同值。 |
+| `capacity_wait_repolled` | 原名称；只计容量 CV 正常返回后的重查，不含 native 槽等待返回。 |
+| `capacity_wait_refused_context` | 原名称；与 `tt_capacity_refuse_by_reason.context` 同值。 |
+| `capacity_wait_refused_proof` | 原名称；与 `tt_capacity_refuse_by_reason.proof` 同值。 |
+
+这些计数分别采样，不要求并发读取时等待、重查、取消和拒绝构成相等的总数；一次事务也可能多次进入原重查路径。重查增加不表示槽已分配或清偿已完成。查询示例见[容量等待采样](12-operations-and-query-cost.md#8-undo-容量等待采样)。
+
+| key | 含义 |
+|---|---|
+| `undo_retain_by_reason.active_or_prepared` | 观察到活动或未解决事务占用的次数。 |
+| `undo_retain_by_reason.record_writer` | 观察到记录写入者保护的次数。 |
+| `undo_retain_by_reason.seal_or_drain` | 观察到记录封存或清偿前置未满足的次数。 |
+| `undo_retain_by_reason.horizon_missing` | 观察到缺少合格保留下界的次数。 |
+| `undo_retain_by_reason.history_pin` | 观察到历史 SCN 仍受保留下界限制的次数。 |
+| `undo_retain_by_reason.reference_pending` | 观察到仍有 undo 引用的次数。 |
+| `undo_retain_by_reason.release_not_durable` | 观察到缺少耐久释放证据的次数。 |
+| `undo_retain_by_reason.publisher_pending` | 观察到释放发表者交接未完成的次数。 |
+| `undo_retain_by_reason.identity_or_io` | 观察到无法确认样本身份或读取结果的次数。 |
+
+这些计数记录容量检查中合格样本的原因观察，不是当前段数、不同段数或全池扫描结果。一次观察可以使多个原因分别增加，重复检查同一原因也会再次增加。没有实际原因样本的类别保持零；零不证明该类保护不存在。`history_pin` 不单独证明有长读者，任何计数均不表示容量已经可复用。分析时比较同一来源在时间窗内的增量，并结合原等待和错误信息。
+
 ## category = `xid_stripe`
 
 | key | 值形态 | 含义 | 运维解释 |
@@ -933,6 +966,18 @@
 | `tt_durable_lookup_miss_count` | 十进制整数文本 | `tt` / `durable` / `lookup` / `miss`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `tt_durable_by_xid_scan_count` | 十进制整数文本 | `tt` / `durable` / `by` / `xid` / `scan`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `tt_durable_redo_apply_count` | 十进制整数文本 | `tt` / `durable` / redo / 应用的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
+| `old_tt_locator_stats_available` | `true` / `false` | 本实例旧事务位置查询统计是否可用。 | `false` 时省略下列来源与计数键，不把不可用读成 0。 |
+| `old_tt_locator_origin_node_id` | 非负整数文本 | 执行查询的本实例 origin 节点号，从 0 开始。 | 不是被查事务所在的节点；计数在本 postmaster 生命周期内累计。 |
+| `old_tt_locator_fallback_count` | uint64 十进制文本 | 旧事务位置查询的调用次数，含无效参数调用。 | 另一个按 xid 查询 SCN 的接口不计入；ERROR 不伪造正常返回结果。 |
+| `old_tt_locator_fallback_result.found` | uint64 十进制文本 | 查询正常返回唯一位置的次数。 | 位置可为 ACTIVE、COMMITTED 或 ABORTED；不是终态或可回收证明。 |
+| `old_tt_locator_fallback_result.missing` | uint64 十进制文本 | 查询正常返回完整扫描无匹配的次数。 | 诊断值不能代替当前查询和身份复核，不作负缓存。 |
+| `old_tt_locator_fallback_result.ambiguous` | uint64 十进制文本 | 查询正常返回多个匹配的次数。 | 与调用数独立原子采样，不要求并发读取的结果和恰好等于调用数。 |
+| `old_tt_locator_fallback_result.scan_unavailable` | uint64 十进制文本 | 查询正常返回扫描不可用的次数，含原无效参数结果。 | 不同于完整扫描无匹配；与其他计数结合做时间窗增量。 |
+| `old_tt_locator_family.<family>.fallback_count` | uint64 十进制文本 | 本实例带调用族标签的位置查询入口次数。 | `<family>` 为 `runtime_active`、`runtime_terminal`、`mx_current_origin`、`mx_projection`；分别对应运行期活动身份、运行期终态身份、current-MX来源成员及MX投影成员查询。 |
+| `old_tt_locator_family.<family>.fallback_result.found` | uint64 十进制文本 | 该调用族正常返回唯一位置的次数。 | 原 `old_tt_locator_stats_available=false` 时省略全部调用族键；来源沿用 `old_tt_locator_origin_node_id`。 |
+| `old_tt_locator_family.<family>.fallback_result.missing` | uint64 十进制文本 | 该调用族正常返回完整扫描无匹配的次数。 | 不包含扫描不可用；不作负缓存或回收授权。 |
+| `old_tt_locator_family.<family>.fallback_result.ambiguous` | uint64 十进制文本 | 该调用族正常返回多个匹配的次数。 | 调用和结果独立原子读取，并发采样不要求相等。 |
+| `old_tt_locator_family.<family>.fallback_result.scan_unavailable` | uint64 十进制文本 | 该调用族正常返回扫描不可用的次数。 | ERROR保留入口计数，不补造正常返回结果；原未带标签API仍只计原总数。调用数不等于物理读次数，不能证明状态或换权成功。 |
 | `retention_horizon_scn` | 十进制整数文本 | 保留 / `horizon`对应的集群 SCN。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `retention_max_recycle_horizon` | 十进制整数文本 | 保留 / 上限 / `recycle` / `horizon`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `tt_slot_retain_skip_count` | 十进制整数文本 | `tt` / 槽位 / `retain` / `skip`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
@@ -965,7 +1010,7 @@
 | `horizon_admission_refuse_count` | 十进制整数文本 | `horizon` / 准入 / `refuse`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `horizon_last_floor_scn` | 十进制整数文本 | `horizon` / 最近 / `floor`对应的集群 SCN。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `horizon_idle_sentinel_sent_count` | 十进制整数文本 | `horizon` / `idle` / `sentinel` / `sent`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
-| `horizon_peer_reports` | 枚举/名称/格式化文本 | `horizon` / 对端 / `reports`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
+| `horizon_peer_reports` | 格式化文本 | 原对端报告及 V2 采样状态；READY 时追加限制 H 的 `h_source=n<节点>`：`scn`、采样 `clock`、`kind`、`token`。远端另有 `report_seq`、接收后 `age_ms`；本地采样无这两项。 | kind：0 UNKNOWN、1 CLOCK、2 SNAPSHOT、3 PREPARED、4 REPLICATION。同 SCN 时间的来源全部列出；非 READY 不列来源。年龄不可计算时为 -1。来源信息不证明读者仍存活、全池已扫描或容量可回收。 |
 | `cleaner_header_tt_slots_below_horizon` | 十进制整数文本 | `cleaner` / `header` / `tt` / `slots` / `below` / `horizon`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `undo_buf_held_wal` | 十进制整数文本 | undo / `buf` / `held` / WAL的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
 | `undo_buf_held_evidence` | 十进制整数文本 | undo / `buf` / `held` / `evidence`的当前快照值。 | 与同分类其他键组成快照，不单独作为 authority 证明。 |
@@ -1261,3 +1306,60 @@
 | `vis_unknown_count` | 十进制整数文本 | `vis` / 未知的累计计数。 | 非零或异常枚举需要与同类成功计数、epoch 和日志关联分析。 |
 | `buf_hit_count` | 十进制整数文本 | `buf` / `hit`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
 | `buf_miss_count` | 十进制整数文本 | `buf` / `miss`的累计计数。 | 先做时间窗增量；单个绝对值不能直接判定当前故障。 |
+
+
+## Cleaner 无进展原因计数（分类 `ctrc`）
+
+这些 uint64 十进制计数在本 postmaster 生命周期内跨 cleaner worker 累计。每次正常完成的 pass 若该 worker 没有真实生命周期进展，只按其最终观察到的一个原因加一；不表示该 pass 的全部原因。未执行的 pass 与 ERROR 不计，其他 worker 的全局进展和重复发送不算本 worker 的进展。各键独立采样，宜比较时间窗增量；无进展不证明 idle、停机完成、槽可复用或 undo 可释放。
+
+| 键 | 值 | 读法 |
+|---|---|---|
+| `ctrc_phase_no_progress_stats_available` | `true` / `false` | `false` 时省略以下 origin 和全部原因计数，不将不可用展示成 0。 |
+| `ctrc_phase_no_progress_origin_node_id` | 非负整数文本 | 执行 cleaner 的本实例节点号，从 0 开始；不是被处理事务的节点号或集群总数。 |
+| `ctrc_phase_no_progress_by_reason.NONE` | uint64 十进制文本 | 最终未记录阻塞原因的无进展 pass，包括完成的空扫描。 |
+| `ctrc_phase_no_progress_by_reason.PREPARED_DRAIN` | uint64 十进制文本 | 最终原因是 prepared drain 的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.RESOURCE_X` | uint64 十进制文本 | 最终原因是资源 X 获取的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.PAGE_REVALIDATE` | uint64 十进制文本 | 最终原因是页重新验证的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.WAL_DURABILITY` | uint64 十进制文本 | 最终原因是 WAL 持久性的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.PARTICIPANT_ACK` | uint64 十进制文本 | 最终原因是参与者 ACK 的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.BLOCK0_CERTIFICATE` | uint64 十进制文本 | 最终原因是 block0 certificate 的无进展 pass。 |
+| `ctrc_phase_no_progress_by_reason.BLOCKED` | uint64 十进制文本 | 最终原因是 BLOCKED 的无进展 pass；结合原阶段与日志定位。 |
+
+
+## Cleaner 清偿完成计数（分类 `ctrc`）
+
+| 键 | 值 | 读法 |
+|---|---|---|
+| `ctrc_completion_stats_available` | `true` / `false` | `false` 时省略以下 origin 和完成计数，不把不可用展示成 0。 |
+| `ctrc_completion_origin_node_id` | 非负整数文本 | 执行清偿的本实例节点号，从 0 开始；不是被处理事务的节点号或集群合计。 |
+| `ctrc_real_completion_count` | uint64 十进制文本 | 本 postmaster 生命周期内，原 origin 清偿责任实际退休的次数；原证书和全部必要通知完成后，每次成功退休恰好加一。零参与者的成功退休也计入。 |
+
+receipt 清理、参与者 ACK、证书发表、一般状态推进、重复回复或失败重试都不单独增加完成计数。计数表示原清偿责任完成，不表示 allocator 已复用事务槽或已回收 undo 块。统计跨 worker 累计，attach 不清零；可用的真实 0 与不可用不同，比较时间窗增量时同时保留 origin 和实例生命周期。
+
+
+## Cleaner 待发表条目（分类 `ctrc`）
+
+| 键 | 值 | 读法 |
+|---|---|---|
+| `ctrc_publisher_stats_available` | `true` / `false` | 原诊断快照成功且本实例 origin 有效时为 `true`；否则省略以下 origin 和计数，不把不可用展示成 0。 |
+| `ctrc_publisher_origin_node_id` | 非负整数文本 | 执行观察的本实例节点号，从 0 开始；不是远端事务节点号或集群合计。 |
+| `ctrc_publisher_pending_count` | uint64 十进制文本 | 原本地 origin 表处于 `CERTIFYING` 的条目数；反映共享发表 handoff 尚未完成，可包括写入前或已耐久但尚未 handoff 的条目。 |
+
+这是查询时的阶段快照，退回 `BLOCKED` 或进入 `RELEASE_PROVEN` 后不再计入。`RELEASE_PROVEN` 仍可能等待通知或最终责任退休，不能据该计数为 0 推断所有清偿已完成。阶段观察也不证明磁盘耐久、owner 可运行、槽可复用或 undo 可回收；原身份和释放检查仍由实际使用路径完成。该值不是自 postmaster 启动累计的完成数。
+
+
+## Cleaner 未退休责任行（分类 `ctrc`）
+
+| 键 | 值 | 读法 |
+|---|---|---|
+| `ctrc_unsettled_stats_available` | `true` / `false` | 原诊断快照成功且本实例 origin 有效时为 `true`；否则省略以下 origin 和计数，不把不可用展示成 0。 |
+| `ctrc_unsettled_origin_node_id` | 非负整数文本 | 执行观察的本实例节点号，从 0 开始；不是远端事务节点号或集群合计。 |
+| `ctrc_unsettled_count` | uint64 十进制文本 | 查询时本地 origin、participant、receipt 三张表中尚占用的责任行数之和；同一事务可占多行，不是去重事务数或累计完成数。 |
+| `ctrc_oldest_unsettled_age_stats_available` | `true` / `false` | 原快照及本实例 origin 有效，所有观察到的占用行都有有效创建时间，且本机单调时钟未早于这些时间时为 `true`；否则省略年龄，原可用计数仍展示。 |
+| `ctrc_oldest_unsettled_age_ms` | uint64 十进制文本 | 本次逐表观察到的最早责任创建时间至观察结束的毫秒数，向下取整；无占用行为 0，新责任不足 1 毫秒也可为 0，应结合计数读取。 |
+
+origin 和 participant 非全零的行计入，包含预留但仍为 `EMPTY` 的 origin、`RELEASE_PROVEN`、`ACK_FROZEN`、`BLOCKED` 和非零异常行。receipt 状态非 `FREE` 或池中位置仍占用时计入，空位置与可复用 tombstone 不计。责任只有完成原退休才退出该观察范围；异常占用并不证明身份有效或可推进。
+
+三张表分别在原保护锁下依次观察，并非同一时刻的完整切片。计数为 0 不证明无其他残留责任、停机就绪、可复用事务槽或可回收 undo；应结合原阶段、日志及实际使用路径的完整检查。该计数也不表示可供给的容量。
+
+年龄从首次占用责任行开始，重复请求和清偿阶段变化不重置；只在原责任行完成退休后结束。它是本实例当前共享内存中的诊断时长，重启后重新记录，不是事务提交时间、undo 保留期限或 worker 的 pending 观察时长。缺少创建时间的异常占用仍计数，但年龄不可用；年龄不参与回收、准入、超时或停机判定。

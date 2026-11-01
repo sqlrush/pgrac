@@ -8,6 +8,10 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * PGRAC MODIFICATIONS
+ *    Preflight native text-search commands before role or catalog lookup.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/backend/commands/tsearchcmds.c
  *
@@ -33,6 +37,11 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#endif
 #include "commands/alter.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -40,6 +49,9 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_func.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "tsearch/ts_cache.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
@@ -62,6 +74,36 @@ static void DropConfigurationMapping(AlterTSConfigurationStmt *stmt,
 static DefElem *buildDefItem(const char *name, const char *val,
 							 bool was_quoted);
 
+
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before their first role or catalog query. */
+static void
+PreflightClusterSharedTSearchWrite(const char *command, bool alter)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+	const char *action = alter ? "alteration" : "creation";
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog %s does not support subtransactions", action)));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog %s", action)));
+}
+#endif
 
 /* --------------------- TS Parser commands ------------------------ */
 
@@ -193,6 +235,10 @@ DefineTSParser(List *names, List *parameters)
 	Oid			prsOid;
 	Oid			namespaceoid;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedTSearchWrite("CREATE TEXT SEARCH PARSER", false);
+#endif
 
 	if (!superuser())
 		ereport(ERROR,
@@ -410,6 +456,10 @@ DefineTSDictionary(List *names, List *parameters)
 	char	   *dictname;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedTSearchWrite("CREATE TEXT SEARCH DICTIONARY", false);
+#endif
+
 	/* Convert list of names to a name and namespace */
 	namespaceoid = QualifiedNameGetCreationNamespace(names, &dictname);
 
@@ -504,6 +554,10 @@ AlterTSDictionary(AlterTSDictionaryStmt *stmt)
 	bool		repl_null[Natts_pg_ts_dict];
 	bool		repl_repl[Natts_pg_ts_dict];
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedTSearchWrite("ALTER TEXT SEARCH DICTIONARY", true);
+#endif
 
 	dictId = get_ts_dict_oid(stmt->dictname, false);
 
@@ -700,6 +754,10 @@ DefineTSTemplate(List *names, List *parameters)
 	Oid			namespaceoid;
 	char	   *tmplname;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedTSearchWrite("CREATE TEXT SEARCH TEMPLATE", false);
+#endif
 
 	if (!superuser())
 		ereport(ERROR,
@@ -912,6 +970,10 @@ DefineTSConfiguration(List *names, List *parameters, ObjectAddress *copied)
 	Oid			cfgOid;
 	ListCell   *pl;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedTSearchWrite("CREATE TEXT SEARCH CONFIGURATION", false);
+#endif
 
 	/* Convert list of names to a name and namespace */
 	namespaceoid = QualifiedNameGetCreationNamespace(names, &cfgname);
@@ -1159,6 +1221,10 @@ AlterTSConfiguration(AlterTSConfigurationStmt *stmt)
 	Oid			cfgId;
 	Relation	relMap;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedTSearchWrite("ALTER TEXT SEARCH CONFIGURATION", true);
+#endif
 
 	/* Find the configuration */
 	tup = GetTSConfigTuple(stmt->cfgname);

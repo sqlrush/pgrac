@@ -15,16 +15,27 @@ int header_fixture_main(void);
 #include "catalog/pg_control.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_undo_capacity.h"
+#include "cluster/cluster_native_itl_trace.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 
-/* The inherited header fixture admits locks immediately and models no outer
- * content lock. Keep that same leaf boundary for the real block-zero writer. */
-bool
-LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+/* Diagnostics remain disabled at this standalone I/O boundary. */
+bool cluster_trace_tx_identity = false;
+void
+cluster_native_itl_trace_terminal(ClusterNativeItlTraceKind kind, uint8 owner, uint32 segment,
+								  uint32 generation, uint16 offset, const TTSlot *slot,
+								  XLogRecPtr lsn, const ClusterCanonicalTxnBinding *binding)
 {
-	(void)mode;
-	return LWLockHeldByMe(lock);
+	(void)kind;
+	(void)owner;
+	(void)segment;
+	(void)generation;
+	(void)offset;
+	(void)slot;
+	(void)lsn;
+	(void)binding;
+	abort();
 }
 
 static PGPROC coverage_proc;

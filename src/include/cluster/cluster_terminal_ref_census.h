@@ -126,6 +126,23 @@ typedef enum ClusterCtrcCleanerReason {
 	CTRC_CLEANER_REASON_COUNT
 } ClusterCtrcCleanerReason;
 
+#define CLUSTER_CTRC_COMPLETION_STATS_V1 1
+
+/* Counts completed origin responsibility retirement, not allocator reuse. */
+typedef struct ClusterCtrcCompletionStats {
+	int32 origin_node_id;
+	uint64 real_completion_count;
+} ClusterCtrcCompletionStats;
+
+#define CLUSTER_CTRC_NO_PROGRESS_STATS_V1 1
+
+/* Independent diagnostic counters for completed passes without local progress.
+ * The origin identifies the executing instance, not a transaction or release. */
+typedef struct ClusterCtrcNoProgressStats {
+	int32 origin_node_id;
+	uint64 by_reason[CTRC_CLEANER_REASON_COUNT];
+} ClusterCtrcNoProgressStats;
+
 #define CLUSTER_CTRC_CLEANER_WORKERS 8
 
 /* Scheduling observations only; neither a coherent authority snapshot nor
@@ -356,6 +373,8 @@ typedef struct ClusterCtrcOriginEntry {
 	uint8 reserved8[6];
 	ClusterCtrcParticipantIdentity touched[CLUSTER_CTRC_MAX_PARTICIPANTS];
 	uint64 close_request_id[CLUSTER_CTRC_MAX_PARTICIPANTS];
+	/* Local monotonic diagnostic only; cleared by original row retirement. */
+	uint64 diagnostic_born_us;
 } ClusterCtrcOriginEntry;
 
 typedef enum ClusterCtrcOriginReservationKind {
@@ -395,6 +414,8 @@ typedef struct ClusterCtrcParticipantEntry {
 	uint64 cancelled_count;
 	uint64 cleaned_count;
 	uint64 ack_frozen_count;
+	/* First occupation, including a CLOSE tombstone; not a release deadline. */
+	uint64 diagnostic_born_us;
 } ClusterCtrcParticipantEntry;
 
 typedef struct ClusterCtrcReceipt {
@@ -406,6 +427,8 @@ typedef struct ClusterCtrcReceipt {
 	uint8 reserved8[3];
 	XLogRecPtr highest_local_wal_lsn;
 	XLogRecPtr required_lsn[CLUSTER_SF_DEP_MAX_ORIGINS];
+	/* Immutable from pool placement through final pool-locked reclamation. */
+	uint64 diagnostic_born_us;
 } ClusterCtrcReceipt;
 
 /* A process-local observation of the original cleaner's one APPLIED
@@ -838,6 +861,10 @@ extern void cluster_ctrc_active_scan_step_source(
 	ClusterCtrcActiveScan *scan, const struct ClusterSemanticActiveSampleFence *source);
 
 
+#define CLUSTER_CTRC_PUBLISHER_STATS_V1 1
+#define CLUSTER_CTRC_UNSETTLED_STATS_V1 1
+#define CLUSTER_CTRC_UNSETTLED_AGE_STATS_V1 1
+
 typedef struct ClusterCtrcDebugSnapshot {
 	uint64 origin_open;
 	uint64 origin_sealing;
@@ -858,6 +885,20 @@ typedef struct ClusterCtrcDebugSnapshot {
 	uint64 test_barrier_hit_count;
 	uint32 test_barrier_phase;
 	uint32 cleaner_reason;
+	/* Require snapshot success and field availability; phase only, not
+	 * durable release, owner liveness, notifications or allocator proof. */
+	uint64 publisher_pending_count;
+	int32 publisher_origin_node_id;
+	bool publisher_stats_available;
+	/* Occupied responsibility rows, not distinct keys or an idle proof.
+	 * Require snapshot success; domains are sampled under separate locks. */
+	uint64 unsettled_count;
+	int32 unsettled_origin_node_id;
+	bool unsettled_stats_available;
+	/* Same sampled responsibility rows; never a coherent authority cut.
+	 * Missing birth metadata or a backwards clock makes age unavailable. */
+	uint64 oldest_unsettled_age_ms;
+	bool oldest_unsettled_age_available;
 } ClusterCtrcDebugSnapshot;
 
 typedef enum ClusterCtrcCapacityDisposition {
@@ -938,6 +979,10 @@ extern uint64 cluster_ctrc_cleaner_local_passes(void);
 extern ClusterCtrcCleanerReason cluster_ctrc_cleaner_worker_reason(unsigned worker_id);
 extern bool cluster_ctrc_cleaner_worker_observation(unsigned worker_id,
 													ClusterCtrcCleanerWorkerObservation *out);
+/* False preserves output, including when the local origin is unavailable. */
+extern bool cluster_ctrc_no_progress_stats_snapshot(ClusterCtrcNoProgressStats *out);
+/* False preserves output; origin identifies the executing local instance. */
+extern bool cluster_ctrc_completion_stats_snapshot(ClusterCtrcCompletionStats *out);
 extern bool cluster_ctrc_debug_snapshot(ClusterCtrcDebugSnapshot *snapshot);
 extern bool cluster_ctrc_test_barrier_control(ClusterCtrcTestBarrierPhase phase, bool armed);
 extern void cluster_ctrc_test_barrier_wait(ClusterCtrcTestBarrierPhase phase);
@@ -1146,6 +1191,32 @@ extern ClusterCapacityReasonV1
 cluster_ctrc_capacity_probe_pool_segment_v1(uint32 current_segment, SCN horizon, uint64 epoch,
 											const ClusterCtrcTxnKeyV1 *hint,
 											ClusterCapacityObservationV1 *observation);
+
+/* Caller-private coverage of a single unchanged horizon/identity cut. A legal
+ * bounded continuation sets incomplete+progress; unknown evidence sets only
+ * incomplete. This is never a release/reuse grant or a long-reader verdict. */
+#define CLUSTER_CTRC_CAPACITY_HISTORY_V1 1
+typedef struct ClusterCapacityHistoryPass {
+	ClusterCapacitySegmentIdentityV1 identity;
+	SCN horizon;
+	uint64 change_sequence;
+	uint32 next_position;
+	uint32 covered_positions;
+	uint32 allocated_count;
+	uint32 first_absent_position;
+	uint32 record_segment;
+	uint32 configured_cap;
+	bool started;
+	bool complete;
+	bool incomplete;
+	bool progress;
+	bool history_only;
+	bool current_proven;
+	bool saw_history;
+} ClusterCapacityHistoryPass;
+extern ClusterCapacityReasonV1 cluster_ctrc_capacity_probe_history_v1(
+	uint32 current_segment, SCN horizon, uint64 epoch, const ClusterCtrcTxnKeyV1 *hint,
+	ClusterCapacityHistoryPass *pass, ClusterCapacityObservationV1 *observation);
 
 /*
  * L11/L12 canonical release sampler for the current allocator GC.  The

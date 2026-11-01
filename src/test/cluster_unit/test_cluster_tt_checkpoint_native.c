@@ -211,8 +211,11 @@ native_clear(SCN scn)
 static void *
 native_producer(void *unused)
 {
+	ClusterSpaceDropState *deferred_drop = NULL;
+
 	(void)unused;
-	native_result = RecordTransactionCommit();
+	native_result = RecordTransactionCommit(&deferred_drop);
+	UT_ASSERT(deferred_drop == NULL);
 	pthread_mutex_lock(&native_mutex);
 	native_done = true;
 	pthread_cond_signal(&native_cond);

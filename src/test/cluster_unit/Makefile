@@ -38,7 +38,7 @@ endif
 
 # The backend CRC dispatcher logs its hardware selection on some platforms.
 # Retain that real dispatcher; supply a fail-stop standalone logging boundary.
-CLUSTER_UNIT_PORT_LIBS = $(top_builddir)/src/port/libpgport_srv.a cluster_unit_port_stubs.o cluster_catalog_trace_test.o
+CLUSTER_UNIT_PORT_LIBS = $(top_builddir)/src/port/libpgport_srv.a cluster_unit_port_stubs.o cluster_catalog_trace_test.o cluster_undo_capacity_unit.o
 CLUSTER_UNIT_CLANG ?= $(if $(strip $(CLANG)),$(CLANG),clang)
 
 # Analyze the same extracted product bodies that the standalone tests compile.
@@ -229,7 +229,7 @@ TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_rea
 
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 TESTS += test_cluster_recovery_ctrc_record
-TESTS += test_cluster_tt_abort_owner test_cluster_tt_active_owner
+TESTS += test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_alter_early_bind test_cluster_analyze_preflight test_cluster_largeobject_preflight test_cluster_subscription_preflight test_cluster_drop_early_bind
 TESTS += test_cluster_abort_writer test_cluster_storage_abort_writeback
 TESTS += test_cluster_undo_header_durability
 TESTS += test_cluster_tt_checkpoint_cuts
@@ -429,6 +429,8 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 
+TESTS += test_cluster_tt_locator_family
+
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
 # test_cluster_gviews / test_cluster_ic / test_cluster_conf have
@@ -460,6 +462,12 @@ SIMPLE_TESTS := $(filter-out test_cluster_current_mx_publication_cassert test_cl
 		test_cluster_r4_lms_controls test_cluster_r4_slot_reservation \
 		test_cluster_r4_observe test_cluster_r4_multi_subx_2pc \
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_tt_locator_family,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_alter_early_bind,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_analyze_preflight,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_largeobject_preflight,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_subscription_preflight,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_drop_early_bind,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_native_wal_stop test_cluster_hw_initdb test_cluster_hw_cold test_cluster_cr_inline_stop test_cluster_mrp_stop test_cluster_backup_stop test_cluster_recovery_stop test_cluster_node_remove_stop test_cluster_postmaster_stop test_cluster_checkpointer_stop test_cluster_allocation_stop test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
 		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_successor_fence test_cluster_ctrc_dispatch test_cluster_heap_receipt \
@@ -974,7 +982,43 @@ test_cluster_fresh_read.inc: $(top_srcdir)/src/common/controldata_utils.c Makefi
 	mv $@.tmp $@
 test_cluster_fresh_boolean.inc: $(top_srcdir)/src/backend/commands/define.c Makefile
 	awk '/^defGetBoolean\(/ { print "bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	     /^errorConflictingDefElem\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_alter_lookup.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^AlterTableLookupRelation\(/ { print "Oid"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_alter_apply.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^AlterTable\(/ { print "void"; emit=1; count++ } \
+	     emit && /Caller is required to provide an adequate lock/ \
+	     { print "return; }"; emit=0; cuts++ } \
+	     emit { print } /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (count != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_drop_relations.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^RemoveRelations\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_drop_objects.inc: $(top_srcdir)/src/backend/commands/dropcmds.c Makefile
+	awk '/^RemoveObjects\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_drop_owned.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^DropOwnedObjects\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_index_create.inc: $(top_srcdir)/src/backend/commands/indexcmds.c Makefile
+	awk '/^DefineIndex\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /root_save_nestlevel = NewGUCNestLevel\(\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_index.inc: $(top_srcdir)/src/backend/commands/indexcmds.c Makefile
 	awk '/^CheckClusterIndexAccessMethodName\(/ { print "static void"; emit=1 } \
@@ -998,25 +1042,713 @@ test_cluster_create_utility_entry.inc: $(top_srcdir)/src/backend/tcop/utility.c 
 	     emit { print } /^}/ { inside=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_shared_utility.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefile
-	awk '/^CheckClusterSharedUtilitySupport\(/ { print "static void"; emit=1; count++ } \
+	awk '/^(static )?void$$/ { declaration=$$0 } \
+	     /^CheckClusterSharedUtilitySupport\(/ { print declaration; emit=1; count++ } \
+	     /^CheckClusterShared(StorageDrop|UtilitySupportInternal)\(/ { print "static void"; emit=1; phases++ } \
 	     /^ClassifyUtilityCommandAsReadOnly\(/ { print "static int"; emit=1; classify++ } \
+	     /^PreflightClusterSharedCatalogAlterTable\(/ { print "void"; emit=1; native_alter++ } \
+	     /^PreflightClusterSharedCatalogDrop\(/ { print "void"; emit=1; native_drop++ } \
 	     /^PreflightClusterSharedCatalog(Create|Write)\(/ \
 	     { print "static void"; emit=1; preflight++ } \
 	     /^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
 	     { print "void"; emit=1; guards++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (count != 1 || classify != 1 || preflight != 1 || guards != 3 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 1 || classify != 1 || preflight != 1 || guards != 3 || phases > 2 || native_drop > 1 || native_alter > 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_catalog_index.inc: $(top_srcdir)/src/backend/catalog/index.c Makefile
 	awk '/^index_create\(/ { print "Oid"; emit=1; count++ } \
 	     emit && /\/\* constraint flags can only be set/ { print "return InvalidOid; }"; emit=0 } \
 	     emit { print } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_import.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^ImportForeignSchema\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_import_filter.inc: $(top_srcdir)/src/backend/foreign/foreign.c Makefile
+	awk '/^IsImportableForeignTable\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_extension.inc: $(top_srcdir)/src/backend/commands/extension.c Makefile
+	awk '/^check_valid_extension_name\(/ { print "static void"; emit=1; validator++ } \
+	     /^CreateExtension\(/ { print "ObjectAddress"; emit=1; create++ } \
+	     /^AlterExtensionNamespace\(/ { print "ObjectAddress"; emit=1; namespace=1; entries++ } \
+	     /^PreflightClusterSharedExtensionWrite\(/ { print "static void"; emit=1; helper++ } \
+	     /^ExecAlterExtensionStmt\(/ { print "ObjectAddress"; emit=1; update=1; entries++ } \
+	     /^ExecAlterExtensionContentsStmt\(/ { print "ObjectAddress"; emit=1; contents=1; entries++ } \
+	     emit { print } \
+	     namespace && /extensionOid = get_extension_oid\(extensionName, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; namespace=0; cuts++ } \
+	     update && /extRel = table_open\(ExtensionRelationId, AccessShareLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; update=0; cuts++ } \
+	     contents && /&relation, AccessShareLock, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; contents=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 3 || cuts != 3 || helper != 1 || validator != 1 || create != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_schema_create.inc: $(top_srcdir)/src/backend/commands/schemacmds.c Makefile
+	awk '/^CreateSchemaCommand\(/ { print "Oid"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /GetUserIdAndSecContext\(&saved_uid, &save_sec_context\);/ \
+	     { print "return InvalidOid; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_schema.inc: $(top_srcdir)/src/backend/commands/schemacmds.c Makefile
+	awk '/^PreflightClusterSharedSchemaWrite\(/ { print "static void"; emit=1; helper++ } \
+	     /^RenameSchema\(/ { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     /^AlterSchemaOwner\(/ { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && /rel = table_open\(NamespaceRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 2 || cuts != 2 || helper > 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_comment.inc: $(top_srcdir)/src/backend/commands/comment.c Makefile
+	awk '/^CommentObject\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /&relation, ShareUpdateExclusiveLock, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_seclabel.inc: $(top_srcdir)/src/backend/commands/seclabel.c Makefile
+	awk '/^typedef struct$$/ { emit=1; types++ } \
+	     /^static List \*label_provider_list = NIL;/ { print; lists++ } \
+	     /^SecLabelSupportsObjectType\(/ { print "static bool"; emit=1; support++ } \
+	     /^ExecSecLabelStmt\(/ { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && /&relation, ShareUpdateExclusiveLock, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (types != 1 || lists != 1 || support != 1 || entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_policy.inc: $(top_srcdir)/src/backend/commands/policy.c Makefile
+	awk '/^parse_policy_command\(/ { print "static char"; emit=1; commands++ } \
+	     /^policy_role_list_to_array\(/ { print "static Datum *"; emit=1; roles++ } \
+	     /^PreflightClusterSharedPolicyWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^CreatePolicy\(/ || /^AlterPolicy\(/ || /^rename_policy\(/ \
+	     { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && /\(void \*\) stmt\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (commands != 1 || roles != 1 || helpers > 1 || entries != 3 || cuts != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_conversion.inc: $(top_srcdir)/src/backend/commands/conversioncmds.c Makefile
+	awk '/^CreateConversionCommand\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /&conversion_name\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_collation.inc: $(top_srcdir)/src/backend/commands/collationcmds.c Makefile
+	awk '/^PreflightClusterSharedCollationWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^DefineCollation\(/ || /^AlterCollation\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && (/collNamespace = QualifiedNameGetCreationNamespace\(names, &collName\);/ \
+	              || /rel = table_open\(CollationRelationId, RowExclusiveLock\);/) \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_event_trigger.inc: $(top_srcdir)/src/backend/commands/event_trigger.c Makefile
+	awk '/^PreflightClusterSharedEventTriggerWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^CreateEventTrigger\(/ || /^AlterEventTrigger\(/ \
+	     { print "Oid"; emit=1; create=($$0 ~ /^CreateEventTrigger\(/); entries++ } \
+	     /^AlterEventTriggerOwner\(/ { print "ObjectAddress"; emit=1; owner=1; entries++ } \
+	     emit { print } \
+	     create && /Must be superuser to create an event trigger\./ \
+	     { print "return InvalidOid; }"; emit=0; create=0; cuts++ } \
+	     emit && /table_open\(EventTriggerRelationId, RowExclusiveLock\);/ \
+	     { print owner ? "return InvalidObjectAddress; }" : "return InvalidOid; }"; \
+	       emit=0; owner=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 3 || cuts != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_owner.inc: $(top_srcdir)/src/backend/commands/alter.c Makefile
+	awk '/^PreflightClusterSharedOwnerWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^ExecAlterOwnerStmt\(/ { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && /newowner = get_rolespec_oid\(stmt->newowner, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_language.inc: $(top_srcdir)/src/backend/commands/proclang.c Makefile
+	awk '/^CreateProceduralLanguage\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /must be superuser to create custom procedural language/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_access_method.inc: $(top_srcdir)/src/backend/commands/amcmds.c Makefile
+	awk '/^CreateAccessMethod\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(AccessMethodRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_function.inc: $(top_srcdir)/src/backend/commands/functioncmds.c Makefile
+	awk '/^PreflightClusterSharedFunctionWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^CreateFunction\(/ || /^AlterFunction\(/ || /^CreateCast\(/ || /^CreateTransform\(/ \
+	     { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && (/&funcname\);/ || /rel = table_open\(ProcedureRelationId, RowExclusiveLock\);/ \
+	               || /sourcetypeid = typenameTypeId\(NULL, stmt->sourcetype\);/ \
+	               || /typeid = typenameTypeId\(NULL, stmt->type_name\);/) \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 4 || cuts != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_fdw.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^PreflightClusterSharedFdwWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^CreateForeignDataWrapper\(/ || /^AlterForeignDataWrapper\(/ \
+	     { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && /rel = table_open\(ForeignDataWrapperRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_foreign_table_create.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^CreateForeignTable\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*CommandCounterIncrement\(\);/ { print "return; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_foreign_server.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^CreateForeignServer\(/ || /^AlterForeignServer\(/ \
+	     { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && /rel = table_open\(ForeignServerRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_user_mapping.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^CreateUserMapping\(/ || /^AlterUserMapping\(/ \
+	     { print "ObjectAddress"; emit=1; entries++ } \
+	     /^RemoveUserMapping\(/ { print "Oid"; emit=1; removing=1; entries++ } \
+	     emit { print } \
+	     emit && !removing && /rel = table_open\(UserMappingRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     emit && removing && /srv = GetForeignServerByName\(stmt->servername, true\);/ \
+	     { print "return InvalidOid; }"; emit=0; removing=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 3 || cuts != 3 || emit || removing) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_statistics_alter.inc: $(top_srcdir)/src/backend/commands/statscmds.c Makefile
+	awk '/^AlterStatistics\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /stxoid = get_statistics_object_oid\(stmt->defnames, stmt->missing_ok\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_operator.inc: $(top_srcdir)/src/backend/commands/operatorcmds.c Makefile
+	awk '/^CheckClusterSharedOperatorSupport\(/ { print "static void"; emit=1; helpers++ } \
+	     /^DefineOperator\(/ || /^AlterOperator\(/ \
+	     { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && (/oprNamespace = QualifiedNameGetCreationNamespace\(names, &oprName\);/ || \
+	              /oprId = LookupOperWithArgs\(stmt->opername, false\);/) \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_opclass.inc: $(top_srcdir)/src/backend/commands/opclasscmds.c Makefile
+	awk '/^CheckClusterSharedOpClassSupport\(/ { print "static void"; emit=1; helpers++ } \
+	     /^DefineOpClass\(/ || /^DefineOpFamily\(/ \
+	     { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     /^AlterOpFamily\(/ { print "Oid"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && (/&opcname\);/ || /&opfname\);/) \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     entry && /tup = SearchSysCache1\(AMNAME, CStringGetDatum\(stmt->amname\)\);/ \
+	     { print "return InvalidOid; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 3 || cuts != 3 || emit || entry) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_aggregate.inc: $(top_srcdir)/src/backend/commands/aggregatecmds.c Makefile
+	awk '/^DefineAggregate\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /aggNamespace = QualifiedNameGetCreationNamespace\(name, &aggName\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_tsearch.inc: $(top_srcdir)/src/backend/commands/tsearchcmds.c Makefile
+	awk '/^PreflightClusterSharedTSearchWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^DefineTSParser\(/ || /^DefineTSDictionary\(/ || /^DefineTSTemplate\(/ || \
+	     /^DefineTSConfiguration\(/ || /^AlterTSDictionary\(/ || /^AlterTSConfiguration\(/ \
+	     { print "ObjectAddress"; emit=1; entry=1; entries++ } \
+	     emit { print } \
+	     entry && (/errmsg\("must be superuser to create text search (parsers|templates)"\)\)\);/ || \
+	               /namespaceoid = QualifiedNameGetCreationNamespace\(names, &(dictname|cfgname)\);/ || \
+	               /dictId = get_ts_dict_oid\(stmt->dictname, false\);/ || \
+	               /tup = GetTSConfigTuple\(stmt->cfgname\);/) \
+	     { print "return InvalidObjectAddress; }"; emit=0; entry=0; cuts++ } \
+	     /^}/ { emit=0; entry=0 } \
+	     END { if (helpers > 1 || entries != 6 || cuts != 6 || emit || entry) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_publication.inc: $(top_srcdir)/src/backend/commands/publicationcmds.c Makefile
+	awk '/^PreflightClusterSharedPublicationWrite\(/ \
+	     { print "static void"; emit=1; helpers++ } \
+	     /^CreatePublication\(/ { print "ObjectAddress"; emit=1; creating=1; entries++ } \
+	     /^AlterPublication\(/ { print "void"; emit=1; creating=0; entries++ } \
+	     emit { print } \
+	     emit && creating && /aclresult = object_aclcheck\(DatabaseRelationId, MyDatabaseId, GetUserId\(\), ACL_CREATE\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     emit && !creating && /rel = table_open\(PublicationRelationId, RowExclusiveLock\);/ \
+	     { print "return; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_foreign_owner.inc: $(top_srcdir)/src/backend/commands/foreigncmds.c Makefile
+	awk '/^AlterForeign(DataWrapper|Server)Owner\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(Foreign(DataWrapper|Server)RelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_subscription_owner.inc: $(top_srcdir)/src/backend/commands/subscriptioncmds.c Makefile
+	awk '/^AlterSubscriptionOwner\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(SubscriptionRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_tablespace_options.inc: $(top_srcdir)/src/backend/commands/tablespace.c Makefile
+	awk '/^AlterTableSpaceOptions\(/ { print "Oid"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(TableSpaceRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidOid; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_vacuum_scope.inc: $(top_srcdir)/src/backend/commands/vacuum.c Makefile
+	awk '/^vacuum\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /in_outer_xact = IsInTransactionBlock\(isTopLevel\);/ { print "}"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_tablespace_move_scope.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^AlterTableMoveAll\(/ { print "Oid"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /role_oids = roleSpecsToIds\(stmt->roles\);/ { print "return InvalidOid; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_tablespace_rename.inc: $(top_srcdir)/src/backend/commands/tablespace.c Makefile
+	awk '/^RenameTableSpace\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(TableSpaceRelationId, RowExclusiveLock\);/ { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_tablespace_create_scope.inc: $(top_srcdir)/src/backend/commands/tablespace.c Makefile
+	awk '/^CreateTableSpace\(/ { print "Oid"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /errhint\("Must be superuser to create a tablespace\."\)\)\);/ { print "return InvalidOid; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_tablespace_drop_scope.inc: $(top_srcdir)/src/backend/commands/tablespace.c Makefile
+	awk '/^DropTableSpace\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(TableSpaceRelationId, RowExclusiveLock\);/ { print "}"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_cluster_scope.inc: $(top_srcdir)/src/backend/commands/cluster.c Makefile
+	awk '/^cluster\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*RangeVarCallbackOwnsTable, NULL\);/ { print "\t}"; emit=0; relation_cuts++ } \
+	     entries && !emit && /^[[:space:]]*PreventInTransactionBlock\(isTopLevel, "CLUSTER"\);/ \
+	     { print; print "}"; restriction_cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || relation_cuts != 1 || restriction_cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_matview_scope.inc: $(top_srcdir)/src/backend/commands/matview.c Makefile
+	awk '/^ExecRefreshMatView\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*RangeVarCallbackOwnsTable, NULL\);/ { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_domain_constraint_entry.inc: $(top_srcdir)/src/backend/commands/typecmds.c Makefile
+	awk '/^AlterDomainAddConstraint\(/ { print "ObjectAddress"; emit=1; publics++ } \
+	     /^AlterDomainAddConstraintInternal\(/ { print "ObjectAddress"; emit=1; internals++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*typename = makeTypeNameFromNameList\(names\);/ { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) ends++; emit=0 } \
+	     END { if (publics != 1 || internals > 1 || cuts != 1 || ends != internals || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_domain_constraint_rebuild.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^[[:space:]]*case AT_ReAddDomainConstraint:.*Re-add pre-existing domain check/ { emit=1; entries++ } \
+	     emit && /^[[:space:]]*case AT_ReAddComment:/ { emit=0; cuts++ } \
+	     emit { print } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_domain_alter_scope.inc: $(top_srcdir)/src/backend/commands/typecmds.c Makefile
+	awk '/^AlterDomainDefault\(/ { print "ObjectAddress"; emit=1; entries++; defaults++ } \
+	     /^AlterDomainNotNull\(/ { print "ObjectAddress"; emit=1; entries++; notnulls++ } \
+	     /^AlterDomainDropConstraint\(/ { print "ObjectAddress"; emit=1; entries++; drops++ } \
+	     /^AlterDomainValidateConstraint\(/ { print "ObjectAddress"; emit=1; entries++; validates++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*typename = makeTypeNameFromNameList\(names\);/ { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 4 || defaults != 1 || notnulls != 1 || drops != 1 || validates != 1 || cuts != 4 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_type_factory_scope.inc: $(top_srcdir)/src/backend/commands/typecmds.c Makefile
+	awk '/^DefineType\(/ { print "ObjectAddress"; emit=base=1; entries++ } \
+	     /^DefineCompositeType\(/ { print "ObjectAddress"; emit=composite=1; entries++ } \
+	     emit { print } \
+	     emit && base && /typeNamespace = QualifiedNameGetCreationNamespace\(names, &typeName\);/ { print "return InvalidObjectAddress; }"; emit=base=0; basecuts++ } \
+	     emit && composite && /makeNode\(CreateStmt\);/ { print "return InvalidObjectAddress; }"; emit=composite=0; compositecuts++ } \
+	     /^}/ { if (emit) bad++; emit=base=composite=0 } \
+	     END { if (entries != 2 || basecuts != 1 || compositecuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_type_creation_scope.inc: $(top_srcdir)/src/backend/commands/typecmds.c Makefile
+	awk '/^DefineDomain\(/ { print "ObjectAddress"; emit=domain=1; entries++ } \
+	     /^DefineRange\(/ { print "ObjectAddress"; emit=range=1; entries++ } \
+	     emit { print } \
+	     emit && domain && /^[[:space:]]*&domainName\);/ { print "return InvalidObjectAddress; }"; emit=domain=0; domaincuts++ } \
+	     emit && range && /^[[:space:]]*&typeName\);/ { print "return InvalidObjectAddress; }"; emit=range=0; rangecuts++ } \
+	     /^}/ { if (emit) bad++; emit=domain=range=0 } \
+	     END { if (entries != 2 || domaincuts != 1 || rangecuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_enum_scope.inc: $(top_srcdir)/src/backend/commands/typecmds.c Makefile
+	awk '/^DefineEnum\(/ { print "ObjectAddress"; emit=create=1; entries++ } \
+	     /^AlterEnum\(/ { print "ObjectAddress"; emit=alter=1; entries++ } \
+	     emit { print } \
+	     emit && create && /^[[:space:]]*&enumName\);/ { print "return InvalidObjectAddress; }"; emit=create=0; createcuts++ } \
+	     emit && alter && /^[[:space:]]*typename = makeTypeNameFromNameList\(stmt->typeName\);/ { print "return InvalidObjectAddress; }"; emit=alter=0; altercuts++ } \
+	     /^}/ { if (emit) bad++; emit=create=alter=0 } \
+	     END { if (entries != 2 || createcuts != 1 || altercuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_type_mutation_scope.inc: $(top_srcdir)/src/backend/commands/typecmds.c Makefile
+	awk '/^\/\* parameter structure for AlterTypeRecurse\(\) \*\// { emit=typedef=1; typedefs++ } \
+	     /^RenameType\(/ { print "ObjectAddress"; emit=rename=1; entries++ } \
+	     /^AlterType\(/ { print "ObjectAddress"; emit=options=1; entries++ } \
+	     emit { print } \
+	     emit && typedef && /^} AlterTypeRecurseParams;/ { emit=typedef=0; typedefends++ } \
+	     emit && rename && /^[[:space:]]*typename = makeTypeNameFromNameList\(names\);/ { print "return InvalidObjectAddress; }"; emit=rename=0; renamecuts++ } \
+	     emit && options && /^[[:space:]]*catalog = table_open\(TypeRelationId, RowExclusiveLock\);/ { print "return InvalidObjectAddress; }"; emit=options=0; optionscuts++ } \
+	     /^}/ { if (emit) bad++; emit=rename=options=0 } \
+	     END { if (typedefs != 1 || typedefends != 1 || entries != 2 || renamecuts != 1 || optionscuts != 1 || emit || typedef || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_type_scope.inc: $(top_srcdir)/src/backend/commands/typecmds.c Makefile
+	awk '/^CheckClusterSharedTypeSupport\(/ { print "static void"; emit=1; helper=1; helpers++ } \
+	     /^AlterTypeOwner\(/ { print "ObjectAddress"; emit=1; owner=1; entries++ } \
+	     /^AlterTypeNamespace\(/ { print "ObjectAddress"; emit=1; namespace=1; entries++ } \
+	     emit { print } \
+	     emit && owner && /^[[:space:]]*rel = table_open\(TypeRelationId, RowExclusiveLock\);/ { print "return InvalidObjectAddress; }"; emit=owner=0; ownercuts++ } \
+	     emit && namespace && /^[[:space:]]*typename = makeTypeNameFromNameList\(names\);/ { print "return InvalidObjectAddress; }"; emit=namespace=0; namespacecuts++ } \
+	     emit && helper && /^}/ { emit=helper=0 } \
+	     /^}/ { if (emit) bad++; emit=owner=namespace=0 } \
+	     END { if (helpers > 1 || entries != 2 || ownercuts != 1 || namespacecuts != 1 || emit || helper || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_table_namespace.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^AlterTableNamespace\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*\(void \*\) stmt\);/ { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_constraint_rename.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^RenameConstraint\(/ { print "ObjectAddress"; emit=1; entries++; phase=1 } \
+	     phase == 2 && /^\telse$$/ { emit=1; phase=3; alternatives++ } \
+	     emit { print } \
+	     emit && phase == 1 && /^[[:space:]]*typid = typenameTypeId\(NULL, makeTypeNameFromNameList\(castNode\(List, stmt->object\)\)\);$$/ { print "return InvalidObjectAddress; }"; emit=0; phase=2; domaincuts++ } \
+	     emit && phase == 3 && /^[[:space:]]*NULL\);$$/ { print "return InvalidObjectAddress; } }"; emit=0; phase=4; tablecuts++ } \
+	     phase && /^}/ { emit=0; if (phase != 4) bad++; phase=0; closed++ } \
+	     END { if (entries != 1 || domaincuts != 1 || alternatives != 1 || tablecuts != 1 || closed != 1 || emit || phase || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_relation_rename.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^RenameRelation\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*\(void \*\) stmt\);/ \
+	     { print "return InvalidObjectAddress; } }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_column_rename.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^renameatt\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*NULL\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_trigger_rename.inc: $(top_srcdir)/src/backend/commands/trigger.c Makefile
+	awk '/^renametrig\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*NULL\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_rule_rename.inc: $(top_srcdir)/src/backend/rewrite/rewriteDefine.c Makefile
+	awk '/^RenameRewriteRule\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^[[:space:]]*NULL\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_publication_owner.inc: $(top_srcdir)/src/backend/commands/publicationcmds.c Makefile
+	awk '/^AlterPublicationOwner\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(PublicationRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_database_settings.inc: $(top_srcdir)/src/backend/commands/dbcommands.c Makefile
+	awk '/^PreflightClusterSharedDatabaseWrite\(/ \
+	     { print "static void"; emit=1; helpers++ } \
+	     /^AlterDatabaseRefreshColl\(/ { print "ObjectAddress"; emit=1; refreshing=1; entries++ } \
+	     /^AlterDatabaseSet\(/ { print "Oid"; emit=1; refreshing=0; entries++ } \
+	     emit { print } \
+	     emit && refreshing && /rel = table_open\(DatabaseRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     emit && !refreshing && /datid = get_database_oid\(stmt->dbname, false\);/ \
+	     { print "return InvalidOid; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (helpers > 1 || entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_database_identity.inc: $(top_srcdir)/src/backend/commands/dbcommands.c Makefile
+	awk '/^RenameDatabase\(/ || /^AlterDatabaseOwner\(/ \
+	     { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(DatabaseRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 2 || cuts != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_database_options.inc: $(top_srcdir)/src/backend/commands/dbcommands.c $(top_srcdir)/src/backend/commands/define.c Makefile
+	awk '/^defGetInt32\(/ { print "int32"; emit=1; entries++ } \
+	     emit { print } emit && /^}/ { emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' \
+	     $(top_srcdir)/src/backend/commands/define.c > $@.tmp
+	awk '/^AlterDatabase\(/ { print "Oid"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(DatabaseRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidOid; }"; emit=0; cuts++ } \
+	     /^}/ { emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_view.inc: $(top_srcdir)/src/backend/commands/view.c Makefile
+	awk '/^DefineView\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /viewParse = parse_analyze_fixedparams\(rawstmt, queryString, NULL, 0, NULL\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_rule.inc: $(top_srcdir)/src/backend/rewrite/rewriteDefine.c Makefile
+	awk '/^DefineRule\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /transformRuleStmt\(stmt, queryString, &actions, &whereClause\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_relation_create.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^DefineRelation\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /RangeVarGetAndCheckCreationNamespace\(stmt->relation, NoLock, NULL\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_truncate.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^ExecuteTruncate\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /myrelid = RangeVarGetRelidExtended\(/ { pending=1 } \
+	     emit && pending && /NULL\);$$/ \
+	     { print "} }"; emit=0; pending=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || pending || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_trigger_create.inc: $(top_srcdir)/src/backend/commands/trigger.c Makefile
+	awk '/^CreateTrigger\(/ { print "ObjectAddress"; wrapper=1; wrappers++ } \
+	     wrapper { print } \
+	     wrapper && /^}/ { wrapper=0; wrapper_cuts++ } \
+	     /^CreateTriggerFiringOn\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_openrv\(stmt->relation, ShareRowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (wrappers != 1 || wrapper_cuts != 1 || wrapper \
+	               || entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_ctas_create.inc: $(top_srcdir)/src/backend/commands/createas.c Makefile
+	awk '/^ExecCreateTableAs\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^\t\treturn InvalidObjectAddress;$$/ { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_sequence_create.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^DefineSequence\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /makeNode\(CreateStmt\);/ { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     /^}/ { if (emit) bad++; emit=0 } \
+	     END { if (entries != 1 || cuts != 1 || emit || bad) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_sequence_alter.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^typedef struct SeqTableData$$/ { type_emit=1; types++ } \
+	     type_emit { print } \
+	     /^typedef SeqTableData \*SeqTable;$$/ { type_emit=0; type_cuts++ } \
+	     /^AlterSequence\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /relid = RangeVarGetRelidExtended\(stmt->sequence,/ { lookup=1 } \
+	     emit && lookup && /NULL\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; lookup=0; cuts++ } \
+	     END { if (types != 1 || type_cuts != 1 || type_emit \
+	               || entries != 1 || cuts != 1 || emit || lookup) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_role_alter.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^typedef struct$$/ { type_emit=1; types++ } \
+	     type_emit { print } \
+	     /^} GrantRoleOptions;$$/ { type_emit=0; type_cuts++ } \
+	     /^AlterRole\(/ { print "Oid"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /check_rolespec_name\(stmt->role,/ { validation=1 } \
+	     emit && validation && /_\("Cannot alter reserved roles\."\)\);/ \
+	     { print "return InvalidOid; }"; emit=0; validation=0; cuts++ } \
+	     END { if (types != 1 || type_cuts != 1 || type_emit \
+	               || entries != 1 || cuts != 1 || emit || validation) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_role_settings.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^have_createrole_privilege\(/ { print "static bool"; emit=1; helpers++ } \
+	     /^AlterRoleSet\(/ { print "Oid"; emit=2; entries++ } \
+	     emit { print } \
+	     emit && /^}/ { if (emit == 1) helper_cuts++; else cuts++; emit=0 } \
+	     END { if (helpers != 1 || helper_cuts != 1 || entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_role_drop.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^DropRole\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /if \(!have_createrole_privilege\(\)\)/ { permission=1 } \
+	     emit && permission && /"CREATEROLE", "ADMIN"\)\)\);/ \
+	     { print "}"; emit=0; permission=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit || permission) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_role_grant.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^#define GRANT_ROLE_SPECIFIED_/ { defs=defs $$0 ORS; macros++ } \
+	     /^InitGrantRoleOptions\(/ { helper="static void" ORS; h_emit=1; helpers++ } \
+	     h_emit { helper=helper $$0 ORS } \
+	     h_emit && /^}/ { h_emit=0; h_cuts++ } \
+	     /^GrantRole\(/ { prefix="void" ORS; emit=1; entries++ } \
+	     emit { prefix=prefix $$0 ORS } \
+	     emit && /grantee_ids = roleSpecsToIds\(stmt->grantee_roles\);/ \
+	     { prefix=prefix "}" ORS; emit=0; cuts++ } \
+	     END { if (macros != 3 || helpers != 1 || h_cuts != 1 || h_emit \
+	               || entries != 1 || cuts != 1 || emit) exit 1; \
+	           printf "%s%s%s", defs, helper, prefix }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_role_create.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^CreateRole\(/ { print "Oid"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /if \(!superuser_arg\(currentUserId\)\)/ { permission=1 } \
+	     emit && permission && /"CREATEROLE"\)\)\);/ \
+	     { print "} return InvalidOid; }"; emit=0; permission=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit || permission) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_reassign_owned.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^ReassignOwnedObjects\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /role_ids = roleSpecsToIds\(stmt->roles\);/ \
+	     { print "}"; emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_role_rename.inc: $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^RenameRole\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = table_open\(AuthIdRelationId, RowExclusiveLock\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_statistics_create.inc: $(top_srcdir)/src/backend/commands/statscmds.c Makefile
+	awk '/^CreateStatistics\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /rel = relation_openrv\(\(RangeVar \*\) rln, ShareUpdateExclusiveLock\);/ \
+	     { print "} return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_object_depends.inc: $(top_srcdir)/src/backend/commands/alter.c Makefile
+	awk '/^ExecAlterObjectDependsStmt\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /&rel, AccessExclusiveLock, false\);/ \
+	     { print "return InvalidObjectAddress; }"; emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_acl_grant.inc: $(top_srcdir)/src/backend/catalog/aclchk.c Makefile
+	awk '/^ExecuteGrantStmt\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /switch \(stmt->targtype\)/ { targets=1 } \
+	     emit && targets && /^\t}/ \
+	     { print "}"; emit=0; targets=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit || targets) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_default_privileges.inc: $(top_srcdir)/src/backend/catalog/aclchk.c Makefile
+	awk '/^ \* Internal format used by ALTER DEFAULT PRIVILEGES\./ { pending=1 } \
+	     pending && /^typedef struct/ { t=1; types++; pending=0 } \
+	     t { defs=defs $$0 ORS } \
+	     t && /^} InternalDefaultACL;/ { t=0; type_cuts++ } \
+	     /^ExecAlterDefaultPrivilegesStmt\(/ { entry="void" ORS; e=1; entries++ } \
+	     e { entry=entry $$0 ORS } \
+	     e && /^}/ { e=0; cuts++ } \
+	     /^string_to_privilege\(/ { helpers=helpers "static AclMode" ORS; h=1; strings++ } \
+	     /^privilege_to_string\(/ { helpers=helpers "static const char *" ORS; h=1; names++ } \
+	     h { helpers=helpers $$0 ORS } \
+	     h && /^}/ { h=0; helper_cuts++ } \
+	     END { if (types != 1 || type_cuts != 1 || pending || t || entries != 1 \
+	               || cuts != 1 || e || strings != 1 || names != 1 || helper_cuts != 2 || h) exit 1; \
+	           printf "%sstatic void SetDefaultACLsInSchemas(InternalDefaultACL *, List *);\n%s%s", \
+	                  defs, helpers, entry }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_rename_tag.inc: $(top_srcdir)/src/backend/tcop/utility.c $(top_srcdir)/src/include/tcop/cmdtaglist.h Makefile
+	awk '/^AlterObjectTypeCommandTag\(/ { print "static CommandTag"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^}/ { emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_rename_dispatch.inc: $(top_srcdir)/src/backend/commands/alter.c Makefile
+	awk '/^ExecRenameStmt\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^}/ { emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_schema_dispatch.inc: $(top_srcdir)/src/backend/commands/alter.c Makefile
+	awk '/^ExecAlterObjectSchemaStmt\(/ { print "ObjectAddress"; emit=1; entries++ } \
+	     emit { print } \
+	     emit && /^}/ { emit=0; cuts++ } \
+	     END { if (entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
-		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
+		test_cluster_fresh_boolean.inc test_cluster_fresh_alter_lookup.inc test_cluster_fresh_alter_apply.inc test_cluster_fresh_drop_relations.inc test_cluster_fresh_drop_objects.inc test_cluster_fresh_drop_owned.inc test_cluster_fresh_index_create.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
-		test_cluster_create_utility_entry.inc
+		test_cluster_create_utility_entry.inc test_cluster_fresh_import.inc \
+		test_cluster_fresh_import_filter.inc test_cluster_fresh_extension.inc \
+		test_cluster_fresh_schema_create.inc test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
+		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
+		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_default_privileges.inc test_cluster_fresh_rename_tag.inc test_cluster_fresh_rename_dispatch.inc test_cluster_fresh_schema_dispatch.inc test_cluster_fresh_language.inc \
+		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
+		test_cluster_fresh_foreign_table_create.inc test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
+		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
+		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
+		test_cluster_fresh_publication.inc test_cluster_fresh_publication_owner.inc test_cluster_fresh_foreign_owner.inc test_cluster_fresh_subscription_owner.inc test_cluster_fresh_rule_rename.inc test_cluster_fresh_trigger_rename.inc test_cluster_fresh_tablespace_options.inc test_cluster_fresh_column_rename.inc test_cluster_fresh_relation_rename.inc test_cluster_fresh_constraint_rename.inc test_cluster_fresh_table_namespace.inc test_cluster_fresh_vacuum_scope.inc test_cluster_fresh_tablespace_move_scope.inc test_cluster_fresh_tablespace_rename.inc test_cluster_fresh_tablespace_create_scope.inc test_cluster_fresh_tablespace_drop_scope.inc test_cluster_fresh_cluster_scope.inc test_cluster_fresh_matview_scope.inc test_cluster_fresh_domain_constraint_entry.inc test_cluster_fresh_domain_constraint_rebuild.inc test_cluster_fresh_domain_alter_scope.inc test_cluster_fresh_type_factory_scope.inc test_cluster_fresh_type_creation_scope.inc test_cluster_fresh_enum_scope.inc test_cluster_fresh_type_mutation_scope.inc test_cluster_fresh_type_scope.inc test_cluster_fresh_database_settings.inc test_cluster_fresh_database_identity.inc test_cluster_fresh_database_options.inc \
+		test_cluster_fresh_view.inc test_cluster_fresh_rule.inc test_cluster_fresh_relation_create.inc test_cluster_fresh_truncate.inc test_cluster_fresh_trigger_create.inc test_cluster_fresh_ctas_create.inc test_cluster_fresh_sequence_create.inc test_cluster_fresh_sequence_alter.inc test_cluster_fresh_role_alter.inc test_cluster_fresh_role_settings.inc test_cluster_fresh_role_drop.inc test_cluster_fresh_role_grant.inc test_cluster_fresh_role_create.inc test_cluster_fresh_reassign_owned.inc test_cluster_fresh_role_rename.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -6951,6 +7683,64 @@ test_cluster_debug: test_cluster_debug.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Compose the unchanged capacity producer and real SRF; no snapshot stub.
+TESTS += test_cluster_capacity_counter_srf
+all: test_cluster_capacity_counter_srf
+test_cluster_capacity_counter_srf.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk 'BEGIN { pointer=0; functions=0; emit=0 } \
+	     /^static UndoCleanerSharedState \*undo_cleaner_state/ { print; pointer++ } \
+	     /^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; functions++ } \
+	     /^cluster_undo_cleaner_note_tx_slot_recheck\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (pointer != 1 || functions != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_capacity_counter_srf: test_cluster_capacity_counter_srf.c test_cluster_debug.c \
+		test_cluster_capacity_counter_srf.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Compose both TT statistics regions with the complete debug SRF.
+TESTS += test_cluster_tt_counter_srf
+all: test_cluster_tt_counter_srf
+test_cluster_tt_counter_srf.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_durable_stat.c Makefile
+	awk '/^#else \/\* !USE_PGRAC_CLUSTER \*\// { disabled=1; next } disabled { next } \
+	     /^typedef struct (ClusterUndoRecordShared|ClusterTTDurableShared) \{/ \
+	     { structure=1; types++ } structure { print } structure && /^} / { structure=0 } \
+	     /^static (ClusterUndoRecordShared \*UndoRecordShared|ClusterTTDurableShared \*TTDurableShared) = NULL;/ \
+	     { print; pointers++ } \
+	     /^cluster_undo_tt_retention_rollover_count\(/ { print "uint64"; emit=1; functions++ } \
+	     /^cluster_(undo_tt_retained_rollover_stats|tt_durable_locator_stats)_snapshot\(/ \
+	     { print "bool"; emit=1; functions++ } \
+	     /^cluster_tt_durable_count_locator_(call|result)\(/ \
+	     { print "void"; emit=1; functions++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (types != 2 || pointers != 2 || functions != 5 || emit || structure) exit 1 }' \
+	     $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_counter_srf: test_cluster_tt_counter_srf.c test_cluster_debug.c \
+		test_cluster_tt_counter_srf.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-tt-counter-srf
+.PHONY: clean-tt-counter-srf
+clean-tt-counter-srf:
+	rm -f test_cluster_tt_counter_srf test_cluster_tt_counter_srf.inc \
+		test_cluster_tt_counter_srf.inc.tmp
+
 # test_cluster_xnode_profile links cluster_xnode_profile.o standalone (spec-5.59
 # D10).  The test defines the GUC variable itself (cluster_guc.o is not
 # linked) and stubs ShmemInitStruct / cluster_shmem_register_region; the
@@ -7539,9 +8329,19 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_xmax_hint.inc
 	rm -f test_cluster_page_dependency_base.o
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
-		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
-		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc
+		test_cluster_fresh_boolean.inc test_cluster_fresh_alter_lookup.inc test_cluster_fresh_alter_apply.inc test_cluster_fresh_drop_relations.inc test_cluster_fresh_drop_objects.inc test_cluster_fresh_drop_owned.inc test_cluster_fresh_index_create.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
+		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc \
+		test_cluster_fresh_schema_create.inc test_cluster_fresh_schema.inc test_cluster_fresh_comment.inc test_cluster_fresh_seclabel.inc \
+		test_cluster_fresh_policy.inc test_cluster_fresh_conversion.inc test_cluster_fresh_collation.inc \
+		test_cluster_fresh_event_trigger.inc test_cluster_fresh_owner.inc test_cluster_fresh_object_depends.inc test_cluster_fresh_acl_grant.inc test_cluster_fresh_default_privileges.inc test_cluster_fresh_rename_tag.inc test_cluster_fresh_rename_dispatch.inc test_cluster_fresh_schema_dispatch.inc test_cluster_fresh_language.inc \
+		test_cluster_fresh_access_method.inc test_cluster_fresh_function.inc test_cluster_fresh_fdw.inc \
+		test_cluster_fresh_foreign_table_create.inc test_cluster_fresh_foreign_server.inc test_cluster_fresh_user_mapping.inc \
+		test_cluster_fresh_statistics_alter.inc test_cluster_fresh_statistics_create.inc test_cluster_fresh_operator.inc \
+		test_cluster_fresh_opclass.inc test_cluster_fresh_aggregate.inc test_cluster_fresh_tsearch.inc \
+		test_cluster_fresh_publication.inc test_cluster_fresh_publication_owner.inc test_cluster_fresh_foreign_owner.inc test_cluster_fresh_subscription_owner.inc test_cluster_fresh_rule_rename.inc test_cluster_fresh_trigger_rename.inc test_cluster_fresh_tablespace_options.inc test_cluster_fresh_column_rename.inc test_cluster_fresh_relation_rename.inc test_cluster_fresh_constraint_rename.inc test_cluster_fresh_table_namespace.inc test_cluster_fresh_vacuum_scope.inc test_cluster_fresh_tablespace_move_scope.inc test_cluster_fresh_tablespace_rename.inc test_cluster_fresh_tablespace_create_scope.inc test_cluster_fresh_tablespace_drop_scope.inc test_cluster_fresh_cluster_scope.inc test_cluster_fresh_matview_scope.inc test_cluster_fresh_domain_constraint_entry.inc test_cluster_fresh_domain_constraint_rebuild.inc test_cluster_fresh_domain_alter_scope.inc test_cluster_fresh_type_factory_scope.inc test_cluster_fresh_type_creation_scope.inc test_cluster_fresh_enum_scope.inc test_cluster_fresh_type_mutation_scope.inc test_cluster_fresh_type_scope.inc test_cluster_fresh_database_settings.inc test_cluster_fresh_database_identity.inc test_cluster_fresh_database_options.inc \
+		test_cluster_fresh_view.inc test_cluster_fresh_rule.inc test_cluster_fresh_relation_create.inc test_cluster_fresh_truncate.inc test_cluster_fresh_trigger_create.inc test_cluster_fresh_ctas_create.inc test_cluster_fresh_sequence_create.inc test_cluster_fresh_sequence_alter.inc test_cluster_fresh_role_alter.inc test_cluster_fresh_role_settings.inc test_cluster_fresh_role_drop.inc test_cluster_fresh_role_grant.inc test_cluster_fresh_role_create.inc test_cluster_fresh_reassign_owned.inc test_cluster_fresh_role_rename.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
+		test_cluster_tt_locator_stats.inc \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
 		test_cluster_heap_confirm_version.inc test_cluster_heap_spec_abort_version.inc \
 		test_cluster_heap_confirm_capture.inc test_cluster_heap_spec_abort_capture.inc \
@@ -10040,6 +10840,27 @@ test_cluster_tt_active_owner test_cluster_tt_slot_allocator: \
 		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
 		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
 
+# Exact shmem initialization and locator metrics for the existing TT fixture.
+# The old source has2 functions; the versioned source must supply all5.
+test_cluster_tt_locator_stats.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_durable_stat.c \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h Makefile
+	awk 'FNR == NR { if (/^#define CLUSTER_TT_DURABLE_LOCATOR_STATS_V1 1/) metrics=3; next } \
+	     /^#else \/\* !USE_PGRAC_CLUSTER \*\// { exit } \
+	     /^typedef struct ClusterTTDurableShared/ { fields=1; types++ } \
+	     fields { print; if (/^} ClusterTTDurableShared;/) fields=0; next } \
+	     /^static ClusterTTDurableShared \*TTDurableShared/ { print; pointers++ } \
+	     /^cluster_tt_durable_shmem_size\(/ { print "Size"; emit=1; basic++ } \
+	     /^cluster_tt_durable_shmem_init\(/ { print "void"; emit=1; basic++ } \
+	     /^cluster_tt_durable_count_locator_(call|result)\(/ { print "void"; emit=1; hooks++ } \
+	     /^cluster_tt_durable_locator_stats_snapshot\(/ { print "bool"; emit=1; hooks++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (types != 1 || pointers != 1 || basic != 2 || hooks != metrics || emit) exit 1 }' \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_durable test_cluster_tt_abort_owner test_cluster_tt_active_owner \
+		test_cluster_tt_rollback_entry test_cluster_tt_terminal_trace: test_cluster_tt_locator_stats.inc
+
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked
 # cluster_undo_smgr.  File-I/O behavior is e2e in cluster_tap t/219.
@@ -10050,6 +10871,29 @@ test_cluster_tt_durable: test_cluster_tt_durable.c unit_test.h \
 		$(CLUSTER_TT_DURABLE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Keep the wrapper and its shared layout exact; no backend init dependencies.
+test_cluster_tt_locator_family.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_durable_stat.c \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h Makefile
+	awk 'FNR == NR { if (/^#define CLUSTER_TT_DURABLE_LOCATOR_FAMILY_STATS_V1 1/) profile=1; next } \
+	     /^#else \/\* !USE_PGRAC_CLUSTER \*\// { exit } \
+	     /^typedef struct ClusterTTDurableShared/ { fields=1; types++; if (profile) print "#ifndef CLUSTER_TT_LOCATOR_FAMILY_TABLE_DECLARED" } \
+	     fields { if (profile) print; if (/^} ClusterTTDurableShared;/) fields=0; next } \
+	     /^static ClusterTTDurableShared \*TTDurableShared/ { pointers++; if (profile) { print; print "#endif" } } \
+	     /^cluster_tt_slot_durable_locate_any_by_xid_origin_profiled\(/ { print "ClusterTTDurableLocate"; emit=1; wrappers++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (types != 1 || pointers != 1 || wrappers != profile || emit) exit 1 }' \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_r4_tx_outcome test_cluster_r4_route_policy test_cluster_r4_d10_tt_source \
+		test_cluster_r4_d10_multi_source: test_cluster_tt_locator_family.inc
+
+test_cluster_tt_locator_family: test_cluster_tt_locator_family.c test_cluster_tt_durable.c \
+		test_cluster_tt_locator_stats.inc test_cluster_tt_locator_family.inc unit_test.h \
+		$(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Includes the real local consumer to seed otherwise unreachable partial
 # publication states; dead stripping removes unrelated local entry points.
@@ -10081,10 +10925,294 @@ test_cluster_tt_abort_owner: test_cluster_tt_abort_owner.c test_cluster_tt_durab
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Keep the original diagnostic producers, initialization and snapshot together.
+test_cluster_active_capacity_stats.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h Makefile
+	awk 'FNR == NR { if (/^extern void cluster_undo_cleaner_note_(capacity_refusal|tx_slot_recheck)\(/) expected++; next } \
+	     /^cluster_undo_cleaner_shmem_init\(/ { print "void"; emit=1; basic++ } \
+	     /^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; basic++ } \
+	     /^cluster_undo_cleaner_note_(capacity_refusal|tx_slot_recheck)\(/ { print "void"; emit=1; hooks++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (basic != 2 || hooks != expected || expected > 2 || emit) exit 1 }' \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-active-capacity-stats
+.PHONY: clean-active-capacity-stats
+clean-active-capacity-stats:
+	rm -f test_cluster_active_capacity_stats.inc test_cluster_active_capacity_stats.inc.tmp
+
+test_cluster_tt_active_owner test_cluster_alter_early_bind test_cluster_analyze_preflight test_cluster_largeobject_preflight test_cluster_subscription_preflight test_cluster_drop_early_bind test_cluster_relmap_native_tt.o: \
+		test_cluster_active_capacity_stats.inc
+
+test_cluster_collation_import_preflight: test_cluster_active_capacity_stats.inc
+
+# Native import prefix through static checks, before any platform enumeration.
+test_cluster_collation_import_preflight.inc: $(top_srcdir)/src/backend/commands/collationcmds.c \
+		$(top_srcdir)/src/backend/tcop/utility.c Makefile
+	awk '/^PreflightClusterSharedCollationWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^pg_import_system_collations\(/ { print "Datum"; emit=1; entries++ } \
+	     emit && /^[ \t]*\/\* Load collations known to libc,/ \
+	     { print "(void)ncreated; import_enumeration_boundary(); }"; emit=0; cuts++; exit } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (helpers != 1 || entries != 1 || cuts != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
+	     { print "void"; emit=1; found++ } emit { print } \
+	     emit && /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' \
+		$(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_collation_import_preflight: test_cluster_collation_import_preflight.c \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
+		test_cluster_collation_import_preflight.inc test_cluster_tt_locator_stats.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c \
+		$(top_srcdir)/src/include/utils/syscache.h $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-collation-import-preflight
+.PHONY: clean-collation-import-preflight
+clean-collation-import-preflight:
+	rm -f test_cluster_collation_import_preflight test_cluster_collation_import_preflight.inc \
+		test_cluster_collation_import_preflight.inc.tmp
+
+# Keep complete explicit DISCARD and namespace cleanup bodies together.
+test_cluster_discard_preflight.inc: $(top_srcdir)/src/backend/commands/discard.c \
+		$(top_srcdir)/src/backend/catalog/namespace.c \
+		$(top_srcdir)/src/backend/tcop/utility.c \
+		$(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk 'FNR == NR { if (/^DiscardTemp\(/) helpers++; next } \
+	     FNR == 1 { print "static void DiscardAll(bool isTopLevel);"; \
+	                 if (helpers) print "static void DiscardTemp(void);" } \
+	     /^DiscardCommand\(/ { print "void"; emit=1; entries++ } \
+	     /^Discard(All|Temp)\(/ { print "static void"; emit=1; private_entries++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (entries != 1 || helpers > 1 || private_entries != 1 + helpers || emit) exit 1 }' \
+		$< $< > $@.tmp
+	awk '/^(GetTempNamespaceState|ResetTempTableNamespace)\(/ { print "void"; emit=1; entries++ } \
+	     /^RemoveTempRelations(Callback)?\(/ { print "static void"; emit=1; private_entries++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (entries != 2 || private_entries != 2 || emit) exit 1 }' $(word 2,$^) >> $@.tmp
+	awk '/^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
+	     { print "void"; emit=1; entries++ } emit { print } \
+	     emit && /^}/ { emit=0 } END { if (entries != 3 || emit) exit 1 }' $(word 3,$^) >> $@.tmp
+	awk '/^PreventInTransactionBlock\(/ { print "void"; emit=1; entries++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (entries != 1 || emit) exit 1 }' $(word 4,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_discard_xact_types.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^typedef enum TBlockState/ { emit=1; entries++ } emit { print } \
+	     /^} TBlockState;/ { emit=0 } \
+	     END { if (entries != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_discard_preflight: test_cluster_discard_preflight.c \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
+		test_cluster_discard_preflight.inc test_cluster_discard_xact_types.inc \
+		test_cluster_active_capacity_stats.inc test_cluster_tt_locator_stats.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-discard-preflight
+.PHONY: clean-discard-preflight
+clean-discard-preflight:
+	rm -f test_cluster_discard_preflight test_cluster_discard_preflight.inc \
+		test_cluster_discard_preflight.inc.tmp test_cluster_discard_xact_types.inc \
+		test_cluster_discard_xact_types.inc.tmp
+
 test_cluster_tt_active_owner: test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+
+# Stop the native ANALYZE prefix at its original first target-lock call.
+test_cluster_analyze_preflight.inc: $(top_srcdir)/src/backend/commands/analyze.c \
+		$(top_srcdir)/src/backend/tcop/utility.c Makefile
+	awk '/^analyze_rel\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^\tonerel = vacuum_open_relation\(/ { boundary=1 } \
+	     boundary && /ShareUpdateExclusiveLock\);/ { print "}"; emit=0; done++; exit } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
+	     { print "void"; emit=1; found++ } emit { print } \
+	     emit && /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' \
+		$(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_analyze_preflight: test_cluster_analyze_preflight.c test_cluster_tt_active_owner.c \
+		test_cluster_tt_durable.c unit_test.h test_cluster_analyze_preflight.inc \
+		test_cluster_tt_locator_stats.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c \
+		$(top_srcdir)/src/include/commands/vacuum.h \
+		$(top_srcdir)/src/include/foreign/fdwapi.h $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-analyze-preflight
+.PHONY: clean-analyze-preflight
+clean-analyze-preflight:
+	rm -f test_cluster_analyze_preflight.inc test_cluster_analyze_preflight.inc.tmp
+
+# Complete native LO mutation entries; operation bodies stop at ERROR-only leaves.
+test_cluster_largeobject_preflight.inc: $(top_srcdir)/src/backend/storage/large_object/inv_api.c \
+		$(top_srcdir)/src/backend/tcop/utility.c Makefile
+	awk '/^PreflightClusterSharedLargeObjectWrite\(/ { print "static void"; emit=1; helpers++ } \
+	     /^getdatafield\(/ { print "static void"; emit=1; found++ } \
+	     /^inv_create\(/ { print "Oid"; emit=1; found++ } \
+	     /^inv_(drop|write)\(/ { print "int"; emit=1; found++ } \
+	     /^inv_truncate\(/ { print "void"; emit=1; found++ } emit { print } \
+	     emit && /^}/ { emit=0 } \
+	     END { if (found != 5 || helpers > 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
+	     { print "void"; emit=1; found++ } emit { print } \
+	     emit && /^}/ { emit=0 } END { if (found != 3 || emit) exit 1 }' \
+		$(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_largeobject_preflight: test_cluster_largeobject_preflight.c test_cluster_tt_active_owner.c \
+		test_cluster_tt_durable.c unit_test.h test_cluster_largeobject_preflight.inc \
+		test_cluster_tt_locator_stats.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c \
+		$(top_srcdir)/src/include/catalog/dependency.h \
+		$(top_srcdir)/src/include/catalog/pg_largeobject.h \
+		$(top_srcdir)/src/include/storage/large_object.h $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-largeobject-preflight
+.PHONY: clean-largeobject-preflight
+clean-largeobject-preflight:
+	rm -f test_cluster_largeobject_preflight.inc test_cluster_largeobject_preflight.inc.tmp
+
+test_cluster_subscription_types.inc: $(top_srcdir)/src/backend/commands/subscriptioncmds.c Makefile
+	awk '/^#define SUBOPT_/ { print; macros++ } \
+	     /^typedef struct SubOpts$$/ { emit=1; found++ } emit { print } \
+	     /^} SubOpts;/ { emit=0 } \
+	     END { if (macros != 15 || found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Parent replay has no private helper; all three native entries are still tested.
+test_cluster_subscription_preflight.inc: $(top_srcdir)/src/backend/commands/subscriptioncmds.c \
+		$(top_srcdir)/src/backend/tcop/utility.c Makefile
+	awk '/^PreflightClusterSharedSubscriptionWrite\(/ \
+	     { print "static void"; emit=1; found++ } emit { print } \
+	     emit && /^}/ { emit=0 } END { if (found > 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^CreateSubscription\(/ { print "ObjectAddress"; emit=1; found++ } \
+	     emit { print } emit && /supported_opts, &opts\);/ \
+	     { print "\tabort();\n}"; emit=0; done++; exit } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^(AlterSubscription|DropSubscription)\(/ \
+	     { print (/^Alter/ ? "ObjectAddress" : "void"); emit=1; found++ } \
+	     emit { print } emit && /^\trel = table_open\(SubscriptionRelationId, RowExclusiveLock\);/ \
+	     { print "\tabort();\n}"; emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< >> $@.tmp
+	awk '/^PreflightClusterSharedCatalogWrite\(/ \
+	     { print "static void"; emit=1; preflight++ } \
+	     /^PreventCommand(IfReadOnly|IfParallelMode|DuringRecovery)\(/ \
+	     { print "void"; emit=1; guards++ } emit { print } \
+	     emit && /^}/ { emit=0 } \
+	     END { if (preflight != 1 || guards != 3 || emit) exit 1 }' \
+		$(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_subscription_preflight: test_cluster_subscription_preflight.c test_cluster_tt_active_owner.c \
+		test_cluster_tt_durable.c unit_test.h test_cluster_subscription_types.inc \
+		test_cluster_subscription_preflight.inc test_cluster_tt_locator_stats.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c \
+		$(top_srcdir)/src/include/catalog/pg_subscription.h \
+		$(top_srcdir)/src/include/commands/subscriptioncmds.h \
+		$(top_srcdir)/src/include/replication/walreceiver.h \
+		$(top_srcdir)/src/include/access/table.h \
+		$(top_srcdir)/src/include/utils/acl.h $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-subscription-preflight
+.PHONY: clean-subscription-preflight
+clean-subscription-preflight:
+	rm -f test_cluster_subscription_types.inc test_cluster_subscription_types.inc.tmp
+	rm -f test_cluster_subscription_preflight.inc test_cluster_subscription_preflight.inc.tmp
+
+# Compose the original upper utility/classifier with the real 48-slot producer.
+
+# Real DROP deletion consumer/storage judges; graph/catalog inputs are modeled.
+test_cluster_drop_dependency.inc: $(top_srcdir)/src/backend/catalog/dependency.c Makefile
+	awk '/^AcquireDeletionLock\(/ { print "void"; emit=1; found++ } \
+	     /^performMultipleDeletions\(/ { print "void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_drop_storage.inc: $(top_srcdir)/src/backend/catalog/storage.c Makefile
+	awk '/^RelationCheckStorage(Drain|DDLTransaction)\(/ { print "void"; emit=1; found++ } \
+	     /^RelationStorageUsesClusterSharedPath\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_drop_storage_roots.inc: $(top_srcdir)/src/backend/commands/tablecmds.c \
+		$(top_srcdir)/src/backend/commands/dropcmds.c $(top_srcdir)/src/backend/commands/user.c Makefile
+	awk '/^Check(Relations|Objects|OwnedObjects)StorageDrop\(/ { print "void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 3 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+test_cluster_drop_early_bind: test_cluster_drop_early_bind.c test_cluster_tt_active_owner.c \
+		test_cluster_tt_durable.c unit_test.h test_cluster_shared_utility.inc \
+		test_cluster_create_utility_entry.inc test_cluster_alter_early_index.inc \
+		test_cluster_storage_delete_gate.inc test_cluster_drop_dependency.inc \
+		test_cluster_drop_storage.inc test_cluster_drop_storage_roots.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-drop-early-bind
+.PHONY: clean-drop-early-bind
+clean-drop-early-bind:
+	rm -f test_cluster_drop_dependency.inc test_cluster_drop_dependency.inc.tmp \
+		test_cluster_drop_storage.inc test_cluster_drop_storage.inc.tmp \
+		test_cluster_drop_storage_roots.inc test_cluster_drop_storage_roots.inc.tmp
+
+test_cluster_alter_early_index.inc: $(top_srcdir)/src/backend/commands/indexcmds.c Makefile
+	awk '/^CheckClusterIndexAccessMethodName\(/ { print "static void"; emit=1; found++ } \
+	     /^CheckClusterIndexSupport\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { if (emit) done++; emit=0 } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_alter_early_classifier.inc: $(top_srcdir)/src/backend/commands/tablecmds.c Makefile
+	awk '/^ClusterAlter(DropsColumn|AddColumnRewrites)\(/ { print "static bool"; emit=1; found++ } \
+	     /^CheckClusterSharedAlterTable\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { if (emit) done++; emit=0 } \
+	     END { if (found != 3 || done != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_alter_early_bind: test_cluster_alter_early_bind.c test_cluster_tt_active_owner.c \
+		test_cluster_tt_durable.c unit_test.h test_cluster_shared_utility.inc \
+		test_cluster_create_utility_entry.inc test_cluster_fresh_alter_lookup.inc \
+		test_cluster_alter_early_index.inc test_cluster_alter_early_classifier.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c \
+		$(top_srcdir)/src/backend/nodes/list.c $(CLUSTER_TT_DURABLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -10521,9 +11649,12 @@ test_cluster_tt_checkpoint_apply.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     fields { print } /^} TTCommitStage;/ { fields=0 } \
 	     /^static TTCommitStage tt_commit_stage =/ { print; stages++ } \
 	     /^tt_commit_stage_clear\(/ { print "static void"; emit=1; functions++ } \
+	     /^tt_slot_install_resident\(/ { print "static void"; emit=1; functions++ } \
+	     /^static void cluster_tt_slot_durable_commit_apply_capacity_body\(/ { emit=1; functions++ } \
+	     /^cluster_tt_slot_durable_commit_apply_capacity_body\(/ { print "static void"; emit=1; functions++ } \
 	     /^cluster_tt_slot_durable_commit_apply\(/ { print "void"; emit=1; functions++ } \
-	     emit { print } emit && /^}/ { emit=0 } \
-	     END { if (functions != 3 || types != 1 || stages != 1 || emit || fields) exit 1 }' $< > $@.tmp
+	     emit { print } emit && /^\{/ { body=1 } emit && ((body && /^}/) || (!body && /;$$/)) { emit=0; body=0 } \
+	     END { if (functions != 6 || types != 1 || stages != 1 || emit || fields) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_tt_checkpoint_wait.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
@@ -11357,8 +12488,9 @@ test_cluster_undo_extent_types.inc: $(top_srcdir)/src/backend/cluster/cluster_un
 	mv $@.tmp $@
 
 test_cluster_undo_extent_claim.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_record.c Makefile
-	awk '/^claim_undo_extent\(/ { print "static UndoExtentClaimResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	awk '/^static UndoExtentClaimResult claim_undo_extent_capacity_body\(/ { emit=1; count++ } \
+	     /^claim_undo_extent(_capacity_body)?\(/ { print "static UndoExtentClaimResult"; emit=1; count++ } \
+	     emit { print } emit && /^\{/ { body=1 } emit && ((body && /^}/) || (!body && /;$$/)) { emit=0; body=0 } END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_extent_claim: test_cluster_undo_extent_claim.c unit_test.h \
@@ -11559,11 +12691,15 @@ test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: test_cluster_ctrc
 
 # Same actual producer-to-consumer path, including the original CV cleanup.
 test_cluster_ctrc_capacity_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
-	awk '/^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
+	awk '/^cluster_undo_cleaner_capacity_stats_snapshot\(/ { print "bool"; emit=1; found++ } \
+	     /^cluster_undo_cleaner_note_capacity_refusal\(/ { print "void"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; found++ } \
 	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; found++ } \
-	     /^undo_cleaner_capacity_probe\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_note_retention\(/ { print "static void"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_(probe|history_probe)\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; found++ } \
+	     /^undo_cleaner_capacity_(report_wait|real_protector|reports_advance)\(/ { print "static bool"; emit=1; found++ } \
 	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}$$/ { emit=0 } END { if (found != 4 || emit) exit 1 }' $< > $@.tmp
+	     emit { print } /^}$$/ { emit=0 } END { if (found != 11 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 clean distclean maintainer-clean: clean-ctrc-capacity-wait
@@ -11583,6 +12719,24 @@ test_cluster_ctrc_capacity: test_cluster_ctrc_capacity.c test_cluster_ctrc_clean
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 test_cluster_undo_cleaner: $(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
 	$(top_srcdir)/src/include/miscadmin.h
+
+# Use the complete CTRC display path with the existing real shared fixture.
+test_cluster_ctrc_counter_display.inc: $(top_srcdir)/src/backend/cluster/cluster_debug.c Makefile
+	awk '/^fmt_(int64|uint64)\(/ { print "static char *"; emit=1; formats++ } \
+	     /^dump_ctrc(_completion|_no_progress|_publisher|_unsettled)?\(/ \
+	     { print "static void"; emit=1; dumps++ } \
+	     emit { print } /^}$$/ { emit=0 } \
+	     END { if (formats != 2 || dumps != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ctrc_cleaner test_cluster_ctrc_capacity test_cluster_ctrc_horizon \
+		test_cluster_ctrc_dispatch test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence \
+		test_cluster_ctrc_allocator_gc test_cluster_undo_capacity_history: \
+		test_cluster_ctrc_counter_display.inc
+clean distclean maintainer-clean: clean-ctrc-counter-display
+.PHONY: clean-ctrc-counter-display
+clean-ctrc-counter-display:
+	rm -f test_cluster_ctrc_counter_display.inc test_cluster_ctrc_counter_display.inc.tmp
 
 # These fixtures use the real shared engine and PGPROC allocation identity.
 test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch \
@@ -15883,3 +17037,184 @@ clean: clean-recovery-carriers
 .PHONY: clean-recovery-carriers
 clean-recovery-carriers:
 	rm -f test_cluster_recovery_carriers
+
+# Local read-only capacity invalidation uses the same core as the backend.
+# Only process-exit callback registration is outside standalone fixtures.
+TESTS += test_cluster_undo_capacity
+all: test_cluster_undo_capacity
+
+cluster_undo_capacity_unit.o: $(top_srcdir)/src/backend/cluster/cluster_undo_capacity.c $(top_srcdir)/src/include/cluster/cluster_undo_capacity.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_UNDO_CAPACITY_UNIT_TEST -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_undo_capacity: test_cluster_undo_capacity.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_capacity.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_srcdir)/src/backend/cluster/cluster_undo_capacity.c \
+		$(filter-out cluster_undo_capacity_unit.o,$(CLUSTER_UNIT_PORT_LIBS)) -o $@
+
+# Append after original recipes: preserve each original $< test input.
+$(TESTS): cluster_undo_capacity_unit.o
+
+# Capacity classification consumes the same two pure policy helpers over
+# observations made by the actual LMON/receiver in the horizon fixture.
+test_cluster_undo_capacity_history_policy.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^undo_cleaner_capacity_(real_protector|reports_advance)\(/ { print "static bool"; emit=1; n++ } emit { print } /^}$$/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_horizon: test_cluster_undo_capacity_history_policy.inc
+
+# Same actual local publisher, cohort and wait controller as the backend.
+TESTS += test_cluster_undo_capacity_history
+all: test_cluster_undo_capacity_history
+
+test_cluster_undo_capacity_history_lmon.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	awk '/^undo_horizon_publish_local_history\(/ { print "static void"; emit=1; n++ } \
+	     /^undo_horizon_capacity_local_sample\(/ { print "static ClusterHeapFreezeCohortStatus"; emit=1; n++ } \
+	     /^cluster_undo_capacity_history_(observe|current)\(/ { print "ClusterHeapFreezeCohortStatus"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if (n != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_capacity_history: test_cluster_undo_capacity_history.c \
+		test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_capacity_wait.inc test_cluster_ctrc_horizon_sender.inc \
+		test_cluster_ctrc_horizon_cohort.inc test_cluster_undo_capacity_history_lmon.inc \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_worker_sample.inc \
+		test_cluster_ctrc_read_scope.inc test_cluster_ctrc_native_exit.inc \
+		test_cluster_ctrc_native_group_exit.inc test_cluster_ctrc_native_prepare.inc \
+		test_cluster_pgproc_active_types.inc unit_test.h cluster_undo_capacity_unit.o \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_heap_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_cleaner.h \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+clean distclean maintainer-clean: clean-undo-capacity-history
+.PHONY: clean-undo-capacity-history
+clean-undo-capacity-history:
+	rm -f test_cluster_undo_capacity_history_lmon.inc test_cluster_undo_capacity_history_lmon.inc.tmp \
+		test_cluster_undo_capacity_history_policy.inc test_cluster_undo_capacity_history_policy.inc.tmp \
+		cluster_undo_capacity_unit.o test_cluster_undo_capacity test_cluster_undo_capacity_history
+
+# Compose the original early preflight with real BIND and empty-undo finish.
+TESTS += test_cluster_empty_undo_preflight
+all: test_cluster_empty_undo_preflight
+
+TESTS += test_cluster_empty_undo_xact
+all: test_cluster_empty_undo_xact
+test_cluster_empty_undo_xact.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^RecordTransaction(Commit|Abort)\(/ { print "static TransactionId"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 2 || done != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_empty_undo_xact: test_cluster_empty_undo_xact.c test_cluster_empty_undo_preflight.c \
+		test_cluster_empty_undo_xact.inc test_cluster_empty_undo_preflight.inc \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c \
+		test_cluster_tt_locator_stats.inc test_cluster_active_capacity_stats.inc unit_test.h \
+		$(top_srcdir)/src/backend/nodes/list.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-empty-undo-xact
+.PHONY: clean-empty-undo-xact
+clean-empty-undo-xact:
+	rm -f test_cluster_empty_undo_xact test_cluster_empty_undo_xact.inc \
+		test_cluster_empty_undo_xact.inc.tmp
+
+test_cluster_empty_undo_preflight.inc: $(top_srcdir)/src/backend/access/heap/heapam.c \
+		$(top_srcdir)/src/backend/executor/execMain.c Makefile
+	awk '/^(cluster_heap_itl_relation_route|cluster_itl_write_path_enabled)\(/ \
+	     { print "static bool"; emit=1; n++ } \
+	     /^cluster_heap_itl_require_top_xact\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_heap_preflight_write\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if(n != 4 || emit) exit 1 }' $< > $@.tmp
+	awk '/^cluster_executor_preflight_write\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if(n != 1 || emit) exit 1 }' \
+		$(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_empty_undo_preflight: test_cluster_empty_undo_preflight.c \
+		test_cluster_empty_undo_preflight.inc test_cluster_tt_active_owner.c \
+		test_cluster_tt_durable.c test_cluster_tt_locator_stats.inc \
+		test_cluster_active_capacity_stats.inc unit_test.h $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/backend/nodes/list.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-empty-undo-preflight
+.PHONY: clean-empty-undo-preflight
+clean-empty-undo-preflight:
+	rm -f test_cluster_empty_undo_preflight.inc test_cluster_empty_undo_preflight.inc.tmp \
+		test_cluster_empty_undo_preflight
+
+# Real early caller, original capacity CV, allocator/BIND and local completion.
+TESTS += test_cluster_undo_capacity_bind
+all: test_cluster_undo_capacity_bind
+
+test_cluster_undo_capacity_bind_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^undo_cleaner_capacity_owner_generation_locked\(/ { print "static uint64"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_segment_worker\(/ { print "static bool"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_note_retention\(/ { print "static void"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_(probe|history_probe)\(/ { print "static ClusterCtrcCapacityProbeResult"; emit=1; n++ } \
+	     /^undo_cleaner_capacity_(report_wait|real_protector|reports_advance)\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_undo_cleaner_wait_for_capacity\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if (n != 9 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_capacity_bind: test_cluster_undo_capacity_bind.c \
+		test_cluster_empty_undo_preflight.c test_cluster_empty_undo_preflight.inc \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c \
+		test_cluster_tt_locator_stats.inc test_cluster_active_capacity_stats.inc \
+		test_cluster_undo_capacity_bind_wait.inc unit_test.h $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/backend/nodes/list.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-undo-capacity-bind
+.PHONY: clean-undo-capacity-bind
+clean-undo-capacity-bind:
+	rm -f test_cluster_undo_capacity_bind_wait.inc test_cluster_undo_capacity_bind_wait.inc.tmp \
+		test_cluster_undo_capacity_bind
+
+# Actual shared certificate/handoff and allocator GC in the same process.
+TESTS += test_cluster_ctrc_allocator_gc
+all: test_cluster_ctrc_allocator_gc
+
+test_cluster_ctrc_allocator_gc: test_cluster_ctrc_allocator_gc.c \
+		test_cluster_ctrc_capacity.c test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_capacity_wait.inc \
+		test_cluster_ctrc_read_scope.inc test_cluster_ctrc_worker_sample.inc \
+		test_cluster_ctrc_native_exit.inc test_cluster_ctrc_native_group_exit.inc \
+		test_cluster_ctrc_native_prepare.inc test_cluster_pgproc_active_types.inc \
+		test_cluster_capacity_pool_compat.h unit_test.h $(CLUSTER_UNIT_PORT_LIBS) \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_UNDO_RETENTION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+clean distclean maintainer-clean: clean-ctrc-allocator-gc
+.PHONY: clean-ctrc-allocator-gc
+clean-ctrc-allocator-gc:
+	rm -f test_cluster_ctrc_allocator_gc

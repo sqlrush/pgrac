@@ -17,6 +17,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 
 #include "access/xlog.h"
 #include "miscadmin.h"
@@ -670,6 +671,7 @@ cluster_undo_block0_admit_runtime(const ClusterUndoBlock0LogicalKey *logical,
 		LWLockRelease(&meta->content_lock);
 		return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
 	}
+	cluster_undo_capacity_write_mark();
 	meta->logical = *logical;
 	meta->resolved_root = *root;
 	meta->proof = *proof;
@@ -807,6 +809,7 @@ cluster_undo_block0_provision_begin(const ClusterUndoBlock0LogicalKey *logical,
 		LWLockRelease(&meta->content_lock);
 		return CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
 	}
+	cluster_undo_capacity_write_mark();
 	meta->logical = *logical;
 	meta->resolved_root = *target_root;
 	meta->proof = *proof;
@@ -880,8 +883,27 @@ cluster_undo_block0_provision_begin(const ClusterUndoBlock0LogicalKey *logical,
 }
 
 
+static void cluster_undo_block0_provision_publish_capacity_body(ClusterUndoBlock0Pin *pin,
+																XLogRecPtr init_lsn);
+
 void
 cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init_lsn)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_undo_block0_provision_publish_capacity_body(pin, init_lsn);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_undo_block0_provision_publish_capacity_body(ClusterUndoBlock0Pin *pin, XLogRecPtr init_lsn)
 {
 	ClusterUndoBlock0OwnedResource *owned;
 	ClusterUndoBlock0SlotData *meta;
@@ -909,6 +931,7 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 	if (!cluster_undo_segment_header_seal(sealed.data))
 		ereport(ERROR, (errmsg("could not seal undo block-zero provision image")));
 
+	cluster_undo_capacity_write_mark();
 	XLogFlush(init_lsn);
 	publish_result = cluster_undo_smgr_provision_temp_publish(
 		meta->resolved_root.intent, meta->logical.segment_id, meta->logical.owner_instance,
@@ -1812,6 +1835,7 @@ cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin, XLogRecPtr wal_lsn
 	Assert(!XLogRecPtrIsInvalid(wal_lsn));
 	meta = &Block0Slots[pin->slot].data;
 	state = pg_atomic_read_u32(&meta->state);
+	(void)state; /* The state check below is assertion-only in release builds. */
 	Assert(state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN
 		   || state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY);
 	if (XLogRecPtrIsInvalid(meta->last_wal_lsn) || wal_lsn > meta->last_wal_lsn)
@@ -1820,9 +1844,32 @@ cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin, XLogRecPtr wal_lsn
 }
 
 
+static void cluster_undo_block0_flush_sync_capacity_body(ClusterUndoBlock0Pin *pin,
+														 const char *successor_page,
+														 XLogRecPtr required_wal_lsn,
+														 bool fsync_parent);
+
 void
 cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_page,
 							   XLogRecPtr required_wal_lsn, bool fsync_parent)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_undo_block0_flush_sync_capacity_body(pin, successor_page, required_wal_lsn,
+													 fsync_parent);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_undo_block0_flush_sync_capacity_body(ClusterUndoBlock0Pin *pin, const char *successor_page,
+											 XLogRecPtr required_wal_lsn, bool fsync_parent)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Generation successor_generation;
@@ -1860,6 +1907,7 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 									   meta->logical.owner_instance, 0, sealed.data, true))
 		ereport(ERROR, (errmsg("could not flush undo block zero")));
 
+	cluster_undo_capacity_write_mark();
 	memcpy(BLOCK0_FRAME_DATA(meta->frame_index), sealed.data, BLCKSZ);
 	meta->generation = successor_generation;
 	pin->observed_generation = successor_generation;

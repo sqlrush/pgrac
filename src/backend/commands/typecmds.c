@@ -7,6 +7,10 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * PGRAC MODIFICATIONS
+ * Portions Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/backend/commands/typecmds.c
  *
@@ -52,6 +56,9 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
@@ -140,6 +147,17 @@ static void AlterTypeRecurse(Oid typeOid, bool isImplicitArray,
 							 AlterTypeRecurseParams *atparams);
 
 
+#ifdef USE_PGRAC_CLUSTER
+static void
+CheckClusterSharedTypeSupport(void)
+{
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("custom types is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+}
+#endif
+
 /*
  * DefineType
  *		Registers a new base type.
@@ -199,6 +217,10 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 	Oid			typoid;
 	ListCell   *pl;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/*
 	 * As of Postgres 8.4, we require superuser privilege to create a base
@@ -728,6 +750,10 @@ DefineDomain(CreateDomainStmt *stmt)
 	Oid			baseColl;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Convert list of names to a name and namespace */
 	domainNamespace = QualifiedNameGetCreationNamespace(stmt->domainname,
 														&domainName);
@@ -1144,6 +1170,10 @@ DefineEnum(CreateEnumStmt *stmt)
 	Oid			enumArrayOid;
 	ObjectAddress enumTypeAddr;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Convert list of names to a name and namespace */
 	enumNamespace = QualifiedNameGetCreationNamespace(stmt->typeName,
 													  &enumName);
@@ -1265,6 +1295,10 @@ AlterEnum(AlterEnumStmt *stmt)
 	HeapTuple	tup;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(stmt->typeName);
 	enum_type_oid = typenameTypeId(NULL, typename);
@@ -1363,6 +1397,10 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 	ObjectAddress address;
 	ObjectAddress mltrngaddress PG_USED_FOR_ASSERTS_ONLY;
 	Oid			castFuncOid;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Convert list of names to a name and namespace */
 	typeNamespace = QualifiedNameGetCreationNamespace(stmt->typeName,
@@ -2507,10 +2545,16 @@ AssignTypeMultirangeArrayOid(void)
 ObjectAddress
 DefineCompositeType(RangeVar *typevar, List *coldeflist)
 {
-	CreateStmt *createStmt = makeNode(CreateStmt);
+	CreateStmt *createStmt;
 	Oid			old_type_oid;
 	Oid			typeNamespace;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
+	createStmt = makeNode(CreateStmt);
 
 	/*
 	 * now set the parameters for keys/inheritance etc. All of these are
@@ -2578,6 +2622,10 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 	HeapTuple	newtuple;
 	Form_pg_type typTup;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
@@ -2700,6 +2748,10 @@ AlterDomainNotNull(List *names, bool notNull)
 	HeapTuple	tup;
 	Form_pg_type typTup;
 	ObjectAddress address = InvalidObjectAddress;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
@@ -2826,6 +2878,10 @@ AlterDomainDropConstraint(List *names, const char *constrName,
 	bool		found = false;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
 	domainoid = typenameTypeId(NULL, typename);
@@ -2913,6 +2969,17 @@ AlterDomainDropConstraint(List *names, const char *constrName,
 ObjectAddress
 AlterDomainAddConstraint(List *names, Node *newConstraint,
 						 ObjectAddress *constrAddr)
+{
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
+	return AlterDomainAddConstraintInternal(names, newConstraint, constrAddr);
+}
+
+/* Rebuild an existing constraint through the original internal path. */
+ObjectAddress
+AlterDomainAddConstraintInternal(List *names, Node *newConstraint, ObjectAddress *constrAddr)
 {
 	TypeName   *typename;
 	Oid			domainoid;
@@ -3043,6 +3110,10 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 	HeapTuple	copyTuple;
 	ScanKeyData skey[3];
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
@@ -3599,6 +3670,10 @@ RenameType(RenameStmt *stmt)
 	Form_pg_type typTup;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
+
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
 	typeOid = typenameTypeId(NULL, typename);
@@ -3678,6 +3753,9 @@ AlterTypeOwner(List *names, Oid newOwnerId, ObjectType objecttype)
 	AclResult	aclresult;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 	rel = table_open(TypeRelationId, RowExclusiveLock);
 
 	/* Make a TypeName so we can use standard type lookup machinery */
@@ -3882,6 +3960,9 @@ AlterTypeNamespace(List *names, const char *newschema, ObjectType objecttype,
 	ObjectAddresses *objsMoved;
 	ObjectAddress myself;
 
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
 	typeOid = typenameTypeId(NULL, typename);
@@ -4103,6 +4184,10 @@ AlterType(AlterTypeStmt *stmt)
 	bool		requireSuper = false;
 	AlterTypeRecurseParams atparams;
 	ListCell   *pl;
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedTypeSupport();
+#endif
 
 	catalog = table_open(TypeRelationId, RowExclusiveLock);
 

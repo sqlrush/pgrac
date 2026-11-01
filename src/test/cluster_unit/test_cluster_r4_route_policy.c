@@ -697,6 +697,8 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node pg_attribute_un
 	return CLUSTER_TT_DURABLE_LOCATE_MISSING;
 }
 
+#include "test_cluster_tt_locator_family.inc"
+
 static bool origin_generation_sample_enabled;
 static uint32 origin_generation_sample_value;
 static int origin_generation_sample_calls;
@@ -1154,6 +1156,15 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *retry_d
 	}
 	return cluster_gcs_send_block_request_and_wait(buf, PCM_TRANS_N_TO_S, UT_MASTER_NODE, false,
 												   retry_denied);
+}
+
+/* This fixture supplies no first-fill source. Unexpected use must fail. */
+ClusterPcmReadSourceKind
+cluster_pcm_lock_acquire_buffer_source(BufferDesc *buf, ClusterPcmReadSource *source)
+{
+	(void)buf;
+	(void)source;
+	abort();
 }
 
 /* The real bufmgr rearm and header snapshots below are generated verbatim.

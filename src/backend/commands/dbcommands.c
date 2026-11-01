@@ -8,6 +8,9 @@
  * stepping on each others' toes.  Formerly we used table-level locks
  * on pg_database, but that's too coarse-grained.
  *
+ * PGRAC modifications:
+ *    Preflight native database settings and collation refresh before catalog work.
+ *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -45,6 +48,8 @@
 #include "commands/comment.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h" /* PGRAC: shared database lifecycle refusal */
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
 #endif
 #include "commands/dbcommands.h"
 #include "commands/dbcommands_xlog.h"
@@ -64,6 +69,9 @@
 #include "storage/md.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "tcop/utility.h"
+#endif
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -114,6 +122,9 @@ typedef struct CreateDBRelInfo
 
 
 /* non-export function prototypes */
+#ifdef USE_PGRAC_CLUSTER
+static void PreflightClusterSharedDatabaseWrite(const char *command);
+#endif
 static void createdb_failure_callback(int code, Datum arg);
 static void movedb(const char *dbname, const char *tblspcname);
 static void movedb_failure_callback(int code, Datum arg);
@@ -1848,6 +1859,10 @@ RenameDatabase(const char *oldname, const char *newname)
 	int			npreparedxacts;
 	ObjectAddress address;
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedDatabaseWrite("ALTER DATABASE");
+#endif
+
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
 	 * need this for the same reasons as DROP DATABASE.
@@ -2392,6 +2407,10 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 					 errmsg("invalid connection limit: %d", dbconnlimit)));
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedDatabaseWrite("ALTER DATABASE");
+#endif
+
 	/*
 	 * Get the old tuple.  We don't need a lock on the database per se,
 	 * because we're not going to do anything that would mess up incoming
@@ -2472,6 +2491,35 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers must bind before their first database query or catalog lock. */
+static void
+PreflightClusterSharedDatabaseWrite(const char *command)
+{
+	ClusterCanonicalTxnBinding binding;
+	TransactionId current_xid;
+
+	if (!cluster_shared_catalog || !cluster_storage_mode_enabled())
+		return;
+
+	PreventCommandIfReadOnly(command);
+	PreventCommandIfParallelMode(command);
+	PreventCommandDuringRecovery(command);
+	if (IsSubTransaction())
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared catalog alteration does not support subtransactions")));
+	current_xid = GetCurrentTransactionIdIfAny();
+	if (TransactionIdIsValid(current_xid)
+		&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("shared catalog top-level transaction identity mismatch")));
+	if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+}
+#endif
+
 /*
  * ALTER DATABASE name REFRESH COLLATION VERSION
  */
@@ -2489,6 +2537,10 @@ AlterDatabaseRefreshColl(AlterDatabaseRefreshCollStmt *stmt)
 	bool		isnull;
 	char	   *oldversion;
 	char	   *newversion;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedDatabaseWrite("ALTER DATABASE");
+#endif
 
 	rel = table_open(DatabaseRelationId, RowExclusiveLock);
 	ScanKeyInit(&scankey,
@@ -2564,7 +2616,13 @@ AlterDatabaseRefreshColl(AlterDatabaseRefreshCollStmt *stmt)
 Oid
 AlterDatabaseSet(AlterDatabaseSetStmt *stmt)
 {
-	Oid			datid = get_database_oid(stmt->dbname, false);
+	Oid datid;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedDatabaseWrite("ALTER DATABASE");
+#endif
+
+	datid = get_database_oid(stmt->dbname, false);
 
 	/*
 	 * Obtain a lock on the database and make sure it didn't go away in the
@@ -2597,6 +2655,10 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 	SysScanDesc scan;
 	Form_pg_database datForm;
 	ObjectAddress address;
+
+#ifdef USE_PGRAC_CLUSTER
+	PreflightClusterSharedDatabaseWrite("ALTER DATABASE");
+#endif
 
 	/*
 	 * Get the old tuple.  We don't need a lock on the database per se,

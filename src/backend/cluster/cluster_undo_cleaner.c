@@ -66,12 +66,14 @@
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP */
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"				 /* cluster_storage_mode_enabled */
 #include "cluster/cluster_reconfig.h"			 /* ordinary/replacement write gate */
 #include "cluster/cluster_semantic_activation.h" /* operation-scoped modifier gate */
 #include "cluster/cluster_undo_horizon.h"		 /* cluster floor + fence (spec-5.22e D5-3) */
+#include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_undo_retention.h"		 /* horizon (C17: once per pass) */
 #include "cluster/cluster_tt_slot.h"			 /* current TT segment (exclusion) */
 #include "cluster/cluster_terminal_ref_census.h"
@@ -142,10 +144,15 @@ cluster_undo_cleaner_shmem_init(void)
 
 	if (!found) {
 		memset(undo_cleaner_state, 0, sizeof(*undo_cleaner_state));
+		cluster_undo_capacity_fence_init(&undo_cleaner_state->capacity_change);
 		LWLockInitialize(&undo_cleaner_state->lwlock, LWTRANCHE_CLUSTER_UNDO_CLEANER);
 		ConditionVariableInit(&undo_cleaner_state->capacity_cv);
+		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_refused_context, 0);
+		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_refused_proof, 0);
 		pg_atomic_init_u64(&undo_cleaner_state->capacity_wait_cancelled, 0);
+		pg_atomic_init_u64(&undo_cleaner_state->active_full_wakeup_recheck_count, 0);
 	}
+	cluster_undo_capacity_fence_attach(&undo_cleaner_state->capacity_change);
 }
 
 
@@ -238,12 +245,40 @@ cluster_undo_cleaner_capacity_stats_snapshot(ClusterUndoCapacityStats *out)
 	snapshot.active_full_wait_count = undo_cleaner_state->active_full_wait_count;
 	snapshot.pool_wait_count = undo_cleaner_state->capacity_wait_entered;
 	snapshot.wakeup_recheck_count = undo_cleaner_state->capacity_wait_repolled;
-	snapshot.refused_context_count = undo_cleaner_state->capacity_wait_refused_context;
-	snapshot.refused_proof_count = undo_cleaner_state->capacity_wait_refused_proof;
+	snapshot.native_wakeup_recheck_count
+		= pg_atomic_read_u64(&undo_cleaner_state->active_full_wakeup_recheck_count);
+	snapshot.refused_context_count
+		= pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_context);
+	snapshot.refused_proof_count
+		= pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof);
 	snapshot.cancel_count = pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_cancelled);
+	memcpy(snapshot.retain_by_reason, undo_cleaner_state->retain_by_reason,
+		   sizeof(snapshot.retain_by_reason));
 	LWLockRelease(&undo_cleaner_state->lwlock);
 	*out = snapshot;
 	return true;
+}
+
+/* A refused caller may already hold an LWLock. Count without taking another
+ * lock, changing its wait event, or granting any capacity/owner authority. */
+void
+cluster_undo_cleaner_note_capacity_refusal(bool unsafe_context)
+{
+	if (undo_cleaner_state == NULL)
+		return;
+	if (unsafe_context)
+		pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_refused_context, 1);
+	else
+		pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_refused_proof, 1);
+}
+
+/* Count only the normal native handoff, after its original finally cleanup.
+ * No extra lock, wait state or allocation authority is introduced here. */
+void
+cluster_undo_cleaner_note_tx_slot_recheck(void)
+{
+	if (undo_cleaner_state != NULL)
+		pg_atomic_fetch_add_u64(&undo_cleaner_state->active_full_wakeup_recheck_count, 1);
 }
 
 bool
@@ -531,6 +566,22 @@ undo_cleaner_capacity_segment_worker(uint32 current_segment, uint64 epoch,
 	return *worker == observation->owner_worker;
 }
 
+/* Count the qualified observation, not distinct segments or readers.
+ * A recheck can observe the same cause again. Unknown bits cannot index
+ * the counters, and none of these diagnostics changes the decision. */
+static void
+undo_cleaner_capacity_note_retention(ClusterCapacityReasonV1 reason,
+									 const ClusterCapacityObservationV1 *observation)
+{
+	if (reason != CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER || observation->retain_reasons == 0)
+		return;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+	for (unsigned bit = 0; bit < lengthof(undo_cleaner_state->retain_by_reason); bit++)
+		if ((observation->retain_reasons & (UINT32_C(1) << bit)) != 0)
+			undo_cleaner_state->retain_by_reason[bit]++;
+	LWLockRelease(&undo_cleaner_state->lwlock);
+}
+
 /* The CURRENT-only preflight may clear an old pool key. Preserve its exact
  * provenance while observing both paths under the original owner bracket. */
 static ClusterCtrcCapacityProbeResult
@@ -554,6 +605,7 @@ undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *fl
 	}
 	reason = cluster_ctrc_capacity_probe_pool_segment_v1(segment_id, floor->scn, floor->epoch,
 														 &prior, &observation);
+	undo_cleaner_capacity_note_retention(reason, &observation);
 	if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
 		ClusterCtrcTxnKeyV1 empty;
 
@@ -576,6 +628,166 @@ undo_cleaner_capacity_probe(uint32 segment_id, const ClusterUndoHorizonFloor *fl
 	return proof;
 }
 
+/* Reuse the original report cadence and frontend CV. A timer expiry only
+ * requests another observation; it never converts a wait into an error. */
+static bool
+undo_cleaner_capacity_report_wait(void)
+{
+	if (!undo_cleaner_capacity_context_safe())
+		return false;
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+	undo_cleaner_state->capacity_wait_entered++;
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	(void)ConditionVariableTimedSleep(&undo_cleaner_state->capacity_cv,
+									  Max(cluster_lmon_main_loop_interval, 200),
+									  WAIT_EVENT_CLUSTER_UNDO_CAPACITY_WAIT);
+	LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
+	undo_cleaner_state->capacity_wait_repolled++;
+	LWLockRelease(&undo_cleaner_state->lwlock);
+	return true;
+}
+
+static bool
+undo_cleaner_capacity_real_protector(const ClusterHeapFreezeCohortObservation *history)
+{
+	for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		uint64 members = peer < 64 ? history->admitted_members_lo : history->admitted_members_hi;
+		const ClusterHeapFreezeHistorySourceObservationV1 *source;
+		SCN horizon;
+
+		if ((members & (UINT64CONST(1) << (peer % 64))) == 0)
+			continue;
+		source = peer == cluster_node_id ? &history->source_local_history
+										 : &history->source_peer_history[peer];
+		horizon = peer == cluster_node_id ? history->source_local_horizon_scn
+										  : history->source_peer_horizon_scn[peer];
+		if (scn_time_cmp(horizon, history->horizon_scn) == 0
+			&& (source->contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT
+				|| source->contributor_kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_PREPARED
+				|| source->contributor_kind
+					   == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_REPLICATION))
+			return true;
+	}
+	return false;
+}
+
+/* All actual required reports must advance, including self's publication.
+ * F sample id, a replay, and the last sequence sent to another peer do not
+ * constitute a second H observation. Identity changes retire the pair. */
+static bool
+undo_cleaner_capacity_reports_advance(const ClusterHeapFreezeCohortObservation *first,
+									  const ClusterHeapFreezeCohortObservation *next)
+{
+	if (memcmp(&first->admission_fence, &next->admission_fence, sizeof(first->admission_fence)) != 0
+		|| next->source_local_report_sequence <= first->source_local_report_sequence)
+		return false;
+	for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		uint64 members = peer < 64 ? next->admitted_members_lo : next->admitted_members_hi;
+
+		if (peer != cluster_node_id && (members & (UINT64CONST(1) << (peer % 64))) != 0
+			&& next->source_peer_report_sequence[peer] <= first->source_peer_report_sequence[peer])
+			return false;
+	}
+	return true;
+}
+
+/* One waiting invocation owns its observations. No negative result is cached
+ * across allocator re-entry. Each iteration spends only the original bounded
+ * physical pass; an incomplete real pass can continue without sleeping. */
+static ClusterCtrcCapacityProbeResult
+undo_cleaner_capacity_history_probe(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation,
+									uint64 *owner_generations, unsigned *worker, bool *handled)
+{
+	ClusterHeapFreezeCohortObservation history, first;
+	ClusterCapacityHistoryPass pass = { 0 };
+	bool producer = false;
+	bool have_first = false;
+	uint64 first_change = 0;
+	ClusterHeapFreezeCohortStatus status;
+
+	*handled = false;
+	status = cluster_undo_capacity_history_observe(&history, &producer);
+	if (!producer)
+		return CLUSTER_CTRC_CAPACITY_REFUSE; /* original positive observer remains available */
+	*handled = true;
+	for (;;) {
+		ClusterCapacityObservationV1 observation;
+		ClusterCapacityReasonV1 reason;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!cluster_undo_cleaner_enabled || !cluster_storage_mode_enabled()
+			|| !undo_cleaner_capacity_context_safe() || !producer)
+			return CLUSTER_CTRC_CAPACITY_REFUSE;
+		if (status != CLUSTER_HEAP_FREEZE_COHORT_READY) {
+			if (status != CLUSTER_HEAP_FREEZE_COHORT_INCOMPLETE
+				&& status != CLUSTER_HEAP_FREEZE_COHORT_BUSY_PUBLISH
+				&& status != CLUSTER_HEAP_FREEZE_COHORT_H_STALE)
+				return CLUSTER_CTRC_CAPACITY_REFUSE;
+			MemSet(&pass, 0, sizeof(pass));
+			have_first = false;
+			if (!undo_cleaner_capacity_report_wait())
+				return CLUSTER_CTRC_CAPACITY_REFUSE;
+			status = cluster_undo_capacity_history_observe(&history, &producer);
+			continue;
+		}
+		if (have_first
+			&& (!cluster_undo_capacity_change_current(first_change)
+				|| memcmp(&first.admission_fence, &history.admission_fence,
+						  sizeof(first.admission_fence))
+					   != 0))
+			have_first = false;
+		LWLockAcquire(&undo_cleaner_state->lwlock, LW_SHARED);
+		for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
+			owner_generations[i] = undo_cleaner_capacity_owner_generation_locked(i);
+		LWLockRelease(&undo_cleaner_state->lwlock);
+		reason = cluster_ctrc_capacity_probe_history_v1(segment_id, history.horizon_scn,
+														cluster_epoch_get_current(), continuation,
+														&pass, &observation);
+		undo_cleaner_capacity_note_retention(reason, &observation);
+		if (reason == CLUSTER_CAPACITY_SUPPLY_RECHECK) {
+			MemSet(continuation, 0, sizeof(*continuation));
+			return CLUSTER_CTRC_CAPACITY_RETRY;
+		}
+		if (reason == CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE) {
+			if (observation.key.segment_id != 0)
+				*worker = (observation.key.segment_id - 1) % CLUSTER_UNDO_CLEANER_WORKER_TYPES;
+			else if (!undo_cleaner_capacity_segment_worker(segment_id, cluster_epoch_get_current(),
+														   &observation, worker))
+				return CLUSTER_CTRC_CAPACITY_REFUSE;
+			*continuation = observation.key;
+			return CLUSTER_CTRC_CAPACITY_WAIT;
+		}
+		if (!pass.complete) {
+			if (pass.incomplete && pass.progress)
+				continue;
+			return CLUSTER_CTRC_CAPACITY_REFUSE;
+		}
+		if (!pass.history_only)
+			return CLUSTER_CTRC_CAPACITY_REFUSE;
+		if (cluster_undo_capacity_history_current(&history) != CLUSTER_HEAP_FREEZE_COHORT_READY) {
+			MemSet(&pass, 0, sizeof(pass));
+			have_first = false;
+			status = cluster_undo_capacity_history_observe(&history, &producer);
+			continue;
+		}
+		if (undo_cleaner_capacity_real_protector(&history)) {
+			if (have_first && undo_cleaner_capacity_reports_advance(&first, &history)
+				&& cluster_undo_capacity_change_current(first_change))
+				return CLUSTER_CTRC_CAPACITY_REFUSE; /* original protected-history refusal */
+			if (!have_first) {
+				first = history;
+				first_change = pass.change_sequence;
+				have_first = true;
+			}
+		} else
+			have_first = false;
+		if (!undo_cleaner_capacity_report_wait())
+			return CLUSTER_CTRC_CAPACITY_REFUSE;
+		MemSet(&pass, 0, sizeof(pass));
+		status = cluster_undo_capacity_history_observe(&history, &producer);
+	}
+}
+
 bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *continuation)
 {
@@ -586,9 +798,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 	if (undo_cleaner_state == NULL || continuation == NULL)
 		return false;
 	if (!undo_cleaner_capacity_context_safe()) {
-		LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
-		undo_cleaner_state->capacity_wait_refused_context++;
-		LWLockRelease(&undo_cleaner_state->lwlock);
+		cluster_undo_cleaner_note_capacity_refusal(true);
 		pgstat_report_wait_start(previous_wait_event);
 		return false;
 	}
@@ -599,12 +809,16 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		ClusterCtrcCapacityProbeResult proof = CLUSTER_CTRC_CAPACITY_REFUSE;
 		uint64 owner_generations[CLUSTER_UNDO_CLEANER_WORKER_TYPES] = { 0 };
 		unsigned worker = 0;
+		bool history_handled = false;
 
 		CHECK_FOR_INTERRUPTS();
-		if (cluster_undo_cleaner_enabled && cluster_storage_mode_enabled()
-			&& undo_cleaner_capacity_floor(&floor))
-			proof = undo_cleaner_capacity_probe(segment_id, &floor, continuation, owner_generations,
-												&worker);
+		if (cluster_undo_cleaner_enabled && cluster_storage_mode_enabled()) {
+			proof = undo_cleaner_capacity_history_probe(segment_id, continuation, owner_generations,
+														&worker, &history_handled);
+			if (!history_handled && undo_cleaner_capacity_floor(&floor))
+				proof = undo_cleaner_capacity_probe(segment_id, &floor, continuation,
+													owner_generations, &worker);
+		}
 		if (proof == CLUSTER_CTRC_CAPACITY_RETRY)
 			retry = true;
 		else if (proof == CLUSTER_CTRC_CAPACITY_WAIT && undo_cleaner_capacity_context_safe()) {
@@ -623,7 +837,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 			if (supplied && !owner_changed)
 				undo_cleaner_state->capacity_wait_entered++;
 			else if (!supplied)
-				undo_cleaner_state->capacity_wait_refused_proof++;
+				cluster_undo_cleaner_note_capacity_refusal(false);
 			LWLockRelease(&undo_cleaner_state->lwlock);
 			if (owner_changed) {
 				/* Re-enter the original allocator/proof under the new owner;
@@ -643,12 +857,7 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 				retry = true;
 			}
 		} else {
-			LWLockAcquire(&undo_cleaner_state->lwlock, LW_EXCLUSIVE);
-			if (proof == CLUSTER_CTRC_CAPACITY_WAIT)
-				undo_cleaner_state->capacity_wait_refused_context++;
-			else
-				undo_cleaner_state->capacity_wait_refused_proof++;
-			LWLockRelease(&undo_cleaner_state->lwlock);
+			cluster_undo_cleaner_note_capacity_refusal(proof == CLUSTER_CTRC_CAPACITY_WAIT);
 		}
 		completed = true;
 	}
@@ -659,10 +868,10 @@ cluster_undo_cleaner_wait_for_capacity(uint32 segment_id, ClusterCtrcTxnKeyV1 *c
 		 * must not turn a different failure into caller cancellation. */
 		if (!completed && geterrcode() == ERRCODE_QUERY_CANCELED)
 			pg_atomic_fetch_add_u64(&undo_cleaner_state->capacity_wait_cancelled, 1);
+		/* CV and bookkeeping LWLock waits clear their events on either exit. */
+		pgstat_report_wait_start(previous_wait_event);
 	}
 	PG_END_TRY();
-	/* CV and bookkeeping LWLock waits clear their events. Errors use PG cleanup. */
-	pgstat_report_wait_start(previous_wait_event);
 	return retry;
 }
 
@@ -1458,8 +1667,23 @@ UNDO_CLEANER_COUNTER_ACCESSOR(segments_marked_recyclable)
 UNDO_CLEANER_COUNTER_ACCESSOR(stale_active_skipped)
 UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_entered)
 UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_repolled)
-UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_refused_context)
-UNDO_CLEANER_COUNTER_ACCESSOR(capacity_wait_refused_proof)
+
+uint64
+cluster_undo_cleaner_capacity_wait_refused_context(void)
+{
+	if (undo_cleaner_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_context);
+}
+
+uint64
+cluster_undo_cleaner_capacity_wait_refused_proof(void)
+{
+	if (undo_cleaner_state == NULL)
+		return 0;
+	return pg_atomic_read_u64(&undo_cleaner_state->capacity_wait_refused_proof);
+}
+
 UNDO_CLEANER_COUNTER_ACCESSOR(header_tt_slots_below_horizon) /* spec-5.22e D5-5 */
 
 

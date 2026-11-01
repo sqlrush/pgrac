@@ -504,6 +504,13 @@ vacuum(List *relations, VacuumParams *params, BufferAccessStrategy bstrategy,
 
 	Assert(params != NULL);
 
+#ifdef USE_PGRAC_CLUSTER
+	if ((cluster_shared_config || cluster_shared_catalog) && (params->options & VACOPT_FULL))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("VACUUM FULL is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+#endif
+
 	stmttype = (params->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
 
 	/*

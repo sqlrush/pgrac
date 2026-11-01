@@ -8,6 +8,10 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
+ * PGRAC MODIFICATIONS
+ *    Enforce shared scope at native operator class and family entries.
+ *    Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/backend/commands/opclasscmds.c
  *
@@ -36,6 +40,9 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 #include "commands/alter.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -326,6 +333,18 @@ CreateOpFamily(CreateOpFamilyStmt *stmt, const char *opfname,
 	return myself;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Direct callers share the original utility refusal before catalog work. */
+static void
+CheckClusterSharedOpClassSupport(void)
+{
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("custom operators is not supported in shared mode"),
+						errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+}
+#endif
+
 /*
  * DefineOpClass
  *		Define a new index operator class.
@@ -359,6 +378,10 @@ DefineOpClass(CreateOpClassStmt *stmt)
 				referenced;
 
 	/* Convert list of names to a name and namespace */
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedOpClassSupport();
+#endif
+
 	namespaceoid = QualifiedNameGetCreationNamespace(stmt->opclassname,
 													 &opcname);
 
@@ -778,6 +801,10 @@ DefineOpFamily(CreateOpFamilyStmt *stmt)
 	AclResult	aclresult;
 
 	/* Convert list of names to a name and namespace */
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedOpClassSupport();
+#endif
+
 	namespaceoid = QualifiedNameGetCreationNamespace(stmt->opfamilyname,
 													 &opfname);
 
@@ -827,6 +854,10 @@ AlterOpFamily(AlterOpFamilyStmt *stmt)
 	IndexAmRoutine *amroutine;
 
 	/* Get necessary info about access method */
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterSharedOpClassSupport();
+#endif
+
 	tup = SearchSysCache1(AMNAME, CStringGetDatum(stmt->amname));
 	if (!HeapTupleIsValid(tup))
 		ereport(ERROR,

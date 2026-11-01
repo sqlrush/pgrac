@@ -38,6 +38,11 @@
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#include "cluster/cluster_tt_local.h"
+#include "tcop/utility.h"
+#endif
 #include "common/pg_prng.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
@@ -140,6 +145,30 @@ analyze_rel(Oid relid, RangeVar *relation,
 	 * Check for user-requested abort.
 	 */
 	CHECK_FOR_INTERRUPTS();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Bind this transaction before taking the target's strong relation lock. */
+	if (cluster_shared_catalog && cluster_storage_mode_enabled()) {
+		ClusterCanonicalTxnBinding binding;
+		TransactionId current_xid;
+
+		PreventCommandIfReadOnly("ANALYZE");
+		PreventCommandIfParallelMode("ANALYZE");
+		PreventCommandDuringRecovery("ANALYZE");
+		if (IsSubTransaction())
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared catalog alteration does not support subtransactions")));
+		current_xid = GetCurrentTransactionIdIfAny();
+		if (TransactionIdIsValid(current_xid)
+			&& !TransactionIdEquals(current_xid, GetTopTransactionIdIfAny()))
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("shared catalog top-level transaction identity mismatch")));
+		if (!cluster_tt_local_prepare_canonical_active(GetTopTransactionId(), &binding))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication failed before shared catalog alteration")));
+	}
+#endif
 
 	/*
 	 * Open the relation, getting ShareUpdateExclusiveLock to ensure that two

@@ -86,3 +86,33 @@ SELECT name, setting, boot_val, reset_val, unit, context,
 3. 采样失败、超时或节点缺行必须保留为失败样本，不能当作 0。
 4. 视图返回 `unknown`/`blocked` 时保持该结论，不用其他计数器推测成功。
 5. 高频采集优先结构化单行视图和 `pg_cluster_state` 汇总键，避免反复扫描 GRD entry。
+
+## 8. Undo 容量等待采样
+
+段池达到 `cluster.undo_segments_max_per_instance` 后，新共享写可能进入容量等待。是否能等待仍取决于原执行上下文与清偿证据；已有强锁、已发生写副作用或证据不足的调用者保留原拒绝。单段事务槽满时还可能等待当前活动事务结束，调大段池上限不能保证解除这种等待。
+
+先观察当前会话等待，再低频采集同一实例的计数增量：
+
+```sql
+SELECT pid, state, wait_event_type, wait_event
+  FROM pg_stat_activity
+ WHERE wait_event IN ('ClusterUndoCapacityWait', 'ClusterUndoTxSlotWait');
+
+SELECT statement_timestamp() AS sampled_at,
+       pg_postmaster_start_time() AS postmaster_started_at,
+       category, key, value
+  FROM pg_cluster_state
+ WHERE category = 'undo_cleaner'
+   AND key IN ('tt_capacity_stats_available', 'tt_capacity_origin_node_id',
+               'tt_slot_active_full_wait_count', 'tt_capacity_pool_wait_count',
+               'tt_capacity_wakeup_recheck_count', 'tt_capacity_cancel_count',
+               'tt_capacity_refuse_by_reason.context',
+               'tt_capacity_refuse_by_reason.proof')
+ ORDER BY key;
+```
+
+`pg_cluster_state` 先生成诊断快照，`WHERE` 只过滤返回结果，不减少其底层采样成本；其中包含共享状态扫描，勿把这个查询当作 O(1) 高频探针。没有等待行也不证明等待从未发生。统计不可用时保留 `tt_capacity_stats_available=false`，不要把缺少的键补零。按来源和 postmaster 启动时间分组比较，重启前后的累计值不能直接相减。
+
+`tt_capacity_wakeup_recheck_count` 是重查次数，包含周期性返回，不代表新槽、成功提交或 cleaner 实际完成数。原 `capacity_wait_repolled` 仍只计容量 CV，不能与它等同。拒绝原因计数和 `undo_retain_by_reason.*` 是诊断观察，不能单凭 `history_pin` 或池满断定长读者是根因。
+
+周期性容量重查不会自行产生新的事务超时。调用者取消/statement timeout (`57014`)、原 lock timeout (`55P03`)、死锁 (`40P01`) 和准入变化 (`53R60`) 保持各自含义，排查时保留原 SQLSTATE 与日志。shared 配置下 cleaner 必须开启；不要通过关闭 cleaner、释放用户锁或重置保留信息来消除等待。

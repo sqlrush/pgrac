@@ -1079,7 +1079,7 @@ _classify_owners(
 _classify_owners(
     "ITL_TERMINAL_DISCHARGE",
     "src/backend/cluster/cluster_terminal_ref_census.c",
-    ("ctrc_cleaner_companions_discharge_locked",),
+    ("ctrc_cleaner_companions_discharge_locked_capacity_internal",),
     "TERMINAL_PROJECTION_DISCHARGE",
     "CTRC_REF_HEAP_ITL_UBA",
     "CTRC_TARGET_EXACT_ITL_SLOT",
@@ -1244,7 +1244,7 @@ _classify_owners(
 _classify_owners(
     "ROLLED_SEGMENT_RECYCLE",
     "src/backend/cluster/cluster_undo_record.c",
-    ("claim_undo_extent", "cluster_undo_segment_advance_recyclable", "cluster_undo_tt_rollover_locked"),
+    ("claim_undo_extent_capacity_body", "cluster_undo_segment_advance_recyclable", "cluster_undo_tt_rollover_locked_capacity_body"),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
     "ROLLED_CANONICAL_TT_SLOT",
@@ -1294,7 +1294,7 @@ _classify_owners(
 _classify_owners(
     "TT_RELEASE_FLAG_WRITER",
     "src/backend/cluster/cluster_terminal_ref_census.c",
-    ("cluster_ctrc_terminal_release_sample_exact", "ctrc_cleaner_publish_certificate"),
+    ("cluster_ctrc_terminal_release_sample_exact", "ctrc_cleaner_publish_certificate_capacity_internal"),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
     "CANONICAL_TT_SLOT",
@@ -1407,6 +1407,54 @@ _classify_owners(
     "DURABLE_TERMINAL_STATUS_WITH_RELEASE_BIT_CLEARED",
     "cluster_ctrc_terminal_release_sample_exact",
     "MXA-T33",
+)
+
+_classify_owners(
+    'CTRC_ORIGIN_PROVENANCE',
+    'src/backend/cluster/cluster_tt_slot.c',
+    ('cluster_tt_slot_origin_identity_retain_capacity_body',),
+    'REGISTERED_REFERENCE',
+    'ALL_CTRC_REFERENCE_KINDS',
+    'CANONICAL_TT_SLOT',
+    'NO_REFERENCE_TRANSFER_REQUIRED',
+    'NO_REFERENCE_TO_DISCHARGE',
+    'MXA-T40',
+)
+
+_classify_owners(
+    'CURRENT_MX_TERMINAL_CLEANOUT',
+    'src/backend/cluster/cluster_terminal_ref_census.c',
+    ('cluster_ctrc_receipt_discharge_current_mx_shared_capacity_internal',),
+    'TERMINAL_PROJECTION_DISCHARGE',
+    'CTRC_REF_CURRENT_MX_LOCKER|CTRC_REF_CURRENT_MX_UPDATER|CTRC_REF_RECOMPOSED_SURVIVOR|CTRC_REF_HOT_FOLLOW_EDGE',
+    'CTRC_TARGET_EXACT_TID',
+    'TERMINAL_REWRITE_OR_PROVED_ABSENCE',
+    'cluster_ctrc_receipt_discharge_current_mx_shared',
+    'MXA-T25',
+)
+
+_classify_owners(
+    'ITL_TERMINAL_DISCHARGE',
+    'src/backend/cluster/cluster_terminal_ref_census.c',
+    ('cluster_ctrc_receipt_discharge_itl_shared_capacity_internal',),
+    'TERMINAL_PROJECTION_DISCHARGE',
+    'CTRC_REF_HEAP_ITL_UBA',
+    'CTRC_TARGET_EXACT_ITL_SLOT',
+    'TERMINAL_INDEPENDENT_ITL_PROJECTION',
+    'cluster_ctrc_receipt_discharge_itl_shared',
+    'MXA-T23',
+)
+
+_classify_owners(
+    "TT_RELEASE_FLAG_WRITER",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_capacity_history_current", "ctrc_capacity_history_inventory"),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "CANONICAL_TT_SLOT",
+    "READ_ONLY_CAPACITY_OBSERVATION",
+    "NO_RELEASE_MUTATION",
+    "MXA-T35/test_history_negative_requires_actual_current48_and_complete_physical_pool",
 )
 
 

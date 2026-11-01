@@ -329,6 +329,20 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 												 uint16 *out_seg, uint16 *out_slot,
 												 uint16 *out_wrap, uint8 *out_status);
 
+/* Local diagnostic labels only; they do not affect locator decisions. */
+#define CLUSTER_TT_DURABLE_LOCATOR_FAMILY_STATS_V1 1
+typedef enum ClusterTTDurableLocatorFamily {
+	CLUSTER_TT_LOCATOR_RUNTIME_ACTIVE = 0,
+	CLUSTER_TT_LOCATOR_RUNTIME_TERMINAL,
+	CLUSTER_TT_LOCATOR_MX_CURRENT_ORIGIN,
+	CLUSTER_TT_LOCATOR_MX_PROJECTION,
+	CLUSTER_TT_LOCATOR_FAMILY_COUNT
+} ClusterTTDurableLocatorFamily;
+
+extern ClusterTTDurableLocate cluster_tt_slot_durable_locate_any_by_xid_origin_profiled(
+	ClusterTTDurableLocatorFamily family, int origin_node, TransactionId xid, uint16 *out_seg,
+	uint16 *out_slot, uint16 *out_wrap, uint8 *out_status);
+
 /*
  * cluster_tt_slot_durable_lookup_by_xid -- scan the local node's undo segment
  *	headers for a COMMITTED TT slot owned by `xid`.  Used by the spec-3.10
@@ -502,6 +516,31 @@ extern void cluster_tt_durable_count_commit(void);
 extern void cluster_tt_durable_count_lookup(bool hit);
 extern void cluster_tt_durable_count_by_xid_scan(void);
 extern void cluster_tt_durable_count_redo_apply(void);
+
+/* Local postmaster-lifetime locator diagnostics, independent atomic samples.
+ * A FOUND identity is not terminal authority. False preserves the output. */
+#define CLUSTER_TT_DURABLE_LOCATOR_STATS_V1 1
+typedef struct ClusterTTDurableLocatorFamilyStats {
+	uint64 fallback_count;
+	uint64 found_count;
+	uint64 missing_count;
+	uint64 ambiguous_count;
+	uint64 unavailable_count;
+} ClusterTTDurableLocatorFamilyStats;
+
+typedef struct ClusterTTDurableLocatorStats {
+	int32 origin_node_id;
+	uint64 fallback_count;
+	uint64 found_count;
+	uint64 missing_count;
+	uint64 ambiguous_count;
+	uint64 unavailable_count;
+	ClusterTTDurableLocatorFamilyStats families[CLUSTER_TT_LOCATOR_FAMILY_COUNT];
+} ClusterTTDurableLocatorStats;
+
+extern void cluster_tt_durable_count_locator_call(void);
+extern void cluster_tt_durable_count_locator_result(ClusterTTDurableLocate result);
+extern bool cluster_tt_durable_locator_stats_snapshot(ClusterTTDurableLocatorStats *out);
 
 /* wait-event bracket hooks (WAIT_EVENT_UNDO_TT_DURABLE_IO). */
 extern void cluster_tt_durable_io_wait_start(void);

@@ -32,6 +32,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_capacity.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -235,8 +236,26 @@ cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
  *   INIT WAL, complete file contents and no-replace publication are durable.
  *   Invalid existing files are never repaired by a live allocator.
  */
+static void cluster_undo_segment_allocate_capacity_body(uint32 segment_id, uint8 owner_instance);
+
 void
 cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+
+	PG_TRY();
+	{
+		cluster_undo_segment_allocate_capacity_body(segment_id, owner_instance);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+}
+
+static void
+cluster_undo_segment_allocate_capacity_body(uint32 segment_id, uint8 owner_instance)
 {
 	ClusterUndoBlock0LogicalKey logical = { 0 };
 	ClusterUndoBlock0Result result;
@@ -408,10 +427,35 @@ typedef enum ClusterUndoLifecycleMutationKind {
 /* Freeze one legal monotonic lifecycle successor, then let the sole live
  * block-zero current/content-X owner compare and publish it.  This function
  * may wait for 0xFB and therefore must run without lifecycle/content locks. */
+static bool cluster_undo_block0_current_live_owner_lifecycle_exact_capacity_body(
+	uint32 segment_id, uint8 owner_instance, ClusterUndoLifecycleMutationKind kind, uint32 arg1,
+	uint32 arg2);
+
 static bool
 cluster_undo_block0_current_live_owner_lifecycle_exact(uint32 segment_id, uint8 owner_instance,
 													   ClusterUndoLifecycleMutationKind kind,
 													   uint32 arg1, uint32 arg2)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	bool result;
+
+	PG_TRY();
+	{
+		result = cluster_undo_block0_current_live_owner_lifecycle_exact_capacity_body(
+			segment_id, owner_instance, kind, arg1, arg2);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_undo_block0_current_live_owner_lifecycle_exact_capacity_body(
+	uint32 segment_id, uint8 owner_instance, ClusterUndoLifecycleMutationKind kind, uint32 arg1,
+	uint32 arg2)
 {
 	PGAlignedBlock predecessor;
 	PGAlignedBlock successor;
@@ -588,8 +632,32 @@ cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance
  *	Caller holds no lifecycle/content lock.  Returns the
  *	segment_id, or 0 on I/O failure (caller falls back to fresh create).
  */
+static uint32 cluster_undo_segment_reuse_in_place_capacity_body(uint32 segment_id,
+																uint8 owner_instance,
+																uint32 old_generation);
+
 uint32
 cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance, uint32 old_generation)
+{
+	bool entered = cluster_undo_capacity_write_scope_begin();
+	uint32 result;
+
+	PG_TRY();
+	{
+		result = cluster_undo_segment_reuse_in_place_capacity_body(segment_id, owner_instance,
+																   old_generation);
+	}
+	PG_FINALLY();
+	{
+		cluster_undo_capacity_write_scope_end(entered);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static uint32
+cluster_undo_segment_reuse_in_place_capacity_body(uint32 segment_id, uint8 owner_instance,
+												  uint32 old_generation)
 {
 	PGAlignedBlock page;
 	UndoSegmentHeaderData *hdr;
@@ -992,6 +1060,27 @@ cluster_undo_segment_scan_max_existing(uint8 owner_instance)
 	return max_found;
 }
 
+
+ClusterUndoBlock0Result
+cluster_undo_segment_capacity_presence(uint8 owner_instance, uint32 segment_id)
+{
+	char path[MAXPGPATH];
+	uint32 first;
+
+	if (cluster_node_id < 0 || cluster_node_id >= UNDO_OWNER_INSTANCE_MAX || owner_instance == 0
+		|| owner_instance > UNDO_OWNER_INSTANCE_MAX
+		|| owner_instance != (uint8)(cluster_node_id + 1))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	first = ((uint32)owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	if (segment_id < first || segment_id - first >= CLUSTER_UNDO_SEGS_PER_INSTANCE
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner_instance, segment_id,
+									 path, sizeof(path))
+			   != 0)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	if (access(path, F_OK) == 0)
+		return CLUSTER_UNDO_BLOCK0_OK;
+	return errno == ENOENT ? CLUSTER_UNDO_BLOCK0_NOT_FOUND : CLUSTER_UNDO_BLOCK0_IO_ERROR;
+}
 
 /*
  * cluster_undo_segment_file_exists -- spec-3.22 lock-free existence probe.
