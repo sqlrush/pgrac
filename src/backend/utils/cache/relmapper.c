@@ -135,6 +135,7 @@
 #include "cluster/cluster_inject.h"	  /* crash-window test levers (D5) */
 #include "cluster/cluster_mode.h"		  /* cluster_peer_mode_enabled (D5) */
 #include "cluster/cluster_relmap_authority.h" /* shared relmap authority (D5) */
+#include "cluster/cluster_relmap_control.h"
 #include "cluster/cluster_relmap_lock.h"  /* singleton relmap X lock (D5) */
 #include "cluster/cluster_relmap_owner.h" /* immutable producer identity */
 #include "cluster/cluster_relmap_retention_runtime.h"
@@ -833,6 +834,26 @@ RestoreRelationMap(char *startAddress)
 	active_shared_updates = relmaps->active_shared_updates;
 	active_local_updates = relmaps->active_local_updates;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Explicit control-selected companions. The original control owner chooses
+ * this format and holds CF before entry; managed refusal has no legacy route. */
+bool
+RelationMapReadManagedV2(const ClusterSharedConfigRef *expected, Size registry_budget,
+	Oid database_oid, Oid tablespace_oid, RelMapFile *out)
+{
+	return cluster_relmap_control_read_v2(expected, registry_budget,
+	database_oid, tablespace_oid, out);
+}
+
+bool
+CheckPointRelationMapManagedV2(const ClusterSharedConfigRef *expected,
+	Size registry_budget, Size receipt_budget,
+	ClusterRelmapCheckpointReceiptV2 **fresh)
+{
+	return cluster_relmap_control_checkpoint_v2(expected, registry_budget, receipt_budget, fresh);
+}
+#endif
 
 /*
  * load_relmap_file -- load the shared or local map file

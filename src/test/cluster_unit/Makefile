@@ -15905,3 +15905,48 @@ clean: clean-control-relmap-selection
 .PHONY: clean-control-relmap-selection
 clean-control-relmap-selection:
 	rm -f test_cluster_control_relmap_selection test_cluster_control_relmap_selection.d
+
+# Managed cache/checkpoint companions use the complete original control selector.
+TESTS += test_cluster_relmap_control
+all: test_cluster_relmap_control
+test_cluster_relmap_control_entries.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
+	awk '/^(RelationMapReadManagedV2|CheckPointRelationMapManagedV2)\(/ { print "bool"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_relmap_control_authority.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_relmap_authority_managed_read_v2=control_original_read \
+		-Dcluster_relmap_authority_managed_checkpoint_v2=control_original_checkpoint -c $< -o $@
+test_cluster_relmap_control: test_cluster_relmap_control.c test_cluster_control_relmap_selection.c \
+		test_cluster_control_file_selection.c test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		test_cluster_relmap_control_entries.inc test_cluster_relmap_control_authority.o \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_control.h \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c unit_test.h Makefile \
+		cluster_control_registry_original.o cluster_registry_common_test.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c \
+		test_cluster_relmap_control_authority.o cluster_control_registry_original.o cluster_registry_common_test.o \
+		$(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-relmap-control
+.PHONY: clean-relmap-control
+clean-relmap-control:
+	rm -f test_cluster_relmap_control test_cluster_relmap_control.d test_cluster_relmap_control_authority.o test_cluster_relmap_control_authority.d test_cluster_relmap_control_entries.inc test_cluster_relmap_control_entries.inc.tmp

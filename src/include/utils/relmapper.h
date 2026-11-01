@@ -58,6 +58,19 @@ extern void AtPrepare_RelationMap(void);
 struct RelMapFile;
 struct ClusterRelmapOwnerSampleV2;
 struct ClusterRelmapV2Image;
+struct ClusterSharedConfigRef;
+struct ClusterRelmapCheckpointReceiptV2;
+
+/* Explicit managed companions for the original cache/checkpoint owner. Borrow
+ * its CF-S/X, enter before MappingLock, and retain all original protection and
+ * failure duties. Selection/sync failure never falls back to old files.
+ * The checkpoint receipt is local copied input for the original all-family
+ * publisher, not checkpoint coverage, role authority or format activation. */
+extern bool RelationMapReadManagedV2(const struct ClusterSharedConfigRef *expected,
+	Size registry_budget, Oid database_oid, Oid tablespace_oid, struct RelMapFile *out);
+extern bool CheckPointRelationMapManagedV2(const struct ClusterSharedConfigRef *expected,
+	Size registry_budget, Size receipt_budget, struct ClusterRelmapCheckpointReceiptV2 **fresh);
+
 
 /* Dormant stage-only producer under the caller's original global relmap X.
  * Captures the original owner before local locking, prepares retention, then

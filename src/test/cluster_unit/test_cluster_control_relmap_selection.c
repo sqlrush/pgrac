@@ -291,6 +291,8 @@ UT_TEST(test_copied_checkpoint_reference_does_not_revive_cf_authority)
 	cluster_control_root_relmap_selection_destroy_v4(&fresh);
 	selection_end();
 }
+
+#ifndef TEST_CONTROL_RELMAP_CONSUMER
 int main(void)
 {
 	UT_PLAN(19);
@@ -316,3 +318,5 @@ int main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+
+#endif /* TEST_CONTROL_RELMAP_CONSUMER */

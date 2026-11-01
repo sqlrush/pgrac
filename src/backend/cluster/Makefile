@@ -296,6 +296,7 @@ OBJS = \
 	cluster_oid_lease_shmem.o \
 	cluster_relmap_arb.o \
 	cluster_relmap_authority.o \
+	cluster_relmap_control.o \
 	cluster_relmap_lock.o \
 	cluster_relmap_owner.o \
 	cluster_relmap_recovery.o \
