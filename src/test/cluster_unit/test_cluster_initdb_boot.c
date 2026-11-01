@@ -32,7 +32,7 @@ result(const ClusterRecoveryFileIdentityV2 *id, ClusterRecoveryBootFileV2 *out)
 {
 	memset(out, 0, sizeof(*out));
 	out->identity = *id;
-	out->page.page_generation = 1;
+	out->page.page_generation = id->kind == CLUSTER_RECOVERY_FILE_CLOG_V2 ? 3 : 0;
 	out->image_digest[0] = 1;
 	out->synced_bytes = id->kind == CLUSTER_RECOVERY_FILE_UNDO_V2 ? UNDO_SEGMENT_SIZE_BYTES : 16448;
 	if (fault == 2)
@@ -221,10 +221,51 @@ UT_TEST(native_child_consumes_boot_fd_without_shared_base_publication_custody)
 	UT_ASSERT(!close(root) && !rmdir(temp));
 }
 
+UT_TEST(boot_result_keeps_clog_birth_and_unused_tt_facts_separate)
+{
+	ClusterRecoveryBootFileV2 tt, bad, clog;
+	ClusterRecoveryFileIdentityV2 other;
+	setup();
+	UT_ASSERT(cluster_undo_bootstrap_v2(71, &pgrac_native_recovery.boot_files[1], &tt));
+	UT_ASSERT(cluster_recovery_boot_file_matches_v2(&pgrac_native_recovery.boot_files[1], &tt));
+	UT_ASSERT(BootStrapCLOGManagedV2(&pgrac_native_recovery.boot_files[0],
+									 FirstNormalFullTransactionId, &clog));
+	UT_ASSERT(cluster_recovery_boot_file_matches_v2(&pgrac_native_recovery.boot_files[0], &clog));
+	for (unsigned i = 0; i < 5; ++i) {
+		bad = tt;
+		if (i == 0)
+			bad.page.page_generation = 1;
+		if (i == 1)
+			bad.page.birth_observed = true;
+		if (i == 2)
+			bad.page.birth_full_xid = FirstNormalFullTransactionId;
+		if (i == 3)
+			bad.page.page_lsn = 1;
+		if (i == 4)
+			bad.page.metadata_crc = 1;
+		UT_ASSERT(
+			!cluster_recovery_boot_file_matches_v2(&pgrac_native_recovery.boot_files[1], &bad));
+	}
+	bad = clog;
+	bad.page.birth_observed = false;
+	UT_ASSERT(!cluster_recovery_boot_file_matches_v2(&pgrac_native_recovery.boot_files[0], &bad));
+	bad = clog;
+	++bad.synced_bytes;
+	UT_ASSERT(!cluster_recovery_boot_file_matches_v2(&pgrac_native_recovery.boot_files[0], &bad));
+	bad = clog;
+	bad.page.page_generation = 4;
+	UT_ASSERT(!cluster_recovery_boot_file_matches_v2(&pgrac_native_recovery.boot_files[0], &bad));
+	other = pgrac_native_recovery.first;
+	bad = tt;
+	bad.identity = other;
+	UT_ASSERT(!cluster_recovery_boot_file_matches_v2(&other, &bad));
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
+	UT_RUN(boot_result_keeps_clog_birth_and_unused_tt_facts_separate);
 	UT_RUN(native_child_consumes_boot_fd_without_shared_base_publication_custody);
 	UT_RUN(original_bootstrap_uses_complete_identity_and_actual_initial_xid);
 	UT_RUN(legacy_bootstrap_keeps_original_raw_call);

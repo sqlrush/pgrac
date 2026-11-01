@@ -424,7 +424,9 @@ UT_TEST(managed_registry_matches_each_captured_image_and_preallocated_identity) 
 		ctx->boot_files[i].tablespace_oid = 0;
 		ctx->boot_files[i].creation_generation += 4 + i;
 		b->identity = ctx->boot_files[i];
-		b->page.page_generation = 1;
+		b->page.page_generation = i ? 0 : 3;
+		b->page.birth_observed = !i;
+		b->page.birth_full_xid = i ? FullTransactionIdFromU64(0) : FirstNormalFullTransactionId;
 		b->synced_bytes = i ? UNDO_SEGMENT_SIZE_BYTES : 16448;
 		b->image_digest[0] = i + 1;
 		complete[8 + i].identity = b->identity;

@@ -557,7 +557,7 @@ cluster_clog_bootstrap_read_v2(int fd, const ClusterRecoveryFileIdentityV2 *id,
 	out->identity = *id;
 	out->synced_bytes = st.st_size;
 	out->image_digest[0] = byte;
-	out->page.page_generation = 1;
+	out->page.page_generation = id->kind == CLUSTER_RECOVERY_FILE_CLOG_V2 ? 3 : 0;
 	out->page.birth_observed = id->kind == CLUSTER_RECOVERY_FILE_CLOG_V2;
 	out->page.birth_full_xid
 		= out->page.birth_observed ? FirstNormalFullTransactionId : FullTransactionIdFromU64(0);
