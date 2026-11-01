@@ -11,6 +11,7 @@
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_ir.h"
@@ -401,7 +402,7 @@ static void actual_startup_eor_claim(EndOfWalRecoveryInfo *endOfRecoveryInfo)
 /* Saved-receipt readers remain real. The physical recheck boundary is
  * controlled here; the Startup storage component exercises its full body. */
 bool test_start_unused_relmap_recheck(const struct ClusterRecoveryStartV1 *start);
-#ifndef TEST_CLUSTER_STARTUP_RELMAP_FILES
+#if !defined(TEST_CLUSTER_STARTUP_RELMAP_FILES) && !defined(TEST_CLUSTER_STARTUP_RELMAP_TERMINAL)
 #define cluster_cold_relmap_replay_recheck_v1 test_start_unused_relmap_recheck
 #include "../../backend/cluster/cluster_cold_recovery_relmap.c"
 #undef cluster_cold_relmap_replay_recheck_v1
