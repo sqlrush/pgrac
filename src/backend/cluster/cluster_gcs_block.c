@@ -11185,6 +11185,27 @@ typedef enum GcsBlockCurrentMxAdvance {
 	GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT
 } GcsBlockCurrentMxAdvance;
 
+/* Preload only the operation-aware A/B strategy under its original DATA
+ * guard. Share the history drain budget/statistics; READY remains candidate
+ * bytes for the original three-phase proof. */
+static ClusterHistoryDataStep
+gcs_block_current_mx_prepare_data_held(GcsBlockR4TxOriginContext *context,
+	volatile bool *cold_read_available)
+{
+	ClusterHistoryDataStep step;
+	const ClusterUndoBlock0ResolvedRoot *root = context->phase == GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE
+		? &context->root : &context->recheck_root;
+	if (!context->current_mx_exact
+		|| (!context->current_mx_exact_b && !gcs_block_current_mx_exact_record(context))
+		|| context->request_conflict || !gcs_block_current_mx_requester_identity_current(context))
+		return CLUSTER_HISTORY_DATA_FAILED;
+	step = cluster_runtime_visibility_mx_history_prepare_data_held(&context->locator,
+		context->resolve_mode, &context->admission, &context->guard, root, cold_read_available);
+	return step == CLUSTER_HISTORY_DATA_READY
+		&& (context->request_conflict || !gcs_block_current_mx_requester_identity_current(context))
+		? CLUSTER_HISTORY_DATA_FAILED : step;
+}
+
 static bool
 gcs_block_current_mx_exact_held(GcsBlockR4TxOriginContext *context)
 {
@@ -11611,6 +11632,19 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context, volatile bool *c
 			break;
 		}
 		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+			if (context->current_mx_exact
+				&& (context->current_mx_exact_b || gcs_block_current_mx_exact_record(context))) {
+				ClusterHistoryDataStep loaded = gcs_block_current_mx_prepare_data_held(
+					context, cold_read_available);
+				if (loaded == CLUSTER_HISTORY_DATA_DEFERRED)
+					break;
+				if (loaded != CLUSTER_HISTORY_DATA_READY) {
+					context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+					context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+					context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+					break;
+				}
+			}
 			if (context->current_mx_exact && !context->current_mx_exact_b) {
 				context->phase = gcs_block_current_mx_exact_held(context)
 					? GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_BEGIN
@@ -11924,6 +11958,19 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context, volatile bool *c
 			}
 			gcs_block_mx_history_origin_copy_held(context, &history);
 		} else if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+			if (context->current_mx_exact
+				&& (context->current_mx_exact_b || gcs_block_current_mx_exact_record(context))) {
+				ClusterHistoryDataStep loaded = gcs_block_current_mx_prepare_data_held(
+					context, cold_read_available);
+				if (loaded == CLUSTER_HISTORY_DATA_DEFERRED)
+					break;
+				if (loaded != CLUSTER_HISTORY_DATA_READY) {
+					context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+					context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+					context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+					break;
+				}
+			}
 			if (context->current_mx_exact && !context->current_mx_exact_b)
 				(void)gcs_block_current_mx_exact_held(context);
 			else
@@ -12124,6 +12171,22 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 					context->reason = CLUSTER_TX_RESOLVE_IO_ERROR;
 					context->undo_data_ready = false;
 					memset(&context->resolution, 0, sizeof(context->resolution));
+					context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+				} else if (context->current_mx_exact
+					&& (phase_before == GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE
+						|| phase_before == GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK)) {
+					/* Pool ERROR must return UNKNOWN, never partial A or
+					 * a silently abandoned live request. */
+					if (context->guard_active)
+						cluster_undo_block0_current_cancel(&context->guard);
+					context->guard_active = false;
+					memset(&context->guard, 0, sizeof(context->guard));
+					context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+					context->current_mx_proof_count = 0;
+					memset(&context->current_mx_updater_proof, 0,
+						sizeof(context->current_mx_updater_proof));
+					context->current_mx_updater_proof.verdict = CUCP_UNKNOWN;
+					context->reason = CLUSTER_TX_RESOLVE_IO_ERROR;
 					context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 				} else
 					gcs_block_r4_tx_origin_context_clear(context, true);

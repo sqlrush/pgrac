@@ -7604,7 +7604,7 @@ test_cluster_mx_operation_origin: test_cluster_mx_operation_origin.c test_cluste
 TESTS += test_cluster_mx_history_origin
 all: test_cluster_mx_history_origin
 
-test_cluster_mx_history_origin: test_cluster_mx_history_origin.c test_cluster_mx_operation_origin.c \
+test_cluster_mx_history_origin: test_cluster_mx_history_origin.c test_cluster_mx_exact_cold_runtime.inc test_cluster_mx_operation_origin.c \
 		test_cluster_r4_tx_outcome $(top_builddir)/src/backend/cluster/cluster_mx_history_wire.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_OPERATION_WORKER_TEST_O) \
 		$(CLUSTER_SAVEPOINT_READER_O) test_cluster_hot_bufpage_product.o \
@@ -7679,7 +7679,7 @@ test_cluster_current_mx_reply_builder.inc: $(top_srcdir)/src/backend/cluster/clu
 	     END { if (found != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
+test_cluster_r4_route_policy: test_cluster_r4_route_policy.c test_cluster_mx_exact_cold_route.inc unit_test.h \
 		test_cluster_r4_forward_ingress_boundaries.inc \
 		$(top_srcdir)/src/include/cluster/cluster_runtime_visibility.h \
 		test_cluster_current_mx_reply_builder.inc \
@@ -13378,7 +13378,7 @@ test_cluster_gcs_block_shard: $(CLUSTER_MX_HISTORY_WIRE_O)
 
 test_cluster_mx_history_backend test_cluster_mx_history_gcs: %: %.c \
         test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc \
-        test_cluster_r4_route_policy.c unit_test.h \
+        test_cluster_r4_route_policy.c test_cluster_mx_exact_cold_route.inc unit_test.h \
         $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h \
         test_cluster_r4_forward_ingress_boundaries.inc \
         test_cluster_current_mx_reply_builder.inc test_cluster_pcm_snapshot_owner.inc \
@@ -13449,7 +13449,7 @@ TESTS += test_cluster_mx_history_graph
 all: test_cluster_mx_history_graph
 
 test_cluster_mx_history_graph: test_cluster_mx_history_graph.c \
-		test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc test_cluster_r4_route_policy.c unit_test.h \
+		test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc test_cluster_r4_route_policy.c test_cluster_mx_exact_cold_route.inc unit_test.h \
 		test_cluster_r4_forward_ingress_boundaries.inc test_cluster_current_mx_reply_builder.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
 		$(top_srcdir)/src/include/cluster/cluster_mx_history_graph.h \
@@ -13471,7 +13471,7 @@ TESTS += test_cluster_mx_history_members
 all: test_cluster_mx_history_members
 
 test_cluster_mx_history_members: test_cluster_mx_history_members.c test_cluster_mx_history_graph.c \
-		test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc test_cluster_r4_route_policy.c unit_test.h \
+		test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc test_cluster_r4_route_policy.c test_cluster_mx_exact_cold_route.inc unit_test.h \
 		test_cluster_r4_forward_ingress_boundaries.inc test_cluster_current_mx_reply_builder.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
 		$(top_srcdir)/src/include/cluster/cluster_mx_history_graph.h \

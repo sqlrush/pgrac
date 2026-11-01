@@ -919,10 +919,12 @@ UT_TEST(creator_origin_refuses_missing_identity_and_unflushed_commit)
 	}
 }
 
+#include "test_cluster_mx_exact_cold_runtime.inc"
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(26);
 	UT_RUN(history_origin_root_three_phases_same_and_cross_segment);
 	UT_RUN(history_origin_global_and_v1_keep_exact_identity);
 	UT_RUN(history_origin_control_returns_fresh_snapshot);
@@ -944,6 +946,9 @@ main(void)
 	UT_RUN(history_cold_error_and_disabled_pool_preserve_unknown_and_account_reads);
 	UT_RUN(history_cold_post_io_drift_never_becomes_proof);
 	UT_RUN(history_cold_first_and_fresh_data_use_only_original_three_currents);
+	UT_RUN(mx_cold_real_loader_shares_budget_and_observation);
+	UT_RUN(mx_cold_real_loader_rejects_scope_and_post_io_drift);
+	UT_RUN(mx_cold_real_loader_error_accounts_before_rethrow);
 	UT_RUN(creator_origin_reuses_three_phases_without_live_grant);
 	UT_RUN(creator_origin_refuses_missing_identity_and_unflushed_commit);
 	UT_DONE();

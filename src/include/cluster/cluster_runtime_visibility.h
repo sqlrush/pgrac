@@ -309,6 +309,15 @@ extern ClusterHistoryDataStep cluster_runtime_visibility_history_prepare_data_he
 	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, volatile bool *cold_read_available);
 
+/* Same pool preload for already-qualified operation-aware MX A/B origin
+ * contexts only. Caller keeps the original exact-request/capture authority;
+ * this supplies candidate bytes, never a proof. Share the history per-drain
+ * budget/statistics; do not enable legacy resident-only operation readers. */
+extern ClusterHistoryDataStep cluster_runtime_visibility_mx_history_prepare_data_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, volatile bool *cold_read_available);
+
 #define CLUSTER_HISTORY_COLD_HIST_BUCKETS 11
 typedef struct ClusterHistoryColdStats {
 	uint64 reads, read_failures, read_ns, drain_ns, max_read_ns;

@@ -3037,13 +3037,11 @@ StaticAssertDecl(sizeof(ClusterHistoryColdStats) == 128, "history cold observati
 static const uint64 history_cold_bounds_us[CLUSTER_HISTORY_COLD_HIST_BUCKETS]
 	= { 10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 1000000, UINT64_MAX };
 
-ClusterHistoryDataStep
-cluster_runtime_visibility_history_prepare_data_held(const ClusterMxHistoryRequest *request,
-													 ClusterTxResolveMode mode,
-													 const ClusterSemanticAdmissionToken *admission,
-													 ClusterUndoBlock0CurrentGuard *guard,
-													 const ClusterUndoBlock0ResolvedRoot *root,
-													 volatile bool *cold_read_available)
+static ClusterHistoryDataStep
+cluster_runtime_visibility_history_prepare_locator_held(const ClusterTxLocator *locator,
+	bool expect_generation, uint32 expected_generation, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, volatile bool *cold_read_available)
 {
 	ClusterUndoBlock0Generation generation = { false, 0 }, final_generation = { false, 0 };
 	ClusterUndoBlock0ResolvedRoot current_root;
@@ -3056,11 +3054,11 @@ cluster_runtime_visibility_history_prepare_data_held(const ClusterMxHistoryReque
 	uint16 slot, row;
 	uint8 owner;
 
-	if (CritSectionCount != 0 || cold_read_available == NULL || guard == NULL || root == NULL
-		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission)
-		|| !uba_decode_record(request->locator.uba, &segment, &block, &slot, &row)
+	if (CritSectionCount != 0 || locator == NULL || cold_read_available == NULL
+		|| guard == NULL || root == NULL
+		|| !uba_decode_record(locator->uba, &segment, &block, &slot, &row)
 		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
-		|| uba_origin_node_id(request->locator.uba) != (NodeId)cluster_node_id)
+		|| uba_origin_node_id(locator->uba) != (NodeId)cluster_node_id)
 		return CLUSTER_HISTORY_DATA_FAILED;
 	owner = (uint8)(cluster_node_id + 1);
 	if (!cluster_runtime_visibility_resolve_root_admitted(
@@ -3069,8 +3067,7 @@ cluster_runtime_visibility_history_prepare_data_held(const ClusterMxHistoryReque
 		|| cluster_undo_block0_current_sample_generation(guard, root, &generation)
 			   != CLUSTER_UNDO_BLOCK0_OK
 		|| !generation.known || generation.value == UINT32_MAX
-		|| ((request->flags & CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION)
-			&& request->expected_data_generation != generation.value))
+		|| (expect_generation && expected_generation != generation.value))
 		return CLUSTER_HISTORY_DATA_FAILED;
 	if (cluster_undo_buf_copy_resident(segment, owner, block, page.data))
 		return CLUSTER_HISTORY_DATA_READY;
@@ -3114,10 +3111,43 @@ cluster_runtime_visibility_history_prepare_data_held(const ClusterMxHistoryReque
 		|| !final_generation.known || final_generation.value != generation.value
 		|| !cluster_runtime_visibility_resolve_root_admitted(
 			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment, &current_root)
-		|| !cluster_runtime_visibility_candidate_root_matches(root, &current_root)
-		|| !cluster_runtime_visibility_history_scope_current(request, mode, admission))
+		|| !cluster_runtime_visibility_candidate_root_matches(root, &current_root))
 		return CLUSTER_HISTORY_DATA_FAILED;
 	return CLUSTER_HISTORY_DATA_READY;
+}
+
+ClusterHistoryDataStep
+cluster_runtime_visibility_history_prepare_data_held(const ClusterMxHistoryRequest *request,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	volatile bool *cold_read_available)
+{
+	ClusterHistoryDataStep step;
+	if (!cluster_runtime_visibility_history_scope_current(request, mode, admission))
+		return CLUSTER_HISTORY_DATA_FAILED;
+	step = cluster_runtime_visibility_history_prepare_locator_held(&request->locator,
+		(request->flags & CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION) != 0,
+		request->expected_data_generation, mode, admission, guard, root, cold_read_available);
+	return step == CLUSTER_HISTORY_DATA_READY
+		&& !cluster_runtime_visibility_history_scope_current(request, mode, admission)
+		? CLUSTER_HISTORY_DATA_FAILED : step;
+}
+
+ClusterHistoryDataStep
+cluster_runtime_visibility_mx_history_prepare_data_held(const ClusterTxLocator *locator,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	volatile bool *cold_read_available)
+{
+	ClusterHistoryDataStep step;
+	if ((mode != CLUSTER_TX_RESOLVE_VISIBILITY && mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
+		|| !cluster_runtime_visibility_admission_current(mode, admission))
+		return CLUSTER_HISTORY_DATA_FAILED;
+	step = cluster_runtime_visibility_history_prepare_locator_held(locator, false, 0,
+		mode, admission, guard, root, cold_read_available);
+	return step == CLUSTER_HISTORY_DATA_READY
+		&& !cluster_runtime_visibility_admission_current(mode, admission)
+		? CLUSTER_HISTORY_DATA_FAILED : step;
 }
 
 void

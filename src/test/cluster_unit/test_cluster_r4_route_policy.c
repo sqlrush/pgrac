@@ -405,6 +405,7 @@ static bool mx_origin_sample_enabled;
 static int mx_v6_origin_override = -1;
 static bool mx_exact_enabled;
 static int mx_exact_fault, mx_exact_stage, mx_exact_b_freezes;
+static unsigned mx_cold_mask, mx_cold_reads, mx_cold_fault_at, mx_cold_fault;
 static bool mx_exact_initial_live = true;
 static uint8 mx_exact_final_effect = CLUSTER_SAVEPOINT_EFFECT_LIVE;
 static ClusterSavepointOperationKey mx_exact_key;
@@ -2467,6 +2468,47 @@ route_test_fill_origin_resolution(const ClusterTxLocator *locator,
 	return route_seam.candidate_outcome;
 }
 
+/* Controlled cold-pool boundary; real held qualification is tested by the
+ * runtime fixture. Missing bytes also make the old resident reader fail. */
+static unsigned
+mx_exact_cold_bit(void)
+{
+	switch (route_seam.candidate_acquire_begin_calls) {
+	case 1: return 1;
+	case 3: return 2;
+	case 4: return 4;
+	case 6: return 8;
+	default: return 0;
+	}
+}
+ClusterHistoryDataStep cluster_runtime_visibility_mx_history_prepare_data_held(
+	const ClusterTxLocator *, ClusterTxResolveMode, const ClusterSemanticAdmissionToken *,
+	ClusterUndoBlock0CurrentGuard *, const ClusterUndoBlock0ResolvedRoot *, volatile bool *);
+ClusterHistoryDataStep
+cluster_runtime_visibility_mx_history_prepare_data_held(const ClusterTxLocator *locator,
+	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	volatile bool *available)
+{
+	unsigned bit = mx_exact_cold_bit();
+	UT_ASSERT(mx_exact_enabled);
+	UT_ASSERT(locator && guard && root && admission && admission->entered && available);
+	UT_ASSERT(mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS || mode == CLUSTER_TX_RESOLVE_VISIBILITY);
+	UT_ASSERT_EQ(mx_origin_guard_held, 1);
+	if (mx_cold_mask == 0) return CLUSTER_HISTORY_DATA_READY;
+	UT_ASSERT(bit != 0);
+	if (!(mx_cold_mask & bit)) return CLUSTER_HISTORY_DATA_READY;
+	if (!*available) return CLUSTER_HISTORY_DATA_DEFERRED;
+	*available = false; mx_cold_reads++;
+	if (mx_cold_reads == mx_cold_fault_at) {
+		if (mx_cold_fault == 1) return CLUSTER_HISTORY_DATA_FAILED;
+		if (mx_cold_fault == 2) pg_re_throw();
+		if (mx_cold_fault == 3) route_seam.recheck_ok = false;
+	}
+	mx_cold_mask &= ~bit;
+	return CLUSTER_HISTORY_DATA_READY;
+}
+
 /* This route fixture supplies no history DATA/FullXid authority. The real
  * held history provider has its own original-current integration tests. */
 ClusterHistoryDataStep
@@ -2547,7 +2589,7 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 		UT_ASSERT_EQ(mx_exact_stage, 3);
 		UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 3);
 		mx_exact_b_freezes++;
-		if (mx_exact_fault == 7)
+		if (mx_exact_fault == 7 || (mx_cold_mask & mx_exact_cold_bit()))
 			return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
 		memset(plan, 0, sizeof(*plan));
 		plan->opaque[0] = 1;
@@ -2627,7 +2669,7 @@ cluster_runtime_visibility_origin_plan_recheck_data_held(
 		|| admission == NULL || !admission->entered
 		|| guard == NULL || root == NULL || root->root_id != UINT64_C(0x8000))
 		return CLUSTER_TX_UNKNOWN;
-	if (mx_exact_enabled && mx_exact_fault == 10)
+	if (mx_exact_enabled && (mx_exact_fault == 10 || (mx_cold_mask & mx_exact_cold_bit())))
 		return CLUSTER_TX_UNKNOWN;
 	memcpy(&locator, plan->opaque + 8, sizeof(locator));
 	return route_test_fill_origin_resolution(&locator, admission, out, reason_out);
@@ -4272,7 +4314,7 @@ cluster_runtime_visibility_origin_plan_freeze_mx_operation_held(
 	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveReason *reason pg_attribute_unused())
 {
-	if (!mx_exact_enabled || mx_exact_fault == 1)
+	if (!mx_exact_enabled || mx_exact_fault == 1 || (mx_cold_mask & mx_exact_cold_bit()))
 		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
 	UT_ASSERT(mx_exact_stage == 0 || mx_exact_stage == 3);
 	UT_ASSERT_EQ(mx_origin_guard_held, 1);
@@ -4346,7 +4388,7 @@ cluster_runtime_visibility_origin_plan_copy_mx_operation_held(
 	effect->top_outcome = top->outcome;
 	effect->top_commit_scn = top->commit_scn;
 	effect->effect_state = mx_exact_final_effect;
-	return mx_exact_fault != 4;
+	return mx_exact_fault != 4 && !(mx_cold_mask & mx_exact_cold_bit());
 }
 
 bool
@@ -9146,12 +9188,14 @@ peer_projection_land(FILE *input, FILE *output)
 	return fwrite(&frame.fixture, sizeof(frame.fixture), 1, output) == 1 ? 0 : 1;
 }
 
+#include "test_cluster_mx_exact_cold_route.inc"
+
 int
 main(int argc, char **argv)
 {
 	if (argc == 2 && strcmp(argv[1], "--peer-full-land-fixture") == 0)
 		return peer_projection_land(stdin, stdout);
-	UT_PLAN(177);
+	UT_PLAN(180);
 	UT_RUN(test_native_retry_trace_samples_owner_generation_and_clears);
 	UT_RUN(test_current_mx_updater_precommit_final_release_failure_is_unknown);
 	UT_RUN(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences);
@@ -9324,6 +9368,9 @@ main(int argc, char **argv)
 	UT_RUN(test_current_mx_v6_origin_positive_conflict_and_release);
 	UT_RUN(test_current_mx_v6_exact_request_never_uses_raw_sampler);
 	UT_RUN(test_current_mx_v6_exact_origin_qualifies_before_reply);
+	UT_RUN(test_exact_cold_A_and_B_share_one_read_per_drain);
+	UT_RUN(test_exact_cold_failure_and_error_never_publish_A);
+	UT_RUN(test_exact_cold_post_load_scope_drift_is_unknown);
 	UT_RUN(test_current_mx_v6_exact_updater_a_before_independent_b);
 	UT_RUN(test_current_mx_v6_exact_active_discard_and_grant_polarity);
 	UT_RUN(test_current_mx_v6_exact_release_and_conflict_do_not_publish_a_only);
