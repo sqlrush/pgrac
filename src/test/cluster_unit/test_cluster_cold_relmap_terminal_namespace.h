@@ -1,0 +1,19 @@
+/* Isolate only the declared-plan/Start leaves beside the original terminal
+ * scanner, scope and CLOG. Author: SqlRush <sqlrush@gmail.com> */
+#define ClusterColdRecoveryRelmapCurrent terminal_start_current
+#define ClusterColdRecoveryRelmapFail terminal_start_fail
+#define ClusterColdRecoveryTxInputs terminal_start_inputs
+#define ClusterColdRecoveryTxCheckpointOwnerV1 terminal_start_owner
+#define ClusterStartupInstalledRecoveryWriterV1 terminal_installed_writer
+#define cluster_cold_typed_sources_current_v1 terminal_sources_current
+#define rf_side_online_plan_relmap_input_matches_v1 terminal_side_input
+#define rf_side_online_plan_relmap_count_v1 terminal_side_count
+#define ForEachLWLockHeldByMe terminal_held_locks
+
+#define LWLockAcquire terminal_lock_acquire
+#define LWLockRelease terminal_lock_release
+#define InterruptHoldoffCount terminal_holdoff
+
+#define cluster_cold_typed_checkpoint_v1 terminal_checkpoint
+
+#define cluster_recovery_plan_output_distinct_v1 terminal_output_distinct

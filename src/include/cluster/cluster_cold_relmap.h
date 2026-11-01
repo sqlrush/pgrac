@@ -15,8 +15,26 @@
 
 #include "cluster/cluster_cold_recovery.h"
 #include "common/cluster_relmap_v2.h"
+#include "access/clog.h"
 
 #define CLUSTER_COLD_RELMAP_MAX_INPUTS 64
+/* Checked values only; neither polarity is a publication/release grant. */
+typedef struct ClusterColdRelmapTerminalEntryV1 {
+	uint32 participant;
+	ClusterRelmapV2Namespace identity;
+	uint64 generation, top_full_xid;
+	XidStatus status;
+	ClusterRelmapV2Image staged;
+} ClusterColdRelmapTerminalEntryV1;
+typedef struct ClusterColdRelmapTerminalCheckV1 {
+	uint32 count;
+	ClusterColdRelmapTerminalEntryV1 entries[CLUSTER_COLD_RELMAP_MAX_INPUTS];
+} ClusterColdRelmapTerminalCheckV1;
+struct ClusterRecoveryStartV1;
+extern bool cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence);
+extern bool cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdRelmapTerminalCheckV1 *out);
 /* Original Startup-only recovery path. No ordinary directory/lock may be
  * supplied. Full original source set must be passed, not a replay prefix.
  * A failed attempt retains its private carrier until joint transfer or exit. */

@@ -62,6 +62,7 @@
 #include <unistd.h>
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_native_startup.h"
@@ -1147,7 +1148,12 @@ struct ClusterClogNativeBaseHandleV1 {
 	int fd;
 	struct stat file;
 	bool failed;
+	bool terminal_sealed, mutation_observed;
+	uint64 mutation_generation;
 };
+
+static bool clog_relmap_mutation_snapshot(int origin, uint64 *generation);
+static bool clog_relmap_mutation_matches(int origin, uint64 generation);
 
 /* The raw and held variants share the original native lock/I/O checks. */
 static bool
@@ -1174,7 +1180,9 @@ clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *
 			return false;
 		/* Every later failure, including ERROR in an owner check, is sticky. */
 		held->failed = true;
-		if (held->origin != origin || held->xid != xid || held->fd < 0)
+		if (held->terminal_sealed || held->origin != origin || held->xid != xid || held->fd < 0
+			|| (held->mutation_observed
+				&& !clog_relmap_mutation_matches(origin, held->mutation_generation)))
 			return false;
 	}
 	if (!enableFsync || CritSectionCount != 0 || !TransactionIdIsNormal(xid)
@@ -1216,6 +1224,12 @@ clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *
 				ok = pg_fsync(fd) == 0;
 				pgstat_report_wait_end();
 			}
+			if (ok && custody != NULL && !existing && ClogRelmapMutations != NULL) {
+				held->mutation_observed = true;
+				ok = clog_relmap_mutation_snapshot(origin, &held->mutation_generation);
+			}
+			if (ok && custody != NULL && held->mutation_observed)
+				ok = clog_relmap_mutation_matches(origin, held->mutation_generation);
 			if (ok) {
 				ok = pg_pread(fd, readback.data, BLCKSZ,
 							  (off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ)
@@ -1233,7 +1247,9 @@ clog_recovery_base_read(int origin, TransactionId xid, ClusterClogNativeBaseV1 *
 			}
 		}
 		if (ok && custody != NULL)
-			ok = clog_recovery_directory_ready(origin);
+			ok = clog_recovery_directory_ready(origin)
+				&& (!held->mutation_observed
+					|| clog_relmap_mutation_matches(origin, held->mutation_generation));
 		if (fd >= 0 && !existing && (custody == NULL || !ok)) {
 			int closing = fd;
 			fd = -1;
@@ -1470,6 +1486,40 @@ clog_relmap_mutation_matches(int origin, uint64 generation)
 {
 	uint64 current;
 	return clog_relmap_mutation_snapshot(origin, &current) && current == generation;
+}
+
+/* Keep the original fd.c allocation, not a replacement descriptor or owner.
+ * Reopening an unchanged file can satisfy fstat; this is an observation of
+ * identity plus the existing shared mutation sequence, not allocation identity
+ * or continuous/inter-instance lifetime. */
+bool
+cluster_clog_native_terminal_seal_v1(ClusterClogNativeBaseHandleV1 *held)
+{
+	if (held == NULL || held->pid != getpid() || held->failed || held->terminal_sealed)
+		return false;
+	held->failed = true;
+	if (!clog_recovery_permitted(held->origin)
+		|| !held->mutation_observed)
+		return false;
+	held->terminal_sealed = true;
+	held->failed = false;
+	return cluster_clog_native_terminal_current_v1(held);
+}
+
+bool
+cluster_clog_native_terminal_current_v1(ClusterClogNativeBaseHandleV1 *held)
+{
+	struct stat current;
+	if (held == NULL || held->pid != getpid() || held->failed || !held->terminal_sealed)
+		return false;
+	held->failed = true;
+	if (held->fd < 0 || fstat(held->fd, &current) != 0
+		|| !clog_recovery_same_file(&held->file, &current)
+		|| !held->mutation_observed
+		|| !clog_relmap_mutation_matches(held->origin, held->mutation_generation))
+		return false;
+	held->failed = false;
+	return true;
 }
 
 static void

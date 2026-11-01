@@ -3471,6 +3471,9 @@ UT_TEST(test_terminal_read_native_error_keeps_output_zero_and_custody_dead)
 #include "test_cluster_relmap_checkpoint_pending.inc"
 #include "test_cluster_relmap_producer_pending.inc"
 
+#ifdef TEST_RELMAP_RETAINED_MAIN
+#define main TEST_RELMAP_RETAINED_MAIN
+#endif
 int
 main(int argc, char **argv)
 {
@@ -3637,3 +3640,6 @@ main(int argc, char **argv)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#ifdef TEST_RELMAP_RETAINED_MAIN
+#undef main
+#endif

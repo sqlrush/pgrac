@@ -1050,6 +1050,7 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 	plan = *plan_address;
 	if (plan->magic != CLUSTER_COLD_PLAN_MAGIC)
 		return;
+	cold_relmap_terminal_cleanup(plan);
 	/* Untransferred recovery debt outlives failed cleanup. */
 	if (plan->relmap_recovery != NULL && plan->relmap_recovery->count != 0
 		&& !plan->relmap_recovery->transferred)
