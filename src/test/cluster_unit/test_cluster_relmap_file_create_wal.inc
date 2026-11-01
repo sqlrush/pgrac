@@ -13,11 +13,10 @@ static void
 create_wal_crc(unsigned char *b)
 {
 	pg_crc32c crc;
-	memset(b+40,0,4);
 	INIT_CRC32C(crc);
-	COMP_CRC32C(crc,b,CLUSTER_RELMAP_CREATE_WAL_SIZE_V1);
+	COMP_CRC32C(crc,b,60);
 	FIN_CRC32C(crc);
-	for(unsigned i=0;i<4;i++) b[40+i]=(uint8)(crc>>(24-8*i));
+	for(unsigned i=0;i<4;i++) b[60+i]=(uint8)(crc>>(24-8*i));
 }
 
 static void
@@ -27,7 +26,7 @@ create_wal_image_crc(unsigned char *b)
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc,b+64,CLUSTER_RELMAP_FILE_SIZE_V2);
 	FIN_CRC32C(crc);
-	for(unsigned i=0;i<4;i++) b[36+i]=(uint8)(crc>>(24-8*i));
+	for(unsigned i=0;i<4;i++) b[56+i]=(uint8)(crc>>(24-8*i));
 	create_wal_crc(b);
 }
 
@@ -40,8 +39,8 @@ UT_TEST(creation_wal_roundtrip_preserves_full_identity_batch_and_generation_one)
 	ClusterRelmapV2Image inner;
 	prepare(); identity.database_oid=2000; identity.tablespace_oid=1663;
 	UT_ASSERT(cluster_relmap_create_encode_v1(&identity,batch,&image.committed,bytes,sizeof(bytes)));
-	UT_ASSERT(!memcmp(bytes,"RMC1",4) && bytes[7]==1 && bytes[15]==2);
-	UT_ASSERT(!memcmp(bytes+16,batch,16) && !memcmp(bytes+64,"RFM2",4));
+	UT_ASSERT(!memcmp(bytes,"RMC1",4) && bytes[7]==1 && bytes[11]==2);
+	UT_ASSERT(!memcmp(bytes+24,batch,16) && !memcmp(bytes+64,"RFM2",4));
 	UT_ASSERT(cluster_relmap_create_decode_v1(bytes,sizeof(bytes),&decoded));
 	UT_ASSERT(!memcmp(&decoded.identity,&identity,sizeof(identity)));
 	UT_ASSERT(!memcmp(decoded.batch_uuid,batch,16));
@@ -83,8 +82,8 @@ UT_TEST(creation_wal_rejects_valid_crc_but_wrong_state_birth_and_pending)
 	memcpy(good,bytes,sizeof(bytes));
 	for(unsigned i=0;i<4;i++) {
 		memcpy(bytes,good,sizeof(bytes));
-		if(i==0) bytes[15]=1; /* An UPDATE WAL_INTENT is not CREATE. */
-		if(i==1) memset(bytes+16,0,16);
+		if(i==0) bytes[11]=1; /* An UPDATE WAL_INTENT is not CREATE. */
+		if(i==1) memset(bytes+24,0,16);
 		if(i==2) bytes[44]=1;
 		if(i==3) bytes[7]=2;
 		create_wal_crc(bytes);
@@ -152,5 +151,45 @@ UT_TEST(creation_wal_alias_and_invalid_input_do_not_change_any_output)
 	UT_ASSERT(!cluster_relmap_create_encode_v1(&identity,batch,&image.committed,area.bytes,sizeof(record)));
 	UT_ASSERT(!cluster_relmap_create_decode_v1(NULL,sizeof(record),&decoded));
 	UT_ASSERT(!memcmp(&area,&saved,sizeof(area)));
+	cleanup();
+}
+
+UT_TEST(creation_wal_matches_frozen_header_and_rejects_old_layout)
+{
+	static const unsigned char header[56]={
+		[0]='R',[1]='M',[2]='C',[3]='1',[7]=1,[11]=2,
+		[14]=9,[15]=64,[19]=64,[22]=9,[24]=17,[39]=99
+	};
+	uint8 batch[16]={17,0,0,0,0,0,0,0,0,0,0,0,0,0,0,99};
+	unsigned char bytes[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1],legacy[sizeof(bytes)];
+	unsigned char expected[64]={0};
+	ClusterRelmapCreateWalV1 output,saved;
+	pg_crc32c crc;
+	prepare(); identity.database_oid=2000; identity.tablespace_oid=1663;
+	UT_ASSERT(cluster_relmap_create_encode_v1(&identity,batch,&image.committed,bytes,sizeof(bytes)));
+	memcpy(expected,header,sizeof(header));
+	INIT_CRC32C(crc); COMP_CRC32C(crc,bytes+64,2304); FIN_CRC32C(crc);
+	for(unsigned i=0;i<4;i++) expected[56+i]=(uint8)(crc>>(24-8*i));
+	INIT_CRC32C(crc); COMP_CRC32C(crc,expected,60); FIN_CRC32C(crc);
+	for(unsigned i=0;i<4;i++) expected[60+i]=(uint8)(crc>>(24-8*i));
+	UT_ASSERT(!memcmp(bytes,expected,sizeof(expected)));
+	memcpy(legacy,bytes,sizeof(bytes)); memset(legacy,0,64);
+	memcpy(legacy,"RMC1",4); legacy[7]=1; legacy[10]=9; legacy[11]=64;
+	legacy[15]=2; memcpy(legacy+16,batch,16); legacy[34]=9;
+	INIT_CRC32C(crc); COMP_CRC32C(crc,legacy+64,2304); FIN_CRC32C(crc);
+	for(unsigned i=0;i<4;i++) legacy[36+i]=(uint8)(crc>>(24-8*i));
+	INIT_CRC32C(crc); COMP_CRC32C(crc,legacy,sizeof(legacy)); FIN_CRC32C(crc);
+	for(unsigned i=0;i<4;i++) legacy[40+i]=(uint8)(crc>>(24-8*i));
+	memset(&output,0xa5,sizeof(output)); saved=output;
+	UT_ASSERT(!cluster_relmap_create_decode_v1(legacy,sizeof(legacy),&output));
+	for(unsigned field=0;field<3;field++) {
+		memcpy(legacy,bytes,sizeof(bytes));
+		if(field==0) --legacy[15];
+		if(field==1) --legacy[19];
+		if(field==2) --legacy[23];
+		create_wal_crc(legacy);
+		UT_ASSERT(!cluster_relmap_create_decode_v1(legacy,sizeof(legacy),&output));
+	}
+	UT_ASSERT(!memcmp(&output,&saved,sizeof(saved)));
 	cleanup();
 }

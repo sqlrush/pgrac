@@ -15,8 +15,10 @@
 #include "cluster/cluster_relmap_create_format.h"
 #include "common/cluster_relmap_file.h"
 
-#define CLUSTER_RELMAP_CREATE_HEADER_SIZE_V1 64
-#define CLUSTER_RELMAP_CREATE_WAL_SIZE_V1 (64 + CLUSTER_RELMAP_FILE_SIZE_V2)
+#define CLUSTER_RELMAP_CREATE_HEADER_SIZE_V1 CLUSTER_RELMAP_CREATE_HEADER_BYTES_V1
+#define CLUSTER_RELMAP_CREATE_WAL_SIZE_V1 CLUSTER_RELMAP_CREATE_RECORD_BYTES_V1
+StaticAssertDecl(CLUSTER_RELMAP_FILE_SIZE_V2 == CLUSTER_RELMAP_CREATE_IMAGE_BYTES_V1,
+	"RMC1 preserves the complete original RFM2 extent");
 
 typedef struct ClusterRelmapCreateWalV1
 {
@@ -31,10 +33,11 @@ typedef struct ClusterRelmapCreateReplayV1
 	XLogRecPtr actual_end;
 } ClusterRelmapCreateReplayV1;
 
-/* RMC1: big-endian magic/version/total/state at 0/4/8/12, batch at16,
- * image bytes/CRC/record CRC at32/36/40, reserved44..63 zero, complete
- * generation-one clean RFM2 at64. Record CRC covers all bytes with its own
- * four bytes zero. Local carrier fields/padding are never serialized.
+/* RMC1 uses the frozen CREATE_* offsets and lengths in the format header:
+ * big-endian metadata, original batch, zero reserved bytes, complete clean
+ * generation-one RFM2 payload. Image CRC covers the whole original payload;
+ * header CRC covers [0,60), including that stored CRC. Local fields/padding
+ * are never serialized. The earlier in-progress layout is not accepted.
  * This observation grants no transaction/AVAILABLE/episode permission.
  * All failures preserve output; overlapping outputs refuse before access. */
 extern bool cluster_relmap_create_encode_v1(const ClusterRecoveryFileIdentityV2 *,

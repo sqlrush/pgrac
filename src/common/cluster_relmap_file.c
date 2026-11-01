@@ -120,6 +120,7 @@ cluster_relmap_file_decode_v2(const void *input, size_t length,
 }
 
 /* Independent CREATE WAL never borrows an UPDATE/pending owner. */
+#define CREATE_OFFSET(name) CLUSTER_RELMAP_CREATE_##name##_OFFSET_V1
 
 static bool
 create_nonzero_batch(const uint8 batch[16])
@@ -136,19 +137,6 @@ create_target(const ClusterRecoveryFileIdentityV2 *id)
 	return id != NULL && id->kind == CLUSTER_RECOVERY_FILE_RELMAP_V2
 		&& OidIsValid(id->database_oid) && OidIsValid(id->tablespace_oid)
 		&& id->tablespace_oid != GLOBALTABLESPACE_OID && id->object_id == 0;
-}
-
-static pg_crc32c
-create_record_crc(const unsigned char *bytes)
-{
-	static const unsigned char zero[4] = {0};
-	pg_crc32c crc;
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, bytes, 40);
-	COMP_CRC32C(crc, zero, 4);
-	COMP_CRC32C(crc, bytes + 44, CLUSTER_RELMAP_CREATE_WAL_SIZE_V1 - 44);
-	FIN_CRC32C(crc);
-	return crc;
 }
 
 bool
@@ -168,16 +156,19 @@ cluster_relmap_create_encode_v1(const ClusterRecoveryFileIdentityV2 *id,
 		id->database_incarnation, id->database_oid, false};
 	image.committed_generation = 1;
 	image.committed = *map;
-	if (!cluster_relmap_file_encode_v2(id, &image, bytes + 64, CLUSTER_RELMAP_FILE_SIZE_V2))
+	if (!cluster_relmap_file_encode_v2(id, &image, bytes + CREATE_OFFSET(IMAGE), CLUSTER_RELMAP_FILE_SIZE_V2))
 		return false;
-	file_put32(bytes, CLUSTER_RELMAP_CREATE_FORMAT_ID_V1);
-	file_put32(bytes + 4, CLUSTER_RELMAP_CREATE_FORMAT_VERSION_V1);
-	file_put32(bytes + 8, sizeof(bytes));
-	file_put32(bytes + 12, CLUSTER_RELMAP_CREATE_RECORD_STATE_V1);
-	memcpy(bytes + 16, batch, 16);
-	file_put32(bytes + 32, CLUSTER_RELMAP_FILE_SIZE_V2);
-	file_put32(bytes + 36, file_crc(bytes + 64, CLUSTER_RELMAP_FILE_SIZE_V2, NULL, 0));
-	file_put32(bytes + 40, create_record_crc(bytes));
+	file_put32(bytes + CREATE_OFFSET(FORMAT_ID), CLUSTER_RELMAP_CREATE_FORMAT_ID_V1);
+	file_put32(bytes + CREATE_OFFSET(FORMAT_VERSION), CLUSTER_RELMAP_CREATE_FORMAT_VERSION_V1);
+	file_put32(bytes + CREATE_OFFSET(STATE), CLUSTER_RELMAP_CREATE_RECORD_STATE_V1);
+	file_put32(bytes + CREATE_OFFSET(RECORD_BYTES), sizeof(bytes));
+	file_put32(bytes + CREATE_OFFSET(HEADER_BYTES), CLUSTER_RELMAP_CREATE_HEADER_BYTES_V1);
+	file_put32(bytes + CREATE_OFFSET(IMAGE_BYTES), CLUSTER_RELMAP_FILE_SIZE_V2);
+	memcpy(bytes + CREATE_OFFSET(BATCH_UUID), batch, CLUSTER_RELMAP_CREATE_BATCH_UUID_BYTES_V1);
+	file_put32(bytes + CREATE_OFFSET(IMAGE_CRC32C),
+		file_crc(bytes + CREATE_OFFSET(IMAGE), CLUSTER_RELMAP_FILE_SIZE_V2, NULL, 0));
+	file_put32(bytes + CREATE_OFFSET(HEADER_CRC32C),
+		file_crc(bytes, CREATE_OFFSET(HEADER_CRC32C), NULL, 0));
 	memcpy(out, bytes, sizeof(bytes));
 	return true;
 }
@@ -192,30 +183,33 @@ cluster_relmap_create_decode_v1(const void *input, Size length, ClusterRelmapCre
 	if (input == NULL || out == NULL || length != CLUSTER_RELMAP_CREATE_WAL_SIZE_V1
 		|| file_overlap(out, sizeof(*out), input, length))
 		return false;
-	if (!cluster_relmap_create_format_registered_v1(file_get32(bytes), file_get32(bytes + 4),
-			file_get32(bytes + 12), CATALOG_VERSION_NO)
-		|| file_get32(bytes + 8) != length
-		|| file_get32(bytes + 32) != CLUSTER_RELMAP_FILE_SIZE_V2
-		|| !create_nonzero_batch(bytes + 16)
-		|| file_get32(bytes + 40) != create_record_crc(bytes)
-		|| file_get32(bytes + 36) != file_crc(bytes + 64, CLUSTER_RELMAP_FILE_SIZE_V2, NULL, 0))
+	if (!cluster_relmap_create_format_registered_v1(file_get32(bytes + CREATE_OFFSET(FORMAT_ID)),
+			file_get32(bytes + CREATE_OFFSET(FORMAT_VERSION)), file_get32(bytes + CREATE_OFFSET(STATE)), CATALOG_VERSION_NO)
+		|| file_get32(bytes + CREATE_OFFSET(RECORD_BYTES)) != length
+		|| file_get32(bytes + CREATE_OFFSET(HEADER_BYTES)) != CLUSTER_RELMAP_CREATE_HEADER_BYTES_V1
+		|| file_get32(bytes + CREATE_OFFSET(IMAGE_BYTES)) != CLUSTER_RELMAP_FILE_SIZE_V2
+		|| !create_nonzero_batch(bytes + CREATE_OFFSET(BATCH_UUID))
+		|| file_get32(bytes + CREATE_OFFSET(HEADER_CRC32C))
+			!= file_crc(bytes, CREATE_OFFSET(HEADER_CRC32C), NULL, 0)
+		|| file_get32(bytes + CREATE_OFFSET(IMAGE_CRC32C)) != file_crc(bytes + CREATE_OFFSET(IMAGE), CLUSTER_RELMAP_FILE_SIZE_V2, NULL, 0))
 		return false;
-	for (unsigned i = 44; i < 64; ++i)
+	for (unsigned i = CREATE_OFFSET(RESERVED_ZERO);
+		 i < CREATE_OFFSET(RESERVED_ZERO) + CLUSTER_RELMAP_CREATE_RESERVED_ZERO_BYTES_V1; ++i)
 		if (bytes[i] != 0)
 			return false;
 	/* Decode only scratch: the complete original RFM2, including its envelope
 	 * CRC and all identity fields, is still independently checked below. */
-	memcpy(reference, bytes + 64, sizeof(reference));
+	memcpy(reference, bytes + CREATE_OFFSET(IMAGE), sizeof(reference));
 	memcpy(reference, "RFI2", 4);
 	memset(reference + 112, 0, 12);
 	file_put32(reference + 124, file_crc(reference, 124, NULL, 0));
 	if (!cluster_recovery_file_identity_decode_v2(reference, sizeof(reference), &record.identity)
 		|| !create_target(&record.identity)
-		|| !cluster_relmap_file_decode_v2(bytes + 64, CLUSTER_RELMAP_FILE_SIZE_V2,
+		|| !cluster_relmap_file_decode_v2(bytes + CREATE_OFFSET(IMAGE), CLUSTER_RELMAP_FILE_SIZE_V2,
 			&record.identity, &image)
 		|| image.committed_generation != 1 || image.pending_generation != 0)
 		return false;
-	memcpy(record.batch_uuid, bytes + 16, 16);
+	memcpy(record.batch_uuid, bytes + CREATE_OFFSET(BATCH_UUID), CLUSTER_RELMAP_CREATE_BATCH_UUID_BYTES_V1);
 	record.committed = image.committed;
 	*out = record;
 	return true;

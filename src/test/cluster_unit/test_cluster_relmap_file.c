@@ -335,7 +335,7 @@ UT_TEST(assigned_format_matches_the_complete_big_endian_byte_table)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
 	UT_RUN(assigned_format_matches_the_complete_big_endian_byte_table);
 	UT_RUN(complete_envelope_preserves_inner_and_rejects_old_format);
 	UT_RUN(creation_identity_is_independent_of_map_generation);
@@ -357,6 +357,7 @@ main(void)
 	UT_RUN(creation_wal_rejects_valid_crc_but_wrong_state_birth_and_pending);
 	UT_RUN(creation_rebuild_requires_independent_identity_batch_and_actual_end);
 	UT_RUN(creation_wal_alias_and_invalid_input_do_not_change_any_output);
+	UT_RUN(creation_wal_matches_frozen_header_and_rejects_old_layout);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
