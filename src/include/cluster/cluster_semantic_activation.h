@@ -79,6 +79,22 @@ extern ClusterSemanticAdmissionObservationResult cluster_semantic_activation_adm
 	uint64 expected_epoch, uint64 expected_generation, ClusterSemanticAdmissionObservation *out);
 
 
+/* Observe return of the ORIGINAL feature-token domain. New token admission
+ * must be blocked by its original transition_closed gate or native epoch
+ * mismatch; rechecks and leave remain unchanged. expected_gate_epoch and
+ * generation bind the original gate, expected_epoch the current native epoch.
+ * CURRENT is only this domain's drained observation under that guard, never
+ * global/native producer closure, a receipt, QUIESCED or service permission.
+ * Revalidate the original gate/native epoch before consuming this sample.
+ * Unchanged open gates stay PENDING even with zero counts. Missing/invalid
+ * scope refuses; gate/native drift is STALE; contention is bounded PENDING.
+ * No allocation, gate publication, token retirement, lock, wait or wakeup.
+ */
+extern ClusterSemanticAdmissionObservationResult cluster_semantic_activation_admission_return_observe(
+	uint64 expected_epoch, uint64 expected_gate_epoch, uint64 expected_generation,
+	ClusterSemanticAdmissionObservation *out);
+
+
 typedef enum ClusterSemanticActivationAckKind {
 	CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_INVALID = 0,
 	CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST = 1,

@@ -9190,6 +9190,101 @@ cluster_semantic_activation_admission_observe(uint64 expected_epoch, uint64 expe
 				   : CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT;
 }
 
+/* Pin the original shared region throughout the bounded publication read. */
+static bool
+semantic_activation_return_snapshot(ClusterSemanticActivationShmem *owner,
+	SemanticActivationAdmissionSnapshot *snapshot)
+{
+	int attempt;
+
+	if (owner == NULL || snapshot == NULL)
+		return false;
+
+	for (attempt = 0; attempt < CLUSTER_SEMANTIC_ADMISSION_SNAPSHOT_TRIES; attempt++) {
+		uint64 seq_before;
+		uint64 seq_after;
+
+		seq_before = pg_atomic_read_u64(&owner->admission_seq);
+		if ((seq_before & UINT64_C(1)) != 0)
+			continue;
+		pg_read_barrier();
+		snapshot->active_bits = pg_atomic_read_u64(&owner->active_bits);
+		snapshot->record_generation
+			= pg_atomic_read_u64(&owner->record_generation);
+		snapshot->formation_epoch = pg_atomic_read_u64(&owner->formation_epoch);
+		snapshot->transition_closed
+			= pg_atomic_read_u32(&owner->transition_closed) != 0;
+		pg_read_barrier();
+		seq_after = pg_atomic_read_u64(&owner->admission_seq);
+		if (seq_before == seq_after && (seq_after & UINT64_C(1)) == 0) {
+			snapshot->seq = seq_after;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Only the original feature-token domain, not all ordinary/native users.
+ * The original enter/recheck epoch and close guards block new use while old
+ * owners retain their counters until their original leave/exit callbacks.
+ * In-progress failed entrants can still publish transient debt: they remain
+ * observed PENDING and must execute their original rollback, never this reader.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterSemanticAdmissionObservationResult
+cluster_semantic_activation_admission_return_observe(uint64 expected_epoch,
+	uint64 expected_gate_epoch, uint64 expected_generation, ClusterSemanticAdmissionObservation *out)
+{
+	SemanticActivationAdmissionSnapshot before, after;
+	ClusterSemanticAdmissionObservation sample;
+	ClusterSemanticActivationShmem *owner = SemanticActivationShmem;
+	int32 pid = MyProcPid;
+	bool pending = false;
+
+	if (out == NULL)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	memset(out, 0, sizeof(*out));
+	if (!IsUnderPostmaster || pid <= 0 || owner == NULL || expected_epoch == 0
+		|| expected_epoch == UINT64_MAX || expected_gate_epoch == 0
+		|| expected_gate_epoch == UINT64_MAX || expected_gate_epoch > expected_epoch
+		|| expected_generation == 0 || expected_generation == UINT64_MAX)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	if (cluster_epoch_get_current() != expected_epoch)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE;
+	if (!semantic_activation_return_snapshot(owner, &before) || before.seq == 0)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+	if (SemanticActivationShmem != owner || !IsUnderPostmaster || MyProcPid != pid)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	if (before.formation_epoch != expected_gate_epoch || before.record_generation != expected_generation)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE;
+	memset(&sample, 0, sizeof(sample));
+	for (unsigned side = 0; side < 2; side++)
+		for (unsigned bit = 0; bit < 64; bit++) {
+			sample.inflight[side][bit] = pg_atomic_read_u32(&owner->inflight[side][bit]);
+			if (sample.inflight[side][bit] != 0) pending = true;
+		}
+	pg_read_barrier();
+	if (SemanticActivationShmem != owner || !IsUnderPostmaster || MyProcPid != pid)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	if (!semantic_activation_return_snapshot(owner, &after))
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+	if (SemanticActivationShmem != owner || !IsUnderPostmaster || MyProcPid != pid)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	if (cluster_epoch_get_current() != expected_epoch
+		|| after.formation_epoch != expected_gate_epoch || after.record_generation != expected_generation)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE;
+	if (before.seq != after.seq || before.active_bits != after.active_bits
+		|| before.transition_closed != after.transition_closed)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+	/* A zero sample from an open, current-epoch gate has no return barrier. */
+	pending |= !after.transition_closed && after.formation_epoch == expected_epoch;
+	sample.seq = after.seq; sample.active_bits = after.active_bits;
+	sample.record_generation = after.record_generation; sample.formation_epoch = after.formation_epoch;
+	sample.transition_closed = after.transition_closed; sample.known = true;
+	*out = sample;
+	return pending ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
+		: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT;
+}
+
 /* A postmaster-safe lifecycle hint, NOT a pristine/OPEN/close proof. Once any
  * original publisher has run (including an odd/incomplete publication), keep
  * the original actors. Missing regions are also conservative retention. The
