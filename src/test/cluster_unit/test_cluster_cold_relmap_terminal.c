@@ -3,7 +3,11 @@
  * controlled. Author: SqlRush <sqlrush@gmail.com> */
 int terminal_retained_fixture_main(int argc, char **argv);
 #define TEST_RELMAP_RETAINED_MAIN terminal_retained_fixture_main
+/* The included retained fixture has refusal providers; this component supplies
+ * the original episode readers below instead. */
+#define TEST_TERMINAL_CLEANUP
 #include "test_cluster_relmap_retained_wal.c"
+#undef TEST_TERMINAL_CLEANUP
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "test_cluster_cold_relmap_terminal_namespace.h"
@@ -731,7 +735,9 @@ int main(int argc, char **argv)
 {
 	test_program_path = argv[0]; setup_fixture();
 #ifdef TEST_TERMINAL_REAL_START
-	UT_PLAN(16);
+	UT_PLAN(18);
+	UT_RUN(test_terminal_segment_receipt_binds_complete_batch);
+	UT_RUN(test_terminal_segment_invalid_offset_zeroes_and_keeps_debt);
 	UT_RUN(test_terminal_episode_after_scope_commit);
 	UT_RUN(test_terminal_episode_after_scope_abort);
 	UT_RUN(test_terminal_episode_requires_completed_current_ir);

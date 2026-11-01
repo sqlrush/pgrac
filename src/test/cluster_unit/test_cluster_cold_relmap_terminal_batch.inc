@@ -150,3 +150,43 @@ UT_TEST(test_terminal_batch_partial_capture_error_never_enters_start)
 	UT_ASSERT_EQ(test_relmap_native_clog_stats().open_fds, 1);
 	terminal_done();
 }
+
+UT_TEST(test_terminal_segment_receipt_binds_complete_batch)
+{
+	ClusterColdRelmapTerminalCheckV1 *all = calloc(1, sizeof(*all));
+	ClusterColdRelmapTerminalCheckV1 *tail = calloc(1, sizeof(*tail));
+	terminal_batch_setup(false, false);
+	UT_ASSERT(cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+	if (terminal_bind_original_start()) {
+		UT_ASSERT(cluster_cold_relmap_terminal_recheck_v1(terminal_start, all));
+		UT_ASSERT(cluster_cold_relmap_terminal_recheck_segment_v1(terminal_start, 1, tail));
+		UT_ASSERT_EQ(tail->count, 1);
+		UT_ASSERT_EQ(tail->total_count, 2);
+		UT_ASSERT_EQ(tail->offset, 1);
+		UT_ASSERT_EQ(memcmp(tail->digest, all->digest, sizeof(tail->digest)), 0);
+		UT_ASSERT_EQ(memcmp(&tail->entries[0], &all->entries[1], sizeof(tail->entries[0])), 0);
+		/* The excluded prefix is still required for a tail receipt. */
+		terminal_batch[0].input.staged.pending_owner.boot_incarnation++;
+		UT_ASSERT(!cluster_cold_relmap_terminal_recheck_segment_v1(terminal_start, 1, tail));
+		UT_ASSERT(terminal_batch_output_empty(tail));
+		UT_ASSERT(!terminal_pins.transferred);
+	} else UT_ASSERT(false);
+	free(all); free(tail); terminal_done();
+}
+
+UT_TEST(test_terminal_segment_invalid_offset_zeroes_and_keeps_debt)
+{
+	ClusterColdRelmapTerminalCheckV1 *out = calloc(1, sizeof(*out));
+	terminal_batch_setup(false, false);
+	UT_ASSERT(cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
+	if (terminal_bind_original_start()) {
+		UT_ASSERT(cluster_cold_relmap_terminal_recheck_segment_v1(terminal_start, 0, out));
+		UT_ASSERT_EQ(out->count, 2);
+		UT_ASSERT_EQ(out->total_count, 2);
+		UT_ASSERT(bytes_nonzero(out->digest, sizeof(out->digest)));
+		UT_ASSERT(!cluster_cold_relmap_terminal_recheck_segment_v1(terminal_start, UINT32_MAX, out));
+		UT_ASSERT(terminal_batch_output_empty(out));
+		UT_ASSERT(!terminal_pins.transferred && terminal_pins.count == 2);
+	} else UT_ASSERT(false);
+	free(out); terminal_done();
+}

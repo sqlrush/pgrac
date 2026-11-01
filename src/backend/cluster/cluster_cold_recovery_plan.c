@@ -110,11 +110,14 @@ cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
 	ClusterColdDetailV1 detail;
 
 	if (!plan_valid(plan) || inputs == NULL || count == 0
-		|| count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+		|| count == UINT32_MAX)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	if (plan->phase != COLD_PHASE_FEEDING || plan->input_frame_count != 0
 		|| plan->relmap_inputs != NULL)
 		return CLUSTER_COLD_STATE;
+	/* Bound traversal and multiplication by the original whole-plan budget. */
+	if (count > plan->memory_budget / sizeof(ColdRelmapInput))
+		return CLUSTER_COLD_CAPACITY;
 	detail = cold_relmap_inputs_valid(plan, inputs, count);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
@@ -1055,8 +1058,15 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 	if (plan->relmap_recovery != NULL && plan->relmap_recovery->count != 0
 		&& !plan->relmap_recovery->transferred)
 		return;
-	if (plan->relmap_recovery != NULL)
+	if (plan->relmap_recovery != NULL) {
+		ClusterRelmapRecoverySegment *segment = plan->relmap_recovery->segments;
+		while (segment != NULL) {
+			ClusterRelmapRecoverySegment *next = segment->next;
+			cold_free(segment);
+			segment = next;
+		}
 		cold_free(plan->relmap_recovery);
+	}
 	plan->magic = 0;
 	if (plan->schedule != NULL)
 		cold_free(plan->schedule);

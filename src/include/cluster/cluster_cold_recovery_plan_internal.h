@@ -333,13 +333,12 @@ cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Si
 	if (plan == NULL) return true;
 	if (cold_relmap_storage_overlap(out, bytes, plan, sizeof(*plan))
 		|| plan->magic != CLUSTER_COLD_PLAN_MAGIC
-		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS
+		|| plan->relmap_count == UINT32_MAX
 		|| (plan->relmap_terminal != NULL && plan->relmap_terminal_bytes == 0))
 		return false;
 	return !cold_relmap_storage_overlap(out, bytes, plan->relmap_inputs,
 			(Size)plan->relmap_count * sizeof(ColdRelmapInput))
-		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_recovery,
-			sizeof(ClusterRelmapRecoveryPins))
+		&& cluster_relmap_recovery_output_distinct(plan->relmap_recovery, out, bytes)
 		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_terminal,
 			plan->relmap_terminal_bytes);
 }

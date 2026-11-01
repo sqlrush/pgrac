@@ -31,6 +31,8 @@
 #include "miscadmin.h"
 #include "catalog/pg_tablespace_d.h"
 #include "replication/origin.h"
+#include "common/cryptohash.h"
+#include "common/sha2.h"
 
 static bool
 relmap_current(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence,
@@ -226,7 +228,7 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 	volatile ClusterColdDetailV1 detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 
 	if (!plan_valid(plan) || sources == NULL || wal == NULL || count == 0
-		|| count > CLUSTER_COLD_RELMAP_MAX_INPUTS || replay_count == 0
+		|| count == UINT32_MAX || replay_count == 0
 		|| replay_count > plan->participant_count)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	if (plan->phase != COLD_PHASE_FEEDING || plan->relmap_failed
@@ -236,6 +238,9 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 	 * scratch AND copied declarations must fit the original plan budget. */
 	plan->relmap_failed = true;
 	plan->phase = COLD_PHASE_FAILED;
+	if (count > (plan->memory_budget - Min(plan->memory_used, plan->memory_budget))
+		/ (MAXALIGN(sizeof(*inputs)) + sizeof(*snapshots) + sizeof(ColdRelmapInput)))
+		return CLUSTER_COLD_CAPACITY;
 	input_bytes = MAXALIGN((Size)count * sizeof(*inputs));
 	scratch = input_bytes + (Size)count * sizeof(*snapshots);
 	total = scratch + (Size)count * sizeof(ColdRelmapInput);
@@ -319,10 +324,12 @@ cluster_cold_plan_relmap_from_recovery_wal_v1(ClusterColdPlanV1 *plan,
 {
 	ClusterColdRelmapInputV1 *inputs;
 	ClusterRelmapRecoveryPins *pins;
-	Size bytes = (Size)count * sizeof(*inputs);
+	Size bytes, permanent, remaining;
+	uint32 segments;
+	ClusterRelmapRecoverySegment **link;
 	volatile ClusterColdDetailV1 detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 	if (!plan_valid(plan) || sources == NULL || wal == NULL || count == 0
-		|| count > CLUSTER_COLD_RELMAP_MAX_INPUTS || source_count != plan->participant_count
+		|| count == UINT32_MAX || source_count != plan->participant_count
 		|| replay_count == 0 || replay_count > source_count)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	if (plan->phase != COLD_PHASE_FEEDING || plan->relmap_failed
@@ -332,15 +339,26 @@ cluster_cold_plan_relmap_from_recovery_wal_v1(ClusterColdPlanV1 *plan,
 	plan->phase = COLD_PHASE_FAILED;
 	/* All permanent custody, scratch and copied declarations must fit before
 	 * any pin or file operation. The carrier stays attached on every failure. */
-	if (sizeof(*pins) + bytes + (Size)count * sizeof(ColdRelmapInput) > plan->memory_budget
-		|| plan->memory_used > plan->memory_budget - sizeof(*pins) - bytes
-			- (Size)count * sizeof(ColdRelmapInput))
+	remaining = plan->memory_budget - Min(plan->memory_used, plan->memory_budget);
+	segments = (count - 1) / CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS;
+	if (remaining < sizeof(*pins)
+		|| segments > (remaining - sizeof(*pins)) / sizeof(ClusterRelmapRecoverySegment))
 		return CLUSTER_COLD_CAPACITY;
+	permanent = sizeof(*pins) + (Size)segments * sizeof(ClusterRelmapRecoverySegment);
+	if (count > (remaining - permanent) / (sizeof(*inputs) + sizeof(ColdRelmapInput)))
+		return CLUSTER_COLD_CAPACITY;
+	bytes = (Size)count * sizeof(*inputs);
 	pins = cold_plan_scratch(plan, sizeof(*pins), NULL);
 	if (pins == NULL) return CLUSTER_COLD_CAPACITY;
 	plan->relmap_recovery = pins;
 	pins->state = CLUSTER_RELMAP_RETENTION_BUILDING;
 	pins->expected = count;
+	link = &pins->segments;
+	for (uint32 i = 0; i < segments; ++i) {
+		*link = cold_plan_scratch(plan, sizeof(**link), NULL);
+		if (*link == NULL) return CLUSTER_COLD_CAPACITY;
+		link = &(*link)->next;
+	}
 	inputs = cold_plan_scratch(plan, bytes, NULL);
 	if (inputs == NULL) return CLUSTER_COLD_CAPACITY;
 	PG_TRY();
@@ -359,8 +377,9 @@ cluster_cold_plan_relmap_from_recovery_wal_v1(ClusterColdPlanV1 *plan,
 		/* Restore the ENTIRE original batch before the first baseline I/O.
 		 * Partial or poisoned declarations never become staging authority. */
 		for (uint32 i = 0; i < count && ok; ++i) {
-			pins->images[i] = inputs[i].staged;
-			++pins->count;
+			ClusterRelmapV2Image *saved = cluster_relmap_recovery_image_at(pins, i);
+			ok = saved != NULL;
+			if (ok) { *saved = inputs[i].staged; ++pins->count; }
 		}
 		for (uint32 i = 0; i < count && ok; ++i) {
 			ClusterRelmapV2View base;
@@ -371,9 +390,10 @@ cluster_cold_plan_relmap_from_recovery_wal_v1(ClusterColdPlanV1 *plan,
 				&& base.pending_complete && !base.has_pending
 				&& base.committed_generation == inputs[i].staged.committed_generation;
 			if (ok) {
+				ClusterRelmapV2Image *saved = cluster_relmap_recovery_image_at(pins, i);
 				inputs[i].staged.committed = base.committed;
-				pins->images[i] = inputs[i].staged;
-				ok = cluster_relmap_v2_encode(&inputs[i].staged, encoded, sizeof(encoded))
+				if (saved != NULL) *saved = inputs[i].staged;
+				ok = saved != NULL && cluster_relmap_v2_encode(&inputs[i].staged, encoded, sizeof(encoded))
 					== CLUSTER_RELMAP_V2_VALID;
 			}
 		}
@@ -541,7 +561,7 @@ cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
 		return UINT32_MAX;
 	plan = typed->plan;
 	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed
-		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+		|| plan->relmap_count == UINT32_MAX)
 		return UINT32_MAX;
 	if (plan->relmap_count == 0)
 		return plan->relmap_inputs == NULL ? 0 : UINT32_MAX;
@@ -731,6 +751,7 @@ typedef struct ColdRelmapTerminal {
 	pid_t pid;
 	uint32 count, participants, replay_count;
 	bool failed, sealed;
+	uint8 digest[PG_SHA256_DIGEST_LENGTH];
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterColdParticipantV1 cuts[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterControlRootSnapshot roots[CLUSTER_COLD_MAX_PARTICIPANTS];
@@ -742,7 +763,42 @@ typedef struct ColdRelmapTerminal {
 static Size
 relmap_terminal_bytes(uint32 count)
 {
+	if (count != 0 && (SIZE_MAX - offsetof(ColdRelmapTerminal, entries)) / count < sizeof(ColdRelmapTerminalEntry))
+		return SIZE_MAX;
 	return offsetof(ColdRelmapTerminal, entries) + (Size)count * sizeof(ColdRelmapTerminalEntry);
+}
+
+/* Process-local complete-batch summary, never a persistent/wire identity or
+ * qualification. Hash saved value fields and canonical staged bytes, excluding
+ * pointers, descriptors and locks. Each page describes this same ordered batch. */
+static bool
+relmap_terminal_digest(ColdRelmapTerminal *receipt)
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	bool ok;
+	if (ctx == NULL) return false;
+	ok = pg_cryptohash_init(ctx) >= 0
+		&& pg_cryptohash_update(ctx, (const uint8 *)&receipt->count, sizeof(receipt->count)) >= 0;
+	for (uint32 p = 0; p < receipt->participants && ok; ++p)
+		ok = pg_cryptohash_update(ctx, (const uint8 *)&receipt->sources[p], sizeof(receipt->sources[p])) >= 0
+			&& pg_cryptohash_update(ctx, (const uint8 *)&receipt->roots[p], sizeof(receipt->roots[p])) >= 0
+			&& pg_cryptohash_update(ctx, (const uint8 *)&receipt->checkpoints[p], sizeof(receipt->checkpoints[p])) >= 0;
+	for (uint32 i = 0; i < receipt->count && ok; ++i) {
+		const ColdRelmapTerminalEntry *entry = &receipt->entries[i];
+		const ClusterColdRelmapInputV1 *in = &entry->input.input;
+		unsigned char encoded[CLUSTER_RELMAP_V2_FILE_SIZE];
+		ok = cluster_relmap_v2_encode(&in->staged, encoded, sizeof(encoded)) == CLUSTER_RELMAP_V2_VALID
+			&& pg_cryptohash_update(ctx, (const uint8 *)&in->participant, sizeof(in->participant)) >= 0
+			&& pg_cryptohash_update(ctx, (const uint8 *)&in->cut, sizeof(in->cut)) >= 0
+			&& pg_cryptohash_update(ctx, (const uint8 *)&in->source, sizeof(in->source)) >= 0
+			&& pg_cryptohash_update(ctx, (const uint8 *)&in->frame, sizeof(in->frame)) >= 0
+			&& pg_cryptohash_update(ctx, encoded, sizeof(encoded)) >= 0
+			&& pg_cryptohash_update(ctx, (const uint8 *)&entry->native.terminal,
+				sizeof(entry->native.terminal)) >= 0;
+	}
+	ok = ok && pg_cryptohash_final(ctx, receipt->digest, sizeof(receipt->digest)) >= 0;
+	pg_cryptohash_free(ctx);
+	return ok;
 }
 
 static void
@@ -1016,6 +1072,7 @@ cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 				&& entry->native.selected.checkpoint.validated_tail_lsn_exclusive == input->cut.tail_end
 				&& relmap_current(typed, fence, input) && relmap_terminal_inputs(receipt);
 		}
+		ok = ok && relmap_terminal_digest(receipt);
 		for (uint32 i = 0; i < count && ok; ++i)
 			ok = cluster_clog_native_terminal_current_v1(receipt->entries[i].native.held);
 		ok = ok && relmap_terminal_inputs(receipt);
@@ -1034,9 +1091,9 @@ cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	return ok;
 }
 
-bool
-cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
-	ClusterColdRelmapTerminalCheckV1 *out)
+static bool
+relmap_terminal_recheck(const struct ClusterRecoveryStartV1 *start,
+	uint32 offset, bool legacy, ClusterColdRelmapTerminalCheckV1 *out)
 {
 	const ClusterColdTypedV1 *typed;
 	ColdRelmapTerminal *volatile receipt = NULL;
@@ -1062,6 +1119,9 @@ cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *sta
 			if (receipt == NULL || receipt->failed || !receipt->sealed || typed->plan->relmap_failed)
 				break;
 			receipt->failed = true; typed->plan->relmap_failed = true;
+			if ((legacy && receipt->count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+				|| (receipt->count == 0 ? offset != 0 : offset >= receipt->count))
+				break;
 			ForEachLWLockHeldByMe(relmap_recheck_held_lock, &held);
 			if (held || MyBackendType != B_STARTUP || RecoveryInProgress() || CritSectionCount != 0)
 				break;
@@ -1073,8 +1133,8 @@ cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *sta
 				ok = cluster_clog_native_terminal_current_v1(receipt->entries[i].native.held);
 			if (!ok) break;
 			/* No fallible work after this all-entry identity preflight. */
-			for (uint32 i = 0; i < receipt->count; ++i) {
-				const ColdRelmapTerminalEntry *entry = &receipt->entries[i];
+			for (uint32 i = 0; i < Min(receipt->count - offset, CLUSTER_COLD_RELMAP_MAX_INPUTS); ++i) {
+				const ColdRelmapTerminalEntry *entry = &receipt->entries[offset + i];
 				out->entries[i].participant = entry->input.input.participant;
 				out->entries[i].identity = entry->input.input.staged.identity;
 				out->entries[i].generation = entry->input.input.staged.pending_generation;
@@ -1082,7 +1142,10 @@ cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *sta
 				out->entries[i].status = entry->native.terminal.status;
 				out->entries[i].staged = entry->input.input.staged;
 			}
-			out->count = receipt->count;
+			out->count = Min(receipt->count - offset, CLUSTER_COLD_RELMAP_MAX_INPUTS);
+			out->total_count = receipt->count;
+			out->offset = offset;
+			memcpy(out->digest, receipt->digest, sizeof(out->digest));
 			receipt->failed = false; typed->plan->relmap_failed = false;
 		} while (false);
 	}
@@ -1100,5 +1163,18 @@ cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *sta
 		ClusterColdRecoveryRelmapFail(start);
 	}
 	return ok;
+}
+bool
+cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdRelmapTerminalCheckV1 *out)
+{
+	return relmap_terminal_recheck(start, 0, true, out);
+}
+
+bool
+cluster_cold_relmap_terminal_recheck_segment_v1(const struct ClusterRecoveryStartV1 *start,
+	uint32 offset, ClusterColdRelmapTerminalCheckV1 *out)
+{
+	return relmap_terminal_recheck(start, offset, false, out);
 }
 #endif

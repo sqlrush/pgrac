@@ -14864,3 +14864,12 @@ test_cluster_relmap_desc: test_cluster_relmap_desc.c unit_test.h \
 clean: clean-managed-relmap-desc
 clean-managed-relmap-desc:
 	rm -f test_cluster_relmap_desc
+
+# Relmap recovery segment and terminal-page layout consumers.
+$(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_relmap test_cluster_cold_relmap_terminal \
+		test_cluster_cold_relmap_terminal_start test_cluster_relmap_original_start.o \
+		test_cluster_cold_relmap_terminal_product.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
