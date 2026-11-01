@@ -342,11 +342,82 @@ UT_TEST(test_resident_disk_quiet_codec_never_authorizes_normal_disk_completion)
 	complete_idle();
 }
 
+static ClusterPcmLocalPiSnapshotV1 resident_capacity_pi;
+static void
+resident_capacity_start(ClusterBufmgrFirstFill *read, unsigned profile)
+{
+	ClusterPageWalBindingV1 wal = local_pi_setup(make_tag(850));
+	resident_start(&read->request, profile);
+	read->buf = &request_buf; read->base = request_base; read->token = request_token;
+	read->owner = CurrentResourceOwner; read->pending = read->resident = true;
+	read->backend_id = MyBackendId; read->backend_generation = MyProc->cluster_grd_generation;
+	cluster_enabled = cluster_shared_config = true; cluster_page_wal_shmem_init();
+	wal.identity.locator = BufTagGetRelFileLocator(&request_base.tag);
+	wal.identity.forknum = request_base.tag.forkNum; wal.identity.blockno = request_base.tag.blockNum;
+	wal.source.claim.identity.origin_node_id = cluster_node_id;
+	wal.source.claim.identity.origin_thread_id = cluster_node_id + 1;
+	wal.source.claim.identity.origin_owner_incarnation = cluster_qvotec_get_self_incarnation();
+	local_pi_writer = wal.source; local_pi_writer_ready = true;
+	UT_ASSERT(cluster_pcm_local_pi_record_first_v1(request_base.tag, &wal, &wal));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(request_base.tag, &resident_capacity_pi));
+}
+static void
+resident_capacity_retire(void)
+{
+	UT_ASSERT_EQ(ordinary_sends, 0); UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.phase, 0 /* EMPTY */);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.highest_attempt_floor, 0);
+	local_pi_covered = pi_receipt_valid = true; pi_storage_receipt_valid = false;
+	memset(&pi_receipt_cut, 0, sizeof(pi_receipt_cut)); pi_ack_cut = pi_receipt_cut;
+	pi_ack_available = UINT32_C(1) << cluster_node_id; pi_ack_imported = 0;
+	UT_ASSERT(cluster_pcm_local_pi_retire_v1(&resident_capacity_pi,
+		(const void *)&pi_receipt_fixture, NULL, NULL, 0, pi_acks[cluster_node_id]));
+	ordinary_on_pause = NULL;
+}
+UT_TEST(test_resident_PI_capacity_cancel_precedes_REQUEST_and_keeps_old_duty)
+{
+	for (unsigned profile = 1; profile <= 2; profile++) {
+		ClusterBufmgrFirstFill read = {0}; ClusterPcmOwnEntry before;
+		ClusterPcmLocalPiSnapshotV1 after; volatile bool caught = false;
+		resident_capacity_start(&read, profile); before = request_own;
+		PG_TRY(); {
+			(void)cluster_gcs_block_resident_read_begin(&request_buf, &request_base, request_token, &read.request);
+		} PG_CATCH(); { caught = true; } PG_END_TRY();
+		UT_ASSERT(caught); UT_ASSERT_EQ(ordinary_pauses, ordinary_pause_limit);
+		UT_ASSERT_EQ(ordinary_sends, 0); UT_ASSERT(!read.request.round_prepared);
+		UT_ASSERT(memcmp(&before, &request_own, sizeof(before)) == 0);
+		UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.highest_attempt_floor, 0);
+		/* Actual outer cleanup retires only its never-issued GP. */
+		cluster_bufmgr_first_fill_cleanup(&request_buf, &read);
+		UT_ASSERT(!read.pending); UT_ASSERT(read.unissued_quiet);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+		UT_ASSERT_EQ(ordinary_panics, 0); UT_ASSERT_EQ(disk_reads, 0);
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(request_base.tag, &after));
+		UT_ASSERT(memcmp(&after, &resident_capacity_pi, sizeof(after)) == 0);
+		complete_idle();
+	}
+}
+UT_TEST(test_resident_PI_DATA_progress_allows_same_episode_one_REQUEST)
+{
+	ClusterBufmgrFirstFill read = {0}; ClusterPcmOwnEntry before;
+	resident_capacity_start(&read, 2); before = request_own;
+	ordinary_on_pause = resident_capacity_retire;
+	RESIDENT_REQUIRE_EQ(cluster_gcs_block_resident_read_begin(&request_buf, &request_base,
+		request_token, &read.request), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ordinary_pauses, 1); UT_ASSERT_EQ(ordinary_sends, 1);
+	UT_ASSERT(memcmp(&before, &request_own, sizeof(before)) == 0);
+	UT_ASSERT_EQ(read.request.episode.reservation_token, request_token);
+	UT_ASSERT_EQ(read.request.episode.base_generation, request_base.generation);
+	UT_ASSERT_EQ(cluster_gcs_block_first_fill_wait(&read.request), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ordinary_sends, 1); resident_unchanged_bytes();
+	cluster_gcs_block_first_fill_end(&read.request); complete_idle();
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(17);
+	UT_PLAN(19);
 	UT_RUN(test_resident_current_and_PI_issue_once_and_passively_join);
 	UT_RUN(test_resident_empty_wait_slices_keep_one_request);
 	UT_RUN(test_resident_completion_during_wait_enrollment_is_not_lost);
@@ -364,6 +435,8 @@ main(void)
 	UT_RUN(test_resident_late_material_uses_real_LMS_and_both_retirement_events);
 	UT_RUN(test_resident_quiet_settlement_does_not_sample_successor_native);
 	UT_RUN(test_resident_disk_quiet_codec_never_authorizes_normal_disk_completion);
+	UT_RUN(test_resident_PI_capacity_cancel_precedes_REQUEST_and_keeps_old_duty);
+	UT_RUN(test_resident_PI_DATA_progress_allows_same_episode_one_REQUEST);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -1120,6 +1120,10 @@ static uint64 pcm_resource_x_source_fence_get_u64(const uint8 *bytes);
 static ResourceXApplyResult pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
 	struct GrdEntry *entry, int32 current_master_node, uint64 current_master_session,
 	uint64 current_formation, uint64 expected_carrier_generation);
+static ResourceXApplyResult pcm_resource_x_acquire_predecessor_locked(
+	struct GrdEntry *entry, int32 master, uint64 session, uint64 formation);
+static ResourceXApplyResult pcm_resource_x_resident_preserved_locked(
+	struct GrdEntry *entry, const ClusterPcmOwnSnapshot *base, const char *page);
 static ResourceXApplyResult pcm_resource_x_predecessor_wait_observation_locked(
 	struct GrdEntry *entry, int32 current_master_node, uint64 current_master_session,
 	uint64 current_formation, uint64 expected_carrier_generation);
@@ -17135,6 +17139,18 @@ pcm_resource_x_bootstrap_round_step_internal(
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	}
+	/* A new resident N episode must preserve its old PI before taking master
+	 * priority. Original DATA/send owners retire that duty; this observer
+	 * changes nothing. Already-issued work keeps its completion owner. */
+	if (acquire_episode != NULL && acquire_episode->path == RESOURCE_X_ACQUIRE_RESIDENT
+		&& acquire_base->pcm_state == PCM_STATE_N && !pcm_resource_x_acquire_retained(round)) {
+		ResourceXApplyResult capacity = pcm_resource_x_resident_preserved_locked(entry, acquire_base, NULL);
+		if (capacity != RESOURCE_X_APPLY_APPLIED) {
+			action = capacity == RESOURCE_X_APPLY_LOCAL_WAIT
+				? RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE : RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+			goto round_step_done;
+		}
+	}
 	if (round->resident_s_authorized != 0 && acquire_episode != NULL) {
 		if (!pcm_resource_x_acquire_s_successor_locked(entry, acquire_base, acquire_episode)) {
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
@@ -17263,9 +17279,11 @@ pcm_resource_x_bootstrap_round_step_internal(
 		}
 		action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
-			   && (predecessor_result = pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(
-					   entry, current_master_node, master_session_incarnation, resource_formation,
-					   0))
+			   && (predecessor_result = acquire_episode != NULL
+					? pcm_resource_x_acquire_predecessor_locked(entry, current_master_node,
+						master_session_incarnation, resource_formation)
+					: pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(entry,
+						current_master_node, master_session_incarnation, resource_formation, 0))
 					  == RESOURCE_X_APPLY_APPLIED) {
 		/* The already-published holder pair belongs to an earlier canonical
 		 * conversion.  Keep this requester round byte-empty until its exact
@@ -26347,6 +26365,34 @@ pcm_resource_x_read_source_pair_clear(ClusterPcmResourceXMasterState *state)
 	memset(&state->pi_carrier, 0, sizeof(state->pi_carrier));
 }
 
+/* Metadata capacity is observed before REQUEST under the same entry lock.
+ * A NULL page is private to that preflight; the installer still requires
+ * native ownership and byte-exact evidence through the public predicate. */
+static ResourceXApplyResult
+pcm_resource_x_resident_preserved_locked(struct GrdEntry *entry,
+	const ClusterPcmOwnSnapshot *base, const char *page)
+{
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmLocalPiSnapshotV1 local, covered;
+	ResourceXDecodedFrame image;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_LOCAL_WAIT;
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (state == NULL || !pcm_local_pi_snapshot_locked(entry, &local)
+		|| !pcm_resource_x_pi_carrier_decode_locked(entry, state, &covered))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (local.first.record_start == 0 && !state->pi_carrier.pi_refs)
+		result = RESOURCE_X_APPLY_APPLIED;
+	else if (state->pi_carrier.pi_refs == 1
+		&& state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PUBLISHED
+		&& cluster_pcm_own_snapshot_equal_exact(base, &state->pi_carrier.completed)
+		&& cluster_page_wal_same_mutation_v1(&local.first, &covered.first)
+		&& cluster_page_wal_same_mutation_v1(&local.last, &covered.last)
+		&& pcm_resource_x_s_source_body_valid_inner(entry, state, &image)
+		&& (page == NULL || memcmp(page, image.body.acquire_image.original_image.page_bytes, BLCKSZ) == 0))
+		result = RESOURCE_X_APPLY_APPLIED;
+	return result;
+}
+
 /* A resident refill may overwrite old bytes only when any local PI duty
  * has an independently retained, byte-exact body and WAL scope. This is
  * evidence only: the caller must retain and recheck its native GP/hold. */
@@ -26356,10 +26402,7 @@ cluster_pcm_lock_resource_x_resident_image_preserved_exact(
 {
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
-	ClusterPcmResourceXMasterState *state;
-	ClusterPcmLocalPiSnapshotV1 local, covered;
-	ResourceXDecodedFrame image;
-	ResourceXApplyResult result = RESOURCE_X_APPLY_LOCAL_WAIT;
+	ResourceXApplyResult result;
 
 	if (base == NULL || page == NULL || base->pcm_state != PCM_STATE_N
 		|| (base->buffer_type != BUF_TYPE_CURRENT && base->buffer_type != BUF_TYPE_PI)
@@ -26369,20 +26412,7 @@ cluster_pcm_lock_resource_x_resident_image_preserved_exact(
 	if (!pcm_entry_ref_acquire(&base->tag, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
-	state = pcm_resource_x_master_state_for_entry(ref.entry);
-	if (state == NULL || !pcm_local_pi_snapshot_locked(ref.entry, &local)
-		|| !pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, &covered))
-		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	else if (local.first.record_start == 0 && !state->pi_carrier.pi_refs)
-		result = RESOURCE_X_APPLY_APPLIED;
-	else if (state->pi_carrier.pi_refs == 1
-		&& state->holder_status.valid == RESOURCE_X_HOLDER_PAIR_PUBLISHED
-		&& cluster_pcm_own_snapshot_equal_exact(base, &state->pi_carrier.completed)
-		&& cluster_page_wal_same_mutation_v1(&local.first, &covered.first)
-		&& cluster_page_wal_same_mutation_v1(&local.last, &covered.last)
-		&& pcm_resource_x_s_source_body_valid_inner(ref.entry, state, &image)
-		&& memcmp(page, image.body.acquire_image.original_image.page_bytes, BLCKSZ) == 0)
-		result = RESOURCE_X_APPLY_APPLIED;
+	result = pcm_resource_x_resident_preserved_locked(ref.entry, base, page);
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;
@@ -26480,6 +26510,106 @@ pcm_resource_x_s_source_work_block_locked(const struct GrdEntry *entry,
 	frame.body.acquire_decision = decision;
 	return pcm_resource_x_s_source_block_valid(&frame, work->master_node, block)
 		&& pcm_resource_x_s_source_block_matches(state, block);
+}
+
+/* Complete-A sources use their typed receipt, not the legacy pair decoder.
+ * A PI-only body is capacity, not transport. Its original physical ACK must
+ * still finish before a new REQUEST. No old responsibility is retired here. */
+static ResourceXApplyResult
+pcm_resource_x_acquire_predecessor_locked(struct GrdEntry *entry,
+	int32 master, uint64 session, uint64 formation)
+{
+	ClusterPcmResourceXMasterState *state = pcm_resource_x_master_state_for_entry(entry);
+	ResourceXDecodedFrame frame, block, receipt;
+	ResourceXDecodedAcquireWitness witness;
+	ResourceXWireReject reject;
+	ResourceXApplyResult result;
+	const ClusterPcmResourceXSettlementRetry *r;
+	const ResourceXDecodedAcquireDecision *a;
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES];
+	uint16 length;
+
+	if (state == NULL) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	result = pcm_resource_x_s_source_ack_capacity_locked(entry, state);
+	if (result == RESOURCE_X_APPLY_LOCAL_WAIT) {
+		r = &state->settlement_retry;
+		if (!pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)
+			|| !pcm_resource_x_settlement_retry_decode_locked(entry, state, &receipt))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		a = &receipt.body.acquire_completion.decision;
+		if (receipt.common.resource_formation != formation
+			|| receipt.common.master_session_incarnation != session || a->master_node != master)
+			return RESOURCE_X_APPLY_STALE;
+		return r->retired_authority == receipt.common.authority_generation
+			&& r->retired_resource_binding == a->resource_binding
+			&& r->retired_formation == formation && r->retired_master_session == session
+			&& r->retired_master == master
+			? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	if (pcm_resource_x_s_source_empty(state))
+		return pcm_resource_x_holder_pair_precedes_local_bootstrap_locked(entry, master, session, formation, 0);
+	if (state->holder_status.valid == RESOURCE_X_HOLDER_SOURCE_FORWARD) {
+		if (!pcm_resource_x_s_source_forward_valid(entry, state, &block))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	} else {
+		if (!pcm_resource_x_s_source_pair_valid(entry, state)
+			|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N,
+				state->holder_status.payload, state->holder_status.payload_bytes, &frame, &reject))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		witness = frame.body.acquire_witness;
+		frame.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
+		frame.common.outcome = RESOURCE_X_OUTCOME_NONE;
+		frame.common.sender_connection_generation = witness.has_source_proof
+			? (uint32)witness.original_proof.holder_connection_generation
+			: state->holder_acquire_s_forward_connection;
+		frame.body.acquire_decision = witness.decision;
+		if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes), &length, &reject)
+			|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, length, &block, &reject))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (block.common.resource_formation != formation || block.common.master_session_incarnation != session
+		|| block.body.acquire_decision.master_node != master)
+		return RESOURCE_X_APPLY_STALE;
+	if (entry->resource_x_source_drain.r4_record_generation != 0 || state->pi_carrier.transport_refs != 0) {
+		result = pcm_resource_x_s_source_domain_locked(entry, state, &block, master);
+		if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	} else {
+		/* DONE has normally removed the old local-master canonical/priority.
+		 * Historical PI below must prove its consumed full receipt instead of
+		 * borrowing a live request. Current membership/routing still applies. */
+		if (!cluster_pcm_lock_resource_x_gate_open_exact(formation)
+			|| cluster_grd_pi_rebuild_blocked_v1(entry->tag))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		if (cluster_gcs_lookup_master(entry->tag) != master
+			|| cluster_qvotec_get_self_incarnation() != block.body.acquire_decision.holders[cluster_node_id].boot_incarnation)
+			return RESOURCE_X_APPLY_STALE;
+	}
+	if (entry->resource_x_source_drain.r4_record_generation != 0) {
+		if (!pcm_resource_x_s_source_work_block_locked(entry, state, &entry->resource_x_source_drain, &frame))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return RESOURCE_X_APPLY_APPLIED;
+	}
+	if (state->pi_carrier.transport_refs != 0) return RESOURCE_X_APPLY_APPLIED;
+	if (state->pi_carrier.pi_refs != 1 || state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_status_intent.slot)
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_image_intent))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	/* A quiet descriptor alone never proves transport retirement. Consume
+	 * only the original full receipt and its exact retired authority. */
+	r = &state->settlement_retry;
+	if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, &receipt)
+		|| r->generation == 0 || r->pending || r->running || !receipt.has_acquire_decision
+		|| !pcm_resource_x_read_source_block(&receipt, &frame)
+		|| !pcm_resource_x_s_source_block_matches(state, &frame))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	a = &receipt.body.acquire_completion.decision;
+	return r->retired_authority == receipt.common.authority_generation
+		&& r->retired_resource_binding == a->resource_binding
+		&& r->retired_formation == receipt.common.resource_formation
+		&& r->retired_master_session == receipt.common.master_session_incarnation
+		&& r->retired_master == master
+		? RESOURCE_X_APPLY_NOT_FOUND : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
 ResourceXApplyResult

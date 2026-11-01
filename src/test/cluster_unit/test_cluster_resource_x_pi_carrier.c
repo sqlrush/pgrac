@@ -663,10 +663,208 @@ UT_TEST(test_pi_capacity_does_not_turn_invalid_ACK_or_old_A_into_wait)
 	pi_end();
 }
 
+/* This adapter enters the actual ordinary round owner. Native completion
+ * and peer receipt remain explicit provider inputs, not a network run. */
+static ResourceXBootstrapRoundAction
+pi_resident_round_domain(const ClusterPcmOwnSnapshot *base, int32 master, uint64 session)
+{
+	ResourceXAssertion assertion;
+	ResourceXDecodedAcquireIntent episode = {0};
+	ResourceXDecodedFrame dispatch;
+	ResourceXAcquisitionRef terminal;
+	UT_ASSERT(resource_x_assertion_init(&base->tag, cluster_node_id, &assertion));
+	episode.requester_incarnation = cluster_qvotec_get_self_incarnation();
+	episode.backend_generation = 44; episode.backend_id = 1; episode.buffer_id = 7;
+	episode.base_generation = base->generation; episode.reservation_token = base->reservation_token + 1;
+	episode.cluster_epoch = 17; episode.r4_generation = 83; episode.path = RESOURCE_X_ACQUIRE_RESIDENT;
+	return cluster_pcm_lock_resource_x_acquire_round_step_exact(&assertion, master, 17, session,
+		83, 51, 61, 1000, 900, 115, 50, base, &episode, &dispatch, &terminal);
+}
+static ResourceXBootstrapRoundAction
+pi_resident_round(const ClusterPcmOwnSnapshot *base)
+{
+	return pi_resident_round_domain(base, 2, 777);
+}
+static bool
+pi_resident_remote(PiFixture *f, ClusterPcmOwnSnapshot *base)
+{
+	if (!pi_start_target(f, true, 2, PCM_STATE_X, PCM_STATE_X)) return false;
+	*base = f->source.finished; base->flags = 0;
+	return cluster_pcm_lock_resource_x_acquire_s_source_handoff_exact(&f->source.block,
+		2, 7, &f->source.finished, base) == RESOURCE_X_APPLY_APPLIED;
+}
+static ResourceXDecodedFrame
+pi_resident_settlement(PiFixture *f)
+{
+	ResourceXDecodedFrame grant = f->source.block, request = {0};
+	uint8 bytes[RESOURCE_X_DECISION_V4_BYTES]; uint16 length;
+	ResourceXWireReject reject;
+	grant.kind = RESOURCE_X_WIRE_AUTHORITY_GRANT;
+	grant.common.action_node = grant.common.logical_assertion.requester_node;
+	grant.common.sender_connection_generation = 1; /* Original retained canonical grant. */
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &grant,
+		bytes, sizeof(bytes), &length, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes,
+		length, &grant, &reject));
+	request.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2; request.has_acquire_decision = true;
+	request.payload_bytes = RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
+	request.common = grant.common; request.common.action_node = cluster_node_id;
+	request.common.outcome = RESOURCE_X_OUTCOME_OK; request.common.sender_connection_generation = 61;
+	request.body.acquire_completion.decision = grant.body.acquire_decision;
+	request.body.acquire_completion.native_generation = grant.body.acquire_decision.episode.base_generation + 1;
+	request.body.acquire_completion.decision_crc32c = grant.common.semantic_crc32c;
+	request.body.acquire_completion.page_lsn = 144;
+	request.body.acquire_completion.page_scn = f->source.ack.body.acquire_witness.original_proof.page_scn_lsn;
+	request.body.acquire_completion.page_crc32c = f->source.ack.body.acquire_witness.original_proof.page_checksum;
+	UT_ASSERT(clean_encode(&request));
+	return request;
+}
+static bool
+pi_resident_quiet(PiFixture *f, ClusterPcmOwnSnapshot *base, ResourceXIntentSlot *staged)
+{
+	ResourceXDecodedFrame request;
+	if (!pi_resident_remote(f, base)) return false;
+	clean_send(&f->source.m.state->holder_status_intent.slot);
+	clean_send(&f->source.m.state->holder_image_intent);
+	request = pi_resident_settlement(f);
+	if (clean_receive(&request) != RESOURCE_X_APPLY_APPLIED) { UT_ASSERT(false); return false; }
+	*staged = clean_stage(&f->source.m.state->holder_status_intent.slot);
+	return true;
+}
+UT_TEST(test_resident_PI_waits_before_request_until_real_transport_and_ACK_quiet)
+{
+	PiFixture f; ClusterPcmOwnSnapshot base; ResourceXDecodedFrame request;
+	ResourceXIntentSlot staged; ClusterPcmResourceXMasterState before;
+	struct StopPcmEntryLayout *entry;
+	if (!pi_resident_remote(&f, &base)) { UT_ASSERT(false); return; }
+	entry = (struct StopPcmEntryLayout *)fake_pcm_entries.data[0]; before = *f.source.m.state;
+	UT_ASSERT_EQ(pi_resident_round(&base), RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT);
+	UT_ASSERT_EQ(entry->resource_x_bootstrap_round.highest_attempt_floor, 0);
+	UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+	clean_send(&f.source.m.state->holder_status_intent.slot);
+	clean_send(&f.source.m.state->holder_image_intent);
+	request = pi_resident_settlement(&f);
+	UT_ASSERT_EQ(clean_receive(&request), RESOURCE_X_APPLY_APPLIED);
+	staged = clean_stage(&f.source.m.state->holder_status_intent.slot);
+	before = *f.source.m.state;
+	UT_ASSERT_EQ(pi_resident_round(&base), RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT);
+	UT_ASSERT_EQ(entry->resource_x_bootstrap_round.highest_attempt_floor, 0);
+	UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged, true, ++fake_pcm_clock_us));
+	before = *f.source.m.state;
+	UT_ASSERT_EQ(pi_resident_round(&base), RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(pi_resident_round(&base), RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(f.source.m.state->pi_carrier.pi_refs, 1);
+	UT_ASSERT_EQ(f.source.m.state->pi_carrier.transport_refs, 0);
+	UT_ASSERT_EQ(entry->resource_x_bootstrap_round.highest_attempt_floor, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base,
+		f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	pi_end();
+}
+UT_TEST(test_resident_PI_pre_request_scope_native_and_receipt_guards)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		PiFixture f; ClusterPcmOwnSnapshot base; ResourceXIntentSlot staged;
+		ClusterPcmResourceXMasterState before;
+		if (!pi_resident_quiet(&f, &base, &staged)) { UT_ASSERT(false); return; }
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged, true, ++fake_pcm_clock_us));
+		switch (fault) {
+		case 0: base.generation++; break;
+		case 1: base.reservation_token++; break;
+		case 2: {
+			ClusterPageWalBindingV1 later = f.last;
+			later.record_start = later.record_end; later.record_end += 10; later.version.mutation_token++;
+			UT_ASSERT(cluster_pcm_local_pi_record_v1(base.tag, &later)); break;
+		}
+		case 3: f.source.m.state->pi_carrier.reserved[0] = 1; break;
+		case 4: f.source.m.state->settlement_retry.retired_authority++; break;
+		case 5: f.source.m.state->settlement_retry.retired_resource_binding++; break;
+		case 6: f.source.m.state->settlement_retry.retired_master_session++; break;
+		case 7: f.source.m.state->settlement_retry.payload[0] ^= 1; break;
+		case 8: fake_gcs_master_node = 3; break;
+		}
+		before = *f.source.m.state;
+		UT_ASSERT_EQ(pi_resident_round(&base), fault < 3
+			? RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE : RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+		UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+		UT_ASSERT_EQ(((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->resource_x_bootstrap_round.highest_attempt_floor, 0);
+		pi_end();
+	}
+}
+
+UT_TEST(test_resident_PI_ACK_wait_keeps_exact_master_session)
+{
+	{
+		PiFixture f; ClusterPcmOwnSnapshot base; ResourceXIntentSlot staged;
+		struct StopPcmEntryLayout *entry;
+		ClusterPcmResourceXMasterState before;
+		if (!pi_resident_quiet(&f, &base, &staged)) { UT_ASSERT(false); return; }
+		entry = (struct StopPcmEntryLayout *)fake_pcm_entries.data[0];
+		{
+			ResourceXAssertion assertion; ResourceXDecodedAcquireIntent episode = {0};
+			ResourceXDecodedFrame dispatch; ResourceXAcquisitionRef terminal;
+			UT_ASSERT(resource_x_assertion_init(&base.tag, cluster_node_id, &assertion));
+			episode.requester_incarnation = cluster_qvotec_get_self_incarnation();
+			episode.backend_generation = 44; episode.backend_id = 1; episode.buffer_id = 7;
+			episode.base_generation = base.generation; episode.reservation_token = base.reservation_token + 1;
+			episode.cluster_epoch = 17; episode.r4_generation = 83; episode.path = RESOURCE_X_ACQUIRE_RESIDENT;
+			before = *f.source.m.state;
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_round_step_exact(&assertion, 2, 17, 778,
+				83, 51, 61, 1000, 900, 115, 50, &base, &episode, &dispatch, &terminal),
+				RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+			UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+			UT_ASSERT_EQ(entry->resource_x_bootstrap_round.highest_attempt_floor, 0);
+		}
+		pi_end();
+	}
+}
+
+UT_TEST(test_resident_PI_local_master_uses_retired_full_receipt_after_DONE)
+{
+	PiFixture f; ClusterPcmOwnSnapshot base;
+	ResourceXDecodedFrame done, request, ack; ResourceXMasterSnapshot out;
+	ClusterPcmResourceXMasterState before;
+	if (!pi_start_target(&f, true, 0, PCM_STATE_X, PCM_STATE_X)) { UT_ASSERT(false); return; }
+	base = f.source.finished; base.flags = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_handoff_exact(&f.source.block,
+		0, 7, &f.source.finished, &base), RESOURCE_X_APPLY_APPLIED);
+	clean_send(&f.source.m.state->holder_status_intent.slot);
+	clean_send(&f.source.m.state->holder_image_intent);
+	done = pi_resident_settlement(&f); done.kind = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
+	done.common.action_node = done.common.logical_assertion.requester_node;
+	done.common.sender_connection_generation = 71;
+	UT_ASSERT(source_done_encode(&done));
+	if (!source_done_keep(&f.source.m, &done)) { pi_end(); return; }
+	UT_ASSERT_EQ(source_apply(&f.source.ack, 0), RESOURCE_X_APPLY_APPLIED);
+	source_done_callback(&f.source.m, true);
+	if (!clean_arm(&f.source, &request)) { pi_end(); return; }
+	clean_send(&f.source.m.state->source_settlement.intent.slot);
+	UT_ASSERT_EQ(clean_receive(&request), RESOURCE_X_APPLY_APPLIED);
+	ack = clean_decode(f.source.m.state->holder_status_intent.payload, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&ack, 0, &out), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.source.m.work), RESOURCE_X_APPLY_APPLIED);
+	clean_send(&f.source.m.state->holder_status_intent.slot);
+	clean_send(&f.source.m.state->grant_intent.slot);
+	{
+		uint8 empty[sizeof(f.source.m.state->requests[1])] = {0};
+		UT_ASSERT(memcmp(&f.source.m.state->requests[1], empty, sizeof(empty)) == 0);
+	}
+	UT_ASSERT_EQ(f.source.m.state->deferred_settlement.present, 0);
+	UT_ASSERT_EQ(f.source.m.state->pi_carrier.pi_refs, 1);
+	UT_ASSERT_EQ(f.source.m.state->pi_carrier.transport_refs, 0);
+	before = *f.source.m.state;
+	UT_ASSERT_EQ(pi_resident_round_domain(&base, 0, f.source.block.common.master_session_incarnation),
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base, f.source.page.data), RESOURCE_X_APPLY_APPLIED);
+	pi_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(24);
 	UT_RUN(test_pi_master_arms_settlement_without_retiring_pi);
 	UT_RUN(test_pi_transport_settlement_keeps_original_body_and_wal_scope);
 	UT_RUN(test_pi_retirement_after_transport_releases_body_with_ack_still_owned);
@@ -687,6 +885,10 @@ main(void)
 	UT_RUN(test_pi_capacity_S_transport_and_ACK_wait_for_original_owners);
 	UT_RUN(test_pi_capacity_X_transport_and_ACK_wait_for_original_owners);
 	UT_RUN(test_pi_capacity_does_not_turn_invalid_ACK_or_old_A_into_wait);
+	UT_RUN(test_resident_PI_waits_before_request_until_real_transport_and_ACK_quiet);
+	UT_RUN(test_resident_PI_pre_request_scope_native_and_receipt_guards);
+	UT_RUN(test_resident_PI_ACK_wait_keeps_exact_master_session);
+	UT_RUN(test_resident_PI_local_master_uses_retired_full_receipt_after_DONE);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
