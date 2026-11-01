@@ -26774,6 +26774,8 @@ UT_TEST(test_runtime_terminal_rejoin_cf_refusal_withholds_proof_and_consumption)
 	}
 }
 
+#include "test_cluster_control_bootstrap_v4.inc"
+
 int
 main(int argc, char **argv)
 {
@@ -26786,6 +26788,8 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_BOOTSTRAP_V4") != NULL)
+		return bootstrap_v4_tests();
 	if (getenv("PGRAC_PRE2_TEST_CONFIG_OBSERVATION") != NULL) {
 		UT_PLAN(16);
 		UT_RUN(test_config_trace_off_does_not_observe_or_acquire_blocked_hold);
@@ -27439,7 +27443,12 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(637);
+	UT_PLAN(642);
+	UT_RUN(test_bootstrap4_actual_files_and_complete_history);
+	UT_RUN(test_bootstrap4_composer_metadata_and_alias_preserve_full_identity);
+	UT_RUN(test_bootstrap4_selected_registry_is_mandatory_and_exact);
+	UT_RUN(test_bootstrap4_registry_cannot_substitute_selected_source);
+	UT_RUN(test_bootstrap4_late_root_change_and_close_failure_refuse);
 	UT_RUN(test_post_eor_scopes_borrow_original_walr_without_native_acquire_or_release);
 	UT_RUN(test_post_eor_borrow_missing_member_and_late_owner_loss_keep_original_debt);
 	UT_RUN(test_ctrc_writer_retention_binds_both_original_sources_without_new_cut);

@@ -101,6 +101,28 @@ static bool common_matches(const ControlRootImage *root, const ClusterRecoveryRe
 			return false;
 	return true;
 }
+bool
+cluster_control_root_registry_decode_v4(const uint8 *bytes, Size length,
+	const uint8 storage[16], uint64 system, ControlRootImage *out)
+{
+	ControlRootImage *scratch;
+	bool ok;
+	if (!out || !storage || overlaps(bytes, length, out, sizeof(*out)) ||
+		overlaps(storage, 16, out, sizeof(*out)))
+		return false;
+	scratch = malloc(sizeof(*scratch));
+	if (!scratch)
+		return false;
+	ok = decode(bytes, length, system, storage, scratch);
+	if (ok) {
+		memset(scratch->bytes, 0, sizeof(scratch->bytes));
+		scratch->header.format_version = 4;
+		scratch->header.target_feature_bitmap |= CLUSTER_RECOVERY_CONTROL_ROOT_FEATURE;
+		*out = *scratch;
+	}
+	free(scratch);
+	return ok;
+}
 static bool reference_matches(const ClusterRecoveryRegistryV2 *r, const uint8 ref[128])
 {
 	uint8 *bytes, expected[128];

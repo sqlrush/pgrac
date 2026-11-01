@@ -554,3 +554,7 @@ cluster_semantic_activation.o: $(srcdir)/cluster_control_rebind.inc
 cluster_control_root_registry.o: $(srcdir)/cluster_control_root_registry_private.h \
 	$(srcdir)/cluster_control_root_private.h \
 	$(top_srcdir)/src/include/common/cluster_recovery_registry.h
+
+cluster_control_bootstrap.o cluster_control_bootstrap_read.o: \
+	$(srcdir)/cluster_control_root_registry_private.h \
+	$(top_srcdir)/src/include/common/cluster_recovery_registry.h

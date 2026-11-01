@@ -3,6 +3,10 @@
 #define CLUSTER_CONTROL_ROOT_REGISTRY_PRIVATE_H
 #include "cluster_control_root_private.h"
 #include "common/cluster_recovery_registry.h"
+/* Pure pre-CF observation. Original fields are validated in private scratch;
+ * metadata.bytes is empty and format_version remains 4. No token or grant. */
+extern bool cluster_control_root_registry_decode_v4(const uint8 *, Size,
+	const uint8 storage_uuid[16], uint64 system_identifier, ControlRootImage *metadata);
 /* Original owner supplies its unpublished candidate and complete registry.
  * The v3 codec validates all original common/record semantics; bytes are built
  * only as v4. This does not migrate a selected legacy ROOT or authorize one. */

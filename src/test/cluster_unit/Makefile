@@ -5548,6 +5548,7 @@ test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recov
 		$(if $(filter test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census,$@),test_cluster_recovery_consumed_inputs.o,test_cluster_wal_inputs_product.o) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
+		$(top_builddir)/src/backend/cluster/cluster_control_root_registry.o $(top_builddir)/src/common/cluster_recovery_registry.o \
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_catalog_read.o \
 		$(top_builddir)/src/backend/cluster/cluster_initdb_catalog.o \
@@ -15918,3 +15919,7 @@ clean: clean-control-relmap-selection
 .PHONY: clean-control-relmap-selection
 clean-control-relmap-selection:
 	rm -f test_cluster_control_relmap_selection test_cluster_control_relmap_selection.d
+
+# Explicit ROOTv4 bootstrap reads use the selected complete registry.
+test_cluster_control_root test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census test_cluster_relmap_retained_wal test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start test_cluster_ctrc_native_fpi: test_cluster_control_bootstrap_v4.inc $(top_builddir)/src/backend/cluster/cluster_control_root_registry.o $(top_builddir)/src/common/cluster_recovery_registry.o
+cluster_control_bootstrap_read_test.o: $(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h $(top_srcdir)/src/include/common/cluster_recovery_registry.h

@@ -61,6 +61,12 @@ typedef struct ClusterControlBootstrapSnapshot {
  * Every refusal clears out. Uses the caller's memory/hash resource owner, but
  * performs no I/O, native assignment, locking, retry or publication.
  */
+/* Exact selected-registry borrow for the v4 provisional composer only.
+ * Registry-output aliases are refused without modifying borrowed bytes. */
+struct ClusterRecoveryRegistryV2;
+extern ClusterControlRootResult cluster_control_bootstrap_decode_v4(
+	const ClusterControlBootstrapInput *, const struct ClusterRecoveryRegistryV2 *,
+	ClusterControlBootstrapSnapshot *);
 extern ClusterControlRootResult
 cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 								 ClusterControlBootstrapSnapshot *out);
