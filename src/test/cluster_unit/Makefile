@@ -632,7 +632,9 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_retained_producer.inc \
 		test_cluster_relmap_managed_writer.inc test_cluster_relmap_native_borrow.inc \
-		test_cluster_relmap_native_cache.inc \
+		test_cluster_relmap_native_cache.inc test_cluster_relmap_native_checkpoint.inc \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_control.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
 		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
 		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
 		$(top_srcdir)/src/include/common/pgrac_initdb_wal.h \

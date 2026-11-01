@@ -81,6 +81,8 @@ static unsigned int begins, inserts, flushes, stages, preserves, sync_commits;
 static unsigned int registered;
 static bool managed_writer_test;
 static bool managed_cache_test;
+static bool managed_checkpoint_test;
+static int managed_checkpoint_sync(int fd);
 static unsigned managed_cache_fault;
 static void managed_cache_after_read(void);
 static bool managed_cache_fatal_probe, managed_cache_fatal_inherited;
@@ -360,7 +362,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	}
 	UT_ASSERT(lock == RelationMappingLock
 			  && (mode == LW_EXCLUSIVE || (managed_writer_test && mode == LW_SHARED)));
-	UT_ASSERT((managed_cache_test || authority_held) && !local_held && CritSectionCount == 0);
+	UT_ASSERT((managed_cache_test || managed_checkpoint_test || authority_held)
+		&& !local_held && CritSectionCount == 0);
 	local_held = true;
 	local_acquires++;
 	lock_order = ++sequence;
@@ -1164,11 +1167,23 @@ static void managed_native_table_setup(void);
 #include "test_cluster_relmap_managed_writer.inc"
 #include "test_cluster_relmap_native_borrow.inc"
 #include "test_cluster_relmap_native_cache.inc"
+#include "test_cluster_relmap_native_checkpoint.inc"
 
 int
 main(void)
 {
 	bool focus = getenv("PGRAC_RELMAP_RETAINED_FOCUS") != NULL;
+	if (getenv("PGRAC_RELMAP_NATIVE_CHECKPOINT_FOCUS")) {
+		UT_PLAN(6);
+		UT_RUN(native_checkpoint_pending_pair_and_old_cache);
+		UT_RUN(native_checkpoint_commit_abort_and_fresh_receipt);
+		UT_RUN(native_checkpoint_partial_sync_and_error_keep_duties);
+		UT_RUN(native_checkpoint_late_control_and_release_refuse_whole_receipt);
+		UT_RUN(native_checkpoint_source_recheck_is_sticky);
+		UT_RUN(native_checkpoint_inherited_cf_and_preflight);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_RELMAP_NATIVE_CACHE_FOCUS")) {
 		UT_PLAN(9);
 		UT_RUN(native_cache_registered_address_under_original_mapping_lock);
@@ -1206,7 +1221,7 @@ main(void)
 		return ut_failed_count != 0;
 	}
 
-	UT_PLAN(focus ? 4 : 121);
+	UT_PLAN(focus ? 4 : 127);
 	UT_RUN(retained_stage_uses_native_writer_identity_before_mapping_and_wal);
 	UT_RUN(retained_stage_missing_writer_never_assigns_or_stages);
 	UT_RUN(retained_stage_allocator_error_preserves_outputs_and_pins);
@@ -1334,6 +1349,13 @@ main(void)
 	if (!focus) UT_RUN(native_cache_refuses_inconsistent_caller_locks);
 	if (!focus) UT_RUN(native_cache_borrow_capacity_refuses_before_file_io);
 	if (!focus) UT_RUN(native_cache_fatal_refusal_retires_local_borrow_before_exit);
+
+	if (!focus) UT_RUN(native_checkpoint_pending_pair_and_old_cache);
+	if (!focus) UT_RUN(native_checkpoint_commit_abort_and_fresh_receipt);
+	if (!focus) UT_RUN(native_checkpoint_partial_sync_and_error_keep_duties);
+	if (!focus) UT_RUN(native_checkpoint_late_control_and_release_refuse_whole_receipt);
+	if (!focus) UT_RUN(native_checkpoint_source_recheck_is_sticky);
+	if (!focus) UT_RUN(native_checkpoint_inherited_cf_and_preflight);
 
 	UT_DONE();
 	return ut_failed_count != 0;

@@ -36,6 +36,7 @@ cluster_control_root_relmap_selection_reference_v4(ClusterControlRelmapSelection
 	else {
 		memset(out, 0, sizeof(*out));
 		out->logical_count = 2;
+		if (managed_checkpoint_test) out->source_count = 2;
 	}
 	return true;
 }

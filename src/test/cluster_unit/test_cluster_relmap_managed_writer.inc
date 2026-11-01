@@ -17,6 +17,7 @@ volatile uint32 InterruptHoldoffCount;
 int
 pg_fsync(int fd)
 {
+	if (managed_checkpoint_test) return managed_checkpoint_sync(fd);
 	return fsync(fd);
 }
 void *
@@ -52,7 +53,7 @@ cluster_cf_held_is_clusterwide(LOCKMODE mode)
 bool
 cluster_cf_lock(LOCKMODE mode)
 {
-	UT_ASSERT(mode == ShareLock && !local_held && authority_held);
+	UT_ASSERT(mode == ShareLock && !local_held && (authority_held || managed_checkpoint_test));
 	managed_cf = true;
 	return true;
 }
