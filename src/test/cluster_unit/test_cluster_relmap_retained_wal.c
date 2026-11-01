@@ -2160,6 +2160,10 @@ static void (*origin_build_recheck_hook)(void);
 static unsigned custody_terminal_calls, custody_terminal_fault;
 static unsigned custody_inventory_fault, custody_inventory_calls, custody_inventory_expected = 1;
 static bool custody_extra_terminal;
+/* Opt-in batch fixture: emit both namespace records before capturing ROOT. */
+static bool custody_second_namespace;
+static ClusterRelmapV2Image custody_second_image;
+static WalTestRecord custody_second_record;
 static void
 custody_image_init(const ClusterControlRootSnapshot *snapshot, uint64 dbinc)
 {
@@ -2220,7 +2224,8 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 	lower = snapshot->checkpoint_lower_lsn;
 	at = lower + MAXALIGN(SizeOfXLogRecord + 2 + terminal_bytes);
 	if (fault >= 29 && fault <= 32)
-		at += MAXALIGN(SizeOfXLogRecord + 5 + MinSizeOfRelmapUpdate + sizeof(RelMapFile));
+		at += (custody_second_namespace ? 2 : 1)
+			* MAXALIGN(SizeOfXLogRecord + 5 + MinSizeOfRelmapUpdate + sizeof(RelMapFile));
 	if (fault == 4 || fault == 5 || fault == 6)
 		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(timestamp));
 	if (fault == 14 || fault == 27)
@@ -2262,6 +2267,19 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 		pending = terminal_test_record(&source, lower, 0, RM_RELMAP_ID, XLOG_RELMAP_UPDATE, 99,
 									   payload, sizeof(payload));
 		custody_image.pending_owner.wal_end = pending.exclusive_end;
+		if (custody_second_namespace) {
+			custody_second_image = custody_image;
+			custody_second_image.identity.shared = !custody_shared;
+			custody_second_image.identity.dbid = custody_shared ? 42 : InvalidOid;
+			update.dbid = custody_second_image.identity.dbid;
+			update.tsid = custody_shared ? DEFAULTTABLESPACE_OID : GLOBALTABLESPACE_OID;
+			memcpy(payload, &update, MinSizeOfRelmapUpdate);
+			custody_second_record = terminal_test_record(&source, pending.exclusive_end,
+				pending.record_start, RM_RELMAP_ID, XLOG_RELMAP_UPDATE, 99,
+				payload, sizeof(payload));
+			custody_second_image.pending_owner.wal_end = custody_second_record.exclusive_end;
+			pending = custody_second_record;
+		}
 		terminal = terminal_test_record(&source, pending.exclusive_end, pending.record_start,
 										RM_XACT_ID, terminal_info, 99, terminal_data, terminal_bytes);
 	} else if (fault == 14 || fault == 28) {
