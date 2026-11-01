@@ -871,7 +871,7 @@ UT_TEST(creation_shmem_rejects_online_or_changed_original_child_context)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(44);
 	UT_RUN(test_original_codec_v4_extent_and_exact_reference);
 	UT_RUN(test_v4_refuses_forged_reference_and_record);
 	UT_RUN(test_selected_root_registry_real_files_and_late_change);
