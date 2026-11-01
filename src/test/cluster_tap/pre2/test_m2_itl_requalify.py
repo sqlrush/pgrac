@@ -33,6 +33,16 @@ def finished(kind='update'):
                 remaining=[dict(h, state='idle in transaction') for h in m['start']['holders'][1:]])
 
 
+def lock_only_finished():
+    case = finished()
+    case['rows'][0]['xmax'] = '1400'
+    case['tuple_page'] = dict(page_known=True, stored=True, sequence=23,
+        image_scope='native_buffer_owned_copy', tag=case['mutation']['start']['tag'],
+        heap_tuples_known=True, heap_tuples=[dict(offset=19, xmin=1400, xmax=1400,
+            infomask=0x2090, infomask2=2, ctid='(0,19)')])
+    return case
+
+
 class RequalificationEvidence(unittest.TestCase):
     def setUp(self):
         self.mutate = getattr(native, 'validate_requalification_mutation', None)
@@ -90,6 +100,48 @@ class RequalificationEvidence(unittest.TestCase):
             r = self.finish(finished(kind))
             self.assertEqual((r['kind'], r['completed_waits']), (kind, 1))
             self.assertFalse(r['authoritative'])
+
+    def test_own_lock_only_xmax_needs_the_exact_successor_header(self):
+        for infomask2 in (2, 0x8002):
+            c = lock_only_finished(); c['tuple_page']['heap_tuples'][0]['infomask2'] = infomask2
+            try:
+                result = self.finish(c)
+            except ValueError as error:
+                self.fail('the exact own lock-only successor was refused: ' + str(error))
+            self.assertEqual((result['kind'], result['completed_waits']), ('update', 1))
+            self.assertFalse(result['authoritative'])
+
+    def test_already_updated_header_cannot_be_a_fresh_lock_only_successor(self):
+        for infomask2 in (0x2002, 0x4002, 0x6002, 0xe002):
+            c = lock_only_finished(); c['tuple_page']['heap_tuples'][0]['infomask2'] = infomask2
+            with self.subTest(infomask2=hex(infomask2)), self.assertRaises(ValueError): self.finish(c)
+
+    def test_nonzero_xmax_without_a_matching_lock_only_header_refuses(self):
+        changes = [lambda c:c.pop('tuple_page'),
+                   lambda c:c['tuple_page'].update(page_known=False),
+                   lambda c:c['tuple_page'].update(stored=False),
+                   lambda c:c['tuple_page'].update(sequence=0),
+                   lambda c:c['tuple_page'].update(image_scope='scratch'),
+                   lambda c:c['tuple_page'].update(tag=[1663, 5, 999, 0, 0]),
+                   lambda c:c['tuple_page'].update(heap_tuples_known=False),
+                   lambda c:c['tuple_page'].update(heap_tuples=[]),
+                   lambda c:c['tuple_page']['heap_tuples'].append(
+                       copy.deepcopy(c['tuple_page']['heap_tuples'][0]))]
+        for change in changes:
+            c = lock_only_finished(); change(c)
+            with self.subTest(change=change), self.assertRaises(ValueError): self.finish(c)
+        for field, value in (('offset', 18), ('xmin', 1200), ('xmax', 1200),
+                             ('ctid', '(0,18)'), ('infomask2', 65536)):
+            c = lock_only_finished(); c['tuple_page']['heap_tuples'][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError): self.finish(c)
+
+    def test_delete_multi_committed_invalid_or_foreign_xmax_cannot_pass_as_a_lock(self):
+        for infomask in (0x2000, 0x2010, 0x2080, 0x20d0, 0x2490, 0x2890, 0x3090, 0x6090):
+            c = lock_only_finished(); c['tuple_page']['heap_tuples'][0]['infomask'] = infomask
+            with self.subTest(infomask=hex(infomask)), self.assertRaises(ValueError): self.finish(c)
+        c = lock_only_finished(); c['rows'][0]['xmax'] = '1200'
+        c['tuple_page']['heap_tuples'][0]['xmax'] = 1200
+        with self.assertRaises(ValueError): self.finish(c)
 
     def test_finish_refuses_stale_value_reused_tuple_or_wrong_creator(self):
         for field, value in (('v', 1), ('id', 8), ('xmin', '1200'), ('ctid', '(0,18)')):

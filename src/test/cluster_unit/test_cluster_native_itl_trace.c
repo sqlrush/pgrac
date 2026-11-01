@@ -1,6 +1,7 @@
 /* Actual finite recorder; only backend environment is supplied by the test. */
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
+#include "access/htup_details.h"
 #include "cluster/cluster_native_itl_trace.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_shmem.h"
@@ -446,11 +447,71 @@ static int retry_json(bool missing)
 	return 0;
 }
 
+static void successor_header_page(PGAlignedBlock *page)
+{
+	PageHeader h = (PageHeader)page->data;
+	HeapTupleHeader tuple;
+	memset(page, 0, sizeof(*page));
+	h->pd_lower = SizeOfPageHeaderData + 2 * sizeof(ItemIdData);
+	h->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	h->pd_upper = h->pd_special - MAXALIGN(SizeofHeapTupleHeader);
+	h->pd_flags = PD_HAS_ITL;
+	ItemIdSetUnused(PageGetItemId(page->data, 1));
+	ItemIdSetNormal(PageGetItemId(page->data, 2), h->pd_upper, SizeofHeapTupleHeader);
+	tuple = (HeapTupleHeader)PageGetItem(page->data, PageGetItemId(page->data, 2));
+	HeapTupleHeaderSetXmin(tuple, 1400);
+	HeapTupleHeaderSetXmax(tuple, 1400);
+	tuple->t_infomask = HEAP_UPDATED | HEAP_XMAX_KEYSHR_LOCK | HEAP_XMAX_LOCK_ONLY;
+	tuple->t_infomask2 = 2;
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	ItemPointerSet(&tuple->t_ctid, 7, 2);
+}
+
+static void page_projection_keeps_raw_lock_flags_and_tuple_location(void)
+{
+	PGAlignedBlock page, before;
+	StringInfoData out;
+	successor_header_page(&page); memcpy(&before, &page, sizeof(page));
+	initStringInfo(&out); append_heap_tuple_headers(&out, page.data, true);
+	UT_ASSERT_STR_CONTAINS(out.data, "\"heap_tuples_known\":true");
+	UT_ASSERT_STR_CONTAINS(out.data, "{\"offset\":2,\"xmin\":1400,\"xmax\":1400,\"infomask\":8336,\"infomask2\":2,\"ctid\":\"(7,2)\"}");
+	UT_ASSERT_EQ(memcmp(&page, &before, sizeof(page)), 0);
+	free(out.data);
+}
+
+static void page_projection_never_decodes_an_unknown_page(void)
+{
+	StringInfoData out;
+	initStringInfo(&out); append_heap_tuple_headers(&out, (Page)(uintptr_t)1, false);
+	UT_ASSERT_STR_CONTAINS(out.data, "\"heap_tuples_known\":false,\"heap_tuples\":[]");
+	free(out.data);
+}
+
+static void malformed_tuple_or_line_array_yields_no_partial_headers(void)
+{
+	for (unsigned i = 0; i < 5; i++) {
+		PGAlignedBlock page;
+		PageHeader h = (PageHeader)page.data;
+		HeapTupleHeader tuple;
+		StringInfoData out;
+		successor_header_page(&page);
+		tuple = (HeapTupleHeader)PageGetItem(page.data, PageGetItemId(page.data, 2));
+		if (i == 0) h->pd_lower++;
+		if (i == 1) ItemIdSetNormal(PageGetItemId(page.data, 2), h->pd_special - 1, SizeofHeapTupleHeader);
+		if (i == 2) ItemIdSetNormal(PageGetItemId(page.data, 2), h->pd_upper, SizeofHeapTupleHeader - 1);
+		if (i == 3) tuple->t_hoff = SizeofHeapTupleHeader - 1;
+		if (i == 4) tuple->t_hoff = SizeofHeapTupleHeader + 1;
+		initStringInfo(&out); append_heap_tuple_headers(&out, page.data, true);
+		UT_ASSERT_STR_CONTAINS(out.data, "\"heap_tuples_known\":false,\"heap_tuples\":[]");
+		free(out.data);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 2 && strcmp(argv[1], "--retry-json") == 0) return retry_json(false);
 	if (argc == 2 && strcmp(argv[1], "--missing-retry-json") == 0) return retry_json(true);
-	UT_PLAN(27);
+	UT_PLAN(30);
 	UT_RUN(disabled_is_inert); UT_RUN(immutable_owned_copy); UT_RUN(prefix_is_complete);
 	UT_RUN(unpublished_hole_is_incomplete); UT_RUN(full_never_overwrites);
 	UT_RUN(unavailable_is_incomplete); UT_RUN(missing_actor_is_not_invented);
@@ -473,5 +534,8 @@ int main(int argc, char **argv)
 	UT_RUN(retry_invalid_native_binding_is_copied_but_not_qualified);
 	UT_RUN(retry_disabled_does_not_dereference_supplied_inputs);
 	UT_RUN(retry_export_preserves_integer_precision_and_unknown_scope);
+	UT_RUN(page_projection_keeps_raw_lock_flags_and_tuple_location);
+	UT_RUN(page_projection_never_decodes_an_unknown_page);
+	UT_RUN(malformed_tuple_or_line_array_yields_no_partial_headers);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }

@@ -1,6 +1,7 @@
 /* Opt-in native TT/ITL copies. Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 #include "fmgr.h"
+#include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/pg_class.h"
 #include "lib/stringinfo.h"
@@ -34,6 +35,49 @@ static void append_hex(StringInfo out, const void *data, Size size)
 		appendStringInfoChar(out, digits[bytes[i] >> 4]);
 		appendStringInfoChar(out, digits[bytes[i] & 15]);
 	}
+}
+
+/* Decode only the already owned heap image; never consult transaction state. */
+static void append_heap_tuple_headers(StringInfo out, Page page, bool known)
+{
+	const PageHeaderData *h = (const PageHeaderData *)page;
+	OffsetNumber maxoff = 0;
+	bool comma = false;
+	if (known) {
+		known = h->pd_lower >= SizeOfPageHeaderData && h->pd_lower <= h->pd_upper &&
+			h->pd_upper <= h->pd_special && h->pd_special <= BLCKSZ &&
+			(h->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) == 0;
+		if (known) maxoff = PageGetMaxOffsetNumber(page);
+		for (OffsetNumber off = FirstOffsetNumber; known && off <= maxoff; off++) {
+			ItemId item = PageGetItemId(page, off);
+			HeapTupleHeader tuple;
+			if (!ItemIdIsNormal(item)) continue;
+			if (ItemIdGetOffset(item) < h->pd_upper ||
+				ItemIdGetOffset(item) % MAXIMUM_ALIGNOF != 0 ||
+				ItemIdGetLength(item) < SizeofHeapTupleHeader ||
+				(Size)ItemIdGetOffset(item) + ItemIdGetLength(item) > h->pd_special) {
+				known = false; break;
+			}
+			tuple = (HeapTupleHeader)PageGetItem(page, item);
+			known = tuple->t_hoff >= SizeofHeapTupleHeader &&
+				tuple->t_hoff <= ItemIdGetLength(item) && ItemPointerIsValid(&tuple->t_ctid);
+		}
+	}
+	appendStringInfo(out, ",\"heap_tuples_known\":%s,\"heap_tuples\":[", known ? "true" : "false");
+	for (OffsetNumber off = FirstOffsetNumber; known && off <= maxoff; off++) {
+		ItemId item = PageGetItemId(page, off);
+		HeapTupleHeader tuple;
+		if (!ItemIdIsNormal(item)) continue;
+		tuple = (HeapTupleHeader)PageGetItem(page, item);
+		if (comma) appendStringInfoChar(out, ',');
+		appendStringInfo(out, "{\"offset\":%u,\"xmin\":%u,\"xmax\":%u,"
+			"\"infomask\":%u,\"infomask2\":%u,\"ctid\":\"(%u,%u)\"}",
+			off, HeapTupleHeaderGetRawXmin(tuple), HeapTupleHeaderGetRawXmax(tuple),
+			tuple->t_infomask, tuple->t_infomask2,
+			ItemPointerGetBlockNumber(&tuple->t_ctid), ItemPointerGetOffsetNumber(&tuple->t_ctid));
+		comma = true;
+	}
+	appendStringInfoChar(out, ']');
 }
 
 static void append_event(StringInfo out, const ClusterNativeItlTraceEvent *r)
@@ -191,7 +235,10 @@ Datum test_pgrac_native_itl_page(PG_FUNCTION_ARGS)
 		",\"page_known\":%s,\"image_scope\":\"native_buffer_owned_copy\",\"page_bytes\":\"",
 		stored ? "true" : "false", sequence, row.page_known ? "true" : "false");
 	append_hex(&out, image.data, BLCKSZ);
-	appendStringInfoString(&out, "\"}");
+	appendStringInfo(&out, "\",\"tag\":[%u,%u,%u,%d,%u]",
+		tag.spcOid, tag.dbOid, tag.relNumber, (int)tag.forkNum, tag.blockNum);
+	append_heap_tuple_headers(&out, image.data, row.page_known);
+	appendStringInfoChar(&out, '}');
 	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 #else
 	PG_RETURN_NULL();
