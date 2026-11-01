@@ -79,6 +79,29 @@ tt_slot_file_offset(uint16 slot_offset)
 		   + (uint32)slot_offset * (uint32)sizeof(TTSlot);
 }
 
+/* A legacy WAL delta carries no FullXid. Check all original framing bytes
+ * before any fixed-width slot interpretation, including stale/no-write paths. */
+static bool
+tt_legacy_layout_matches(const uint8 layout[7])
+{
+	const uint8 legacy[7] = { 0 };
+
+	return memcmp(layout, legacy, sizeof(legacy)) == 0;
+}
+
+static bool
+tt_redo_read_legacy_slot(ClusterUndoPathIntent intent, uint32 segment_id, uint8 instance,
+						 uint16 slot_offset, TTSlot *slot)
+{
+	uint8 layout[7];
+
+	return cluster_undo_smgr_read_header_bytes(intent, segment_id, instance,
+			   offsetof(UndoSegmentHeaderData, _pad_57), (char *)layout, sizeof(layout))
+		&& tt_legacy_layout_matches(layout)
+		&& cluster_undo_smgr_read_header_bytes(intent, segment_id, instance,
+			   tt_slot_file_offset(slot_offset), (char *)slot, sizeof(*slot));
+}
+
 /*
  * Own-instance owner derivation from segment_id (mirrors cluster_undo_alloc.c
  * encoding: segment_id = (owner_instance-1)*SEGS + slot + 1).
@@ -838,7 +861,9 @@ cluster_tt_durable_bind_preflight_exact(uint8 instance, uint32 segment_id,
 	}
 	cluster_tt_durable_io_wait_end();
 
-	if (first_header->segment_id != segment_id || first_header->owner_instance != instance
+	if (!tt_legacy_layout_matches(first_header->_pad_57)
+		|| !tt_legacy_layout_matches(second_header->_pad_57)
+		|| first_header->segment_id != segment_id || first_header->owner_instance != instance
 		|| first_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
 		|| second_header->segment_id != first_header->segment_id
 		|| second_header->owner_instance != first_header->owner_instance
@@ -878,7 +903,9 @@ cluster_tt_durable_abort_preflight_exact(uint8 instance, uint32 segment_id,
 		return CLUSTER_TT_TERMINAL_CONFLICT;
 	}
 	cluster_tt_durable_io_wait_end();
-	if (first_header->segment_id != segment_id || first_header->owner_instance != instance
+	if (!tt_legacy_layout_matches(first_header->_pad_57)
+		|| !tt_legacy_layout_matches(second_header->_pad_57)
+		|| first_header->segment_id != segment_id || first_header->owner_instance != instance
 		|| first_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
 		|| second_header->segment_id != first_header->segment_id
 		|| second_header->owner_instance != first_header->owner_instance
@@ -916,7 +943,9 @@ cluster_tt_durable_ctrc_release_preflight_exact(const xl_undo_tt_slot_ctrc_relea
 		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
 	}
 	cluster_tt_durable_io_wait_end();
-	if (first_header->segment_id != record->segment_id
+	if (!tt_legacy_layout_matches(first_header->_pad_57)
+		|| !tt_legacy_layout_matches(second_header->_pad_57)
+		|| first_header->segment_id != record->segment_id
 		|| first_header->owner_instance != record->owner_instance
 		|| first_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
 		|| second_header->segment_id != first_header->segment_id
@@ -953,7 +982,8 @@ cluster_tt_durable_redo_ctrc_release_slot_exact(const xl_undo_tt_slot_ctrc_relea
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("cannot read undo segment %u for CTRC release redo", record->segment_id)));
 	}
-	if (header->segment_id != record->segment_id || header->owner_instance != record->owner_instance
+	if (!tt_legacy_layout_matches(header->_pad_57)
+		|| header->segment_id != record->segment_id || header->owner_instance != record->owner_instance
 		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -2199,9 +2229,8 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slo
 				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid typed TT abort redo identity")));
 	off = tt_slot_file_offset(slot_offset);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
-											 segment_id, instance, off, (char *)&slot,
-											 sizeof(slot))) {
+	if (!tt_redo_read_legacy_slot(cluster_undo_recovery_intent_for_owner(instance),
+								 segment_id, instance, slot_offset, &slot)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read TT slot %u of undo segment %u for abort redo",
@@ -2261,7 +2290,8 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read undo segment %u for exact abort redo", segment_id)));
 	}
-	if (header->segment_id != segment_id || header->owner_instance != instance
+	if (!tt_legacy_layout_matches(header->_pad_57)
+		|| header->segment_id != segment_id || header->owner_instance != instance
 		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -2318,9 +2348,8 @@ cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id, uint16 
 						errmsg("invalid typed TT set-head redo identity")));
 	off = tt_slot_file_offset(slot_offset);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
-											 segment_id, instance, off, (char *)&slot,
-											 sizeof(slot))) {
+	if (!tt_redo_read_legacy_slot(cluster_undo_recovery_intent_for_owner(instance),
+								 segment_id, instance, slot_offset, &slot)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read TT slot %u of undo segment %u for set-head redo",

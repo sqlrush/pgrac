@@ -1685,10 +1685,37 @@ UT_TEST(test_legacy_operation80_retains_original_control_and_tt32_owner)
 	UT_ASSERT_EQ(memcmp(disk.data, expected.data, BLCKSZ), 0);
 }
 
+UT_TEST(test_native_old_commit_refuses_new_and_unknown_slot_layout)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		PGAlignedBlock before;
+		volatile bool refused = false;
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)disk.data;
+
+		native_v2_base((UINT64_C(7) << 32) | 701, TT_SLOT_ACTIVE);
+		if (fault > 0) {
+			memset(header->_pad_57, 0, sizeof(header->_pad_57));
+			header->_pad_57[fault - 1] = 1;
+		}
+		before = disk;
+		reset_io();
+		expect_panic = true;
+		if (setjmp(panic_jump) == 0)
+			cluster_tt_durable_redo_stamp_slot(3, 513, 4, 2, 701, 804);
+		else
+			refused = true;
+		expect_panic = false;
+		UT_ASSERT(refused);
+		UT_ASSERT_EQ(writes + syncs + applies + skips + notes, 0);
+		UT_ASSERT_EQ(closes, 1);
+		UT_ASSERT_EQ(memcmp(before.data, disk.data, BLCKSZ), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(31);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);
@@ -1719,6 +1746,7 @@ main(void)
 	UT_RUN(test_operation_v2_native_refuses_bad_control_chain_and_owner_before_write);
 	UT_RUN(test_operation_v2_native_physical_stale_and_old_format_are_separate);
 	UT_RUN(test_legacy_operation80_retains_original_control_and_tt32_owner);
+	UT_RUN(test_native_old_commit_refuses_new_and_unknown_slot_layout);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

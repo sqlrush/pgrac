@@ -25,6 +25,9 @@
 #include "access/twophase.h"
 #include "access/xlog.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_runtime_visibility.h"
@@ -7247,7 +7250,7 @@ UT_TEST(test_aborted_modification_projection_rejects_malformed_record_image)
 				else ((UndoDeletePayload *)test_origin_payload)->full_tuple_offset = BLCKSZ;
 				break;
 			case 7: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = 0; break;
-			case 8: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = UINT8_MAX; break;
+			case 8: test_origin_payload[old_offset + offsetof(HeapTupleHeaderData, t_hoff)] = (char)UINT8_MAX; break;
 			case 9: test_origin_record.flags = 0; break;
 			}
 			resolve_creation_record(false, 0, &resolution);

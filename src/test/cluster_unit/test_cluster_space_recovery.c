@@ -42,7 +42,6 @@
 #include "storage/buf_internals.h"
 #include "storage/smgr.h"
 #include "storage/checksum.h"
-#include "storage/checksum_impl.h"
 #include "utils/resowner.h"
 #include "unit_test.h"
 

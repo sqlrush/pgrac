@@ -1196,6 +1196,7 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 	UndoSegmentHeaderData *hdr;
 	TTSlot *slot;
 	ssize_t nread;
+	const uint8 legacy_layout[7] = { 0 };
 
 	if (slot_offset >= TT_SLOTS_PER_SEGMENT)
 		ereport(PANIC, (errmsg("TT slot commit redo: slot_offset %u out of range (max %d)",
@@ -1232,6 +1233,12 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 	}
 
 	hdr = (UndoSegmentHeaderData *)blockbuf.data;
+	if (memcmp(hdr->_pad_57, legacy_layout, sizeof(legacy_layout)) != 0) {
+		close(fd);
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("legacy TT commit redo requires the original slot layout")));
+	}
 	slot = &hdr->tt_slots[slot_offset];
 
 	/* Decide via the shared pure predicate (cluster_unit-tested; spec-3.11 §2.3). */

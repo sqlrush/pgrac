@@ -4931,10 +4931,94 @@ UT_TEST(test_lookup_v2_prefix_cannot_authorize_legacy_side_mutations)
 	reset_header_read_mock();
 }
 
+/* Missing original identity in old WAL is not permission to project a TT40
+ * owner into the TT32 transition tables, even at the shared first slot. */
+UT_TEST(test_legacy_preflight_refuses_every_nonzero_layout_byte)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)g_canned_block;
+		xl_undo_tt_slot_ctrc_release_v1 release = {
+			.segment_id = 1, .xid = 100, .root_id = 1, .root_generation = 1,
+			.admission_record_generation = 1, .seal_generation = 1,
+			.slot_offset = 0, .slot_wrap = 9, .owner_instance = 1,
+			.terminal_status = TT_SLOT_COMMITTED,
+			.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION,
+			.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED
+		};
+		PGAlignedBlock before;
+
+		lookup_v2_seed(0, TT_SLOT_ACTIVE);
+		g_write_hdr_calls = g_fsync_segment_calls = 0;
+		if (fault > 0) {
+			memset(header->_pad_57, 0, sizeof(header->_pad_57));
+			header->_pad_57[fault - 1] = 1;
+		}
+		memcpy(before.data, g_canned_block, BLCKSZ);
+		UT_ASSERT_EQ(cluster_tt_durable_bind_preflight_exact(1, 1, header->wrap_count, 0, 9, 100),
+					 CLUSTER_TT_ACTIVE_CORRUPT);
+		UT_ASSERT_EQ(cluster_tt_durable_abort_preflight_exact(1, 1, header->wrap_count, 0, 9, 100),
+					 CLUSTER_TT_TERMINAL_CORRUPT);
+		UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+
+		((UndoSegmentHeaderDataV2 *)g_canned_block)->tt_slots[0].status = TT_SLOT_COMMITTED;
+		((UndoSegmentHeaderDataV2 *)g_canned_block)->tt_slots[0].commit_scn = scn_encode(1, 42);
+		release.segment_generation = header->wrap_count;
+		UT_ASSERT(cluster_undo_tt_ctrc_release_valid(&release));
+		UT_ASSERT_EQ(cluster_tt_durable_ctrc_release_preflight_exact(&release),
+					 CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls, 0);
+	}
+	reset_header_read_mock();
+}
+
+UT_TEST(test_legacy_redo_rejects_tt40_before_mutation_or_durability)
+{
+	for (int kind = 0; kind < 4; kind++) {
+		volatile bool caught = false;
+		uint8 status = kind == 2 ? TT_SLOT_ABORTED
+			: kind == 3 ? TT_SLOT_COMMITTED : TT_SLOT_ACTIVE;
+		PGAlignedBlock before;
+		xl_undo_tt_slot_ctrc_release_v1 release = {
+			.segment_id = 1, .xid = 100, .root_id = 1, .root_generation = 1,
+			.admission_record_generation = 1, .seal_generation = 1,
+			.slot_offset = 0, .slot_wrap = 9, .owner_instance = 1,
+			.terminal_status = TT_SLOT_COMMITTED,
+			.format_version = CLUSTER_UNDO_TT_CTRC_RELEASE_VERSION,
+			.flags = CLUSTER_UNDO_TT_CTRC_RELEASE_ALL_TOUCHED_ACKED
+		};
+
+		lookup_v2_seed(0, status);
+		release.segment_generation = ((UndoSegmentHeaderData *)g_canned_block)->wrap_count;
+		memcpy(before.data, g_canned_block, BLCKSZ);
+		g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+		PG_TRY();
+		{
+			if (kind == 0)
+				cluster_tt_durable_redo_abort_slot(1, 1, 0, 9, 100);
+			else if (kind == 1)
+				cluster_tt_durable_redo_abort_slot_exact(1, 1, release.segment_generation, 0, 9, 100);
+			else if (kind == 2)
+				cluster_tt_durable_redo_set_head_slot(1, 1, 0, 9, 100, uba_encode(1, 2, 0, 64));
+			else
+				cluster_tt_durable_redo_ctrc_release_slot_exact(&release);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(last_ereport_elevel, PANIC);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls + g_present_durable_calls, 0);
+		UT_ASSERT_EQ(memcmp(before.data, g_canned_block, BLCKSZ), 0);
+	}
+	reset_header_read_mock();
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(140);
+	UT_PLAN(142);
 
 	UT_RUN(test_layout_sizes);
 
@@ -5089,6 +5173,8 @@ main(int argc, char **argv)
 	UT_RUN(test_lookup_v2_stable_io_and_native_rejections_preserve_output);
 	UT_RUN(test_lookup_invalid_physical_identity_refuses_before_io);
 	UT_RUN(test_lookup_v2_prefix_cannot_authorize_legacy_side_mutations);
+	UT_RUN(test_legacy_preflight_refuses_every_nonzero_layout_byte);
+	UT_RUN(test_legacy_redo_rejects_tt40_before_mutation_or_durability);
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
 }
