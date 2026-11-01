@@ -15689,3 +15689,17 @@ test_cluster_relmap_retained_wal: $(top_srcdir)/src/include/cluster/cluster_relm
 
 test_cluster_cold_recovery_startup: test_cluster_cold_terminal_episode.inc \
  $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
+
+# Metadata-only recovery contracts; no backend provider or disk format IDs.
+TESTS += test_cluster_recovery_carriers
+all: test_cluster_recovery_carriers
+test_cluster_recovery_carriers: test_cluster_recovery_carriers.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt.h \
+		$(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport.a -o $@
+clean: clean-recovery-carriers
+.PHONY: clean-recovery-carriers
+clean-recovery-carriers:
+	rm -f test_cluster_recovery_carriers
