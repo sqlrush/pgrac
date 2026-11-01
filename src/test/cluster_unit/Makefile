@@ -8744,7 +8744,10 @@ test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 	mv $@.tmp $@
 
 test_cluster_buffer_cr_pins.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^typedef struct PrivateRefCountEntry/ { emit=1; type++ } \
+	awk '/^cluster_bufmgr_failed_read_held_lock\(/ { print "static void"; emit=1; held++ } \
+	     /^cluster_bufmgr_failed_read_unpin_lock\(/ { print "static LWLock *"; emit=1; failed_lock++ } \
+	     /^cluster_bufmgr_failed_read_unpin_finish\(/ { print "static void"; emit=1; failed_finish++ } \
+	     /^typedef struct PrivateRefCountEntry/ { emit=1; type++ } \
 	     /^typedef enum PinBufferLookupResult/ { emit=1; lookup_type++ } \
 	     /^PinBufferForLookup\(/ { print "static PinBufferLookupResult"; emit=1; lookup_pin++ } \
 	     /^PinBufferForObjectRead\(/ { print "static PinBufferLookupResult"; emit=1; ko_pin++ } \
@@ -8752,7 +8755,7 @@ test_cluster_buffer_cr_pins.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr
 	     /^PinBuffer_Locked\(/ { print "static void"; emit=1; locked_pin++ } \
 	     /^UnpinBuffer\(/ { print "static void"; emit=1; unpin++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (lookup_pin != 1 || type != 1 || lookup_type != 1 || ko_pin != 1 || pin != 1 || locked_pin != 1 || unpin != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (held != 1 || failed_lock != 1 || failed_finish != 1 || lookup_pin != 1 || type != 1 || lookup_type != 1 || ko_pin != 1 || pin != 1 || locked_pin != 1 || unpin != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_buffer_cr_refs.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
