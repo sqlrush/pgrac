@@ -1,0 +1,22 @@
+/* Runtime-boundary adapter for actual dormant heap receipt functions. */
+#ifndef TEST_CLUSTER_MX_OPERATION_RECEIPT_H
+#define TEST_CLUSTER_MX_OPERATION_RECEIPT_H
+#include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_savepoint_reader.h"
+#include "cluster/cluster_terminal_ref_census.h"
+typedef struct MxReceiptReadout {
+	MultiXactMember normalized[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	ClusterCurrentMemberProof proofs[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	uint32 capabilities[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	uint16 normalized_count, proof_count;
+	uint64 operation_id;
+	uint32 attempt_generation;
+} MxReceiptReadout;
+bool mx_receipt_retain(const ClusterCurrentMxKey *key,
+	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, const uint32 *capabilities,
+	uint16 count, TransactionId requester, MultiXactStatus status,
+	uint64 operation_id, uint32 restarts, MxReceiptReadout *out);
+bool mx_receipt_prepare(TransactionId requester, uint64 hash,
+	const ClusterCtrcTargetV1 *target, uint16 *count);
+#endif

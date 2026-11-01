@@ -8309,6 +8309,82 @@ cluster_current_mx_result_retain_proofs(
 	return true;
 }
 
+/* Dormant operation-aware receipt bridge.  The caller must have accepted
+ * the same-attempt operation decision before retaining its survivor set.
+ * Typed effects are consumed before projecting canonical top identities for
+ * CTRC; this projection must never be used to infer SQL visibility or SELF.
+ */
+static bool pg_attribute_unused()
+cluster_current_mx_result_retain_operations(
+	ClusterCurrentMxHeapResult *heap_result,
+	const ClusterCurrentMxKey *key,
+	const ClusterCurrentMxMemberDesc *members,
+	const struct ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs,
+	const uint32 *proof_capability_generations, uint16 proof_count,
+	TransactionId requester_xid, MultiXactStatus requester_status,
+	const ClusterCurrentMxOperationState *operation)
+{
+	uint16 i;
+
+	if (heap_result == NULL)
+		return false;
+	/* No partially retained authority survives a bad member, capability,
+	 * attempt, or bounded recomposition.  Other decision fields belong to
+	 * the caller and are deliberately not changed here. */
+	memset(heap_result->normalized, 0, sizeof(heap_result->normalized));
+	memset(heap_result->proofs, 0, sizeof(heap_result->proofs));
+	memset(heap_result->proof_capability_generations, 0,
+		   sizeof(heap_result->proof_capability_generations));
+	heap_result->normalized_count = 0;
+	heap_result->proof_count = 0;
+	heap_result->operation_id = 0;
+	heap_result->attempt_generation = 0;
+	if (proof_capability_generations == NULL || operation == NULL
+		|| operation->operation_id == 0 || operation->restarts == UINT32_MAX)
+		return false;
+
+	/* This validates the complete typed set before any base proof can be
+	 * consumed by the old receipt path.  DISCARDED and terminal lockers
+	 * are removed; surviving member xids stay raw child xids. */
+	if (cluster_multixact_current_recompose_operations(
+			key, members, keys, proofs, proof_count, requester_xid,
+			requester_status, heap_result->normalized,
+			CLUSTER_CURRENT_MX_MAX_MEMBERS, &heap_result->normalized_count)
+		!= CMX_RECOMPOSE_OK)
+		return false;
+	/* Validate every retained capability before copying even one proof. */
+	for (i = 0; i < proof_count; i++)
+		if (proofs[i].base.state == CCM_ACTIVE
+			&& (proofs[i].flags == 0
+				|| proofs[i].effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE)
+			&& proof_capability_generations[i] == 0)
+		{
+			memset(heap_result->normalized, 0,
+				   sizeof(heap_result->normalized));
+			heap_result->normalized_count = 0;
+			return false;
+		}
+	for (i = 0; i < proof_count; i++)
+	{
+		uint16 retained;
+
+		if (proofs[i].base.state != CCM_ACTIVE
+			|| (proofs[i].flags != 0
+				&& proofs[i].effect_state == CLUSTER_SAVEPOINT_EFFECT_DISCARDED))
+			continue;
+		retained = heap_result->proof_count++;
+		/* Keep canonical top key and original descriptor ordinal together;
+		 * stamp PREPARE will bind them to the normalized receipt ordinal. */
+		heap_result->proofs[retained] = proofs[i].base;
+		heap_result->proof_capability_generations[retained]
+			= proof_capability_generations[i];
+	}
+	heap_result->operation_id = operation->operation_id;
+	heap_result->attempt_generation = operation->restarts + 1;
+	return true;
+}
+
 static bool
 cluster_current_mx_memo_lookup(
 	ClusterCurrentMxOperationState *operation,
