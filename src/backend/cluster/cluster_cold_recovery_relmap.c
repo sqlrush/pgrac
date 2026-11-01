@@ -130,8 +130,10 @@ relmap_pin(const ClusterColdRelmapInputV1 *input, RelmapPinUse use,
 }
 
 static bool
-relmap_entry_pin(const ColdRelmapInput *entry, bool staged)
+relmap_entry_pin(const ClusterColdPlanV1 *plan, const ColdRelmapInput *entry, bool staged)
 {
+	if (plan->relmap_recovery != NULL)
+		return cluster_relmap_recovery_check(plan->relmap_recovery, &entry->input.staged);
 	/* Producer snapshots already armed the original pin before pass-1.
 	 * Legacy explicit declarations retain their original stage transition. */
 	return relmap_pin(&entry->input, staged || entry->has_retention_snapshot
@@ -304,6 +306,124 @@ cluster_cold_plan_relmap_from_wal_v1(ClusterColdPlanV1 *plan,
 	return detail;
 }
 
+ClusterColdDetailV1
+cluster_cold_plan_relmap_from_recovery_wal_v1(ClusterColdPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count, uint32 replay_count,
+	const ClusterColdRelmapWalV1 *wal, uint32 count)
+{
+	ClusterColdRelmapInputV1 *inputs;
+	ClusterRelmapRecoveryPins *pins;
+	Size bytes = (Size)count * sizeof(*inputs);
+	volatile ClusterColdDetailV1 detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+	if (!plan_valid(plan) || sources == NULL || wal == NULL || count == 0
+		|| count > CLUSTER_COLD_RELMAP_MAX_INPUTS || source_count != plan->participant_count
+		|| replay_count == 0 || replay_count > source_count)
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	if (plan->phase != COLD_PHASE_FEEDING || plan->relmap_failed
+		|| plan->input_frame_count != 0 || plan->relmap_inputs != NULL || plan->relmap_recovery != NULL)
+		return CLUSTER_COLD_STATE;
+	plan->relmap_failed = true;
+	plan->phase = COLD_PHASE_FAILED;
+	/* All permanent custody, scratch and copied declarations must fit before
+	 * any pin or file operation. The carrier stays attached on every failure. */
+	if (sizeof(*pins) + bytes + (Size)count * sizeof(ColdRelmapInput) > plan->memory_budget
+		|| plan->memory_used > plan->memory_budget - sizeof(*pins) - bytes
+			- (Size)count * sizeof(ColdRelmapInput))
+		return CLUSTER_COLD_CAPACITY;
+	pins = cold_plan_scratch(plan, sizeof(*pins), NULL);
+	if (pins == NULL) return CLUSTER_COLD_CAPACITY;
+	plan->relmap_recovery = pins;
+	pins->state = CLUSTER_RELMAP_RETENTION_BUILDING;
+	pins->expected = count;
+	inputs = cold_plan_scratch(plan, bytes, NULL);
+	if (inputs == NULL) return CLUSTER_COLD_CAPACITY;
+	PG_TRY();
+	{
+		bool ok = enableFsync && cluster_relmap_authority_x_held();
+		for (uint32 i = 0; i < source_count && ok; ++i) {
+			const ClusterColdParticipantV1 *cut = &plan->participants[plan->canonical[i]].cut;
+			ok = sources[i].claim.identity.origin_thread_id == cut->thread_id
+				&& sources[i].timeline == cut->timeline
+				&& sources[i].claim.identity.origin_owner_incarnation == cut->owner_incarnation;
+		}
+		for (uint32 i = 0; i < count && ok; ++i)
+			ok = wal[i].retention == NULL && wal[i].retention_lock == NULL
+				&& relmap_wal_input(plan, sources, replay_count, &wal[i], &inputs[i]);
+		if (ok) ok = cold_relmap_inputs_valid(plan, inputs, count) == CLUSTER_COLD_OK;
+		/* Restore the ENTIRE original batch before the first baseline I/O.
+		 * Partial or poisoned declarations never become staging authority. */
+		for (uint32 i = 0; i < count && ok; ++i) {
+			pins->images[i] = inputs[i].staged;
+			++pins->count;
+		}
+		for (uint32 i = 0; i < count && ok; ++i) {
+			ClusterRelmapV2View base;
+			unsigned char encoded[CLUSTER_RELMAP_V2_FILE_SIZE];
+			ok = cluster_relmap_authority_x_held()
+				&& cluster_relmap_authority_v2_read(&inputs[i].staged.identity, &base)
+					== CLUSTER_RELMAP_V2_PAIR_VALID
+				&& base.pending_complete && !base.has_pending
+				&& base.committed_generation == inputs[i].staged.committed_generation;
+			if (ok) {
+				inputs[i].staged.committed = base.committed;
+				pins->images[i] = inputs[i].staged;
+				ok = cluster_relmap_v2_encode(&inputs[i].staged, encoded, sizeof(encoded))
+					== CLUSTER_RELMAP_V2_VALID;
+			}
+		}
+		for (uint32 i = 0; i < count && ok; ++i)
+			ok = cluster_relmap_authority_x_held()
+				&& wal[i].reader->system_identifier == inputs[i].staged.identity.system_identifier
+				&& wal[i].reader->cluster_expected_thread_id == inputs[i].cut.thread_id
+				&& wal[i].reader->seg.ws_tli == inputs[i].cut.timeline
+				&& relmap_record_matches(&inputs[i], wal[i].reader);
+		if (ok) {
+			plan->phase = COLD_PHASE_FEEDING;
+			detail = cluster_cold_plan_relmap_declare_v1(plan, inputs, count);
+			if (detail == CLUSTER_COLD_OK) pins->restored = true;
+		}
+	}
+	PG_CATCH();
+	{
+		plan->phase = COLD_PHASE_FAILED;
+		cold_free(inputs);
+		cold_plan_release(plan, bytes);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cold_free(inputs);
+	cold_plan_release(plan, bytes);
+	if (detail == CLUSTER_COLD_OK) plan->relmap_failed = false;
+	else plan->phase = COLD_PHASE_FAILED;
+	return detail;
+}
+
+bool
+cluster_cold_typed_relmap_recovery_transfer_v1(ClusterColdTypedV1 *typed,
+	ClusterRelmapRetentionDirectory *const *targets, uint32 count, LWLock *publication_lock)
+{
+	ClusterColdPlanV1 *plan;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK || !plan_valid(typed->plan)
+		|| publication_lock == NULL || CritSectionCount == 0
+		|| !LWLockHeldByMeInMode(publication_lock, LW_EXCLUSIVE))
+		return false;
+	plan = typed->plan;
+	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed || plan->relmap_recovery == NULL
+		|| count == 0 || count != plan->relmap_count || count != plan->relmap_recovery->count
+		|| typed->participant_count != plan->participant_count || plan->relmap_inputs == NULL)
+		return false;
+	for (uint32 i = 0; i < count; ++i) {
+		const ColdRelmapInput *entry = &plan->relmap_inputs[i];
+		uint32 p = entry->input.participant;
+		if (!entry->captured || !entry->attempted || !entry->applied || p >= typed->replay_count
+			|| !cold_relmap_cut_equal(&entry->input.cut, &typed->participants[p])
+			|| memcmp(&entry->input.source, &typed->sources[p], sizeof(entry->input.source)) != 0
+			|| !cluster_relmap_recovery_check(plan->relmap_recovery, &entry->input.staged))
+			return false;
+	}
+	return cluster_relmap_recovery_transfer(plan->relmap_recovery, targets, count);
+}
+
 bool
 cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence, const ClusterColdStepV1 *step, XLogReaderState *reader)
@@ -340,7 +460,7 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 			&& relmap_side_matches(typed, input, reader)
 			&& relmap_record_matches(input, reader)
 			&& cluster_relmap_v2_encode(&input->staged, encoded, sizeof(encoded)) == CLUSTER_RELMAP_V2_VALID
-			&& relmap_entry_pin(entry, entry->applied)) {
+			&& relmap_entry_pin(plan, entry, entry->applied)) {
 			if (entry->applied)
 				ok = cluster_relmap_authority_v2_check_staged(&input->staged);
 			else if (cluster_relmap_authority_v2_read(&input->staged.identity, &base)
@@ -348,12 +468,14 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 				&& base.committed_generation == input->staged.committed_generation
 				&& memcmp(&base.committed, &input->staged.committed, sizeof(RelMapFile)) == 0
 				&& relmap_current(typed, fence, input) && relmap_side_matches(typed, input, reader)
-				&& relmap_entry_pin(entry, false))
-				ok = cluster_relmap_authority_v2_write_pending(&input->staged.identity,
+				&& relmap_entry_pin(plan, entry, false))
+				ok = (plan->relmap_recovery != NULL
+					? cluster_relmap_authority_v2_write_recovery_pending(&input->staged, plan->relmap_recovery)
+					: cluster_relmap_authority_v2_write_pending(&input->staged.identity,
 					input->staged.pending_generation, &input->staged.pending_owner,
-					&input->staged.pending, input->retention, input->retention_lock)
+					&input->staged.pending, input->retention, input->retention_lock))
 					&& cluster_relmap_authority_v2_check_staged(&input->staged);
-			ok = ok && relmap_current(typed, fence, input) && relmap_entry_pin(entry, true)
+			ok = ok && relmap_current(typed, fence, input) && relmap_entry_pin(plan, entry, true)
 				&& relmap_side_matches(typed, input, reader);
 		}
 	}
@@ -392,9 +514,9 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 		const ColdRelmapInput *entry = &plan->relmap_inputs[i];
 		const ClusterColdRelmapInputV1 *input = &entry->input;
 		ok = relmap_current(typed, fence, input) && relmap_side_matches(typed, input, NULL)
-			&& relmap_entry_pin(entry, true)
+			&& relmap_entry_pin(plan, entry, true)
 			&& cluster_relmap_authority_v2_check_staged(&input->staged)
-			&& relmap_current(typed, fence, input) && relmap_entry_pin(entry, true)
+			&& relmap_current(typed, fence, input) && relmap_entry_pin(plan, entry, true)
 			&& relmap_side_matches(typed, input, NULL);
 	}
 	if (ok)
@@ -545,19 +667,19 @@ cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start
 				const ColdRelmapInput *entry = &check.saved[i];
 				ok = cold_relmap_inputs_valid(check.plan, &entry->input, 1) == CLUSTER_COLD_OK
 					&& relmap_side_matches(check.typed, &entry->input, NULL)
-					&& relmap_entry_pin(entry, true);
+					&& relmap_entry_pin(check.plan, entry, true);
 			}
 			for (uint32 i = 0; i < check.count && ok; ++i) {
 				const ColdRelmapInput *entry = &check.saved[i];
-				ok = relmap_recheck_current(&check) && relmap_entry_pin(entry, true)
+				ok = relmap_recheck_current(&check) && relmap_entry_pin(check.plan, entry, true)
 					&& cluster_relmap_authority_v2_check_staged(&entry->input.staged)
-					&& relmap_recheck_current(&check) && relmap_entry_pin(entry, true)
+					&& relmap_recheck_current(&check) && relmap_entry_pin(check.plan, entry, true)
 					&& relmap_side_matches(check.typed, &entry->input, NULL);
 			}
 			/* A later file/provider may invalidate an earlier pin. Recheck the
 			 * entire original batch and owner before publishing this observation. */
 			for (uint32 i = 0; i < check.count && ok; ++i)
-				ok = relmap_entry_pin(&check.saved[i], true)
+				ok = relmap_entry_pin(check.plan, &check.saved[i], true)
 					&& relmap_side_matches(check.typed, &check.saved[i].input, NULL);
 			ok = ok && relmap_recheck_current(&check);
 		} while (false);

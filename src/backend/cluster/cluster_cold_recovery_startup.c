@@ -1309,7 +1309,7 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 static ClusterColdTypedV1 *
 cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 	XLogRecPtr own_redo, const ClusterColdRelmapInputV1 *relmap, uint32 relmap_count,
-	const ClusterColdRelmapWalV1 *relmap_wal, uint32 wal_count)
+	const ClusterColdRelmapWalV1 *relmap_wal, uint32 wal_count, bool recovery)
 {
 	MemoryContext context;
 	MemoryContext old_context;
@@ -1352,8 +1352,11 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 			/* Pass-1 source ownership: exact original ROOT tokens and the
 			 * original fence generation order, never a pass-2 serial grant. */
 			detail = cold_sources_match(typed, fence)
-				? cluster_cold_plan_relmap_from_wal_v1(typed->plan, typed->sources,
-					typed->replay_count, relmap_wal, wal_count)
+				? (recovery
+					? cluster_cold_plan_relmap_from_recovery_wal_v1(typed->plan, typed->sources,
+						typed->participant_count, typed->replay_count, relmap_wal, wal_count)
+					: cluster_cold_plan_relmap_from_wal_v1(typed->plan, typed->sources,
+						typed->replay_count, relmap_wal, wal_count))
 				: CLUSTER_COLD_SOURCE_GAP;
 			if (detail == CLUSTER_COLD_OK && !cold_sources_match(typed, fence))
 				detail = CLUSTER_COLD_SOURCE_GAP;
@@ -1401,7 +1404,7 @@ done:
 ClusterColdTypedV1 *
 cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread, XLogRecPtr own_redo)
 {
-	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, NULL, 0);
+	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, NULL, 0, false);
 }
 
 ClusterColdTypedV1 *
@@ -1411,7 +1414,7 @@ cluster_cold_typed_prepare_relmap_v1(ClusterRecoveryFencePlan *fence, uint16 own
 	/* Invalid declaration never falls back to the ordinary undeclared mode. */
 	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
 		return NULL;
-	return cold_typed_prepare(fence, own_thread, own_redo, inputs, count, NULL, 0);
+	return cold_typed_prepare(fence, own_thread, own_redo, inputs, count, NULL, 0, false);
 }
 
 ClusterColdTypedV1 *
@@ -1420,7 +1423,16 @@ cluster_cold_typed_prepare_relmap_wal_v1(ClusterRecoveryFencePlan *fence, uint16
 {
 	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
 		return NULL;
-	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, inputs, count);
+	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, inputs, count, false);
+}
+
+ClusterColdTypedV1 *
+cluster_cold_typed_prepare_relmap_recovery_wal_v1(ClusterRecoveryFencePlan *fence,
+	uint16 own_thread, XLogRecPtr own_redo, const ClusterColdRelmapWalV1 *inputs, uint32 count)
+{
+	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+		return NULL;
+	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, inputs, count, true);
 }
 
 void
@@ -1431,6 +1443,9 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	if (typed_address == NULL || *typed_address == NULL)
 		return;
 	typed = *typed_address;
+	/* Keep the complete original context and ownership until joint transfer. */
+	if (cluster_cold_plan_relmap_recovery_held_v1(typed->plan))
+		return;
 	if (typed->inputs != NULL)
 		cluster_wal_inputs_release_v1(&typed->inputs);
 	if (typed->tx_fence != NULL) {

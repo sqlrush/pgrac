@@ -28,6 +28,8 @@ typedef struct TestColdRelmapStorageStats {
 
 extern void test_cold_relmap_storage_begin(ClusterColdRelmapInputV1 *input);
 extern void test_cold_relmap_storage_end(void);
+extern LWLock *test_cold_relmap_storage_publication_lock(bool enter);
+extern bool test_cold_relmap_storage_held_mode(LWLock *lock, LWLockMode mode);
 extern bool test_cold_relmap_storage_stage(ClusterColdRelmapInputV1 *input,
 	ClusterRelmapRetentionSnapshot *snapshot);
 extern void test_cold_relmap_storage_fault(unsigned write, void (*hook)(bool));

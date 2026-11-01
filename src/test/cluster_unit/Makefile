@@ -14564,7 +14564,7 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_recovery_io_core.o: \
 # Original Startup declaration, sealed SIDE and dual-copy storage in one component.
 test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_early_retention.inc
 test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_handoff.inc
-test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_recheck.inc
+test_cluster_cold_recovery_startup: test_cluster_cold_startup_relmap_recheck.inc test_cluster_cold_startup_relmap_recovery.inc
 test_cluster_cold_tx_start: test_cluster_cold_tx_relmap_handoff.inc \
 		test_cluster_cold_ctrc_relmap_gate.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_cold_recovery_relmap.c \
@@ -14602,6 +14602,7 @@ test_cluster_cold_startup_relmap_executor.o: $(top_srcdir)/src/backend/cluster/c
 		-DLWLockAcquire=test_cold_relmap_storage_acquire \
 		-DLWLockRelease=startup_relmap_storage_LWLockRelease \
 		-DLWLockHeldByMe=startup_relmap_storage_LWLockHeldByMe \
+		-DLWLockHeldByMeInMode=test_cold_relmap_storage_held_mode \
 		-DenableFsync=startup_relmap_storage_enableFsync \
 		-Dcluster_relmap_authority_x_held=startup_relmap_storage_cluster_relmap_authority_x_held \
 		-DForEachLWLockHeldByMe=test_cold_relmap_storage_each_lock \
@@ -14672,3 +14673,14 @@ test_cluster_cold_ctrc_relmap_executor.o: $(top_srcdir)/src/backend/cluster/clus
 clean: clean-ctrc-relmap-files
 clean-ctrc-relmap-files:
 	rm -f test_cluster_cold_ctrc_relmap_files test_cluster_cold_ctrc_relmap_executor.o
+
+# Private recovery custody changes both the planner layout and writer inputs.
+$(top_srcdir)/src/backend/cluster/cluster_relmap_retention.o \
+$(top_srcdir)/src/backend/cluster/cluster_relmap_authority.o \
+test_cluster_cold_recovery_startup_plan_core.o test_cluster_cold_recovery_plan_core.o \
+test_cluster_cold_recovery_plan_store_core.o test_cluster_cold_recovery_plan_seal_core.o \
+test_cluster_cold_recovery_plan_space_core.o test_cluster_cold_recovery_plan_schedule_core.o \
+test_cluster_cold_startup_relmap_authority.o test_cluster_cold_startup_relmap_executor.o \
+test_cluster_cold_ctrc_relmap_executor.o test_cluster_cold_recovery_startup \
+test_cluster_cold_ctrc_relmap_files: \
+        $(top_srcdir)/src/include/cluster/cluster_relmap_recovery_internal.h

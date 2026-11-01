@@ -32,6 +32,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_relmap_retention.h"
+#include "cluster/cluster_relmap_recovery_internal.h"
 
 #ifdef USE_CLUSTER_UNIT
 #define cold_alloc0(size_) calloc(1, (size_))
@@ -260,6 +261,7 @@ struct ClusterColdPlanV1 {
 	Size space_scratch_bytes;
 	uint32 *schedule;
 	uint32 schedule_count;
+	ClusterRelmapRecoveryPins *relmap_recovery;
 	ColdRelmapInput *relmap_inputs;
 	uint32 relmap_count;
 	bool relmap_failed;
