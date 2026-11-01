@@ -83,4 +83,10 @@ extern void UnregisterResourceReleaseCallback(ResourceReleaseCallback callback,
 extern void CreateAuxProcessResourceOwner(void);
 extern void ReleaseAuxProcessResources(bool isCommit);
 
+#ifdef USE_PGRAC_CLUSTER
+/* Current owner only, never its ancestors/children or a producer closure.
+ * NULL is unknown and conservatively pending. Read-only, O(1). */
+extern bool ResourceOwnerHasBufferIOs(ResourceOwner owner);
+#endif
+
 #endif							/* RESOWNER_H */

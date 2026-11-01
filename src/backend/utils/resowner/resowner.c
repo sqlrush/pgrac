@@ -1036,6 +1036,16 @@ ResourceOwnerForgetBufferIO(ResourceOwner owner, Buffer buffer)
 			 buffer, owner->name);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Point observation of the original private owner, without traversing or
+ * retiring any resources. An absent owner cannot prove IO has returned. */
+bool
+ResourceOwnerHasBufferIOs(ResourceOwner owner)
+{
+	return owner == NULL || owner->bufferioarr.nitems != 0;
+}
+#endif
+
 /*
  * Remember that a Local Lock is owned by a ResourceOwner
  *

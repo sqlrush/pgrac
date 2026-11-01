@@ -35,12 +35,40 @@ static void snapshot_return_read_barrier(void)
 #define pg_read_barrier() pg_read_barrier_impl()
 #include "test_cluster_snapshot_admission_horizon.inc"
 
+/* Use the original private owner and BufferIO arrays. Snapshot and buffer-pin
+ * accounting remain the existing host boundaries; their unused native twins
+ * are renamed rather than substituting the BufferIO lifecycle under test. */
+#define CurTransactionResourceOwner fixture_native_transaction_owner
+#define TopTransactionResourceOwner fixture_native_top_owner
+#define AuxProcessResourceOwner fixture_native_aux_owner
+#define ResourceOwnerEnlargeSnapshots fixture_native_enlarge_snapshots
+#define ResourceOwnerRememberSnapshot fixture_native_remember_snapshot
+#define ResourceOwnerForgetSnapshot fixture_native_forget_snapshot
+#define ResourceOwnerRememberBuffer fixture_native_remember_buffer
+#define ResourceOwnerForgetBuffer fixture_native_forget_buffer
+void fixture_native_enlarge_snapshots(ResourceOwner owner);
+void fixture_native_remember_snapshot(ResourceOwner owner, Snapshot snapshot);
+void fixture_native_forget_snapshot(ResourceOwner owner, Snapshot snapshot);
+void fixture_native_remember_buffer(ResourceOwner owner, Buffer buffer);
+void fixture_native_forget_buffer(ResourceOwner owner, Buffer buffer);
+#include "../../backend/utils/resowner/resowner.c"
+#undef ResourceOwnerForgetBuffer
+#undef ResourceOwnerRememberBuffer
+#undef ResourceOwnerForgetSnapshot
+#undef ResourceOwnerRememberSnapshot
+#undef ResourceOwnerEnlargeSnapshots
+#undef AuxProcessResourceOwner
+#undef TopTransactionResourceOwner
+#undef CurTransactionResourceOwner
+#include "../../common/hashfn.c"
+
 UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true;
 int cluster_node_id = 1;
 PGPROC *MyProc;
-ResourceOwner CurrentResourceOwner = (ResourceOwner)1;
+static ResourceOwner backend_resource_one, backend_resource_two;
+MemoryContext TopMemoryContext = (MemoryContext)1;
 MemoryContext TopTransactionContext = (MemoryContext)1;
 MemoryContext CurrentMemoryContext = (MemoryContext)1;
 sigjmp_buf *PG_exception_stack;
@@ -258,6 +286,13 @@ palloc(Size size)
 {
 	return MemoryContextAlloc(CurrentMemoryContext, size);
 }
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	void *allocation = MemoryContextAlloc(context, size);
+	memset(allocation, 0, size);
+	return allocation;
+}
 void
 pfree(void *p)
 {
@@ -405,14 +440,14 @@ UT_TEST(snapshot_identity_and_retention_cannot_drift_during_evaluation)
 			pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 101);
 			break;
 		case 5:
-			CurrentResourceOwner = (ResourceOwner)2;
+			CurrentResourceOwner = backend_resource_two;
 			break;
 		case 6:
 			s->snapshot_type = SNAPSHOT_SELF;
 			break;
 		}
 		UT_ASSERT(!evidence(100, s));
-		CurrentResourceOwner = (ResourceOwner)1;
+		CurrentResourceOwner = backend_resource_one;
 		cluster_snapshot_read_exit_v1(&scope);
 		UnregisterSnapshot(s);
 	}
@@ -699,7 +734,7 @@ UT_TEST(cr_identity_preserves_snapshot_and_retention_refusals)
 			pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 101);
 			break;
 		case 6:
-			CurrentResourceOwner = (ResourceOwner)2;
+			CurrentResourceOwner = backend_resource_two;
 			break;
 		case 7:
 			a->read_epoch = scope.read_epoch = 6;
@@ -708,7 +743,7 @@ UT_TEST(cr_identity_preserves_snapshot_and_retention_refusals)
 		UT_ASSERT(!cluster_snapshot_cr_identity_v1(a, &identity));
 		UT_ASSERT_EQ(identity, 777);
 		UT_ASSERT_EQ(a->cluster_cr_identity, 0);
-		CurrentResourceOwner = (ResourceOwner)1;
+		CurrentResourceOwner = backend_resource_one;
 		cluster_snapshot_read_exit_v1(&scope);
 		UnregisterSnapshot(a);
 	}
@@ -1093,6 +1128,9 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	backend_resource_one = ResourceOwnerCreate(NULL, "backend-one");
+	backend_resource_two = ResourceOwnerCreate(NULL, "backend-two");
+	CurrentResourceOwner = backend_resource_one;
 	MyProc = &proc;
 	proc.pid = 1234;
 	procArray = calloc(1, sizeof(ProcArrayStruct) + 2 * sizeof(int));
@@ -1110,7 +1148,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(122);
+	UT_PLAN(127);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1233,10 +1271,18 @@ main(void)
 	UT_RUN(survivor_backend_rejects_exit_after_leaf_sample_without_retiring_resources);
 	UT_RUN(survivor_backend_refuses_already_exiting_before_leaf_observation);
 	UT_RUN(survivor_backend_stable_original_owner_keeps_pin_and_snapshot_debt);
+	UT_RUN(backend_bufferio_observation_follows_original_remember_and_forget);
+	UT_RUN(backend_bufferio_current_owner_does_not_claim_parent_or_null_closure);
+	UT_RUN(backend_bufferio_change_during_shared_cut_discards_the_point);
+	UT_RUN(survivor_backend_final_refusal_retains_original_bufferio);
+	UT_RUN(backend_bufferio_never_dereferences_a_retired_entry_owner);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
 	free(procArray);
+	CurrentResourceOwner = NULL;
+	ResourceOwnerDelete(backend_resource_one);
+	ResourceOwnerDelete(backend_resource_two);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

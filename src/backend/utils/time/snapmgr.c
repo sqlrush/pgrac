@@ -1229,7 +1229,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	PGPROC *owner = MyProc;
 	ResourceOwner resource_owner = CurrentResourceOwner;
 	bool held_lock = false;
-	bool gate_known, pins_after;
+	bool gate_known, pins_after, io_after;
 
 	if (out == NULL)
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
@@ -1256,6 +1256,9 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	}
 	/* Original producer state only; this never pins, retires or grants use. */
 	sample.buffer_pins_pending = cluster_buffer_backend_has_pins();
+	/* A preceding owner callback may already have deleted the entry owner.
+	 * Read only the live current owner; the saved identity is compared below. */
+	sample.buffer_io_pending = ResourceOwnerHasBufferIOs(CurrentResourceOwner);
 	admission = cluster_semantic_activation_admission_return_observe(expected_epoch,
 		expected_gate_epoch, expected_generation, &sample.admission);
 	if (admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
@@ -1271,6 +1274,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
 	}
 	pins_after = cluster_buffer_backend_has_pins();
+	io_after = ResourceOwnerHasBufferIOs(CurrentResourceOwner);
 	gate_known = cluster_semantic_activation_wait_graph_snapshot(&gate);
 	ForEachLWLockHeldByMe(cluster_backend_collection_lock, &held_lock);
 	if (held_lock || CritSectionCount != 0 || proc_exit_inprogress
@@ -1295,6 +1299,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 		|| gate.transition_closed != sample.admission.transition_closed
 		|| memcmp(&after.identity, &sample.snapshots.identity, sizeof(after.identity)) != 0
 		|| pins_after != sample.buffer_pins_pending
+		|| io_after != sample.buffer_io_pending
 		|| after.references != sample.snapshots.references
 		|| after.retained_read_scn != sample.snapshots.retained_read_scn) {
 		out->reason = "BACKEND_COLLECTION_POINT_CHANGED_OR_UNKNOWN";
@@ -1303,6 +1308,8 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	sample.reason = sample.snapshots.references != 0 || sample.snapshots.retained_read_scn != 0
 		? sample.snapshots.reason : sample.buffer_pins_pending
 		? "BACKEND_COLLECTION_BUFFER_PINS_PENDING"
+		: sample.buffer_io_pending && resource_owner != NULL
+		? "BACKEND_COLLECTION_BUFFER_IO_PENDING"
 		: admission == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
 		? "BACKEND_COLLECTION_ADMISSION_PENDING" : "BACKEND_COLLECTION_PRODUCER_CLOSURE_UNPROVED";
 	*out = sample;

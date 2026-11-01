@@ -13709,3 +13709,8 @@ test_cluster_survivor_buffer_native.inc: $(top_srcdir)/src/backend/storage/buffe
 test_cluster_snapshot_admission: test_cluster_survivor_buffer_fixture.h \
  test_cluster_survivor_buffer_return.inc test_cluster_survivor_buffer_type.inc \
  test_cluster_survivor_buffer_native.inc cluster_catalog_trace_test.o
+
+# Original ResourceOwner IO source and return scheduling are native fixture inputs.
+test_cluster_snapshot_admission: test_cluster_survivor_return_context.inc \
+ $(top_srcdir)/src/backend/utils/resowner/resowner.c \
+ $(top_srcdir)/src/include/utils/resowner.h $(top_srcdir)/src/common/hashfn.c

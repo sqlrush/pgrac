@@ -99,6 +99,9 @@ typedef struct ClusterServiceBackendCollection {
 	/* Valid only with both observations known. Original shared/local pin predicate;
 	 * true also retains unknown local state, false is never closure or IO proof. */
 	bool buffer_pins_pending;
+	/* Original current ResourceOwner only; true also retains NULL/unknown.
+	 * False says nothing about parent, child or other owners, or IO closure. */
+	bool buffer_io_pending;
 	const char *reason;
 } ClusterServiceBackendCollection;
 StaticAssertDecl(sizeof(ClusterServiceBackendCollection)
