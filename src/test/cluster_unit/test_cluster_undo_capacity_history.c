@@ -74,6 +74,8 @@ static ClusterUndoCapacityChangeFence history_fence;
 static unsigned history_schedule;
 static uint64 history_initial_sequence;
 static ClusterCtrcTxnKeyV1 history_writer_key;
+static bool maximum_pool_seen_at_wait;
+static UndoSegmentHeaderData maximum_pool_before[CLUSTER_UNDO_SEGS_PER_INSTANCE];
 
 static void
 history_publish(SCN h, uint32 kind)
@@ -142,6 +144,18 @@ history_wait_scheduler(void)
 			} else
 				history_publish(1000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
 			break;
+		case 6:
+		case 7:
+			/* Observe the real physical path before advancing its report. */
+			maximum_pool_seen_at_wait = true;
+			for (unsigned segment = 0; segment < 256; segment++)
+				if (segment_reads[segment] == 0)
+					maximum_pool_seen_at_wait = false;
+			history_publish(history_schedule == 6 ? 3000 : 1000,
+							history_schedule == 6
+								? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK
+								: CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+			break;
 		default:
 			abort();
 		}
@@ -187,10 +201,10 @@ history_start(uint32 kind)
 }
 
 static void
-history_finish(unsigned sleeps)
+history_finish_observation(unsigned sleeps, unsigned cancels)
 {
 	UT_ASSERT_EQ(capacity_sleeps, sleeps);
-	UT_ASSERT_EQ(capacity_cancels, 1);
+	UT_ASSERT_EQ(capacity_cancels, cancels);
 	UT_ASSERT(!capacity_subscribed);
 	UT_ASSERT_EQ(capacity_wait_event, 41);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&history_fence.inflight_writers), 0);
@@ -205,6 +219,12 @@ history_finish(unsigned sleeps)
 	native_source_exit = native_publish_source = native_pass_mode = false;
 	external_lock_hook = NULL;
 	test_cluster_epoch = 13;
+}
+
+static void
+history_finish(unsigned sleeps)
+{
+	history_finish_observation(sleeps, 1);
 }
 
 UT_TEST(test_actual_clock_report_reaches_original_wait_and_physical_supply)
@@ -441,6 +461,136 @@ UT_TEST(test_actual_history_writer_change_cannot_bridge_complete_pass)
 	history_finish(2);
 }
 
+/* Physical bytes and native status remain inputs; all observation, retention,
+ * LMON sequencing and wait decisions below execute their original consumers. */
+static void
+history_fill_maximum_pool(int configured_cap)
+{
+	cluster_undo_segments_max_per_instance = configured_cap;
+	for (unsigned segment = 16; segment < 256; segment++)
+	{
+		UndoSegmentHeaderData *header = &history_headers[segment];
+
+		*header = history_headers[15];
+		header->segment_id = segment + 1;
+		for (unsigned slot = 0; slot < TT_SLOTS_PER_SEGMENT; slot++)
+			header->tt_slots[slot].xid = 7001 + segment * TT_SLOTS_PER_SEGMENT + slot;
+		history_present[segment] = true;
+	}
+	memcpy(maximum_pool_before, history_headers, sizeof(history_headers));
+}
+
+UT_TEST(test_maximum_pool_requires_complete_bounded_physical_passes)
+{
+	static const int configured_caps[] = {16, 256};
+	static const unsigned cursors[] = {0, 251};
+
+	for (unsigned cap = 0; cap < lengthof(configured_caps); cap++)
+		for (unsigned cursor = 0; cursor < lengthof(cursors); cursor++)
+		{
+			ClusterCapacityHistoryPass pass = {0};
+			ClusterCapacityObservationV1 out;
+			unsigned calls = 0;
+
+			history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+			history_fill_maximum_pool(configured_caps[cap]);
+			CtrcCapacitySegmentCursor = cursors[cursor];
+			do
+			{
+				unsigned holds = sample_holds, current_reads = segment_reads[0];
+				uint32 covered = pass.covered_positions;
+
+				UT_ASSERT_EQ(cluster_ctrc_capacity_probe_history_v1(
+					1, 1000, test_cluster_epoch, NULL, &pass, &out),
+					CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
+				UT_ASSERT(segment_reads[0] - current_reads <= 48);
+				UT_ASSERT(sample_holds - holds - (segment_reads[0] - current_reads) <= 16);
+				UT_ASSERT(pass.covered_positions > covered);
+				UT_ASSERT(pass.covered_positions - covered <= 16);
+				if (++calls > 256)
+					break;
+			} while (!pass.complete && pass.progress);
+			UT_ASSERT(calls >= 16 && calls <= 256);
+			UT_ASSERT(pass.complete && pass.history_only && pass.current_proven);
+			UT_ASSERT_EQ(pass.covered_positions, 256);
+			UT_ASSERT_EQ(pass.allocated_count, 256);
+			for (unsigned segment = 0; segment < 256; segment++)
+			{
+				UT_ASSERT(history_logical_positions[segment]);
+				UT_ASSERT(segment_reads[segment] > 0);
+			}
+			UT_ASSERT_EQ(history_lmon.report_sequence, 1);
+			/* This direct observer never prepared a CV subscription. */
+			UT_ASSERT_EQ(memcmp(maximum_pool_before, history_headers, sizeof(history_headers)), 0);
+			history_finish_observation(0, 0);
+			cluster_undo_segments_max_per_instance = 16;
+		}
+}
+
+UT_TEST(test_maximum_pool_clock_and_protector_reach_original_controller)
+{
+	for (unsigned protector = 0; protector < 2; protector++)
+	{
+		ClusterCtrcTxnKeyV1 continuation = {0};
+		ClusterUndoCapacityStats stats;
+
+		history_start(protector ? CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT
+								: CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+		history_fill_maximum_pool(256);
+		CtrcCapacitySegmentCursor = 251;
+		maximum_pool_seen_at_wait = false;
+		history_schedule = protector ? 7 : 6;
+		UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation), !protector);
+		UT_ASSERT(maximum_pool_seen_at_wait);
+		UT_ASSERT_EQ(history_lmon.report_sequence, 2);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(stats.pool_wait_count, 1);
+		UT_ASSERT_EQ(stats.wakeup_recheck_count, 1);
+		UT_ASSERT_EQ(stats.refused_proof_count, protector ? 1 : 0);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		UT_ASSERT_EQ(cluster_undo_segments_max_per_instance, 256);
+		UT_ASSERT_EQ(memcmp(maximum_pool_before, history_headers, sizeof(history_headers)), 0);
+		history_finish(1);
+		cluster_undo_segments_max_per_instance = 16;
+	}
+}
+
+UT_TEST(test_maximum_pool_last_image_cannot_be_hidden_by_a_protected_prefix)
+{
+	for (unsigned missing = 0; missing < 2; missing++)
+	{
+		ClusterCtrcTxnKeyV1 continuation = {0};
+		UndoSegmentHeaderData last;
+		ClusterUndoCapacityStats stats;
+
+		history_start(CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
+		history_fill_maximum_pool(256);
+		CtrcCapacitySegmentCursor = 0;
+		if (missing)
+			history_present[255] = false;
+		else
+			history_headers[255].tt_slots[47].first_undo_block.raw[0] = 1;
+		last = history_headers[255];
+		memcpy(maximum_pool_before, history_headers, sizeof(history_headers));
+		/* A missing configured position requests recheck, not an allocation;
+		 * non-H record debt is an unproven refusal, not a protective pair. */
+		UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation), missing != 0);
+		UT_ASSERT(history_logical_positions[255]);
+		if (!missing)
+			UT_ASSERT(segment_reads[255] > 0);
+		UT_ASSERT_EQ(history_lmon.report_sequence, 1);
+		UT_ASSERT(cluster_undo_cleaner_capacity_stats_snapshot(&stats));
+		UT_ASSERT_EQ(stats.pool_wait_count, 0);
+		UT_ASSERT_EQ(stats.refused_proof_count, missing ? 0 : 1);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		UT_ASSERT_EQ(memcmp(&last, &history_headers[255], sizeof(last)), 0);
+		UT_ASSERT_EQ(memcmp(maximum_pool_before, history_headers, sizeof(history_headers)), 0);
+		UT_ASSERT_EQ(cluster_undo_segments_max_per_instance, 256);
+		history_finish(0);
+		cluster_undo_segments_max_per_instance = 16;
+	}
+}
+
 int
 main(void)
 {
@@ -448,7 +598,7 @@ main(void)
 	(void)undo_horizon_send_v2;
 	(void)undo_horizon_v2_publish;
 	(void)undo_horizon_publish_freeze_watermark;
-	UT_PLAN(9);
+	UT_PLAN(12);
 	UT_RUN(test_actual_clock_report_reaches_original_wait_and_physical_supply);
 	UT_RUN(test_actual_protective_pair_requires_distinct_reports);
 	UT_RUN(test_history_non_h_rejections_count_the_actual_reason_union_once);
@@ -458,6 +608,9 @@ main(void)
 	UT_RUN(test_actual_history_unknown_inputs_refuse_before_wait);
 	UT_RUN(test_actual_history_cancel_retires_original_cv_and_wait_event);
 	UT_RUN(test_actual_history_writer_change_cannot_bridge_complete_pass);
+	UT_RUN(test_maximum_pool_requires_complete_bounded_physical_passes);
+	UT_RUN(test_maximum_pool_clock_and_protector_reach_original_controller);
+	UT_RUN(test_maximum_pool_last_image_cannot_be_hidden_by_a_protected_prefix);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count != 0;
