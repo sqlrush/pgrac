@@ -485,6 +485,36 @@ extern ClusterMxRecomposeResult cluster_multixact_current_recompose(
 	const ClusterCurrentMxMemberDesc *members, const ClusterCurrentMemberProof *proofs,
 	uint16 nmembers, TransactionId requester_xid, MultiXactStatus requester_status,
 	MultiXactMember *normalized_members, uint16 normalized_cap, uint16 *normalized_count);
+/* Exact operation consumers are dormant until the complete wire family is
+ * installed. Inputs remain private to the original collector/snapshot scope.
+ * Validation is whole-set; a discarded operation never changes top state.
+ * Inputs and outputs must not overlap. These functions grant no retention. */
+struct ClusterSavepointOperationKey;
+struct ClusterR4CrOwnerChallenge;
+extern ClusterMxResolveResult cluster_multixact_current_validate_operation_proof_set(
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
+	const struct ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers);
+extern ClusterCurrentMxDecision cluster_multixact_current_decide_operations(
+	const ClusterCurrentMxMemberDesc *members, const struct ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *ctx, const struct ClusterR4CrOwnerChallenge *owner,
+	const ClusterCurrentUpdaterChallenge *challenge, const ClusterCurrentUpdaterProof *updater,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace);
+extern ClusterMxRecomposeResult cluster_multixact_current_recompose_operations(
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
+	const struct ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers, TransactionId requester_xid,
+	MultiXactStatus requester_status, MultiXactMember *normalized, uint16 capacity, uint16 *count);
+/* Recheck original admission/root/membership/CTRC identity for each LIVE
+ * ACTIVE member. This does not replace heap relock or receipt PREPARE/APPLY.
+ * It acquires no DATA/TT current and gives no retirement permission. */
+extern bool cluster_multixact_current_operation_grants_current(
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
+	const struct ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,
+	uint32 requester_capability_generation);
+
 extern bool cluster_multixact_current_plan_heap_header(const void *base_header, Size header_size,
 													   const ClusterCurrentMxHeapHeaderPlan *plan,
 													   void *planned_header);

@@ -566,9 +566,15 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId 
 	return CLUSTER_TT_DURABLE_LOCATE_FOUND;
 }
 
+/* Explicit child-origin input for exact-operation consumer tests. */
+static TransactionId test_operation_consumer_child;
+
 int
 cluster_xid_origin_slot(TransactionId xid)
 {
+	if (TransactionIdIsNormal(test_operation_consumer_child)
+		&& xid == test_operation_consumer_child)
+		return 0;
 	if (test_mx_batch_enabled && xid == TEST_ORIGIN_XID + 1)
 		return 1;
 	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
@@ -1467,6 +1473,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterT
 static void
 reset_exact_origin_fixture(void)
 {
+	test_operation_consumer_child = InvalidTransactionId;
 	cluster_runtime_visibility_exact_counters_reset();
 	memset(&test_origin_locator, 0, sizeof(test_origin_locator));
 	test_origin_locator.uba = uba_encode(TEST_RECORD_SEGMENT, 7, TEST_TT_OFFSET, 400);

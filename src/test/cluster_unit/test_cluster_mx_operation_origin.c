@@ -572,13 +572,70 @@ UT_TEST(mx_origin_provisional_key_is_only_an_exact_challenge)
 	}
 }
 
+/* Real original runtime identity gate; external root/admission storage is
+ * controlled by the existing fixture, not replaced with a success verifier. */
+UT_TEST(mx_operation_before_mutation_rechecks_runtime_identity)
+{
+	ClusterCurrentMxKey mx = { .origin_node_id = 0, .multixact_id = 17, .cluster_epoch = 42 };
+	ClusterCurrentMxMemberDesc member
+		= { .xid = TEST_ORIGIN_XID + 1, .member_status = MultiXactStatusForShare };
+	ClusterSavepointOperationKey key;
+	ClusterCurrentMemberOperationProof proof = { 0 };
+	reset_exact_origin_fixture();
+	test_operation_consumer_child = member.xid;
+	key = (ClusterSavepointOperationKey){
+		.locator = { .uba = uba_encode(TEST_RECORD_SEGMENT, 2, TEST_TT_OFFSET, 0),
+					 .xid = TEST_ORIGIN_XID,
+					 .tt_wrap = TEST_ORIGIN_WRAP,
+					 .itl_kind = ITL_FLAG_ACTIVE,
+					 .itl_slot_index = 0 },
+		.target
+		= { .locator = { 1663, 42, 77 }, .forknum = MAIN_FORKNUM, .blockno = 23, .offnum = 3 },
+		.top_fxid = FullTransactionIdFromEpochAndXid(9, TEST_ORIGIN_XID),
+		.operation_fxid = FullTransactionIdFromEpochAndXid(9, TEST_ORIGIN_XID + 1)
+	};
+	proof.base = (ClusterCurrentMemberProof){ .key = { .origin_node_id = 0,
+													   .undo_segment_id = TEST_TT_SEGMENT,
+													   .tt_slot_id = TEST_TT_OFFSET + 1,
+													   .cluster_epoch = 42,
+													   .local_xid = TEST_ORIGIN_XID,
+													   .segment_generation = 23,
+													   .slot_wrap = TEST_ORIGIN_WRAP,
+													   .binding_version = 1 },
+											  .member_xid = member.xid,
+											  .member_status = member.member_status,
+											  .state = CCM_ACTIVE };
+	ClusterCurrentMemberProofSetCtrcGrant(&proof.base, 17);
+	proof.operation_uba = key.locator.uba;
+	proof.top_fxid = key.top_fxid;
+	proof.operation_fxid = key.operation_fxid;
+	proof.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	proof.format_version = 2;
+	proof.flags = 1;
+	UT_ASSERT(
+		cluster_multixact_current_operation_grants_current(&mx, &member, &key, &proof, 1, 313));
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	UT_ASSERT(
+		!cluster_multixact_current_operation_grants_current(&mx, &member, &key, &proof, 1, 0));
+	test_admission_revoked = true;
+	UT_ASSERT(
+		!cluster_multixact_current_operation_grants_current(&mx, &member, &key, &proof, 1, 313));
+	proof.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+	ClusterCurrentMemberProofSetCtrcGrant(&proof.base, 0);
+	UT_ASSERT(
+		cluster_multixact_current_operation_grants_current(&mx, &member, &key, &proof, 1, 313));
+	UT_ASSERT_EQ(proof.base.state, CCM_ACTIVE);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+}
+
 #ifndef MX_OPERATION_ORIGIN_TEST_MAIN
 #define MX_OPERATION_ORIGIN_TEST_MAIN main
 #endif
 int
 MX_OPERATION_ORIGIN_TEST_MAIN(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
+	UT_RUN(mx_operation_before_mutation_rechecks_runtime_identity);
 	UT_RUN(mx_origin_same_and_cross_segment_three_current_phases);
 	UT_RUN(mx_origin_stages_until_final_release);
 	UT_RUN(mx_origin_copies_begin_key_and_admission);

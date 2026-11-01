@@ -852,7 +852,7 @@ validate_updater_proof_state(const ClusterCurrentMxKey *key,
 							 const ClusterCurrentUpdaterChallenge *challenge,
 							 const ClusterCurrentUpdaterProof *updater_proof,
 							 uint16 updater_origin_node_id,
-							 ClusterCurrentMemberState expected_state)
+							 ClusterCurrentMemberState expected_state, const uint8 *effects)
 {
 	int updater_ordinal = -1;
 	uint16 i;
@@ -865,10 +865,12 @@ validate_updater_proof_state(const ClusterCurrentMxKey *key,
 		return false;
 
 	for (i = 0; i < nmembers; i++) {
-		if (!proof_entry_semantic_valid(&proofs[i], &members[i], i, key->cluster_epoch, -1)
+		if ((effects == NULL
+			 && !proof_entry_semantic_valid(&proofs[i], &members[i], i, key->cluster_epoch, -1))
 			|| proofs[i].state == CCM_UNKNOWN)
 			return false;
-		if (ISUPDATE_from_mxstatus(members[i].member_status))
+		if (ISUPDATE_from_mxstatus(members[i].member_status)
+			&& (effects == NULL || effects[i] == CLUSTER_SAVEPOINT_EFFECT_LIVE))
 			updater_ordinal = i;
 	}
 
@@ -901,7 +903,7 @@ cluster_multixact_current_validate_updater_proof(const ClusterCurrentMxKey *key,
 												 uint16 updater_origin_node_id)
 {
 	return validate_updater_proof_state(key, members, proofs, nmembers, challenge, updater_proof,
-										updater_origin_node_id, CCM_COMMITTED);
+										updater_origin_node_id, CCM_COMMITTED, NULL);
 }
 
 
@@ -1068,14 +1070,14 @@ current_mx_unknown(ClusterCurrentMxDecisionTrace *trace, ClusterCurrentMxUnknown
 }
 
 
-ClusterCurrentMxDecision
-cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *members,
-										  const ClusterCurrentMemberProof *proofs, uint16 nmembers,
-										  const ClusterCurrentMxRequestContext *ctx,
-										  const ClusterCurrentUpdaterChallenge *challenge,
-										  const ClusterCurrentUpdaterProof *updater_proof,
-										  ClusterTTStatusKey *wait_key,
-										  ClusterCurrentMxDecisionTrace *trace)
+static ClusterCurrentMxDecision
+current_mx_decide_internal(const ClusterCurrentMxMemberDesc *members,
+						   const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+						   const ClusterCurrentMxRequestContext *ctx,
+						   const ClusterCurrentUpdaterChallenge *challenge,
+						   const ClusterCurrentUpdaterProof *updater_proof,
+						   ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace,
+						   const uint8 *effects)
 {
 	ClusterTTStatusKey selected_wait_key;
 	ClusterCurrentMxDecision self_result = CMDL_CONTINUE;
@@ -1107,8 +1109,13 @@ cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *memb
 		bool conflicts;
 		bool valid;
 
-		if (!proof_entry_semantic_valid(&proofs[i], &members[i], i, ctx->mxkey.cluster_epoch, -1))
+		if (effects == NULL
+			&& !proof_entry_semantic_valid(&proofs[i], &members[i], i, ctx->mxkey.cluster_epoch,
+										   -1))
 			return current_mx_unknown(trace, CMX_UNKNOWN_PROOF_ENTRY, i);
+
+		if (effects != NULL && effects[i] == CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
+			continue;
 
 		conflicts = cluster_multixact_current_status_conflicts(members[i].member_status,
 															   ctx->lock_mode, &valid);
@@ -1117,7 +1124,7 @@ cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *memb
 
 		switch ((ClusterCurrentMemberState)proofs[i].state) {
 		case CCM_SELF:
-			if (proofs[i].member_xid != ctx->current_member_xid
+			if (effects == NULL && proofs[i].member_xid != ctx->current_member_xid
 				&& proofs[i].member_xid != ctx->top_xid)
 				return current_mx_unknown(trace, CMX_UNKNOWN_SELF_XID, i);
 			if (ISUPDATE_from_mxstatus(members[i].member_status)
@@ -1187,9 +1194,9 @@ cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *memb
 		if (ctx->tuple_shape != CCM_SHAPE_UPDATED)
 			return current_mx_unknown(trace, CMX_UNKNOWN_COMMITTED_UPDATER_SHAPE,
 									  committed_updater);
-		if (!cluster_multixact_current_validate_updater_proof(&ctx->mxkey, members, proofs,
-															  nmembers, challenge, updater_proof,
-															  (uint16)ctx->updater_origin_node_id))
+		if (!validate_updater_proof_state(&ctx->mxkey, members, proofs, nmembers, challenge,
+										  updater_proof, (uint16)ctx->updater_origin_node_id,
+										  CCM_COMMITTED, effects))
 			return current_mx_unknown(trace, CMX_UNKNOWN_COMMITTED_UPDATER_PROOF,
 									  committed_updater);
 		return CMDL_UPDATED;
@@ -1209,7 +1216,7 @@ cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *memb
 			return current_mx_unknown(trace, CMX_UNKNOWN_ACTIVE_UPDATER_SHAPE, active_updater);
 		if (!validate_updater_proof_state(&ctx->mxkey, members, proofs, nmembers, challenge,
 										  updater_proof, (uint16)ctx->updater_origin_node_id,
-										  CCM_ACTIVE))
+										  CCM_ACTIVE, effects))
 			return current_mx_unknown(trace, CMX_UNKNOWN_ACTIVE_UPDATER_PROOF, active_updater);
 		return CMDL_FOLLOW_UPDATED;
 	}
@@ -1218,6 +1225,20 @@ cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *memb
 		return active_conflict_decision(ctx, &selected_wait_key, wait_key);
 
 	return CMDL_CONTINUE;
+}
+
+
+ClusterCurrentMxDecision
+cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *members,
+										  const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+										  const ClusterCurrentMxRequestContext *ctx,
+										  const ClusterCurrentUpdaterChallenge *challenge,
+										  const ClusterCurrentUpdaterProof *updater_proof,
+										  ClusterTTStatusKey *wait_key,
+										  ClusterCurrentMxDecisionTrace *trace)
+{
+	return current_mx_decide_internal(members, proofs, nmembers, ctx, challenge, updater_proof,
+									  wait_key, trace, NULL);
 }
 
 
@@ -1680,12 +1701,12 @@ cluster_multixact_current_members_resolve_until(
 }
 
 
-ClusterMxRecomposeResult
-cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
-									const ClusterCurrentMemberProof *proofs, uint16 nmembers,
-									TransactionId requester_xid, MultiXactStatus requester_status,
-									MultiXactMember *normalized_members, uint16 normalized_cap,
-									uint16 *normalized_count)
+static ClusterMxRecomposeResult
+current_mx_recompose_internal(const ClusterCurrentMxMemberDesc *members,
+							  const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+							  TransactionId requester_xid, MultiXactStatus requester_status,
+							  MultiXactMember *normalized_members, uint16 normalized_cap,
+							  uint16 *normalized_count, const uint8 *effects)
 {
 	MultiXactMember scratch[CLUSTER_CURRENT_MX_MAX_MEMBERS];
 	uint16 out_count = 0;
@@ -1716,17 +1737,22 @@ cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 			|| proof->member_status != members[i].member_status || proof->state > CCM_UNKNOWN)
 			return CMX_RECOMPOSE_UNKNOWN;
 
+		if (effects != NULL && effects[i] == CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
+			continue;
+
 		switch ((ClusterCurrentMemberState)proof->state) {
 		case CCM_SELF:
 		case CCM_ACTIVE:
 			if (ClusterCurrentMemberProofGetCtrcGrant(proof) == 0 || proof->commit_scn != InvalidScn
-				|| !proof_key_valid_holder(proof, proof->member_xid, proof->key.cluster_epoch,
-										   proof->key.origin_node_id))
+				|| (effects == NULL
+					&& !proof_key_valid_holder(proof, proof->member_xid, proof->key.cluster_epoch,
+											   proof->key.origin_node_id)))
 				return CMX_RECOMPOSE_UNKNOWN;
 			keep = true;
 			break;
 		case CCM_COMMITTED:
-			if (ClusterCurrentMemberProofGetCtrcGrant(proof) != 0 || !proof_key_is_zero(&proof->key)
+			if (ClusterCurrentMemberProofGetCtrcGrant(proof) != 0
+				|| (effects == NULL && !proof_key_is_zero(&proof->key))
 				|| !SCN_VALID(proof->commit_scn))
 				return CMX_RECOMPOSE_UNKNOWN;
 			/*
@@ -1738,7 +1764,8 @@ cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 				return CMX_RECOMPOSE_DENIED;
 			break;
 		case CCM_ABORTED:
-			if (ClusterCurrentMemberProofGetCtrcGrant(proof) != 0 || !proof_key_is_zero(&proof->key)
+			if (ClusterCurrentMemberProofGetCtrcGrant(proof) != 0
+				|| (effects == NULL && !proof_key_is_zero(&proof->key))
 				|| proof->commit_scn != InvalidScn)
 				return CMX_RECOMPOSE_UNKNOWN;
 			break;
@@ -1838,4 +1865,212 @@ cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 	memcpy(normalized_members, scratch, sizeof(*normalized_members) * out_count);
 	*normalized_count = out_count;
 	return CMX_RECOMPOSE_OK;
+}
+
+
+ClusterMxRecomposeResult
+cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
+									const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+									TransactionId requester_xid, MultiXactStatus requester_status,
+									MultiXactMember *normalized_members, uint16 normalized_cap,
+									uint16 *normalized_count)
+{
+	return current_mx_recompose_internal(members, proofs, nmembers, requester_xid, requester_status,
+										 normalized_members, normalized_cap, normalized_count,
+										 NULL);
+}
+
+static bool
+operation_proof_entry_valid(const ClusterCurrentMxMemberDesc *member,
+							const ClusterSavepointOperationKey *key,
+							const ClusterCurrentMemberOperationProof *p, uint16 ordinal,
+							uint32 epoch)
+{
+	static const ClusterSavepointOperationKey zero;
+	uint32 segment, block;
+	uint16 slot, row;
+	int origin = cluster_xid_origin_slot(member->xid);
+	const ClusterCurrentMemberProofKey *binding = &p->base.key;
+	uint32 grant = ClusterCurrentMemberProofGetCtrcGrant(&p->base);
+
+	if (origin < 0 || origin >= CLUSTER_MAX_NODES || p->format_version != 2 || p->reserved != 0
+		|| p->base.member_xid != member->xid || p->base.member_status != member->member_status
+		|| p->base.member_ordinal != ordinal || p->base.state == CCM_SELF
+		|| p->base.state >= CCM_UNKNOWN)
+		return false;
+	/* A V1 proof has no operation identity. It must name the actual top,
+	 * including when the requester later compares its canonical owner. */
+	if (p->flags == 0)
+		return memcmp(key, &zero, sizeof(zero)) == 0 && UBA_is_invalid(p->operation_uba)
+			   && U64FromFullTransactionId(p->top_fxid) == 0
+			   && U64FromFullTransactionId(p->operation_fxid) == 0 && p->effect_state == 0
+			   && (p->base.state != CCM_ACTIVE || binding->local_xid == member->xid)
+			   && proof_entry_semantic_valid(&p->base, member, ordinal, epoch, origin);
+	if (p->flags != CLUSTER_CURRENT_OPERATION_PROOF_EXACT
+		|| (p->effect_state != CLUSTER_SAVEPOINT_EFFECT_LIVE
+			&& p->effect_state != CLUSTER_SAVEPOINT_EFFECT_DISCARDED)
+		|| !FullTransactionIdEquals(key->top_fxid, p->top_fxid)
+		|| !FullTransactionIdEquals(key->operation_fxid, p->operation_fxid)
+		|| !FullTransactionIdFollows(p->operation_fxid, p->top_fxid)
+		|| U64FromFullTransactionId(p->top_fxid) == UINT64_MAX
+		|| U64FromFullTransactionId(p->operation_fxid) == UINT64_MAX
+		|| !TransactionIdIsNormal(key->locator.xid)
+		|| XidFromFullTransactionId(p->top_fxid) != key->locator.xid
+		|| XidFromFullTransactionId(p->operation_fxid) != member->xid
+		|| cluster_xid_origin_slot(key->locator.xid) != origin
+		|| !cluster_undo_record_uba_equal(key->locator.uba, p->operation_uba)
+		|| !uba_decode_record(p->operation_uba, &segment, &block, &slot, &row)
+		|| (segment - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != origin
+		|| key->locator.tt_wrap > TT_WRAP_MAX
+		|| key->locator.itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| !((key->locator.itl_kind >= ITL_FLAG_ACTIVE
+			  && key->locator.itl_kind <= ITL_FLAG_NEEDS_CLEANOUT)
+			 || ITL_FLAG_IS_LOCK_ONLY(key->locator.itl_kind))
+		|| key->target._pad != 0 || !RelFileNumberIsValid(key->target.locator.relNumber)
+		|| key->target.forknum != MAIN_FORKNUM || key->target.blockno == InvalidBlockNumber
+		|| !OffsetNumberIsValid(key->target.offnum) || binding->origin_node_id != origin
+		|| binding->undo_segment_id == 0
+		|| (binding->undo_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != origin
+		|| binding->tt_slot_id != (uint32)slot + 1 || binding->cluster_epoch != epoch
+		|| binding->local_xid != key->locator.xid || binding->slot_wrap != key->locator.tt_wrap
+		|| binding->segment_generation == UINT32_MAX
+		|| binding->binding_version != CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION)
+		return false;
+	/* Top outcome and data disposition are independent, including an
+	 * ACTIVE top with no LIVE grant after its child operation was discarded. */
+	if ((p->base.state == CCM_ACTIVE && p->effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE)
+		!= (grant != 0))
+		return false;
+	return p->base.state == CCM_COMMITTED ? SCN_VALID(p->base.commit_scn)
+										  : p->base.commit_scn == InvalidScn;
+}
+
+ClusterMxResolveResult
+cluster_multixact_current_validate_operation_proof_set(
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
+	const ClusterSavepointOperationKey *keys, const ClusterCurrentMemberOperationProof *proofs,
+	uint16 nmembers)
+{
+	const ClusterUndoRecordTarget *target = NULL;
+	if (nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS)
+		return CMX_RESOLVE_SUPPORTED_LIMIT;
+	if (!current_mx_key_valid(key) || key->cluster_epoch == 0
+		|| !descriptor_entries_valid(members, nmembers) || keys == NULL || proofs == NULL)
+		return CMX_RESOLVE_UNKNOWN;
+	for (uint16 i = 0; i < nmembers; ++i) {
+		if (!operation_proof_entry_valid(&members[i], &keys[i], &proofs[i], i, key->cluster_epoch))
+			return CMX_RESOLVE_UNKNOWN;
+		if (proofs[i].flags == 0)
+			continue;
+		if (target != NULL
+			&& (target->locator.spcOid != keys[i].target.locator.spcOid
+				|| target->locator.dbOid != keys[i].target.locator.dbOid
+				|| target->locator.relNumber != keys[i].target.locator.relNumber
+				|| target->forknum != keys[i].target.forknum
+				|| target->blockno != keys[i].target.blockno
+				|| target->offnum != keys[i].target.offnum))
+			return CMX_RESOLVE_UNKNOWN;
+		target = &keys[i].target;
+	}
+	return CMX_RESOLVE_OK;
+}
+
+ClusterCurrentMxDecision
+cluster_multixact_current_decide_operations(
+	const ClusterCurrentMxMemberDesc *members, const ClusterSavepointOperationKey *keys,
+	const ClusterCurrentMemberOperationProof *proofs, uint16 nmembers,
+	const ClusterCurrentMxRequestContext *ctx, const ClusterR4CrOwnerChallenge *owner,
+	const ClusterCurrentUpdaterChallenge *challenge, const ClusterCurrentUpdaterProof *updater,
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+{
+	ClusterCurrentMemberProof base[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	uint8 effects[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	if (wait_key != NULL)
+		memset(wait_key, 0, sizeof(*wait_key));
+	if (trace != NULL) {
+		trace->unknown_reason = CMX_UNKNOWN_PROOF_ENTRY;
+		trace->member_ordinal = -1;
+	}
+	if (!request_context_valid(ctx) || !ClusterR4CrOwnerForRequester(owner, cluster_node_id)
+		|| (owner->flags != 0 && owner->top_xid != ctx->top_xid)
+		|| cluster_multixact_current_validate_operation_proof_set(&ctx->mxkey, members, keys,
+																  proofs, nmembers)
+			   != CMX_RESOLVE_OK)
+		return CMDL_UNKNOWN;
+	for (uint16 i = 0; i < nmembers; ++i) {
+		const ClusterCurrentMemberOperationProof *p = &proofs[i];
+		const ClusterCurrentMemberProofKey *b = &p->base.key;
+		base[i] = p->base;
+		effects[i] = p->flags == 0 ? CLUSTER_SAVEPOINT_EFFECT_LIVE : p->effect_state;
+		if (effects[i] == CLUSTER_SAVEPOINT_EFFECT_DISCARDED || p->base.state != CCM_ACTIVE)
+			continue;
+		if (b->local_xid == ctx->top_xid || p->base.member_xid == ctx->current_member_xid) {
+			if (owner->flags == 0 || b->local_xid != owner->top_xid
+				|| (p->flags != 0 && !FullTransactionIdEquals(p->top_fxid, owner->top_fxid))
+				|| b->origin_node_id + 1 != owner->origin_instance
+				|| b->undo_segment_id != owner->segment_id
+				|| b->segment_generation != owner->segment_generation
+				|| b->tt_slot_id != (uint32)owner->slot_offset + 1
+				|| b->slot_wrap != owner->slot_wrap)
+				return current_mx_unknown(trace, CMX_UNKNOWN_SELF_XID, i);
+			base[i].state = CCM_SELF;
+		}
+	}
+	return current_mx_decide_internal(members, base, nmembers, ctx, challenge, updater, wait_key,
+									  trace, effects);
+}
+
+ClusterMxRecomposeResult
+cluster_multixact_current_recompose_operations(
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
+	const ClusterSavepointOperationKey *keys, const ClusterCurrentMemberOperationProof *proofs,
+	uint16 nmembers, TransactionId requester_xid, MultiXactStatus requester_status,
+	MultiXactMember *normalized, uint16 capacity, uint16 *count)
+{
+	ClusterCurrentMemberProof base[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	uint8 effects[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	if (count != NULL)
+		*count = 0;
+	if (capacity > CLUSTER_CURRENT_MX_MAX_MEMBERS)
+		return CMX_RECOMPOSE_SUPPORTED_LIMIT;
+	if (normalized != NULL)
+		memset(normalized, 0, sizeof(*normalized) * capacity);
+	if (cluster_multixact_current_validate_operation_proof_set(key, members, keys, proofs, nmembers)
+		!= CMX_RESOLVE_OK)
+		return nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS ? CMX_RECOMPOSE_SUPPORTED_LIMIT
+														 : CMX_RECOMPOSE_UNKNOWN;
+	for (uint16 i = 0; i < nmembers; ++i) {
+		base[i] = proofs[i].base;
+		effects[i] = proofs[i].flags == 0 ? CLUSTER_SAVEPOINT_EFFECT_LIVE : proofs[i].effect_state;
+	}
+	return current_mx_recompose_internal(members, base, nmembers, requester_xid, requester_status,
+										 normalized, capacity, count, effects);
+}
+
+bool
+cluster_multixact_current_operation_grants_current(const ClusterCurrentMxKey *key,
+												   const ClusterCurrentMxMemberDesc *members,
+												   const ClusterSavepointOperationKey *keys,
+												   const ClusterCurrentMemberOperationProof *proofs,
+												   uint16 nmembers,
+												   uint32 requester_capability_generation)
+{
+	if (requester_capability_generation == 0
+		|| cluster_multixact_current_validate_operation_proof_set(key, members, keys, proofs,
+																  nmembers)
+			   != CMX_RESOLVE_OK)
+		return false;
+	for (uint16 i = 0; i < nmembers; ++i) {
+		ClusterCtrcTxnKeyV1 ctrc;
+		ClusterCtrcParticipantIdentity participant;
+		const ClusterCurrentMemberOperationProof *p = &proofs[i];
+		if (p->base.state != CCM_ACTIVE
+			|| (p->flags != 0 && p->effect_state == CLUSTER_SAVEPOINT_EFFECT_DISCARDED))
+			continue;
+		if (!cluster_runtime_visibility_active_proof_ctrc_identity_exact(
+				&p->base.key, ClusterCurrentMemberProofGetCtrcGrant(&p->base),
+				requester_capability_generation, &ctrc, &participant))
+			return false;
+	}
+	return true;
 }

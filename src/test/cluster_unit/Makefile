@@ -13481,3 +13481,18 @@ test_cluster_mx_history_members: test_cluster_mx_history_members.c test_cluster_
 		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Dormant complete-set operation consumers; production family remains gated.
+TESTS += test_cluster_mx_operation_consumer
+all: test_cluster_mx_operation_consumer
+
+test_cluster_mx_operation_consumer: test_cluster_mx_operation_consumer.c \
+        test_cluster_multixact_current.c test_cluster_multixact_current \
+        $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		-DHEAPAM_CURRENT_MX_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DMULTIXACT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/transam/multixact.c"' \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PGPORT) -o $@
