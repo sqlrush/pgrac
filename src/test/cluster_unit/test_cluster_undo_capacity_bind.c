@@ -1,8 +1,9 @@
 /* Author: SqlRush <sqlrush@gmail.com>
  * Copyright (c) 2026, pgrac contributors.
  * Actual executor/heap -> allocator/local -> original capacity CV -> fresh
- * admission/BIND -> local abort. CTRC proof/floor and cleaner completion are
- * independent leaves, as are inherited native scheduling/admission/IO/WAL.
+ * admission/BIND -> local abort. Selected-terminal cases also execute actual
+ * CURRENT GC. CTRC proof/floor/release and scheduling remain independent
+ * leaves, as are inherited native scheduling/admission/IO/WAL.
  * This does not execute the physical pool classifier, release owner or SQL.
  */
 #define TT_ACTIVE_OWNER_EXTERNAL_CAPACITY_WAIT
@@ -16,6 +17,114 @@ static bool bind_subscribed, bind_recheck_first, bind_drift, bind_no_owner;
 static bool bind_same_segment, bind_lease_drift;
 static unsigned bind_prepares, bind_cancels, bind_sleeps, bind_probes, bind_supply_after;
 static int bind_wait_error;
+
+typedef enum BindGcMode {
+	BIND_GC_RELEASE,
+	BIND_GC_HORIZON_LAG,
+	BIND_GC_HORIZON_INVALID,
+	BIND_GC_ABORT_SCN,
+	BIND_GC_WRAP_RETIRED,
+	BIND_GC_OUTER_EPOCH,
+	BIND_GC_LOCKED_EPOCH,
+	BIND_GC_BINDING_DRIFT,
+	BIND_GC_ENTRY_DRIFT
+} BindGcMode;
+
+static bool bind_gc_enabled, bind_gc_released;
+static BindGcMode bind_gc_mode;
+static ClusterConf bind_gc_conf;
+static ClusterUndoCleanerPassStats bind_gc_stats;
+static unsigned bind_gc_passes, bind_gc_samples, bind_gc_recycles, bind_gc_cancel_after;
+
+/* Exact release is a controlled input, not a replacement release owner. The
+ * real GC must sample it without the allocator lock and recheck ownership. */
+bool
+cluster_ctrc_terminal_release_sample_exact(uint32 segment, uint16 offset, TransactionId xid,
+										 uint16 wrap, uint8 status, SCN scn, uint64 epoch)
+{
+	UT_ASSERT(bind_gc_enabled);
+	UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+	UT_ASSERT_EQ(segment, 1);
+	UT_ASSERT_EQ(offset, 0);
+	UT_ASSERT_EQ(xid, 200);
+	UT_ASSERT_EQ(wrap, 0);
+	UT_ASSERT_EQ(epoch, 17);
+	UT_ASSERT_EQ(status, slot_wait_commit ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(scn, slot_wait_commit ? (SCN)91 : InvalidScn);
+	bind_gc_samples++;
+	if (bind_gc_mode == BIND_GC_BINDING_DRIFT || bind_gc_mode == BIND_GC_ENTRY_DRIFT) {
+		/* Controlled competing mutation between the original sample and its
+		 * final lock acquisition. Never grants FREE or publishes a BIND. */
+		ClusterTTSlotAllocPerSegment *seg = &allocator_storage.per_node[0];
+
+		LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
+		if (bind_gc_mode == BIND_GC_BINDING_DRIFT)
+			seg->binding_generation++;
+		else
+			seg->slots[0].xid++;
+		LWLockRelease(&seg->lock);
+	}
+	return bind_gc_released;
+}
+
+bool
+cluster_undo_horizon_epoch_fence_tripped(uint64 epoch)
+{
+	UT_ASSERT(bind_gc_enabled);
+	UT_ASSERT_EQ(epoch, 17);
+	return (bind_gc_mode == BIND_GC_OUTER_EPOCH && lock_depth == 0)
+		|| (bind_gc_mode == BIND_GC_LOCKED_EPOCH && lock_depth == 1);
+}
+
+void
+cluster_ctrc_stat_bump(ClusterCtrcStatId stat)
+{
+	UT_ASSERT(bind_gc_enabled);
+	UT_ASSERT_EQ(stat, CTRC_STAT_L12_RECYCLE);
+	UT_ASSERT_EQ(lock_depth, 1);
+	bind_gc_recycles++;
+}
+
+static void
+bind_gc_scheduled_pass(void)
+{
+	ClusterTTSlotAllocPerSegment *seg = &allocator_storage.per_node[0];
+	ClusterTTSlotAllocEntry others[TT_SLOTS_PER_SEGMENT - 1];
+	char origin[sizeof(seg->origins[0])], zero[sizeof(seg->origins[0])] = { 0 };
+	SCN horizon = bind_gc_mode == BIND_GC_HORIZON_LAG ? (SCN)90
+		: bind_gc_mode == BIND_GC_HORIZON_INVALID ? InvalidScn : (SCN)91;
+	bool result;
+
+	UT_ASSERT_EQ(slot_wait_calls, 1);
+	UT_ASSERT_EQ(seg->slots[0].status, slot_wait_commit ? CTS_COMMITTED : CTS_ABORTED);
+	if (bind_gc_mode == BIND_GC_ABORT_SCN)
+		seg->slots[0].commit_scn = 91; /* Negative malformed terminal input. */
+	if (bind_gc_mode == BIND_GC_WRAP_RETIRED)
+		seg->slots[0].wrap = TT_WRAP_MAX;
+	if (bind_gc_passes == 0)
+		MemSet(&seg->origins[0], 0x5a, sizeof(seg->origins[0]));
+	memcpy(origin, &seg->origins[0], sizeof(origin));
+	memcpy(others, &seg->slots[1], sizeof(others));
+	bind_gc_released = bind_sleeps >= bind_supply_after;
+	bind_gc_passes++;
+	result = cluster_tt_slot_gc_current_pass(horizon, 17, &bind_gc_stats);
+	UT_ASSERT_EQ(result, bind_gc_mode != BIND_GC_OUTER_EPOCH
+						   && bind_gc_mode != BIND_GC_LOCKED_EPOCH);
+	UT_ASSERT_EQ(memcmp(others, &seg->slots[1], sizeof(others)), 0);
+	UT_ASSERT_EQ(lock_depth, 0);
+	if (bind_gc_mode == BIND_GC_RELEASE && bind_gc_released) {
+		UT_ASSERT_EQ(seg->slots[0].status, CTS_FREE);
+		UT_ASSERT_EQ(seg->slots[0].xid, InvalidTransactionId);
+		UT_ASSERT_EQ(seg->slots[0].wrap, 1);
+		UT_ASSERT_EQ(memcmp(zero, &seg->origins[0], sizeof(zero)), 0);
+	} else {
+		UT_ASSERT_EQ(seg->slots[0].status, slot_wait_commit ? CTS_COMMITTED : CTS_ABORTED);
+		UT_ASSERT_EQ(memcmp(origin, &seg->origins[0], sizeof(origin)), 0);
+		UT_ASSERT_EQ(bind_gc_stats.shmem_tt_slots_gcd, 0);
+		UT_ASSERT_EQ(bind_gc_recycles, 0);
+	}
+}
 
 static bool
 undo_cleaner_capacity_context_safe(void)
@@ -137,7 +246,11 @@ ConditionVariableTimedSleep(ConditionVariable *cv, long timeout, uint32 event)
 		modifier_refused = true;
 	if (bind_lease_drift)
 		capacity_lease_current = false;
-	if (bind_sleeps == bind_supply_after) {
+	if (bind_gc_enabled) {
+		if (bind_sleeps == bind_gc_cancel_after)
+			ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("controlled caller cancel")));
+		bind_gc_scheduled_pass();
+	} else if (bind_sleeps == bind_supply_after) {
 		/* The real release owner is a boundary, not a fake CV grant. Only
 		 * its explicit completion makes the original allocator see supply. */
 		if (bind_same_segment)
@@ -178,6 +291,8 @@ bind_selected_media(void)
 static void
 bind_reset(bool rowmark, bool active)
 {
+	ClusterConfShmem = NULL;
+	bind_gc_enabled = false;
 	empty_reset(rowmark);
 	g_modifier_recheck_hook = bind_selected_media;
 	bind_lease_drift = false;
@@ -330,15 +445,117 @@ UT_TEST(test_actual_cv_wakeup_cannot_bridge_changed_or_unsafe_admission)
 	}
 }
 
+static void
+bind_gc_reset(BindGcMode mode, bool committed)
+{
+	bind_reset(false, true);
+	MemSet(&bind_gc_conf, 0, sizeof(bind_gc_conf));
+	bind_gc_conf.node_count = 2;
+	ClusterConfShmem = &bind_gc_conf;
+	bind_gc_enabled = true;
+	bind_gc_mode = mode;
+	bind_gc_released = false;
+	bind_gc_passes = bind_gc_samples = bind_gc_recycles = bind_gc_cancel_after = 0;
+	MemSet(&bind_gc_stats, 0, sizeof(bind_gc_stats));
+	slot_wait_commit = committed;
+	if (mode != BIND_GC_RELEASE) {
+		bind_supply_after = 1;
+		bind_gc_cancel_after = 2;
+	}
+}
+
+static void
+bind_gc_expect_cancel(void)
+{
+	volatile bool caught = false;
+
+	PG_TRY();
+	{
+		cluster_executor_preflight_write(&empty_statement, &empty_estate, 0);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_QUERY_CANCELED);
+	UT_ASSERT_EQ(empty_xids, 1);
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+	UT_ASSERT_EQ(g_bind_emit_calls + g_ctrc_reserve_calls + g_current_acquire_calls, 0);
+	UT_ASSERT_EQ(bind_gc_passes, 1);
+	UT_ASSERT_EQ(bind_gc_stats.segments_scanned, 1);
+	UT_ASSERT_EQ(bind_gc_stats.shmem_tt_slots_gcd, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&allocator_storage.retention_recycle_count), 0);
+	UT_ASSERT_EQ(bind_gc_recycles, 0);
+	UT_ASSERT_EQ(slot_wait_calls, 1);
+	UT_ASSERT_EQ(cold_selection_calls, 0);
+	bind_assert_counts(2, 2, 1, 1, 0);
+	UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+	for (unsigned i = 1; i < TT_SLOTS_PER_SEGMENT; i++) {
+		UT_ASSERT_EQ(allocator_storage.per_node[0].slots[i].status, CTS_ACTIVE);
+		UT_ASSERT_EQ(allocator_storage.per_node[0].slots[i].xid, 200 + i);
+	}
+	list_free(empty_statement.resultRelations);
+}
+
+UT_TEST(test_actual_current_gc_release_then_cv_reentry_binds_same_slot)
+{
+	for (unsigned committed = 0; committed < 2; committed++) {
+		ClusterCanonicalTxnBinding binding;
+
+		bind_gc_reset(BIND_GC_RELEASE, committed != 0);
+		if (!empty_preflight(&binding))
+			return;
+		UT_ASSERT_EQ(binding.segment_id, 1);
+		UT_ASSERT_EQ(binding.slot_offset, 0);
+		UT_ASSERT_EQ(binding.slot_wrap, 1);
+		UT_ASSERT_EQ(bind_gc_passes, 3);
+		UT_ASSERT_EQ(bind_gc_samples, 3);
+		UT_ASSERT_EQ(bind_gc_stats.segments_scanned, 3);
+		UT_ASSERT_EQ(bind_gc_stats.shmem_tt_slots_gcd, 1);
+		UT_ASSERT_EQ(bind_gc_stats.slots_wrap_retired, 0);
+		UT_ASSERT_EQ(bind_gc_recycles, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&allocator_storage.retention_recycle_count), committed);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&allocator_storage.retention_off_recycle_count), 0);
+		UT_ASSERT_EQ(slot_wait_calls, 1);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+		bind_assert_counts(3, 3, 3, 0, 0);
+		bind_abort_and_reuse(&binding);
+	}
+}
+
+UT_TEST(test_actual_current_gc_retention_and_wrap_refusal_cannot_grant_bind)
+{
+	for (BindGcMode mode = BIND_GC_HORIZON_LAG; mode <= BIND_GC_WRAP_RETIRED; mode++) {
+		bind_gc_reset(mode, mode != BIND_GC_ABORT_SCN);
+		bind_gc_expect_cancel();
+		UT_ASSERT_EQ(bind_gc_samples, 0);
+		UT_ASSERT_EQ(bind_gc_stats.slots_wrap_retired, mode == BIND_GC_WRAP_RETIRED);
+	}
+}
+
+UT_TEST(test_actual_current_gc_epoch_and_final_identity_refusal_cannot_grant_bind)
+{
+	for (BindGcMode mode = BIND_GC_OUTER_EPOCH; mode <= BIND_GC_ENTRY_DRIFT; mode++) {
+		bind_gc_reset(mode, true);
+		bind_gc_expect_cancel();
+		UT_ASSERT_EQ(bind_gc_samples, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(8);
 	UT_RUN(test_actual_capacity_cv_rechecks_then_binds_once_before_empty_caller_work);
 	UT_RUN(test_actual_slot_wait_terminal_cv_and_same_segment_bind_compose);
 	UT_RUN(test_actual_supply_recheck_reenters_allocator_without_granting_a_slot);
 	UT_RUN(test_actual_cv_errors_leave_no_binding_and_preserve_original_error_counts);
 	UT_RUN(test_actual_cv_wakeup_cannot_bridge_changed_or_unsafe_admission);
+	UT_RUN(test_actual_current_gc_release_then_cv_reentry_binds_same_slot);
+	UT_RUN(test_actual_current_gc_retention_and_wrap_refusal_cannot_grant_bind);
+	UT_RUN(test_actual_current_gc_epoch_and_final_identity_refusal_cannot_grant_bind);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
