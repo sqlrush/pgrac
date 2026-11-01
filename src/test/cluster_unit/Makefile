@@ -11318,9 +11318,39 @@ test_cluster_clog_file: test_cluster_clog_file.c unit_test.h \
 test_cluster_clog_write_snapshot: test_cluster_clog_write_snapshot.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
 		$(top_srcdir)/src/include/access/clog_file.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# Managed SLRU state transitions with the actual WAL-first CLOG writer.
+TESTS += test_cluster_slru_clog_managed_write
+all: test_cluster_slru_clog_managed_write
+test_cluster_slru_clog_managed_write: test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-slru-clog-managed-write
+.PHONY: clean-slru-clog-managed-write
+clean-slru-clog-managed-write:
+	rm -f test_cluster_slru_clog_managed_write test_cluster_slru_clog_managed_write.d
 
 # Pure shared RFI2 codec; no backend authority or file provider is linked.
 TESTS += test_cluster_recovery_file_identity

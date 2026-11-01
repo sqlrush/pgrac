@@ -141,6 +141,24 @@ extern int	SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
 extern int	SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno,
 									   TransactionId xid);
 extern void SimpleLruWritePage(SlruCtl ctl, int slotno);
+
+/* Managed CLOG overwrite through the original SLRU snapshot/I/O locks. Caller
+ * holds ControlLock EX and continuously owns the selected registration, file
+ * lifetime, borrowed read/write FD and original write authority. This entry
+ * neither selects/opens/creates a file nor acquires control/source custody.
+ * It requires a known original birth and an already initialized V2 segment.
+ * No raw-file fallback, legacy sync tag, bootstrap or recovery write is used.
+ *
+ * Returns the actual flushed image end only after full sync/readback and a
+ * same-birth cache recheck; InvalidXLogRecPtr means no successful write (also
+ * for a clean/replaced slot). Refusal/error retains dirty responsibility and
+ * the FD. ControlLock is held at normal/error exit; only our I/O lock is
+ * released. Concurrent re-dirty/source watermarks are preserved. Native WAL
+ * errors propagate after restoring state. No checkpoint/coverage authority
+ * is returned; the original owner must recheck custody before publication.
+ */
+extern XLogRecPtr SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
+										 const ClusterClogFileBindingV2 *expected);
 extern void SimpleLruWriteAll(SlruCtl ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING
 extern void SlruPagePrecedesUnitTests(SlruCtl ctl, int per_page);

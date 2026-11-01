@@ -58,6 +58,7 @@
 
 #include "access/slru.h"
 #include "access/transam.h"
+#include "access/clog_storage.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
@@ -696,6 +697,100 @@ void
 SimpleLruWritePage(SlruCtl ctl, int slotno)
 {
 	SlruInternalWritePage(ctl, slotno, NULL);
+}
+
+/* A managed write uses the same slot/ControlLock/per-buffer I/O protocol, but
+ * its full-image WAL can raise ERROR and its durable file is generation-bound.
+ * Keep it separate from the raw writer and its segno-only sync queue. */
+XLogRecPtr
+SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
+						  const ClusterClogFileBindingV2 *expected)
+{
+	SlruShared shared;
+	SlruWriteSnapshot snapshot;
+	ClusterClogFileBindingV2 binding;
+	ClusterClogPageIdentityV2 *current;
+	uint8 checked_frame[CLUSTER_CLOG_FRAME_BYTES];
+	XLogRecPtr end = InvalidXLogRecPtr;
+	bool ok = false;
+	int pageno;
+
+	if (ctl == NULL || expected == NULL || fd < 0 ||
+		ctl->sync_handler != SYNC_HANDLER_CLOG || (shared = ctl->shared) == NULL ||
+		slotno < 0 || slotno >= shared->num_slots || shared->ControlLock == NULL ||
+		shared->page_buffer == NULL || shared->page_status == NULL ||
+		shared->page_dirty == NULL || shared->page_number == NULL ||
+		shared->buffer_locks == NULL || shared->clog_page_identity == NULL ||
+		shared->group_lsn == NULL || shared->lsn_groups_per_page <= 0 ||
+		!LWLockHeldByMeInMode(shared->ControlLock, LW_EXCLUSIVE))
+		return InvalidXLogRecPtr;
+	pageno = shared->page_number[slotno];
+	while (shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS &&
+		   shared->page_number[slotno] == pageno)
+		SimpleLruWaitIO(ctl, slotno);
+	if (!shared->page_dirty[slotno] || shared->page_status[slotno] != SLRU_PAGE_VALID ||
+		shared->page_number[slotno] != pageno || pageno < 0 ||
+		shared->page_buffer[slotno] == NULL)
+		return InvalidXLogRecPtr;
+
+	/* Validate the complete by-value snapshot before changing any slot state.
+	 * In particular, a raw page number or an LSN cannot supply missing birth. */
+	binding = *expected;
+	SlruCaptureWriteSnapshot(ctl, slotno, &snapshot);
+	if (snapshot.clog_page.identity.logical_page != (uint64) pageno ||
+		!cluster_clog_file_page_encode_v2(&binding, &snapshot.clog_page,
+										 snapshot.page.data, BLCKSZ,
+										 checked_frame, sizeof(checked_frame)))
+		return InvalidXLogRecPtr;
+
+	shared->page_status[slotno] = SLRU_PAGE_WRITE_IN_PROGRESS;
+	shared->page_dirty[slotno] = false;
+	LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
+	LWLockRelease(shared->ControlLock);
+
+	PG_TRY();
+	{
+		pgstat_count_slru_page_written(shared->slru_stats_idx);
+		pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
+		ok = cluster_clog_storage_write_page_v2(fd, &binding, &snapshot.clog_page,
+												 snapshot.page.data, BLCKSZ, &end);
+		pgstat_report_wait_end();
+	}
+	PG_CATCH();
+	{
+		pgstat_report_wait_end();
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+		shared->page_dirty[slotno] = true;
+		shared->page_status[slotno] = SLRU_PAGE_VALID;
+		LWLockRelease(&shared->buffer_locks[slotno].lock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	current = &shared->clog_page_identity[slotno];
+	if (shared->page_number[slotno] != pageno ||
+		shared->page_status[slotno] != SLRU_PAGE_WRITE_IN_PROGRESS ||
+		current->identity.logical_page != snapshot.clog_page.identity.logical_page ||
+		current->identity.page_generation != snapshot.clog_page.identity.page_generation ||
+		!current->identity.birth_observed ||
+		!FullTransactionIdEquals(current->identity.birth_full_xid,
+							 snapshot.clog_page.identity.birth_full_xid) ||
+		current->image_lsn != snapshot.clog_page.image_lsn)
+		ok = false;
+	if (ok)
+	{
+		current->image_lsn = end;
+		current->identity.page_lsn = Max(current->identity.page_lsn,
+									 snapshot.clog_page.identity.page_lsn);
+		/* A live page may already differ from the captured on-disk image. */
+		current->identity.payload_crc = current->identity.metadata_crc = 0;
+	}
+	else
+		shared->page_dirty[slotno] = true;
+	shared->page_status[slotno] = SLRU_PAGE_VALID;
+	LWLockRelease(&shared->buffer_locks[slotno].lock);
+	return ok ? end : InvalidXLogRecPtr;
 }
 
 /*
