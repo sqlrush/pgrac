@@ -1,9 +1,12 @@
 /* Actual native range -> holder service -> caller -> G2. The transport,
  * control/KO providers and ResourceOwner dispatcher are controlled leaves. */
 int k_native_component_main(void);
+#pragma push_macro("main")
+#undef main
 #define main k_native_component_main
 #include "test_cluster_mx_native_range.c"
 #undef main
+#pragma pop_macro("main")
 #include "cluster/cluster_multixact_range.h"
 #include "cluster/cluster_ko.h"
 #include "utils/resowner.h"

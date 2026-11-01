@@ -6,6 +6,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ko.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_multixact_range.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_qvotec.h"
@@ -336,6 +337,9 @@ cluster_multixact_current_describe_scoped(const ClusterCurrentMxKey *key,
 	value.read_scn = snapshot->read_scn; value.read_epoch = snapshot->read_epoch;
 	value.snapshot_type = snapshot->snapshot_type; value.xmin = snapshot->xmin;
 	value.xmax = snapshot->xmax; value.curcid = snapshot->curcid;
+	/* Count the logical describe once, irrespective of its range frames.
+	 * The legacy fallback above retains its original statistics owner. */
+	cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_ASK);
 	PG_TRY();
 	{
 		if (cluster_multixact_current_describe_full(key, target, &value, &op, &stats)) {
@@ -357,5 +361,12 @@ cluster_multixact_current_describe_scoped(const ClusterCurrentMxKey *key,
 		cluster_multixact_current_describe_finish(&op);
 	}
 	PG_END_TRY();
+	/* ERROR/cancel rethrows through FINALLY and has no returned outcome. */
+	if (result == CMX_DESC_OK)
+		cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_HIT);
+	else if (result == CMX_DESC_SUPPORTED_LIMIT)
+		cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_SUPPORTED_LIMIT);
+	else
+		cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_UNKNOWN);
 	return result;
 }
