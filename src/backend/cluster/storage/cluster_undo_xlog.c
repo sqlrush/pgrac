@@ -879,6 +879,100 @@ cluster_undo_emit_block_write_multi(uint8 instance, uint32 segment_id, uint32 bl
  */
 /* These checks operate on private, aligned bytes. The existing lifecycle
  * owners still perform all opens, generation decisions and durability work. */
+typedef struct UndoTTReplayFile {
+	int fd;
+	bool close_failed;
+#ifdef USE_PGRAC_CLUSTER
+	bool native;
+	ClusterControlNativeFileBorrowV2 native_file;
+#endif
+} UndoTTReplayFile;
+
+static void
+undo_tt_replay_close(UndoTTReplayFile *file)
+{
+	if (file->close_failed)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not close native TT40 redo file")));
+	if (file->fd >= 0) {
+		if (close(file->fd) != 0) {
+			file->close_failed = true;
+			ereport(PANIC, (errcode_for_file_access(),
+							errmsg("could not close native TT40 redo file")));
+		}
+		file->fd = -1;
+	}
+}
+
+static void undo_tt_init_file(const ClusterUndoDecoded *, const uint8 *, UndoTTReplayFile *);
+static void undo_tt_reuse_file(const ClusterUndoDecoded *, const uint8 *, UndoTTReplayFile *);
+
+static void
+undo_tt_birth_identity(UndoTTReplayFile *file, const char *image)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native
+		&& ((image != NULL
+			 && !cluster_tt_file_reference_matches_v2(image, BLCKSZ, &file->native_file.expected))
+			|| !cluster_control_native_file_current_v2(&file->native_file)))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("native TT40 birth redo has a different or stale selected file identity")));
+#endif
+}
+
+/* Original WAL/recovery permission remains the sole creation authority.
+ * Selection protects that permission's exact file through directory sync. */
+static void
+undo_tt_replay_birth(const ClusterUndoDecoded *decoded, const uint8 *payload)
+{
+	UndoTTReplayFile legacy = { .fd = -1 };
+
+	if (!cluster_undo_preflight(decoded)
+		|| (decoded->kind != CLUSTER_UNDO_KIND_SEGMENT_INIT
+			&& decoded->kind != CLUSTER_UNDO_KIND_SEGMENT_REUSE))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid native TT birth record")));
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2) {
+		UndoTTReplayFile *file = palloc0(sizeof(*file));
+
+		file->fd = -1;
+		file->native = true;
+		PG_TRY();
+		{
+			ClusterControlFileKeyV2 key = {0};
+
+			key.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+			key.origin = decoded->instance - 1;
+			key.object_id = decoded->segment_id;
+			if (!cluster_control_native_file_acquire_v2(&key, &file->native_file))
+				ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("native TT40 birth has no selected file identity")));
+			undo_tt_birth_identity(file, NULL);
+			if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT)
+				undo_tt_init_file(decoded, payload, file);
+			else
+				undo_tt_reuse_file(decoded, payload, file);
+		}
+		PG_FINALLY();
+		{
+			undo_tt_replay_close(file);
+			if (file->native_file.private_self != 0
+				&& !cluster_control_native_file_release_v2(&file->native_file))
+				ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+								errmsg("could not release native TT40 birth file identity")));
+			pfree(file);
+		}
+		PG_END_TRY();
+		return;
+	}
+#endif
+	if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT)
+		undo_tt_init_file(decoded, payload, &legacy);
+	else
+		undo_tt_reuse_file(decoded, payload, &legacy);
+}
+
 static bool
 cluster_undo_lifecycle_v2_checksum(const char *page)
 {
@@ -898,7 +992,7 @@ cluster_undo_lifecycle_v2_readback(int fd, const char *expected)
 }
 
 static void
-cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *payload)
+undo_tt_init_file(const ClusterUndoDecoded *decoded, const uint8 *payload, UndoTTReplayFile *file)
 {
 	PGAlignedBlock prepared;
 	char path[MAXPGPATH];
@@ -914,6 +1008,7 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 		&& !cluster_undo_lifecycle_v2_checksum(prepared.data))
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid checksum in undo segment V2 initialization image")));
+	undo_tt_birth_identity(file, prepared.data);
 	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
 								decoded->instance, decoded->segment_id, path, sizeof(path))
 		!= 0)
@@ -924,12 +1019,13 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 	ensure_undo_instance_subdir(decoded->instance);
 
 	/* Step 2: open the segment file, creating if missing. */
-	fd = BasicOpenFile(path, O_CREAT | O_RDWR | PG_BINARY);
+	file->fd = fd = BasicOpenFile(path, O_CREAT | O_RDWR | PG_BINARY);
 	/* The standalone native-header fixture supplies a fixed valid fd. */
 	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not open or create undo segment file \"%s\": %m", path)));
+	undo_tt_birth_identity(file, NULL);
 
 	{
 		static const char empty[BLCKSZ] = { 0 };
@@ -941,11 +1037,20 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 		if (nread < 0) {
 			int save_errno = errno;
 
-			close(fd);
+			undo_tt_replay_close(file);
 			errno = save_errno;
 			ereport(PANIC, (errcode_for_file_access(),
 							errmsg("could not inspect undo segment layout before initialization: %m")));
 		}
+#ifdef USE_PGRAC_CLUSTER
+		if (file->native && nread != 0 && nread != BLCKSZ)
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("incomplete native TT40 initialization predecessor")));
+		if (file->native && memcmp(prior.data, empty, BLCKSZ) != 0)
+			undo_tt_birth_identity(file, prior.data);
+		else
+#endif
+			undo_tt_birth_identity(file, NULL);
 		if (((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
 			 || (uint8)prior.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2)
 			&& memcmp(prior.data, empty, BLCKSZ) != 0
@@ -954,11 +1059,12 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 					&& !cluster_undo_lifecycle_v2_checksum(prior.data))
 				|| cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length,
 												 prior.data, prepared.data) != CLUSTER_UNDO_HEADER_APPLY)) {
-			close(fd);
+			undo_tt_replay_close(file);
 			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("undo segment initialization cannot change an existing layout")));
 		}
 	}
+	undo_tt_birth_identity(file, prepared.data);
 
 	/*
 	 * Step 3: ensure file is exactly UNDO_SEGMENT_SIZE_BYTES (64 MB).
@@ -970,19 +1076,20 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 	if (ftruncate(fd, (off_t)UNDO_SEGMENT_SIZE_BYTES) != 0) {
 		int save_errno = errno;
 
-		close(fd);
+		undo_tt_replay_close(file);
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not extend undo segment file \"%s\" to %d bytes: %m", path,
 							   UNDO_SEGMENT_SIZE_BYTES)));
 	}
+	undo_tt_birth_identity(file, NULL);
 
 	/* Step 4: pwrite block 0 with the WAL-shipped page image. */
 	written = pg_pwrite(fd, prepared.data, BLCKSZ, 0);
 	if (written != BLCKSZ) {
 		int save_errno = errno;
 
-		close(fd);
+		undo_tt_replay_close(file);
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not write undo segment header for \"%s\": "
@@ -994,21 +1101,22 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 	if (pg_fsync(fd) != 0) {
 		int save_errno = errno;
 
-		close(fd);
+		undo_tt_replay_close(file);
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not fsync undo segment file \"%s\": %m", path)));
 	}
+	undo_tt_birth_identity(file, NULL);
 
 	if ((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
 		&& !cluster_undo_lifecycle_v2_readback(fd, prepared.data)) {
-		close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("undo segment V2 initialization readback mismatch")));
 	}
-	if (close(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close undo segment file \"%s\": %m", path)));
+	undo_tt_birth_identity(file, NULL);
+	undo_tt_replay_close(file);
+	undo_tt_birth_identity(file, NULL);
 
 	/*
 	 * Step 6: fsync the parent directory (instance_<N>/).  Required for
@@ -1027,10 +1135,16 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 		get_parent_directory(dir);
 		fsync_fname(dir, true);
 	}
+	undo_tt_birth_identity(file, NULL);
 
 	cluster_vis_bump_recovery_undo_redo_applies(); /* spec-3.16 D5 */
 }
 
+static void
+cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *payload)
+{
+	undo_tt_replay_birth(decoded, payload);
+}
 
 /* spec-4.8 D7-A (P1#1): canonical invalid chain head for commit/abort redo. */
 static const UBA InvalidUbaVal = InvalidUba_init;
@@ -1405,31 +1519,6 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 	if (close(fd) != 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not close undo segment file \"%s\": %m", path)));
-}
-
-typedef struct UndoTTReplayFile {
-	int fd;
-	bool close_failed;
-#ifdef USE_PGRAC_CLUSTER
-	bool native;
-	ClusterControlNativeFileBorrowV2 native_file;
-#endif
-} UndoTTReplayFile;
-
-static void
-undo_tt_replay_close(UndoTTReplayFile *file)
-{
-	if (file->close_failed)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close native TT40 redo file")));
-	if (file->fd >= 0) {
-		if (close(file->fd) != 0) {
-			file->close_failed = true;
-			ereport(PANIC, (errcode_for_file_access(),
-							errmsg("could not close native TT40 redo file")));
-		}
-		file->fd = -1;
-	}
 }
 
 /* A V2 delta needs an existing complete TT40 predecessor. Keep every byte
@@ -1941,7 +2030,7 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
  *   vanished.  Generation decision via the header-inline pure table.
  */
 static void
-cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *payload)
+undo_tt_reuse_file(const ClusterUndoDecoded *decoded, const uint8 *payload, UndoTTReplayFile *file)
 {
 	char path[MAXPGPATH];
 	int fd;
@@ -1959,23 +2048,31 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 		&& !cluster_undo_lifecycle_v2_checksum(prepared.data))
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid checksum in undo segment V2 reuse image")));
+	undo_tt_birth_identity(file, prepared.data);
 	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
 								decoded->instance, decoded->segment_id, path, sizeof(path))
 		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", decoded->instance,
 							   decoded->segment_id)));
 	ensure_undo_instance_subdir(decoded->instance);
-	fd = BasicOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	file->fd = fd = BasicOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
 	/* The standalone native-header fixture supplies a fixed valid fd. */
 	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not open undo segment \"%s\" for reuse redo: %m", path)));
+	undo_tt_birth_identity(file, NULL);
 
 	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
+#ifdef USE_PGRAC_CLUSTER
+	if (file->native && nread != 0 && nread != BLCKSZ)
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("incomplete native TT40 reuse predecessor")));
+#endif
+	undo_tt_birth_identity(file, nread == BLCKSZ ? blockbuf.data : NULL);
 	if (nread == BLCKSZ && (uint8)blockbuf.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
 		&& !cluster_undo_lifecycle_v2_checksum(blockbuf.data)) {
-		close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid undo segment V2 reuse predecessor checksum")));
 	}
@@ -1983,26 +2080,29 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 		= cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length,
 										 nread == BLCKSZ ? blockbuf.data : NULL, prepared.data);
 	if (decision == CLUSTER_UNDO_HEADER_BLOCKED) {
-		close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("undo segment \"%s\" has an invalid reuse predecessor", path)));
 	}
+	undo_tt_birth_identity(file, decision == CLUSTER_UNDO_HEADER_APPLY
+		? prepared.data : blockbuf.data);
 	if (decision == CLUSTER_UNDO_HEADER_APPLY) {
 		ssize_t written;
 
 		if (ftruncate(fd, (off_t)UNDO_SEGMENT_SIZE_BYTES) != 0) {
 			int save_errno = errno;
 
-			close(fd);
+			undo_tt_replay_close(file);
 			errno = save_errno;
 			ereport(PANIC, (errcode_for_file_access(),
 							errmsg("could not extend undo segment file \"%s\": %m", path)));
 		}
+		undo_tt_birth_identity(file, NULL);
 		written = pg_pwrite(fd, prepared.data, BLCKSZ, 0);
 		if (written != BLCKSZ || pg_fsync(fd) != 0) {
 			int save_errno = errno;
 
-			close(fd);
+			undo_tt_replay_close(file);
 			errno = save_errno;
 			ereport(PANIC,
 					(errcode_for_file_access(),
@@ -2013,21 +2113,22 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 		&& decision != CLUSTER_UNDO_HEADER_APPLY && pg_fsync(fd) != 0) {
 		int save_errno = errno;
 
-		close(fd);
+		undo_tt_replay_close(file);
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not make unchanged undo segment V2 reuse durable: %m")));
 	}
+	undo_tt_birth_identity(file, NULL);
 	if ((uint8)prepared.data[57] == CLUSTER_UNDO_TT_LAYOUT_V2
 		&& !cluster_undo_lifecycle_v2_readback(fd,
 				decision == CLUSTER_UNDO_HEADER_APPLY ? prepared.data : blockbuf.data)) {
-		close(fd);
+		undo_tt_replay_close(file);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("undo segment V2 reuse readback failed")));
 	}
-	if (close(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close undo segment file \"%s\": %m", path)));
+	undo_tt_birth_identity(file, NULL);
+	undo_tt_replay_close(file);
+	undo_tt_birth_identity(file, NULL);
 	if (decision == CLUSTER_UNDO_HEADER_APPLY) {
 		char dir[MAXPGPATH];
 
@@ -2035,9 +2136,16 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 		strlcpy(dir, path, sizeof(dir));
 		get_parent_directory(dir);
 		fsync_fname(dir, true);
+		undo_tt_birth_identity(file, NULL);
 		cluster_vis_bump_recovery_undo_redo_applies();
 	} else
 		cluster_vis_bump_recovery_undo_redo_skips();
+}
+
+static void
+cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *payload)
+{
+	undo_tt_replay_birth(decoded, payload);
 }
 
 

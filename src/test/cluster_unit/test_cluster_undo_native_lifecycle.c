@@ -88,6 +88,7 @@ fixture_open(const char *path, int flags)
 static int
 fixture_extend(int fd, off_t size)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT_EQ(size, UNDO_SEGMENT_SIZE_BYTES);
 	extends++;
@@ -184,6 +185,7 @@ fixture_close(int fd)
 static void
 fixture_dir_sync(const char *path, bool isdir)
 {
+	UNDO_NATIVE_TT_REDO_IO();
 	UT_ASSERT(isdir);
 	UT_ASSERT(strcmp(path, "undo/instance_2") == 0);
 	UT_ASSERT_EQ(syncs, 1);

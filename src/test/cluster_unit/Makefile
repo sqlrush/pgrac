@@ -3556,15 +3556,16 @@ test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cl
 
 test_cluster_undo_tt_file_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^typedef struct UndoTTReplayFile/ { emit=1; found++ } \
+	     /^static void undo_tt_(init_file|reuse_file)\(/ { print; declarations++ } \
 	     /^undo_tt_replay_close\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 2 || declarations != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_lifecycle_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^cluster_undo_lifecycle_v2_(checksum|readback)\(/ { print "static bool"; emit=1; found++ } \
-	     /^undo_tt_recycle_file\(/ { print "static void"; emit=1; found++ } \
+	     /^undo_tt_(recycle_file|init_file|reuse_file|birth_identity|replay_birth)\(/ { print "static void"; emit=1; found++ } \
 	     /^cluster_undo_redo_segment_(init|recycle|reuse)\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 6) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 10) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_bind_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
@@ -3675,6 +3676,21 @@ test_cluster_undo_native_tt_redo_identity: test_cluster_undo_native_tt_redo_iden
 TESTS += test_cluster_undo_native_tt_recycle_identity
 all: test_cluster_undo_native_tt_recycle_identity
 
+TESTS += test_cluster_undo_native_tt_birth_identity
+all: test_cluster_undo_native_tt_birth_identity
+
+test_cluster_undo_native_tt_birth_identity: test_cluster_undo_native_tt_birth_identity.c \
+		test_cluster_undo_native_tt_redo_identity.c \
+		test_cluster_undo_native_lifecycle cluster_unit_no_native_files.h \
+		$(top_srcdir)/src/include/access/clog_file.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
+		test_cluster_undo_segment_init_backend.o \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UBA_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 test_cluster_undo_native_tt_recycle_identity: test_cluster_undo_native_tt_recycle_identity.c \
 		test_cluster_undo_native_tt_redo_identity.c \
 		test_cluster_undo_native_lifecycle cluster_unit_no_native_files.h \
@@ -3692,7 +3708,8 @@ clean: clean-native-tt-redo-identity
 .PHONY: clean-native-tt-redo-identity
 clean-native-tt-redo-identity:
 	rm -f test_cluster_undo_native_tt_redo_identity test_cluster_undo_native_tt_redo_identity.d \
-		test_cluster_undo_native_tt_recycle_identity test_cluster_undo_native_tt_recycle_identity.d
+		test_cluster_undo_native_tt_recycle_identity test_cluster_undo_native_tt_recycle_identity.d \
+		test_cluster_undo_native_tt_birth_identity test_cluster_undo_native_tt_birth_identity.d
 
 test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h $(CLUSTER_UBA_O) \
 		test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc \
