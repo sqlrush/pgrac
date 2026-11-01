@@ -634,6 +634,11 @@ extern bool cluster_normal_stop_postmaster_frontends_gone(void);
 extern bool cluster_normal_stop_requested(void);
 extern bool cluster_normal_stop_native_wal_mode(void);
 extern void cluster_normal_stop_fail(ClusterNormalStopFailure reason);
+/* Caller location is diagnostic only; retain the original ABI for function pointers. */
+extern void cluster_normal_stop_fail_at(ClusterNormalStopFailure reason, const char *caller,
+										int line);
+#define cluster_normal_stop_fail(reason) cluster_normal_stop_fail_at((reason), __func__, __LINE__)
+
 extern ClusterNormalStopFailure cluster_normal_stop_failure(void);
 extern bool cluster_normal_stop_protocol_closed(void);
 /* Checkpointer's first producer cut. READY means all four exact frontend

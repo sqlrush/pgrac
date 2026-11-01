@@ -6244,13 +6244,17 @@ test_cluster_gcs_serving_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs
 # t/061_lmon_skeleton.pl where postmaster orchestration is real.
 test_cluster_lmon_stop_service.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h
-	awk '/^cluster_normal_stop_requested\(/ || /^cluster_normal_stop_protocol_closed\(/ || /^cluster_normal_stop_service_(enter|leave|new_work|data_sealed)\(/ { print "bool"; emit=1; count++ } \
+	awk '/^typedef struct ClStopFirstFailureTrace/ { emit=1; types++ } \
+	     /^static ClStopFirstFailureTrace cl_stop_first_failure;/ { print; globals++ } \
+	     /^cl_stop_trace_lock\(/ || /^cl_stop_trace_first_failure\(/ { print "static void"; emit=1; diagnostics++ } \
+	     /^cl_stop_trace_safe\(/ { print "static bool"; emit=1; diagnostics++ } \
+	     /^cluster_normal_stop_requested\(/ || /^cluster_normal_stop_protocol_closed\(/ || /^cluster_normal_stop_service_(enter|leave|new_work|data_sealed)\(/ { print "bool"; emit=1; count++ } \
 	     /^cl_normal_stop_service_mask_valid\(/ { print "static bool"; emit=1; count++ } \
-	     /^cluster_normal_stop_fail\(/ { print "void"; emit=1; count++ } \
+	     /^cluster_normal_stop_fail_at\(/ { print "void"; emit=1; count++ } \
 	     /^cluster_normal_stop_failure\(/ { print "ClusterNormalStopFailure"; emit=1; count++ } \
 	     /^cl_normal_stop_actor_bit\(/ || /^cl_normal_stop_member_mask\(/ { print "static uint32"; emit=1; count++ } \
 	     /^cluster_normal_stop_service_(idle|seal)\(/ { print "ClusterNormalStopPollResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 13) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 13 || types != 1 || globals != 1 || diagnostics != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_lmon_producer_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \

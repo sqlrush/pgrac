@@ -12306,10 +12306,55 @@ UT_TEST(test_stop_trace_recovered_equal_epoch_refuses_before_owner)
 }
 
 
+UT_TEST(test_run15_pending_subpredicate_is_continuing_without_authority_changes)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[512];
+	uint64 seq[2];
+	unsigned sample_calls[2][CLUSTER_MAX_NODES];
+	unsigned barriers[2];
+	for (int on = 0; on < 2; on++) {
+		ut_stop_diag_setup(&open, root);
+		cluster_trace_normal_stop = on;
+		test_capability_missing_peer = 3;
+		seq[on] = pg_atomic_read_u64(&SemanticActivationShmem->admission_seq);
+		test_read_barrier_count = 0;
+		memset(test_peer_capability_sample_calls, 0, sizeof(test_peer_capability_sample_calls));
+		for (int repeat = 0; repeat < 3; repeat++)
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+						 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->admission_seq), seq[on]);
+		memcpy(sample_calls[on], test_peer_capability_sample_calls, sizeof(sample_calls[on]));
+		barriers[on] = test_read_barrier_count;
+		UT_ASSERT_EQ(test_stop_diag_reports, 0);
+		if (on) {
+			UT_ASSERT(strstr(test_stop_diag_text, "semantic normal-stop identity pending") != NULL);
+			UT_ASSERT(strstr(test_stop_diag_text, "predicate=ack.peer.capability_valid") != NULL);
+			UT_ASSERT(strstr(test_stop_diag_text, "member=3") != NULL);
+		} else
+			UT_ASSERT_EQ(strlen(test_stop_diag_text), 0);
+		test_gate_reset();
+	}
+	UT_ASSERT_EQ(memcmp(sample_calls, sample_calls + 1, sizeof(sample_calls[0])), 0);
+	UT_ASSERT_EQ(barriers[0], barriers[1]);
+}
+UT_TEST(test_run15_pending_publication_names_original_first_cut)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[512];
+	ut_stop_diag_setup(&open, root);
+	pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, 1);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strstr(test_stop_diag_text, "predicate=before.admission_snapshot") != NULL);
+	UT_ASSERT_EQ(test_stop_diag_reports, 0);
+	test_gate_reset();
+}
+
 int
 main(void)
 {
-	UT_PLAN(418);
+	UT_PLAN(420);
 	UT_RUN(test_stop_trace_preserves_recovered_record_acceptance);
 	UT_RUN(test_stop_trace_preserves_recovered_service_owner_guards);
 	UT_RUN(test_stop_trace_recovered_equal_epoch_refuses_before_owner);
@@ -12729,6 +12774,8 @@ main(void)
 	UT_RUN(test_a148_semantic_stop_poll_invalid_not_hidden_by_pending);
 	UT_RUN(test_a148_postmaster_retention_hint_preserves_unknown_and_publication_history);
 	UT_RUN(test_a148_stop_poll_includes_original_phase3_handoff);
+	UT_RUN(test_run15_pending_subpredicate_is_continuing_without_authority_changes);
+	UT_RUN(test_run15_pending_publication_names_original_first_cut);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

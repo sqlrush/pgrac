@@ -90,6 +90,7 @@
 
 bool IsUnderPostmaster = false;
 bool cluster_lmd_enabled = true;
+bool cluster_trace_normal_stop;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 int MyProcPid = 0;

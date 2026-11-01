@@ -65,6 +65,7 @@
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
@@ -363,6 +364,87 @@ static int tier1_outbound_queued_total[CLUSTER_MAX_NODES];
 static ResourceXIntentSlot tier1_resource_x_sending;
 static bool tier1_resource_x_send_captured;
 static ResourceXIntentSlot tier1_resource_x_tail[CLUSTER_MAX_NODES];
+
+/* Default-off CONTROL stop ACK observations. These copies never own bytes or
+ * authorize completion. FIFO frames retain their original layout and order. */
+typedef struct Tier1StopAckTrace {
+	bool known;
+	uint8 type;
+	uint32 source, destination;
+	uint64 epoch, nonce, serial;
+} Tier1StopAckTrace;
+static Tier1StopAckTrace tier1_stop_ack_tail[CLUSTER_MAX_NODES];
+static uint64 tier1_stop_ack_skipped[CLUSTER_MAX_NODES];
+StaticAssertDecl(sizeof(tier1_stop_ack_tail) + sizeof(tier1_stop_ack_skipped) <= 8192,
+				 "CONTROL ACK diagnostics exceed 8KiB");
+
+static void
+tier1_stop_ack_capture(int peer, const void *buf, size_t len, Tier1StopAckTrace *out)
+{
+	ClusterICEnvelope env;
+	ClusterLeaveAckPayload ack;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_trace_normal_stop || tier1_my_plane != CLUSTER_IC_PLANE_CONTROL
+		|| len != PGRAC_IC_ENVELOPE_BYTES + sizeof(ack))
+		return;
+	memcpy(&env, buf, PGRAC_IC_ENVELOPE_BYTES);
+	if (env.msg_type != PGRAC_IC_MSG_LEAVE_DRAIN_ACK || env.payload_length != sizeof(ack)
+		|| env.source_node_id != (uint32)cluster_node_id || env.dest_node_id != (uint32)peer)
+		return;
+	memcpy(&ack, (const char *)buf + PGRAC_IC_ENVELOPE_BYTES, sizeof(ack));
+	if (ack.phase1_round != 0)
+		return;
+	out->known = true;
+	out->type = env.msg_type;
+	out->source = env.source_node_id;
+	out->destination = env.dest_node_id;
+	out->epoch = env.epoch;
+	out->nonce = ack.leave_nonce;
+	out->serial = tier1_stream_serial[peer];
+}
+
+static void
+tier1_stop_ack_held(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)arg = true;
+}
+
+static void
+tier1_stop_ack_emit(int peer, const Tier1StopAckTrace *d, const char *event)
+{
+	bool held = false;
+	int saved_errno = errno;
+	if (!cluster_trace_normal_stop || !d->known)
+		return;
+	if (CritSectionCount != 0) {
+		tier1_stop_ack_skipped[peer]++;
+		return;
+	}
+	ForEachLWLockHeldByMe(tier1_stop_ack_held, &held);
+	if (held) {
+		tier1_stop_ack_skipped[peer]++;
+		return;
+	}
+	ereport(
+		LOG,
+		(errmsg("normal-stop producer ACK transport"),
+		 errdetail("event=%s node=%d pid=%d peer=%d type=%u source=%u destination=%u"
+				   " epoch=" UINT64_FORMAT " nonce=" UINT64_FORMAT " stream_serial=" UINT64_FORMAT
+				   " skipped=" UINT64_FORMAT " proof=local_socket_write_only",
+				   event, cluster_node_id, MyProcPid, peer, d->type, d->source, d->destination,
+				   d->epoch, d->nonce, d->serial, tier1_stop_ack_skipped[peer])));
+	errno = saved_errno;
+}
+
+static void
+tier1_stop_ack_frame_event(int peer, const void *buf, size_t len, const char *event)
+{
+	Tier1StopAckTrace d;
+	tier1_stop_ack_capture(peer, buf, len, &d);
+	tier1_stop_ack_emit(peer, &d, event);
+}
 
 static void
 tier1_resource_x_finish(ResourceXIntentSlot *owner, bool sent)
@@ -1271,6 +1353,8 @@ tier1_drain_pending(int32 target_node_id, int fd)
 			if (tier1_outbound_remaining[target_node_id] > 0)
 				return CLUSTER_IC_SEND_WOULD_BLOCK; /* still pending, defer new payload */
 			tier1_outbound_queued_total[target_node_id] = 0;
+			tier1_stop_ack_emit(target_node_id, &tier1_stop_ack_tail[target_node_id], "complete");
+			memset(&tier1_stop_ack_tail[target_node_id], 0, sizeof(Tier1StopAckTrace));
 			tier1_resource_x_finish(&tier1_resource_x_tail[target_node_id], true);
 		}
 
@@ -1299,6 +1383,8 @@ tier1_drain_pending(int32 target_node_id, int fd)
 		tier1_outbound_remaining[target_node_id] = frame->len;
 		tier1_outbound_queued_total[target_node_id] = frame->len;
 		tier1_resource_x_tail[target_node_id] = frame->resource_x_intent;
+		tier1_stop_ack_capture(target_node_id, frame->data, frame->len,
+							   &tier1_stop_ack_tail[target_node_id]);
 		pfree(frame);
 		if (Tier1Shmem != NULL)
 			pg_atomic_fetch_add_u64(&Tier1Shmem->fifo_promoted_count, 1);
@@ -1370,6 +1456,7 @@ tier1_fifo_reset(int32 peer_id)
 	while (frame != NULL) {
 		Tier1OutboundFrame *next = frame->next;
 
+		tier1_stop_ack_frame_event(peer_id, frame->data, frame->len, "discard");
 		tier1_resource_x_finish(&frame->resource_x_intent, false);
 		pfree(frame);
 		frame = next;
@@ -1574,6 +1661,7 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 			 * cursor base (dyn_size is capacity, never a cursor base). */
 			tier1_outbound_queued_total[target_node_id] = (int)len;
 			tier1_resource_x_capture(target_node_id, &tier1_resource_x_tail[target_node_id]);
+			tier1_stop_ack_capture(target_node_id, buf, len, &tier1_stop_ack_tail[target_node_id]);
 
 			return CLUSTER_IC_SEND_WOULD_BLOCK;
 		}
@@ -1619,6 +1707,7 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		 * base (dyn_size is capacity, never a cursor base). */
 		tier1_outbound_queued_total[target_node_id] = (int)tail_len;
 		tier1_resource_x_capture(target_node_id, &tier1_resource_x_tail[target_node_id]);
+		tier1_stop_ack_capture(target_node_id, buf, len, &tier1_stop_ack_tail[target_node_id]);
 
 		if (Tier1Shmem != NULL && sent > 0) {
 			pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send, (uint64)sent);
@@ -1636,6 +1725,7 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send, len);
 		Tier1Shmem->peers[target_node_id].last_send_at = GetCurrentTimestamp();
 	}
+	tier1_stop_ack_frame_event(target_node_id, buf, len, "complete");
 	return CLUSTER_IC_SEND_DONE;
 }
 
@@ -3250,6 +3340,8 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		return;
 	cluster_ic_tier1_trace_connection(DEBUG1, "close", peer_id, tier1_peer_fds[peer_id], -1,
 									 -1, -1, 0, 0);
+	tier1_stop_ack_emit(peer_id, &tier1_stop_ack_tail[peer_id], "discard");
+	memset(&tier1_stop_ack_tail[peer_id], 0, sizeof(Tier1StopAckTrace));
 	tier1_stream_serial[peer_id] = 0;
 	tier1_resource_x_finish(&tier1_resource_x_tail[peer_id], false);
 

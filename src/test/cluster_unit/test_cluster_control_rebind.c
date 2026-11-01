@@ -1601,10 +1601,55 @@ UT_TEST(rebind_stop_tail_rechecks_late_observation_and_publication)
 		rebind_stop_tail_finish();
 	}
 }
+UT_TEST(test_run15_proof_pending_names_actual_capability_cut_without_new_work)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		unsigned samples[2];
+		int sends[CLUSTER_MAX_NODES];
+		for (int on = 0; on < 2; on++) {
+			ClusterSemanticActivationAckTableV1 ordinary;
+			SemanticControlRebindShmem shared;
+			rebind_stop_tail_fixture(true);
+			test_terminal_peer_eligible = false;
+			test_open_proof_caps_busy = fault == 0;
+			ordinary = *SemanticActivationAckTable;
+			shared = *SemanticControlRebindState;
+			memcpy(sends, test_send_calls, sizeof(sends));
+			test_open_proof_caps_samples = 0;
+			cluster_trace_normal_stop = on;
+			test_capture_stop_log = true;
+			test_stop_diag_text[0] = 0;
+			/* Reset original episode's diagnostic owner through its existing no-stop path. */
+			test_terminal_stop = false;
+			(void)cluster_semantic_normal_stop_match(&test_serving_expected_open,
+													 test_serving_expected_root, NULL, NULL);
+			test_terminal_stop = true;
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&test_serving_expected_open,
+															test_serving_expected_root, NULL, NULL),
+						 CLUSTER_NORMAL_STOP_PENDING);
+			samples[on] = test_open_proof_caps_samples;
+			UT_ASSERT_EQ(memcmp(&ordinary, SemanticActivationAckTable, sizeof(ordinary)), 0);
+			UT_ASSERT_EQ(memcmp(&shared, SemanticControlRebindState, sizeof(shared)), 0);
+			UT_ASSERT_EQ(memcmp(sends, test_send_calls, sizeof(sends)), 0);
+			if (on)
+				UT_ASSERT(strstr(test_stop_diag_text,
+								 fault == 0 ? "predicate=proof.capability_snapshot_busy"
+											: "predicate=proof.peer_capability_missing")
+						  != NULL);
+			else
+				UT_ASSERT_EQ(strlen(test_stop_diag_text), 0);
+			test_terminal_peer_record_enabled = test_terminal_peer_eligible = false;
+			MyAuxProcType = NotAnAuxProcess;
+			test_first_open_finish();
+		}
+		UT_ASSERT_EQ(samples[0], samples[1]);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(95);
+	UT_PLAN(96);
 	UT_RUN(rebind_codec_has_independent_exact_request_and_ack_bytes);
 	UT_RUN(rebind_codec_rejects_invalid_identity_without_mutating_output);
 	UT_RUN(rebind_decoder_rejects_wrong_version_reserved_and_identity);
@@ -1700,6 +1745,7 @@ main(void)
 	UT_RUN(rebind_unfinished_stop_tail_cannot_complete_a_round);
 	UT_RUN(rebind_terminal_stop_tail_never_reopens_online_consumers);
 	UT_RUN(rebind_stop_tail_rechecks_late_observation_and_publication);
+	UT_RUN(test_run15_proof_pending_names_actual_capability_cut_without_new_work);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
