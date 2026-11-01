@@ -16350,3 +16350,26 @@ cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_r
 test_cluster_relmap_create_copy: test_cluster_relmap_recovery_create.inc \
         $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h \
         $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
+
+# Relmap diagnostics use the same frontend codecs as pg_waldump.
+TESTS += test_cluster_relmap_wal_desc
+all: test_cluster_relmap_wal_desc
+test_cluster_relmap_wal_desc: test_cluster_relmap_wal_desc.c unit_test.h \
+		$(top_srcdir)/src/backend/access/rmgrdesc/relmapdesc.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/backend/access/rmgrdesc/relmapdesc.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-relmap-wal-desc
+.PHONY: clean-relmap-wal-desc
+clean-relmap-wal-desc:
+	rm -f test_cluster_relmap_wal_desc test_cluster_relmap_wal_desc.d

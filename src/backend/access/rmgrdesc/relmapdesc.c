@@ -12,8 +12,16 @@
  *
  *-------------------------------------------------------------------------
  */
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS
+ *     Modified by: SqlRush <sqlrush@gmail.com>
+ *     Describe canonical creation records and reject malformed MAIN data.
+ *     Spec: 2026-11-01-pre2-e1-format-closure-v1.2-path-c.md
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
+#include "common/cluster_relmap_create.h"
 #include "utils/relmapper.h"
 
 void
@@ -24,11 +32,50 @@ relmap_desc(StringInfo buf, XLogReaderState *record)
 
 	if (info == XLOG_RELMAP_UPDATE)
 	{
-		xl_relmap_update *xlrec = (xl_relmap_update *) rec;
+		xl_relmap_update xlrec;
+		uint32 length = XLogRecGetDataLen(record);
 
+		if (rec == NULL || length < MinSizeOfRelmapUpdate)
+		{
+			appendStringInfoString(buf, "invalid update record");
+			return;
+		}
+		memcpy(&xlrec, rec, MinSizeOfRelmapUpdate);
+		if (xlrec.nbytes < 0 || (uint32) xlrec.nbytes != length - MinSizeOfRelmapUpdate)
+		{
+			appendStringInfoString(buf, "invalid update record");
+			return;
+		}
 		appendStringInfo(buf, "database %u tablespace %u size %d",
-						 xlrec->dbid, xlrec->tsid, xlrec->nbytes);
+						 xlrec.dbid, xlrec.tsid, xlrec.nbytes);
 	}
+	else if (info == XLOG_RELMAP_CREATE_V1)
+	{
+		ClusterRelmapCreateWalV1 creation;
+		char batch[33];
+		static const char hex[] = "0123456789abcdef";
+
+		if (XLogRecHasAnyBlockRefs(record) || XLogRecHasPageVersionEdge(record)
+			|| !cluster_relmap_create_decode_v1(rec, XLogRecGetDataLen(record), &creation))
+		{
+			appendStringInfoString(buf, "invalid creation record");
+			return;
+		}
+		for (unsigned i = 0; i < sizeof(creation.batch_uuid); ++i)
+		{
+			batch[2 * i] = hex[creation.batch_uuid[i] >> 4];
+			batch[2 * i + 1] = hex[creation.batch_uuid[i] & 15];
+		}
+		batch[32] = '\0';
+		appendStringInfo(buf, "database %u tablespace %u origin %u creation " UINT64_FORMAT
+						 " registration " UINT64_FORMAT " batch %s generation 1 mappings %d",
+						 creation.identity.database_oid, creation.identity.tablespace_oid,
+						 creation.identity.origin, creation.identity.creation_generation,
+						 creation.identity.registration_generation, batch,
+						 creation.committed.num_mappings);
+	}
+	else if (info == CLUSTER_RECOVERY_RELMAP_UPDATE_WAL_V2)
+		appendStringInfoString(buf, "unsupported managed update record");
 }
 
 const char *
@@ -40,6 +87,12 @@ relmap_identify(uint8 info)
 	{
 		case XLOG_RELMAP_UPDATE:
 			id = "UPDATE";
+			break;
+		case XLOG_RELMAP_CREATE_V1:
+			id = "CREATE_V1";
+			break;
+		case CLUSTER_RECOVERY_RELMAP_UPDATE_WAL_V2:
+			id = "UPDATE_V2";
 			break;
 	}
 
