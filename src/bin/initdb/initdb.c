@@ -267,7 +267,7 @@ static bool authwarning = false;
 /*
  * Centralized knowledge of switches to pass to backend
  *
- * Note: we run the backend with -F (fsync disabled) and then do a single
+ * Note: ordinary initdb runs the backend with -F (fsync disabled) and then does a single
  * pass of fsync'ing at the end.  This is faster than fsync'ing each step.
  *
  * Note: in the shell-script version, we also passed PGDATA as a -D switch,
@@ -3936,6 +3936,9 @@ pgrac_native_bind_creation(void)
 				unsetenv(PGRAC_INITDB_RECOVERY_ENV) != 0)
 				pg_fatal("INITDB_RECOVERY_CONTEXT: original precreation registration refused");
 			pgrac_native_recovery_requested = true;
+			/* Managed files must sync before the original registry/ROOT publish. */
+			boot_options = "-c fsync=on -c log_checkpoints=false";
+			backend_options = "--single -O -j -c fsync=on -c search_path=pg_catalog -c exit_on_error=true -c log_checkpoints=false";
 			pgrac_native_config_check(false);
 		}
 	}

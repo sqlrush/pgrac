@@ -15848,6 +15848,27 @@ clean: clean-initdb-recovery
 clean-initdb-recovery:
 	rm -f test_cluster_initdb_recovery_owner.inc test_cluster_initdb_recovery_owner.inc.tmp test_cluster_initdb_recovery test_cluster_initdb_recovery.d test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_fixture.inc.tmp test_cluster_initdb_recovery_dispatch.inc test_cluster_initdb_recovery_dispatch.inc.tmp
 
+# Original authenticated initdb binding selects both native child options.
+TESTS += test_cluster_initdb_child_sync
+all: test_cluster_initdb_child_sync
+test_cluster_initdb_child_sync_original.inc: $(top_srcdir)/src/bin/initdb/initdb.c
+	awk '/^static const char \*(boot_options|backend_options) = / { print; d++ } /^pgrac_native_bind_creation\(void\)/ { print "static void"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(d!=2 || n!=1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_initdb_child_sync: test_cluster_initdb_child_sync.c test_cluster_initdb_child_sync_original.inc test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_relmap.c unit_test.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -DFRONTEND $< $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-child-sync
+.PHONY: clean-initdb-child-sync
+clean-initdb-child-sync:
+	rm -f test_cluster_initdb_child_sync_original.inc test_cluster_initdb_child_sync_original.inc.tmp test_cluster_initdb_child_sync test_cluster_initdb_child_sync.d
+
 TESTS += test_cluster_control_file_selection
 all: test_cluster_control_file_selection
 test_cluster_control_file_selection: test_cluster_control_file_selection.c test_cluster_control_registry.c test_cluster_recovery_registry.c \
