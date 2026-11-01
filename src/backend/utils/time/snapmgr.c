@@ -62,6 +62,7 @@
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "port/pg_lfind.h"
+#include "storage/bufmgr.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -1226,7 +1227,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	ClusterSemanticAdmissionObservationResult result, admission;
 	PGPROC *owner = MyProc;
 	bool held_lock = false;
-	bool gate_known;
+	bool gate_known, pins_after;
 
 	if (out == NULL)
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
@@ -1247,6 +1248,8 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 		out->reason = "BACKEND_COLLECTION_CALLER_LOCK_HELD";
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
 	}
+	/* Original producer state only; this never pins, retires or grants use. */
+	sample.buffer_pins_pending = cluster_buffer_backend_has_pins();
 	admission = cluster_semantic_activation_admission_return_observe(expected_epoch,
 		expected_gate_epoch, expected_generation, &sample.admission);
 	if (admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
@@ -1261,6 +1264,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 		return result == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE ? result
 			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
 	}
+	pins_after = cluster_buffer_backend_has_pins();
 	gate_known = cluster_semantic_activation_wait_graph_snapshot(&gate);
 	ForEachLWLockHeldByMe(cluster_backend_collection_lock, &held_lock);
 	if (held_lock || CritSectionCount != 0 || MyProc != owner || !IsUnderPostmaster
@@ -1283,13 +1287,16 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 		|| gate.seq != sample.admission.seq || gate.active_bits != sample.admission.active_bits
 		|| gate.transition_closed != sample.admission.transition_closed
 		|| memcmp(&after.identity, &sample.snapshots.identity, sizeof(after.identity)) != 0
+		|| pins_after != sample.buffer_pins_pending
 		|| after.references != sample.snapshots.references
 		|| after.retained_read_scn != sample.snapshots.retained_read_scn) {
 		out->reason = "BACKEND_COLLECTION_POINT_CHANGED_OR_UNKNOWN";
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
 	}
 	sample.reason = sample.snapshots.references != 0 || sample.snapshots.retained_read_scn != 0
-		? sample.snapshots.reason : admission == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
+		? sample.snapshots.reason : sample.buffer_pins_pending
+		? "BACKEND_COLLECTION_BUFFER_PINS_PENDING"
+		: admission == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
 		? "BACKEND_COLLECTION_ADMISSION_PENDING" : "BACKEND_COLLECTION_PRODUCER_CLOSURE_UNPROVED";
 	*out = sample;
 	return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
