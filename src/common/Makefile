@@ -53,6 +53,8 @@ OBJS_COMMON = \
 	cluster_catalog_init.o \
 	cluster_catalog_manifest.o \
 	cluster_catalog_verify.o \
+	cluster_clog_file.o \
+	cluster_clog_wal.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_recovery_file_identity.o \
 	cluster_relmap_init.o \

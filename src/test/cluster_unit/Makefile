@@ -11300,7 +11300,7 @@ clean-cold-undo-scan:
 	rm -f cluster_unit_page_checksum.o
 
 test_cluster_clog_file: test_cluster_clog_file.c unit_test.h \
-		$(top_srcdir)/src/backend/access/transam/clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_srcdir)/src/include/access/clog_file.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
@@ -11309,7 +11309,7 @@ test_cluster_clog_file: test_cluster_clog_file.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_srcdir)/src/backend/access/transam/clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
@@ -11334,3 +11334,26 @@ clean: clean-recovery-identity-codec
 .PHONY: clean-recovery-identity-codec
 clean-recovery-identity-codec:
 	rm -f test_cluster_recovery_file_identity test_cluster_recovery_file_identity.d
+
+# Complete native CLOG descriptor with common file/record codecs.
+TESTS += test_cluster_clog_wal
+all: test_cluster_clog_wal
+test_cluster_clog_wal: test_cluster_clog_wal.c unit_test.h \
+        $(top_srcdir)/src/backend/access/rmgrdesc/clogdesc.c \
+        $(top_srcdir)/src/common/cluster_clog_wal.c \
+        $(top_srcdir)/src/common/cluster_clog_file.c \
+        $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+        $(top_srcdir)/src/include/access/clog_wal.h \
+        $(top_srcdir)/src/include/access/clog_file.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+        $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/backend/access/rmgrdesc/clogdesc.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
+clean: clean-clog-wal-observation
+.PHONY: clean-clog-wal-observation
+clean-clog-wal-observation:
+	rm -f test_cluster_clog_wal test_cluster_clog_wal.d

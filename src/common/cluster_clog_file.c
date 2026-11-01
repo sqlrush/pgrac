@@ -1,5 +1,9 @@
 /* Versioned CLOG file framing. Author: SqlRush <sqlrush@gmail.com> */
+#ifdef FRONTEND
+#include "postgres_fe.h"
+#else
 #include "postgres.h"
+#endif
 #include "access/clog_file.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
