@@ -747,6 +747,9 @@ struct ClusterRecoveryStartV1 {
 	bool effects_fixed;
 	ClusterColdEffectsReceiptV1 effects_receipt;
 	bool relmap_declared;
+	/* Original Start selection, retained after its narrow CF is released. */
+	bool managed_relmap_table;
+	ClusterControlNativeTableInfoV2 relmap_table;
 	bool ctrc_observation_started, ctrc_observation_complete;
 	bool ctrc_page_plan_started;
 	RfPageOnlinePlanV1 *ctrc_page_plan;
@@ -1361,6 +1364,12 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					memory_budget - bytes - physical_bytes, &state->ctrc_observation_census);
 				if (result != CLUSTER_RECOVERY_CENSUS_MORE) {
 					cluster_recovery_cold_observation_refuse(state, "census_begin", (int)result);
+					break;
+				}
+				if (state->managed_relmap_table
+					&& !cluster_recovery_census_bind_managed_relmap_v2(
+						state->ctrc_observation_census, &state->relmap_table)) {
+					cluster_recovery_cold_observation_refuse(state, "relmap_table", 0);
 					break;
 				}
 				for (;;) {
@@ -5829,10 +5838,11 @@ ClusterColdRecoveryTxC0Reserve(const struct ClusterRecoveryStartV1 *start,
  * target IR. The table is control input only; it carries no file lifetime,
  * native recovery, checkpoint or joint completion permission. */
 static bool
-cluster_recovery_cold_native_files_publish(const struct ClusterRecoveryStartV1 *start)
+cluster_recovery_cold_native_files_publish(struct ClusterRecoveryStartV1 *start)
 {
 	ClusterControlRelmapFormatV2 before, after;
-	volatile bool attempted = false, selected = false;
+	ClusterControlNativeTableInfoV2 table;
+	volatile bool attempted = false, selected = false, managed = false;
 
 	if (!cluster_recovery_cold_ctrc_replays_actor()
 		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
@@ -5864,6 +5874,17 @@ cluster_recovery_cold_native_files_publish(const struct ClusterRecoveryStartV1 *
 					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &after) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				&& !memcmp(&before, &after, sizeof(before))
 				&& ClusterColdRecoveryTxCurrent(start);
+			if (selected && before.root_version == 4) {
+				/* Save this exact publication under the same CF, never choose
+				 * a later table when the original census is opened. */
+				selected = cluster_control_native_files_info_v2(&table)
+					&& table.mode == CLUSTER_NATIVE_FILES_MANAGED_V2
+					&& table.table_generation != 0
+					&& table.startup_generation == start->owner_boot
+					&& !memcmp(&table.control.config, &before.config, sizeof(before.config))
+					&& ClusterColdRecoveryTxCurrent(start);
+				managed = selected;
+			}
 		}
 	}
 	PG_FINALLY();
@@ -5876,7 +5897,14 @@ cluster_recovery_cold_native_files_publish(const struct ClusterRecoveryStartV1 *
 	}
 	PG_END_TRY();
 	/* No CF is carried into the original WAL/namespace/census entries. */
-	return selected && ClusterColdRecoveryTxCurrent(start);
+	if (!selected || !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	if (managed) {
+		table.borrowed = 0; /* Local borrow traffic is not a new selection. */
+		start->relmap_table = table;
+		start->managed_relmap_table = true;
+	}
+	return true;
 }
 
 bool

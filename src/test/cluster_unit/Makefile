@@ -13523,12 +13523,20 @@ test_cluster_recovery_slru_scan: test_cluster_recovery_slru_scan.c test_cluster_
 test_cluster_recovery_relmap_scan: test_cluster_recovery_relmap_scan.c test_cluster_recovery_root_set.c test_cluster_recovery_relmap_fixture.h test_cluster_recovery_namespace.c test_cluster_recovery_crypto_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_relmap_scan.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_relmap_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_recovery_namespace: test_cluster_recovery_namespace.c unit_test.h \
@@ -16169,3 +16177,56 @@ clean: clean-control-clog-preparation
 .PHONY: clean-control-clog-preparation
 clean-control-clog-preparation:
 	rm -f test_cluster_control_clog_preparation test_cluster_control_clog_preparation.d
+
+# Managed physical maps borrow the original complete control selection.
+TESTS += test_cluster_recovery_managed_relmap_scan
+all: test_cluster_recovery_managed_relmap_scan
+test_cluster_recovery_managed_relmap_scan: test_cluster_recovery_managed_relmap_scan.c test_cluster_control_relmap_selection.c test_cluster_control_file_selection.c test_cluster_control_registry.c test_cluster_recovery_registry.c test_cluster_recovery_crypto_boundary.h unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_relmap_scan.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_root_set.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_relmap_scan.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) cluster_control_registry_original.o cluster_registry_common_test.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(top_srcdir)/src/common/cluster_relmap_v2.c \
+		cluster_control_registry_original.o $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-managed-relmap-scan
+.PHONY: clean-managed-relmap-scan
+clean-managed-relmap-scan:
+	rm -f test_cluster_recovery_managed_relmap_scan test_cluster_recovery_managed_relmap_scan.d
+
+# Original full census plus managed relmap scratch and real shared table.
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: \
+        test_cluster_recovery_managed_census_fixture.h test_cluster_recovery_managed_census.inc \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_relmap_scan.c \
+        $(top_srcdir)/src/include/cluster/cluster_control_file_identity.h
+
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: \
+        $(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+        $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+        $(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_relmap_scan.h
+
+test_cluster_recovery_relmap_scan test_cluster_recovery_managed_relmap_scan: \
+        test_cluster_recovery_relmap_table_unavailable.h \
+        $(top_srcdir)/src/include/cluster/cluster_control_native_files.h

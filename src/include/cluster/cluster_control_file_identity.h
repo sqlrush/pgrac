@@ -71,6 +71,11 @@ cluster_control_root_relmap_selection_recheck_locked_v4(ClusterControlRelmapSele
 extern ClusterControlRootResult cluster_control_root_relmap_selection_complete_locked_v4(
 	ClusterControlRelmapSelectionV2 *, const ClusterRecoveryFileIdentityV2 *completed,
 	uint64 count);
+/* Pure extent check over known selection/registry/vector storage, even after
+ * failure; no CF check, I/O, mutation or authority. Borrowers call before any
+ * output dereference/clear. Destroy still belongs to the original owner. */
+extern bool cluster_control_root_relmap_selection_output_distinct_v4(
+	const ClusterControlRelmapSelectionV2 *, const void *out, Size length);
 /* All returned values are copies. No pointer/view may outlive this local
  * custody. False/ERROR retains original CF/FD/pins/debt; destroy consumes only
  * local decoded storage and its own directory FD, before original owner exit.
