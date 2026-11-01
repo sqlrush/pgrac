@@ -2,6 +2,9 @@
  * socket transport, peer authentication and OS lock/storage leaves are
  * controlled; no master decision or native completion is manufactured.
  * Author: SqlRush <sqlrush@gmail.com> */
+#ifdef NATIVE_MASTER_HOLDER_COMPOSITION
+#include "test_cluster_native_holder.c"
+#else
 #define cluster_test_pcm_clock_gettime cluster_publish_fixture_clock_gettime
 #include "test_cluster_native_first_fill_fixture.inc"
 #undef cluster_test_pcm_clock_gettime
@@ -11,6 +14,7 @@
 #include "test_cluster_resource_x_master_ack_fixture.inc"
 #undef RESOURCE_X_ACQUIRE_REUSE_PCM_FIXTURE
 #undef gcs_block_resource_x_payload_candidate
+#endif
 #include "test_cluster_resource_x_master_done_ingress.inc"
 #include <unistd.h>
 #include <sys/socket.h>
@@ -58,12 +62,12 @@ static bool nm_receive(int fd, uint16 type, ResourceXDecodedFrame *frame)
 		&& cluster_resource_x_wire_decode(type, bytes, header[1], frame, &reject);
 }
 #define NM_REQUIRE(condition) do { bool ok_ = (condition); UT_ASSERT(ok_); if (!ok_) { printf("# Required: %s\n", #condition); return false; } } while (0)
-static bool nm_master_begin(PublishFixture *f, const ResourceXDecodedFrame *request)
+static bool nm_master_admit(PublishFixture *f, const ResourceXDecodedFrame *request)
 {
 	ClusterPcmResourceXMasterRequest canonical = {0};
 	unsigned matches = 0; Size offset;
 	unsigned char *memory;
-	acquire_reset(); memset(f, 0, sizeof(*f)); f->request = *request;
+	memset(f, 0, sizeof(*f)); f->request = *request;
 	NM_REQUIRE(acquire_canonical_start(&f->request, &f->work));
 	f->plan = decision_plan_read(&f->work);
 	canonical.base_authority_generation = f->plan.input.canonical_base_generation;
@@ -82,6 +86,10 @@ static bool nm_master_begin(PublishFixture *f, const ResourceXDecodedFrame *requ
 	NM_REQUIRE(matches == 1);
 	publish_apply(f);
 	return true;
+}
+static bool nm_master_begin(PublishFixture *f, const ResourceXDecodedFrame *request)
+{
+	acquire_reset(); return nm_master_admit(f, request);
 }
 static bool nm_master_callback(ResourceXIntentSlot *slot, bool sent)
 {
@@ -224,7 +232,7 @@ static bool nm_parent(int fd, int mode)
 	UT_ASSERT_EQ(complete_commits, 1); UT_ASSERT_EQ(ordinary_sends, 1);
 	complete_idle(); return true;
 }
-static void nm_run(int mode)
+static void nm_run_roles(int mode, bool (*master)(int, int), bool (*parent)(int, int))
 {
 	int sockets[2], status = 0; pid_t child; bool ok;
 	int created = socketpair(AF_UNIX, SOCK_STREAM, 0, sockets);
@@ -235,10 +243,10 @@ static void nm_run(int mode)
 	fflush(NULL); child = fork(); UT_ASSERT(child >= 0);
 	if (child < 0) { close(sockets[0]); close(sockets[1]); return; }
 	if (child == 0) {
-		close(sockets[0]); ok = nm_master(sockets[1], mode); close(sockets[1]);
+		close(sockets[0]); ok = master(sockets[1], mode); close(sockets[1]);
 		fflush(NULL); _exit(ok && !ut_current_failed ? 0 : 1);
 	}
-	close(sockets[1]); ok = nm_parent(sockets[0], mode); close(sockets[0]);
+	close(sockets[1]); ok = parent(sockets[0], mode); close(sockets[0]);
 	UT_ASSERT(ok);
 	/* IPC failure closes the peer and releases a blocked role. Only this
 	 * test's own child is reaped; no other process or test environment. */
@@ -251,6 +259,7 @@ static void nm_run(int mode)
 	UT_ASSERT_EQ(reaped, child);
 	UT_ASSERT(WIFEXITED(status)); if (WIFEXITED(status)) UT_ASSERT_EQ(WEXITSTATUS(status), 0);
 }
+static void nm_run(int mode) { nm_run_roles(mode, nm_master, nm_parent); }
 UT_TEST(test_native_master_actual_disk_episode) { nm_run(0); }
 UT_TEST(test_native_master_done_before_grant_callback) { nm_run(1); }
 UT_TEST(test_native_master_duplicate_frames_complete_once) { nm_run(2); }

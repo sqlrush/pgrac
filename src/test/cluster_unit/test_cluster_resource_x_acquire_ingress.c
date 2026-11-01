@@ -1366,9 +1366,8 @@ UT_TEST(test_service_snapshot_unsealed_proof_is_required_for_entire_canonical)
  * wire lacks a remote requester boot; only a colocated original session can
  * produce known provenance before the complete conditional producer exists. */
 static void
-provenance_grant(int32 node)
+provenance_grant_for(int32 node, BufferTag tag)
 {
-	BufferTag tag = make_tag(850);
 	ResourceXDecodedFrame assertion, settlement;
 	ResourceXDurableProof durable = {0};
 	ResourceXMasterSnapshot snapshot;
@@ -1415,6 +1414,12 @@ provenance_grant(int32 node)
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_settled_retire_exact(
 		&assertion.common.logical_assertion, 41, &snapshot), RESOURCE_X_APPLY_APPLIED);
+}
+
+static void
+provenance_grant(int32 node)
+{
+	provenance_grant_for(node, make_tag(850));
 }
 
 static bool

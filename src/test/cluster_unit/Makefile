@@ -11591,3 +11591,27 @@ clean distclean maintainer-clean: clean-native-master
 .PHONY: clean-native-master
 clean-native-master:
 	rm -f test_cluster_native_master
+
+# Real current-source production through requester and master retirement.
+TESTS += test_cluster_native_current
+all: test_cluster_native_current
+test_cluster_native_current: test_cluster_native_current.c test_cluster_native_holder test_cluster_native_master \
+		test_cluster_native_first_fill_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
+		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_candidate.inc \
+		test_cluster_resource_x_master_done_ingress.inc test_cluster_native_master_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_master_fixture.inc: test_cluster_native_master.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-current
+.PHONY: clean-native-current
+clean-native-current:
+	rm -f test_cluster_native_current test_cluster_native_master_fixture.inc \
+		test_cluster_native_master_fixture.inc.tmp

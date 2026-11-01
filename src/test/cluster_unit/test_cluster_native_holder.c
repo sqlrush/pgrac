@@ -19,6 +19,7 @@ static bool holder_content_busy;
 static unsigned holder_pins, holder_fuses;
 static unsigned holder_interrupt_repairs, holder_interrupt_releases;
 static bool holder_peer_current = true;
+static uint32 holder_requester_connection = 83;
 static void (*holder_after_prepare)(void);
 static void holder_pin(BufferDesc *buf, uint32 state)
 {
@@ -187,13 +188,13 @@ static bool holder_master_peer(int32 node, uint32 *connection)
 static ResourceXApplyResult holder_peer_result(const ClusterSemanticAdmissionToken *admission,
 	int32 node, uint32 connection)
 {
-	return holder_peer_current && admission->entered && ((node == 0 && connection == 61) || (node == 1 && connection == 83))
+	return holder_peer_current && admission->entered && ((node == 0 && connection == 61) || (node == 1 && connection == holder_requester_connection))
 		? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE;
 }
 static bool holder_peer_sample(int32 node, uint64 required, uint64 *caps, uint32 *connection)
 {
 	UT_ASSERT(node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
-	*caps = required; *connection = 83; return true;
+	*caps = required; *connection = holder_requester_connection; return true;
 }
 #define cluster_sf_peer_capability_word_sample holder_peer_sample
 static ErrorData holder_error = { .message = "controlled storage ERROR" };
@@ -234,10 +235,9 @@ static bool holder_probe(ResourceXSourceDrainWork *work)
 	}
 	return false;
 }
-static bool holder_start_role(HolderFixture *f, PcmState mode, PcmState target, int32 holder)
+static void holder_native_start(PcmState mode)
 {
 	ClusterBufmgrFirstFill scratch;
-	uint32 state;
 	ordinary_start(&scratch, 2);
 	ResourceOwnerForgetBufferIO(CurrentResourceOwner, 1);
 	memset(&request_own, 0, sizeof(request_own));
@@ -253,6 +253,12 @@ static bool holder_start_role(HolderFixture *f, PcmState mode, PcmState target, 
 	holder_after_prepare = NULL; holder_peer_current = true; holder_write_error = false;
 	holder_io_enters = holder_io_ends = 0;
 	holder_interrupt_repairs = holder_interrupt_releases = 0;
+	holder_requester_connection = 83;
+}
+static bool holder_start_role(HolderFixture *f, PcmState mode, PcmState target, int32 holder)
+{
+	uint32 state;
+	holder_native_start(mode);
 	memset(f, 0, sizeof(*f));
 	if (!publish_start(mode == PCM_STATE_X ? 1 : 2, target, &f->master)) return false;
 	publish_apply(&f->master);
@@ -914,7 +920,7 @@ UT_TEST(test_other_S_holder_corrupt_receipt_cannot_release_native_fence)
 		UT_ASSERT_EQ(holder_pins, 0); complete_idle();
 	}
 }
-#ifdef NATIVE_HOLDER_WRITEBACK
+#if defined(NATIVE_HOLDER_WRITEBACK) || defined(NATIVE_MASTER_HOLDER_COMPOSITION)
 int holder_clean_fixture_main(void)
 #else
 int main(void)
