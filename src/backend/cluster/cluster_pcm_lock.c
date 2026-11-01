@@ -25863,7 +25863,7 @@ cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(const ResourceXDecode
 	ResourceXSourceDrainWork work;
 	PcmEntryRef ref;
 	PcmEntryAcquireResult acquired;
-	ResourceXApplyResult result;
+	ResourceXApplyResult result, capacity;
 
 	if (r4 == 0 || r4 == UINT64_MAX || authenticated_connection == 0
 		|| authenticated_connection == UINT32_MAX
@@ -25883,8 +25883,10 @@ cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(const ResourceXDecode
 	if (!pcm_resource_x_pi_carrier_decode_locked(ref.entry, state, NULL)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
 	}
-	result = pcm_resource_x_s_source_ack_capacity_locked(ref.entry, state);
-	if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+	capacity = pcm_resource_x_s_source_ack_capacity_locked(ref.entry, state);
+	if (capacity != RESOURCE_X_APPLY_APPLIED && capacity != RESOURCE_X_APPLY_LOCAL_WAIT) {
+		result = capacity; goto done;
+	}
 	if (state->holder_coverage_forward.valid != 0) {
 		result = pcm_resource_x_s_source_coverage_valid(ref.entry, state, &retained)
 			&& memcmp(&status, &state->holder_coverage_forward, sizeof(status)) == 0
@@ -25893,16 +25895,25 @@ cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(const ResourceXDecode
 			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE;
 		goto done;
 	}
-	if ((state->pi_carrier.pi_refs || state->pi_carrier.transport_refs)
-		&& !pcm_resource_x_s_source_block_matches(state, &canonical)) {
+	if (capacity == RESOURCE_X_APPLY_LOCAL_WAIT
+		|| ((state->pi_carrier.pi_refs || state->pi_carrier.transport_refs)
+			&& !pcm_resource_x_s_source_block_matches(state, &canonical))) {
 		ResourceXDecodedFrame prior;
 
+		/* The master may consume the old ACK before its local physical
+		 * callback returns. Retain only control behind that exact receipt;
+		 * neither its ACK slot nor its independently owned PI moves here. */
 		if (state->pi_carrier.transport_refs || state->pi_carrier.completed.flags != 0
-			|| state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
-			|| !pcm_resource_x_s_source_intent_empty(&state->holder_status_intent.slot)
+			|| (capacity == RESOURCE_X_APPLY_APPLIED
+				&& !pcm_resource_x_s_source_intent_empty(&state->holder_status_intent.slot))
 			|| !pcm_resource_x_s_source_intent_empty(&state->holder_image_intent)
 			|| state->holder_pi_first.source_flags != 0
-			|| !pcm_resource_x_pi_prior_settlement_locked(ref.entry, state, &canonical, &prior)) {
+			|| !pcm_resource_x_pi_prior_settlement_locked(ref.entry, state, &canonical, &prior)
+			|| (state->pi_carrier.pi_refs
+				? (state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+					|| !pcm_resource_x_s_source_block_matches(state, &prior))
+				: (!pcm_resource_x_s_source_empty(state)
+					|| state->holder_status.valid != 0 || state->holder_image.valid != 0))) {
 			result = RESOURCE_X_APPLY_LOCAL_WAIT; goto done;
 		}
 		if (!pcm_resource_x_s_source_work_reserve_locked(ref.entry, &canonical, master,
@@ -26765,8 +26776,16 @@ cluster_pcm_lock_resource_x_source_coverage_claim_exact(const ResourceXSourceDra
 	state = pcm_resource_x_master_state_for_entry(ref.entry);
 	if (state != NULL && memcmp(work, &ref.entry->resource_x_source_drain, sizeof(*work)) == 0
 		&& pcm_resource_x_s_source_coverage_valid(ref.entry, state, &current)
-		&& memcmp(&current, block, sizeof(current)) == 0
-		&& pcm_resource_x_intent_mark_pending(false)) {
+		&& memcmp(&current, block, sizeof(current)) == 0) {
+		/* Saving a FORWARD is not permission to consume the old send slot.
+		 * Cancel/unclaim remain available while that callback is pending. */
+		if (claimed) {
+			result = pcm_resource_x_s_source_ack_capacity_locked(ref.entry, state);
+			if (result != RESOURCE_X_APPLY_APPLIED) goto done;
+		}
+		if (!pcm_resource_x_intent_mark_pending(false)) {
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED; goto done;
+		}
 		result = claimed && state->holder_coverage_claimed ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_APPLIED;
 		state->holder_coverage_claimed = claimed ? 1 : 0;
 		if (cancel) {
@@ -26775,6 +26794,7 @@ cluster_pcm_lock_resource_x_source_coverage_claim_exact(const ResourceXSourceDra
 			pcm_resource_x_source_drain_clear_locked(ref.entry);
 		}
 	}
+done:
 	LWLockRelease(&ref.entry->entry_lock.lock); pcm_entry_ref_release(&ref);
 	return result;
 }
@@ -35039,11 +35059,14 @@ cluster_pcm_lock_resource_x_outbound_intent_complete_exact(const ResourceXIntent
 	PcmEntryRef entry_ref;
 	ResourceXIntentSlot *slot;
 	uint8 *payload;
-	bool completed;
+	bool completed, source_ack;
 
 	slot = pcm_resource_x_outbound_intent_lock_exact(expected, &entry_ref, &payload);
 	if (slot == NULL)
 		return false;
+	source_ack = expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_STATUS
+		&& expected->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2
+		&& expected->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
 	/* Only the physical callback may discharge the consumed notification. */
 	completed = !(slot->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT
 		&& slot->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
@@ -35066,6 +35089,8 @@ cluster_pcm_lock_resource_x_outbound_intent_complete_exact(const ResourceXIntent
 	}
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
+	if (completed && source_ack)
+		cluster_pcm_lock_resource_x_source_drain_content_released();
 	return completed;
 }
 
@@ -35078,13 +35103,16 @@ cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXInt
 	PcmEntryRef entry_ref;
 	ResourceXIntentSlot *slot;
 	uint8 *payload;
-	bool applied = false;
+	bool applied = false, source_ack;
 
 	if (expected == NULL || expected->send_episode == 0 || now_us == 0 || now_us == UINT64_MAX)
 		return false;
 	slot = pcm_resource_x_outbound_intent_lock_exact(expected, &entry_ref, &payload);
 	if (slot == NULL)
 		return false;
+	source_ack = expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_STATUS
+		&& expected->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2
+		&& expected->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
 	if (slot->state == RESOURCE_X_INTENT_SLOT_STAGED
 		&& pcm_resource_x_intent_identity_equal(slot, expected)
 		&& slot->send_episode == expected->send_episode
@@ -35141,6 +35169,8 @@ cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXInt
 			pcm_resource_x_master_state_for_entry(entry_ref.entry));
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
+	if (applied && sent && source_ack)
+		cluster_pcm_lock_resource_x_source_drain_content_released();
 	return applied;
 }
 

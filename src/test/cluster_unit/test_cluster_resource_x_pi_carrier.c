@@ -562,13 +562,43 @@ pi_capacity_observe(PiFixture *f, const ResourceXDecodedFrame *block,
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(block,
 		2, 7, &f->source.prepared, f->source.page.data, &f->last, 83, 61, 83, 61), wanted);
 	UT_ASSERT(memcmp(&before, f->source.m.state, sizeof(before)) == 0);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(block,
-		2, 83, 61), wanted);
-	UT_ASSERT(memcmp(&before, f->source.m.state, sizeof(before)) == 0);
+	if (wanted == RESOURCE_X_APPLY_LOCAL_WAIT
+		&& before.holder_status_intent.slot.kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2) {
+		ClusterPcmResourceXMasterState retained;
+		ResourceXDecodedFrame forward; ResourceXWireReject reject;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(block, 2, 83, 61),
+			before.holder_coverage_forward.valid ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_APPLIED);
+		retained = *f->source.m.state;
+		UT_ASSERT_EQ(retained.holder_coverage_forward.valid, RESOURCE_X_HOLDER_SOURCE_FORWARD);
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N,
+			retained.holder_coverage_forward.payload, retained.holder_coverage_forward.payload_bytes, &forward, &reject));
+		UT_ASSERT(memcmp(&forward, block, sizeof(forward)) == 0);
+		retained.holder_coverage_forward = before.holder_coverage_forward;
+		UT_ASSERT(memcmp(&before, &retained, sizeof(before)) == 0);
+	} else {
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(block, 2, 83, 61), wanted);
+		UT_ASSERT(memcmp(&before, f->source.m.state, sizeof(before)) == 0);
+	}
 	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f->local.resource, &after));
 	UT_ASSERT(memcmp(&local, &after, sizeof(local)) == 0);
 	UT_ASSERT(memcmp(page.data, f->source.page.data, BLCKSZ) == 0);
 	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps);
+}
+static bool
+pi_capacity_claim(ResourceXSourceDrainWork *work)
+{
+	BackendType saved = MyBackendType;
+	ResourceXIntentSlot slot; ResourceXAcquisitionRef delivery;
+	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES]; uint32 examined; bool found = false;
+	MyBackendType = B_LMS;
+	for (int n = 0; n < 256; n++) {
+		ResourceXIntentProbeResult result = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+			4, &slot, payload, sizeof(payload), &examined, &delivery);
+		UT_ASSERT(result != RESOURCE_X_INTENT_PROBE_CORRUPT);
+		if (result == RESOURCE_X_INTENT_PROBE_SOURCE_DRAIN) { memcpy(work, payload, sizeof(*work)); found = true; break; }
+		if (result == RESOURCE_X_INTENT_PROBE_IDLE || result == RESOURCE_X_INTENT_PROBE_COMPLETE) break;
+	}
+	MyBackendType = saved; return found;
 }
 static void
 pi_capacity_lifetimes(PcmState mode, bool data_first)
@@ -605,8 +635,13 @@ pi_capacity_lifetimes(PcmState mode, bool data_first)
 	UT_ASSERT_EQ(f.source.m.state->pi_carrier.pi_refs, 0);
 	UT_ASSERT_EQ(f.source.m.state->pi_carrier.transport_refs, 0);
 	next = f.source.prepared; next.generation += 2; next.reservation_token += 2;
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(&block,
-		2, 7, &next, f.source.page.data, &f.last, 83, 61, 83, 61), RESOURCE_X_APPLY_APPLIED);
+	{
+		ResourceXSourceDrainWork work;
+		if (!pi_capacity_claim(&work)) UT_ASSERT(pi_capacity_claim(&work));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_claim_exact(&work, &block, true, false), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(&work,
+			7, &next, f.source.page.data, &f.last, 83, 61), RESOURCE_X_APPLY_APPLIED);
+	}
 	UT_ASSERT_EQ(f.source.m.state->holder_image.valid, RESOURCE_X_HOLDER_PAIR_PENDING);
 	UT_ASSERT_EQ(f.source.m.state->holder_status.authority_generation, block.common.authority_generation);
 	printf("# capacity mode=%d DATA-first=%d old-PI=0 old-transport=0 old-ACK=0 successor=owned\n", mode, data_first);

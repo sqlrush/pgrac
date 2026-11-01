@@ -1310,6 +1310,7 @@ cluster_pi_writeback_source_begin_v1(const ResourceXSourceDrainWork *work,
 		sizeof(request.forward), &length, &reject) || length != sizeof(request.forward))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	claimed = cluster_pcm_lock_resource_x_source_coverage_claim_exact(work, forward, true, false);
+	if (claimed == RESOURCE_X_APPLY_LOCAL_WAIT) return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	if (claimed != RESOURCE_X_APPLY_APPLIED && claimed != RESOURCE_X_APPLY_DUPLICATE) return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	SpinLockAcquire(&wb_shared->lock);
 	if (wb_shared->inbound_version == WB_LOCAL_SOURCE

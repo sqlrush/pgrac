@@ -111,10 +111,10 @@ void cluster_thread_recovery_fabric_plan_destroy_v1(ClusterThreadRecoveryFabricP
 	if (*plan) rf_page_online_plan_destroy_v1(&coverage_fixture->plan);
 	*plan = NULL;
 }
-static bool coverage_start(ReplaceFixture *f, ResourceXSourceDrainWork *work)
+static bool coverage_start_phase(ReplaceFixture *f, ResourceXSourceDrainWork *work, bool quiet, bool retired)
 {
 	ResourceXApplyResult r;
-	if (!replace_start(f, true)) return false;
+	if (!replace_start(f, quiet)) return false;
 	rf_page_online_plan_destroy_v1(&f->plan);
 	coverage_fixture = f; coverage_input_wait = false; coverage_input_current = true;
 	coverage_input_pinned = false; coverage_plans = coverage_releases = coverage_aborts = 0;
@@ -123,10 +123,13 @@ static bool coverage_start(ReplaceFixture *f, ResourceXSourceDrainWork *work)
 	wb_shared = calloc(1, sizeof(*wb_shared)); SpinLockInit(&wb_shared->lock);
 	pg_atomic_init_u64(&wb_shared->local_revision, 1); wb_shared->bgwriter_procno = -1;
 	wb_notice = NULL;
+	if (retired) { local_pi_covered = true; UT_ASSERT(pi_retire(&f->old, false)); }
 	r = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f->block, 2, 77, 61);
 	UT_ASSERT_EQ(r, RESOURCE_X_APPLY_APPLIED);
 	return r == RESOURCE_X_APPLY_APPLIED && replace_claim(work);
 }
+static bool coverage_start(ReplaceFixture *f, ResourceXSourceDrainWork *work)
+{ return coverage_start_phase(f, work, true, false); }
 static void coverage_end(ReplaceFixture *f)
 {
 	if (wb_notice) {
@@ -310,9 +313,171 @@ UT_TEST(test_duplicate_begin_cannot_unclaim_an_existing_job)
 	local_pi_writer = saved; MyBackendType = B_BG_WRITER; UT_ASSERT(wb_source_tick());
 	UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY); coverage_end(&f);
 }
+/* The remote master may have consumed the ACK before its sender callback.
+ * The real old settlement, ACK transport, PCM work and background job run. */
+static bool capacity_start(ReplaceFixture *f, ResourceXSourceDrainWork *work)
+{ return coverage_start_phase(f, work, false, false); }
+static void capacity_wait(ReplaceFixture *f, const ResourceXSourceDrainWork *work)
+{
+	UT_ASSERT_EQ(cluster_pi_writeback_source_begin_v1(work, &f->block), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY);
+	UT_ASSERT_EQ(f->old.source.m.state->holder_coverage_claimed, 0);
+	UT_ASSERT_EQ(coverage_plans, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(work,
+		RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+}
+static void capacity_finish(ReplaceFixture *f)
+{
+	ResourceXSourceDrainWork next;
+	if (!replace_claim(&next)) UT_ASSERT(replace_claim(&next));
+	UT_ASSERT(coverage_enqueue(f, &next));
+	MyBackendType = B_BG_WRITER; UT_ASSERT(wb_source_tick());
+	UT_ASSERT_EQ(coverage_plans, 1); UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY);
+	MyBackendType = B_LMS;
+	if (!replace_claim(&next)) UT_ASSERT(replace_claim(&next));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(&f->block, 2, 7,
+		&f->prepared, &f->finished), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&next,
+		RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+}
+UT_TEST(test_remote_successor_waits_for_original_ACK_callback)
+{
+	for (int staged = 0; staged < 2; staged++) {
+		ReplaceFixture f; ResourceXSourceDrainWork work, next; ResourceXIntentSlot ack;
+		ClusterPcmResourceXPiCarrier carrier; int refs;
+		if (!capacity_start(&f, &work)) { coverage_end(&f); return; }
+		if (staged) ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot);
+		else ack = f.old.source.m.state->holder_status_intent.slot;
+		carrier = f.old.source.m.state->pi_carrier; refs = replace_references;
+		capacity_wait(&f, &work);
+		UT_ASSERT(memcmp(&ack, &f.old.source.m.state->holder_status_intent.slot, sizeof(ack)) == 0);
+		UT_ASSERT(memcmp(&carrier, &f.old.source.m.state->pi_carrier, sizeof(carrier)) == 0);
+		UT_ASSERT_EQ(replace_references, refs); UT_ASSERT(!replace_claim(&next));
+		if (!staged) ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, true, ++fake_pcm_clock_us));
+		capacity_finish(&f); UT_ASSERT_EQ(replace_references, refs); coverage_end(&f);
+	}
+}
+UT_TEST(test_failed_ACK_keeps_old_send_and_new_service)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work, next; ResourceXIntentSlot ack;
+	if (!capacity_start(&f, &work)) { coverage_end(&f); return; }
+	ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot); capacity_wait(&f, &work);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, false, ++fake_pcm_clock_us));
+	UT_ASSERT_EQ(f.old.source.m.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT(!replace_claim(&next));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(
+		&f.old.source.m.state->holder_status_intent.slot, ++fake_pcm_clock_us, &ack), RESOURCE_X_INTENT_NOT_DUE);
+	/* Advance the clock leaf through the unchanged 500ms transport backoff. */
+	fake_pcm_clock_us += 500000;
+	ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, true, ++fake_pcm_clock_us));
+	capacity_finish(&f); coverage_end(&f);
+}
+UT_TEST(test_DATA_before_ACK_keeps_successor_and_finishes_without_old_body)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work, next; ResourceXIntentSlot ack;
+	if (!capacity_start(&f, &work)) { coverage_end(&f); return; }
+	ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot); capacity_wait(&f, &work);
+	local_pi_covered = true; UT_ASSERT(pi_retire(&f.old, false));
+	UT_ASSERT_EQ(f.old.source.m.state->pi_carrier.pi_refs, 0); UT_ASSERT(!replace_claim(&next));
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, true, ++fake_pcm_clock_us));
+	capacity_finish(&f); coverage_end(&f);
+}
+UT_TEST(test_duplicate_FORWARD_and_old_settlement_preserve_parked_service)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work; ClusterPcmResourceXMasterState before;
+	if (!capacity_start(&f, &work)) { coverage_end(&f); return; }
+	before = *f.old.source.m.state;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 77, 61), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 78, 61), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 77, 62), RESOURCE_X_APPLY_STALE);
+	f.block.body.acquire_decision.source_service_generation++; UT_ASSERT(replace_block_encode(&f));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 77, 61), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(clean_receive(&f.request), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0); coverage_end(&f);
+}
+UT_TEST(test_cancel_preserves_old_ACK_PI_and_rejects_late_callback)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work; ResourceXIntentSlot ack;
+	ClusterPcmResourceXPiCarrier carrier; ResourceXDecodedFrame block;
+	if (!capacity_start(&f, &work)) { coverage_end(&f); return; }
+	ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot); carrier = f.old.source.m.state->pi_carrier;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_claim_exact(&work, &f.block, false, true), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(memcmp(&carrier, &f.old.source.m.state->pi_carrier, sizeof(carrier)) == 0);
+	UT_ASSERT(memcmp(&ack, &f.old.source.m.state->holder_status_intent.slot, sizeof(ack)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(&work, &block), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, true, ++fake_pcm_clock_us));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 77, 61), RESOURCE_X_APPLY_APPLIED);
+	capacity_finish(&f);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, true, ++fake_pcm_clock_us));
+	coverage_end(&f);
+}
+UT_TEST(test_ACK_release_between_busy_and_rearm_is_not_lost)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work; ResourceXIntentSlot ack;
+	if (!capacity_start(&f, &work)) { coverage_end(&f); return; }
+	ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot);
+	UT_ASSERT_EQ(cluster_pi_writeback_source_begin_v1(&work, &f.block), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, true, ++fake_pcm_clock_us));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work,
+		RESOURCE_X_APPLY_BAD_STATE), RESOURCE_X_APPLY_APPLIED);
+	capacity_finish(&f); coverage_end(&f);
+}
+UT_TEST(test_malformed_ACK_cannot_admit_successor)
+{
+	ReplaceFixture f; ClusterPcmResourceXMasterState before;
+	if (!replace_start(&f, false)) return;
+	f.old.source.m.state->holder_status_intent.slot.authority_generation++; before = *f.old.source.m.state;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 77, 61), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0); replace_end(&f);
+}
+UT_TEST(test_unsettled_transport_cannot_be_displaced_by_successor)
+{
+	ReplaceFixture f; ClusterPcmResourceXMasterState before;
+	if (!replace_start_phase(&f, 0)) return;
+	before = *f.old.source.m.state;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 77, 61), RESOURCE_X_APPLY_LOCAL_WAIT);
+	UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0);
+	UT_ASSERT_EQ(clean_receive(&f.request), RESOURCE_X_APPLY_APPLIED);
+	clean_send(&f.old.source.m.state->holder_status_intent.slot); replace_end(&f);
+}
+
+UT_TEST(test_DATA_already_retired_before_FORWARD_keeps_ACK_owner)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work; ResourceXIntentSlot ack;
+	if (!coverage_start_phase(&f, &work, false, true)) { coverage_end(&f); return; }
+	UT_ASSERT_EQ(f.old.source.m.state->pi_carrier.pi_refs, 0);
+	ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot); capacity_wait(&f, &work);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&ack, true, ++fake_pcm_clock_us));
+	capacity_finish(&f); coverage_end(&f);
+}
+UT_TEST(test_original_intent_completion_also_releases_capacity)
+{
+	ReplaceFixture f; ResourceXSourceDrainWork work; ResourceXIntentSlot ack;
+	if (!capacity_start(&f, &work)) { coverage_end(&f); return; }
+	ack = clean_stage(&f.old.source.m.state->holder_status_intent.slot); capacity_wait(&f, &work);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&ack));
+	capacity_finish(&f); coverage_end(&f);
+}
+UT_TEST(test_unproved_prior_domain_cannot_use_ACK_capacity)
+{
+	for (int domain = 0; domain < 4; domain++) {
+		ReplaceFixture f; ClusterPcmResourceXMasterState before; ResourceXApplyResult result;
+		if (!replace_start(&f, false)) return;
+		if (domain == 0) f.block.body.acquire_decision.resource_binding++;
+		else if (domain == 1) f.block.common.master_session_incarnation++;
+		else if (domain == 2) f.block.common.resource_formation++;
+		else { f.block.common.authority_generation--; f.block.common.base_authority_generation--; }
+		UT_ASSERT(replace_block_encode(&f)); before = *f.old.source.m.state;
+		result = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&f.block, 2, 77, 61);
+		UT_ASSERT(result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(memcmp(&before, f.old.source.m.state, sizeof(before)) == 0); replace_end(&f);
+	}
+}
 int main(void)
 {
-	UT_PLAN(10); UT_RUN(test_original_holder_park_job_carrier_and_LMS_resume);
+	UT_PLAN(21); UT_RUN(test_original_holder_park_job_carrier_and_LMS_resume);
 	UT_RUN(test_ROOT_lock_contention_keeps_the_same_service_and_PI);
 	UT_RUN(test_old_DATA_completion_does_not_hide_the_new_FORWARD);
 	UT_RUN(test_ordinary_job_capacity_release_wakes_the_parked_source);
@@ -322,5 +487,16 @@ int main(void)
 	UT_RUN(test_BG_ERROR_requeues_the_original_job_and_claim);
 	UT_RUN(test_exact_cancel_preserves_PI_and_late_job_cannot_touch_successor);
 	UT_RUN(test_duplicate_begin_cannot_unclaim_an_existing_job);
+	UT_RUN(test_remote_successor_waits_for_original_ACK_callback);
+	UT_RUN(test_failed_ACK_keeps_old_send_and_new_service);
+	UT_RUN(test_DATA_before_ACK_keeps_successor_and_finishes_without_old_body);
+	UT_RUN(test_duplicate_FORWARD_and_old_settlement_preserve_parked_service);
+	UT_RUN(test_cancel_preserves_old_ACK_PI_and_rejects_late_callback);
+	UT_RUN(test_ACK_release_between_busy_and_rearm_is_not_lost);
+	UT_RUN(test_malformed_ACK_cannot_admit_successor);
+	UT_RUN(test_unsettled_transport_cannot_be_displaced_by_successor);
+	UT_RUN(test_DATA_already_retired_before_FORWARD_keeps_ACK_owner);
+	UT_RUN(test_original_intent_completion_also_releases_capacity);
+	UT_RUN(test_unproved_prior_domain_cannot_use_ACK_capacity);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }
