@@ -68,11 +68,12 @@
  *	  buf                         -- caller-provided 8KB buffer (BLCKSZ)
  *
  *	Returns: true on success, false on I/O error or short read.
- *  Managed TT block zero additionally borrows the independently selected
+ *  Managed block reads additionally borrow the independently selected
  *  UNDO identity and validates the complete TT40 reference and checksum on
  *  the same FD, including cache hits. Refusal/ERROR preserves buf. This I/O
  *  borrow grants no current/recovery authority or longer resident lifetime;
- *  the original caller retains those obligations. DATA blocks are unchanged.
+ *  the original caller retains those obligations. DATA reads validate block
+ *  zero on that same FD before reading the requested DATA block.
  */
 extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment_id,
 										 uint8 owner_instance, uint32 block_no, char *buf);
@@ -91,9 +92,11 @@ extern bool cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 se
  *
  *	NOT critical-section safe.
  */
-/* Selected native block-zero writes require a valid TT40 successor and an
- * already matching on-disk page. One file-identity borrow spans write/fsync;
- * the caller still owns content-X, WAL and the original file lifetime. */
+/* Selected native writes require an already matching TT40 file header. A
+ * block-zero successor must also be a valid sealed page. One file-identity
+ * borrow spans header validation and DATA/block-zero write/fsync; the caller
+ * still owns content-X, WAL and the original file lifetime. Late refusal does
+ * not undo any completed write. */
 extern bool cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id,
 										  uint8 owner_instance, uint32 block_no, const char *buf,
 										  bool do_fsync);
