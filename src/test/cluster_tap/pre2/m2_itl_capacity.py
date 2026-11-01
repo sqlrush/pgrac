@@ -436,6 +436,36 @@ def _requalification_wait_identity(row):
     return tuple(number(row.get(k)) for k in fields) + (row.get('uba0'), row.get('uba1'), proc)
 
 
+def _requalification_lock_only_successor(case, row):
+    """Accept only a copied, exact own key-share lock on the new successor."""
+    page = case.get('tuple_page', {})
+    tag = case['mutation']['start']['tag']
+    block, offset = _requalification_tid(row['ctid'])
+    if (not isinstance(page, dict) or page.get('stored') is not True or page.get('page_known') is not True
+            or number(page.get('sequence')) == 0
+            or page.get('image_scope') != 'native_buffer_owned_copy'
+            or page.get('tag') != tag or block != number(tag[4])
+            or page.get('heap_tuples_known') is not True):
+        raise ValueError('nonzero xmax has no exact owned successor page')
+    tuples = page.get('heap_tuples', [])
+    if not isinstance(tuples, list) or any(not isinstance(h, dict) for h in tuples):
+        raise ValueError('invalid copied successor headers')
+    headers = [h for h in tuples if number(h.get('offset')) == offset]
+    if len(headers) != 1:
+        raise ValueError('nonzero xmax has no unique successor header')
+    header = headers[0]
+    infomask, infomask2 = number(header.get('infomask')), number(header.get('infomask2'))
+    # The native successor builder inherits a single locker as KEYSHR|LOCK_ONLY.
+    # COMMITTED/INVALID/MULTI/EXCL/MOVED and an already-updated successor
+    # are not proof of that shape. A heap-only successor remains valid.
+    if (number(row['xmax']) != number(case['waiter_xid'])
+            or number(header.get('xmin')) != number(row['xmin'])
+            or number(header.get('xmax')) != number(row['xmax'])
+            or header.get('ctid') != row['ctid'] or infomask >= 2**16 or infomask2 >= 2**16
+            or (infomask & 0xfcd0) != 0x2090 or infomask2 & 0x6000):
+        raise ValueError('nonzero xmax is not the exact own lock-only successor')
+
+
 def validate_requalification_finish(case):
     """Require the same UPDATE to recheck the changed row after exact waits."""
     mutation = case['mutation']
@@ -458,9 +488,11 @@ def validate_requalification_finish(case):
         tid = _requalification_tid(row['ctid'])
         if (number(row['id']) != 9 or number(row['v']) != 11
                 or number(row['xmin']) != number(mutation['waiter_xid'])
-                or number(row['xmax']) != 0 or tid[0] != number(start['tag'][4])
+                or tid[0] != number(start['tag'][4])
                 or row['ctid'] in (mutation['before']['ctid'], mutation['mutation_row']['ctid'])):
             raise ValueError('original UPDATE reused its stale tuple or row plan')
+        if number(row['xmax']) != 0:
+            _requalification_lock_only_successor(case, row)
     elif rows != []:
         raise ValueError('original UPDATE did not observe the deleted target')
     return dict(kind=kind, selected=proof['selected'],

@@ -348,9 +348,12 @@ sub requalification_cell {
   my $post_xid=0+$r->query_safe('SELECT pg_current_xact_id()::text');
   my $rows=decode_json($r->query_safe("SELECT COALESCE(json_agg(t),'[]'::json) FROM (
    SELECT id,v,ctid::text AS ctid,xmin::text AS xmin,xmax::text AS xmax FROM $name WHERE id=9) t"));
+  my $tuple_page=$kind eq 'update' ? decode_json($node->safe_psql('postgres',
+   "SELECT test_pgrac_native_itl_page('$name',$block)")) : undef;
   my $case={mutation=>$mutation,waits=>\@waits,log=>substr(slurp_file($node->logfile),$offset),
    stdout=>$out,stderr=>$r->{stderr},client_had_error=>$had_error ? JSON::PP::true : JSON::PP::false,
-   reader=>$state,waiter_xid=>$post_xid,rows=>$rows,remaining=>exit_owners($node,\@holders)};
+   reader=>$state,waiter_xid=>$post_xid,rows=>$rows,tuple_page=>$tuple_page,
+   remaining=>exit_owners($node,\@holders)};
   save_json("b06-$name-finish",$case);
   my ($result,$error)=judge_requalification($case,'--requalify');
   save_json("b06-$name-judge",{result=>$result,error=>$error});

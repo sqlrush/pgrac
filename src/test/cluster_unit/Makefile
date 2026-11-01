@@ -13415,9 +13415,9 @@ test_cluster_pcm_lock_clock_product.o test_cluster_ko_extend_recovery: \
 
 # Native TT/ITL recorder; real publisher with backend environment boundaries.
 test_cluster_native_itl_json.inc: $(top_srcdir)/src/test/modules/test_pgrac_shared_config/test_pgrac_native_itl.c Makefile
-	awk '/^static void append_(hex|event)\(/ { emit=1; found++ } \
+	awk '/^static void append_(hex|heap_tuple_headers|event)\(/ { emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     END { if (found != 2 || done != 2) exit 1 }' $< > $@.tmp
+	     END { if (found != 3 || done != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_native_itl_trace: test_cluster_native_itl_trace.c unit_test.h \
