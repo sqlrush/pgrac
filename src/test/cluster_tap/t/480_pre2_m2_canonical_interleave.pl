@@ -35,6 +35,9 @@ sub save_json {
 sub session {
  my ($node,$cell)=@_;
  my $s=$node->background_psql('postgres',timeout=>180);
+ # Same-segment clients are prepared before other cells run. Keep the
+ # original bound per query rather than spending it on idle matrix time.
+ $s->set_query_timer_restart;
  push @{$sessions{$cell->{number}}},$s;
  $s->query_safe('SET statement_timeout=90000');
  return $s;

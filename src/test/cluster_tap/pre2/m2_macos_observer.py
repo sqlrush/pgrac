@@ -107,6 +107,9 @@ def main():
     raw = trace.read_text() if trace.exists() else ''
     rows = {r['case']: r for r in observer.timeline}
     expected = observer.targets[4]['context']['producer_pid']
+    endpoint = rows.get(4, {}).get('endpoint', {})
+    actual_port = endpoint.get('listener', {}).get('port')
+    command = rows.get(4, {}).get('command', [])
     result = dict(summary=summary, attachments=observer.attachments,
         positive_attach=positive.get('status') in ('PARTIAL_UNKNOWN', 'RAW_CAPTURED')
             and positive.get('returncode') == 0 and positive.get('attach_attempted')
@@ -114,6 +117,12 @@ def main():
             and f'Process {expected} stopped' in raw,
         correct_endpoint=rows.get(4, {}).get('status') == 'SAMPLED'
             and rows[4].get('activity', {}).get('pid') == expected,
+        actual_dynamic_port=type(actual_port) is int and actual_port != 5432
+            and endpoint.get('observed', {}).get('port') == str(actual_port)
+            and rows[4].get('activity', {}).get('server_port') == actual_port,
+        layout_ignored=actual_port is not None
+            and endpoint.get('expected', {}).get('port') != actual_port
+            and '-p' in command and command[command.index('-p') + 1] == str(actual_port),
         negative_refusal=rows.get(8, {}).get('status') == 'IDENTITY_UNKNOWN'
             and rows[8].get('endpoint', {}).get('failed_predicates') == ['producer_parent_matches']
             and bool(rows[8]['endpoint'].get('producer_stat')))
