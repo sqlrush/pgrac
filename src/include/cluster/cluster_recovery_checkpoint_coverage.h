@@ -43,6 +43,8 @@ typedef struct ClusterRecoveryCheckpointFileV2
 	uint8		image_digest[CLUSTER_RECOVERY_V2_DIGEST_BYTES];
 	uint64		source_count;
 	const ClusterRecoveryCheckpointFileSourceV2 *sources;
+	/* Original creation evidence only, never coverage or an inferred batch. */
+	uint8 creation_batch_uuid[16];
 } ClusterRecoveryCheckpointFileV2;
 
 /*

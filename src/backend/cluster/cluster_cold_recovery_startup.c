@@ -44,6 +44,8 @@
 #include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_control_relmap_recovery.h"
+#include "cluster/cluster_relmap_create_format.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
@@ -2522,6 +2524,112 @@ cold_c0_source_authority(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fe
 		&& cluster_wal_thread_restart_v2_ref(&restart)
 		&& cold_source_ref_matches(&restart, &typed->sources[participant])
 		&& cold_replay_sources_current(typed, fence);
+}
+
+/* Original sealed input and original serial/fence/WALR owners only. This
+ * local variant is also usable inside the caller's native MappingLock. */
+bool
+cluster_cold_typed_relmap_create_record_held_v2(ClusterColdTypedV1 *typed,
+												ClusterRecoveryFencePlan *fence, uint32 participant,
+												const ClusterWalSourceRef *source, XLogRecPtr read,
+												XLogRecPtr end)
+{
+	ClusterThreadRecoveryAuthorityV1 authority = { 0 };
+	ClusterWalSourceRef restart;
+	ClusterColdRecordFrameV1 frame;
+	uint32 count = 0, matches = 0;
+	bool matched = false;
+	volatile bool valid = false;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	PG_TRY();
+	{
+		do {
+			if (MyBackendType != B_STARTUP || !RecoveryInProgress() || source == NULL
+				|| !cluster_cold_replay_window_active_v1() || participant >= typed->replay_count
+				|| participant >= CLUSTER_COLD_MAX_PARTICIPANTS
+				|| !cold_source_ref_matches(source, &typed->sources[participant])
+				|| read == InvalidXLogRecPtr || end <= read
+				|| read < typed->participants[participant].native_redo
+				|| end > typed->participants[participant].tail_end
+				|| !cold_captured_sources_match(typed, fence)
+				|| !cluster_recovery_merge_fence_plan_revalidate_nowait(fence)
+				|| !cold_side_source_matches(typed, participant))
+				break;
+			if (participant == typed->own_participant) {
+				if (!cluster_wal_thread_restart_v2_ref(&restart)
+					|| !cold_source_ref_matches(&restart, source))
+					break;
+			} else {
+				const ColdRoot *selected = &typed->replay_roots[participant];
+				const ClusterColdParticipantV1 *cut = &typed->participants[participant];
+				/* Same original foreign authority conjuncts. The physical
+				 * profile bracket belongs to current_v2 outside MappingLock. */
+				if (!cluster_recovery_merge_fence_plan_authority(fence, cut->thread_id, &authority)
+					|| authority.duty == NULL || authority.root_snapshot == NULL
+					|| authority.root_token == NULL || authority.serial_guard == NULL
+					|| authority.serial_guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+					|| memcmp(authority.root_snapshot, &selected->root, sizeof(selected->root))
+					|| memcmp(authority.root_token, &selected->token, sizeof(selected->token))
+					|| !cold_control_authority_current(&authority)
+					|| !cluster_thread_recovery_authority_covers_window_v1(
+						&authority, cut->thread_id, cut->physical_lower, cut->tail_end))
+					break;
+			}
+			if (!cluster_cold_plan_input_frame_count_v1(typed->plan, &count))
+				break;
+			for (uint32 i = 0; i < count; i++) {
+				if (!cluster_cold_plan_input_frame_v1(typed->plan, i, &frame))
+					break;
+				if (frame.participant == participant && frame.read_rec_ptr == read
+					&& frame.end_rec_ptr == end && !frame.history && frame.rmid == RM_RELMAP_ID
+					&& (frame.info & ~XLR_INFO_MASK) == CLUSTER_RELMAP_CREATE_WAL_INFO_V1
+					&& !frame.page_components && !frame.space_effects)
+					matches++;
+				if (i + 1 == count)
+					matched = matches == 1;
+			}
+			valid = matched && cold_captured_sources_match(typed, fence)
+					&& cluster_recovery_merge_fence_plan_revalidate_nowait(fence);
+		} while (0);
+	}
+	PG_FINALLY();
+	{
+		if (!valid)
+			cold_execution_inputs_failed(typed);
+	}
+	PG_END_TRY();
+	return valid;
+}
+bool
+cluster_cold_typed_relmap_create_record_current_v2(ClusterColdTypedV1 *typed,
+												   ClusterRecoveryFencePlan *fence,
+												   uint32 participant,
+												   const ClusterWalSourceRef *source,
+												   XLogRecPtr read, XLogRecPtr end)
+{
+	volatile bool valid = false;
+	PG_TRY();
+	{
+		valid = cluster_cold_typed_relmap_create_record_held_v2(typed, fence, participant, source,
+																read, end)
+				&& cold_native_profiles_match(typed)
+				&& cluster_cold_typed_relmap_create_record_held_v2(typed, fence, participant,
+																   source, read, end);
+	}
+	PG_FINALLY();
+	{
+		if (!valid && typed != NULL)
+			cold_execution_inputs_failed(typed);
+	}
+	PG_END_TRY();
+	return valid;
+}
+void
+cluster_cold_typed_relmap_create_failed_v2(ClusterColdTypedV1 *typed)
+{
+	if (typed != NULL)
+		cold_execution_inputs_failed(typed);
 }
 
 typedef struct ColdNativeClogReplay {

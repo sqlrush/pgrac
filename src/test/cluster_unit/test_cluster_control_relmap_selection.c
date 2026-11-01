@@ -4,6 +4,35 @@
 #include "catalog/pg_tablespace_d.h"
 #include "common/cluster_relmap_file.h"
 #include "test_cluster_control_file_selection.c"
+#ifndef TEST_CONTROL_RECOVERY_CREATE
+#include "access/xlog.h"
+#include "cluster/cluster_control_relmap_recovery.h"
+#include "miscadmin.h"
+BackendType MyBackendType = B_INVALID;
+int MyProcPid;
+bool RecoveryInProgress(void) { return false; }
+bool
+cluster_cold_typed_relmap_create_record_current_v2(ClusterColdTypedV1 *t,
+	struct ClusterRecoveryFencePlan *f, uint32 participant, const ClusterWalSourceRef *source,
+	XLogRecPtr read, XLogRecPtr end)
+{
+	(void)t; (void)f; (void)participant; (void)source; (void)read; (void)end;
+	return false;
+}
+bool
+cluster_cold_typed_relmap_create_record_held_v2(ClusterColdTypedV1 *t,
+	struct ClusterRecoveryFencePlan *f, uint32 participant, const ClusterWalSourceRef *source,
+	XLogRecPtr read, XLogRecPtr end)
+{
+	return cluster_cold_typed_relmap_create_record_current_v2(t, f, participant, source, read, end);
+}
+void cluster_cold_typed_relmap_create_failed_v2(ClusterColdTypedV1 *t)
+{
+	(void)t;
+	abort(); /* Original non-recovery fixture must never enter this path. */
+}
+#endif
+
 static uint64 cf_sequence = 1;
 uint64 cluster_cf_attempt_sequence(void);
 uint64 cluster_cf_attempt_sequence(void)
