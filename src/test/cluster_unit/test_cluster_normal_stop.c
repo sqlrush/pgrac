@@ -6778,6 +6778,159 @@ UT_TEST(test_run15_producer_ack_retention_and_consumption_are_observed)
 	cluster_trace_normal_stop = false;
 }
 
+
+#include "test_cluster_service_collection_refusals.h"
+static void (*collect_barrier_hook)(void);
+static void
+collect_read_barrier(void)
+{
+	pg_read_barrier_impl();
+	if (collect_barrier_hook != NULL)
+		collect_barrier_hook();
+}
+#undef pg_read_barrier
+#define pg_read_barrier() collect_read_barrier()
+#include "test_cluster_shared_admission_observe.inc"
+#undef pg_read_barrier
+#define pg_read_barrier() pg_read_barrier_impl()
+static ClusterSemanticActivationShmem collect_admission;
+static void
+collect_begin(const NativeActorFixtureRole *role)
+{
+	producer_begin(role);
+	collect_barrier_hook = NULL;
+	sinval_observation = ko_observation = CLUSTER_NORMAL_STOP_READY;
+	memset(&collect_admission, 0, sizeof(collect_admission));
+	SemanticActivationShmem = &collect_admission;
+	pg_atomic_init_u64(&collect_admission.admission_seq, 2);
+	pg_atomic_init_u64(&collect_admission.active_bits, 0);
+	pg_atomic_init_u64(&collect_admission.record_generation, 11);
+	pg_atomic_init_u64(&collect_admission.formation_epoch, 9);
+	pg_atomic_init_u32(&collect_admission.transition_closed, 0);
+	for (unsigned side = 0; side < 2; side++)
+		for (unsigned bit = 0; bit < 64; bit++)
+			pg_atomic_init_u32(&collect_admission.inflight[side][bit], 0);
+}
+
+UT_TEST(test_collect_shared_debt_cannot_hide_behind_private_idle)
+{
+	ClusterServiceProducerCollection out;
+	ClusterCleanLeaveSharedState before;
+	unsigned locks;
+	collect_begin(&native_actor_roles[1]);
+	before = test_region;
+	locks = lock_acquisitions;
+	/* Explicit original atomic debt input; not a producer receipt. */
+	pg_atomic_write_u32(&collect_admission.inflight[1][63], 1);
+	UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+	UT_ASSERT(out.admission.known);
+	UT_ASSERT_EQ(out.admission.inflight[1][63], 1);
+	UT_ASSERT_EQ(out.producer.identity.proc_generation, 7);
+	UT_ASSERT_EQ(out.producer.identity.backend_id, InvalidBackendId);
+	UT_ASSERT_EQ(lms_polls, 5);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&collect_admission.inflight[1][63]), 1);
+	pg_atomic_write_u32(&collect_admission.inflight[1][63], 0); /* Original input boundary. */
+	UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT);
+	UT_ASSERT_EQ(lms_polls, 10);
+	UT_ASSERT_EQ(memcmp(&before, &test_region, sizeof(before)), 0);
+	UT_ASSERT_EQ(lock_acquisitions, locks);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_collect_all_original_actor_roles_keep_active_and_module_owners)
+{
+	for (unsigned r = 0; r < lengthof(native_actor_roles); r++) {
+		ClusterServiceProducerCollection out;
+		collect_begin(&native_actor_roles[r]);
+		UT_ASSERT(cluster_normal_stop_service_enter());
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+			CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		UT_ASSERT_EQ(out.producer.actor.active_depth, 1);
+		UT_ASSERT_EQ(out.producer.responsibility.modules, 0);
+		UT_ASSERT_EQ(lms_polls, 0);
+		UT_ASSERT(cluster_normal_stop_service_leave(true));
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+			r == 0 || r == 10 ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT);
+		UT_ASSERT_EQ(out.producer.identity.actor_bit, native_actor_roles[r].bit);
+	}
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterServiceProducerCollection out;
+		collect_begin(&native_actor_roles[1]);
+		lms_cr_observation = CLUSTER_NORMAL_STOP_PENDING;
+		lms_ic_observation = fault == 2 ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_READY;
+		pg_atomic_write_u64(&collect_admission.record_generation, fault == 1 ? 12 : 11);
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out), fault == 2
+			? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED : fault == 1
+			? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		UT_ASSERT_EQ(lms_cr_observation, CLUSTER_NORMAL_STOP_PENDING);
+	}
+	cluster_shared_config = false;
+}
+
+static void
+collect_change_during_admission(void)
+{
+	collect_barrier_hook = NULL;
+	if (producer_fault == 12) {
+		producer_proc.cluster_grd_generation++;
+		pg_atomic_write_u64(&collect_admission.record_generation, 12);
+	} else
+		producer_change_during_poll();
+}
+UT_TEST(test_collect_rechecks_original_identity_after_shared_scan)
+{
+	for (producer_fault = 0; producer_fault < 13; producer_fault++) {
+		ClusterServiceProducerCollection out;
+		collect_begin(&native_actor_roles[1]);
+		collect_barrier_hook = collect_change_during_admission;
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+			(producer_fault == 10 || producer_fault == 11) ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED
+			: (producer_fault == 6 || producer_fault == 12) ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+		if (producer_fault < 9 || producer_fault >= 10)
+			UT_ASSERT(!out.admission.known);
+		UT_ASSERT_EQ(lms_polls, 5);
+		lock_holds = 0;
+		CritSectionCount = 0;
+	}
+	collect_barrier_hook = NULL;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_collect_unknown_scope_and_full_matrix_remain_observations)
+{
+	ClusterServiceProducerCollection out;
+	for (unsigned fault = 0; fault < 5; fault++) {
+		collect_begin(&native_actor_roles[1]);
+		if (fault == 0) SemanticActivationShmem = NULL;
+		if (fault == 1) pg_atomic_write_u64(&collect_admission.admission_seq, 3);
+		if (fault == 2) pg_atomic_write_u64(&collect_admission.record_generation, 12);
+		if (fault == 3) MyProc = NULL;
+		UT_ASSERT_EQ(cluster_service_producer_collect(9, fault == 4 ? 0 : 11, &out),
+			fault == 1 ? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING : fault == 2
+			? CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED);
+		UT_ASSERT(!out.admission.known);
+	}
+	collect_begin(&native_actor_roles[1]);
+	for (unsigned side = 0; side < 2; side++)
+		for (unsigned bit = 0; bit < 64; bit++)
+			pg_atomic_write_u32(&collect_admission.inflight[side][bit], side * 64 + bit + 1);
+	UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, &out),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING);
+	for (unsigned side = 0; side < 2; side++)
+		for (unsigned bit = 0; bit < 64; bit++)
+			UT_ASSERT_EQ(out.admission.inflight[side][bit], side * 64 + bit + 1);
+	UT_ASSERT_EQ(cluster_service_producer_collect(9, 11, NULL),
+		CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED);
+	collect_begin(&native_actor_roles[1]);
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
@@ -6787,7 +6940,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(190);
+	UT_PLAN(194);
 	UT_RUN(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
@@ -6978,6 +7131,10 @@ main(void)
 	UT_RUN(test_run15_short_ack_never_reads_an_unavailable_tuple);
 	UT_RUN(test_run15_first_failure_caller_and_budget_are_original);
 	UT_RUN(test_run15_first_failure_defers_emission_under_original_lock);
+	UT_RUN(test_collect_shared_debt_cannot_hide_behind_private_idle);
+	UT_RUN(test_collect_all_original_actor_roles_keep_active_and_module_owners);
+	UT_RUN(test_collect_rechecks_original_identity_after_shared_scan);
+	UT_RUN(test_collect_unknown_scope_and_full_matrix_remain_observations);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

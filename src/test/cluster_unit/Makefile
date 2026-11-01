@@ -1635,6 +1635,14 @@ test_cluster_normal_stop_lms.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.
 	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Original shared admission point observer, in the native actor fixture.
+test_cluster_shared_admission_observe.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^#define CLUSTER_SEMANTIC_ADMISSION_SNAPSHOT_TRIES / { print; n++ } /^typedef struct ClusterSemanticActivationShmem / || /^typedef struct SemanticActivationAdmissionSnapshot / { emit=1; n++ } emit { print } /^} / { emit=0 } /^static ClusterSemanticActivationShmem \*/ { print; n++ } END { if(n!=4 || emit) exit 1 }' $< > $@.tmp
+	awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; n++ } /^cluster_semantic_activation_admission_observe\(/ { print "ClusterSemanticAdmissionObservationResult"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=2 || emit) exit 1 }' $< >> $@.tmp
+	mv $@.tmp $@
+test_cluster_normal_stop: test_cluster_shared_admission_observe.inc test_cluster_service_collection_refusals.h $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
+
+
 test_cluster_normal_stop: test_cluster_normal_stop.c test_cluster_service_producer_observe.inc test_cluster_native_actor_observe.inc test_cluster_native_producers_observe.inc test_cluster_normal_stop_cleaner.inc test_cluster_normal_stop_sinval.inc test_cluster_normal_stop_lms.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_service_observe.c cluster_unit_service_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \

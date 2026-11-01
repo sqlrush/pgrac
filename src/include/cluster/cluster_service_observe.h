@@ -55,6 +55,22 @@ typedef struct ClusterServiceProducerObservation {
 StaticAssertDecl(sizeof(ClusterServiceProducerIdentity) == 32, "native owner identity size");
 StaticAssertDecl(sizeof(ClusterServiceProducerObservation) <= 128, "native observation size");
 
+/* Same original actor, private/module plus shared admission point observations.
+ * Caller-owned only: CURRENT does not seal either owner or grant permission.
+ * No atomic cross-domain zero proof is implied; producer closure is separate. */
+typedef struct ClusterServiceProducerCollection {
+	ClusterServiceProducerObservation producer;
+	ClusterSemanticAdmissionObservation admission;
+	const char *reason;
+} ClusterServiceProducerCollection;
+
+StaticAssertDecl(sizeof(ClusterServiceProducerCollection) <= 1024,
+				 "native producer collection is bounded caller storage");
+
+extern ClusterSemanticAdmissionObservationResult cluster_service_producer_collect(
+	uint64 expected_epoch, uint64 expected_generation, ClusterServiceProducerCollection *out);
+
+
 /* One actual native owner's point observation, at an unlocked boundary.
  * Binds the existing actor bracket and original role fanout to its own
  * PGPROC identity and epoch, rechecking after the module calls. An active

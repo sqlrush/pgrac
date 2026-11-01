@@ -4559,6 +4559,86 @@ cluster_service_producer_observe(uint64 expected_epoch, ClusterServiceProducerOb
 	return result;
 }
 
+
+/* Observe both original domains at the same owner's unlocked return point.
+ * This does not close admission, sign a cut, or cache any permission.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterSemanticAdmissionObservationResult
+cluster_service_producer_collect(uint64 expected_epoch, uint64 expected_generation,
+								 ClusterServiceProducerCollection *out)
+{
+	ClusterNormalStopPollResult producer, actor;
+	ClusterSemanticAdmissionObservationResult admission;
+	PGPROC *owner = MyProc;
+	BackendType backend = MyBackendType;
+	AuxProcType aux = MyAuxProcType;
+	bool held_lock = false;
+
+	if (out == NULL)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	memset(out, 0, sizeof(*out));
+	out->reason = "NATIVE_COLLECTION_SCOPE_INVALID";
+	if (expected_generation == 0 || expected_generation == UINT64_MAX)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	producer = cluster_service_producer_observe(expected_epoch, &out->producer);
+	out->reason = out->producer.reason;
+	if (producer != CLUSTER_NORMAL_STOP_READY && producer != CLUSTER_NORMAL_STOP_PENDING)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	admission = cluster_semantic_activation_admission_observe(expected_epoch, expected_generation,
+		&out->admission);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT
+		&& admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING
+		&& admission != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE) {
+		out->reason = "NATIVE_COLLECTION_ADMISSION_REFUSED";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
+	ForEachLWLockHeldByMe(cl_native_observe_lock, &held_lock);
+	if (held_lock || CritSectionCount != 0) {
+		memset(&out->admission, 0, sizeof(out->admission));
+		out->reason = "NATIVE_COLLECTION_RETURN_CONTEXT_INVALID";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
+	if (cluster_epoch_get_current() != expected_epoch) {
+		memset(&out->admission, 0, sizeof(out->admission));
+		out->reason = "NATIVE_COLLECTION_ADMISSION_STALE";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE;
+	}
+	/* The shared observer can span another original identity publication.
+	 * Never leave a usable shared sample attached to an old actor identity. */
+	if (MyProc != owner || MyBackendType != backend || MyAuxProcType != aux
+		|| !IsUnderPostmaster || !cluster_enabled || !cluster_shared_config
+		|| MyProcPid != out->producer.identity.pid || owner->pid != out->producer.identity.pid
+		|| owner->pgprocno != out->producer.identity.pgprocno
+		|| owner->backendId != out->producer.identity.backend_id
+		|| owner->cluster_grd_generation != out->producer.identity.proc_generation) {
+		memset(&out->admission, 0, sizeof(out->admission));
+		out->reason = "NATIVE_COLLECTION_IDENTITY_CHANGED";
+		return admission == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE ? admission
+			: CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+	}
+	actor = cluster_service_actor_observe(&out->producer.actor);
+	if (actor == CLUSTER_NORMAL_STOP_INVALID) {
+		out->reason = out->producer.actor.reason;
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
+	if (admission == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE) {
+		out->reason = "NATIVE_COLLECTION_ADMISSION_STALE";
+		return admission;
+	}
+	if (actor == CLUSTER_NORMAL_STOP_PENDING) {
+		out->reason = out->producer.actor.reason;
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+	}
+	if (producer == CLUSTER_NORMAL_STOP_PENDING)
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING;
+	if (admission == CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING) {
+		out->reason = "NATIVE_COLLECTION_ADMISSION_PENDING";
+		return admission;
+	}
+	out->reason = "NATIVE_COLLECTION_POINT_ONLY";
+	return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT;
+}
+
 bool
 cluster_normal_stop_service_enter(void)
 {
