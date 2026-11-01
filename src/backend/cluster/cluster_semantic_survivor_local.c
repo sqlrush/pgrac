@@ -59,8 +59,8 @@ local_unlocked(void)
  return !held;
 }
 
-static bool
-local_lmon(void)
+bool
+cluster_semantic_survivor_local_owner_ready(void)
 {
 	return IsUnderPostmaster && cluster_enabled && cluster_shared_config && !proc_exit_inprogress
 		&& MyBackendType == B_LMON && AmLmonProcess() && MyBackendId == InvalidBackendId
@@ -72,7 +72,7 @@ local_lmon(void)
 static bool
 local_sender(const ClusterSurvivorLocalMailbox *m)
 {
-	return local_lmon() && m->sender_pid == MyProcPid && m->sender_pgprocno == MyProc->pgprocno
+	return cluster_semantic_survivor_local_owner_ready() && m->sender_pid == MyProcPid && m->sender_pgprocno == MyProc->pgprocno
 		&& m->sender_proc_generation == MyProc->cluster_grd_generation;
 }
 
@@ -121,7 +121,7 @@ cluster_semantic_survivor_local_invalidate(void)
 {
 	ClusterSurvivorLocalMailbox *m = local_mailbox();
 	uint64 word;
-	if (m == NULL || !local_lmon()) return;
+	if (m == NULL || !cluster_semantic_survivor_local_owner_ready()) return;
 	word = pg_atomic_read_u64(&m->word);
 	if (LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_EMPTY) return;
 	pg_atomic_write_u64(&m->invalidated_generation, LOCAL_GENERATION(word));
@@ -141,7 +141,7 @@ cluster_semantic_survivor_local_begin(const ClusterSurvivorLocalTarget *target)
 	PGPROC *proc;
 	uint64 word, generation;
 
-	if (m == NULL || !local_lmon() || m->flags != 0 || !local_target_shape(target)) return LOCAL_REFUSED;
+	if (m == NULL || !cluster_semantic_survivor_local_owner_ready() || m->flags != 0 || !local_target_shape(target)) return LOCAL_REFUSED;
 	word = pg_atomic_read_u64(&m->word);
 	if (LOCAL_STATE(word) != CLUSTER_SURVIVOR_LOCAL_EMPTY) return LOCAL_PENDING;
 	if (LOCAL_GENERATION(word) == CLUSTER_SURVIVOR_LOCAL_MAX_GENERATION) return LOCAL_REFUSED;
@@ -320,7 +320,7 @@ cluster_semantic_survivor_local_poll(ClusterSurvivorLocalReply *out)
 	ClusterSemanticAdmissionObservationResult result = LOCAL_REFUSED;
 	uint64 word, generation;
 	if (out != NULL) memset(out, 0, sizeof(*out));
-	if (m == NULL || out == NULL || !local_lmon()) return LOCAL_REFUSED;
+	if (m == NULL || out == NULL || !cluster_semantic_survivor_local_owner_ready()) return LOCAL_REFUSED;
 	word = pg_atomic_read_u64(&m->word);
 	if (LOCAL_STATE(word) == CLUSTER_SURVIVOR_LOCAL_EMPTY) return LOCAL_PENDING;
 	if (m->local_abi != CLUSTER_SURVIVOR_LOCAL_ABI || m->flags != 0) {

@@ -58,7 +58,7 @@ StaticAssertDecl(offsetof(ClusterSurvivorLocalMailbox, reserved) == 1792, "Clust
 StaticAssertDecl(offsetof(ClusterSurvivorLocalQuery, basis) == 88, "ClusterSurvivorLocalQuery.basis offset");
 StaticAssertDecl(offsetof(ClusterSurvivorLocalReply, body) == 128, "ClusterSurvivorLocalReply.body offset");
 StaticAssertDecl(CLUSTER_SURVIVOR_LOCAL_BYTES + 2784 == sizeof(((ClusterSurvivorControl *)0)->reserved),
- "local mailbox stays inside the original tail; 2784 bytes remain zero");
+ "local mailbox leaves 2784 bytes for target cursor and zero tail");
 
 /* Shared storage only, NULL before original gate allocation. */
 extern ClusterSurvivorControl *cluster_semantic_survivor_shared_control(void);
@@ -72,4 +72,5 @@ extern void cluster_semantic_survivor_local_process(void);
 extern void cluster_semantic_survivor_local_invalidate(void);
 /* Called only adjacent to the original successful postmaster waitpid. */
 extern void cluster_semantic_survivor_local_postmaster_reap(pid_t pid);
+extern bool cluster_semantic_survivor_local_owner_ready(void);
 #endif

@@ -13768,3 +13768,42 @@ test_cluster_snapshot_admission test_cluster_wal_inputs_job_service: \
  test_cluster_survivor_local_owner_fixture.h \
  $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_local.c \
  $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_local.h
+
+# Original process-table target selection through the native LMON loop.
+TESTS += test_cluster_survivor_targets
+all: test_cluster_survivor_targets
+test_cluster_survivor_targets: test_cluster_survivor_targets.c test_cluster_survivor_local.c test_cluster_survivor_candidate.c test_cluster_lmon.c unit_test.h \
+		test_cluster_survivor_pgsa.inc \
+		test_cluster_lmon_stop_service.inc test_cluster_lmon_producer_observe.inc \
+		test_cluster_lmon_producer_pause.inc test_cluster_shared_admission_observe.inc \
+		test_cluster_lmon_admission_pause.inc \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_survivor_candidate.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_survivor.h \
+		$(top_srcdir)/src/include/cluster/cluster_service_observe.h \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+test_cluster_survivor_targets: test_cluster_survivor_candidate_invalidation.inc test_cluster_backend_return_gate.inc test_cluster_survivor_producer_fixture.h test_cluster_survivor_shared.inc test_cluster_survivor_signal_fixture.h test_cluster_survivor_signal_types.inc test_cluster_survivor_signal.inc
+
+test_cluster_survivor_status_identity.inc: $(top_srcdir)/src/backend/utils/activity/backend_status.c Makefile
+	awk '/^pgstat_read_backend_identity\(/ { print "bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_survivor_generation.inc: $(top_srcdir)/src/backend/cluster/cluster_grd.c Makefile
+	awk '/^cluster_grd_generation_snapshot\(/ { print "uint64"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_survivor_targets: test_cluster_survivor_status_identity.inc test_cluster_survivor_generation.inc \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_targets.c \
+ $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_targets.h \
+ $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_local.c \
+ $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_local.h \
+ $(top_srcdir)/src/include/cluster/cluster_grd.h \
+ $(top_srcdir)/src/include/utils/backend_status.h

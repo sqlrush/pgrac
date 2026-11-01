@@ -371,6 +371,7 @@ UT_TEST(unassigned_query_bytes_cannot_supply_a_usable_sample) {run_local(18);}
 UT_TEST(unknown_local_header_cannot_supply_a_sample) {run_local(19);}
 UT_TEST(original_signal_slot_and_control_sizes_are_exact) {run_local(20);}
 UT_TEST(unconfirmed_scope_cannot_mix_rounds_or_claim_authority) {run_local(21);}
+#ifndef SURVIVOR_TARGET_FIXTURE
 int main(void)
 {
  UT_PLAN(22);
@@ -398,3 +399,5 @@ int main(void)
  UT_RUN(unconfirmed_scope_cannot_mix_rounds_or_claim_authority);
  UT_DONE();return ut_failed_count?1:0;
 }
+
+#endif /* SURVIVOR_TARGET_FIXTURE */

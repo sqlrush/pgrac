@@ -109,3 +109,7 @@ cluster_semantic_survivor_local_process(void)
 {
  if (cluster_semantic_survivor_shared_control() != NULL) abort();
 }
+
+/* Unrelated native-loop fixtures do not run the target-census consumer. */
+void cluster_semantic_survivor_targets_tick(void);
+void __attribute__((weak)) cluster_semantic_survivor_targets_tick(void) {}
