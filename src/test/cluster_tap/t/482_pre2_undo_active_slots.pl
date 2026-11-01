@@ -550,7 +550,7 @@ sub empty_statement
 		die "$name: expected statement-trigger P0001 was not observed\n" unless
 		  $error == 1 && $states[0] eq 'P0001'
 		  && $stderr =~ /ERROR:\s+P0001: G_EMPTY_EXPECTED_TRIGGER_ERROR/;
-		my @observations = $stderr =~ /^NOTICE:.*G_EMPTY_OBSERVATION (\{.*\})\r?$/mg;
+		my @observations = $stderr =~ /^(?:psql:[^\r\n]*:\d+:[ \t]+)?NOTICE:.*G_EMPTY_OBSERVATION (\{.*\})\r?$/mg;
 		die "$name: missing or ambiguous pre-error native observation\n" unless @observations == 1;
 		my $sample = decode_json($observations[0]);
 		$sample->{result} = $result;
