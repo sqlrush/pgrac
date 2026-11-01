@@ -11704,3 +11704,26 @@ clean distclean maintainer-clean: clean-native-cancel-master
 .PHONY: clean-native-cancel-master
 clean-native-cancel-master:
 	rm -f test_cluster_native_cancel_master
+
+# Ordinary resident cancellation with the original independent master.
+TESTS += test_cluster_native_resident_read_cancel_master test_cluster_native_resident_write_cancel_master
+all: test_cluster_native_resident_read_cancel_master test_cluster_native_resident_write_cancel_master
+test_cluster_native_resident_read_cancel_master test_cluster_native_resident_write_cancel_master: test_cluster_native_resident_cancel_master.c test_cluster_native_cancel_master test_cluster_native_resident_lock test_cluster_native_resident_x \
+		test_cluster_native_resident_lock_fixture.inc test_cluster_native_resident_x_fixture.inc test_cluster_native_master_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		$(if $(filter test_cluster_native_resident_write_cancel_master,$@),-DRESIDENT_CANCEL_WRITE) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_resident_lock_fixture.inc: test_cluster_native_resident_lock.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-resident-cancel-master
+.PHONY: clean-native-resident-cancel-master
+clean-native-resident-cancel-master:
+	rm -f test_cluster_native_resident_read_cancel_master test_cluster_native_resident_write_cancel_master \
+		test_cluster_native_resident_lock_fixture.inc test_cluster_native_resident_lock_fixture.inc.tmp

@@ -6,7 +6,13 @@
 #include "test_cluster_native_holder.c"
 #else
 #define cluster_test_pcm_clock_gettime cluster_publish_fixture_clock_gettime
+#if defined(NATIVE_MASTER_RESIDENT_READ_COMPOSITION)
+#include "test_cluster_native_resident_lock_fixture.inc"
+#elif defined(NATIVE_MASTER_RESIDENT_WRITE_COMPOSITION)
+#include "test_cluster_native_resident_x_fixture.inc"
+#else
 #include "test_cluster_native_first_fill_fixture.inc"
+#endif
 #undef cluster_test_pcm_clock_gettime
 #define ereport(level, rest) ordinary_report(level)
 #define gcs_block_resource_x_payload_candidate native_master_payload_candidate
