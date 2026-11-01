@@ -20,6 +20,8 @@
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
+#include "cluster/cluster_ir.h"
+#include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_wal_writer.h"
 #include <unistd.h>
@@ -835,6 +837,75 @@ relmap_terminal_start(ColdRelmapTerminal *receipt,
 		&& memcmp(receipt->operation, operation, sizeof(operation)) == 0;
 }
 
+/* No owner is created here. Keep the exact original IR guard/request in
+ * this call's stack until the native reader has moved its descriptor. */
+typedef struct ColdRelmapTerminalEpisode {
+	ColdRelmapTerminal *receipt;
+	uint32 entry;
+	ClusterThreadRecoveryAuthorityV1 authority;
+	ClusterRecoverySerialGuard serial;
+} ColdRelmapTerminalEpisode;
+
+static bool
+relmap_episode_permitted(void *arg, int origin)
+{
+	ColdRelmapTerminalEpisode *episode = arg;
+	ColdRelmapTerminal *receipt = episode->receipt;
+	const ClusterColdPlanV1 *plan = receipt->plan;
+	return receipt->pid == getpid() && MyBackendType == B_STARTUP && RecoveryInProgress()
+		&& CritSectionCount == 0 && !receipt->sealed && receipt->failed
+		&& receipt->typed->refusal == CLUSTER_COLD_OK && receipt->typed->plan == plan
+		&& plan->phase == COLD_PHASE_SEALED && plan->relmap_terminal == receipt
+		&& plan->relmap_terminal_attempted && episode->entry < receipt->count
+		&& plan->relmap_inputs == receipt->original && plan->relmap_count == receipt->count
+		&& receipt->entries[episode->entry].input.input.source.claim.identity.origin_node_id == origin
+		&& episode->authority.serial_guard != NULL
+		&& memcmp(episode->authority.serial_guard, &episode->serial, sizeof(episode->serial)) == 0
+		&& episode->serial.held && !episode->serial.release_uncertain
+		&& episode->serial.lock_request.request_id != 0;
+}
+
+static bool
+relmap_episode_current(void *arg, const ClusterWalInputV1 *selected)
+{
+	ColdRelmapTerminalEpisode *episode = arg;
+	ColdRelmapTerminal *receipt = episode->receipt;
+	const ClusterColdRelmapInputV1 *input = &receipt->entries[episode->entry].input.input;
+	ClusterThreadRecoveryAuthorityV1 current;
+	uint32 p = input->participant;
+	if (!relmap_episode_permitted(arg, input->source.claim.identity.origin_node_id)
+		|| !relmap_terminal_inputs(receipt) || !relmap_current(receipt->typed, (struct ClusterRecoveryFencePlan *)receipt->fence, input)
+		|| !cluster_cold_typed_terminal_authority_v1(receipt->typed,
+			(struct ClusterRecoveryFencePlan *)receipt->fence, p, &current)
+		|| current.serial_guard != episode->authority.serial_guard
+		|| memcmp(current.serial_guard, &episode->serial, sizeof(episode->serial)) != 0
+		|| !rf_side_online_plan_recovery_single_source_v1(receipt->sides[p], &input->source)
+		|| !rf_side_online_plan_replay_start_matches_v1(receipt->sides[p],
+			input->source.claim.identity.origin_thread_id, input->source.claim.identity.origin_owner_incarnation,
+			input->source.claim.database_incarnation, input->cut.native_redo))
+		return false;
+	return selected == NULL || (selected->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+		&& memcmp(&selected->source, &input->source, sizeof(input->source)) == 0
+		&& memcmp(&selected->checkpoint, &receipt->roots[p], sizeof(selected->checkpoint)) == 0
+		&& selected->checkpoint_start == receipt->checkpoints[p].checkpoint_start
+		&& selected->native_redo == input->cut.native_redo
+		&& memcmp(&selected->native_checkpoint, &receipt->checkpoints[p].checkpoint, sizeof(CheckPoint)) == 0
+		&& memcmp(selected->native_window, receipt->checkpoints[p].native_window,
+			CLUSTER_RELMAP_CHECKPOINT_WINDOW_SIZE) == 0);
+}
+
+static bool
+relmap_episode_visit(void *arg, ClusterUndoRecoveryCheckpointVisitorV1 visitor, void *visitor_arg)
+{
+	ColdRelmapTerminalEpisode *episode = arg;
+	ColdRelmapTerminal *receipt = episode->receipt;
+	return relmap_episode_current(arg, NULL)
+		&& cluster_cold_typed_terminal_visit_v1(receipt->typed,
+			(struct ClusterRecoveryFencePlan *)receipt->fence,
+			receipt->entries[episode->entry].input.input.participant, visitor, visitor_arg)
+		&& relmap_episode_current(arg, NULL);
+}
+
 bool
 cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence)
@@ -907,6 +978,17 @@ cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 			const ClusterColdRelmapInputV1 *input = &entry->input.input;
 			ClusterRelmapV2View view = {0};
 			ClusterRelmapRecoveryTerminalV1 terminal;
+			ColdRelmapTerminalEpisode episode = {0};
+			ClusterRelmapTerminalEpisodeV1 adapter = {0};
+			episode.receipt = receipt; episode.entry = i;
+			if (!cluster_cold_typed_terminal_authority_v1(typed, fence, input->participant, &episode.authority)) {
+				ok = false; break;
+			}
+			episode.serial = *episode.authority.serial_guard;
+			adapter.arg = &episode; adapter.current = relmap_episode_current;
+			adapter.permitted = relmap_episode_permitted; adapter.visit = relmap_episode_visit;
+			adapter.side = typed->side_plans[input->participant];
+			adapter.serial = episode.serial.lock_request.request_id;
 			view.committed = view.pending_committed = input->staged.committed;
 			view.committed_generation = view.pending_committed_generation = input->staged.committed_generation;
 			view.pending = input->staged.pending;
@@ -915,7 +997,7 @@ cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 			view.pending_complete = view.has_pending = true;
 			ok = relmap_terminal_inputs(receipt)
 				&& relmap_current(typed, fence, input)
-				&& cluster_relmap_recovery_prepare_cold_v1(&input->staged.identity, &view,
+				&& cluster_relmap_recovery_prepare_episode_v1(&input->staged.identity, &view, &adapter,
 					(ClusterRelmapRecoveryHandle **)&handle)
 				&& cluster_relmap_recovery_terminal_read(handle, &input->staged.identity, &view, &terminal)
 				&& terminal.top_full_xid == input->staged.pending_owner.top_full_xid

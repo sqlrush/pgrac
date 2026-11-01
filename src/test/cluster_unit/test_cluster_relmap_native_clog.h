@@ -3,6 +3,7 @@
 #ifndef TEST_CLUSTER_RELMAP_NATIVE_CLOG_H
 #define TEST_CLUSTER_RELMAP_NATIVE_CLOG_H
 #include "access/clog.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
 
 typedef struct TestRelmapNativeClogStats {
 	unsigned calls, file_syncs, directory_syncs;
@@ -28,4 +29,7 @@ extern void test_relmap_native_clog_mutate(bool begin);
 
 extern void test_relmap_native_clog_reopen_same_fd(ClusterClogNativeBaseHandleV1 *held, bool cleanup);
 extern void test_relmap_native_clog_reopen_fault(ClusterClogNativeBaseHandleV1 *held, unsigned fault);
+extern bool test_relmap_native_clog_episode_read(int, TransactionId, ClusterClogNativeBaseV1 *,
+	sigjmp_buf *, ClusterClogNativeBaseHandleV1 **, const ClusterRelmapTerminalEpisodeV1 *);
+extern bool test_relmap_native_clog_episode_seal(ClusterClogNativeBaseHandleV1 *, const ClusterRelmapTerminalEpisodeV1 *);
 #endif

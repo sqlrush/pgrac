@@ -15853,3 +15853,18 @@ test_cluster_relmap_original_start.o: $(srcdir)/test_cluster_cold_claim_service.
         test_cluster_cold_tx_writer.inc \
         test_cluster_cold_tx_xid_maximum.inc \
         test_cluster_ctrc_projector.inc
+
+# The private terminal episode is shared by the original reader and participant.
+test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_product.o \
+ test_cluster_cold_relmap_terminal_start test_cluster_cold_relmap_executor.o \
+ test_cluster_cold_startup_relmap_executor.o test_cluster_cold_ctrc_relmap_executor.o \
+ test_cluster_cold_recovery_startup_core.o \
+ $(top_builddir)/src/backend/access/transam/clog.o \
+ $(top_builddir)/src/backend/cluster/cluster_cold_recovery_startup.o \
+ $(top_builddir)/src/backend/cluster/cluster_cold_recovery_relmap.o: \
+ $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
+
+test_cluster_relmap_retained_wal: $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h
+
+test_cluster_cold_recovery_startup: test_cluster_cold_terminal_episode.inc \
+ $(top_srcdir)/src/include/cluster/cluster_relmap_terminal_internal.h

@@ -46,6 +46,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_cold_relmap.h"
+#include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_online_owner.h"
@@ -3136,6 +3137,80 @@ cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
 		cold_reason_append(reason, reason_size, text);
 	}
 	return reason[0] == '\0';
+}
+
+/* Read the already completed original episode before publication. No new
+ * native scope or serial acquisition is permitted here. Own/history inputs
+ * cannot borrow a foreign recovery controller through this entry. */
+bool
+cluster_cold_typed_terminal_authority_v1(ClusterColdTypedV1 *typed,
+	ClusterRecoveryFencePlan *fence, uint32 participant, ClusterThreadRecoveryAuthorityV1 *out)
+{
+	if (out == NULL || typed == NULL || MyBackendType != B_STARTUP || !RecoveryInProgress()
+		|| CritSectionCount != 0 || !cluster_cold_typed_effects_ready_v1(typed)
+		|| participant >= typed->replay_count || participant == typed->own_participant
+		|| !typed->source_drained[participant]
+		|| !cluster_cold_typed_sources_current_v1(typed, fence)
+		|| !cold_participant_authority(typed, fence, participant, out)
+		|| out->serial_guard == NULL || !out->serial_guard->held
+		|| out->serial_guard->release_uncertain || out->serial_guard->lock_request.request_id == 0)
+		return false;
+	return cluster_cold_typed_sources_current_v1(typed, fence);
+}
+
+typedef struct ColdTerminalVisit {
+	const ColdRoot *selected;
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+	ClusterUndoRecoveryCheckpointVisitorV1 visitor;
+	void *arg;
+	uint64 serial, records;
+} ColdTerminalVisit;
+
+static bool
+cold_terminal_record(XLogReaderState *reader, void *arg)
+{
+	ColdTerminalVisit *work = arg;
+	if (reader == NULL || work->records == UINT64_MAX
+		|| !work->visitor(&work->checkpoint, &work->selected->root,
+			work->serial, reader, work->arg))
+		return false;
+	work->records++;
+	return true;
+}
+
+bool
+cluster_cold_typed_terminal_visit_v1(ClusterColdTypedV1 *typed,
+	ClusterRecoveryFencePlan *fence, uint32 participant,
+	ClusterUndoRecoveryCheckpointVisitorV1 visitor, void *arg)
+{
+	ClusterThreadRecoveryAuthorityV1 before, after;
+	ClusterRecoverySerialGuard serial;
+	ColdTerminalVisit work = {0};
+	ClusterWalTailObservation observed = {0};
+	ClusterWalRecoveryCheckpointV1 checkpoint;
+	if (visitor == NULL || !cluster_cold_typed_terminal_authority_v1(typed, fence, participant, &before))
+		return false;
+	serial = *before.serial_guard;
+	work.selected = &typed->replay_roots[participant];
+	work.visitor = visitor; work.arg = arg;
+	work.serial = serial.lock_request.request_id;
+	if (cluster_control_root_recovery_checkpoint_v1(&work.selected->root, &work.selected->token,
+		&work.checkpoint) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| cluster_control_root_recovery_visit(&work.selected->root, &work.selected->token,
+			cold_terminal_record, &work, &observed) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| work.records == 0 || observed.records != work.records
+		|| observed.complete_end != work.selected->root.validated_tail_lsn_exclusive
+		|| observed.last_record_start != work.selected->root.tail_last_record_lsn
+		|| observed.last_record_crc != work.selected->root.tail_last_record_crc32c
+		|| observed.database_incarnation != work.checkpoint.source.claim.database_incarnation
+		|| cluster_control_root_recovery_checkpoint_v1(&work.selected->root, &work.selected->token,
+			&checkpoint) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&checkpoint, &work.checkpoint, sizeof(checkpoint)) != 0
+		|| !cluster_cold_typed_terminal_authority_v1(typed, fence, participant, &after)
+		|| after.serial_guard != before.serial_guard
+		|| memcmp(after.serial_guard, &serial, sizeof(serial)) != 0)
+		return false;
+	return true;
 }
 
 static bool cold_replay_window = false;
