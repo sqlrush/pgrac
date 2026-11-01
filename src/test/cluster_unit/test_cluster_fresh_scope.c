@@ -272,12 +272,16 @@ cluster_tt_local_prepare_canonical_active(TransactionId xid, ClusterCanonicalTxn
 CommandTag
 CreateCommandTag(Node *statement)
 {
+	if (IsA(statement, TruncateStmt))
+		return CMDTAG_TRUNCATE_TABLE;
 	return IsA(statement, CreateTableAsStmt) ? CMDTAG_CREATE_TABLE_AS : CMDTAG_CREATE_TABLE;
 }
 
 const char *
 GetCommandTagName(CommandTag tag)
 {
+	if (tag == CMDTAG_TRUNCATE_TABLE)
+		return "TRUNCATE TABLE";
 	return tag == CMDTAG_CREATE_TABLE_AS ? "CREATE TABLE AS" : "CREATE TABLE";
 }
 
@@ -1230,10 +1234,137 @@ UT_TEST(test_noncreate_utility_does_not_reserve_canonical_binding)
 	}
 }
 
+/* The same verbatim utility prologue must finish BIND before TRUNCATE can
+ * reach its DDL locks/triggers. Later native DDL remains an explicit boundary. */
+UT_TEST(test_shared_truncate_variants_and_targets_bind_before_later_work)
+{
+	RangeVar targets[2] = { { .type = T_RangeVar }, { .type = T_RangeVar } };
+	ListCell cells[2] = { { .ptr_value = &targets[0] }, { .ptr_value = &targets[1] } };
+	List relations = { .type = T_List, .length = 2, .max_length = 2, .elements = cells };
+	TruncateStmt truncate = { .type = T_TruncateStmt, .relations = &relations };
+
+	for (unsigned variant = 0; variant < 4; variant++) {
+		reset_create_preflight();
+		utility_expect_binding = true;
+		truncate.restart_seqs = (variant & 1) != 0;
+		truncate.behavior = variant & 2 ? DROP_CASCADE : DROP_RESTRICT;
+		create_sql_entry((Node *)&truncate);
+		UT_ASSERT_EQ(utility_unbound, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 1);
+		UT_ASSERT_EQ(utility_xids, 1);
+		UT_ASSERT_EQ(utility_prepares, 1);
+		UT_ASSERT_EQ(utility_binds, 1);
+	}
+}
+
+UT_TEST(test_truncate_reuses_existing_top_binding_across_utility_calls)
+{
+	CreateStmt create = { .type = T_CreateStmt };
+	TruncateStmt truncate = { .type = T_TruncateStmt };
+
+	reset_create_preflight();
+	utility_expect_binding = true;
+	create_sql_entry((Node *)&create);
+	create_sql_entry((Node *)&truncate);
+	create_sql_entry((Node *)&truncate);
+	UT_ASSERT_EQ(utility_unbound, 0);
+	UT_ASSERT_EQ(utility_after_preflight, 3);
+	UT_ASSERT_EQ(utility_xids, 1);
+	UT_ASSERT_EQ(utility_prepares, 3);
+	UT_ASSERT_EQ(utility_binds, 1);
+}
+
+UT_TEST(test_truncate_publication_refusal_precedes_later_utility_work)
+{
+	TruncateStmt truncate = { .type = T_TruncateStmt };
+	int caught;
+
+	reset_create_preflight();
+	utility_bind_ok = false;
+	caught = sigsetjmp(boundary, 1);
+	if (!caught)
+		create_sql_entry((Node *)&truncate);
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(error_code, ERRCODE_DATA_CORRUPTED);
+	UT_ASSERT_EQ(utility_xids, 1);
+	UT_ASSERT_EQ(utility_prepares, 1);
+	UT_ASSERT_EQ(utility_binds, 0);
+	UT_ASSERT_EQ(utility_after_preflight, 0);
+}
+
+UT_TEST(test_truncate_child_or_wrong_top_refuses_before_allocation)
+{
+	TruncateStmt truncate = { .type = T_TruncateStmt };
+
+	for (unsigned child = 0; child < 2; child++) {
+		int caught;
+
+		reset_create_preflight();
+		utility_in_child = child != 0;
+		if (!child) {
+			utility_top_xid = 400;
+			utility_current_xid = 401;
+		}
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			create_sql_entry((Node *)&truncate);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, child ? ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_INTERNAL_ERROR);
+		UT_ASSERT_EQ(utility_xids, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+}
+
+UT_TEST(test_truncate_preflight_requires_shared_catalog_storage)
+{
+	TruncateStmt truncate = { .type = T_TruncateStmt };
+
+	for (unsigned mode = 0; mode < 8; mode++) {
+		reset_create_preflight();
+		cluster_shared_catalog = (mode & 1) != 0;
+		utility_storage_mode = (mode & 2) != 0;
+		cluster_shared_config = (mode & 4) != 0;
+		create_sql_entry((Node *)&truncate);
+		UT_ASSERT_EQ(utility_after_preflight, 1);
+		UT_ASSERT_EQ(utility_xids, (mode & 3) == 3);
+		UT_ASSERT_EQ(utility_prepares, (mode & 3) == 3);
+		UT_ASSERT_EQ(utility_binds, (mode & 3) == 3);
+	}
+}
+
+UT_TEST(test_truncate_original_readonly_parallel_guards_precede_binding)
+{
+	TruncateStmt truncate = { .type = T_TruncateStmt };
+
+	for (unsigned parallel = 0; parallel < 2; parallel++) {
+		int caught;
+
+		reset_create_preflight();
+		XactReadOnly = parallel == 0;
+		utility_parallel = parallel != 0;
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			create_sql_entry((Node *)&truncate);
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(error_code, parallel ? ERRCODE_INVALID_TRANSACTION_STATE
+										  : ERRCODE_READ_ONLY_SQL_TRANSACTION);
+		UT_ASSERT_EQ(utility_xids, 0);
+		UT_ASSERT_EQ(utility_prepares, 0);
+		UT_ASSERT_EQ(utility_after_preflight, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(34);
+	UT_RUN(test_shared_truncate_variants_and_targets_bind_before_later_work);
+	UT_RUN(test_truncate_reuses_existing_top_binding_across_utility_calls);
+	UT_RUN(test_truncate_publication_refusal_precedes_later_utility_work);
+	UT_RUN(test_truncate_child_or_wrong_top_refuses_before_allocation);
+	UT_RUN(test_truncate_preflight_requires_shared_catalog_storage);
+	UT_RUN(test_truncate_original_readonly_parallel_guards_precede_binding);
 	UT_RUN(test_pre1_startup_refuses_before_root_and_without_writes);
 	UT_RUN(test_selected_pre1_image_and_corruption_are_distinct);
 	UT_RUN(test_nonshared_startup_remains_native);
