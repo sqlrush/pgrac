@@ -11798,3 +11798,22 @@ clean distclean maintainer-clean: clean-native-s-read-successor
 clean-native-s-read-successor:
 	rm -f test_cluster_native_s_read_successor test_cluster_native_remote_x_fixture.inc \
 		test_cluster_native_remote_x_fixture.inc.tmp
+
+# Exact retirement of resident PI reservations before any protocol producer.
+TESTS += test_cluster_native_unissued_pi
+all: test_cluster_native_unissued_pi
+test_cluster_native_unissued_pi: test_cluster_native_unissued_pi.c \
+		test_cluster_native_resident_lock test_cluster_native_resident_lock_fixture.inc \
+		test_cluster_native_first_fill_native.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-unissued-pi
+.PHONY: clean-native-unissued-pi
+clean-native-unissued-pi:
+	rm -f test_cluster_native_unissued_pi

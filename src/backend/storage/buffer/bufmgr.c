@@ -7034,6 +7034,17 @@ cluster_bufmgr_first_fill_abort_unissued(ClusterBufmgrFirstFill *read)
 		&& (read->base.semantic_buf_state & (BM_TAG_VALID | BM_VALID)) == (BM_TAG_VALID | BM_VALID)
 		&& (read->base.semantic_buf_state & ~(BM_TAG_VALID | BM_VALID | BM_DIRTY
 			| BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) == 0;
+	/* Unavailable PI bytes still carry their original recovery obligation.
+	 * A rejected, never-issued read may retire only the GP it just acquired;
+	 * this does not make the PI readable or retire any PI/WAL responsibility. */
+	bool unavailable_pi = read->resident && read->base.pcm_state == PCM_STATE_N
+		&& read->base.buffer_type == BUF_TYPE_PI
+		&& read->base.semantic_buf_state == BM_TAG_VALID
+		&& read->base.flags == 0 && read->base.writer_activation_token == 0
+		&& read->base.resource_x_activation_generation == 0
+		&& read->base.generation < UINT64_MAX - 1
+		&& read->base.reservation_token < UINT64_MAX - 1
+		&& read->token == read->base.reservation_token + 1;
 	uint32 state;
 
 	if (!cluster_bufmgr_first_fill_local_owner(read)
@@ -7044,7 +7055,7 @@ cluster_bufmgr_first_fill_abort_unissued(ClusterBufmgrFirstFill *read)
 	state = LockBufHdr(read->buf);
 	cluster_pcm_own_snapshot_locked(read->buf, &live);
 	if (!cluster_pcm_own_snapshot_equal_exact(&expected, &live)
-		|| (!local_s_x && (live.pcm_state != PCM_STATE_N
+		|| (!local_s_x && !unavailable_pi && (live.pcm_state != PCM_STATE_N
 			|| (live.buffer_type != BUF_TYPE_CURRENT && (!read->resident || live.buffer_type != BUF_TYPE_PI))
 			|| live.semantic_buf_state != (BM_TAG_VALID | (read->resident ? BM_VALID : BM_IO_IN_PROGRESS))))
 		|| cluster_pcm_own_delivery_attempt_get(read->buf->buf_id) != 0

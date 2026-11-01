@@ -453,6 +453,11 @@ UT_TEST(test_resident_X_C_callback_and_authenticated_ACK_retire_independently)
 		for (int order = 0; order < 2; order++) {
 			ClusterGcsFirstFill request; ResourceXIntentSlot slot;
 			RX_REQUIRE(rx_start(&request, 2, source));
+			/* Complete the actual REQUEST ticket before testing the independent
+			 * installed-notice callback and master-consumption debts. */
+			UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.send.pending, 1);
+			cluster_lms_outbound_resource_x_send_complete(&ordinary_material.ticket, true);
+			UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.send.pending, 0);
 			RESIDENT_REQUIRE_EQ(rf_run(), RESOURCE_X_APPLY_APPLIED);
 			slot = qn_stage();
 			if (order == 0) {
@@ -752,6 +757,11 @@ UT_TEST(test_local_S_X_C_callback_and_master_ACK_are_independent_debts)
 	for (int order = 0; order < 2; order++) {
 		ClusterGcsFirstFill request; ResourceXIntentSlot slot;
 		RX_REQUIRE(rx_start(&request, 3, 6)); rx_local_bytes();
+		/* Complete the actual REQUEST ticket before testing the independent
+		 * installed-notice callback and master-consumption debts. */
+		UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.send.pending, 1);
+		cluster_lms_outbound_resource_x_send_complete(&ordinary_material.ticket, true);
+		UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.send.pending, 0);
 		RESIDENT_REQUIRE_EQ(rf_run(), RESOURCE_X_APPLY_APPLIED);
 		slot = qn_stage();
 		if (order == 0) {
