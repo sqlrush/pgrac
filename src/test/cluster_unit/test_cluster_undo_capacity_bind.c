@@ -697,6 +697,11 @@ UT_TEST(test_capacity_reentry_unflushed_commit_unstages_before_original_abort)
 	}
 }
 
+#ifdef UNDO_CAPACITY_BIND_FIXTURE_MAIN
+int UNDO_CAPACITY_BIND_FIXTURE_MAIN(void);
+#define main UNDO_CAPACITY_BIND_FIXTURE_MAIN
+#endif
+
 int
 main(void)
 {
@@ -715,3 +720,7 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+
+#ifdef UNDO_CAPACITY_BIND_FIXTURE_MAIN
+#undef main
+#endif

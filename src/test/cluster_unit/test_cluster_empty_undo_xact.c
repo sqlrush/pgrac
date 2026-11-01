@@ -1,8 +1,11 @@
 /* Original native transaction dispatch with real empty-undo TT consumers.
  * WAL storage, CLOG, SCN and unrelated subsystems remain explicit leaves.
  * Author: SqlRush <sqlrush@gmail.com> */
+#ifndef EMPTY_UNDO_XACT_PREFLIGHT_SOURCE
 #define EMPTY_UNDO_PREFLIGHT_FIXTURE_MAIN empty_xact_preflight_fixture_main
-#include "test_cluster_empty_undo_preflight.c"
+#define EMPTY_UNDO_XACT_PREFLIGHT_SOURCE "test_cluster_empty_undo_preflight.c"
+#endif
+#include EMPTY_UNDO_XACT_PREFLIGHT_SOURCE
 
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_xnode_profile.h"
@@ -327,6 +330,11 @@ UT_TEST(test_empty_native_no_xid_controls_keep_lazy_binding)
 	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
 }
 
+#ifdef EMPTY_UNDO_XACT_FIXTURE_MAIN
+int EMPTY_UNDO_XACT_FIXTURE_MAIN(void);
+#define main EMPTY_UNDO_XACT_FIXTURE_MAIN
+#endif
+
 int
 main(void)
 {
@@ -337,3 +345,7 @@ main(void)
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+
+#ifdef EMPTY_UNDO_XACT_FIXTURE_MAIN
+#undef main
+#endif

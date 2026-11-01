@@ -14342,6 +14342,28 @@ clean-undo-capacity-bind:
 	rm -f test_cluster_undo_capacity_bind_wait.inc test_cluster_undo_capacity_bind_wait.inc.tmp \
 		test_cluster_undo_capacity_bind
 
+# Keep capacity-wait ownership through the original native xact entry points.
+TESTS += test_cluster_undo_capacity_xact
+all: test_cluster_undo_capacity_xact
+test_cluster_undo_capacity_xact: test_cluster_undo_capacity_xact.c \
+		test_cluster_empty_undo_xact.c test_cluster_empty_undo_xact.inc \
+		test_cluster_undo_capacity_bind.c test_cluster_undo_capacity_bind_wait.inc \
+		test_cluster_empty_undo_preflight.c test_cluster_empty_undo_preflight.inc \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c \
+		test_cluster_tt_locator_stats.inc test_cluster_active_capacity_stats.inc unit_test.h \
+		$(top_srcdir)/src/backend/nodes/list.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-undo-capacity-xact
+.PHONY: clean-undo-capacity-xact
+clean-undo-capacity-xact:
+	rm -f test_cluster_undo_capacity_xact
+
 # Actual shared certificate/handoff and allocator GC in the same process.
 TESTS += test_cluster_ctrc_allocator_gc
 all: test_cluster_ctrc_allocator_gc
