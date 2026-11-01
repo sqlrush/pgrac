@@ -189,7 +189,7 @@ UT_TEST(shared_subtrans_write_is_registered_for_sync)
 	reset_fixture(true);
 	UT_ASSERT(SubTransCtl->sync_handler != SYNC_HANDLER_NONE);
 	UT_ASSERT_EQ(SubTransCtl->sync_handler, SYNC_HANDLER_CLUSTER_SUBTRANS);
-	UT_ASSERT(SlruPhysicalWritePage(SubTransCtl, 3 * SLRU_PAGES_PER_SEGMENT, 0, NULL));
+	UT_ASSERT(SlruPhysicalWritePage(SubTransCtl, 3 * SLRU_PAGES_PER_SEGMENT, 0, NULL, NULL));
 	UT_ASSERT_EQ(queue_calls, 1);
 	UT_ASSERT_EQ(sync_calls, 0);
 	UT_ASSERT_EQ(write_calls, 1);
@@ -206,11 +206,11 @@ UT_TEST(full_queue_requires_synchronous_flush_and_propagates_failure)
 {
 	reset_fixture(true);
 	queue_accepts = false;
-	UT_ASSERT(SlruPhysicalWritePage(SubTransCtl, 0, 0, NULL));
+	UT_ASSERT(SlruPhysicalWritePage(SubTransCtl, 0, 0, NULL, NULL));
 	UT_ASSERT_EQ(queue_calls, 1);
 	UT_ASSERT_EQ(sync_calls, 1);
 	sync_fails = true;
-	UT_ASSERT(!SlruPhysicalWritePage(SubTransCtl, 0, 0, NULL));
+	UT_ASSERT(!SlruPhysicalWritePage(SubTransCtl, 0, 0, NULL, NULL));
 	UT_ASSERT_EQ(queue_calls, 2);
 	UT_ASSERT_EQ(sync_calls, 2);
 	UT_ASSERT_EQ(slru_errcause, SLRU_FSYNC_FAILED);
@@ -221,7 +221,7 @@ UT_TEST(ordinary_subtrans_keeps_native_nondurable_selection)
 {
 	reset_fixture(false);
 	UT_ASSERT_EQ(SubTransCtl->sync_handler, SYNC_HANDLER_NONE);
-	UT_ASSERT(SlruPhysicalWritePage(SubTransCtl, 0, 0, NULL));
+	UT_ASSERT(SlruPhysicalWritePage(SubTransCtl, 0, 0, NULL, NULL));
 	UT_ASSERT_EQ(queue_calls, 0);
 	UT_ASSERT_EQ(sync_calls, 0);
 }
@@ -230,7 +230,7 @@ UT_TEST(queued_consumer_syncs_exact_segment_and_returns_real_errors)
 {
 	char path[MAXPGPATH];
 	reset_fixture(true);
-	UT_ASSERT(SlruPhysicalWritePage(SubTransCtl, 3 * SLRU_PAGES_PER_SEGMENT, 0, NULL));
+	UT_ASSERT(SlruPhysicalWritePage(SubTransCtl, 3 * SLRU_PAGES_PER_SEGMENT, 0, NULL, NULL));
 	UT_ASSERT_EQ(subtranssyncfiletag(&queued, path), 0);
 	UT_ASSERT(strcmp(path, "pg_subtrans/0003") == 0);
 	UT_ASSERT_EQ(sync_calls, 1);

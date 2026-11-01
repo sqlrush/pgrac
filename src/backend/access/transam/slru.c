@@ -88,6 +88,13 @@ typedef struct SlruWriteAllData
 
 typedef struct SlruWriteAllData *SlruWriteAll;
 
+/* CLOG page bytes and their WAL dependency captured under ControlLock. */
+typedef struct SlruWriteSnapshot
+{
+	PGAlignedBlock page;
+	XLogRecPtr	flush_lsn;
+} SlruWriteSnapshot;
+
 /*
  * Populate a file tag describing a segment file.  We only use the segment
  * number, since we can derive everything else we need by having separate
@@ -148,7 +155,8 @@ static void SimpleLruWaitIO(SlruCtl ctl, int slotno);
 static void SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata);
 static bool SlruPhysicalReadPage(SlruCtl ctl, int pageno, int slotno);
 static bool SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno,
-								  SlruWriteAll fdata);
+								  SlruWriteAll fdata,
+								  const SlruWriteSnapshot *snapshot);
 static void SlruReportIOError(SlruCtl ctl, int pageno, TransactionId xid);
 static int	SlruSelectLRUPage(SlruCtl ctl, int pageno);
 
@@ -555,6 +563,8 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	SlruShared	shared = ctl->shared;
 	int			pageno = shared->page_number[slotno];
 	bool		ok;
+	SlruWriteSnapshot snapshot;
+	const SlruWriteSnapshot *write_snapshot = NULL;
 
 	/* If a write is in progress, wait for it to finish */
 	while (shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS &&
@@ -575,6 +585,28 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 		return;
 
 	/*
+	 * CLOG updaters can modify the shared page and its async-commit LSNs as
+	 * soon as we release ControlLock.  Capture both now, so WAL flush and
+	 * physical data write refer to the same bytes.  A subsequent update still
+	 * sets page_dirty and must be written by a later attempt.  Other SLRUs
+	 * retain their existing shared-buffer write path.
+	 */
+	if (ctl->sync_handler == SYNC_HANDLER_CLOG)
+	{
+		int			lsnindex = slotno * shared->lsn_groups_per_page;
+
+		memcpy(snapshot.page.data, shared->page_buffer[slotno], BLCKSZ);
+		snapshot.flush_lsn = InvalidXLogRecPtr;
+		if (shared->group_lsn != NULL)
+		{
+			for (int i = 0; i < shared->lsn_groups_per_page; i++)
+				snapshot.flush_lsn = Max(snapshot.flush_lsn,
+									 shared->group_lsn[lsnindex + i]);
+		}
+		write_snapshot = &snapshot;
+	}
+
+	/*
 	 * Mark the slot write-busy, and clear the dirtybit.  After this point, a
 	 * transaction status update on this page will mark it dirty again.
 	 */
@@ -588,7 +620,7 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	LWLockRelease(shared->ControlLock);
 
 	/* Do the write */
-	ok = SlruPhysicalWritePage(ctl, pageno, slotno, fdata);
+	ok = SlruPhysicalWritePage(ctl, pageno, slotno, fdata, write_snapshot);
 
 	/* If we failed, and we're in a flush, better close the files */
 	if (!ok && fdata)
@@ -769,7 +801,8 @@ SlruPhysicalReadPage(SlruCtl ctl, int pageno, int slotno)
  * SimpleLruWriteAll.
  */
 static bool
-SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
+SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata,
+					  const SlruWriteSnapshot *snapshot)
 {
 	SlruShared	shared = ctl->shared;
 	int			segno = pageno / SLRU_PAGES_PER_SEGMENT;
@@ -785,7 +818,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 	 * write out data before associated WAL records.  This is the same action
 	 * performed during FlushBuffer() in the main buffer manager.
 	 */
-	if (shared->group_lsn != NULL)
+	if (snapshot != NULL || shared->group_lsn != NULL)
 	{
 		/*
 		 * We must determine the largest async-commit LSN for the page. This
@@ -798,14 +831,19 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 		int			lsnindex,
 					lsnoff;
 
-		lsnindex = slotno * shared->lsn_groups_per_page;
-		max_lsn = shared->group_lsn[lsnindex++];
-		for (lsnoff = 1; lsnoff < shared->lsn_groups_per_page; lsnoff++)
+		if (snapshot != NULL)
+			max_lsn = snapshot->flush_lsn;
+		else
 		{
-			XLogRecPtr	this_lsn = shared->group_lsn[lsnindex++];
+			lsnindex = slotno * shared->lsn_groups_per_page;
+			max_lsn = shared->group_lsn[lsnindex++];
+			for (lsnoff = 1; lsnoff < shared->lsn_groups_per_page; lsnoff++)
+			{
+				XLogRecPtr	this_lsn = shared->group_lsn[lsnindex++];
 
-			if (max_lsn < this_lsn)
-				max_lsn = this_lsn;
+				if (max_lsn < this_lsn)
+					max_lsn = this_lsn;
+			}
 		}
 
 		if (!XLogRecPtrIsInvalid(max_lsn))
@@ -889,7 +927,8 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
-	if (pg_pwrite(fd, shared->page_buffer[slotno], BLCKSZ, offset) != BLCKSZ)
+	if (pg_pwrite(fd, snapshot != NULL ? snapshot->page.data : shared->page_buffer[slotno],
+				  BLCKSZ, offset) != BLCKSZ)
 	{
 		pgstat_report_wait_end();
 		/* if write didn't set errno, assume problem is no disk space */
