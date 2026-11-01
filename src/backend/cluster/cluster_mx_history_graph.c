@@ -357,6 +357,8 @@ cluster_mx_history_graph_accept(ClusterMxHistoryGraph *g, const ClusterMxHistory
 	if (node->bytes == NULL)
 		goto failed;
 	memcpy(node->bytes, bytes.data, record.record_length);
+	/* Keep the actual routed/landed echo for peer-only member assembly. */
+	node->request = r;
 	node->record = record;
 	node->record.identity = identity;
 	node->record.canonical_generation_known = true;
@@ -382,8 +384,12 @@ cluster_mx_history_graph_view(const ClusterMxHistoryGraph *g, size_t ordinal,
 	node = g->nodes[ordinal];
 	if (!node->done)
 		return false;
-	*out = (ClusterMxHistoryNodeView){ &node->record, &node->peer, node->bytes, node->global_prev,
-									   node->page_prior };
+	*out = (ClusterMxHistoryNodeView){ .request = &node->request,
+									   .record = &node->record,
+									   .peer = &node->peer,
+									   .bytes = node->bytes,
+									   .global_prev = node->global_prev,
+									   .page_prior = node->page_prior };
 	return true;
 }
 

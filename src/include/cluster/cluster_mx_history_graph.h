@@ -17,6 +17,7 @@ typedef struct ClusterMxHistoryGraph ClusterMxHistoryGraph;
 /* Views expire on graph cancellation. They are not local TT resolutions or
  * assembled member proofs. page_prior is the actual page/slot ordering edge. */
 typedef struct ClusterMxHistoryNodeView {
+	const ClusterMxHistoryRequest *request;
 	const ClusterMxHistoryRecord *record;
 	const ClusterMxHistoryPeer *peer;
 	const char *bytes;

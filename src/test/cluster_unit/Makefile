@@ -13453,3 +13453,28 @@ test_cluster_mx_history_graph: test_cluster_mx_history_graph.c \
 		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_mx_history_members
+all: test_cluster_mx_history_members
+
+test_cluster_mx_history_members: test_cluster_mx_history_members.c test_cluster_mx_history_graph.c \
+		test_cluster_mx_history_backend.c test_cluster_r4_route_policy.c unit_test.h \
+		test_cluster_r4_forward_ingress_boundaries.inc test_cluster_current_mx_reply_builder.inc \
+		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
+		$(top_srcdir)/src/include/cluster/cluster_mx_history_graph.h \
+		$(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_member.o \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_graph.o \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_CR_APPLY_O) $(CLUSTER_SAVEPOINT_READER_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_PCM_OWN_O) \
+		$(CLUSTER_R4_CONTINUATION_PAGE_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_member.o \
+		$(top_builddir)/src/backend/cluster/cluster_mx_history_graph.o \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_CR_APPLY_O) $(CLUSTER_SAVEPOINT_READER_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_R4_GCS_BLOCK_TEST_O) $(CLUSTER_PCM_OWN_O) \
+		$(CLUSTER_R4_CONTINUATION_PAGE_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_MX_HISTORY_WIRE_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@

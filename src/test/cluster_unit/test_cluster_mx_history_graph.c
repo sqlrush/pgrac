@@ -50,6 +50,12 @@ typedef struct GraphSource {
 	UBA address, previous;
 	ClusterItlSlotData prior;
 	uint32 top, child, block, generation;
+	uint32 top_epoch, child_epoch;
+	OffsetNumber offset;
+	uint8 record_type;
+	XLogRecPtr lsn;
+	ClusterTxOutcome outcome;
+	uint32 grant;
 	uint8 slot, kind, effect;
 	uint64 sequence;
 	uint16 wrap;
@@ -65,6 +71,10 @@ source_at(uint32 block)
 {
 	GraphSource s = { 0 };
 	s.address = uba_encode(257, block, 3, 0);
+	s.top_epoch = s.child_epoch = 2;
+	s.offset = 2;
+	s.record_type = UNDO_RECORD_INSERT;
+	s.outcome = CLUSTER_TX_COMMITTED;
 	s.top = 100;
 	s.child = 103;
 	s.block = 17;
@@ -149,6 +159,9 @@ graph_deliver(ClusterMxHistoryGraph *g, ClusterMxHistoryRequest r)
 	UndoOperationTrailer op = { 0 };
 	UndoItlHistoryTrailer history = { 0 };
 	UndoInsertPayload insert = { 64, 0 };
+	UndoUpdatePayload update = { 17, 2, 32, sizeof(update), 0 };
+	UndoDeletePayload deleted = { 32, sizeof(deleted), 0 };
+	UndoItlPayload locked = { 0 };
 	UndoSavepointRollbackPayload control = { 0 };
 	PGAlignedBlock data;
 	uint8 auth[16] = { 0 };
@@ -179,9 +192,9 @@ graph_deliver(ClusterMxHistoryGraph *g, ClusterMxHistoryRequest r)
 	bh.magic = PGRAC_UNDO_BLOCK_MAGIC;
 	bh.block_version = UNDO_BLOCK_VERSION_1;
 	bh.slot_count = 1;
-	bh.block_lsn = 120 + s->sequence;
+	bh.block_lsn = s->lsn ? s->lsn : 120 + s->sequence;
 	h.record_type
-		= s->kind == CMXH_ROLLBACK_CONTROL ? UNDO_RECORD_SAVEPOINT_ROLLBACK : UNDO_RECORD_INSERT;
+		= s->kind == CMXH_ROLLBACK_CONTROL ? UNDO_RECORD_SAVEPOINT_ROLLBACK : s->record_type;
 	h.flags = s->kind == CMXH_ROLLBACK_CONTROL ? UNDO_REC_FLAG_HAS_OPERATION
 											   : UNDO_REC_FLAG_HAS_ITL_HISTORY;
 	if (s->kind == CMXH_OPERATION)
@@ -198,12 +211,14 @@ graph_deliver(ClusterMxHistoryGraph *g, ClusterMxHistoryRequest r)
 	h.target_locator = (RelFileLocator){ 1663, 42, 99 };
 	h.target_fork = MAIN_FORKNUM;
 	h.target_block = s->block;
-	h.target_offset = 2;
+	h.target_offset = s->offset;
 	op.version = UNDO_OPERATION_TRAILER_VERSION;
 	op.length = sizeof(op);
 	op.effect_state = s->effect;
-	op.canonical_top_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, s->top));
-	op.operation_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(2, s->child));
+	op.canonical_top_fxid
+		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(s->top_epoch, s->top));
+	op.operation_fxid
+		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(s->child_epoch, s->child));
 	op.operation_sequence = s->sequence;
 	op.canonical_segment_generation = s->generation;
 	op.command_id = 4;
@@ -216,6 +231,8 @@ graph_deliver(ClusterMxHistoryGraph *g, ClusterMxHistoryRequest r)
 												.after_kind = ITL_FLAG_ACTIVE,
 												.after_write_scn = h.write_scn,
 												.prior = s->prior };
+	if (h.record_type == UNDO_RECORD_ITL)
+		history.entries[0].after_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
 	body = data.data + sizeof(bh) + sizeof(h);
 	if (s->kind == CMXH_ROLLBACK_CONTROL) {
 		memset(&h.target_locator, 0, sizeof(h.target_locator));
@@ -230,9 +247,29 @@ graph_deliver(ClusterMxHistoryGraph *g, ClusterMxHistoryRequest r)
 		memcpy(body + sizeof(control), &op, sizeof(op));
 		body_size = sizeof(control) + sizeof(op);
 	} else {
-		memcpy(body, &insert, sizeof(insert));
-		memcpy(body + sizeof(insert), &history, sizeof(history));
-		body_size = sizeof(insert) + sizeof(history);
+		switch (h.record_type) {
+		case UNDO_RECORD_UPDATE:
+			memcpy(body, &update, sizeof(update));
+			body_size = sizeof(update) + update.old_tuple_length;
+			break;
+		case UNDO_RECORD_DELETE:
+			memcpy(body, &deleted, sizeof(deleted));
+			body_size = sizeof(deleted) + deleted.full_tuple_length;
+			break;
+		case UNDO_RECORD_ITL:
+			locked.itl_slot_idx = s->slot;
+			locked.new_flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+			locked.lock_xid = h.xid;
+			memcpy(body, &locked, sizeof(locked));
+			body_size = sizeof(locked);
+			break;
+		default:
+			memcpy(body, &insert, sizeof(insert));
+			body_size = sizeof(insert);
+			break;
+		}
+		memcpy(body + body_size, &history, sizeof(history));
+		body_size += sizeof(history);
 		if (s->kind == CMXH_OPERATION) {
 			memcpy(body + body_size, &op, sizeof(op));
 			body_size += sizeof(op);
@@ -249,21 +286,25 @@ graph_deliver(ClusterMxHistoryGraph *g, ClusterMxHistoryRequest r)
 	memcpy(data.data + BLCKSZ - sizeof(dir), &dir, sizeof(dir));
 	p.flags = CLUSTER_MX_HISTORY_ORDERED;
 	p.record_class = s->kind;
-	p.outcome = CLUSTER_TX_COMMITTED;
+	p.outcome = s->outcome;
 	p.effect = s->kind == CMXH_ROLLBACK_CONTROL ? 0 : s->effect;
 	p.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
 	p.canonical = (ClusterTTSlotPhysicalLocator){ 257, s->top, 3, s->wrap, 0 };
 	p.canonical_generation = s->generation;
-	p.top_fxid = FullTransactionIdFromEpochAndXid(2, s->top);
-	p.operation_fxid
-		= s->kind == CMXH_V1_TOP ? p.top_fxid : FullTransactionIdFromEpochAndXid(2, s->child);
+	p.top_fxid = FullTransactionIdFromEpochAndXid(s->top_epoch, s->top);
+	p.operation_fxid = s->kind == CMXH_V1_TOP
+						   ? p.top_fxid
+						   : FullTransactionIdFromEpochAndXid(s->child_epoch, s->child);
 	p.operation_sequence = s->kind == CMXH_V1_TOP ? 0 : s->sequence;
 	p.record = s->address;
 	p.previous = s->previous;
 	p.data_generation = 0;
 	p.data_crc = history_crc(data.data, BLCKSZ);
 	p.data_lsn = bh.block_lsn;
-	p.commit_scn = 1100;
+	p.commit_scn = s->outcome == CLUSTER_TX_COMMITTED ? 1100 : 0;
+	p.ctrc_grant = s->grant;
+	if (s->grant)
+		p.flags |= CLUSTER_MX_HISTORY_HAS_GRANT;
 	p.formation_epoch = r.read_epoch;
 	p.admission_generation = r.admission_generation;
 	if (malformed_peer == 1)
@@ -620,8 +661,11 @@ UT_TEST(graph_routes_actual_backend_and_capacity)
 	}
 	graph_clean(g);
 }
+#ifndef HISTORY_GRAPH_TEST_MAIN
+#define HISTORY_GRAPH_TEST_MAIN main
+#endif
 int
-main(void)
+HISTORY_GRAPH_TEST_MAIN(void)
 {
 	UT_PLAN(14);
 	UT_RUN(graph_single_root_real_landing);
