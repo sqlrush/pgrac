@@ -43,4 +43,27 @@ extern bool cluster_clog_storage_write_page_v2(int fd,
 									 const void *payload, Size payload_length,
 									 XLogRecPtr *last_end);
 
+/* Initialize an empty, exclusively owned local segment FD with its header and
+ * first materialized page. The original file owner has already reserved the
+ * exact name/registration and excludes every other writer for this call. It
+ * supplies the same private control-lock snapshot as write_page, with no prior
+ * image_lsn. The first materialized page need not be local page zero; gaps are
+ * not valid pages and readers must continue to refuse them.
+ *
+ * Native header and complete-page WAL records are flushed before either file
+ * write. Success requires fsync and complete readback, and returns the page
+ * record's actual end. Existing/partial/legacy files are never overwritten or
+ * repaired. Failures preserve last_end, inputs, borrowed FD and any partial
+ * material; WAL errors restore only our checkpoint-delay flag and propagate.
+ *
+ * This does not open/publish a name, sync its directory, register a file, or
+ * provide bootstrap/replay authority. The original owner retains namespace
+ * durability and custody. Recovery/bootstrap/fsync-disabled writes are refused.
+ */
+extern bool cluster_clog_storage_initialize_v2(int fd,
+									 const ClusterClogFileBindingV2 *expected,
+									 const ClusterClogPageIdentityV2 *page,
+									 const void *payload, Size payload_length,
+									 XLogRecPtr *last_end);
+
 #endif

@@ -11407,6 +11407,31 @@ clean: clean-clog-storage-write
 clean-clog-storage-write:
 	rm -f test_cluster_clog_write test_cluster_clog_write.d
 
+# Native-WAL-first header and first-frame initialization of an empty local FD.
+TESTS += test_cluster_clog_initialize
+all: test_cluster_clog_initialize
+test_cluster_clog_initialize: test_cluster_clog_initialize.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-storage-initialize
+.PHONY: clean-clog-storage-initialize
+clean-clog-storage-initialize:
+	rm -f test_cluster_clog_initialize test_cluster_clog_initialize.d
+
 # Original issuer/CLOG birth and cache provenance lifecycle.
 TESTS += test_cluster_clog_birth
 all: test_cluster_clog_birth
