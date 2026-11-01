@@ -14366,3 +14366,29 @@ clean distclean maintainer-clean: clean-ctrc-allocator-gc
 .PHONY: clean-ctrc-allocator-gc
 clean-ctrc-allocator-gc:
 	rm -f test_cluster_ctrc_allocator_gc
+
+# Native owner handoff through the original cleaner counter producers.
+TESTS += test_cluster_native_slot_counters
+all: test_cluster_native_slot_counters
+
+test_cluster_native_slot_scope.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c Makefile
+	awk '/^cluster_undo_cleaner_tx_slot_wait_(begin|end)\(/ { print "void"; emit=1; n++ } \
+	     /^cluster_undo_cleaner_tx_slot_waiting\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}$$/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_slot_counters: test_cluster_native_slot_counters.c \
+		test_cluster_tt_active_owner.c test_cluster_tt_durable.c unit_test.h \
+		test_cluster_active_capacity_stats.inc test_cluster_native_slot_scope.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_local.c \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_slot.c $(CLUSTER_TT_DURABLE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_TT_DURABLE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-native-slot-counters
+.PHONY: clean-native-slot-counters
+clean-native-slot-counters:
+	rm -f test_cluster_native_slot_counters test_cluster_native_slot_scope.inc \
+		test_cluster_native_slot_scope.inc.tmp

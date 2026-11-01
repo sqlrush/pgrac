@@ -354,6 +354,8 @@ cluster_undo_cleaner_capacity_context_safe(void)
 	return slot_wait_context_safe && !capacity_other_admission;
 }
 
+/* The counter composition supplies the original cleaner scope functions. */
+#ifndef TT_ACTIVE_OWNER_EXTERNAL_WAIT_SCOPE
 void
 cluster_undo_cleaner_tx_slot_wait_begin(void)
 {
@@ -370,6 +372,7 @@ cluster_undo_cleaner_tx_slot_wait_end(bool cancelled)
 	slot_wait_ends++;
 	slot_wait_cancels += cancelled;
 }
+#endif
 
 void
 pfree(void *pointer)
@@ -432,6 +435,9 @@ VirtualXactLock(VirtualTransactionId owner, bool wait)
 	const ClusterTTSlotAllocEntry *entry = &allocator_storage.per_node[0].slots[0];
 
 	UT_ASSERT(slot_wait_test && slot_wait_in_native);
+#ifdef TT_ACTIVE_OWNER_EXTERNAL_WAIT_SCOPE
+	UT_ASSERT(cluster_undo_cleaner_tx_slot_waiting());
+#endif
 	UT_ASSERT_EQ(owner.backendId, 9);
 	UT_ASSERT_EQ(owner.localTransactionId, 19);
 	UT_ASSERT(wait);
