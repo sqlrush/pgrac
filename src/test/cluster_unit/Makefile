@@ -11663,3 +11663,26 @@ clean distclean maintainer-clean: clean-native-multi-holder
 clean-native-multi-holder:
 	rm -f test_cluster_native_multi_holder test_cluster_native_resident_x_fixture.inc \
 		test_cluster_native_resident_x_fixture.inc.tmp
+
+# Independent current-X writer, actual writeback and later S/X acquisition.
+TESTS += test_cluster_native_remote_x
+all: test_cluster_native_remote_x
+test_cluster_native_remote_x: test_cluster_native_remote_x.c test_cluster_native_multi_holder \
+		test_cluster_native_holder_writeback test_cluster_native_three_role_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_three_role_fixture.inc: test_cluster_native_three_role.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+		END { if (!stop || lines < 150) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-remote-x
+.PHONY: clean-native-remote-x
+clean-native-remote-x:
+	rm -f test_cluster_native_remote_x test_cluster_native_three_role_fixture.inc \
+		test_cluster_native_three_role_fixture.inc.tmp
