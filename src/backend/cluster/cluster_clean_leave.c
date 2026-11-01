@@ -861,24 +861,103 @@ cluster_normal_stop_requested(void)
 	return cl_normal_stop != NULL && pg_atomic_read_u32(&cl_normal_stop->requested) == 1;
 }
 
+/* Private observations only. No shared publication, lock or lifetime authority. */
+typedef struct ClStopFirstFailureTrace {
+	bool pending;
+	const char *caller;
+	int line, pid, procno, backend_id;
+	uint32 phase, reason;
+	uint64 epoch, nonce, deadline, proc_generation;
+	bool leave_known, proc_known;
+} ClStopFirstFailureTrace;
+static ClStopFirstFailureTrace cl_stop_first_failure;
+
+static void
+cl_stop_trace_lock(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)arg = true;
+}
+
+static bool
+cl_stop_trace_safe(void)
+{
+	bool held = false;
+	if (CritSectionCount != 0)
+		return false;
+	ForEachLWLockHeldByMe(cl_stop_trace_lock, &held);
+	return !held;
+}
+
+static void
+cl_stop_trace_first_failure(void)
+{
+	if (!cluster_trace_normal_stop || !cl_stop_first_failure.pending || !cl_stop_trace_safe())
+		return;
+	cl_stop_first_failure.pending = false;
+	ereport(
+		LOG,
+		(errmsg("normal-stop first failure"),
+		 errdetail(
+			 "node=%d pid=%d caller=%s line=%d reason=%u phase=%u"
+			 " epoch=" UINT64_FORMAT " nonce=" UINT64_FORMAT " deadline_pg_us=" UINT64_FORMAT
+			 " leave_known=%d proc_known=%d procno=%d backend_id=%d proc_generation=" UINT64_FORMAT
+			 " cut=caller_local_nonatomic",
+			 cluster_node_id, cl_stop_first_failure.pid, cl_stop_first_failure.caller,
+			 cl_stop_first_failure.line, cl_stop_first_failure.reason, cl_stop_first_failure.phase,
+			 cl_stop_first_failure.epoch, cl_stop_first_failure.nonce,
+			 cl_stop_first_failure.deadline, cl_stop_first_failure.leave_known,
+			 cl_stop_first_failure.proc_known, cl_stop_first_failure.procno,
+			 cl_stop_first_failure.backend_id, cl_stop_first_failure.proc_generation)));
+}
+
 void
-cluster_normal_stop_fail(ClusterNormalStopFailure reason)
+cluster_normal_stop_fail_at(ClusterNormalStopFailure reason, const char *caller, int line)
 {
 	uint32 expected = CLUSTER_NORMAL_STOP_FAILURE_NONE;
-
+	bool first;
 	if (cl_normal_stop == NULL || reason == CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		return;
 	if (reason < CLUSTER_NORMAL_STOP_FAILURE_NONE
 		|| reason > CLUSTER_NORMAL_STOP_FAILURE_LATE_UNSEALED_WORK)
 		reason = CLUSTER_NORMAL_STOP_FAILURE_STATE;
-	(void)pg_atomic_compare_exchange_u32(&cl_normal_stop->failure_reason, &expected, reason);
+	first = pg_atomic_compare_exchange_u32(&cl_normal_stop->failure_reason, &expected, reason);
+	if (first && cluster_trace_normal_stop) {
+		memset(&cl_stop_first_failure, 0, sizeof(cl_stop_first_failure));
+		cl_stop_first_failure.pending = true;
+		cl_stop_first_failure.caller = caller;
+		cl_stop_first_failure.line = line;
+		cl_stop_first_failure.pid = MyProcPid;
+		cl_stop_first_failure.reason = reason;
+		cl_stop_first_failure.phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+		cl_stop_first_failure.epoch = cl_normal_stop->epoch;
+		if (cl_state != NULL) {
+			cl_stop_first_failure.leave_known = true;
+			cl_stop_first_failure.nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+			cl_stop_first_failure.deadline = cl_state->barrier_deadline_us;
+		}
+		if (MyProc != NULL) {
+			cl_stop_first_failure.proc_known = true;
+			cl_stop_first_failure.procno = MyProc->pgprocno;
+			cl_stop_first_failure.backend_id = MyProc->backendId;
+			cl_stop_first_failure.proc_generation = MyProc->cluster_grd_generation;
+		}
+		cl_stop_trace_first_failure();
+	}
 	if (reason == CLUSTER_NORMAL_STOP_FAILURE_DEADLINE)
 		cluster_content_trace_deadline_dump(reason);
+}
+
+void(cluster_normal_stop_fail)(ClusterNormalStopFailure reason)
+{
+	cluster_normal_stop_fail_at(reason, "ABI_caller_unknown", 0);
 }
 
 ClusterNormalStopFailure
 cluster_normal_stop_failure(void)
 {
+	cl_stop_trace_first_failure();
 	return cl_normal_stop == NULL
 			   ? CLUSTER_NORMAL_STOP_FAILURE_STATE
 			   : (ClusterNormalStopFailure)pg_atomic_read_u32(&cl_normal_stop->failure_reason);
@@ -1530,12 +1609,59 @@ cl_normal_stop_fronts_announce(const ClusterICEnvelope *env,
 	LWLockRelease(&cl_state->lock);
 }
 
+typedef struct ClStopAckTrace {
+	const char *event, *first_reject;
+	uint64 epoch, nonce, events, overwritten;
+	uint64 rejected_epoch, rejected_nonce;
+	const char *identity_reason;
+	uint32 identity_result;
+	bool identity_result_known;
+	bool first_reported;
+	const char *reported_event;
+	uint64 reported_nonce, reported_events;
+	TimestampTz reported_at;
+} ClStopAckTrace;
+static ClStopAckTrace cl_stop_ack_trace[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT + 1];
+StaticAssertDecl(sizeof(cl_stop_ack_trace) + sizeof(cl_stop_first_failure) <= 2048,
+				 "normal-stop private diagnostics exceed 2KiB");
+
+static void
+cl_stop_ack_note(int peer, const char *event, const char *reject, uint64 epoch, uint64 nonce)
+{
+	ClStopAckTrace *d;
+	if (!cluster_trace_normal_stop)
+		return;
+	d = &cl_stop_ack_trace[peer >= 0 && peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+							   ? peer
+							   : CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	if (d->event != NULL)
+		d->overwritten++;
+	d->event = event;
+	d->epoch = epoch;
+	d->nonce = nonce;
+	d->events++;
+	if (reject != NULL && d->first_reject == NULL) {
+		d->first_reject = reject;
+		d->rejected_epoch = epoch;
+		d->rejected_nonce = nonce;
+	}
+}
+
+static bool
+cl_stop_ack_reject(int peer, const char *predicate, bool rejected, uint64 epoch, uint64 nonce)
+{
+	if (rejected)
+		cl_stop_ack_note(peer, "ack.reject", predicate, epoch, nonce);
+	return rejected;
+}
+
 static void
 cl_normal_stop_fronts_ack(const ClusterICEnvelope *env, const ClusterLeaveAckPayload *ack)
 {
 	ClNormalStopFrontInbox *inbox;
 	bool nak;
 	int peer;
+	uint64 observed_nonce = 0;
 
 	if (!IsUnderPostmaster || !AmLmonProcess() || cl_state == NULL || cl_normal_stop == NULL
 		|| env == NULL || ack == NULL || !cluster_enabled
@@ -1543,28 +1669,66 @@ cl_normal_stop_fronts_ack(const ClusterICEnvelope *env, const ClusterLeaveAckPay
 		return;
 	peer = (int)env->source_node_id;
 	nak = env->msg_type == PGRAC_IC_MSG_LEAVE_DRAIN_NAK;
-	if (peer < 0 || peer >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT || peer == cluster_node_id
-		|| (!nak && env->msg_type != PGRAC_IC_MSG_LEAVE_DRAIN_ACK)
-		|| env->dest_node_id != (uint32)cluster_node_id || env->payload_length != sizeof(*ack)
-		|| !cluster_clean_leave_ack_payload_valid(ack) || ack->survivor_node_id != peer
-		|| ack->leaving_node_id != cluster_node_id || ack->leave_epoch != env->epoch
-		|| ack->phase1_round != 0 || ack->nak != (uint8)nak
-		|| (!nak && ack->nak_reason != CLUSTER_LEAVE_NAK_NONE)) {
+	/* A refused short payload has no readable tuple. Do not inspect its bytes. */
+	if (cluster_trace_normal_stop && env->payload_length == sizeof(*ack))
+		observed_nonce = ack->leave_nonce;
+	if (cl_stop_ack_reject(peer, "peer.range_low", (peer < 0), env->epoch, observed_nonce)
+		|| cl_stop_ack_reject(peer, "peer.range_high",
+							  (peer >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT), env->epoch,
+							  observed_nonce)
+		|| cl_stop_ack_reject(peer, "peer.self", (peer == cluster_node_id), env->epoch,
+							  observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.type",
+							  ((!nak && env->msg_type != PGRAC_IC_MSG_LEAVE_DRAIN_ACK)), env->epoch,
+							  observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.destination",
+							  (env->dest_node_id != (uint32)cluster_node_id), env->epoch,
+							  observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.length", (env->payload_length != sizeof(*ack)),
+							  env->epoch, observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.payload", (!cluster_clean_leave_ack_payload_valid(ack)),
+							  env->epoch, observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.survivor", (ack->survivor_node_id != peer), env->epoch,
+							  observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.leaving", (ack->leaving_node_id != cluster_node_id),
+							  env->epoch, observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.epoch", (ack->leave_epoch != env->epoch), env->epoch,
+							  observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.round", (ack->phase1_round != 0), env->epoch,
+							  observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.nak", (ack->nak != (uint8)nak), env->epoch,
+							  observed_nonce)
+		|| cl_stop_ack_reject(peer, "wire.nak_reason",
+							  ((!nak && ack->nak_reason != CLUSTER_LEAVE_NAK_NONE)), env->epoch,
+							  observed_nonce)) {
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 		return;
 	}
+	cl_stop_ack_note(peer, "ack.receive", NULL, env->epoch, ack->leave_nonce);
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	/* Like the original wire consumer, a delayed ACK for another attempt is
 	 * not a vote. It cannot replace this attempt or extend its budget. */
-	if (pg_atomic_read_u32(&cl_state->request_in_progress) != 1
-		|| pg_atomic_read_u32(&cl_state->shutdown_driven) != 1
-		|| ack->leave_nonce != pg_atomic_read_u64(&cl_state->leave_attempt_nonce)) {
+	if (cl_stop_ack_reject(peer, "receive.request_in_progress",
+						   pg_atomic_read_u32(&cl_state->request_in_progress) != 1, env->epoch,
+						   ack->leave_nonce)
+		|| cl_stop_ack_reject(peer, "receive.shutdown_driven",
+							  pg_atomic_read_u32(&cl_state->shutdown_driven) != 1, env->epoch,
+							  ack->leave_nonce)
+		|| cl_stop_ack_reject(peer, "receive.nonce",
+							  ack->leave_nonce
+								  != pg_atomic_read_u64(&cl_state->leave_attempt_nonce),
+							  env->epoch, ack->leave_nonce)) {
 		LWLockRelease(&cl_state->lock);
 		return;
 	}
 	if (pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0) {
-		if (ack->leave_epoch != cl_normal_stop->epoch || nak
-			|| !cl_phase1_member_bit_is_set(cl_state->ack_bitmap, peer))
+		if (cl_stop_ack_reject(peer, "receive.release_epoch",
+							   ack->leave_epoch != cl_normal_stop->epoch, env->epoch,
+							   ack->leave_nonce)
+			|| cl_stop_ack_reject(peer, "receive.release_nak", nak, env->epoch, ack->leave_nonce)
+			|| cl_stop_ack_reject(peer, "receive.release_ack_missing",
+								  !cl_phase1_member_bit_is_set(cl_state->ack_bitmap, peer),
+								  env->epoch, ack->leave_nonce))
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 		LWLockRelease(&cl_state->lock);
 		return;
@@ -1573,25 +1737,83 @@ cl_normal_stop_fronts_ack(const ClusterICEnvelope *env, const ClusterLeaveAckPay
 	if (inbox->ack_pending && inbox->ack.leave_nonce != ack->leave_nonce)
 		inbox->ack_pending = false; /* completed predecessor, never a new vote */
 	if (inbox->ack_pending
-		&& (inbox->ack.leave_nonce != ack->leave_nonce || inbox->ack.leave_epoch != ack->leave_epoch
-			|| inbox->ack.nak != ack->nak || inbox->ack.nak_reason != ack->nak_reason))
+		&& (cl_stop_ack_reject(peer, "receive.retained_nonce",
+							   inbox->ack.leave_nonce != ack->leave_nonce, env->epoch,
+							   ack->leave_nonce)
+			|| cl_stop_ack_reject(peer, "receive.retained_epoch",
+								  inbox->ack.leave_epoch != ack->leave_epoch, env->epoch,
+								  ack->leave_nonce)
+			|| cl_stop_ack_reject(peer, "receive.retained_nak", inbox->ack.nak != ack->nak,
+								  env->epoch, ack->leave_nonce)
+			|| cl_stop_ack_reject(peer, "receive.retained_reason",
+								  inbox->ack.nak_reason != ack->nak_reason, env->epoch,
+								  ack->leave_nonce)))
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 	else if (!inbox->ack_pending) {
 		inbox->ack_envelope = *env;
 		inbox->ack = *ack;
 		inbox->ack_pending = true;
+		cl_stop_ack_note(peer, "ack.retain", NULL, env->epoch, ack->leave_nonce);
 	}
 	LWLockRelease(&cl_state->lock);
 }
 
+/* The original LMON owns its inbox and events. The checkpointer cannot export
+ * process-private ACK state. Repeats are coalesced, first rejects retained. */
 static void
-cl_normal_stop_fronts_lmon_tick(void)
+cl_stop_ack_trace_emit(void)
+{
+	TimestampTz now;
+	if (!cluster_trace_normal_stop || !IsUnderPostmaster || !AmLmonProcess() || cl_state == NULL
+		|| cl_normal_stop == NULL || !cl_stop_trace_safe())
+		return;
+	now = GetCurrentTimestamp();
+	for (int peer = 0; peer <= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		ClStopAckTrace *d = &cl_stop_ack_trace[peer];
+		bool known = peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT;
+		if (d->events == 0 || d->events == d->reported_events)
+			continue;
+		if (d->reported_at != 0 && now >= d->reported_at
+			&& now - d->reported_at < INT64CONST(1000000) && d->reported_event == d->event
+			&& d->reported_nonce == d->nonce && (d->first_reject == NULL || d->first_reported))
+			continue;
+		ereport(
+			LOG,
+			(errmsg("normal-stop producer ACK observation"),
+			 errdetail(
+				 "node=%d pid=%d peer=%d event=%s epoch=" UINT64_FORMAT " nonce=" UINT64_FORMAT
+				 " nonce_known=%d ack_pending_known=%d ack_pending=%d inbox_epoch=" UINT64_FORMAT
+				 " inbox_nonce=" UINT64_FORMAT " inbox_tuple_known=%d first_reject=%s "
+				 "rejected_epoch=" UINT64_FORMAT " rejected_nonce=" UINT64_FORMAT
+				 " events=" UINT64_FORMAT " overwritten=" UINT64_FORMAT
+				 " identity_result_known=%d identity_result=%u identity_reason=%s"
+				 " phase=%u deadline_pg_us=" UINT64_FORMAT " cut=lmon_local_nonatomic",
+				 cluster_node_id, MyProcPid, known ? peer : -1, d->event, d->epoch, d->nonce,
+				 d->nonce != 0, known, known ? cl_normal_stop_front_inbox[peer].ack_pending : 0,
+				 known ? cl_normal_stop_front_inbox[peer].ack_envelope.epoch : 0,
+				 known ? cl_normal_stop_front_inbox[peer].ack.leave_nonce : 0,
+				 known && cl_normal_stop_front_inbox[peer].ack.leave_nonce != 0,
+				 d->first_reject ? d->first_reject : "none", d->rejected_epoch, d->rejected_nonce,
+				 d->events, d->overwritten, d->identity_result_known, d->identity_result,
+				 d->identity_reason ? d->identity_reason : "unknown",
+				 pg_atomic_read_u32(&cl_normal_stop->phase), cl_state->barrier_deadline_us)));
+		d->reported_at = now;
+		d->reported_events = d->events;
+		d->reported_nonce = d->nonce;
+		d->reported_event = d->event;
+		d->first_reported = d->first_reject != NULL;
+	}
+}
+
+static void
+cl_normal_stop_fronts_lmon_tick_impl(void)
 {
 	ClusterPhase1FullStopPlan observed;
 	ClusterNormalStopPollResult result;
 	bool inbox_work = false;
 	int peer;
 	uint32 phase;
+	const char *identity_reason = NULL;
 
 	if (!IsUnderPostmaster || !AmLmonProcess() || cl_state == NULL || cl_normal_stop == NULL
 		|| !cluster_enabled || cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
@@ -1635,11 +1857,21 @@ cl_normal_stop_fronts_lmon_tick(void)
 		if (!work && !cl_normal_stop_front_read_pending)
 			return;
 	}
-	result = cl_normal_stop_identity_poll(false, &observed, NULL);
+	result = cl_normal_stop_identity_poll(false, &observed, &identity_reason);
 	cl_normal_stop_front_read_pending
 		= cluster_shared_config && result == CLUSTER_NORMAL_STOP_PENDING;
-	if (result != CLUSTER_NORMAL_STOP_READY)
+	if (result != CLUSTER_NORMAL_STOP_READY) {
+		for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++)
+			if (cl_normal_stop_front_inbox[peer].ack_pending) {
+				cl_stop_ack_note(peer, "identity.poll", "identity.poll",
+								 cl_normal_stop_front_inbox[peer].ack_envelope.epoch,
+								 cl_normal_stop_front_inbox[peer].ack.leave_nonce);
+				cl_stop_ack_trace[peer].identity_reason = identity_reason;
+				cl_stop_ack_trace[peer].identity_result = result;
+				cl_stop_ack_trace[peer].identity_result_known = true;
+			}
 		return;
+	}
 
 	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
 		ClNormalStopFrontInbox *inbox = &cl_normal_stop_front_inbox[peer];
@@ -1691,21 +1923,36 @@ cl_normal_stop_fronts_lmon_tick(void)
 		bool source_active = false, source_stopped = false;
 		if (!inbox->ack_pending)
 			continue;
-		if (inbox->ack_envelope.epoch != observed.epoch
+		if (cl_stop_ack_reject(peer, "consume.epoch", inbox->ack_envelope.epoch != observed.epoch,
+							   inbox->ack_envelope.epoch, inbox->ack.leave_nonce)
 			|| (!cluster_normal_stop_native_wal_mode()
-				&& !cl_phase1_full_stop_capture_source_phase(&observed, peer, &source_active,
-															 &source_stopped))) {
+				&& cl_stop_ack_reject(peer, "consume.source_phase",
+									  !cl_phase1_full_stop_capture_source_phase(
+										  &observed, peer, &source_active, &source_stopped),
+									  inbox->ack_envelope.epoch, inbox->ack.leave_nonce))) {
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 			return;
 		}
-		result = cl_normal_stop_identity_recheck(false, &observed, &verified, NULL);
-		if (result != CLUSTER_NORMAL_STOP_READY)
+		result = cl_normal_stop_identity_recheck(false, &observed, &verified, &identity_reason);
+		if (result != CLUSTER_NORMAL_STOP_READY) {
+			cl_stop_ack_note(peer, "identity.recheck", "identity.recheck",
+							 inbox->ack_envelope.epoch, inbox->ack.leave_nonce);
+			cl_stop_ack_trace[peer].identity_reason = identity_reason;
+			cl_stop_ack_trace[peer].identity_result = result;
+			cl_stop_ack_trace[peer].identity_result_known = true;
 			return;
+		}
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
-		if (inbox->ack.leave_nonce != pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
-			|| verified.epoch != inbox->ack_envelope.epoch)
+		if (cl_stop_ack_reject(peer, "consume.nonce",
+							   inbox->ack.leave_nonce
+								   != pg_atomic_read_u64(&cl_state->leave_attempt_nonce),
+							   inbox->ack_envelope.epoch, inbox->ack.leave_nonce)
+			|| cl_stop_ack_reject(peer, "consume.verified_epoch",
+								  verified.epoch != inbox->ack_envelope.epoch,
+								  inbox->ack_envelope.epoch, inbox->ack.leave_nonce))
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
-		else if (inbox->ack.nak) {
+		else if (cl_stop_ack_reject(peer, "consume.nak", inbox->ack.nak, inbox->ack_envelope.epoch,
+									inbox->ack.leave_nonce)) {
 			pg_atomic_write_u32(&cl_state->nak_reason, inbox->ack.nak_reason);
 			pg_atomic_write_u32(&cl_state->nak_received, 1);
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
@@ -1714,7 +1961,11 @@ cl_normal_stop_fronts_lmon_tick(void)
 			 * neither advances the local phase nor permits a checkpoint. */
 			cl_phase1_member_bit_set(cl_state->ack_bitmap, peer);
 			inbox->ack_pending = false;
-		}
+			cl_stop_ack_note(peer, "ack.install", NULL, inbox->ack_envelope.epoch,
+							 inbox->ack.leave_nonce);
+		} else
+			cl_stop_ack_note(peer, "ack.wait_peer_request", "consume.peer_request_missing",
+							 inbox->ack_envelope.epoch, inbox->ack.leave_nonce);
 		LWLockRelease(&cl_state->lock);
 	}
 	if (cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
@@ -1826,6 +2077,12 @@ cl_normal_stop_fronts_lmon_tick(void)
 		ack.leave_nonce = nonce;
 		cluster_clean_leave_ack_compute_crc(&ack);
 		sent = cluster_ic_send_envelope(PGRAC_IC_MSG_LEAVE_DRAIN_ACK, peer, &ack, sizeof(ack));
+		cl_stop_ack_note(peer,
+						 sent == CLUSTER_IC_SEND_DONE			? "send.done"
+						 : sent == CLUSTER_IC_SEND_WOULD_BLOCK	? "send.queued"
+						 : sent == CLUSTER_IC_SEND_NOT_ADMITTED ? "send.not_admitted"
+																: "send.error",
+						 NULL, observed.epoch, nonce);
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 		if (pg_atomic_read_u32(&cl_normal_stop->phase) != CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK
 			|| cl_normal_stop->peer_request_nonce[peer] != nonce
@@ -1840,6 +2097,13 @@ cl_normal_stop_fronts_lmon_tick(void)
 	}
 	if (ProcGlobal != NULL && ProcGlobal->checkpointerLatch != NULL)
 		SetLatch(ProcGlobal->checkpointerLatch);
+}
+
+static void
+cl_normal_stop_fronts_lmon_tick(void)
+{
+	cl_normal_stop_fronts_lmon_tick_impl();
+	cl_stop_ack_trace_emit();
 }
 
 static ClusterNormalStopPollResult

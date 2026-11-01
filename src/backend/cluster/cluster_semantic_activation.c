@@ -468,6 +468,10 @@ typedef struct ClusterSemanticActivationAckTableV1 {
 /* Process-local diagnostics only. Copies never grant or replace authority. */
 typedef struct SemanticStopTrace {
 	char predicate[112];
+	const char *pending_predicate;
+	int pending_member;
+	bool pending_operands_known;
+	uint64 pending_expected, pending_current;
 	const char *stage;
 	const char *failure_stage;
 	int member;
@@ -505,6 +509,17 @@ typedef struct SemanticStopTrace {
 		SemanticActivationAckTuple tuple;
 	} live[CLUSTER_MAX_NODES];
 } SemanticStopTrace;
+
+/* Observe an already evaluated pending branch; no additional predicate call. */
+static bool
+semantic_stop_pending_if(SemanticStopTrace *trace, const char *predicate, bool pending)
+{
+	if (pending && trace != NULL && trace->pending_predicate == NULL) {
+		trace->pending_predicate = predicate;
+		trace->pending_member = -1;
+	}
+	return pending;
+}
 
 static SemanticStopTrace semantic_stop_first_trace;
 static bool semantic_stop_trace_reported;
@@ -5117,6 +5132,12 @@ semantic_activation_ack_complete_image_check_internal(
 												self_incarnation, admitted_incarnation)))))
 				return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 			if (self_incarnation == 0 || admitted_incarnation == 0) {
+				if (trace != NULL && trace->pending_predicate == NULL) {
+					trace->pending_predicate = self_incarnation == 0
+												   ? "ack.self.incarnation_missing"
+												   : "ack.member.admitted_missing";
+					trace->pending_member = node;
+				}
 				observation_pending = true;
 				continue;
 			}
@@ -5150,6 +5171,13 @@ semantic_activation_ack_complete_image_check_internal(
 					&& cluster_normal_stop_peer_receipt_tail(stop_record, stop_root, node,
 															 admitted_incarnation))
 					continue;
+				if (trace != NULL && trace->pending_predicate == NULL) {
+					trace->pending_predicate = "ack.peer.capability_valid";
+					trace->pending_member = node;
+					trace->pending_operands_known = true;
+					trace->pending_expected = 1;
+					trace->pending_current = 0;
+				}
 				observation_pending = true;
 				continue;
 			}
@@ -5171,6 +5199,10 @@ semantic_activation_ack_complete_image_check_internal(
 									image->observed[node].capability_word))
 				return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
 			if (admitted_incarnation == 0) {
+				if (trace != NULL && trace->pending_predicate == NULL) {
+					trace->pending_predicate = "ack.member.admitted_missing";
+					trace->pending_member = node;
+				}
 				observation_pending = true;
 				continue;
 			}
@@ -15801,23 +15833,35 @@ semantic_normal_stop_match_mode(
 		goto done;
 	result = CLUSTER_NORMAL_STOP_PENDING;
 	reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
-	if (!semantic_activation_snapshot(&before))
+	if (semantic_stop_pending_if(trace, "before.admission_snapshot",
+								 !semantic_activation_snapshot(&before)))
 		goto done;
 	if (use_open_view) {
-		proof_status = semantic_open_proof_snapshot_mode(&table, &proof, allow_stop);
-		if (proof_status == SEMANTIC_OPEN_PROOF_PENDING || proof_status == SEMANTIC_OPEN_PROOF_TABLE_TORN
-			|| proof_status == SEMANTIC_OPEN_PROOF_OBSERVATION_PENDING)
+		proof_status = semantic_open_proof_snapshot_diagnostic(&table, &proof, allow_stop, trace);
+		if (proof_status == SEMANTIC_OPEN_PROOF_PENDING
+			|| proof_status == SEMANTIC_OPEN_PROOF_TABLE_TORN
+			|| proof_status == SEMANTIC_OPEN_PROOF_OBSERVATION_PENDING) {
+			(void)semantic_stop_pending_if(trace,
+										   proof_status == SEMANTIC_OPEN_PROOF_TABLE_TORN
+											   ? "before.ack_table_torn"
+											   : "before.open_proof_pending",
+										   true);
 			goto done;
+		}
 		if (proof_status == SEMANTIC_OPEN_PROOF_INVALID) {
 			result = CLUSTER_NORMAL_STOP_INVALID;
 			reason = "SEMANTIC_STOP_IDENTITY_INVALID";
 			goto done;
 		}
-	} else if (!semantic_activation_ack_table_snapshot(&table))
+	} else if (semantic_stop_pending_if(trace, "before.ack_table_snapshot",
+										!semantic_activation_ack_table_snapshot(&table)))
 		goto done;
-	if (!semantic_activation_pgrd_snapshot_copy(root)
-		|| !semantic_activation_ack_current_authority_internal(
-			cluster_node_id, &lo, &hi, &epoch, &coordinator, open_record, root_descriptor))
+	if (semantic_stop_pending_if(trace, "before.pgrd_snapshot",
+								 !semantic_activation_pgrd_snapshot_copy(root))
+		|| semantic_stop_pending_if(
+			trace, "before.current_authority",
+			!semantic_activation_ack_current_authority_internal(
+				cluster_node_id, &lo, &hi, &epoch, &coordinator, open_record, root_descriptor)))
 		goto done;
 	if (trace != NULL) {
 		trace->stage = "before";
@@ -15882,6 +15926,10 @@ semantic_normal_stop_match_mode(
 		if (image == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
 			reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
+			if (trace != NULL && trace->pending_predicate == NULL) {
+				trace->pending_predicate = "ack.image_observation_pending";
+				trace->pending_member = trace->failure_member;
+			}
 		}
 		goto done;
 	}
@@ -15890,23 +15938,36 @@ semantic_normal_stop_match_mode(
 	 * around its own leave-lock publication and producer cut. */
 	result = CLUSTER_NORMAL_STOP_PENDING;
 	reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
-	if (!semantic_activation_snapshot(&after))
+	if (semantic_stop_pending_if(trace, "after.admission_snapshot",
+								 !semantic_activation_snapshot(&after)))
 		goto done;
 	if (use_open_view) {
-		proof_status = semantic_open_proof_snapshot_mode(&table_after, &proof_after, allow_stop);
-		if (proof_status == SEMANTIC_OPEN_PROOF_PENDING || proof_status == SEMANTIC_OPEN_PROOF_TABLE_TORN
-			|| proof_status == SEMANTIC_OPEN_PROOF_OBSERVATION_PENDING)
+		proof_status = semantic_open_proof_snapshot_diagnostic(&table_after, &proof_after,
+															   allow_stop, trace);
+		if (proof_status == SEMANTIC_OPEN_PROOF_PENDING
+			|| proof_status == SEMANTIC_OPEN_PROOF_TABLE_TORN
+			|| proof_status == SEMANTIC_OPEN_PROOF_OBSERVATION_PENDING) {
+			(void)semantic_stop_pending_if(trace,
+										   proof_status == SEMANTIC_OPEN_PROOF_TABLE_TORN
+											   ? "after.ack_table_torn"
+											   : "after.open_proof_pending",
+										   true);
 			goto done;
+		}
 		if (proof_status == SEMANTIC_OPEN_PROOF_INVALID) {
 			result = CLUSTER_NORMAL_STOP_INVALID;
 			reason = "SEMANTIC_STOP_IDENTITY_INVALID";
 			goto done;
 		}
-	} else if (!semantic_activation_ack_table_snapshot(&table_after))
+	} else if (semantic_stop_pending_if(trace, "after.ack_table_snapshot",
+										!semantic_activation_ack_table_snapshot(&table_after)))
 		goto done;
-	if (!semantic_activation_pgrd_snapshot_copy(root_after)
-		|| !semantic_activation_ack_current_authority_internal(
-			cluster_node_id, &lo, &hi, &epoch, &coordinator, open_record, root_descriptor))
+	if (semantic_stop_pending_if(trace, "after.pgrd_snapshot",
+								 !semantic_activation_pgrd_snapshot_copy(root_after))
+		|| semantic_stop_pending_if(
+			trace, "after.current_authority",
+			!semantic_activation_ack_current_authority_internal(
+				cluster_node_id, &lo, &hi, &epoch, &coordinator, open_record, root_descriptor)))
 		goto done;
 	if (trace != NULL) {
 		trace->stage = "after";
@@ -15925,8 +15986,10 @@ semantic_normal_stop_match_mode(
 		|| before.transition_closed != after.transition_closed
 		|| memcmp(&table, &table_after, sizeof(table)) != 0
 		|| (use_open_view && memcmp(&proof, &proof_after, sizeof(proof)) != 0)
-		|| memcmp(root, root_after, sizeof(root)) != 0)
+		|| memcmp(root, root_after, sizeof(root)) != 0) {
+		(void)semantic_stop_pending_if(trace, "publication.changed", true);
 		goto done;
+	}
 	result = CLUSTER_NORMAL_STOP_INVALID;
 	reason = "SEMANTIC_STOP_IDENTITY_INVALID";
 	if (semantic_stop_ne(trace, "authority.members_lo", lo, expected_members)
@@ -15945,6 +16008,10 @@ semantic_normal_stop_match_mode(
 		if (image == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_OBSERVATION_PENDING) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
 			reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
+			if (trace != NULL && trace->pending_predicate == NULL) {
+				trace->pending_predicate = "ack.image_observation_pending";
+				trace->pending_member = trace->failure_member;
+			}
 		}
 		goto done;
 	}
@@ -16293,6 +16360,50 @@ semantic_stop_emit_first_trace(void)
 	semantic_stop_log_service(trace);
 }
 
+static TimestampTz semantic_stop_pending_last;
+static uint64 semantic_stop_pending_suppressed;
+StaticAssertDecl(sizeof(((SemanticStopTrace *)0)->pending_predicate)
+						 + sizeof(((SemanticStopTrace *)0)->pending_member)
+						 + sizeof(((SemanticStopTrace *)0)->pending_operands_known)
+						 + sizeof(((SemanticStopTrace *)0)->pending_expected)
+						 + sizeof(((SemanticStopTrace *)0)->pending_current)
+						 + sizeof(semantic_stop_pending_last)
+						 + sizeof(semantic_stop_pending_suppressed)
+					 <= 64,
+				 "semantic pending diagnostics exceed 64-byte field budget");
+
+static void
+semantic_stop_emit_pending(const char *predicate, int member, const char *stage, uint64 expected,
+						   uint64 current, bool operands_known)
+{
+	bool held = false;
+	TimestampTz now;
+	if (!cluster_trace_normal_stop || !cluster_normal_stop_requested())
+		return;
+	if (CritSectionCount != 0) {
+		semantic_stop_pending_suppressed++;
+		return;
+	}
+	ForEachLWLockHeldByMe(semantic_stop_note_held_lock, &held);
+	if (held) {
+		semantic_stop_pending_suppressed++;
+		return;
+	}
+	now = GetCurrentTimestamp();
+	if (semantic_stop_pending_last != 0 && now >= semantic_stop_pending_last
+		&& now - semantic_stop_pending_last < INT64CONST(1000000)) {
+		semantic_stop_pending_suppressed++;
+		return;
+	}
+	semantic_stop_pending_last = now;
+	ereport(LOG, (errmsg("semantic normal-stop identity pending predicate=%s member=%d stage=%s"
+						 " expected=" UINT64_FORMAT " current=" UINT64_FORMAT
+						 " operands_known=%d suppressed=" UINT64_FORMAT,
+						 predicate, member, stage, expected, current, operands_known,
+						 semantic_stop_pending_suppressed)));
+	semantic_stop_pending_suppressed = 0;
+}
+
 static pg_noinline ClusterNormalStopPollResult
 semantic_normal_stop_match_traced(const ClusterSemanticActivationRecord *open, const uint8 *root,
 								  uint64 *incarnations, const char **reason)
@@ -16309,6 +16420,14 @@ semantic_normal_stop_match_traced(const ClusterSemanticActivationRecord *open, c
 			(void)semantic_stop_bad(&trace, "matcher.unclassified", true);
 		semantic_stop_first_trace = trace;
 	}
+	if (result == CLUSTER_NORMAL_STOP_PENDING)
+		semantic_stop_emit_pending(
+			trace.pending_predicate != NULL
+				? trace.pending_predicate
+				: (trace.predicate[0] != '\0' ? trace.predicate : "matcher.unclassified"),
+			trace.pending_predicate != NULL ? trace.pending_member : trace.failure_member,
+			trace.stage, trace.pending_expected, trace.pending_current,
+			trace.pending_operands_known);
 	semantic_stop_emit_first_trace();
 	return result;
 }
@@ -16323,6 +16442,8 @@ cluster_semantic_normal_stop_match(const ClusterSemanticActivationRecord *open,
 		return semantic_normal_stop_match_impl(open, root, incarnations, reason, NULL);
 	if (!cluster_normal_stop_requested()) {
 		semantic_stop_trace_reported = false;
+		semantic_stop_pending_last = 0;
+		semantic_stop_pending_suppressed = 0;
 		memset(&semantic_stop_first_trace, 0, sizeof(semantic_stop_first_trace));
 		return semantic_normal_stop_match_impl(open, root, incarnations, reason, NULL);
 	}
@@ -16402,6 +16523,7 @@ cluster_semantic_normal_stop_read_identity(
 	uint64 incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
 	uint64 request_seq, completion_seq;
 	uint32 utility_state;
+	const char *pending_predicate = NULL;
 
 	if (open_out != NULL)
 		memset(open_out, 0, sizeof(*open_out));
@@ -16422,6 +16544,7 @@ cluster_semantic_normal_stop_read_identity(
 	(void)semantic_control_rebind_tick(GetCurrentTimestamp());
 	if (semantic_activation_authority_mailbox_owner(false) >= 0) {
 		reason = "SEMANTIC_STOP_READ_OWNER_BUSY";
+		pending_predicate = "read.authority_mailbox_owner";
 		result = semantic_activation_lmon_stop_read_seq == 0 ? CLUSTER_NORMAL_STOP_PENDING
 															 : CLUSTER_NORMAL_STOP_INVALID;
 		goto done;
@@ -16434,11 +16557,13 @@ cluster_semantic_normal_stop_read_identity(
 			|| utility_state == SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING)) {
 		result = CLUSTER_NORMAL_STOP_PENDING;
 		reason = "SEMANTIC_STOP_READ_OWNER_BUSY";
+		pending_predicate = "read.utility_mailbox_owner";
 		goto done;
 	}
 	if (!semantic_activation_snapshot(&gate)) {
 		result = CLUSTER_NORMAL_STOP_PENDING;
 		reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
+		pending_predicate = "read.admission_snapshot";
 		goto done;
 	}
 	if (gate.transition_closed || gate.record_generation < 6 || gate.record_generation == UINT64_MAX
@@ -16461,8 +16586,11 @@ cluster_semantic_normal_stop_read_identity(
 			goto done;
 		result = CLUSTER_NORMAL_STOP_PENDING;
 		reason = "SEMANTIC_STOP_READ_PENDING";
-		if (semantic_control_rebind_stop_wait())
+		pending_predicate = "read.record_mailbox";
+		if (semantic_control_rebind_stop_wait()) {
+			pending_predicate = "read.rebind_wait";
 			goto done;
+		}
 		if (request_seq == completion_seq)
 			(void)semantic_activation_record_read_mailbox_submit(
 				&semantic_activation_lmon_stop_read_seq);
@@ -16477,6 +16605,7 @@ cluster_semantic_normal_stop_read_identity(
 		goto done;
 	result = CLUSTER_NORMAL_STOP_PENDING;
 	reason = "SEMANTIC_STOP_READ_PENDING";
+	pending_predicate = "read.record_mailbox";
 	if (!semantic_activation_record_read_mailbox_poll_completion(request_seq, &completion))
 		goto done;
 	result = CLUSTER_NORMAL_STOP_INVALID;
@@ -16488,8 +16617,11 @@ cluster_semantic_normal_stop_read_identity(
 	}
 	result = CLUSTER_NORMAL_STOP_PENDING;
 	reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
-	if (!semantic_activation_pgrd_snapshot_copy(root))
+	if (!semantic_activation_pgrd_snapshot_copy(root)) {
+		pending_predicate = "read.pgrd_snapshot";
 		goto done;
+	}
+	pending_predicate = NULL;
 	result = cluster_semantic_normal_stop_match(&open, root, incarnations, &reason);
 	if (result == CLUSTER_NORMAL_STOP_PENDING) {
 		/* This creator has consumed its exact completed read. A rebind
@@ -16508,6 +16640,8 @@ cluster_semantic_normal_stop_read_identity(
 			memcpy(member_incarnations_out, incarnations, sizeof(incarnations));
 	}
 done:
+	if (result == CLUSTER_NORMAL_STOP_PENDING && pending_predicate != NULL)
+		semantic_stop_emit_pending(pending_predicate, -1, "read", 0, 0, false);
 	if (reason_out != NULL)
 		*reason_out = reason;
 	return result;

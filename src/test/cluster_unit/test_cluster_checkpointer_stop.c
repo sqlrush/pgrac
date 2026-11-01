@@ -189,7 +189,8 @@ cluster_normal_stop_failure(void)
 	return failure;
 }
 void
-cluster_normal_stop_fail(ClusterNormalStopFailure f)
+cluster_normal_stop_fail_at(ClusterNormalStopFailure f, const char *caller pg_attribute_unused(),
+							int line pg_attribute_unused())
 {
 	if (failure == 0)
 		failure = f;

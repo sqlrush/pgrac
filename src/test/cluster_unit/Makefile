@@ -7130,13 +7130,17 @@ test_cluster_gcs_serving_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs
 # t/061_lmon_skeleton.pl where postmaster orchestration is real.
 test_cluster_lmon_stop_service.inc: $(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h
-	awk '/^cluster_normal_stop_requested\(/ || /^cluster_normal_stop_protocol_closed\(/ || /^cluster_normal_stop_service_(enter|leave|new_work|data_sealed)\(/ { print "bool"; emit=1; count++ } \
+	awk '/^typedef struct ClStopFirstFailureTrace/ { emit=1; types++ } \
+	     /^static ClStopFirstFailureTrace cl_stop_first_failure;/ { print; globals++ } \
+	     /^cl_stop_trace_lock\(/ || /^cl_stop_trace_first_failure\(/ { print "static void"; emit=1; diagnostics++ } \
+	     /^cl_stop_trace_safe\(/ { print "static bool"; emit=1; diagnostics++ } \
+	     /^cluster_normal_stop_requested\(/ || /^cluster_normal_stop_protocol_closed\(/ || /^cluster_normal_stop_service_(enter|leave|new_work|data_sealed)\(/ { print "bool"; emit=1; count++ } \
 	     /^cl_normal_stop_service_mask_valid\(/ { print "static bool"; emit=1; count++ } \
-	     /^cluster_normal_stop_fail\(/ { print "void"; emit=1; count++ } \
+	     /^cluster_normal_stop_fail_at\(/ { print "void"; emit=1; count++ } \
 	     /^cluster_normal_stop_failure\(/ { print "ClusterNormalStopFailure"; emit=1; count++ } \
 	     /^cl_normal_stop_actor_bit\(/ || /^cl_normal_stop_member_mask\(/ { print "static uint32"; emit=1; count++ } \
 	     /^cluster_normal_stop_service_(idle|seal)\(/ { print "ClusterNormalStopPollResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 13) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 13 || types != 1 || globals != 1 || diagnostics != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_lmon: test_cluster_lmon.c unit_test.h test_cluster_lmon_stop_service.inc \
@@ -10588,7 +10592,6 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \
 		test_cluster_normal_cold_prepare.inc test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
-		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		cluster_r4_open_route_test_stubs.h $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
@@ -10601,7 +10604,6 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
-		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
@@ -10619,7 +10621,6 @@ test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activ
 		test_cluster_normal_cold_capture.inc test_cluster_normal_cold_prepare.inc \
 		test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h cluster_r4_open_route_test_stubs.h \
-		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_control_rebind.inc \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
@@ -10633,7 +10634,6 @@ test_cluster_control_rebind: test_cluster_control_rebind.c test_cluster_r4_activ
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
-		$(CLUSTER_NORMAL_COLD_GUARDS_O) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 

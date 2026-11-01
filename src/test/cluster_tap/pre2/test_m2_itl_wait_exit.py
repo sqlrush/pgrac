@@ -41,6 +41,29 @@ class WaitExitEvidence(unittest.TestCase):
     def test_original_sql_timeout_has_no_cancel_signal(self):
         self.assertEqual(self.observed(exit_fixture('statement_timeout'))['kind'], 'statement_timeout')
 
+    def test_psql_stdin_location_preserves_the_exact_native_error(self):
+        for kind in ('cancel', 'statement_timeout'):
+            with self.subTest(kind=kind):
+                case = exit_fixture(kind)
+                case['stderr'] = 'psql:<stdin>:32: ' + case['stderr']
+                before = copy.deepcopy(case)
+                self.assertEqual(self.observed(case)['kind'], kind)
+                self.assertEqual(case, before)
+
+    def test_ambiguous_or_unrecognized_error_records_are_rejected(self):
+        error = exit_fixture()['stderr']
+        for stderr in (
+                'psql:/tmp/case.sql:32: ' + error,
+                'psql:<stdin>:0: ' + error,
+                'psql:<stdin>:32: ' + error + error,
+                error + 'psql:<stdin>:32: ' + error,
+                error + 'psql:<stdin>:bad: ' + error,
+                error + 'psql:<stdin>:32: FATAL:  57P01: terminating connection\n',
+                error + 'PANIC:  XX000: invalid state\n'):
+            with self.subTest(stderr=stderr):
+                case = exit_fixture(); case['stderr'] = stderr
+                with self.assertRaises(ValueError): m2_itl_capacity.validate_wait_exit(case)
+
     def test_other_errors_or_missing_native_cause_never_count_as_cancel(self):
         for stdout, stderr, had_error in (
                 ('B08_SQLSTATE 00000', '', False),

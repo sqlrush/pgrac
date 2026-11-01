@@ -12,6 +12,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <sys/mman.h>
+#include <unistd.h>
 #include "cluster/cluster_terminal_ref_census.h"
 #include "postmaster/interrupt.h"
 #include "libpq/pqsignal.h"
@@ -49,6 +51,7 @@ bool cluster_trace_cleanup;
 bool cluster_trace_normal_stop;
 static unsigned stop_trace_records, stop_trace_ko_calls;
 static char stop_trace_detail[1024];
+static char run15_stop_log[32768];
 
 void
 cluster_ko_normal_stop_trace_v1(void)
@@ -66,6 +69,15 @@ static bool test_found;
 static Size requested_size;
 static unsigned lock_initializations;
 static unsigned lock_holds, lock_acquisitions;
+PGPROC *MyProc;
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *arg)
+{
+	if (lock_holds != 0)
+		callback(&test_region.leave.lock, LW_SHARED, arg);
+}
+
 static unsigned cleaner_wakes;
 static bool modifier_held;
 static LWLock *fixture_cleaner_lock;
@@ -1231,8 +1243,16 @@ errcode(int code pg_attribute_unused())
 	return 0;
 }
 int
-errmsg(const char *format pg_attribute_unused(), ...)
+errmsg(const char *format, ...)
 {
+	if (cluster_trace_normal_stop) {
+		va_list args;
+		size_t used = strlen(run15_stop_log);
+		va_start(args, format);
+		vsnprintf(run15_stop_log + used, sizeof(run15_stop_log) - used, format, args);
+		va_end(args);
+		strlcat(run15_stop_log, "\n", sizeof(run15_stop_log));
+	}
 	return 0;
 }
 int
@@ -1255,6 +1275,8 @@ errdetail(const char *format pg_attribute_unused(), ...)
 		vsnprintf(stop_trace_detail, sizeof(stop_trace_detail), format, args);
 		va_end(args);
 		stop_trace_records++;
+		strlcat(run15_stop_log, stop_trace_detail, sizeof(run15_stop_log));
+		strlcat(run15_stop_log, "\n", sizeof(run15_stop_log));
 	}
 	return 0;
 }
@@ -6645,6 +6667,117 @@ UT_TEST(test_pre_front_buffer_observation_never_advances_cut)
 	cluster_trace_cleanup = false;
 }
 
+
+
+UT_TEST(test_run15_short_ack_never_reads_an_unavailable_tuple)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	uint8 *area = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	UT_ASSERT(area != MAP_FAILED);
+	if (area == MAP_FAILED)
+		return;
+	UT_ASSERT_EQ(mprotect(area + page, page, PROT_NONE), 0);
+	for (int on = 0; on < 2; on++) {
+		ClusterICEnvelope env = { 0 };
+		reset_identity();
+		MyAuxProcType = LmonProcess;
+		cluster_trace_normal_stop = on;
+		env.source_node_id = 1;
+		env.dest_node_id = cluster_node_id;
+		env.msg_type = PGRAC_IC_MSG_LEAVE_DRAIN_ACK;
+		env.payload_length = 0;
+		cl_normal_stop_fronts_ack(&env, (const ClusterLeaveAckPayload *)(area + page));
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+	}
+	cluster_trace_normal_stop = false;
+	UT_ASSERT_EQ(munmap(area, 2 * page), 0);
+}
+
+UT_TEST(test_run15_first_failure_caller_and_budget_are_original)
+{
+	ClusterCleanLeaveSharedState outcomes[2];
+	unsigned calls[2];
+	for (int on = 0; on < 2; on++) {
+		ClusterPhase1FullStopPlan plan;
+		unsigned dumps = deadline_observations;
+		seed_at_checkpoint(&plan);
+		cluster_trace_normal_stop = on;
+		run15_stop_log[0] = 0;
+		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
+		calls[on] = deadline_observations - dumps;
+		outcomes[on] = test_region;
+		if (on) {
+			UT_ASSERT(strstr(run15_stop_log, "normal-stop first failure") != NULL);
+			UT_ASSERT(strstr(run15_stop_log,
+							 "caller=test_run15_first_failure_caller_and_budget_are_original")
+					  != NULL);
+			UT_ASSERT(strstr(run15_stop_log, "phase=4") != NULL);
+			UT_ASSERT(strstr(run15_stop_log, "deadline_pg_us=") != NULL);
+		} else
+			UT_ASSERT_EQ(strlen(run15_stop_log), 0);
+	}
+	UT_ASSERT_EQ(calls[0], calls[1]);
+	UT_ASSERT_EQ(calls[1], 1);
+	UT_ASSERT_EQ(memcmp(outcomes, outcomes + 1, sizeof(outcomes[0])), 0);
+	cluster_trace_normal_stop = false;
+}
+UT_TEST(test_run15_first_failure_defers_emission_under_original_lock)
+{
+	ClusterPhase1FullStopPlan plan;
+	seed_at_checkpoint(&plan);
+	cluster_trace_normal_stop = true;
+	run15_stop_log[0] = 0;
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	UT_ASSERT_EQ(strlen(run15_stop_log), 0);
+	LWLockRelease(&cl_state->lock);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	UT_ASSERT(strstr(run15_stop_log, "normal-stop first failure") != NULL);
+	cluster_trace_normal_stop = false;
+}
+UT_TEST(test_run15_producer_ack_retention_and_consumption_are_observed)
+{
+	ClusterCleanLeaveSharedState outcomes[2];
+	unsigned locks[2];
+	for (int on = 0; on < 2; on++) {
+		ClusterPhase1FullStopPlan out;
+		uint64 nonce;
+		reset_identity();
+		front_local_postmaster_cut(true);
+		UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&out, NULL), CLUSTER_NORMAL_STOP_PENDING);
+		nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+		cluster_trace_normal_stop = on;
+		run15_stop_log[0] = 0;
+		locks[on] = lock_acquisitions;
+		front_peer_ack(1, nonce, false);
+		identity_read_result = CLUSTER_NORMAL_STOP_PENDING;
+		cl_normal_stop_fronts_lmon_tick();
+		UT_ASSERT(cl_normal_stop_front_inbox[1].ack_pending);
+		UT_ASSERT_EQ(cl_state->ack_bitmap[0], 0);
+		fixture_now += 2000000;
+		if (on) {
+			UT_ASSERT(strstr(run15_stop_log, "ack_pending=1") != NULL);
+			UT_ASSERT(strstr(run15_stop_log, "first_reject=identity.poll") != NULL);
+		}
+		identity_read_result = CLUSTER_NORMAL_STOP_READY;
+		front_peer_request(1, 1501);
+		cl_normal_stop_fronts_lmon_tick();
+		UT_ASSERT(!cl_normal_stop_front_inbox[1].ack_pending);
+		UT_ASSERT_EQ(cl_state->ack_bitmap[0], 2);
+		fixture_now += 2000000;
+		if (on)
+			UT_ASSERT(strstr(run15_stop_log, "event=ack.install") != NULL);
+		outcomes[on] = test_region;
+		locks[on] = lock_acquisitions - locks[on];
+	}
+	UT_ASSERT_EQ(memcmp(outcomes, outcomes + 1, sizeof(outcomes[0])), 0);
+	UT_ASSERT_EQ(locks[0], locks[1]);
+	cluster_trace_normal_stop = false;
+}
+
 int
 main(void)
 {
@@ -6654,7 +6787,7 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(169);
+	UT_PLAN(173);
 	UT_RUN(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
@@ -6824,6 +6957,10 @@ main(void)
 	UT_RUN(test_pre2_pair_release_never_shrinks_or_rebinds_members);
 	UT_RUN(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal);
 	UT_RUN(test_pre2_pair_identity_rejects_root_serving_set_mismatch);
+	UT_RUN(test_run15_producer_ack_retention_and_consumption_are_observed);
+	UT_RUN(test_run15_short_ack_never_reads_an_unavailable_tuple);
+	UT_RUN(test_run15_first_failure_caller_and_budget_are_original);
+	UT_RUN(test_run15_first_failure_defers_emission_under_original_lock);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

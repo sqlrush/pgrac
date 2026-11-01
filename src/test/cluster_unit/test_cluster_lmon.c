@@ -42,6 +42,7 @@
 
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_qvotec.h"
@@ -88,6 +89,8 @@
 
 bool IsUnderPostmaster = false;
 bool cluster_lmd_enabled = true;
+bool cluster_trace_normal_stop;
+volatile uint32 CritSectionCount;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 int MyProcPid = 0;
@@ -185,6 +188,15 @@ cluster_lock_owners_service_poll(void)
 {
 	test_control_owner_polls++;
 }
+/* Read-only deadline diagnostics have no authority or completion result. */
+static unsigned test_deadline_dumps;
+void
+cluster_content_trace_deadline_dump(uint32 reason)
+{
+ UT_ASSERT_EQ(reason, CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+ test_deadline_dumps++;
+}
+
 static void test_stop_work(bool event);
 static int test_stop_wait(WaitEvent *events);
 #include "test_cluster_lmon_stop_service.inc"
@@ -387,6 +399,13 @@ LWLockRelease(LWLock *lock)
 		test_stop_lock_depth--;
 	}
 }
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *arg)
+{
+	for (unsigned i = 0; i < test_stop_lock_depth; i++)
+		callback(test_stop_locks[i], LW_SHARED, arg);
+}
+
 void
 LWLockReleaseAll(void)
 {
