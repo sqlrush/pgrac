@@ -7222,6 +7222,151 @@ UT_TEST(test_hot_prune_rejects_cyclic_input_before_origin_resolution)
 	ut_prune_end();
 }
 
+/* A different valid edge must not start authority work for a broken HOT graph.
+ * UNKNOWN keeps the parent implementation away from physical mutation in RED. */
+UT_TEST(test_hot_prune_rejects_broken_hot_links_before_origin_resolution)
+{
+	for (int leg = 0; leg < 4; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		PGAlignedBlock before;
+		Page page;
+		HeapTupleHeader second;
+		HeapTupleHeader tail;
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		page = (Page)fixture.live_page;
+		second = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 2));
+		tail = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 3));
+		if (leg == 0)
+			tail->t_infomask2 &= ~HEAP_ONLY_TUPLE;
+		else if (leg == 1)
+			HeapTupleHeaderSetXmin(tail, 1903);
+		else {
+			second->t_infomask2 &= ~HEAP_ONLY_TUPLE;
+			if (leg == 3)
+				ItemIdSetRedirect(PageGetItemId(page, 1), 2);
+		}
+		ut_prune_verdict_kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+		memcpy(before.data, page, BLCKSZ);
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		UT_ASSERT_EQ(ut_prune_resolve_calls, 0);
+		UT_ASSERT_EQ(ut_prune_reclaimed, 0);
+		UT_ASSERT_EQ(ut_prune_wal_records, 0);
+		UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+		ut_prune_end();
+	}
+}
+
+UT_TEST(test_hot_prune_rejects_secondary_hot_target_shapes_before_resolution)
+{
+	for (int leg = 0; leg < 6; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		PGAlignedBlock before;
+		Page page;
+		HeapTupleHeader second;
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		page = (Page)fixture.live_page;
+		second = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 2));
+		switch (leg) {
+		case 0:
+			ItemPointerSet(&second->t_ctid, UT_HOT_BLOCK, 4);
+			break;
+		case 1:
+			ItemPointerSet(&second->t_ctid, UT_HOT_BLOCK, InvalidOffsetNumber);
+			break;
+		case 2:
+			ItemPointerSet(&second->t_ctid, UT_HOT_BLOCK + 1, 3);
+			break;
+		case 3:
+			ItemIdSetDead(PageGetItemId(page, 3));
+			break;
+		case 4:
+			ItemIdSetUnused(PageGetItemId(page, 3));
+			break;
+		case 5:
+			ItemIdSetRedirect(PageGetItemId(page, 3), 2);
+			break;
+		}
+		ut_prune_verdict_kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+		memcpy(before.data, page, BLCKSZ);
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		UT_ASSERT_EQ(ut_prune_resolve_calls, 0);
+		UT_ASSERT_EQ(ut_prune_reclaimed, 0);
+		UT_ASSERT_EQ(ut_prune_wal_records, 0);
+		UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+		ut_prune_end();
+	}
+}
+
+UT_TEST(test_hot_prune_four_member_graph_preserves_original_root_and_wal)
+{
+	for (int redirected = 0; redirected <= 1; redirected++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		PGAlignedBlock storage;
+		Page page;
+		HeapTupleHeader third;
+		HeapTupleHeader tail = (HeapTupleHeader)storage.data;
+		ClusterItlSlotData *itl;
+		OffsetNumber roots[MaxHeapTuplesPerPage];
+		Size free_before;
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		page = (Page)fixture.live_page;
+		third = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 3));
+		memcpy(storage.data, third, 64);
+		HeapTupleHeaderSetXmin(tail, 904);
+		ItemPointerSet(&tail->t_ctid, UT_HOT_BLOCK, 4);
+		storage.data[63] = 0x34;
+		UT_ASSERT_EQ(PageAddItem(page, (Item)tail, 64, InvalidOffsetNumber, false, true), 4);
+		third->t_infomask &= ~HEAP_XMAX_INVALID;
+		third->t_infomask2 |= HEAP_HOT_UPDATED;
+		HeapTupleHeaderSetXmax(third, 904);
+		ItemPointerSet(&third->t_ctid, UT_HOT_BLOCK, 4);
+		itl = &ClusterPageGetItlSlots(page)[2];
+		itl->xid = 904;
+		itl->flags = ITL_FLAG_COMMITTED;
+		itl->wrap = 14;
+		itl->commit_scn = 275;
+		itl->undo_segment_head = uba_encode(1, 3, 2, 0);
+		if (redirected) {
+			ItemIdSetRedirect(PageGetItemId(page, 1), 2);
+			PageRepairFragmentation(page);
+		}
+		free_before = PageGetHeapFreeSpace(page);
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		UT_ASSERT_EQ(ut_prune_resolve_calls, redirected ? 2 : 3);
+		UT_ASSERT_EQ(ut_prune_reclaimed, redirected ? 2 : 3);
+		UT_ASSERT(ItemIdIsRedirected(PageGetItemId(page, 1)));
+		UT_ASSERT_EQ(ItemIdGetRedirect(PageGetItemId(page, 1)), 4);
+		UT_ASSERT(!ItemIdIsUsed(PageGetItemId(page, 2)));
+		UT_ASSERT(!ItemIdIsUsed(PageGetItemId(page, 3)));
+		UT_ASSERT(ItemIdIsNormal(PageGetItemId(page, 4)));
+		UT_ASSERT_EQ(PageGetItem(page, PageGetItemId(page, 4))[63], 0x34);
+		UT_ASSERT_EQ(PageGetHeapFreeSpace(page) - free_before, redirected ? 128 : 192);
+		heap_get_root_tuples(page, roots);
+		UT_ASSERT_EQ(roots[3], 1);
+		UT_ASSERT_EQ(ut_prune_wal_records, 1);
+		UT_ASSERT_EQ(ut_prune_wal.nredirected, 1);
+		UT_ASSERT_EQ(ut_prune_wal.ndead, 0);
+		UT_ASSERT_EQ(ut_prune_wal_offset_bytes, 4 * sizeof(OffsetNumber));
+		UT_ASSERT_EQ(ut_prune_wal_offsets[0], 1);
+		UT_ASSERT_EQ(ut_prune_wal_offsets[1], 4);
+		UT_ASSERT_EQ(ut_prune_wal_offsets[2], 2);
+		UT_ASSERT_EQ(ut_prune_wal_offsets[3], 3);
+		ut_prune_end();
+	}
+}
+
 UT_TEST(test_hot_prune_rejects_page_drift_and_member_loss_during_resolution)
 {
 	int leg;
@@ -7471,7 +7616,7 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(152);
+	UT_PLAN(155);
 	UT_RUN(test_prune_trace_off_keeps_real_prune_quiet);
 	UT_RUN(test_prune_trace_on_records_real_redirect_unused_and_actual_tag);
 	UT_RUN(test_prune_trace_capture_refusal_never_reads_unknown_image);
@@ -7518,6 +7663,9 @@ main(void)
 	UT_RUN(test_hot_prune_without_xmin_hint_never_reads_requester_clog);
 	UT_RUN(test_hot_prune_preserves_excluded_tuple_snapshot_and_locator_shapes);
 	UT_RUN(test_hot_prune_rejects_cyclic_input_before_origin_resolution);
+	UT_RUN(test_hot_prune_rejects_broken_hot_links_before_origin_resolution);
+	UT_RUN(test_hot_prune_rejects_secondary_hot_target_shapes_before_resolution);
+	UT_RUN(test_hot_prune_four_member_graph_preserves_original_root_and_wal);
 	UT_RUN(test_hot_prune_rejects_page_drift_and_member_loss_during_resolution);
 	UT_RUN(test_hot_prune_initial_four_member_epoch_is_not_unknown);
 	UT_RUN(test_hot_prune_authority_error_unwinds_before_caller_receives_error);

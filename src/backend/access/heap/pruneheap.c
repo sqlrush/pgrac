@@ -228,11 +228,23 @@ cluster_heap_prune_page_valid(Page page, BlockNumber block)
 	{
 		OffsetNumber next = off;
 		unsigned int steps = 0;
+		ItemId item = PageGetItemId(page, off);
+
+		/* All normal headers were checked above, including redirect targets. */
+		if (ItemIdIsRedirected(item))
+		{
+			HeapTupleHeader target = (HeapTupleHeader) PageGetItem(page,
+				PageGetItemId(page, ItemIdGetRedirect(item)));
+
+			if (!HeapTupleHeaderIsHeapOnly(target))
+				return false;
+		}
 
 		while (ItemIdIsNormal(PageGetItemId(page, next)))
 		{
 			HeapTupleHeader tuple = (HeapTupleHeader)
 				PageGetItem(page, PageGetItemId(page, next));
+			HeapTupleHeader successor;
 
 			if (!HeapTupleHeaderIsHotUpdated(tuple))
 				break;
@@ -242,6 +254,14 @@ cluster_heap_prune_page_valid(Page page, BlockNumber block)
 			next = ItemPointerGetOffsetNumber(&tuple->t_ctid);
 			if (next < FirstOffsetNumber || next > maxoff
 				|| !ItemIdIsNormal(PageGetItemId(page, next)))
+				return false;
+			successor = (HeapTupleHeader) PageGetItem(page, PageGetItemId(page, next));
+			if (!HeapTupleHeaderIsHeapOnly(successor))
+				return false;
+			/* A raw MultiXactId is not the updater XID. Its membership still
+			 * belongs to the original MX consumer, never this local gate. */
+			if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) == 0
+				&& HeapTupleHeaderGetRawXmin(successor) != HeapTupleHeaderGetRawXmax(tuple))
 				return false;
 		}
 	}
