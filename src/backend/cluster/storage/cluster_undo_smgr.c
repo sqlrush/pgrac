@@ -425,6 +425,107 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 
 
 #ifdef USE_PGRAC_CLUSTER
+/* A final-file observation borrows one AVAILABLE identity through the original
+ * read and directory sync. It neither creates a file nor supplies path/recovery
+ * authority. Keep the caller's output private until all owned cleanup succeeds. */
+static ClusterUndoSmgrFinalState
+undo_native_tt_probe(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+					 char block0[BLCKSZ])
+{
+	ClusterControlFileKeyV2 key = { 0 };
+	ClusterControlNativeFileBorrowV2 borrow = { 0 };
+	PGAlignedBlock page;
+	char path[MAXPGPATH];
+	volatile int fd = -1;
+	volatile int save_errno = 0;
+	volatile ClusterUndoSmgrFinalState result = CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
+
+	if (block0 == NULL || owner_instance == 0 || owner_instance > UNDO_OWNER_INSTANCE_MAX
+		|| segment_id == 0 || segment_id > UINT16_MAX
+		|| (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != owner_instance)
+		return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
+	key.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+	key.origin = owner_instance - 1;
+	key.object_id = segment_id;
+	if (!cluster_control_native_file_acquire_v2(&key, &borrow))
+		return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
+	PG_TRY();
+	{
+		do {
+			struct stat st;
+			ssize_t nread;
+			int owned_fd;
+
+			if (!cluster_control_native_file_current_v2(&borrow)
+				|| cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path))
+					   != 0)
+				break;
+			fd = BasicOpenFile(path, O_RDONLY | PG_BINARY | O_NOFOLLOW);
+			if (fd < 0) {
+				save_errno = errno;
+				if (cluster_control_native_file_current_v2(&borrow) && save_errno == ENOENT)
+					result = CLUSTER_UNDO_SMGR_FINAL_ABSENT;
+				break;
+			}
+			if (!cluster_control_native_file_current_v2(&borrow))
+				break;
+			if (fstat(fd, &st) != 0) {
+				save_errno = errno;
+				break;
+			}
+			if (st.st_size != UNDO_SEGMENT_SIZE_BYTES) {
+				result = CLUSTER_UNDO_SMGR_FINAL_INVALID;
+				break;
+			}
+			nread = pg_pread(fd, page.data, BLCKSZ, 0);
+			cluster_undo_record_note_smgr_pread();
+			if (nread < 0) {
+				save_errno = errno;
+				break;
+			}
+			if (nread != BLCKSZ
+				|| !cluster_undo_segment_header_identity_ok(page.data, segment_id, owner_instance)
+				|| !cluster_tt_file_reference_matches_v2(page.data, BLCKSZ, &borrow.expected)
+				|| cluster_undo_segment_header_integrity(page.data) != CLUSTER_UNDO_HEADER_VALID) {
+				result = CLUSTER_UNDO_SMGR_FINAL_INVALID;
+				break;
+			}
+			if (!cluster_control_native_file_current_v2(&borrow))
+				break;
+			/* Preserve the original close-before-directory-sync order. Do not
+			 * retry close on a descriptor the kernel may already have retired. */
+			owned_fd = fd;
+			fd = -1;
+			if (close(owned_fd) != 0) {
+				save_errno = errno;
+				break;
+			}
+			if (!cluster_control_native_file_current_v2(&borrow)
+				|| !provision_fsync_parent(path)
+				|| !cluster_control_native_file_current_v2(&borrow))
+				break;
+			result = CLUSTER_UNDO_SMGR_FINAL_EXACT;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		if (fd >= 0 && close(fd) != 0) {
+			if (save_errno == 0)
+				save_errno = errno;
+			result = CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
+		}
+		if (!cluster_control_native_file_release_v2(&borrow))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not release native TT probe identity borrow")));
+	}
+	PG_END_TRY();
+	if (save_errno != 0)
+		errno = save_errno;
+	if (result == CLUSTER_UNDO_SMGR_FINAL_EXACT)
+		memcpy(block0, page.data, BLCKSZ);
+	return result;
+}
+
 /* This protects only this physical read/sync. The original caller still owns its
  * path/current/recovery authority and must bind any longer resident lifetime.
  * An idle cached FD has no table borrow: each operation reselects and checks
@@ -971,6 +1072,11 @@ cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent, uint32 segment_id,
 	int fd;
 	int save_errno;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2)
+		return undo_native_tt_probe(intent, segment_id, owner_instance, block0);
+#endif
 	if (block0 == NULL
 		|| cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
 		return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;

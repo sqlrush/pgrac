@@ -8528,6 +8528,28 @@ clean-undo-native-tt-read:
 clean: clean-undo-native-tt-read
 .PHONY: clean-undo-native-tt-read
 
+test_cluster_undo_native_tt_probe: test_cluster_undo_native_tt_probe.c \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		test_cluster_undo_publication_alloc_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+TESTS += test_cluster_undo_native_tt_probe
+all: test_cluster_undo_native_tt_probe
+clean-undo-native-tt-probe:
+	rm -f test_cluster_undo_native_tt_probe test_cluster_undo_native_tt_probe.d
+clean: clean-undo-native-tt-probe
+.PHONY: clean-undo-native-tt-probe
+
 # The physical TT writer shares the original file providers and read fixture;
 # only the finite selected table and ERROR schedule are controlled there.
 test_cluster_undo_native_tt_write: test_cluster_undo_native_tt_write.c \
