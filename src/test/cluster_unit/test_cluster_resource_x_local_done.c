@@ -24,20 +24,21 @@ local_ring_reset(void)
 
 /* The original fixture's metadata locator, after real canonical admission. */
 static bool
-local_start(PcmState mode, PcmState target, unsigned others, uint8 outcome,
-	PublishFixture *f, ResourceXDecodedFrame *done)
+local_start_requester(PcmState mode, PcmState target, unsigned others, uint8 outcome,
+	PublishFixture *f, ResourceXDecodedFrame *done, int32 requester)
 {
 	ClusterPcmResourceXMasterRequest canonical = {0};
 	ResourceXDecodedFrame grant; ResourceXWireReject reject;
 	uint8 bytes[RESOURCE_X_ACQUIRE_V3_BYTES]; uint16 len;
-	Size offset = offsetof(ClusterPcmResourceXMasterState, requests[0]);
+	Size offset = offsetof(ClusterPcmResourceXMasterState, requests[0]) + requester * sizeof(canonical);
 	unsigned matches = 0;
 	memset(f, 0, sizeof(*f));
 	provenance_grant(0);
 	if (mode == PCM_STATE_S) service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	if (requester != 0 && decision_plan_inject_shared_holder(requester, 101) == NULL) return false;
 	for (unsigned n = 0; n < others; n++)
 		if (decision_plan_inject_shared_holder(n + 2, 102 + n) == NULL) return false;
-	f->request = acquire_frame(0, RESOURCE_X_ACQUIRE_RESIDENT, mode, target);
+	f->request = acquire_frame(requester, RESOURCE_X_ACQUIRE_RESIDENT, mode, target);
 	f->request.common.assertion_sequence++;
 	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &f->request, bytes, sizeof(bytes), &len, &reject)
 		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, len, &f->request, &reject)
@@ -45,8 +46,8 @@ local_start(PcmState mode, PcmState target, unsigned others, uint8 outcome,
 	f->plan = decision_plan_read(&f->work);
 	/* R's original native C covers its own mode conversion, not a forwarded
 	 * holder service to itself. Only incompatible other holders owe ACKs. */
-	UT_ASSERT_EQ(f->plan.decision.required_holders_bitmap & UINT32_C(1), 0);
-	UT_ASSERT_EQ(f->plan.service_holders_bitmap & UINT32_C(1), 0);
+	UT_ASSERT_EQ(f->plan.decision.required_holders_bitmap & (UINT32_C(1) << requester), 0);
+	UT_ASSERT_EQ(f->plan.service_holders_bitmap & (UINT32_C(1) << requester), 0);
 	canonical.base_authority_generation = f->plan.input.canonical_base_generation;
 	canonical.resource_formation = f->work.request.resource_formation;
 	canonical.master_session_incarnation = f->work.request.master_session_incarnation;
@@ -61,7 +62,7 @@ local_start(PcmState mode, PcmState target, unsigned others, uint8 outcome,
 	UT_ASSERT_EQ(matches, 1); if (matches != 1) return false;
 	publish_apply(f); grant = publish_decode(f->state->grant_intent.payload, false);
 	UT_ASSERT_EQ(grant.body.acquire_decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT);
-	UT_ASSERT_EQ(grant.body.acquire_decision.source_node, 0);
+	UT_ASSERT_EQ(grant.body.acquire_decision.source_node, requester);
 	memset(done, 0, sizeof(*done));
 	done->kind = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
 	done->payload_bytes = RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
@@ -77,6 +78,12 @@ local_start(PcmState mode, PcmState target, unsigned others, uint8 outcome,
 		done->body.acquire_completion.page_crc32c = 0x87456123;
 	}
 	return source_done_encode(done);
+}
+static bool
+local_start(PcmState mode, PcmState target, unsigned others, uint8 outcome,
+	PublishFixture *f, ResourceXDecodedFrame *done)
+{
+	return local_start_requester(mode, target, others, outcome, f, done, 0);
 }
 
 static ResourceXIntentSlot
@@ -113,11 +120,41 @@ local_acks(PublishFixture *f, bool callbacks)
 		}
 }
 
+/* Native holder completion remains an authenticated input of this master
+ * component. Independently consume each actual full-A cleanup ACK and wait
+ * for its transport owner; requester DONE cannot supply that evidence. */
+static void
+local_holder_settlements(PublishFixture *f, ResourceXDecodedFrame *done)
+{
+	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		ResourceXDecodedFrame request, ack; ResourceXMasterSnapshot out;
+		uint8 bytes[RESOURCE_X_SOURCE_COMPLETE_V11_BYTES]; uint16 length; ResourceXWireReject reject;
+		if ((done->body.acquire_completion.decision.required_holders_bitmap & (UINT32_C(1) << node)) == 0) continue;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f->work), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N,
+			f->state->source_settlement.intent.payload, sizeof(bytes), &request, &reject));
+		UT_ASSERT_EQ(request.common.action_node, node);
+		UT_ASSERT(lms_outbound_resource_x_intent_payload_valid(&f->state->source_settlement.intent.slot,
+			f->state->source_settlement.intent.payload));
+		ResourceXIntentSlot staged = local_stage(&f->state->source_settlement.intent.slot);
+		ack = request; ack.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2;
+		UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &ack, bytes, sizeof(bytes), &length, &reject));
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, length, &ack, &reject));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&ack, node, &out), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f->work), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged, true, ++fake_pcm_clock_us));
+	}
+}
+
 static bool
 local_consumed(PublishFixture *f, ResourceXDecodedFrame *done)
 {
 	ResourceXApplyResult result = source_done_receive(done);
 	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+	if (f->state->deferred_settlement.present == 4) {
+		local_holder_settlements(f, done);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f->work), RESOURCE_X_APPLY_APPLIED);
+	}
 	UT_ASSERT_EQ(f->state->deferred_settlement.present, 3);
 	return result == RESOURCE_X_APPLY_APPLIED && f->state->deferred_settlement.present == 3;
 }
@@ -140,7 +177,13 @@ local_directory(PublishFixture *f, ResourceXDecodedFrame *done, uint64 old_grant
 	UT_ASSERT_EQ(f->state->holder_grants[0].grant_generation,
 		done->common.outcome == RESOURCE_X_OUTCOME_OK ? done->common.authority_generation : old_grant);
 	UT_ASSERT(memcmp(&f->state->requests[0], &empty_request, sizeof(empty_request)) == 0);
-	UT_ASSERT(memcmp(&f->state->source_settlement, &empty_settlement, sizeof(empty_settlement)) == 0);
+	if (a->required_holders_bitmap == 0)
+		UT_ASSERT(memcmp(&f->state->source_settlement, &empty_settlement, sizeof(empty_settlement)) == 0);
+	else {
+		UT_ASSERT_EQ(f->state->source_settlement.state, RESOURCE_X_SOURCE_SETTLEMENT_ACKED);
+		UT_ASSERT_EQ(f->state->source_settlement.intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	}
+	UT_ASSERT_EQ(f->state->acquire_settled_holders_bitmap, 0);
 	UT_ASSERT_EQ(f->state->bootstrap_priority[0].state, RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY);
 	UT_ASSERT_EQ(f->state->bootstrap_receipts[0].highest_attempt_floor, done->common.assertion_sequence);
 	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) UT_ASSERT_EQ(f->state->acquire_ack_connections[node], 0);
@@ -190,8 +233,10 @@ UT_TEST(test_local_done_waits_for_every_independent_holder_ACK)
 	for (int node = 3; node >= 2; node--) {
 		ack = source_ack(&f, node); LOCAL_REQUIRE(source_apply(&ack, node), RESOURCE_X_APPLY_APPLIED);
 		LOCAL_REQUIRE(cluster_gcs_block_resource_x_bootstrap_tick(&f.work),
-			node == 3 ? RESOURCE_X_APPLY_LOCAL_WAIT : RESOURCE_X_APPLY_APPLIED);
+			RESOURCE_X_APPLY_LOCAL_WAIT);
 	}
+	local_holder_settlements(&f, &done);
+	LOCAL_REQUIRE(cluster_gcs_block_resource_x_bootstrap_tick(&f.work), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(f.state->deferred_settlement.present, 3); local_directory(&f, &done, 2);
 }
 UT_TEST(test_local_done_waits_for_grant_and_all_original_transport_callbacks)
@@ -207,6 +252,7 @@ UT_TEST(test_local_done_waits_for_grant_and_all_original_transport_callbacks)
 		LOCAL_REQUIRE(cluster_gcs_block_resource_x_bootstrap_tick(&f.work), RESOURCE_X_APPLY_LOCAL_WAIT);
 		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&block[n], true, ++fake_pcm_clock_us));
 	}
+	local_holder_settlements(&f, &done);
 	LOCAL_REQUIRE(cluster_gcs_block_resource_x_bootstrap_tick(&f.work), RESOURCE_X_APPLY_APPLIED);
 	local_directory(&f, &done, 2);
 }
@@ -353,10 +399,55 @@ UT_TEST(test_local_done_late_receipt_and_callback_cannot_clear_successor)
 	UT_ASSERT(memcmp(&before, f.state, sizeof(before)) == 0);
 }
 
+UT_TEST(test_local_source_remote_requester_settles_master_own_control_receipt)
+{
+	const uint8 outcomes[] = {RESOURCE_X_OUTCOME_OK, RESOURCE_X_OUTCOME_QUIET, RESOURCE_X_OUTCOME_QUIET_NO_IMAGE};
+	for (int n = 0; n < 3; n++) {
+		PublishFixture f; ResourceXDecodedFrame done, block, ack, request; ResourceXMasterSnapshot out;
+		ClusterPcmOwnSnapshot prepared = {0}, finished, quiet; PGAlignedBlock page = {0};
+		ResourceXWireReject reject;
+		UT_ASSERT(local_start_requester(PCM_STATE_S, PCM_STATE_X, 0, outcomes[n], &f, &done, 1));
+		UT_ASSERT_EQ(done.body.acquire_completion.decision.required_holders_bitmap, 1);
+		block = publish_decode(f.state->block_intents[0].payload, true);
+		prepared.tag = block.common.logical_assertion.resource; prepared.generation = 901; prepared.reservation_token = 77;
+		prepared.flags = PCM_OWN_FLAG_REVOKING; prepared.pcm_state = PCM_STATE_S;
+		prepared.buffer_type = BUF_TYPE_SCUR; prepared.semantic_buf_state = BM_VALID;
+		LOCAL_REQUIRE(cluster_pcm_lock_resource_x_acquire_s_source_prepare_exact(&block, 0, 7, &prepared,
+			page.data, NULL, 83, 61), RESOURCE_X_APPLY_APPLIED);
+		finished = prepared; finished.generation++; finished.pcm_state = PCM_STATE_N; finished.buffer_type = BUF_TYPE_PI;
+		LOCAL_REQUIRE(cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(&block, 0, 7, &prepared, &finished), RESOURCE_X_APPLY_APPLIED);
+		quiet = finished; quiet.flags = 0;
+		LOCAL_REQUIRE(cluster_pcm_lock_resource_x_acquire_s_source_handoff_exact(&block, 0, 7, &finished, &quiet), RESOURCE_X_APPLY_APPLIED);
+		LOCAL_REQUIRE(cluster_pcm_lock_resource_x_holder_status_exact(&block.common.logical_assertion, &ack), RESOURCE_X_APPLY_APPLIED);
+		LOCAL_REQUIRE(source_apply(&ack, 0), RESOURCE_X_APPLY_APPLIED);
+		local_grant_sent(&f); local_sent(&f.state->block_intents[0].slot);
+		local_sent(&f.state->holder_status_intent.slot); local_sent(&f.state->holder_image_intent);
+		LOCAL_REQUIRE(source_done_receive(&done), RESOURCE_X_APPLY_APPLIED);
+		LOCAL_REQUIRE(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.work), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT_EQ(f.state->source_settlement.state, RESOURCE_X_SOURCE_SETTLEMENT_PENDING);
+		if (f.state->source_settlement.state != RESOURCE_X_SOURCE_SETTLEMENT_PENDING) return;
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, f.state->source_settlement.intent.payload,
+			RESOURCE_X_SOURCE_COMPLETE_V11_BYTES, &request, &reject));
+		UT_ASSERT_EQ(request.common.action_node, 0);
+		ResourceXIntentSlot staged = local_stage(&f.state->source_settlement.intent.slot);
+		LOCAL_REQUIRE(cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(&request, 0, 61), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, f.state->holder_status_intent.payload,
+			RESOURCE_X_SOURCE_COMPLETE_V11_BYTES, &ack, &reject));
+		LOCAL_REQUIRE(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&ack, 0, &out), RESOURCE_X_APPLY_APPLIED);
+		local_sent(&f.state->holder_status_intent.slot);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged, true, ++fake_pcm_clock_us));
+		LOCAL_REQUIRE(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.work), RESOURCE_X_APPLY_APPLIED);
+		struct StopPcmEntryLayout *entry = (void *)fake_pcm_entries.data[0];
+		UT_ASSERT_EQ(entry->x_holder_node, n ? -1 : 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->s_holders_bitmap), n ? 2 : 0);
+		UT_ASSERT_EQ(f.state->acquire_settled_holders_bitmap, 0);
+		UT_ASSERT_EQ(f.state->holder_image.valid, 0);
+	}
+}
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_local_done_success_updates_only_the_original_requester);
 	UT_RUN(test_local_done_quiet_preserves_old_grant_and_records_actual_revocations);
 	UT_RUN(test_local_done_waits_for_every_independent_holder_ACK);
@@ -370,5 +461,6 @@ int main(void)
 	UT_RUN(test_local_done_full_transition_budget_refuses_before_partial_revoke);
 	UT_RUN(test_local_done_corrupt_independent_ACK_cannot_be_replaced_by_DONE);
 	UT_RUN(test_local_done_late_receipt_and_callback_cannot_clear_successor);
+	UT_RUN(test_local_source_remote_requester_settles_master_own_control_receipt);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }

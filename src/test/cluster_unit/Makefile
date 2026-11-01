@@ -11465,6 +11465,7 @@ clean-resource-x-pi-handoff:
 TESTS += test_cluster_resource_x_write_settlement
 all: test_cluster_resource_x_write_settlement
 test_cluster_resource_x_write_settlement: test_cluster_resource_x_pi_fixture.inc \
+		test_cluster_resource_x_consumed_ring.inc test_cluster_resource_x_consumed_lms.inc \
 		test_cluster_resource_x_clean_fixture.inc test_cluster_resource_x_source_done_fixture.inc \
 		test_cluster_resource_x_source_ack_fixture.inc test_cluster_resource_x_master_done_ingress.inc \
 		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_fixture.inc \

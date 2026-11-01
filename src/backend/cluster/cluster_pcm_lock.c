@@ -828,6 +828,10 @@ typedef struct ClusterPcmResourceXMasterState {
 	/* The one conditional canonical head owns these original ACK identities.
 	 * Physical sender rebinding does not replace an already consumed receipt. */
 	uint32 acquire_ack_connections[RESOURCE_X_PROTOCOL_NODE_LIMIT];
+	/* Consumed full-A quiet receipts, independent of original holder ACKs.
+	 * One canonical head owns this mask and the existing settlement send slot. */
+	uint32 acquire_settled_holders_bitmap;
+	uint32 acquire_settled_reserved;
 	/* Original source reservation, retained before native finish. PENDING is
 	 * no-cancel-through: only exact source completion/settlement may retire it.
 	 * This tuple is local evidence, never another grant or a wire field. */
@@ -865,7 +869,7 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 13680,
 				 "Resource-X requester join must bound A, image and original ACKs");
 StaticAssertDecl(sizeof(ClusterPcmResourceXDeferredSettlement) == 784,
 				 "Resource-X deferred settlement must remain bounded");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 85296,
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 85304,
 				 "D4 Resource-X master state must bind object generation");
 
 typedef struct ClusterPcmShared {
@@ -1994,6 +1998,7 @@ static void
 pcm_resource_x_holder_grants_digest_locked(const ClusterPcmResourceXMasterState *state,
 										  uint64 *digest)
 {
+	*digest = pcm_resource_x_proof_digest_u64(*digest, state->acquire_settled_holders_bitmap);
 	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
 		const ResourceXHolderGrantProvenance *grant = &state->holder_grants[node];
 
@@ -2177,7 +2182,7 @@ pcm_resource_x_settlement_retry_decode_locked(struct GrdEntry *entry,
 	if (decoded.has_acquire_decision) {
 		const ResourceXDecodedAcquireDecision *a = &decoded.body.acquire_completion.decision;
 
-		if (a->master_node != retry->master || a->source_node != cluster_node_id
+		if (a->master_node != retry->master || decoded.common.action_node != cluster_node_id
 			|| (decoded.common.target_mode != PCM_STATE_S && decoded.common.target_mode != PCM_STATE_X)
 			|| (a->directory_mode != PCM_STATE_S && a->directory_mode != PCM_STATE_X)
 			|| decoded.common.sender_connection_generation != PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION)
@@ -21012,6 +21017,8 @@ pcm_resource_x_acquire_queue_active(const ClusterPcmResourceXMasterState *state)
 static bool
 pcm_resource_x_acquire_acks_empty(const ClusterPcmResourceXMasterState *state)
 {
+	if (state->acquire_settled_holders_bitmap != 0 || state->acquire_settled_reserved != 0)
+		return false;
 	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
 		if (state->acquire_ack_connections[node] != 0)
 			return false;
@@ -21228,6 +21235,9 @@ pcm_resource_x_acquire_canonical_decided(const ClusterPcmResourceXMasterState *s
 			|| ((connection != 0) != ((acknowledged & bit) != 0)))
 			return false;
 	}
+	if (state->acquire_settled_reserved != 0
+		|| (state->acquire_settled_holders_bitmap & ~acknowledged) != 0)
+		return false;
 	memset(&expected, 0, sizeof(expected));
 	expected.base_authority_generation = request->base_authority_generation;
 	expected.resource_formation = priority->request.resource_formation;
@@ -26007,6 +26017,30 @@ pcm_resource_x_pi_carrier_decode_locked(const struct GrdEntry *entry,
 	if (scope != NULL) memset(scope, 0, sizeof(*scope));
 	if (carrier->transport_refs == 0 && carrier->pi_refs == 0)
 		return memcmp(carrier, &empty, sizeof(empty)) == 0;
+	/* A non-source S holder retains a control receipt, not an image/PI
+	 * producer. Validate its immutable full witness and original native tuple
+	 * separately; no later tag lookup or empty-WAL inference proves it quiet. */
+	if (state->holder_image.kind == RESOURCE_X_WIRE_BLOCKED_TO_N) {
+		if (!pcm_resource_x_s_holder_pair_valid((struct GrdEntry *)entry, state)
+			|| state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+			|| carrier->transport_refs != 1 || carrier->pi_refs != 0
+			|| carrier->reserved[0] != 0 || carrier->reserved[1] != 0
+			|| carrier->binding_generation != entry->binding_generation
+			|| carrier->pi_revision == UINT64_MAX
+			|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, state->holder_status.payload,
+				state->holder_status.payload_bytes, &image, &(ResourceXWireReject){0})
+			|| carrier->image_crc != image.common.semantic_crc32c
+			|| (carrier->completed.flags != 0 && carrier->completed.flags != PCM_OWN_FLAG_REVOKING)
+			|| memcmp(&carrier->first, &empty_ref, sizeof(empty_ref)) != 0
+			|| memcmp(&carrier->last, &empty_ref, sizeof(empty_ref)) != 0)
+			return false;
+		expected = state->holder_acquire_s_native;
+		expected.generation++;
+		expected.pcm_state = PCM_STATE_N;
+		expected.buffer_type = BUF_TYPE_PI;
+		expected.flags = carrier->completed.flags;
+		return cluster_pcm_own_snapshot_equal_exact(&expected, &carrier->completed);
+	}
 	if (carrier->transport_refs > 1 || carrier->pi_refs > 1
 		|| carrier->reserved[0] != 0 || carrier->reserved[1] != 0
 		|| carrier->binding_generation != entry->binding_generation
@@ -26091,6 +26125,22 @@ pcm_resource_x_pi_carrier_prepare_locked(struct GrdEntry *entry,
 		return cluster_pcm_own_snapshot_equal_exact(&state->pi_carrier.completed, finished)
 			? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_LOCAL_WAIT;
 	if (!pcm_local_pi_snapshot_locked(entry, &local)) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (state->holder_image.kind == RESOURCE_X_WIRE_BLOCKED_TO_N) {
+		ResourceXWireReject reject;
+
+		if (!pcm_resource_x_s_holder_pair_valid(entry, state)
+			|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, state->holder_status.payload,
+				state->holder_status.payload_bytes, &image, &reject))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		/* A control witness cannot take ownership of an unrelated PI lower. */
+		if (local.first.record_start != 0) return RESOURCE_X_APPLY_LOCAL_WAIT;
+		prepared->completed = *finished;
+		prepared->binding_generation = entry->binding_generation;
+		prepared->pi_revision = local.revision;
+		prepared->image_crc = image.common.semantic_crc32c;
+		prepared->transport_refs = 1;
+		return RESOURCE_X_APPLY_APPLIED;
+	}
 	/* Even after DATA has retired PI, X->S needs its exact native receipt
 	 * until the original transport is quiet. Clean compatible S has no
 	 * separate native change to retain. S/X->N also retains its exact fence
@@ -26934,7 +26984,6 @@ pcm_resource_x_pi_handoff_locked(struct GrdEntry *entry,
 	if (state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED)
 		return RESOURCE_X_APPLY_LOCAL_WAIT;
 	if (block->common.target_mode != PCM_STATE_X
-		|| block->body.acquire_decision.source_node != cluster_node_id
 		|| !pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL)
 		|| state->pi_carrier.completed.pcm_state != PCM_STATE_N
 		|| state->pi_carrier.completed.buffer_type != BUF_TYPE_PI)
@@ -27035,7 +27084,8 @@ pcm_resource_x_read_source_frame(const ResourceXDecodedFrame *input,
 		|| canonical->common.semantic_crc32c != input->common.semantic_crc32c)
 		return false;
 	a = &canonical->body.acquire_completion.decision;
-	if (a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+	if ((a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+			&& a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT)
 		|| (canonical->common.target_mode != PCM_STATE_S && canonical->common.target_mode != PCM_STATE_X)
 		|| (a->directory_mode != PCM_STATE_S && a->directory_mode != PCM_STATE_X))
 		return false;
@@ -27121,7 +27171,7 @@ pcm_resource_x_read_source_ack_send_valid(struct GrdEntry *entry,
 		&& slot->authority_generation == prepared.slot.authority_generation
 		&& slot->destination_node == prepared.slot.destination_node
 		&& memcmp(payload, prepared.payload, sizeof(prepared.payload)) == 0
-		&& a->source_node == cluster_node_id && a->master_node == retry->master
+		&& request.common.action_node == cluster_node_id && a->master_node == retry->master
 		&& cluster_gcs_lookup_master(entry->tag) == retry->master
 		&& cluster_qvotec_get_self_incarnation() == a->holders[cluster_node_id].boot_incarnation
 		&& cluster_pcm_lock_resource_x_gate_open_exact(request.common.resource_formation)
@@ -27147,6 +27197,7 @@ cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
 	PcmEntryAcquireResult acquired;
 	ResourceXApplyResult result;
 	bool same;
+	bool source;
 
 	if (peer_generation == 0 || peer_generation == UINT32_MAX
 		|| !pcm_resource_x_read_source_frame(input, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2, &request, bytes)
@@ -27155,6 +27206,7 @@ cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
 	if (master != request.body.acquire_completion.decision.master_node
 		|| request.common.action_node != cluster_node_id)
 		return RESOURCE_X_APPLY_STALE;
+	source = request.body.acquire_completion.decision.source_node == cluster_node_id;
 	if (!pcm_entry_ref_acquire(&request.common.logical_assertion.resource, false, &ref, &acquired))
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	pcm_entry_lock_exclusive(ref.entry);
@@ -27200,13 +27252,14 @@ cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
 	if (!pcm_resource_x_s_source_block_matches(state, &block)
 		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, state->holder_status.payload,
 			state->holder_status.payload_bytes, &proof, &reject)
-		|| (request.common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE
+		|| (source && request.common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE
 			&& (request.body.acquire_completion.page_scn != proof.body.acquire_witness.original_proof.page_scn_lsn
 				|| request.body.acquire_completion.page_crc32c != proof.body.acquire_witness.original_proof.page_checksum))) {
 		result = RESOURCE_X_APPLY_STALE; goto done;
 	}
 	if ((request.common.target_mode == PCM_STATE_X
-			? (proof.body.acquire_witness.original_ack.flags != RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED
+			? (proof.body.acquire_witness.original_ack.flags != (source ? RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED : 0)
+				|| proof.body.acquire_witness.has_source_proof != source
 				|| state->pi_carrier.transport_refs != 1 || state->pi_carrier.completed.flags != 0)
 			: (state->holder_acquire_s_native.pcm_state == PCM_STATE_S
 				? proof.body.acquire_witness.original_ack.flags != 0
@@ -35692,7 +35745,7 @@ pcm_resource_x_acquire_consumed_prepare(const ResourceXDecodedFrame *notice,
 }
 
 static ResourceXApplyResult
-pcm_resource_x_acquire_source_ready_locked(const ClusterPcmResourceXMasterState *state,
+pcm_resource_x_acquire_source_ready_locked(struct GrdEntry *entry, const ClusterPcmResourceXMasterState *state,
 	const ResourceXDecodedFrame *notice)
 {
 	static const ResourceXIntentSlot empty_slot;
@@ -35707,9 +35760,26 @@ pcm_resource_x_acquire_source_ready_locked(const ClusterPcmResourceXMasterState 
 	 * prerequisites; requester DONE cannot stand in for either of them. */
 	if ((!remote && a->source_kind != RESOURCE_X_ACQUIRE_SOURCE_LOCAL_CURRENT)
 		|| (remote && state->acquire_ack_connections[a->source_node] == 0)
-		|| (!remote && !pcm_resource_x_s_source_empty(state))
 		|| request->blocked_holders_bitmap != a->required_holders_bitmap)
 		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	if (!remote && !pcm_resource_x_s_source_empty(state)) {
+		ResourceXDecodedFrame self = *notice, block;
+
+		/* R may be the local source on another node while M is itself an
+		 * incompatible S holder. Its exact quiet control receipt is what the
+		 * following settlement must retire, not a prerequisite to erase it. */
+		if (!pcm_resource_x_s_source_pair_valid(entry, state))
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		self.common.action_node = cluster_node_id;
+		if (notice->common.target_mode != PCM_STATE_X || a->directory_mode != PCM_STATE_S
+			|| (a->required_holders_bitmap & (UINT32_C(1) << cluster_node_id)) == 0
+			|| state->holder_image.kind != RESOURCE_X_WIRE_BLOCKED_TO_N
+			|| state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PUBLISHED
+			|| state->pi_carrier.transport_refs != 1 || state->pi_carrier.completed.flags != 0
+			|| !pcm_resource_x_read_source_block(&self, &block)
+			|| !pcm_resource_x_s_source_block_matches(state, &block))
+			return RESOURCE_X_APPLY_LOCAL_WAIT;
+	}
 	if (remote && notice->common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE
 		&& (c->page_scn != request->page_scn_lsn || c->page_crc32c != request->page_checksum))
 		return RESOURCE_X_APPLY_STALE;
@@ -35735,19 +35805,55 @@ pcm_resource_x_acquire_clean_source_progress_locked(struct GrdEntry *entry,
 	ResourceXWireReject reject;
 	ResourceXApplyResult result;
 	const ResourceXDecodedAcquireDecision *a = &notice->body.acquire_completion.decision;
+	uint32 targets = a->required_holders_bitmap, owed;
+	int32 holder = -1;
 	uint16 length = 0;
 
-	/* H's exact settlement proves original native publication and quiet
-	 * transport. PI remains a separate duty on both read and write handoffs. */
 	if ((notice->common.target_mode != PCM_STATE_S && notice->common.target_mode != PCM_STATE_X)
 		|| (a->directory_mode != PCM_STATE_S && a->directory_mode != PCM_STATE_X))
 		return RESOURCE_X_APPLY_LOCAL_WAIT;
-	result = pcm_resource_x_acquire_source_ready_locked(state, notice);
+	result = pcm_resource_x_acquire_source_ready_locked(entry, state, notice);
 	if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	if (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT)
+		targets |= UINT32_C(1) << a->source_node;
+	if (state->acquire_settled_reserved != 0
+		|| (state->acquire_settled_holders_bitmap & ~targets) != 0)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (targets == 0) return RESOURCE_X_APPLY_APPLIED;
 	if (!pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &retained))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	/* One bounded send owner serves all original holders. The mask records
+	 * consumed full-A ACKs, never physical callback success or a later head. */
+	if (state->acquire_settled_holders_bitmap != 0) {
+		request.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2;
+		request.common.action_node = retained.common.action_node;
+		request.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
+		if (debt->state == RESOURCE_X_SOURCE_SETTLEMENT_NONE || !retained.has_acquire_decision
+			|| (targets & (UINT32_C(1) << retained.common.action_node)) == 0
+			|| ((debt->state == RESOURCE_X_SOURCE_SETTLEMENT_ACKED)
+				!= ((state->acquire_settled_holders_bitmap & (UINT32_C(1) << retained.common.action_node)) != 0))
+			|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &request,
+				prepared.intent.payload, sizeof(prepared.intent.payload), &length, &reject)
+			|| length != RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
+			|| memcmp(prepared.intent.payload, debt->intent.payload, sizeof(prepared.intent.payload)) != 0)
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (debt->state == RESOURCE_X_SOURCE_SETTLEMENT_ACKED
+		&& memcmp(&debt->intent.slot, &empty_slot, sizeof(empty_slot)) != 0)
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	owed = targets & ~state->acquire_settled_holders_bitmap;
+	if (owed == 0) return RESOURCE_X_APPLY_APPLIED;
+	/* Keep the selected source first, then settle each control producer.
+	 * Neither a requester DONE nor another holder's ACK retires that producer. */
+	if (a->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+		&& (owed & (UINT32_C(1) << a->source_node)) != 0)
+		holder = a->source_node;
+	else for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+		if ((owed & (UINT32_C(1) << node)) != 0) { holder = node; break; }
+	if (holder < 0) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	memset(&prepared, 0, sizeof(prepared));
 	request.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2;
-	request.common.action_node = a->source_node;
+	request.common.action_node = holder;
 	request.common.sender_connection_generation = PGRAC_RESOURCE_X_RETAINED_SENDER_GENERATION;
 	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &request,
 		prepared.intent.payload, sizeof(prepared.intent.payload), &length, &reject)
@@ -35755,9 +35861,8 @@ pcm_resource_x_acquire_clean_source_progress_locked(struct GrdEntry *entry,
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	if (debt->state != RESOURCE_X_SOURCE_SETTLEMENT_NONE
 		&& memcmp(debt->intent.payload, prepared.intent.payload, sizeof(prepared.intent.payload)) == 0)
-		return debt->state == RESOURCE_X_SOURCE_SETTLEMENT_ACKED
-			&& memcmp(&debt->intent.slot, &empty_slot, sizeof(empty_slot)) == 0
-			? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_LOCAL_WAIT;
+		return debt->state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING
+			? RESOURCE_X_APPLY_LOCAL_WAIT : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	if (debt->state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING
 		|| memcmp(&debt->intent.slot, &empty_slot, sizeof(empty_slot)) != 0)
 		return RESOURCE_X_APPLY_LOCAL_WAIT;
@@ -35767,7 +35872,7 @@ pcm_resource_x_acquire_clean_source_progress_locked(struct GrdEntry *entry,
 	body.owner_kind = RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE;
 	if (!cluster_pcm_lock_resource_x_intent_arm_exact(&prepared.intent.slot, &body,
 		request.common.assertion_sequence, request.common.authority_generation,
-		pcm_resource_x_monotonic_us(), (uint32)a->source_node, length, request.kind)
+		pcm_resource_x_monotonic_us(), (uint32)holder, length, request.kind)
 		|| !pcm_resource_x_intent_mark_dirty())
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	prepared.state = RESOURCE_X_SOURCE_SETTLEMENT_PENDING;
@@ -35811,7 +35916,7 @@ pcm_resource_x_acquire_done_apply_locked(struct GrdEntry *entry,
 
 		if (ready != RESOURCE_X_APPLY_APPLIED) return ready;
 	} else if (local) {
-		ResourceXApplyResult ready = pcm_resource_x_acquire_source_ready_locked(state, &notice);
+		ResourceXApplyResult ready = pcm_resource_x_acquire_clean_source_progress_locked(entry, state, &notice);
 
 		if (ready != RESOURCE_X_APPLY_APPLIED) return ready;
 	} else if (!pcm_resource_x_acquire_service_quiet(state))
@@ -35863,6 +35968,7 @@ pcm_resource_x_acquire_done_apply_locked(struct GrdEntry *entry,
 		for (int old = 0; old < RESOURCE_X_PROTOCOL_NODE_LIMIT; old++)
 			if ((a->required_holders_bitmap & (UINT32_C(1) << old)) != 0)
 				state->acquire_ack_connections[old] = 0;
+		state->acquire_settled_holders_bitmap = 0;
 	}
 	memset(&state->requests[node], 0, sizeof(state->requests[node]));
 	pcm_resource_x_bootstrap_priority_clear(&state->bootstrap_priority[node]);
@@ -36018,7 +36124,7 @@ cluster_pcm_lock_resource_x_acquire_source_done_snapshot_exact(
 		|| memcmp(done, state->deferred_settlement.payload, sizeof(done)) != 0
 		|| !pcm_resource_x_acquire_done_matches_locked(ref.entry, state, &notice, grant))
 		goto done;
-	result = pcm_resource_x_acquire_source_ready_locked(state, &notice);
+	result = pcm_resource_x_acquire_source_ready_locked(ref.entry, state, &notice);
 	if (result == RESOURCE_X_APPLY_APPLIED)
 		*notice_out = notice;
 done:
@@ -36264,7 +36370,7 @@ cluster_pcm_lock_resource_x_source_settlement_ack_exact(const ResourceXDecodedFr
 
 		if (!pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &retained))
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		else if (a->master_node != cluster_node_id || a->source_node != authenticated_source_node
+		else if (a->master_node != cluster_node_id
 			|| a->resource_binding != state->binding_generation || state->binding_generation != entry->binding_generation
 			|| ack->common.authority_generation != state->authority_generation
 			|| cluster_gcs_lookup_master(entry->tag) != cluster_node_id
@@ -36275,6 +36381,9 @@ cluster_pcm_lock_resource_x_source_settlement_ack_exact(const ResourceXDecodedFr
 			result = RESOURCE_X_APPLY_STALE;
 		else if (debt->state == RESOURCE_X_SOURCE_SETTLEMENT_ACKED)
 			result = RESOURCE_X_APPLY_DUPLICATE;
+		else if (state->acquire_ack_connections[authenticated_source_node] == 0
+			|| !pcm_resource_x_acquire_canonical_decided(state, ack->common.logical_assertion.requester_node))
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		else if (!pcm_resource_x_intent_mark_dirty())
 			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		else {
@@ -36282,6 +36391,7 @@ cluster_pcm_lock_resource_x_source_settlement_ack_exact(const ResourceXDecodedFr
 			if (debt->intent.slot.state == RESOURCE_X_INTENT_SLOT_ARMED)
 				memset(&debt->intent.slot, 0, sizeof(debt->intent.slot));
 			debt->state = RESOURCE_X_SOURCE_SETTLEMENT_ACKED;
+			state->acquire_settled_holders_bitmap |= UINT32_C(1) << authenticated_source_node;
 			debt->busy = debt->busy_channel = 0;
 			debt->busy_stream_generation = debt->busy_capability_generation = 0;
 			ConditionVariableBroadcast(&entry->wait_cv);

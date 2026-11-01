@@ -549,7 +549,9 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 					|| intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2))
 				|| ((intent->payload_bytes == RESOURCE_X_WITNESS_V4_BYTES
 					 || intent->payload_bytes == RESOURCE_X_SOURCE_WITNESS_V4_BYTES)
-					&& intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N))
+					&& intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N)
+				|| (intent->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
+					&& intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2))
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE:
@@ -580,7 +582,8 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE:
-		return intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
+		return (intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
+				|| intent->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES)
 			   && intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
 			   && intent->body.assertion.requester_node != (int32)intent->destination_node
 			   && intent->body.owner_generation == intent->logical_generation
@@ -646,6 +649,16 @@ lms_outbound_resource_x_intent_payload_valid(const ResourceXIntentSlot *intent,
 	if (intent->payload_bytes == RESOURCE_X_COMPLETE_V5_BYTES
 		|| intent->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES) {
 		decision = &frame.body.acquire_completion.decision;
+		if (frame.kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2)
+			return intent->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
+				&& intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE
+				&& decision->master_node == (int32)intent->body.owner_node
+				&& common->action_node == (int32)intent->destination_node;
+		if (frame.kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
+			return intent->payload_bytes == RESOURCE_X_SOURCE_COMPLETE_V11_BYTES
+				&& intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_STATUS
+				&& common->action_node == (int32)intent->body.owner_node
+				&& decision->master_node == (int32)intent->destination_node;
 		if (intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT)
 			return (common->outcome == RESOURCE_X_OUTCOME_DUPLICATE
 					|| common->outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED

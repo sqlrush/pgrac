@@ -868,8 +868,13 @@ resource_x_decision_body_valid(const ResourceXDecodedFrame *frame)
 	}
 	if (frame->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
 		|| frame->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
-		return body->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
-			&& frame->common.action_node == body->source_node;
+		return (body->source_kind == RESOURCE_X_ACQUIRE_SOURCE_REMOTE_CURRENT
+				&& frame->common.action_node == body->source_node)
+			/* Other incompatible S holders settle their own control witness,
+			 * never the selected source's image or the requester's native C. */
+			|| (frame->common.target_mode == PCM_STATE_X && body->directory_mode == PCM_STATE_S
+				&& frame->common.action_node != body->source_node
+				&& (required & (UINT32_C(1) << frame->common.action_node)) != 0);
 	if (frame->kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT
 		&& (frame->common.outcome == RESOURCE_X_OUTCOME_DUPLICATE
 			|| frame->common.outcome == RESOURCE_X_OUTCOME_QUIET_RETIRED

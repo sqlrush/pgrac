@@ -539,8 +539,10 @@ static ResourceXApplyResult holder_retained_native(HolderFixture *f, ClusterPcmO
 	ClusterPcmOwnFinishRefusal refusal;
 	ClusterPcmOwnResult own;
 	if (result != RESOURCE_X_APPLY_APPLIED) return result;
-	own = cluster_bufmgr_pcm_own_finish_revoke_retain(&request_buf, &f->prepared,
-		PageGetLSN((Page)image.body.acquire_image.original_image.page_bytes), finished, &refusal, NULL);
+	own = f->block.body.acquire_decision.source_node == cluster_node_id
+		? cluster_bufmgr_pcm_own_finish_revoke_retain(&request_buf, &f->prepared,
+			PageGetLSN((Page)image.body.acquire_image.original_image.page_bytes), finished, &refusal, NULL)
+		: cluster_bufmgr_pcm_own_finish_s_holder_revoke(&request_buf, &f->prepared, finished, &refusal);
 	UT_ASSERT_EQ(own, CLUSTER_PCM_OWN_OK);
 	return own == CLUSTER_PCM_OWN_OK ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
@@ -720,9 +722,9 @@ UT_TEST(test_other_S_holder_real_native_N_emits_only_two_control_witnesses)
 	UT_ASSERT_EQ(holder_slot(&f, false)->payload_bytes, RESOURCE_X_WITNESS_V4_BYTES);
 	UT_ASSERT_EQ(holder_slot(&f, true)->payload_bytes, RESOURCE_X_WITNESS_V4_BYTES);
 	UT_ASSERT_EQ(f.master.state->pi_carrier.pi_refs, 0); holder_no_debt();
-	/* This boundary proves native N and witnesses, not final release of a
-	 * non-source receipt. Keep the outstanding native fence explicit. */
-	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+	/* Native release is now proven by the retained control receipt; both
+	 * independent send/settlement responsibilities still remain. */
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 }
 UT_TEST(test_other_S_holder_busy_keeps_original_native_fence_until_event)
 {
@@ -739,9 +741,152 @@ UT_TEST(test_other_S_holder_busy_keeps_original_native_fence_until_event)
 	HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_N); UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 902); holder_no_debt();
 }
+/* Full-A settlement uses a real conditional decision and CRC. The original
+ * requester completion is an authenticated input here; native H and both
+ * actual LMS callbacks are executed below. */
+static bool
+holder_control_settlement(HolderFixture *f, ResourceXDecodedFrame *request, int outcome)
+{
+	ResourceXDecodedFrame grant = f->block;
+	ResourceXDecodedAcquireDecision decision = grant.body.acquire_decision;
+	uint8 bytes[RESOURCE_X_SOURCE_COMPLETE_V11_BYTES]; uint16 length; ResourceXWireReject reject;
+	grant.kind = RESOURCE_X_WIRE_AUTHORITY_GRANT;
+	grant.common.action_node = grant.common.logical_assertion.requester_node;
+	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &grant, bytes, sizeof(bytes), &length, &reject)
+		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, length, &grant, &reject)) return false;
+	memset(request, 0, sizeof(*request));
+	request->kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2; request->has_acquire_decision = true;
+	request->payload_bytes = RESOURCE_X_SOURCE_COMPLETE_V11_BYTES;
+	request->common = f->block.common; request->common.outcome = outcome;
+	request->body.acquire_completion.decision = decision;
+	request->body.acquire_completion.decision_crc32c = grant.common.semantic_crc32c;
+	request->body.acquire_completion.native_generation = decision.episode.base_generation
+		+ (outcome == RESOURCE_X_OUTCOME_OK ? 1 : 0);
+	if (outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE) {
+		request->body.acquire_completion.page_lsn = 144;
+		request->body.acquire_completion.page_scn = 236;
+		request->body.acquire_completion.page_crc32c = 1234;
+	}
+	return cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, request, bytes, sizeof(bytes), &length, &reject)
+		&& length == sizeof(bytes)
+		&& cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, length, request, &reject);
+}
+static void
+holder_send_control(HolderFixture *f, bool image, bool sent)
+{
+	ResourceXIntentSlot slot = *holder_slot(f, image), staged;
+	uint32 index = request_shared.rings[0].head;
+	const uint8 *payload = image ? f->master.state->holder_image.payload : f->master.state->holder_status_intent.payload;
+	UT_ASSERT(lms_outbound_resource_x_intent_payload_valid(&slot, payload));
+	fake_pcm_clock_us += 1000000;
+	UT_ASSERT_EQ(done_actual_lms_enqueue(0, &slot, image ? 83 : 61, UINT64_C(900000000)), CLUSTER_LMS_ENQUEUE_ADMITTED);
+	memcpy(&staged, request_shared.rings[0].ring[index].payload, sizeof(staged));
+	cluster_lms_outbound_resource_x_send_complete(&staged, sent);
+}
+UT_TEST(test_other_S_holder_retains_exact_quiet_native_receipt)
+{
+	HolderFixture f; ClusterPcmResourceXPiCarrier before; ClusterPcmOwnSnapshot quiet; int32 id;
+	bool ok = holder_start_role(&f, PCM_STATE_S, PCM_STATE_X, 2); UT_ASSERT(ok); if (!ok) return;
+	HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+	HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+	UT_ASSERT_EQ(f.master.state->pi_carrier.transport_refs, 1);
+	UT_ASSERT_EQ(f.master.state->pi_carrier.pi_refs, 0);
+	before = f.master.state->pi_carrier;
+	HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_s_source_handoff_snapshot_exact(&f.block, 0, &id, &quiet), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(id, 0); UT_ASSERT_EQ(quiet.flags, 0); UT_ASSERT_EQ(quiet.generation, 902);
+	HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT(memcmp(&before, &f.master.state->pi_carrier, sizeof(before)) == 0); holder_no_debt();
+}
+UT_TEST(test_other_S_holder_settlement_waits_real_work_and_both_callbacks)
+{
+	const int outcomes[] = {RESOURCE_X_OUTCOME_OK, RESOURCE_X_OUTCOME_QUIET, RESOURCE_X_OUTCOME_QUIET_NO_IMAGE};
+	for (int n = 0; n < 3; n++) {
+		HolderFixture f; ResourceXDecodedFrame request; ClusterPcmResourceXPiCarrier before;
+		bool ok = holder_start_role(&f, PCM_STATE_S, PCM_STATE_X, 2); UT_ASSERT(ok); if (!ok) return;
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED); HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
+		ok = holder_control_settlement(&f, &request, outcomes[n]); UT_ASSERT(ok); if (!ok) return;
+		before = f.master.state->pi_carrier;
+		HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(&request, 0, 61), RESOURCE_X_APPLY_LOCAL_WAIT);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+		holder_send_control(&f, false, true); holder_send_control(&f, true, false);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(&request, 0, 61), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT(memcmp(&before, &f.master.state->pi_carrier, sizeof(before)) == 0);
+		holder_send_control(&f, true, true);
+		HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(&request, 0, 61), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(f.master.state->holder_image.valid, 0); UT_ASSERT_EQ(f.master.state->pi_carrier.transport_refs, 0);
+		UT_ASSERT_EQ(f.master.state->settlement_retry.pending, 0);
+		UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.kind, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+		holder_send_control(&f, false, false);
+		UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+		holder_send_control(&f, false, true); UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+		holder_no_debt();
+	}
+}
+UT_TEST(test_other_S_holder_old_settlement_does_not_touch_reused_native_descriptor)
+{
+	HolderFixture f; ResourceXDecodedFrame request; BufferDesc before; uint64 gen, token;
+	bool ok = holder_start_role(&f, PCM_STATE_S, PCM_STATE_X, 2); UT_ASSERT(ok); if (!ok) return;
+	HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED); HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
+	ok = holder_control_settlement(&f, &request, RESOURCE_X_OUTCOME_QUIET_NO_IMAGE); UT_ASSERT(ok); if (!ok) return;
+	HOLDER_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&f.work, RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+	holder_send_control(&f, false, true); holder_send_control(&f, true, true);
+	HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(&request, 0, 61), RESOURCE_X_APPLY_APPLIED);
+	holder_send_control(&f, false, true);
+	request_buf.pcm_state = PCM_STATE_S; request_buf.buffer_type = BUF_TYPE_SCUR;
+	gen = pg_atomic_fetch_add_u64(&request_own.generation, 7) + 7;
+	token = pg_atomic_fetch_add_u64(&request_own.reservation_token, 3) + 3;
+	before = request_buf;
+	HOLDER_EQ(cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(&request, 0, 61), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT(memcmp(&before, &request_buf, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), gen); UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), token);
+	holder_send_control(&f, false, true); holder_no_debt();
+}
+UT_TEST(test_other_S_holder_interruption_rejoins_only_original_native_receipt)
+{
+	for (int phase = 0; phase < 3; phase++) {
+		HolderFixture f; ClusterPcmOwnSnapshot pending, completed;
+		bool ok = holder_start_role(&f, PCM_STATE_S, PCM_STATE_X, 3); UT_ASSERT(ok); if (!ok) return;
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+		if (phase == 0) {
+			HOLDER_EQ(holder_retained_native(&f, &completed), RESOURCE_X_APPLY_APPLIED);
+		} else {
+			HOLDER_EQ(holder_publish_retained(&f), RESOURCE_X_APPLY_APPLIED);
+			pending = f.master.state->pi_carrier.completed;
+			if (phase == 1) {
+				holder_content_busy = true; HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_BAD_STATE);
+				UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+				holder_content_busy = false;
+			} else UT_ASSERT_EQ(cluster_bufmgr_pcm_own_release_pi_carrier_exact(0, &pending, &completed), CLUSTER_PCM_OWN_OK);
+		}
+		HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_APPLIED);
+		HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 902);
+		UT_ASSERT_EQ(f.master.state->pi_carrier.completed.flags, 0); holder_no_debt();
+	}
+}
+UT_TEST(test_other_S_holder_corrupt_receipt_cannot_release_native_fence)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		HolderFixture f;
+		bool ok = holder_start_role(&f, PCM_STATE_S, PCM_STATE_X, 2); UT_ASSERT(ok); if (!ok) return;
+		HOLDER_EQ(holder_capture(&f), RESOURCE_X_APPLY_APPLIED);
+		HOLDER_EQ(holder_publish_retained(&f), RESOURCE_X_APPLY_APPLIED);
+		if (fault == 0) f.master.state->pi_carrier.completed.generation++;
+		if (fault == 1) f.master.state->pi_carrier.completed.reservation_token++;
+		if (fault == 2) f.master.state->pi_carrier.completed.tag.blockNum++;
+		if (fault == 3) f.master.state->pi_carrier.image_crc++;
+		if (fault == 4) f.master.state->pi_carrier.pi_refs = 1;
+		if (fault == 5) f.master.state->pi_carrier.reserved[0] = 1;
+		HOLDER_EQ(holder_finish(&f), RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 902); UT_ASSERT_EQ(f.master.state->holder_image.valid, RESOURCE_X_HOLDER_PAIR_PUBLISHED);
+		UT_ASSERT_EQ(holder_pins, 0); complete_idle();
+	}
+}
 int main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(33);
 	UT_RUN(test_holder_capture_native_downgrade_and_original_pair);
 	UT_RUN(test_holder_real_busy_before_capture_keeps_one_work_until_release);
 	UT_RUN(test_holder_real_busy_after_capture_preserves_exact_native_fence_and_image);
@@ -770,6 +915,11 @@ int main(void)
 	UT_RUN(test_holder_N_finish_storage_ERROR_preserves_pair_fence_and_dirty_page);
 	UT_RUN(test_other_S_holder_real_native_N_emits_only_two_control_witnesses);
 	UT_RUN(test_other_S_holder_busy_keeps_original_native_fence_until_event);
+	UT_RUN(test_other_S_holder_retains_exact_quiet_native_receipt);
+	UT_RUN(test_other_S_holder_settlement_waits_real_work_and_both_callbacks);
+	UT_RUN(test_other_S_holder_old_settlement_does_not_touch_reused_native_descriptor);
+	UT_RUN(test_other_S_holder_interruption_rejoins_only_original_native_receipt);
+	UT_RUN(test_other_S_holder_corrupt_receipt_cannot_release_native_fence);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

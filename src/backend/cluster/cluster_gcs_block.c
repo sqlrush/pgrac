@@ -11580,7 +11580,7 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 		|| buffer_id != buf->buf_id
 		|| !cluster_pcm_own_snapshot_equal_exact(&prepared, caller_prepared))
 		goto fail_closed;
-	if (source && pair_state == RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED)
+	if (pair_state == RESOURCE_X_ACQUIRE_S_SOURCE_PUBLISHED)
 		return gcs_block_resource_x_acquire_s_native_handoff_owned(block, master, buffer_id);
 	if (cluster_bufmgr_pcm_own_snapshot_by_tag(&prepared.tag, &live_id, &live) != CLUSTER_PCM_OWN_OK
 		|| live_id != buffer_id) goto fail_closed;
@@ -11647,7 +11647,7 @@ gcs_block_resource_x_acquire_s_source_finish_owned(
 	result = cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
 		block, master, buffer_id, &prepared, &finished);
 	if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
-		return source ? gcs_block_resource_x_acquire_s_native_handoff_owned(block, master, buffer_id) : result;
+		return gcs_block_resource_x_acquire_s_native_handoff_owned(block, master, buffer_id);
 fail_closed:
 	gcs_block_resource_x_fail_closed_current();
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;

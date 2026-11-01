@@ -12,6 +12,31 @@
  *-------------------------------------------------------------------------
  */
 #include "test_cluster_resource_x_pi_fixture.inc"
+#include "test_cluster_resource_x_consumed_ring.inc"
+ClusterLmsEnqueueResult write_actual_lms_enqueue(int worker, const ResourceXIntentSlot *intent,
+	uint32 connection, uint64 deadline);
+#define cluster_lms_outbound_enqueue_resource_x_intent write_actual_lms_enqueue
+#include "test_cluster_resource_x_consumed_lms.inc"
+#undef cluster_lms_outbound_enqueue_resource_x_intent
+static ClusterLmsOutboundSharedState write_ring;
+static LWLock write_ring_locks[CLUSTER_LMS_MAX_WORKERS];
+
+static ResourceXIntentSlot
+write_settlement_send(ResourceXIntentSlot *intent)
+{
+	ResourceXIntentSlot staged;
+	ClusterPcmResourceXSourceSettlement *debt = (void *)intent;
+	UT_ASSERT(lms_outbound_resource_x_intent_payload_valid(intent, debt->intent.payload));
+	/* Each independent M transport is admitted by the real LMS body. */
+	memset(&write_ring, 0, sizeof(write_ring));
+	cluster_lms_outbound_shared = &write_ring; cluster_lms_outbound_rings = write_ring.rings;
+	pg_atomic_init_u64(&write_ring.resource_x_transport_mutation_sequence, 1);
+	for (int n = 0; n < CLUSTER_LMS_MAX_WORKERS; n++) cluster_lms_outbound_locks[n] = &write_ring_locks[n];
+	fake_pcm_clock_us += 1000000;
+	UT_ASSERT_EQ(write_actual_lms_enqueue(0, intent, 61, UINT64_C(900000000)), CLUSTER_LMS_ENQUEUE_ADMITTED);
+	memcpy(&staged, write_ring.rings[0].ring[0].payload, sizeof(staged));
+	return staged;
+}
 
 static bool
 write_start(PiFixture *f, PcmState mode, bool quiet)
@@ -145,7 +170,7 @@ write_arm(PiFixture *f, int outcome, ResourceXDecodedFrame *request)
 }
 
 static bool
-write_settle(PiFixture *f, ResourceXDecodedFrame *request)
+write_settle_source(PiFixture *f, ResourceXDecodedFrame *request)
 {
 	ResourceXDecodedFrame ack; ResourceXMasterSnapshot out;
 	clean_send(&f->source.m.state->source_settlement.intent.slot);
@@ -155,6 +180,32 @@ write_settle(PiFixture *f, ResourceXDecodedFrame *request)
 	ack = clean_decode(f->source.m.state->holder_status_intent.payload, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&ack, 0, &out), RESOURCE_X_APPLY_APPLIED);
 	clean_send(&f->source.m.state->holder_status_intent.slot);
+	return true;
+}
+
+/* Other holders' native C is an explicit authenticated input in this master
+ * component. Their real native/receipt/transport path runs in native_holder. */
+static void
+write_settle_others(PiFixture *f, ResourceXDecodedFrame *request)
+{
+	for (int h = 0; h < RESOURCE_X_PROTOCOL_NODE_LIMIT; h++) {
+		ResourceXDecodedFrame next, ack; ResourceXMasterSnapshot out;
+		if (h == request->body.acquire_completion.decision.source_node
+			|| (request->body.acquire_completion.decision.required_holders_bitmap & (UINT32_C(1) << h)) == 0) continue;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f->source.m.work), RESOURCE_X_APPLY_LOCAL_WAIT);
+		next = clean_decode(f->source.m.state->source_settlement.intent.payload, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+		UT_ASSERT_EQ(next.common.action_node, h);
+		ResourceXIntentSlot staged = write_settlement_send(&f->source.m.state->source_settlement.intent.slot);
+		ack = next; ack.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2; UT_ASSERT(clean_encode(&ack));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&ack, h, &out), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged, true, ++fake_pcm_clock_us));
+	}
+}
+static bool
+write_settle(PiFixture *f, ResourceXDecodedFrame *request)
+{
+	if (!write_settle_source(f, request)) return false;
+	write_settle_others(f, request);
 	return true;
 }
 
@@ -321,6 +372,7 @@ UT_TEST(test_write_master_source_ack_and_physical_callback_are_independent)
 	UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
 	UT_ASSERT(!cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&pending));
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&pending, false, ++fake_pcm_clock_us));
+	write_settle_others(&f, &request);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.source.m.work), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->x_holder_node, -1);
 	UT_ASSERT_EQ(f.source.m.state->pi_carrier.pi_refs, 1);
@@ -355,10 +407,49 @@ UT_TEST(test_write_source_ack_send_refusal_keeps_its_exact_receipt)
 	pi_end();
 }
 
+UT_TEST(test_write_master_settles_every_other_S_holder_before_retiring_head)
+{
+	PiFixture f; ResourceXDecodedFrame request, ack, prior; ResourceXMasterSnapshot out;
+	if (!write_start(&f, PCM_STATE_S, true) || !write_arm(&f, RESOURCE_X_OUTCOME_OK, &request)
+		|| !write_settle_source(&f, &request)) return;
+	prior = request; prior.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2; UT_ASSERT(clean_encode(&prior));
+	for (int h = 2; h < 4; h++) {
+		ResourceXApplyResult result = cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.source.m.work);
+		UT_ASSERT_EQ(result, RESOURCE_X_APPLY_LOCAL_WAIT); if (result != RESOURCE_X_APPLY_LOCAL_WAIT) { pi_end(); return; }
+		request = clean_decode(f.source.m.state->source_settlement.intent.payload, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+		UT_ASSERT_EQ(request.common.action_node, h);
+		UT_ASSERT(f.source.m.state->requests[1].phase != RESOURCE_X_MASTER_NONE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&prior, prior.common.action_node, &out), RESOURCE_X_APPLY_STALE);
+		ack = request; ack.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2; UT_ASSERT(clean_encode(&ack));
+		ResourceXIntentSlot staged = write_settlement_send(&f.source.m.state->source_settlement.intent.slot);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&ack, h, &out), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&ack, h, &out), RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.source.m.work), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged, true, ++fake_pcm_clock_us));
+		prior = ack;
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.source.m.work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(f.source.m.state->acquire_settled_holders_bitmap, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&prior, 3, &out), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(f.source.m.state->acquire_settled_holders_bitmap, 0);
+	pi_end();
+}
+UT_TEST(test_write_holder_settlement_codec_rejects_nonholder_and_wrong_mode)
+{
+	PiFixture f; ResourceXDecodedFrame request;
+	if (!write_start(&f, PCM_STATE_S, true) || !write_done(&f, RESOURCE_X_OUTCOME_QUIET_NO_IMAGE)) return;
+	request = f.source.done; request.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2;
+	request.common.action_node = 2; UT_ASSERT(clean_encode(&request));
+	request.common.action_node = 1; UT_ASSERT(!clean_encode(&request));
+	request = f.source.done; request.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2;
+	request.common.action_node = 3; UT_ASSERT(clean_encode(&request));
+	request.common.target_mode = PCM_STATE_S; UT_ASSERT(!clean_encode(&request));
+	pi_end();
+}
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_write_source_all_six_complete_receipts_retain_full_authority);
 	UT_RUN(test_write_source_settlement_waits_exact_native_quiet_receipt);
 	UT_RUN(test_write_source_settlement_keeps_pi_and_independent_quiet_receipt);
@@ -371,6 +462,8 @@ main(void)
 	UT_RUN(test_write_source_mismatched_full_receipt_cannot_retire_original_pair);
 	UT_RUN(test_write_master_source_ack_and_physical_callback_are_independent);
 	UT_RUN(test_write_source_ack_send_refusal_keeps_its_exact_receipt);
+	UT_RUN(test_write_master_settles_every_other_S_holder_before_retiring_head);
+	UT_RUN(test_write_holder_settlement_codec_rejects_nonholder_and_wrong_mode);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
