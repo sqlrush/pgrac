@@ -78,6 +78,8 @@ static bool retained_assignment_error, retained_assignment_drift;
 static unsigned int xid_under_lock, xid_in_crit, local_acquires;
 static unsigned int begins, inserts, flushes, stages, preserves, sync_commits;
 static unsigned int registered;
+static bool managed_writer_test;
+static unsigned char managed_writer_wal[2304];
 static TransactionId xid_at_lock, xid_at_wal[2];
 static xl_relmap_update wal_header;
 static RelMapFile committed, updates, wal_image, staged_image[2];
@@ -248,7 +250,8 @@ void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
 {
-	if (v2_postcommit_error_stack && error_level == ERROR && PG_exception_stack)
+	if ((v2_postcommit_error_stack || managed_writer_test) && error_level == ERROR
+		&& PG_exception_stack)
 		siglongjmp(*PG_exception_stack, 1);
 	siglongjmp(error_target, 1);
 }
@@ -345,7 +348,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 		v2_retention_held = true;
 		return true;
 	}
-	UT_ASSERT(lock == RelationMappingLock && mode == LW_EXCLUSIVE);
+	UT_ASSERT(lock == RelationMappingLock
+			  && (mode == LW_EXCLUSIVE || (managed_writer_test && mode == LW_SHARED)));
 	UT_ASSERT(authority_held && !local_held && CritSectionCount == 0);
 	local_held = true;
 	local_acquires++;
@@ -404,6 +408,13 @@ XLogBeginInsert(void)
 void
 XLogRegisterData(char *data, uint32 len)
 {
+	if (managed_writer_test) {
+		UT_ASSERT_EQ(registered++, 0);
+		UT_ASSERT_EQ(len, sizeof(managed_writer_wal));
+		if (len == sizeof(managed_writer_wal))
+			memcpy(managed_writer_wal, data, len);
+		return;
+	}
 	if (registered++ == 0)
 	{
 		UT_ASSERT_EQ(len, MinSizeOfRelmapUpdate);
@@ -421,8 +432,8 @@ XLogRecPtr
 XLogInsert(RmgrId rmid, uint8 info)
 {
 	UT_ASSERT_EQ(rmid, RM_RELMAP_ID);
-	UT_ASSERT_EQ(info, XLOG_RELMAP_UPDATE);
-	UT_ASSERT_EQ(registered, 2);
+	UT_ASSERT_EQ(info, managed_writer_test ? 0x10 : XLOG_RELMAP_UPDATE);
+	UT_ASSERT_EQ(registered, managed_writer_test ? 1 : 2);
 	UT_ASSERT(local_held && CritSectionCount == 1 && inserts < 2);
 	xid_at_wal[inserts] = XidFromFullTransactionId(assigned_xid);
 	wal_order = ++sequence;
@@ -1136,11 +1147,27 @@ UT_TEST(unarmed_commit_preserves_other_writers_pending_and_global_lock)
 #include "test_cluster_relmap_active_hook_terminal.inc"
 #include "test_cluster_relmap_retained_producer.inc"
 
+#include "test_cluster_relmap_managed_writer.inc"
+
 int
 main(void)
 {
 	bool focus = getenv("PGRAC_RELMAP_RETAINED_FOCUS") != NULL;
-	UT_PLAN(focus ? 4 : 96);
+	if (getenv("PGRAC_RELMAP_MANAGED_WRITER_FOCUS")) {
+		UT_PLAN(8);
+		UT_RUN(managed_writer_original_transaction_dispatches_registered_batch);
+		UT_RUN(managed_writer_commit_and_abort_finish_before_original_unlock);
+		UT_RUN(managed_writer_missing_registration_refuses_whole_batch_before_wal);
+		UT_RUN(managed_writer_late_control_or_partial_write_keeps_whole_input_and_debt);
+		UT_RUN(managed_writer_terminal_rejects_replacement_and_never_retries_partial_clear);
+		UT_RUN(managed_writer_error_and_unconfirmed_release_keep_batch_without_lock_inversion);
+		UT_RUN(managed_writer_borrows_original_control_without_reentry_or_release);
+		UT_RUN(managed_writer_exact_legacy_dispatch_keeps_original_native_format);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+
+	UT_PLAN(focus ? 4 : 104);
 	UT_RUN(retained_stage_uses_native_writer_identity_before_mapping_and_wal);
 	UT_RUN(retained_stage_missing_writer_never_assigns_or_stages);
 	UT_RUN(retained_stage_allocator_error_preserves_outputs_and_pins);
@@ -1239,6 +1266,17 @@ main(void)
 	UT_RUN(database_ack_exhaustion_panics_with_remaining_arm_retained);
 	UT_RUN(unarmed_commit_preserves_other_writers_pending_and_global_lock);
 	}
+	if (!focus) {
+		UT_RUN(managed_writer_original_transaction_dispatches_registered_batch);
+		UT_RUN(managed_writer_commit_and_abort_finish_before_original_unlock);
+		UT_RUN(managed_writer_missing_registration_refuses_whole_batch_before_wal);
+		UT_RUN(managed_writer_late_control_or_partial_write_keeps_whole_input_and_debt);
+		UT_RUN(managed_writer_terminal_rejects_replacement_and_never_retries_partial_clear);
+		UT_RUN(managed_writer_error_and_unconfirmed_release_keep_batch_without_lock_inversion);
+		UT_RUN(managed_writer_borrows_original_control_without_reentry_or_release);
+		UT_RUN(managed_writer_exact_legacy_dispatch_keeps_original_native_format);
+	}
+
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -639,6 +639,7 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_retained_producer.inc \
+		test_cluster_relmap_managed_writer.inc \
 		test_cluster_relmap_producer_stage.inc test_cluster_relmap_commit_native.h \
 		test_cluster_relmap_producer_prepare.inc \
 		test_cluster_relmap_producer_terminal.inc \
@@ -669,15 +670,15 @@ test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention_runtime.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
-		test_cluster_relmap_v2_codec_product.o \
+		test_cluster_relmap_v2_codec_product.o test_cluster_relmap_file_writer.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		test_cluster_relmap_native_lock.o \
 		test_cluster_relmap_physical_pair.o \
 		test_cluster_relmap_native_tt.o test_cluster_relmap_native_tt_durable.o \
+		test_cluster_relmap_v2_codec_product.o test_cluster_relmap_file_writer.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		test_cluster_relmap_v2_codec_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -10886,7 +10887,8 @@ test_cluster_tt_locator_stats.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_
 	mv $@.tmp $@
 
 test_cluster_tt_durable test_cluster_tt_abort_owner test_cluster_tt_active_owner \
-		test_cluster_tt_rollback_entry test_cluster_tt_terminal_trace: test_cluster_tt_locator_stats.inc
+		test_cluster_tt_rollback_entry test_cluster_tt_terminal_trace \
+		test_cluster_relmap_native_tt.o: test_cluster_tt_locator_stats.inc
 
 # spec-3.11 D2/D9: test_cluster_tt_durable — pure decision predicates
 # (redo wrap table / slot match) + lookup / by-xid scan with a mocked
@@ -17621,3 +17623,12 @@ test_cluster_survivor_buffer_native.inc: $(top_srcdir)/src/backend/storage/buffe
 test_cluster_snapshot_admission: test_cluster_survivor_buffer_fixture.h \
  test_cluster_survivor_buffer_return.inc test_cluster_survivor_buffer_type.inc \
  test_cluster_survivor_buffer_native.inc cluster_catalog_trace_test.o
+
+# Current envelope codec must precede reusable support archives.
+test_cluster_relmap_file_writer.o: $(top_srcdir)/src/common/cluster_relmap_file.c \
+        $(top_srcdir)/src/include/common/cluster_relmap_file.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
+clean-relmap-writer:
+	rm -f test_cluster_relmap_file_writer.o
+clean: clean-relmap-writer
+.PHONY: clean-relmap-writer
