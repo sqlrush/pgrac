@@ -95,3 +95,64 @@ clean-k-p130-h02:
 		test_cluster_k_p130_h02_three.inc test_cluster_k_p130_h02_three.inc.tmp \
 		test_cluster_k_p130_h02_wal.inc test_cluster_k_p130_h02_wal.inc.tmp \
 		test_cluster_k_p130_h02_leaves.inc test_cluster_k_p130_h02_leaves.inc.tmp
+
+.PHONY: k-p130-h03-deps k-p130-h03 clean-k-p130-h03
+k-p130-h03-deps: k-p130-h01-deps
+	$(MAKE) test_cluster_native_resident_lock test_cluster_native_current
+
+test_cluster_k_p130_h03_request.inc: test_cluster_native_resident_request.c Makefile.p130_k_matrix
+	awk '/^#(define|undef) NATIVE_RESIDENT_REQUEST_COMPOSITION/ { next } \
+	     /^#include "test_cluster_native_first_fill_fixture.inc"/ { includes++; next } \
+	     /^UT_TEST/ { stop=1; exit } { print } \
+	     END { if (includes != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h03_fill.inc: test_cluster_native_resident_fill.c Makefile.p130_k_matrix
+	awk '/^#(define|undef) NATIVE_RESIDENT_FILL_COMPOSITION/ { next } \
+	     /^#include "test_cluster_native_resident_fixture.inc"/ { includes++; next } \
+	     /^UT_TEST/ { stop=1; exit } { print } \
+	     END { if (includes != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h03_lock.inc: test_cluster_native_resident_lock.c Makefile.p130_k_matrix
+	awk '/^#include "test_cluster_native_resident_fill_fixture.inc"/ { includes++; next } \
+	     /^UT_TEST/ { stop=1; exit } { print } \
+	     END { if (includes != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h03_current.inc: test_cluster_native_current.c Makefile.p130_k_matrix
+	awk '/^#(define|undef) NATIVE_MASTER_HOLDER_COMPOSITION/ { next } \
+	     /^#include "test_cluster_native_master_fixture.inc"/ { includes++; next } \
+	     /^UT_TEST/ { stop=1; exit } { print } \
+	     END { if (includes != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h03_notice.inc: test_cluster_native_current.c Makefile.p130_k_matrix
+	awk '/^\tNM_REQUIRE\(nc_requester_state\(&state\)\);/ { emit=1; found++ } \
+	     emit { print } /^\tcomplete_idle\(\); return true;/ && emit { emit=0; stopped++ } \
+	     END { if (found != 1 || stopped != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h03: test_cluster_k_p130_h03.c test_cluster_k_p130_h03_request.inc \
+		test_cluster_k_p130_h03_fill.inc test_cluster_k_p130_h03_lock.inc \
+		test_cluster_k_p130_h03_current.inc test_cluster_k_p130_h03_notice.inc \
+		test_cluster_k_p130_h02_three.inc test_cluster_k_p130_h02_leaves.inc \
+		test_cluster_k_p130_h01_drain.inc k-p130-h03-deps
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H03_CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+k-p130-h03: test_cluster_k_p130_h03
+	./test_cluster_k_p130_h03
+
+clean-k-p130-h03:
+	rm -f test_cluster_k_p130_h03 test_cluster_k_p130_h03_request.inc test_cluster_k_p130_h03_request.inc.tmp \
+		test_cluster_k_p130_h03_fill.inc test_cluster_k_p130_h03_fill.inc.tmp \
+		test_cluster_k_p130_h03_lock.inc test_cluster_k_p130_h03_lock.inc.tmp \
+		test_cluster_k_p130_h03_current.inc test_cluster_k_p130_h03_current.inc.tmp \
+		test_cluster_k_p130_h03_notice.inc test_cluster_k_p130_h03_notice.inc.tmp
