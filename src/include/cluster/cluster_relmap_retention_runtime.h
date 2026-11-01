@@ -123,6 +123,20 @@ extern ClusterRelmapV2ClearResult cluster_relmap_retention_runtime_publish_v2(
 extern ClusterRelmapV2ClearResult cluster_relmap_retention_runtime_discard_pending_v2(
 	const ClusterRelmapOwnerSampleV2 *sample, const ClusterRelmapV2Image *staged);
 
+/* Registered counterparts use immutable copies of the independently selected
+ * control identity and exact original stage. Same terminal/owner/pin contract
+ * as above; commit native sync precedes local MappingLock(X), abort keeps its
+ * original pre-abort order. Caller holds global relmap X and no MappingLock or
+ * XidGenLock. The original map lock brackets full-pair cleanup and final checks;
+ * ERROR uses the original backend unwind. No internal retry, registration,
+ * activation or pin release; a clean result is only this call's storage fact. */
+extern ClusterRelmapV2ClearResult cluster_relmap_retention_runtime_publish_managed_v2(
+	const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *registered_identity, const ClusterRelmapV2Image *staged);
+extern ClusterRelmapV2ClearResult cluster_relmap_retention_runtime_discard_pending_managed_v2(
+	const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *registered_identity, const ClusterRelmapV2Image *staged);
+
 /* Dormant original ACTIVE-owner adapter, after actual publication and before
  * terminal/release work. Reads the current real FullXid without assignment and
  * the original TT owner's published receipt, then rechecks both the full era

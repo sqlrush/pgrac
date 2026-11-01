@@ -414,11 +414,54 @@ cluster_relmap_retention_runtime_cancel_prepare_v2(const ClusterRelmapOwnerSampl
 	return result;
 }
 
+/* Native terminal I/O has finished before acquiring the original map lock.
+ * ERROR follows the original backend lock unwind; no obligation is canceled. */
+static ClusterRelmapV2ClearResult
+relmap_runtime_finish_managed_pair(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *identity, const ClusterRelmapV2Image *staged,
+	ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionKey *key,
+	bool publish)
+{
+	ClusterRelmapRetentionResult result;
+	ClusterRelmapV2ClearResult cleared = CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+	if (!cluster_relmap_owner_terminal_matches_v2(sample))
+		goto done;
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_directory_matches(directory, key);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = cluster_relmap_retention_stage_check(directory, key, staged->pending_owner.wal_end);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		goto done;
+	cleared = publish ? cluster_relmap_authority_managed_publish_v2(identity, staged)
+		: cluster_relmap_authority_managed_discard_pending_v2(identity, staged);
+	if (cleared != CLUSTER_RELMAP_V2_CLEARED_POSTREAD
+		|| !LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE)
+		|| !cluster_relmap_owner_terminal_matches_v2(sample)) {
+		cleared = CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+		goto done;
+	}
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = relmap_runtime_directory_matches(directory, key);
+	if (result == CLUSTER_RELMAP_RETENTION_OK)
+		result = cluster_relmap_retention_stage_check(directory, key, staged->pending_owner.wal_end);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	if (result != CLUSTER_RELMAP_RETENTION_OK)
+		cleared = CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+done:
+	if (LWLockHeldByMe(RelationMappingLock))
+		LWLockRelease(RelationMappingLock);
+	return cleared;
+}
+
 /* The original producer supplies terminal polarity. This routes storage
  * cleanup only; a staged obligation survives success, refusal and ERROR. */
 static ClusterRelmapV2ClearResult
 relmap_runtime_finish_v2(const ClusterRelmapOwnerSampleV2 *sample,
-	const ClusterRelmapV2Image *staged, bool publish)
+	const ClusterRelmapV2Image *staged, bool publish,
+	const ClusterRecoveryFileIdentityV2 *managed)
 {
 	ClusterRelmapRetentionKey key = { 0 };
 	ClusterRelmapRetentionDirectory *directory;
@@ -479,6 +522,9 @@ relmap_runtime_finish_v2(const ClusterRelmapOwnerSampleV2 *sample,
 #endif
 	}
 
+	if (managed != NULL)
+		return relmap_runtime_finish_managed_pair(sample, managed, staged, directory, &key, publish);
+
 	/* Existing storage validates the full image, writes/syncs BOTH copies and
 	 * reads back this call's result, even for a clean retry. Never hold the
 	 * retention lock across that I/O or the original native owner recheck. */
@@ -500,14 +546,51 @@ ClusterRelmapV2ClearResult
 cluster_relmap_retention_runtime_publish_v2(const ClusterRelmapOwnerSampleV2 *sample,
 	const ClusterRelmapV2Image *staged)
 {
-	return relmap_runtime_finish_v2(sample, staged, true);
+	return relmap_runtime_finish_v2(sample, staged, true, NULL);
 }
 
 ClusterRelmapV2ClearResult
 cluster_relmap_retention_runtime_discard_pending_v2(const ClusterRelmapOwnerSampleV2 *sample,
 	const ClusterRelmapV2Image *staged)
 {
-	return relmap_runtime_finish_v2(sample, staged, false);
+	return relmap_runtime_finish_v2(sample, staged, false, NULL);
+}
+
+static ClusterRelmapV2ClearResult
+relmap_runtime_finish_managed_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *registered_identity,
+	const ClusterRelmapV2Image *staged, bool publish)
+{
+	ClusterRelmapOwnerSampleV2 original;
+	ClusterRecoveryFileIdentityV2 bound;
+	ClusterRelmapV2Image image;
+	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
+
+	if (sample == NULL || registered_identity == NULL || staged == NULL || !enableFsync
+		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock))
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	original = *sample;
+	bound = *registered_identity;
+	image = *staged;
+	if (bound.tablespace_oid != (image.identity.shared ? GLOBALTABLESPACE_OID : MyDatabaseTableSpace)
+		|| memcmp(bound.storage_uuid, original.writer.ref.claim.identity.storage_uuid, 16) != 0
+		|| !cluster_relmap_file_encode_v2(&bound, &image, bytes, sizeof(bytes)))
+		return CLUSTER_RELMAP_V2_RETAINED_UNKNOWN;
+	return relmap_runtime_finish_v2(&original, &image, publish, &bound);
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_retention_runtime_publish_managed_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *registered_identity, const ClusterRelmapV2Image *staged)
+{
+	return relmap_runtime_finish_managed_v2(sample, registered_identity, staged, true);
+}
+
+ClusterRelmapV2ClearResult
+cluster_relmap_retention_runtime_discard_pending_managed_v2(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *registered_identity, const ClusterRelmapV2Image *staged)
+{
+	return relmap_runtime_finish_managed_v2(sample, registered_identity, staged, false);
 }
 
 static bool

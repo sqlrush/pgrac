@@ -11975,9 +11975,9 @@ test_cluster_xid_retention_stage_product.inc: $(top_srcdir)/src/backend/utils/ca
 	     /^(cluster_relmap_producer_(stage|prepare|arm|finish)_v2|cluster_relmap_retention_runtime_(write_pending|check_staged)_v2)\(/ { print "bool"; emit=1; functions++ } \
 	     /^relmap_runtime_(producer_key|directory_matches)\(/ { print "static ClusterRelmapRetentionResult"; emit=1; functions++ } \
 	     /^cluster_relmap_retention_runtime_insert_pending_v2\(/ { print "XLogRecPtr"; emit=1; functions++ } \
-	     /^relmap_runtime_finish_v2\(/ { print "static ClusterRelmapV2ClearResult"; emit=1; functions++ } \
+	     /^relmap_runtime_finish_(managed_pair|v2)\(/ { print "static ClusterRelmapV2ClearResult"; emit=1; functions++ } \
 	     /^cluster_relmap_retention_runtime_(publish|discard_pending)_v2\(/ { print "ClusterRelmapV2ClearResult"; emit=1; functions++ } \
-	     emit { print } /^}/ { emit=0 } END { if (functions != 17 || maps != 2 || states != 1 || state) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (functions != 18 || maps != 2 || states != 1 || state) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_retention_native_clog_main.o: $(XID_RETENTION_TEST_INPUTS) \

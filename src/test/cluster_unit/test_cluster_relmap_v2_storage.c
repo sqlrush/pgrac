@@ -77,6 +77,11 @@ static const ClusterRelmapV2Owner owner = { 3, UINT64CONST(0x200000123), 0, 101,
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (lock == RelationMappingLock) {
+		if (mode != LW_EXCLUSIVE || mapping_held || retention_held) abort();
+		mapping_held = true;
+		return true;
+	}
 	if ((lock != &retention_lock && lock != runtime_test_lock)
 		|| mode != LW_EXCLUSIVE || retention_held)
 		abort();
@@ -89,6 +94,11 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (lock == RelationMappingLock) {
+		if (!mapping_held || retention_held) abort();
+		mapping_held = false;
+		return;
+	}
 	if (lock != held_retention_lock || !retention_held)
 		abort();
 	retention_held = false;

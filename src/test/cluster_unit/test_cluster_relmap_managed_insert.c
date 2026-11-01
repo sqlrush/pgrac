@@ -298,16 +298,209 @@ UT_TEST(managed_insert_original_staged_pin_rejects_second_native_attempt)
 	insert_assert_debt(); cleanup();
 }
 
+static unsigned terminal_fault;
+
+static bool
+managed_terminal_native(const ClusterRelmapOwnerSampleV2 *sample,
+	ClusterRelmapRecoveryNativeTerminal *out)
+{
+	UT_ASSERT(!mapping_held && !retention_held);
+	UT_ASSERT_EQ(writes + renames, 0);
+	UT_ASSERT(test_relmap_native_commit_default(sample, out));
+	if (terminal_fault == 1) out->status = TRANSACTION_STATUS_ABORTED;
+	if (terminal_fault == 2) out->top_full_xid++;
+	if (terminal_fault == 3) out->bounds.system_identifier++;
+	if (terminal_fault == 4) out->bounds.database_incarnation++;
+	if (terminal_fault == 5) out->bounds.origin++;
+	if (terminal_fault == 6) out->bounds.membership_epoch++;
+	if (terminal_fault == 7) out->bounds.admitted_incarnation++;
+	if (terminal_fault == 8) out->bounds.boot_incarnation++;
+	if (terminal_fault == 9) out->bounds.native_floor = sample->owner.top_full_xid + 1;
+	if (terminal_fault == 10) out->bounds.last_issued = sample->owner.top_full_xid - 1;
+	if (terminal_fault == 11) runtime_storage_writer.epoch++;
+	if (terminal_fault == 12) stage_directory->pins[0].wal_end++;
+	if (terminal_fault == 14) siglongjmp(native_error, 1);
+	return terminal_fault != 13;
+}
+
+static void
+managed_finish_setup(ClusterRelmapOwnerSampleV2 *sample,
+	ClusterRecoveryFileIdentityV2 *id, ClusterRelmapV2Image *staged,
+	bool shared, unsigned origin, bool publish)
+{
+	managed_insert_setup(sample, id, staged, shared, origin);
+	UT_ASSERT_EQ(cluster_relmap_retention_runtime_insert_managed_v2(sample, id, staged), actual_end);
+	staged->pending_owner.wal_end = actual_end;
+	runtime_storage_reset_terminal_io(publish);
+	test_relmap_native_commit_calls = terminal_fault = 0;
+	test_relmap_native_commit_hook = managed_terminal_native;
+}
+
+static ClusterRelmapV2ClearResult
+managed_finish(const ClusterRelmapOwnerSampleV2 *sample,
+	const ClusterRecoveryFileIdentityV2 *id, const ClusterRelmapV2Image *staged,
+	bool publish)
+{
+	return publish ? cluster_relmap_retention_runtime_publish_managed_v2(sample, id, staged)
+		: cluster_relmap_retention_runtime_discard_pending_managed_v2(sample, id, staged);
+}
+
+UT_TEST(managed_terminal_original_stage_to_both_clean_copies_keeps_pin)
+{
+	for (unsigned shared = 0; shared < 2; ++shared)
+		for (unsigned origin = 0; origin < 4; origin += 3)
+			for (unsigned publish = 0; publish < 2; ++publish) {
+		ClusterRelmapOwnerSampleV2 sample, saved_sample;
+		ClusterRecoveryFileIdentityV2 id, saved_id;
+		ClusterRelmapV2Image staged, saved_staged, clean;
+		ClusterRelmapRetentionPin pin;
+		ClusterRelmapFilePairV2 pair;
+		unsigned char expected[CLUSTER_RELMAP_FILE_SIZE_V2];
+		managed_finish_setup(&sample, &id, &staged, shared, origin, publish);
+		saved_sample = sample; saved_id = id; saved_staged = staged;
+		pin = stage_directory->pins[0];
+		UT_ASSERT_EQ(managed_finish(&sample, &id, &staged, publish), CLUSTER_RELMAP_V2_CLEARED_POSTREAD);
+		UT_ASSERT_EQ(test_relmap_native_commit_calls, publish);
+		UT_ASSERT_EQ(writes, 2); UT_ASSERT_EQ(renames, 2);
+		UT_ASSERT_EQ(file_syncs, 2); UT_ASSERT_EQ(dir_syncs, 2);
+		UT_ASSERT(!mapping_held);
+		clean = staged;
+		clean.pending_generation = 0;
+		memset(&clean.pending_owner, 0, sizeof(clean.pending_owner));
+		memset(&clean.pending, 0, sizeof(clean.pending));
+		if (publish) { clean.committed_generation = staged.pending_generation; clean.committed = staged.pending; }
+		UT_ASSERT(cluster_relmap_file_encode_v2(&id, &clean, expected, sizeof(expected)));
+		mapping_held = true;
+		UT_ASSERT(cluster_relmap_authority_managed_read_v2(&id, &pair));
+		mapping_held = false;
+		UT_ASSERT_EQ(memcmp(pair.bytes[0], expected, sizeof(expected)), 0);
+		UT_ASSERT_EQ(memcmp(pair.bytes[1], expected, sizeof(expected)), 0);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+		UT_ASSERT_EQ(memcmp(&sample, &saved_sample, sizeof(sample)), 0);
+		UT_ASSERT_EQ(memcmp(&id, &saved_id, sizeof(id)), 0);
+		UT_ASSERT_EQ(memcmp(&staged, &saved_staged, sizeof(staged)), 0);
+		insert_assert_debt(); cleanup();
+	}
+	test_relmap_native_commit_hook = NULL;
+}
+
+UT_TEST(managed_terminal_refuses_wrong_registration_image_owner_and_pin)
+{
+	for (unsigned publish = 0; publish < 2; ++publish)
+		for (unsigned fault = 0; fault < 21; ++fault) {
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRecoveryFileIdentityV2 id;
+		ClusterRelmapV2Image staged;
+		ClusterRelmapRetentionDirectory before;
+		managed_finish_setup(&sample, &id, &staged, true, 3, publish);
+		if (fault == 0) id.creation_generation++;
+		if (fault == 1) id.registration_generation++;
+		if (fault == 2) id.storage_uuid[0]++;
+		if (fault == 3) id.redo_branch_uuid[0]++;
+		if (fault == 4) id.tablespace_oid = DEFAULTTABLESPACE_OID;
+		if (fault == 5) id.system_identifier++;
+		if (fault == 6) staged.pending.crc++;
+		if (fault == 7) staged.committed = map_image(39999);
+		if (fault == 8) staged.pending_owner.wal_end++;
+		if (fault == 9) staged.pending_owner.node++;
+		if (fault == 10) sample.producer_pid++;
+		if (fault == 11) stage_directory->pins[0].may_be_staged = false;
+		if (fault == 12) stage_directory->pins[0].wal_end++;
+		if (fault == 13) stage_directory->state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+		if (fault == 14) relmap_x_held = false;
+		if (fault == 15) mapping_held = true;
+		if (fault == 16) enableFsync = false;
+		if (fault == 17) staged.pending_owner.wal_end = 0;
+		before = *stage_directory;
+		UT_ASSERT_EQ(managed_finish(fault == 18 ? NULL : &sample,
+			fault == 19 ? NULL : &id, fault == 20 ? NULL : &staged, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(writes + renames, 0);
+		UT_ASSERT_EQ(memcmp(&before, stage_directory, sizeof(before)), 0);
+		UT_ASSERT_EQ(mapping_held, fault == 15);
+		mapping_held = false; enableFsync = true;
+		insert_assert_debt(); cleanup();
+	}
+	test_relmap_native_commit_hook = NULL;
+}
+
+UT_TEST(managed_terminal_commit_requires_exact_original_native_committed_fact)
+{
+	for (unsigned fault = 1; fault <= 13; ++fault) {
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRecoveryFileIdentityV2 id;
+		ClusterRelmapV2Image staged;
+		managed_finish_setup(&sample, &id, &staged, true, 3, true);
+		terminal_fault = fault;
+		UT_ASSERT_EQ(managed_finish(&sample, &id, &staged, true), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT_EQ(test_relmap_native_commit_calls, 1);
+		UT_ASSERT_EQ(writes + renames, 0);
+		UT_ASSERT(!mapping_held);
+		insert_assert_debt(); cleanup();
+	}
+	test_relmap_native_commit_hook = NULL;
+}
+
+UT_TEST(managed_terminal_late_pair_failures_and_owner_drift_retain_pin)
+{
+	for (unsigned publish = 0; publish < 2; ++publish)
+		for (unsigned fault = 0; fault < 7; ++fault) {
+		ClusterRelmapOwnerSampleV2 sample;
+		ClusterRecoveryFileIdentityV2 id;
+		ClusterRelmapV2Image staged;
+		ClusterRelmapRetentionPin pin;
+		managed_finish_setup(&sample, &id, &staged, true, 3, publish);
+		pin = stage_directory->pins[0];
+		if (fault == 0) fail_write = 1;
+		if (fault == 1) fail_file_sync = 2;
+		if (fault == 2) fail_dir_sync = 2;
+		if (fault == 3) fail_rename = 2;
+		if (fault == 4) post_sync_hook = lose_owner_after_pair_sync;
+		if (fault == 5) post_sync_hook = runtime_storage_invalidate_after_last_sync;
+		if (fault == 6) fail_directory_close = true;
+		UT_ASSERT_EQ(managed_finish(&sample, &id, &staged, publish), CLUSTER_RELMAP_V2_RETAINED_UNKNOWN);
+		UT_ASSERT(!mapping_held);
+		UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+		insert_assert_debt(); cleanup();
+	}
+	test_relmap_native_commit_hook = NULL;
+}
+
+UT_TEST(managed_terminal_native_error_precedes_map_lock_and_preserves_pin)
+{
+	ClusterRelmapOwnerSampleV2 sample;
+	ClusterRecoveryFileIdentityV2 id;
+	ClusterRelmapV2Image staged;
+	ClusterRelmapRetentionPin pin;
+	volatile bool caught = false;
+	managed_finish_setup(&sample, &id, &staged, true, 3, true);
+	pin = stage_directory->pins[0];
+	terminal_fault = 14;
+	if (sigsetjmp(native_error, 1) == 0)
+		(void) managed_finish(&sample, &id, &staged, true);
+	else caught = true;
+	UT_ASSERT(caught);
+	UT_ASSERT(!mapping_held);
+	UT_ASSERT_EQ(writes + renames, 0);
+	UT_ASSERT_EQ(memcmp(&pin, &stage_directory->pins[0], sizeof(pin)), 0);
+	insert_assert_debt(); cleanup();
+	test_relmap_native_commit_hook = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(11);
 	UT_RUN(managed_insert_wal_intent_precedes_exact_actual_end_pair);
 	UT_RUN(managed_insert_refuses_invalid_owner_binding_base_and_preparation_before_wal);
 	UT_RUN(managed_insert_late_native_refusal_never_stages_or_cancels);
 	UT_RUN(managed_insert_partial_files_or_final_owner_failure_keep_staged_debt);
 	UT_RUN(managed_insert_critical_errors_propagate_without_file_or_pin_cleanup);
 	UT_RUN(managed_insert_original_staged_pin_rejects_second_native_attempt);
+	UT_RUN(managed_terminal_original_stage_to_both_clean_copies_keeps_pin);
+	UT_RUN(managed_terminal_refuses_wrong_registration_image_owner_and_pin);
+	UT_RUN(managed_terminal_commit_requires_exact_original_native_committed_fact);
+	UT_RUN(managed_terminal_late_pair_failures_and_owner_drift_retain_pin);
+	UT_RUN(managed_terminal_native_error_precedes_map_lock_and_preserves_pin);
 	free(runtime_storage_allocation);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
