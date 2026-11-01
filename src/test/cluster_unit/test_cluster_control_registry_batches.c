@@ -694,6 +694,9 @@ UT_TEST(test_combined_budget_and_more_than_active_pin_capacity)
 	UT_ASSERT_EQ(cluster_control_root_relmap_selection_count_v4(s), 2);
 	cluster_control_root_relmap_selection_destroy_v4(&s);
 }
+#ifdef TEST_CONTROL_NATIVE_RESERVATIONS
+#define main original_registry_batch_main
+#endif
 int
 main(int argc, char **argv)
 {

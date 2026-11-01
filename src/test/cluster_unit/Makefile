@@ -16085,3 +16085,46 @@ cluster_control_registry_original.o cluster_registry_common_test.o test_cluster_
 test_cluster_control_registry_batches: test_cluster_control_relmap_selection.c \
 	test_cluster_control_file_selection.c \
 	$(top_srcdir)/src/backend/cluster/cluster_recovery_anchor_private.h
+
+# Full persistent reservation projection and original creator borrowing.
+TESTS += test_cluster_control_native_reservations
+all: test_cluster_control_native_reservations
+test_cluster_control_native_reservations: test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_control_native_reservations.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-native-reservations
+.PHONY: clean-control-native-reservations
+clean-control-native-reservations:
+	rm -f test_cluster_control_native_reservations test_cluster_control_native_reservations.d
+
+
+# Direct native-table consumers also use the selected reservation vector.
+test_cluster_control_native_files test_cluster_control_native_reservations: \
+ $(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+ $(top_srcdir)/src/include/cluster/cluster_control_registry_batch.h \
+ $(top_srcdir)/src/include/cluster/cluster_recovery_registry_reservation_format.h

@@ -3,6 +3,8 @@
 #include "miscadmin.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
+#include "storage/lwlock.h"
+#include "cluster/cluster_control_registry_batch.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_recovery_format.h"
 #include "cluster/cluster_control_native_files.h"
@@ -13,6 +15,7 @@
 typedef struct NativeFileBank {
 	ClusterControlNativeTableInfoV2 info;
 	ClusterRecoveryFileIdentityV2 files[CLUSTER_NATIVE_FILES_CAPACITY_V2];
+	ClusterRecoveryFileReservationV1 reservations[CLUSTER_NATIVE_RESERVATIONS_CAPACITY_V2];
 } NativeFileBank;
 typedef struct NativeFileShared {
 	slock_t lock;
@@ -70,6 +73,30 @@ native_find(const NativeFileBank *bank, const ClusterRecoveryFileIdentityV2 *key
 	}
 	return -1;
 }
+static int
+native_reserved_find(const NativeFileBank *bank, const ClusterRecoveryFileIdentityV2 *key)
+{
+	uint64 lo = 0, hi = bank->info.reservation_count;
+	while (lo < hi) {
+		uint64 mid = lo + (hi - lo) / 2;
+		int cmp = native_key_compare(key, &bank->reservations[mid].expected);
+		if (!cmp)
+			return (int)mid;
+		if (cmp < 0)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	return -1;
+}
+static bool
+native_reservation_same(const ClusterRecoveryFileReservationV1 *a,
+						const ClusterRecoveryFileReservationV1 *b)
+{
+	return native_same(&a->expected, &b->expected) && !memcmp(a->batch_uuid, b->batch_uuid, 16)
+		   && cluster_control_root_identity_equal(&a->creation_owner, &b->creation_owner)
+		   && a->owner_generation == b->owner_generation && a->state == b->state;
+}
 static bool
 native_canonical(NativeFileBank *bank)
 {
@@ -100,7 +127,7 @@ native_range(const NativeFileBank *bank, uint16 origin, uint64 first, uint64 las
 	key.origin = origin;
 	for (uint64 i = first;; i++) {
 		key.object_id = i;
-		if (native_find(bank, &key) < 0)
+		if (native_find(bank, &key) < 0 && native_reserved_find(bank, &key) < 0)
 			return CLUSTER_NATIVE_FILES_NEEDS_REGISTRATION_V2;
 		if (i == last)
 			break;
@@ -139,7 +166,8 @@ native_install(NativeFileBank *next, ClusterControlRelmapSelectionV2 *selection,
 			  && old->info.registry_byte_budget == next->info.registry_byte_budget
 			  && !memcmp(&old->info.control, &next->info.control, sizeof(next->info.control))
 			  && !memcmp(&old->info.creation, &next->info.creation, sizeof(next->info.creation))
-			  && old->info.count == next->info.count;
+			  && old->info.count == next->info.count
+			  && old->info.reservation_count == next->info.reservation_count;
 		bool compatible = generation != UINT64_MAX;
 		if (generation
 			&& (old->info.mode != next->info.mode
@@ -153,6 +181,21 @@ native_install(NativeFileBank *next, ClusterControlRelmapSelectionV2 *selection,
 			if (at < 0 || !native_same(&old->files[i], &next->files[at]))
 				compatible = false;
 		}
+		/* Local zero borrowers alone does not authorize removal/reidentity. An
+   * original same-identity COMPLETE may move a reservation to AVAILABLE. */
+		for (uint64 i = 0; compatible && i < old->info.reservation_count; i++) {
+			const ClusterRecoveryFileReservationV1 *r = &old->reservations[i];
+			int at = native_reserved_find(next, &r->expected);
+			if (at >= 0) {
+				if (!native_reservation_same(r, &next->reservations[at]))
+					compatible = false;
+			} else {
+				at = native_find(next, &r->expected);
+				if (at < 0 || !native_same(&r->expected, &next->files[at]))
+					compatible = false;
+			}
+		}
+
 		if (compatible) {
 			next->info.table_generation = same ? generation : generation + 1;
 			next->info.capacity = CLUSTER_NATIVE_FILES_CAPACITY_V2;
@@ -262,12 +305,19 @@ static bool
 native_borrow_valid(const ClusterControlNativeFileBorrowV2 *b)
 {
 	NativeFileBank *bank = &native_files->banks[native_files->active];
-	return b->private_self == (uintptr_t)b && b->private_pid == MyProcPid && b->table_generation
-		   && b->table_generation == bank->info.table_generation
-		   && b->startup_generation == bank->info.startup_generation
-		   && b->private_index < bank->info.count && native_files->borrowed
-		   && native_same(&b->expected, &bank->files[b->private_index]);
+	uint64 at = b->private_index;
+	if (b->private_self != (uintptr_t)b || b->private_pid != MyProcPid || !b->table_generation
+		|| b->table_generation != bank->info.table_generation
+		|| b->startup_generation != bank->info.startup_generation || !native_files->borrowed)
+		return false;
+	if (at < CLUSTER_NATIVE_FILES_CAPACITY_V2)
+		return at < bank->info.count && native_same(&b->expected, &bank->files[at]);
+	at -= CLUSTER_NATIVE_FILES_CAPACITY_V2;
+	return at < bank->info.reservation_count
+		   && bank->reservations[at].state == CLUSTER_RECOVERY_FILE_RESERVED_V1
+		   && native_same(&b->expected, &bank->reservations[at].expected);
 }
+
 bool
 cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 									   ClusterControlNativeFileBorrowV2 *out)
@@ -334,6 +384,16 @@ cluster_control_native_file_borrow_by_address_v2(ClusterRecoveryFileKindV2 kind,
 			}
 			at = (int)i;
 		}
+		if (at < 0 && result == CLUSTER_NATIVE_FILES_NOT_FOUND_V2) {
+			for (uint64 i = 0; i < bank->info.reservation_count; i++) {
+				const ClusterRecoveryFileIdentityV2 *id = &bank->reservations[i].expected;
+				if (id->kind == kind && id->database_oid == db && id->tablespace_oid == ts
+					&& id->object_id == object) {
+					result = CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2;
+					break;
+				}
+			}
+		}
 		if (at >= 0 && result != CLUSTER_NATIVE_FILES_AMBIGUOUS_V2) {
 			result = CLUSTER_NATIVE_FILES_BUSY_V2;
 			if (native_files->borrowed != UINT64_MAX) {
@@ -389,6 +449,95 @@ cluster_control_native_files_clog_range_v2(uint16 origin, uint64 first, uint64 l
 	SpinLockRelease(&native_files->lock);
 	return result;
 }
+static bool
+native_overlap(const void *a, Size an, const void *b, Size bn)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+	return x < y + bn && y < x + an;
+}
+ClusterControlNativeResultV2
+cluster_control_native_file_reserved_acquire_locked_v2(
+	const ClusterSharedConfigRef *config, Size budget, uint64 startup, const uint8 batch[16],
+	const ClusterRecoveryFileIdentityV2 *expected, ClusterControlNativeFileBorrowV2 *out)
+{
+	struct NativeReservedWork {
+		ClusterControlRelmapSelectionV2 *selection;
+		ClusterControlRelmapReferenceV2 control;
+		ClusterRecoveryFileIdentityV2 expected, verified;
+		ClusterSharedConfigRef config;
+		uint8 batch[16];
+		uint64 cf_sequence;
+		bool qualified;
+	} *work;
+	ClusterControlNativeFileBorrowV2 zero = { 0 }, value = { 0 };
+	ClusterControlNativeResultV2 result = CLUSTER_NATIVE_FILES_REFUSED_V2;
+	if (!native_files || !startup || startup == UINT64_MAX
+		|| budget > CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2
+		|| !native_distinct(config, sizeof(*config)) || !native_distinct(batch, 16)
+		|| !native_distinct(expected, sizeof(*expected)) || !native_distinct(out, sizeof(*out))
+		|| native_overlap(config, sizeof(*config), out, sizeof(*out))
+		|| native_overlap(batch, 16, out, sizeof(*out))
+		|| native_overlap(expected, sizeof(*expected), out, sizeof(*out))
+		|| memcmp(out, &zero, sizeof(zero)) || !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| CritSectionCount || LWLockHeldByMe(ControlFileLock)
+		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock)
+		|| LWLockHeldByMe(XactSLRULock))
+		return result;
+	work = palloc0(sizeof(*work));
+	work->config = *config;
+	work->expected = *expected;
+	memcpy(work->batch, batch, 16);
+	work->cf_sequence = cluster_cf_attempt_sequence();
+	PG_TRY();
+	{
+		work->qualified = cluster_control_root_relmap_selection_read_locked_v4(
+							  &work->config, budget, &work->selection)
+							  == 0
+						  && cluster_control_root_reserved_file_locked_v4(
+							  work->selection, work->batch, &work->expected, &work->verified)
+						  && cluster_control_root_relmap_selection_reference_v4(work->selection,
+																				&work->control);
+		/* Finish every potentially failing descriptor cleanup before a borrow. */
+		cluster_control_root_relmap_selection_destroy_v4(&work->selection);
+	}
+	PG_CATCH();
+	{
+		cluster_control_root_relmap_selection_destroy_v4(&work->selection);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (work->qualified && cluster_cf_held_is_clusterwide(ExclusiveLock)
+		&& cluster_cf_attempt_sequence() == work->cf_sequence
+		&& !memcmp(config, &work->config, sizeof(*config)) && !memcmp(batch, work->batch, 16)
+		&& native_same(expected, &work->expected) && !memcmp(out, &zero, sizeof(zero))) {
+		NativeFileBank *bank;
+		int at;
+		SpinLockAcquire(&native_files->lock);
+		bank = &native_files->banks[native_files->active];
+		at = native_reserved_find(bank, &work->expected);
+		if (bank->info.mode == CLUSTER_NATIVE_FILES_MANAGED_V2
+			&& bank->info.startup_generation == startup && bank->info.registry_byte_budget == budget
+			&& !memcmp(&bank->info.control, &work->control, sizeof(work->control)) && at >= 0
+			&& bank->reservations[at].state == CLUSTER_RECOVERY_FILE_RESERVED_V1
+			&& !memcmp(bank->reservations[at].batch_uuid, work->batch, 16)
+			&& native_same(&bank->reservations[at].expected, &work->expected)
+			&& native_files->borrowed != UINT64_MAX) {
+			value.expected = work->expected;
+			value.table_generation = bank->info.table_generation;
+			value.startup_generation = startup;
+			value.private_self = (uintptr_t)out;
+			value.private_pid = MyProcPid;
+			value.private_index = CLUSTER_NATIVE_FILES_CAPACITY_V2 + at;
+			++native_files->borrowed;
+			*out = value;
+			result = CLUSTER_NATIVE_FILES_OK_V2;
+		}
+		SpinLockRelease(&native_files->lock);
+	}
+	pfree(work);
+	return result;
+}
 static ClusterControlNativeResultV2
 native_publish(const ClusterSharedConfigRef *expected, Size budget, uint64 startup, bool range,
 			   uint16 origin, uint64 first, uint64 last)
@@ -415,12 +564,32 @@ native_publish(const ClusterSharedConfigRef *expected, Size budget, uint64 start
 			&& cluster_control_root_native_files_copy_v4(
 				work->selection, next->files, CLUSTER_NATIVE_FILES_CAPACITY_V2, &next->info.count)
 			&& native_canonical(next)) {
-			next->info.mode = CLUSTER_NATIVE_FILES_MANAGED_V2;
-			next->info.startup_generation = startup;
-			next->info.registry_byte_budget = budget;
-			result = range ? native_range(next, origin, first, last) : CLUSTER_NATIVE_FILES_OK_V2;
-			if (result == 0)
-				result = native_install(next, work->selection, NULL);
+			next->info.reservation_count
+				= cluster_control_root_registry_reservation_count_v4(work->selection);
+			if (next->info.reservation_count > CLUSTER_NATIVE_RESERVATIONS_CAPACITY_V2
+				|| next->info.reservation_count
+					   > CLUSTER_NATIVE_FILES_CAPACITY_V2 - next->info.count)
+				result = CLUSTER_NATIVE_FILES_CAPACITY_EXCEEDED_V2;
+			else {
+				bool complete = true;
+				for (uint64 i = 0; i < next->info.reservation_count; i++)
+					if (!cluster_control_root_registry_reservation_at_v4(work->selection, i,
+																		 &next->reservations[i]))
+						complete = false;
+				if (!complete) {
+					cluster_control_root_relmap_selection_destroy_v4(&work->selection);
+				} else {
+					qsort(next->reservations, next->info.reservation_count,
+						  sizeof(next->reservations[0]), native_key_compare);
+					next->info.mode = CLUSTER_NATIVE_FILES_MANAGED_V2;
+					next->info.startup_generation = startup;
+					next->info.registry_byte_budget = budget;
+					result = range ? native_range(next, origin, first, last)
+								   : CLUSTER_NATIVE_FILES_OK_V2;
+					if (result == 0)
+						result = native_install(next, work->selection, NULL);
+				}
+			}
 		}
 	}
 	PG_FINALLY();
