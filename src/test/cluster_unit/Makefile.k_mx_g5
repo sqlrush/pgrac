@@ -176,3 +176,31 @@ test_k_mx_g5_full_consumer_red: test_k_mx_g5_full_consumer_red.c \
 		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# Original heap acceptance RED, manually selected; no default-suite override.
+# Service is controlled; the original pure consumer bodies remain unchanged.
+K_MX_HEAP_FULL_CURRENT_O ?= test_k_mx_g5_heap_full_current.o
+$(K_MX_HEAP_FULL_CURRENT_O): $(top_srcdir)/src/backend/cluster/cluster_multixact_current.c \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current_wire.h \
+		$(top_srcdir)/src/include/cluster/cluster_ctrc_origin_fullxid.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_multixact_current_members_resolve_until=k_heap_product_resolve_until \
+		-Dcluster_multixact_current_decide_observed=k_heap_product_decide_observed \
+		-Dcluster_multixact_current_recompose=k_heap_product_recompose -c $< -o $@
+
+test_k_mx_g5_heap_full_red: test_k_mx_g5_heap_full_red.c test_cluster_r4_lock_order.c \
+		unit_test.h cluster_r4_activation_test_stubs.h cluster_snapshot_test_stubs.h \
+		test_cluster_heap_capacity_vm_unwind.inc test_cluster_heap_writer_wait_delete.inc \
+		test_cluster_heap_writer_wait_update.inc test_cluster_heap_writer_wait_lock.inc \
+		$(K_MX_HEAP_RECHECK_O) $(K_MX_HEAP_FULL_CURRENT_O) \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+		test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
+		$(top_builddir)/src/backend/storage/lmgr/lock.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(K_MX_HEAP_RECHECK_O) $(K_MX_HEAP_FULL_CURRENT_O) \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_R4_HOT_VIS_TEST_O) \
+		test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
+		$(top_builddir)/src/backend/storage/lmgr/lock.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
