@@ -2,7 +2,7 @@
 #-------------------------------------------------------------------------
 #
 # 482_pre2_undo_active_slots.pl
-#    Native full-segment wait, owner commit/abort, and caller cancellation.
+#    Native empty-undo preflight, full-segment wait, and terminal cleanup.
 #
 # Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
@@ -13,8 +13,9 @@
 #    src/test/cluster_tap/t/482_pre2_undo_active_slots.pl
 #
 # NOTES
-#    Four normal members; all 49 transactions run on node 0. Independent
-#    heaps avoid page ITL and row-lock pressure. No allocator state is set.
+#    Four normal members; empty-undo cases and all 49 slot transactions run
+#    on node 0. Independent heaps avoid page ITL and row-lock pressure.
+#    No allocator state is set and no terminal cleanup is forced.
 #-------------------------------------------------------------------------
 use strict;
 use warnings;
@@ -47,10 +48,11 @@ sub save_json
 
 sub evaluate_sample
 {
-	my ($sample) = @_;
+	my ($sample, $script) = @_;
+	$script //= 'undo_slot_wait.py';
 	my $input = encode_json($sample);
 	my ($out, $err) = ('', '');
-	run([$ENV{PYTHON} // 'python3', "$FindBin::RealBin/../pre2/undo_slot_wait.py"],
+	run([$ENV{PYTHON} // 'python3', "$FindBin::RealBin/../pre2/$script"],
 		'<', \$input, '>', \$out, '2>', \$err, timeout(10))
 	  or die "native slot evidence evaluator failed: $err";
 	return decode_json($out);
@@ -350,6 +352,120 @@ sub run_case
 	data_ledger($name);
 }
 
+sub empty_observation
+{
+	my ($entry) = @_;
+	my $sample = decode_json($entry->{client}->query_safe(
+		q{SELECT json_build_object('pid',pg_backend_pid(),}
+		. q{'top',coalesce(pg_current_xact_id_if_assigned()::text,'none'),}
+		. q{'binding',test_pgrac_undo_slot_binding()::json)}));
+	$sample->{snapshot} = decode_json($writer->safe_psql('postgres',
+		'SELECT test_pgrac_undo_slot_snapshot()', timeout => 10));
+	$sample->{counters} = counters();
+	return $sample;
+}
+
+sub empty_statement
+{
+	my ($name, $entry, $sql, $trigger) = @_;
+	my ($out, $error) = $entry->{client}->query(
+		"$sql\n\\echo G_EMPTY_SQLSTATE :SQLSTATE\n");
+	my $stderr = $entry->{client}{stderr};
+	save_json("$name-statement", {output => $out, error => $error, stderr => $stderr});
+	my @states = $out =~ /^G_EMPTY_SQLSTATE ([A-Z0-9]{5})\r?$/mg;
+	die "$name: missing or ambiguous native SQLSTATE\n" unless @states == 1;
+	my $result = {error => $error, sqlstate => $states[0]};
+	if ($trigger)
+	{
+		die "$name: expected statement-trigger P0001 was not observed\n" unless
+		  $error == 1 && $states[0] eq 'P0001'
+		  && $stderr =~ /ERROR:\s+P0001: G_EMPTY_EXPECTED_TRIGGER_ERROR/;
+		my @observations = $stderr =~ /^NOTICE:.*G_EMPTY_OBSERVATION (\{.*\})\r?$/mg;
+		die "$name: missing or ambiguous pre-error native observation\n" unless @observations == 1;
+		my $sample = decode_json($observations[0]);
+		$sample->{result} = $result;
+		$sample->{counters} = counters();
+		# Preserve the complete expected NOTICE/ERROR before reusing this backend.
+		$entry->{client}{stderr} = '';
+		return $sample;
+	}
+	die "$name: empty statement failed (SQLSTATE $states[0])\n" unless
+	  $error == 0 && $states[0] eq '00000';
+	my $sample = empty_observation($entry);
+	$sample->{result} = $result;
+	return $sample;
+}
+
+sub run_empty_case
+{
+	my ($kind, $finish, $sql) = @_;
+	my $name = "empty-$kind-$finish";
+	wait_idle($name);
+	my $entry = open_session("g_empty_${kind}_$finish");
+	$entry->{client}->query_safe("\\set VERBOSITY verbose\nSET client_min_messages=notice");
+	$entry->{transaction} = 1;
+	$entry->{client}->query_safe('BEGIN');
+	my $before = empty_observation($entry);
+	save_json("$name-before", $before);
+	my $trigger = $kind eq 'statement_trigger_error';
+	my $first = empty_statement("$name-first", $entry, $sql, $trigger);
+	save_json("$name-first-observation", $first);
+	my $repeated = $trigger ? undef
+	  : empty_statement("$name-repeated", $entry, $sql, 0);
+	save_json("$name-repeated-observation", $repeated) unless $trigger;
+	end_owner($entry, $finish eq 'commit' ? 'COMMIT' : 'ROLLBACK');
+	wait_idle("$name-finished");
+	my $after = empty_observation($entry);
+	my $data_sql = q{SELECT 'data',id,value FROM g_empty_undo }
+	  . q{UNION ALL SELECT 'trigger',id,value FROM g_empty_trigger ORDER BY 1,2};
+	my $sample = {kind => $kind, finish => $finish, pid => $entry->{pid},
+		before => $before, first => $first, repeated => $repeated, after => $after,
+		data => [map { $_->safe_psql('postgres', $data_sql, timeout => 30) } @nodes]};
+	save_json("$name-input", $sample);
+	my $result = evaluate_sample($sample, 'empty_undo_preflight.py');
+	save_json("$name-result", $result);
+	die "NOT_REACHED $name: $result->{reason}\n" unless $result->{passed};
+	pass("$name: original preflight and terminal cleanup join exact native evidence");
+	finish_sessions($name);
+}
+
+sub run_empty_cases
+{
+	$writer->safe_psql('postgres', <<'SQL', timeout => 90);
+CREATE TABLE g_empty_undo (id integer PRIMARY KEY, value integer);
+CREATE TABLE g_empty_trigger (id integer, value integer);
+INSERT INTO g_empty_undo VALUES (1,100);
+CREATE FUNCTION g_empty_statement_error() RETURNS trigger LANGUAGE plpgsql AS $body$
+BEGIN
+  RAISE NOTICE 'G_EMPTY_OBSERVATION %', json_build_object(
+    'pid', pg_backend_pid(),
+    'top', coalesce(pg_current_xact_id_if_assigned()::text,'none'),
+    'binding', test_pgrac_undo_slot_binding()::json,
+    'snapshot', test_pgrac_undo_slot_snapshot()::json);
+  RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='G_EMPTY_EXPECTED_TRIGGER_ERROR';
+END;
+$body$;
+CREATE TRIGGER g_empty_raise BEFORE UPDATE ON g_empty_trigger
+FOR EACH STATEMENT EXECUTE FUNCTION g_empty_statement_error();
+SQL
+	my @cases = (
+		['zero_update', 'UPDATE g_empty_undo SET value=999 WHERE false;'],
+		['empty_copy', "COPY g_empty_undo FROM STDIN;\n\\.\n"],
+		['conflict_nothing', 'INSERT INTO g_empty_undo VALUES(1,999) ON CONFLICT(id) DO NOTHING;'],
+		['zero_row_lock', 'SELECT * FROM g_empty_undo WHERE false FOR UPDATE;']);
+	for my $case (@cases)
+	{
+		for my $finish (qw(commit abort))
+		{
+			run_empty_case($case->[0], $finish, $case->[1]);
+		}
+	}
+	run_empty_case('statement_trigger_error', 'abort',
+		'UPDATE g_empty_trigger SET value=999 WHERE false;');
+	run_empty_case('pure_select', 'commit', 'SELECT * FROM g_empty_undo WHERE false;');
+	run_empty_case('explain_only', 'commit', 'EXPLAIN UPDATE g_empty_undo SET value=999 WHERE false;');
+}
+
 my $execution = eval {
 	$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('undo_active_slots', nodes => 4,
 		blackbox => 1, required_operations => [], extra_conf => ['autovacuum=off',
@@ -369,6 +485,7 @@ my $execution = eval {
 	}
 	$writer->safe_psql('postgres', join('; ',
 		map { "CREATE TABLE g_slot_heap_$_ (trial integer)" } 0 .. 48), timeout => 90);
+	run_empty_cases();
 	run_case('commit', 1);
 	run_case('abort', 2);
 	run_case('cancel', 3);
