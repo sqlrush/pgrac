@@ -11357,3 +11357,24 @@ clean: clean-clog-wal-observation
 .PHONY: clean-clog-wal-observation
 clean-clog-wal-observation:
 	rm -f test_cluster_clog_wal test_cluster_clog_wal.d
+
+# Actual borrowed-FD CLOG reads; fault timing wraps the real pread only.
+TESTS += test_cluster_clog_storage
+all: test_cluster_clog_storage
+test_cluster_clog_storage: test_cluster_clog_storage.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-storage-read
+.PHONY: clean-clog-storage-read
+clean-clog-storage-read:
+	rm -f test_cluster_clog_storage test_cluster_clog_storage.d
