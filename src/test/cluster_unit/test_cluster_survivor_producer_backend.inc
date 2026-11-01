@@ -38,3 +38,18 @@ UT_TEST(survivor_backend_poll_discards_final_owner_drift_and_leaf_stale)
  UT_ASSERT_EQ(cluster_semantic_survivor_producer_poll(CLUSTER_SURVIVOR_PRODUCER_BACKEND,scope,&out),CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_STALE);
  survivor_poll_unknown(&out);backend_return_begin();
 }
+
+#include "test_cluster_survivor_local_owner_fixture.h"
+UT_TEST(local_backend_reply_projects_actual_snapshot_buffer_and_xact_without_retirement)
+{
+ ClusterSurvivorLocalReply r;Snapshot held;
+ backend_return_begin();snapshot_return_epoch=8;held=registered(88);
+ pg_atomic_write_u32(&backend_return_gate.inflight[1][63],9);
+ r=survivor_local_owner_sample(CLUSTER_SURVIVOR_PRODUCER_BACKEND,8,7,19);
+ UT_ASSERT_EQ(survivor_local_scalar(r.body+40,4),CLUSTER_SERVICE_SNAPSHOT_REGISTERED);
+ UT_ASSERT_EQ(survivor_local_scalar(r.body+80+127*4,4),9);
+ UT_ASSERT_EQ(r.identity.epoch,8);UT_ASSERT_EQ(r.gate_epoch,7);
+ UT_ASSERT_EQ(held->regd_count,1);UT_ASSERT_EQ(remembered,1);
+ UT_ASSERT((survivor_local_scalar(r.body+44,4)&17)==17);
+ UnregisterSnapshot(held);
+}

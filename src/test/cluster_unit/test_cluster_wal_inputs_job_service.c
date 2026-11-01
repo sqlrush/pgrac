@@ -4,6 +4,7 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #define PGRAC_WAL_INPUTS_JOB_PIN_EMBEDDED
 #include "test_cluster_wal_inputs_job_pin.c"
+#include "cluster/cluster_semantic_survivor_local.h"
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_clean_leave.h"
 #include "test_cluster_pi_empty_batch_fixture.h"
@@ -335,7 +336,7 @@ main(void)
 	cluster_control_request_shmem_init();
 	control_driver = retire_driver = cluster_control_request_driver_start();
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(21);
+	UT_PLAN(22);
 	UT_RUN(service_bgwriter_128_acks_progress_without_delay_or_new_wait);
 	UT_RUN(service_checkpointer_128_acks_progress_without_checkpoint_timer);
 	UT_RUN(service_ack_at_latch_reset_is_observed_before_interrupt_handling);
@@ -357,6 +358,7 @@ main(void)
  UT_RUN(survivor_input_poll_refuses_wrong_family_and_preserves_unknown);
  UT_RUN(survivor_input_poll_rechecks_actual_original_owner_at_final_return);
  UT_RUN(survivor_input_poll_keeps_original_invalid_and_stale_outcomes);
+ UT_RUN(local_input_reply_projects_original_pending_cf_job_without_ack_or_cleanup);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

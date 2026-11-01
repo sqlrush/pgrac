@@ -110,3 +110,25 @@ UT_TEST(survivor_input_poll_keeps_original_invalid_and_stale_outcomes)
  survivor_poll_unknown(&out);inputs_jobs[3]=saved;
  foundation_end();
 }
+
+#define SURVIVOR_LOCAL_INPUT_FIXTURE
+#include "test_cluster_survivor_local_owner_fixture.h"
+UT_TEST(local_input_reply_projects_original_pending_cf_job_without_ack_or_cleanup)
+{
+ for(unsigned role=0;role<2;role++) {
+  ClusterSurvivorLocalReply r;ClusterWalInputsJobV1 *job;unsigned calls,wakes;
+  unsigned consumer=role?WAL_INPUT_JOB_PI_REBUILD:WAL_INPUT_JOB_RETAINED_CUT;
+  input_observation_begin(role!=0);job=foundation_open((ClusterWalInputsConsumerV1)consumer);
+  g_seven_result=CLUSTER_LOCK_ACQUIRE_OK_GRANTED;UT_ASSERT(cluster_cf_lock(ShareLock));
+  UT_ASSERT_EQ(cluster_cf_unlock_job_v1(ShareLock,NULL,&job->cf),CF_JOB_PENDING);
+  job_resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS,false,true,job_resource_argument);
+  calls=pin_native_calls;wakes=job_wakes;
+  r=survivor_local_owner_sample(CLUSTER_SURVIVOR_PRODUCER_INPUT_JOBS,owner_epoch,owner_epoch,19);
+  UT_ASSERT_EQ(r.identity.backend_id,InvalidBackendId);
+  UT_ASSERT_EQ(survivor_local_scalar(r.body+632+consumer*32+16,4),WAL_INPUT_JOB_STATE_RETIRING_CF);
+  UT_ASSERT_EQ(survivor_local_scalar(r.body+632+consumer*32,8),job->generation);
+  UT_ASSERT_EQ(pin_native_calls,calls);UT_ASSERT_EQ(job_wakes,wakes);
+  job_ack(&job->cf);if(role)bgwriter_tick();else checkpointer_tick();
+  foundation_finish(&job);
+ }
+}

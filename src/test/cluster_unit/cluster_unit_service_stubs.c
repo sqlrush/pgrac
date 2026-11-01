@@ -100,3 +100,12 @@ UNUSED_REASON(cluster_pi_data_normal_stop_poll_v1)
 UNUSED_REASON(cluster_wal_cut_normal_stop_poll_v1)
 UNUSED_REASON(cluster_pi_writeback_normal_stop_poll_v1)
 UNUSED_REASON(cluster_ko_shared_normal_stop_poll_v2)
+
+#include "cluster/cluster_semantic_survivor_local.h"
+ClusterSurvivorControl * __attribute__((weak))
+cluster_semantic_survivor_shared_control(void) { return NULL; }
+void __attribute__((weak))
+cluster_semantic_survivor_local_process(void)
+{
+ if (cluster_semantic_survivor_shared_control() != NULL) abort();
+}

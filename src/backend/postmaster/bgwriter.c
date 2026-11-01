@@ -30,6 +30,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_semantic_survivor_local.h"
+#endif
 
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -246,6 +249,7 @@ BackgroundWriterMain(void)
 #ifdef USE_PGRAC_CLUSTER
 		/* Original ACK/retirement wakes also run during the stop cut. Reset
 		 * first so a continuation wake cannot be consumed before waiting. */
+		cluster_semantic_survivor_local_process();
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
 		cluster_wal_inputs_jobs_service_poll_v1();

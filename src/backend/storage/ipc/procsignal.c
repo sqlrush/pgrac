@@ -97,6 +97,14 @@ typedef struct {
 	pg_atomic_uint32 pss_barrierCheckMask;
 	ConditionVariable pss_barrierCV;
 } ProcSignalSlot;
+#ifdef USE_PGRAC_CLUSTER
+/* One extra reason consumes only the previous prefix's alignment padding.
+ * Refuse a platform/layout where it would add a per-backend resident record. */
+StaticAssertDecl(offsetof(ProcSignalSlot, pss_barrierGeneration)
+ == MAXALIGN(sizeof(pid_t) + PROCSIG_CLUSTER_SURVIVOR_OBSERVE * sizeof(sig_atomic_t)),
+ "survivor reason must fit the old ProcSignalSlot prefix padding");
+#endif
+
 
 /*
  * Information that is global to the entire ProcSignal system can be stored
@@ -717,6 +725,8 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 	/* spec-5.13 D7 — leaving-node quiesce request (writable backends abort). */
 	if (CheckProcSignal(PROCSIG_CLUSTER_CLEAN_LEAVE_QUIESCE))
 		cluster_clean_leave_handle_quiesce_interrupt();
+	if (CheckProcSignal(PROCSIG_CLUSTER_SURVIVOR_OBSERVE))
+		InterruptPending = true;
 #endif
 
 	SetLatch(MyLatch);

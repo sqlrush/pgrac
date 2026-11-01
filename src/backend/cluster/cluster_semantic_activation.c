@@ -15,6 +15,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_semantic_survivor_local.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster_wal_inputs_job_private.h"
 
@@ -10763,7 +10764,7 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 Size
 cluster_semantic_activation_shmem_size(void)
 {
-	return MAXALIGN(sizeof(ClusterSemanticActivationShmem))
+	return (MAXALIGN(sizeof(ClusterSemanticActivationShmem)) + CLUSTER_SURVIVOR_CONTROL_BYTES)
 		   + MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem))
 		   + MAXALIGN(sizeof(ClusterSemanticActivationAckTableV1))
 		   + MAXALIGN(sizeof(ClusterSemanticActivationPgrdSnapshotShmem))
@@ -10793,8 +10794,19 @@ cluster_semantic_activation_shmem_init(void)
 	int feature_index;
 
 	SemanticActivationShmem = (ClusterSemanticActivationShmem *)ShmemInitStruct(
-		"pgrac cluster semantic activation gate", MAXALIGN(sizeof(ClusterSemanticActivationShmem)),
+		"pgrac cluster semantic activation gate",
+		(MAXALIGN(sizeof(ClusterSemanticActivationShmem)) + CLUSTER_SURVIVOR_CONTROL_BYTES),
 		&gate_found);
+	/* Initialize the new tail exactly once, even if another original named
+	 * allocation below fails. Attach/restart must not erase an in-flight callback. */
+	if (SemanticActivationShmem != NULL && !gate_found) {
+		ClusterSurvivorControl *c = cluster_semantic_survivor_shared_control();
+		ClusterSurvivorLocalMailbox *m = (ClusterSurvivorLocalMailbox *)c->reserved;
+		memset(c, 0, sizeof(*c));
+		pg_atomic_init_u64(&m->word, 0);
+		pg_atomic_init_u64(&m->invalidated_generation, 0);
+		pg_atomic_init_u64(&m->reaped_generation, 0);
+	}
 	SemanticActivationUtilityMailbox
 		= (ClusterSemanticActivationUtilityMailboxShmem *)ShmemInitStruct(
 			"pgrac cluster semantic activation utility mailbox",
@@ -16848,6 +16860,16 @@ done:
 	if (reason_out != NULL)
 		*reason_out = out.reason;
 	return out.result;
+}
+
+/* Same original named allocation; no second private 64KiB object or pointer
+ * field in the original gate. Only its first creator initializes the tail. */
+ClusterSurvivorControl *
+cluster_semantic_survivor_shared_control(void)
+{
+ if (SemanticActivationShmem == NULL) return NULL;
+ return (ClusterSurvivorControl *)((char *)SemanticActivationShmem
+  + MAXALIGN(sizeof(*SemanticActivationShmem)));
 }
 
 #endif /* USE_PGRAC_CLUSTER */

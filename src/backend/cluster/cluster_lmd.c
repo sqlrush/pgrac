@@ -77,6 +77,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_semantic_survivor_local.h"
 
 #include <signal.h>
 
@@ -1241,6 +1242,8 @@ LmdMain(void)
 		volatile bool completed = false;
 
 		CHECK_FOR_INTERRUPTS();
+
+		cluster_semantic_survivor_local_process();
 
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;

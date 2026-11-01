@@ -97,6 +97,7 @@ typedef enum
 	PROCSIG_CLUSTER_GRD_REDECLARE,	/* spec-4.6 D3: cooperative holder rebind */
 	PROCSIG_CLUSTER_HANG_DUMP,		/* spec-5.11 D5: ask backend to log its hang/wait state */
 	PROCSIG_CLUSTER_CLEAN_LEAVE_QUIESCE, /* spec-5.13 D7: leaving node quiesce writable backends */
+	PROCSIG_CLUSTER_SURVIVOR_OBSERVE, /* local read-only owner observation */
 #endif
 
 	NUM_PROCSIGNALS				/* Must be last! */

@@ -5,8 +5,9 @@
 #define CLUSTER_SEMANTIC_SURVIVOR_CANDIDATE_H
 #include "cluster/cluster_semantic_survivor.h"
 #include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_semantic_survivor_producer.h"
 
-/* The original LMON exclusively serializes this process-local object.
+/* The original LMON exclusively serializes this unconfirmed object (shared storage is supplied by its owner).
  * Begin requires zeroed storage. Invalidation retains original obligations;
  * it does not permit reuse. Inputs are untrusted syntax, including receipts
  * and transport generation: staging never authenticates an ingress owner.
@@ -16,7 +17,7 @@
  * An exiting original owner refuses; exit during a write invalidates while
  * retaining the original basis, rows and cleanup obligations.
  * None of these operations can return CURRENT or set confirmed table bits.
- * There is no live routing, allocation, wakeup, closure or service effect.
+ * Candidate operations themselves do not allocate, route, wake or close.
  */
 extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_candidate_begin(
 	ClusterSurvivorControl *control, const uint8 *bytes, Size length,
@@ -33,4 +34,7 @@ extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_candi
 extern ClusterSemanticAdmissionObservationResult cluster_semantic_survivor_candidate_probe(
 	ClusterSurvivorControl *control, ClusterServiceProducerCollection *out,
 	const char **reason);
+/* Internal read-only scope: true is metadata validity, never authority. */
+extern bool cluster_semantic_survivor_candidate_scope(ClusterSurvivorControl *control,
+ ClusterSurvivorProducerScope *scope, uint8 basis[32]);
 #endif

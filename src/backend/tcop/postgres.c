@@ -27,6 +27,9 @@
  */
 
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_semantic_survivor_local.h"
+#endif
 
 #include <fcntl.h>
 #include <limits.h>
@@ -2994,6 +2997,9 @@ ProcessInterrupts(void)
 	if (InterruptHoldoffCount != 0 || CritSectionCount != 0)
 		return;
 	InterruptPending = false;
+#ifdef USE_PGRAC_CLUSTER
+	cluster_semantic_survivor_local_process();
+#endif
 
 	if (ProcDiePending) {
 		ProcDiePending = false;

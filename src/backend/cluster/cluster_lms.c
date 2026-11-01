@@ -54,6 +54,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_semantic_survivor_local.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_lock_owner.h"
@@ -1167,6 +1168,8 @@ LmsMain(void)
 
 		CHECK_FOR_INTERRUPTS();
 
+		cluster_semantic_survivor_local_process();
+
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
@@ -1383,6 +1386,8 @@ LmsWorkerMain(int worker_id)
 		volatile bool work_completed = false;
 
 		CHECK_FOR_INTERRUPTS();
+
+		cluster_semantic_survivor_local_process();
 
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;

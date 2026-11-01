@@ -26,6 +26,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_semantic_survivor_local.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -205,6 +206,7 @@ SinvalBcastMain(void)
 
 		CHECK_FOR_INTERRUPTS();
 		ResetLatch(MyLatch);
+		cluster_semantic_survivor_local_process();
 		if (ShutdownRequestPending) {
 			if (!SinvalBcastNormalStopCanExit()) {
 				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);

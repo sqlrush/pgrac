@@ -473,6 +473,7 @@ UT_TEST(return_collection_preserves_refusal_and_pending_priorities) { run_candid
 UT_TEST(original_open_historical_source_does_not_replace_current_target) { run_candidate(15); }
 UT_TEST(survivor_native_dispatch_uses_actual_roles_at_original_lmon_return) { run_candidate(16); }
 #include "test_cluster_survivor_candidate_invalidation.inc"
+#ifndef SURVIVOR_LOCAL_FIXTURE
 int main(void)
 {
 	UT_PLAN(40);
@@ -518,3 +519,5 @@ int main(void)
 	UT_RUN(candidate_probe_exit_clears_native_sample_without_retiring_debt);
 	UT_DONE(); return ut_failed_count ? 1 : 0;
 }
+
+#endif /* SURVIVOR_LOCAL_FIXTURE */

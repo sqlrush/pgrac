@@ -35,6 +35,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_semantic_survivor_local.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1475,6 +1476,8 @@ LmonMain(void)
 
 			CHECK_FOR_INTERRUPTS();
 
+			cluster_semantic_survivor_local_process();
+
 			if (ConfigReloadPending) {
 				ConfigReloadPending = false;
 				ProcessConfigFile(PGC_SIGHUP);
@@ -2306,6 +2309,8 @@ LmonMain(void)
 			volatile bool work_completed = false;
 
 			CHECK_FOR_INTERRUPTS();
+
+			cluster_semantic_survivor_local_process();
 
 			if (ConfigReloadPending) {
 				ConfigReloadPending = false;

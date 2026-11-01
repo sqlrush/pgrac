@@ -1570,6 +1570,7 @@ UT_TEST(test_63_ack_tuple_encoder_is_exact_and_clears_reserved_gaps)
 UT_TEST(test_64_shmem_size_includes_exact_ack_table)
 {
 	Size expected = MAXALIGN(sizeof(ClusterSemanticActivationShmem))
+					+ CLUSTER_SURVIVOR_CONTROL_BYTES
 					+ MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem))
 					+ MAXALIGN(CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES)
 					+ MAXALIGN(sizeof(ClusterSemanticActivationPgrdSnapshotShmem))

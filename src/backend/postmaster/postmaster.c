@@ -114,6 +114,9 @@
  */
 
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_semantic_survivor_local.h"
+#endif
 
 #include <unistd.h>
 #include <signal.h>
@@ -3590,6 +3593,7 @@ process_pm_child_exit(void)
 #ifdef USE_PGRAC_CLUSTER
 		/* Preserve the exact producer exit before its original PID is cleared. */
 		NormalStopPostmasterReap(pid, exitstatus);
+		cluster_semantic_survivor_local_postmaster_reap(pid);
 #endif
 		/*
 		 * Check if this child was a startup process.
