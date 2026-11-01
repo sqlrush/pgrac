@@ -11753,6 +11753,28 @@ clean distclean maintainer-clean: clean-native-remote-cancel
 clean-native-remote-cancel:
 	rm -f test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel
 
+# Ordinary remote-image acquisition across the original R8 freeze.
+TESTS += test_cluster_native_read_reconfig test_cluster_native_write_reconfig
+all: test_cluster_native_read_reconfig test_cluster_native_write_reconfig
+test_cluster_native_read_reconfig test_cluster_native_write_reconfig: test_cluster_native_reconfig.c \
+		test_cluster_native_remote_x test_cluster_native_holder test_cluster_native_resident_lock test_cluster_native_resident_x \
+		test_cluster_native_remote_x_fixture.inc \
+		test_cluster_native_three_role_fixture.inc test_cluster_native_current_fixture.inc \
+		test_cluster_native_resident_lock_fixture.inc test_cluster_native_resident_x_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		$(if $(filter test_cluster_native_write_reconfig,$@),-DNATIVE_RECONFIG_WRITE) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(CLUSTER_SCN_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-reconfig
+.PHONY: clean-native-reconfig
+clean-native-reconfig:
+	rm -f test_cluster_native_read_reconfig test_cluster_native_write_reconfig
+
 # Real prior S, ordinary S-to-X ERROR cleanup and independent master.
 TESTS += test_cluster_native_s_x_cancel_master
 all: test_cluster_native_s_x_cancel_master

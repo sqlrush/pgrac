@@ -48,10 +48,15 @@ uint32 LockBufHdr(BufferDesc *buf) { return request_header_lock(buf); }
 static unsigned ordinary_pauses, ordinary_sends, ordinary_leaves;
 static ResourceXApplyResult ordinary_wait(void);
 static unsigned ordinary_panics;
+/* PANIC terminates the native process without ordinary ERROR unwinding. */
+static void (*ordinary_panic_hook)(void);
 static void ordinary_report(int level)
 {
 	if (level < ERROR) return;
-	if (level >= PANIC) ordinary_panics++;
+	if (level >= PANIC) {
+		ordinary_panics++;
+		if (ordinary_panic_hook != NULL) ordinary_panic_hook();
+	}
 	pg_re_throw();
 }
 static unsigned ordinary_peer_samples, ordinary_current_calls;
@@ -284,7 +289,7 @@ ordinary_start(ClusterBufmgrFirstFill *read, int profile)
 	ordinary_active = &read->request;
 	ordinary_delivery_transport = NULL;
 	ordinary_profile = profile; ordinary_sends = ordinary_pauses = ordinary_leaves = 0;
-	ordinary_panics = 0;
+	ordinary_panics = 0; ordinary_panic_hook = NULL;
 	ordinary_master_session = 31; ordinary_connection = 61;
 	ordinary_peer_samples = ordinary_current_calls = 0;
 	ordinary_unavailable = ordinary_unavailable_after_send = 0;
