@@ -48,6 +48,7 @@ static void
 native_storage_begin(bool truncate)
 {
 	char path[MAXPGPATH], target[MAXPGPATH];
+	char *resolved_root;
 	XLogReaderState *reader = &native_storage.reader;
 	DecodedXLogRecord *decoded = &native_storage.decoded;
 
@@ -60,8 +61,11 @@ native_storage_begin(bool truncate)
 		sizeof(native_storage.root));
 	UT_ASSERT(mkdtemp(native_storage.root) != NULL);
 	/* Resolve the platform's temporary-directory alias before native I/O. */
-	UT_ASSERT(realpath(native_storage.root, path) != NULL);
-	strlcpy(native_storage.root, path, sizeof(native_storage.root));
+	resolved_root = realpath(native_storage.root, NULL);
+	UT_ASSERT(resolved_root != NULL);
+	UT_ASSERT(strlen(resolved_root) < sizeof(native_storage.root));
+	strlcpy(native_storage.root, resolved_root, sizeof(native_storage.root));
+	free(resolved_root);
 	native_storage_path(path, "native_side"); UT_ASSERT_EQ(mkdir(path, 0700), 0);
 	native_storage_path(path, "native_side/origin_0"); UT_ASSERT_EQ(mkdir(path, 0700), 0);
 	native_storage_path(target, "native_side/origin_0/pg_xact"); UT_ASSERT_EQ(mkdir(target, 0700), 0);
