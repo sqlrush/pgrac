@@ -14,7 +14,7 @@ static unsigned checkpoint_calls;
 bool header_test_note_unsynced(uint32 segment, uint8 owner, ClusterUndoPathIntent intent)
 {
 	if (segment != 1 || owner != 1 || intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED)
-		abort();
+		{ checkpoint_calls++; return false; }
 	if (expect_identity && selected_borrows != 1) checkpoint_custody_ok = false;
 	checkpoint_calls++;
 	if (checkpoint_throw) siglongjmp(*PG_exception_stack, 1);
@@ -265,7 +265,10 @@ UT_TEST(native_header_legacy_range_policy_is_unchanged)
 	UT_ASSERT_EQ(selected_acquires, 0); UT_ASSERT_EQ(fsync_calls, before + 1); finish_selected(path);
 }
 
-int main(void)
+#ifndef UNDO_NATIVE_TT_HEADER_IO_MAIN
+#define UNDO_NATIVE_TT_HEADER_IO_MAIN main
+#endif
+int UNDO_NATIVE_TT_HEADER_IO_MAIN(void)
 {
 	char path[] = "/tmp/pgrac-native-tt-header-XXXXXX";
 

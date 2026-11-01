@@ -152,9 +152,16 @@ extern bool cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, u
 
 /*
  * Header writer for a critical section: _open resolves and opens a private
- * descriptor beforehand (returns -1 on failure); _write performs the same
+ * descriptor beforehand, returning a process-local opaque handle (-1 on
+ * failure), never an OS FD. Its value is not reused after close or original
+ * ResourceOwner cleanup. The caller must have a CurrentResourceOwner.
+ * _write performs the same
  * write and checkpoint bookkeeping as cluster_undo_smgr_write_header_bytes
- * without path resolution, allocation or ERROR; _close never throws.
+ * without path resolution, allocation or ERROR; managed TT40 requires a
+ * complete sealed page and holds an address-bound file borrow from open to
+ * close/ResourceOwner cleanup. Failed writes retain both for original cleanup.
+ * _close raises no ordinary ERROR; failed FD/borrow cleanup PANICs instead of
+ * discarding the original duty. Unknown/previously closed handles are no-ops.
  */
 extern int cluster_undo_smgr_header_writer_open(ClusterUndoPathIntent intent, uint32 segment_id,
 												uint8 owner_instance);

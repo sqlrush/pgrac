@@ -10,6 +10,8 @@
 static bool selected_missing, selected_current = true;
 static unsigned selected_change_on, selected_throw_on;
 static unsigned selected_borrows, selected_reads, selected_acquires;
+static ClusterControlNativeFileBorrowV2 *selected_handles[8];
+static bool selected_release_ok = true;
 static ClusterRecoveryFileIdentityV2 selected;
 static ClusterControlNativeModeV2 selected_mode = CLUSTER_NATIVE_FILES_MANAGED_V2;
 
@@ -29,8 +31,10 @@ void pg_re_throw(void)
 	abort();
 }
 
+#ifndef UNDO_NATIVE_TT_EXIT_TEST
 void before_shmem_exit(pg_on_exit_callback function, Datum arg)
 { (void) function; (void) arg; }
+#endif
 
 #ifndef UNDO_NATIVE_TT_HEADER_RECORDER_TEST
 /* These original physical-I/O cases have no resident checkpoint region.
@@ -53,12 +57,16 @@ bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 	borrow->expected = selected;
 	borrow->table_generation = 41; borrow->startup_generation = 1;
 	borrow->private_self = (uintptr_t) borrow; borrow->private_pid = 4321;
+	if (selected_borrows >= lengthof(selected_handles)) abort();
+	selected_handles[selected_borrows] = borrow;
 	selected_borrows++;
 	return true;
 }
 bool cluster_control_native_file_current_v2(const ClusterControlNativeFileBorrowV2 *borrow)
 {
-	if (selected_borrows != 1 || borrow->private_self != (uintptr_t) borrow) abort();
+	unsigned i;
+	for (i = 0; i < selected_borrows; i++) if (selected_handles[i] == borrow) break;
+	if (i == selected_borrows || borrow->private_self != (uintptr_t) borrow) abort();
 	selected_reads++;
 	if (selected_reads == selected_throw_on)
 		siglongjmp(*PG_exception_stack, 1);
@@ -66,8 +74,12 @@ bool cluster_control_native_file_current_v2(const ClusterControlNativeFileBorrow
 }
 bool cluster_control_native_file_release_v2(ClusterControlNativeFileBorrowV2 *borrow)
 {
-	if (selected_borrows != 1 || borrow->private_self != (uintptr_t) borrow) abort();
-	selected_borrows--; memset(borrow, 0, sizeof(*borrow));
+	unsigned i;
+	for (i = 0; i < selected_borrows; i++) if (selected_handles[i] == borrow) break;
+	if (i == selected_borrows || borrow->private_self != (uintptr_t) borrow) abort();
+	if (!selected_release_ok) return false;
+	selected_handles[i] = selected_handles[--selected_borrows];
+	memset(borrow, 0, sizeof(*borrow));
 	return true;
 }
 
@@ -77,6 +89,7 @@ static void reset_selected(PGAlignedBlock *page, char path[MAXPGPATH])
 	selected_borrows = selected_reads = selected_acquires = 0;
 	selected_change_on = selected_throw_on = 0;
 	selected_missing = false; selected_current = true;
+	selected_release_ok = true;
 	selected_mode = CLUSTER_NATIVE_FILES_MANAGED_V2; cluster_enabled = true;
 	pread_forced_error = basic_open_forced_error = false;
 	memset(&selected, 0, sizeof(selected));

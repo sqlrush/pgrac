@@ -44,6 +44,8 @@
 #include "storage/fd.h"
 #include "storage/ipc.h" /* before_shmem_exit (fd cache cleanup) */
 #include "utils/elog.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 
 #include "cluster/cluster_undo_gcs.h"		 /* cluster_undo_intent_for_owner (D2-2) */
 #include "cluster/cluster_undo_record_api.h" /* smgr syscall counter bumps */
@@ -703,36 +705,226 @@ header_write_recorded(int fd, ClusterUndoPathIntent intent, uint32 segment_id, u
 	return pg_fsync(fd) == 0;
 }
 
+/* The caller stores only a process-local handle. Never reuse its value: an
+ * ERROR cleanup may precede the original stage's later close, while the OS
+ * has already reused the descriptor. The original ResourceOwner owns both
+ * this private FD and its stable-address identity borrow, not the FD cache. */
+typedef struct UndoHeaderWriterResource {
+	struct UndoHeaderWriterResource *next;
+	ResourceOwner owner;
+	int handle;
+	int fd;
+	ClusterUndoPathIntent intent;
+	uint32 segment_id;
+	uint8 owner_instance;
+#ifdef USE_PGRAC_CLUSTER
+	bool native;
+	ClusterControlNativeFileBorrowV2 native_file;
+#endif
+} UndoHeaderWriterResource;
+
+static UndoHeaderWriterResource *header_writers;
+static int header_writer_serial;
+static bool header_writer_callback_registered;
+static bool header_writer_exit_registered;
+
+static UndoHeaderWriterResource *
+header_writer_find(int handle)
+{
+	UndoHeaderWriterResource *resource;
+
+	for (resource = header_writers; resource != NULL; resource = resource->next)
+		if (resource->handle == handle)
+			return resource;
+	return NULL;
+}
+
+static void
+header_writer_resource_release(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
+							   void *arg)
+{
+	UndoHeaderWriterResource *resource = header_writers;
+
+	(void)isCommit;
+	(void)isTopLevel;
+	(void)arg;
+	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS)
+		return;
+	while (resource != NULL) {
+		UndoHeaderWriterResource *next = resource->next;
+
+		if (resource->owner == CurrentResourceOwner)
+			cluster_undo_smgr_header_writer_close(resource->handle);
+		resource = next;
+	}
+}
+
+static void
+header_writer_on_exit(int code, Datum arg)
+{
+	(void)code;
+	(void)arg;
+	while (header_writers != NULL)
+		cluster_undo_smgr_header_writer_close(header_writers->handle);
+}
+
 int
 cluster_undo_smgr_header_writer_open(ClusterUndoPathIntent intent, uint32 segment_id,
 									 uint8 owner_instance)
 {
-	int fd = get_segment_fd(intent, segment_id, owner_instance);
+	UndoHeaderWriterResource *resource;
+	volatile bool ok = false;
+	int handle;
 
-	return fd < 0 ? -1 : dup(fd);
+	if (CurrentResourceOwner == NULL || TopMemoryContext == NULL || header_writer_serial == INT_MAX)
+		return -1;
+#ifdef USE_PGRAC_CLUSTER
+	if (owner_instance == 0 || owner_instance > UNDO_OWNER_INSTANCE_MAX || segment_id == 0
+		|| segment_id > UINT16_MAX
+		|| (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1 != owner_instance)
+		return -1;
+#endif
+	if (!header_writer_callback_registered) {
+		RegisterResourceReleaseCallback(header_writer_resource_release, NULL);
+		header_writer_callback_registered = true;
+	}
+	if (!header_writer_exit_registered) {
+		before_shmem_exit(header_writer_on_exit, (Datum)0);
+		header_writer_exit_registered = true;
+	}
+	resource = MemoryContextAlloc(TopMemoryContext, sizeof(*resource));
+	memset(resource, 0, sizeof(*resource));
+	resource->owner = CurrentResourceOwner;
+	resource->handle = handle = ++header_writer_serial;
+	resource->fd = -1;
+	resource->intent = intent;
+	resource->segment_id = segment_id;
+	resource->owner_instance = owner_instance;
+	resource->next = header_writers;
+	header_writers = resource;
+	PG_TRY();
+	{
+		int fd;
+		bool eligible = true;
+		bool ready = false;
+
+#ifdef USE_PGRAC_CLUSTER
+		resource->native = cluster_enabled
+			|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2;
+		if (resource->native) {
+			ClusterControlFileKeyV2 key = {0};
+
+			key.kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+			key.origin = owner_instance - 1;
+			key.object_id = segment_id;
+			eligible = cluster_control_native_file_acquire_v2(&key, &resource->native_file)
+				&& cluster_control_native_file_current_v2(&resource->native_file);
+		}
+#endif
+		if (eligible && (fd = get_segment_fd(intent, segment_id, owner_instance)) >= 0) {
+			resource->fd = dup(fd);
+			ready = resource->fd >= 0;
+#ifdef USE_PGRAC_CLUSTER
+			if (ready && resource->native) {
+				PGAlignedBlock disk;
+
+				ready = cluster_control_native_file_current_v2(&resource->native_file);
+				if (ready) {
+					ssize_t count = pg_pread(resource->fd, disk.data, BLCKSZ, 0);
+
+					cluster_undo_record_note_smgr_pread();
+					ready = count == BLCKSZ
+						&& cluster_tt_file_reference_matches_v2(disk.data, BLCKSZ, &resource->native_file.expected)
+						&& cluster_undo_segment_header_integrity(disk.data) == CLUSTER_UNDO_HEADER_VALID
+						&& cluster_control_native_file_current_v2(&resource->native_file);
+				}
+			}
+#endif
+		}
+		/* Do not publish success before every possible ERROR above completed. */
+		ok = ready;
+	}
+	PG_FINALLY();
+	{
+		if (!ok)
+			cluster_undo_smgr_header_writer_close(handle);
+	}
+	PG_END_TRY();
+	return ok ? handle : -1;
 }
 
 bool
-cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent, uint32 segment_id,
+cluster_undo_smgr_header_writer_write(int handle, ClusterUndoPathIntent intent, uint32 segment_id,
 									  uint8 owner_instance, uint32 offset, const char *buf,
 									  uint32 len)
 {
+	UndoHeaderWriterResource *resource = header_writer_find(handle);
 	ssize_t nwritten;
+	bool ok;
 
-	if (fd < 0 || buf == NULL || len == 0 || (uint64)offset + (uint64)len > (uint64)BLCKSZ)
+	if (resource == NULL || resource->fd < 0 || resource->owner != CurrentResourceOwner
+		|| resource->intent != intent || resource->segment_id != segment_id
+		|| resource->owner_instance != owner_instance || buf == NULL || len == 0
+		|| (uint64)offset + (uint64)len > (uint64)BLCKSZ)
 		return false;
-	nwritten = pg_pwrite(fd, buf, len, (off_t)offset);
+#ifdef USE_PGRAC_CLUSTER
+	if (resource->native) {
+		PGAlignedBlock disk;
+		ssize_t count;
+
+		if (offset != 0 || len != BLCKSZ
+			|| !cluster_control_native_file_current_v2(&resource->native_file)
+			|| !cluster_tt_file_reference_matches_v2(buf, BLCKSZ, &resource->native_file.expected)
+			|| cluster_undo_segment_header_integrity(buf) != CLUSTER_UNDO_HEADER_VALID)
+			return false;
+		count = pg_pread(resource->fd, disk.data, BLCKSZ, 0);
+		cluster_undo_record_note_smgr_pread();
+		if (count != BLCKSZ
+			|| !cluster_tt_file_reference_matches_v2(disk.data, BLCKSZ, &resource->native_file.expected)
+			|| cluster_undo_segment_header_integrity(disk.data) != CLUSTER_UNDO_HEADER_VALID
+			|| !cluster_control_native_file_current_v2(&resource->native_file))
+			return false;
+	} else if (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2)
+		return false;
+#endif
+	nwritten = pg_pwrite(resource->fd, buf, len, (off_t)offset);
 	cluster_undo_record_note_smgr_pwrite();
 	if (nwritten != (ssize_t)len)
 		return false;
-	return header_write_recorded(fd, intent, segment_id, owner_instance);
+	ok = header_write_recorded(resource->fd, intent, segment_id, owner_instance);
+#ifdef USE_PGRAC_CLUSTER
+	if (ok && resource->native)
+		ok = cluster_control_native_file_current_v2(&resource->native_file);
+#endif
+	return ok;
 }
 
 void
-cluster_undo_smgr_header_writer_close(int fd)
+cluster_undo_smgr_header_writer_close(int handle)
 {
-	if (fd >= 0)
-		(void)close(fd);
+	UndoHeaderWriterResource **link = &header_writers;
+	UndoHeaderWriterResource *resource;
+
+	while (*link != NULL && (*link)->handle != handle)
+		link = &(*link)->next;
+	resource = *link;
+	if (resource == NULL)
+		return;
+	if (resource->fd >= 0) {
+		if (close(resource->fd) != 0)
+			ereport(PANIC, (errcode_for_file_access(),
+							errmsg("could not close staged undo header writer")));
+		resource->fd = -1;
+	}
+#ifdef USE_PGRAC_CLUSTER
+	if (resource->native_file.private_self != 0
+		&& !cluster_control_native_file_release_v2(&resource->native_file))
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("could not release staged undo header writer identity")));
+#endif
+	*link = resource->next;
+	pfree(resource);
 }
 
 bool
