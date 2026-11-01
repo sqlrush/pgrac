@@ -199,6 +199,7 @@ static bool test_collection_on;
 static void test_collection_prepare(void);
 static void test_collection_work(bool event);
 static int test_collection_wait(WaitEvent *events);
+static int (*test_collection_extra_wait)(WaitEvent *events);
 
 #include "test_cluster_lmon_stop_service.inc"
 static void (*test_collection_barrier_hook)(void);

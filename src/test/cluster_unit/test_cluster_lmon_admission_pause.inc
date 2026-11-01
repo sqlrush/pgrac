@@ -95,7 +95,11 @@ test_collection_wait(WaitEvent *events)
 	ClusterServiceProducerCollection out;
 	ClusterCleanLeaveSharedState before = test_stop_region;
 	ClusterSemanticAdmissionObservationResult result, expected;
-	unsigned polls = test_stop_polls, sample = ++test_collection_samples;
+	unsigned polls = test_stop_polls, sample;
+
+	if (test_collection_extra_wait != NULL)
+		return test_collection_extra_wait(events);
+	sample = ++test_collection_samples;
 
 	UT_ASSERT(sample <= 3);
 	UT_ASSERT(!cluster_normal_stop_requested());

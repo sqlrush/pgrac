@@ -13629,3 +13629,26 @@ test_cluster_pi_empty_batch_release.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_service test_cluster_normal_stop: test_cluster_pi_empty_batch_fixture.h test_cluster_pi_empty_batch_release.inc $(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
+
+# Unconfirmed survivor collection at actual original LMON wait boundaries.
+TESTS += test_cluster_survivor_candidate
+all: test_cluster_survivor_candidate
+
+test_cluster_survivor_candidate: test_cluster_survivor_candidate.c test_cluster_lmon.c unit_test.h \
+		test_cluster_lmon_stop_service.inc test_cluster_lmon_producer_observe.inc \
+		test_cluster_lmon_producer_pause.inc test_cluster_shared_admission_observe.inc \
+		test_cluster_lmon_admission_pause.inc \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_survivor_candidate.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_survivor.h \
+		$(top_srcdir)/src/include/cluster/cluster_service_observe.h \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+		$(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
