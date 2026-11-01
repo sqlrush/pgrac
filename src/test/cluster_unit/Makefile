@@ -15743,12 +15743,15 @@ clean-recovery-identity-codec:
 
 # Managed envelope: real pair I/O, while control registration remains external.
 test_cluster_relmap_file: test_cluster_relmap_file.c test_cluster_relmap_file_replay_create.inc unit_test.h \
+		test_cluster_relmap_file_create_wal.inc $(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
 		$(top_srcdir)/src/common/cluster_relmap_file_io.c \
 		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(top_srcdir)/src/common/cluster_relmap_file.c $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
@@ -16310,3 +16313,9 @@ test_cluster_relmap_create_copy: $(top_srcdir)/src/include/common/cluster_relmap
         $(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
         $(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
         $(top_srcdir)/src/include/storage/fd.h
+
+# Independent CREATE bytes are shared by the original copy consumer and replay.
+test_cluster_relmap_create_copy test_cluster_relmap_control: \
+        $(top_srcdir)/src/include/common/cluster_relmap_create.h \
+        $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+        $(top_srcdir)/src/include/access/xlog.h $(top_srcdir)/src/include/access/xloginsert.h

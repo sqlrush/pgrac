@@ -16,6 +16,9 @@
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "access/xlog.h"
+#include "access/xloginsert.h"
+#include "common/cluster_relmap_create.h"
 #include "catalog/pg_tablespace_d.h"
 #include "storage/fd.h"
 #include "common/cryptohash.h"
@@ -315,6 +318,34 @@ cluster_relmap_checkpoint_source_at_v2(const ClusterRelmapCheckpointReceiptV2 *r
 
 /* Heap state survives ERROR longjmp; failed borrow retirement retains its
  * address-bound original counter, and PANICs rather than discarding custody. */
+/* Only the original current decoded record supplies EndRecPtr. This does not
+ * authenticate an episode or replace its independent RESERVED registration. */
+bool
+cluster_relmap_control_create_redo_input_v1(XLogReaderState *reader,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	ClusterRelmapCreateReplayV1 *out)
+{
+	DecodedXLogRecord *record;
+	if (reader == NULL || out == NULL
+		|| relmap_control_overlap(out, sizeof(*out), reader, sizeof(*reader)))
+		return false;
+	record = reader->record;
+	if (record == NULL || relmap_control_overlap(out, sizeof(*out), record, sizeof(*record)))
+		return false;
+	if (record->size < sizeof(*record)
+		|| relmap_control_overlap(out, sizeof(*out), record, record->size)
+		|| XLogRecGetRmid(reader) != RM_RELMAP_ID
+		|| (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) != CLUSTER_RELMAP_CREATE_WAL_INFO_V1
+		|| XLogRecHasAnyBlockRefs(reader) || record->has_page_version_edge
+		|| XLogRecGetData(reader) == NULL
+		|| XLogRecGetDataLen(reader) != CLUSTER_RELMAP_CREATE_WAL_SIZE_V1
+		|| reader->ReadRecPtr != record->lsn || reader->EndRecPtr != record->next_lsn
+		|| XLogRecPtrIsInvalid(reader->ReadRecPtr) || reader->EndRecPtr <= reader->ReadRecPtr)
+		return false;
+	return cluster_relmap_create_rebuild_v1(XLogRecGetData(reader), XLogRecGetDataLen(reader),
+		expected, batch, reader->EndRecPtr, out);
+}
+
 typedef struct RelmapCreateWork
 {
 	ClusterControlRelmapSelectionV2 *selection;
@@ -322,6 +353,9 @@ typedef struct RelmapCreateWork
 	ClusterRelmapFilePairV2 source_pair, target_pair;
 	ClusterRecoveryCheckpointFileSourceV2 *sources;
 	ClusterRecoveryCheckpointFileV2 receipts[2];
+	unsigned char creation_wal[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1];
+	ClusterRelmapCreateReplayV1 creation;
+	XLogRecPtr creation_end;
 	pg_cryptohash_ctx *hash;
 	bool source_held, target_held, mapping;
 } RelmapCreateWork;
@@ -376,7 +410,7 @@ cluster_relmap_control_copy_create_v2(ClusterControlNativeRelmapCreateV2 *c,
 		|| c->private_cf_sequence != cluster_cf_attempt_sequence() || CritSectionCount
 		|| LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(RelationMappingLock)
 		|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactSLRULock)
-		|| LWLockHeldByMe(XactTruncationLock) || !enableFsync
+		|| LWLockHeldByMe(XactTruncationLock) || !enableFsync || RecoveryInProgress()
 		|| !OidIsValid(source_database) || source_database == c->expected.database_oid
 		|| source_tablespace != DEFAULTTABLESPACE_OID
 		|| c->expected.tablespace_oid != DEFAULTTABLESPACE_OID)
@@ -417,9 +451,31 @@ cluster_relmap_control_copy_create_v2(ClusterControlNativeRelmapCreateV2 *c,
 				|| !cluster_control_native_file_current_v2(&w->target)
 				|| !cluster_relmap_authority_x_held()
 				|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+				|| c->private_cf_sequence != cluster_cf_attempt_sequence()) break;
+			/* An independent creation record carries only the original target,
+			 * creation batch and complete clean generation-one image. Neither
+			 * a pending transaction nor a guessed record end is manufactured.
+			 * The carrier's one-shot latch already owns failure after WAL. */
+			if (!cluster_relmap_create_encode_v1(&w->target.expected, c->batch_uuid,
+					&w->source_pair.view.committed, w->creation_wal, sizeof(w->creation_wal))) break;
+			XLogBeginInsert();
+			XLogRegisterData((char *) w->creation_wal, sizeof(w->creation_wal));
+			w->creation_end = XLogInsert(RM_RELMAP_ID, CLUSTER_RELMAP_CREATE_WAL_INFO_V1);
+			if (XLogRecPtrIsInvalid(w->creation_end) || w->creation_end == UINT64_MAX) break;
+			XLogFlush(w->creation_end);
+			/* No target name is opened for writing until the actual insertion
+			 * end has flushed and the original protected inputs remain current.
+			 * Install exactly the WAL image, never a newly sampled local map. */
+			if (!cluster_relmap_authority_x_held()
+				|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
 				|| c->private_cf_sequence != cluster_cf_attempt_sequence()
+				|| !cluster_control_native_file_current_v2(&w->source)
+				|| !cluster_control_native_file_current_v2(&w->target)
+				|| !cluster_relmap_create_rebuild_v1(w->creation_wal, sizeof(w->creation_wal),
+					&c->expected, c->batch_uuid, w->creation_end, &w->creation)
+				|| memcmp(&w->creation.record.committed, &w->source_pair.view.committed, sizeof(RelMapFile))
 				|| !cluster_relmap_authority_managed_create_v2(&w->target.expected,
-					&w->source_pair.view.committed, &w->target_pair)
+					&w->creation.record.committed, &w->target_pair)
 				|| !cluster_control_native_file_current_v2(&w->source)
 				|| !cluster_control_native_file_current_v2(&w->target)) break;
 			for (unsigned i = 0; i < 2; ++i) {

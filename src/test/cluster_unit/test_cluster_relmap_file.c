@@ -330,11 +330,12 @@ UT_TEST(assigned_format_matches_the_complete_big_endian_byte_table)
 }
 
 #include "test_cluster_relmap_file_replay_create.inc"
+#include "test_cluster_relmap_file_create_wal.inc"
 
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(21);
 	UT_RUN(assigned_format_matches_the_complete_big_endian_byte_table);
 	UT_RUN(complete_envelope_preserves_inner_and_rejects_old_format);
 	UT_RUN(creation_identity_is_independent_of_map_generation);
@@ -351,6 +352,11 @@ main(void)
 	UT_RUN(replay_sync_late_corruption_and_close_failure_keep_output);
 	UT_RUN(replay_alias_invalid_image_and_linked_names_refuse);
 	UT_RUN(replay_late_input_drift_cannot_publish_saved_output);
+	UT_RUN(creation_wal_roundtrip_preserves_full_identity_batch_and_generation_one);
+	UT_RUN(creation_wal_every_byte_and_exact_length_are_checked);
+	UT_RUN(creation_wal_rejects_valid_crc_but_wrong_state_birth_and_pending);
+	UT_RUN(creation_rebuild_requires_independent_identity_batch_and_actual_end);
+	UT_RUN(creation_wal_alias_and_invalid_input_do_not_change_any_output);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
