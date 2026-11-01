@@ -48,11 +48,45 @@ typedef struct ClusterMxRangeResponse {
 	PGAlignedBlock data;
 } ClusterMxRangeResponse;
 
+/* The existing kind=2 body uses this independent variable-length request.
+ * Only route.wire_bytes are transported; no padding/tail is sent. */
+typedef struct ClusterMxProofRequest {
+	ClusterMxRangeRoute route;
+	PGAlignedBlock data;
+} ClusterMxProofRequest;
+
+/* Process-local copied request, not storage/TT/grant/admission authority. */
+typedef struct ClusterMxProofRequestView {
+	ClusterMxRangeRoute route;
+	ClusterCurrentMxKey key;
+	ClusterMxRangeSource source;
+	uint32 peer_generation, total, first, count, next;
+	ClusterMxRangeProofAsk asks[CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME];
+} ClusterMxProofRequestView;
+
 StaticAssertDecl(sizeof(ClusterMxRangeSnapshot) == 32, "range snapshot size");
 StaticAssertDecl(sizeof(ClusterMxRangeSource) == 128, "range source size");
 StaticAssertDecl(sizeof(ClusterMxRangeRoute) == 48, "range route size");
 StaticAssertDecl(sizeof(ClusterMxRangeRequest) == 264, "range request size");
 StaticAssertDecl(offsetof(ClusterMxRangeResponse, data) == 48, "aligned range reply");
+StaticAssertDecl(offsetof(ClusterMxProofRequest, data) == 48, "aligned proof request");
+
+/* Structural packet codecs, without allocation, transport or CTRC touch.
+ * Pack failures preserve destination bytes and return bytes=0. Decode failure
+ * clears the entire view. loaded_catalog and peer_capabilities must come from
+ * the original loaded control/negotiated peer, never the incoming packet.
+ * peer_generation is a requester-side echo, not the holder's own connection
+ * generation. The original service must still hold/revalidate its KO/CONTROL
+ * admission and native H/source/TT/grants through the final checks. */
+extern bool cluster_mx_proof_request_pack(const ClusterMxRangeWireContext *ctx,
+	int32 requester_node, int32 requester_backend, const void *body, uint32 body_bytes,
+	ClusterMxProofRequest *request, uint32 capacity, uint32 *bytes);
+extern bool cluster_mx_proof_request_decode(const void *wire, uint32 bytes,
+	uint32 loaded_catalog, uint32 peer_capabilities, ClusterMxProofRequestView *view);
+extern bool cluster_mx_proof_response_pack(const ClusterMxProofRequestView *request,
+	const ClusterMxRangeWireContext *ctx, ClusterMxCompositionReadStatus status,
+	const ClusterMxProofReply *reply, ClusterMxRangeResponse *response,
+	uint32 capacity, uint32 *bytes);
 
 extern void cluster_mx_range_request_seal(ClusterMxRangeRequest *request);
 extern void cluster_mx_range_response_seal(ClusterMxRangeResponse *response, uint32 body_bytes);

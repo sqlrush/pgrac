@@ -513,6 +513,164 @@ range_request_valid(const ClusterMxRangeRequest *r)
 		&& (r->has_source || (r->first == 0 && memcmp(&r->source, &zero, sizeof(zero)) == 0));
 }
 
+static bool
+range_route_read(const void *wire, uint32 bytes, ClusterMxRangeRoute *h)
+{
+	if (wire == NULL || bytes < sizeof(*h) || bytes > sizeof(*h) + BLCKSZ)
+		return false;
+	memcpy(h, wire, sizeof(*h));
+	return h->format_id == CLUSTER_FOREIGN_MX_FORMAT_ID_V1
+		&& h->version == CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1 && h->wire_bytes == bytes
+		&& h->request_id != 0 && h->epoch > 0 && h->epoch <= UINT32_MAX
+		&& h->requester_node >= 0 && h->requester_node < CLUSTER_MAX_NODES
+		&& h->requester_backend > 0 && h->reserved == 0
+		&& h->checksum == range_checksum(wire, bytes);
+}
+
+static bool
+range_proof_source_valid(const ClusterMxRangeSource *source, const ClusterCurrentMxKey *key,
+	uint32 total)
+{
+	return source->system_identifier != 0 && source->formation_epoch == key->cluster_epoch
+		&& source->boot_incarnation != 0 && source->admission_revision != 0
+		&& source->admission_revision != UINT64_MAX && source->capability_generation != 0
+		&& source->capability_generation != UINT32_MAX && source->reserved == 0
+		&& source->native.multi == key->multixact_id && source->native.origin_node == key->origin_node_id
+		&& source->native.epoch == key->cluster_epoch && source->native.start != 0
+		&& total > 0 && total <= INT32_MAX
+		&& ((uint64)source->native.span == total
+			|| ((uint64)source->native.span == (uint64)total + 1
+				&& (uint32)(0 - source->native.start) < source->native.span))
+		&& range_target_valid(&source->target)
+		&& range_snapshot_valid(&source->snapshot, key->cluster_epoch);
+}
+
+/* Only syntax and exact request/source binding. Routing calls this without
+ * establishing peer admission; the original service must decode with its
+ * actual local control/capabilities before any proof work. */
+static bool
+range_proof_request_read(const void *wire, uint32 bytes, const ClusterMxRangeRoute *route,
+	uint32 loaded_catalog, uint32 peer_capabilities, ClusterMxProofRequestView *view)
+{
+	ClusterMxRangeWireHeader h;
+	ClusterMxRangeWireContext ctx = {0};
+	ClusterMxRangeSource source;
+	ClusterMxRangeProofAsk asks[CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME];
+	const char *body = (const char *)wire + sizeof(*route);
+	uint32 count = 0, total = 0;
+	const uint32 prefix = sizeof(*route) + sizeof(h) + sizeof(source);
+
+	if (route->kind != CLUSTER_MX_RANGE_REQUEST_KIND || bytes <= prefix
+		|| bytes > prefix + sizeof(asks) || (bytes - prefix) % sizeof(*asks) != 0)
+		return false;
+	memcpy(&h, body, sizeof(h));
+	if (h.source_bytes != sizeof(source))
+		return false;
+	memcpy(&source, body + sizeof(h), sizeof(source));
+	ctx.request_id = route->request_id; ctx.epoch = route->epoch; ctx.key = h.key;
+	ctx.format_id = route->format_id; ctx.version = route->version;
+	ctx.loaded_catalog = loaded_catalog; ctx.peer_capabilities = peer_capabilities;
+	ctx.peer_generation = h.peer_generation;
+	ctx.requested_cap = CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME;
+	ctx.source = &source; ctx.source_bytes = sizeof(source);
+	if (!cluster_mx_range_wire_decode_proof_asks(body, bytes - sizeof(*route), &ctx,
+		asks, lengthof(asks), &count, &total)
+		|| !range_proof_source_valid(&source, &h.key, total))
+		return false;
+	view->route = *route; view->key = h.key; view->source = source;
+	view->peer_generation = h.peer_generation;
+	view->total = total; view->first = h.first; view->count = count; view->next = h.next;
+	memcpy(view->asks, asks, sizeof(asks));
+	return true;
+}
+
+bool
+cluster_mx_proof_request_decode(const void *wire, uint32 bytes,
+	uint32 loaded_catalog, uint32 peer_capabilities, ClusterMxProofRequestView *view)
+{
+	ClusterMxRangeRoute route;
+	if (view == NULL)
+		return false;
+	memset(view, 0, sizeof(*view));
+	return range_route_read(wire, bytes, &route)
+		&& range_proof_request_read(wire, bytes, &route, loaded_catalog, peer_capabilities, view);
+}
+
+bool
+cluster_mx_proof_request_pack(const ClusterMxRangeWireContext *ctx,
+	int32 requester_node, int32 requester_backend, const void *body, uint32 body_bytes,
+	ClusterMxProofRequest *request, uint32 capacity, uint32 *bytes)
+{
+	ClusterMxProofRequest candidate;
+	ClusterMxProofRequestView view;
+	ClusterMxRangeProofAsk asks[CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME];
+	uint32 count = 0, total = 0;
+	if (bytes != NULL)
+		*bytes = 0;
+	if (ctx == NULL || request == NULL || bytes == NULL || requester_node < 0
+		|| requester_node >= CLUSTER_MAX_NODES || requester_backend <= 0
+		|| ctx->source_bytes != sizeof(ClusterMxRangeSource)
+		|| ctx->requested_cap > CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME
+		|| body_bytes > BLCKSZ || (uint64)sizeof(candidate.route) + body_bytes > capacity
+		|| !cluster_mx_range_wire_decode_proof_asks(body, body_bytes, ctx, asks, lengthof(asks),
+			&count, &total) || count > ctx->requested_cap)
+		return false;
+	memset(&candidate.route, 0, sizeof(candidate.route));
+	candidate.route.format_id = ctx->format_id; candidate.route.version = ctx->version;
+	candidate.route.kind = CLUSTER_MX_RANGE_REQUEST_KIND;
+	candidate.route.request_id = ctx->request_id; candidate.route.epoch = ctx->epoch;
+	candidate.route.requester_node = requester_node; candidate.route.requester_backend = requester_backend;
+	candidate.route.wire_bytes = sizeof(candidate.route) + body_bytes;
+	memcpy(candidate.data.data, body, body_bytes);
+	candidate.route.checksum = range_checksum(&candidate, candidate.route.wire_bytes);
+	if (!cluster_mx_proof_request_decode(&candidate, candidate.route.wire_bytes,
+		ctx->loaded_catalog, ctx->peer_capabilities, &view))
+		return false;
+	memcpy(request, &candidate, candidate.route.wire_bytes);
+	*bytes = candidate.route.wire_bytes;
+	return true;
+}
+
+bool
+cluster_mx_proof_response_pack(const ClusterMxProofRequestView *request,
+	const ClusterMxRangeWireContext *ctx, ClusterMxCompositionReadStatus status,
+	const ClusterMxProofReply *reply, ClusterMxRangeResponse *response,
+	uint32 capacity, uint32 *bytes)
+{
+	ClusterMxRangeResponse candidate;
+	uint32 body_bytes = 0;
+	if (bytes != NULL)
+		*bytes = 0;
+	if (request == NULL || ctx == NULL || response == NULL || bytes == NULL
+		|| request->count == 0 || request->count > CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME
+		|| (uint64)request->first + request->count != request->next || request->next > request->total
+		|| request->route.request_id != ctx->request_id || request->route.epoch != ctx->epoch
+		|| request->peer_generation != ctx->peer_generation
+		|| memcmp(&request->key, &ctx->key, sizeof(ctx->key)) != 0
+		|| ctx->source == NULL || ctx->source_bytes != sizeof(request->source)
+		|| memcmp(ctx->source, &request->source, sizeof(request->source)) != 0
+		|| !range_proof_source_valid(&request->source, &request->key, request->total))
+		return false;
+	if (status == MXCOMP_READ_OK) {
+		if (reply == NULL || reply->total != request->total || reply->first != request->first
+			|| reply->count != request->count || reply->next != request->next || reply->proofs == NULL
+			|| reply->proof_bytes != (uint64)reply->count * sizeof(*reply->proofs))
+			return false;
+		for (uint32 i = 0; i < request->count; i++)
+			if (reply->proofs[i].proof.member_xid != request->asks[i].xid
+				|| reply->proofs[i].proof.member_status != request->asks[i].member_status)
+				return false;
+	}
+	if (!cluster_mx_range_wire_encode_proofs(ctx, status, reply, candidate.data.data,
+		BLCKSZ, &body_bytes) || (uint64)sizeof(candidate.route) + body_bytes > capacity)
+		return false;
+	candidate.route = request->route;
+	cluster_mx_range_response_seal(&candidate, body_bytes);
+	memcpy(response, &candidate, candidate.route.wire_bytes);
+	*bytes = candidate.route.wire_bytes;
+	return true;
+}
+
 void
 cluster_mx_range_request_seal(ClusterMxRangeRequest *request)
 {
@@ -537,7 +695,10 @@ cluster_mx_range_transport_candidate(const void *wire, uint32 bytes, uint8 messa
 	if (wire == NULL)
 		return false;
 	if (message_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD) {
-		if (bytes != sizeof(ClusterMxRangeRequest))
+		if (bytes != sizeof(ClusterMxRangeRequest)
+			&& (bytes <= minimum
+				|| bytes > minimum + CLUSTER_MX_RANGE_PROOF_ASKS_PER_FRAME * sizeof(ClusterMxRangeProofAsk)
+				|| (bytes - minimum) % sizeof(ClusterMxRangeProofAsk) != 0))
 			return false;
 	} else if (message_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY) {
 		if (bytes < minimum || bytes > maximum
@@ -560,21 +721,24 @@ cluster_mx_range_transport_route(const void *wire, uint32 bytes, uint8 message_t
 	if (route == NULL || tag == NULL
 		|| !cluster_mx_range_transport_candidate(wire, bytes, message_type))
 		return false;
-	memcpy(&h, wire, sizeof(h));
-	if (h.format_id != CLUSTER_FOREIGN_MX_FORMAT_ID_V1
-		|| h.version != CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1 || h.wire_bytes != bytes
-		|| h.request_id == 0 || h.epoch == 0 || h.epoch > UINT32_MAX
-		|| h.requester_node < 0 || h.requester_node >= CLUSTER_MAX_NODES
-		|| h.requester_backend <= 0 || h.reserved != 0
-		|| h.checksum != range_checksum(wire, bytes))
+	if (!range_route_read(wire, bytes, &h))
 		return false;
 	if (message_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD) {
 		ClusterMxRangeRequest request;
-		if (h.kind != CLUSTER_MX_RANGE_REQUEST_KIND || bytes != sizeof(request))
+		if (h.kind != CLUSTER_MX_RANGE_REQUEST_KIND)
 			return false;
-		memcpy(&request, wire, sizeof(request));
-		if (!range_request_valid(&request))
-			return false;
+		if (bytes == sizeof(request)) {
+			memcpy(&request, wire, sizeof(request));
+			if (!range_request_valid(&request))
+				return false;
+		} else {
+			ClusterMxProofRequestView view;
+			/* Syntax for shard affinity only, not negotiated capability or
+			 * service admission. The real service supplies its own facts. */
+			if (!range_proof_request_read(wire, bytes, &h, CATALOG_VERSION_NO,
+				CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, &view))
+				return false;
+		}
 	} else if (message_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY) {
 		if (h.kind != CLUSTER_MX_RANGE_RESPONSE_KIND
 			|| bytes < sizeof(h) + sizeof(ClusterMxRangeWireHeader))
