@@ -323,3 +323,40 @@ mx_receipt_prepare(TransactionId requester, uint64 hash,
 		cluster_current_mx_stamp_cancel(&plan);
 	return ok;
 }
+
+static HeapHotSearchResult full_companion_result;
+int
+mx_history_full_companion(Relation rel, Buffer buffer, Snapshot actual,
+	ItemPointer tid, bool first_call, bool *all_dead, MxFullReadout *out)
+{
+	volatile int kind = -1;
+	ClusterR4ProjectionScratch empty_projection = {0};
+	memset(out, 0, sizeof(*out));
+	PG_TRY();
+	{
+		kind = heap_hot_search_buffer_result_scoped(tid, rel, buffer, actual,
+			&full_companion_result, all_dead, first_call, true);
+	}
+	PG_FINALLY();
+	{
+		out->kind = full_companion_result.kind;
+		out->owned = full_companion_result.tuple.t_data ==
+			(HeapTupleHeader)full_companion_result.scratch_page;
+		out->cr_full_page = full_companion_result.cr_full_page;
+		out->cr_private_projection = full_companion_result.cr_private_projection;
+		out->projection_empty = memcmp(&full_companion_result.projection,
+			&empty_projection, sizeof(empty_projection)) == 0;
+		out->tid = full_companion_result.tuple.t_self;
+		out->xmin = out->owned ? HeapTupleHeaderGetRawXmin(full_companion_result.tuple.t_data) : 0;
+		out->operation_bytes = sizeof(ClusterCurrentMxOperationState);
+	}
+	PG_END_TRY();
+	return kind;
+}
+TransactionId
+mx_history_full_owned_xmin(void)
+{
+	Assert(full_companion_result.tuple.t_data ==
+		(HeapTupleHeader)full_companion_result.scratch_page);
+	return HeapTupleHeaderGetRawXmin(full_companion_result.tuple.t_data);
+}

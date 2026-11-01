@@ -219,6 +219,10 @@ UT_TEST(native_walkers_preserve_tid_when_no_version_is_visible)
 		walk_balanced(latest); auth_clean(s);
 	}
 }
+#ifdef HISTORY_FULL_FIXTURE
+int history_full_unused_walk_main(void);
+#define main history_full_unused_walk_main
+#endif
 int main(void)
 {
 	history_fixture_init(); UT_PLAN(8);

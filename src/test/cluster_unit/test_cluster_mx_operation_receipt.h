@@ -80,4 +80,17 @@ bool mx_receipt_retain(const ClusterCurrentMxKey *key,
 	uint64 operation_id, uint32 restarts, MxReceiptReadout *out);
 bool mx_receipt_prepare(TransactionId requester, uint64 hash,
 	const ClusterCtrcTargetV1 *target, uint16 *count);
+
+/* Directed native FULL companion readout, without exporting private heap types. */
+typedef struct MxFullReadout
+{
+	int kind;
+	bool owned, cr_full_page, cr_private_projection, projection_empty;
+	TransactionId xmin;
+	ItemPointerData tid;
+	Size operation_bytes;
+} MxFullReadout;
+extern int mx_history_full_companion(Relation rel, Buffer buffer, Snapshot actual,
+	ItemPointer tid, bool first_call, bool *all_dead, MxFullReadout *out);
+extern TransactionId mx_history_full_owned_xmin(void);
 #endif

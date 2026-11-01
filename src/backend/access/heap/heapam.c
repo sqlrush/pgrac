@@ -4666,6 +4666,11 @@ typedef struct HeapHotCurrentMxSuccessorProof
 	bool		valid;
 } HeapHotCurrentMxSuccessorProof;
 
+static bool heap_hot_current_mx_history_resolve_updater_caller(
+	Relation relation, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	TransactionId *updater, bool *restart, HeapHotCurrentMxSuccessorProof *successor,
+	ClusterCurrentMxOperationState *operation);
+
 /* Temporary PRE diagnosis; removed after the four-node witness closes. */
 static int	heap_hot_current_mx_capture_diagnostic_budget = 16;
 
@@ -6214,10 +6219,14 @@ extern bool cluster_heap_test_r4_surely_dead(HeapTuple tuple,
  * byte-for-byte compatible; this closed result domain additionally carries a
  * request-owned FULL tuple until heapam_handler.c copies it into the slot.
  */
-HeapHotSearchResultKind
-heap_hot_search_buffer_result(ItemPointer tid, Relation relation, Buffer buffer,
+static HeapHotSearchResultKind
+heap_hot_search_buffer_result_scoped(ItemPointer tid, Relation relation, Buffer buffer,
 							  Snapshot snapshot, HeapHotSearchResult *result,
-							  bool *all_dead, bool first_call)
+							  bool *all_dead, bool first_call
+#ifdef USE_PGRAC_CLUSTER
+	, bool history
+#endif
+	)
 {
 	Page		page;
 	TransactionId prev_xmax;
@@ -6232,6 +6241,7 @@ heap_hot_search_buffer_result(ItemPointer tid, Relation relation, Buffer buffer,
 	bool		r4_target_dormant = false;
 	HeapHotCurrentMxSuccessorProof current_mx_successor;
 	TimestampTz current_mx_proof_deadline = 0;
+	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
 #endif
 
 	Assert(result != NULL);
@@ -6342,6 +6352,7 @@ restart_live_search:
 					*tid = result->tuple.t_self;
 					if (all_dead)
 						*all_dead = false;
+					cluster_current_mx_operation_finish(&cluster_current_mx_operation);
 					return HEAP_HOT_SEARCH_OWNED_SCRATCH;
 				}
 				if (outcome == HEAP_HOT_R4_CYCLE_NOT_FOUND)
@@ -6355,6 +6366,7 @@ restart_live_search:
 											 : ItemPointerGetOffsetNumber(&logical_root),
 										 (Page)result->scratch_page, false,
 										 &result->visibility_trace);
+					cluster_current_mx_operation_finish(&cluster_current_mx_operation);
 					return HEAP_HOT_SEARCH_NOT_FOUND;
 				}
 
@@ -6402,6 +6414,9 @@ restart_live_search:
 					result->kind = HEAP_HOT_SEARCH_OWNED_CURRENT;
 				}
 #endif
+#ifdef USE_PGRAC_CLUSTER
+				cluster_current_mx_operation_finish(&cluster_current_mx_operation);
+#endif
 				return result->kind;
 			}
 		}
@@ -6437,10 +6452,14 @@ restart_live_search:
 			{
 				bool		restart = false;
 
-				if (!heap_hot_current_mx_resolve_updater(
+				if (!(history
+					? heap_hot_current_mx_history_resolve_updater_caller(
+						relation, buffer, &result->tuple, snapshot, &prev_xmax,
+						&restart, &current_mx_successor, &cluster_current_mx_operation)
+					: heap_hot_current_mx_resolve_updater(
 						relation, buffer, &result->tuple, &prev_xmax,
 						&restart, &current_mx_successor,
-						&current_mx_proof_deadline))
+						&current_mx_proof_deadline)))
 				{
 					Assert(restart);
 					CHECK_FOR_INTERRUPTS();
@@ -6462,7 +6481,24 @@ restart_live_search:
 		heap_hot_r4_log_miss(relation, buffer, snapshot, &logical_root, offnum, NULL,
 							 all_dead != NULL && *all_dead, NULL);
 #endif
+#ifdef USE_PGRAC_CLUSTER
+	cluster_current_mx_operation_finish(&cluster_current_mx_operation);
+#endif
 	return result->kind;
+}
+
+/* Production dispatch stays on the original path until the family is ready. */
+HeapHotSearchResultKind
+heap_hot_search_buffer_result(ItemPointer tid, Relation relation, Buffer buffer,
+							  Snapshot snapshot, HeapHotSearchResult *result,
+							  bool *all_dead, bool first_call)
+{
+	return heap_hot_search_buffer_result_scoped(tid, relation, buffer, snapshot,
+		result, all_dead, first_call
+#ifdef USE_PGRAC_CLUSTER
+		, false
+#endif
+		);
 }
 
 /*
