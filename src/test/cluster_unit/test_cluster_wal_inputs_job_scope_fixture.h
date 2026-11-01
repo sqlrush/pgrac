@@ -25,6 +25,14 @@ RecoveryInProgress(void)
 	abort();
 #endif
 }
+/* This ONLINE-only fixture cannot supply a cold recovery input owner. */
+ClusterWalReadPinOwnerV1
+ClusterColdRecoveryTxInputOwnerV1(const struct ClusterRecoveryStartV1 *start)
+{
+	(void)start;
+	abort();
+}
+
 bool
 ClusterColdRecoveryCtrcWorkCurrent(const struct ClusterRecoveryStartV1 *start,
 	const ClusterColdCtrcWorkV1 *work)

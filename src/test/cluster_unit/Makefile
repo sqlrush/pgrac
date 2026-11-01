@@ -7024,9 +7024,9 @@ test_cluster_wal_inputs_job_scope_types.inc: $(top_srcdir)/src/backend/cluster/c
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_scope_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c Makefile
-	awk '/^(inputs_prepare_budget|inputs_prepare_current|cluster_wal_inputs_scope_job_binding_v1|cluster_wal_inputs_scope_job_suspended_v1|cluster_wal_inputs_scope_job_allocate_v1|cluster_wal_inputs_scope_job_pin_slot_v1|cluster_wal_inputs_scope_job_revoke_v1|cluster_wal_inputs_scope_job_drained_v1|cluster_wal_inputs_scope_job_forget_v1|inputs_io_role|inputs_owned|inputs_scope_role|inputs_current|cluster_wal_inputs_release_v1|cluster_wal_inputs_count_v1)\(/ { print prev; emit=1; count++ } \
+	awk '/^(inputs_prepare_budget|inputs_prepare_current|cluster_wal_inputs_scope_job_binding_v1|cluster_wal_inputs_scope_job_suspended_v1|cluster_wal_inputs_scope_job_allocate_v1|cluster_wal_inputs_scope_job_pin_slot_v1|cluster_wal_inputs_scope_job_revoke_v1|cluster_wal_inputs_scope_job_drained_v1|cluster_wal_inputs_scope_job_forget_v1|inputs_io_role|inputs_owned|inputs_scope_role|inputs_pin_covers|inputs_current|cluster_wal_inputs_release_v1|cluster_wal_inputs_count_v1)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 15 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 16 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_pin: test_cluster_wal_inputs_job_pin.c test_cluster_wal_inputs_job.c \
@@ -7045,17 +7045,17 @@ test_cluster_wal_inputs_job_pin: test_cluster_wal_inputs_job_pin.c test_cluster_
 		$(CLUSTER_LMD_WAIT_STATE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_wal_inputs_job_pin_types.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
-	awk '/^#define CLUSTER_WAL_READ_PIN_MAGIC/ { print; constants++ } \
-	     /^typedef struct ClusterWalPinLock \{/ || /^struct ClusterWalReadPinV1 \{/ || /^struct ClusterWalRootPublishGuard \{/ { emit=1; types++ } \
-	     emit { print } /^};/ || /^} ClusterWalPinLock;/ { emit=0 } \
+	awk '/^#define CLUSTER_WAL_(READ_)?PIN_MAGIC/ { print; constants++ } \
+	     /^typedef enum ClusterWalPinState \{/ || /^typedef struct ClusterWalPin(Lock|Thread) \{/ || /^struct ClusterWal(RetentionPin|ReadPinV1|RootPublishGuard) \{/ { emit=1; types++ } \
+	     emit { print } /^}/ { emit=0 } \
 	     /^static .* (read_pin_generation);/ || /^static .*\*(active_pin|active_read_pin|active_root_publish_guard|active_reuse_guard|active_e1_context|active_action_context);/ { print; globals++ } \
-	     END { if (constants != 1 || types != 3 || globals != 7 || emit) exit 1 }' $< > $@.tmp
+	     END { if (constants != 2 || types != 6 || globals != 7 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_pin_bodies.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
-	awk '/^(read_pin_acquire|cluster_wal_read_pin_owner_v1|cluster_wal_read_pin_owner_current_v1|cluster_wal_retention_resid_encode|walr_request_current|walr_share_request_init|read_pin_valid|cluster_wal_read_pin_job_binding_v1|cluster_wal_read_pin_covers_v1|cluster_wal_read_pin_release_v1|cluster_wal_read_pin_acquire_v1|read_pin_job_finish_native|cluster_wal_read_pin_acquire_job_v1|read_pin_job_release|cluster_wal_read_pin_release_job_v1|cluster_wal_read_pin_suspend_job_v1|cluster_wal_read_pin_release_job_poll_v1|read_pin_job_owner_cleanup)\(/ { print prev; emit=1; count++ } \
+	awk '/^(pin_valid|pin_walr_for_thread|pin_readers_current|root_publish_member|pin_thread_walr_current|pin_post_ir_current|cluster_wal_read_pin_owner_covers_v1|read_pin_acquire|cluster_wal_read_pin_owner_v1|cluster_wal_read_pin_owner_current_v1|cluster_wal_retention_resid_encode|walr_request_current|walr_share_request_init|read_pin_valid|cluster_wal_read_pin_job_binding_v1|cluster_wal_read_pin_covers_v1|cluster_wal_read_pin_release_v1|cluster_wal_read_pin_acquire_v1|read_pin_job_finish_native|cluster_wal_read_pin_acquire_job_v1|read_pin_job_release|cluster_wal_read_pin_release_job_v1|cluster_wal_read_pin_suspend_job_v1|cluster_wal_read_pin_release_job_poll_v1|read_pin_job_owner_cleanup)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 18 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 25 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_inputs_job_callback.inc: $(top_srcdir)/src/backend/utils/resowner/resowner.c Makefile
