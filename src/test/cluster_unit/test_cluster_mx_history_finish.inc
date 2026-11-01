@@ -9,7 +9,7 @@ static unsigned finish_requests, finish_reads, finish_cancels;
 static bool finish_pending;
 static TransactionId finish_top;
 static ClusterTxOutcome finish_outcome;
-static bool finish_all_discarded;
+static bool finish_all_discarded, finish_successor_in_graph, finish_successor_fxid_drift;
 
 static uint32
 finish_crc(const void *data, size_t n)
@@ -63,9 +63,10 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	if (finish_pending)
 		return CMXH_PENDING;
 	if (!cluster_mx_history_request_decode(wire, sizeof(*wire), cluster_node_id, 0, 7, &r)
-		|| !uba_decode_record(r.locator.uba, &segment, &block, &tt, &row) || block < 7 || block > 8)
+		|| !uba_decode_record(r.locator.uba, &segment, &block, &tt, &row)
+		|| ((block < 7 || block > 8) && !(finish_successor_in_graph && block == 6)))
 		return CMXH_UNKNOWN;
-	index = block - 7;
+	index = block == 6 ? 2 : block - 7;
 	finish_reads++;
 	bh.magic = PGRAC_UNDO_BLOCK_MAGIC;
 	bh.block_version = UNDO_BLOCK_VERSION_1;
@@ -74,30 +75,39 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	h.record_type = UNDO_RECORD_INSERT;
 	h.flags
 		= UNDO_REC_FLAG_HAS_ITL_HISTORY | UNDO_REC_FLAG_HAS_OPERATION | UNDO_REC_FLAG_FIRST_IN_TX;
-	h.xid = members[index].xid;
+	h.xid = members[index == 2 ? 0 : index].xid;
+	if (finish_successor_in_graph && index == 0) {
+		h.flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+		h.prev_uba = uba_encode(1, 6, 3, 0);
+	}
 	h.origin_node_id = 0;
 	h.tt_slot_segment_id = 1;
 	h.tt_slot_id = 4;
 	h.tt_wrap_plus1 = 1;
-	h.write_scn = 80 + index;
+	h.write_scn = index == 2 ? 79 : 80 + index;
 	h.target_locator = r.target_locator;
 	h.target_fork = r.target_fork;
 	h.target_block = r.target_block;
 	h.target_offset = r.target_offset;
+	if (index == 2)
+		h.target_block++; /* B may create a successor on another heap page. */
 	history.magic = UNDO_ITL_HISTORY_MAGIC;
 	history.version = UNDO_ITL_HISTORY_VERSION;
 	history.count = 1;
-	history.entries[0] = (UndoItlHistoryEntry){ .block = r.target_block,
+	history.entries[0] = (UndoItlHistoryEntry){ .block = h.target_block,
 												.slot_index = index,
 												.after_kind = ITL_FLAG_ACTIVE,
 												.after_write_scn = h.write_scn };
 	op.version = UNDO_OPERATION_TRAILER_VERSION;
 	op.length = sizeof(op);
 	op.effect_state = index || finish_all_discarded ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED
-													  : CLUSTER_SAVEPOINT_EFFECT_LIVE;
-	op.canonical_top_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, finish_top));
+													: CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	op.canonical_top_fxid
+		= U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, finish_top));
 	op.operation_fxid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, h.xid));
-	op.operation_sequence = index + 1;
+	op.operation_sequence = finish_successor_in_graph ? (index == 2 ? 1 : index + 2) : index + 1;
+	if (index == 2 && finish_successor_fxid_drift)
+		op.operation_fxid += UINT64CONST(1) << 32;
 	op.command_id = 4;
 	op.subid = 3;
 	body = (char *)out->data + sizeof(bh) + sizeof(h);
@@ -121,12 +131,14 @@ finish_landing_input(const ClusterMxHistoryRequestWire *wire, ClusterMxHistoryPe
 	peer.canonical = (ClusterTTSlotPhysicalLocator){ 1, finish_top, 3, 0, 0 };
 	peer.top_fxid = FullTransactionIdFromU64(op.canonical_top_fxid);
 	peer.operation_fxid = FullTransactionIdFromU64(op.operation_fxid);
-	peer.operation_sequence = index + 1;
+	peer.operation_sequence = op.operation_sequence;
+	peer.previous = h.prev_uba;
 	peer.record = r.locator.uba;
 	peer.data_crc = finish_crc(out->data, BLCKSZ);
 	peer.data_lsn = bh.block_lsn;
 	peer.commit_scn = finish_outcome == CLUSTER_TX_COMMITTED ? 90 : InvalidScn;
-	if (finish_outcome == CLUSTER_TX_IN_PROGRESS && op.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE) {
+	if (finish_outcome == CLUSTER_TX_IN_PROGRESS
+		&& op.effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE) {
 		peer.flags |= CLUSTER_MX_HISTORY_HAS_GRANT;
 		peer.ctrc_grant = 47;
 	}
@@ -165,6 +177,7 @@ finish_sources(void)
 	finish_top = 100;
 	finish_outcome = CLUSTER_TX_COMMITTED;
 	finish_all_discarded = false;
+	finish_successor_in_graph = finish_successor_fxid_drift = false;
 	memset(finish_keys, 0xa5, sizeof(finish_keys));
 	memset(finish_proofs, 0xa5, sizeof(finish_proofs));
 }
@@ -462,4 +475,347 @@ finish_read_image_requires_new_bracket(void)
 			finish_unknown(2);
 		clean(c, s);
 	}
+}
+
+
+static ClusterCurrentUpdaterChallenge
+updater_challenge(unsigned block)
+{
+	ClusterCurrentUpdaterChallenge c = { 0 };
+	c.updater_xid = members[0].xid;
+	c.candidate_next_xmin_alias = (ClusterCurrentMxSuccessorAlias){ .origin_node_id = 0,
+																	.undo_record_segment_id = 1,
+																	.tt_slot_id = 4,
+																	.cluster_epoch = 7,
+																	.local_xid = c.updater_xid };
+	c.candidate_next_xmin_locator = (ClusterTxLocator){ .uba = uba_encode(1, block, 3, 0),
+														.xid = c.updater_xid,
+														.tt_wrap = TT_WRAP_INVALID,
+														.itl_kind = ITL_FLAG_ACTIVE,
+														.itl_slot_index = 0 };
+	return c;
+}
+static bool
+updater_begin(Snapshot s, const ClusterCurrentUpdaterChallenge *challenge,
+			  ClusterMxHistoryCollector **c)
+{
+	members[0].member_status = MultiXactStatusNoKeyUpdate;
+	return cluster_mx_history_capture_begin_with_updater(&relation, 1, &tuple, s, &mxkey, members,
+														 2, &admission, challenge, c);
+}
+static ClusterMxHistoryStep
+updater_deliver(ClusterMxHistoryCollector *c, const ClusterCurrentUpdaterChallenge *challenge,
+				ClusterCurrentUpdaterProof *proof)
+{
+	content_locked = true;
+	return cluster_mx_history_recheck_and_finish_with_updater(c, &relation, 1, &tuple, &mxkey,
+															  members, 2, finish_keys,
+															  finish_proofs, 2, challenge, proof);
+}
+static void
+updater_graph_proof_reused_and_delivered_once(void)
+{
+	Snapshot s = setup();
+	ClusterMxHistoryCollector *c = NULL;
+	ClusterCurrentUpdaterChallenge challenge = updater_challenge(7);
+	ClusterCurrentUpdaterProof proof;
+	finish_sources();
+	UT_ASSERT(updater_begin(s, &challenge, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	UT_ASSERT_EQ(updater_deliver(c, &challenge, &proof), CMXH_COMPLETE);
+	UT_ASSERT_EQ(proof.verdict, CUCP_MATCH);
+	UT_ASSERT_EQ(proof.candidate_next_xmin_locator.tt_wrap, 0);
+	UT_ASSERT_EQ(proof.updater_xid, 101);
+	UT_ASSERT_EQ(finish_proofs[0].base.member_xid, 101);
+	UT_ASSERT_EQ(finish_reads, 2);
+	UT_ASSERT_EQ(remembered, 2);
+	UT_ASSERT_EQ(updater_deliver(c, &challenge, &proof), CMXH_UNKNOWN);
+	UT_ASSERT_EQ(proof.verdict, CUCP_UNKNOWN);
+	finish_unknown(2);
+	clean(c, s);
+	members[0].member_status = MultiXactStatusForShare;
+}
+static void
+updater_legacy_finish_cannot_drop_required_B(void)
+{
+	Snapshot s = setup();
+	ClusterMxHistoryCollector *c = NULL;
+	ClusterCurrentUpdaterChallenge challenge = updater_challenge(7);
+	finish_sources();
+	UT_ASSERT(updater_begin(s, &challenge, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	UT_ASSERT_EQ(finish_deliver(c, 2), CMXH_UNKNOWN);
+	finish_unknown(2);
+	UT_ASSERT_EQ(remembered, 1);
+	clean(c, s);
+	members[0].member_status = MultiXactStatusForShare;
+}
+static void
+updater_finish_rechecks_challenge(void)
+{
+	Snapshot s = setup();
+	ClusterMxHistoryCollector *c = NULL;
+	ClusterCurrentUpdaterChallenge challenge = updater_challenge(7), fresh;
+	ClusterCurrentUpdaterProof proof;
+	finish_sources();
+	UT_ASSERT(updater_begin(s, &challenge, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	fresh = challenge;
+	fresh.candidate_next_xmin_locator.uba = uba_encode(1, 9, 3, 0);
+	UT_ASSERT_EQ(updater_deliver(c, &fresh, &proof), CMXH_REQUALIFY);
+	UT_ASSERT_EQ(proof.verdict, CUCP_UNKNOWN);
+	finish_unknown(2);
+	UT_ASSERT_EQ(remembered, 1);
+	clean(c, s);
+	members[0].member_status = MultiXactStatusForShare;
+}
+static void
+updater_found_wrong_writer_is_unknown_without_retry(void)
+{
+	Snapshot s = setup();
+	ClusterMxHistoryCollector *c = NULL;
+	ClusterCurrentUpdaterChallenge challenge = updater_challenge(8);
+	ClusterCurrentUpdaterProof proof;
+	finish_sources();
+	UT_ASSERT(updater_begin(s, &challenge, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_UNKNOWN);
+	UT_ASSERT_EQ(updater_deliver(c, &challenge, &proof), CMXH_UNKNOWN);
+	UT_ASSERT_EQ(proof.verdict, CUCP_UNKNOWN);
+	UT_ASSERT_EQ(remembered, 1);
+	clean(c, s);
+	members[0].member_status = MultiXactStatusForShare;
+}
+
+
+/* Controlled external B landing; real request and reply codecs remain in
+ * the path. This is not an origin TT/CTRC or transport witness. */
+static unsigned updater_fetches, updater_fault;
+#ifndef HISTORY_ROUNDTRIP_FIXTURE
+void
+cluster_xid_stripe_lazy_latch(void)
+{
+	abort();
+}
+#endif
+ClusterMxResolveResult
+cluster_gcs_current_mx_operation_proof_fetch_and_wait(int32 origin,
+													  ClusterCurrentMxOperationForwardV6 *request,
+													  ClusterCurrentMemberOperationProof *proofs,
+													  uint16 capacity, uint16 *count,
+													  ClusterCurrentUpdaterProof *updater,
+													  uint32 *capability, TimestampTz deadline)
+{
+	ClusterCurrentMxOperationForwardV6 decoded;
+	ClusterCurrentMxOperationAsk ask;
+	ClusterCurrentMxUpdaterChallengeWire challenge;
+	ClusterCurrentMxOperationReplyPageV6 page;
+	ClusterCurrentMemberOperationProof peer = { 0 };
+	ClusterCurrentUpdaterProof b = { 0 };
+	ClusterMxResolveResult result;
+	updater_fetches++;
+	UT_ASSERT(!content_locked && CritSectionCount == 0);
+	UT_ASSERT_EQ(remembered, 2);
+	UT_ASSERT_EQ(finish_reads, 2); /* A already complete; never repeat it. */
+	if (!cluster_multixact_operation_wire_validate_forward(request, sizeof(*request),
+														   cluster_node_id, origin, 7, &decoded)
+		|| !cluster_multixact_operation_wire_get_ask(&decoded, 0, &ask))
+		return CMX_RESOLVE_UNKNOWN;
+	UT_ASSERT(!ask.exact);
+	UT_ASSERT_EQ(decoded.prefix.body_kind, CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE);
+	memcpy(&challenge, decoded.body, sizeof(challenge));
+	peer.format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
+	peer.base.member_xid = challenge.updater_xid;
+	peer.base.member_status = challenge.member_status;
+	peer.base.member_ordinal = challenge.member_ordinal;
+	peer.base.state = CCM_COMMITTED;
+	peer.base.commit_scn = 90;
+	b.mxkey = decoded.prefix.mxkey;
+	b.candidate_next_xmin_alias = challenge.candidate_next_xmin_alias;
+	b.candidate_next_xmin_locator = challenge.candidate_next_xmin_locator;
+	b.candidate_next_xmin_locator.tt_wrap = 0;
+	b.updater_xid = challenge.updater_xid;
+	b.member_ordinal = challenge.member_ordinal;
+	b.verdict = updater_fault == 2 ? CUCP_MISMATCH : CUCP_MATCH;
+	if (updater_fault == 1)
+		return CMX_RESOLVE_UNKNOWN;
+	if (updater_fault == 3)
+		pg_atomic_write_u32(&history_gate.transition_closed, 1);
+	if (updater_fault == 4)
+		pg_re_throw();
+	if (!cluster_multixact_operation_wire_encode_reply(&decoded, origin, 7, CMX_RESOLVE_OK, &peer,
+													   1, &b, 12, &page)
+		|| !cluster_multixact_operation_wire_validate_reply(&page, sizeof(page), origin, 7, request,
+															&result, proofs, capacity, count,
+															updater, capability))
+		return CMX_RESOLVE_UNKNOWN;
+	if (updater_fault == 5)
+		updater->updater_xid++;
+	if (updater_fault == 6)
+		*capability = 0;
+	return result;
+}
+static Snapshot
+updater_remote_setup(ClusterCurrentUpdaterChallenge *challenge)
+{
+	Snapshot s = setup();
+	finish_sources();
+	vacuum_next_xid = U64FromFullTransactionId(FullTransactionIdFromEpochAndXid(1, 256));
+	cluster_xid_stripe_latch_runtime(true, cluster_node_id, FullTransactionIdFromEpochAndXid(1, 3));
+	members[0].xid = 96;
+	members[1].xid = 112;
+	finish_top = 80;
+	for (unsigned i = 0; i < 2; ++i)
+		ClusterPageGetItlSlots(BufferBlocks)[i].xid = finish_top;
+	*challenge = updater_challenge(9); /* B is outside the retained A graph. */
+	updater_fetches = updater_fault = 0;
+	return s;
+}
+static void
+updater_missing_B_uses_original_provenance_once(void)
+{
+	ClusterCurrentUpdaterChallenge challenge;
+	Snapshot s = updater_remote_setup(&challenge);
+	ClusterMxHistoryCollector *c = NULL;
+	ClusterCurrentUpdaterProof proof;
+	UT_ASSERT(updater_begin(s, &challenge, &c));
+	UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+	UT_ASSERT_EQ(cluster_mx_history_poll(c), CMXH_COMPLETE);
+	UT_ASSERT_EQ(updater_fetches, 1);
+	UT_ASSERT_EQ(updater_deliver(c, &challenge, &proof), CMXH_COMPLETE);
+	UT_ASSERT_EQ(proof.verdict, CUCP_MATCH);
+	UT_ASSERT_EQ(finish_reads, 2);
+	clean(c, s);
+	members[0] = (ClusterCurrentMxMemberDesc){ 101, MultiXactStatusForShare, { 0 } };
+	members[1].xid = 102;
+}
+static void
+updater_missing_B_failure_cancels_whole_attempt(void)
+{
+	for (unsigned fault = 1; fault <= 6; ++fault) {
+		ClusterCurrentUpdaterChallenge challenge;
+		Snapshot s = updater_remote_setup(&challenge);
+		ClusterMxHistoryCollector *c = NULL;
+		ClusterCurrentUpdaterProof proof;
+		volatile bool caught = false;
+		updater_fault = fault;
+		UT_ASSERT(updater_begin(s, &challenge, &c));
+		PG_TRY();
+		{
+			UT_ASSERT_EQ(finish_ready(c, false), CMXH_UNKNOWN);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 4);
+		UT_ASSERT_EQ(updater_fetches, 1);
+		UT_ASSERT_EQ(updater_deliver(c, &challenge, &proof), CMXH_UNKNOWN);
+		UT_ASSERT_EQ(proof.verdict, CUCP_UNKNOWN);
+		finish_unknown(2);
+		UT_ASSERT_EQ(remembered, 1);
+		clean(c, s);
+	}
+	members[0] = (ClusterCurrentMxMemberDesc){ 101, MultiXactStatusForShare, { 0 } };
+	members[1].xid = 102;
+}
+
+static void
+updater_reuses_distinct_B_page_and_checks_full_xid(void)
+{
+	for (unsigned drift = 0; drift < 2; ++drift) {
+		Snapshot s = setup();
+		ClusterMxHistoryCollector *c = NULL;
+		ClusterCurrentUpdaterChallenge challenge = updater_challenge(6);
+		ClusterCurrentUpdaterProof proof;
+		finish_sources();
+		updater_fetches = 0;
+		finish_successor_in_graph = true;
+		finish_successor_fxid_drift = drift;
+		UT_ASSERT(updater_begin(s, &challenge, &c));
+		UT_ASSERT_EQ(finish_ready(c, false), drift ? CMXH_UNKNOWN : CMXH_COMPLETE);
+		UT_ASSERT_EQ(updater_deliver(c, &challenge, &proof), drift ? CMXH_UNKNOWN : CMXH_COMPLETE);
+		UT_ASSERT_EQ(proof.verdict, drift ? CUCP_UNKNOWN : CUCP_MATCH);
+		UT_ASSERT_EQ(finish_reads, 3);
+		UT_ASSERT_EQ(updater_fetches, 0);
+		UT_ASSERT_EQ(remembered, drift ? 1 : 2);
+		clean(c, s);
+	}
+	members[0].member_status = MultiXactStatusForShare;
+}
+static void
+updater_graph_reuse_preserves_A_outcome_and_effect(void)
+{
+	ClusterTxOutcome outcomes[]
+		= { CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_COMMITTED, CLUSTER_TX_ABORTED };
+	for (unsigned state = 0; state < lengthof(outcomes); ++state)
+		for (unsigned discarded = 0; discarded < 2; ++discarded) {
+			Snapshot s = setup();
+			ClusterMxHistoryCollector *c = NULL;
+			ClusterCurrentUpdaterChallenge challenge = updater_challenge(7);
+			ClusterCurrentUpdaterProof proof;
+			finish_sources();
+			finish_outcome = outcomes[state];
+			finish_all_discarded = discarded;
+			UT_ASSERT(updater_begin(s, &challenge, &c));
+			UT_ASSERT_EQ(finish_ready(c, false), CMXH_COMPLETE);
+			UT_ASSERT_EQ(updater_deliver(c, &challenge, &proof), CMXH_COMPLETE);
+			UT_ASSERT_EQ(proof.verdict, CUCP_MATCH);
+			UT_ASSERT_EQ(finish_proofs[0].effect_state, discarded
+															? CLUSTER_SAVEPOINT_EFFECT_DISCARDED
+															: CLUSTER_SAVEPOINT_EFFECT_LIVE);
+			UT_ASSERT_EQ(finish_proofs[0].base.state, state == 0   ? CCM_ACTIVE
+													  : state == 1 ? CCM_COMMITTED
+																   : CCM_ABORTED);
+			UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&finish_proofs[0].base),
+						 state == 0 && !discarded ? 47 : 0);
+			clean(c, s);
+		}
+	members[0].member_status = MultiXactStatusForShare;
+}
+static void
+updater_bad_capture_and_unfinished_attempt_refused(void)
+{
+	for (unsigned fault = 0; fault < 7; ++fault) {
+		Snapshot s = setup();
+		ClusterMxHistoryCollector *c = NULL;
+		ClusterCurrentUpdaterChallenge challenge = updater_challenge(7);
+		ClusterCurrentUpdaterProof proof;
+		finish_sources();
+		members[0].member_status = MultiXactStatusNoKeyUpdate;
+		switch (fault) {
+		case 0:
+			challenge.reserved16++;
+			break;
+		case 1:
+			challenge.member_ordinal = 2;
+			break;
+		case 2:
+			challenge.updater_xid++;
+			break;
+		case 3:
+			challenge.candidate_next_xmin_alias.reserved32++;
+			break;
+		case 4:
+			challenge.candidate_next_xmin_locator.tt_wrap = 0;
+			break;
+		case 5:
+			members[0].member_status = MultiXactStatusForShare;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_mx_history_capture_begin_with_updater(
+						 &relation, 1, &tuple, s, &mxkey, members, 2, &admission, &challenge, &c),
+					 fault == 6);
+		if (fault == 6) {
+			UT_ASSERT_EQ(finish_ready(c, true), CMXH_COMPLETE);
+			UT_ASSERT_EQ(updater_deliver(c, &challenge, &proof), CMXH_PENDING);
+			UT_ASSERT_EQ(proof.verdict, CUCP_UNKNOWN);
+			finish_unknown(2);
+		} else {
+			UT_ASSERT(c == NULL);
+			UT_ASSERT_EQ(remembered, 1);
+		}
+		clean(c, s);
+	}
+	members[0].member_status = MultiXactStatusForShare;
 }

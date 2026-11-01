@@ -9,6 +9,9 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xact.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_multixact_operation_wire.h"
+#include "storage/backendid.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_tt_local.h"
 #include "miscadmin.h"
@@ -22,7 +25,8 @@ typedef struct HistoryCollectorDriver {
 	ClusterMxHistoryRequestWire request;
 	ClusterSavepointOperationKey *keys;
 	ClusterCurrentMemberOperationProof *proofs;
-	bool prepared, submitted, complete, members_ready, members_delivered;
+	ClusterCurrentUpdaterProof updater;
+	bool prepared, submitted, complete, members_ready, updater_ready, members_delivered;
 } HistoryCollectorDriver;
 
 struct ClusterMxHistoryCollector {
@@ -30,6 +34,8 @@ struct ClusterMxHistoryCollector {
 	Snapshot snapshot;
 	ClusterMxHistoryCapture *capture;
 	HistoryCollectorDriver *driver;
+	ClusterCurrentUpdaterChallenge challenge;
+	bool has_updater;
 };
 static ClusterMxHistoryCollector *active_collector;
 static uint64 collector_serial;
@@ -447,6 +453,78 @@ cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *collector, R
 	*out = collector->driver->graph;
 	return true;
 }
+
+/* A is already staged. An absent B uses only the original updater provenance
+ * FSM, via a top-only V6 challenge. In particular, do not attach A's exact key
+ * here and accidentally run its three phases a second time. The original
+ * outstanding slot owns cancellation and the event-driven backend wait. */
+static bool
+history_updater_fetch(ClusterMxHistoryCollector *collector)
+{
+	ClusterMxHistoryCapture capture;
+	ClusterCurrentMxProofForwardV2 semantic = { 0 };
+	ClusterCurrentMxOperationForwardV6 request;
+	ClusterCurrentMemberOperationProof redundant;
+	ClusterCurrentUpdaterProof b;
+	ClusterCurrentMxUpdaterChallengeWire *wire = &semantic.trailer.body.updater.challenge;
+	const ClusterCurrentUpdaterChallenge *challenge = &collector->challenge;
+	uint16 count = 0;
+	uint32 capability = 0;
+	uint16 origin = challenge->candidate_next_xmin_alias.origin_node_id;
+	volatile bool valid = false;
+
+	if (!cluster_mx_history_capture_read(collector, &capture) || origin == cluster_node_id)
+		return false;
+	semantic.prefix.request_id = capture.collector_id;
+	semantic.prefix.epoch = capture.read_epoch;
+	semantic.prefix.mxkey = capture.mxkey;
+	semantic.prefix.original_requester_node = cluster_node_id;
+	semantic.prefix.requester_backend_id = MyBackendId;
+	semantic.prefix.total_count = capture.nmembers;
+	semantic.prefix.entry_count = 1;
+	semantic.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE;
+	semantic.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	ClusterCurrentMxProofPrefixSetDescriptorHash(&semantic.prefix, capture.descriptor_hash);
+	semantic.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	semantic.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	wire->candidate_next_xmin_alias = challenge->candidate_next_xmin_alias;
+	wire->candidate_next_xmin_locator = challenge->candidate_next_xmin_locator;
+	wire->updater_xid = challenge->updater_xid;
+	wire->member_ordinal = challenge->member_ordinal;
+	wire->member_status = capture.members[challenge->member_ordinal].member_status;
+	if (!cluster_multixact_operation_wire_upgrade_top_request(&semantic, cluster_node_id, origin,
+															  capture.read_epoch, &request))
+		return false;
+	memset(&b, 0, sizeof(b));
+	b.verdict = CUCP_UNKNOWN;
+	PG_TRY();
+	{
+		valid = cluster_gcs_current_mx_operation_proof_fetch_and_wait(origin, &request, &redundant,
+																	  1, &count, &b, &capability, 0)
+				== CMX_RESOLVE_OK;
+	}
+	PG_CATCH();
+	{
+		/* Release the whole attempt after the original transport has released
+		 * its outstanding slot; native Snapshot retention is dropped last. */
+		cluster_mx_history_cancel(collector);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!valid || count != 1 || capability == 0 || b.verdict != CUCP_MATCH || b.reserved8 != 0
+		|| memcmp(&b.mxkey, &capture.mxkey, sizeof(b.mxkey)) != 0
+		|| b.updater_xid != challenge->updater_xid || b.member_ordinal != challenge->member_ordinal
+		|| memcmp(&b.candidate_next_xmin_alias, &challenge->candidate_next_xmin_alias,
+				  sizeof(b.candidate_next_xmin_alias))
+			   != 0
+		|| !cluster_tx_locator_reply_matches(&challenge->candidate_next_xmin_locator,
+											 &b.candidate_next_xmin_locator)
+		|| !cluster_mx_history_capture_read(collector, &capture))
+		return false;
+	collector->driver->updater = b;
+	return true;
+}
+
 ClusterMxHistoryStep
 cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
 {
@@ -470,6 +548,17 @@ cluster_mx_history_poll(ClusterMxHistoryCollector *collector)
 	if (!cluster_mx_history_assemble_members(collector->capture, driver->graph, driver->keys,
 											 driver->proofs, n))
 		goto failed;
+	if (collector->has_updater) {
+		step
+			= cluster_mx_history_assemble_updater(collector->capture, driver->graph, driver->proofs,
+												  &collector->challenge, &driver->updater);
+		if (step == CMXH_PENDING) {
+			if (!history_updater_fetch(collector))
+				goto failed;
+		} else if (step != CMXH_COMPLETE)
+			goto failed;
+		driver->updater_ready = true;
+	}
 	driver->members_ready = true;
 	return CMXH_COMPLETE;
 failed:
@@ -494,17 +583,21 @@ history_finish_unknown(ClusterSavepointOperationKey *keys,
 	}
 }
 
-ClusterMxHistoryStep
-cluster_mx_history_recheck_and_finish(ClusterMxHistoryCollector *collector, Relation rel,
-									  Buffer buffer, HeapTuple tuple,
-									  const ClusterCurrentMxKey *mxkey,
-									  const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
-									  ClusterSavepointOperationKey *keys,
-									  ClusterCurrentMemberOperationProof *proofs, uint16 capacity)
+static ClusterMxHistoryStep
+history_finish(ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer, HeapTuple tuple,
+			   const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members,
+			   uint16 nmembers, ClusterSavepointOperationKey *keys,
+			   ClusterCurrentMemberOperationProof *proofs, uint16 capacity,
+			   const ClusterCurrentUpdaterChallenge *fresh_challenge,
+			   ClusterCurrentUpdaterProof *updater)
 {
 	HistoryCollectorDriver *driver;
 	uint16 n;
 
+	if (updater != NULL) {
+		memset(updater, 0, sizeof(*updater));
+		updater->verdict = CUCP_UNKNOWN;
+	}
 	history_finish_unknown(keys, proofs, capacity);
 	if (collector == NULL || collector->capture == NULL)
 		return CMXH_UNKNOWN;
@@ -513,17 +606,28 @@ cluster_mx_history_recheck_and_finish(ClusterMxHistoryCollector *collector, Rela
 		return CMXH_UNKNOWN;
 	n = collector->capture->nmembers;
 	if (CritSectionCount != 0 || capacity > CLUSTER_CURRENT_MX_MAX_MEMBERS || capacity < n
-		|| keys == NULL || proofs == NULL) {
+		|| keys == NULL || proofs == NULL
+		|| (collector->has_updater && (updater == NULL || fresh_challenge == NULL))
+		|| (!collector->has_updater && fresh_challenge != NULL)) {
 		cluster_mx_history_cancel(collector);
 		return CMXH_UNKNOWN;
 	}
-	if (driver == NULL || !driver->members_ready)
+	if (collector->has_updater
+		&& memcmp(fresh_challenge, &collector->challenge, sizeof(*fresh_challenge)) != 0) {
+		cluster_mx_history_cancel(collector);
+		return CMXH_REQUALIFY;
+	}
+	if (driver == NULL || !driver->members_ready
+		|| (collector->has_updater && !driver->updater_ready))
 		return CMXH_PENDING;
 	if (!cluster_mx_history_capture_recheck(collector, rel, buffer, tuple, mxkey, members,
 											nmembers))
 		return CMXH_REQUALIFY;
 	memcpy(keys, driver->keys, n * sizeof(*keys));
 	memcpy(proofs, driver->proofs, n * sizeof(*proofs));
+	if (collector->has_updater)
+		*updater = driver->updater;
+	memset(&driver->updater, 0, sizeof(driver->updater));
 	driver->members_delivered = true;
 	driver->members_ready = false;
 	cluster_mx_history_graph_destroy(driver->graph);
@@ -534,5 +638,56 @@ cluster_mx_history_recheck_and_finish(ClusterMxHistoryCollector *collector, Rela
 	/* Keep capture/Snapshot until the last consumer calls cancel. Even an
 	 * otherwise unregistered Snapshot may have this sole native reference. */
 	return CMXH_COMPLETE;
+}
+
+bool
+cluster_mx_history_capture_begin_with_updater(Relation rel, Buffer buffer, HeapTuple tuple,
+											  Snapshot actual, const ClusterCurrentMxKey *mxkey,
+											  const ClusterCurrentMxMemberDesc *members,
+											  uint16 nmembers,
+											  const ClusterSemanticAdmissionToken *admission,
+											  const ClusterCurrentUpdaterChallenge *challenge,
+											  ClusterMxHistoryCollector **out)
+{
+	if (out == NULL)
+		return false;
+	*out = NULL;
+	if (challenge == NULL || challenge->reserved16 != 0 || members == NULL || admission == NULL
+		|| challenge->member_ordinal >= nmembers || nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS
+		|| !ISUPDATE_from_mxstatus(members[challenge->member_ordinal].member_status)
+		|| members[challenge->member_ordinal].xid != challenge->updater_xid
+		|| !cluster_multixact_current_successor_provenance_well_formed(
+			&challenge->candidate_next_xmin_alias, &challenge->candidate_next_xmin_locator,
+			challenge->updater_xid, challenge->candidate_next_xmin_alias.origin_node_id,
+			admission->formation_epoch)
+		|| !cluster_mx_history_capture_begin(rel, buffer, tuple, actual, mxkey, members, nmembers,
+											 admission, out))
+		return false;
+	(*out)->has_updater = true;
+	(*out)->challenge = *challenge;
+	return true;
+}
+
+ClusterMxHistoryStep
+cluster_mx_history_recheck_and_finish(ClusterMxHistoryCollector *collector, Relation rel,
+									  Buffer buffer, HeapTuple tuple,
+									  const ClusterCurrentMxKey *mxkey,
+									  const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+									  ClusterSavepointOperationKey *keys,
+									  ClusterCurrentMemberOperationProof *proofs, uint16 capacity)
+{
+	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
+						  capacity, NULL, NULL);
+}
+
+ClusterMxHistoryStep
+cluster_mx_history_recheck_and_finish_with_updater(
+	ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer, HeapTuple tuple,
+	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs, uint16 capacity,
+	const ClusterCurrentUpdaterChallenge *fresh_challenge, ClusterCurrentUpdaterProof *updater)
+{
+	return history_finish(collector, rel, buffer, tuple, mxkey, members, nmembers, keys, proofs,
+						  capacity, fresh_challenge, updater);
 }
 #endif

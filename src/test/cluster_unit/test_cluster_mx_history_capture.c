@@ -10,6 +10,9 @@ int snapshot_fixture_unused_main(void);
 #include "storage/backendid.h"
 #include "cluster/cluster_tt_local.h"
 #include "storage/ipc.h"
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_multixact_operation_wire.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "test_cluster_active_sample_types.inc"
 
 /* Transport is normally unavailable. New delivery tests control the external
@@ -775,7 +778,7 @@ int
 main(void)
 {
 	history_fixture_init();
-	UT_PLAN(29);
+	UT_PLAN(38);
 	UT_RUN(real_capture_and_relock);
 	UT_RUN(snapshot_own_reference_keeps_original_floor);
 	UT_RUN(original_scope_restored_and_older_floor_preserved);
@@ -805,6 +808,15 @@ main(void)
 	UT_RUN(member_transport_pending_and_cancel_order);
 	UT_RUN(finish_capacity_boundaries);
 	UT_RUN(finish_read_image_requires_new_bracket);
+	UT_RUN(updater_graph_proof_reused_and_delivered_once);
+	UT_RUN(updater_legacy_finish_cannot_drop_required_B);
+	UT_RUN(updater_finish_rechecks_challenge);
+	UT_RUN(updater_found_wrong_writer_is_unknown_without_retry);
+	UT_RUN(updater_missing_B_uses_original_provenance_once);
+	UT_RUN(updater_missing_B_failure_cancels_whole_attempt);
+	UT_RUN(updater_reuses_distinct_B_page_and_checks_full_xid);
+	UT_RUN(updater_graph_reuse_preserves_A_outcome_and_effect);
+	UT_RUN(updater_bad_capture_and_unfinished_attempt_refused);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

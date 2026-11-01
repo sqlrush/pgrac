@@ -13391,6 +13391,16 @@ test_cluster_mx_history_backend test_cluster_mx_history_gcs: %: %.c \
         $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
         $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Collector qualification includes the dormant original B carrier and graph assembler.
+$(top_builddir)/src/backend/cluster/cluster_mx_history.o: \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history.h \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
+        $(top_srcdir)/src/include/cluster/cluster_multixact_operation_wire.h \
+        $(top_srcdir)/src/include/cluster/cluster_cr_server.h
+$(top_builddir)/src/backend/cluster/cluster_mx_history_member.o: \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history.h \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h
+
 # Actual snapshot retention and exact capture lifecycle.
 TESTS += test_cluster_mx_history_capture
 all: test_cluster_mx_history_capture
@@ -13403,7 +13413,7 @@ test_cluster_mx_history_admission.inc: $(top_srcdir)/src/backend/cluster/cluster
 test_cluster_mx_history_capture: test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
 		test_cluster_mx_history_finish.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
 		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
-		test_cluster_mx_history_admission.inc $(CLUSTER_MULTIXACT_CURRENT_O) \
+		test_cluster_mx_history_admission.inc $(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(top_srcdir)/src/include/cluster/cluster_mx_history.h \
 		$(top_builddir)/src/backend/cluster/cluster_mx_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_mx_history_graph.o \
@@ -13427,7 +13437,7 @@ test_cluster_mx_history_capture: test_cluster_mx_history_capture.c test_cluster_
 		$(top_builddir)/src/backend/lib/pairingheap.o $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
 		$(top_builddir)/src/common/psprintf_srv.o \
-		$(CLUSTER_MULTIXACT_CURRENT_O) $(top_builddir)/src/backend/cluster/cluster_mx_history.o \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) $(top_builddir)/src/backend/cluster/cluster_mx_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_mx_history_graph.o \
 		$(top_builddir)/src/backend/cluster/cluster_mx_history_member.o \
 		$(CLUSTER_CR_APPLY_O) $(CLUSTER_SAVEPOINT_READER_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \

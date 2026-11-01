@@ -335,4 +335,88 @@ done:
 		history_members_reset(keys, proofs, capacity);
 	return ok;
 }
+
+/* Reuse an original ordered peer proof, not a raw writer/echo. The successor
+ * may be on another heap page, so B need not match A's target tuple. */
+ClusterMxHistoryStep
+cluster_mx_history_assemble_updater(const ClusterMxHistoryCapture *c,
+									const ClusterMxHistoryGraph *g,
+									const ClusterCurrentMemberOperationProof *proofs,
+									const ClusterCurrentUpdaterChallenge *challenge,
+									ClusterCurrentUpdaterProof *out)
+{
+	const ClusterCurrentMemberOperationProof *a;
+	uint16 ordinal;
+	if (out == NULL)
+		return CMXH_UNKNOWN;
+	memset(out, 0, sizeof(*out));
+	out->verdict = CUCP_UNKNOWN;
+	if (!history_members_capture_valid(c) || proofs == NULL || challenge == NULL
+		|| challenge->reserved16 != 0 || challenge->member_ordinal >= c->nmembers)
+		return CMXH_UNKNOWN;
+	ordinal = challenge->member_ordinal;
+	a = &proofs[ordinal];
+	if (!ISUPDATE_from_mxstatus(c->members[ordinal].member_status)
+		|| challenge->updater_xid != c->members[ordinal].xid || a->base.state >= CCM_UNKNOWN
+		|| a->base.member_xid != challenge->updater_xid || a->base.member_ordinal != ordinal
+		|| !cluster_multixact_current_successor_provenance_well_formed(
+			&challenge->candidate_next_xmin_alias, &challenge->candidate_next_xmin_locator,
+			challenge->updater_xid, challenge->candidate_next_xmin_alias.origin_node_id,
+			c->read_epoch))
+		return CMXH_UNKNOWN;
+	for (size_t i = 0; i < cluster_mx_history_graph_count(g); ++i) {
+		ClusterMxHistoryNodeView v;
+		ClusterMxHistoryRecord record;
+		ClusterSavepointReaderIdentity identity;
+		if (!cluster_mx_history_graph_view(g, i, &v))
+			return CMXH_UNKNOWN;
+		if (!cluster_undo_record_uba_equal(v.peer->record,
+										   challenge->candidate_next_xmin_locator.uba))
+			continue;
+		if (!history_member_echo(c, v.request)
+			|| !cluster_mx_history_record_from_bytes(v.request, v.bytes, v.record->record_length,
+													 v.record->record_offset, &record)
+			|| record.record_class > CMXH_OPERATION || record.header.xid != challenge->updater_xid
+			|| record.header.origin_node_id != challenge->candidate_next_xmin_alias.origin_node_id
+			|| !cluster_mx_history_record_bind_peer(v.request, &record, v.peer, &identity)
+			|| v.peer->formation_epoch != c->read_epoch
+			|| v.peer->admission_generation != c->admission.record_generation
+			|| XidFromFullTransactionId(identity.operation_fxid) != challenge->updater_xid)
+			return CMXH_UNKNOWN;
+		if (a->flags & CLUSTER_CURRENT_OPERATION_PROOF_EXACT) {
+			if (!FullTransactionIdEquals(a->top_fxid, identity.top_fxid)
+				|| !FullTransactionIdEquals(a->operation_fxid, identity.operation_fxid)
+				|| a->base.key.undo_segment_id != identity.canonical.segment_id
+				|| a->base.key.local_xid != identity.canonical.xid
+				|| a->base.key.tt_slot_id != (uint32)identity.canonical.slot_offset + 1
+				|| a->base.key.segment_generation != identity.canonical_generation
+				|| a->base.key.slot_wrap != identity.canonical.wrap)
+				return CMXH_UNKNOWN;
+		} else {
+			/* V1 A has no typed extension. Compare the already qualified A
+			 * record itself, including its independent original FullXid. */
+			bool same = false;
+			for (size_t j = 0; j < cluster_mx_history_graph_count(g); ++j) {
+				ClusterMxHistoryNodeView av;
+				if (!cluster_mx_history_graph_view(g, j, &av))
+					return CMXH_UNKNOWN;
+				if (av.record->matches_target && av.record->record_class == CMXH_V1_TOP
+					&& av.record->header.xid == challenge->updater_xid
+					&& history_member_same_identity(&av, &v))
+					same = true;
+			}
+			if (!same)
+				return CMXH_UNKNOWN;
+		}
+		out->mxkey = c->mxkey;
+		out->candidate_next_xmin_alias = challenge->candidate_next_xmin_alias;
+		out->candidate_next_xmin_locator = challenge->candidate_next_xmin_locator;
+		out->candidate_next_xmin_locator.tt_wrap = identity.canonical.wrap;
+		out->updater_xid = challenge->updater_xid;
+		out->member_ordinal = ordinal;
+		out->verdict = CUCP_MATCH;
+		return CMXH_COMPLETE;
+	}
+	return CMXH_PENDING;
+}
 #endif

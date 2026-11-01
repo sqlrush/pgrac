@@ -20,5 +20,13 @@ extern bool cluster_mx_history_assemble_members(const ClusterMxHistoryCapture *c
 												ClusterSavepointOperationKey *keys,
 												ClusterCurrentMemberOperationProof *proofs,
 												uint16 capacity);
+/* proofs must be the complete assemble_members output from this same graph.
+ * COMPLETE reuses independently qualified B bytes from the completed graph;
+ * PENDING means that exact address is absent and requires the original B
+ * provenance reader. A found-but-unprovable record is UNKNOWN, never retried. */
+extern ClusterMxHistoryStep cluster_mx_history_assemble_updater(
+	const ClusterMxHistoryCapture *capture, const ClusterMxHistoryGraph *graph,
+	const ClusterCurrentMemberOperationProof *proofs,
+	const ClusterCurrentUpdaterChallenge *challenge, ClusterCurrentUpdaterProof *out);
 #endif
 #endif

@@ -48,6 +48,14 @@ extern bool cluster_mx_history_capture_begin(Relation rel, Buffer buffer, HeapTu
 											 uint16 nmembers,
 											 const ClusterSemanticAdmissionToken *admission,
 											 ClusterMxHistoryCollector **out);
+/* Dormant opt-in updater attempt: copy a page-derived compare input in the
+ * same native Snapshot lifetime. B is required and cannot be dropped by the
+ * legacy finish API. This does not enable the deployed wire family. */
+extern bool cluster_mx_history_capture_begin_with_updater(
+	Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual, const ClusterCurrentMxKey *mxkey,
+	const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	const ClusterSemanticAdmissionToken *admission, const ClusterCurrentUpdaterChallenge *challenge,
+	ClusterMxHistoryCollector **out);
 /* Refreshes native scope/admission/owner evidence; failure zeroes out and
  * cancels this capture. No DATA request or proof is produced by this API. */
 extern bool cluster_mx_history_capture_read(ClusterMxHistoryCollector *collector,
@@ -64,7 +72,10 @@ typedef struct ClusterMxHistoryGraph ClusterMxHistoryGraph;
  * means traversal only, never assembled member or SQL authority. */
 extern ClusterMxHistoryStep cluster_mx_history_collect_poll(ClusterMxHistoryCollector *collector);
 /* Outside heap content locks. COMPLETE means all member results are staged,
- * not delivered or authorized for SQL. No per-member transport is repeated. */
+ * not delivered or authorized for SQL. No per-member transport is repeated.
+ * With a challenge, reuse a qualified B already in the graph; otherwise wait
+ * on the original foreign B provenance request (event-driven, cancellable).
+ * collect_poll itself remains one bounded graph/transport step. */
 extern ClusterMxHistoryStep cluster_mx_history_poll(ClusterMxHistoryCollector *collector);
 /* Original heap lock held: recheck actual Relation/MX/heap/scope before one
  * complete-set copy. Outputs have capacity entries and must not overlap any
@@ -78,6 +89,16 @@ extern ClusterMxHistoryStep cluster_mx_history_recheck_and_finish(
 	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
 	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs,
 	uint16 capacity);
+/* Caller rebuilds fresh_challenge under the original content lock. Both A
+ * and B are copied once only after exact challenge and full heap/scope checks;
+ * B is UNKNOWN on every non-success. The native Snapshot remains retained
+ * until cancel, including after successful delivery. Outputs cannot overlap
+ * inputs or one another. Original before-mutation grant checks still apply. */
+extern ClusterMxHistoryStep cluster_mx_history_recheck_and_finish_with_updater(
+	ClusterMxHistoryCollector *collector, Relation rel, Buffer buffer, HeapTuple tuple,
+	const ClusterCurrentMxKey *mxkey, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	ClusterSavepointOperationKey *keys, ClusterCurrentMemberOperationProof *proofs, uint16 capacity,
+	const ClusterCurrentUpdaterChallenge *fresh_challenge, ClusterCurrentUpdaterProof *updater);
 /* Full original heap relock comparison before borrowing completed private
  * graph views. The caller retains that lock; cancellation expires the view. */
 extern bool cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *collector,
