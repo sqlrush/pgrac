@@ -17,6 +17,7 @@ volatile uint32 InterruptHoldoffCount;
 int
 pg_fsync(int fd)
 {
+	if (managed_checkpoint_test) return managed_checkpoint_sync(fd);
 	return fsync(fd);
 }
 void *
@@ -47,12 +48,12 @@ static unsigned managed_fault;
 bool
 cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
-	return managed_cf && mode == ShareLock;
+	return managed_cf && (mode == ShareLock || mode == ExclusiveLock);
 }
 bool
 cluster_cf_lock(LOCKMODE mode)
 {
-	UT_ASSERT(mode == ShareLock && !local_held && authority_held);
+	UT_ASSERT(mode == ShareLock && !local_held && (authority_held || managed_checkpoint_test));
 	managed_cf = true;
 	return true;
 }
@@ -140,12 +141,17 @@ cluster_relmap_authority_managed_read_v2(const ClusterRecoveryFileIdentityV2 *id
 										 ClusterRelmapFilePairV2 *pair)
 {
 	unsigned slot = id->database_oid ? 1 : 0;
-	UT_ASSERT(managed_cf && local_held && authority_held && !v2_retention_held);
+	UT_ASSERT(local_held && !v2_retention_held
+		&& (managed_cache_test ? !managed_cf : (managed_cf && authority_held)));
 	managed_reads++;
-	if (memcmp(id, &managed_files[slot], sizeof(*id)))
+	if (!managed_cache_test && memcmp(id, &managed_files[slot], sizeof(*id)))
 		return false;
 	if (!test_relmap_physical_managed_read_v2(id, pair))
 		return false;
+	if (managed_cache_test) {
+		managed_cache_after_read();
+		if (managed_cache_fault == 1) return false;
+	}
 	managed_disk[slot].committed_generation = pair->view.committed_generation;
 	managed_disk[slot].committed = pair->view.committed;
 	managed_disk[slot].pending_generation = pair->view.pending_generation;
@@ -274,6 +280,7 @@ managed_setup_files(void)
 	}
 	managed_fault = managed_reads = managed_clears = 0;
 	managed_finishing = false;
+	managed_native_table_setup();
 }
 
 static void

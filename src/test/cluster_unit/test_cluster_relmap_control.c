@@ -14,6 +14,7 @@
 #define TEST_CONTROL_RELMAP_CONSUMER 1
 #include "test_cluster_control_relmap_selection.c"
 #include "cluster/cluster_relmap_control.h"
+#include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_relmap_authority.h"
 #include "utils/relmapper.h"
 #include "storage/lwlock.h"
@@ -157,6 +158,37 @@ static void cluster_read_relmap_from_authority(RelMapFile *map, const char *path
 }
 /* Standalone ERROR leaf; complete production wrappers are extracted below. */
 #undef ereport
+/* The existing CF companion tests retain their original whole-control
+ * contract. The native table is a controlled leaf here; the separate original
+ * writer/cache component links the production shared table and real pairs. */
+ClusterControlNativeResultV2
+cluster_control_native_file_borrow_by_address_v2(ClusterRecoveryFileKindV2 kind,
+ Oid db, Oid ts, uint64 object, ClusterControlNativeFileBorrowV2 *out)
+{
+ if (!mapping_held || kind != CLUSTER_RECOVERY_FILE_RELMAP_V2 || object)
+  return CLUSTER_NATIVE_FILES_REFUSED_V2;
+ for (uint64 i = 0; i < reg.coverage.file_count / 2; i++) {
+  if (completed[i].database_oid == db && completed[i].tablespace_oid == ts) {
+   out->expected = completed[i];
+   out->private_self = (uintptr_t)out;
+   out->table_generation = 1;
+   return CLUSTER_NATIVE_FILES_OK_V2;
+  }
+ }
+ return CLUSTER_NATIVE_FILES_NOT_FOUND_V2;
+}
+bool
+cluster_control_native_file_current_v2(const ClusterControlNativeFileBorrowV2 *b)
+{
+ return mapping_held && b->private_self == (uintptr_t)b && b->table_generation == 1;
+}
+bool
+cluster_control_native_file_release_v2(ClusterControlNativeFileBorrowV2 *b)
+{
+ if (!cluster_control_native_file_current_v2(b)) return false;
+ memset(b, 0, sizeof(*b));
+ return true;
+}
 #define ereport(level, ...) pg_re_throw()
 #include "test_cluster_relmap_control_entries.inc"
 UT_TEST(cache_uses_registered_origin_and_original_shared_and_cross_database_paths)

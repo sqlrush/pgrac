@@ -66,6 +66,7 @@ OBJS = \
 	cluster_config_members.o \
 	cluster_service_observe.o \
 	cluster_control_root.o \
+	cluster_control_native_files.o \
 	cluster_control_root_registry.o \
 	cluster_control_observe.o \
 	cluster_wal_history.o \

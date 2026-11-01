@@ -14,6 +14,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/xlogreader.h"
+#include "common/relpath.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_relmap_control.h"
 #include "cluster/cluster_cf_enqueue.h"
@@ -36,6 +38,8 @@ static bool x_held, cf_held, mapping_held, xidgen_held, control_held;
 static unsigned x_acquires, x_releases, cf_acquires, cf_releases, formats;
 static unsigned reads, writes, mapping_acquires, mapping_releases, violations;
 static unsigned fault, version;
+static bool redo_test;
+static unsigned redo_paths;
 static LOCKMODE cf_mode;
 static int error_level;
 static RelMapFile source, destination;
@@ -68,10 +72,18 @@ errmsg(const char *format pg_attribute_unused(), ...)
 {
 	return 0;
 }
+int
+errmsg_internal(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
 void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *function pg_attribute_unused())
 {
+	/* Match errfinish(ERROR), including ERROR during cleanup. */
+	if (error_level == ERROR)
+		InterruptHoldoffCount = 0;
 	if (PG_exception_stack)
 		siglongjmp(*PG_exception_stack, 1);
 	abort();
@@ -114,7 +126,7 @@ bool
 cluster_cf_lock(LOCKMODE mode)
 {
 	cf_acquires++;
-	violations += !x_held || cf_held || mapping_held || mode != ShareLock;
+	violations += (!redo_test && !x_held) || cf_held || mapping_held || mode != ShareLock;
 	if (fault == 2)
 		return false;
 	if (fault == 3)
@@ -129,7 +141,7 @@ cluster_cf_unlock_confirmed(LOCKMODE mode)
 	cf_releases++;
 	violations += !cf_held || mapping_held || mode != ShareLock;
 	cf_held = false;
-	if (fault == 9)
+	if (fault == 9 || fault == 12 || fault == 13)
 		ereport(ERROR, (errmsg("unconfirmed release ERROR")));
 	return fault == 8 ? CLUSTER_CF_RELEASE_UNCONFIRMED : CLUSTER_CF_RELEASE_CONFIRMED;
 }
@@ -144,7 +156,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	violations += lock != RelationMappingLock || mode != LW_EXCLUSIVE || mapping_held;
 	if (cluster_shared_config && !IsBootstrapProcessingMode())
-		violations += !x_held || !cf_held;
+		violations += (!redo_test && !x_held) || !cf_held;
+	HOLD_INTERRUPTS(); /* Original LWLockAcquire retains a holdoff. */
 	mapping_held = true;
 	mapping_acquires++;
 	return true;
@@ -157,13 +170,14 @@ LWLockRelease(LWLock *lock)
 		violations++;
 	mapping_held = false;
 	mapping_releases++;
+	RESUME_INTERRUPTS(); /* Original LWLockRelease consumes it. */
 }
 ClusterControlRootResult
 cluster_control_root_relmap_format_locked_v2(Size budget, ClusterControlRelmapFormatV2 *out)
 {
 	formats++;
-	violations += !x_held || !cf_held || mapping_held || !budget;
-	if (fault == 4)
+	violations += (!redo_test && !x_held) || !cf_held || mapping_held || !budget;
+	if (fault == 4 || fault == 13)
 		ereport(ERROR, (errmsg("format read ERROR")));
 	memset(out, 0, sizeof(*out));
 	out->root_version = version;
@@ -180,6 +194,7 @@ read_relmap_file(RelMapFile *out, char *path, bool held, int level, Oid db, Oid 
 	read_ts = ts;
 	if (fault == 6) {
 		/* The original reader can ERROR while its own MappingLock is held. */
+		HOLD_INTERRUPTS();
 		mapping_held = true;
 		ereport(ERROR, (errmsg("source read ERROR")));
 	}
@@ -189,12 +204,26 @@ static void
 write_relmap_file(RelMapFile *map, bool wal, bool sinval, bool preserve, Oid db, Oid ts, char *path)
 {
 	writes++;
-	violations += !mapping_held || !wal || sinval || preserve || strcmp(path, "destination") != 0;
+	violations += !mapping_held || (redo_test ? (wal || !sinval) : (!wal || sinval))
+		|| preserve || strcmp(path, "destination") != 0;
 	write_db = db;
 	write_ts = ts;
 	destination = *map;
-	if (fault == 7)
+	if (fault == 7 || fault == 12)
 		ereport(ERROR, (errmsg("target write ERROR")));
+}
+char *
+GetDatabasePath(Oid db, Oid ts)
+{
+	redo_paths++;
+	violations += !redo_test || mapping_held || db != 200 || ts != 1663;
+	if (fault == 11) ereport(ERROR, (errmsg("path allocation ERROR")));
+	return strdup("destination");
+}
+void
+pfree(void *p)
+{
+	free(p);
 }
 static bool relmap_writer_cf_enter_v2(bool *owned);
 static void cluster_copy_relmap_from_control(Oid, Oid, char *, char *, Oid, Oid);
@@ -207,6 +236,8 @@ setup(unsigned selected)
 	x_acquires = x_releases = cf_acquires = cf_releases = formats = 0;
 	reads = writes = mapping_acquires = mapping_releases = violations = 0;
 	fault = 0;
+	redo_test = false;
+	redo_paths = 0;
 	cf_mode = ShareLock;
 	version = selected;
 	error_level = 0;
@@ -375,10 +406,18 @@ UT_TEST(managed_control_cannot_be_bypassed_by_catalog_guc)
 	UT_ASSERT(!copy_call());
 	no_effects();
 }
+#include "test_cluster_relmap_redo_control.inc"
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	if (getenv("PGRAC_RELMAP_REDO_MANAGED_FOCUS")) {
+		UT_PLAN(1);
+		UT_RUN(redo_managed_and_unknown_refuse_before_effect);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(17);
 	UT_RUN(managed_copy_refuses_before_source_and_target_effects);
 	UT_RUN(unknown_or_failed_control_never_chooses_legacy);
 	UT_RUN(exact_legacy_copy_keeps_source_destination_and_lock_order);
@@ -388,6 +427,14 @@ main(void)
 	UT_RUN(late_failure_unwinds_owned_local_locks_but_keeps_creation_debt);
 	UT_RUN(off_and_bootstrap_copy_preserve_the_original_route);
 	UT_RUN(managed_control_cannot_be_bypassed_by_catalog_guc);
+	UT_RUN(redo_managed_and_unknown_refuse_before_effect);
+	UT_RUN(redo_exact_legacy_preserves_original_route);
+	UT_RUN(redo_control_refusals_and_errors_keep_duties);
+	UT_RUN(redo_late_drift_and_unconfirmed_release_are_fail_stop);
+	UT_RUN(redo_error_unwinds_only_owned_locks);
+	UT_RUN(redo_full_record_shape_precedes_control_and_io);
+	UT_RUN(redo_inverted_locks_are_not_released);
+	UT_RUN(redo_catalog_toggle_cannot_bypass_managed_format);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

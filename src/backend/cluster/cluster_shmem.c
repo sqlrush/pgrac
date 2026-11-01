@@ -148,6 +148,7 @@
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D1 region */
+#include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_startup_phase.h"	  /* cluster_phase_shmem_register (1.10.1) */
 #include "cluster/cluster_version_macros.h"
 
@@ -639,6 +640,8 @@ cluster_init_shmem_module(void)
 	 */
 	if (cluster_shmem_lookup_region("pgrac cluster startup phase") == NULL)
 		cluster_phase_shmem_register();
+	if (cluster_shmem_lookup_region("pgrac native file identities") == NULL)
+		cluster_control_native_files_shmem_register();
 
 	/*
 	 * Stage 1.11 (Sprint A): register cluster_lmon shmem region.  LMON

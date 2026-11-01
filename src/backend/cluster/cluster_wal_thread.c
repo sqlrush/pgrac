@@ -51,6 +51,7 @@
 #include "catalog/catversion.h"
 #include "common/controldata_utils.h"
 #include "common/pgrac_initdb_wal.h"
+#include "common/pgrac_initdb_recovery.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h"
@@ -164,6 +165,46 @@ cluster_wal_thread_shmem_register(void)
  */
 
 static PgracInitdbWalContext initdb_wal_context;
+static PgracInitdbRecoveryContext initdb_recovery_context;
+static bool initdb_recovery_present;
+
+/* Native child consumes only its creator's original closed request. The
+ * temporary shared directory is an input proof, not post-bootstrap custody. */
+static bool
+initdb_boot_recovery_accept(PgracInitdbWalContext *context)
+{
+	PgracInitdbRecoveryContext recovery;
+	ClusterRecoveryFileIdentityV2 boot[2];
+	int data_fd;
+	bool valid;
+	if (!context || context->phase != PGRAC_INITDB_WAL_BOOTSTRAP || context->thread_id != 1
+		|| context->recovery_fd < 3 || context->base_fd < 3 || context->config.fd < 3
+		|| context->recovery_fd == context->base_fd || context->recovery_fd == context->config.fd
+		|| context->base_fd == context->config.fd || initdb_recovery_present)
+		return false;
+	data_fd = open(".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	valid = data_fd >= 0
+			&& pgrac_initdb_recovery_read_v2(context->recovery_fd, &context->config,
+											 context->system_identifier,
+											 context->database_incarnation, context->storage_uuid,
+											 data_fd, context->base_fd, &recovery)
+			&& pgrac_initdb_recovery_boot_v2(&recovery, boot);
+	if (data_fd >= 0 && close(data_fd))
+		valid = false;
+	if (!valid)
+		return false;
+	/* This descriptor proved the original request's shared target. It is not
+	 * the later SQL child's independent post-bootstrap DATA publication grant. */
+	if (close(context->base_fd))
+		return false;
+	context->base_fd = 0;
+	context->base_device = context->base_inode = context->database_incarnation = 0;
+	memset(context->storage_uuid, 0, sizeof(context->storage_uuid));
+	initdb_recovery_context = recovery;
+	initdb_recovery_present = true;
+	context->recovery_fd = 0;
+	return true;
+}
 
 /* BKI bootstrap finishes with a real shutdown checkpoint, but has not allocated
  * any normal XID.  Post-bootstrap SQL necessarily advances it.  A valid pipe
@@ -287,12 +328,16 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 		uint8 any = 0;
 		for (int i = 0; i < sizeof(context.storage_uuid); ++i)
 			any |= context.storage_uuid[i];
-		if (context.reserved != 0
+		if (context.recovery_fd < 0
+			|| (context.recovery_fd != 0
+				&& (!bootstrap || context.thread_id != 1 || context.recovery_fd < 3
+					|| context.recovery_fd == context.base_fd
+					|| context.recovery_fd == context.config.fd))
 			|| (context.base_fd == 0
 					? (context.database_incarnation != 0 || context.base_device != 0
 					   || context.base_inode != 0 || any != 0)
-					: (bootstrap || context.thread_id != 1 || context.base_fd < 3
-					   || context.database_incarnation == 0 || any == 0
+					: ((bootstrap && context.recovery_fd == 0) || context.thread_id != 1
+					   || context.base_fd < 3 || context.database_incarnation == 0 || any == 0
 					   || fstat(context.base_fd, &base_st) != 0 || !S_ISDIR(base_st.st_mode)
 					   || base_st.st_uid != geteuid() || (base_st.st_mode & 0022) != 0
 					   || (uint64)base_st.st_dev != context.base_device
@@ -327,6 +372,8 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 	}
 	if (context.config.fd != 0)
 		cluster_initdb_config_apply_native(&context);
+	if (context.recovery_fd != 0 && !initdb_boot_recovery_accept(&context))
+		ereport(FATAL, (errmsg("INITDB_RECOVERY_CONTEXT: incomplete original BOOT identity")));
 	initdb_wal_context = context;
 }
 
@@ -334,6 +381,12 @@ const PgracInitdbWalContext *
 cluster_wal_thread_initdb_context(void)
 {
 	return initdb_wal_context.thread_id == 0 ? NULL : &initdb_wal_context;
+}
+
+const PgracInitdbRecoveryContext *
+cluster_wal_thread_initdb_recovery_context(void)
+{
+	return initdb_recovery_present ? &initdb_recovery_context : NULL;
 }
 
 uint64

@@ -131,6 +131,7 @@
 #include "utils/relmapper.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_guc.h"		  /* cluster_enabled + cluster_smgr_user_relations */
 #include "cluster/cluster_inject.h"	  /* crash-window test levers (D5) */
 #include "cluster/cluster_mode.h"		  /* cluster_peer_mode_enabled (D5) */
@@ -993,6 +994,95 @@ cluster_read_relmap_from_authority(RelMapFile *map, const char *dbpath,
 #endif							/* USE_PGRAC_CLUSTER */
 
 #ifdef USE_PGRAC_CLUSTER
+/* The ordinary managed cache borrows only the unique selected address under
+ * its ORIGINAL MappingLock. Creation origin is returned, never guessed. */
+static void
+cluster_read_relmap_from_native(RelMapFile *out, bool lock_held, Oid dbid, Oid tsid, int elevel)
+{
+	static ClusterControlNativeFileBorrowV2 borrow;
+	ClusterRelmapFilePairV2 pair;
+	volatile bool owned_mapping = false;
+	volatile bool borrowed = false;
+	volatile bool ok = false;
+	ClusterControlNativeResultV2 result = CLUSTER_NATIVE_FILES_REFUSED_V2;
+	uintptr_t output = (uintptr_t)out;
+	uintptr_t saved = (uintptr_t)&borrow;
+	if (!out || output > UINTPTR_MAX - sizeof(*out)
+		|| (output < saved + sizeof(borrow) && saved < output + sizeof(*out)) || borrow.private_self
+		|| CritSectionCount || LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(XidGenLock)
+		|| lock_held != LWLockHeldByMe(RelationMappingLock))
+		ereport(
+			elevel,
+			(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+			 errmsg(
+				 "relation map cache requires its original lock and no unfinished file borrow")));
+	PG_TRY();
+	{
+		if (!lock_held) {
+			LWLockAcquire(RelationMappingLock, LW_SHARED);
+			owned_mapping = true;
+		}
+		result = cluster_control_native_file_borrow_by_address_v2(CLUSTER_RECOVERY_FILE_RELMAP_V2,
+																  dbid, tsid, 0, &borrow);
+		if (result == CLUSTER_NATIVE_FILES_OK_V2) {
+			borrowed = true;
+			ok = cluster_control_native_file_current_v2(&borrow)
+				&& cluster_relmap_authority_managed_read_v2(&borrow.expected, &pair)
+				&& pair.view.pending_complete
+				&& cluster_control_native_file_current_v2(&borrow);
+			/* Do not raise the caller's FATAL before retiring local duty:
+			 * FATAL exits without running PG_CATCH. A refused release keeps
+			 * its stable handle and is never retried in ERROR cleanup. */
+			borrowed = false;
+			if (!cluster_control_native_file_release_v2(&borrow))
+				ok = false;
+		}
+		if (owned_mapping) {
+			owned_mapping = false;
+			LWLockRelease(RelationMappingLock);
+		}
+	}
+	PG_CATCH();
+	{
+		HOLD_INTERRUPTS();
+		PG_TRY();
+		{
+			if (borrowed) {
+				borrowed = false;
+				(void)cluster_control_native_file_release_v2(&borrow);
+			}
+		}
+		PG_FINALLY();
+		{
+			PG_TRY();
+			{
+				if (owned_mapping) {
+					owned_mapping = false;
+					/* ERROR reset the acquisition holdoff. Replace the one
+					 * consumed by release, as LWLockReleaseAll does. */
+					HOLD_INTERRUPTS();
+					LWLockRelease(RelationMappingLock);
+				}
+			}
+			PG_FINALLY();
+			{
+				/* Borrow or lock cleanup can itself ERROR and reset it. */
+				if (InterruptHoldoffCount > 0)
+					RESUME_INTERRUPTS();
+			}
+			PG_END_TRY();
+		}
+		PG_END_TRY();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok)
+		ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						 errmsg("relation map cache registered file is unavailable, changed or not unique"),
+						 errdetail_internal("lookup_reason=%d", (int)result)));
+	*out = pair.view.committed;
+}
+
 /* Same original CF across format selection, mapping I/O and control recheck.
  * Copy only after confirmed release; inherited CF stays with its original owner. */
 static void
@@ -1016,9 +1106,7 @@ cluster_read_relmap_from_control(RelMapFile *out, const char *path, Oid dbid, Oi
 			ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
 				errmsg("relation map format is not selected by complete control inputs")));
 		if (before.root_version == 4) {
-			if (!RelationMapReadManagedV2(&before.config, MaxAllocSize, dbid, tsid, &map))
-				ereport(elevel, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-					errmsg("managed relation map read failed")));
+			cluster_read_relmap_from_native(&map, false, dbid, tsid, elevel);
 		} else
 			cluster_read_relmap_from_authority(&map, path, false, elevel);
 		if (cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &after) != CLUSTER_CONTROL_ROOT_OK_PRIMARY ||
@@ -1106,10 +1194,17 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel, Oid 
 	Assert(elevel >= ERROR);
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: on-mode reads adopt the shared relmap authority (spec-6.14 D5). */
-	if (cluster_shared_catalog && !IsBootstrapProcessingMode())
+	/* PGRAC: control-selected shared files do not depend on the catalog GUC.
+	 * Keep bootstrap and explicit nonshared configurations on their original
+	 * paths; a managed or unknown registration must never select a local map. */
+	if ((cluster_shared_config || cluster_shared_catalog) && !IsBootstrapProcessingMode())
 	{
-		if (cluster_shared_config && !lock_held)
+		if (cluster_shared_config && (lock_held ||
+			cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_MANAGED_V2))
+			cluster_read_relmap_from_native(map, lock_held, dbid, tsid, elevel);
+		else if (cluster_shared_config)
+			/* Preserve only explicit original ROOTv3 format selection. A ROOTv4
+			 * with an unavailable table reaches the same native refusal, never raw. */
 			cluster_read_relmap_from_control(map, dbpath, dbid, tsid, elevel);
 		else
 			/* Strict legacy writer reader; managed files cannot satisfy it.
@@ -1448,6 +1543,8 @@ static ClusterRelmapPublishArm cluster_relmap_publish_arms[2];
 
 typedef struct ClusterRelmapProducerArmV2
 {
+	bool native_borrowed;
+	ClusterControlNativeFileBorrowV2 native_file;
 	bool managed;
 	ClusterRecoveryFileIdentityV2 file;
 	ClusterSharedConfigRef config;
@@ -1469,6 +1566,41 @@ typedef struct RelmapManagedWriterV2 {
 	ClusterRecoveryFileIdentityV2 files[2];
 } RelmapManagedWriterV2;
 static RelmapManagedWriterV2 *relmap_managed_writer;
+
+/* Keep each live handle at its original static address through terminal I/O
+ * and notification; no cleanup copies or clears an outstanding borrow. */
+static bool
+relmap_writer_has_borrows_v2(void)
+{
+	return cluster_relmap_v2_arms[0].native_borrowed || cluster_relmap_v2_arms[1].native_borrowed;
+}
+static bool
+relmap_writer_borrows_current_v2(void)
+{
+	for (int slot = 0; slot < 2; slot++) {
+		const ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+		if (arm->native_borrowed && !cluster_control_native_file_current_v2(&arm->native_file))
+			return false;
+		if (arm->managed && !arm->native_borrowed)
+			return false;
+	}
+	return true;
+}
+static bool
+relmap_writer_release_borrows_v2(void)
+{
+	if (!relmap_writer_borrows_current_v2())
+		return false;
+	for (int slot = 0; slot < 2; slot++) {
+		ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+		if (arm->native_borrowed) {
+			if (!cluster_control_native_file_release_v2(&arm->native_file))
+				return false;
+			arm->native_borrowed = false;
+		}
+	}
+	return true;
+}
 
 static ClusterRelmapV2PairResult
 relmap_producer_read_v2(const ClusterRelmapV2Namespace *identity, ClusterRelmapV2View *out)
@@ -1693,7 +1825,9 @@ cluster_relmap_producer_arm_v2(bool shared, const RelMapFile *updates)
 	ClusterRelmapOwnerSampleV2 sample;
 	ClusterRelmapV2Image staged;
 
-	if (arm->armed || cluster_relmap_v2_finish_entered || cluster_relmap_v2_prepare_unfinished
+	if ((!relmap_managed_writer && relmap_writer_has_borrows_v2())
+		|| !relmap_writer_borrows_current_v2()
+		|| arm->armed || cluster_relmap_v2_finish_entered || cluster_relmap_v2_prepare_unfinished
 		|| cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed)
 		return false;
 	for (int slot = 0; slot < 2; slot++)
@@ -1705,7 +1839,7 @@ cluster_relmap_producer_arm_v2(bool shared, const RelMapFile *updates)
 			return false;
 	}
 	if (!relmap_producer_prepare_v2(shared, updates, &sample, &staged,
-		&cluster_relmap_v2_prepare_unfinished))
+		&cluster_relmap_v2_prepare_unfinished) || !relmap_writer_borrows_current_v2())
 		return false;
 	/* Only nofail stores follow the original successful prepare. */
 	arm->managed = relmap_managed_writer != NULL;
@@ -1868,8 +2002,12 @@ cluster_copy_relmap_from_control(Oid dbid, Oid tsid, char *srcdbpath, char *dstd
 		HOLD_INTERRUPTS();
 		PG_TRY();
 		{
-			if (local_operation && LWLockHeldByMe(RelationMappingLock))
+			if (local_operation && LWLockHeldByMe(RelationMappingLock)) {
+				/* ERROR reset the acquisition holdoff; replace the one
+				 * consumed by release, as LWLockReleaseAll does. */
+				HOLD_INTERRUPTS();
 				LWLockRelease(RelationMappingLock);
+			}
 			if (owned_cf) {
 				owned_cf = false;
 				(void)cluster_cf_unlock_confirmed(ShareLock);
@@ -1877,7 +2015,9 @@ cluster_copy_relmap_from_control(Oid dbid, Oid tsid, char *srcdbpath, char *dstd
 		}
 		PG_FINALLY();
 		{
-			RESUME_INTERRUPTS();
+			/* A second ERROR in CF cleanup resets the count again. */
+			if (InterruptHoldoffCount > 0)
+				RESUME_INTERRUPTS();
 		}
 		PG_END_TRY();
 		PG_RE_THROW();
@@ -1921,6 +2061,42 @@ relmap_writer_selection_v2(RelmapManagedWriterV2 *w, bool finishing)
 		   == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+static bool
+relmap_writer_acquire_borrows_v2(RelmapManagedWriterV2 *w)
+{
+	ClusterControlNativeTableInfoV2 info;
+	ClusterControlRelmapReferenceV2 reference;
+	if (relmap_writer_has_borrows_v2() || cluster_relmap_v2_prepare_unfinished
+		|| cluster_relmap_v2_finish_entered || !cluster_control_native_files_info_v2(&info)
+		|| info.mode != CLUSTER_NATIVE_FILES_MANAGED_V2
+		|| !cluster_control_root_relmap_selection_reference_v4(w->selection, &reference)
+		|| memcmp(&info.control, &reference, sizeof(reference)))
+		return false;
+	for (int slot = 0; slot < 2; slot++) {
+		ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
+		ClusterControlFileKeyV2 key = { 0 };
+		uint8 wire[128];
+		if (!(slot ? active_local_updates.num_mappings : active_shared_updates.num_mappings))
+			continue;
+		key.kind = w->files[slot].kind;
+		key.origin = w->files[slot].origin;
+		key.database_oid = w->files[slot].database_oid;
+		key.tablespace_oid = w->files[slot].tablespace_oid;
+		key.object_id = w->files[slot].object_id;
+		if (arm->armed || !cluster_control_native_file_acquire_v2(&key, &arm->native_file))
+			return false;
+		/* No fallible operation between acquisition and retaining its duty. */
+		arm->native_borrowed = true;
+		if (!cluster_recovery_file_identity_encode_v2(&w->files[slot], wire, sizeof(wire))
+			|| !cluster_recovery_file_identity_matches_v2(wire, sizeof(wire),
+														  &arm->native_file.expected)
+			|| arm->native_file.table_generation != info.table_generation
+			|| arm->native_file.startup_generation != info.startup_generation)
+			return false;
+	}
+	return relmap_writer_borrows_current_v2();
+}
+
 static void
 relmap_writer_cleanup_v2(RelmapManagedWriterV2 *w, bool owned)
 {
@@ -1948,6 +2124,11 @@ relmap_control_update_batch_v2(bool is_parallel_worker)
 		&& !pending_shared_updates.num_mappings && !pending_local_updates.num_mappings) {
 		return false;
 	}
+	/* An entered managed attempt cannot fall back to raw after any later
+	 * format change, even if no namespace obtained a prepare receipt. */
+	if (relmap_writer_has_borrows_v2())
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+			errmsg("relation map writer retains an unfinished native file borrow")));
 	/* The common no-update commit does not allocate or acquire any lock. */
 	if (CritSectionCount || LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(ControlFileLock)
 		|| LWLockHeldByMe(XidGenLock))
@@ -1970,7 +2151,7 @@ relmap_control_update_batch_v2(bool is_parallel_worker)
 									"retrying the transaction.")));
 		managed = w->format.root_version == 4;
 		if (managed) {
-			if (!relmap_writer_selection_v2(w, false))
+			if (!relmap_writer_selection_v2(w, false) || !relmap_writer_acquire_borrows_v2(w))
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
 						 errmsg("managed relation map writer has no complete file registration"),
@@ -1978,7 +2159,8 @@ relmap_control_update_batch_v2(bool is_parallel_worker)
 			relmap_managed_writer = w;
 			cluster_relmap_producer_precommit_v2(is_parallel_worker);
 			relmap_managed_writer = NULL;
-			if (cluster_control_root_relmap_selection_recheck_locked_v4(w->selection)
+			if (!relmap_writer_borrows_current_v2()
+				|| cluster_control_root_relmap_selection_recheck_locked_v4(w->selection)
 				!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
@@ -2003,7 +2185,8 @@ relmap_control_update_batch_v2(bool is_parallel_worker)
 	}
 	PG_CATCH();
 	{
-		if (managed && (cluster_relmap_v2_arms[0].armed || cluster_relmap_v2_arms[1].armed))
+		if (managed && (cluster_relmap_v2_arms[0].armed || cluster_relmap_v2_arms[1].armed
+					|| relmap_writer_has_borrows_v2()))
 			cluster_relmap_v2_prepare_unfinished = true;
 		relmap_writer_cleanup_v2(w, owned);
 		pfree(w);
@@ -2029,7 +2212,7 @@ relmap_writer_finish_managed_v2(bool is_commit)
 	}
 	PG_TRY();
 	{
-		ok = relmap_writer_selection_v2(w, true);
+		ok = relmap_writer_selection_v2(w, true) && relmap_writer_borrows_current_v2();
 		for (int slot = 0; ok && slot < 2; slot++) {
 			const ClusterRelmapProducerArmV2 *arm = &cluster_relmap_v2_arms[slot];
 			if (!arm->armed)
@@ -2039,6 +2222,11 @@ relmap_writer_finish_managed_v2(bool is_commit)
 							: cluster_relmap_retention_runtime_discard_pending_managed_v2(
 								  &arm->sample, &arm->file, &arm->staged))
 				 == CLUSTER_RELMAP_V2_CLEARED_POSTREAD;
+			/* Recheck even a normal unsuccessful terminal result. */
+			{
+				bool current = relmap_writer_borrows_current_v2();
+				ok = ok && current;
+			}
 			if (ok)
 				ok = cluster_control_root_relmap_selection_recheck_locked_v4(w->selection)
 					 == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -2074,7 +2262,8 @@ relmap_producer_finish_v2(bool is_commit, bool keep_custody)
 	/* Latch before any fallible check or I/O. Even a partial cleanup must not
 	 * be retried here, including by switching to the other terminal polarity. */
 	cluster_relmap_v2_finish_entered = true;
-	if (cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed
+	if (!relmap_writer_borrows_current_v2()
+		|| cluster_relmap_publish_arms[0].armed || cluster_relmap_publish_arms[1].armed
 		|| LWLockHeldByMe(RelationMappingLock) || LWLockHeldByMe(XidGenLock)
 		|| (is_commit && keep_custody && IsTransactionState()))
 		return false;
@@ -2114,6 +2303,8 @@ relmap_producer_finish_v2(bool is_commit, bool keep_custody)
 	/* Retire local custody only. Original pins and all caller duties remain. */
 	if (!keep_custody)
 	{
+		if (!relmap_writer_release_borrows_v2())
+			return false;
 		memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
 		cluster_relmap_v2_finish_entered = false;
 	}
@@ -2144,7 +2335,7 @@ relmap_producer_postcommit_failed_v2(const char *stage)
 static bool
 relmap_producer_postcommit_current_v2(void)
 {
-	if (!cluster_relmap_v2_finish_entered
+	if (!relmap_writer_borrows_current_v2() || !cluster_relmap_v2_finish_entered
 		|| (!cluster_relmap_v2_arms[0].armed && !cluster_relmap_v2_arms[1].armed))
 		return false;
 	for (int slot = 0; slot < 2; slot++)
@@ -2205,7 +2396,10 @@ cluster_relmap_producer_postcommit_v2(void)
 		}
 		if (!relmap_producer_postcommit_current_v2())
 			relmap_producer_postcommit_failed_v2("RELEASE_SOURCE");
-		/* Keep custody until the last fallible original operation succeeds. */
+		/* Storage and notifications are complete. Retire each borrow once
+		 * before X; a refusal retains all remaining duty. */
+		if (!relmap_writer_release_borrows_v2())
+			relmap_producer_postcommit_failed_v2("NATIVE_BORROW_RELEASE");
 		cluster_relmap_authority_x_unlock();
 		memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
 		cluster_relmap_v2_finish_entered = false;
@@ -2249,7 +2443,9 @@ cluster_relmap_producer_abort_v2(void)
 		 * caller's decision, never inferred from transaction-state tests. */
 		if (!relmap_producer_finish_v2(false, true))
 			relmap_producer_abort_failed_v2("DISCARD");
-		/* Keep original receipts through the last fallible operation. */
+		/* Storage is complete; X stays held until all borrows retire. */
+		if (!relmap_writer_release_borrows_v2())
+			relmap_producer_abort_failed_v2("NATIVE_BORROW_RELEASE");
 		cluster_relmap_authority_x_unlock();
 		memset(cluster_relmap_v2_arms, 0, sizeof(cluster_relmap_v2_arms));
 		cluster_relmap_v2_finish_entered = false;
@@ -2324,8 +2520,11 @@ cluster_perform_relmap_update(bool shared, const RelMapFile *updates)
 
 	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
 
-	/* Adopt the current committed image, then merge our updates over it. */
-	load_relmap_file(shared, true);
+	/* This legacy producer already holds its original authority header and
+	 * MappingLock. Keep its strict legacy reader; ordinary managed cache
+	 * admission is a separate registered-address path. */
+	cluster_read_relmap_from_authority(shared ? &shared_map : &local_map,
+		shared ? "global" : DatabasePath, true, FATAL);
 	if (shared)
 		memcpy(&newmap, &shared_map, sizeof(RelMapFile));
 	else
@@ -2626,50 +2825,132 @@ perform_relmap_update(bool shared, const RelMapFile *updates)
 /*
  * RELMAP resource manager's routines
  */
+static void
+relmap_redo_apply(xl_relmap_update *xlrec, RelMapFile *newmap)
+{
+	char *dbpath;
+
+	/* We need to construct the pathname for this database */
+	dbpath = GetDatabasePath(xlrec->dbid, xlrec->tsid);
+
+	/*
+	 * Write out the new map and send sinval, but of course don't write a
+	 * new WAL entry.  There's no surrounding transaction to tell to
+	 * preserve files, either.
+	 *
+	 * There shouldn't be anyone else updating relmaps during WAL replay,
+	 * but grab the lock to interlock against load_relmap_file().
+	 *
+	 * Note that we use the same WAL record for updating the relmap of an
+	 * existing database as we do for creating a new database. In the
+	 * latter case, taking the relmap log and sending sinval messages is
+	 * unnecessary, but harmless. If we wanted to avoid it, we could add a
+	 * flag to the WAL record to indicate which operation is being
+	 * performed.
+	 */
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+	write_relmap_file(newmap, false, true, false,
+					  xlrec->dbid, xlrec->tsid, dbpath);
+	LWLockRelease(RelationMappingLock);
+
+	pfree(dbpath);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* Legacy WAL has no managed creation identity. Only an explicitly selected
+ * original ROOTv3 may use its unchanged writer. Keep CF before MappingLock,
+ * and retain the original recovery owner/protections on every refusal.
+ * Spec: 2026-11-01-pre2-e1-format-closure-v1.2-path-c.md */
+static bool
+cluster_redo_relmap_from_control(xl_relmap_update *xlrec, RelMapFile *newmap)
+{
+	ClusterControlRelmapFormatV2 before, after;
+	volatile bool owned_cf = false;
+	volatile bool entered_io = false;
+	volatile bool ok = false;
+
+	if (CritSectionCount || LWLockHeldByMe(RelationMappingLock)
+		|| LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(XidGenLock))
+		return false;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock)) {
+		if (!cluster_cf_lock(ShareLock)) return false;
+		owned_cf = true;
+	}
+	PG_TRY();
+	{
+		ok = cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &before)
+			== CLUSTER_CONTROL_ROOT_OK_PRIMARY && before.root_version == 3;
+		if (ok) {
+			entered_io = true;
+			relmap_redo_apply(xlrec, newmap);
+			ok = cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &after)
+				== CLUSTER_CONTROL_ROOT_OK_PRIMARY && !memcmp(&before, &after, sizeof(before));
+		}
+		if (owned_cf) {
+			owned_cf = false; /* Never retry an unconfirmed/error release. */
+			if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+				ok = false;
+		}
+	}
+	PG_CATCH();
+	{
+		HOLD_INTERRUPTS();
+		PG_TRY();
+		{
+			if (entered_io && LWLockHeldByMe(RelationMappingLock)) {
+				/* ERROR reset the acquisition holdoff; replace the one
+				 * consumed by release, as LWLockReleaseAll does. */
+				HOLD_INTERRUPTS();
+				LWLockRelease(RelationMappingLock);
+			}
+			if (owned_cf) {
+				owned_cf = false;
+				(void)cluster_cf_unlock_confirmed(ShareLock);
+			}
+		}
+		PG_FINALLY();
+		{
+			/* A second ERROR in CF cleanup resets the count again. */
+			if (InterruptHoldoffCount > 0)
+				RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
+}
+#endif
+
 void
 relmap_redo(XLogReaderState *record)
 {
-	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	xl_relmap_update header;
+	RelMapFile newmap;
 
-	/* Backup blocks are not used in relmap records */
-	Assert(!XLogRecHasAnyBlockRefs(record));
-
-	if (info == XLOG_RELMAP_UPDATE)
-	{
-		xl_relmap_update *xlrec = (xl_relmap_update *) XLogRecGetData(record);
-		RelMapFile	newmap;
-		char	   *dbpath;
-
-		if (xlrec->nbytes != sizeof(RelMapFile))
-			elog(PANIC, "relmap_redo: wrong size %u in relmap update record",
-				 xlrec->nbytes);
-		memcpy(&newmap, xlrec->data, sizeof(newmap));
-
-		/* We need to construct the pathname for this database */
-		dbpath = GetDatabasePath(xlrec->dbid, xlrec->tsid);
-
-		/*
-		 * Write out the new map and send sinval, but of course don't write a
-		 * new WAL entry.  There's no surrounding transaction to tell to
-		 * preserve files, either.
-		 *
-		 * There shouldn't be anyone else updating relmaps during WAL replay,
-		 * but grab the lock to interlock against load_relmap_file().
-		 *
-		 * Note that we use the same WAL record for updating the relmap of an
-		 * existing database as we do for creating a new database. In the
-		 * latter case, taking the relmap log and sending sinval messages is
-		 * unnecessary, but harmless. If we wanted to avoid it, we could add a
-		 * flag to the WAL record to indicate which operation is being
-		 * performed.
-		 */
-		LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
-		write_relmap_file(&newmap, false, true, false,
-						  xlrec->dbid, xlrec->tsid, dbpath);
-		LWLockRelease(RelationMappingLock);
-
-		pfree(dbpath);
-	}
-	else
+	if (info != XLOG_RELMAP_UPDATE)
 		elog(PANIC, "relmap_redo: unknown op code %u", info);
+	/* WAL lengths and backup-block refusal must hold in release builds too,
+	 * before dereferencing the header or selecting any target/control input. */
+	if (XLogRecHasAnyBlockRefs(record) || XLogRecGetData(record) == NULL
+		|| XLogRecGetDataLen(record) != MinSizeOfRelmapUpdate + sizeof(RelMapFile))
+		elog(PANIC, "relmap_redo: invalid relmap update record shape");
+	memcpy(&header, XLogRecGetData(record), MinSizeOfRelmapUpdate);
+	if (header.nbytes != sizeof(RelMapFile))
+		elog(PANIC, "relmap_redo: wrong size %u in relmap update record", header.nbytes);
+	memcpy(&newmap, XLogRecGetData(record) + MinSizeOfRelmapUpdate, sizeof(newmap));
+#ifdef USE_PGRAC_CLUSTER
+	/* The catalog GUC cannot bypass independently selected managed format.
+	 * A managed WAL intent still requires the original episode's bound consumer;
+	 * this legacy entry neither infers that input nor falls back to raw files. */
+	if (cluster_shared_config) {
+		if (!cluster_redo_relmap_from_control(&header, &newmap))
+			ereport(PANIC, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						 errmsg("relation map WAL has no unchanged legacy control selection")));
+		return;
+	}
+#endif
+	relmap_redo_apply(&header, &newmap);
 }
