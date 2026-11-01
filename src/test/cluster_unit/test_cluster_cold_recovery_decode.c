@@ -46,6 +46,7 @@
 #include "replication/message.h"
 #include "storage/standbydefs.h"
 #include "utils/relmapper.h"
+#include "common/cluster_relmap_file.h"
 
 #include "unit_test.h"
 
@@ -191,7 +192,7 @@ rf_side_xact_decode_recovery_v1(XLogReaderState *record, uint64 system_identifie
 
 typedef struct FakeRecord {
 	XLogReaderState reader;
-	char data[2 * CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	char data[Max(2 * CLUSTER_SPACE_STRUCTURE_WAL_BYTES, CLUSTER_RELMAP_FILE_SIZE_V2)];
 	union {
 		DecodedXLogRecord decoded;
 		/* Reserves the trailing block array addressed through decoded. */
@@ -1285,10 +1286,81 @@ UT_TEST(test_relmap_incomplete_or_corrupt_native_bytes_cannot_get_a_route)
 	}
 }
 
+UT_TEST(test_managed_relmap_intent_has_only_declared_structural_route)
+{
+	for (unsigned foreign = 0; foreign < 2; ++foreign) {
+		FakeRecord record;
+		ClusterColdDecodedV1 out = {0};
+		ClusterRecoveryFileIdentityV2 id = {0};
+		ClusterRelmapV2Image intent = {0};
+		native_relmap_record(&record);
+		id.kind = CLUSTER_RECOVERY_FILE_RELMAP_V2;
+		id.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+		id.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+		id.system_identifier = 99; id.database_incarnation = 19;
+		memcpy(id.storage_uuid, UUID, 16); id.redo_branch_uuid[0] = 7;
+		id.redo_branch_generation = 1; id.redo_timeline = 1;
+		id.tablespace_oid = GLOBALTABLESPACE_OID;
+		id.creation_generation = 31; id.registration_generation = 5;
+		intent.identity = (ClusterRelmapV2Namespace){99, 19, InvalidOid, true};
+		intent.committed_generation = 3; intent.pending_generation = 4;
+		intent.pending_owner = (ClusterRelmapV2Owner){3, 97, 1, 11, 0, 13};
+		memcpy(&intent.committed, record.data + MinSizeOfRelmapUpdate, sizeof(RelMapFile));
+		intent.pending = intent.committed;
+		UT_ASSERT(cluster_relmap_wal_encode_intent_v2(&id, &intent, record.data, CLUSTER_RELMAP_FILE_SIZE_V2));
+		record.storage.decoded.header.xl_info = XLOG_RELMAP_UPDATE_V2;
+		record.storage.decoded.main_data_len = CLUSTER_RELMAP_FILE_SIZE_V2;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, foreign, &out), CLUSTER_COLD_OK);
+		UT_ASSERT((out.record.record_flags & CLUSTER_COLD_RECORD_STRUCTURAL) != 0);
+		UT_ASSERT_EQ(out.effects.participant_apply, CLUSTER_COLD_EFFECT_RECORD);
+		UT_ASSERT_EQ(out.effects.native_apply | out.effects.no_effect | out.effects.refused, 0);
+		UT_ASSERT(out.record.relmap_image != NULL);
+		cluster_cold_decoded_release_v1(&out);
+	}
+}
+
+UT_TEST(test_managed_relmap_malformed_or_other_namespace_has_no_effect_route)
+{
+	for (unsigned fault = 0; fault < 6; ++fault) {
+		FakeRecord record;
+		ClusterColdDecodedV1 out = {0};
+		ClusterRecoveryFileIdentityV2 id = {0};
+		ClusterRelmapV2Image intent = {0};
+		native_relmap_record(&record);
+		id.kind = CLUSTER_RECOVERY_FILE_RELMAP_V2;
+		id.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+		id.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+		id.system_identifier = 99; id.database_incarnation = 19;
+		memcpy(id.storage_uuid, UUID, 16); id.redo_branch_uuid[0] = 7;
+		id.redo_branch_generation = 1; id.redo_timeline = 1;
+		id.tablespace_oid = GLOBALTABLESPACE_OID;
+		id.creation_generation = 31; id.registration_generation = 5;
+		intent.identity = (ClusterRelmapV2Namespace){99, 19, InvalidOid, true};
+		intent.committed_generation = 3; intent.pending_generation = 4;
+		intent.pending_owner = (ClusterRelmapV2Owner){3, 97, 1, 11, 0, 13};
+		memcpy(&intent.committed, record.data + MinSizeOfRelmapUpdate, sizeof(RelMapFile));
+		intent.pending = intent.committed;
+		UT_ASSERT(cluster_relmap_wal_encode_intent_v2(&id, &intent, record.data, CLUSTER_RELMAP_FILE_SIZE_V2));
+		record.storage.decoded.header.xl_info = XLOG_RELMAP_UPDATE_V2;
+		record.storage.decoded.main_data_len = CLUSTER_RELMAP_FILE_SIZE_V2;
+		if (fault == 0) --record.storage.decoded.main_data_len;
+		if (fault == 1) record.data[CLUSTER_RELMAP_FILE_SIZE_V2 - 1] ^= 1;
+		if (fault == 2) record.storage.decoded.header.xl_xid++;
+		if (fault == 3) record.storage.decoded.has_page_version_edge = true;
+		if (fault == 4) record.storage.decoded.record_origin = 1;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, fault == 5 ? 100 : 99,
+			UUID, true, false, &out), CLUSTER_COLD_COMPONENT_INVALID);
+		UT_ASSERT_EQ(out.effects.participant_apply | out.effects.native_apply | out.effects.no_effect, 0);
+		cluster_cold_decoded_release_v1(&out);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(27);
+	UT_RUN(test_managed_relmap_malformed_or_other_namespace_has_no_effect_route);
+	UT_RUN(test_managed_relmap_intent_has_only_declared_structural_route);
 	UT_RUN(test_relmap_complete_image_keeps_structural_and_exclusive_participant_route);
 	UT_RUN(test_relmap_incomplete_or_corrupt_native_bytes_cannot_get_a_route);
 	UT_RUN(test_full_clog_truncate_keeps_native_and_foreign_owner_routes);

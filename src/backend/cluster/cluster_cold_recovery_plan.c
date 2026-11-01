@@ -46,6 +46,7 @@
 #include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "utils/relmapper.h"
+#include "cluster/cluster_cold_relmap_managed_internal.h"
 #include "catalog/pg_tablespace_d.h"
 
 ClusterColdDetailV1
@@ -65,7 +66,8 @@ cold_relmap_inputs_valid(const ClusterColdPlanV1 *plan,
 			|| !cold_relmap_cut_equal(&in->cut,
 				&plan->participants[plan->canonical[in->participant]].cut)
 			|| in->frame.participant != in->participant || in->frame.history
-			|| in->frame.rmid != RM_RELMAP_ID || in->frame.info != XLOG_RELMAP_UPDATE
+			|| in->frame.rmid != RM_RELMAP_ID
+			|| (in->frame.info != XLOG_RELMAP_UPDATE && in->frame.info != XLOG_RELMAP_UPDATE_V2)
 			|| in->frame.page_components != 0 || in->frame.space_effects != 0
 			|| in->frame.read_rec_ptr < in->cut.native_redo
 			|| in->frame.read_rec_ptr >= in->frame.end_rec_ptr
@@ -91,6 +93,15 @@ cold_relmap_inputs_valid(const ClusterColdPlanV1 *plan,
 			|| source->claim.max_config_generation == 0
 			|| !bytes_nonzero(source->claim.identity.storage_uuid, 16)
 			|| !bytes_nonzero(source->claim.claim_sha256, 32))
+			return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		if (in->frame.info == XLOG_RELMAP_UPDATE_V2
+			&& (plan->relmap_recovery == NULL || in->retention != NULL || in->retention_lock != NULL
+				|| in->file_identity.tablespace_oid != (image->identity.shared
+					? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID)
+				|| memcmp(in->file_identity.storage_uuid, source->claim.identity.storage_uuid, 16) != 0
+				|| !cold_relmap_managed_image_matches(in, &in->file_identity, image)))
+			return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		if (in->frame.info == XLOG_RELMAP_UPDATE && in->file_identity.kind != CLUSTER_RECOVERY_FILE_UNKNOWN_V2)
 			return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 		/* One pending pair per namespace. Multiple writes to that pair need
 		 * the original terminal owner, never an implicit stage overwrite. */
@@ -148,7 +159,10 @@ relmap_capture(ClusterColdPlanV1 *plan, uint32 participant, const ClusterColdRec
 			&& cold_relmap_frame_equal(&in->frame, record)
 			&& record->relmap_image != NULL && record->relmap_dbid == in->staged.identity.dbid
 			&& record->relmap_tsid == (in->staged.identity.shared ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID)
-			&& memcmp(record->relmap_image, &in->staged.pending, sizeof(RelMapFile)) == 0) {
+			&& memcmp(record->relmap_image, &in->staged.pending, sizeof(RelMapFile)) == 0
+			&& (in->frame.info == XLOG_RELMAP_UPDATE_V2
+				? cold_relmap_managed_image_matches(in, record->relmap_file_identity, record->relmap_staged)
+				: record->relmap_file_identity == NULL && record->relmap_staged == NULL)) {
 			entry->captured = true;
 			return i;
 		}
@@ -191,7 +205,10 @@ cluster_cold_plan_relmap_captured_v1(const ClusterColdPlanV1 *plan, uint32 parti
 			&& record->relmap_dbid == input->staged.identity.dbid
 			&& record->relmap_tsid == (input->staged.identity.shared
 				? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID)
-			&& memcmp(record->relmap_image, &input->staged.pending, sizeof(RelMapFile)) == 0)
+			&& memcmp(record->relmap_image, &input->staged.pending, sizeof(RelMapFile)) == 0
+			&& (input->frame.info == XLOG_RELMAP_UPDATE_V2
+				? cold_relmap_managed_image_matches(input, record->relmap_file_identity, record->relmap_staged)
+				: record->relmap_file_identity == NULL && record->relmap_staged == NULL))
 			return input;
 	}
 	return NULL;

@@ -49,6 +49,8 @@
 #define CLUSTER_COLD_RECOVERY_H
 
 #include "common/relmap.h"
+#include "common/cluster_relmap_v2.h"
+#include "cluster/cluster_recovery_file_identity.h"
 
 #include "access/xlogrecord.h"
 #include "cluster/cluster_page_stable_base.h"
@@ -193,6 +195,9 @@ typedef struct ClusterColdRecordV1 {
 	Oid relmap_dbid;
 	Oid relmap_tsid;
 	const RelMapFile *relmap_image;
+	/* Managed values are saved observations, never control registration. */
+	const ClusterRecoveryFileIdentityV2 *relmap_file_identity;
+	const ClusterRelmapV2Image *relmap_staged;
 } ClusterColdRecordV1;
 
 /* Original record frame metadata, not an ownership or effects proof. */
@@ -674,6 +679,8 @@ typedef struct ClusterColdDecodedV1 {
 	ClusterColdSpaceOpV1 *space_ops;
 	uint32 space_capacity;
 	RelMapFile relmap_image;
+	ClusterRecoveryFileIdentityV2 relmap_file_identity;
+	ClusterRelmapV2Image relmap_staged;
 } ClusterColdDecodedV1;
 
 /* Classify one decoded record of the exact source namespace. Reserved raw/top

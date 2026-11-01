@@ -78,12 +78,19 @@ typedef struct ClusterColdRelmapInputV1 {
 	ClusterWalSourceRef source;
 	ClusterColdRecordFrameV1 frame;
 	ClusterRelmapV2Image staged;
+	/* Original control-selected identity; zero only for explicit raw mode. */
+	ClusterRecoveryFileIdentityV2 file_identity;
 	struct ClusterRelmapRetentionDirectory *retention;
 	struct LWLock *retention_lock;
 } ClusterColdRelmapInputV1;
 
 /* Original owner pin plus a complete decoded WAL record. The owner supplies
  * its actual FullXid/era and pin generation, never an epoch inferred from WAL.
+ * Managed UPDATE_V2 additionally requires file_identity independently chosen
+ * by the original control owner, rechecked with the whole source/episode
+ * before/after use. Only the recovery carrier accepts that mode; the complete
+ * intent provides both images and cannot borrow history from current files.
+ * Old UPDATE plus a managed file_identity is refused, without fallback.
  * owner.wal_end must be zero: the producer takes the actual record end.
  * All pointers are borrowed through prepare; the resulting declaration owns
  * copied values and retains only the original directory/lock pointers. */
@@ -92,6 +99,7 @@ typedef struct ClusterColdRelmapWalV1 {
 	ClusterRelmapV2Namespace identity;
 	uint64 generation;
 	ClusterRelmapV2Owner owner;
+	ClusterRecoveryFileIdentityV2 file_identity;
 	struct ClusterRelmapRetentionDirectory *retention;
 	struct LWLock *retention_lock;
 	struct XLogReaderState *reader;

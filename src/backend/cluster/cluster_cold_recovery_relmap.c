@@ -16,6 +16,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
+#include "cluster/cluster_cold_relmap_managed_internal.h"
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_relmap_lock.h"
@@ -165,8 +166,12 @@ relmap_record_matches(const ClusterColdRelmapInputV1 *input, XLogReaderState *re
 		|| record->toplevel_xid != frame->source_top_xid || XLogRecHasAnyBlockRefs(reader)
 		|| record->has_page_version_edge || XLogRecGetOrigin(reader) != InvalidRepOriginId
 		|| XLogRecGetData(reader) == NULL
-		|| XLogRecGetDataLen(reader) != MinSizeOfRelmapUpdate + sizeof(RelMapFile))
+		|| (frame->info == XLOG_RELMAP_UPDATE_V2
+			? XLogRecGetDataLen(reader) != CLUSTER_RELMAP_FILE_SIZE_V2
+			: XLogRecGetDataLen(reader) != MinSizeOfRelmapUpdate + sizeof(RelMapFile)))
 		return false;
+	if (frame->info == XLOG_RELMAP_UPDATE_V2)
+		return cold_relmap_managed_wal_matches(input, reader);
 	memcpy(&header, XLogRecGetData(reader), MinSizeOfRelmapUpdate);
 	return header.dbid == input->staged.identity.dbid
 		&& header.tsid == (input->staged.identity.shared ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID)
@@ -188,9 +193,12 @@ relmap_wal_input(const ClusterColdPlanV1 *plan, const ClusterWalSourceRef *sourc
 		|| wal->owner.wal_end != 0 || reader == NULL || reader->record == NULL)
 		return false;
 	record = reader->record;
-	if (record->header.xl_rmid != RM_RELMAP_ID || record->header.xl_info != XLOG_RELMAP_UPDATE
+	if (record->header.xl_rmid != RM_RELMAP_ID
+		|| (record->header.xl_info != XLOG_RELMAP_UPDATE && record->header.xl_info != XLOG_RELMAP_UPDATE_V2)
 		|| record->main_data == NULL
-		|| record->main_data_len != MinSizeOfRelmapUpdate + sizeof(RelMapFile)
+		|| (record->header.xl_info == XLOG_RELMAP_UPDATE_V2
+			? record->main_data_len != CLUSTER_RELMAP_FILE_SIZE_V2
+			: record->main_data_len != MinSizeOfRelmapUpdate + sizeof(RelMapFile))
 		|| reader->system_identifier != wal->identity.system_identifier
 		|| reader->cluster_expected_thread_id != sources[wal->participant].claim.identity.origin_thread_id
 		|| reader->seg.ws_tli != sources[wal->participant].timeline)
@@ -201,6 +209,25 @@ relmap_wal_input(const ClusterColdPlanV1 *plan, const ClusterWalSourceRef *sourc
 	input->frame = (ClusterColdRecordFrameV1){reader->ReadRecPtr, reader->EndRecPtr,
 		record->header.xl_crc, wal->participant, record->header.xl_xid,
 		record->toplevel_xid, 0, 0, record->header.xl_rmid, record->header.xl_info, false};
+	if (record->header.xl_info == XLOG_RELMAP_UPDATE_V2) {
+		unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
+		ClusterRelmapV2Image requested;
+		input->file_identity = wal->file_identity;
+		if (wal->retention != NULL || wal->retention_lock != NULL
+			|| !cluster_relmap_wal_rebuild_pending_v2(record->main_data, record->main_data_len,
+				&input->file_identity, reader->EndRecPtr, bytes, sizeof(bytes))
+			|| !cluster_relmap_file_decode_v2(bytes, sizeof(bytes), &input->file_identity, &input->staged))
+			return false;
+		requested = input->staged;
+		requested.identity = wal->identity;
+		requested.pending_generation = wal->generation;
+		requested.pending_owner = wal->owner;
+		requested.pending_owner.wal_end = reader->EndRecPtr;
+		return cold_relmap_managed_image_matches(input, &input->file_identity, &requested)
+			&& relmap_record_matches(input, reader);
+	}
+	if (wal->file_identity.kind != CLUSTER_RECOVERY_FILE_UNKNOWN_V2)
+		return false;
 	input->staged.identity = wal->identity;
 	input->staged.committed_generation = wal->generation - 1;
 	input->staged.pending_generation = wal->generation;
@@ -384,14 +411,22 @@ cluster_cold_plan_relmap_from_recovery_wal_v1(ClusterColdPlanV1 *plan,
 		for (uint32 i = 0; i < count && ok; ++i) {
 			ClusterRelmapV2View base;
 			unsigned char encoded[CLUSTER_RELMAP_V2_FILE_SIZE];
-			ok = cluster_relmap_authority_x_held()
-				&& cluster_relmap_authority_v2_read(&inputs[i].staged.identity, &base)
-					== CLUSTER_RELMAP_V2_PAIR_VALID
-				&& base.pending_complete && !base.has_pending
-				&& base.committed_generation == inputs[i].staged.committed_generation;
+			bool managed = inputs[i].frame.info == XLOG_RELMAP_UPDATE_V2;
+			if (managed) {
+				ClusterRelmapFilePairV2 pair;
+				ok = cluster_relmap_authority_x_held()
+					&& cluster_relmap_authority_managed_read_v2(&inputs[i].file_identity, &pair);
+				if (ok) base = pair.view;
+			} else
+				ok = cluster_relmap_authority_x_held()
+					&& cluster_relmap_authority_v2_read(&inputs[i].staged.identity, &base)
+						== CLUSTER_RELMAP_V2_PAIR_VALID;
+			ok = ok && base.pending_complete && !base.has_pending
+				&& base.committed_generation == inputs[i].staged.committed_generation
+				&& (!managed || memcmp(&base.committed, &inputs[i].staged.committed, sizeof(RelMapFile)) == 0);
 			if (ok) {
 				ClusterRelmapV2Image *saved = cluster_relmap_recovery_image_at(pins, i);
-				inputs[i].staged.committed = base.committed;
+				if (!managed) inputs[i].staged.committed = base.committed;
 				if (saved != NULL) *saved = inputs[i].staged;
 				ok = saved != NULL && cluster_relmap_v2_encode(&inputs[i].staged, encoded, sizeof(encoded))
 					== CLUSTER_RELMAP_V2_VALID;
@@ -450,6 +485,21 @@ cluster_cold_typed_relmap_recovery_transfer_v1(ClusterColdTypedV1 *typed,
 	return cluster_relmap_recovery_transfer(plan->relmap_recovery, targets, count);
 }
 
+static bool
+relmap_staged_current(const ClusterColdRelmapInputV1 *input)
+{
+	ClusterRelmapFilePairV2 pair;
+	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
+	if (input->frame.info != XLOG_RELMAP_UPDATE_V2)
+		return cluster_relmap_authority_v2_check_staged(&input->staged);
+	return enableFsync && cluster_relmap_authority_x_held()
+		&& cluster_relmap_file_encode_v2(&input->file_identity, &input->staged, bytes, sizeof(bytes))
+		&& cluster_relmap_authority_managed_read_v2(&input->file_identity, &pair)
+		&& memcmp(pair.bytes[0], bytes, sizeof(bytes)) == 0
+		&& memcmp(pair.bytes[1], bytes, sizeof(bytes)) == 0
+		&& enableFsync && cluster_relmap_authority_x_held();
+}
+
 bool
 cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence, const ClusterColdStepV1 *step, XLogReaderState *reader)
@@ -488,7 +538,12 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 			&& cluster_relmap_v2_encode(&input->staged, encoded, sizeof(encoded)) == CLUSTER_RELMAP_V2_VALID
 			&& relmap_entry_pin(plan, entry, entry->applied)) {
 			if (entry->applied)
-				ok = cluster_relmap_authority_v2_check_staged(&input->staged);
+				ok = relmap_staged_current(input);
+			else if (input->frame.info == XLOG_RELMAP_UPDATE_V2)
+				ok = plan->relmap_recovery != NULL
+					&& cluster_relmap_authority_managed_replay_v2(&input->file_identity,
+						&input->staged, &input->source, reader, plan->relmap_recovery)
+					&& relmap_staged_current(input);
 			else if (cluster_relmap_authority_v2_read(&input->staged.identity, &base)
 					== CLUSTER_RELMAP_V2_PAIR_VALID && !base.has_pending
 				&& base.committed_generation == input->staged.committed_generation
@@ -541,7 +596,7 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 		const ClusterColdRelmapInputV1 *input = &entry->input;
 		ok = relmap_current(typed, fence, input) && relmap_side_matches(typed, input, NULL)
 			&& relmap_entry_pin(plan, entry, true)
-			&& cluster_relmap_authority_v2_check_staged(&input->staged)
+			&& relmap_staged_current(input)
 			&& relmap_current(typed, fence, input) && relmap_entry_pin(plan, entry, true)
 			&& relmap_side_matches(typed, input, NULL);
 	}

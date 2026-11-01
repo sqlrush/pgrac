@@ -35,6 +35,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "common/cluster_relmap_file.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -82,6 +83,28 @@ cold_relmap_image(XLogReaderState *reader, ClusterColdDecodedV1 *out)
 	xl_relmap_update header;
 	RelMapFile *map = &out->relmap_image;
 	pg_crc32c crc;
+
+	if (XLogRecGetInfo(reader) == XLOG_RELMAP_UPDATE_V2) {
+		unsigned char rebuilt[CLUSTER_RELMAP_FILE_SIZE_V2];
+		if (XLogRecHasAnyBlockRefs(reader) || reader->record->has_page_version_edge
+			|| XLogRecGetOrigin(reader) != InvalidRepOriginId
+			|| !cluster_relmap_wal_observe_intent_v2(XLogRecGetData(reader), XLogRecGetDataLen(reader),
+				&out->relmap_file_identity, &out->relmap_staged)
+			|| !cluster_relmap_wal_rebuild_pending_v2(XLogRecGetData(reader), XLogRecGetDataLen(reader),
+				&out->relmap_file_identity, reader->EndRecPtr, rebuilt, sizeof(rebuilt))
+			|| !cluster_relmap_file_decode_v2(rebuilt, sizeof(rebuilt), &out->relmap_file_identity,
+				&out->relmap_staged)
+			|| (TransactionId)out->relmap_staged.pending_owner.top_full_xid != XLogRecGetXid(reader)
+			|| out->relmap_file_identity.tablespace_oid != (out->relmap_staged.identity.shared
+				? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID))
+			return false;
+		out->record.relmap_dbid = out->relmap_file_identity.database_oid;
+		out->record.relmap_tsid = out->relmap_file_identity.tablespace_oid;
+		out->record.relmap_image = &out->relmap_staged.pending;
+		out->record.relmap_file_identity = &out->relmap_file_identity;
+		out->record.relmap_staged = &out->relmap_staged;
+		return true;
+	}
 
 	if (XLogRecGetInfo(reader) != XLOG_RELMAP_UPDATE || XLogRecHasAnyBlockRefs(reader)
 		|| reader->record->has_page_version_edge || XLogRecGetOrigin(reader) != InvalidRepOriginId
@@ -1087,6 +1110,10 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 		out->record.record_flags |= CLUSTER_COLD_RECORD_FOREIGN_SIDE;
 	}
 	detail = cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
+	if (detail == CLUSTER_COLD_OK && out->record.relmap_file_identity != NULL
+		&& (out->relmap_file_identity.system_identifier != system_identifier
+			|| memcmp(out->relmap_file_identity.storage_uuid, storage_uuid, 16) != 0))
+		detail = CLUSTER_COLD_COMPONENT_INVALID;
 	if (detail == CLUSTER_COLD_OK) {
 		cold_effect_routes(&plan, effects, out);
 		out->detached = plan;

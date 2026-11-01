@@ -891,6 +891,7 @@ test_cluster_cold_relmap: test_cluster_cold_relmap.c test_cluster_relmap_v2_stor
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) $(top_builddir)/src/common/libpgcommon_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(top_srcdir)/src/common/cluster_relmap_v2.c \
 		$(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_replay_core.o \
 		test_cluster_cold_relmap_executor.o test_cluster_relmap_v2_storage_product.o \
 		test_cluster_relmap_pending_product.o test_cluster_side_online_plan.o \
@@ -14885,3 +14886,15 @@ $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_STARTUP_O) \
 		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o: \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
+
+# Complete managed cold records share exact codec/header dependencies.
+$(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_DECODE_O) test_cluster_cold_relmap_executor.o \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap_managed_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h
+
+test_cluster_cold_relmap test_cluster_cold_recovery_decode: \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c

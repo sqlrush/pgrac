@@ -23,6 +23,7 @@
 #include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_cold_relmap.h"
+#include "cluster/cluster_cold_relmap_managed_internal.h"
 #include "utils/relmapper.h"
 #include "cluster_side_online_plan_internal.h"
 #include "cluster/cluster_uba.h"
@@ -74,7 +75,8 @@ typedef struct SideNativeRelmapWitness {
 	ClusterColdRelmapInputV1 input;
 	RfPageOnlineRecordIdentityV1 identity;
 	XLogRecord header;
-	uint8 payload[MinSizeOfRelmapUpdate + sizeof(RelMapFile)];
+	uint32 payload_length;
+	uint8 payload[CLUSTER_RELMAP_FILE_SIZE_V2];
 } SideNativeRelmapWitness;
 
 struct RfSideOnlinePlanV1 {
@@ -1373,7 +1375,8 @@ side_relmap_native_matches(const ClusterColdRelmapInputV1 *input,
 	if (reader->cluster_record_crc_failed || input->frame.history
 		|| input->frame.participant != input->participant
 		|| frame->page_components != 0 || frame->space_effects != 0
-		|| frame->rmid != RM_RELMAP_ID || frame->info != XLOG_RELMAP_UPDATE
+		|| frame->rmid != RM_RELMAP_ID
+		|| (frame->info != XLOG_RELMAP_UPDATE && frame->info != XLOG_RELMAP_UPDATE_V2)
 		|| frame->read_rec_ptr < input->cut.native_redo
 		|| frame->end_rec_ptr > input->cut.tail_end
 		|| reader->system_identifier != input->source.claim.identity.system_identifier
@@ -1383,14 +1386,16 @@ side_relmap_native_matches(const ClusterColdRelmapInputV1 *input,
 		|| reader->ReadRecPtr != reader->record->lsn
 		|| reader->EndRecPtr != reader->record->next_lsn
 		|| frame->read_rec_ptr >= frame->end_rec_ptr
-		|| XLogRecGetRmid(reader) != RM_RELMAP_ID || XLogRecGetInfo(reader) != XLOG_RELMAP_UPDATE
+		|| XLogRecGetRmid(reader) != RM_RELMAP_ID || XLogRecGetInfo(reader) != frame->info
 		|| reader->record->header.xl_crc != frame->record_crc
 		|| reader->record->header.xl_xid != frame->source_xid
 		|| reader->record->toplevel_xid != frame->source_top_xid
 		|| XLogRecHasAnyBlockRefs(reader) || reader->record->has_page_version_edge
 		|| XLogRecGetOrigin(reader) != InvalidRepOriginId
 		|| XLogRecGetData(reader) == NULL
-		|| XLogRecGetDataLen(reader) != MinSizeOfRelmapUpdate + sizeof(map)
+		|| (frame->info == XLOG_RELMAP_UPDATE_V2
+			? XLogRecGetDataLen(reader) != CLUSTER_RELMAP_FILE_SIZE_V2
+			: XLogRecGetDataLen(reader) != MinSizeOfRelmapUpdate + sizeof(map))
 		|| identity->reserved_zero != 0
 		|| identity->record.system_identifier != reader->system_identifier
 		|| memcmp(identity->record.storage_uuid, input->source.claim.identity.storage_uuid, 16) != 0
@@ -1402,6 +1407,10 @@ side_relmap_native_matches(const ClusterColdRelmapInputV1 *input,
 		|| identity->record.rmid != frame->rmid || identity->record.info != frame->info
 		|| input->staged.identity.system_identifier != reader->system_identifier
 		|| input->staged.identity.database_incarnation != input->source.claim.database_incarnation)
+		return false;
+	if (frame->info == XLOG_RELMAP_UPDATE_V2)
+		return cold_relmap_managed_wal_matches(input, reader);
+	if (input->file_identity.kind != CLUSTER_RECOVERY_FILE_UNKNOWN_V2)
 		return false;
 	memcpy(&header, XLogRecGetData(reader), MinSizeOfRelmapUpdate);
 	if (header.nbytes != sizeof(map) || header.dbid != input->staged.identity.dbid
@@ -1456,7 +1465,7 @@ rf_side_online_plan_feed_relmap_v1(RfSideOnlinePlanV1 *plan,
 		|| record_plan->component_count != 0
 		|| record_plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED
 		|| record_plan->route.rmid != RM_RELMAP_ID
-		|| record_plan->route.normalized_info != XLOG_RELMAP_UPDATE
+		|| record_plan->route.normalized_info != input->frame.info
 		|| record_plan->route.codec_id != RF_ROUTE_CODEC_SIDE_STANDARD
 		|| !side_relmap_native_matches(input, identity, record_plan->source_record)) {
 		detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -1481,7 +1490,8 @@ rf_side_online_plan_feed_relmap_v1(RfSideOnlinePlanV1 *plan,
 	witness->input = *input;
 	witness->identity = *identity;
 	memcpy(&witness->header, &record_plan->source_record->record->header, SizeOfXLogRecord);
-	memcpy(witness->payload, XLogRecGetData(record_plan->source_record), sizeof(witness->payload));
+	witness->payload_length = XLogRecGetDataLen(record_plan->source_record);
+	memcpy(witness->payload, XLogRecGetData(record_plan->source_record), witness->payload_length);
 	witness->next = plan->native_relmaps;
 	plan->native_relmaps = witness;
 	plan->participant_seen[identity->participant_index] = true;
@@ -1516,7 +1526,8 @@ rf_side_online_plan_relmap_matches_v1(const RfSideOnlinePlanV1 *plan,
 		if (memcmp(&w->input.source, source, sizeof(*source)) != 0
 			|| !side_relmap_native_matches(&w->input, &w->identity, reader)
 			|| memcmp(&w->header, &reader->record->header, SizeOfXLogRecord) != 0
-			|| memcmp(w->payload, XLogRecGetData(reader), sizeof(w->payload)) != 0)
+			|| w->payload_length != XLogRecGetDataLen(reader)
+			|| memcmp(w->payload, XLogRecGetData(reader), w->payload_length) != 0)
 			continue;
 		if (found != NULL)
 			return false;
@@ -1550,7 +1561,10 @@ rf_side_online_plan_relmap_input_matches_v1(const RfSideOnlinePlanV1 *plan,
 			|| !SAME(staged.pending_owner.wal_end) || !SAME(staged.pending_owner.boot_incarnation)
 			|| memcmp(&w->input.staged.committed, &input->staged.committed, sizeof(RelMapFile)) != 0
 			|| memcmp(&w->input.staged.pending, &input->staged.pending, sizeof(RelMapFile)) != 0
-			|| !SAME(retention) || !SAME(retention_lock))
+			|| !SAME(retention) || !SAME(retention_lock)
+			|| (input->frame.info == XLOG_RELMAP_UPDATE_V2
+				? !cold_relmap_managed_image_matches(input, &w->input.file_identity, &w->input.staged)
+				: !SAME(file_identity.kind)))
 			continue;
 #undef SAME
 		if (found)

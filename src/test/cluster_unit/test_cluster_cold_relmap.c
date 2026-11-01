@@ -14,8 +14,22 @@
  */
 int storage_fixture_main(void);
 #define main storage_fixture_main
+#define cluster_relmap_authority_x_held cold_original_namespace_x_held
 #include "test_cluster_relmap_v2_storage.c"
+#undef cluster_relmap_authority_x_held
 #undef main
+
+/* Retain the original provider; the new fixture can lose X specifically
+ * at the executor's final owner check, after its managed read completed. */
+static unsigned namespace_x_checks_until_loss;
+bool cluster_relmap_authority_x_held(void);
+bool
+cluster_relmap_authority_x_held(void)
+{
+	if (namespace_x_checks_until_loss != 0 && --namespace_x_checks_until_loss == 0)
+		relmap_x_held = false;
+	return cold_original_namespace_x_held();
+}
 #include "access/xlogreader.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -33,7 +47,7 @@ static bool original_source_current;
 static unsigned source_checks, source_error_at;
 static XLogReaderState map_reader;
 static DecodedXLogRecord map_decoded;
-static char map_payload[MinSizeOfRelmapUpdate + sizeof(RelMapFile)];
+static char map_payload[CLUSTER_RELMAP_FILE_SIZE_V2];
 static RfSideOnlinePlanV1 *detached_side;
 static unsigned late_side_fault;
 static unsigned side_source_limit;
@@ -136,14 +150,14 @@ cold_map_setup(void)
 	map_reader.record = &map_decoded;
 	map_decoded.lsn = 800;
 	map_decoded.next_lsn = 909;
-	map_decoded.header.xl_tot_len = SizeOfXLogRecord + 3 + sizeof(map_payload);
+	map_decoded.header.xl_tot_len = SizeOfXLogRecord + 3 + MinSizeOfRelmapUpdate + sizeof(RelMapFile);
 	map_decoded.header.xl_rmid = RM_RELMAP_ID;
 	map_decoded.header.xl_info = XLOG_RELMAP_UPDATE;
 	map_decoded.header.xl_xid = 0x123;
 	map_decoded.header.xl_crc = 77;
 	map_decoded.max_block_id = -1;
 	map_decoded.main_data = map_payload;
-	map_decoded.main_data_len = sizeof(map_payload);
+	map_decoded.main_data_len = MinSizeOfRelmapUpdate + sizeof(RelMapFile);
 	records[0][0].read_rec_ptr = 800;
 	records[0][0].end_rec_ptr = 909;
 	records[0][0].record_crc = 77;
@@ -186,7 +200,7 @@ cold_map_side(const ClusterColdRelmapInputV1 *input, bool seal)
 	RfSideOnlinePlanV1 *side = NULL;
 	RfContributorStreamCutV1 cut = {.failed_thread = 4, .timeline_id = 1,
 		.origin_owner_incarnation = 101, .scan_begin_inclusive = 800,
-		.scan_end_exclusive = 909, .flags = RF_CONTRIBUTOR_CUT_COMPLETE};
+		.scan_end_exclusive = input->cut.tail_end, .flags = RF_CONTRIBUTOR_CUT_COMPLETE};
 	RfSideOnlinePlanRequestV1 request = {0};
 	RfDetachedRecordPlanV1 record = {0};
 	RfPageOnlineRecordIdentityV1 frame = {0};
@@ -205,17 +219,17 @@ cold_map_side(const ClusterColdRelmapInputV1 *input, bool seal)
 	record.preflight_complete = true;
 	record.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 	record.route.rmid = RM_RELMAP_ID;
-	record.route.normalized_info = XLOG_RELMAP_UPDATE;
+	record.route.normalized_info = input->frame.info;
 	record.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
 	frame.record.system_identifier = identity.system_identifier;
 	memcpy(frame.record.storage_uuid, request.storage_uuid, 16);
 	frame.record.origin_thread = 4;
 	frame.record.timeline_id = 1;
 	frame.record.read_rec_ptr = 800;
-	frame.record.end_rec_ptr = 909;
+	frame.record.end_rec_ptr = input->frame.end_rec_ptr;
 	frame.record.record_crc = 77;
 	frame.record.rmid = RM_RELMAP_ID;
-	frame.record.info = XLOG_RELMAP_UPDATE;
+	frame.record.info = input->frame.info;
 	UT_ASSERT_EQ(rf_side_online_plan_feed_relmap_v1(side, &record, &frame, input), 0);
 	if (seal) UT_ASSERT_EQ(rf_side_online_plan_seal_v1(side), 0);
 	return side;
@@ -233,7 +247,7 @@ cold_map_seal(bool declaration, bool include_map)
 	if (include_map) {
 		detail = cluster_cold_plan_feed_v1(replay.plan, 0, &records[0][0]);
 		if (detail != CLUSTER_COLD_OK) return detail;
-		if (declaration) replay.side_plans[0] = cold_map_side(&declared, true);
+		if (declaration || declared.frame.info == XLOG_RELMAP_UPDATE_V2) replay.side_plans[0] = cold_map_side(&declared, true);
 	}
 	for (unsigned i = 0; i < 2; ++i) {
 		detail = cluster_cold_plan_feed_v1(replay.plan, 1, &records[1][i]);
@@ -276,8 +290,12 @@ cold_map_scheduled(void *arg, uint32 p, const ClusterColdStepV1 *step,
 	}
 	if (action != CLUSTER_COLD_PAGE_APPLY)
 		return false;
-	if (cluster_relmap_authority_v2_read(&identity, &view) != CLUSTER_RELMAP_V2_PAIR_VALID
-		|| view.has_pending != (page_observations == 1)) return false;
+	if (declared.frame.info == XLOG_RELMAP_UPDATE_V2) {
+		ClusterRelmapFilePairV2 pair;
+		if (!cluster_relmap_authority_managed_read_v2(&declared.file_identity, &pair)) return false;
+		view = pair.view;
+	} else if (cluster_relmap_authority_v2_read(&identity, &view) != CLUSTER_RELMAP_V2_PAIR_VALID) return false;
+	if (view.has_pending != (page_observations == 1)) return false;
 	if (view.has_pending && memcmp(&view.pending, &declared.staged.pending, sizeof(view.pending)))
 		return false;
 	++page_observations;
@@ -623,10 +641,204 @@ UT_TEST(test_relmap_large_batch_rejects_whole_tail_and_budget_before_copy)
 	free(batch); cold_map_end();
 }
 
+/* The original control selection is a controlled value here; every pair
+ * write/read and both original planner passes execute their product bodies. */
+static ClusterColdDetailV1
+cold_managed_setup(unsigned fault)
+{
+	ClusterColdRelmapWalV1 wal = {0};
+	ClusterRelmapV2Image clean, intent;
+	unsigned char bytes[CLUSTER_RELMAP_FILE_SIZE_V2];
+	cold_map_setup();
+	declared.retention = NULL; declared.retention_lock = NULL;
+	declared.file_identity = (ClusterRecoveryFileIdentityV2){0};
+	declared.file_identity.kind = CLUSTER_RECOVERY_FILE_RELMAP_V2;
+	declared.file_identity.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+	declared.file_identity.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+	declared.file_identity.system_identifier = identity.system_identifier;
+	declared.file_identity.database_incarnation = identity.database_incarnation;
+	memcpy(declared.file_identity.storage_uuid, replay.sources[0].claim.identity.storage_uuid, 16);
+	declared.file_identity.redo_branch_uuid[0] = 7;
+	declared.file_identity.redo_branch_generation = 2;
+	declared.file_identity.redo_timeline = 1;
+	declared.file_identity.tablespace_oid = GLOBALTABLESPACE_OID;
+	declared.file_identity.origin = 0; /* creator differs from replay writer */
+	declared.file_identity.creation_generation = 91;
+	declared.file_identity.registration_generation = 6;
+	clean = declared.staged; clean.pending_generation = 0;
+	memset(&clean.pending_owner, 0, sizeof(clean.pending_owner));
+	memset(&clean.pending, 0, sizeof(clean.pending));
+	UT_ASSERT(cluster_relmap_file_encode_v2(&declared.file_identity, &clean, bytes, sizeof(bytes)));
+	write_copy(0, bytes, sizeof(bytes)); write_copy(1, bytes, sizeof(bytes));
+	reset_io(); mapping_held = true; relmap_x_held = true;
+	declared.frame.info = map_decoded.header.xl_info = XLOG_RELMAP_UPDATE_V2;
+	declared.cut.tail_end = replay.participants[0].tail_end = 4096;
+	declared.frame.end_rec_ptr = declared.staged.pending_owner.wal_end = 4096;
+	map_reader.EndRecPtr = map_decoded.next_lsn = 4096;
+	map_decoded.main_data_len = sizeof(map_payload);
+	map_decoded.header.xl_tot_len = SizeOfXLogRecord + 5 + sizeof(map_payload);
+	intent = declared.staged; intent.pending_owner.wal_end = 0;
+	UT_ASSERT(cluster_relmap_wal_encode_intent_v2(&declared.file_identity, &intent, map_payload, sizeof(map_payload)));
+	records[0][0].info = XLOG_RELMAP_UPDATE_V2; records[0][0].end_rec_ptr = 4096;
+	records[0][0].relmap_file_identity = &declared.file_identity;
+	records[0][0].relmap_staged = &declared.staged;
+	/* Replace the empty original plan to use the actual changed cut. */
+	cluster_cold_plan_destroy_v1(&replay.plan);
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(replay.participants, 2, 4194304, &replay.plan), CLUSTER_COLD_OK);
+	wal.participant = 0; wal.identity = identity; wal.generation = 8;
+	wal.owner = intent.pending_owner; wal.file_identity = declared.file_identity; wal.reader = &map_reader;
+	if (fault == 1) ++wal.file_identity.creation_generation;
+	if (fault == 2) ++wal.owner.boot_incarnation;
+	if (fault == 3) map_payload[127] ^= 1;
+	return cluster_cold_plan_relmap_from_recovery_wal_v1(replay.plan, replay.sources, 2, 2, &wal, 1);
+}
+
+UT_TEST(test_managed_original_merge_stages_between_pages_and_rechecks_duplicate)
+{
+	ClusterColdStepV1 step;
+	unsigned after;
+	UT_ASSERT_EQ(cold_managed_setup(0), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cold_map_seal(false, true), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cold_map_run(), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(page_observations, 2);
+	UT_ASSERT(cluster_cold_typed_relmap_ready_v1(&replay, (ClusterRecoveryFencePlan *)&replay));
+	UT_ASSERT(cluster_cold_plan_step_v1(replay.plan, 1, &step));
+	after = writes;
+	UT_ASSERT(cluster_cold_typed_relmap_record_v1(&replay, (ClusterRecoveryFencePlan *)&replay, &step, &map_reader));
+	UT_ASSERT_EQ(writes, after);
+	UT_ASSERT(replay.plan->relmap_recovery->attempted[0] && replay.plan->relmap_recovery->staged[0]);
+	UT_ASSERT(!replay.plan->relmap_recovery->transferred);
+	cold_map_end();
+}
+
+UT_TEST(test_managed_declaration_independent_binding_and_complete_intent_refuse_before_io)
+{
+	for (unsigned fault = 1; fault <= 3; ++fault) {
+		UT_ASSERT_NE(cold_managed_setup(fault), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(writes, 0); UT_ASSERT_EQ(reads, 0);
+		UT_ASSERT(replay.plan->relmap_failed);
+		cold_map_end();
+	}
+}
+
+UT_TEST(test_managed_missing_declaration_and_changed_full_image_cannot_capture)
+{
+	UT_ASSERT_EQ(cold_managed_setup(0), CLUSTER_COLD_OK);
+	++declared.staged.committed.mappings[0].mapfilenumber;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(replay.plan, 0, &records[0][0]), CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	UT_ASSERT_EQ(writes, 0); cold_map_end();
+}
+
+UT_TEST(test_managed_partial_pair_failure_and_owner_error_keep_custody_no_retry)
+{
+	for (unsigned fault = 0; fault < 2; ++fault) {
+		ClusterColdStepV1 step;
+		unsigned after;
+		UT_ASSERT_EQ(cold_managed_setup(0), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(cold_map_seal(false, true), CLUSTER_COLD_OK);
+		if (fault == 0) fail_rename = 2;
+		else source_error_at = source_checks + 1;
+		if (fault == 0) UT_ASSERT_EQ(cold_map_run(), CLUSTER_COLD_REPLAY_CALLBACK);
+		else {
+			bool caught = false;
+			PG_TRY(); { (void)cold_map_run(); } PG_CATCH(); { caught = true; } PG_END_TRY();
+			UT_ASSERT(caught);
+		}
+		after = writes; fail_rename = 0; source_error_at = 0;
+		UT_ASSERT(cluster_cold_plan_step_v1(replay.plan, 1, &step));
+		UT_ASSERT(!cluster_cold_typed_relmap_record_v1(&replay, (ClusterRecoveryFencePlan *)&replay, &step, &map_reader));
+		UT_ASSERT(!cluster_cold_typed_relmap_ready_v1(&replay, (ClusterRecoveryFencePlan *)&replay));
+		UT_ASSERT_EQ(writes, after);
+		UT_ASSERT_EQ(replay.plan->relmap_recovery->count, 1);
+		UT_ASSERT(!replay.plan->relmap_recovery->transferred);
+		cold_map_end();
+	}
+}
+
+UT_TEST(test_managed_full_binding_and_wal_tail_remain_required_after_seal)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		UT_ASSERT_EQ(cold_managed_setup(0), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(cold_map_seal(false, true), CLUSTER_COLD_OK);
+		if (fault == 0) map_payload[sizeof(map_payload) - 1] ^= 1;
+		if (fault == 1) ++map_decoded.header.xl_tot_len;
+		if (fault == 2) ++replay.plan->relmap_inputs[0].input.file_identity.creation_generation;
+		UT_ASSERT_EQ(cold_map_run(), CLUSTER_COLD_REPLAY_CALLBACK);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT(!cluster_cold_typed_relmap_ready_v1(&replay, (ClusterRecoveryFencePlan *)&replay));
+		UT_ASSERT(replay.plan->relmap_recovery->count == 1 && !replay.plan->relmap_recovery->transferred);
+		cold_map_end();
+	}
+}
+
+UT_TEST(test_managed_observation_cannot_supply_a_missing_declaration_or_registration)
+{
+	cold_map_setup(); records[0][0].info = XLOG_RELMAP_UPDATE_V2;
+	UT_ASSERT_EQ(cold_map_seal(false, true), CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	UT_ASSERT_EQ(writes, 0); cold_map_end();
+	UT_ASSERT_EQ(cold_managed_setup(0), CLUSTER_COLD_OK);
+	++declared.file_identity.creation_generation;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(replay.plan, 0, &records[0][0]), CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	UT_ASSERT_EQ(writes, 0); cold_map_end();
+}
+
+UT_TEST(test_managed_ready_rechecks_both_complete_original_files_and_never_rewrites)
+{
+	unsigned after;
+	char path[MAXPGPATH];
+	UT_ASSERT_EQ(cold_managed_setup(0), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cold_map_seal(false, true), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cold_map_run(), CLUSTER_COLD_REPLAY_OK);
+	after = writes;
+	snprintf(path, sizeof(path), "%s/%s", directory, names[1]);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT(!cluster_cold_typed_relmap_ready_v1(&replay, (ClusterRecoveryFencePlan *)&replay));
+	UT_ASSERT_EQ(writes, after);
+	UT_ASSERT(replay.plan->relmap_recovery->staged[0] && !replay.plan->relmap_recovery->transferred);
+	cold_map_end();
+}
+
+UT_TEST(test_managed_repeat_and_ready_retain_original_sync_and_namespace_x_guards)
+{
+	for (unsigned mode = 0; mode < 2; ++mode) {
+		for (unsigned fault = 0; fault < 3; ++fault) {
+			ClusterColdStepV1 step;
+			unsigned after;
+			bool ok;
+			UT_ASSERT_EQ(cold_managed_setup(0), CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(cold_map_seal(false, true), CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(cold_map_run(), CLUSTER_COLD_REPLAY_OK);
+			UT_ASSERT(cluster_cold_plan_step_v1(replay.plan, 1, &step));
+			after = writes;
+			if (fault == 0) relmap_x_held = false;
+			if (fault == 1) enableFsync = false;
+			if (fault == 2) namespace_x_checks_until_loss = 2;
+			ok = mode == 0
+				? cluster_cold_typed_relmap_record_v1(&replay, (ClusterRecoveryFencePlan *)&replay, &step, &map_reader)
+				: cluster_cold_typed_relmap_ready_v1(&replay, (ClusterRecoveryFencePlan *)&replay);
+			enableFsync = true; relmap_x_held = true; namespace_x_checks_until_loss = 0;
+			UT_ASSERT(!ok);
+			UT_ASSERT(replay.plan->relmap_failed);
+			UT_ASSERT(!cluster_cold_typed_relmap_ready_v1(&replay, (ClusterRecoveryFencePlan *)&replay));
+			UT_ASSERT_EQ(writes, after);
+			UT_ASSERT(replay.plan->relmap_recovery->staged[0] && !replay.plan->relmap_recovery->transferred);
+			cold_map_end();
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(25);
+	UT_RUN(test_managed_repeat_and_ready_retain_original_sync_and_namespace_x_guards);
+	UT_RUN(test_managed_full_binding_and_wal_tail_remain_required_after_seal);
+	UT_RUN(test_managed_observation_cannot_supply_a_missing_declaration_or_registration);
+	UT_RUN(test_managed_ready_rechecks_both_complete_original_files_and_never_rewrites);
+	UT_RUN(test_managed_original_merge_stages_between_pages_and_rechecks_duplicate);
+	UT_RUN(test_managed_declaration_independent_binding_and_complete_intent_refuse_before_io);
+	UT_RUN(test_managed_missing_declaration_and_changed_full_image_cannot_capture);
+	UT_RUN(test_managed_partial_pair_failure_and_owner_error_keep_custody_no_retry);
 	UT_RUN(test_relmap_runs_between_other_source_pages_and_duplicate_does_not_write);
 	UT_RUN(test_relmap_without_declared_participant_keeps_structural_refusal);
 	UT_RUN(test_relmap_missing_capture_never_seals_or_writes);
