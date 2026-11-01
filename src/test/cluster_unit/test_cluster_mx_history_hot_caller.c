@@ -163,6 +163,10 @@ UT_TEST(read_caller_share_bracket_is_never_promoted_or_replaced)
 		read_balanced(); auth_clean(s);
 	}
 }
+#ifdef HISTORY_WALKER_FIXTURE
+int history_walker_unused_caller_main(void);
+#define main history_walker_unused_caller_main
+#endif
 int main(void)
 {
 	history_fixture_init(); UT_PLAN(8);

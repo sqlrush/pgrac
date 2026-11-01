@@ -2551,6 +2551,10 @@ static bool cluster_current_mx_hot_updater_for_chain(
 	TransactionId *updater_xid, bool *restart,
 	ClusterHeapSuccessorProof *successor_proof,
 	ClusterCurrentMxOperationState *operation);
+static bool cluster_current_mx_history_hot_updater_for_chain_caller(
+	Relation relation, Buffer buffer, HeapTuple tuple, Snapshot actual,
+	TransactionId *updater, bool *restart, ClusterHeapSuccessorProof *successor,
+	ClusterCurrentMxOperationState *operation);
 static bool cluster_current_mx_successor_key_matches(
 	Buffer buffer, HeapTuple tuple, const ClusterHeapSuccessorProof *proof);
 static void cluster_current_mx_operation_finish(
@@ -4377,10 +4381,16 @@ extern bool cluster_heap_test_r4_surely_dead(HeapTuple tuple,
  * Unlike heap_fetch, the caller must already have pin and (at least) share
  * lock on the buffer; it is still pinned/locked at exit.
  */
-bool
-heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+/* Both modes use the native traversal. Public dispatch stays legacy until
+ * the complete operation-aware family can be activated together. */
+static bool
+heap_hot_search_buffer_scoped(ItemPointer tid, Relation relation, Buffer buffer,
 					   Snapshot snapshot, HeapTuple heapTuple,
-					   bool *all_dead, bool first_call)
+					   bool *all_dead, bool first_call
+#ifdef USE_PGRAC_CLUSTER
+					   , bool history
+#endif
+					   )
 {
 	Page		page = BufferGetPage(buffer);
 	TransactionId prev_xmax = InvalidTransactionId;
@@ -4562,10 +4572,15 @@ cluster_hot_search_restart:
 				 * authority.  This traversal is read-only: the proof helper
 				 * preserves and returns the caller's SHARE/SCUR contract.
 				 */
-				if (!cluster_current_mx_hot_updater_for_chain(
+				if (!(history
+					? cluster_current_mx_history_hot_updater_for_chain_caller(
+						relation, buffer, heapTuple, snapshot, &prev_xmax, &restart,
+						&cluster_expected_successor,
+						&cluster_current_mx_operation)
+					: cluster_current_mx_hot_updater_for_chain(
 						relation, buffer, heapTuple, &prev_xmax, &restart,
 						&cluster_expected_successor,
-						&cluster_current_mx_operation))
+						&cluster_current_mx_operation)))
 				{
 					Assert(restart);
 					goto cluster_hot_search_restart;
@@ -4584,6 +4599,18 @@ cluster_hot_search_restart:
 		&cluster_current_mx_operation);
 #endif
 	return false;
+}
+
+bool
+heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+	Snapshot snapshot, HeapTuple heapTuple, bool *all_dead, bool first_call)
+{
+	return heap_hot_search_buffer_scoped(tid, relation, buffer, snapshot, heapTuple,
+		all_dead, first_call
+#ifdef USE_PGRAC_CLUSTER
+		, false
+#endif
+		);
 }
 
 #ifdef USE_PGRAC_CLUSTER
@@ -6449,9 +6476,12 @@ restart_live_search:
  * show the latest version of the row.  Note that it will not be changed
  * if no version of the row passes the snapshot test.
  */
-void
-heap_get_latest_tid(TableScanDesc sscan,
-					ItemPointer tid)
+static void
+heap_get_latest_tid_scoped(TableScanDesc sscan, ItemPointer tid
+#ifdef USE_PGRAC_CLUSTER
+	, bool history
+#endif
+	)
 {
 	Relation	relation = sscan->rs_rd;
 	Snapshot	snapshot = sscan->rs_snapshot;
@@ -6597,10 +6627,15 @@ cluster_latest_tid_recheck:
 			 * proof never authorizes the later heap_update mutation, and never
 			 * decodes a foreign mxid against this node's pg_multixact.
 			 */
-			if (!cluster_current_mx_hot_updater_for_chain(
+			if (!(history
+				? cluster_current_mx_history_hot_updater_for_chain_caller(
+					relation, buffer, &tp, snapshot, &priorXmax, &restart,
+					&cluster_expected_successor,
+					&cluster_current_mx_operation)
+				: cluster_current_mx_hot_updater_for_chain(
 					relation, buffer, &tp, &priorXmax, &restart,
 					&cluster_expected_successor,
-					&cluster_current_mx_operation))
+					&cluster_current_mx_operation)))
 			{
 				Assert(restart);
 				goto cluster_latest_tid_recheck;
@@ -6623,6 +6658,16 @@ cluster_latest_tid_recheck:
 	cluster_current_mx_operation_finish(
 		&cluster_current_mx_operation);
 #endif
+}
+
+void
+heap_get_latest_tid(TableScanDesc scan, ItemPointer tid)
+{
+	heap_get_latest_tid_scoped(scan, tid
+#ifdef USE_PGRAC_CLUSTER
+		, false
+#endif
+		);
 }
 
 

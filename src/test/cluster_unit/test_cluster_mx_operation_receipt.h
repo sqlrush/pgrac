@@ -58,6 +58,8 @@ bool mx_history_hot(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actua
 	const ClusterSemanticAdmissionToken *admission, bool full, MxHotReadout *out);
 bool mx_history_hot_caller(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot actual,
 	bool full, MxHotReadout *out);
+bool mx_history_native_hot_walk(Relation rel, Buffer buffer, Snapshot actual,
+	ItemPointer tid, bool latest, bool first_call, bool *all_dead);
 bool mx_history_hot_matches(Buffer buffer, HeapTuple candidate, bool full);
 ClusterMxHistoryStep mx_history_collect(Relation rel, Buffer buffer, HeapTuple tuple,
 	Snapshot actual, const ClusterSemanticAdmissionToken *admission,

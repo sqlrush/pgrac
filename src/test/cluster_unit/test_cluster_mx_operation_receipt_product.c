@@ -199,6 +199,20 @@ mx_history_hot_caller(Relation rel, Buffer buffer, HeapTuple tuple, Snapshot act
 	return result;
 }
 bool
+mx_history_native_hot_walk(Relation rel, Buffer buffer, Snapshot actual,
+	ItemPointer tid, bool latest, bool first_call, bool *all_dead)
+{
+	HeapTupleData tuple = { 0 };
+	TableScanDescData scan = { 0 };
+	if (!latest)
+		return heap_hot_search_buffer_scoped(tid, rel, buffer, actual, &tuple,
+			all_dead, first_call, true);
+	scan.rs_rd = rel;
+	scan.rs_snapshot = actual;
+	heap_get_latest_tid_scoped(&scan, tid, true);
+	return ItemPointerGetOffsetNumber(tid) == 2;
+}
+bool
 mx_history_hot_matches(Buffer buffer, HeapTuple candidate, bool full)
 {
 	return full ? heap_hot_current_mx_successor_matches(buffer, candidate, &hot_full_proof)
