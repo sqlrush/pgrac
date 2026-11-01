@@ -30,6 +30,31 @@ def fixture():
                 tag=[1663,5,20000,0,0],log=log,waiter_pid=200,waiter_node=0)
 
 
+def own_lock_fixture():
+    case = fixture()
+    case['holders'] = case['holders'][1:]
+    slot = case['trace']['events'][-1]['slots'][0]
+    slot.update(flags=5, xid=1400, itl_wrap=2,
+                uba_bytes='01000000090000001200400000000000')
+    producer = copy.deepcopy(case['trace']['events'][0])
+    producer.update(pid=200, procno=20, backend_id=3, backend_start='1000',
+                    process_incarnation='41', sequence=9, bind_lsn='1111')
+    producer['key'].update(xid=1400, slot_offset=18, slot_wrap=58)
+    producer['tt_slot'].update(xid=1400, wrap=58)
+    case['trace']['events'].insert(8, producer)
+    case['log'] += case['log'].replace('event=WAIT_TARGET', 'event=WAIT_END').replace(
+        'seq=17 ', 'seq=18 ').rstrip() + ' status=0\n'
+    case['log'] += ('TX_IDENTITY event=ORIGIN_MAP seq=19 actor_node=0 pid=200 proc=20 '
+        'node=0 xid=1400 epoch=0 tt_known=1 tt_segment=1 tt_slot=18 tt_wrap=58 '
+        'generation_known=1 tt_generation=0 target_known=1 uba_known=1 '
+        'uba0=0000000900000001 uba1=0000000000400012 itl_wrap=65535 '
+        'itl_kind=5 itl_slot=0 wait_seq=0 status=1\n'
+        'TX_IDENTITY event=WAIT_TARGET seq=20 actor_node=0 pid=200 node=0 xid=1201 '
+        'epoch=0 target_known=1 uba_known=1 uba0=0000000200000001 '
+        'uba1=000000000040000b itl_wrap=51 itl_kind=1 itl_slot=1 wait_seq=10\n')
+    return case
+
+
 class CapacityEvidence(unittest.TestCase):
     def observed(self,c):
         try:
@@ -136,6 +161,58 @@ class CapacityEvidence(unittest.TestCase):
                        lambda c:c['trace']['events'][0].update(authoritative=True)):
             c=fixture();mutate(c)
             with self.assertRaises(ValueError): select_blocker(c)
+
+    def test_exact_own_lock_slot_leaves_the_lowest_foreign_data_owner_selected(self):
+        case = own_lock_fixture(); before = copy.deepcopy(case)
+        selected = self.observed(case)
+        self.assertEqual((selected['pid'], selected['slot'], selected['wait_seq']), (101, 1, 10))
+        self.assertEqual(selected['key']['xid'], 1201)
+        self.assertFalse(selected['authoritative'])
+        self.assertEqual(case, before)
+
+    def test_lock_slot_requires_the_original_waiter_full_publication(self):
+        for field, value in (('pid', 201), ('node', 1), ('procno', 21),
+                             ('backend_start', 0), ('process_incarnation', 0),
+                             ('sequence', 91), ('bind_lsn', 0), ('key_known', False)):
+            case = own_lock_fixture(); case['trace']['events'][8][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError): select_blocker(case)
+        for field in ('segment_id', 'segment_generation', 'slot_offset', 'slot_wrap',
+                      'xid', 'formation_epoch', 'root_id', 'root_generation'):
+            case = own_lock_fixture()
+            key = case['trace']['events'][8]['key']; key[field] = int(key[field]) + 1
+            with self.subTest(field=field), self.assertRaises(ValueError): select_blocker(case)
+
+    def test_missing_duplicate_or_changed_self_mapping_fails_closed(self):
+        for old, new in (('proc=20', 'proc=21'), ('node=0 xid=1400', 'node=1 xid=1400'),
+                         ('tt_known=1', 'tt_known=0'), ('tt_generation=0', 'tt_generation=1'),
+                         ('tt_wrap=58', 'tt_wrap=59'), ('uba_known=1', 'uba_known=0'),
+                         ('uba1=0000000000400012', 'uba1=0000000000400013'),
+                         ('itl_kind=5', 'itl_kind=1'), ('status=1', 'status=0'),
+                         ('status=1', 'status=2'), ('status=1', 'status=3'),
+                         ('status=1', 'status=4')):
+            case = own_lock_fixture(); case['log'] = case['log'].replace(old, new)
+            with self.subTest(new=new), self.assertRaises(ValueError): select_blocker(case)
+        for count in (0, 2):
+            case = own_lock_fixture(); lines = case['log'].splitlines(keepends=True)
+            mapping = next(line for line in lines if 'event=ORIGIN_MAP' in line)
+            case['log'] = case['log'].replace(mapping, mapping * count)
+            with self.subTest(count=count), self.assertRaises(ValueError): select_blocker(case)
+
+    def test_free_terminal_or_foreign_lock_slots_are_not_self_exemptions(self):
+        for field, value in (('flags', 0), ('flags', 4), ('flags', 6), ('flags', 7),
+                             ('flags', 8), ('xid', 1201), ('uba_bytes', '00' * 16)):
+            case = own_lock_fixture(); case['trace']['events'][-1]['slots'][0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError): select_blocker(case)
+
+    def test_own_lock_does_not_make_an_ended_or_self_targeted_wait_current(self):
+        for mode in ('ended', 'self'):
+            case = own_lock_fixture()
+            if mode == 'ended':
+                case['log'] += case['log'].splitlines()[-1].replace(
+                    'event=WAIT_TARGET', 'event=WAIT_END').replace('seq=20 ', 'seq=21 ') + ' status=4\n'
+            else:
+                case['log'] = case['log'].replace('xid=1201', 'xid=1400')
+            with self.subTest(mode=mode), self.assertRaises(ValueError): select_blocker(case)
 
 
 if __name__ == '__main__':

@@ -2,7 +2,7 @@
 import copy
 import unittest
 import m2_itl_capacity as native
-from test_m2_itl_capacity import fixture
+from test_m2_itl_capacity import fixture, own_lock_fixture
 
 
 def mutation(kind='update'):
@@ -191,6 +191,20 @@ class RequalificationEvidence(unittest.TestCase):
         self.assertEqual(self.finish(c)['completed_waits'], 2)
         c['waits'].pop()
         with self.assertRaises(ValueError): self.finish(c)
+
+    def test_requalification_keeps_its_own_lock_and_waits_for_another_exact_owner(self):
+        case = finished(); second = own_lock_fixture()
+        case['waits'].append(second)
+        case['log'] = second['log'] + second['log'].splitlines()[-1].replace(
+            'event=WAIT_TARGET', 'event=WAIT_END').replace('seq=20 ', 'seq=21 ') + ' status=0\n'
+        case['remaining'] = case['remaining'][1:]
+        before = copy.deepcopy(case)
+        try:
+            result = self.finish(case)
+        except ValueError as exc:
+            self.fail('exact requalification wait with own lock refused: ' + str(exc))
+        self.assertEqual((result['completed_waits'], result['released_owners']), (2, 2))
+        self.assertEqual(case, before)
 
     def test_completed_recheck_of_an_already_finished_owner_needs_no_second_commit(self):
         c = finished()

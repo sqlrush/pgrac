@@ -21,6 +21,48 @@ def number(value):
     return result
 
 
+def _own_lock_only_key(case, page, slot):
+    """Exclude only the caller's fully joined lock slot from DATA selection."""
+    pid, node = number(case.get('waiter_pid')), number(case.get('waiter_node'))
+    producer, actor, key, _, _ = _retry_waiter(case['trace']['events'], pid, node,
+                                              number(slot.get('xid')))
+    if number(producer.get('sequence')) >= number(page.get('sequence')):
+        raise ValueError('own lock publication does not precede the copied page')
+    mappings = []
+    for line in case['log'].splitlines():
+        if 'TX_IDENTITY ' not in line:
+            continue
+        pairs = re.findall(r'([a-z_0-9]+)=([^ \n]+)', line.split('TX_IDENTITY ', 1)[1])
+        row = dict(pairs)
+        if len(row) != len(pairs):
+            raise ValueError('duplicate diagnostic fields')
+        if number(row.get('pid')) != pid or number(row.get('actor_node')) != node:
+            continue
+        if row.get('event') == 'LIMIT':
+            raise ValueError('own lock identity trace overflow')
+        if (row.get('event') == 'ORIGIN_MAP' and number(row.get('itl_kind')) == 5
+                and number(row.get('itl_slot')) == slot['index']):
+            mappings.append(row)
+    if len(mappings) != 1:
+        raise ValueError('own lock mapping is missing or ambiguous')
+    row = mappings[0]
+    required = dict(proc=actor[2], node=node, xid=key['xid'], epoch=key['formation_epoch'],
+                    tt_known=1, tt_segment=key['segment_id'], tt_slot=key['slot_offset'],
+                    tt_wrap=key['slot_wrap'], generation_known=1,
+                    tt_generation=key['segment_generation'], target_known=1, uba_known=1, status=1)
+    if any(number(row.get(k)) != v for k, v in required.items()):
+        raise ValueError('own lock mapping and full caller identity disagree')
+    raw = [row.get(k, '') for k in ('uba0', 'uba1')]
+    if sys.byteorder != 'little' or any(not re.fullmatch('[0-9a-f]{16}', word) for word in raw):
+        raise ValueError('own lock UBA observation is incomplete')
+    words = [int(word, 16) for word in raw]
+    if (struct.pack('<QQ', *words).hex() != slot.get('uba_bytes')
+            or (words[0] & 0xffffffff) != key['segment_id'] or words[0] >> 32 == 0
+            or (words[1] & 0xffff) != key['slot_offset'] or words[1] >> 32 != 0):
+        raise ValueError('own lock UBA and canonical coordinates disagree')
+    return key
+
+
 def select_page_owner(case):
     """Map the lowest observed DATA slot to an owned test client, not authority."""
     trace = case['trace']
@@ -38,12 +80,14 @@ def select_page_owner(case):
     page = pages[0]
     if page.get('authoritative') is not False or len(page['slots']) != 8:
         raise ValueError('invalid copied page observation')
-    active = []
+    active, own_locks = [], []
     for index, slot in enumerate(page['slots']):
-        if slot.get('index') != index or slot.get('flags') not in (1, 2, 3):
+        if slot.get('index') != index or slot.get('flags') not in (1, 2, 3, 5):
             raise ValueError('page is not the expected full DATA ITL set')
         if slot['flags'] == 1:
             active.append(slot)
+        elif slot['flags'] == 5:
+            own_locks.append(_own_lock_only_key(case, page, slot))
     if len(active) != len(holders):
         raise ValueError('active page and producer registry disagree')
     if not active:
@@ -72,6 +116,11 @@ def select_page_owner(case):
                         'root_descriptor_incarnation', 'root_id', 'root_generation'))
             or any(tt.get(k) != v for k, v in dict(xid=key['xid'], wrap=key['slot_wrap'], status=1).items())):
         raise ValueError('invalid canonical ACTIVE publication')
+    context = ('owner_instance', 'origin_node_id', 'cluster_epoch', 'system_identifier',
+               'origin_boot_incarnation', 'formation_epoch', 'admission_record_generation',
+               'root_descriptor_incarnation', 'root_id', 'root_generation')
+    if any(own[k] != key[k] for own in own_locks for k in context):
+        raise ValueError('own lock and DATA owner admission contexts disagree')
     return dict(holder, slot=slot['index'], page_itl_wrap=slot['itl_wrap'],
                 key=key, authoritative=False)
 
