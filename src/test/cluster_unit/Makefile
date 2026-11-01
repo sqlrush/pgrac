@@ -12918,7 +12918,7 @@ test_cluster_cold_recovery_plan: test_cluster_cold_recovery_plan.c unit_test.h \
 		test_cluster_cold_recovery_plan_fixture.h $(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_plan_store_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan_store.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
@@ -12944,14 +12944,14 @@ test_cluster_cold_recovery_space: test_cluster_cold_recovery_space.c unit_test.h
 		test_cluster_cold_recovery_space_fixture.h $(CLUSTER_COLD_PLAN_O) \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_space_refail: test_cluster_cold_recovery_space_refail.c unit_test.h \
 		test_cluster_cold_recovery_space_gen.h test_cluster_cold_recovery_space_sim.h \
 		$(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 CLUSTER_COLD_DECODE_O = test_cluster_cold_recovery_decode_core.o
 
@@ -12973,7 +12973,7 @@ test_cluster_cold_recovery_xid: test_cluster_cold_recovery_xid.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_xid_core.o \
 		test_cluster_cold_recovery_replay_core.o $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 $(CLUSTER_COLD_DECODE_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_decode.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
@@ -13230,7 +13230,7 @@ test_cluster_cold_recovery_refail_plan_core.o: $(top_srcdir)/src/backend/cluster
 test_cluster_cold_recovery_refail: test_cluster_cold_recovery_refail.c unit_test.h $(D_COLD_REFAIL_O) \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(D_COLD_REFAIL_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 D_COLD_REPLAY_O = test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 
@@ -13248,7 +13248,7 @@ test_cluster_cold_recovery_replay_plan_core.o: $(top_srcdir)/src/backend/cluster
 test_cluster_cold_recovery_replay: test_cluster_cold_recovery_replay.c unit_test.h $(D_COLD_REPLAY_O) \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(D_COLD_REPLAY_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # Native reader and typed block consumer; storage is an explicit fixture.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -13298,7 +13298,7 @@ test_cluster_cold_recovery_validate: test_cluster_cold_recovery_validate.c unit_
 		$(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_io_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_io.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
@@ -16377,7 +16377,7 @@ clean-relmap-wal-desc:
 # Complete RMC1 observations keep the original cold structural refusal.
 TESTS += test_cluster_relmap_cold_create
 all: test_cluster_relmap_cold_create
-test_cluster_relmap_cold_create: test_cluster_relmap_cold_create.c test_cluster_cold_recovery_effects.c unit_test.h test_cluster_cold_dependency.inc \
+test_cluster_relmap_cold_create: test_cluster_relmap_cold_create.c test_cluster_relmap_create_plan.inc test_cluster_cold_recovery_effects.c unit_test.h test_cluster_cold_dependency.inc \
 		test_cluster_cold_abort_replay.inc test_cluster_cold_effects_consumer.h \
 		test_cluster_cold_effects_consumer.inc \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
@@ -16408,3 +16408,12 @@ $(CLUSTER_COLD_DECODE_O) test_cluster_relmap_cold_create: \
 clean: clean-relmap-cold-create
 clean-relmap-cold-create:
 	rm -f test_cluster_relmap_cold_create test_cluster_relmap_cold_create.d
+
+# Creation declarations validate through the original canonical common codec.
+test_cluster_cold_recovery_plan \
+test_cluster_cold_recovery_replay \
+test_cluster_cold_recovery_space \
+test_cluster_cold_recovery_space_refail \
+test_cluster_cold_recovery_validate \
+test_cluster_cold_recovery_xid: $(top_builddir)/src/common/libpgcommon.a
+test_cluster_cold_recovery_refail: $(top_builddir)/src/common/libpgcommon.a

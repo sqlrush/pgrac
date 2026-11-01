@@ -113,6 +113,20 @@ typedef struct ColdRelmapInput {
 	ClusterRelmapRetentionSnapshot retention_snapshot;
 } ColdRelmapInput;
 
+/* Creation has no pending/terminal pin. Fixed segments use the SAME plan
+ * budget, without imposing the legacy pending carrier's 64-entry array. */
+#define COLD_RELMAP_CREATE_SEGMENT 16
+#define COLD_RECORD_RELMAP_CREATE 0x20
+
+typedef struct ColdRelmapCreateInput {
+	ClusterColdRelmapCreateInputV1 input;
+	bool captured;
+} ColdRelmapCreateInput;
+typedef struct ColdRelmapCreateChunk {
+	struct ColdRelmapCreateChunk *next;
+	ColdRelmapCreateInput entries[COLD_RELMAP_CREATE_SEGMENT];
+} ColdRelmapCreateChunk;
+
 /* Shared shape validation; caller has validated plan/count/storage. */
 extern ClusterColdDetailV1 cold_relmap_inputs_valid(const ClusterColdPlanV1 *plan,
 	const ClusterColdRelmapInputV1 *inputs, uint32 count);
@@ -269,8 +283,22 @@ struct ClusterColdPlanV1 {
 	ClusterRelmapRecoveryPins *relmap_recovery;
 	ColdRelmapInput *relmap_inputs;
 	uint32 relmap_count;
+	ColdRelmapCreateChunk *relmap_creates;
+	uint32 relmap_create_count;
 	bool relmap_failed;
 };
+
+static inline ColdRelmapCreateInput *
+cold_relmap_create_at(const ClusterColdPlanV1 *plan, uint32 index)
+{
+	ColdRelmapCreateChunk *chunk = plan->relmap_creates;
+	if (index >= plan->relmap_create_count) return NULL;
+	while (chunk != NULL && index >= COLD_RELMAP_CREATE_SEGMENT) {
+		chunk = chunk->next;
+		index -= COLD_RELMAP_CREATE_SEGMENT;
+	}
+	return chunk == NULL ? NULL : &chunk->entries[index];
+}
 
 static inline bool
 cold_relmap_cut_equal(const ClusterColdParticipantV1 *a, const ClusterColdParticipantV1 *b)
@@ -336,6 +364,9 @@ cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Si
 		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS
 		|| (plan->relmap_terminal != NULL && plan->relmap_terminal_bytes == 0))
 		return false;
+	for (const ColdRelmapCreateChunk *chunk = plan->relmap_creates;
+		chunk != NULL; chunk = chunk->next)
+		if (cold_relmap_storage_overlap(out, bytes, chunk, sizeof(*chunk))) return false;
 	return !cold_relmap_storage_overlap(out, bytes, plan->relmap_inputs,
 			(Size)plan->relmap_count * sizeof(ColdRelmapInput))
 		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_recovery,

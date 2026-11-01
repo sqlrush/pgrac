@@ -75,6 +75,28 @@ typedef struct ClusterColdRelmapInputV1 {
 	struct LWLock *retention_lock;
 } ClusterColdRelmapInputV1;
 
+/* Clean creation is a separate declared obligation, never a staged pin.
+ * The original episode supplies its independently selected identity/batch,
+ * full selected source/cut and scanner frame before pass-1. Values are copied
+ * in budgeted segments. Declaration/capture/ordering grants no RESERVED,
+ * execution, AVAILABLE, receipt or joint completion qualification. */
+typedef struct ClusterColdRelmapCreateInputV1 {
+	uint32 participant;
+	ClusterColdParticipantV1 cut;
+	ClusterWalSourceRef source;
+	ClusterColdRecordFrameV1 frame;
+	ClusterRelmapCreateWalV1 creation;
+} ClusterColdRelmapCreateInputV1;
+extern ClusterColdDetailV1 cluster_cold_plan_relmap_create_declare_v1(
+	ClusterColdPlanV1 *, const ClusterColdRelmapCreateInputV1 *, uint32 count);
+/* Borrowed immutable plan values. Capture is visible only during pass-1;
+ * step lookup only after seal and for the exact original merged step. Neither
+ * getter performs execution or makes a saved observation current. */
+extern const ClusterColdRelmapCreateInputV1 *cluster_cold_plan_relmap_create_captured_v1(
+	const ClusterColdPlanV1 *, uint32 participant, const ClusterColdRecordV1 *);
+extern const ClusterColdRelmapCreateInputV1 *cluster_cold_plan_relmap_create_step_v1(
+	const ClusterColdPlanV1 *, const ClusterColdStepV1 *);
+
 /* Original owner pin plus a complete decoded WAL record. The owner supplies
  * its actual FullXid/era and pin generation, never an epoch inferred from WAL.
  * owner.wal_end must be zero: the producer takes the actual record end.

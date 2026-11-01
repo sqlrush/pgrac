@@ -214,16 +214,25 @@ UT_TEST(reusing_decode_cannot_reuse_a_prior_creation_carrier)
 	cluster_cold_decoded_release_v1(&out);
 }
 
+#include "test_cluster_relmap_create_plan.inc"
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(13);
 	UT_RUN(canonical_creation_keeps_complete_by_value_carrier);
 	UT_RUN(creation_has_no_native_noop_page_or_pending_execution_route);
 	UT_RUN(original_plan_refuses_undeclared_creation_after_native_redo);
 	UT_RUN(creation_rejects_every_damaged_byte_and_nonexact_extent);
 	UT_RUN(creation_rejects_wrong_source_and_incomplete_envelopes);
 	UT_RUN(reusing_decode_cannot_reuse_a_prior_creation_carrier);
+	UT_RUN(create_declaration_captures_whole_values_and_original_step);
+	UT_RUN(create_steps_keep_original_cross_source_merge_order);
+	UT_RUN(create_declaration_validates_whole_batch_before_copy);
+	UT_RUN(create_capture_rejects_changed_frame_and_complete_image);
+	UT_RUN(create_plan_refuses_missing_or_repeated_obligations);
+	UT_RUN(create_declarations_cross_segments_without_a_64_item_limit);
+	UT_RUN(create_budget_and_sealed_state_refuse_without_publication);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
