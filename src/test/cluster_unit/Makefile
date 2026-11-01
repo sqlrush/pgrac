@@ -11121,11 +11121,11 @@ test_cluster_native_resident_fill_fixture.inc: test_cluster_native_resident_fill
 	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_native_resident_lock_reserve.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^cluster_bufmgr_pcm_own_snapshot\(/ { print "ClusterPcmOwnResult"; emit=1; snapshot++ } \
+	awk '/^cluster_bufmgr_pcm_own_snapshot\(/ { print "#ifndef NATIVE_RESIDENT_LOCK_REUSE_FIXTURE"; print "ClusterPcmOwnResult"; emit=1; snapshot++; snapshot_body=1 } \
 	     /^cluster_pcm_own_begin_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; begin++ } \
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; cancel++ } \
 	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; wait++ } \
-	     emit { print } /^}/ { emit=0 } \
+	     emit { print } /^}/ { if (snapshot_body) { print "#endif"; snapshot_body=0 } emit=0 } \
 	     END { if (snapshot != 1 || begin != 1 || cancel != 1 || wait != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_native_resident_lock.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -11773,3 +11773,28 @@ test_cluster_native_s_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufm
 	mv $@.tmp $@
 clean-native-s-x-cancel-master:
 	rm -f test_cluster_native_s_x_cancel_master test_cluster_native_s_release.inc test_cluster_native_s_release.inc.tmp
+
+# Actual invalidation followed by a new ordinary SHARE on the same descriptor.
+TESTS += test_cluster_native_s_read_successor
+all: test_cluster_native_s_read_successor
+test_cluster_native_s_read_successor: test_cluster_native_s_read_successor.c \
+		test_cluster_native_remote_x test_cluster_native_resident_lock \
+		test_cluster_native_remote_x_fixture.inc test_cluster_native_three_role_fixture.inc \
+		test_cluster_native_resident_lock_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_remote_x_fixture.inc: test_cluster_native_remote_x.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+		END { if (!stop || lines < 100) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-s-read-successor
+.PHONY: clean-native-s-read-successor
+clean-native-s-read-successor:
+	rm -f test_cluster_native_s_read_successor test_cluster_native_remote_x_fixture.inc \
+		test_cluster_native_remote_x_fixture.inc.tmp

@@ -11,6 +11,9 @@ static bool nt_keep_seed_bytes;
 static bool (*nt_seed_holder)(int, int, int) = nm_parent_as;
 static bool (*nt_requester)(int, int, int, int, uint64) = nc_parent_from;
 static void (*nt_source_finished)(void);
+/* Consecutive compositions retain each process's actual state across roles. */
+static bool (*nt_seed_master)(int, int) = nm_master;
+static int nt_holder_node = 2, nt_requester_node = 1;
 
 static bool nt_master(int requester, int holder, int mode)
 {
@@ -18,13 +21,13 @@ static bool nt_master(int requester, int holder, int mode)
 	ResourceXIntentSlot forwarded, cleanup; ResourceXMasterSnapshot snapshot;
 	/* Seed the remote incumbent through a complete real ordinary disk episode.
 	 * Legacy/tag-only remote grants deliberately lack boot provenance. */
-	NM_REQUIRE(nm_master(holder, 0));
+	NM_REQUIRE(nt_seed_master(holder, 0));
 	NM_REQUIRE(nm_receive(requester, RESOURCE_X_MSG_ASSERT_X, &request));
 	NM_REQUIRE(nm_master_admit(&f, &request));
-	block = publish_decode(f.state->block_intents[2].payload, true);
-	UT_ASSERT_EQ(block.body.acquire_decision.source_node, 2);
+	block = publish_decode(f.state->block_intents[nt_holder_node].payload, true);
+	UT_ASSERT_EQ(block.body.acquire_decision.source_node, nt_holder_node);
 	UT_ASSERT_EQ(block.body.acquire_decision.directory_mode, nt_source_mode);
-	NM_REQUIRE(nc_stage(&f.state->block_intents[2].slot, &forwarded));
+	NM_REQUIRE(nc_stage(&f.state->block_intents[nt_holder_node].slot, &forwarded));
 	NM_REQUIRE(nm_send(holder, RESOURCE_X_MSG_BLOCK_TO_N, &block));
 	NM_REQUIRE(nc_callback(&forwarded));
 	/* R's C and H's proof are independent messages, on independent peers. */
@@ -35,7 +38,7 @@ static bool nt_master(int requester, int holder, int mode)
 	}
 	NM_REQUIRE(nm_receive(holder, RESOURCE_X_MSG_BLOCKED_TO_N, &ack));
 	auth_peer_boot = 101;
-	NM_REQUIRE(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack, 2, &snapshot) == RESOURCE_X_APPLY_APPLIED);
+	NM_REQUIRE(cluster_pcm_lock_resource_x_blocked_to_n_exact(&ack, nt_holder_node, &snapshot) == RESOURCE_X_APPLY_APPLIED);
 	if (mode != 2) {
 		NM_REQUIRE(nm_receive(requester, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &done));
 		NM_REQUIRE(nm_master_done(&done) == RESOURCE_X_APPLY_APPLIED);
@@ -47,7 +50,7 @@ static bool nt_master(int requester, int holder, int mode)
 	NM_REQUIRE(nc_stage(&f.state->source_settlement.intent.slot, &cleanup));
 	NM_REQUIRE(nm_send(holder, RESOURCE_X_MSG_BLOCK_TO_N, &release));
 	NM_REQUIRE(nm_receive(holder, RESOURCE_X_MSG_BLOCKED_TO_N, &retired));
-	NM_REQUIRE(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&retired, 2, &snapshot) == RESOURCE_X_APPLY_APPLIED);
+	NM_REQUIRE(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&retired, nt_holder_node, &snapshot) == RESOURCE_X_APPLY_APPLIED);
 	/* ACK arrival cannot consume this master's still-owned physical send. */
 	NM_REQUIRE(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.work) == RESOURCE_X_APPLY_LOCAL_WAIT);
 	NM_REQUIRE(nc_callback(&cleanup));
@@ -57,15 +60,16 @@ static bool nt_master(int requester, int holder, int mode)
 	NM_REQUIRE(nm_send(requester, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &consumed));
 	NM_REQUIRE(nm_master_callback(&f.state->grant_intent.slot, true));
 	UT_ASSERT_EQ(f.state->deferred_settlement.present, 0);
-	UT_ASSERT_EQ(f.state->requests[1].phase, RESOURCE_X_MASTER_NONE);
+	UT_ASSERT_EQ(f.state->requests[nt_requester_node].phase, RESOURCE_X_MASTER_NONE);
 	UT_ASSERT_EQ(f.state->source_settlement.state, RESOURCE_X_SOURCE_SETTLEMENT_ACKED);
 	UT_ASSERT_EQ(f.state->source_settlement.intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
-	UT_ASSERT_EQ(f.state->bootstrap_receipts[1].highest_attempt_floor, request.common.assertion_sequence);
+	UT_ASSERT_EQ(f.state->bootstrap_receipts[nt_requester_node].highest_attempt_floor, request.common.assertion_sequence);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->s_holders_bitmap),
-		nt_target_mode == PCM_STATE_X ? 0 : done.common.outcome == RESOURCE_X_OUTCOME_OK ? 6 : 4);
+		nt_target_mode == PCM_STATE_X ? 0 : done.common.outcome == RESOURCE_X_OUTCOME_OK
+			? (1u << nt_holder_node) | (1u << nt_requester_node) : (1u << nt_holder_node));
 	if (nt_target_mode == PCM_STATE_X)
 		UT_ASSERT_EQ(((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->x_holder_node,
-			done.common.outcome == RESOURCE_X_OUTCOME_OK ? 1 : -1);
+			done.common.outcome == RESOURCE_X_OUTCOME_OK ? nt_requester_node : -1);
 	UT_ASSERT_EQ(fake_lwlock_depth, 0); return true;
 }
 static bool nt_holder_state(const ResourceXDecodedFrame *image, ClusterPcmResourceXMasterState **out)
@@ -103,15 +107,15 @@ static bool nt_holder(int master, int requester, int mode)
 	ClusterPcmResourceXMasterState *state = NULL; ClusterICEnvelope env = {0};
 	ResourceXSourceDrainWork next; ResourceXAcquisitionRef cleanup_ref;
 	uint32 header; uint64 base;
-	NM_REQUIRE(nt_seed_holder(master, 0, 2));
+	NM_REQUIRE(nt_seed_holder(master, 0, nt_holder_node));
 	/* Preserve the actual installed mode, generation and local PCM owner. */
-	UT_ASSERT_EQ(cluster_node_id, 2); UT_ASSERT_EQ(request_buf.pcm_state, nt_source_mode);
+	UT_ASSERT_EQ(cluster_node_id, nt_holder_node); UT_ASSERT_EQ(request_buf.pcm_state, nt_source_mode);
 	base = cluster_pcm_own_gen_get(0);
 	holder_pins = holder_fuses = 0; holder_content_busy = false;
 	holder_after_prepare = NULL; holder_peer_current = true; holder_write_error = false;
 	holder_io_enters = holder_io_ends = 0;
 	holder_interrupt_repairs = holder_interrupt_releases = 0;
-	holder_requester_connection = 61; MyBackendType = B_LMS;
+	holder_requester_connection = 61; holder_requester_node = nt_requester_node; MyBackendType = B_LMS;
 	NM_REQUIRE(nm_receive(master, RESOURCE_X_MSG_BLOCK_TO_N, &block)); f.block = block;
 	UT_ASSERT(BufferTagsEqual(&request_buf.tag, &block.common.logical_assertion.resource));
 	NM_REQUIRE(cluster_pcm_lock_resource_x_gate_snapshot(&f.gate));
@@ -149,7 +153,7 @@ static bool nt_holder(int master, int requester, int mode)
 	NM_REQUIRE(nm_send(master, RESOURCE_X_MSG_BLOCKED_TO_N, &ack));
 	NM_REQUIRE(nc_callback(&proof_send));
 	NM_REQUIRE(nm_receive(master, RESOURCE_X_MSG_BLOCK_TO_N, &release));
-	env.msg_type = RESOURCE_X_MSG_BLOCK_TO_N; env.source_node_id = 0; env.dest_node_id = 2;
+	env.msg_type = RESOURCE_X_MSG_BLOCK_TO_N; env.source_node_id = 0; env.dest_node_id = nt_holder_node;
 	env.epoch = 17; env.payload_length = release.payload_bytes;
 	if (mode == 4) {
 		NM_REQUIRE(gcs_block_resource_x_source_settlement_ingress(&env, &release, 61) == RESOURCE_X_APPLY_LOCAL_WAIT);
@@ -172,6 +176,8 @@ static bool nt_holder(int master, int requester, int mode)
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); NM_REQUIRE(!holder_probe(&next));
 	holder_no_debt(); return true;
 }
+static bool (*nt_master_role)(int, int, int) = nt_master;
+static bool (*nt_holder_role)(int, int, int) = nt_holder;
 static void nt_run(int mode)
 {
 	int rm[2], mh[2], hr[2]; pid_t master, holder; bool ok;
@@ -189,7 +195,7 @@ static void nt_run(int mode)
 	fflush(NULL); master = fork(); UT_ASSERT(master >= 0);
 	if (master == 0) {
 		close(rm[0]); close(mh[1]); close(hr[0]); close(hr[1]);
-		ok = nt_master(rm[1], mh[0], mode); close(rm[1]); close(mh[0]);
+		ok = nt_master_role(rm[1], mh[0], mode); close(rm[1]); close(mh[0]);
 		fflush(NULL); _exit(ok && !ut_current_failed ? 0 : 1);
 	}
 	if (master < 0) {
@@ -198,7 +204,7 @@ static void nt_run(int mode)
 	fflush(NULL); holder = fork(); UT_ASSERT(holder >= 0);
 	if (holder == 0) {
 		close(rm[0]); close(rm[1]); close(mh[0]); close(hr[0]);
-		ok = nt_holder(mh[1], hr[1], mode); close(mh[1]); close(hr[1]);
+		ok = nt_holder_role(mh[1], hr[1], mode); close(mh[1]); close(hr[1]);
 		fflush(NULL); _exit(ok && !ut_current_failed ? 0 : 1);
 	}
 	close(rm[1]); close(mh[0]); close(mh[1]); close(hr[1]);

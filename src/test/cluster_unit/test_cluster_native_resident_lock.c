@@ -1,6 +1,8 @@
 /* Ordinary resident SHARE: retain actual native reservation, requester,
  * installation and cleanup bodies. Peers, process and OS events are leaves. */
+#ifndef NATIVE_RESIDENT_LOCK_REUSE_FIXTURE
 #include "test_cluster_native_resident_fill_fixture.inc"
+#endif
 #include "cluster/cluster_pcm_x_bufmgr.h"
 
 #undef cluster_bufmgr_pcm_begin_grant_reservation_wait
