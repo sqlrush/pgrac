@@ -82,6 +82,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_service_observe.h"
 #include "storage/lwlock.h"
+#include "storage/ipc.h"
 #include "cluster/cluster_guc.h"		/* PGRAC (spec-3.3 D3/D4): cluster_enabled */
 #include "cluster/cluster_catalog_bootstrap.h"	/* PGRAC (spec-6.14 D8): services-ready gate */
 #include "cluster/cluster_visibility_resolve.h" /* PGRAC (spec-6.14 D8): no-recursion guard */
@@ -1226,6 +1227,7 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	ClusterSemanticWaitGraphSnapshot gate;
 	ClusterSemanticAdmissionObservationResult result, admission;
 	PGPROC *owner = MyProc;
+	ResourceOwner resource_owner = CurrentResourceOwner;
 	bool held_lock = false;
 	bool gate_known, pins_after;
 
@@ -1237,6 +1239,10 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 		|| expected_gate_epoch == UINT64_MAX || expected_gate_epoch > expected_epoch
 		|| expected_generation == 0 || expected_generation == UINT64_MAX)
 		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	if (proc_exit_inprogress) {
+		out->reason = "BACKEND_COLLECTION_CALLER_EXITING";
+		return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+	}
 	result = cluster_snapshot_service_observe(expected_epoch, &sample.snapshots);
 	if (result != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_PENDING || !sample.snapshots.known) {
 		out->reason = "BACKEND_COLLECTION_SNAPSHOT_UNAVAILABLE";
@@ -1267,7 +1273,8 @@ cluster_service_backend_collect_return(uint64 expected_epoch, uint64 expected_ga
 	pins_after = cluster_buffer_backend_has_pins();
 	gate_known = cluster_semantic_activation_wait_graph_snapshot(&gate);
 	ForEachLWLockHeldByMe(cluster_backend_collection_lock, &held_lock);
-	if (held_lock || CritSectionCount != 0 || MyProc != owner || !IsUnderPostmaster
+	if (held_lock || CritSectionCount != 0 || proc_exit_inprogress
+		|| CurrentResourceOwner != resource_owner || MyProc != owner || !IsUnderPostmaster
 		|| !AmRegularBackendProcess() || !cluster_enabled || !cluster_shared_config
 		|| MyProcPid != sample.snapshots.identity.pid || owner->pid != sample.snapshots.identity.pid
 		|| owner->pgprocno != sample.snapshots.identity.pgprocno

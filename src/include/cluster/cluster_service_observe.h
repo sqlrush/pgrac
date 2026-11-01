@@ -87,7 +87,9 @@ extern ClusterSemanticAdmissionObservationResult cluster_snapshot_service_observ
 /* Same ordinary backend's snapshots, original buffer pins and shared token-return
  * domain. Brackets the shared read with original private snapshot observations;
  * rechecks the original gate and owner at return. Caller-owned, read-only,
- * unlocked boundary only. No atomic cross-domain zero or producer seal.
+ * unlocked boundary only. The same ResourceOwner (including stable NULL) must
+ * remain current, and an exiting backend refuses without changing cleanup.
+ * No atomic cross-domain zero or producer seal.
  * Always PENDING/STALE/REFUSED; absent, changed or contradictory samples are
  * cleared. Neither a populated result nor an empty point is a receipt or
  * ordinary/GCS permission. Existing auxiliary-owner entries stay unchanged. */
