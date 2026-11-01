@@ -61,6 +61,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_membership.h" /* spec-5.16 D3b — is_member master-side gate */
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_multixact_operation_wire.h"
 #include "cluster/cluster_mx_history_wire.h"
 #include "cluster/cluster_mx_history_record.h"
 #include "cluster/cluster_multixact_current_stats.h"
@@ -4166,6 +4167,29 @@ cluster_gcs_block_mx_history_poll(const ClusterMxHistoryRequestWire *wire,
 	LWLockRelease(&blk->lock.lock);
 	if (step == CMXH_REQUALIFY)
 		cluster_gcs_block_mx_history_cancel(wire);
+	return step;
+}
+
+ClusterMxHistoryStep
+cluster_gcs_block_foreign_creator_poll(const ClusterMxHistoryRequestWire *wire,
+									   ClusterForeignCreatorResult *out)
+{
+	ClusterMxHistoryRequest request;
+	ClusterMxHistoryPeerResult shared;
+	ClusterMxHistoryStep step;
+	if (out == NULL)
+		return CMXH_UNKNOWN;
+	memset(out, 0, sizeof(*out));
+	if (!gcs_mx_history_decode(wire, &request, true) || request.edge_kind != CMXH_CREATOR_ROOT)
+		return CMXH_UNKNOWN;
+	step = cluster_gcs_block_mx_history_poll(wire, &shared);
+	if (step == CMXH_COMPLETE) {
+		out->request = shared.request;
+		memcpy(out->data, shared.data, sizeof(out->data));
+		memcpy(out->auth, shared.auth, sizeof(out->auth));
+		out->peer = shared.peer;
+		out->admitted = shared.admitted;
+	}
 	return step;
 }
 
@@ -9790,7 +9814,9 @@ gcs_block_mx_history_origin_try_accept(const ClusterICEnvelope *env, const void 
 	free_context->in_use = true;
 	free_context->domain = GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_MX_HISTORY;
 	free_context->phase = GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN;
-	free_context->resolve_mode = CLUSTER_TX_RESOLVE_VISIBILITY;
+	free_context->resolve_mode = request.edge_kind == CMXH_CREATOR_ROOT
+									 ? CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
+									 : CLUSTER_TX_RESOLVE_VISIBILITY;
 	free_context->deadline
 		= cluster_gcs_reply_timeout_ms > 0
 			  ? TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms)
@@ -9848,6 +9874,11 @@ gcs_block_mx_history_origin_sample_held(GcsBlockR4TxOriginContext *context,
 			&context->origin_plan, request, context->resolve_mode, &context->admission,
 			&context->guard, &context->tt_root, &context->resolution, &context->reason))
 		return false;
+	if (request->edge_kind == CMXH_CREATOR_ROOT)
+		return context->resolution.outcome == CLUSTER_TX_COMMITTED
+			   && context->resolution.proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+			   && context->history_peer.effect == CLUSTER_SAVEPOINT_EFFECT_LIVE
+			   && context->history_peer.ctrc_grant == 0;
 	if (context->resolution.outcome != CLUSTER_TX_IN_PROGRESS
 		|| context->history_peer.record_class == CMXH_ROLLBACK_CONTROL
 		|| context->history_peer.effect != CLUSTER_SAVEPOINT_EFFECT_LIVE)
@@ -9926,7 +9957,8 @@ gcs_block_mx_history_origin_copy_held(GcsBlockR4TxOriginContext *context,
 	if (context->outcome == CLUSTER_TX_UNKNOWN)
 		return;
 	memset(peer, 0, sizeof(*peer));
-	peer->record_class = record.record_class;
+	peer->record_class
+		= request->edge_kind == CMXH_CREATOR_ROOT ? CMXH_FOREIGN_CREATOR : record.record_class;
 	peer->effect = record.effect;
 	peer->canonical = record.identity.canonical;
 	peer->canonical_generation = record.identity.canonical_generation;
@@ -9963,6 +9995,12 @@ gcs_block_mx_history_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 					&& !context->guard_active && context->final_released
 					&& context->canonical_sampled && context->undo_data_ready
 					&& gcs_block_r4_tx_origin_resolution_valid(context);
+	if (positive && peer.record_class == CMXH_FOREIGN_CREATOR)
+		positive = CLUSTER_CURRENT_MX_WIRE_VERSION == CLUSTER_CURRENT_MX_OPERATION_WIRE_VERSION
+				   && peer.outcome == CLUSTER_TX_COMMITTED
+				   && peer.proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+				   && peer.effect == CLUSTER_SAVEPOINT_EFFECT_LIVE && peer.ctrc_grant == 0
+				   && FullTransactionIdEquals(peer.top_fxid, peer.operation_fxid);
 	if (positive && peer.ctrc_grant != 0)
 		positive = cluster_ctrc_origin_grant_publishable(
 			&context->history_ctrc_key, &context->current_mx_requester_identity, peer.ctrc_grant);

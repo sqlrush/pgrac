@@ -383,10 +383,132 @@ UT_TEST(unaligned_frames_and_cancelled_request_never_gain_admission)
 	UT_ASSERT(!cluster_mx_history_reply_decode(raw + 1, 8816, 0, &c, &status, &out));
 	UT_ASSERT(zero(&out, sizeof(out)));
 }
+
+static ClusterMxHistoryRequest
+creator_request(void)
+{
+	ClusterMxHistoryRequest r = request();
+	r.edge_kind = CMXH_CREATOR_ROOT;
+	r.retained_floor = 0;
+	r.descriptor_hash = 0;
+	r.multixact_id = 0;
+	r.member_count = 0;
+	return r;
+}
+static ClusterMxHistoryPeer
+creator_peer(void)
+{
+	ClusterMxHistoryPeer p = peer();
+	p.record_class = CMXH_FOREIGN_CREATOR;
+	p.flags = CLUSTER_MX_HISTORY_ORDERED;
+	p.outcome = CLUSTER_TX_COMMITTED;
+	p.commit_scn = 999;
+	p.ctrc_grant = 0;
+	p.operation_fxid = p.top_fxid;
+	p.operation_sequence = 0;
+	return p;
+}
+UT_TEST(creator_v2_exact_request_and_version_separation)
+{
+	ClusterMxHistoryRequest r = creator_request(), d;
+	ClusterMxHistoryRequestWire w, b, c;
+	UT_ASSERT(cluster_mx_history_request_encode(&r, &w));
+	UT_ASSERT_EQ(ClusterR4WireReadU16(w.bytes + 96), 2);
+	UT_ASSERT_EQ(w.bytes[198], 1);
+	UT_ASSERT(cluster_mx_history_request_decode(&w, 424, 1, 0, 9, &d));
+	UT_ASSERT(cluster_mx_history_request_cancel(&w, &c));
+	UT_ASSERT(cluster_mx_history_request_same(&w, &c, true));
+	for (int i = 0; i < 7; i++) {
+		b = w;
+		if (i == 0)
+			ClusterR4WireWriteU16(b.bytes + 96, 1);
+		if (i == 1)
+			b.bytes[198] = 8;
+		if (i == 2)
+			b.bytes[100] = 1;
+		if (i == 3)
+			b.bytes[184] = 1;
+		if (i == 4)
+			b.bytes[192] = 1;
+		if (i == 5)
+			b.bytes[196] = 1;
+		if (i == 6)
+			b.bytes[168] = 1;
+		ClusterR4WireWriteU32(b.bytes + 416, crc(b.bytes, 416));
+		UT_ASSERT(!cluster_mx_history_request_decode(&b, 424, 1, 0, 9, &d));
+		UT_ASSERT(zero(&d, sizeof(d)));
+	}
+	r = creator_request();
+	r.root_ordinal++;
+	UT_ASSERT(!cluster_mx_history_request_encode(&r, &w));
+}
+UT_TEST(creator_peer_accepts_only_committed_live_top_without_grant)
+{
+	ClusterMxHistoryPeer p = creator_peer(), d;
+	ClusterMxHistoryPeerWire w, b;
+	UT_ASSERT(cluster_mx_history_peer_encode(&p, &w));
+	UT_ASSERT_EQ(ClusterR4WireReadU16(w.bytes + 4), 2);
+	UT_ASSERT(cluster_mx_history_peer_decode(&w, &d));
+	p.operation_sequence = 4;
+	UT_ASSERT(cluster_mx_history_peer_encode(&p, &w));
+	for (int i = 0; i < 7; i++) {
+		p = creator_peer();
+		if (i == 0)
+			p.operation_fxid = FullTransactionIdFromEpochAndXid(2, 103);
+		if (i == 1)
+			p.effect = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+		if (i == 2) {
+			p.outcome = CLUSTER_TX_IN_PROGRESS;
+			p.commit_scn = 0;
+		}
+		if (i == 3) {
+			p.flags |= CLUSTER_MX_HISTORY_HAS_GRANT;
+			p.ctrc_grant = 1;
+		}
+		if (i == 4)
+			p.proof_kind = CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP;
+		if (i == 5)
+			p.commit_scn = 0;
+		if (i == 6)
+			p.commit_scn = UINT64_MAX;
+		UT_ASSERT(!cluster_mx_history_peer_encode(&p, &b));
+		UT_ASSERT(zero(&b, sizeof(b)));
+	}
+	b = w;
+	ClusterR4WireWriteU16(b.bytes + 4, 1);
+	UT_ASSERT(!cluster_mx_history_peer_decode(&b, &d));
+	b = w;
+	b.bytes[12] = CMXH_V1_TOP;
+	UT_ASSERT(!cluster_mx_history_peer_decode(&b, &d));
+}
+UT_TEST(creator_reply_cannot_cross_into_mx_strategy)
+{
+	ClusterMxHistoryRequest r = creator_request(), mx = request();
+	ClusterMxHistoryRequestWire w, mw;
+	ClusterMxHistoryPeer p = creator_peer();
+	ClusterMxHistoryPeerWire pw;
+	ClusterMxHistoryReplyWire reply;
+	ClusterMxHistoryPeerResult result;
+	uint8 data[8192] = { 0 }, auth[16] = { 0 }, status;
+	p.data_crc = crc(data, 8192);
+	ClusterR4WireWriteU64(auth, 12);
+	ClusterR4WireWriteU64(auth + 8, 1001);
+	UT_ASSERT(cluster_mx_history_request_encode(&r, &w));
+	UT_ASSERT(cluster_mx_history_request_encode(&mx, &mw));
+	UT_ASSERT(cluster_mx_history_peer_encode(&p, &pw));
+	UT_ASSERT(cluster_mx_history_reply_encode(&w, 0, 130, data, auth, &pw, &reply));
+	UT_ASSERT(cluster_mx_history_reply_decode(&reply, 8816, 0, &w, &status, &result));
+	UT_ASSERT(!cluster_mx_history_reply_encode(&mw, 0, 130, data, auth, &pw, &reply));
+	p = peer();
+	p.data_crc = crc(data, 8192);
+	UT_ASSERT(cluster_mx_history_peer_encode(&p, &pw));
+	UT_ASSERT(!cluster_mx_history_reply_encode(&w, 0, 130, data, auth, &pw, &reply));
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(14);
 	UT_RUN(request_roundtrip_literal_offsets);
 	UT_RUN(request_semantic_failures_clear_output);
 	UT_RUN(request_wire_rejects_mutations_and_transport_mismatch);
@@ -398,6 +520,9 @@ main(void)
 	UT_RUN(negative_reply_has_no_page_or_proof);
 	UT_RUN(recomputed_crc_does_not_hide_wrong_slot_or_unsupported_context);
 	UT_RUN(unaligned_frames_and_cancelled_request_never_gain_admission);
+	UT_RUN(creator_v2_exact_request_and_version_separation);
+	UT_RUN(creator_peer_accepts_only_committed_live_top_without_grant);
+	UT_RUN(creator_reply_cannot_cross_into_mx_strategy);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

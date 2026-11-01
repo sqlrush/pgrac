@@ -511,10 +511,80 @@ UT_TEST(history_unknown_request_wrap_still_binds_exact_tt_echo)
 	UT_ASSERT(!cluster_mx_history_record_bind_top(&f.request, &f.captured, &top, &identity));
 }
 
+
+UT_TEST(creator_capture_requires_actual_top_creation)
+{
+	HistoryFixture f;
+	history_init(&f);
+	history_v1(&f);
+	f.request.edge_kind = CMXH_CREATOR_ROOT;
+	UT_ASSERT(history_capture(&f));
+	UT_ASSERT(f.captured.matches_target);
+	f.request.target_offset++;
+	UT_ASSERT(!history_capture(&f));
+	history_init(&f);
+	f.request.edge_kind = CMXH_CREATOR_ROOT;
+	UT_ASSERT(!history_capture(&f));
+	history_init(&f);
+	history_v1(&f);
+	f.request.edge_kind = CMXH_CREATOR_ROOT;
+	f.reader.record.record_type = UNDO_RECORD_ITL;
+	history_pack(&f);
+	UT_ASSERT(!history_capture(&f));
+	history_init(&f);
+	history_v1(&f);
+	f.request.edge_kind = CMXH_CREATOR_ROOT;
+	((UndoInsertPayload *)f.reader.body)->inserted_tuple_len = 0;
+	history_pack(&f);
+	UT_ASSERT(!history_capture(&f));
+}
+UT_TEST(creator_bind_requires_committed_independent_identity)
+{
+	HistoryFixture f;
+	ClusterTxResolution top;
+	ClusterSavepointReaderIdentity identity;
+	history_init(&f);
+	history_v1(&f);
+	f.request.edge_kind = CMXH_CREATOR_ROOT;
+	UT_ASSERT(history_capture(&f));
+	top = history_top(&f);
+	UT_ASSERT(cluster_mx_history_record_bind_top(&f.request, &f.captured, &top, &identity));
+	top.outcome = CLUSTER_TX_ABORTED;
+	top.commit_scn = 0;
+	UT_ASSERT(!cluster_mx_history_record_bind_top(&f.request, &f.captured, &top, &identity));
+	UT_ASSERT(history_zero(&identity, sizeof(identity)));
+}
+
+UT_TEST(creator_uses_original_decoder_and_exact_update_replacement)
+{
+	HistoryFixture f;
+	history_init(&f);
+	f.request.edge_kind = CMXH_CREATOR_ROOT;
+	f.reader.record.xid = 100;
+	f.reader.operation.operation_fxid = f.reader.operation.canonical_top_fxid;
+	f.reader.operation.subid = TopSubTransactionId;
+	seal_fixture(&f.reader);
+	history_pack(&f);
+	UT_ASSERT(!history_capture(&f));
+	/* Top tails unsupported by the original decoder do not gain a shortcut. */
+	f.reader.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED;
+	seal_fixture(&f.reader);
+	history_pack(&f);
+	UT_ASSERT(!history_recheck(&f));
+	history_init(&f);
+	make_update(&f.reader, true);
+	history_v1(&f);
+	f.request.edge_kind = CMXH_CREATOR_ROOT;
+	UT_ASSERT(!history_capture(&f));
+	f.request.target_block = 18;
+	f.request.target_offset = 2;
+	UT_ASSERT(history_capture(&f));
+}
+
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(16);
+	UT_PLAN(19);
 	printf("# history record view: %zu bytes\n", sizeof(ClusterMxHistoryRecord));
 	UT_RUN(history_root_operation_and_prior);
 	UT_RUN(history_global_keeps_non_target_record);
@@ -532,6 +602,9 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(history_valid_marking_progress_and_active_stays_active);
 	UT_RUN(history_control_count_needs_new_cursor_and_effect_wal);
 	UT_RUN(history_unknown_request_wrap_still_binds_exact_tt_echo);
+	UT_RUN(creator_capture_requires_actual_top_creation);
+	UT_RUN(creator_bind_requires_committed_independent_identity);
+	UT_RUN(creator_uses_original_decoder_and_exact_update_replacement);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

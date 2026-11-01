@@ -164,6 +164,16 @@ history_reply(const ClusterMxHistoryRequestWire *w, int fill)
 	p.formation_epoch = 9;
 	p.admission_generation = 12;
 	p.ctrc_grant = 13;
+	if (w->bytes[100] == 4) {
+		p.record_class = CMXH_FOREIGN_CREATOR;
+		p.flags = CLUSTER_MX_HISTORY_ORDERED;
+		p.ctrc_grant = 0;
+		p.operation_fxid = p.top_fxid;
+		p.operation_sequence = 0;
+		p.outcome = CLUSTER_TX_COMMITTED;
+		p.commit_scn = 999;
+	}
+
 	ClusterR4WireWriteU64(auth, 12);
 	ClusterR4WireWriteU64(auth + 8, 1001);
 	UT_ASSERT(cluster_mx_history_peer_encode(&p, &pw));
@@ -478,13 +488,41 @@ UT_TEST(history_data_send_failure_only_retires_exact_attempt)
 	UT_ASSERT_EQ(cluster_gcs_block_r4_requester_count(), 0);
 }
 
+UT_TEST(creator_landing_is_typed_consume_once_and_rejects_mx)
+{
+	ClusterMxHistoryRequest request = history_input();
+	ClusterMxHistoryRequestWire wire;
+	ClusterForeignCreatorResult out;
+	history_reset();
+	request.edge_kind = CMXH_CREATOR_ROOT;
+	request.retained_floor = 0;
+	request.descriptor_hash = 0;
+	request.multixact_id = 0;
+	request.member_count = 0;
+	UT_ASSERT(cluster_gcs_block_mx_history_prepare(&request, &wire));
+	UT_ASSERT(cluster_gcs_block_mx_history_submit(&wire));
+	UT_ASSERT_EQ(cluster_gcs_block_foreign_creator_poll(&wire, &out), CMXH_PENDING);
+	UT_ASSERT(history_zero(&out, sizeof(out)));
+	history_deliver(&wire, 7);
+	UT_ASSERT_EQ(cluster_gcs_block_foreign_creator_poll(&wire, &out), CMXH_COMPLETE);
+	UT_ASSERT_EQ(out.admitted, 1);
+	UT_ASSERT_EQ(out.consumed, 0);
+	UT_ASSERT_EQ(out.data[0], 7);
+	UT_ASSERT_EQ(cluster_gcs_block_foreign_creator_poll(&wire, &out), CMXH_UNKNOWN);
+	UT_ASSERT(history_zero(&out, sizeof(out)));
+	wire = history_reset_prepare();
+	UT_ASSERT_EQ(cluster_gcs_block_foreign_creator_poll(&wire, &out), CMXH_UNKNOWN);
+	UT_ASSERT_EQ(cluster_gcs_block_r4_requester_count(), 1);
+	cluster_gcs_block_mx_history_cancel(&wire);
+}
+
 #ifndef HISTORY_BACKEND_TEST_MAIN
 #define HISTORY_BACKEND_TEST_MAIN main
 #endif
 int
 HISTORY_BACKEND_TEST_MAIN(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(history_publication_precedes_reentrant_reply);
 	UT_RUN(history_queue_full_preserves_exact_attempt);
 	UT_RUN(history_eight_slots_and_request_id_nonreuse);
@@ -501,6 +539,7 @@ HISTORY_BACKEND_TEST_MAIN(void)
 	UT_RUN(history_subcommit_preserves_and_backend_exit_closes);
 	UT_RUN(history_data_stream_loss_requalifies_without_resending);
 	UT_RUN(history_data_send_failure_only_retires_exact_attempt);
+	UT_RUN(creator_landing_is_typed_consume_once_and_rejects_mx);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

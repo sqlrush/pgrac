@@ -534,7 +534,7 @@ history_record_decode(const ClusterMxHistoryRequest *request, const UndoRecordHe
 	if (request == NULL || header == NULL || body == NULL
 		|| length != sizeof(*header) + (size_t)header->payload_length || length > BLCKSZ
 		|| offset < sizeof(UndoBlockHeader) || offset > BLCKSZ - length
-		|| request->edge_kind < CMXH_ROOT || request->edge_kind > CMXH_PAGE_PRIOR
+		|| request->edge_kind < CMXH_ROOT || request->edge_kind > CMXH_CREATOR_ROOT
 		|| (request->flags
 			& ~(CLUSTER_MX_HISTORY_EXPECT_OWNER | CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION))
 			   != 0
@@ -627,6 +627,26 @@ history_record_decode(const ClusterMxHistoryRequest *request, const UndoRecordHe
 					|| !FullTransactionIdEquals(identity->top_fxid, request->expected_top_fxid))))
 			return false;
 	}
+	if (request->edge_kind == CMXH_CREATOR_ROOT) {
+		bool creation = false;
+		if (header->record_type == UNDO_RECORD_INSERT) {
+			UndoInsertPayload insert;
+			memcpy(&insert, body, sizeof(insert));
+			creation = insert.inserted_tuple_len >= SizeofHeapTupleHeader
+					   && insert.inserted_tuple_len <= BLCKSZ - SizeOfPageHeaderData
+					   && request->target_block == header->target_block
+					   && request->target_offset == header->target_offset;
+		} else if (header->record_type == UNDO_RECORD_UPDATE) {
+			UndoUpdatePayload update;
+			memcpy(&update, body, sizeof(update));
+			creation = request->target_block == update.new_block
+					   && request->target_offset == update.new_offset;
+		}
+		if (!creation || !record.matches_target || record.effect != CLUSTER_SAVEPOINT_EFFECT_LIVE
+			|| (record.record_class != CMXH_V1_TOP
+				&& !FullTransactionIdEquals(identity->operation_fxid, identity->top_fxid)))
+			return false;
+	}
 	if (request->edge_kind == CMXH_GLOBAL_PREV) {
 		ClusterItlSlotData zero = { 0 };
 		if (!owner || request->locator.tt_wrap == TT_WRAP_INVALID || request->locator.itl_kind != 0
@@ -707,6 +727,12 @@ cluster_mx_history_record_bind_top(const ClusterMxHistoryRequest *request,
 			&& !FullTransactionIdEquals(top->local_original_full_xid, record->identity.top_fxid))
 		|| ((request->flags & CLUSTER_MX_HISTORY_EXPECT_OWNER)
 			&& !FullTransactionIdEquals(top->local_original_full_xid, request->expected_top_fxid)))
+		return false;
+	if (request->edge_kind == CMXH_CREATOR_ROOT
+		&& (top->outcome != CLUSTER_TX_COMMITTED || top->commit_scn == UINT64_MAX
+			|| (record->record_class != CMXH_V1_TOP
+				&& !FullTransactionIdEquals(record->identity.operation_fxid,
+											record->identity.top_fxid))))
 		return false;
 	identity = record->identity;
 	identity.canonical_generation = top->local_canonical_generation;

@@ -3,7 +3,9 @@
  * original fixture; no TT40, grant or complete native warm claim. */
 int history_unused_mx_origin_main(void);
 #define MX_OPERATION_ORIGIN_TEST_MAIN history_unused_mx_origin_main
+#define TransactionIdGetStatus creator_fixture_xid_status
 #include "test_cluster_mx_operation_origin.c"
+#undef TransactionIdGetStatus
 #undef MX_OPERATION_ORIGIN_TEST_MAIN
 #include "cluster/cluster_mx_history_record.h"
 
@@ -17,6 +19,16 @@ typedef struct HistoryOriginFixture {
 	PGAlignedBlock output;
 } HistoryOriginFixture;
 
+static bool creator_commit_needs_flush;
+XidStatus TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn);
+XidStatus
+TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
+{
+	XidStatus status = creator_fixture_xid_status(xid, lsn);
+	if (creator_commit_needs_flush && lsn != NULL)
+		*lsn = test_flush_lsn + 1;
+	return status;
+}
 static HistoryOriginFixture *history_observed;
 static int history_action, history_release;
 static bool history_cold_cache_race;
@@ -859,10 +871,58 @@ UT_TEST(history_cold_first_and_fresh_data_use_only_original_three_currents)
 	UT_ASSERT(strstr(dump, "max_read_ns=123000") != NULL);
 }
 
+
+static void
+creator_origin_init(HistoryOriginFixture *f)
+{
+	history_origin_init(f, false);
+	history_origin_v1();
+	f->request.edge_kind = CMXH_CREATOR_ROOT;
+	f->request.retained_floor = 0;
+	f->request.descriptor_hash = 0;
+	f->request.multixact_id = 0;
+	f->request.member_count = 0;
+}
+UT_TEST(creator_origin_reuses_three_phases_without_live_grant)
+{
+	HistoryOriginFixture f;
+	creator_origin_init(&f);
+	if (!history_begin(&f))
+		return;
+	UT_ASSERT_EQ(history_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_COMPLETE);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+	UT_ASSERT_EQ(test_candidate_release_calls, 3);
+	UT_ASSERT_EQ(f.top.outcome, CLUSTER_TX_COMMITTED);
+	UT_ASSERT(
+		FullTransactionIdEquals(f.record.identity.top_fxid, f.record.identity.operation_fxid));
+}
+UT_TEST(creator_origin_refuses_missing_identity_and_unflushed_commit)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		HistoryOriginFixture f;
+		creator_origin_init(&f);
+		if (fault == 0)
+			test_original_available = false;
+		if (fault == 1) {
+			test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+			test_twophase_xid = TEST_ORIGIN_XID;
+		}
+		if (fault == 2)
+			creator_commit_needs_flush = true;
+		if (!history_begin(&f))
+			return;
+		UT_ASSERT_EQ(history_finish(&f), CLUSTER_RUNTIME_VISIBILITY_OPERATION_FAILED);
+		UT_ASSERT(history_is_zero(&f.top, sizeof(f.top)));
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 2);
+		UT_ASSERT_EQ(test_candidate_release_calls, 2);
+		creator_commit_needs_flush = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(history_origin_root_three_phases_same_and_cross_segment);
 	UT_RUN(history_origin_global_and_v1_keep_exact_identity);
 	UT_RUN(history_origin_control_returns_fresh_snapshot);
@@ -884,6 +944,8 @@ main(void)
 	UT_RUN(history_cold_error_and_disabled_pool_preserve_unknown_and_account_reads);
 	UT_RUN(history_cold_post_io_drift_never_becomes_proof);
 	UT_RUN(history_cold_first_and_fresh_data_use_only_original_three_currents);
+	UT_RUN(creator_origin_reuses_three_phases_without_live_grant);
+	UT_RUN(creator_origin_refuses_missing_identity_and_unflushed_commit);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

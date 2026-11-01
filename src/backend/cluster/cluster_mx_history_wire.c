@@ -130,6 +130,7 @@ history_request_valid(const ClusterMxHistoryRequest *r, int32 source, int32 orig
 	uint16 slot, row;
 	BufferTag expected;
 	bool owner, generation;
+	bool creator = r != NULL && r->edge_kind == CMXH_CREATOR_ROOT;
 
 	if (r == NULL || source < 0 || source >= RESOURCE_X_PROTOCOL_NODE_LIMIT || origin < 0
 		|| origin >= RESOURCE_X_PROTOCOL_NODE_LIMIT || r->forward.original_requester_node != source
@@ -141,7 +142,7 @@ history_request_valid(const ClusterMxHistoryRequest *r, int32 source, int32 orig
 		|| !uba_decode_record(r->locator.uba, &segment, &block, &slot, &row)
 		|| uba_origin_node_id(r->locator.uba) != origin || !TransactionIdIsNormal(r->locator.xid)
 		|| (r->locator.tt_wrap != TT_WRAP_INVALID && r->locator.tt_wrap > TT_WRAP_MAX)
-		|| r->edge_kind < CMXH_ROOT || r->edge_kind > CMXH_PAGE_PRIOR || r->root_ordinal >= 8
+		|| r->edge_kind < CMXH_ROOT || r->edge_kind > CMXH_CREATOR_ROOT || r->root_ordinal >= 8
 		|| (r->flags
 			& ~(CLUSTER_MX_HISTORY_EXPECT_OWNER | CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION
 				| CLUSTER_MX_HISTORY_CANCEL))
@@ -152,9 +153,13 @@ history_request_valid(const ClusterMxHistoryRequest *r, int32 source, int32 orig
 		|| r->origin_capability_generation == 0
 		|| r->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 || r->admission_generation == 0
 		|| r->admission_generation == UINT64_MAX || !SCN_VALID(r->read_scn)
-		|| r->read_epoch != epoch || !SCN_VALID(r->retained_floor)
-		|| scn_local(r->retained_floor) > scn_local(r->read_scn) || r->snapshot_identity == 0
-		|| r->multixact_id == 0 || r->member_count == 0 || r->member_count > 256
+		|| r->read_epoch != epoch || r->snapshot_identity == 0
+		|| (creator ? (r->retained_floor != 0 || r->descriptor_hash != 0 || r->multixact_id != 0
+					   || r->member_count != 0 || r->requester_owner.flags != 0
+					   || r->read_scn == UINT64_MAX)
+					: (!SCN_VALID(r->retained_floor)
+					   || scn_local(r->retained_floor) > scn_local(r->read_scn)
+					   || r->multixact_id == 0 || r->member_count == 0 || r->member_count > 256))
 		|| !RelFileNumberIsValid(r->target_locator.relNumber) || r->target_fork != MAIN_FORKNUM
 		|| r->target_block == InvalidBlockNumber || !OffsetNumberIsValid(r->target_offset)
 		|| r->target_offset > MaxHeapTuplesPerPage
@@ -193,7 +198,7 @@ history_request_valid(const ClusterMxHistoryRequest *r, int32 source, int32 orig
 			   || r->edge.flags != r->locator.itl_kind
 			   || !cluster_undo_record_uba_equal(r->edge.undo_segment_head, r->locator.uba))
 		return false;
-	if (r->edge_kind == CMXH_ROOT)
+	if (r->edge_kind == CMXH_ROOT || creator)
 		return UBA_is_invalid(r->parent) && r->parent_data_generation == 0
 			   && r->parent_record_crc == 0 && r->root_ordinal == r->edge_itl_slot
 			   && memcmp(&r->root, &r->edge, sizeof(r->root)) == 0;
@@ -288,9 +293,10 @@ cluster_mx_history_request_encode(const ClusterMxHistoryRequest *r,
 	p[65] = CLUSTER_MX_HISTORY_KIND;
 	history_uba_write(p + 68, r->locator.uba);
 	HWRITE32(p + 92, r->expected_data_generation);
-	HWRITE16(p + 96, 1);
+	HWRITE16(p + 96, r->edge_kind == CMXH_CREATOR_ROOT ? CLUSTER_FOREIGN_CREATOR_HISTORY_VERSION
+													   : CLUSTER_MX_HISTORY_VERSION);
 	HWRITE16(p + 98, 328);
-	p[198] = 8;
+	p[198] = r->edge_kind == CMXH_CREATOR_ROOT ? 1 : 8;
 	memcpy(p + 224, owner.bytes, 40);
 	history_itl_write(p + 264, &r->root);
 	history_itl_write(p + 312, &r->edge);
@@ -313,8 +319,12 @@ cluster_mx_history_request_decode(const void *payload, uint32 length, int32 sour
 	memset(out, 0, sizeof(*out));
 	if (p == NULL || length != 424 || p[64] != CLUSTER_R4_WIRE_VERSION
 		|| p[65] != CLUSTER_MX_HISTORY_KIND || HREAD16(p + 66) != 0 || !history_zero(p + 49, 15)
-		|| HREAD16(p + 96) != 1 || HREAD16(p + 98) != 328 || p[198] != 8 || HREAD16(p + 222) != 0
-		|| HREAD32(p + 420) != 0 || HREAD32(p + 416) != history_crc(p, 416))
+		|| HREAD16(p + 96)
+			   != (p[100] == CMXH_CREATOR_ROOT ? CLUSTER_FOREIGN_CREATOR_HISTORY_VERSION
+											   : CLUSTER_MX_HISTORY_VERSION)
+		|| HREAD16(p + 98) != 328 || p[198] != (p[100] == CMXH_CREATOR_ROOT ? 1 : 8)
+		|| HREAD16(p + 222) != 0 || HREAD32(p + 420) != 0
+		|| HREAD32(p + 416) != history_crc(p, 416))
 		return false;
 #define READ_FIELD(n, off, field) r.field = history_read(p + off, n);
 	HISTORY_REQUEST_FIELDS(READ_FIELD)
@@ -389,7 +399,7 @@ history_peer_valid(const ClusterMxHistoryPeer *p)
 	if (p == NULL
 		|| (p->flags != CLUSTER_MX_HISTORY_ORDERED
 			&& p->flags != (CLUSTER_MX_HISTORY_ORDERED | CLUSTER_MX_HISTORY_HAS_GRANT))
-		|| p->record_class < CMXH_V1_TOP || p->record_class > CMXH_ROLLBACK_CONTROL
+		|| p->record_class < CMXH_V1_TOP || p->record_class > CMXH_FOREIGN_CREATOR
 		|| !history_physical_valid(&p->canonical) || p->canonical_generation == UINT32_MAX
 		|| !FullTransactionIdIsNormal(p->top_fxid)
 		|| U64FromFullTransactionId(p->top_fxid) == UINT64_MAX
@@ -411,6 +421,12 @@ history_peer_valid(const ClusterMxHistoryPeer *p)
 		|| p->admission_generation == 0 || p->admission_generation == UINT64_MAX
 		|| ((p->flags & CLUSTER_MX_HISTORY_HAS_GRANT) != 0) != (p->ctrc_grant != 0))
 		return false;
+	if (p->record_class == CMXH_FOREIGN_CREATOR)
+		return p->flags == CLUSTER_MX_HISTORY_ORDERED && p->ctrc_grant == 0
+			   && p->commit_scn != UINT64_MAX && p->outcome == CLUSTER_TX_COMMITTED
+			   && p->effect == CLUSTER_SAVEPOINT_EFFECT_LIVE
+			   && p->proof_kind == CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+			   && FullTransactionIdEquals(p->operation_fxid, p->top_fxid);
 	child = p->record_class != CMXH_V1_TOP;
 	if (child ? (p->operation_sequence == 0
 				 || U64FromFullTransactionId(p->operation_fxid)
@@ -460,7 +476,9 @@ cluster_mx_history_peer_encode(const ClusterMxHistoryPeer *peer, ClusterMxHistor
 		return false;
 	p = out->bytes;
 	HWRITE32(p, UINT32_C(0x3158484d));
-	HWRITE16(p + 4, 1);
+	HWRITE16(p + 4, peer->record_class == CMXH_FOREIGN_CREATOR
+						? CLUSTER_FOREIGN_CREATOR_HISTORY_VERSION
+						: CLUSTER_MX_HISTORY_VERSION);
 	HWRITE16(p + 6, 136);
 #define WRITE_FIELD(n, off, field) history_write(p + off, n, peer->field);
 	HISTORY_PEER_FIELDS(WRITE_FIELD)
@@ -483,8 +501,11 @@ cluster_mx_history_peer_decode(const ClusterMxHistoryPeerWire *wire, ClusterMxHi
 	if (wire == NULL)
 		return false;
 	p = wire->bytes;
-	if (HREAD32(p) != UINT32_C(0x3158484d) || HREAD16(p + 4) != 1 || HREAD16(p + 6) != 136
-		|| HREAD32(p + 132) != 0)
+	if (HREAD32(p) != UINT32_C(0x3158484d)
+		|| HREAD16(p + 4)
+			   != (p[12] == CMXH_FOREIGN_CREATOR ? CLUSTER_FOREIGN_CREATOR_HISTORY_VERSION
+												 : CLUSTER_MX_HISTORY_VERSION)
+		|| HREAD16(p + 6) != 136 || HREAD32(p + 132) != 0)
 		return false;
 #define READ_FIELD(n, off, field) peer.field = history_read(p + off, n);
 	HISTORY_PEER_FIELDS(READ_FIELD)
@@ -506,7 +527,8 @@ history_reply_binding(const ClusterMxHistoryRequest *r, const ClusterMxHistoryPe
 	uint32 segment, block;
 	uint16 slot, row;
 
-	if ((r->flags & CLUSTER_MX_HISTORY_CANCEL) != 0
+	if ((r->edge_kind == CMXH_CREATOR_ROOT) != (p->record_class == CMXH_FOREIGN_CREATOR)
+		|| (r->flags & CLUSTER_MX_HISTORY_CANCEL) != 0
 		|| !uba_decode_record(r->locator.uba, &segment, &block, &slot, &row)
 		|| p->canonical.slot_offset != slot
 		|| (p->canonical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE != r->forward.master_node

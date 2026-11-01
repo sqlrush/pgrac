@@ -3013,6 +3013,8 @@ cluster_runtime_visibility_history_scope_current(const ClusterMxHistoryRequest *
 {
 	return request != NULL && admission != NULL
 		   && (mode == CLUSTER_TX_RESOLVE_VISIBILITY || mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
+		   && (request->edge_kind != CMXH_CREATOR_ROOT
+			   || mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
 		   && !(request->flags & CLUSTER_MX_HISTORY_CANCEL)
 		   && request->feature_bit == admission->feature_bit
 		   && request->admission_generation == admission->record_generation
@@ -3252,6 +3254,26 @@ cluster_runtime_visibility_origin_plan_sample_history_held(
 	if (!cluster_runtime_visibility_origin_plan_sample_canonical_held(plan, mode, admission, guard,
 																	  root, reason_out))
 		return false;
+	if (request->edge_kind == CMXH_CREATOR_ROOT) {
+		XLogRecPtr commit_lsn;
+		ClusterUndoBlock0Generation generation = { false, 0 };
+		ClusterUndoBlock0ResolvedRoot final_root;
+		/* Native CLOG's group LSN covers this exact xid's commit record.
+		 * Zero means synchronous/already-persisted CLOG, not an arbitrary flush
+		 * pointer. Never flush or wait in LMS to make precommit evidence pass. */
+		if (data->candidate.outcome != CLUSTER_TX_COMMITTED
+			|| TransactionIdGetStatus(data->candidate.top_xid, &commit_lsn)
+				   != TRANSACTION_STATUS_COMMITTED
+			|| commit_lsn > GetFlushRecPtr(NULL)
+			|| cluster_undo_block0_current_sample_generation(guard, root, &generation)
+				   != CLUSTER_UNDO_BLOCK0_OK
+			|| !generation.known || generation.value != data->candidate.local_canonical_generation
+			|| !cluster_runtime_visibility_resolve_root_admitted(
+				mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, data->tt_logical.owner_instance,
+				data->tt_logical.segment_id, &final_root)
+			|| !cluster_runtime_visibility_candidate_root_matches(root, &final_root))
+			goto failed;
+	}
 	record.identity = data->operation;
 	record.record_class
 		= data->operation_plan <= ORIGIN_PLAN_HISTORY_V1_OWNER

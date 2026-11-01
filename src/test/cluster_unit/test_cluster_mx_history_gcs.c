@@ -388,10 +388,31 @@ UT_TEST(history_origin_cold_budget_is_per_drain_and_rotates)
 	UT_ASSERT_EQ(history_sent_header.status, GCS_BLOCK_REPLY_R4_DENIED);
 }
 
+UT_TEST(creator_origin_uses_original_context_and_refuses_missing_proof)
+{
+	ClusterMxHistoryRequest request;
+	history_origin_prepare();
+	UT_ASSERT(cluster_mx_history_request_decode(&history_origin_request, 424, 2, 1, 9, &request));
+	request.edge_kind = CMXH_CREATOR_ROOT;
+	request.retained_floor = 0;
+	request.descriptor_hash = 0;
+	request.multixact_id = 0;
+	request.member_count = 0;
+	UT_ASSERT(cluster_mx_history_request_encode(&request, &history_origin_request));
+	cluster_gcs_handle_block_forward_envelope(&history_env, &history_origin_request);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+	history_origin_drain();
+	UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, 1);
+	UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 1);
+	UT_ASSERT_EQ(history_sent_header.status, GCS_BLOCK_REPLY_R4_DENIED);
+	UT_ASSERT_EQ(route_seam.raw_send_payload_len, 48);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(history_origin_accepts_exact_once_and_refuses_unproven_data);
 	UT_RUN(history_origin_cancel_before_acquire_is_idempotent);
 	UT_RUN(history_origin_cancel_waits_for_pending_release);
@@ -406,6 +427,7 @@ main(void)
 	UT_RUN(history_origin_same_numeric_key_keeps_legacy_domain);
 	UT_RUN(history_origin_ingress_error_releases_untransferred_admission);
 	UT_RUN(history_origin_cold_budget_is_per_drain_and_rotates);
+	UT_RUN(creator_origin_uses_original_context_and_refuses_missing_proof);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

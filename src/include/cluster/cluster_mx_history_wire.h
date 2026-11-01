@@ -16,6 +16,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #define CLUSTER_MX_HISTORY_VERSION 1
+#define CLUSTER_FOREIGN_CREATOR_HISTORY_VERSION 2
 #define CLUSTER_MX_HISTORY_KIND 5
 #define CLUSTER_MX_HISTORY_REPLY_STATUS 31
 #define CLUSTER_MX_HISTORY_REQUEST_BYTES 424
@@ -31,13 +32,15 @@
 typedef enum ClusterMxHistoryEdge {
 	CMXH_ROOT = 1,
 	CMXH_GLOBAL_PREV = 2,
-	CMXH_PAGE_PRIOR = 3
+	CMXH_PAGE_PRIOR = 3,
+	CMXH_CREATOR_ROOT = 4
 } ClusterMxHistoryEdge;
 
 typedef enum ClusterMxHistoryRecordClass {
 	CMXH_V1_TOP = 1,
 	CMXH_OPERATION = 2,
-	CMXH_ROLLBACK_CONTROL = 3
+	CMXH_ROLLBACK_CONTROL = 3,
+	CMXH_FOREIGN_CREATOR = 4
 } ClusterMxHistoryRecordClass;
 
 typedef struct ClusterMxHistoryRequestWire {
@@ -66,6 +69,7 @@ typedef struct ClusterMxHistoryRequest {
 	uint64 collector_id, capture_generation, backend_incarnation;
 	uint32 requester_capability_generation, origin_capability_generation;
 	uint64 feature_bit, admission_generation;
+	/* CREATOR uses H/formation epoch/zero/local collector scope here. */
 	SCN read_scn;
 	uint64 read_epoch;
 	SCN retained_floor;
@@ -112,6 +116,18 @@ typedef struct ClusterMxHistoryPeerResult {
 	uint8 admitted, consumed, zero[6];
 } ClusterMxHistoryPeerResult;
 
+/* Separate caller-private type; never a local TT or live companion. */
+typedef struct ClusterForeignCreatorResult {
+	ClusterMxHistoryRequestWire request;
+	uint8 data[8192];
+	uint8 auth[16];
+	ClusterMxHistoryPeerWire peer;
+	uint8 admitted, consumed, zero[6];
+} ClusterForeignCreatorResult;
+StaticAssertDecl(sizeof(ClusterForeignCreatorResult) == 8776, "private creator result size");
+StaticAssertDecl(offsetof(ClusterForeignCreatorResult, data) == 424, "creator DATA offset");
+StaticAssertDecl(offsetof(ClusterForeignCreatorResult, peer) == 8632, "creator peer offset");
+
 typedef enum ClusterMxHistoryStep {
 	CMXH_UNKNOWN = 0,
 	CMXH_PENDING = 1,
@@ -129,6 +145,9 @@ extern bool cluster_gcs_block_mx_history_submit(const ClusterMxHistoryRequestWir
 extern ClusterMxHistoryStep
 cluster_gcs_block_mx_history_poll(const ClusterMxHistoryRequestWire *request,
 								  ClusterMxHistoryPeerResult *out);
+extern ClusterMxHistoryStep
+cluster_gcs_block_foreign_creator_poll(const ClusterMxHistoryRequestWire *request,
+									   ClusterForeignCreatorResult *out);
 extern void cluster_gcs_block_mx_history_cancel(const ClusterMxHistoryRequestWire *request);
 /* Original DATA-ring disposal notification; no wire message or new authority. */
 extern void cluster_gcs_block_mx_history_send_failed(const void *payload, uint16 length,
