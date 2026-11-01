@@ -12,6 +12,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_write_fence.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -23,6 +24,7 @@ typedef struct RangeOwned {
 	ClusterKoDirectoryIoV3 io;
 	ClusterCurrentMxKey key;
 	uint64 system_identifier;
+	uint64 describe_request_id;
 	uint32 loaded_catalog, peer_generation;
 } RangeOwned;
 
@@ -228,6 +230,142 @@ cluster_multixact_current_describe_finish(ClusterMxCompositionReceive **op)
 	*op = NULL;
 }
 
+static bool
+range_proof_window(const RangeOwned *owned, ClusterMxProofWindow *window)
+{
+	ClusterMxCompositionProofWindow raw;
+	ClusterMxProofWindow candidate = {0};
+	int32 origin;
+
+	if (window == NULL || !range_owned_current(owned)
+		|| !cluster_mx_composition_proof_window(owned->op, CLUSTER_MX_PROOF_PAGE_MEMBERS, &raw)
+		|| raw.source_bytes != sizeof(candidate.source))
+		return false;
+	origin = cluster_xid_origin_slot(raw.members[0].xid);
+	if (origin < 0 || origin >= CLUSTER_MAX_NODES)
+		return false;
+	candidate.key = owned->key; memcpy(&candidate.source, raw.source, sizeof(candidate.source));
+	candidate.total = raw.total; candidate.first = raw.first; candidate.origin = origin;
+	for (uint32 i = 0; i < raw.count; i++) {
+		int32 member_origin = cluster_xid_origin_slot(raw.members[i].xid);
+		if (member_origin < 0 || member_origin >= CLUSTER_MAX_NODES)
+			return false;
+		if (member_origin != origin)
+			break;
+		candidate.members[candidate.count++] = raw.members[i];
+	}
+	if (!range_owned_current(owned))
+		return false;
+	*window = candidate;
+	return true;
+}
+
+bool
+cluster_multixact_current_proofs_window(ClusterMxCompositionReceive **op,
+	ClusterMxProofWindow *window)
+{
+	RangeOwned *owned;
+	bool ok = false;
+	if (window != NULL) memset(window, 0, sizeof(*window));
+	if (op == NULL || *op == NULL) return false;
+	for (owned = range_owned; owned != NULL; owned = owned->next)
+		if (owned->op == *op) break;
+	if (owned == NULL) { *op = NULL; return false; }
+	PG_TRY();
+	{
+		ok = range_proof_window(owned, window);
+		if (!ok)
+			(void)cluster_mx_composition_accept_proofs(&owned->op, MXCOMP_READ_RETRY, NULL);
+	}
+	PG_CATCH();
+	{
+		*op = NULL; range_owned_end(owned); PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*op = owned->op;
+	if (!ok) range_owned_end(owned);
+	return ok;
+}
+
+static bool
+range_proof_member_current(const RangeOwned *owned, int32 origin, uint32 generation)
+{
+	return range_owned_current(owned)
+		&& cluster_sf_peer_foreign_mx_capability_matches_v1(origin,
+			CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1,
+			owned->loaded_catalog, generation);
+}
+
+ClusterMxCompositionReceiveResult
+cluster_multixact_current_proofs_fetch_window(ClusterMxCompositionReceive **op,
+	const ClusterMxProofWindow *window, ClusterMxProofTransportStats *stats)
+{
+	RangeOwned *owned;
+	ClusterMxProofWindow current;
+	ClusterMxProofRequest request;
+	ClusterMxProofRequestView view;
+	ClusterMxRangeResponse response;
+	ClusterMxRangeWireContext ctx = {0};
+	ClusterMxProofReply reply;
+	PGAlignedBlock body;
+	ClusterMxCompositionReceiveResult result = MXCOMP_UNKNOWN;
+	ClusterMxCompositionReadStatus status = MXCOMP_READ_RETRY;
+	uint32 generation = 0, body_bytes = 0, request_bytes = 0, bytes = 0;
+
+	if (op == NULL || *op == NULL) return MXCOMP_UNKNOWN;
+	for (owned = range_owned; owned != NULL; owned = owned->next)
+		if (owned->op == *op) break;
+	if (owned == NULL) { *op = NULL; return MXCOMP_UNKNOWN; }
+	PG_TRY();
+	{
+		if (window == NULL || stats == NULL || !range_proof_window(owned, &current)
+			|| memcmp(window, &current, sizeof(current)) != 0 || current.origin == cluster_node_id
+			|| owned->describe_request_id == 0
+			|| !cluster_sf_peer_foreign_mx_capability_sample_v1(current.origin,
+				CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1,
+				owned->loaded_catalog, &generation))
+			goto proof_window_accept;
+		/* Seed encoding with a genuine original describe identity. The original
+		 * GCS sender replaces both ids with its newly reserved attempt before
+		 * any enqueue. This seed is never transmitted as a proof attempt. */
+		ctx.request_id = owned->describe_request_id; ctx.epoch = owned->key.cluster_epoch;
+		ctx.key = current.key; ctx.format_id = CLUSTER_FOREIGN_MX_FORMAT_ID_V1;
+		ctx.version = CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1; ctx.loaded_catalog = owned->loaded_catalog;
+		ctx.peer_capabilities = CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES; ctx.peer_generation = generation;
+		ctx.requested_cap = current.count; ctx.source = &current.source; ctx.source_bytes = sizeof(current.source);
+		if (!cluster_mx_range_wire_encode_proof_asks(&ctx, current.total, current.first,
+			current.members, current.count, body.data, BLCKSZ, &body_bytes)
+			|| !cluster_mx_proof_request_pack(&ctx, cluster_node_id, MyBackendId, body.data, body_bytes,
+				&request, sizeof(request), &request_bytes)
+			|| !range_proof_member_current(owned, current.origin, generation)
+			|| !cluster_gcs_current_mx_proofs_fetch_and_wait(current.origin, &request, request_bytes,
+				&response, &bytes, stats)
+			|| !range_proof_member_current(owned, current.origin, generation))
+			goto proof_window_accept;
+		ctx.request_id = request.route.request_id;
+		status = MXCOMP_READ_UNKNOWN;
+		if (cluster_mx_proof_request_decode(&request, request_bytes, owned->loaded_catalog,
+			CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, &view)
+			&& cluster_mx_proof_response_matches(&view, &response, bytes, owned->loaded_catalog,
+				CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, current.origin))
+			status = cluster_mx_range_wire_decode_proofs(response.data.data, bytes - sizeof(response.route),
+				&ctx, current.origin, current.total, current.first, current.members, current.count, &reply);
+	proof_window_accept:
+		result = cluster_mx_composition_accept_proofs(&owned->op, status,
+			status == MXCOMP_READ_OK ? &reply : NULL);
+		if (result != MXCOMP_UNKNOWN && !range_proof_member_current(owned, current.origin, generation))
+			result = cluster_mx_composition_accept_proofs(&owned->op, MXCOMP_READ_RETRY, NULL);
+	}
+	PG_CATCH();
+	{
+		*op = NULL; range_owned_end(owned); PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*op = owned->op;
+	if (result == MXCOMP_UNKNOWN) range_owned_end(owned);
+	return result;
+}
+
 bool
 cluster_multixact_current_proofs_request(ClusterMxCompositionReceive **op,
 	const ClusterMxRangeWireContext *ctx, void *wire, uint32 capacity, uint32 *bytes)
@@ -410,7 +548,10 @@ cluster_multixact_current_describe_full(const ClusterCurrentMxKey *key,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (complete) { *op = owned->op; return true; }
+	if (complete) {
+		owned->describe_request_id = request.route.request_id;
+		*op = owned->op; return true;
+	}
 	range_owned_end(owned);
 	/* G2 may already have counted the failed complete operation. Incomplete
 	 * cleanup also records UNKNOWN; do not count the same outcome twice. */

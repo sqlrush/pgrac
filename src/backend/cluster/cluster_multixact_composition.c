@@ -263,22 +263,20 @@ cluster_mx_composition_pages(const ClusterMxCompositionReceive *op, uint32 *tota
 }
 
 bool
-cluster_mx_composition_encode_proof_asks(const ClusterMxCompositionReceive *op,
-	const ClusterMxRangeWireContext *ctx, void *wire, uint32 capacity, uint32 *bytes)
+cluster_mx_composition_proof_window(const ClusterMxCompositionReceive *op,
+	uint32 cap, ClusterMxCompositionProofWindow *window)
 {
-	ClusterCurrentMxMemberDesc members[CLUSTER_MX_PROOF_PAGE_MEMBERS];
+	ClusterMxCompositionProofWindow candidate = {0};
 	const ClusterMxCompositionPage *page;
 	uint32 count;
 
-	if (bytes != NULL)
-		*bytes = 0;
-	if (op == NULL || !op->complete || op->proofs_complete || ctx == NULL
-		|| ctx->source == NULL || ctx->source_bytes != op->source_bytes
-		|| memcmp(ctx->source, op->source, op->source_bytes) != 0
-		|| ctx->requested_cap == 0 || ctx->requested_cap > CLUSTER_MX_PROOF_PAGE_MEMBERS
+	if (window != NULL)
+		memset(window, 0, sizeof(*window));
+	if (op == NULL || window == NULL || !op->complete || op->proofs_complete
+		|| cap == 0 || cap > CLUSTER_MX_PROOF_PAGE_MEMBERS
 		|| op->proof_accepted >= op->member_count)
 		return false;
-	count = Min(ctx->requested_cap, op->member_count - op->proof_accepted);
+	count = Min(cap, op->member_count - op->proof_accepted);
 	page = op->proof_members == NULL ? op->head : op->proof_members;
 	for (uint32 i = 0; i < count; i++) {
 		uint32 ordinal = op->proof_accepted + i;
@@ -289,10 +287,28 @@ cluster_mx_composition_encode_proof_asks(const ClusterMxCompositionReceive *op,
 		if (page == NULL || page->count == 0 || page->count > CLUSTER_MX_COMPOSITION_PAGE_MEMBERS
 			|| ordinal < page->first || (uint64)ordinal >= (uint64)page->first + page->count)
 			return false;
-		members[i] = page->members[ordinal - page->first];
+		candidate.members[i] = page->members[ordinal - page->first];
 	}
-	return cluster_mx_range_wire_encode_proof_asks(ctx, op->member_count,
-		op->proof_accepted, members, count, wire, capacity, bytes);
+	candidate.source = op->source; candidate.source_bytes = op->source_bytes;
+	candidate.total = op->member_count; candidate.first = op->proof_accepted; candidate.count = count;
+	*window = candidate;
+	return true;
+}
+
+bool
+cluster_mx_composition_encode_proof_asks(const ClusterMxCompositionReceive *op,
+	const ClusterMxRangeWireContext *ctx, void *wire, uint32 capacity, uint32 *bytes)
+{
+	ClusterMxCompositionProofWindow window;
+	if (bytes != NULL)
+		*bytes = 0;
+	if (ctx == NULL || ctx->source == NULL
+		|| !cluster_mx_composition_proof_window(op, ctx->requested_cap, &window)
+		|| ctx->source_bytes != window.source_bytes
+		|| memcmp(ctx->source, window.source, window.source_bytes) != 0)
+		return false;
+	return cluster_mx_range_wire_encode_proof_asks(ctx, window.total, window.first,
+		window.members, window.count, wire, capacity, bytes);
 }
 
 ClusterMxCompositionReceiveResult

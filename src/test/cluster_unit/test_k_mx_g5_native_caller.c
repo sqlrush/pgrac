@@ -7,8 +7,12 @@ int k_service_component_main(void);
 #define MemoryContextAllocZero k_proof_original_alloc_zero
 #define GetControlFileCatalogVersion k_proof_original_catalog
 #define cluster_gcs_current_mx_range_fetch_and_wait k_controlled_range_transport
+#define cluster_sf_peer_foreign_mx_capability_sample_v1 k_native_original_capability_sample
+#define cluster_sf_peer_foreign_mx_capability_matches_v1 k_native_original_capability_matches
 #include "test_k_mx_g5_service.c"
 #undef cluster_gcs_current_mx_range_fetch_and_wait
+#undef cluster_sf_peer_foreign_mx_capability_sample_v1
+#undef cluster_sf_peer_foreign_mx_capability_matches_v1
 #undef LWLockAcquire
 #undef LWLockRelease
 #undef MemoryContextAllocZero
@@ -18,6 +22,11 @@ void *MemoryContextAllocZero(MemoryContext context, Size size);
 uint32 GetControlFileCatalogVersion(void);
 bool LWLockAcquire(LWLock *lock, LWLockMode mode);
 void LWLockRelease(LWLock *lock);
+bool cluster_sf_peer_foreign_mx_capability_sample_v1(int32 peer,uint32 format,
+	uint32 version,uint32 catalog,uint32 *generation);
+bool cluster_sf_peer_foreign_mx_capability_matches_v1(int32 peer,uint32 format,
+	uint32 version,uint32 catalog,uint32 expected);
+
 bool cluster_gcs_current_mx_range_fetch_and_wait(ClusterMxRangeRequest *request,
 	ClusterMxRangeResponse *response,uint32 *bytes);
 bool k_real_range_fetch_and_wait(ClusterMxRangeRequest *request,
@@ -41,6 +50,22 @@ static unsigned proof_allocation_fault;
 static bool proof_allocation_fired, proof_catalog_error;
 static uint32 proof_catalog_delta;
 static unsigned proof_request_checks, proof_request_drift_at;
+static uint32 native_member_generation_delta;
+static bool (*native_proof_enqueue)(int,uint8,uint32,const void *,uint16,uint32,uint32);
+
+bool cluster_sf_peer_foreign_mx_capability_sample_v1(int32 peer,uint32 format,
+	uint32 version,uint32 catalog,uint32 *generation)
+{
+	bool ok=k_native_original_capability_sample(peer,format,version,catalog,generation);
+	if(ok && peer==2)*generation+=native_member_generation_delta;
+	return ok;
+}
+bool cluster_sf_peer_foreign_mx_capability_matches_v1(int32 peer,uint32 format,
+	uint32 version,uint32 catalog,uint32 expected)
+{
+	uint32 actual=0;
+	return cluster_sf_peer_foreign_mx_capability_sample_v1(peer,format,version,catalog,&actual) && actual==expected;
+}
 
 static void
 proof_drift(unsigned kind)
@@ -52,6 +77,7 @@ proof_drift(unsigned kind)
 	case 4: capability_ok = false; break;
 	case 5: proof_catalog_delta++; break;
 	case 6: proof_catalog_error = true; break;
+	case 7: native_member_generation_delta++; break;
 	default: abort();
 	}
 }
@@ -147,6 +173,8 @@ bool cluster_lms_outbound_enqueue_cap_bound(int worker,uint8 type,uint32 destina
 {
 	ClusterICEnvelope env={0};const ClusterMxRangeRequest *request=payload;
 	int saved_node=cluster_node_id;BackendId saved_backend=MyBackendId;
+	if(native_proof_enqueue && bytes!=sizeof(ClusterMxRangeRequest))
+		return native_proof_enqueue(worker,type,destination,payload,bytes,capabilities,generation);
 	UT_ASSERT_EQ(gcs_locks,0);UT_ASSERT_EQ(type,PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
 	UT_ASSERT_EQ(destination,0);UT_ASSERT_EQ(generation,connection_generation);
 	UT_ASSERT_EQ(capabilities,CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES);
@@ -199,6 +227,7 @@ static void chain_seed(uint32 count,uint32 start)
 	proof_allocation_fault = proof_catalog_delta = 0;
 	proof_allocation_fired = proof_catalog_error = false;
 	proof_request_checks = proof_request_drift_at = 0;
+	native_member_generation_delta=0;native_proof_enqueue=NULL;
 	cluster_multixact_current_stats_shmem_init();
 }
 static void chain_clean(void)

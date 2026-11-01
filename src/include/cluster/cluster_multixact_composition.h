@@ -95,6 +95,18 @@ StaticAssertDecl(sizeof(ClusterMxFullMemberProof) == 200, "full proof entry size
 
 typedef struct ClusterMxCompositionReceive ClusterMxCompositionReceive;
 
+typedef struct ClusterMxCompositionProofWindow {
+	const void *source;
+	Size source_bytes;
+	uint32 total, first, count;
+	ClusterCurrentMxMemberDesc members[CLUSTER_MX_PROOF_PAGE_MEMBERS];
+} ClusterMxCompositionProofWindow;
+
+/* Bounded next unaccepted logical window. No advance, allocation or authority.
+ * Copied members and borrowed source expire with the original operation. */
+extern bool cluster_mx_composition_proof_window(const ClusterMxCompositionReceive *op,
+	uint32 cap, ClusterMxCompositionProofWindow *window);
+
 /* source is the caller's complete, prevalidated semantic identity, never a
  * hash or raw MXID. Exact bytes are owned/copied; no wire layout is defined
  * here. G1 retention and G5 decoder/capability checks remain caller duties.

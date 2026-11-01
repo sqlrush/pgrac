@@ -134,6 +134,32 @@ extern bool cluster_multixact_current_describe_full(const ClusterCurrentMxKey *k
 	const BufferTag *target, const ClusterMxRangeSnapshot *snapshot,
 	ClusterMxCompositionReceive **op, ClusterMxCompositionReceiveStats *stats);
 extern void cluster_multixact_current_describe_finish(ClusterMxCompositionReceive **op);
+
+/* Process-local copied prefix of the next unaccepted window, ending at the
+ * first member-origin boundary or seven entries. It is not a wire or a grant.
+ * The local origin must be handed to its original qualified owner; preparation
+ * never enters a proof service, reserves G4 capacity, or advances G2. */
+typedef struct ClusterMxProofWindow {
+	ClusterCurrentMxKey key;
+	ClusterMxRangeSource source;
+	uint32 total, first, count;
+	int32 origin;
+	ClusterCurrentMxMemberDesc members[CLUSTER_MX_PROOF_PAGE_MEMBERS];
+} ClusterMxProofWindow;
+
+extern bool cluster_multixact_current_proofs_window(ClusterMxCompositionReceive **op,
+	ClusterMxProofWindow *window);
+/* One remote window only. Retain the original operation/read scope and obtain
+ * whole-operation G4 capacity before any eventual proof-touch service. This
+ * dormant requester entry does not provide that reservation or activate FULL.
+ * Revalidates the current window and both source/member CONTROL records,
+ * invokes the original transport once, decodes and appends to the same G2.
+ * COMPLETE remains provisional until canonical/grant/tuple/fence final checks.
+ * Non-OK/invalid input discards the entire operation; ERROR cleans and rethrows.
+ * Calling it for a local window is invalid; do not send local work remotely. */
+extern ClusterMxCompositionReceiveResult cluster_multixact_current_proofs_fetch_window(
+	ClusterMxCompositionReceive **op, const ClusterMxProofWindow *window,
+	ClusterMxProofTransportStats *stats);
 /* Same original owner and qualification as describe_full/proofs_accept. Encode
  * only the next unaccepted window, without sending or entering CTRC touch.
  * Context key/catalog/peer generation and exact source must match the original
