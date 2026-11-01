@@ -229,6 +229,8 @@ ordinary_episode_input(ResourceXDecodedFrame *request, ResourceXDecodedFrame *le
 #undef episode_begin
 
 static EvidenceFixture ordinary_material;
+/* Optional transport boundary for the independent master composition. */
+static void (*ordinary_delivery_transport)(void);
 static void
 ordinary_deliver(void)
 {
@@ -237,6 +239,7 @@ ordinary_deliver(void)
 	ResourceXWireReject reject; uint32 component;
 	UT_ASSERT_EQ(fake_lwlock_depth, 0);
 	if (ordinary_cancel_at == 1) pg_re_throw();
+	if (ordinary_delivery_transport != NULL) { ordinary_delivery_transport(); return; }
 	evidence_disk_watermark_scn = 90;
 	UT_ASSERT(ordinary_evidence_begin(&ordinary_material, ordinary_profile));
 	evidence_disk_watermark_scn = 0;
@@ -279,6 +282,7 @@ ordinary_start(ClusterBufmgrFirstFill *read, int profile)
 	pg_atomic_init_u64(&request_shared.resource_x_transport_mutation_sequence, 1);
 	memset(read, 0, sizeof(*read)); read->buf = &request_buf;
 	ordinary_active = &read->request;
+	ordinary_delivery_transport = NULL;
 	ordinary_profile = profile; ordinary_sends = ordinary_pauses = ordinary_leaves = 0;
 	ordinary_panics = 0;
 	ordinary_master_session = 31; ordinary_connection = 61;
