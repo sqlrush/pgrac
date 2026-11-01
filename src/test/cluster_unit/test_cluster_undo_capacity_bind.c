@@ -544,10 +544,163 @@ UT_TEST(test_actual_current_gc_epoch_and_final_identity_refusal_cannot_grant_bin
 	}
 }
 
+/* These completions run after the original capacity controller returns and
+ * the real allocator/durable publisher has installed one canonical binding.
+ * Flushed native commit input and physical IO/WAL remain fixture boundaries. */
+UT_TEST(test_capacity_reentry_empty_commit_finishes_the_original_binding)
+{
+	for (unsigned active = 0; active < 2; active++) {
+		for (unsigned rowmark = 0; rowmark < 2; rowmark++) {
+			ClusterCanonicalTxnBinding binding;
+			xl_xact_tt_commit fold = { 0 };
+			void *bindings;
+			int flags;
+
+			bind_reset(rowmark != 0, active != 0);
+			if (!empty_preflight(&binding))
+				return;
+			empty_assert_active(&binding);
+			bind_assert_counts(3, 3, 3, 0, 0);
+			bindings = cluster_tt_local_bindings;
+			UT_ASSERT_EQ(binding.segment_id, active ? 1 : 2);
+			UT_ASSERT_EQ(binding.slot_offset, 0);
+			UT_ASSERT(cluster_tt_local_precommit_durable_finish(100, 91, &fold));
+			UT_ASSERT_EQ(fold.segment_id, active ? 1 : 2);
+			UT_ASSERT_EQ(fold.xid, 100);
+			UT_ASSERT_EQ(fold.slot_offset, 0);
+			UT_ASSERT_EQ(fold.wrap, binding.slot_wrap);
+			UT_ASSERT_EQ(fold.commit_scn, 91);
+			UT_ASSERT_EQ(modifier_enters, modifier_leaves + 1);
+			UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_ACTIVE);
+			g_flush_ptr = g_write_requires_flush = 0x1000000;
+			flags = MyProc->delayChkptFlags;
+			MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+			CritSectionCount++;
+			PG_TRY();
+			{
+				cluster_tt_local_commit_durable_apply(g_flush_ptr);
+			}
+			PG_FINALLY();
+			{
+				MyProc->delayChkptFlags = flags;
+				CritSectionCount--;
+			}
+			PG_END_TRY();
+			UT_ASSERT(!g_write_before_flush);
+			cluster_tt_local_record_commit(100, 91);
+			empty_assert_finished(&binding, true);
+			UT_ASSERT_EQ(g_bind_emit_calls, 1);
+			UT_ASSERT_EQ(g_abort_exact_emit_calls, 0);
+			bind_assert_counts(3, 3, 3, 0, 0);
+			free(bindings);
+		}
+	}
+}
+
+UT_TEST(test_capacity_reentry_execution_error_retains_binding_until_original_abort)
+{
+	static const int errors[] = { ERRCODE_RAISE_EXCEPTION, ERRCODE_QUERY_CANCELED };
+
+	for (unsigned active = 0; active < 2; active++) {
+		for (unsigned rowmark = 0; rowmark < 2; rowmark++) {
+			for (unsigned fault = 0; fault < lengthof(errors); fault++) {
+				ClusterCanonicalTxnBinding binding, observed;
+				volatile bool caught = false;
+				void *bindings;
+
+				bind_reset(rowmark != 0, active != 0);
+				if (!empty_preflight(&binding))
+					return;
+				bindings = cluster_tt_local_bindings;
+				PG_TRY();
+				{
+					ereport(ERROR, (errcode(errors[fault]),
+									errmsg("controlled execution error after capacity reentry")));
+				}
+				PG_CATCH();
+				{
+					caught = true;
+				}
+				PG_END_TRY();
+				UT_ASSERT(caught);
+				UT_ASSERT_EQ(last_ereport_errcode, errors[fault]);
+				UT_ASSERT(cluster_tt_local_get_published_binding(100, &observed));
+				UT_ASSERT_EQ(memcmp(&binding, &observed, sizeof(binding)), 0);
+				empty_assert_active(&binding);
+				/* The error occurs after leaving the capacity wait. In
+				 * particular, execution cancellation is not a wait cancel. */
+				bind_assert_counts(3, 3, 3, 0, 0);
+				g_require_abort_flush_before_write = true;
+				UT_ASSERT(cluster_tt_local_preabort_durable_finish(100));
+				UT_ASSERT_EQ(g_abort_exact_emit_calls, 1);
+				UT_ASSERT_EQ(g_flushed_lsn, g_abort_exact_lsn);
+				if (!empty_record_abort())
+					return;
+				empty_assert_finished(&binding, false);
+				UT_ASSERT_EQ(g_bind_emit_calls, 1);
+				UT_ASSERT(!g_write_before_flush);
+				bind_assert_counts(3, 3, 3, 0, 0);
+				free(bindings);
+			}
+		}
+	}
+}
+
+UT_TEST(test_capacity_reentry_unflushed_commit_unstages_before_original_abort)
+{
+	for (unsigned active = 0; active < 2; active++) {
+		for (unsigned rowmark = 0; rowmark < 2; rowmark++) {
+			ClusterCanonicalTxnBinding binding;
+			xl_xact_tt_commit fold = { 0 };
+			volatile bool aborted = false, caught = false;
+			void *bindings;
+
+			bind_reset(rowmark != 0, active != 0);
+			if (!empty_preflight(&binding))
+				return;
+			bindings = cluster_tt_local_bindings;
+			UT_ASSERT(cluster_tt_local_precommit_durable_finish(100, 91, &fold));
+			UT_ASSERT(cluster_tt_slot_durable_commit_staged(binding.segment_id, 0, 100,
+														  binding.slot_wrap));
+			UT_ASSERT_EQ(g_writer_fd_open, 1);
+			UT_ASSERT(g_pin_reserved);
+			UT_ASSERT_EQ(modifier_enters, modifier_leaves + 1);
+			UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_ACTIVE);
+			PG_TRY();
+			{
+				aborted = cluster_tt_local_preabort_durable_finish(100);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(!caught && aborted);
+			if (caught || !aborted)
+				return;
+			UT_ASSERT(!cluster_tt_slot_durable_commit_staged(binding.segment_id, 0, 100,
+														   binding.slot_wrap));
+			UT_ASSERT_EQ(g_reservation_release_calls, 1);
+			UT_ASSERT_EQ(g_writer_fd_open, 0);
+			UT_ASSERT(!g_pin_reserved && !g_current_active);
+			UT_ASSERT_EQ(g_abort_exact_emit_calls, 1);
+			UT_ASSERT_EQ(cluster_tt_local_binding_count, 1);
+			UT_ASSERT_EQ(cluster_tt_local_bindings[0].terminal_state,
+						 CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE);
+			if (!empty_record_abort())
+				return;
+			empty_assert_finished(&binding, false);
+			UT_ASSERT_EQ(g_bind_emit_calls, 1);
+			bind_assert_counts(3, 3, 3, 0, 0);
+			free(bindings);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(test_actual_capacity_cv_rechecks_then_binds_once_before_empty_caller_work);
 	UT_RUN(test_actual_slot_wait_terminal_cv_and_same_segment_bind_compose);
 	UT_RUN(test_actual_supply_recheck_reenters_allocator_without_granting_a_slot);
@@ -556,6 +709,9 @@ main(void)
 	UT_RUN(test_actual_current_gc_release_then_cv_reentry_binds_same_slot);
 	UT_RUN(test_actual_current_gc_retention_and_wrap_refusal_cannot_grant_bind);
 	UT_RUN(test_actual_current_gc_epoch_and_final_identity_refusal_cannot_grant_bind);
+	UT_RUN(test_capacity_reentry_empty_commit_finishes_the_original_binding);
+	UT_RUN(test_capacity_reentry_execution_error_retains_binding_until_original_abort);
+	UT_RUN(test_capacity_reentry_unflushed_commit_unstages_before_original_abort);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
