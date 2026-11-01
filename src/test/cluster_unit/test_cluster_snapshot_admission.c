@@ -1150,6 +1150,7 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 #include "test_cluster_survivor_buffer_return.inc"
 #include "test_cluster_survivor_return_context.inc"
 #include "test_cluster_survivor_xact_return.inc"
+#include "test_cluster_survivor_backend_interrupt_fixture.h"
 int
 main(void)
 {
@@ -1174,7 +1175,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(133);
+	UT_PLAN(139);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1308,6 +1309,12 @@ main(void)
 	UT_RUN(backend_return_discards_transaction_change_during_shared_cut);
 	UT_RUN(backend_return_transaction_observation_preserves_resources_and_empty_pending);
 	UT_RUN(local_backend_reply_projects_actual_snapshot_buffer_and_xact_without_retirement);
+	UT_RUN(local_observation_preserves_original_process_termination_priority);
+	UT_RUN(local_observation_preserves_original_query_cancel_priority);
+	UT_RUN(local_observation_preserves_original_client_loss_priority);
+	UT_RUN(local_observation_preserves_original_timeout_priority);
+	UT_RUN(local_observation_defers_during_cancel_holdoff_and_uses_original_reentry);
+	UT_RUN(local_observation_keeps_original_interrupt_and_critical_holdoffs);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

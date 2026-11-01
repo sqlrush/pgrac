@@ -2997,9 +2997,6 @@ ProcessInterrupts(void)
 	if (InterruptHoldoffCount != 0 || CritSectionCount != 0)
 		return;
 	InterruptPending = false;
-#ifdef USE_PGRAC_CLUSTER
-	cluster_semantic_survivor_local_process();
-#endif
 
 	if (ProcDiePending) {
 		ProcDiePending = false;
@@ -3292,6 +3289,12 @@ ProcessInterrupts(void)
 
 	if (ParallelApplyMessagePending)
 		HandleParallelApplyMessages();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Preserve the original interrupt priority and cancel holdoff reentry. */
+	if (!QueryCancelPending)
+		cluster_semantic_survivor_local_process();
+#endif
 }
 
 /*

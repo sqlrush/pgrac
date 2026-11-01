@@ -13807,3 +13807,10 @@ test_cluster_survivor_targets: test_cluster_survivor_status_identity.inc test_cl
  $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_local.h \
  $(top_srcdir)/src/include/cluster/cluster_grd.h \
  $(top_srcdir)/src/include/utils/backend_status.h
+
+# Original backend interrupt ordering around read-only local observation.
+test_cluster_survivor_backend_interrupts.inc: $(top_srcdir)/src/backend/tcop/postgres.c Makefile
+	awk '/^ProcessInterrupts\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_snapshot_admission: test_cluster_survivor_backend_interrupt_fixture.h test_cluster_survivor_backend_interrupts.inc
