@@ -130,10 +130,24 @@ cluster_multixact_current_member_proof_bind_ctrc(ClusterCurrentMemberProof *proo
 		|| proof->key.cluster_epoch != ctrc_key->cluster_epoch
 		|| proof->key.local_xid != ctrc_key->xid)
 		return false;
+	memset(proof->origin_fullxid_v2, 0, sizeof(proof->origin_fullxid_v2));
 	ClusterCurrentMemberProofSetCtrcBinding(proof, ctrc_key->segment_generation,
 											ctrc_key->slot_wrap);
 	return true;
 }
+
+
+/* The original touch protects this receiver through the grant/CLOSE path. */
+bool
+cluster_multixact_current_member_proof_bind_origin_v2(ClusterCurrentMemberProof *proof,
+	const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcParticipantIdentity *receiver)
+{
+	if (!cluster_multixact_current_member_proof_bind_ctrc(proof, key))
+		return false;
+	return cluster_ctrc_origin_fullxid_capture_v2(key, receiver,
+		ClusterCurrentMemberProofGetCtrcGrant(proof), proof->origin_fullxid_v2);
+}
+
 
 
 bool

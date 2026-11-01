@@ -378,9 +378,12 @@ OBJS = \
 	cluster_r4_observe.o \
 	cluster_subtrans.o \
 	cluster_multixact.o \
+	cluster_multixact_composition.o \
 	cluster_multixact_current.o \
 	cluster_multixact_current_stats.o \
 	cluster_multixact_current_wire.o \
+	cluster_multixact_range_wire.o \
+	cluster_multixact_range.o \
 	cluster_terminal_ref_census.o \
 	cluster_multixact_served.o \
 	cluster_mxid_stripe.o \

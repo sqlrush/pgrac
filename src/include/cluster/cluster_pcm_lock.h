@@ -397,7 +397,9 @@ extern PcmRxWaitFailure cluster_pcm_rx_take_wait_failure(void);
 	X(PCM_VM_ALL_VISIBLE_CLEARED, "vm_all_visible_clear_count")                                    \
 	X(PCM_VM_REPEAT_CLEAR, "vm_repeated_heap_clear_count")                                         \
 	X(PCM_VM_CLEAR_OBSERVATION_GAP, "vm_clear_observation_gap_count")                              \
-	X(PCM_VM_LATENCY_GAP, "vm_latency_capture_gap_count")
+	X(PCM_VM_LATENCY_GAP, "vm_latency_capture_gap_count")                                           \
+	X(PCM_VM_EMPTY_PUBLISH_WAL, "vm_empty_publish_wal_count")                                       \
+	X(PCM_VM_EMPTY_PUBLISH_NOOP, "vm_empty_publish_noop_count")
 
 typedef enum PcmVmMetric {
 #define PCM_VM_ENUM(id, key) id,

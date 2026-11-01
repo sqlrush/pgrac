@@ -86,6 +86,8 @@ InvalidateBufferCommitLocked(BufferDesc *buf pg_attribute_unused(), const Buffer
 static void
 pin_return_begin(void)
 {
+	/* Restore this fixture's complete descriptor set after a VM-only case. */
+	NBuffers = lengthof(pin_descriptors);
 	backend_return_begin(); UT_ASSERT_EQ(pin_remembered, 0);
 	memset(PrivateRefCountArray, 0, sizeof(PrivateRefCountArray));
 	memset(pin_hash, 0, sizeof(pin_hash)); memset(pin_hash_used, 0, sizeof(pin_hash_used));

@@ -247,6 +247,10 @@ extern void cluster_sf_origin_durable_lmon_tick(void);
  * registered tier1-only boundary). */
 extern void cluster_sf_note_peer_hello_capabilities_gen(int32 peer_id, uint32 capabilities,
 														uint32 generation);
+/* Lock-free invalidation observation, never capability permission. Capture
+ * must still use the original locked capability queries; zero is unavailable. */
+extern uint64 cluster_sf_peer_capability_cut_generation(void);
+extern bool cluster_sf_peer_capability_cut_generation_current(uint64 expected);
 extern bool cluster_sf_peer_supports_reply_v2(int32 peer_id);
 /* spec-5.22d D4-6: did the peer's HELLO advertise the kind-4 authority-serve
  * protocol capability?  Deliberately NOT gated on any local GUC (unlike the
@@ -298,6 +302,14 @@ extern bool cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 requi
 extern bool cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
 												   uint32 *capability_word_out,
 												   uint32 *generation_out);
+extern bool cluster_sf_peer_foreign_mx_capability_sample_v1(int32 peer_id, uint32 format_id,
+															uint32 format_version,
+															uint32 control_catalog_version,
+															uint32 *generation_out);
+extern bool cluster_sf_peer_foreign_mx_capability_matches_v1(int32 peer_id, uint32 format_id,
+															 uint32 format_version,
+															 uint32 control_catalog_version,
+															 uint32 expected_generation);
 extern bool cluster_sf_peer_capability_generation_matches(int32 peer_id,
 														  uint32 required_capabilities,
 														  uint32 expected_generation);

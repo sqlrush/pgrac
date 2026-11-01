@@ -29,9 +29,11 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_visibility_resolve.h"
 #endif
 #include "executor/tuptable.h"
@@ -41,6 +43,27 @@
 #include "utils/rel.h"
 
 #ifdef USE_PGRAC_CLUSTER
+/* Operation-local observations, never a saved-page visibility permission.
+ * Prepare without content locks; consume only the original live heap image
+ * under its current content-S bracket. Neither function acquires a block. */
+typedef struct ClusterHeapPageVisibility
+{
+	ClusterSpaceIdentityObservationV1 identity;
+	ClusterUndoReadAdmissionFence admission;
+	uint64 snapshot_identity;
+	CommandId command_id;
+	BlockNumber block;
+	bool valid;
+} ClusterHeapPageVisibility;
+
+extern void cluster_heap_page_visibility_prepare(Relation relation, BlockNumber block,
+	Snapshot snapshot, ClusterHeapPageVisibility *observation);
+extern bool cluster_heap_page_all_visible(Relation relation, Buffer buffer, Page page,
+	Snapshot snapshot, const ClusterHeapPageVisibility *observation);
+/* Exact bitmap first-call search, retaining the caller's original heap S. */
+extern bool cluster_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+	Snapshot snapshot, HeapTuple heapTuple, const ClusterHeapPageVisibility *observation);
+
 /* Exact remote Dirty wait channel for the built-in successor consumer only. */
 extern bool cluster_heap_fetch_waitable(Relation relation, Snapshot snapshot, HeapTuple tuple,
 										Buffer *userbuf, bool keep_buf, bool *remote_xmax_wait,
@@ -286,7 +309,8 @@ extern bool cluster_heap_tuple_satisfies_visibility_waitable(
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_heap_test_satisfies_mvcc(HeapTuple tuple, Snapshot snapshot, Buffer buffer);
 extern bool cluster_heap_test_writer_wait(Relation relation, Buffer buffer, HeapTuple tuple,
-										  TransactionId xid, uint16 infomask, TM_Result *result);
+										  TransactionId xid, uint16 infomask, TM_Result *result,
+										  Buffer *vmbuffer);
 extern bool cluster_heap_test_r4_target_reachable(void);
 extern HeapHotSearchResultKind cluster_heap_test_r4_hot_full_cycle(
 	BufferTag tag, ItemPointerData logical_root, SCN read_scn,
@@ -320,6 +344,13 @@ extern ClusterTxwResult cluster_heap_test_itl_wait_lock_capacity(Buffer buffer, 
 	uint64 *deadline_us, const char **diagnostic_reason);
 extern bool cluster_heap_test_itl_resolve_pair_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer);
+extern ClusterHeapItlCapacityResult cluster_heap_test_itl_capacity_with_vm(
+	Relation relation, Buffer buffer, TransactionId xid, bool lock_only, Buffer *vmbuffer);
+extern bool cluster_heap_test_itl_pair_census_with_vm(Relation relation, Buffer old_buffer,
+	Buffer new_buffer, Buffer full_buffer, Buffer *old_vm, Buffer *new_vm);
+extern ClusterTxwResult cluster_heap_test_itl_wait_capacity_with_vm(Relation relation,
+	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer, TransactionId xid, bool lock_only,
+	uint64 *deadline_us, const char **reason, Buffer *old_vm, Buffer *new_vm);
 extern bool cluster_heap_test_itl_update_same_page_failure_cleanup(void);
 extern void cluster_heap_test_itl_last_census_stats(
 	uint8 *locator_mask, uint8 *attempted_mask,
@@ -352,6 +383,9 @@ extern bool cluster_heap_test_current_mx_authorize_keyshare(
 	TransactionId requester_xid, TM_Result *result,
 	MultiXactMember *normalized, uint16 normalized_cap,
 	uint16 *normalized_count);
+extern int cluster_heap_test_current_mx_with_vm(Relation relation, Buffer buffer,
+	HeapTuple tuple, TransactionId requester_xid, bool single, LockTupleMode lock_mode,
+	LockWaitPolicy wait_policy, Buffer *vmbuffer, TM_Result *result, uint16 *normalized_count);
 extern bool cluster_heap_test_current_mx_epoch_supported(uint64 epoch);
 extern bool cluster_heap_test_current_mx_read_requalification(
 	const ClusterPcmOwnSnapshot *before,

@@ -17,6 +17,7 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/xact.h"
+#include "access/visibilitymap.h"
 #include "access/xloginsert.h"
 #include "access/tableam.h"
 #include "catalog/pg_class.h"
@@ -218,7 +219,7 @@ int NBuffers = 2;
 int NLocBuffer = 0;
 char *BufferBlocks = NULL;
 Block *LocalBufferBlockPointers = NULL;
-static BufferDescPadded ut_buffer_descriptors[2];
+static BufferDescPadded ut_buffer_descriptors[4];
 BufferDescPadded *BufferDescriptors = ut_buffer_descriptors;
 TransactionId RecentXmin = FirstNormalTransactionId;
 int XactIsoLevel = XACT_READ_COMMITTED;
@@ -246,11 +247,33 @@ HeapTupleHeaderGetCmax(HeapTupleHeader tup pg_attribute_unused())
 	return InvalidCommandId;
 }
 
+static bool ut_mx_vm_active, ut_mx_vm_single;
+static int ut_mx_vm_fault;
+static unsigned ut_mx_vm_services, ut_mx_vm_service_pins, ut_mx_vm_wait_calls;
+static unsigned ut_mx_vm_create_calls;
+static uint32 ut_mx_vm_recorded_restarts;
+static ClusterTxwResult ut_mx_vm_wait_result;
+static void ut_mx_vm_service(void);
+
 ClusterTxwResult
 cluster_tx_enqueue_wait_current_mx(const ClusterTTStatusKey *holder_key pg_attribute_unused(),
 								   int effective_timeout_ms pg_attribute_unused(),
 								   uint64 *absolute_deadline_mono_us pg_attribute_unused())
 {
+	if (ut_mx_vm_active) {
+		ut_mx_vm_service();
+		ut_mx_vm_wait_calls++;
+		UT_ASSERT_NOT_NULL(holder_key);
+		UT_ASSERT_EQ(holder_key->local_xid, (TransactionId)897);
+		UT_ASSERT(effective_timeout_ms > 0);
+		UT_ASSERT_EQ(*absolute_deadline_mono_us, 0);
+		*absolute_deadline_mono_us = UINT64_C(987654321);
+		if (ut_mx_vm_fault == 3)
+			elog(ERROR, "controlled current MX wait error");
+		if (ut_mx_vm_fault == 13)
+			ut_mx_vm_fault = 14;
+		return ut_mx_vm_wait_result;
+	}
 	UT_ASSERT(false);
 	return CLUSTER_TXW_UNPROVABLE;
 }
@@ -380,6 +403,27 @@ static ClusterUndoTTSlotRef ut_scratch_expected_ref;
 static ClusterVisEvidence ut_scratch_resolve_evidence;
 static ClusterTTStatus ut_scratch_resolve_status;
 static bool ut_writer_bridge_fixture;
+/* An independent caller-owned VM pin; never a heap buffer reference. */
+static bool ut_writer_vm_active, ut_writer_vm_pinned;
+static unsigned ut_writer_vm_releases, ut_writer_vm_service_calls, ut_writer_vm_service_pins;
+static unsigned ut_writer_vm_unlock_pins, ut_writer_vm_relock_pins;
+static unsigned ut_writer_vm_warms, ut_writer_vm_repins, ut_writer_vm_misses;
+/* Separate reference counts let pair tests distinguish two pins on one map. */
+static bool ut_census_vm_active, ut_census_vm_new;
+static unsigned ut_census_vm_refs[2], ut_census_vm_services, ut_census_vm_service_pins;
+static unsigned ut_census_vm_releases, ut_census_vm_repins, ut_census_vm_relock_pins;
+static unsigned ut_census_vm_misses;
+static int ut_census_vm_error;
+
+static void
+ut_census_vm_service(void)
+{
+	if (ut_census_vm_active) {
+		ut_census_vm_services++;
+		ut_census_vm_service_pins += ut_census_vm_refs[0] + ut_census_vm_refs[1];
+	}
+}
+
 static int ut_writer_bridge_mutation;
 static int ut_writer_bridge_tuple_pulls;
 static bool ut_writer_target_fixture;
@@ -445,6 +489,16 @@ static bool ut_itl_census_consume_allocated_slot;
 static int ut_hot_current_mx_describe_calls;
 static int ut_hot_current_mx_resolve_calls;
 static int ut_hot_current_mx_validate_calls;
+static void
+ut_mx_vm_service(void)
+{
+	if (ut_mx_vm_active) {
+		ut_mx_vm_services++;
+		ut_mx_vm_service_pins += ut_writer_vm_pinned;
+		UT_ASSERT(!ut_hot_content_lock_held);
+	}
+}
+
 static int ut_hot_requester_requalify_barrier_calls;
 static int ut_hot_requester_requalify_barrier_lock_calls;
 static bool ut_itl_census_active;
@@ -512,6 +566,13 @@ ClusterTxwResult
 cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_timeout_ms,
 							  ClusterTxResolveReason *reason_out)
 {
+	ut_census_vm_service();
+	if (ut_census_vm_active && ut_census_vm_error == 2)
+		elog(ERROR, "controlled capacity wait error");
+	if (ut_writer_vm_active) {
+		ut_writer_vm_service_calls++;
+		ut_writer_vm_service_pins += ut_writer_vm_pinned;
+	}
 	ut_itl_wait_calls++;
 	ut_itl_wait_locator = *locator;
 	ut_itl_wait_budget_ms = effective_timeout_ms;
@@ -537,6 +598,10 @@ cluster_multixact_current_stats_bump(ClusterCurrentMxStatId stat pg_attribute_un
 void
 cluster_multixact_current_stats_record_restarts(uint32 restarts)
 {
+	if (ut_mx_vm_active) {
+		ut_mx_vm_recorded_restarts = restarts;
+		return;
+	}
 	UT_ASSERT_EQ(restarts, 0);
 }
 
@@ -660,6 +725,10 @@ void
 cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
 										XLogRecPtr anchor_lsn, SCN read_scn, ClusterVisResolve *out)
 {
+	if (ut_writer_vm_active) {
+		ut_writer_vm_service_calls++;
+		ut_writer_vm_service_pins += ut_writer_vm_pinned;
+	}
 	ut_scratch_exact_resolve_calls++;
 	if (ut_hot_production_core_active)
 		UT_ASSERT(!ut_hot_content_lock_held);
@@ -907,6 +976,19 @@ bool
 cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId xid, ClusterUndoTTSlotRef *ref)
 {
 	uint8 index;
+
+	if (ut_mx_vm_active && ut_mx_vm_single) {
+		UT_ASSERT(ut_hot_content_lock_held);
+		UT_ASSERT(page == ut_hot_live_ref_page);
+		UT_ASSERT_EQ(xid, UT_ORDINARY_LOCKER);
+		memset(ref, 0, sizeof(*ref));
+		ref->origin_node_id = UT_HOT_CURRENT_MX_ORIGIN;
+		ref->undo_segment_id = 258;
+		ref->tt_slot_id = 7;
+		ref->local_xid = xid;
+		ref->cluster_epoch = UT_HOT_CURRENT_EPOCH;
+		return true;
+	}
 	if (!cluster_itl_find_lock_slot_index_by_xmax(page, xid, &index))
 		return false;
 	*ref = ut_scratch_expected_ref;
@@ -1024,6 +1106,8 @@ cluster_mxid_is_mine(MultiXactId mxid)
 int
 cluster_xid_origin_slot(TransactionId xid)
 {
+	if (ut_mx_vm_active && ut_mx_vm_single && xid == UT_ORDINARY_LOCKER)
+		return UT_HOT_CURRENT_MX_ORIGIN;
 	if (ut_prune_fixture_active) {
 		UT_ASSERT(xid == 902 || xid == 903);
 		return ut_prune_self_origin_unknown ? -1 : 0;
@@ -1109,6 +1193,8 @@ cluster_bufmgr_itl_recycle_guard_relock(Buffer buffer)
 	UT_ASSERT(ut_itl_recycle_guard_active);
 	UT_ASSERT(!ut_hot_content_lock_held);
 	ut_itl_recycle_guard_relock_calls++;
+	if (ut_census_vm_active && ut_census_vm_error == 3)
+		return false;
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	ut_itl_recycle_guard_active = false;
 	return true;
@@ -1253,6 +1339,10 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode m
 		UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_VISIBILITY);
 		return ut_itl_resolve_fixture(locator, mode, NULL, out, reason_out);
 	}
+	if (ut_writer_vm_active) {
+		ut_writer_vm_service_calls++;
+		ut_writer_vm_service_pins += ut_writer_vm_pinned;
+	}
 	UT_ASSERT(ut_writer_target_fixture);
 	UT_ASSERT(!ut_hot_content_lock_held);
 	UT_ASSERT_EQ(semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
@@ -1299,6 +1389,7 @@ void cluster_tx_resolve_terminal_census_batch_preflight(void);
 void
 cluster_tx_resolve_terminal_census_batch_preflight(void)
 {
+	ut_census_vm_service();
 	UT_ASSERT(ut_itl_census_active);
 	UT_ASSERT(!ut_hot_content_lock_held);
 	UT_ASSERT_EQ(ut_itl_census_resolve_calls,
@@ -1313,6 +1404,9 @@ ut_itl_resolve_fixture(const ClusterTxLocator *locator, ClusterTxResolveMode mod
 {
 	ClusterTxOutcome outcome;
 
+	ut_census_vm_service();
+	if (ut_census_vm_active && ut_census_vm_error == 1)
+		elog(ERROR, "controlled census resolve error");
 	UT_ASSERT(ut_itl_census_active);
 	if (mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS) {
 		UT_ASSERT_NOT_NULL(admission);
@@ -1493,6 +1587,33 @@ cluster_multixact_current_validate_descriptor(const ClusterCurrentMxKey *key, ui
 	return CMX_DESC_OK;
 }
 
+MultiXactId
+MultiXactIdCreateLocalCurrentMembers(int nmembers, MultiXactMember *members)
+{
+	UT_ASSERT(ut_mx_vm_active && ut_mx_vm_single);
+	UT_ASSERT_EQ(nmembers, 1);
+	UT_ASSERT_EQ(members[0].xid, UT_ORDINARY_LOCKER);
+	UT_ASSERT_EQ(members[0].status, MultiXactStatusForKeyShare);
+	ut_mx_vm_service();
+	ut_mx_vm_create_calls++;
+	if (ut_mx_vm_fault == 11)
+		elog(ERROR, "controlled current MX materialize error");
+	return UT_HOT_FOREIGN_MXID;
+}
+
+/* The existing compositor leaves remain controlled. Only pin ownership
+ * across the real heap authorizer's service/reentry boundaries is tested. */
+bool
+cluster_multixact_current_status_conflicts(uint8 member_status, LockTupleMode wanted_mode,
+	bool *valid_out)
+{
+	UT_ASSERT(ut_mx_vm_active && ut_mx_vm_single);
+	UT_ASSERT_EQ(member_status, MultiXactStatusForKeyShare);
+	UT_ASSERT_EQ(wanted_mode, LockTupleNoKeyExclusive);
+	*valid_out = true;
+	return false;
+}
+
 ClusterMxDescribeResult
 cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 								   ClusterCurrentMxMemberDesc *members, uint16 members_cap,
@@ -1506,6 +1627,13 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 	UT_ASSERT_EQ(key->multixact_id, UT_HOT_FOREIGN_MXID);
 	UT_ASSERT_EQ(key->cluster_epoch, UT_HOT_CURRENT_EPOCH);
 	ut_hot_current_mx_describe_calls++;
+	ut_mx_vm_service();
+	if (ut_mx_vm_active && ut_mx_vm_fault == 1)
+		elog(ERROR, "controlled current MX describe error");
+	if (ut_mx_vm_active && ut_mx_vm_fault == 8)
+		return CMX_DESC_TIMEOUT;
+	if (ut_mx_vm_active && ut_mx_vm_fault == 4)
+		PageSetLSN(BufferGetPage((Buffer)1), UINT64_C(0x998877));
 	memset(members, 0, sizeof(*members) * members_cap);
 	if (ut_current_mx_ordinary_lock_only) {
 		UT_ASSERT_EQ(ut_hot_current_mx_member_count, 1);
@@ -1525,6 +1653,22 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 	*reported_total_members = ut_hot_current_mx_member_count;
 	return CMX_DESC_OK;
 }
+
+/* Full-range transport remains a controlled leaf in this lock/pin fixture.
+ * Preserve the existing describe checks/results; the range service and
+ * capability/format qualification execute in their separate native callers. */
+#ifndef K_G5_SCOPED_PROVIDER
+SnapshotData SnapshotAnyData = {.snapshot_type = SNAPSHOT_ANY};
+ClusterMxDescribeResult
+cluster_multixact_current_describe_scoped(const ClusterCurrentMxKey *key,
+	const BufferTag *target, Snapshot snapshot, ClusterCurrentMxMemberDesc *members,
+	uint16 cap, uint16 *count, uint32 *total)
+{
+	UT_ASSERT_NOT_NULL(target);
+	UT_ASSERT_NOT_NULL(snapshot);
+	return cluster_multixact_current_describe(key, members, cap, count, total);
+}
+#endif
 
 ClusterMxResolveResult
 cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
@@ -1602,14 +1746,30 @@ cluster_multixact_current_members_resolve_until(
 	ClusterCurrentMemberProof *proofs, ClusterCurrentUpdaterProof *updater_proof,
 	uint32 *proof_capability_generations, TimestampTz *operation_deadline)
 {
+	ClusterMxResolveResult result;
+
+	ut_mx_vm_service();
+	if (ut_mx_vm_active && ut_mx_vm_fault == 2)
+		elog(ERROR, "controlled current MX resolve error");
 	UT_ASSERT_NOT_NULL(operation_deadline);
 	if (*operation_deadline == 0)
 		*operation_deadline = (TimestampTz)UINT64_C(123456789);
 	else
 		UT_ASSERT_EQ(*operation_deadline, (TimestampTz)UINT64_C(123456789));
-	return cluster_multixact_current_members_resolve(key, members, nmembers, descriptor_hash,
+	result = cluster_multixact_current_members_resolve(key, members, nmembers, descriptor_hash,
 													 challenge, proofs, updater_proof,
 													 proof_capability_generations);
+	if (ut_mx_vm_active) {
+		if (ut_mx_vm_fault == 5)
+			PageSetLSN(BufferGetPage((Buffer)1), UINT64_C(0x998877));
+		if (ut_mx_vm_fault == 6)
+			return CMX_RESOLVE_RETRY;
+		if (ut_mx_vm_fault == 7)
+			proofs[0].state = CCM_UNKNOWN;
+		if (ut_mx_vm_fault == 9)
+			return CMX_RESOLVE_TIMEOUT;
+	}
+	return result;
 }
 
 bool
@@ -1683,6 +1843,20 @@ cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *memb
 		trace->unknown_reason = CMX_UNKNOWN_NONE;
 		trace->member_ordinal = -1;
 	}
+	if (ut_mx_vm_active) {
+		UT_ASSERT(ut_hot_content_lock_held);
+		UT_ASSERT_EQ(nmembers, 1);
+		UT_ASSERT_EQ(ctx->tuple_shape, CCM_SHAPE_LOCK_ONLY);
+		if (proofs[0].state == CCM_UNKNOWN)
+			return CMDL_UNKNOWN;
+		UT_ASSERT_EQ(proofs[0].state, CCM_ACTIVE);
+		if (ctx->lock_mode == LockTupleExclusive) {
+			if (ctx->wait_policy == LockWaitSkip) return CMDL_WOULD_BLOCK;
+			if (ctx->wait_policy == LockWaitError) return CMDL_LOCK_NOT_AVAILABLE;
+			memcpy(wait_key, &proofs[0].key, sizeof(*wait_key));
+			return CMDL_WAIT_MEMBER;
+		}
+	}
 	return cluster_multixact_current_decide(members, proofs, nmembers, ctx, challenge,
 											updater_proof, wait_key);
 }
@@ -1705,8 +1879,13 @@ cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 	UT_ASSERT(ut_current_mx_ordinary_lock_only);
 	UT_ASSERT_EQ(nmembers, 1);
 	UT_ASSERT_EQ(members[0].xid, UT_ORDINARY_LOCKER);
+	if (ut_mx_vm_active && proofs[0].state == CCM_UNKNOWN)
+		return CMX_RECOMPOSE_UNKNOWN;
 	UT_ASSERT_EQ(proofs[0].state, CCM_ACTIVE);
-	UT_ASSERT_EQ(requester_status, MultiXactStatusForKeyShare);
+	if (ut_mx_vm_active && ut_mx_vm_single)
+		UT_ASSERT_EQ(requester_status, MultiXactStatusForNoKeyUpdate);
+	else
+		UT_ASSERT_EQ(requester_status, MultiXactStatusForKeyShare);
 	UT_ASSERT(normalized_cap >= 2);
 	UT_ASSERT_NOT_NULL(normalized_count);
 	normalized_members[0].xid = members[0].xid;
@@ -1795,6 +1974,18 @@ IncrBufferRefCount(Buffer buffer)
 void
 ReleaseBuffer(Buffer buffer)
 {
+	if (ut_census_vm_active && (buffer == (Buffer)3 || buffer == (Buffer)4)) {
+		UT_ASSERT(ut_census_vm_refs[buffer - 3] > 0);
+		ut_census_vm_refs[buffer - 3]--;
+		ut_census_vm_releases++;
+		return;
+	}
+	if (ut_writer_vm_active && buffer == (Buffer)2) {
+		UT_ASSERT(ut_writer_vm_pinned);
+		ut_writer_vm_pinned = false;
+		ut_writer_vm_releases++;
+		return;
+	}
 	UT_ASSERT_EQ(buffer, ut_itl_pair_active ? 2 : 1);
 	if (ut_itl_pair_active) {
 		UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
@@ -2472,6 +2663,8 @@ LockBuffer(Buffer buffer, int mode)
 	UT_ASSERT_NOT_NULL(fixture);
 	if (fixture == NULL)
 		return;
+	if (ut_census_vm_active && mode != BUFFER_LOCK_UNLOCK)
+		ut_census_vm_relock_pins += ut_census_vm_refs[0] + ut_census_vm_refs[1];
 	if (ut_itl_pair_active) {
 		int index;
 
@@ -2490,6 +2683,12 @@ LockBuffer(Buffer buffer, int mode)
 		fixture->lock_modes[fixture->lock_calls] = mode;
 	fixture->lock_calls++;
 
+	if (ut_writer_vm_active) {
+		if (mode == BUFFER_LOCK_UNLOCK)
+			ut_writer_vm_unlock_pins += ut_writer_vm_pinned;
+		else
+			ut_writer_vm_relock_pins += ut_writer_vm_pinned;
+	}
 	if (mode == BUFFER_LOCK_UNLOCK) {
 		UT_ASSERT(ut_hot_content_lock_held);
 		ut_hot_content_lock_held = false;
@@ -5794,19 +5993,313 @@ UT_TEST(test_lock_only_xid_breach_never_asks_fallback_or_changes_page)
 	ut_itl_census_end();
 }
 
+/* VM I/O/residency leaves for the actual production repin helper. */
+void
+visibilitymap_pin(Relation relation, BlockNumber block, Buffer *map)
+{
+	UT_ASSERT(ut_writer_vm_active && !ut_hot_content_lock_held);
+	UT_ASSERT(!ut_writer_vm_pinned && !BufferIsValid(*map));
+	UT_ASSERT_EQ(block, UT_HOT_BLOCK);
+	UT_ASSERT(!RelationUsesLocalBuffers(relation));
+	ut_writer_vm_warms++;
+	if (ut_mx_vm_active && ut_mx_vm_fault == 10)
+		elog(ERROR, "controlled current MX VM pin error");
+	ut_writer_vm_pinned = true;
+	*map = (Buffer)2;
+}
+
+bool
+visibilitymap_pin_recent(Relation relation, BlockNumber block, Buffer recent, Buffer *map)
+{
+	if (ut_census_vm_active) {
+		UT_ASSERT(ut_hot_content_lock_held && !BufferIsValid(*map));
+		UT_ASSERT_EQ(block, UT_HOT_BLOCK);
+		UT_ASSERT(!RelationUsesLocalBuffers(relation));
+		ut_census_vm_repins++;
+		if (ut_census_vm_misses > 0) {
+			ut_census_vm_misses--;
+			return false;
+		}
+		if (recent != (Buffer)3 || ut_census_vm_new)
+			return false;
+		UT_ASSERT_EQ(ut_census_vm_refs[0], 0);
+		ut_census_vm_refs[0]++;
+		*map = recent;
+		return true;
+	}
+	UT_ASSERT(ut_writer_vm_active && ut_hot_content_lock_held);
+	UT_ASSERT(!ut_writer_vm_pinned && !BufferIsValid(*map));
+	UT_ASSERT_EQ(block, UT_HOT_BLOCK);
+	if (ut_mx_vm_active) {
+		if (ut_mx_vm_fault == 14) {
+			ut_mx_vm_fault = 0;
+			ut_writer_vm_misses = 1;
+		}
+		if (recent != (Buffer)2)
+			return false;
+	}
+	UT_ASSERT_EQ(recent, (Buffer)2);
+	UT_ASSERT(!RelationUsesLocalBuffers(relation));
+	if (ut_writer_vm_misses > 0) {
+		ut_writer_vm_misses--;
+		return false;
+	}
+	ut_writer_vm_repins++;
+	ut_writer_vm_pinned = true;
+	*map = (Buffer)2;
+	return true;
+}
+
 static bool
 ut_writer_wait_with_relation(Buffer buffer, HeapTuple tuple, TransactionId xid, uint16 infomask,
 							 TM_Result *result)
 {
 	RelationData relation = { 0 };
 	FormData_pg_class form = { 0 };
+	Buffer map = InvalidBuffer;
+	bool handled;
 
 	relation.rd_id = UT_HOT_TABLE_OID;
 	relation.rd_rel = &form;
 	form.relpersistence = RELPERSISTENCE_PERMANENT;
-	return cluster_heap_test_writer_wait(&relation, buffer, tuple, xid, infomask, result);
+	handled = cluster_heap_test_writer_wait(&relation, buffer, tuple, xid, infomask, result, &map);
+	if (BufferIsValid(map))
+		ReleaseBuffer(map);
+	return handled;
 }
 
+/* The original callers own this pin. Execute each source pre-call bracket
+ * with the full compiled bridge; only the existing authority/lock leaves are
+ * controlled. The seam fixes Block policy, so these cases qualify Block only. */
+static bool
+ut_writer_vm_bridge(Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
+					uint16 infomask, LockWaitPolicy policy, TM_Result *result, uint64 *deadline,
+					Buffer *map)
+{
+	UT_ASSERT_EQ(policy, LockWaitBlock);
+	UT_ASSERT_EQ(*deadline, 0);
+	return cluster_heap_test_writer_wait(relation, buffer, tuple, xid, infomask, result, map);
+}
+
+#define cluster_heap_writer_wait_failclosed ut_writer_vm_bridge
+/* The included source opens the if block closed below. */
+/* clang-format off */
+
+static bool
+ut_writer_vm_delete_entry(Relation relation, HeapTuple target, Buffer *map, TM_Result *result)
+{
+	HeapTupleData tp = *target;
+	Buffer buffer = UT_HOT_BUFFER;
+	Buffer vmbuffer = *map;
+	TransactionId xwait = HeapTupleHeaderGetRawXmax(target->t_data);
+	uint16 infomask = target->t_data->t_infomask;
+	uint64 cluster_writer_wait_deadline_us = 0;
+	TM_Result cluster_writer_res = TM_Invisible;
+	bool handled = false;
+
+#include "test_cluster_heap_writer_wait_delete.inc"
+		handled = true;
+	}
+	*map = vmbuffer;
+	*result = cluster_writer_res;
+	return handled;
+}
+
+static bool
+ut_writer_vm_update_entry(Relation relation, HeapTuple target, Buffer *map, TM_Result *result)
+{
+	HeapTupleData oldtup = *target;
+	Buffer buffer = UT_HOT_BUFFER;
+	Buffer vmbuffer = *map;
+	TransactionId xwait = HeapTupleHeaderGetRawXmax(target->t_data);
+	uint16 infomask = target->t_data->t_infomask;
+	uint64 cluster_writer_wait_deadline_us = 0;
+	TM_Result cluster_writer_res = TM_Invisible;
+	bool handled = false;
+
+#include "test_cluster_heap_writer_wait_update.inc"
+		handled = true;
+	}
+	*map = vmbuffer;
+	*result = cluster_writer_res;
+	return handled;
+}
+
+static bool
+ut_writer_vm_lock_entry(Relation relation, HeapTuple target, Buffer *map, TM_Result *result)
+{
+	HeapTuple tuple = target;
+	Buffer heap = UT_HOT_BUFFER, *buffer = &heap;
+	LockWaitPolicy wait_policy = LockWaitBlock;
+	Buffer vmbuffer = *map;
+	TransactionId xwait = HeapTupleHeaderGetRawXmax(target->t_data);
+	uint16 infomask = target->t_data->t_infomask;
+	uint64 cluster_writer_wait_deadline_us = 0;
+	TM_Result cwres = TM_Invisible;
+	bool handled = false;
+
+#include "test_cluster_heap_writer_wait_lock.inc"
+		handled = true;
+	}
+	*map = vmbuffer;
+	*result = cwres;
+	return handled;
+}
+#undef cluster_heap_writer_wait_failclosed
+/* clang-format on */
+
+typedef bool (*UtWriterVmEntry)(Relation, HeapTuple, Buffer *, TM_Result *);
+
+static void
+ut_writer_vm_entry_cases(UtWriterVmEntry entry, bool all_visible)
+{
+	volatile int leg;
+
+	for (leg = 0; leg < 14; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		HeapTupleData tuple = { 0 };
+		RelationData relation = { 0 };
+		FormData_pg_class form = { 0 };
+		ClusterItlSlotData *slot;
+		PGAlignedBlock before;
+		Buffer map = leg == 9 ? InvalidBuffer : (Buffer)2;
+		TM_Result result = TM_Invisible;
+		volatile bool caught = false, handled = false;
+		bool recycled = leg == 6 || leg == 7 || leg == 13;
+		bool expect_error = leg == 4 || leg == 7 || leg == 8;
+		bool drops_pin = leg != 9 && leg != 10 && leg != 11;
+		bool repins = all_visible && !expect_error && leg != 10 && leg != 11 && leg != 12;
+		unsigned attempts = repins ? (leg == 5 ? 3 : 1) : 0;
+
+		ut_itl_census_begin(&fixture, &hot, false);
+		pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+							CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+		relation.rd_id = UT_HOT_TABLE_OID;
+		relation.rd_rel = &form;
+		form.relpersistence = leg == 11 ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT;
+		tuple.t_data = ut_r4_hot_tuple_at((Page)fixture.live_page, UT_HOT_ROOT_OFF);
+		tuple.t_len = UT_HOT_TUPLE_LEN;
+		tuple.t_tableOid = UT_HOT_TABLE_OID;
+		ItemPointerSet(&tuple.t_self, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+		tuple.t_data->t_ctid = tuple.t_self;
+		tuple.t_data->t_infomask = HEAP_XMIN_COMMITTED;
+		tuple.t_data->t_itl_slot_idx = 2;
+		HeapTupleHeaderSetXmax(tuple.t_data, 1200);
+		slot = &ClusterPageGetItlSlots((Page)fixture.live_page)[2];
+		slot->xid = 1200;
+		slot->undo_segment_head = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 3, 2, 0);
+		memset(&ut_scratch_expected_ref, 0, sizeof(ut_scratch_expected_ref));
+		ut_scratch_expected_ref.origin_node_id = leg == 12 || leg == 13 ? 0 : 1;
+		ut_scratch_expected_ref.tt_slot_id = 3;
+		ut_scratch_expected_ref.local_xid = recycled ? 1536 : 1200;
+		if (all_visible)
+			PageSetAllVisible((Page)fixture.live_page);
+		ut_scratch_expected_xid = 1200;
+		ut_scratch_expected_lsn = PageGetLSN((Page)fixture.live_page);
+		ut_scratch_expected_read_scn = InvalidScn;
+		ut_scratch_resolve_evidence = leg == 7	  ? CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS
+									  : leg == 13 ? CLUSTER_VIS_EVIDENCE_LOCAL
+												  : CLUSTER_VIS_EVIDENCE_REMOTE;
+		ut_scratch_resolve_status = CLUSTER_TT_STATUS_COMMITTED;
+		ut_scratch_resolve_scn = (SCN)9001;
+		ut_scratch_exact_resolve_calls = 0;
+		ut_writer_bridge_fixture = ut_writer_target_fixture = true;
+		ut_writer_bridge_mutation = leg == 3 ? 1 : leg == 5 ? 2 : 0;
+		ut_writer_bridge_tuple_pulls = 0;
+		ut_writer_target_resolve_calls = 0;
+		ut_writer_target_already_terminal = leg == 2;
+		ut_writer_target_outcome = leg == 1	  ? CLUSTER_TX_ABORTED
+								   : leg == 8 ? CLUSTER_TX_UNKNOWN
+											  : CLUSTER_TX_COMMITTED;
+		if (leg == 4)
+			ut_itl_wait_result = CLUSTER_TXW_UNPROVABLE;
+		ut_successor_proof_fixture = leg == 4 || leg == 8; /* existing error-name leaf */
+		ut_successor_proof_fault = 0;
+		cluster_shared_config = true;
+		cluster_enabled = leg != 10;
+		ut_writer_vm_active = true;
+		ut_writer_vm_pinned = BufferIsValid(map);
+		ut_writer_vm_releases = ut_writer_vm_service_calls = ut_writer_vm_service_pins = 0;
+		ut_writer_vm_unlock_pins = ut_writer_vm_relock_pins = 0;
+		ut_writer_vm_warms = ut_writer_vm_repins = 0;
+		ut_writer_vm_misses = all_visible && leg == 5 ? 2 : 0;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		ut_capture_error = true;
+		PG_TRY();
+		{
+			handled = entry(&relation, &tuple, &map, &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		ut_capture_error = false;
+		UT_ASSERT_EQ(caught, expect_error);
+		UT_ASSERT_EQ(ut_writer_vm_releases, (drops_pin ? 1 : 0) + attempts);
+		UT_ASSERT_EQ(ut_writer_vm_warms, attempts);
+		UT_ASSERT_EQ(ut_writer_vm_repins, repins ? 1 : 0);
+		UT_ASSERT_EQ(ut_writer_vm_pinned, repins || leg == 10 || leg == 11);
+		UT_ASSERT_EQ(ut_writer_vm_service_calls, recycled				  ? 1
+												 : leg == 10 || leg == 12 ? 0
+												 : leg == 2				  ? 1
+												 : leg == 4				  ? 2
+																		  : 3);
+		UT_ASSERT_EQ(ut_writer_vm_service_pins,
+					 leg == 10 || leg == 11 ? ut_writer_vm_service_calls : 0);
+		if (!expect_error) {
+			UT_ASSERT_EQ(map, repins || leg == 10 || leg == 11 ? (Buffer)2 : InvalidBuffer);
+			UT_ASSERT_EQ(handled, leg != 10 && leg != 12 && leg != 13);
+			UT_ASSERT_EQ(result, leg == 10 || leg == 12 || leg == 13 ? TM_Invisible
+								 : leg == 3 || leg == 5				 ? TM_BeingModified
+								 : leg == 1							 ? TM_Ok
+																	 : TM_Deleted);
+			UT_ASSERT(ut_hot_content_lock_held);
+		}
+		UT_ASSERT_EQ(ut_writer_vm_unlock_pins, leg == 11 ? 1 : 0);
+		UT_ASSERT_EQ(ut_writer_vm_relock_pins, leg == 11 ? 1 : 0);
+		UT_ASSERT_EQ(ut_writer_bridge_tuple_pulls, 0);
+		if (leg != 3 && leg != 5)
+			UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		ut_writer_vm_active = ut_writer_vm_pinned = false;
+		cluster_shared_config = false;
+		cluster_enabled = true;
+		ut_successor_proof_fixture = ut_writer_target_fixture = ut_writer_bridge_fixture = false;
+		if (!ut_hot_content_lock_held)
+			LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE);
+		ut_itl_census_end();
+	}
+}
+
+UT_TEST(test_delete_writer_bridge_releases_its_own_vm_pin)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_delete_entry, false);
+}
+
+UT_TEST(test_update_writer_bridge_releases_its_own_vm_pin)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_update_entry, false);
+}
+
+UT_TEST(test_row_lock_writer_bridge_releases_its_own_vm_pin)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_lock_entry, false);
+}
+UT_TEST(test_delete_writer_bridge_restores_vm_pin_before_av_retry)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_delete_entry, true);
+}
+
+UT_TEST(test_update_writer_bridge_restores_vm_pin_before_av_retry)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_update_entry, true);
+}
+
+UT_TEST(test_lock_writer_bridge_restores_vm_pin_before_av_retry)
+{
+	ut_writer_vm_entry_cases(ut_writer_vm_lock_entry, true);
+}
 UT_TEST(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck)
 {
 	int leg;
@@ -7487,10 +7980,568 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 	BufferBlocks = NULL;
 }
 
+#include "test_cluster_heap_capacity_vm_unwind.inc"
+
+static void
+ut_census_vm_begin(RelationData *relation, FormData_pg_class *form)
+{
+	memset(relation, 0, sizeof(*relation));
+	memset(form, 0, sizeof(*form));
+	relation->rd_rel = form;
+	form->relpersistence = RELPERSISTENCE_PERMANENT;
+	ut_census_vm_active = true;
+	cluster_enabled = true;
+	NBuffers = 4;
+	ut_capture_error = true;
+	ut_census_vm_new = false;
+	ut_census_vm_refs[0] = 1;
+	ut_census_vm_refs[1] = 0;
+	ut_census_vm_services = ut_census_vm_service_pins = ut_census_vm_releases = 0;
+	ut_census_vm_repins = ut_census_vm_relock_pins = ut_census_vm_misses = 0;
+	ut_census_vm_error = 0;
+}
+
+static void
+ut_census_vm_finish(void)
+{
+	UT_ASSERT(!ut_itl_recycle_guard_active);
+	ut_census_vm_active = false;
+	cluster_enabled = true;
+	NBuffers = 2;
+	ut_capture_error = false;
+	if (!ut_itl_pair_active && !ut_hot_content_lock_held)
+		ut_hot_content_lock_held = true; /* fixture-only final teardown bracket */
+	ut_itl_census_end();
+}
+
+UT_TEST(test_capacity_census_hands_off_vm_before_proof_and_conditionally_repins)
+{
+	for (int lock_only = 0; lock_only < 2; lock_only++)
+		for (int single_node = 0; single_node < 2; single_node++)
+			for (int leg = 0; leg < 13; leg++) {
+				UtR4HotProductFixture fixture;
+				HeapHotSearchResult hot;
+				RelationData relation;
+				FormData_pg_class form;
+				Buffer map = 3;
+				ClusterHeapItlCapacityResult outcome = CLUSTER_HEAP_ITL_CAPACITY_READY;
+				volatile bool caught = false;
+				sigjmp_buf error;
+				bool native = leg == 10 || leg == 11;
+				bool early = leg == 8 || leg == 9;
+				bool miss = leg == 1 || leg == 2 || leg == 3;
+
+				ut_itl_census_begin(&fixture, &hot, lock_only != 0);
+				ut_census_vm_begin(&relation, &form);
+				ut_cluster_conf.node_count = single_node ? 1 : 2;
+				ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+				PageSetAllVisible(fixture.live_page);
+				if (leg == 1)
+					ut_census_vm_misses = 1;
+				if (leg == 2) {
+					map = InvalidBuffer;
+					ut_census_vm_refs[0] = 0;
+				}
+				if (leg == 3)
+					ut_census_vm_new = true;
+				if (leg == 4)
+					ut_itl_census_replace_current_page = true;
+				if (leg == 5)
+					ut_itl_census_outcomes[0] = CLUSTER_TX_UNKNOWN;
+				if (leg == 6 || leg == 12)
+					ut_census_vm_error = leg == 6 ? 1 : 3;
+				if (leg == 7)
+					PageClearAllVisible(fixture.live_page);
+				if (leg == 8)
+					ClusterPageGetItlSlots((Page)fixture.live_page)[0].flags = ITL_FLAG_FREE;
+				if (leg == 9)
+					ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
+				if (leg == 10)
+					cluster_enabled = false;
+				if (leg == 11)
+					form.relpersistence = RELPERSISTENCE_TEMP;
+				PG_exception_stack = &error;
+				if (sigsetjmp(error, 0) == 0)
+					outcome = cluster_heap_test_itl_capacity_with_vm(&relation, 1, 9900,
+																	 lock_only != 0, &map);
+				else
+					caught = true;
+				PG_exception_stack = NULL;
+				UT_ASSERT_EQ(caught, leg == 6 || (leg == 12 && !single_node));
+				if (!native && !early) {
+					UT_ASSERT(ut_census_vm_services > 0);
+					UT_ASSERT_EQ(ut_census_vm_service_pins, 0);
+					UT_ASSERT_EQ(ut_census_vm_relock_pins, 0);
+				}
+				if (native || early) {
+					UT_ASSERT_EQ(map, 3);
+					UT_ASSERT_EQ(ut_census_vm_releases + ut_census_vm_repins, 0);
+				} else if (!caught) {
+					/* Preserve the existing N-state refusal on identity drift;
+					 * only peer X asks the DML owner to requalify. */
+					UT_ASSERT_EQ(outcome, miss || (leg == 4 && !single_node)
+											  ? CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY
+										  : leg == 5 || leg == 4
+											  ? CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED
+											  : CLUSTER_HEAP_ITL_CAPACITY_READY);
+					UT_ASSERT_EQ(BufferIsValid(map), !miss && leg != 7);
+					if (miss || leg == 4 || leg == 5)
+						UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+				} else
+					UT_ASSERT_EQ(ut_census_vm_refs[0], 0);
+				ut_census_vm_finish();
+			}
+}
+
+UT_TEST(test_pair_census_drops_both_vm_references_before_unlocked_resolution)
+{
+	for (int alias = 0; alias < 3; alias++)
+		for (int leg = 0; leg < 6; leg++) {
+			UtR4HotProductFixture fixture;
+			HeapHotSearchResult hot;
+			RelationData relation;
+			FormData_pg_class form;
+			Buffer old_vm = 3, new_vm = alias ? 3 : 4;
+			Buffer *new_pin = alias == 2 ? &old_vm : &new_vm;
+			volatile bool caught = false;
+			sigjmp_buf error;
+			bool resolved = false;
+
+			ut_itl_census_begin(&fixture, &hot, false);
+			ut_census_vm_begin(&relation, &form);
+			ut_census_vm_refs[0] = alias == 1 ? 2 : 1;
+			ut_census_vm_refs[1] = alias ? 0 : 1;
+			ut_itl_pair_active = true;
+			ut_itl_pair_content_lock_held[0] = ut_itl_pair_content_lock_held[1] = true;
+			ut_hot_content_lock_held = false;
+			if (leg == 1)
+				ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
+			if (leg == 2)
+				ut_itl_census_force_pcm_n = true;
+			if (leg == 3)
+				ut_census_vm_error = 1;
+			if (leg == 4)
+				cluster_enabled = false;
+			if (leg == 5)
+				form.relpersistence = RELPERSISTENCE_TEMP;
+			PG_exception_stack = &error;
+			if (sigsetjmp(error, 0) == 0)
+				resolved = cluster_heap_test_itl_pair_census_with_vm(&relation, 1, 2, 1, &old_vm,
+																	 new_pin);
+			else
+				caught = true;
+			PG_exception_stack = NULL;
+			UT_ASSERT_EQ(caught, leg == 3);
+			UT_ASSERT_EQ(resolved, leg == 0 || leg == 5);
+			if (leg < 4 && leg != 2) {
+				UT_ASSERT(!BufferIsValid(old_vm) && !BufferIsValid(*new_pin));
+				UT_ASSERT_EQ(ut_census_vm_refs[0] + ut_census_vm_refs[1], 0);
+				UT_ASSERT_EQ(ut_census_vm_service_pins, 0);
+			} else
+				UT_ASSERT_EQ(ut_census_vm_releases, 0);
+			if (leg == 2 || leg == 4) {
+				LockBuffer(2, BUFFER_LOCK_UNLOCK);
+				LockBuffer(1, BUFFER_LOCK_UNLOCK);
+			}
+			UT_ASSERT_EQ(ut_itl_pair_lock_buffers[0], 2);
+			UT_ASSERT_EQ(ut_itl_pair_lock_buffers[1], 1);
+			ut_census_vm_finish();
+		}
+}
+
+UT_TEST(test_capacity_wait_releases_vm_pins_without_changing_exact_wake_or_budget)
+{
+	for (int pair = 0; pair < 2; pair++)
+		for (int alias = 0; alias < 3; alias++)
+			for (int leg = 0; leg < 9; leg++) {
+				UtR4HotProductFixture fixture;
+				HeapHotSearchResult hot;
+				RelationData relation;
+				FormData_pg_class form;
+				Buffer old_vm = 3, new_vm = alias ? 3 : 4;
+				Buffer *new_pin = pair ? (alias == 2 ? &old_vm : &new_vm) : NULL;
+				uint64 deadline = leg == 1 ? 1 : 0;
+				const char *reason = NULL;
+				volatile bool caught = false;
+				sigjmp_buf error;
+				ClusterTxwResult result = CLUSTER_TXW_UNPROVABLE;
+
+				ut_itl_census_begin(&fixture, &hot, false);
+				ut_census_vm_begin(&relation, &form);
+				ut_census_vm_refs[0] = pair && alias == 1 ? 2 : 1;
+				ut_census_vm_refs[1] = pair && alias == 0 ? 1 : 0;
+				for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+					ut_itl_census_outcomes[i] = CLUSTER_TX_IN_PROGRESS;
+				if (pair) {
+					ut_itl_pair_active = true;
+					ut_itl_pair_content_lock_held[0] = ut_itl_pair_content_lock_held[1] = true;
+					ut_hot_content_lock_held = false;
+				}
+				if (leg == 2)
+					ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+				if (leg == 3)
+					for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+						ut_itl_census_outcomes[i] = CLUSTER_TX_UNKNOWN;
+				if (leg == 4)
+					ut_itl_wait_result = CLUSTER_TXW_DEADLOCK;
+				if (leg == 5 || leg == 6)
+					ut_census_vm_error = leg == 5 ? 1 : 2;
+				if (leg == 7)
+					ut_itl_census_pcm_flags = PCM_OWN_FLAG_REVOKING;
+				if (leg == 8)
+					ClusterPageGetItlSlots((Page)fixture.live_page)[0].flags = ITL_FLAG_FREE;
+				PG_exception_stack = &error;
+				if (sigsetjmp(error, 0) == 0)
+					result = cluster_heap_test_itl_wait_capacity_with_vm(&relation, 1, pair ? 2 : 1,
+																		 1, 9900, false, &deadline,
+																		 &reason, &old_vm, new_pin);
+				else
+					caught = true;
+				PG_exception_stack = NULL;
+				UT_ASSERT_EQ(caught, leg == 5 || leg == 6);
+				UT_ASSERT(!BufferIsValid(old_vm));
+				UT_ASSERT(new_pin == NULL || !BufferIsValid(*new_pin));
+				UT_ASSERT_EQ(ut_census_vm_refs[0] + ut_census_vm_refs[1], 0);
+				UT_ASSERT_EQ(ut_census_vm_service_pins, 0);
+				UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+				if (!caught)
+					UT_ASSERT_EQ(result, leg == 1							? CLUSTER_TXW_TIMEOUT
+										 : leg == 2 || leg == 7 || leg == 8 ? CLUSTER_TXW_RETRY
+										 : leg == 3							? CLUSTER_TXW_UNPROVABLE
+										 : leg == 4							? CLUSTER_TXW_DEADLOCK
+																			: CLUSTER_TXW_RESOLVED);
+				if (leg == 1)
+					UT_ASSERT_EQ(deadline, 1);
+				ut_census_vm_finish();
+			}
+}
+
+UT_TEST(test_update_capacity_retry_drops_remaining_maps_before_receipt_service)
+{
+	for (int alias = 0; alias < 2; alias++)
+		for (int native = 0; native < 3; native++) {
+			UtR4HotProductFixture fixture;
+			HeapHotSearchResult hot;
+			RelationData relation;
+			FormData_pg_class form;
+			Buffer old_vm = 3, new_vm = alias ? 3 : 4;
+
+			ut_itl_census_begin(&fixture, &hot, false);
+			ut_census_vm_begin(&relation, &form);
+			ut_census_vm_refs[0] = alias ? 2 : 1;
+			ut_census_vm_refs[1] = alias ? 0 : 1;
+			if (native == 1)
+				cluster_enabled = false;
+			if (native == 2)
+				form.relpersistence = RELPERSISTENCE_TEMP;
+			ut_update_capacity_vm_unwind(&relation, 1, &old_vm, &new_vm);
+			ut_census_vm_service(); /* controlled receipt-service boundary */
+			UT_ASSERT(!ut_hot_content_lock_held);
+			UT_ASSERT_EQ(ut_census_vm_service_pins, native ? 2 : 0);
+			UT_ASSERT_EQ(BufferIsValid(old_vm), native != 0);
+			UT_ASSERT_EQ(BufferIsValid(new_vm), native != 0);
+			ut_census_vm_finish();
+		}
+}
+
+/* Real heap authorizer, single-holder composition and VM reentry;
+ * descriptor/proof/compositor, residency and error leaves are controlled. */
+static void
+ut_mx_vm_begin(UtR4HotProductFixture *fixture, HeapHotSearchResult *hot, RelationData *relation,
+			   FormData_pg_class *form, HeapTuple tuple, bool single)
+{
+	HeapTupleHeader root;
+
+	ut_r4_hot_init_product_fixture(fixture, hot);
+	ut_r4_hot_build_foreign_multixact_chain(fixture->live_page);
+	root = ut_r4_hot_tuple_at((Page)fixture->live_page, UT_HOT_ROOT_OFF);
+	root->t_infomask = HEAP_XMIN_COMMITTED | HEAP_XMAX_KEYSHR_LOCK | HEAP_XMAX_LOCK_ONLY;
+	if (!single)
+		root->t_infomask |= HEAP_XMAX_IS_MULTI;
+	HeapTupleHeaderSetXmax(root, single ? UT_ORDINARY_LOCKER : UT_HOT_FOREIGN_MXID);
+	root->t_infomask2 = 0;
+	ItemPointerSet(&root->t_ctid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	PageSetAllVisible(fixture->live_page);
+	ut_itl_census_tag = fixture->expected_tag;
+	memset(&ut_cluster_conf, 0, sizeof(ut_cluster_conf));
+	ut_cluster_conf.node_count = 2;
+	cluster_r4_activation_test_current_epoch = UT_HOT_CURRENT_EPOCH;
+	ut_hot_current_mx_active = true;
+	ut_hot_current_mx_pcm_state = (uint8)PCM_STATE_X;
+	ut_hot_current_mx_member_count = 1;
+	ut_current_mx_ordinary_lock_only = true;
+	ut_hot_pcm_snapshot_calls = 0;
+	ut_hot_current_mx_describe_calls = ut_hot_current_mx_resolve_calls = 0;
+	ut_hot_current_mx_validate_calls = 0;
+	ut_itl_census_change_writer_activation_projection = false;
+	ut_itl_census_replace_current_page = false;
+	ut_itl_census_dirty_hint_calls = 0;
+	memset(relation, 0, sizeof(*relation));
+	memset(form, 0, sizeof(*form));
+	relation->rd_rel = form;
+	relation->rd_id = UT_HOT_TABLE_OID;
+	form->relpersistence = RELPERSISTENCE_PERMANENT;
+	memset(tuple, 0, sizeof(*tuple));
+	tuple->t_data = root;
+	tuple->t_len = ItemIdGetLength(PageGetItemId((Page)fixture->live_page, UT_HOT_ROOT_OFF));
+	tuple->t_tableOid = UT_HOT_TABLE_OID;
+	ItemPointerSet(&tuple->t_self, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	ut_mx_vm_active = ut_writer_vm_active = ut_writer_vm_pinned = true;
+	ut_mx_vm_single = single;
+	ut_mx_vm_services = ut_mx_vm_service_pins = ut_mx_vm_wait_calls = 0;
+	ut_mx_vm_create_calls = ut_mx_vm_recorded_restarts = 0;
+	ut_mx_vm_fault = 0;
+	ut_mx_vm_wait_result = CLUSTER_TXW_RESOLVED;
+	ut_writer_vm_releases = ut_writer_vm_service_calls = ut_writer_vm_service_pins = 0;
+	ut_writer_vm_unlock_pins = ut_writer_vm_relock_pins = 0;
+	ut_writer_vm_warms = ut_writer_vm_repins = ut_writer_vm_misses = 0;
+	cluster_enabled = true;
+	ut_capture_error = true;
+}
+
+static void
+ut_mx_vm_finish(void)
+{
+	PG_exception_stack = NULL;
+	if (ut_hot_content_lock_held)
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	if (ut_writer_vm_pinned)
+		ReleaseBuffer((Buffer)2); /* fixture teardown, not ResourceOwner qualification */
+	ut_mx_vm_active = ut_writer_vm_active = ut_mx_vm_single = false;
+	ut_capture_error = false;
+	cluster_enabled = true;
+	ut_current_mx_ordinary_lock_only = false;
+	ut_hot_current_mx_member_count = 2;
+	ut_hot_current_mx_active = ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+}
+
+UT_TEST(test_current_mx_proof_drops_vm_pin_and_restarts_after_full_repin)
+{
+	for (int leg = 0; leg < 17; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		HeapTupleData tuple;
+		volatile Buffer map = 2;
+		TM_Result result = TM_BeingModified;
+		uint16 count = 0;
+		int disposition = -1;
+		volatile bool caught = false;
+		sigjmp_buf error;
+		bool native = leg == 12 || leg == 13;
+		bool early = leg == 12 || leg == 14;
+		bool no_owner = leg == 16;
+		bool want_error = leg == 4 || leg == 5 || leg == 9 || leg == 10 || leg == 11 || leg == 15;
+		bool restart = leg == 1 || leg == 2 || leg == 6 || leg == 7 || leg == 8;
+
+		ut_mx_vm_begin(&fixture, &hot, &relation, &form, &tuple, false);
+		if (leg == 1)
+			ut_writer_vm_misses = 1;
+		if (leg == 2 || leg == 15 || no_owner) {
+			map = InvalidBuffer;
+			ut_writer_vm_pinned = false;
+		}
+		if (leg == 3)
+			PageClearAllVisible(fixture.live_page);
+		if (leg == 4)
+			ut_mx_vm_fault = 1;
+		if (leg == 5)
+			ut_mx_vm_fault = 2;
+		if (leg == 6)
+			ut_mx_vm_fault = 4;
+		if (leg == 7)
+			ut_mx_vm_fault = 5;
+		if (leg == 8)
+			ut_mx_vm_fault = 6;
+		if (leg == 9)
+			ut_mx_vm_fault = 7;
+		if (leg == 10)
+			ut_mx_vm_fault = 8;
+		if (leg == 11)
+			ut_mx_vm_fault = 9;
+		if (leg == 12)
+			cluster_enabled = false;
+		if (leg == 13)
+			form.relpersistence = RELPERSISTENCE_TEMP;
+		if (leg == 14)
+			tuple.t_data->t_infomask &= ~HEAP_XMAX_IS_MULTI;
+		if (leg == 15)
+			ut_mx_vm_fault = 10;
+		PG_exception_stack = &error;
+		if (sigsetjmp(error, 0) == 0)
+			disposition = cluster_heap_test_current_mx_with_vm(
+				&relation, 1, &tuple, UT_ORDINARY_REQUESTER, false, LockTupleKeyShare,
+				LockWaitBlock, no_owner ? NULL : (Buffer *)&map, &result, &count);
+		else
+			caught = true;
+		PG_exception_stack = NULL;
+		UT_ASSERT_EQ(caught, want_error);
+		UT_ASSERT_EQ(ut_mx_vm_service_pins, native && !early ? ut_mx_vm_services : 0);
+		if (!native && !early && !no_owner)
+			UT_ASSERT_EQ(ut_writer_vm_relock_pins, 0);
+		if (early || native || no_owner)
+			UT_ASSERT_EQ(ut_writer_vm_releases + ut_writer_vm_warms + ut_writer_vm_repins, 0);
+		if (!caught) {
+			UT_ASSERT_EQ(disposition, early ? 0 : restart ? 1 : 2);
+			UT_ASSERT_EQ(count, early || restart ? 0 : 2);
+			if (!early && !restart)
+				UT_ASSERT_EQ(result, TM_Ok);
+			UT_ASSERT_EQ(BufferIsValid(map), leg != 3 && !no_owner);
+			if (leg == 1 || leg == 2) {
+				UT_ASSERT_EQ(ut_hot_current_mx_resolve_calls, 0);
+				UT_ASSERT_EQ(ut_writer_vm_warms, 1);
+			}
+			if (restart)
+				UT_ASSERT_EQ(ut_mx_vm_recorded_restarts, 1);
+		} else if (!ut_hot_content_lock_held)
+			UT_ASSERT(!ut_writer_vm_pinned);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+		ut_mx_vm_finish();
+	}
+}
+
+UT_TEST(test_current_mx_exact_wait_hands_off_vm_and_keeps_wait_policy)
+{
+	const LockWaitPolicy policies[] = { LockWaitBlock, LockWaitSkip, LockWaitError };
+	const ClusterTxwResult wakes[]
+		= { CLUSTER_TXW_RESOLVED, CLUSTER_TXW_DEAD_HOLDER, CLUSTER_TXW_RETRY,
+			CLUSTER_TXW_TIMEOUT,  CLUSTER_TXW_UNPROVABLE,  CLUSTER_TXW_DEADLOCK };
+
+	for (unsigned policy = 0; policy < lengthof(policies); policy++)
+		for (unsigned leg = 0; leg < 8; leg++) {
+			UtR4HotProductFixture fixture;
+			HeapHotSearchResult hot;
+			RelationData relation;
+			FormData_pg_class form;
+			HeapTupleData tuple;
+			volatile Buffer map = 2;
+			TM_Result result = TM_BeingModified;
+			uint16 count = 0;
+			int disposition = -1;
+			volatile bool caught = false;
+			sigjmp_buf error;
+			bool want_error = policy == 2 || (policy == 0 && leg >= 3 && leg <= 6);
+
+			ut_mx_vm_begin(&fixture, &hot, &relation, &form, &tuple, false);
+			ut_mx_vm_wait_result = leg < lengthof(wakes) ? wakes[leg] : CLUSTER_TXW_RESOLVED;
+			if (leg == 6)
+				ut_mx_vm_fault = 3;
+			if (leg == 7)
+				ut_mx_vm_fault = 13;
+			PG_exception_stack = &error;
+			if (sigsetjmp(error, 0) == 0)
+				disposition = cluster_heap_test_current_mx_with_vm(
+					&relation, 1, &tuple, UT_ORDINARY_REQUESTER, false, LockTupleExclusive,
+					policies[policy], (Buffer *)&map, &result, &count);
+			else
+				caught = true;
+			PG_exception_stack = NULL;
+			UT_ASSERT_EQ(caught, want_error);
+			UT_ASSERT_EQ(ut_mx_vm_service_pins, 0);
+			UT_ASSERT_EQ(ut_writer_vm_relock_pins, 0);
+			UT_ASSERT_EQ(ut_mx_vm_wait_calls, policy == 0 ? 1 : 0);
+			if (!caught) {
+				UT_ASSERT_EQ(disposition, policy == 0 ? 1 : 2);
+				UT_ASSERT_EQ(count, 0);
+				UT_ASSERT(BufferIsValid(map) && ut_writer_vm_pinned);
+				if (policy == 1)
+					UT_ASSERT_EQ(result, TM_WouldBlock);
+				else
+					UT_ASSERT_EQ(ut_mx_vm_recorded_restarts, 1);
+				if (policy == 0 && leg == 7)
+					UT_ASSERT_EQ(ut_writer_vm_warms, 1);
+			} else if (!ut_hot_content_lock_held)
+				UT_ASSERT(!ut_writer_vm_pinned);
+			UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+			ut_mx_vm_finish();
+		}
+}
+
+UT_TEST(test_current_mx_remote_single_hands_off_vm_before_materialization)
+{
+	for (int leg = 0; leg < 11; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		HeapTupleData tuple;
+		volatile Buffer map = 2;
+		TM_Result result = TM_BeingModified;
+		uint16 count = 0;
+		int disposition = -1;
+		volatile bool caught = false;
+		sigjmp_buf error;
+		bool native = leg == 8 || leg == 9;
+		bool want_error = leg == 4 || leg == 5 || leg == 7 || leg == 10;
+		bool restart = leg == 1 || leg == 2 || leg == 6;
+
+		ut_mx_vm_begin(&fixture, &hot, &relation, &form, &tuple, true);
+		if (leg == 1)
+			ut_writer_vm_misses = 1;
+		if (leg == 2 || leg == 10) {
+			map = InvalidBuffer;
+			ut_writer_vm_pinned = false;
+		}
+		if (leg == 3)
+			PageClearAllVisible(fixture.live_page);
+		if (leg == 4)
+			ut_mx_vm_fault = 2;
+		if (leg == 5)
+			ut_mx_vm_fault = 11;
+		if (leg == 6)
+			ut_mx_vm_fault = 6;
+		if (leg == 7)
+			ut_mx_vm_fault = 7;
+		if (leg == 8)
+			cluster_enabled = false;
+		if (leg == 9)
+			form.relpersistence = RELPERSISTENCE_TEMP;
+		if (leg == 10)
+			ut_mx_vm_fault = 10;
+		PG_exception_stack = &error;
+		if (sigsetjmp(error, 0) == 0)
+			disposition = cluster_heap_test_current_mx_with_vm(
+				&relation, 1, &tuple, UT_ORDINARY_REQUESTER, true, LockTupleNoKeyExclusive,
+				LockWaitBlock, (Buffer *)&map, &result, &count);
+		else
+			caught = true;
+		PG_exception_stack = NULL;
+		UT_ASSERT_EQ(caught, want_error);
+		UT_ASSERT_EQ(ut_mx_vm_service_pins, native && leg != 8 ? ut_mx_vm_services : 0);
+		if (!native)
+			UT_ASSERT_EQ(ut_writer_vm_relock_pins, 0);
+		else
+			UT_ASSERT_EQ(ut_writer_vm_releases + ut_writer_vm_warms + ut_writer_vm_repins, 0);
+		if (!caught) {
+			UT_ASSERT_EQ(disposition, leg == 8 ? 0 : restart ? 1 : 2);
+			UT_ASSERT_EQ(count, leg == 8 || restart ? 0 : 2);
+			if (leg != 8 && !restart)
+				UT_ASSERT_EQ(result, TM_Ok);
+			UT_ASSERT_EQ(BufferIsValid(map), leg != 3);
+			if (restart)
+				UT_ASSERT_EQ(ut_mx_vm_recorded_restarts, 1);
+		} else if (!ut_hot_content_lock_held)
+			UT_ASSERT(!ut_writer_vm_pinned);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+		ut_mx_vm_finish();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(152);
+	UT_PLAN(165);
+	UT_RUN(test_current_mx_proof_drops_vm_pin_and_restarts_after_full_repin);
+	UT_RUN(test_current_mx_exact_wait_hands_off_vm_and_keeps_wait_policy);
+	UT_RUN(test_current_mx_remote_single_hands_off_vm_before_materialization);
+	UT_RUN(test_capacity_census_hands_off_vm_before_proof_and_conditionally_repins);
+	UT_RUN(test_pair_census_drops_both_vm_references_before_unlocked_resolution);
+	UT_RUN(test_capacity_wait_releases_vm_pins_without_changing_exact_wake_or_budget);
+	UT_RUN(test_update_capacity_retry_drops_remaining_maps_before_receipt_service);
 	UT_RUN(test_prune_trace_off_keeps_real_prune_quiet);
 	UT_RUN(test_prune_trace_on_records_real_redirect_unused_and_actual_tag);
 	UT_RUN(test_prune_trace_capture_refusal_never_reads_unknown_image);
@@ -7549,6 +8600,12 @@ main(void)
 	UT_RUN(test_released_xmax_without_write_authority_preserves_every_byte);
 	UT_RUN(test_update_live_and_committed_writers_never_normalize_xmax);
 	UT_RUN(test_target_writer_uses_bit0_exact_wait_and_requalifies_terminal_proof);
+	UT_RUN(test_delete_writer_bridge_releases_its_own_vm_pin);
+	UT_RUN(test_update_writer_bridge_releases_its_own_vm_pin);
+	UT_RUN(test_row_lock_writer_bridge_releases_its_own_vm_pin);
+	UT_RUN(test_delete_writer_bridge_restores_vm_pin_before_av_retry);
+	UT_RUN(test_update_writer_bridge_restores_vm_pin_before_av_retry);
+	UT_RUN(test_lock_writer_bridge_restores_vm_pin_before_av_retry);
 	UT_RUN(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck);
 	UT_RUN(test_local_writer_ref_requires_matching_identity_or_resolver_proof);
 	UT_RUN(test_itl_wait_negative_boundaries_preserve_page_and_close_owners);

@@ -32,6 +32,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_multixact_range.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "storage/buf_internals.h"
@@ -147,6 +148,12 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 
 	if (payload == NULL)
 		return -1;
+	if (cluster_mx_range_transport_candidate(payload, payload_len, msg_type)) {
+		ClusterMxRangeRoute route;
+		if (!cluster_mx_range_transport_route(payload, payload_len, msg_type, &route, &route_tag))
+			return -1;
+		return cluster_lms_shard_for_tag(&route_tag, n_workers);
+	}
 
 	switch (msg_type) {
 	case PGRAC_IC_MSG_GCS_BLOCK_REQUEST:

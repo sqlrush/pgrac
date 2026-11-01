@@ -4,6 +4,10 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 #include "unit_test.h"
+#include "access/visibilitymap.h"
+#include "storage/bufmgr.h"
+#include "storage/smgr.h"
+#include "utils/rel.h"
 #include "cluster/cluster_adg.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_inject.h"
@@ -14,6 +18,7 @@
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_heap_horizon.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_retention.h"
 #include "access/twophase.h"
@@ -34,6 +39,20 @@ static void snapshot_return_read_barrier(void)
 #undef pg_read_barrier
 #define pg_read_barrier() pg_read_barrier_impl()
 #include "test_cluster_snapshot_admission_horizon.inc"
+
+#include "test_cluster_space_identity_observation_available.inc"
+#ifndef FIXTURE_HAS_SPACE_IDENTITY_OBSERVATION
+/* Parent has an unguarded identity cache, without an operation observation. */
+typedef struct ClusterSpaceIdentityObservationV1 {
+	ClusterSpaceIdentity identity;
+	uint64 invalidations;
+	Oid relid;
+} ClusterSpaceIdentityObservationV1;
+extern bool cluster_space_relation_identity_capture_v1(Relation rel,
+														 ClusterSpaceIdentityObservationV1 *out);
+extern bool cluster_space_relation_identity_current_v1(
+	Relation rel, const ClusterSpaceIdentityObservationV1 *expected);
+#endif
 
 UT_DEFINE_GLOBALS();
 
@@ -64,6 +83,34 @@ static unsigned remembered;
 static ClusterUndoHorizonShmem horizon;
 static ClusterMembershipState self_member = CLUSTER_MEMBER_MEMBER;
 static bool peer_capable = true;
+static bool vm_fixture, vm_locked, vm_shared, vm_refuse;
+static bool vm_caught, vm_result;
+static int vm_drift, vm_error;
+static unsigned vm_begins, vm_ends, vm_admissions;
+static Snapshot vm_expected;
+static uint64 vm_member_cut = 2, vm_cap_cut = 10;
+static int vm_admission_change;
+static bool vm_space_available, vm_space_error;
+static uint64 vm_space_generation;
+static unsigned vm_space_captures, vm_space_checks;
+static Relation vm_space_relation;
+/* Shared buffer globals are provided by the native pin fixture below. */
+/* Joint native snapshot/VM chain: the transport and storage remain scheduled. */
+static bool vm_chain_enabled, vm_chain_pcm, vm_chain_grant, vm_chain_released;
+static int vm_chain_drift, vm_chain_error;
+static unsigned vm_chain_reads, vm_chain_grants, vm_chain_unlocks, vm_chain_releases;
+static PGAlignedBlock vm_chain_disk, vm_chain_current, vm_chain_image;
+static SMgrRelationData vm_chain_smgr;
+static RelFileLocator vm_chain_locator;
+static ForkNumber vm_chain_fork;
+static BlockNumber vm_chain_block;
+static Buffer vm_chain_read_buffer;
+
+static bool vm_chain_read_begin(Relation rel, BlockNumber block, Buffer *buffer,
+								volatile VisibilityMapReadScope *scope, uint8 *status);
+static void vm_chain_read_end(volatile VisibilityMapReadScope *scope);
+static uint8 vm_chain_raw_status(Relation rel, BlockNumber block, Buffer *buffer);
+static bool vm_chain_pinned_status(Relation rel, BlockNumber block, Buffer buffer, uint8 *status);
 static int error_code;
 static OldSnapshotControlData snapshot_control;
 static bool snapshot_control_found;
@@ -179,6 +226,26 @@ cluster_epoch_get_current(void)
 {
 	return snapshot_return_epoch;
 }
+uint64
+cluster_membership_cut_generation(void)
+{
+	return vm_member_cut;
+}
+bool
+cluster_membership_cut_generation_current(uint64 expected)
+{
+	return expected != 0 && expected == vm_member_cut;
+}
+uint64
+cluster_sf_peer_capability_cut_generation(void)
+{
+	return vm_cap_cut;
+}
+bool
+cluster_sf_peer_capability_cut_generation_current(uint64 expected)
+{
+	return expected != 0 && expected == vm_cap_cut;
+}
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int node)
 {
@@ -186,8 +253,42 @@ cluster_conf_lookup_node(int node)
 	return node == 0 ? &peer : NULL;
 }
 bool
+cluster_space_relation_identity_capture_v1(Relation rel, ClusterSpaceIdentityObservationV1 *out)
+{
+	UT_ASSERT(!vm_locked);
+	vm_space_captures++;
+	memset(out, 0, sizeof(*out));
+	if (vm_space_error)
+		siglongjmp(*PG_exception_stack, 1);
+	if (!vm_space_available)
+		return false;
+	out->invalidations = vm_space_generation;
+	if (vm_chain_enabled) {
+		out->relid = RelationGetRelid(rel);
+		out->identity.key.locator = rel->rd_locator;
+	}
+	return true;
+}
+bool
+cluster_space_relation_identity_current_v1(Relation rel,
+										 const ClusterSpaceIdentityObservationV1 *expected)
+{
+	vm_space_checks++;
+	return expected->invalidations == vm_space_generation && vm_space_available
+		&& (!vm_chain_enabled || (rel->rd_isvalid && RelationGetRelid(rel) == expected->relid
+			&& RelFileLocatorEquals(rel->rd_locator, expected->identity.key.locator)));
+}
+bool
 cluster_sf_peer_supports_undo_horizon(int node)
 {
+	if (vm_fixture) {
+		UT_ASSERT(!vm_locked);
+		vm_admissions++;
+		if (vm_admission_change == 1)
+			vm_cap_cut++;
+		else if (vm_admission_change == 2)
+			vm_member_cut += 2;
+	}
 	return peer_capable;
 }
 bool
@@ -1089,6 +1190,863 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 #include "test_cluster_survivor_buffer_fixture.h"
 #include "test_cluster_survivor_buffer_return.inc"
 #include "test_cluster_survivor_return_context.inc"
+
+/* The native snapshot manager and read-admission body above execute. Only
+ * the coherent VM acquisition/storage leaf is scheduled by this fixture. */
+bool
+cluster_heap_maintenance_restricted(Relation rel)
+{
+	return vm_shared;
+}
+
+bool
+visibilitymap_read_begin(Relation rel, BlockNumber block, Buffer *buffer,
+						 volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	if (vm_chain_enabled)
+		return vm_chain_read_begin(rel, block, buffer, scope, status);
+	if (status != NULL)
+		*status = 0;
+	if (rel == NULL || block == InvalidBlockNumber || buffer == NULL || scope == NULL
+		|| status == NULL || BufferIsValid(scope->locked_buffer))
+		return false;
+	vm_begins++;
+	if (!vm_shared) {
+		*buffer = 1;
+		*status = VISIBILITYMAP_VALID_BITS;
+		return true;
+	}
+	UT_ASSERT(ClusterSnapshotReadScope != NULL
+			  && ClusterSnapshotReadScope->snapshot == vm_expected);
+	UT_ASSERT(!vm_locked);
+	if (vm_error == 1)
+		siglongjmp(*PG_exception_stack, 1);
+	if (vm_refuse)
+		return false;
+	*buffer = scope->locked_buffer = 1;
+	vm_locked = true;
+	*status = VISIBILITYMAP_VALID_BITS;
+	if (vm_error == 2)
+		siglongjmp(*PG_exception_stack, 1);
+	switch (vm_drift) {
+	case 1:
+		vm_expected->read_scn++;
+		break;
+	case 2:
+		vm_expected->read_epoch++;
+		break;
+	case 3:
+		vm_expected->cluster_source = SNAPSHOT_SOURCE_LOCAL;
+		break;
+	case 4:
+		vm_expected->cluster_cr_identity++;
+		break;
+	case 5:
+		CurrentResourceOwner = (ResourceOwner)2;
+		break;
+	case 6:
+		pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 101);
+		break;
+	default:
+		break;
+	}
+	return true;
+}
+
+void
+visibilitymap_read_end(volatile VisibilityMapReadScope *scope)
+{
+	if (vm_chain_enabled) {
+		vm_chain_read_end(scope);
+		return;
+	}
+	if (scope == NULL || !BufferIsValid(scope->locked_buffer))
+		return;
+	UT_ASSERT(vm_locked);
+	vm_ends++;
+	vm_locked = false;
+	scope->locked_buffer = InvalidBuffer;
+}
+
+#include "test_cluster_vm_snapshot_read.inc"
+#ifndef FIXTURE_HAS_VM_SNAPSHOT_READER
+/* API-absent parent: the existing VM observation does not bind a snapshot. */
+static bool
+fixture_vm_snapshot_observation(Relation rel, BlockNumber block, Snapshot snapshot, Buffer *buffer,
+								volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	return visibilitymap_read_begin(rel, block, buffer, scope, status);
+}
+#define visibilitymap_read_snapshot_begin fixture_vm_snapshot_observation
+#endif
+
+static void
+vm_setup(Snapshot snapshot)
+{
+	NBuffers = 2;
+	vm_fixture = vm_shared = true;
+	vm_locked = vm_refuse = vm_caught = vm_result = false;
+	vm_drift = vm_error = 0;
+	vm_begins = vm_ends = vm_admissions = 0;
+	vm_expected = snapshot;
+	peer_capable = true;
+	self_member = CLUSTER_MEMBER_MEMBER;
+	pg_atomic_write_u64(&horizon.self_admitted_epoch, 8);
+	CurrentResourceOwner = (ResourceOwner)1;
+	cluster_node_id = 1;
+	vm_member_cut = 2;
+	vm_cap_cut = 10;
+	vm_admission_change = 0;
+	vm_space_available = true;
+	vm_space_error = false;
+	vm_space_generation = 100;
+	vm_space_captures = vm_space_checks = 0;
+	vm_space_relation = NULL;
+}
+
+static void
+vm_observe(Snapshot snapshot, Buffer *buffer, volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	PG_TRY();
+	{
+		vm_result
+			= visibilitymap_read_snapshot_begin((Relation)1, 0, snapshot, buffer, scope, status);
+	}
+	PG_CATCH();
+	{
+		vm_caught = true;
+	}
+	PG_END_TRY();
+}
+
+UT_TEST(vm_observation_binds_registered_snapshot_and_restores_outer_evaluator)
+{
+	Snapshot a = registered(90), s = registered(100);
+	ClusterSnapshotReadScopeV1 outer;
+	VisibilityMapReadScope scope = { 0 };
+	Buffer buffer = InvalidBuffer;
+	uint8 status = 77;
+
+	vm_setup(s);
+	PushActiveSnapshot(a);
+	cluster_snapshot_read_enter_v1(&outer, a);
+	for (int reuse = 0; reuse < 2; reuse++) {
+		vm_observe(s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_caught && vm_result && vm_locked);
+		UT_ASSERT_EQ(status, VISIBILITYMAP_VALID_BITS);
+		UT_ASSERT_EQ(scope.locked_buffer, 1);
+		UT_ASSERT_EQ(buffer, 1);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer);
+		UT_ASSERT(evidence(90, a));
+		UT_ASSERT(GetActiveSnapshot() == a);
+		UT_ASSERT_EQ(s->regd_count, 1);
+		UT_ASSERT_EQ(s->active_count, 0);
+		visibilitymap_read_end(&scope);
+	}
+	UT_ASSERT_EQ(vm_begins, 2);
+	UT_ASSERT_EQ(vm_admissions, 2);
+	UT_ASSERT_EQ(vm_ends, 2);
+	cluster_snapshot_read_exit_v1(&outer);
+	PopActiveSnapshot();
+	vm_fixture = false;
+	UnregisterSnapshot(s);
+	UnregisterSnapshot(a);
+}
+
+UT_TEST(vm_observation_refuses_unretained_or_unqualified_snapshot_before_vm)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		SnapshotData forged = { 0 };
+		Snapshot s = variant == 0 ? &forged : registered(100);
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_setup(s);
+		if (variant == 0) {
+			forged.snapshot_type = SNAPSHOT_MVCC;
+			forged.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+			forged.read_scn = 100;
+			forged.read_epoch = 7;
+			forged.active_count = forged.regd_count = 100;
+		} else if (variant == 1)
+			s->snapshot_type = SNAPSHOT_SELF;
+		else if (variant == 2)
+			s->cluster_source = SNAPSHOT_SOURCE_LOCAL;
+		else if (variant == 3)
+			s->read_scn = InvalidScn;
+		else if (variant == 4)
+			s->read_epoch = 0;
+		else if (variant == 5)
+			s->read_epoch++;
+		else if (variant == 6)
+			UnregisterSnapshot(s);
+		vm_observe(variant == 7 ? NULL : s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_caught && !vm_result && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_begins + vm_admissions + vm_ends, 0);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		visibilitymap_read_end(&scope);
+		vm_fixture = false;
+		if (variant != 0 && variant != 6)
+			UnregisterSnapshot(s);
+	}
+}
+
+UT_TEST(vm_observation_keeps_real_membership_and_peer_capability_admission)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		Snapshot s = registered(100);
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_setup(s);
+		if (variant == 0)
+			self_member = CLUSTER_MEMBER_JOINING;
+		else if (variant == 1)
+			pg_atomic_write_u64(&horizon.self_admitted_epoch, 0);
+		else if (variant == 2)
+			pg_atomic_write_u64(&horizon.self_admitted_epoch, 9);
+		else
+			peer_capable = false;
+		vm_observe(s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_locked);
+		UT_ASSERT_EQ(vm_caught, variant != 3);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_begins + vm_ends, 0);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		visibilitymap_read_end(&scope);
+		vm_fixture = false;
+		self_member = CLUSTER_MEMBER_MEMBER;
+		peer_capable = true;
+		pg_atomic_write_u64(&horizon.self_admitted_epoch, 8);
+		UnregisterSnapshot(s);
+	}
+}
+
+UT_TEST(vm_observation_discards_snapshot_drift_after_vm_acquisition)
+{
+	for (int drift = 1; drift <= 6; drift++) {
+		Snapshot s = registered(100);
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_setup(s);
+		vm_drift = drift;
+		vm_observe(s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_caught && !vm_result && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT_EQ(buffer, 1);
+		UT_ASSERT_EQ(vm_begins, 1);
+		UT_ASSERT_EQ(vm_admissions, 1);
+		UT_ASSERT_EQ(vm_ends, 1);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		visibilitymap_read_end(&scope);
+		vm_fixture = false;
+		CurrentResourceOwner = (ResourceOwner)1;
+		s->read_scn = 100;
+		s->read_epoch = 7;
+		s->cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+		UnregisterSnapshot(s);
+	}
+}
+
+UT_TEST(vm_observation_unwinds_refusal_and_errors_to_the_original_outer_scope)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		Snapshot a = registered(90), s = registered(100);
+		ClusterSnapshotReadScopeV1 outer;
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_setup(s);
+		vm_refuse = fault == 0;
+		vm_error = fault;
+		cluster_snapshot_read_enter_v1(&outer, a);
+		vm_observe(s, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_locked);
+		UT_ASSERT_EQ(vm_caught, fault != 0);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT_EQ(vm_begins, 1);
+		UT_ASSERT_EQ(vm_ends, fault == 2);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer);
+		UT_ASSERT(evidence(90, a));
+		visibilitymap_read_end(&scope);
+		cluster_snapshot_read_exit_v1(&outer);
+		vm_fixture = false;
+		UnregisterSnapshot(s);
+		UnregisterSnapshot(a);
+	}
+}
+
+UT_TEST(vm_observation_preserves_active_vm_scope_and_native_observation)
+{
+	Snapshot s = registered(100);
+	VisibilityMapReadScope scope = { 0 };
+	Buffer buffer = 1;
+	uint8 status = 77;
+
+	vm_setup(s);
+	scope.locked_buffer = 1;
+	vm_locked = true;
+	vm_observe(s, &buffer, &scope, &status);
+	UT_ASSERT(!vm_caught && !vm_result && vm_locked);
+	UT_ASSERT_EQ(scope.locked_buffer, 1);
+	UT_ASSERT_EQ(vm_begins + vm_admissions + vm_ends, 0);
+	visibilitymap_read_end(&scope);
+	vm_fixture = false;
+	UnregisterSnapshot(s);
+	vm_setup(NULL);
+	vm_shared = false;
+	vm_observe(NULL, &buffer, &scope, &status);
+	UT_ASSERT(!vm_caught && vm_result && !vm_locked);
+	UT_ASSERT_EQ(status, VISIBILITYMAP_VALID_BITS);
+	UT_ASSERT_EQ(vm_begins, 1);
+	UT_ASSERT_EQ(vm_admissions, 0);
+	UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+	vm_fixture = false;
+}
+
+
+
+
+/* Only storage/transport leaves are scheduled in the joint source profile. */
+static Buffer
+vm_chain_read(Relation rel, ForkNumber fork, BlockNumber block, ReadBufferMode mode,
+			  BufferAccessStrategy strategy)
+{
+	UT_ASSERT(!vm_locked);
+	UT_ASSERT(ClusterSnapshotReadScope != NULL
+			  && ClusterSnapshotReadScope->snapshot == vm_expected);
+	UT_ASSERT_EQ(vm_admissions, 1);
+	UT_ASSERT_EQ(fork, VISIBILITYMAP_FORKNUM);
+	UT_ASSERT_EQ(mode, RBM_NORMAL);
+	UT_ASSERT(strategy == NULL);
+	vm_chain_reads++;
+	if (vm_chain_error == 1)
+		siglongjmp(*PG_exception_stack, 1);
+	vm_chain_locator = rel->rd_locator;
+	vm_chain_fork = fork;
+	vm_chain_block = block;
+	vm_chain_image = vm_chain_disk;
+	return vm_chain_read_buffer;
+}
+
+static void
+vm_chain_release(Buffer buffer)
+{
+	UT_ASSERT(!vm_locked);
+	UT_ASSERT(BufferIsValid(buffer));
+	vm_chain_releases++;
+}
+
+static void
+vm_chain_tag(Buffer buffer, RelFileLocator *locator, ForkNumber *fork, BlockNumber *block)
+{
+	UT_ASSERT(BufferIsValid(buffer));
+	*locator = vm_chain_locator;
+	*fork = vm_chain_fork;
+	*block = vm_chain_block;
+}
+
+static bool
+vm_chain_acquire(Buffer buffer)
+{
+	UT_ASSERT(BufferIsValid(buffer) && !vm_locked);
+	UT_ASSERT(ClusterSnapshotReadScope != NULL
+			  && ClusterSnapshotReadScope->snapshot == vm_expected);
+	if (vm_chain_error == 2)
+		siglongjmp(*PG_exception_stack, 1);
+	if (!vm_chain_grant)
+		return false;
+	vm_chain_grants++;
+	vm_locked = true;
+	vm_chain_image = vm_chain_current;
+	if (vm_chain_drift == 1)
+		vm_expected->read_scn++;
+	else if (vm_chain_drift == 2)
+		CurrentResourceOwner = (ResourceOwner)2;
+	else if (vm_chain_drift == 3) {
+		UnregisterSnapshot(vm_expected);
+		vm_chain_released = true;
+	} else if (vm_chain_drift == 4) vm_cap_cut++;
+	else if (vm_chain_drift == 5) vm_member_cut += 2;
+	else if (vm_chain_drift == 6) pg_atomic_write_u64(&horizon.self_admitted_epoch, 9);
+	else if (vm_chain_drift == 7) cluster_node_id = 2;
+	else if (vm_chain_drift == 8) vm_space_generation++;
+	else if (vm_chain_drift == 9) vm_space_relation->rd_isvalid = false;
+	else if (vm_chain_drift == 10) vm_space_relation->rd_id++;
+	else if (vm_chain_drift == 11) vm_space_relation->rd_locator.relNumber++;
+	return true;
+}
+
+static void
+vm_chain_unlock(Buffer buffer, int mode)
+{
+	UT_ASSERT(BufferIsValid(buffer) && vm_locked);
+	UT_ASSERT_EQ(mode, BUFFER_LOCK_UNLOCK);
+	vm_locked = false;
+	vm_chain_unlocks++;
+}
+
+#pragma push_macro("BufferGetPage")
+#undef BufferGetPage
+#define BufferGetPage(buf) ((void)(buf), (Page)vm_chain_image.data)
+#pragma push_macro("BufferGetBlockNumber")
+#undef BufferGetBlockNumber
+#define BufferGetBlockNumber(buf) ((void)(buf), vm_chain_block)
+#pragma push_macro("BufferGetTag")
+#undef BufferGetTag
+#define BufferGetTag vm_chain_tag
+#pragma push_macro("ReadBufferExtended")
+#undef ReadBufferExtended
+#define ReadBufferExtended vm_chain_read
+#pragma push_macro("ReleaseBuffer")
+#undef ReleaseBuffer
+#define ReleaseBuffer vm_chain_release
+#pragma push_macro("LockBuffer")
+#undef LockBuffer
+#define LockBuffer vm_chain_unlock
+#pragma push_macro("ClusterLockBufferShareBarrierAware")
+#undef ClusterLockBufferShareBarrierAware
+#define ClusterLockBufferShareBarrierAware vm_chain_acquire
+#pragma push_macro("RelationGetSmgr")
+#undef RelationGetSmgr
+#define RelationGetSmgr(rel) ((void)(rel), &vm_chain_smgr)
+#pragma push_macro("cluster_shared_config")
+#undef cluster_shared_config
+#define cluster_shared_config vm_shared
+#pragma push_macro("cluster_pcm_is_active")
+#undef cluster_pcm_is_active
+#define cluster_pcm_is_active() vm_chain_pcm
+#pragma push_macro("cluster_smgr_which_for")
+#undef cluster_smgr_which_for
+#define cluster_smgr_which_for(...) 1
+#pragma push_macro("cluster_space_relation_get_identity")
+#undef cluster_space_relation_get_identity
+#define cluster_space_relation_get_identity(rel, identity) ((void)(rel), (void)(identity), false)
+#pragma push_macro("cluster_space_init_vm_buffer_wal")
+#undef cluster_space_init_vm_buffer_wal
+#define cluster_space_init_vm_buffer_wal(identity, buf) ((void)(identity), (void)(buf), false)
+#pragma push_macro("vm_extend")
+#undef vm_extend
+#define vm_extend(...) (abort(), InvalidBuffer)
+#pragma push_macro("smgrexists")
+#undef smgrexists
+#define smgrexists(...) true
+#pragma push_macro("smgrnblocks")
+#undef smgrnblocks
+#define smgrnblocks(...) (abort(), 0)
+#pragma push_macro("LockBufferForVisibilityMapPageInit")
+#undef LockBufferForVisibilityMapPageInit
+#define LockBufferForVisibilityMapPageInit(buf) (abort(), (buf))
+#pragma push_macro("PageInit")
+#undef PageInit
+#define PageInit(...) abort()
+#pragma push_macro("CHECK_FOR_INTERRUPTS")
+#undef CHECK_FOR_INTERRUPTS
+#define CHECK_FOR_INTERRUPTS() ((void)0)
+#pragma push_macro("visibilitymap_read_begin")
+#undef visibilitymap_read_begin
+#define visibilitymap_read_begin vm_chain_read_begin
+#pragma push_macro("visibilitymap_read_end")
+#undef visibilitymap_read_end
+#define visibilitymap_read_end vm_chain_read_end
+#pragma push_macro("visibilitymap_get_status")
+#undef visibilitymap_get_status
+#define visibilitymap_get_status vm_chain_raw_status
+#pragma push_macro("visibilitymap_get_status_pinned")
+#undef visibilitymap_get_status_pinned
+#define visibilitymap_get_status_pinned vm_chain_pinned_status
+
+static Buffer vm_readbuf(Relation rel, BlockNumber block, bool extend);
+#include "test_cluster_vm_native_chain.inc"
+#pragma pop_macro("visibilitymap_get_status_pinned")
+#pragma pop_macro("visibilitymap_get_status")
+#pragma pop_macro("visibilitymap_read_end")
+#pragma pop_macro("visibilitymap_read_begin")
+#pragma pop_macro("CHECK_FOR_INTERRUPTS")
+#pragma pop_macro("PageInit")
+#pragma pop_macro("LockBufferForVisibilityMapPageInit")
+#pragma pop_macro("smgrnblocks")
+#pragma pop_macro("smgrexists")
+#pragma pop_macro("vm_extend")
+#pragma pop_macro("cluster_space_init_vm_buffer_wal")
+#pragma pop_macro("cluster_space_relation_get_identity")
+#pragma pop_macro("cluster_smgr_which_for")
+#pragma pop_macro("cluster_pcm_is_active")
+#pragma pop_macro("cluster_shared_config")
+#pragma pop_macro("RelationGetSmgr")
+#pragma pop_macro("ClusterLockBufferShareBarrierAware")
+#pragma pop_macro("LockBuffer")
+#pragma pop_macro("ReleaseBuffer")
+#pragma pop_macro("ReadBufferExtended")
+#pragma pop_macro("BufferGetTag")
+#pragma pop_macro("BufferGetBlockNumber")
+#pragma pop_macro("BufferGetPage")
+#undef MAPSIZE
+#undef HEAPBLOCKS_PER_BYTE
+#undef HEAPBLOCKS_PER_PAGE
+#undef HEAPBLK_TO_MAPBLOCK
+#undef HEAPBLK_TO_MAPBYTE
+#undef HEAPBLK_TO_OFFSET
+
+static void
+vm_chain_setup(RelationData *rel, FormData_pg_class *form, Snapshot snapshot)
+{
+	vm_setup(snapshot);
+	vm_chain_enabled = vm_chain_pcm = vm_chain_grant = true;
+	vm_chain_released = false;
+	vm_chain_drift = vm_chain_error = 0;
+	vm_chain_reads = vm_chain_grants = vm_chain_unlocks = vm_chain_releases = 0;
+	vm_chain_read_buffer = 1;
+	memset(rel, 0, sizeof(*rel));
+	memset(form, 0, sizeof(*form));
+	rel->rd_rel = form;
+	rel->rd_locator = (RelFileLocator){ 1663, 123, 456 };
+	rel->rd_id = 456;
+	rel->rd_isvalid = true;
+	vm_space_relation = rel;
+	form->relpersistence = RELPERSISTENCE_PERMANENT;
+	vm_chain_locator = rel->rd_locator;
+	vm_chain_fork = VISIBILITYMAP_FORKNUM;
+	vm_chain_block = 0;
+	memset(&vm_chain_smgr, 0, sizeof(vm_chain_smgr));
+	vm_chain_smgr.smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 2;
+	memset(&vm_chain_current, 0, sizeof(vm_chain_current));
+	((PageHeader)vm_chain_current.data)->pd_lower = MAXALIGN(SizeOfPageHeaderData);
+	((PageHeader)vm_chain_current.data)->pd_upper = BLCKSZ;
+	((PageHeader)vm_chain_current.data)->pd_special = BLCKSZ;
+	((PageHeader)vm_chain_current.data)->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	((PageHeader)vm_chain_current.data)->pd_block_scn = 17;
+	vm_chain_disk = vm_chain_image = vm_chain_current;
+	PageGetContents(vm_chain_disk.data)[0] = VISIBILITYMAP_VALID_BITS;
+}
+
+static void
+vm_chain_observe(Relation rel, BlockNumber block, Snapshot snapshot, Buffer *buffer,
+				 volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	vm_result = vm_caught = false;
+	PG_TRY();
+	{
+		vm_result = visibilitymap_read_snapshot_begin(rel, block, snapshot, buffer, scope, status);
+	}
+	PG_CATCH();
+	{
+		vm_caught = true;
+	}
+	PG_END_TRY();
+}
+
+static void
+vm_chain_finish(Snapshot snapshot, volatile VisibilityMapReadScope *scope)
+{
+	visibilitymap_read_end(scope);
+	vm_chain_enabled = vm_fixture = false;
+	CurrentResourceOwner = (ResourceOwner)1;
+	if (!vm_chain_released) {
+		snapshot->read_scn = 100;
+		UnregisterSnapshot(snapshot);
+	}
+}
+
+UT_TEST(vm_chain_native_snapshot_observes_current_bits_and_rechecks_reused_pin)
+{
+	Snapshot outer_snapshot = registered(90), snapshot = registered(100);
+	ClusterSnapshotReadScopeV1 outer;
+	RelationData rel;
+	FormData_pg_class form;
+	VisibilityMapReadScope scope = { 0 };
+	Buffer buffer = InvalidBuffer;
+	uint8 status = 77;
+
+	vm_chain_setup(&rel, &form, snapshot);
+	cluster_snapshot_read_enter_v1(&outer, outer_snapshot);
+	for (int visit = 0; visit < 3; visit++) {
+		PageGetContents(vm_chain_current.data)[0] = visit == 1 ? VISIBILITYMAP_VALID_BITS << 2 : 0;
+		vm_chain_observe(&rel, visit == 1 ? 1 : 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(vm_result && !vm_caught && vm_locked);
+		UT_ASSERT_EQ(status, visit == 1 ? VISIBILITYMAP_VALID_BITS : 0);
+		UT_ASSERT_EQ(vm_chain_reads, 1);
+		UT_ASSERT_EQ(vm_chain_grants, visit + 1);
+		UT_ASSERT_EQ(vm_admissions, visit + 1);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer && evidence(90, outer_snapshot));
+		UT_ASSERT_EQ(snapshot->regd_count, 1);
+		UT_ASSERT_EQ(snapshot->active_count, 0);
+		visibilitymap_read_end(&scope);
+		UT_ASSERT(!vm_locked && buffer == 1 && scope.locked_buffer == InvalidBuffer);
+	}
+	UT_ASSERT_EQ(vm_chain_unlocks, 3);
+	UT_ASSERT_EQ(PageGetContents(vm_chain_disk.data)[0], VISIBILITYMAP_VALID_BITS);
+	cluster_snapshot_read_exit_v1(&outer);
+	vm_chain_finish(snapshot, &scope);
+	UnregisterSnapshot(outer_snapshot);
+}
+
+UT_TEST(vm_chain_rebinds_exact_relation_fork_and_map_before_native_observation)
+{
+	for (int mismatch = 0; mismatch < 3; mismatch++) {
+		Snapshot snapshot = registered(100);
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = 1;
+		uint8 status = 77;
+
+		vm_chain_setup(&rel, &form, snapshot);
+		vm_chain_read_buffer = 2;
+		if (mismatch == 0)
+			vm_chain_locator.relNumber++;
+		else if (mismatch == 1)
+			vm_chain_fork = MAIN_FORKNUM;
+		else
+			vm_chain_block = 1;
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(vm_result && !vm_caught && vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(buffer, 2);
+		UT_ASSERT_EQ(scope.locked_buffer, 2);
+		UT_ASSERT_EQ(vm_chain_reads, 1);
+		UT_ASSERT_EQ(vm_chain_releases, 1);
+		UT_ASSERT_EQ(vm_chain_grants, 1);
+		UT_ASSERT(RelFileLocatorEquals(vm_chain_locator, rel.rd_locator));
+		UT_ASSERT_EQ(vm_chain_fork, VISIBILITYMAP_FORKNUM);
+		UT_ASSERT_EQ(vm_chain_block, 0);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		vm_chain_finish(snapshot, &scope);
+	}
+}
+
+UT_TEST(vm_chain_validates_actual_vm_image_and_keeps_absence_read_only)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		Snapshot snapshot = registered(100);
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_chain_setup(&rel, &form, snapshot);
+		if (variant == 0)
+			((PageHeader)vm_chain_current.data)->pd_block_scn = 0;
+		else if (variant == 1)
+			((PageHeader)vm_chain_current.data)->pd_special--;
+		else if (variant == 2)
+			PageGetContents(vm_chain_current.data)[0] = VISIBILITYMAP_ALL_FROZEN;
+		else if (variant == 3)
+			memset(&vm_chain_current, 0, sizeof(vm_chain_current));
+		else
+			vm_chain_smgr.smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT_EQ(vm_result, variant >= 3);
+		UT_ASSERT(!vm_caught);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_chain_reads, variant != 4);
+		UT_ASSERT_EQ(vm_chain_grants, variant != 4);
+		UT_ASSERT_EQ(vm_locked, variant == 3);
+		UT_ASSERT_EQ(vm_chain_unlocks, variant < 3);
+		UT_ASSERT_EQ(buffer, variant == 4 ? InvalidBuffer : 1);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		if (variant == 3)
+			UT_ASSERT_EQ(memcmp(vm_chain_image.data, vm_chain_current.data, BLCKSZ), 0);
+		vm_chain_finish(snapshot, &scope);
+	}
+}
+
+UT_TEST(vm_chain_respects_native_admission_and_coherent_grant_refusals)
+{
+	for (int refusal = 0; refusal < 4; refusal++) {
+		Snapshot snapshot = registered(100);
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_chain_setup(&rel, &form, snapshot);
+		if (refusal == 0)
+			self_member = CLUSTER_MEMBER_JOINING;
+		else if (refusal == 1)
+			peer_capable = false;
+		else if (refusal == 2)
+			vm_chain_pcm = false;
+		else
+			vm_chain_grant = false;
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result);
+		UT_ASSERT_EQ(vm_caught, refusal == 0);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_chain_reads, refusal == 3);
+		UT_ASSERT_EQ(vm_chain_grants, 0);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		/* Also clean any unexpected old controlled leaf ownership in RED. */
+		visibilitymap_read_end(&scope);
+		UT_ASSERT(!vm_locked);
+		vm_chain_finish(snapshot, &scope);
+		self_member = CLUSTER_MEMBER_MEMBER;
+		peer_capable = true;
+	}
+}
+
+UT_TEST(vm_chain_discards_native_snapshot_drift_and_restores_outer_on_io_errors)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		Snapshot outer_snapshot = registered(90), snapshot = registered(100);
+		ClusterSnapshotReadScopeV1 outer;
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = { 0 };
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_chain_setup(&rel, &form, snapshot);
+		vm_chain_drift = fault < 3 ? fault + 1 : 0;
+		vm_chain_error = fault < 3 ? 0 : fault - 2;
+		cluster_snapshot_read_enter_v1(&outer, outer_snapshot);
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_locked);
+		UT_ASSERT_EQ(vm_caught, fault >= 3);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_chain_reads, 1);
+		UT_ASSERT_EQ(vm_chain_grants, fault < 3);
+		UT_ASSERT_EQ(vm_chain_unlocks, fault < 3);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT_EQ(buffer, fault == 3 ? InvalidBuffer : 1);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer);
+		CurrentResourceOwner = (ResourceOwner)1;
+		UT_ASSERT(evidence(90, outer_snapshot));
+		visibilitymap_read_end(&scope);
+		cluster_snapshot_read_exit_v1(&outer);
+		vm_chain_finish(snapshot, &scope);
+		UnregisterSnapshot(outer_snapshot);
+	}
+}
+
+
+UT_TEST(vm_admission_cut_refuses_missing_or_changed_pre_acquire_identity)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		Snapshot snapshot = registered(100);
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = {0};
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+		vm_chain_setup(&rel, &form, snapshot);
+		if (variant == 0) vm_member_cut = 0;
+		else if (variant == 1) vm_cap_cut = 0;
+		else vm_admission_change = variant - 1;
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_caught && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_chain_reads + vm_chain_grants + vm_chain_unlocks, 0);
+		UT_ASSERT_EQ(vm_admissions, 1);
+		UT_ASSERT_EQ(buffer, InvalidBuffer);
+		UT_ASSERT(ClusterSnapshotReadScope == NULL);
+		vm_chain_finish(snapshot, &scope);
+	}
+}
+
+UT_TEST(vm_admission_cut_rejects_capability_membership_self_admission_and_node_drift)
+{
+	for (int drift = 4; drift <= 7; drift++) {
+		Snapshot original = registered(90), snapshot = registered(100);
+		ClusterSnapshotReadScopeV1 outer;
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = {0};
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+		vm_chain_setup(&rel, &form, snapshot);
+		PageGetContents(vm_chain_current.data)[0] = VISIBILITYMAP_VALID_BITS;
+		vm_chain_drift = drift;
+		cluster_snapshot_read_enter_v1(&outer, original);
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_caught && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_chain_reads, 1);
+		UT_ASSERT_EQ(vm_chain_grants, 1);
+		UT_ASSERT_EQ(vm_chain_unlocks, 1);
+		UT_ASSERT_EQ(vm_admissions, 1);
+		UT_ASSERT_EQ(buffer, 1);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer && evidence(90, original));
+		visibilitymap_read_end(&scope);
+		cluster_snapshot_read_exit_v1(&outer);
+		cluster_node_id = 1;
+		vm_chain_finish(snapshot, &scope);
+		UnregisterSnapshot(original);
+	}
+}
+
+
+UT_TEST(vm_space_identity_refuses_missing_or_failed_capture_before_vm_acquisition)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		Snapshot original = registered(90), snapshot = registered(100);
+		ClusterSnapshotReadScopeV1 outer;
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = {0};
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_chain_setup(&rel, &form, snapshot);
+		vm_space_available = fault != 0;
+		vm_space_error = fault == 1;
+		cluster_snapshot_read_enter_v1(&outer, original);
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && vm_caught == (fault == 1) && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_space_captures, 1);
+		UT_ASSERT_EQ(vm_space_checks, 0);
+		UT_ASSERT_EQ(vm_chain_reads + vm_chain_grants + vm_chain_unlocks, 0);
+		UT_ASSERT_EQ(buffer, InvalidBuffer);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer && evidence(90, original));
+		cluster_snapshot_read_exit_v1(&outer);
+		vm_chain_finish(snapshot, &scope);
+		UnregisterSnapshot(original);
+	}
+}
+
+UT_TEST(vm_space_identity_rejects_invalidation_and_relation_drift_during_grant)
+{
+	for (int drift = 8; drift <= 11; drift++) {
+		Snapshot original = registered(90), snapshot = registered(100);
+		ClusterSnapshotReadScopeV1 outer;
+		RelationData rel;
+		FormData_pg_class form;
+		VisibilityMapReadScope scope = {0};
+		Buffer buffer = InvalidBuffer;
+		uint8 status = 77;
+
+		vm_chain_setup(&rel, &form, snapshot);
+		vm_chain_drift = drift;
+		PageGetContents(vm_chain_current.data)[0] = VISIBILITYMAP_VALID_BITS;
+		cluster_snapshot_read_enter_v1(&outer, original);
+		vm_chain_observe(&rel, 0, snapshot, &buffer, &scope, &status);
+		UT_ASSERT(!vm_result && !vm_caught && !vm_locked);
+		UT_ASSERT_EQ(status, 0);
+		UT_ASSERT_EQ(vm_space_captures, 1);
+		UT_ASSERT_EQ(vm_space_checks, drift == 11 ? 0 : 1);
+		UT_ASSERT_EQ(vm_chain_reads, 1);
+		UT_ASSERT_EQ(vm_chain_grants, 1);
+		UT_ASSERT_EQ(vm_chain_unlocks, 1);
+		UT_ASSERT_EQ(scope.locked_buffer, InvalidBuffer);
+		UT_ASSERT_EQ(buffer, 1);
+		UT_ASSERT(ClusterSnapshotReadScope == &outer && evidence(90, original));
+		cluster_snapshot_read_exit_v1(&outer);
+		vm_chain_finish(snapshot, &scope);
+		UnregisterSnapshot(original);
+	}
+}
+
 int
 main(void)
 {
@@ -1110,7 +2068,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(122);
+	UT_PLAN(137);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1233,10 +2191,25 @@ main(void)
 	UT_RUN(survivor_backend_rejects_exit_after_leaf_sample_without_retiring_resources);
 	UT_RUN(survivor_backend_refuses_already_exiting_before_leaf_observation);
 	UT_RUN(survivor_backend_stable_original_owner_keeps_pin_and_snapshot_debt);
+	UT_RUN(vm_observation_binds_registered_snapshot_and_restores_outer_evaluator);
+	UT_RUN(vm_observation_refuses_unretained_or_unqualified_snapshot_before_vm);
+	UT_RUN(vm_observation_keeps_real_membership_and_peer_capability_admission);
+	UT_RUN(vm_observation_discards_snapshot_drift_after_vm_acquisition);
+	UT_RUN(vm_observation_unwinds_refusal_and_errors_to_the_original_outer_scope);
+	UT_RUN(vm_observation_preserves_active_vm_scope_and_native_observation);
+	UT_RUN(vm_chain_native_snapshot_observes_current_bits_and_rechecks_reused_pin);
+	UT_RUN(vm_chain_rebinds_exact_relation_fork_and_map_before_native_observation);
+	UT_RUN(vm_chain_validates_actual_vm_image_and_keeps_absence_read_only);
+	UT_RUN(vm_chain_respects_native_admission_and_coherent_grant_refusals);
+	UT_RUN(vm_chain_discards_native_snapshot_drift_and_restores_outer_on_io_errors);
+	UT_RUN(vm_admission_cut_refuses_missing_or_changed_pre_acquire_identity);
+	UT_RUN(vm_admission_cut_rejects_capability_membership_self_admission_and_node_drift);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
 	free(procArray);
+	UT_RUN(vm_space_identity_refuses_missing_or_failed_capture_before_vm_acquisition);
+	UT_RUN(vm_space_identity_rejects_invalidation_and_relation_drift_during_grant);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

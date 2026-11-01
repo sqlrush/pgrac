@@ -13,7 +13,18 @@
  */
 #include "postgres.h"
 
+#ifdef FIXTURE_NO_ASSERTS
+#undef USE_ASSERT_CHECKING
+#undef Assert
+#define Assert(condition) ((void)0)
+#undef AssertMacro
+#define AssertMacro(condition) ((void)0)
+#undef PG_USED_FOR_ASSERTS_ONLY
+#define PG_USED_FOR_ASSERTS_ONLY
+#endif
+
 #include "access/heapam.h"
+#include "access/hio.h"
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/visibilitymap.h"
@@ -22,11 +33,13 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
@@ -39,6 +52,42 @@
 #include "test_cluster_heap_maintenance_policy.inc"
 
 UT_DEFINE_GLOBALS();
+
+/* The actual AF decision now owns an exception-safe local read bracket.
+ * This publication fixture has no injected decoder ERROR; never fabricate a
+ * successful exception return. The dedicated local-read fixture exercises it. */
+static bool multi_loop_active;
+static sigjmp_buf multi_jump;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	if (multi_loop_active)
+		siglongjmp(multi_jump, 1);
+	abort();
+}
+
+/* Version/storage leaves run online; this is not recovered admission. */
+BackendType MyBackendType = B_BACKEND;
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return CLUSTER_NORMAL_START_TARGET_READY;
+}
+bool
+cluster_semantic_activation_phase1_pristine(void)
+{
+	return false;
+}
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return false;
+}
 
 bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog;
 int wal_level = WAL_LEVEL_REPLICA, NBuffers = 4, NLocBuffer, cluster_node_id = 0;
@@ -73,16 +122,253 @@ static bool confirming, spec_aborting;
 static bool multi_inserting;
 static unsigned vm_locks;
 static unsigned vm_shares;
-static bool vm_share_refused, vm_refresh_frozen;
+static bool vm_share_refused, vm_refresh_frozen, vm_exact_target;
+static unsigned vm_raw_reads;
+static int vm_refresh_invalid;
+
+/* Native-batch selection/transport scheduling only. The full original loop,
+ * tuple mutation, VM clear and version/WAL producer execute below. */
+static bool multi_heap_locked, multi_vm_locked;
+static bool multi_vm_pins[4];
+static int multi_refusals, multi_replacements, multi_change, multi_fault;
+static int multi_selector_calls, multi_aux_calls, multi_plain_waits, multi_releases;
+static int multi_context_starts, multi_target_page, multi_completed_pages;
+static int multi_refusal_page;
+static int multi_target_requests[16];
+static uint64 multi_r4 = 7;
+static bool multi_forbid_nested, multi_missing_writer, multi_same_vm;
+static unsigned multi_captures, multi_resumes, multi_resume_refusals, multi_writer_error;
+volatile sig_atomic_t InterruptPending;
+
+static bool multi_actual_vm_clear(Relation rel, BlockNumber heapblock, Buffer vmbuffer,
+								  uint8 flags);
+
+ResourceXWriterPath
+cluster_resource_x_writer_path_snapshot(uint64 *generation)
+{
+	UT_ASSERT(multi_loop_active);
+	*generation = multi_r4;
+	return RESOURCE_X_WRITER_TARGET;
+}
+
+static void
+multi_assert_unpublished(void)
+{
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(!multi_vm_locked);
+	UT_ASSERT_EQ(inserts, (unsigned)multi_completed_pages);
+	UT_ASSERT_EQ(vm_clears, (unsigned)multi_completed_pages);
+	UT_ASSERT_EQ(next_token, cluster_shared_config ? 100 + multi_completed_pages : 99);
+}
+
+void
+ReleaseBuffer(Buffer buffer)
+{
+	UT_ASSERT(multi_loop_active && (buffer == 2 || buffer == 4));
+	UT_ASSERT(multi_vm_pins[buffer - 1] && !multi_vm_locked);
+	multi_vm_pins[buffer - 1] = false;
+	multi_releases++;
+}
+
+void
+UnlockReleaseBuffer(Buffer buffer)
+{
+	UT_ASSERT(multi_loop_active && multi_heap_locked && !multi_vm_locked);
+	UT_ASSERT(buffer == 1 || buffer == 3);
+	multi_heap_locked = false;
+	if (inserts > (unsigned)multi_completed_pages) {
+		multi_completed_pages++;
+		multi_target_page = 1;
+	}
+}
+
+void
+ProcessInterrupts(void)
+{
+	UT_ASSERT(multi_loop_active && !multi_heap_locked && !multi_vm_locked);
+	UT_ASSERT(!multi_vm_pins[1] && !multi_vm_pins[3]);
+	multi_assert_unpublished();
+	InterruptPending = false;
+	elog(ERROR, "controlled multi-insert cancellation");
+}
+
+Buffer
+RelationGetBufferForTuple(Relation rel, Size len, Buffer *other, int options,
+						  BulkInsertState bistate, Buffer *vm, Buffer *other_vm, int num_pages)
+{
+	Buffer heap, map;
+
+	UT_ASSERT(multi_loop_active && rel == &relation_data && other == NULL);
+	UT_ASSERT(other_vm == NULL && bistate == NULL && len == tuple.t_len);
+	UT_ASSERT(!multi_heap_locked && !multi_vm_locked);
+	multi_assert_unpublished();
+	memset(dirty, 0, sizeof(dirty));
+	if (multi_selector_calls >= 16)
+		abort();
+	multi_target_requests[multi_selector_calls++] = num_pages;
+	if (multi_fault == 2 && multi_selector_calls > 1)
+		elog(ERROR, "controlled multi-insert target selection error");
+	heap = multi_target_page == 0 ? 1 : 3;
+	map = multi_same_vm ? 2 : heap + 1;
+	if (BufferIsValid(*vm) && *vm != map) {
+		ReleaseBuffer(*vm);
+		*vm = InvalidBuffer;
+	}
+	if ((PageIsAllVisible(pages[heap - 1].data) || (options & HEAP_INSERT_FROZEN))
+		&& !BufferIsValid(*vm)) {
+		multi_vm_pins[map - 1] = true;
+		*vm = map;
+	}
+	multi_heap_locked = true;
+	return heap;
+}
+
+void
+visibilitymap_set(Relation rel, BlockNumber heapblock, Buffer heap, XLogRecPtr recptr, Buffer vm,
+				  TransactionId cutoff, uint8 flags, const ClusterSpaceIdentity *space)
+{
+	UT_ASSERT(multi_loop_active && !cluster_shared_config && multi_heap_locked);
+	UT_ASSERT(rel == &relation_data && heapblock == BufferGetBlockNumber(heap));
+	UT_ASSERT(multi_vm_pins[vm - 1] && PageIsAllVisible(BufferGetPage(heap)));
+	UT_ASSERT_EQ(flags, VISIBILITYMAP_VALID_BITS);
+	UT_ASSERT(space == NULL && recptr == InvalidXLogRecPtr && cutoff == InvalidTransactionId);
+	pages[vm - 1].data[SizeOfPageHeaderData] |= flags;
+}
 
 void
 LockBuffer(Buffer buffer, int mode)
 {
+	if (multi_loop_active) {
+		UT_ASSERT((buffer == 2 || buffer == 4) && multi_vm_pins[buffer - 1]);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		if (mode == BUFFER_LOCK_EXCLUSIVE) {
+			UT_ASSERT(multi_heap_locked && !multi_vm_locked);
+			multi_plain_waits += cluster_shared_config;
+			multi_vm_locked = true;
+		} else {
+			UT_ASSERT(mode == BUFFER_LOCK_UNLOCK && multi_vm_locked);
+			multi_vm_locked = false;
+		}
+		return;
+	}
 	if (buffer != 2 || (mode != BUFFER_LOCK_EXCLUSIVE && mode != BUFFER_LOCK_UNLOCK)
 		|| CritSectionCount != 0)
 		abort();
 	if (mode == BUFFER_LOCK_EXCLUSIVE)
 		vm_locks++;
+}
+
+/* Existing publication cases use an already available VM writer.  The
+ * refusal/reobserve path runs in test_cluster_heap_lock_vm_pin. */
+bool
+ClusterLockBufferExclusiveAuxiliaryAliasAware(Buffer *buffer, Buffer *alias,
+											  const ClusterBufferBarrierSiteId *site,
+											  ResourceXAuxiliaryAcquireContext *context)
+{
+	UT_ASSERT(alias == NULL && site == NULL && context != NULL);
+	if (multi_loop_active && cluster_shared_config) {
+		BufferTag target;
+
+		if (multi_forbid_nested && multi_heap_locked)
+			elog(ERROR, "ordinary VM-X acquisition below heap content lock");
+		UT_ASSERT(!multi_vm_locked && multi_vm_pins[*buffer - 1]);
+		InitBufferTag(&target, &tags[*buffer - 1], forks[*buffer - 1], blocks[*buffer - 1]);
+		multi_aux_calls++;
+		multi_assert_unpublished();
+		if (!context->active) {
+			context->active = context->reobserve = true;
+			context->absolute_deadline_us = 4242;
+			context->resource = target;
+			context->r4_record_generation = 7;
+			multi_context_starts++;
+		} else {
+			UT_ASSERT_EQ(context->absolute_deadline_us, 4242);
+			if (!BufferTagsEqual(&context->resource, &target)
+				|| context->r4_record_generation != multi_r4)
+				elog(ERROR, "controlled exact-context refusal");
+		}
+		if (multi_refusals > 0 && multi_completed_pages == multi_refusal_page) {
+			multi_refusals--;
+			if (multi_replacements > 0) {
+				multi_replacements--;
+				ReleaseBuffer(*buffer);
+				*buffer = InvalidBuffer;
+			}
+			if (multi_change == 1)
+				PageClearAllVisible(pages[0].data);
+			if (multi_change >= 2)
+				multi_target_page = 1;
+			if (multi_change == 3)
+				context->caller.failed_attempt = 1;
+			if (multi_change == 4)
+				multi_r4++;
+			if (multi_fault == 1)
+				InterruptPending = true;
+			return false;
+		}
+		multi_vm_locked = true;
+		memset(context, 0, sizeof(*context));
+		return true;
+	}
+	LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+	memset(context, 0, sizeof(*context));
+	return true;
+}
+
+bool
+ClusterBufferCaptureMutationContext(Buffer buffer, ResourceXWriterUseContext *out,
+									uint64 *revision, bool *checked)
+{
+	UT_ASSERT(multi_loop_active && !multi_heap_locked && multi_vm_locked);
+	UT_ASSERT(multi_vm_pins[buffer - 1] && CritSectionCount == 0);
+	multi_captures++;
+	if (multi_writer_error == 1)
+		elog(ERROR, "controlled original VM writer capture error");
+	if (multi_missing_writer)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->writer_activation_token = 80 + buffer;
+	out->r4_record_generation = multi_r4;
+	*revision = 33;
+	*checked = true;
+	return true;
+}
+
+bool
+ClusterConditionalLockBufferWithMutationContext(Buffer buffer,
+		const ResourceXWriterUseContext *expected, uint64 revision, bool checked)
+{
+	/* These legacy cases start after writer preparation and cover only
+	 * capture/mutation/WAL. Require their exact controlled original writer;
+	 * acquisition, loss and error paths run in tuple_vm_authority. */
+	if (!multi_loop_active) {
+		if (buffer != 2 || expected->writer_activation_token != 82
+			|| expected->r4_record_generation != 7 || revision != 33 || !checked)
+			return false;
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		return true;
+	}
+	UT_ASSERT(multi_heap_locked && !multi_vm_locked);
+	UT_ASSERT(multi_vm_pins[buffer - 1] && CritSectionCount == 0);
+	multi_resumes++;
+	if (multi_writer_error == 2)
+		elog(ERROR, "controlled original VM writer resume error");
+	if (multi_resume_refusals != 0) {
+		multi_resume_refusals--;
+		return false;
+	}
+	if (expected->writer_activation_token != (uint64)(80 + buffer)
+		|| expected->r4_record_generation != multi_r4 || revision != 33 || !checked)
+		return false;
+	multi_vm_locked = true;
+	return true;
+}
+
+static void
+cluster_heap_vm_barrier_warm(Buffer *buffer, Buffer *alias,
+							 ResourceXAuxiliaryAcquireContext *context)
+{
+	abort(); /* The publication-only fixture must never simulate a retry. */
 }
 
 bool
@@ -95,7 +381,27 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 		return false;
 	if (vm_refresh_frozen)
 		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_VALID_BITS;
+	if (vm_refresh_invalid == 1)
+		((PageHeader)pages[1].data)->pd_block_scn = 0;
+	else if (vm_refresh_invalid == 2)
+		((PageHeader)pages[1].data)->pd_lower--;
+	else if (vm_refresh_invalid == 3)
+		tags[1].relNumber++;
 	return true;
+}
+
+/* Controlled scheduling/image leaves for the actual AF decision. The new
+ * cache-only entrance itself is exercised by test_cluster_vm_clear_local_read. */
+bool
+ClusterConditionalLockBufferShare(Buffer buffer)
+{
+	return ClusterLockBufferShareBarrierAware(buffer);
+}
+
+void
+ClusterUnlockBufferAfterConditionalRead(Buffer buffer)
+{
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 }
 
 void
@@ -227,6 +533,11 @@ visibilitymap_clear_locked(Relation rel, BlockNumber heapblock, Buffer vmbuffer,
 {
 	bool changed;
 
+	if (multi_loop_active) {
+		UT_ASSERT(multi_heap_locked && multi_vm_locked && multi_vm_pins[vmbuffer - 1]);
+		vm_clears++;
+		return multi_actual_vm_clear(rel, heapblock, vmbuffer, flags);
+	}
 	if (rel != &relation_data || (heapblock != blocks[0] && heapblock != blocks[2])
 		|| (vmbuffer != 2 && vmbuffer != 4)
 		|| flags
@@ -245,16 +556,32 @@ visibilitymap_clear_locked(Relation rel, BlockNumber heapblock, Buffer vmbuffer,
 bool
 visibilitymap_pin_ok(BlockNumber heapblock, Buffer buffer)
 {
+	if (vm_exact_target)
+		return (buffer == 2 || buffer == 4)
+			&& blocks[buffer - 1] == heapblock / ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) * 4);
 	return (heapblock == blocks[0] || heapblock == blocks[2]) && (buffer == 2 || buffer == 4);
 }
 
 uint8
 visibilitymap_get_status(Relation rel, BlockNumber heapblock, Buffer *buffer)
 {
+	vm_raw_reads++;
 	if (rel != &relation_data || !visibilitymap_pin_ok(heapblock, *buffer))
 		abort();
 	return pages[*buffer - 1].data[SizeOfPageHeaderData];
 }
+
+#define MAPSIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
+#define HEAPBLOCKS_PER_PAGE (MAPSIZE * 4)
+#define HEAPBLK_TO_MAPBLOCK(x) ((x) / HEAPBLOCKS_PER_PAGE)
+#define HEAPBLK_TO_MAPBYTE(x) (((x) % HEAPBLOCKS_PER_PAGE) / 4)
+#define HEAPBLK_TO_OFFSET(x) (((x) % 4) * 2)
+#include "test_cluster_vm_pinned_status.inc"
+#define visibilitymap_clear_locked multi_actual_vm_clear
+#include "test_cluster_heap_multi_clear.inc"
+#undef visibilitymap_clear_locked
+#include "test_cluster_heap_multi_helpers.inc"
+#include "test_cluster_heap_insert_vm_authority.inc"
 
 void
 cluster_pcm_vm_metric_note(const BufferTag *tag, PcmVmMetric metric)
@@ -290,6 +617,10 @@ XLogBeginInsert(void)
 {
 	if (begun || CritSectionCount == 0)
 		abort();
+	if (multi_loop_active) {
+		memset(registered, 0, sizeof(registered));
+		data_calls = edge_count = 0;
+	}
 	begun = true;
 }
 
@@ -301,7 +632,7 @@ XLogRegisterData(char *bytes, uint32 len)
 	if (data_calls++ == 0) {
 		if (multi_inserting) {
 			UT_ASSERT(len >= SizeOfHeapMultiInsert);
-			UT_ASSERT_EQ(((xl_heap_multi_insert *)bytes)->ntuples, 2);
+			UT_ASSERT_EQ(((xl_heap_multi_insert *)bytes)->ntuples, multi_loop_active ? 1 : 2);
 			heap_flags = ((xl_heap_multi_insert *)bytes)->flags;
 			return;
 		}
@@ -392,6 +723,8 @@ errstart(int elevel, const char *domain)
 	/* Native CRC dispatch logs its hardware choice on Linux. */
 	if (elevel == DEBUG1)
 		return false;
+	if (multi_loop_active && elevel >= ERROR)
+		return true;
 	printf("# Unexpected error level %d\n", elevel);
 	abort();
 }
@@ -400,21 +733,21 @@ int
 errmsg_internal(const char *fmt, ...)
 {
 	(void)fmt;
-	abort();
+	return 0;
 }
 
 int
 errmsg(const char *fmt, ...)
 {
 	(void)fmt;
-	abort();
+	return 0;
 }
 
 int
 errcode(int code)
 {
 	(void)code;
-	abort();
+	return 0;
 }
 
 void
@@ -423,6 +756,10 @@ errfinish(const char *file, int line, const char *func)
 	(void)file;
 	(void)line;
 	(void)func;
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	if (multi_loop_active)
+		siglongjmp(multi_jump, 1);
 	abort();
 }
 
@@ -495,6 +832,16 @@ reset(bool versioned, bool vm, bool bit_set)
 	RfPageProducerComponentV1 components[2];
 	int i;
 
+	multi_loop_active = multi_heap_locked = multi_vm_locked = false;
+	memset(multi_vm_pins, 0, sizeof(multi_vm_pins));
+	multi_refusals = multi_replacements = multi_change = multi_fault = 0;
+	multi_selector_calls = multi_aux_calls = multi_plain_waits = multi_releases = 0;
+	multi_context_starts = multi_target_page = multi_completed_pages = 0;
+	memset(multi_target_requests, 0, sizeof(multi_target_requests));
+	multi_r4 = 7;
+	multi_forbid_nested = multi_missing_writer = multi_same_vm = false;
+	multi_captures = multi_resumes = multi_resume_refusals = multi_writer_error = 0;
+	InterruptPending = false;
 	memset(pages, 0, sizeof(pages));
 	memset(images, 0, sizeof(images));
 	memset(&relform, 0, sizeof(relform));
@@ -864,6 +1211,8 @@ run_update(bool versioned, bool crosspage, int vm_mode, bool hot)
 	ItemIdData cluster_current_mx_new_line_pointer = { 0 };
 	bool cluster_page_versioned = versioned;
 	RfPageProducerBatchV1 cluster_page_versions = prepared;
+	/* Only the diagnostic field touched by this original WAL fragment. */
+	struct { XLogRecPtr wal_lsn; } cluster_update_trace = {0};
 
 	oldtup.t_data = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
 	(void)cluster_page_versioned;
@@ -1096,6 +1445,21 @@ run_tuple_lock(bool versioned, bool recomposed)
 	tuple_locking = false;
 }
 
+/* Explicit input to the legacy publication-only cases: the same original
+ * writer formerly supplied by their ordinary-X leaf. This does not exercise
+ * writer preparation; the dedicated tuple/chain fixture executes that path. */
+static ClusterHeapVmMutationState
+publication_vm_writer(void)
+{
+	ClusterHeapVmMutationState state = { 0 };
+
+	state.writer.writer_activation_token = 82;
+	state.writer.r4_record_generation = 7;
+	state.object_revision = 33;
+	state.object_checked = state.prepared = true;
+	return state;
+}
+
 static void
 run_chain_lock(bool versioned, bool itl)
 {
@@ -1107,6 +1471,8 @@ run_chain_lock(bool versioned, bool itl)
 	uint16 new_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, new_infomask2 = 0;
 	bool cleared_all_frozen = false, cluster_chain_lock_stamp = itl;
 	bool cluster_chain_vm_locked = want_vm, cluster_page_versioned = versioned;
+	ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
+	ClusterHeapVmMutationState cluster_chain_vm_state = publication_vm_writer();
 	ClusterSpaceIdentity cluster_page_identity = identity;
 	uint8 cluster_chain_slot_idx = 0;
 	SCN cluster_chain_write_scn = 811;
@@ -1126,6 +1492,9 @@ run_chain_lock(bool versioned, bool itl)
 	prepared = cluster_page_versions;
 #include "test_cluster_heap_chain_lock_version.inc"
 	chain_locking = false;
+	return;
+l4:
+	abort();
 }
 
 static void
@@ -1192,6 +1561,8 @@ UT_TEST(test_vm_clear_skip_requires_qualified_current_observation)
 {
 	for (int mode = 0; mode < 4; mode++) {
 		prepare_update(true, false, 1, true);
+		blocks[0] = 0;
+		vm_exact_target = true;
 		pages[1].data[SizeOfPageHeaderData]
 			= mode == 0 ? VISIBILITYMAP_VALID_BITS : VISIBILITYMAP_ALL_VISIBLE;
 		vm_locks = vm_shares = 0;
@@ -1202,7 +1573,7 @@ UT_TEST(test_vm_clear_skip_requires_qualified_current_observation)
 		UT_ASSERT_EQ(vm_locks, 0);
 		UT_ASSERT(!dirty[1]);
 	}
-	vm_share_refused = vm_refresh_frozen = false;
+	vm_share_refused = vm_refresh_frozen = vm_exact_target = false;
 }
 
 UT_TEST(test_legacy_lock_owners_keep_original_wal_shape)
@@ -1234,6 +1605,8 @@ UT_TEST(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm)
 			BlockNumber block = 0;
 			bool vm_locked = vm != 0, cluster_chain_vm_locked = owner == 2 ? false : vm != 0;
 			bool cluster_page_versioned = true;
+			ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
+			ClusterHeapVmMutationState cluster_chain_vm_state = publication_vm_writer();
 			ClusterSpaceIdentity cluster_page_identity;
 			RfPageProducerBatchV1 cluster_page_versions = { 0 };
 			PGAlignedBlock before[4];
@@ -1263,6 +1636,9 @@ UT_TEST(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm)
 				run_chain_lock(true, owner == 1);
 			check_lock_publication(vm != 0, vm == 1, owner != 2, false);
 		}
+	return;
+l4:
+	abort();
 }
 
 static void
@@ -1456,10 +1832,321 @@ UT_TEST(test_actual_multi_capture_leaves_both_pages_unchanged)
 	}
 }
 
+UT_TEST(test_vm_clear_skip_rejects_invalid_shared_current_image)
+{
+	for (int variant = 0; variant < 12; variant++) {
+		PageHeader header;
+
+		prepare_update(true, false, 1, true);
+		blocks[0] = 0;
+		vm_exact_target = true;
+		vm_share_refused = vm_refresh_frozen = false;
+		vm_refresh_invalid = 0;
+		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_ALL_VISIBLE;
+		header = (PageHeader)pages[1].data;
+		switch (variant) {
+		case 0:
+			header->pd_block_scn = 0;
+			break;
+		case 1:
+			header->pd_lower--;
+			break;
+		case 2:
+			header->pd_upper--;
+			break;
+		case 3:
+			header->pd_special--;
+			break;
+		case 4:
+			header->pd_prune_xid = FirstNormalTransactionId;
+			break;
+		case 5:
+			header->pd_flags |= PD_HAS_ITL;
+			break;
+		case 6:
+			header->pd_flags |= PD_UNDO_SEG_HEADER;
+			break;
+		case 7:
+			PageSetPageSizeAndVersion((Page)header, BLCKSZ, 0);
+			break;
+		case 8:
+			header->pd_flags = PD_LSN_ORIGIN_MASK;
+			break;
+		case 9:
+			memset(header, 0, SizeOfPageHeaderData);
+			break;
+		case 10:
+			header->pd_flags |= PD_SPACE_METADATA;
+			break;
+		case 11:
+			header->pd_lower = BLCKSZ;
+			break;
+		}
+		vm_locks = vm_shares = 0;
+		UT_ASSERT(cluster_heap_lock_vm_needs_clear(&relation_data, 0, 2));
+		UT_ASSERT_EQ(vm_shares, 1);
+		UT_ASSERT_EQ(vm_locks, 0);
+		UT_ASSERT(!dirty[1]);
+	}
+	vm_exact_target = false;
+}
+
+UT_TEST(test_vm_clear_skip_rejects_wrong_target_before_raw_read_or_grant)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		prepare_update(true, false, 1, true);
+		blocks[0] = 0;
+		vm_exact_target = true;
+		vm_share_refused = vm_refresh_frozen = false;
+		vm_refresh_invalid = 0;
+		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_ALL_VISIBLE;
+		switch (variant) {
+		case 0:
+			tags[1].spcOid++;
+			break;
+		case 1:
+			tags[1].dbOid++;
+			break;
+		case 2:
+			tags[1].relNumber++;
+			break;
+		case 3:
+			forks[1] = MAIN_FORKNUM;
+			break;
+		case 4:
+			blocks[1]++;
+			break;
+		}
+		vm_locks = vm_shares = vm_raw_reads = 0;
+		UT_ASSERT(cluster_heap_lock_vm_needs_clear(&relation_data, 0, 2));
+		UT_ASSERT_EQ(vm_raw_reads, 0);
+		UT_ASSERT_EQ(vm_shares, 0);
+		UT_ASSERT_EQ(vm_locks, 0);
+		UT_ASSERT(!dirty[1]);
+	}
+	vm_exact_target = false;
+}
+
+UT_TEST(test_vm_clear_skip_revalidates_image_after_current_grant)
+{
+	for (int variant = 1; variant <= 3; variant++) {
+		prepare_update(true, false, 1, true);
+		blocks[0] = 0;
+		vm_exact_target = true;
+		vm_share_refused = vm_refresh_frozen = false;
+		vm_refresh_invalid = variant;
+		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_ALL_VISIBLE;
+		vm_locks = vm_shares = 0;
+		UT_ASSERT(cluster_heap_lock_vm_needs_clear(&relation_data, 0, 2));
+		UT_ASSERT_EQ(vm_shares, 1);
+		UT_ASSERT_EQ(vm_locks, 0);
+		UT_ASSERT(!dirty[1]);
+	}
+	vm_refresh_invalid = 0;
+	vm_exact_target = false;
+}
+
+/* Whole original page loop; entry BIND/TOAST/ITL delegation is outside this
+ * focused seam. Physical target selection and remote outcomes are controlled. */
+static int multi_done, multi_pages_used;
+
+static void
+prepare_multi_loop(bool versioned, bool visible)
+{
+	reset(versioned, true, visible);
+	/* Controlled empty page occupancy gives exactly one tuple per page with
+	 * the reserve used below: 40 tuple bytes plus one four-byte line pointer. */
+	PageInit(pages[0].data, BLCKSZ, 0);
+	PageInit(pages[2].data, BLCKSZ, 0);
+	((PageHeader)pages[0].data)->pd_block_scn = 17;
+	((PageHeader)pages[2].data)->pd_block_scn = 41;
+	blocks[0] = 0;
+	blocks[2] = HEAPBLOCKS_PER_PAGE;
+	if (visible) {
+		PageSetAllVisible(pages[0].data);
+		PageSetAllVisible(pages[2].data);
+	}
+	pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_VALID_BITS;
+	pages[3].data[SizeOfPageHeaderData] = VISIBILITYMAP_VALID_BITS;
+	multi_loop_active = multi_inserting = true;
+	multi_done = multi_pages_used = multi_refusal_page = 0;
+}
+
+static void
+execute_multi_loop(int count, bool versioned, bool frozen)
+{
+	Relation relation = &relation_data;
+	Buffer vmbuffer = InvalidBuffer;
+	Page page;
+	HeapTupleData second = tuple;
+	HeapTuple heaptuples[2] = { &tuple, &second };
+	PGAlignedBlock scratch;
+	int ndone = 0, ntuples = count, npages = 0, npages_used = 0, i;
+	int options = frozen ? HEAP_INSERT_FROZEN : 0;
+	bool vm_locked, starting_with_empty_page = false;
+	bool needwal = true, need_cids = false, need_tuple_data = false;
+	BulkInsertState bistate = NULL;
+	Size saveFreeSpace = PageGetHeapFreeSpace(pages[0].data) - MAXALIGN(tuple.t_len);
+	bool cluster_page_versioned = versioned;
+	ClusterSpaceIdentity cluster_page_identity = identity;
+	RfPageProducerBatchV1 cluster_page_versions = { 0 };
+	ResourceXAuxiliaryAcquireContext cluster_vm_context pg_attribute_unused() = { 0 };
+#ifdef FIXTURE_HAS_INSERT_VM_STATE
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
+#endif
+
+#include "test_cluster_heap_multi_loop.inc"
+	multi_done = ndone;
+	multi_pages_used = npages_used;
+	if (BufferIsValid(vmbuffer))
+		ReleaseBuffer(vmbuffer);
+}
+
+static bool
+try_multi_loop(int count, bool versioned, bool frozen)
+{
+	if (sigsetjmp(multi_jump, 0) == 0) {
+		execute_multi_loop(count, versioned, frozen);
+		return true;
+	}
+	return false;
+}
+
+UT_TEST(test_multi_vm_refusal_reselects_before_any_batch_publication)
+{
+	for (int replace = 0; replace < 2; replace++) {
+		for (int refusal = 1; refusal <= 4; refusal += 3) {
+			prepare_multi_loop(true, true);
+			multi_refusals = refusal;
+			multi_replacements = replace ? refusal : 0;
+			UT_ASSERT(try_multi_loop(1, true, false));
+			UT_ASSERT_EQ(multi_plain_waits, 0);
+			UT_ASSERT_EQ(multi_selector_calls, refusal + 2);
+			UT_ASSERT_EQ(multi_aux_calls, refusal + 1);
+			UT_ASSERT_EQ(multi_context_starts, 1);
+			UT_ASSERT_EQ(multi_releases, refusal + 2);
+			UT_ASSERT_EQ(multi_done, 1);
+			UT_ASSERT_EQ(inserts, 1);
+			UT_ASSERT_EQ(vm_clears, 1);
+			UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 1);
+			UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 101);
+			UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 101);
+			UT_ASSERT_EQ(pages[1].data[SizeOfPageHeaderData], 0);
+			UT_ASSERT_EQ(pages[1].data[BLCKSZ - 1], 42);
+			UT_ASSERT(!multi_heap_locked && !multi_vm_locked && !multi_vm_pins[1]);
+		}
+	}
+	prepare_multi_loop(true, true);
+	multi_refusals = 4;
+	multi_change = 1; /* Current heap becomes non-visible during unlocked retry. */
+	UT_ASSERT(try_multi_loop(1, true, false));
+	UT_ASSERT_EQ(multi_selector_calls, 2);
+	UT_ASSERT_EQ(multi_aux_calls, 1);
+	UT_ASSERT_EQ(multi_plain_waits, 0);
+	UT_ASSERT_EQ(edge_count, 1);
+	UT_ASSERT_EQ(vm_clears, 0);
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 31);
+	UT_ASSERT_EQ(pages[1].data[SizeOfPageHeaderData], VISIBILITYMAP_VALID_BITS);
+}
+
+UT_TEST(test_multi_vm_retarget_preserves_or_rejects_original_context)
+{
+	for (int change = 2; change <= 4; change++) {
+		prepare_multi_loop(true, true);
+		multi_refusals = multi_replacements = 1;
+		multi_change = change;
+		UT_ASSERT(try_multi_loop(1, true, false) == (change == 2));
+		UT_ASSERT_EQ(multi_selector_calls, change == 2 ? 3 : 2);
+		UT_ASSERT_EQ(multi_plain_waits, 0);
+		UT_ASSERT_EQ(multi_aux_calls, 2);
+		UT_ASSERT_EQ(multi_context_starts, change == 2 ? 2 : 1);
+		UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 0);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 17);
+		if (change == 2) {
+			UT_ASSERT_EQ(inserts, 1);
+			UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[2].data), 1);
+			UT_ASSERT_EQ(edges[0].before.mutation_token, 41);
+			UT_ASSERT_EQ(edges[1].before.mutation_token, 61);
+			UT_ASSERT_EQ(((PageHeader)pages[2].data)->pd_block_scn, 101);
+			UT_ASSERT_EQ(((PageHeader)pages[3].data)->pd_block_scn, 101);
+		} else {
+			UT_ASSERT_EQ(inserts + vm_clears, 0);
+			UT_ASSERT_EQ(next_token, 100);
+			UT_ASSERT_EQ(CritSectionCount, 0);
+		}
+	}
+}
+
+UT_TEST(test_multi_vm_retries_do_not_advance_page_accounting)
+{
+	for (int refusal = 0; refusal <= 4; refusal++) {
+		prepare_multi_loop(true, true);
+		multi_refusal_page = 1;
+		multi_refusals = multi_replacements = refusal;
+		UT_ASSERT(try_multi_loop(2, true, false));
+		UT_ASSERT_EQ(multi_plain_waits, 0);
+		UT_ASSERT_EQ(multi_done, 2);
+		UT_ASSERT_EQ(multi_pages_used, 1);
+		UT_ASSERT_EQ(multi_selector_calls, 4 + refusal);
+		UT_ASSERT_EQ(multi_target_requests[0], 2);
+		for (int attempt = 1; attempt < multi_selector_calls; attempt++)
+			UT_ASSERT_EQ(multi_target_requests[attempt], attempt == 1 ? 2 : 1);
+		UT_ASSERT_EQ(inserts, 2);
+		UT_ASSERT_EQ(vm_clears, 2);
+		UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 1);
+		UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[2].data), 1);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 101);
+		UT_ASSERT_EQ(((PageHeader)pages[2].data)->pd_block_scn, 102);
+		UT_ASSERT(!multi_heap_locked && !multi_vm_locked);
+		UT_ASSERT(!multi_vm_pins[1] && !multi_vm_pins[3]);
+	}
+}
+
+UT_TEST(test_multi_vm_retry_cancel_or_selector_error_is_unpublished)
+{
+	for (int fault = 1; fault <= 2; fault++) {
+		prepare_multi_loop(true, true);
+		multi_refusals = multi_replacements = 1;
+		multi_fault = fault;
+		UT_ASSERT(!try_multi_loop(1, true, false));
+		UT_ASSERT_EQ(inserts + vm_clears, 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(multi_plain_waits, 0);
+		UT_ASSERT(!multi_heap_locked && !multi_vm_locked);
+		UT_ASSERT(!multi_vm_pins[1] && !multi_vm_pins[3]);
+		UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 0);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 17);
+		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 31);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
+UT_TEST(test_multi_native_and_frozen_controls_keep_the_original_batch)
+{
+	for (int frozen = 0; frozen < 2; frozen++) {
+		prepare_multi_loop(false, frozen == 0);
+		multi_refusals = 4;
+		UT_ASSERT(try_multi_loop(1, false, frozen != 0));
+		UT_ASSERT_EQ(multi_selector_calls, 1);
+		UT_ASSERT_EQ(multi_aux_calls, 0);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(edge_count, 0);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 17);
+		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 31);
+		UT_ASSERT(!multi_heap_locked && !multi_vm_locked);
+		UT_ASSERT(!multi_vm_pins[1] && !multi_vm_pins[3]);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(34);
+	UT_RUN(test_multi_vm_refusal_reselects_before_any_batch_publication);
+	UT_RUN(test_multi_vm_retarget_preserves_or_rejects_original_context);
+	UT_RUN(test_multi_vm_retries_do_not_advance_page_accounting);
+	UT_RUN(test_multi_vm_retry_cancel_or_selector_error_is_unpublished);
+	UT_RUN(test_multi_native_and_frozen_controls_keep_the_original_batch);
 	UT_RUN(test_native_multi_versions_actual_batch);
 	UT_RUN(test_nonshared_multi_keeps_native_wal_shape);
 	UT_RUN(test_actual_multi_capture_leaves_both_pages_unchanged);
@@ -1486,6 +2173,9 @@ main(void)
 	UT_RUN(test_speculative_abort_versions_original_super_delete);
 	UT_RUN(test_legacy_speculative_owners_keep_existing_tokens);
 	UT_RUN(test_actual_speculative_captures_leave_page_unchanged);
+	UT_RUN(test_vm_clear_skip_rejects_invalid_shared_current_image);
+	UT_RUN(test_vm_clear_skip_rejects_wrong_target_before_raw_read_or_grant);
+	UT_RUN(test_vm_clear_skip_revalidates_image_after_current_grant);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

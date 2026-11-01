@@ -101,7 +101,7 @@ UT_TEST(test_foreign_mx_samples_exact_connection_generation)
 
 UT_TEST(test_foreign_mx_format_and_loaded_catalog_are_exact)
 {
-	const uint32 wrong_catalogs[] = { 0, UINT32_C(202610220), CATALOG_VERSION_NO + 1 };
+	const uint32 wrong_catalogs[] = { 0, UINT32_C(202610220), UINT32_C(202611010), CATALOG_VERSION_NO + 1 };
 	uint32 generation;
 	unsigned i;
 

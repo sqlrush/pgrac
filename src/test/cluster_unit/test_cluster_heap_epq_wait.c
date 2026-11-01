@@ -2,6 +2,7 @@
 /* Real, extracted heapam_tuple_lock consumer; only external boundaries are stubs. */
 #include "postgres.h"
 #include "access/heapam.h"
+#include "access/visibilitymap.h"
 #include "access/genam.h"
 #include "access/relscan.h"
 #include "access/htup_details.h"
@@ -36,6 +37,7 @@ int NLocBuffer = 0;
 int old_snapshot_threshold = -1;
 bool cluster_enabled;
 int cluster_node_id = 0;
+#include "test_cluster_heap_maintenance_policy.inc"
 char *BufferBlocks = (char *)fetch_pages;
 Block *LocalBufferBlockPointers;
 static bool content_locked;
@@ -43,6 +45,22 @@ static int proved_entry_calls, dispatch_entry_calls;
 static bool replace_on_unlock;
 static bool replace_on_lock;
 static bool scan_lifetime_case;
+/* Lifetime/EPQ fixtures have no qualified catalog or snapshot admission.
+ * Qualified heap PD consumers run the actual helpers in their own fixture. */
+void
+cluster_heap_page_visibility_prepare(Relation relation, BlockNumber block,
+	Snapshot snapshot, ClusterHeapPageVisibility *observation)
+{
+	memset(observation, 0, sizeof(*observation));
+}
+
+bool
+cluster_heap_page_all_visible(Relation relation, Buffer buffer, Page page,
+	Snapshot snapshot, const ClusterHeapPageVisibility *observation)
+{
+	return false;
+}
+
 volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount;
 volatile uint32 CritSectionCount;
@@ -192,6 +210,7 @@ void
 pg_re_throw(void)
 {
 	errfinish(__FILE__, __LINE__, __func__);
+	abort();
 }
 bool
 TransactionIdIsCurrentTransactionId(TransactionId xid)
@@ -650,6 +669,10 @@ check_locked_output_lifetime(bool replace)
 	LockBuffer(selected, BUFFER_LOCK_SHARE);
 	/* Actual common row-lock exit. The verdict itself is an external
 	 * boundary: this witness tests its bytes across content unlock. */
+	if (false)
+		goto out_locked;
+	if (false)
+		goto out_unlocked;
 #include "test_cluster_heap_lock_output.inc"
 	UT_ASSERT(!content_locked);
 	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(tuple->t_data), 900);
@@ -717,6 +740,8 @@ UT_TEST(test_compatible_self_lock_keeps_owned_output_after_unlock)
 	ItemPointerSet(&tuple->t_self, 41, 2);
 	LockBuffer(selected, BUFFER_LOCK_EXCLUSIVE);
 	replace_on_unlock = true;
+	if (false)
+		goto out_locked;
 #include "test_cluster_heap_lock_self.inc"
 	UT_ASSERT(false); /* The actual compatible-self branch must return early. */
 #include "test_cluster_heap_lock_output.inc"
@@ -729,6 +754,15 @@ UT_TEST(test_compatible_self_lock_keeps_owned_output_after_unlock)
 	(void)skip_tuple_lock;
 }
 
+/* This fixture exercises tuple relocation with no VM page. The dedicated
+ * row-lock VM fixture executes the original repin body and pin boundaries. */
+void
+cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber block, Buffer buffer, Buffer *vm)
+{
+	UT_ASSERT(vm != NULL && !BufferIsValid(*vm));
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+}
+
 #include "test_cluster_heap_lock_rebind.inc"
 
 UT_TEST(test_lock_reacquisition_resolves_same_tid_after_relocation)
@@ -739,6 +773,7 @@ UT_TEST(test_lock_reacquisition_resolves_same_tid_after_relocation)
 	HeapTupleData value = { 0 };
 	HeapTuple tuple = &value;
 	Buffer selected, *buffer = &selected;
+	Buffer vmbuffer = InvalidBuffer;
 	TransactionId creation_xmin = 900;
 	Page page;
 	ItemId lp;
@@ -946,6 +981,15 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, Snapsh
 	/* The bitmap witness uses the actual lossy branch; HOT has its own suite. */
 	UT_ASSERT(false);
 	return false;
+}
+
+bool
+cluster_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+	Snapshot snapshot, HeapTuple tuple, const ClusterHeapPageVisibility *observation)
+{
+	/* This existing lifetime fixture has no qualified catalog. */
+	(void)observation;
+	return heap_hot_search_buffer(tid, relation, buffer, snapshot, tuple, NULL, true);
 }
 
 static bool SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer, HeapTuple tuple,

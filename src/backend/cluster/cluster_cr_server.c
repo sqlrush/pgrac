@@ -73,6 +73,7 @@
 #include "cluster/cluster_lms.h"	   /* PGRAC: spec-7.3 D8 per-worker serve counters */
 #include "cluster/cluster_lms_shard.h" /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_multixact_range.h"
 #include "cluster/cluster_mxid_stripe.h" /* cluster_mxid_is_mine (spec-7.1 D3-b) */
 #include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_semantic_activation.h"
@@ -4303,6 +4304,43 @@ cluster_cr_server_test_current_mx_build_proof_page(
 														 proof_count, updater_proof, page);
 }
 #endif
+
+void
+cluster_gcs_current_mx_range_serve_inline(const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterMxRangeRequest request;
+	ClusterMxRangeRoute route;
+	ClusterMxRangeResponse *response;
+	BufferTag tag;
+	MemoryContext old;
+	uint32 bytes = 0;
+
+	if (env == NULL || payload == NULL || env->payload_length != sizeof(request)
+		|| env->dest_node_id != (uint32)cluster_node_id || !cluster_gcs_block_family_on_data_plane()
+		|| !cluster_mx_range_transport_route(payload, env->payload_length, env->msg_type, &route, &tag)
+		|| env->source_node_id != (uint32)route.requester_node
+		|| cluster_ic_tier1_my_data_channel() != cluster_lms_shard_for_tag(&tag, cluster_lms_workers))
+		return;
+	memcpy(&request, payload, sizeof(request));
+	old = MemoryContextSwitchTo(cr_serve_scratch_context());
+	response = palloc0(sizeof(*response));
+	PG_TRY();
+	{
+		if (cluster_mx_range_serve(&request, response, sizeof(*response), &bytes))
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+				route.requester_node, response, bytes);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cr_serve_scratch_context());
+		FlushErrorState();
+		if (cluster_mx_range_refuse(&request, GetControlFileCatalogVersion(), response, sizeof(*response), &bytes))
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, route.requester_node, response, bytes);
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(CrServeScratchCtx);
+}
 
 /* Spec-3.6b: the MXID origin enumerates its own immutable member list and
  * returns one typed page.  Every validation, fence or connection doubt is a

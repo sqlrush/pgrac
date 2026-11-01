@@ -713,7 +713,11 @@
 /* Target FULL CR diagnostic entry (oid 8980). Fresh homogeneous initdb only. */
 /* PGRAC: complete foreign-MultiXact and identity-only registry reservations.
  * Fresh homogeneous databases only; no in-place or rolling format upgrade. */
-#define CATALOG_VERSION_NO 202611010
+/* Current-MX V6 carries the original FullXid through every grant proof. */
+#define CATALOG_VERSION_NO 202611011
+
+/* Shared VM qualification remains unassigned in this integration batch. */
+#define PGRAC_VM_QUALIFIED_CATALOG_VERSION 0
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

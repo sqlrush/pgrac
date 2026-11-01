@@ -88,8 +88,9 @@ static void
 space_identity_invalidate(Datum arg, Oid relid)
 {
 	Assert(space_identity_cache != NULL);
-	if (++space_identity_invalidations == 0)
+	if (space_identity_invalidations == UINT64_MAX)
 		elog(ERROR, "SPACE identity invalidation counter exhausted");
+	space_identity_invalidations++;
 	if (OidIsValid(relid))
 		hash_search(space_identity_cache, &relid, HASH_REMOVE, NULL);
 	else {
@@ -125,6 +126,16 @@ space_identity_key_matches(const ClusterSpaceIdentityKey *a, const ClusterSpaceI
 		   && a->database_incarnation == b->database_incarnation
 		   && memcmp(a->storage_uuid, b->storage_uuid, sizeof(a->storage_uuid)) == 0
 		   && RelFileLocatorEquals(a->locator, b->locator);
+}
+
+static bool
+space_namespace_source_matches(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
+{
+	return cluster_control_root_identity_equal(&a->claim.identity, &b->claim.identity)
+		   && a->claim.database_incarnation == b->claim.database_incarnation
+		   && a->claim.max_config_generation == b->claim.max_config_generation
+		   && memcmp(a->claim.claim_sha256, b->claim.claim_sha256, sizeof(a->claim.claim_sha256)) == 0
+		   && a->timeline == b->timeline;
 }
 
 static bool
@@ -348,6 +359,83 @@ cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out
 		*out = identity;
 		return true;
 	}
+}
+
+bool
+cluster_space_relation_identity_capture_v1(Relation relation, ClusterSpaceIdentityObservationV1 *out)
+{
+	ClusterSpaceIdentityObservationV1 candidate;
+	RelFileLocator locator;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (relation == NULL || relation->rd_rel == NULL)
+		return false;
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.relid = RelationGetRelid(relation);
+	locator = relation->rd_locator;
+	if (!cluster_wal_thread_current_v2_ref(&candidate.namespace_source)
+		|| !cluster_space_relation_get_identity(relation, &candidate.identity))
+		return false;
+	candidate.invalidations = space_identity_invalidations;
+	if (!RelFileLocatorEquals(locator, candidate.identity.key.locator)
+		|| !cluster_space_relation_identity_current_v1(relation, &candidate))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+bool
+cluster_space_relation_identity_cached_capture_v1(Relation relation,
+												const ClusterSpaceIdentity *identity,
+												ClusterSpaceIdentityObservationV1 *out)
+{
+	ClusterSpaceIdentityObservationV1 candidate;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (relation == NULL || relation->rd_rel == NULL || identity == NULL)
+		return false;
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.identity = *identity;
+	candidate.relid = RelationGetRelid(relation);
+	candidate.invalidations = space_identity_invalidations;
+	if (!cluster_wal_thread_current_v2_ref(&candidate.namespace_source)
+		|| !cluster_space_relation_identity_current_v1(relation, &candidate))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+bool
+cluster_space_relation_identity_current_v1(Relation relation,
+										 const ClusterSpaceIdentityObservationV1 *expected)
+{
+	SpaceIdentityCacheEntry *entry;
+	ClusterWalSourceRef current;
+
+	if (relation == NULL || relation->rd_rel == NULL || !relation->rd_isvalid
+		|| expected == NULL || !OidIsValid(expected->relid)
+		|| RelationGetRelid(relation) != expected->relid
+		|| !RelFileLocatorEquals(relation->rd_locator, expected->identity.key.locator)
+		|| expected->identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+		|| expected->invalidations == UINT64_MAX
+		|| expected->invalidations != space_identity_invalidations || space_identity_cache == NULL)
+		return false;
+	if (!cluster_wal_thread_current_v2_ref(&current)
+		|| !space_namespace_source_matches(&current, &expected->namespace_source)
+		|| current.claim.identity.system_identifier != expected->identity.key.system_identifier
+		|| current.claim.database_incarnation != expected->identity.key.database_incarnation
+		|| memcmp(current.claim.identity.storage_uuid, expected->identity.key.storage_uuid, 16) != 0)
+		return false;
+	entry = hash_search(space_identity_cache, &expected->relid, HASH_FIND, NULL);
+	return entry != NULL && space_identity_key_matches(&entry->identity.key, &expected->identity.key)
+		   && memcmp(entry->identity.incarnation, expected->identity.incarnation, 16) == 0
+		   && entry->identity.sequence == expected->identity.sequence
+		   && entry->identity.operation == expected->identity.operation
+		   && entry->identity.state == expected->identity.state;
 }
 
 static bool

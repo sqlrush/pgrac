@@ -47,12 +47,58 @@
 #include "utils/rel.h"
 #include "unit_test.h"
 
+#include "test_cluster_space_identity_observation_available.inc"
+#ifndef FIXTURE_HAS_SPACE_IDENTITY_OBSERVATION
+/* Parent has an unguarded identity cache, without an operation observation. */
+typedef struct ClusterSpaceIdentityObservationV1 {
+	ClusterSpaceIdentity identity;
+	uint64 invalidations;
+	Oid relid;
+} ClusterSpaceIdentityObservationV1;
+#endif
+
+#ifndef FIXTURE_HAS_SPACE_IDENTITY_OBSERVATION
+static bool
+parent_identity_capture(Relation rel, ClusterSpaceIdentityObservationV1 *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (rel == NULL || rel->rd_rel == NULL)
+		return false;
+	out->relid = RelationGetRelid(rel);
+	return cluster_space_relation_get_identity(rel, &out->identity);
+}
+static bool
+parent_identity_current(Relation rel, const ClusterSpaceIdentityObservationV1 *expected)
+{
+	return rel != NULL && expected != NULL;
+}
+#define cluster_space_relation_identity_capture_v1 parent_identity_capture
+#define cluster_space_relation_identity_current_v1 parent_identity_current
+#endif
+
+#include "test_cluster_space_namespace_identity_equal.inc"
+
+#ifndef FIXTURE_HAS_SPACE_CACHED_OBSERVATION
+/* Parent has no memory-only capture of the original caller identity. */
+static bool
+parent_identity_cached_capture(Relation rel, const ClusterSpaceIdentity *identity,
+							   ClusterSpaceIdentityObservationV1 *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+#define cluster_space_relation_identity_cached_capture_v1 parent_identity_cached_capture
+#endif
+
 UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA;
-BackendType MyBackendType = B_BACKEND;
 int NBuffers = 1, NLocBuffer;
+BackendType MyBackendType = B_BACKEND;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile sig_atomic_t InterruptPending;
@@ -73,6 +119,8 @@ static ClusterWalSourceRef ref;
 static ClusterSpaceIdentity disk_identity;
 static unsigned exists_calls, size_calls, read_calls;
 static bool pinned, locked, recovering, have_ref, have_space, invalidate_on_release;
+static bool namespace_change_on_release;
+static unsigned namespace_calls;
 volatile uint32 CritSectionCount;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
@@ -444,6 +492,7 @@ RecoveryInProgress(void)
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
+	namespace_calls++;
 	*out = ref;
 	return have_ref;
 }
@@ -535,6 +584,10 @@ UnlockReleaseBuffer(Buffer buffer)
 	if (buffer != 1 || !pinned || !locked)
 		abort();
 	pinned = locked = false;
+	if (namespace_change_on_release) {
+		namespace_change_on_release = false;
+		ref.claim.identity.origin_owner_incarnation++;
+	}
 	if (invalidate_on_release) {
 		invalidate_on_release = false;
 		disk_identity.incarnation[0] = 0x67;
@@ -647,6 +700,8 @@ setup(void)
 	exists_calls = size_calls = read_calls = 0;
 	pinned = locked = false;
 	recovering = invalidate_on_release = false;
+	namespace_change_on_release = false;
+	namespace_calls = 0;
 	have_ref = have_space = true;
 }
 
@@ -1324,10 +1379,251 @@ UT_TEST(test_fsm_truncate_fpi_keeps_rebuildable_class)
 		}
 	}
 }
+
+UT_TEST(test_identity_observation_captures_cold_and_hot_original_cache_without_pointer_borrow)
+{
+	ClusterSpaceIdentityObservationV1 first, second, saved;
+	unsigned reads;
+
+	setup();
+	UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &first));
+	UT_ASSERT_EQ(read_calls, 1);
+	UT_ASSERT(!pinned && !locked);
+	UT_ASSERT_EQ(first.relid, RelationGetRelid(&relation_data));
+	UT_ASSERT_EQ(first.identity.sequence, disk_identity.sequence);
+	UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &second));
+	UT_ASSERT_EQ(read_calls, 1);
+	saved = first;
+	reads = read_calls;
+	/* Only the local current getter is permitted in this held-content window. */
+	pinned = locked = true;
+	UT_ASSERT(cluster_space_relation_identity_current_v1(&relation_data, &first));
+	UT_ASSERT(cluster_space_relation_identity_current_v1(&relation_data, &second));
+	UT_ASSERT(memcmp(&first, &saved, sizeof(first)) == 0);
+	UT_ASSERT_EQ(read_calls, reads);
+	pinned = locked = false;
+}
+
+UT_TEST(test_identity_observation_invalidation_and_same_identity_refill_retires_old_guard)
+{
+	ClusterSpaceIdentityObservationV1 old, fresh;
+	unsigned reads;
+
+	setup();
+	UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &old));
+	invalidate(invalidate_arg, RelationGetRelid(&relation_data));
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &old));
+	UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &fresh));
+	UT_ASSERT_EQ(read_calls, 2);
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &old));
+	UT_ASSERT(cluster_space_relation_identity_current_v1(&relation_data, &fresh));
+	old = fresh;
+	reads = read_calls;
+	invalidate(invalidate_arg, RelationGetRelid(&relation_data) + 1);
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &old));
+	UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &fresh));
+	UT_ASSERT_EQ(read_calls, reads);
+	UT_ASSERT(cluster_space_relation_identity_current_v1(&relation_data, &fresh));
+	invalidate(invalidate_arg, InvalidOid);
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &fresh));
+	UT_ASSERT_EQ(read_calls, reads);
+}
+
+UT_TEST(test_identity_observation_matches_every_native_identity_field_without_refetch)
+{
+	ClusterSpaceIdentityObservationV1 original, changed;
+	unsigned reads;
+
+	setup();
+	UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &original));
+	reads = read_calls;
+	for (int field = 0; field < 11; field++) {
+		changed = original;
+		switch (field) {
+		case 0: changed.relid++; break;
+		case 1: changed.invalidations++; break;
+		case 2: changed.identity.key.system_identifier++; break;
+		case 3: changed.identity.key.database_incarnation++; break;
+		case 4: changed.identity.key.storage_uuid[0]++; break;
+		case 5: changed.identity.key.locator.relNumber++; break;
+		case 6: changed.identity.incarnation[0]++; break;
+		case 7: changed.identity.sequence++; break;
+		case 8: changed.identity.operation++; break;
+		case 9: changed.identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED; break;
+		case 10: changed.invalidations = UINT64_MAX; break;
+		}
+		UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &changed));
+	}
+	relation_data.rd_isvalid = false;
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &original));
+	relation_data.rd_isvalid = true;
+	relation_data.rd_id++;
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &original));
+	relation_data.rd_id--;
+	relation_data.rd_locator.relNumber++;
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &original));
+	relation_data.rd_locator.relNumber--;
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(NULL, &original));
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, NULL));
+	UT_ASSERT(cluster_space_relation_identity_current_v1(&relation_data, &original));
+	UT_ASSERT_EQ(read_calls, reads);
+}
+
+UT_TEST(test_identity_observation_capture_refusal_zeroes_output_and_keeps_original_cache_rules)
+{
+	ClusterSpaceIdentityObservationV1 observation, zero = {0};
+
+	setup();
+	memset(&observation, 0x55, sizeof(observation));
+	have_space = false;
+	UT_ASSERT(!cluster_space_relation_identity_capture_v1(&relation_data, &observation));
+	UT_ASSERT(memcmp(&observation, &zero, sizeof(zero)) == 0);
+	UT_ASSERT_EQ(read_calls, 0);
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &zero));
+	have_space = true;
+	UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &observation));
+	UT_ASSERT(!pinned && !locked);
+	memset(&observation, 0x55, sizeof(observation));
+	have_ref = false;
+	UT_ASSERT(!cluster_space_relation_identity_capture_v1(&relation_data, &observation));
+	UT_ASSERT(memcmp(&observation, &zero, sizeof(zero)) == 0);
+	UT_ASSERT(!cluster_space_relation_identity_capture_v1(&relation_data, NULL));
+	memset(&observation, 0x55, sizeof(observation));
+	UT_ASSERT(!cluster_space_relation_identity_capture_v1(NULL, &observation));
+	UT_ASSERT(memcmp(&observation, &zero, sizeof(zero)) == 0);
+	UT_ASSERT_EQ(read_calls, 1);
+}
+
+
+UT_TEST(test_identity_namespace_current_refuses_unavailable_or_replaced_database_key)
+{
+	for (int field = 0; field < 4; field++) {
+		ClusterSpaceIdentityObservationV1 observation, saved;
+		unsigned reads;
+
+		setup();
+		UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &observation));
+		saved = observation;
+		reads = read_calls;
+		switch (field) {
+		case 0: have_ref = false; break;
+		case 1: ref.claim.identity.system_identifier++; break;
+		case 2: ref.claim.database_incarnation++; break;
+		case 3: ref.claim.identity.storage_uuid[0]++; break;
+		}
+		pinned = locked = true;
+		UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &observation));
+		UT_ASSERT(memcmp(&observation, &saved, sizeof(saved)) == 0);
+		UT_ASSERT_EQ(read_calls, reads);
+		pinned = locked = false;
+	}
+}
+
+UT_TEST(test_identity_namespace_current_matches_complete_same_key_published_source)
+{
+	for (int field = 0; field < 12; field++) {
+		ClusterSpaceIdentityObservationV1 observation;
+		unsigned reads;
+
+		setup();
+		UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &observation));
+		reads = read_calls;
+		switch (field) {
+		case 0: ref.claim.identity.authority_uuid[0]++; break;
+		case 1: ref.claim.identity.origin_thread_id++; break;
+		case 2: ref.claim.identity.origin_node_id++; break;
+		case 3: ref.claim.identity.thread_claim_created_at++; break;
+		case 4: ref.claim.identity.thread_claim_crc32c++; break;
+		case 5: ref.claim.identity.origin_owner_incarnation++; break;
+		case 6: ref.claim.identity.root_lineage_seq++; break;
+		case 7: ref.claim.max_config_generation++; break;
+		case 8: ref.claim.claim_sha256[0]++; break;
+		case 9: ref.timeline++; break;
+		case 10: ref.claim.identity.reserved42 = 1; break;
+		case 11: ref.claim.identity.reserved60 = 1; break;
+		}
+		pinned = locked = true;
+		UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &observation));
+		UT_ASSERT_EQ(read_calls, reads);
+		pinned = locked = false;
+	}
+}
+
+UT_TEST(test_identity_namespace_capture_keeps_original_source_across_cold_space_read)
+{
+	ClusterSpaceIdentityObservationV1 observation, zero = {0};
+
+	setup();
+	namespace_change_on_release = true;
+	memset(&observation, 0x55, sizeof(observation));
+	UT_ASSERT(!cluster_space_relation_identity_capture_v1(&relation_data, &observation));
+	UT_ASSERT(memcmp(&observation, &zero, sizeof(zero)) == 0);
+	UT_ASSERT_EQ(read_calls, 1);
+	UT_ASSERT(!pinned && !locked);
+	UT_ASSERT_EQ(ref.claim.identity.origin_owner_incarnation, 1);
+	UT_ASSERT(!namespace_change_on_release);
+	/* The next operation may capture the new source, without a free refetch. */
+	UT_ASSERT(cluster_space_relation_identity_capture_v1(&relation_data, &observation));
+	UT_ASSERT(cluster_space_relation_identity_current_v1(&relation_data, &observation));
+	UT_ASSERT_EQ(read_calls, 1);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_identity_cached_capture_retains_exact_input_under_content_without_io)
+{
+	ClusterSpaceIdentity input;
+	ClusterSpaceIdentityObservationV1 observation, saved;
+
+	setup();
+	UT_ASSERT(cluster_space_relation_get_identity(&relation_data, &input));
+	pinned = locked = true;
+	UT_ASSERT(cluster_space_relation_identity_cached_capture_v1(&relation_data, &input, &observation));
+	UT_ASSERT(memcmp(&observation.identity, &input, sizeof(input)) == 0);
+	UT_ASSERT(cluster_space_relation_identity_current_v1(&relation_data, &observation));
+	saved = observation;
+	invalidate(invalidate_arg, RelationGetRelid(&relation_data));
+	UT_ASSERT(!cluster_space_relation_identity_current_v1(&relation_data, &observation));
+	UT_ASSERT(memcmp(&observation, &saved, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(read_calls, 1);
+	UT_ASSERT(pinned && locked);
+	pinned = locked = false;
+}
+
+UT_TEST(test_identity_cached_capture_refuses_missing_stale_and_invalid_inputs_without_io)
+{
+	for (int reason = 0; reason < 8; reason++) {
+		ClusterSpaceIdentity input;
+		ClusterSpaceIdentityObservationV1 observation, zero = {0};
+		unsigned reads;
+
+		setup();
+		input = disk_identity;
+		if (reason != 0)
+			UT_ASSERT(cluster_space_relation_get_identity(&relation_data, &input));
+		switch (reason) {
+		case 1: invalidate(invalidate_arg, RelationGetRelid(&relation_data)); break;
+		case 2: input.sequence++; break;
+		case 3: input.incarnation[0]++; break;
+		case 4: have_ref = false; break;
+		case 5: relation_data.rd_isvalid = false; break;
+		}
+		reads = read_calls;
+		pinned = locked = true;
+		memset(&observation, 0x55, sizeof(observation));
+		UT_ASSERT(!cluster_space_relation_identity_cached_capture_v1(
+			reason == 6 ? NULL : &relation_data, reason == 7 ? NULL : &input, &observation));
+		UT_ASSERT(memcmp(&observation, &zero, sizeof(zero)) == 0);
+		UT_ASSERT(!cluster_space_relation_identity_cached_capture_v1(&relation_data, &input, NULL));
+		UT_ASSERT_EQ(read_calls, reads);
+		UT_ASSERT(pinned && locked);
+		pinned = locked = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(34);
 	UT_RUN(test_insert_allocation_and_delete_share_one_identity_read);
 	UT_RUN(test_targeted_invalidation_reloads_new_incarnation);
 	UT_RUN(test_unrelated_invalidation_preserves_hit_global_reset_drops_it);
@@ -1353,6 +1649,15 @@ main(void)
 	UT_RUN(test_fsm_truncate_fpi_keeps_rebuildable_class);
 	UT_RUN(test_terminal_census_invalidated_update_identity_stays_unapplied);
 	UT_RUN(test_terminal_census_original_update_preflight_requalifies_after_invalidation);
+	UT_RUN(test_identity_observation_captures_cold_and_hot_original_cache_without_pointer_borrow);
+	UT_RUN(test_identity_observation_invalidation_and_same_identity_refill_retires_old_guard);
+	UT_RUN(test_identity_observation_matches_every_native_identity_field_without_refetch);
+	UT_RUN(test_identity_observation_capture_refusal_zeroes_output_and_keeps_original_cache_rules);
+	UT_RUN(test_identity_namespace_current_refuses_unavailable_or_replaced_database_key);
+	UT_RUN(test_identity_namespace_current_matches_complete_same_key_published_source);
+	UT_RUN(test_identity_namespace_capture_keeps_original_source_across_cold_space_read);
+	UT_RUN(test_identity_cached_capture_retains_exact_input_under_content_without_io);
+	UT_RUN(test_identity_cached_capture_refuses_missing_stale_and_invalid_inputs_without_io);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

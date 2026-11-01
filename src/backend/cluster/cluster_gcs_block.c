@@ -62,6 +62,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_membership.h" /* spec-5.16 D3b — is_member master-side gate */
 #include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_multixact_range.h"
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_reconfig.h"		/* QVOTEC-observed live peer incarnation */
@@ -149,7 +150,8 @@
 typedef enum ClusterGcsBlockReplyDomain {
 	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE = 0,
 	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR = 1,
-	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX = 2
+	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX = 2,
+	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_FULL_MX = 3
 } ClusterGcsBlockReplyDomain;
 
 /* M4 Candidate-2 remote origin work is process-local and bounded.  The
@@ -363,8 +365,9 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 
 StaticAssertDecl(CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE == 0
 					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR == 1
-					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX == 2,
-				 "GCS block reply domain must remain the closed 0/1/2 set");
+					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX == 2
+					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_FULL_MX == 3,
+				 "GCS block reply domains must remain disjoint");
 StaticAssertDecl(offsetof(ClusterGcsBlockOutstandingSlot, reply_domain) == 1,
 				 "GCS block reply domain must consume byte-1 slot padding");
 StaticAssertDecl(offsetof(ClusterGcsBlockOutstandingSlot, request_id) == 8,
@@ -1239,7 +1242,8 @@ gcs_block_try_reserve_current_mx_slot(const ClusterCurrentMxKey *key, uint64 req
 	if (key == NULL || out_request_id == NULL || MyBackendId <= 0 || MyBackendId > MaxBackends
 		|| expected_origin_node < 0 || expected_origin_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| (expected_reply_status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
-			&& expected_reply_status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT))
+			&& expected_reply_status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+			&& expected_reply_status != CLUSTER_MX_RANGE_RESPONSE_KIND))
 		return NULL;
 	blk = gcs_block_my_block();
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
@@ -1258,7 +1262,8 @@ gcs_block_try_reserve_current_mx_slot(const ClusterCurrentMxKey *key, uint64 req
 	memset(&slot->reply_header, 0, sizeof(slot->reply_header));
 	memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
 	slot->in_use = true;
-	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX;
+	slot->reply_domain = expected_reply_status == CLUSTER_MX_RANGE_RESPONSE_KIND
+		? CLUSTER_GCS_BLOCK_REPLY_DOMAIN_FULL_MX : CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX;
 	slot->request_id = gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1, sequence);
 	slot->transition_id = 0;
 	slot->tag = GcsBlockCurrentMxRouteTagMake(slot->request_id, request_epoch, cluster_node_id,
@@ -6016,6 +6021,88 @@ cluster_gcs_local_master_read_source_and_wait(BufferDesc *buf, const PcmAuthorit
  * page only into the caller's scratch buffer.  A transported status 25
  * closes that attempt before a bounded fresh-id retry; status 26 closes the
  * operation without retry or caller-page mutation. */
+bool
+cluster_gcs_current_mx_range_fetch_and_wait(ClusterMxRangeRequest *request,
+	ClusterMxRangeResponse *response, uint32 *bytes)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterMxRangeRoute route;
+	BufferTag tag;
+	uint32 generation = 0;
+	uint64 request_id = 0;
+	bool received = false;
+	int worker;
+
+	if (bytes != NULL) *bytes = 0;
+	if (response == NULL || bytes == NULL || request == NULL) return false;
+	memset(response, 0, sizeof(*response));
+	if (request->key.origin_node_id == cluster_node_id || request->route.epoch != cluster_epoch_get_current()
+		|| request->route.requester_node != cluster_node_id || request->route.requester_backend != MyBackendId
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| !cluster_sf_peer_foreign_mx_capability_sample_v1(request->key.origin_node_id,
+			CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1,
+			GetControlFileCatalogVersion(), &generation) || generation != request->peer_generation)
+		return false;
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_try_reserve_current_mx_slot(&request->key, request->route.epoch,
+		request->key.origin_node_id, CLUSTER_MX_RANGE_RESPONSE_KIND, &request_id);
+	if (slot == NULL) return false;
+	blk = gcs_block_my_block();
+	PG_TRY();
+	{
+		request->route.request_id = request_id;
+		cluster_mx_range_request_seal(request);
+		if (cluster_mx_range_transport_route(request, sizeof(*request), PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &route, &tag)) {
+			LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+			memcpy(slot->reply_block_data, request, sizeof(*request));
+			LWLockRelease(&blk->lock.lock);
+			worker = cluster_lms_shard_for_tag(&tag, cluster_lms_workers);
+			if (worker >= 0 && cluster_lms_outbound_enqueue_cap_bound(worker, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+				request->key.origin_node_id, request, sizeof(*request), CLUSTER_FOREIGN_MX_REQUIRED_CAPABILITIES, generation)) {
+				ConditionVariablePrepareToSleep(&slot->reply_cv);
+				for (;;) {
+					bool stale;
+					LWLockAcquire(&blk->lock.lock, LW_SHARED);
+					received = slot->in_use && !slot->stale && slot->reply_received;
+					stale = !slot->in_use || slot->stale;
+					if (received) {
+						memcpy(&response->route, &slot->reply_header, sizeof(response->route));
+						memcpy(response->data.data, slot->reply_block_data, BLCKSZ);
+					}
+					LWLockRelease(&blk->lock.lock);
+					if (received || stale || request->route.epoch != cluster_epoch_get_current()
+						|| !cluster_sf_peer_foreign_mx_capability_matches_v1(request->key.origin_node_id,
+							CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1,
+							GetControlFileCatalogVersion(), generation)) break;
+					CHECK_FOR_INTERRUPTS();
+					/* Diagnostic wake only; ordinary waiting never becomes a SQL timeout. */
+					(void)ConditionVariableTimedSleep(&slot->reply_cv, 100, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+				}
+				ConditionVariableCancelSleep();
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		ConditionVariableCancelSleep();
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	gcs_block_release_slot(slot);
+	if (!received || !cluster_mx_range_transport_route(response, response->route.wire_bytes,
+		PGRAC_IC_MSG_GCS_BLOCK_REPLY, &route, &tag)
+		|| route.request_id != request_id || route.epoch != cluster_epoch_get_current()
+		|| !cluster_sf_peer_foreign_mx_capability_matches_v1(request->key.origin_node_id,
+			CLUSTER_FOREIGN_MX_FORMAT_ID_V1, CLUSTER_FOREIGN_MX_FORMAT_VERSION_V1,
+			GetControlFileCatalogVersion(), generation)) {
+		memset(response, 0, sizeof(*response)); return false;
+	}
+	*bytes = route.wire_bytes;
+	return true;
+}
+
 ClusterMxDescribeResult
 cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterCurrentMxKey *key,
 											   ClusterCurrentMxMemberDesc *members,
@@ -9557,12 +9644,15 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 				|| cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)
 				return false;
 			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], ctrc_grant);
-			if (!cluster_multixact_current_member_proof_bind_ctrc(&context->current_mx_proofs[i],
-																  &ctrc_key))
+			if (!cluster_multixact_current_member_proof_bind_origin_v2(&context->current_mx_proofs[i],
+				&ctrc_key, &context->current_mx_requester_identity))
 				return false;
 			context->current_mx_ctrc_keys[i] = ctrc_key;
-		} else
+		} else {
 			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], 0);
+			memset(context->current_mx_proofs[i].origin_fullxid_v2, 0,
+				   sizeof(context->current_mx_proofs[i].origin_fullxid_v2));
+		}
 		context->current_mx_sampled_bitmap |= (uint8)(1U << i);
 	}
 	if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
@@ -22366,6 +22456,40 @@ gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *env, const void *payload)
 	return true;
 }
 
+static bool
+gcs_block_try_land_full_mx_reply(const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterMxRangeRoute route;
+	ClusterGcsBlockBackendBlock *blk;
+	BufferTag tag;
+
+	if (env == NULL || !cluster_mx_range_transport_candidate(payload, env->payload_length, env->msg_type)) return false;
+	if (env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
+		|| !cluster_mx_range_transport_route(payload, env->payload_length, env->msg_type, &route, &tag)
+		|| route.requester_node != cluster_node_id || env->dest_node_id != (uint32)cluster_node_id
+		|| route.requester_backend > MaxBackends || gcs_block_backend_blocks == NULL) return true;
+	blk = &gcs_block_backend_blocks[route.requester_backend - 1];
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[i];
+		if (!slot->in_use || slot->request_id != route.request_id) continue;
+		if (slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_FULL_MX
+			&& slot->expected_reply_status == CLUSTER_MX_RANGE_RESPONSE_KIND
+			&& !slot->reply_received && !slot->stale && slot->direct_state == GCS_BLOCK_DIRECT_UNARMED
+			&& !slot->direct_target_prepared && slot->request_epoch == route.epoch
+			&& slot->expected_master_node == (int32)env->source_node_id) {
+			memcpy(&slot->reply_header, &route, sizeof(route));
+			memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+			memcpy(slot->reply_block_data, (const char *)payload + sizeof(route), route.wire_bytes - sizeof(route));
+			slot->reply_received = true;
+			ConditionVariableBroadcast(&slot->reply_cv);
+		}
+		break;
+	}
+	LWLockRelease(&blk->lock.lock);
+	return true;
+}
+
 /* Current-MX statuses 27/28 have the same outer 48+BLCKSZ carriage as legacy
  * replies, but a disjoint slot domain and typed Spec-3.6b bodies.  Consume
  * every current-MX candidate here so it can never alias the legacy decoder. */
@@ -22614,6 +22738,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	bool trace_enabled;
 	GcsReadImageHopTrace trace;
 
+	if (gcs_block_try_land_full_mx_reply(env, payload))
+		return;
 	if (gcs_block_try_resource_x_frame(env, payload))
 		return;
 	if (gcs_block_try_land_ctrc_reply(env, payload))
@@ -23728,6 +23854,10 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 * only by the read-image branch below; inactive otherwise). */
 	ClusterXpScope xp_fwd_ship = { .active = false };
 
+	if (env != NULL && cluster_mx_range_transport_candidate(payload, env->payload_length, env->msg_type)) {
+		cluster_gcs_current_mx_range_serve_inline(env, payload);
+		return;
+	}
 	if (gcs_block_try_ctrc_forward136(env, payload))
 		return;
 	if (gcs_block_try_current_mx_forward128(env, payload))

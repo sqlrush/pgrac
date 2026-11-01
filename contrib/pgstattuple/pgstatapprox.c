@@ -34,6 +34,7 @@
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/snapmgr.h"
 
 PG_FUNCTION_INFO_V1(pgstattuple_approx);
 PG_FUNCTION_INFO_V1(pgstattuple_approx_v1_5);
@@ -55,6 +56,38 @@ typedef struct output_type
 } output_type;
 
 #define NUM_OUTPUT_COLUMNS 10
+
+/* Finish the shared VM decision before any FSM or heap acquisition. */
+static bool
+statapprox_vm_all_visible(Relation rel, BlockNumber block, Buffer *vmbuffer)
+{
+	Snapshot snapshot;
+	volatile VisibilityMapReadScope scope = {0};
+	uint8 status = 0;
+	bool visible = false;
+
+	if (!cluster_heap_maintenance_restricted(rel))
+		return VM_ALL_VISIBLE(rel, block, vmbuffer);
+
+	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
+	PG_TRY();
+	{
+		if (visibilitymap_read_qualified_begin(rel, block, snapshot, vmbuffer,
+											 &scope, &status))
+			visible = (status & VISIBILITYMAP_ALL_VISIBLE) != 0;
+	}
+	PG_FINALLY();
+	{
+		visibilitymap_read_end(&scope);
+		if (BufferIsValid(*vmbuffer))
+		{
+			ReleaseBuffer(*vmbuffer);
+			*vmbuffer = InvalidBuffer;
+		}
+	}
+	PG_END_TRY();
+	return visible;
+}
 
 /*
  * This function takes an already open relation and scans its pages,
@@ -96,9 +129,7 @@ statapprox_heap(Relation rel, output_type *stat)
 		 * If the page has only visible tuples, then we can find out the free
 		 * space from the FSM and move on.
 		 */
-		/* PGRAC: raw VM positives cannot skip shared heap inspection. */
-		if (!cluster_heap_maintenance_restricted(rel) &&
-			VM_ALL_VISIBLE(rel, blkno, &vmbuffer))
+		if (statapprox_vm_all_visible(rel, blkno, &vmbuffer))
 		{
 			freespace = GetRecordedFreeSpace(rel, blkno);
 			stat->tuple_len += BLCKSZ - freespace;

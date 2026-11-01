@@ -32,6 +32,7 @@
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -42,6 +43,8 @@ static bool fixture_deleting;
 static unsigned fixture_kept;
 static unsigned fixture_prepare, fixture_execute, fixture_should, fixture_vm_reads;
 WalUsage pgWalUsage;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
 
 /* Only fields consumed by the unchanged production predicate are needed. */
 typedef struct LVRelState
@@ -218,6 +221,44 @@ visibilitymap_get_status(Relation rel, BlockNumber block, Buffer *buf)
 void
 vacuum_delay_point(void)
 {
+}
+
+/* This predicate fixture has no owned maintenance snapshot. Exercise the
+ * original shared helper with a refusing read leaf; qualified reads and scope
+ * errors are covered by test_cluster_vm_vacuum_skip. */
+bool
+ActiveSnapshotSet(void)
+{
+	return false;
+}
+
+Snapshot
+GetActiveSnapshot(void)
+{
+	abort();
+}
+
+bool
+visibilitymap_read_qualified_begin(Relation rel, BlockNumber block, Snapshot snapshot,
+								   Buffer *buffer, volatile VisibilityMapReadScope *scope,
+									   uint8 *status)
+{
+	(void)rel; (void)block; (void)buffer;
+	UT_ASSERT(snapshot == NULL && scope->locked_buffer == InvalidBuffer);
+	*status = 0;
+	return false;
+}
+
+void
+visibilitymap_read_end(volatile VisibilityMapReadScope *scope)
+{
+	UT_ASSERT(scope->locked_buffer == InvalidBuffer);
+}
+
+void
+pg_re_throw(void)
+{
+	abort();
 }
 
 #include "test_cluster_heap_maintenance.inc"

@@ -133,11 +133,12 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 					   get_relkind_objtype(rel->rd_rel->relkind),
 					   RelationGetRelationName(rel));
 
-	/* PGRAC: installed repair extensions must respect the runtime freeze gate. */
-	if (heap_force_opt == HEAP_FORCE_FREEZE && cluster_heap_maintenance_restricted(rel))
+	/* Both repairs bypass shared transaction history and heap/VM version
+	 * publication. Reject before reading or locking any target block. */
+	if (cluster_heap_maintenance_restricted(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("forced freezing is not supported for shared heaps"),
+				 errmsg("heap surgery is not supported for shared heaps"),
 				 errhint("Use ordinary VACUUM for supported shared heap maintenance.")));
 
 	tids = ((ItemPointer) ARR_DATA_PTR(ta));

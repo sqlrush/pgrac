@@ -59,6 +59,23 @@ static bool tuple_all_visible(HeapTuple tup, TransactionId OldestXmin,
 							  Buffer buffer);
 static void check_relation_relkind(Relation rel);
 
+/* Copy diagnostic bits without holding up a shared VM holder during heap I/O. */
+static int32
+visibilitymap_get_status_for_report(Relation rel, BlockNumber blkno,
+									Buffer *vmbuffer)
+{
+	int32		mapbits = (int32) visibilitymap_get_status(rel, blkno, vmbuffer);
+
+	if (cluster_heap_maintenance_restricted(rel) && BufferIsValid(*vmbuffer))
+	{
+		Buffer		buffer = *vmbuffer;
+
+		*vmbuffer = InvalidBuffer;
+		ReleaseBuffer(buffer);
+	}
+	return mapbits;
+}
+
 /*
  * Visibility map information for a single block of a relation.
  *
@@ -90,7 +107,7 @@ pg_visibility_map(PG_FUNCTION_ARGS)
 
 	tupdesc = pg_visibility_tupdesc(false, false);
 
-	mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+	mapbits = visibilitymap_get_status_for_report(rel, blkno, &vmbuffer);
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 	values[0] = BoolGetDatum((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0);
@@ -131,7 +148,7 @@ pg_visibility(PG_FUNCTION_ARGS)
 
 	tupdesc = pg_visibility_tupdesc(false, true);
 
-	mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+	mapbits = visibilitymap_get_status_for_report(rel, blkno, &vmbuffer);
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 	values[0] = BoolGetDatum((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0);
@@ -280,7 +297,7 @@ pg_visibility_map_summary(PG_FUNCTION_ARGS)
 		CHECK_FOR_INTERRUPTS();
 
 		/* Get map info. */
-		mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+		mapbits = visibilitymap_get_status_for_report(rel, blkno, &vmbuffer);
 		if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
 			++all_visible;
 		if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
@@ -513,7 +530,7 @@ collect_visibility_data(Oid relid, bool include_pd)
 		CHECK_FOR_INTERRUPTS();
 
 		/* Get map info. */
-		mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
+		mapbits = visibilitymap_get_status_for_report(rel, blkno, &vmbuffer);
 		if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
 			info->bits[blkno] |= (1 << 0);
 		if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
@@ -573,11 +590,13 @@ collect_corrupt_items(Oid relid, bool all_visible, bool all_frozen)
 	Buffer		vmbuffer = InvalidBuffer;
 	BufferAccessStrategy bstrategy = GetAccessStrategy(BAS_BULKREAD);
 	TransactionId OldestXmin = InvalidTransactionId;
+	bool		shared_vm;
 
 	rel = relation_open(relid, AccessShareLock);
 
 	/* Only some relkinds have a visibility map */
 	check_relation_relkind(rel);
+	shared_vm = cluster_heap_maintenance_restricted(rel);
 
 	if (all_visible)
 		OldestXmin = GetOldestNonRemovableTransactionId(rel);
@@ -600,21 +619,35 @@ collect_corrupt_items(Oid relid, bool all_visible, bool all_frozen)
 	/* Loop over every block in the relation. */
 	for (blkno = 0; blkno < nblocks; ++blkno)
 	{
-		bool		check_frozen = false;
-		bool		check_visible = false;
+		bool		check_frozen;
+		bool		check_visible;
+		Buffer		recent_vm = InvalidBuffer;
+		BlockNumber vmblock = InvalidBlockNumber;
 		Buffer		buffer;
 		Page		page;
 		OffsetNumber offnum,
 					maxoff;
 
-		/* Make sure we are interruptible. */
+retry_visibility:
+		/* Make sure we are interruptible, including after a failed local pin. */
 		CHECK_FOR_INTERRUPTS();
+		check_frozen = false;
+		check_visible = false;
 
 		/* Use the visibility map to decide whether to check this page. */
 		if (all_frozen && VM_ALL_FROZEN(rel, blkno, &vmbuffer))
 			check_frozen = true;
 		if (all_visible && VM_ALL_VISIBLE(rel, blkno, &vmbuffer))
 			check_visible = true;
+
+		/* Do not carry a shared VM pin into heap I/O or the next block. */
+		if (shared_vm && BufferIsValid(vmbuffer))
+		{
+			recent_vm = vmbuffer;
+			vmblock = BufferGetBlockNumber(recent_vm);
+			vmbuffer = InvalidBuffer;
+			ReleaseBuffer(recent_vm);
+		}
 		if (!check_visible && !check_frozen)
 			continue;
 
@@ -622,6 +655,19 @@ collect_corrupt_items(Oid relid, bool all_visible, bool all_frozen)
 		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
 									bstrategy);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+
+		/* Never cold-read the VM while holding the heap content lock. */
+		if (shared_vm)
+		{
+			if (!BufferIsValid(recent_vm) ||
+				!ReadRecentBuffer(rel->rd_locator, VISIBILITYMAP_FORKNUM,
+								  vmblock, recent_vm))
+			{
+				UnlockReleaseBuffer(buffer);
+				goto retry_visibility;
+			}
+			vmbuffer = recent_vm;
+		}
 
 		page = BufferGetPage(buffer);
 		maxoff = PageGetMaxOffsetNumber(page);
@@ -634,6 +680,15 @@ collect_corrupt_items(Oid relid, bool all_visible, bool all_frozen)
 			check_frozen = false;
 		if (check_visible && !VM_ALL_VISIBLE(rel, blkno, &vmbuffer))
 			check_visible = false;
+
+		/* The copied raw bits suffice for the remaining diagnostic checks. */
+		if (shared_vm && BufferIsValid(vmbuffer))
+		{
+			Buffer		old_vm = vmbuffer;
+
+			vmbuffer = InvalidBuffer;
+			ReleaseBuffer(old_vm);
+		}
 		if (!check_visible && !check_frozen)
 		{
 			UnlockReleaseBuffer(buffer);

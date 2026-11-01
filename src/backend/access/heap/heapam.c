@@ -63,6 +63,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
+#include "catalog/catversion.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
 #include "catalog/pg_replication_origin.h"
@@ -101,7 +102,8 @@
 #include "cluster/cluster_pcm_lock.h" /* final holder/master authority */
 #include "cluster/cluster_gcs_block.h" /* ACTIVE local writer ledger */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
-#include "cluster/cluster_multixact_current.h" /* current-DML authority */
+#include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_multixact_range.h" /* current-DML authority */
 #include "cluster/cluster_multixact_current_stats.h" /* authority counters */
 #include "cluster/cluster_mxid_stripe.h" /* derived-own guard for local pg_multixact decode */
 #include "cluster/cluster_pcm_x_bufmgr.h" /* tuple/PCM ABA fingerprint */
@@ -1493,10 +1495,29 @@ cluster_heap_itl_apply_terminal_census(
 	return result;
 }
 
+/* Release only caller-owned passive pins before another owner can wait.
+ * Distinct handles for the same map own separate references; an aliased
+ * pointer is invalidated by the first release and is not released twice. */
+static void
+cluster_heap_release_vm_pins_for_wait(Relation relation, Buffer *old_vm, Buffer *new_vm)
+{
+	if (relation == NULL || !cluster_heap_read_needs_copy(relation))
+		return;
+	if (old_vm != NULL && BufferIsValid(*old_vm)) {
+		ReleaseBuffer(*old_vm);
+		*old_vm = InvalidBuffer;
+	}
+	if (new_vm != NULL && BufferIsValid(*new_vm)) {
+		ReleaseBuffer(*new_vm);
+		*new_vm = InvalidBuffer;
+	}
+}
+
 static ClusterHeapItlPairCensusResult
 cluster_heap_itl_unwind_pair_for_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer,
-	ClusterHeapItlTerminalCensus *census)
+	ClusterHeapItlTerminalCensus *census, Relation relation,
+	Buffer *old_vm, Buffer *new_vm)
 {
 	ClusterHeapItlCensusCaptureResult capture_result;
 
@@ -1516,6 +1537,7 @@ cluster_heap_itl_unwind_pair_for_terminal_census(
 		{
 			/* The pair caller owns the retry.  Release in heap_update's
 			 * established high/new then old order and carry no census debt. */
+			cluster_heap_release_vm_pins_for_wait(relation, old_vm, new_vm);
 			LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
 			LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
 			return CLUSTER_HEAP_ITL_PAIR_CENSUS_RETRY_REQUALIFY;
@@ -1525,6 +1547,7 @@ cluster_heap_itl_unwind_pair_for_terminal_census(
 
 	/* Match heap_update's existing full-unwind order.  Resolution starts
 	 * only after neither heap page content authority remains held. */
+	cluster_heap_release_vm_pins_for_wait(relation, old_vm, new_vm);
 	LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
 	LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
 	PG_TRY();
@@ -1542,13 +1565,17 @@ cluster_heap_itl_unwind_pair_for_terminal_census(
 
 static ClusterHeapItlCapacityResult
 cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer, TransactionId xid,
-													  bool lock_only)
+													  bool lock_only, Relation relation,
+													  Buffer *vmbuffer)
 {
 	ClusterHeapItlTerminalCensus census;
 	volatile ClusterHeapItlCapacityResult result = CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
 	volatile bool recycle_guard_armed = false;
 	volatile bool recycle_guard_unlocked = false;
 	ClusterHeapItlCensusCaptureResult capture_result;
+	bool vm_handoff = relation != NULL && vmbuffer != NULL
+		&& cluster_heap_read_needs_copy(relation);
+	Buffer recent_vm = vm_handoff ? *vmbuffer : InvalidBuffer;
 
 	Assert(BufferIsValid(buffer));
 	Assert(TransactionIdIsValid(xid));
@@ -1580,6 +1607,7 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer, Transaction
 	{
 		ClusterHeapItlTerminalBatchApplyResult apply_result;
 
+		cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 		if (recycle_guard_armed) {
 			cluster_bufmgr_itl_recycle_guard_unlock(buffer);
 			recycle_guard_unlocked = true;
@@ -1600,17 +1628,26 @@ cluster_heap_itl_ensure_capacity_with_terminal_census(Buffer buffer, Transaction
 		} else
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
-		apply_result = cluster_heap_itl_apply_terminal_census(buffer, &census);
-		if (apply_result.kind == CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED)
-			result = cluster_itl_has_allocatable_slot(buffer, xid, lock_only)
-						 ? CLUSTER_HEAP_ITL_CAPACITY_READY
-						 : CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
-		else if (apply_result.kind == CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X) {
-			/* Capacity on the new page cannot validate the caller's old
-				 * tuple/page plan.  Only its existing DML owner may restart
-				 * after this unlocked interval; do not refresh just the ITL
-				 * census underneath that stale plan. */
+		/* An AV page still needs its caller's exact VM pin. Only a resident
+		 * lookup is allowed here; a miss belongs to the original DML retry
+		 * owner, before this census applies any cleanout bytes. */
+		if (vm_handoff && PageIsAllVisible(BufferGetPage(buffer))
+			&& !visibilitymap_pin_recent(relation, BufferGetBlockNumber(buffer),
+				recent_vm, vmbuffer))
 			result = CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY;
+		else {
+			apply_result = cluster_heap_itl_apply_terminal_census(buffer, &census);
+			if (apply_result.kind == CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED)
+				result = cluster_itl_has_allocatable_slot(buffer, xid, lock_only)
+							 ? CLUSTER_HEAP_ITL_CAPACITY_READY
+							 : CLUSTER_HEAP_ITL_CAPACITY_EXHAUSTED_OR_REFUSED;
+			else if (apply_result.kind == CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X) {
+				/* Capacity on the new page cannot validate the caller's old
+					 * tuple/page plan.  Only its existing DML owner may restart
+					 * after this unlocked interval; do not refresh just the ITL
+					 * census underneath that stale plan. */
+				result = CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY;
+			}
 		}
 	}
 	PG_FINALLY();
@@ -1704,7 +1741,8 @@ static ClusterTxwResult
 cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer,
 											Buffer full_buffer, TransactionId xid,
 											bool lock_only,
-											uint64 *deadline_us, const char **diagnostic_reason)
+											uint64 *deadline_us, const char **diagnostic_reason,
+											Relation relation, Buffer *old_vm, Buffer *new_vm)
 {
 	ClusterHeapItlTerminalCensus census;
 	ClusterHeapItlCensusCaptureResult capture_result;
@@ -1736,6 +1774,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 		fresh_capacity = cluster_itl_has_allocatable_slot(full_buffer, xid, lock_only);
 	/* No recycle guard is armed by this path; its capture requires flags=0.
 	 * The earlier terminal-census owner has already finished/cancelled. */
+	cluster_heap_release_vm_pins_for_wait(relation, old_vm, new_vm);
 	if (new_buffer != old_buffer)
 		LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
 	LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
@@ -1917,7 +1956,7 @@ cluster_heap_test_itl_wait_capacity(Buffer old_buffer, Buffer new_buffer, Buffer
 									const char **diagnostic_reason)
 {
 	return cluster_heap_itl_wait_capacity_after_census(old_buffer, new_buffer, full_buffer, xid,
-													   false, deadline_us, diagnostic_reason);
+													   false, deadline_us, diagnostic_reason, NULL, NULL, NULL);
 }
 
 ClusterTxwResult
@@ -1925,7 +1964,7 @@ cluster_heap_test_itl_wait_lock_capacity(Buffer buffer, TransactionId xid,
 	uint64 *deadline_us, const char **diagnostic_reason)
 {
 	return cluster_heap_itl_wait_capacity_after_census(buffer, buffer, buffer, xid,
-		true, deadline_us, diagnostic_reason);
+		true, deadline_us, diagnostic_reason, NULL, NULL, NULL);
 }
 #endif
 
@@ -1938,7 +1977,7 @@ cluster_heap_itl_alloc_with_terminal_census(Buffer buffer, TransactionId xid,
 	Assert(slot_index_out != NULL);
 	*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
 	return cluster_heap_itl_ensure_capacity_with_terminal_census(
-			buffer, xid, lock_only) == CLUSTER_HEAP_ITL_CAPACITY_READY
+			buffer, xid, lock_only, NULL, NULL) == CLUSTER_HEAP_ITL_CAPACITY_READY
 		&& cluster_heap_itl_alloc_once(
 			buffer, xid, lock_only, slot_index_out);
 }
@@ -2026,7 +2065,8 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 									   TransactionId xid, bool lock_only,
 									   ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len,
 									   bool *targets_invalidated, const char **refusal_reason,
-									   uint64 *capacity_wait_deadline_us, bool *content_unlocked)
+									   uint64 *capacity_wait_deadline_us, bool *content_unlocked,
+									   Buffer *vmbuffer)
 {
 	ClusterHeapItlCapacityResult capacity_result;
 	ClusterHeapDmlAuthorityGuard dml_guard;
@@ -2039,7 +2079,7 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 	if (refusal_reason != NULL)
 		*refusal_reason = NULL;
 	capacity_result = cluster_heap_itl_ensure_capacity_with_terminal_census(
-		buffer, xid, lock_only);
+		buffer, xid, lock_only, relation, vmbuffer);
 	*targets_invalidated = false;
 	if (capacity_result == CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY)
 		return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
@@ -2057,7 +2097,8 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 
 				cluster_xp_begin(&xp_itl, CLXP_I_ITL_WAIT);
 				wait_result = cluster_heap_itl_wait_capacity_after_census(
-					buffer, buffer, buffer, xid, true, capacity_wait_deadline_us, &wait_reason);
+					buffer, buffer, buffer, xid, true, capacity_wait_deadline_us, &wait_reason,
+					relation, vmbuffer, NULL);
 				cluster_xp_end(&xp_itl);
 			}
 			*content_unlocked = true;
@@ -2335,7 +2376,7 @@ cluster_heap_test_itl_capacity_outcome(Buffer buffer, TransactionId xid,
 									   bool lock_only)
 {
 	return cluster_heap_itl_ensure_capacity_with_terminal_census(
-		buffer, xid, lock_only);
+		buffer, xid, lock_only, NULL, NULL);
 }
 
 bool
@@ -2346,9 +2387,41 @@ cluster_heap_test_itl_resolve_pair_terminal_census(
 	ClusterHeapItlPairCensusResult result;
 
 	result = cluster_heap_itl_unwind_pair_for_terminal_census(
-		old_buffer, new_buffer, full_buffer, &census);
+		old_buffer, new_buffer, full_buffer, &census, NULL, NULL, NULL);
 	cluster_heap_itl_finish_terminal_census(&census);
 	return result == CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED;
+}
+
+ClusterHeapItlCapacityResult
+cluster_heap_test_itl_capacity_with_vm(Relation relation, Buffer buffer, TransactionId xid,
+									   bool lock_only, Buffer *vmbuffer)
+{
+	return cluster_heap_itl_ensure_capacity_with_terminal_census(buffer, xid, lock_only, relation,
+																 vmbuffer);
+}
+
+bool
+cluster_heap_test_itl_pair_census_with_vm(Relation relation, Buffer old_buffer, Buffer new_buffer,
+										  Buffer full_buffer, Buffer *old_vm, Buffer *new_vm)
+{
+	ClusterHeapItlTerminalCensus census;
+	ClusterHeapItlPairCensusResult result;
+
+	result = cluster_heap_itl_unwind_pair_for_terminal_census(old_buffer, new_buffer, full_buffer,
+															  &census, relation, old_vm, new_vm);
+	cluster_heap_itl_finish_terminal_census(&census);
+	return result == CLUSTER_HEAP_ITL_PAIR_CENSUS_RESOLVED;
+}
+
+ClusterTxwResult
+cluster_heap_test_itl_wait_capacity_with_vm(Relation relation, Buffer old_buffer, Buffer new_buffer,
+											Buffer full_buffer, TransactionId xid, bool lock_only,
+											uint64 *deadline_us, const char **reason,
+											Buffer *old_vm, Buffer *new_vm)
+{
+	return cluster_heap_itl_wait_capacity_after_census(old_buffer, new_buffer, full_buffer, xid,
+													   lock_only, deadline_us, reason, relation,
+													   old_vm, new_vm);
 }
 
 bool
@@ -2849,6 +2922,86 @@ heap_setscanlimits(TableScanDesc sscan, BlockNumber startBlk, BlockNumber numBlk
 	scan->rs_numblocks = numBlks;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Capture potentially cold identity services before the original heap acquire.
+ * The evaluator is temporary; the caller retains its original snapshot. */
+void
+cluster_heap_page_visibility_prepare(Relation relation, BlockNumber block,
+	Snapshot snapshot, ClusterHeapPageVisibility *observation)
+{
+	ClusterSnapshotReadScopeV1 evaluation;
+	uint32 minimum_catalog = PGRAC_VM_QUALIFIED_CATALOG_VERSION;
+
+	memset(observation, 0, sizeof(*observation));
+	if (relation == NULL || snapshot == NULL || block == InvalidBlockNumber
+		|| !cluster_heap_maintenance_restricted(relation) || !cluster_pcm_is_active()
+		|| minimum_catalog == 0 || GetControlFileCatalogVersion() < minimum_catalog
+		|| snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->takenDuringRecovery)
+		return;
+	observation->block = block;
+	observation->command_id = snapshot->curcid;
+	cluster_snapshot_read_enter_v1(&evaluation, snapshot);
+	PG_TRY();
+	{
+		observation->valid = cluster_snapshot_cr_identity_v1(snapshot,
+															 &observation->snapshot_identity)
+			&& cluster_undo_horizon_read_admission_capture(evaluation.read_scn,
+																 &observation->admission)
+			&& cluster_space_relation_identity_capture_v1(relation, &observation->identity);
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&evaluation);
+	}
+	PG_END_TRY();
+}
+
+/* The PD source is guarded by the qualified catalog's publisher census.
+ * A live current heap bracket supplies freshness, not a grant for a detached
+ * CR/FULL page or for offsets retained from an earlier observation. */
+bool
+cluster_heap_page_all_visible(Relation relation, Buffer buffer, Page page,
+	Snapshot snapshot, const ClusterHeapPageVisibility *observation)
+{
+	ClusterPcmOwnSnapshot own;
+	BufferTag expected;
+	ClusterSnapshotReadScopeV1 evaluation;
+	uint64 snapshot_identity = 0;
+	volatile bool valid = false;
+
+	if (observation == NULL || !observation->valid || relation == NULL || snapshot == NULL
+		|| !BufferIsValid(buffer) || BufferIsLocal(buffer) || !cluster_pcm_is_active()
+		|| page != BufferGetPage(buffer) || !PageIsAllVisible(page)
+		|| snapshot->snapshot_type != SNAPSHOT_MVCC || snapshot->takenDuringRecovery)
+		return false;
+	InitBufferTag(&expected, &relation->rd_locator, MAIN_FORKNUM, observation->block);
+	if (cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1), &own)
+		!= CLUSTER_PCM_OWN_OK || !BufferTagsEqual(&own.tag, &expected)
+		|| own.buffer_type != (uint8) BUF_TYPE_CURRENT
+		|| (own.semantic_buf_state & (BM_TAG_VALID | BM_VALID | BM_IO_IN_PROGRESS | BM_IO_ERROR))
+			!= (BM_TAG_VALID | BM_VALID)
+		|| own.generation == 0 || own.generation == UINT64_MAX
+		|| own.reservation_token == 0 || own.reservation_token == UINT64_MAX
+		|| !cluster_heap_pcm_read_authority_valid(&own))
+		return false;
+	cluster_snapshot_read_enter_v1(&evaluation, snapshot);
+	PG_TRY();
+	{
+		valid = cluster_snapshot_cr_identity_v1(snapshot, &snapshot_identity)
+			&& snapshot_identity == observation->snapshot_identity
+			&& snapshot->curcid == observation->command_id
+			&& cluster_undo_horizon_read_admission_current(&observation->admission)
+			&& cluster_space_relation_identity_current_v1(relation, &observation->identity);
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&evaluation);
+	}
+	PG_END_TRY();
+	return valid;
+}
+#endif
+
 /*
  * heapgetpage - subroutine for heapgettup()
  *
@@ -2867,6 +3020,9 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 	int			ntup;
 	OffsetNumber lineoff;
 	bool		all_visible;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterHeapPageVisibility visibility = {0};
+#endif
 
 	Assert(block < scan->rs_nblocks);
 #ifdef USE_PGRAC_CLUSTER
@@ -2886,6 +3042,12 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 	 * pages' worth of consecutive dead tuples.
 	 */
 	CHECK_FOR_INTERRUPTS();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (scan->rs_base.rs_flags & SO_ALLOW_PAGEMODE)
+		cluster_heap_page_visibility_prepare(scan->rs_base.rs_rd, block,
+											 scan->rs_base.rs_snapshot, &visibility);
+#endif
 
 	/* read page using selected strategy */
 	scan->rs_cbuf = ReadBufferExtended(scan->rs_base.rs_rd, MAIN_FORKNUM, block,
@@ -2935,9 +3097,14 @@ heapgetpage(TableScanDesc sscan, BlockNumber block)
 	 * full page write. Until we can prove that beyond doubt, let's check each
 	 * tuple for visibility the hard way.
 	 */
-	/* PGRAC: shared pages always use the original precise tuple check. */
+	/* Unqualified shared pages retain the original precise tuple check. */
 	all_visible = !cluster_heap_maintenance_restricted(scan->rs_base.rs_rd) &&
 		PageIsAllVisible(page) && !snapshot->takenDuringRecovery;
+#ifdef USE_PGRAC_CLUSTER
+	if (!all_visible && cluster_heap_page_all_visible(scan->rs_base.rs_rd,
+			buffer, page, snapshot, &visibility))
+		all_visible = true;
+#endif
 
 	for (lineoff = FirstOffsetNumber; lineoff <= lines; lineoff++)
 	{
@@ -4115,10 +4282,10 @@ extern bool cluster_heap_test_r4_surely_dead(HeapTuple tuple,
  * Unlike heap_fetch, the caller must already have pin and (at least) share
  * lock on the buffer; it is still pinned/locked at exit.
  */
-bool
-heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+static bool
+heap_hot_search_buffer_impl(ItemPointer tid, Relation relation, Buffer buffer,
 					   Snapshot snapshot, HeapTuple heapTuple,
-					   bool *all_dead, bool first_call)
+					   bool *all_dead, bool first_call, bool all_visible)
 {
 	Page		page = BufferGetPage(buffer);
 	TransactionId prev_xmax = InvalidTransactionId;
@@ -4232,7 +4399,7 @@ cluster_hot_search_restart:
 		if (!skip)
 		{
 			/* If it's visible per the snapshot, we must return it */
-			valid = HeapHotLiveVisibility(heapTuple, snapshot, buffer);
+			valid = all_visible || HeapHotLiveVisibility(heapTuple, snapshot, buffer);
 			HeapHotConflictOut(valid, relation, heapTuple, buffer, snapshot);
 
 			if (valid)
@@ -4324,7 +4491,32 @@ cluster_hot_search_restart:
 	return false;
 }
 
+bool
+heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+					   Snapshot snapshot, HeapTuple heapTuple,
+					   bool *all_dead, bool first_call)
+{
+	return heap_hot_search_buffer_impl(tid, relation, buffer, snapshot, heapTuple,
+									   all_dead, first_call, false);
+}
+
 #ifdef USE_PGRAC_CLUSTER
+/* Bitmap's qualified entry is first-call-only and never asks for all_dead.
+ * The first legal member returns under this same S bracket before any HOT/MX
+ * successor path can release it. Failed qualification stays false throughout
+ * the original traversal/restarts; a later image cannot borrow permission. */
+bool
+cluster_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
+	Snapshot snapshot, HeapTuple heapTuple,
+	const ClusterHeapPageVisibility *observation)
+{
+	bool all_visible = cluster_heap_page_all_visible(relation, buffer,
+														   BufferGetPage(buffer), snapshot, observation);
+
+	return heap_hot_search_buffer_impl(tid, relation, buffer, snapshot, heapTuple,
+									   NULL, true, all_visible);
+}
+
 typedef enum HeapHotR4CycleOutcome
 {
 	HEAP_HOT_R4_CYCLE_DORMANT = 0,
@@ -4686,8 +4878,8 @@ heap_hot_current_mx_resolve_updater(
 	key.cluster_epoch = (uint32) current_epoch;
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-	describe_result = cluster_multixact_current_describe(
-		&key, members, lengthof(members), &nmembers, &reported_total);
+	describe_result = cluster_multixact_current_describe_scoped(
+		&key, &root_before.pcm.tag, SnapshotAny, members, lengthof(members), &nmembers, &reported_total);
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 	if (cluster_epoch_get_current() != current_epoch
 		|| !heap_hot_current_mx_capture(buffer, root, &root_after)
@@ -6429,6 +6621,65 @@ cluster_heap_vm_retarget_after_repick(Buffer buffer, ResourceXAuxiliaryAcquireCo
 		return;
 	memset(context, 0, sizeof(*context));
 }
+
+/* Operation-local proof of the original VM writer. Every use must resume
+ * that exact writer; the structure grants no authority by itself. */
+typedef struct ClusterHeapVmMutationState
+{
+	ResourceXWriterUseContext writer;
+	uint64 object_revision;
+	bool object_checked;
+	bool prepared;
+} ClusterHeapVmMutationState;
+
+/* Shared mutations cannot enter ordinary VM acquisition below heap content-X:
+ * even a cached request can wait in membership preflight. Nonshared owners
+ * retain their original auxiliary path. */
+static bool
+cluster_heap_vm_mutation_lock(Buffer *vmbuf, bool versioned, ClusterHeapVmMutationState *state,
+							ResourceXAuxiliaryAcquireContext *context)
+{
+	if (!versioned)
+		return ClusterLockBufferExclusiveAuxiliaryAliasAware(vmbuf, NULL, NULL, context);
+	if (!state->prepared)
+		return false;
+	if (ClusterConditionalLockBufferWithMutationContext(*vmbuf, &state->writer,
+														  state->object_revision, state->object_checked))
+		return true;
+	state->prepared = false;
+	return false;
+}
+
+/* Caller has released heap content before this ordinary VM acquisition.
+ * Keep the original cursor on a clean refusal; the caller drops any remaining
+ * pin before cancellation and the original target/receipt retry. */
+static void
+cluster_heap_vm_mutation_prepare(Buffer *vmbuf, Buffer *alias, ClusterHeapVmMutationState *state,
+							   ResourceXAuxiliaryAcquireContext *context)
+{
+	bool captured = false;
+
+	state->prepared = false;
+	if (!BufferIsValid(*vmbuf)
+		|| !ClusterLockBufferExclusiveAuxiliaryAliasAware(vmbuf, alias, NULL, context))
+		return;
+	PG_TRY();
+	{
+		captured = ClusterBufferCaptureMutationContext(*vmbuf, &state->writer,
+														 &state->object_revision, &state->object_checked);
+	}
+	PG_FINALLY();
+	{
+		/* Original managed-X unlock retains node authority, including with
+		 * local caching disabled. It ends only this backend writer use. */
+		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+	}
+	PG_END_TRY();
+	if (!captured)
+		elog(ERROR, "shared heap mutation cannot retain its original VM writer");
+	state->prepared = true;
+}
+
 #endif
 
 void
@@ -6443,6 +6694,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	bool		all_visible_cleared = false;
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	/* PGRAC: static shared profile; identity precedes every content lock. */
 	bool		cluster_page_versioned = false;
 	ClusterSpaceIdentity cluster_page_identity;
@@ -6634,7 +6886,7 @@ cluster_heap_insert_retry:
 
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
 				relation, buffer, NULL, canonical_xid, false, &undo_receipt,
-				sizeof(UndoInsertPayload), &targets_invalidated, NULL, NULL, NULL);
+				sizeof(UndoInsertPayload), &targets_invalidated, NULL, NULL, NULL, &vmbuffer);
 			if (undo_result
 				== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 			{
@@ -6709,14 +6961,17 @@ cluster_heap_insert_retry:
 	{
 #ifdef USE_PGRAC_CLUSTER
 		cluster_heap_vm_retarget_after_repick(vmbuffer, &cluster_vm_context);
-		if (!ClusterLockBufferExclusiveAuxiliaryAliasAware(&vmbuffer, NULL, NULL,
-														   &cluster_vm_context)) {
+		if (!cluster_heap_vm_mutation_lock(&vmbuffer, cluster_page_versioned,
+										 &cluster_vm_state, &cluster_vm_context)) {
 			/* No receipt APPLY or tuple publication has occurred. The target
 			 * and its ITL/receipt plan must be selected again after this wait. */
 			UnlockReleaseBuffer(buffer);
+			if (cluster_page_versioned)
+				cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_vm_state, &cluster_vm_context);
 			if (BufferIsValid(vmbuffer))
 				ReleaseBuffer(vmbuffer);
 			vmbuffer = InvalidBuffer;
+			CHECK_FOR_INTERRUPTS();
 			goto cluster_heap_insert_retry;
 		}
 #else
@@ -7233,6 +7488,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	bool		cluster_page_versioned = false;
 	ClusterSpaceIdentity cluster_page_identity;
 	RfPageProducerBatchV1 cluster_page_versions;
+	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 #endif
 
 	/* PGRAC: reject before acquiring a bulk lease or preparing tuple bytes. */
@@ -7351,8 +7608,6 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		bool		all_frozen_set = false;
 		int			nthispage;
 
-		CHECK_FOR_INTERRUPTS();
-
 		/*
 		 * Compute number of pages needed to fit the to-be-inserted tuples in
 		 * the worst case.  This will be used to determine how much to extend
@@ -7371,6 +7626,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		}
 		else
 			npages_used++;
+
+#ifdef USE_PGRAC_CLUSTER
+cluster_heap_multi_insert_retry:
+#endif
+		CHECK_FOR_INTERRUPTS();
 
 		/*
 		 * Find buffer where at least the next tuple will fit.  If the page is
@@ -7395,7 +7655,24 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 		if (PageIsAllVisible(page) && !(options & HEAP_INSERT_FROZEN)
 			&& BufferIsValid(vmbuffer))
 		{
+#ifdef USE_PGRAC_CLUSTER
+			cluster_heap_vm_retarget_after_repick(vmbuffer, &cluster_vm_context);
+			if (!cluster_heap_vm_mutation_lock(&vmbuffer, cluster_page_versioned,
+										 &cluster_vm_state, &cluster_vm_context)) {
+				/* Reselect this unconsumed batch without counting another page.
+				 * No tuple or page version has been published before this wait. */
+				UnlockReleaseBuffer(buffer);
+				if (cluster_page_versioned)
+					cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_vm_state, &cluster_vm_context);
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+				CHECK_FOR_INTERRUPTS();
+				goto cluster_heap_multi_insert_retry;
+			}
+#else
 			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+#endif
 			vm_locked = true;
 		}
 
@@ -8476,8 +8753,8 @@ cluster_current_mx_hot_updater_for_chain(
 			lengthof(members), &nmembers, &reported_total))
 	{
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		describe_result = cluster_multixact_current_describe(
-			&key, members, lengthof(members), &nmembers,
+		describe_result = cluster_multixact_current_describe_scoped(
+			&key, &before.pcm.tag, SnapshotAny, members, lengthof(members), &nmembers,
 			&reported_total);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		if (!cluster_current_mx_read_capture(buffer, tuple, &live)
@@ -8608,6 +8885,23 @@ cluster_current_mx_hot_updater_for_chain(
 	return true;
 }
 
+/* Reuse only the caller's resident VM pin under heap X. A miss must take
+ * the original unlocked pin path and then return to full DML qualification;
+ * its new observations cannot validate the saved member proof. */
+static bool
+cluster_current_mx_relock_with_vm(Relation relation, Buffer buffer, Buffer *vmbuffer,
+								  Buffer recent_vm)
+{
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (relation == NULL || vmbuffer == NULL || !cluster_heap_read_needs_copy(relation)
+		|| !PageIsAllVisible(BufferGetPage(buffer))
+		|| visibilitymap_pin_recent(relation, BufferGetBlockNumber(buffer), recent_vm, vmbuffer))
+		return true;
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	cluster_heap_lock_with_vm_repin(relation, BufferGetBlockNumber(buffer), buffer, vmbuffer);
+	return false;
+}
+
 /*
  * The first mixed-member composition starts from a single remote lock-only
  * xmax.  Preserve that member from its exact on-page ITL/TT binding rather
@@ -8620,8 +8914,9 @@ cluster_current_mx_compose_remote_single(
 	Buffer buffer, HeapTuple tuple, TransactionId requester_xid,
 	LockTupleMode lock_mode, bool is_update,
 	ClusterCurrentMxHeapResult *heap_result,
-	ClusterCurrentMxOperationState *operation)
+	ClusterCurrentMxOperationState *operation, Relation relation, Buffer *vmbuffer)
 {
+	Buffer recent_vm = vmbuffer != NULL ? *vmbuffer : InvalidBuffer;
 	ClusterCurrentMxHeapFingerprint before;
 	ClusterCurrentMxHeapFingerprint live;
 	ClusterCurrentMxKey descriptor_key;
@@ -8717,6 +9012,7 @@ cluster_current_mx_compose_remote_single(
 	memset(&updater_proof, 0, sizeof(updater_proof));
 	descriptor_member.xid = old_xmax;
 	descriptor_member.member_status = (uint8) old_status;
+	cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	descriptor_mxid = MultiXactIdCreateLocalCurrentMembers(
 		1, &materialized_member);
@@ -8744,8 +9040,8 @@ cluster_current_mx_compose_remote_single(
 				ClusterCurrentMemberProofGetCtrcGrant(&proof),
 				proof_capability_generation,
 				(uint64)GetCurrentTimestamp())));
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	if (!cluster_current_mx_capture(buffer, tuple, &live)
+	if (!cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm)
+		|| !cluster_current_mx_capture(buffer, tuple, &live)
 		|| !cluster_current_mx_capture_equal(&before, &live)) {
 		cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
 		cluster_current_mx_operation_restart(operation);
@@ -8807,8 +9103,9 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 							 LockWaitPolicy wait_policy, bool wait_for_conflict,
 							 bool follow_updates,
 							 ClusterCurrentMxHeapResult *heap_result,
-							 ClusterCurrentMxOperationState *operation)
+							 ClusterCurrentMxOperationState *operation, Buffer *vmbuffer)
 {
+	Buffer recent_vm = vmbuffer != NULL ? *vmbuffer : InvalidBuffer;
 	ClusterCurrentMxHeapFingerprint before;
 	ClusterCurrentMxHeapFingerprint live;
 	ClusterCurrentMxHeapFingerprint candidate_before;
@@ -8887,12 +9184,13 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			operation, &key, raw_mxid, &before, members,
 			lengthof(members), &nmembers, &reported_total))
 	{
+		cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		describe_result = cluster_multixact_current_describe(
-			&key, members, lengthof(members), &nmembers,
+		describe_result = cluster_multixact_current_describe_scoped(
+			&key, &before.pcm.tag, SnapshotAny, members, lengthof(members), &nmembers,
 			&reported_total);
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-		if (!cluster_current_mx_capture(buffer, tuple, &live)
+		if (!cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm)
+			|| !cluster_current_mx_capture(buffer, tuple, &live)
 			|| !cluster_current_mx_capture_equal(&before, &live))
 		{
 			cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
@@ -8955,13 +9253,14 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 
 	descriptor_hash
 		= cluster_multixact_current_descriptor_hash(&key, members, nmembers);
+	cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	resolve_result = cluster_multixact_current_members_resolve_until(
 		&key, members, nmembers, descriptor_hash,
 		have_challenge ? &challenge : NULL, proofs, &updater_proof,
 		proof_capability_generations, &operation->proof_deadline);
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	if (!cluster_current_mx_capture(buffer, tuple, &live)
+	if (!cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm)
+		|| !cluster_current_mx_capture(buffer, tuple, &live)
 		|| !cluster_current_mx_capture_equal(&before, &live)
 		|| (have_challenge
 			&& !cluster_current_mx_hot_capture_still_exact(
@@ -9133,6 +9432,7 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			ClusterTxwResult txw;
 
 			cluster_multixact_current_stats_bump(CMX_STAT_WAIT);
+			cluster_heap_release_vm_pins_for_wait(relation, vmbuffer, NULL);
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			PG_TRY();
 			{
@@ -9181,7 +9481,7 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 							 errdetail("The current MultiXact TX wait was selected as the victim.")));
 					break;
 			}
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			(void)cluster_current_mx_relock_with_vm(relation, buffer, vmbuffer, recent_vm);
 			cluster_current_mx_operation_restart(operation);
 			return CCMH_RESTART;
 		}
@@ -9229,6 +9529,30 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 }
 
 #ifdef USE_CLUSTER_UNIT
+int
+cluster_heap_test_current_mx_with_vm(Relation relation, Buffer buffer, HeapTuple tuple,
+									 TransactionId requester_xid, bool single,
+									 LockTupleMode lock_mode, LockWaitPolicy wait_policy,
+									 Buffer *vmbuffer, TM_Result *result, uint16 *normalized_count)
+{
+	ClusterCurrentMxHeapResult heap_result;
+	ClusterCurrentMxOperationState operation = { 0 };
+	ClusterCurrentMxHeapDisposition disposition;
+
+	if (single)
+		disposition = cluster_current_mx_compose_remote_single(buffer, tuple, requester_xid,
+															   lock_mode, false, &heap_result,
+															   &operation, relation, vmbuffer);
+	else
+		disposition = cluster_current_mx_authorize(relation, buffer, tuple, requester_xid,
+												   CCM_ACTION_LOCK, lock_mode, false, wait_policy,
+												   true, false, &heap_result, &operation, vmbuffer);
+	*result = heap_result.result;
+	*normalized_count = heap_result.normalized_count;
+	cluster_current_mx_operation_finish(&operation);
+	return (int)disposition;
+}
+
 bool
 cluster_heap_test_current_mx_epoch_supported(uint64 epoch)
 {
@@ -9260,7 +9584,7 @@ cluster_heap_test_current_mx_authorize_keyshare(
 	disposition = cluster_current_mx_authorize(
 		relation, buffer, tuple, requester_xid, CCM_ACTION_LOCK,
 		LockTupleKeyShare, false, LockWaitBlock, true, false,
-		&heap_result, &operation);
+		&heap_result, &operation, NULL);
 	if (disposition != CCMH_DECIDED
 		|| heap_result.normalized_count > normalized_cap)
 		return false;
@@ -9496,9 +9820,15 @@ cluster_current_mx_stamp_prepare_slow(
 				: CTRC_REF_RECOMPOSED_SURVIVOR;
 		publication.target_kind = CTRC_TARGET_PAGE_PENDING_OFFNUM;
 		publication.grant_generation = grant;
-		prepare_result = cluster_ctrc_receipt_prepare_shared(
-			&ctrc_key, &participant, grant, &publication,
-			pending_target, &handles[*receipt_count]);
+		if (found && ctrc_key.origin_node_id != (uint16)cluster_node_id)
+			prepare_result = cluster_ctrc_receipt_prepare_origin_v2(
+				&ctrc_key, &participant, grant, &publication, pending_target,
+				proof.origin_fullxid_v2, sizeof(proof.origin_fullxid_v2),
+				&handles[*receipt_count]);
+		else
+			prepare_result = cluster_ctrc_receipt_prepare_shared(
+				&ctrc_key, &participant, grant, &publication,
+				pending_target, &handles[*receipt_count]);
 		if (prepare_result != CLUSTER_CTRC_PREPARE_READY
 			&& prepare_result != CLUSTER_CTRC_PREPARE_DUPLICATE)
 		{
@@ -10509,6 +10839,97 @@ cluster_current_mx_stamp_lock_buffer(Buffer buffer, bool barrier_aware,
 	return acquired;
 }
 
+/* Preserve the tuple owner's original plan cleanup on VM-lock ERROR. */
+static bool
+cluster_heap_vm_tuple_writer_lock(Buffer *vmbuffer, bool versioned,
+				 ClusterHeapVmMutationState *state,
+				 ResourceXAuxiliaryAcquireContext *context,
+				 ClusterCurrentMxStampPlan *plan)
+{
+	bool acquired = false;
+
+	PG_TRY();
+	{
+		acquired = cluster_heap_vm_mutation_lock(vmbuffer, versioned, state, context);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_stamp_cancel(plan);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return acquired;
+}
+
+/* Keep native barrier-site/alias handling and the original plan cleanup. */
+static bool
+cluster_heap_vm_dml_writer_lock(Buffer *vmbuffer, bool versioned,
+		ClusterHeapVmMutationState *state, ClusterBufferBarrierSiteId site,
+		bool *pin_replaced, ClusterCurrentMxStampPlan *plan,
+		ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
+{
+	bool acquired = false;
+
+	*pin_replaced = false;
+	if (!versioned)
+	{
+		acquired = cluster_current_mx_stamp_lock_buffer(*vmbuffer, true, site,
+			pin_replaced, plan, NULL, context, alias);
+		if (*pin_replaced)
+			*vmbuffer = InvalidBuffer;
+		return acquired;
+	}
+	PG_TRY();
+	{
+		acquired = cluster_heap_vm_mutation_lock(vmbuffer, true, state, context);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_stamp_cancel(plan);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return acquired;
+}
+
+/* UPDATE owns two plans. Keep F's native helper and new-target cursor rule;
+ * shared callers can only resume a writer prepared outside all content. */
+static bool
+cluster_heap_vm_pair_writer_lock(Buffer *vmbuffer, bool versioned,
+		ClusterHeapVmMutationState *state, ClusterBufferBarrierSiteId site,
+		bool *pin_replaced, ClusterCurrentMxStampPlan *first,
+		ClusterCurrentMxStampPlan *second,
+		ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
+{
+	bool acquired = false;
+
+	*pin_replaced = false;
+	if (!versioned)
+	{
+		acquired = cluster_current_mx_stamp_lock_buffer(*vmbuffer, true, site,
+			pin_replaced, first, second, context, alias);
+		if (*pin_replaced)
+			*vmbuffer = InvalidBuffer;
+		return acquired;
+	}
+	PG_TRY();
+	{
+		if (site == CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW
+			|| site == CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST)
+			cluster_heap_vm_retarget_after_repick(*vmbuffer, context);
+		acquired = cluster_heap_vm_mutation_lock(vmbuffer, true, state, context);
+	}
+	PG_CATCH();
+	{
+		cluster_current_mx_stamp_cancel(first);
+		cluster_current_mx_stamp_cancel(second);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return acquired;
+}
+
+
 /*
  * spec-3.14 D2b + spec-5.2 §3.2 (C4/D11): cross-node writer/locker wait.
  *
@@ -10756,11 +11177,14 @@ cluster_heap_wait_successor(const ClusterTxLocator *locator, LockWaitPolicy wait
 	return cluster_heap_writer_wait_target(&partial, wait_policy, deadline_us, &proof);
 }
 
+/* Shared callers release their VM pin before entry. Restore that same
+ * caller-owned handle before returning under heap X, then rebind/recheck the
+ * original tuple and proof. A missing pin must not restart an AV row forever. */
 static bool
 cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple tup,
 									TransactionId xwait, uint16 saved_infomask,
 									LockWaitPolicy wait_policy, TM_Result *res,
-									uint64 *wait_deadline_us)
+									uint64 *wait_deadline_us, Buffer *vmbuffer)
 {
 	Page		page = BufferGetPage(buffer);
 	ClusterUndoTTSlotRef cref;
@@ -10829,7 +11253,11 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 		evidence = cluster_heap_resolve_recycled_writer_ref(buffer, xwait, &cref, false, &recycled);
 
 		if (evidence == CLUSTER_VIS_EVIDENCE_LOCAL) {
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			if (cluster_heap_read_needs_copy(relation))
+				cluster_heap_lock_with_vm_repin(
+					relation, ItemPointerGetBlockNumber(&tup->t_self), buffer, vmbuffer);
+			else
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 			cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 			return false; /* existing resolver proved a genuinely own xid */
 		}
@@ -10961,7 +11389,11 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 			 */
 			if (wait_policy == LockWaitSkip)
 			{
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				if (cluster_heap_read_needs_copy(relation))
+					cluster_heap_lock_with_vm_repin(
+						relation, ItemPointerGetBlockNumber(&tup->t_self), buffer, vmbuffer);
+				else
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 				cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 				*res = TM_WouldBlock;
 				return true;
@@ -11070,7 +11502,11 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	 *   instead of running the unsafe native path.
 	 */
 cluster_remote_writer_terminal:
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (cluster_heap_read_needs_copy(relation))
+		cluster_heap_lock_with_vm_repin(
+			relation, ItemPointerGetBlockNumber(&tup->t_self), buffer, vmbuffer);
+	else
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 	if (recycled_terminal || target_terminal || target_would_block) {
 		OffsetNumber offset = ItemPointerGetOffsetNumber(&tup->t_self);
@@ -11235,12 +11671,12 @@ cluster_remote_writer_terminal:
 #ifdef USE_CLUSTER_UNIT
 bool
 cluster_heap_test_writer_wait(Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
-							  uint16 infomask, TM_Result *result)
+							  uint16 infomask, TM_Result *result, Buffer *vmbuffer)
 {
 	uint64 deadline_us = 0;
 
 	return cluster_heap_writer_wait_failclosed(relation, buffer, tuple, xid, infomask,
-											   LockWaitBlock, result, &deadline_us);
+											   LockWaitBlock, result, &deadline_us, vmbuffer);
 }
 #endif
 
@@ -11330,26 +11766,45 @@ cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber heap_block, Buffe
 /*
  * A tuple lock preserves all-visible and only clears all-frozen.  The caller
  * holds heap content X and the exact VM pin.  A set bit conservatively asks
- * for the original VM-X path.  A clear bit can skip that path only after a
- * qualified current SHARE read; a clean nested-barrier refusal is not proof
- * and falls back to the existing X acquisition/retry.  Heap X prevents this
- * heap block's frozen bit from being set after the qualified observation.
+ * for the original VM-X path. A clear bit can skip that path only under a
+ * local conditional current SHARE read. Missing authority or contention
+ * falls back to the existing X acquisition/retry, never a nested S fetch.
+ * Heap X prevents this heap block's frozen bit from being set after the
+ * qualified observation.
  */
 static bool
-cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block,
-								 Buffer vmbuffer)
+cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block, Buffer vmbuffer)
 {
-	bool		needed;
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+	uint8 status;
+	bool needed;
 
-	Assert(BufferIsValid(vmbuffer) && visibilitymap_pin_ok(heap_block, vmbuffer));
-	if (visibilitymap_get_status(relation, heap_block, &vmbuffer)
-		& VISIBILITYMAP_ALL_FROZEN)
+	/* The raw reader may repin/read on a mismatch. Never let it perform that
+	 * work below the caller's heap content lock, or inspect another map. */
+	if (relation == NULL || heap_block == InvalidBlockNumber || !BufferIsValid(vmbuffer)
+		|| !visibilitymap_pin_ok(heap_block, vmbuffer))
 		return true;
-	if (!ClusterLockBufferShareBarrierAware(vmbuffer))
+	BufferGetTag(vmbuffer, &locator, &forknum, &block);
+	if (!RelFileLocatorEquals(locator, relation->rd_locator) || forknum != VISIBILITYMAP_FORKNUM)
 		return true;
-	needed = (visibilitymap_get_status(relation, heap_block, &vmbuffer)
-			  & VISIBILITYMAP_ALL_FROZEN) != 0;
-	LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+	if (visibilitymap_get_status(relation, heap_block, &vmbuffer) & VISIBILITYMAP_ALL_FROZEN)
+		return true;
+	if (!ClusterConditionalLockBufferShare(vmbuffer))
+		return true;
+	/* A coherent grant does not make a malformed/unversioned bitmap a
+	 * proved zero. The decoder cannot acquire or replace the borrowed pin. */
+	PG_TRY();
+	{
+		needed = !visibilitymap_get_status_pinned(relation, heap_block, vmbuffer, &status)
+				 || (status & VISIBILITYMAP_ALL_FROZEN) != 0;
+	}
+	PG_FINALLY();
+	{
+		ClusterUnlockBufferAfterConditionalRead(vmbuffer);
+	}
+	PG_END_TRY();
 	return needed;
 }
 #endif
@@ -11386,6 +11841,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	bool		old_key_copied = false;
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	/* PGRAC: exact versions of this DELETE and its optional VM mutation. */
 	bool		cluster_page_versioned = false;
 	ClusterSpaceIdentity cluster_page_identity;
@@ -11479,7 +11935,12 @@ heap_delete(Relation relation, ItemPointer tid,
 	if (PageIsAllVisible(page))
 		visibilitymap_pin(relation, block, &vmbuffer);
 
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_heap_read_needs_copy(relation))
+		cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+	else
+#endif
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
 	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
 	Assert(ItemIdIsNormal(lp));
@@ -11506,7 +11967,12 @@ l1:
 	{
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		visibilitymap_pin(relation, block, &vmbuffer);
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_heap_read_needs_copy(relation))
+			cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+		else
+#endif
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 		cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
 #endif
@@ -11545,7 +12011,7 @@ l1:
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, buffer, &tp, xid, CCM_ACTION_DELETE,
 				LockTupleExclusive, true, LockWaitBlock, wait, true,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, &cluster_current_mx_operation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l1;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -11567,9 +12033,15 @@ l1:
 		 * below then yields TM_Ok.  A false return means a local locker; the
 		 * native path is correct.  A remote writer / timeout / wait-off raises.
 		 */
+			/* The bridge can wait for a writer which needs this VM page. */
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
 			if (cluster_heap_writer_wait_failclosed(relation, buffer, &tp, xwait, infomask,
 													LockWaitBlock, &cluster_writer_res,
-													&cluster_writer_wait_deadline_us)) {
+													&cluster_writer_wait_deadline_us, &vmbuffer)) {
 				if (cluster_writer_res == TM_BeingModified)
 					goto l1;
 				/*
@@ -11634,6 +12106,13 @@ l1:
 										LockTupleExclusive, &current_is_member))
 			{
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
+#endif
 
 				/*
 				 * Acquire the lock, if necessary (but skip it when we're
@@ -11647,7 +12126,12 @@ l1:
 				MultiXactIdWait((MultiXactId) xwait, MultiXactStatusUpdate, infomask,
 								relation, &(tp.t_self), XLTW_Delete,
 								NULL);
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation))
+					cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+				else
+#endif
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 				cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
 #endif
@@ -11684,10 +12168,22 @@ l1:
 			 * lock.
 			 */
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
+#endif
 			heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
 								 LockWaitBlock, &have_tuple_lock);
 			XactLockTableWait(xwait, relation, &(tp.t_self), XLTW_Delete);
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation))
+				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+			else
+#endif
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 			cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
 #endif
@@ -11864,7 +12360,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			undo_payload_len = sizeof(UndoDeletePayload) + (uint16) tp.t_len;
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
 				relation, buffer, &tp, canonical_xid, false, &undo_receipt, undo_payload_len,
-				&targets_invalidated, NULL, NULL, NULL);
+				&targets_invalidated, NULL, NULL, NULL, &vmbuffer);
 
 			if (undo_result
 				== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
@@ -11882,6 +12378,11 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				cid = pgrac_entry_cid;
 				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 				if (ctrc_prepare_only && !targets_invalidated) {
 					if (!cluster_undo_record_ctrc_prepare_pending(
 							&undo_receipt, 0))
@@ -11978,9 +12479,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 			PG_TRY();
 			{
-				vm_acquired = cluster_current_mx_stamp_lock_buffer(
-					vmbuffer, true, CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM, &vm_pin_replaced,
-					&cluster_current_mx_plan, NULL, &cluster_vm_context, NULL);
+				vm_acquired = cluster_heap_vm_dml_writer_lock(
+					&vmbuffer, cluster_page_versioned, &cluster_vm_state,
+					CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM, &vm_pin_replaced,
+					&cluster_current_mx_plan, &cluster_vm_context, NULL);
 			}
 			PG_CATCH();
 			{
@@ -12018,7 +12520,16 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				refused_rlocator, refused_forknum, refused_blocknum,
 				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
-			if (!vm_pin_replaced)
+			if (cluster_page_versioned)
+			{
+				cluster_heap_vm_mutation_prepare(&vmbuffer, NULL,
+					&cluster_vm_state, &cluster_vm_context);
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+				CHECK_FOR_INTERRUPTS();
+			}
+			else if (!vm_pin_replaced)
 			{
 				cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_vm_context);
 				if (BufferIsValid(vmbuffer))
@@ -12185,6 +12696,11 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			cid = pgrac_entry_cid;
 			iscombo = false;
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
 			if (!cluster_heap_retry_undo_record_exact(
 					UNDO_RECORD_DELETE, (uint16)cluster_undo_record_inline_max_bytes,
 					(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
@@ -12577,7 +13093,9 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	bool		old_tuple_temp_locked = false;	/* PGRAC: t/400 L3 item 3 */
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	ResourceXAuxiliaryAcquireContext cluster_vm_new_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_new_state = { 0 };
 	/* PGRAC: TEMP_LOCK and final UPDATE are distinct WAL/version batches. */
 	bool		cluster_page_versioned = false;
 	ClusterSpaceIdentity cluster_page_identity;
@@ -12940,7 +13458,7 @@ l2:
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, buffer, &oldtup, xid, CCM_ACTION_UPDATE,
 				*lockmode, true, LockWaitBlock, wait, true,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, &cluster_current_mx_operation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l2;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -12963,7 +13481,7 @@ l2:
 
 			current_mx_disposition = cluster_current_mx_compose_remote_single(
 				buffer, &oldtup, xid, *lockmode, true,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, &cluster_current_mx_operation, relation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l2;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -12987,9 +13505,15 @@ l2:
 		 * false return means a local locker; the native path below is correct.
 		 * A remote writer / timeout / wait-off raises inside.
 		 */
+		/* The bridge can wait for a writer which needs this VM page. */
+		if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+		{
+			ReleaseBuffer(vmbuffer);
+			vmbuffer = InvalidBuffer;
+		}
 		if (cluster_heap_writer_wait_failclosed(relation, buffer, &oldtup, xwait, infomask,
 												LockWaitBlock, &cluster_writer_res,
-												&cluster_writer_wait_deadline_us)) {
+												&cluster_writer_wait_deadline_us, &vmbuffer)) {
 			if (cluster_writer_res == TM_BeingModified)
 				goto l2;
 			/*
@@ -13074,6 +13598,13 @@ l2:
 										*lockmode, &current_is_member))
 			{
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
+#endif
 
 				/*
 				 * Acquire the lock, if necessary (but skip it when we're
@@ -13089,7 +13620,12 @@ l2:
 								&remain);
 				checked_lockers = true;
 				locker_remains = remain != 0;
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation))
+					cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+				else
+#endif
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 				cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
 #endif
@@ -13168,12 +13704,24 @@ l2:
 			 * lock.
 			 */
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
+#endif
 			heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
 								 LockWaitBlock, &have_tuple_lock);
 			XactLockTableWait(xwait, relation, &oldtup.t_self,
 							  XLTW_Update);
 			checked_lockers = true;
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation))
+				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+			else
+#endif
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 			cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
 #endif
@@ -13525,9 +14073,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		BufferGetTag(vmbuffer, &refused_rlocator, &refused_forknum,
 					 &refused_blocknum);
 
-		vm_acquired = cluster_current_mx_stamp_lock_buffer(
-			vmbuffer, true, CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM, &vm_pin_replaced,
-			cluster_current_mx_recomposed ? &cluster_current_mx_temp_lock_plan : NULL, NULL,
+		vm_acquired = cluster_heap_vm_dml_writer_lock(
+			&vmbuffer, cluster_page_versioned, &cluster_vm_state,
+			CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM, &vm_pin_replaced,
+			cluster_current_mx_recomposed ? &cluster_current_mx_temp_lock_plan : NULL,
 			&cluster_vm_context, &vmbuffer_new);
 		if (!vm_acquired)
 		{
@@ -13555,7 +14104,22 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 					refused_rlocator, refused_forknum, refused_blocknum,
 					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
-			if (!vm_pin_replaced)
+			if (cluster_page_versioned)
+			{
+				cluster_heap_vm_mutation_prepare(&vmbuffer, &vmbuffer_new,
+					&cluster_vm_state, &cluster_vm_context);
+				/* Drop both declared pins before cancellation or heap wait. */
+				if (BufferIsValid(vmbuffer_new))
+				{
+					ReleaseBuffer(vmbuffer_new);
+					vmbuffer_new = InvalidBuffer;
+				}
+				if (BufferIsValid(vmbuffer))
+					ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+				CHECK_FOR_INTERRUPTS();
+			}
+			else if (!vm_pin_replaced)
 			{
 				cluster_heap_vm_barrier_warm(&vmbuffer, &vmbuffer_new, &cluster_vm_context);
 				if (BufferIsValid(vmbuffer))
@@ -14118,7 +14682,7 @@ l_pgrac_reacquire:
 		else if (newbuf == buffer && !census_was_pending)
 			old_capacity_result
 				= cluster_heap_itl_ensure_capacity_with_terminal_census(
-					buffer, canonical_xid, false);
+					buffer, canonical_xid, false, relation, &vmbuffer);
 		else if (census_was_pending
 				 && cluster_itl_update_census_old_page)
 			old_capacity_result
@@ -14158,6 +14722,7 @@ l_pgrac_reacquire:
 				newbuf = buffer;
 			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			cluster_heap_release_vm_pins_for_wait(relation, &vmbuffer, &vmbuffer_new);
 			if (!cluster_heap_restart_update_undo_record_exact(
 					&canonical_binding, undo_prepare_deadline_us,
 					&undo_receipt))
@@ -14189,7 +14754,8 @@ l_pgrac_reacquire:
 				ClusterHeapItlPairCensusResult pair_result;
 
 				pair_result = cluster_heap_itl_unwind_pair_for_terminal_census(
-					buffer, newbuf, buffer, &cluster_itl_update_census);
+					buffer, newbuf, buffer, &cluster_itl_update_census,
+					relation, &vmbuffer, &vmbuffer_new);
 				if (pair_result != CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED)
 				{
 					if (pair_result
@@ -14246,7 +14812,7 @@ l_pgrac_reacquire:
 					pair_result
 						= cluster_heap_itl_unwind_pair_for_terminal_census(
 							buffer, newbuf, newbuf,
-							&cluster_itl_update_census);
+							&cluster_itl_update_census, relation, &vmbuffer, &vmbuffer_new);
 					if (pair_result != CLUSTER_HEAP_ITL_PAIR_CENSUS_REFUSED)
 					{
 						if (pair_result
@@ -14444,6 +15010,11 @@ l_pgrac_reacquire:
 					}
 				}
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 				/* A different insertion page invalidates its unpublished
 				 * child intent, not an otherwise exact READY undo extent.
 				 * Rebind only a completely captured UPDATE target set, with
@@ -14670,6 +15241,8 @@ l_pgrac_reacquire:
 			Buffer *alias = is_new ? &vmbuffer : &vmbuffer_new;
 			ResourceXAuxiliaryAcquireContext *context
 				= is_new ? &cluster_vm_new_context : &cluster_vm_context;
+			ClusterHeapVmMutationState *state
+				= is_new ? &cluster_vm_new_state : &cluster_vm_state;
 			ClusterBufferBarrierSiteId site
 				= is_new ? (new_first ? CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST
 									  : CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW)
@@ -14682,8 +15255,9 @@ l_pgrac_reacquire:
 				continue;
 #ifdef USE_PGRAC_CLUSTER
 			requested = *target;
-			if (!cluster_current_mx_stamp_lock_buffer(
-					requested, true, site, &refused_pin_replaced, &cluster_current_mx_old_plan,
+			if (!cluster_heap_vm_pair_writer_lock(
+					target, cluster_page_versioned, state, site, &refused_pin_replaced,
+					&cluster_current_mx_old_plan,
 					&cluster_current_mx_new_plan, context, alias)) {
 				refused_vm = requested;
 				refused_vm_is_new = is_new;
@@ -14758,16 +15332,26 @@ l_pgrac_reacquire:
 					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 				if (!refused_pin_replaced)
-					cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
-												 refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
-												 refused_vm_is_new ? &cluster_vm_new_context
-																   : &cluster_vm_context);
+				{
+					if (cluster_page_versioned)
+						cluster_heap_vm_mutation_prepare(
+							refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+							refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+							refused_vm_is_new ? &cluster_vm_new_state : &cluster_vm_state,
+							refused_vm_is_new ? &cluster_vm_new_context : &cluster_vm_context);
+					else
+						cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+							refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+							refused_vm_is_new ? &cluster_vm_new_context : &cluster_vm_context);
+				}
 				if (BufferIsValid(vmbuffer))
 					ReleaseBuffer(vmbuffer);
 				vmbuffer = InvalidBuffer;
 				if (BufferIsValid(vmbuffer_new))
 					ReleaseBuffer(vmbuffer_new);
 				vmbuffer_new = InvalidBuffer;
+				if (cluster_page_versioned)
+					CHECK_FOR_INTERRUPTS();
 				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
 				page = BufferGetPage(buffer);
 				lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
@@ -14804,16 +15388,26 @@ l_pgrac_reacquire:
 				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
 				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 			if (!refused_pin_replaced)
-				cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
-											 refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
-											 refused_vm_is_new ? &cluster_vm_new_context
-															   : &cluster_vm_context);
+			{
+				if (cluster_page_versioned)
+					cluster_heap_vm_mutation_prepare(
+						refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+						refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+						refused_vm_is_new ? &cluster_vm_new_state : &cluster_vm_state,
+						refused_vm_is_new ? &cluster_vm_new_context : &cluster_vm_context);
+				else
+					cluster_heap_vm_barrier_warm(refused_vm_is_new ? &vmbuffer_new : &vmbuffer,
+						refused_vm_is_new ? &vmbuffer : &vmbuffer_new,
+						refused_vm_is_new ? &cluster_vm_new_context : &cluster_vm_context);
+			}
 			if (BufferIsValid(vmbuffer))
 				ReleaseBuffer(vmbuffer);
 			vmbuffer = InvalidBuffer;
 			if (BufferIsValid(vmbuffer_new))
 				ReleaseBuffer(vmbuffer_new);
 			vmbuffer_new = InvalidBuffer;
+			if (cluster_page_versioned)
+				CHECK_FOR_INTERRUPTS();
 			ClusterObserveBufferBarrierReceipt(
 				refused_site, CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
 				refused_rlocator, refused_forknum, refused_blocknum,
@@ -15118,6 +15712,11 @@ l_pgrac_reacquire:
 				}
 			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
 			if (had_undo_ready)
 			{
 				if (!cluster_heap_retry_undo_record_exact(
@@ -15646,7 +16245,8 @@ l_pgrac_itl_capacity_wait: {
 		cluster_xp_begin(&xp_itl, CLXP_I_ITL_WAIT);
 		wait_result = cluster_heap_itl_wait_capacity_after_census(
 			buffer, newbuf, itl_capacity_wait_buffer, canonical_xid, false,
-			&itl_capacity_absolute_deadline_us, &wait_reason);
+			&itl_capacity_absolute_deadline_us, &wait_reason,
+			relation, &vmbuffer, &vmbuffer_new);
 		cluster_xp_end(&xp_itl);
 	}
 	if (wait_result != CLUSTER_TXW_RESOLVED && wait_result != CLUSTER_TXW_RETRY)
@@ -16069,9 +16669,17 @@ cluster_heap_rebind_locked_tuple(Relation relation, Buffer buffer,
 
 static void
 heap_lock_tuple_buffer(Relation relation, Buffer buffer, HeapTuple tuple,
-	TransactionId *creation_xmin)
+					   TransactionId *creation_xmin, Buffer *vmbuffer)
 {
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	/* The row-lock owner must not obstruct a VM transfer while waiting for
+	 * heap current. Rebind only after exact resident repin and heap recheck. */
+	if (cluster_heap_read_needs_copy(relation))
+		cluster_heap_lock_with_vm_repin(relation, ItemPointerGetBlockNumber(&tuple->t_self), buffer,
+										vmbuffer);
+	else
+#endif
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
 	cluster_heap_rebind_locked_tuple(relation, buffer, tuple, creation_xmin);
 #endif
@@ -16143,6 +16751,7 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 	ClusterSpaceIdentity cluster_page_identity;
 	RfPageProducerBatchV1 cluster_page_versions;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	bool		cluster_did_lock_stamp = false;
 	uint64 cluster_writer_wait_deadline_us = 0;
 	bool		cluster_did_multixact_member_bind = false;
@@ -16213,7 +16822,7 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 	if (PageIsAllVisible(BufferGetPage(*buffer)))
 		visibilitymap_pin(relation, block, &vmbuffer);
 
-	heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+	heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 	page = BufferGetPage(*buffer);
 	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
@@ -16300,7 +16909,7 @@ l3:
 				relation, *buffer, tuple, GetCurrentTransactionId(),
 				CCM_ACTION_LOCK, mode, false, wait_policy, true,
 				follow_updates, &cluster_current_mx,
-				&cluster_current_mx_operation);
+				&cluster_current_mx_operation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l3;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -16311,10 +16920,16 @@ l3:
 
 					Assert(cluster_current_mx.successor_proof.valid);
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+					/* The child must not retain the caller's VM pin. */
+					if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 					follow_result = heap_lock_updated_tuple_authoritative(
 						relation, &cluster_current_mx.successor_proof,
 						GetCurrentTransactionId(), mode);
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask,
 											 infomask)
 						|| !TransactionIdEquals(
@@ -16348,7 +16963,7 @@ l3:
 				&cluster_current_mx_operation);
 			current_mx_disposition = cluster_current_mx_compose_remote_single(
 				*buffer, tuple, GetCurrentTransactionId(), mode, false,
-				&cluster_current_mx, &cluster_current_mx_operation);
+				&cluster_current_mx, &cluster_current_mx_operation, relation, &vmbuffer);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l3;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -16545,7 +17160,7 @@ l3:
 						uint16		marker_origin = 0;
 						bool		remote_multi;
 
-						heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+						heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 						if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 							!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 												 xwait))
@@ -16564,6 +17179,11 @@ l3:
 											 "supported; retry the transaction.")));
 						LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 					}
+					if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 #endif
 
 					res = heap_lock_updated_tuple(relation,
@@ -16574,12 +17194,12 @@ l3:
 					{
 						result = res;
 						/* recovery code expects to have buffer lock held */
-						heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+						heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 						goto failed;
 					}
 				}
 
-				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 				/*
 				 * Make sure it's still an appropriate lock, else start over.
@@ -16614,7 +17234,7 @@ l3:
 			if (HEAP_XMAX_IS_LOCKED_ONLY(infomask) &&
 				!HEAP_XMAX_IS_EXCL_LOCKED(infomask))
 			{
-				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 				/*
 				 * Make sure it's still an appropriate lock, else start over.
@@ -16642,7 +17262,7 @@ l3:
 					 * No conflict, but if the xmax changed under us in the
 					 * meantime, start over.
 					 */
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 											 xwait))
@@ -16654,7 +17274,7 @@ l3:
 			}
 			else if (HEAP_XMAX_IS_KEYSHR_LOCKED(infomask))
 			{
-				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 				/* if the xmax changed in the meantime, start over */
 				if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
@@ -16689,7 +17309,7 @@ l3:
 			)
 		{
 			/* ... but if the xmax changed in the meantime, start over */
-			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 			if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 				!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 									 xwait))
@@ -16711,7 +17331,7 @@ l3:
 		 */
 		if (require_sleep && (result == TM_Updated || result == TM_Deleted))
 		{
-			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 			goto failed;
 		} else if (require_sleep) {
 			/*
@@ -16724,6 +17344,13 @@ l3:
 			 * this arranges that we stay at the head of the line while
 			 * rechecking tuple state.
 			 */
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
+#endif
 			if (!skip_tuple_lock &&
 				!heap_acquire_tuplock(relation, tid, mode, wait_policy,
 									  &have_tuple_lock))
@@ -16734,7 +17361,7 @@ l3:
 				 */
 				result = TM_WouldBlock;
 				/* recovery code expects to have buffer lock held */
-				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+				heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 				goto failed;
 			}
 
@@ -16762,7 +17389,7 @@ l3:
 					uint16		marker_origin = 0;
 					bool		remote_multi;
 
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 											 xwait))
@@ -16780,6 +17407,11 @@ l3:
 										 "retry the transaction.")));
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 				}
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 #endif
 
 				/* wait for multixact to end, or die trying  */
@@ -16796,7 +17428,7 @@ l3:
 						{
 							result = TM_WouldBlock;
 							/* recovery code expects to have buffer lock held */
-							heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+							heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 							goto failed;
 						}
 						break;
@@ -16847,15 +17479,21 @@ l3:
 					 * (it expects the content lock held), like all other
 					 * writer consumers. DATA and LOCK_ONLY share this owner.
 					 */
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					if (xmax_infomask_changed(tuple->t_data->t_infomask, infomask) ||
 						!TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data),
 											 xwait))
 						goto l3;
 
+					/* The bridge can wait for a writer which needs this VM page. */
+					if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 					if (cluster_heap_writer_wait_failclosed(relation, *buffer, tuple, xwait,
 															infomask, wait_policy, &cwres,
-															&cluster_writer_wait_deadline_us)) {
+															&cluster_writer_wait_deadline_us, &vmbuffer)) {
 						if (cwres == TM_BeingModified)
 							goto l3;
 						/*
@@ -16897,6 +17535,11 @@ l3:
 					/* LOCAL writer: PG's native wait below is correct. */
 					LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 				}
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 #endif
 				/* wait for regular transaction to end, or die trying */
 				switch (wait_policy)
@@ -16910,7 +17553,7 @@ l3:
 						{
 							result = TM_WouldBlock;
 							/* recovery code expects to have buffer lock held */
-							heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+							heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 							goto failed;
 						}
 						break;
@@ -16930,6 +17573,13 @@ l3:
 			{
 				TM_Result	res;
 
+#ifdef USE_PGRAC_CLUSTER
+				if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
+#endif
 				res = heap_lock_updated_tuple(relation,
 											  infomask, xwait, &t_ctid,
 											  GetCurrentTransactionId(),
@@ -16938,12 +17588,12 @@ l3:
 				{
 					result = res;
 					/* recovery code expects to have buffer lock held */
-					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+					heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 					goto failed;
 				}
 			}
 
-			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+			heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 
 			/*
 			 * xwait is done, but if xwait had just locked the tuple then some
@@ -17039,7 +17689,7 @@ failed:
 	{
 		LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
 		visibilitymap_pin(relation, block, &vmbuffer);
-		heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin);
+		heap_lock_tuple_buffer(relation, *buffer, tuple, &creation_xmin, &vmbuffer);
 		goto l3;
 	}
 
@@ -17255,7 +17905,7 @@ failed:
 					relation, *buffer, tuple, canonical_xid, true, &undo_receipt,
 					sizeof(UndoItlPayload), &targets_invalidated, &refusal_reason,
 					wait_policy == LockWaitBlock ? &itl_capacity_absolute_deadline_us : NULL,
-					&content_unlocked);
+					&content_unlocked, &vmbuffer);
 				if (undo_result
 					== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 				{
@@ -17265,6 +17915,11 @@ failed:
 
 					if (!content_unlocked)
 						LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+					if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 					if (ctrc_prepare_only && !targets_invalidated) {
 						if (!cluster_undo_record_ctrc_prepare_pending(
 								&undo_receipt, 0))
@@ -17376,11 +18031,8 @@ failed:
 		)
 	{
 #ifdef USE_PGRAC_CLUSTER
-		bool vm_pin_replaced = false;
-
-		if (!cluster_current_mx_stamp_lock_buffer(vmbuffer, false, (ClusterBufferBarrierSiteId)0,
-												  &vm_pin_replaced, &cluster_current_mx_lock_plan,
-												  NULL, &cluster_vm_context, NULL)) {
+		if (!cluster_heap_vm_tuple_writer_lock(&vmbuffer, cluster_page_versioned,
+				&cluster_vm_state, &cluster_vm_context, &cluster_current_mx_lock_plan)) {
 			cluster_current_mx_stamp_cancel(&cluster_current_mx_lock_plan);
 			cluster_current_mx_operation_restart(&cluster_current_mx_operation);
 			cluster_did_lock_stamp = false;
@@ -17388,8 +18040,8 @@ failed:
 			cluster_lock_undo_ready = false;
 			cluster_lock_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 			LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
-			if (vm_pin_replaced)
-				vmbuffer = InvalidBuffer;
+			if (cluster_page_versioned)
+				cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_vm_state, &cluster_vm_context);
 			else
 				cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_vm_context);
 			cluster_heap_lock_with_vm_repin(relation, block, *buffer, &vmbuffer);
@@ -17547,6 +18199,11 @@ failed:
 			cluster_lock_undo_ready = false;
 			cluster_lock_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 			LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+			if (cluster_heap_read_needs_copy(relation) && BufferIsValid(vmbuffer))
+			{
+				ReleaseBuffer(vmbuffer);
+				vmbuffer = InvalidBuffer;
+			}
 			if (had_undo_ready)
 			{
 				if (!cluster_heap_retry_undo_record_exact(
@@ -18352,6 +19009,8 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 	uint64 cluster_chain_prepare_deadline_us = 0;
 	uint64 cluster_chain_capacity_deadline_us = 0;
 	bool		cluster_chain_vm_locked = false;
+	ResourceXAuxiliaryAcquireContext cluster_chain_vm_context = {0};
+	ClusterHeapVmMutationState cluster_chain_vm_state = {0};
 	uint8		cluster_chain_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 	UBA			cluster_chain_uba = InvalidUba_init;
 	SCN			cluster_chain_write_scn = InvalidScn;
@@ -18389,6 +19048,8 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 		cluster_chain_lock_stamp = false;
 		cluster_chain_needs_itl = false;
 		cluster_chain_vm_locked = false;
+		MemSet(&cluster_chain_vm_context, 0, sizeof(cluster_chain_vm_context));
+		MemSet(&cluster_chain_vm_state, 0, sizeof(cluster_chain_vm_state));
 		cluster_chain_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 		cluster_chain_uba = (UBA) InvalidUba_init;
 		cluster_chain_write_scn = InvalidScn;
@@ -18422,6 +19083,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 #endif
 
 l4:
+		/* Retry entry owns neither heap nor VM content locks. */
 		CHECK_FOR_INTERRUPTS();
 
 		/*
@@ -18438,7 +19100,12 @@ l4:
 		else
 			pinned_desired_page = false;
 
-		heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+		heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
+#ifdef USE_PGRAC_CLUSTER
+		/* The shared acquisition already handled an installed AV image. */
+		if (cluster_heap_read_needs_copy(rel))
+			pinned_desired_page = BufferIsValid(vmbuffer);
+#endif
 
 		/*
 		 * If we didn't pin the visibility map page and the page has become
@@ -18455,7 +19122,7 @@ l4:
 		{
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			visibilitymap_pin(rel, block, &vmbuffer);
-			heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
+			heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin, &vmbuffer);
 		}
 
 #ifdef USE_PGRAC_CLUSTER
@@ -18627,6 +19294,13 @@ l4:
 					if (needwait)
 					{
 						LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+						if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+#endif
 						XactLockTableWait(members[i].xid, rel,
 										  &mytup.t_self,
 										  XLTW_LockUpdated);
@@ -18700,6 +19374,13 @@ l4:
 				if (needwait)
 				{
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+					if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
+#endif
 					XactLockTableWait(rawxmax, rel, &mytup.t_self,
 									  XLTW_LockUpdated);
 					goto l4;
@@ -18746,6 +19427,11 @@ l4:
 				/* Receipt reservation can allocate/wait; never do it while the
 				 * heap content lock is held. */
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 				if (cluster_chain_prepare_deadline_us == 0)
 					cluster_chain_prepare_deadline_us = cluster_undo_record_prepare_deadline_us();
 				if (!cluster_tt_local_get_published_binding(
@@ -18772,14 +19458,13 @@ l4:
 							 errmsg("cluster undo reservation failed before update-chain lock"),
 							 cluster_heap_undo_receipt_errdetail(false)));
 				cluster_chain_receipt_owned = true;
-				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
 				goto l4;
 			}
 
 			undo_result = cluster_heap_itl_prepare_prepared_undo(
 				rel, buf, &mytup, canonical_xid, true, &cluster_chain_receipt,
 				sizeof(UndoItlPayload), &targets_invalidated, NULL,
-				&cluster_chain_capacity_deadline_us, &content_unlocked);
+				&cluster_chain_capacity_deadline_us, &content_unlocked, &vmbuffer);
 			if (undo_result == CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 			{
 				bool prepare_only
@@ -18788,6 +19473,11 @@ l4:
 
 				if (!content_unlocked)
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+				{
+					ReleaseBuffer(vmbuffer);
+					vmbuffer = InvalidBuffer;
+				}
 				if (prepare_only && !targets_invalidated) {
 					if (!cluster_undo_record_ctrc_prepare_pending(
 							&cluster_chain_receipt, 0))
@@ -18810,7 +19500,6 @@ l4:
 										   cluster_node_id)));
 					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
 				}
-				heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
 				goto l4;
 			}
 			if (undo_result != CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -18829,7 +19518,26 @@ l4:
 				&& (!cluster_page_versioned
 					|| cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer)))
 			{
-				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+				if (!cluster_heap_vm_mutation_lock(&vmbuffer, cluster_page_versioned,
+						&cluster_chain_vm_state, &cluster_chain_vm_context))
+				{
+					/* Retry from the unlocked tuple check before receipt APPLY. */
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					if (cluster_page_versioned)
+					{
+						cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_chain_vm_state,
+							&cluster_chain_vm_context);
+						/* Cancellation and heap acquisition retain no VM pin. */
+						if (BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+					}
+					else
+						cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_chain_vm_context);
+					goto l4;
+				}
 				cluster_chain_vm_locked = true;
 			}
 
@@ -18898,6 +19606,11 @@ l4:
 						cluster_chain_vm_locked = false;
 					}
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					if (cluster_heap_read_needs_copy(rel) && BufferIsValid(vmbuffer))
+					{
+						ReleaseBuffer(vmbuffer);
+						vmbuffer = InvalidBuffer;
+					}
 					requalified = cluster_undo_record_requalify_for_retry(
 						&cluster_chain_receipt, sizeof(UndoItlPayload), false);
 					if (requalified == CLUSTER_UNDO_RECORD_PREPARE_REFUSED)
@@ -18908,7 +19621,6 @@ l4:
 												  cluster_undo_record_receipt_last_reason(),
 												  cluster_node_id)));
 					cluster_chain_receipt_owned = requalified == CLUSTER_UNDO_RECORD_PREPARE_READY;
-					heap_lock_tuple_buffer(rel, buf, &mytup, &creation_xmin);
 					goto l4;
 				}
 				if (boundary_result != CLUSTER_HEAP_BOUNDARY_APPLIED)
@@ -18945,7 +19657,25 @@ l4:
 			if (PageIsAllVisible(BufferGetPage(buf)) && BufferIsValid(vmbuffer)
 				&& cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer))
 			{
-				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+				if (!cluster_heap_vm_mutation_lock(&vmbuffer, cluster_page_versioned,
+						&cluster_chain_vm_state, &cluster_chain_vm_context))
+				{
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					if (cluster_page_versioned)
+					{
+						cluster_heap_vm_mutation_prepare(&vmbuffer, NULL, &cluster_chain_vm_state,
+							&cluster_chain_vm_context);
+						/* Cancellation and heap acquisition retain no VM pin. */
+						if (BufferIsValid(vmbuffer))
+						{
+							ReleaseBuffer(vmbuffer);
+							vmbuffer = InvalidBuffer;
+						}
+					}
+					else
+						cluster_heap_vm_barrier_warm(&vmbuffer, NULL, &cluster_chain_vm_context);
+					goto l4;
+				}
 				cluster_chain_vm_locked = true;
 			}
 			vm_changes = cluster_chain_vm_locked
@@ -19802,7 +20532,7 @@ heap_inplace_lock(Relation relation,
 				relation, buffer, &oldtup, GetCurrentTransactionId(),
 				CCM_ACTION_LOCK, LockTupleNoKeyExclusive, false,
 				LockWaitBlock, true, false, &current_mx,
-				&cluster_current_mx_operation);
+				&cluster_current_mx_operation, NULL);
 			if (current_mx_disposition != CCMH_NOT_APPLICABLE)
 			{
 				ret = current_mx_disposition == CCMH_DECIDED
@@ -21372,21 +22102,29 @@ cluster_heap_freeze_apply_xmin_batch_recent_v1(
 	const ClusterHeapFreezeXminTargetV1 *targets, uint16 target_count,
 	FullTransactionId freeze_limit_full, SCN horizon_scn)
 {
+	ClusterHeapFreezeObservedBoundsV1 bounds;
 	volatile bool applied = false;
 
 	/* The proof phase may have released its pin. Reuse only the original
 	 * resident hint under the caller's still-entered admission: no fetch,
 	 * new current, proof request or replacement source observation.
-	 * Reject an already obsolete local ingress cut before acquiring this
-	 * pin; the pinned continuation repeats the same check after acquisition. */
+	 * Match the original saved F/H and reject an already obsolete local
+	 * ingress cut before acquiring this pin. These pure checks supply no
+	 * provenance or retention authority; the pinned continuation repeats
+	 * them after acquisition and retains its final TARGET/WAL fences. */
 	if (rel == NULL || !rel->rd_isvalid || input == NULL || page == NULL
 		|| proofs == NULL || fence == NULL || authority_before == NULL
 		|| admission == NULL || !admission->entered || targets == NULL
 		|| target_count == 0 || target_count > MaxHeapTuplesPerPage
+		|| target_count > page->tuple_count
 		|| recent_buffer <= 0 || recent_buffer > NBuffers
 		|| BufferDescriptors == NULL
 		|| admission->record_generation != fence->admission_generation
 		|| !RelFileLocatorEquals(rel->rd_locator, fence->identity.key.locator)
+		|| !cluster_heap_freeze_observed_bounds_v1(input->freeze_policy,
+			input->freeze_cohort, admission, cluster_node_id, &bounds)
+		|| !FullTransactionIdEquals(bounds.freeze_limit, freeze_limit_full)
+		|| bounds.horizon_scn != horizon_scn
 		|| input->freeze_cohort == NULL
 		|| input->freeze_cohort->local_registration_cut.status != CTRC_ACTIVE_SCAN_COMPLETE
 		|| input->freeze_cohort->local_registration_cut.unqualified_entries != 0

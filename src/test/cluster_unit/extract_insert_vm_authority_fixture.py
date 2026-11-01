@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Extract the actual operation-local VM writer brackets.
+
+Copyright (c) 2026, pgrac contributors
+Author: SqlRush <sqlrush@gmail.com>
+"""
+import pathlib
+import re
+import sys
+from extract_vacuum_mx_fixture import function
+
+source = pathlib.Path(sys.argv[1]).read_text()
+if len(sys.argv) > 2 and sys.argv[2] == "--delete-capture":
+    owner = function(source, "heap_delete", "TM_Result")
+    start = owner.index("\t\tif (cluster_page_versioned)",
+                        owner.index("PGRAC: after final VM acquisition"))
+    end = owner.index("\n\t\tMemSet(&undo_plan", start)
+    print(owner[start:end])
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[2] == "--insert-capture":
+    owner = function(source, "heap_insert", "void")
+    start = owner.index("\tif (cluster_page_versioned)",
+                        owner.index("PGRAC: capture after the final VM acquisition"))
+    end = owner.index("\n\tMemSet(&cluster_itl_ctrc_handle", start)
+    print(owner[start:end])
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[2] == "--pair-writer":
+    print(function(source, "cluster_heap_vm_retarget_after_repick", "static void"))
+    if "\ncluster_heap_vm_pair_writer_lock(" in source:
+        print(function(source, "cluster_heap_vm_pair_writer_lock", "static bool"))
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[2] == "--dml-writer":
+    if "\ncluster_heap_vm_dml_writer_lock(" in source:
+        print(function(source, "cluster_heap_vm_dml_writer_lock", "static bool"))
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[2] == "--tuple-writer":
+    if "\ncluster_heap_vm_tuple_writer_lock(" in source:
+        print(function(source, "cluster_heap_vm_tuple_writer_lock", "static bool"))
+    sys.exit(0)
+
+match = re.search(r"^typedef struct ClusterHeapVmMutationState\n\{.*?^\} ClusterHeapVmMutationState;", source, re.M | re.S)
+if match is not None:
+    print("#define FIXTURE_HAS_INSERT_VM_STATE 1")
+    print(match.group())
+    print(function(source, "cluster_heap_vm_mutation_lock", "static bool"))
+    print(function(source, "cluster_heap_vm_mutation_prepare", "static void"))

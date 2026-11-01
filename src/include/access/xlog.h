@@ -227,6 +227,8 @@ extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 
 extern uint64 GetSystemIdentifier(void);
+/* Immutable loaded identity; zero when no control file has been selected. */
+extern uint32 GetControlFileCatalogVersion(void);
 extern char *GetMockAuthenticationNonce(void);
 extern bool DataChecksumsEnabled(void);
 extern XLogRecPtr GetFakeLSNForUnloggedRel(void);

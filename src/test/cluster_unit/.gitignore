@@ -7,3 +7,6 @@ test_cluster_*
 test_pgrac_*
 !test_pgrac_*.c
 !test_pgrac_*.h
+test_k_mx_g5_*
+!test_k_mx_g5_*.c
+!test_k_mx_g5_*.h

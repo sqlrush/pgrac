@@ -12,6 +12,7 @@
 #include "catalog/pg_class.h"
 #include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "fmgr.h"
@@ -121,6 +122,15 @@ fixture_block(Buffer buffer)
 	UT_ASSERT(refs[buffer - 1] > 0);
 	UT_ASSERT(tags[buffer - 1].relNumber == 16393);
 	return tags[buffer - 1].blockNum;
+}
+
+static void
+fixture_vm_tag(Buffer buffer, RelFileLocator *locator, ForkNumber *fork, BlockNumber *block)
+{
+	UT_ASSERT(buffer >= 1 && buffer <= 3 && refs[buffer - 1] > 0);
+	*locator = BufTagGetRelFileLocator(&tags[buffer - 1]);
+	*fork = tags[buffer - 1].forkNum;
+	*block = tags[buffer - 1].blockNum;
 }
 
 static void
@@ -280,6 +290,7 @@ fixture_interrupt(void)
 #undef BufferGetPage
 #define BufferGetPage fixture_page
 #define BufferGetBlockNumber fixture_block
+#define BufferGetTag fixture_vm_tag
 #define ReleaseBuffer fixture_release
 #define LockBuffer fixture_lock
 #define UnlockReleaseBuffer fixture_unlock_release
@@ -308,6 +319,7 @@ fixture_interrupt(void)
 static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 									 XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
 									 uint8 flags, const ClusterSpaceIdentity *identity);
+#include "test_cluster_vm_buffer_matches.inc"
 #include "test_cluster_pcm_aux_vm_mutation.inc"
 #include "test_cluster_pcm_aux_heap_repin.inc"
 #include "test_cluster_heap_lock_vm_needed.inc"
@@ -411,6 +423,7 @@ fixture_reset(ForkNumber fork)
 		header->pd_special = BLCKSZ;
 	}
 	smgr_data.smgr_rlocator.locator = BufTagGetRelFileLocator(&tags[0]);
+	relation_data.rd_locator = smgr_data.smgr_rlocator.locator;
 	PageSetAllVisible(pages[2].data);
 	header = (PageHeader)pages[2].data;
 	header->pd_lower += sizeof(ItemIdData);
@@ -484,6 +497,61 @@ UT_TEST(actual_vm_unchanged_clear_is_completed_not_retry)
 	UT_ASSERT_EQ(aux_writes, 0);
 	UT_ASSERT_EQ(wal_writes, 0);
 	UT_ASSERT_EQ(buffer, 1);
+}
+
+UT_TEST(actual_vm_retry_entries_refuse_wrong_target_before_aux_acquire)
+{
+	static bool cleared;
+
+	for (int setting = 0; setting < 2; setting++) {
+		for (int field = 0; field < 4; field++) {
+			ResourceXAuxiliaryAcquireContext context = { 0 };
+			PGAlignedBlock before[3];
+			Buffer buffer = 1;
+
+			fixture_reset(VISIBILITYMAP_FORKNUM);
+			cleared = true;
+			refs[0] = refs[2] = 1;
+			locks[2] = true;
+			if (setting)
+				*PageGetContents(pages[0].data) = 0;
+			switch (field) {
+			case 0:
+				tags[0].spcOid++;
+				break;
+			case 1:
+				tags[0].dbOid++;
+				break;
+			case 2:
+				tags[0].relNumber++;
+				break;
+			case 3:
+				tags[0].forkNum = FSM_FORKNUM;
+				break;
+			}
+			memcpy(before, pages, sizeof(pages));
+			if (sigsetjmp(failure_jump, 1) == 0) {
+				if (setting)
+					(void)visibilitymap_set_retry_aware(&relation_data, 0, 3, InvalidXLogRecPtr,
+														&buffer, InvalidTransactionId,
+														VISIBILITYMAP_VALID_BITS, &context, NULL);
+				else
+					(void)visibilitymap_clear_retry_aware(
+						&relation_data, 0, &buffer, VISIBILITYMAP_VALID_BITS, &context, &cleared);
+				UT_ASSERT(false);
+			}
+			UT_ASSERT_EQ(errors, 1);
+			UT_ASSERT_EQ(aux_locks + aux_unlocks + aux_writes + wal_writes, 0);
+			UT_ASSERT_EQ(refs[0], 1);
+			UT_ASSERT_EQ(refs[2], 1);
+			UT_ASSERT(!locks[0] && locks[2]);
+			UT_ASSERT_EQ(buffer, 1);
+			UT_ASSERT(!context.active);
+			UT_ASSERT(memcmp(before, pages, sizeof(pages)) == 0);
+			if (!setting)
+				UT_ASSERT(!cleared);
+		}
+	}
 }
 
 UT_TEST(actual_consumer_rejects_stale_heap_proof_before_restoring_vm)
@@ -563,6 +631,13 @@ insert_aux_lock(Buffer *buffer, Buffer *alias, const ClusterBufferBarrierSiteId 
 #undef LockBuffer
 #define LockBuffer insert_raw_lock
 #define ClusterLockBufferExclusiveAuxiliaryAliasAware insert_aux_lock
+/* This original fixture is strictly nonshared. Execute the real native
+ * branch; any accidental entry into shared writer services must stop. */
+#define ClusterBufferCaptureMutationContext(...) (abort(), false)
+#define ClusterConditionalLockBufferWithMutationContext(...) (abort(), false)
+#include "test_cluster_heap_insert_vm_authority.inc"
+#undef ClusterBufferCaptureMutationContext
+#undef ClusterConditionalLockBufferWithMutationContext
 /* Retarget safety is executed with the real owner/prepare in aux_reobserve.
  * This fixture keeps one logical VM page while its physical slot changes. */
 #define cluster_heap_vm_retarget_after_repick(buffer, context) ((void)(buffer), (void)(context))
@@ -572,6 +647,8 @@ run_insert_vm_bracket(void)
 	Buffer buffer = 3, vmbuffer = 1;
 	bool vm_locked = false;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	const bool cluster_page_versioned = false;
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 
 cluster_heap_insert_retry:
 	if (insert_entries++ != 0) {
@@ -639,6 +716,24 @@ tuple_vm_warm(Buffer *buffer, Buffer *alias, ResourceXAuxiliaryAcquireContext *c
 	}
 }
 
+/* This inherited fixture remains strictly native. Shared tuple writer
+ * cancellation/resume runs in the dedicated original-bracket fixture. */
+static bool
+tuple_vm_writer_lock(Buffer *buffer, bool versioned, ClusterHeapVmMutationState *state,
+					 ResourceXAuxiliaryAcquireContext *context, int *plan)
+{
+	bool replaced = false;
+	bool acquired;
+
+	UT_ASSERT(!versioned);
+	acquired = tuple_vm_lock(*buffer, false, (ClusterBufferBarrierSiteId)0,
+		&replaced, plan, NULL, context, NULL);
+	if (replaced)
+		*buffer = InvalidBuffer;
+	return acquired;
+}
+
+#define cluster_heap_vm_tuple_writer_lock tuple_vm_writer_lock
 #define cluster_current_mx_stamp_lock_buffer tuple_vm_lock
 #define cluster_current_mx_stamp_cancel(plan) (*(plan) = 0)
 #define cluster_current_mx_operation_restart(plan) (*(plan) = 0)
@@ -655,6 +750,7 @@ run_tuple_vm_bracket(void)
 	ItemPointer tid = &tid_data;
 	BlockNumber block = 0;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
 	int cluster_current_mx_lock_plan = 1, cluster_current_mx_operation = 1;
 	bool cluster_did_lock_stamp = true, cluster_lock_needs_itl_slot = true;
 	bool cluster_lock_undo_ready = true, vm_locked = false;
@@ -764,6 +860,35 @@ dml_stamp_lock(Buffer buffer, bool barrier, ClusterBufferBarrierSiteId site, boo
 	return result;
 }
 
+/* These original native consumers must not enter shared writer services. */
+static bool
+native_single_dml_writer(Buffer *buffer, bool versioned, ClusterHeapVmMutationState *state,
+		ClusterBufferBarrierSiteId site, bool *replaced, int *plan,
+		ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
+{
+	bool acquired;
+
+	UT_ASSERT(!versioned);
+	acquired = dml_stamp_lock(*buffer, true, site, replaced, plan, NULL, context, alias);
+	if (*replaced)
+		*buffer = InvalidBuffer;
+	return acquired;
+}
+
+static bool
+native_pair_vm_writer(Buffer *buffer, bool versioned, ClusterHeapVmMutationState *state,
+		ClusterBufferBarrierSiteId site, bool *replaced, int *first, int *second,
+		ResourceXAuxiliaryAcquireContext *context, Buffer *alias)
+{
+	bool acquired;
+
+	UT_ASSERT(!versioned);
+	acquired = dml_stamp_lock(*buffer, true, site, replaced, first, second, context, alias);
+	if (*replaced)
+		*buffer = InvalidBuffer;
+	return acquired;
+}
+
 static void
 dml_pin(Relation relation, BlockNumber heap, Buffer *vm)
 {
@@ -800,6 +925,7 @@ dml_observe(ClusterBufferBarrierPhase phase)
 #undef BufferGetTag
 #undef ClusterLockBufferExclusiveAuxiliaryAliasAware
 #undef cluster_current_mx_stamp_lock_buffer
+#undef cluster_heap_vm_tuple_writer_lock
 #undef cluster_heap_vm_barrier_warm
 #define LockBuffer dml_lock
 #define ReleaseBuffer dml_release
@@ -807,6 +933,8 @@ dml_observe(ClusterBufferBarrierPhase phase)
 #define BufferGetTag dml_tag
 #define ClusterLockBufferExclusiveAuxiliaryAliasAware dml_aux_lock
 #define cluster_current_mx_stamp_lock_buffer dml_stamp_lock
+#define cluster_heap_vm_dml_writer_lock native_single_dml_writer
+#define cluster_heap_vm_pair_writer_lock native_pair_vm_writer
 #define cluster_heap_vm_barrier_warm dml_warm
 #define cluster_heap_lock_with_vm_repin dml_repin
 #define visibilitymap_pin dml_pin
@@ -830,6 +958,8 @@ run_update_vm_bracket(bool same_vm, bool reverse, bool temp_locked)
 	bool old_key_copied = false, iscombo = true;
 	CommandId cid = 2, pgrac_entry_cid = 1;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 }, cluster_vm_new_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 }, cluster_vm_new_state = { 0 };
+	bool cluster_page_versioned = false;
 	int cluster_current_mx_old_plan = 1, cluster_current_mx_new_plan = 1;
 	Page page;
 	ItemId lp;
@@ -958,6 +1088,8 @@ run_delete_vm_bracket(void)
 	CommandId cid = 2, pgrac_entry_cid = 1;
 	int cluster_current_mx_plan = 1;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
+	bool cluster_page_versioned = false;
 
 	dml_old_vm = 1;
 	dml_refs[0] = dml_refs[2] = 1;
@@ -989,6 +1121,8 @@ run_pretoast_vm_bracket(void)
 	CommandId cid = 2, pgrac_entry_cid = 1;
 	int cluster_current_mx_temp_lock_plan = 1, cluster_current_mx_operation = 1;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	ClusterHeapVmMutationState cluster_vm_state = { 0 };
+	bool cluster_page_versioned = false;
 
 	dml_old_vm = 1;
 	dml_refs[0] = dml_refs[2] = 1;
@@ -1022,11 +1156,12 @@ UT_TEST(actual_pretoast_vm_retry_refreshes_predecessor_before_l2)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(actual_shared_hio_reads_identity_before_locks_and_versions_existing_zero);
 	UT_RUN(actual_shared_hio_missing_identity_stops_before_page_access);
 	UT_RUN(actual_vm_consumer_requalifies_both_stages_without_replaying_clear);
 	UT_RUN(actual_vm_unchanged_clear_is_completed_not_retry);
+	UT_RUN(actual_vm_retry_entries_refuse_wrong_target_before_aux_acquire);
 	UT_RUN(actual_consumer_rejects_stale_heap_proof_before_restoring_vm);
 	UT_RUN(actual_consumer_cancellation_does_not_report_completion);
 	UT_RUN(actual_fsm_consumer_keeps_original_mutation_and_restore);

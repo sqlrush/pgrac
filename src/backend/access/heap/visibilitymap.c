@@ -40,6 +40,12 @@
  *	Out-of-crit callers keep using visibilitymap_clear unchanged, and
  *	single-node builds see only the (behavior-identical) split.
  *
+ *	Coherent bitmap observations acquire and revalidate shared authority on
+ *	every read, including cached pins. Raw diagnostic reads remain separate.
+ *	Write entries reject illegal masks and mismatched relation/fork/block
+ *	tags at runtime; cached write pins must name the same exact target.
+ *
+ *	Spec: 2026-10-19-pre2-m1-vm-positive-paths.md
  *	Spec: spec-2.36-gcs-block-transfer.md
  *
  * NOTES
@@ -109,7 +115,9 @@
 #include "postgres.h"
 
 #include "access/heapam_xlog.h"
+#include "access/htup_details.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
@@ -120,12 +128,17 @@
 #include "utils/inval.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "catalog/catversion.h"
 #include "catalog/pg_control.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_page_cold_redo.h"
+#include "cluster/cluster_undo_horizon.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "utils/snapmgr.h"
 #endif
 
 
@@ -186,6 +199,24 @@ static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer h
 
 
 /*
+ * Check the exact pinned target used by a VM operation. This local tag check
+ * neither acquires a pin nor substitutes for content/PCM or SPACE authority.
+ */
+static bool
+vm_buffer_matches(Relation rel, Buffer buffer, ForkNumber forknum, BlockNumber block)
+{
+	RelFileLocator actual_locator;
+	ForkNumber actual_fork;
+	BlockNumber actual_block;
+
+	if (rel == NULL || !BufferIsValid(buffer) || block == InvalidBlockNumber)
+		return false;
+	BufferGetTag(buffer, &actual_locator, &actual_fork, &actual_block);
+	return RelFileLocatorEquals(actual_locator, rel->rd_locator) && actual_fork == forknum
+		   && actual_block == block;
+}
+
+/*
  *	visibilitymap_clear - clear specified bits for one page in visibility map
  *
  * You must pass a buffer containing the correct map page to this function.
@@ -195,8 +226,14 @@ static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer h
 bool
 visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
 {
-	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	bool		cleared = false;
+
+	/* Reject masks that could clear a neighboring heap block or leave AF
+	 * without AV. These checks must also run in non-cassert builds. */
+	if ((flags != VISIBILITYMAP_ALL_FROZEN && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_clear");
 
 	/* Must never clear all_visible bit while leaving all_frozen bit set */
 	Assert(flags & VISIBILITYMAP_VALID_BITS);
@@ -205,9 +242,6 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 #ifdef TRACE_VISIBILITYMAP
 	elog(DEBUG1, "vm_clear %s %d", RelationGetRelationName(rel), heapBlk);
 #endif
-
-	if (!BufferIsValid(vmbuf) || BufferGetBlockNumber(vmbuf) != mapBlock)
-		elog(ERROR, "wrong buffer passed to visibilitymap_clear");
 
 	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
 	cleared = visibilitymap_clear_locked(rel, heapBlk, vmbuf, flags);
@@ -431,9 +465,13 @@ bool
 visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, Buffer *vmbuf, uint8 flags,
 								struct ResourceXAuxiliaryAcquireContext *context, bool *cleared)
 {
-	Assert(vmbuf != NULL && cleared != NULL && context != NULL);
+	if (vmbuf == NULL || cleared == NULL || context == NULL)
+		elog(ERROR, "invalid arguments passed to visibilitymap_clear_retry_aware");
 	*cleared = false;
-	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
+	if ((flags != VISIBILITYMAP_ALL_FROZEN && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, *vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
+		|| !visibilitymap_pin_ok(heapBlk, *vmbuf))
 		elog(ERROR, "wrong buffer passed to visibilitymap_clear_retry_aware");
 	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
 		return false;
@@ -454,16 +492,29 @@ visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, Buffer *vmbuf
 bool
 visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
 {
-	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	int			mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	int			mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
 	uint8		mask = flags << mapOffset;
 	char	   *map;
 	bool		cleared = false;
 
-	Assert(flags & VISIBILITYMAP_VALID_BITS);
-	Assert(flags != VISIBILITYMAP_ALL_VISIBLE);
-	Assert(BufferIsValid(vmbuf) && BufferGetBlockNumber(vmbuf) == mapBlock);
+	/* Direct callers own their original lock/WAL scope. Validate before
+	 * indexing the bitmap even when the wrapper was not used. */
+	if ((flags != VISIBILITYMAP_ALL_FROZEN && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_clear_locked");
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Validate the stable image before even a no-op bitmap access. Original
+	 * DML ownership/admission was qualified before APPLY; do not acquire or
+	 * resample that authority inside its WAL critical section. Typed shared
+	 * redo uses its separate recorded image/edge apply path. */
+	if (cluster_shared_config && rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1
+		&& !vm_redo_page_valid(BufferGetPage(vmbuf)))
+		elog(ERROR, "shared VM clear has no valid versioned page");
+#endif
 
 	map = PageGetContents(BufferGetPage(vmbuf));
 
@@ -502,7 +553,8 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	/* Reuse the old pinned buffer if possible */
 	if (BufferIsValid(*vmbuf))
 	{
-		if (visibilitymap_pin_ok(heapBlk, *vmbuf))
+		if (vm_buffer_matches(rel, *vmbuf, VISIBILITYMAP_FORKNUM, mapBlock)
+			&& visibilitymap_pin_ok(heapBlk, *vmbuf))
 			return;
 
 		ReleaseBuffer(*vmbuf);
@@ -599,14 +651,17 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 #endif
 				  )
 {
+	if ((flags != VISIBILITYMAP_ALL_VISIBLE && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmBuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
+		|| (BufferIsValid(heapBuf) && !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_set");
+
 	/* PGRAC: only a real WAL redo call may reproduce an old positive bit. */
 	if (cluster_heap_maintenance_restricted(rel) &&
 		!(InRecovery && !XLogRecPtrIsInvalid(recptr)))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("all-visible publication for shared heaps is not supported"),
-				 errhint("Use ordinary heap visibility checks for shared relations.")));
-	if (!BufferIsValid(vmBuf) || !visibilitymap_pin_ok(heapBlk, vmBuf))
+		return;
+	if (!visibilitymap_pin_ok(heapBlk, vmBuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
 	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, vmBuf, cutoff_xid, flags
@@ -626,15 +681,18 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 #endif
 							  )
 {
+	if (vmbuf == NULL || context == NULL
+		|| (flags != VISIBILITYMAP_ALL_VISIBLE && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, *vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
+		|| (BufferIsValid(heapBuf) && !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_set_retry_aware");
+
 	/* PGRAC: only a real WAL redo call may reproduce an old positive bit. */
 	if (cluster_heap_maintenance_restricted(rel) &&
 		!(InRecovery && !XLogRecPtrIsInvalid(recptr)))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("all-visible publication for shared heaps is not supported"),
-				 errhint("Use ordinary heap visibility checks for shared relations.")));
-	Assert(vmbuf != NULL && context != NULL);
-	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
+		return false;
+	if (!visibilitymap_pin_ok(heapBlk, *vmbuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set_retry_aware");
 	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
 		return false;
@@ -646,6 +704,89 @@ visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
 	return true;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* LP_UNUSED can remain after the last tuple is removed. Inspect the complete
+ * bounded array without interpreting a tuple, ITL terminal state or HOT link.
+ * A redirect/dead LP still has a consumer and cannot qualify as empty here. */
+bool
+visibilitymap_heap_page_is_empty(Page page)
+{
+	PageHeader header;
+	OffsetNumber maxoff;
+
+	if (page == NULL)
+		return false;
+	header = (PageHeader)page;
+	if (PageIsNew(page) || PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
+		|| header->pd_special != MAXALIGN(header->pd_special) || !PageHasItl(page)
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE || header->pd_block_scn == 0)
+		return false;
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (maxoff > MaxHeapTuplesPerPage)
+		return false;
+	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff; offnum++) {
+		ItemId item = PageGetItemId(page, offnum);
+
+		if (ItemIdIsUsed(item) || ItemIdHasStorage(item))
+			return false;
+	}
+	return true;
+}
+
+/* An initialized, coherently owned empty heap has no tuple/HOT/MX inputs to
+ * classify, including when only LP_UNUSED remains. This entry grants no
+ * permission for a nonempty page or an old VM
+ * bit. Both writer-use brackets must already be active; never acquire current
+ * or initialize a page here. The original visible WAL couples both versions. */
+bool
+visibilitymap_set_empty(Relation rel, BlockNumber heapBlk, Buffer heapBuf, Buffer vmBuf,
+						const ClusterSpaceIdentityObservationV1 *observation)
+{
+	ResourceXWriterUseContext writer;
+	uint64 object_revision;
+	bool object_checked;
+	Page page;
+	RfPageProducerComponentV1 heap_component, vm_component;
+	BufferTag vm_tag;
+	bool publication_needed;
+	const ClusterSpaceIdentity *identity = observation != NULL ? &observation->identity : NULL;
+
+	if (rel == NULL || identity == NULL || InRecovery || !cluster_heap_maintenance_restricted(rel)
+		|| !cluster_shared_config || rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT
+		|| !RelationNeedsWAL(rel) || cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1
+		|| heapBlk == InvalidBlockNumber || !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)
+		|| !vm_buffer_matches(rel, vmBuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk))
+		|| !ClusterBufferCaptureMutationContext(heapBuf, &writer, &object_revision, &object_checked)
+		|| !ClusterBufferCaptureMutationContext(vmBuf, &writer, &object_revision, &object_checked)
+		|| !cluster_space_relation_identity_current_v1(rel, observation))
+		return false;
+
+	page = BufferGetPage(heapBuf);
+	if (!visibilitymap_heap_page_is_empty(page)
+		|| !vm_redo_page_valid(BufferGetPage(vmBuf))
+		|| !cluster_space_buffer_version_component(identity, heapBuf, 1, 1, &heap_component)
+		|| !cluster_space_buffer_version_component(identity, vmBuf, 0, 0, &vm_component))
+		return false;
+
+	/* Both exact pages remain locked. Distinguish a real native publication
+	 * from an already-qualified no-op; neither is a durability or transfer
+	 * acknowledgement. Record only after the native WAL section returns. */
+	publication_needed = !PageIsAllVisible(page)
+		|| ((((uint8 *)PageGetContents(BufferGetPage(vmBuf)))[HEAPBLK_TO_MAPBYTE(heapBlk)]
+			 >> HEAPBLK_TO_OFFSET(heapBlk)) & VISIBILITYMAP_VALID_BITS) != VISIBILITYMAP_VALID_BITS;
+	visibilitymap_set_locked(rel, heapBlk, heapBuf, InvalidXLogRecPtr, vmBuf, InvalidTransactionId,
+							 VISIBILITYMAP_VALID_BITS, identity);
+	InitBufferTag(&vm_tag, &rel->rd_locator, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk));
+	cluster_pcm_vm_metric_note(&vm_tag, publication_needed ? PCM_VM_EMPTY_PUBLISH_WAL
+															 : PCM_VM_EMPTY_PUBLISH_NOOP);
+	return true;
+}
+#endif
 
 static void
 visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr,
@@ -661,11 +802,17 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 	Page		page;
 	uint8	   *map;
 #ifdef USE_PGRAC_CLUSTER
-	bool		versioned = cluster_shared_config && !InRecovery
-		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
-		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+	bool versioned = rel != NULL && cluster_shared_config && !InRecovery
+					 && rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+					 && cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
 	RfPageProducerBatchV1 versions;
 #endif
+
+	if ((flags != VISIBILITYMAP_ALL_VISIBLE && flags != VISIBILITYMAP_VALID_BITS)
+		|| heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmBuf, VISIBILITYMAP_FORKNUM, mapBlock)
+		|| (BufferIsValid(heapBuf) && !vm_buffer_matches(rel, heapBuf, MAIN_FORKNUM, heapBlk)))
+		elog(ERROR, "invalid target or flags passed to visibilitymap_set_locked");
 
 #ifdef TRACE_VISIBILITYMAP
 	elog(DEBUG1, "vm_set %s %d", RelationGetRelationName(rel), heapBlk);
@@ -681,14 +828,6 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 
 	/* Must never set all_frozen bit without also setting all_visible bit */
 	Assert(flags != VISIBILITYMAP_ALL_FROZEN);
-
-	/* Check that we have the right heap page pinned, if present */
-	if (BufferIsValid(heapBuf) && BufferGetBlockNumber(heapBuf) != heapBlk)
-		elog(ERROR, "wrong heap buffer passed to visibilitymap_set");
-
-	/* Check that we have the right VM page pinned */
-	if (!BufferIsValid(vmBuf) || BufferGetBlockNumber(vmBuf) != mapBlock)
-		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 
 	page = BufferGetPage(vmBuf);
 	map = (uint8 *)PageGetContents(page);
@@ -828,6 +967,202 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	return result;
 }
 
+/* Decode an exact already-pinned image, without fetching, repinning or taking
+ * current authority. A consumer that relies on a zero bit must retain its
+ * existing coherent content-lock bracket. This is not snapshot permission. */
+bool
+visibilitymap_get_status_pinned(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 *status)
+{
+	Page page;
+	uint8 observed;
+#ifdef USE_PGRAC_CLUSTER
+	static const PGAlignedBlock zero;
+#endif
+
+	if (status != NULL)
+		*status = 0;
+	if (status == NULL || heapBlk == InvalidBlockNumber
+		|| !vm_buffer_matches(rel, vmbuf, VISIBILITYMAP_FORKNUM, HEAPBLK_TO_MAPBLOCK(heapBlk)))
+		return false;
+	page = BufferGetPage(vmbuf);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_heap_maintenance_restricted(rel)
+		&& (PageIsNew(page) ? memcmp(page, zero.data, BLCKSZ) != 0 : !vm_redo_page_valid(page)))
+		return false;
+#endif
+	observed = ((uint8 *)PageGetContents(page))[HEAPBLK_TO_MAPBYTE(heapBlk)];
+	observed = (observed >> HEAPBLK_TO_OFFSET(heapBlk)) & VISIBILITYMAP_VALID_BITS;
+	if (observed == VISIBILITYMAP_ALL_FROZEN)
+		return false;
+	*status = observed;
+	return true;
+}
+
+/*
+ * visibilitymap_read_begin -- observe bits and retain a shared VM read bracket.
+ *
+ * The relation owner retains its lifecycle lock. Call before taking any heap
+ * content lock: a cold or revoked VM pin can require a remote acquisition.
+ * The caller owns the pin and ends the scope before releasing/rebinding it or
+ * doing I/O, waiting or acquiring another block. A retained read lock alone
+ * does not prove snapshot admission, publication or visibility/freeze safety.
+ * False clears status and leaves an already-active scope unchanged.
+ */
+bool
+visibilitymap_read_begin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf,
+						 volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+
+	if (status != NULL)
+		*status = 0;
+	if (rel == NULL || vmbuf == NULL || scope == NULL || status == NULL
+		|| heapBlk == InvalidBlockNumber || BufferIsValid(scope->locked_buffer))
+		return false;
+	if (!cluster_heap_maintenance_restricted(rel)) {
+		*status = visibilitymap_get_status(rel, heapBlk, vmbuf);
+		return true;
+	}
+#ifdef USE_PGRAC_CLUSTER
+	/* A local content lock cannot substitute for unavailable PCM authority. */
+	if (!cluster_pcm_is_active())
+		return false;
+#endif
+	if (BufferIsValid(*vmbuf)) {
+		BufferGetTag(*vmbuf, &locator, &forknum, &block);
+		if (!RelFileLocatorEquals(locator, rel->rd_locator) || forknum != VISIBILITYMAP_FORKNUM
+			|| block != mapBlock) {
+			ReleaseBuffer(*vmbuf);
+			*vmbuf = InvalidBuffer;
+		}
+	}
+	if (!BufferIsValid(*vmbuf)) {
+		*vmbuf = vm_readbuf(rel, mapBlock, false);
+		if (!BufferIsValid(*vmbuf))
+			return true;
+	}
+	/* A pin is not a grant. This also revalidates an existing cached grant. */
+	if (!ClusterLockBufferShareBarrierAware(*vmbuf))
+		return false;
+	if (!visibilitymap_get_status_pinned(rel, heapBlk, *vmbuf, status)) {
+		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
+		return false;
+	}
+	scope->locked_buffer = *vmbuf;
+	return true;
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* Bind the caller's retained evaluator to a coherent VM observation. Admission
+ * and SPACE identity are sampled before VM acquisition; local rechecks after
+ * acquisition invoke no services and prove no publication or skip permission. */
+bool
+visibilitymap_read_snapshot_begin(Relation rel, BlockNumber heapBlk, Snapshot snapshot,
+								  Buffer *vmbuf, volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	ClusterSnapshotReadScopeV1 evaluation;
+	ClusterUndoReadAdmissionFence admission;
+	ClusterSpaceIdentityObservationV1 identity;
+	uint64 before = 0, after = 0;
+	volatile bool observed = false;
+
+	if (status != NULL)
+		*status = 0;
+	if (rel == NULL || vmbuf == NULL || scope == NULL || status == NULL
+		|| heapBlk == InvalidBlockNumber || BufferIsValid(scope->locked_buffer))
+		return false;
+	if (!cluster_heap_maintenance_restricted(rel))
+		return visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status);
+	if (snapshot == NULL)
+		return false;
+
+	cluster_snapshot_read_enter_v1(&evaluation, snapshot);
+	PG_TRY();
+	{
+		if (cluster_snapshot_cr_identity_v1(snapshot, &before))
+		{
+			CommandId original_cid = snapshot->curcid;
+
+			if (cluster_undo_horizon_read_admission_capture(evaluation.read_scn, &admission)
+				&& cluster_space_relation_identity_capture_v1(rel, &identity)
+				&& visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status)
+				&& cluster_snapshot_cr_identity_v1(snapshot, &after) && before == after
+				&& snapshot->curcid == original_cid
+				&& cluster_undo_horizon_read_admission_current(&admission)
+				&& cluster_space_relation_identity_current_v1(rel, &identity))
+				observed = true;
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&evaluation);
+		if (!observed) {
+			*status = 0;
+			visibilitymap_read_end(scope);
+		}
+	}
+	PG_END_TRY();
+	return observed;
+}
+#endif
+
+/* Publication eligibility comes from guarded writers in the selected catalog;
+ * freshness still requires the original current-image and snapshot bracket. */
+bool
+visibilitymap_read_qualified_begin(Relation rel, BlockNumber heapBlk,
+								  struct SnapshotData *snapshot, Buffer *vmbuf,
+								  volatile VisibilityMapReadScope *scope, uint8 *status)
+{
+	if (status != NULL)
+		*status = 0;
+	if (rel == NULL || vmbuf == NULL || scope == NULL || status == NULL
+		|| heapBlk == InvalidBlockNumber || BufferIsValid(scope->locked_buffer))
+		return false;
+	if (!cluster_heap_maintenance_restricted(rel))
+		return visibilitymap_read_begin(rel, heapBlk, vmbuf, scope, status);
+#ifdef USE_PGRAC_CLUSTER
+	{
+		uint32 minimum_catalog = PGRAC_VM_QUALIFIED_CATALOG_VERSION;
+
+		if (minimum_catalog == 0 || GetControlFileCatalogVersion() < minimum_catalog)
+			return false;
+	}
+	return visibilitymap_read_snapshot_begin(rel, heapBlk, snapshot, vmbuf, scope, status);
+#else
+	return false;
+#endif
+}
+
+/* Release only the scope's read lock; the caller still owns the pin. */
+void
+visibilitymap_read_end(volatile VisibilityMapReadScope *scope)
+{
+	Buffer buffer;
+
+	if (scope == NULL || !BufferIsValid(scope->locked_buffer))
+		return;
+	buffer = scope->locked_buffer;
+	/* Generic unlock can report a PCM release error after dropping local S.
+	 * An enclosing FINALLY must not try to unlock that same scope again. */
+	scope->locked_buffer = InvalidBuffer;
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+}
+
+/* Observation-only compatibility entry: no read lock survives the return. */
+bool
+visibilitymap_get_status_coherent(Relation rel, BlockNumber heapBlk, Buffer *vmbuf, uint8 *status)
+{
+	VisibilityMapReadScope scope = {0};
+	bool valid;
+
+	valid = visibilitymap_read_begin(rel, heapBlk, vmbuf, &scope, status);
+	visibilitymap_read_end(&scope);
+	return valid;
+}
+
 /*
  *	visibilitymap_count  - count number of bits set in visibility map
  *
@@ -936,37 +1271,69 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 		Page		page;
 		char	   *map;
 #ifdef USE_PGRAC_CLUSTER
-		ClusterSpaceIdentity identity;
+		static const PGAlignedBlock zero;
+		ClusterSpaceIdentityObservationV1 observation;
 		RfPageProducerBatchV1 version_batch;
-		bool		versioned = !InRecovery && cluster_shared_config &&
+		bool		shared_vm = cluster_shared_config &&
 			RelationIsPermanent(rel) &&
 			cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+		bool		versioned = !InRecovery && shared_vm;
+		ResourceXAuxiliaryAcquireContext context = {0};
 
-		/* PGRAC: resolve once before VM pin/content lock, not inside WAL. */
+		/* PGRAC: retain the original observation across VM acquisition. */
 		if (versioned &&
 			(!RelationNeedsWAL(rel) ||
-			 !cluster_space_relation_get_identity(rel, &identity)))
+			 !cluster_space_relation_identity_capture_v1(rel, &observation)))
 			elog(ERROR, "shared VM truncation requires a live SPACE identity");
 #endif
 
 		newnblocks = truncBlock + 1;
 
-		mapBuffer = vm_readbuf(rel, truncBlock, false);
-		if (!BufferIsValid(mapBuffer))
+		for (;;)
 		{
-			/* nothing to do, the file was already smaller */
-			return InvalidBlockNumber;
+			mapBuffer = vm_readbuf(rel, truncBlock, false);
+			if (!BufferIsValid(mapBuffer))
+			{
+				/* nothing to do, the file was already smaller */
+				return InvalidBlockNumber;
+			}
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned)
+			{
+				if (ClusterLockBufferExclusiveAuxiliaryAware(&mapBuffer, &context))
+					break;
+				/* The handoff may have consumed the old pin. Retain this
+				 * operation's cursor while reobserving its exact relation. */
+				if (BufferIsValid(mapBuffer))
+					ReleaseBuffer(mapBuffer);
+				mapBuffer = InvalidBuffer;
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+#endif
+			LockBuffer(mapBuffer, BUFFER_LOCK_EXCLUSIVE);
+			break;
 		}
 
+		/* A replacement-aware acquisition can change the numeric handle. */
 		page = BufferGetPage(mapBuffer);
 		map = PageGetContents(page);
 
-		LockBuffer(mapBuffer, BUFFER_LOCK_EXCLUSIVE);
-
 #ifdef USE_PGRAC_CLUSTER
+		/* Memory-only checks precede both the no-op and the native mutation;
+		 * a fresh identity must not revive the original truncate operation. */
+		if (versioned &&
+			!cluster_space_relation_identity_current_v1(rel, &observation))
+			elog(ERROR, "shared VM truncation lost its original SPACE identity");
+		if (shared_vm &&
+			(!vm_buffer_matches(rel, mapBuffer, VISIBILITYMAP_FORKNUM, truncBlock) ||
+			 (PageIsNew(page) ? memcmp(page, zero.data, BLCKSZ) != 0 :
+			  !vm_redo_page_valid(page))))
+			elog(ERROR, "shared VM truncation requires an exact valid VM tail");
+
 		/* A real zero VM tail already represents no visible blocks. Recheck
 		 * under authority, but do not create an unversioned dirty header. */
-		if (cluster_shared_config && PageIsNew(page))
+		if (shared_vm && PageIsNew(page))
 		{
 			UnlockReleaseBuffer(mapBuffer);
 			goto check_vm_size;
@@ -984,7 +1351,7 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 				UnlockReleaseBuffer(mapBuffer);
 				goto check_vm_size;
 			}
-			if (!cluster_space_prepare_buffer_versions(&identity, &mapBuffer,
+			if (!cluster_space_prepare_buffer_versions(&observation.identity, &mapBuffer,
 													   &block_id, 1, &version_batch))
 				elog(ERROR, "shared VM truncation requires an exact predecessor");
 		}
@@ -1097,8 +1464,12 @@ visibilitymap_prepare_cold_truncate(Relation rel, BlockNumber nheapblocks,
 			buffer = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, truncBlock, RBM_NORMAL, NULL);
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
-			if (PageIsNew(page))
+			if (!vm_buffer_matches(rel, buffer, VISIBILITYMAP_FORKNUM, truncBlock))
+				clear = false;
+			else if (PageIsNew(page))
 				clear = memcmp(page, zero.data, BLCKSZ) == 0;
+			else if (!vm_redo_page_valid(page))
+				clear = false;
 			else {
 				const unsigned char *map = (unsigned char *)PageGetContents(page);
 
@@ -1156,6 +1527,12 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 	 */
 	for (;;)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* A replaced init pin leaves this retry unowned. Honor cancellation
+		 * before obtaining another mapping or initializing its page. */
+		if (versioned)
+			CHECK_FOR_INTERRUPTS();
+#endif
 		/* The init wait can release the pin and invalidate SMgr; reacquire
 		 * the original relation's mapping on every retry. */
 		reln = RelationGetSmgr(rel);

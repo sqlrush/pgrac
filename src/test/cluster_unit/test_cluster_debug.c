@@ -41,6 +41,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_cf_phase2.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -4277,6 +4278,8 @@ bool
 cluster_cf_phase2_verify_pending(const char *pgdata pg_attribute_unused(),
 								 TimestampTz deadline pg_attribute_unused())
 {
+	/* This read-only diagnostic fixture never performs startup rendezvous. */
+	abort();
 	return false;
 }
 
@@ -5734,6 +5737,27 @@ UT_TEST(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts)
 	}
 }
 
+UT_TEST(test_debug_dump_exposes_empty_publication_outcomes_only_with_stats)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	for (int available = 0; available < 2; available++) {
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		vm_stats_available = available != 0;
+		(void)cluster_dump_state(fcinfo);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "vm_empty_publish_wal_count"), available);
+		UT_ASSERT_EQ(captured_dump_count("pcm", "vm_empty_publish_noop_count"), available);
+		if (available) {
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_empty_publish_wal_count"), "0");
+			UT_ASSERT_STR_EQ(captured_dump_value("pcm", "vm_empty_publish_noop_count"), "0");
+		}
+	}
+}
+
 UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
 {
 	LOCAL_FCINFO(fcinfo, 0);
@@ -6887,7 +6911,7 @@ UT_TEST(test_debug_locator_families_keep_availability_origin_and_unsigned_values
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(37);
 	UT_RUN(test_debug_dump_retention_observations_preserve_availability_and_unsigned_values);
 	UT_RUN(test_debug_dump_exposes_native_drop_context_and_real_io_observation);
 	UT_RUN(test_debug_dump_exposes_pcm_first_refusal_identity_and_subpredicate);
@@ -6900,6 +6924,7 @@ main(void)
 	UT_RUN(test_debug_dump_exposes_reply_wait_sites_without_fabricating_zeros);
 	UT_RUN(test_debug_dump_exposes_paired_wait_margins_without_zero_fabrication);
 	UT_RUN(test_debug_dump_exposes_vm_counts_and_histogram_as_separate_cohorts);
+	UT_RUN(test_debug_dump_exposes_empty_publication_outcomes_only_with_stats);
 	UT_RUN(test_debug_dump_exposes_origin_discard_reason_counters);
 	UT_RUN(test_debug_dump_exposes_receipt_lifetime_and_cancel_before_counters);
 	UT_RUN(test_debug_dump_exposes_retained_rollover_counts_without_fake_zero);

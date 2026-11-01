@@ -209,6 +209,21 @@ extern bool cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch);
 extern void cluster_undo_horizon_note_self_member(void);
 extern bool cluster_undo_horizon_read_admission_enforce(SCN read_scn);
 
+/* Operation-local invalidation guard. The caller separately retains its native
+ * snapshot; these fields convey no snapshot, grant or publication authority. */
+typedef struct ClusterUndoReadAdmissionFence {
+	uint64 membership_cut_generation;
+	uint64 capability_cut_generation;
+	uint64 epoch;
+	uint64 self_admitted_epoch;
+	int32 node_id;
+} ClusterUndoReadAdmissionFence;
+
+extern bool cluster_undo_horizon_read_admission_capture(SCN read_scn,
+													  ClusterUndoReadAdmissionFence *out);
+/* Local reads only: safe beneath a content lock, no proof/capability service. */
+extern bool cluster_undo_horizon_read_admission_current(const ClusterUndoReadAdmissionFence *expected);
+
 /* observability (D5-5) */
 extern void cluster_undo_horizon_note_stall(void);
 extern uint64 cluster_undo_horizon_stall_count(void);

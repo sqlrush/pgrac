@@ -39,6 +39,15 @@
 #define BufferIsValid(buf) ((buf) != InvalidBuffer)
 #undef VM_ALL_FROZEN
 #define VM_ALL_FROZEN(...) false
+#undef CHECK_FOR_INTERRUPTS
+#define CHECK_FOR_INTERRUPTS()                                                                     \
+	do {                                                                                           \
+		fixture_interrupt_checks++;                                                                \
+		if (fixture_cancel_on_retry) {                                                             \
+			fixture_error_code = ERRCODE_QUERY_CANCELED;                                           \
+			longjmp(fixture_error, 1);                                                             \
+		}                                                                                          \
+	} while (0)
 
 static ClusterHeapFreezeProofStatusV1
 lazy_collect_shared_freeze_proofs(LVRelState *vacrel, Buffer recent_buffer)
@@ -60,16 +69,57 @@ lazy_scan_skip(LVRelState *vacrel, Buffer *vm, BlockNumber next, bool *allvis, b
 	return next;
 }
 
-void
-visibilitymap_pin(Relation rel, BlockNumber block, Buffer *vm)
+/* The original reader is exercised separately; this leaf verifies scan order. */
+static bool
+fixture_visibilitymap_get_status_coherent(Relation rel, BlockNumber block, Buffer *vm,
+										  uint8 *status)
 {
 	(void)rel;
 	(void)block;
+	(void)vm;
+	UT_ASSERT_EQ(fixture_pins + fixture_locks, 0);
+	fixture_vm_observations++;
+	*status = fixture_vm_bits;
+	return fixture_vm_coherent_ok;
+}
+#define visibilitymap_get_status_coherent fixture_visibilitymap_get_status_coherent
+
+void
+visibilitymap_pin(Relation rel, BlockNumber block, Buffer *vm)
+{
+	fixture_vm_relation = rel;
+	fixture_vm_block = block;
+	if (fixture_pins || fixture_locks)
+		fixture_vm_prepare_with_heap++;
 	if (!BufferIsValid(*vm)) {
 		*vm = FIXTURE_VM_BUFFER;
 		fixture_vm_pins++;
 		fixture_vm_acquires++;
 	}
+}
+
+bool
+visibilitymap_pin_recent(Relation rel, BlockNumber block, Buffer recent, Buffer *vm)
+{
+	UT_ASSERT_EQ(rel, fixture_vm_relation);
+	UT_ASSERT_EQ(block, fixture_vm_block);
+	UT_ASSERT_EQ(recent, FIXTURE_VM_BUFFER);
+	UT_ASSERT_EQ(*vm, InvalidBuffer);
+	UT_ASSERT_EQ(fixture_vm_pins, 0);
+	UT_ASSERT_EQ(fixture_pins, 1);
+	UT_ASSERT_EQ(fixture_locks, 1);
+	fixture_vm_repin_calls++;
+	if (fixture_vm_repin_misses && (!fixture_vm_miss_cleanup_only || fixture_cleanup_waits)) {
+		fixture_vm_repin_misses--;
+		if (fixture_vm_miss_read_error)
+			fixture_read_error = true;
+		return false;
+	}
+	*vm = FIXTURE_VM_BUFFER;
+	fixture_vm_pins++;
+	fixture_vm_acquires++;
+	fixture_vm_repins++;
+	return true;
 }
 
 Buffer
@@ -80,6 +130,8 @@ ReadBufferExtended(Relation rel, ForkNumber fork, BlockNumber block, ReadBufferM
 	(void)fork;
 	(void)mode;
 	(void)strategy;
+	if (fixture_vm_pins)
+		fixture_vm_heap_reads++;
 	if (fixture_read_error)
 		longjmp(fixture_error, 1);
 	fixture_reads++;
@@ -91,6 +143,8 @@ bool
 ConditionalLockBufferForCleanup(Buffer buf)
 {
 	(void)buf;
+	if (fixture_vm_pins)
+		fixture_vm_heap_locks++;
 	if (fixture_cleanup)
 		fixture_locks++;
 	return fixture_cleanup;
@@ -100,12 +154,17 @@ void
 LockBuffer(Buffer buf, int mode)
 {
 	(void)buf;
+	if (mode != BUFFER_LOCK_UNLOCK && fixture_vm_pins)
+		fixture_vm_heap_locks++;
 	fixture_locks += mode == BUFFER_LOCK_UNLOCK ? -1 : 1;
 }
 
 void
 LockBufferForCleanup(Buffer buf)
 {
+	if (fixture_vm_pins)
+		fixture_vm_heap_locks++;
+	fixture_cleanup_waits++;
 	fixture_locks++;
 	if (fixture_cleanup_empty)
 		((PageHeader)BufferGetPage(buf))->pd_lower = SizeOfPageHeaderData;
@@ -138,7 +197,7 @@ ReleaseBuffer(Buffer buf)
 
 static bool
 lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber block, Page page, bool share,
-					   Buffer vm)
+					   Buffer *vm)
 {
 	(void)vacrel;
 	(void)block;
@@ -216,13 +275,28 @@ lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identi
 	(void)buf;
 	(void)block;
 	(void)vm;
+	if (fixture_vm_repair_unlocked)
+		UT_ASSERT_EQ(fixture_pins + fixture_locks, 0);
 	fixture_vm_writes++;
 }
+
+static void
+fixture_clear_vm_after_heap(Relation rel, const ClusterSpaceIdentity *identity, BlockNumber block,
+							Buffer *vm)
+{
+	(void)rel;
+	(void)identity;
+	(void)block;
+	(void)vm;
+	UT_ASSERT_EQ(fixture_pins + fixture_locks, 0);
+	fixture_vm_writes++;
+}
+#define lazy_clear_vm_after_heap fixture_clear_vm_after_heap
 
 #define MarkBufferDirty(buf) (fixture_dirties++)
 #define RecordPageWithFreeSpace(rel, block, space) ((void)(space), fixture_fsm_writes++)
 #define FreeSpaceMapVacuumRange(...) ((void)0)
-#define visibilitymap_get_status(...) 0
+#define visibilitymap_get_status(...) fixture_vm_bits
 #define visibilitymap_clear(...) (fixture_vm_writes++)
 #define visibilitymap_set(rel, block, buf, lsn, vm, cutoff, flags, identity)                       \
 	((void)(flags), fixture_vm_writes++)

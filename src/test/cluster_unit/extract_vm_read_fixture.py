@@ -17,6 +17,15 @@ if "\ncluster_heap_maintenance_restricted(" in vm:
     print(function(vm, "cluster_heap_maintenance_restricted", "bool"))
 print(function(vm, "vm_readbuf", "static Buffer"))
 print(function(vm, "visibilitymap_get_status", "uint8"))
+if "\nvisibilitymap_get_status_coherent(" in vm:
+    print("#define FIXTURE_HAS_COHERENT_VM_READER 1")
+    print(function(vm, "vm_redo_page_valid", "static bool"))
+    if "\nvisibilitymap_get_status_pinned(" in vm:
+        print(function(vm, "vm_buffer_matches", "static bool"))
+        print(function(vm, "visibilitymap_get_status_pinned", "bool"))
+    print(function(vm, "visibilitymap_read_begin", "bool"))
+    print(function(vm, "visibilitymap_read_end", "void"))
+    print(function(vm, "visibilitymap_get_status_coherent", "bool"))
 print(function((root / "executor/nodeIndexonlyscan.c").read_text(),
                "IndexOnlyNext", "static TupleTableSlot *"))
 
@@ -37,7 +46,13 @@ for name, path, owner, args in [
     ("fixture_sample", root / "access/heap/heapam_handler.c", "heapam_scan_sample_next_tuple",
      "TableScanDesc scan, Page page")]:
     statements = assignment(path, owner, "all_visible")
-    assert len(statements) == 1
+    # This legacy fixture has no qualified catalog or prepared heap context.
+    # Keep exercising the original conservative expression; the complete
+    # qualified consumers and saved-page path have their own full-body test.
+    qualified = "cluster_heap_page_all_visible(" in function(path.read_text(), owner, "unused")
+    assert len(statements) == (2 if qualified else 1)
+    if qualified:
+        assert statements[1] == "all_visible = true;"
     wrapper(name, args, statements[0].split("=", 1)[1].strip().removesuffix(";"))
 
 path = root / "executor/nodeBitmapHeapscan.c"
@@ -51,9 +66,9 @@ for owner, expected in [("BitmapHeapNext", 1), ("BitmapPrefetch", 2)]:
                 statement.split("=", 1)[1].strip().removesuffix(";"))
 
 
-def vm_condition(path, owner):
+def vm_condition(path, owner, anchor="VM_ALL_VISIBLE("):
     body = function(path.read_text(), owner, "unused")
-    at = body.index("VM_ALL_VISIBLE(")
+    at = body.index(anchor)
     start = body.rfind("if (", 0, at) + len("if (")
     depth = 1
     end = start
@@ -65,5 +80,10 @@ def vm_condition(path, owner):
 
 wrapper("fixture_planner_fetch", "Relation heapRel, BlockNumber block, Buffer vmbuffer",
         vm_condition(root / "utils/adt/selfuncs.c", "get_actual_variable_endpoint"))
+statapprox = root.parent.parent / "contrib/pgstattuple/pgstatapprox.c"
+anchor = "VM_ALL_VISIBLE("
+if "\nstatapprox_vm_all_visible(" in statapprox.read_text():
+    print(function(statapprox.read_text(), "statapprox_vm_all_visible", "static bool"))
+    anchor = "statapprox_vm_all_visible("
 wrapper("fixture_statapprox_skip", "Relation rel, BlockNumber blkno, Buffer vmbuffer",
-        vm_condition(root.parent.parent / "contrib/pgstattuple/pgstatapprox.c", "statapprox_heap"))
+        vm_condition(statapprox, "statapprox_heap", anchor))

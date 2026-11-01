@@ -5304,6 +5304,12 @@ GetSystemIdentifier(void)
 	return ControlFile->system_identifier;
 }
 
+uint32
+GetControlFileCatalogVersion(void)
+{
+	return ControlFile != NULL ? ControlFile->catalog_version_no : 0;
+}
+
 /*
  * Returns the random nonce from control file.
  */
