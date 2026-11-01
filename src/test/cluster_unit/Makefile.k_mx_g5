@@ -10,3 +10,20 @@ test_k_mx_g5_legacy_domain: test_k_mx_g5_legacy_domain.c \
 		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PGPORT) -o $@
+
+# Opt-in RED target until the range codec and C's headers are composed.
+# Override these only to supply the exact composed headers/product objects.
+K_MX_G5_CPPFLAGS ?=
+K_MX_G5_CODEC_OBJECTS ?=
+test_k_mx_g5_range_contract: test_k_mx_g5_range_contract.c \
+		test_cluster_multixact_current.c unit_test.h \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
+		$(K_MX_G5_CODEC_OBJECTS)
+	$(CC) $(CFLAGS) $(K_MX_G5_CPPFLAGS) $(CPPFLAGS) $< \
+		-DHEAPAM_CURRENT_MX_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DMULTIXACT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/transam/multixact.c"' \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
+		$(K_MX_G5_CODEC_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PGPORT) -o $@
