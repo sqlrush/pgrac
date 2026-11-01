@@ -5726,6 +5726,7 @@ UT_TEST(test_native_committed_seventy_two_owners_survive_full_background_region)
 			uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES],
 				records[72][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 			const char *reason;
+			const bool retained = automatic && drop;
 			template_owner = prepare_native_structure(drop, &binding, wal);
 			UT_ASSERT(cluster_space_structure_wal_decode(wal, sizeof(wal), &change));
 			cluster_ko_shared_release_v2(&template_owner);
@@ -5786,9 +5787,12 @@ UT_TEST(test_native_committed_seventy_two_owners_survive_full_background_region)
 			memset(storage.contexts, 0,
 				   sizeof(storage.contexts)); /* Release the fixture's unrelated owners. */
 			UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason),
-						 CLUSTER_NORMAL_STOP_PENDING);
+				retained ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING);
+			if (retained)
+				UT_ASSERT(strcmp(reason, "KO_SHARED_COMMITTED_RECOVERY_REQUIRED") == 0);
 			for (unsigned n = 0; n < lengthof(owners); n++) {
 				uint32 i;
+				const ClusterKoSharedContext *completed;
 				if (n == 1) {
 					ClusterKoCompletionV2 *arrival = NULL;
 					ClusterPageWalBindingV1 next = binding;
@@ -5813,15 +5817,26 @@ UT_TEST(test_native_committed_seventy_two_owners_survive_full_background_region)
 					UT_ASSERT(native_handoff_after_buffers(&arrival));
 					MyBackendType = B_CHECKPOINTER;
 				}
-				UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
-				i = storage.contexts[0].terminal.identity.locator.relNumber - 1000;
+				UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(),
+					retained ? CLUSTER_KO_STRUCTURE_INVALID : CLUSTER_KO_STRUCTURE_PROGRESS);
+				if (retained) {
+					ClusterKoNativeContinuation *failed;
+					UT_ASSERT(DsaPointerIsValid(storage.native_failed));
+					failed = dsa_get_address(ko_native_area, storage.native_failed);
+					UT_ASSERT(failed->recovery_required && !failed->buffers_released
+						&& !failed->predelete_ready && !failed->context.v3);
+					UT_ASSERT(!storage.contexts[0].used);
+					completed = &failed->context;
+				} else
+					completed = &storage.contexts[0];
+				i = completed->terminal.identity.locator.relNumber - 1000;
 				UT_ASSERT(i < lengthof(owners));
 				if (i < lengthof(owners)) {
 					UT_ASSERT(!seen[i]);
 					seen[i] = true;
-					UT_ASSERT(memcmp(&storage.contexts[0].terminal, &expected[i], sizeof(binding))
+					UT_ASSERT(memcmp(&completed->terminal, &expected[i], sizeof(binding))
 							  == 0);
-					UT_ASSERT(memcmp(storage.contexts[0].structure, records[i], sizeof(wal)) == 0);
+					UT_ASSERT(memcmp(completed->structure, records[i], sizeof(wal)) == 0);
 				}
 				/* An undurable DROP must not be visible to any receipt consumer. */
 				UT_ASSERT_EQ(cluster_ko_shared_structure_observation_v2(
@@ -5837,8 +5852,22 @@ UT_TEST(test_native_committed_seventy_two_owners_survive_full_background_region)
 			UT_ASSERT_EQ(storage.contexts[0].terminal.identity.locator.relNumber, 2000);
 			memset(storage.contexts, 0, sizeof(storage.contexts));
 			UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_RELEASED);
-			UT_ASSERT_EQ(native_allocated, 0);
-			UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
+			UT_ASSERT_EQ(native_allocated, retained ? lengthof(owners) : 0);
+			UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason),
+				retained ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_READY);
+			if (retained) {
+				unsigned count = 0;
+				for (dsa_pointer at = storage.native_failed; DsaPointerIsValid(at);) {
+					ClusterKoNativeContinuation *failed = dsa_get_address(ko_native_area, at);
+					UT_ASSERT(failed->recovery_required);
+					UT_ASSERT(++count <= lengthof(owners));
+					if (count > lengthof(owners))
+						break;
+					at = failed->next;
+				}
+				UT_ASSERT_EQ(count, lengthof(owners));
+				UT_ASSERT_EQ(storage.native_waiting, 0);
+			}
 			UT_ASSERT(exit_callback != NULL);
 			{
 				unsigned detached = native_detaches, released = native_releases;
@@ -5847,6 +5876,10 @@ UT_TEST(test_native_committed_seventy_two_owners_survive_full_background_region)
 				UT_ASSERT_EQ(native_releases, released + 1);
 				UT_ASSERT(ko_native_area == NULL);
 			}
+			/* End only this isolated fixture; retained work is not retired by
+			 * any successful product recovery in this negative cell. */
+			if (retained)
+				native_fixture_shared_memory_end();
 		}
 }
 
@@ -7395,9 +7428,13 @@ UT_TEST(test_raw_copy_scope_keeps_exact_owner_cut_and_error_responsibility)
 		ClusterKoCurrentAdmissionV3 sample = { 0 };
 		RelFileLocator locator = request.base.key.locator;
 		uint64 serial;
+		ClusterKoExtendWorkV3 original;
+		uint32 slot;
 
 		UT_ASSERT(cluster_ko_copy_begin_v3(locator, &serial));
 		UT_ASSERT(cluster_ko_create_write_begin_v3(locator, serial));
+		slot = ko_create_slot;
+		original = storage.extend_work[slot];
 		UT_ASSERT(cluster_ko_peer_fence_begin_v3(&request, &handle, &state));
 		UT_ASSERT(cluster_ko_peer_current_begin_v3(locator, SPACE_FORKNUM, 1, &sample));
 		switch (fault) {
@@ -7419,14 +7456,20 @@ UT_TEST(test_raw_copy_scope_keeps_exact_owner_cut_and_error_responsibility)
 		}
 		UT_ASSERT(!cluster_ko_peer_current_begin_v3(locator, SPACE_FORKNUM, 1, &sample));
 		UT_ASSERT(storage.extend_work[ko_create_slot].used);
-		if (fault == 8) {
+		if (fault == 8 || fault == 9) {
+			/* Exit first expires permission while native ShutdownPostgres
+			 * still owns locks. Run its original release phases before
+			 * inspecting the shared error handoff. */
+			UT_ASSERT(memcmp(&storage.extend_work[slot], &original, sizeof(original)) == 0);
 			ko_shared_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, NULL);
-			UT_ASSERT(storage.extend_work[ko_create_slot].used);
+			UT_ASSERT(memcmp(&storage.extend_work[slot], &original, sizeof(original)) == 0);
 			ko_shared_resource_release(RESOURCE_RELEASE_AFTER_LOCKS, false, false, NULL);
-			UT_ASSERT(storage.extend_work[ko_create_slot].failed);
+			UT_ASSERT(storage.extend_work[slot].used);
+			UT_ASSERT(storage.extend_work[slot].failed);
+			original.failed = true;
+			UT_ASSERT(memcmp(&storage.extend_work[slot], &original, sizeof(original)) == 0);
+			UT_ASSERT(!ko_create_local.used && ko_create_owner == NULL);
 		}
-		if (fault == 9)
-			UT_ASSERT(storage.extend_work[ko_create_slot].failed);
 		cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 	}
 }
