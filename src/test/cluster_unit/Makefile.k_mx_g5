@@ -204,3 +204,22 @@ test_k_mx_g5_heap_full_red: test_k_mx_g5_heap_full_red.c test_cluster_r4_lock_or
 		$(top_builddir)/src/backend/storage/lmgr/lock.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Explicit full-constructor acceptance RED; never added to the default TESTS.
+K_MX_CONSTRUCTOR_FULL_TESTS = test_k_mx_g5_constructor_full_red \
+	test_k_mx_g5_constructor_full_noassert_red
+test_k_mx_g5_constructor_full_red: K_MX_CONSTRUCTOR_MODE = cassert
+test_k_mx_g5_constructor_full_red: K_MX_CONSTRUCTOR_CPPFLAGS = -DPREFLIGHT_EXPECT_CASSERT
+test_k_mx_g5_constructor_full_noassert_red: K_MX_CONSTRUCTOR_MODE = nocassert
+test_k_mx_g5_constructor_full_red: $(MX_PUBLICATION_PROFILE)/cassert/pg_config.h \
+	$(MX_PUBLICATION_PROFILE)/cassert/postgres.h $(MX_PUBLICATION_PROFILE)/cassert/c.h
+test_k_mx_g5_constructor_full_noassert_red: $(MX_PUBLICATION_PROFILE)/nocassert/pg_config.h \
+	$(MX_PUBLICATION_PROFILE)/nocassert/postgres.h $(MX_PUBLICATION_PROFILE)/nocassert/c.h
+$(K_MX_CONSTRUCTOR_FULL_TESTS): test_k_mx_g5_constructor_full_red.c \
+		test_cluster_multixact_preflight.c unit_test.h Makefile.k_mx_g5 \
+		$(top_srcdir)/src/backend/access/transam/multixact.c \
+		$(top_srcdir)/src/include/access/multixact.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h
+	$(CC) $(CFLAGS) -I$(MX_PUBLICATION_PROFILE)/$(K_MX_CONSTRUCTOR_MODE) $(CPPFLAGS) \
+		$(K_MX_CONSTRUCTOR_CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
