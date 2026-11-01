@@ -168,8 +168,8 @@ static PgracInitdbWalContext initdb_wal_context;
 static PgracInitdbRecoveryContext initdb_recovery_context;
 static bool initdb_recovery_present;
 
-/* Native child consumes only its creator's original closed request. The
- * temporary shared directory is an input proof, not post-bootstrap custody. */
+/* Each original native child consumes its creator's closed batch request.
+ * Post-bootstrap retains its original shared-DATA publication descriptor. */
 static bool
 initdb_boot_recovery_accept(PgracInitdbWalContext *context)
 {
@@ -177,7 +177,8 @@ initdb_boot_recovery_accept(PgracInitdbWalContext *context)
 	ClusterRecoveryFileIdentityV2 boot[2];
 	int data_fd;
 	bool valid;
-	if (!context || context->phase != PGRAC_INITDB_WAL_BOOTSTRAP || context->thread_id != 1
+	if (!context || (context->phase != PGRAC_INITDB_WAL_BOOTSTRAP &&
+		context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP) || context->thread_id != 1
 		|| context->recovery_fd < 3 || context->base_fd < 3 || context->config.fd < 3
 		|| context->recovery_fd == context->base_fd || context->recovery_fd == context->config.fd
 		|| context->base_fd == context->config.fd || initdb_recovery_present)
@@ -193,13 +194,16 @@ initdb_boot_recovery_accept(PgracInitdbWalContext *context)
 		valid = false;
 	if (!valid)
 		return false;
-	/* This descriptor proved the original request's shared target. It is not
-	 * the later SQL child's independent post-bootstrap DATA publication grant. */
-	if (close(context->base_fd))
-		return false;
-	context->base_fd = 0;
-	context->base_device = context->base_inode = context->database_incarnation = 0;
-	memset(context->storage_uuid, 0, sizeof(context->storage_uuid));
+	/* The BOOT descriptor is only input proof. The later SQL child already
+	 * owns the original independent post-bootstrap DATA publication grant;
+	 * consuming the same creator batch must not erase that original duty. */
+	if (context->phase == PGRAC_INITDB_WAL_BOOTSTRAP) {
+		if (close(context->base_fd))
+			return false;
+		context->base_fd = 0;
+		context->base_device = context->base_inode = context->database_incarnation = 0;
+		memset(context->storage_uuid, 0, sizeof(context->storage_uuid));
+	}
 	initdb_recovery_context = recovery;
 	initdb_recovery_present = true;
 	context->recovery_fd = 0;
@@ -330,7 +334,7 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 			any |= context.storage_uuid[i];
 		if (context.recovery_fd < 0
 			|| (context.recovery_fd != 0
-				&& (!bootstrap || context.thread_id != 1 || context.recovery_fd < 3
+				&& (context.thread_id != 1 || context.recovery_fd < 3
 					|| context.recovery_fd == context.base_fd
 					|| context.recovery_fd == context.config.fd))
 			|| (context.base_fd == 0

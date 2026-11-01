@@ -86,4 +86,8 @@ typedef struct ClusterControlRelmapFormatV2 {
 } ClusterControlRelmapFormatV2;
 extern ClusterControlRootResult cluster_control_root_relmap_format_locked_v2(
 	Size registry_budget, ClusterControlRelmapFormatV2 *out);
+/* Complete physical registry vector by value under the same selection/CF.
+ * Includes all file families and copies. No target-file identity inference. */
+extern bool cluster_control_root_native_files_copy_v4(ClusterControlRelmapSelectionV2 *,
+	ClusterRecoveryFileIdentityV2 *out, uint64 capacity, uint64 *count);
 #endif

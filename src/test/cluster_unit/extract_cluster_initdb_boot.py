@@ -6,9 +6,10 @@ import sys
 parts = []
 for name, path in [("BootStrapCLOGWithIdentity", sys.argv[1]),
                    ("pgrac_native_create_boot_undo", sys.argv[2]),
-                   ("initdb_boot_recovery_accept", sys.argv[3])]:
+                   ("initdb_boot_recovery_accept", sys.argv[3]),
+                   ("cluster_wal_thread_initdb_accept", sys.argv[3])]:
     source = pathlib.Path(path).read_text()
-    matches = re.findall(r"static (?:bool|void)\n" + name + r"\(.*?^\}", source, re.M | re.S)
+    matches = re.findall(r"(?:static )?(?:bool|void)\n" + name + r"\(.*?^\}", source, re.M | re.S)
     if len(matches) != 1:
         raise SystemExit("missing/duplicate " + name)
     parts += matches

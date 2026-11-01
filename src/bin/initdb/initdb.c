@@ -4007,7 +4007,7 @@ pgrac_native_child_begin(bool bootstrap)
 			pg_fatal("INITDB_CONFIG_CONTEXT: cannot pass original configuration request: %m");
 		context.config.fd = pgrac_native_config_child_fd;
 	}
-	if (bootstrap && pgrac_native_recovery_requested && pgrac_native_recovery.boot_file_count) {
+	if (pgrac_native_recovery_requested && pgrac_native_recovery.boot_file_count) {
 		if (!pgrac_initdb_recovery_relay_v2(&pgrac_native_recovery, &pgrac_native_recovery_child_fd)
 			|| fcntl(pgrac_native_recovery_child_fd, F_SETFD, 0) != 0)
 			pg_fatal("INITDB_BOOT_CONTEXT: cannot relay original full BOOT identities");

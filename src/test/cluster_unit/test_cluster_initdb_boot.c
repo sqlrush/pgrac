@@ -1,5 +1,12 @@
 /* Original A dispatch; only F's family producers are controlled leaves. */
 #include "postgres.h"
+#include "access/xlog_internal.h"
+#include "catalog/catversion.h"
+#include "storage/bufpage.h"
+#include "common/controldata_utils.h"
+#include "cluster/cluster_initdb_config.h"
+#include "cluster/cluster_xlog.h"
+#include "miscadmin.h"
 #include <setjmp.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -69,6 +76,24 @@ cluster_undo_bootstrap_v2(int fd, const ClusterRecoveryFileIdentityV2 *id,
 	result(id, out);
 	return true;
 }
+/* Native control-file/WAL/config providers remain controlled leaves here;
+ * the complete original pipe/directory/phase/base/descriptor gate is real. */
+static PgracInitdbWalContext initdb_wal_context;
+static ControlFileData native_control;
+bool IsUnderPostmaster;
+char *DataDir = ".";
+void cluster_wal_thread_initdb_accept(bool bootstrap);
+void pfree(void *p) { free(p); }
+ControlFileData *get_controlfile(const char *dir, bool *crc)
+{
+	ControlFileData *p = malloc(sizeof(*p));
+	(void)dir;
+	if (!p) abort();
+	*p = native_control; *crc = true; return p;
+}
+static bool initdb_bootstrap_wal_matches(const ControlFileData *control, const PgracInitdbWalContext *ctx)
+{ return control->system_identifier == ctx->system_identifier; }
+void cluster_initdb_config_apply_native(const PgracInitdbWalContext *ctx) { (void)ctx; }
 #undef ereport
 #define ereport(level, args) longjmp(failure, 1)
 #include "test_cluster_initdb_boot_entries.inc"
@@ -221,6 +246,52 @@ UT_TEST(native_child_consumes_boot_fd_without_shared_base_publication_custody)
 	UT_ASSERT(!close(root) && !rmdir(temp));
 }
 
+UT_TEST(postbootstrap_child_keeps_original_creation_batch_and_base_custody)
+{
+	char temp[] = "/tmp/pgrac-boot-native-XXXXXX";
+	PgracInitdbRecoveryContext request;
+	PgracInitdbWalContext ctx = { 0 };
+	int root, data, shared, pipefd, status;
+	pid_t child;
+	setup();
+	UT_ASSERT(mkdtemp(temp) != NULL);
+	root = open(temp, O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(root >= 0);
+	UT_ASSERT(!mkdirat(root, "data", 0700) && !mkdirat(root, "shared", 0700));
+	data = openat(root, "data", O_RDONLY | O_DIRECTORY);
+	shared = openat(root, "shared", O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(data >= 0 && shared >= 0);
+	UT_ASSERT(pgrac_initdb_recovery_prepare_files_v2(
+		&pgrac_native_recovery.first, pgrac_native_recovery.boot_files,
+		&pgrac_native_recovery.config, data, shared, &request));
+	UT_ASSERT(pgrac_initdb_recovery_pipe_v2(&request, &pipefd));
+	ctx.phase = PGRAC_INITDB_WAL_POSTBOOTSTRAP;
+	ctx.thread_id = 1;
+	ctx.system_identifier = request.first.system_identifier;
+	ctx.database_incarnation = request.first.database_incarnation;
+	memcpy(ctx.storage_uuid, request.first.storage_uuid, 16);
+	ctx.base_fd = shared;
+	ctx.recovery_fd = pipefd;
+	ctx.config = request.config;
+	/* A real inherited configuration FD is separately owned by the native
+	 * child; it must not alias the temporary original shared-directory proof. */
+	ctx.config.fd = root;
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (!child) {
+		bool ok = fchdir(data) == 0 && initdb_boot_recovery_accept(&ctx);
+		ok = ok && ctx.base_fd == shared && ctx.recovery_fd == 0
+			 && ctx.database_incarnation == request.first.database_incarnation && initdb_recovery_present
+			 && !memcmp(&initdb_recovery_context, &request, sizeof(request))
+			 && fcntl(shared, F_GETFD) >= 0 && fcntl(root, F_GETFD) >= 0;
+		_exit(ok ? 0 : 7);
+	}
+	UT_ASSERT(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	UT_ASSERT(!close(pipefd) && !close(data) && !close(shared));
+	UT_ASSERT(!unlinkat(root, "data", AT_REMOVEDIR) && !unlinkat(root, "shared", AT_REMOVEDIR));
+	UT_ASSERT(!close(root) && !rmdir(temp));
+}
+
 UT_TEST(boot_result_keeps_clog_birth_and_unused_tt_facts_separate)
 {
 	ClusterRecoveryBootFileV2 tt, bad, clog;
@@ -261,10 +332,81 @@ UT_TEST(boot_result_keeps_clog_birth_and_unused_tt_facts_separate)
 	UT_ASSERT(!cluster_recovery_boot_file_matches_v2(&other, &bad));
 }
 
+UT_TEST(complete_native_postbootstrap_accepts_only_original_closed_batch)
+{
+	char temp[] = "/tmp/pgrac-native-post-XXXXXX", value[32];
+	PgracInitdbRecoveryContext request;
+	PgracInitdbWalContext ctx = {0};
+	struct stat st;
+	int root, data, shared, config, control, wal, fd, status, pipes[2];
+	pid_t child;
+	setup();
+	UT_ASSERT(mkdtemp(temp));
+	root = open(temp, O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(root >= 0 && !mkdirat(root, "data", 0700) && !mkdirat(root, "shared", 0700));
+	data = openat(root, "data", O_RDONLY | O_DIRECTORY);
+	shared = openat(root, "shared", O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(data >= 0 && shared >= 0 && !mkdirat(data, "pg_wal", 0700) && !mkdirat(data, "global", 0700));
+	wal = openat(data, "pg_wal", O_RDONLY | O_DIRECTORY);
+	config = openat(root, "config", O_CREAT | O_EXCL | O_RDWR, 0600);
+	control = openat(data, "global/pg_control", O_CREAT | O_EXCL | O_RDWR, 0600);
+	UT_ASSERT(wal >= 0 && config >= 0 && control >= 0 && write(config, "x", 1) == 1);
+	UT_ASSERT(!fstat(config, &st));
+	pgrac_native_recovery.config.fd = config;
+	pgrac_native_recovery.config.device = st.st_dev;
+	pgrac_native_recovery.config.inode = st.st_ino;
+	ctx.magic = PGRAC_INITDB_WAL_CONTEXT_MAGIC;
+	ctx.phase = PGRAC_INITDB_WAL_POSTBOOTSTRAP; ctx.thread_id = 1;
+	ctx.system_identifier = 91; ctx.database_incarnation = 27;
+	memcpy(ctx.storage_uuid, pgrac_native_recovery.first.storage_uuid, 16);
+	ctx.base_fd = shared; ctx.config = pgrac_native_recovery.config;
+	UT_ASSERT(!fstat(data, &st)); ctx.data_device = st.st_dev; ctx.data_inode = st.st_ino;
+	UT_ASSERT(!fstat(wal, &st)); ctx.wal_device = st.st_dev; ctx.wal_inode = st.st_ino;
+	UT_ASSERT(!fstat(shared, &st)); ctx.base_device = st.st_dev; ctx.base_inode = st.st_ino;
+	memset(&native_control, 0, sizeof(native_control));
+	native_control.system_identifier = 91; native_control.pg_control_version = PG_CONTROL_VERSION;
+	native_control.catalog_version_no = CATALOG_VERSION_NO; native_control.state = DB_SHUTDOWNED;
+	native_control.data_checksum_version = PG_DATA_CHECKSUM_VERSION;
+	for (unsigned fault_case = 0; fault_case < 5; fault_case++) {
+		PgracInitdbWalContext candidate = ctx;
+		UT_ASSERT(pgrac_initdb_recovery_prepare_files_v2(&pgrac_native_recovery.first,
+			pgrac_native_recovery.boot_files, &pgrac_native_recovery.config, data, shared, &request));
+		UT_ASSERT(pgrac_initdb_recovery_pipe_v2(&request, &fd));
+		candidate.recovery_fd = fd;
+		if (fault_case == 1) candidate.recovery_fd = config;
+		if (fault_case == 2) ++candidate.base_inode;
+		if (fault_case == 3) candidate.thread_id = 2;
+		if (fault_case == 4) candidate.phase = PGRAC_INITDB_WAL_BOOTSTRAP;
+		UT_ASSERT(!pipe(pipes) && write(pipes[1], &candidate, sizeof(candidate)) == sizeof(candidate) && !close(pipes[1]));
+		child = fork(); UT_ASSERT(child >= 0);
+		if (!child) {
+			volatile bool accepted = false;
+			bool ok;
+			if (fchdir(data)) _exit(7);
+			snprintf(value, sizeof(value), "%d", pipes[0]);
+			if (setenv(PGRAC_INITDB_WAL_CONTEXT_ENV, value, 1)) _exit(7);
+			if (!setjmp(failure)) { cluster_wal_thread_initdb_accept(false); accepted = true; }
+			ok = fault_case ? !accepted && !initdb_recovery_present :
+				accepted && initdb_recovery_present && initdb_wal_context.base_fd == shared &&
+				initdb_wal_context.recovery_fd == 0 && fcntl(shared, F_GETFD) >= 0 &&
+				!memcmp(&initdb_recovery_context, &request, sizeof(request));
+			_exit(ok ? 0 : 8);
+		}
+		UT_ASSERT(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		UT_ASSERT(!close(fd) && !close(pipes[0]));
+	}
+	UT_ASSERT(!close(control) && !close(config) && !close(wal) && !close(shared));
+	UT_ASSERT(!unlinkat(data, "global/pg_control", 0) && !unlinkat(data, "global", AT_REMOVEDIR) &&
+		!unlinkat(data, "pg_wal", AT_REMOVEDIR) && !close(data) && !unlinkat(root, "config", 0) &&
+		!unlinkat(root, "data", AT_REMOVEDIR) && !unlinkat(root, "shared", AT_REMOVEDIR) && !close(root) && !rmdir(temp));
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
+	UT_RUN(complete_native_postbootstrap_accepts_only_original_closed_batch);
+	UT_RUN(postbootstrap_child_keeps_original_creation_batch_and_base_custody);
 	UT_RUN(boot_result_keeps_clog_birth_and_unused_tt_facts_separate);
 	UT_RUN(native_child_consumes_boot_fd_without_shared_base_publication_custody);
 	UT_RUN(original_bootstrap_uses_complete_identity_and_actual_initial_xid);

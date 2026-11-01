@@ -14232,3 +14232,25 @@ cluster_control_root_relmap_format_locked_v2(Size budget, ClusterControlRelmapFo
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) *out = value;
 	return result;
 }
+
+/* Export the complete already-selected registry without creating a second
+ * selection owner. Native publication deduplicates equal copy identities. */
+bool
+cluster_control_root_native_files_copy_v4(ClusterControlRelmapSelectionV2 *s,
+	ClusterRecoveryFileIdentityV2 *out, uint64 capacity, uint64 *count)
+{
+	const ClusterRecoveryCheckpointCoverageV2 *c;
+	if (!control_relmap_live_v4(s) || !capacity ||
+		capacity > SIZE_MAX / sizeof(*out) ||
+		!control_relmap_distinct_v4(s, out, capacity * sizeof(*out)) ||
+		!control_relmap_distinct_v4(s, count, sizeof(*count)) ||
+		history_ranges_overlap(out, capacity * sizeof(*out), count, sizeof(*count)))
+		return false;
+	c = &cluster_recovery_registry_view_v2(s->work.decoded)->coverage;
+	if (!c->file_count || c->file_count > capacity)
+		return false;
+	for (uint64 i = 0; i < c->file_count; i++)
+		out[i] = c->files[i].identity;
+	*count = c->file_count;
+	return true;
+}
