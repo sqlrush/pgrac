@@ -13315,3 +13315,18 @@ test_cluster_mx_operation_wire: test_cluster_mx_operation_wire.c \
 $(CLUSTER_MULTIXACT_CURRENT_WIRE_O): \
         $(top_srcdir)/src/include/cluster/cluster_multixact_operation_wire.h \
         $(top_srcdir)/src/include/cluster/cluster_savepoint_reader.h
+
+CLUSTER_MX_HISTORY_WIRE_O = $(top_builddir)/src/backend/cluster/cluster_mx_history_wire.o
+TESTS += test_cluster_mx_history_wire
+all: test_cluster_mx_history_wire
+
+$(CLUSTER_MX_HISTORY_WIRE_O): $(top_srcdir)/src/backend/cluster/cluster_mx_history_wire.c \
+        $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h
+	$(MAKE) -C $(top_builddir)/src/backend/cluster cluster_mx_history_wire.o
+
+test_cluster_mx_history_wire: test_cluster_mx_history_wire.c unit_test.h \
+        $(CLUSTER_MX_HISTORY_WIRE_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
+        $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_MX_HISTORY_WIRE_O) \
+        $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@

@@ -900,10 +900,17 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	return true;
 }
 
+static uint8 ut_large_payload[768];
+static uint32 ut_large_payload_len;
+
 ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
 						 uint32 payload_len)
 {
+	if (payload_len >= 424 && payload_len <= sizeof(ut_large_payload)) {
+		memcpy(ut_large_payload, payload, payload_len);
+		ut_large_payload_len = payload_len;
+	}
 	if (ut_sent_n < (int)lengthof(ut_sent_log)) {
 		ut_sent_log[ut_sent_n].msg_type = msg_type;
 		ut_sent_log[ut_sent_n].dest = dest_node_id;
@@ -2867,13 +2874,52 @@ UT_TEST(test_owner_refusal_echo_is_bound_and_old_or_changed_owner_is_rejected)
 																 R4_CR_REQUIRED_HELLO_CAPS, 42));
 }
 
+UT_TEST(test_history_and_operation_carriers_preserve_all_bytes)
+{
+	uint8 data[768];
+	ut_reset_log();
+	for (unsigned i = 0; i < sizeof(data); i++)
+		data[i] = (uint8)(i * 17 + 3);
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, UT_MSG_TYPE, UT_PEER_X, data, 424));
+	memset(ut_large_payload, 0, sizeof(ut_large_payload));
+	(void)cluster_lms_outbound_drain_send(1);
+	UT_ASSERT_EQ(ut_large_payload_len, 424);
+	UT_ASSERT(memcmp(ut_large_payload, data, 424) == 0);
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, UT_MSG_TYPE, UT_PEER_X, data, 768));
+	(void)cluster_lms_outbound_drain_send(1);
+	UT_ASSERT_EQ(ut_large_payload_len, 768);
+	UT_ASSERT(memcmp(ut_large_payload, data, 768) == 0);
+}
+
+UT_TEST(test_large_carrier_refusal_keeps_private_copy_and_exact_capacity)
+{
+	uint8 data[769], saved[768];
+	ut_reset_log();
+	memset(data, 0x35, sizeof(data));
+	memcpy(saved, data, sizeof(saved));
+	UT_ASSERT(!cluster_lms_outbound_enqueue(1, UT_MSG_TYPE, UT_PEER_X, data, 769));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT(cluster_lms_outbound_enqueue(1, UT_MSG_TYPE, UT_PEER_X, data, 768));
+	memset(data, 0x99, sizeof(data));
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	(void)cluster_lms_outbound_drain_send(1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
+	UT_ASSERT(memcmp(ut_large_payload, saved, sizeof(saved)) == 0);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	(void)cluster_lms_outbound_drain_send(1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT(memcmp(ut_large_payload, saved, sizeof(saved)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(62);
+	UT_PLAN(64);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
+	UT_RUN(test_history_and_operation_carriers_preserve_all_bytes);
+	UT_RUN(test_large_carrier_refusal_keeps_private_copy_and_exact_capacity);
 	UT_RUN(test_owner_refusal_echo_is_bound_and_old_or_changed_owner_is_rejected);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
 	UT_RUN(test_blocked_peer_does_not_starve_other_peer);

@@ -60,7 +60,8 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #define PGRAC_LMS_OUTBOUND_CAPACITY 256
-#define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX RESOURCE_X_PROOF_V1_BYTES
+/* Same FIFO owns history requests and complete operation-MX frames too. */
+#define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX 768
 #define PGRAC_LMS_RESOURCE_X_PROBE_BUDGET 4
 #define PGRAC_LMS_RESOURCE_X_CALLS_PER_TICK 16
 
@@ -97,7 +98,7 @@ typedef struct ClusterLmsOutboundSlot {
 
 StaticAssertDecl(PGRAC_LMS_OUTBOUND_PAYLOAD_MAX >= RESOURCE_X_PROOF_V1_BYTES,
 				 "LMS outbound slot must hold a Resource-X proof ACK");
-StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 408,
+StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 864,
 				 "LMS outbound slot capability guard layout changed");
 
 typedef struct ClusterLmsZeroBlockReplyWire {
