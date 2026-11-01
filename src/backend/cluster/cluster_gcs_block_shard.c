@@ -31,6 +31,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_mx_history_wire.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_terminal_ref_census.h"
@@ -172,6 +173,17 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &resource_x_tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
+		if (payload_len == CLUSTER_MX_HISTORY_REQUEST_BYTES) {
+			const uint8 *bytes = payload;
+			ClusterMxHistoryRequest request;
+			if (!cluster_mx_history_request_decode(payload, payload_len,
+												   (int32)ClusterR4WireReadU32(bytes + 36),
+												   (int32)ClusterR4WireReadU32(bytes + 44),
+												   ClusterR4WireReadU64(bytes + 8), &request))
+				return -1;
+			/* Exact history and its CANCEL share the original origin driver. */
+			return n_workers > 0 ? 0 : -1;
+		}
 		if (payload_len == sizeof(GcsBlockFirstFillForwardPayload)) {
 			if (!GcsBlockFirstFillForwardPayloadValid(payload, payload_len))
 				return -1;

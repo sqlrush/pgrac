@@ -3034,7 +3034,7 @@ cluster_runtime_visibility_origin_plan_freeze_history_held(
 	const ClusterMxHistoryRequest *request, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
-	ClusterTxResolveReason *reason_out)
+	ClusterMxHistoryRecord *record_out, ClusterTxResolveReason *reason_out)
 {
 	ClusterRuntimeVisibilityOriginPlanData *data;
 	ClusterUndoBlock0Generation generation = { false, 0 }, final_generation = { false, 0 };
@@ -3044,6 +3044,8 @@ cluster_runtime_visibility_origin_plan_freeze_history_held(
 	uint16 slot, row;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 
+	if (record_out != NULL)
+		memset(record_out, 0, sizeof(*record_out));
 	if (plan != NULL)
 		memset(plan, 0, sizeof(*plan));
 	if (plan == NULL || guard == NULL || root == NULL
@@ -3091,6 +3093,8 @@ cluster_runtime_visibility_origin_plan_freeze_history_held(
 		= (uint8)((data->tt_logical.segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE + 1);
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	if (record_out != NULL)
+		*record_out = record;
 	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL;
 failed:
 	if (plan != NULL)
@@ -3435,7 +3439,7 @@ cluster_runtime_visibility_history_origin_observe(ClusterOperationOriginRead *re
 		read->data_root = read->root;
 		return cluster_runtime_visibility_origin_plan_freeze_history_held(
 				   &request, read->mode, &read->admission, &read->guard, &read->root, &read->plan,
-				   &read->reason)
+				   NULL, &read->reason)
 				   == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
 			   && cluster_runtime_visibility_origin_plan_canonical_logical(&read->plan,
 																		   &read->tt_logical);

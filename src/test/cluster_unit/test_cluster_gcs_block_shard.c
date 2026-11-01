@@ -52,6 +52,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_mx_history_wire.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_resource_x_node_wire.h"
@@ -967,10 +968,71 @@ UT_TEST(test_first_fill_service_wire_routes_only_canonical_extension)
 		&service, sizeof(service), 4), -1);
 }
 
+UT_TEST(test_history424_exact_codec_routes_to_original_data0)
+{
+	ClusterMxHistoryRequest r = { 0 };
+	ClusterMxHistoryRequestWire wire, cancel;
+	r.forward = (GcsBlockForwardPayload){ .request_id = 51,
+										  .epoch = 9,
+										  .original_requester_node = 2,
+										  .requester_backend_id = 1,
+										  .master_node = 1,
+										  .transition_id = PCM_TRANS_N_TO_S,
+										  .tag = GcsBlockUndoFetchTagMake(257, 2) };
+	r.locator = (ClusterTxLocator){ .uba = uba_encode(257, 2, 3, 1),
+									.xid = 100,
+									.tt_wrap = 2,
+									.itl_kind = ITL_FLAG_ACTIVE,
+									.itl_slot_index = 1 };
+	r.edge_kind = CMXH_ROOT;
+	r.root_ordinal = r.edge_itl_slot = 1;
+	r.collector_id = 1;
+	r.capture_generation = 2;
+	r.backend_incarnation = 1000;
+	r.requester_capability_generation = 42;
+	r.origin_capability_generation = 12;
+	r.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	r.admission_generation = 12;
+	r.read_scn = 1000;
+	r.read_epoch = 9;
+	r.retained_floor = 900;
+	r.snapshot_identity = 8;
+	r.descriptor_hash = 9;
+	r.multixact_id = 10;
+	r.member_count = 256;
+	r.target_locator = (RelFileLocator){ 1663, 42, 99 };
+	r.target_fork = MAIN_FORKNUM;
+	r.target_block = 17;
+	r.target_offset = 2;
+	r.root = (ClusterItlSlotData){ .xid = 100,
+								   .wrap = 2,
+								   .flags = ITL_FLAG_ACTIVE,
+								   .undo_segment_head = r.locator.uba,
+								   .write_scn = 100 };
+	r.edge = r.root;
+	UT_ASSERT(cluster_mx_history_request_encode(&r, &wire));
+	UT_ASSERT(cluster_mx_history_request_cancel(&wire, &cancel));
+	for (int workers = 1; workers <= CLUSTER_LMS_MAX_WORKERS; workers++) {
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &wire,
+													 sizeof(wire), workers),
+					 0);
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &cancel,
+													 sizeof(cancel), workers),
+					 0);
+	}
+	UT_ASSERT_EQ(
+		cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &wire, sizeof(wire), 0),
+		-1);
+	wire.bytes[416] ^= 1;
+	UT_ASSERT_EQ(
+		cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &wire, sizeof(wire), 4),
+		-1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(test_first_fill_service_wire_routes_only_canonical_extension);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
@@ -989,6 +1051,7 @@ main(void)
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_RUN(test_resource_x_reused_types_route_only_after_strict_domain_decode);
 	UT_RUN(test_resource_x_length_collisions_preserve_legacy_domains);
+	UT_RUN(test_history424_exact_codec_routes_to_original_data0);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

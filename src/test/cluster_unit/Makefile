@@ -406,6 +406,7 @@ test_cluster_gcs_block_shard: test_cluster_gcs_block_shard.c unit_test.h $(CLUST
 		$(CLUSTER_VERSION_O) $(CLUSTER_GCS_BLOCK_SHARD_O) $(CLUSTER_LMS_SHARD_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/backend/cluster/cluster_uba.o \
+		$(CLUSTER_MX_HISTORY_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
@@ -13370,9 +13371,13 @@ test_cluster_mx_history_wire: test_cluster_mx_history_wire.c unit_test.h \
 # requester table. Only transport, scheduling and admission are fixture seams.
 TESTS += test_cluster_mx_history_backend
 all: test_cluster_mx_history_backend
+TESTS += test_cluster_mx_history_gcs
+all: test_cluster_mx_history_gcs
 test_cluster_r4_route_policy: $(CLUSTER_MX_HISTORY_WIRE_O)
+test_cluster_gcs_block_shard: $(CLUSTER_MX_HISTORY_WIRE_O)
 
-test_cluster_mx_history_backend: test_cluster_mx_history_backend.c \
+test_cluster_mx_history_backend test_cluster_mx_history_gcs: %: %.c \
+        test_cluster_mx_history_backend.c \
         test_cluster_r4_route_policy.c unit_test.h \
         $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h \
         test_cluster_r4_forward_ingress_boundaries.inc \

@@ -523,8 +523,11 @@ UT_TEST(history_origin_held_plan_never_falls_back_to_untyped_copy)
 		UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_history_held(
 						 &f.request, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &f.base.origin.admission,
 						 &f.base.origin.guard, &f.base.origin.data_root, &f.base.origin.plan,
-						 &f.base.origin.reason),
+						 &f.record, &f.base.origin.reason),
 					 CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL);
+		UT_ASSERT_EQ(f.record.record_class,
+					 kind == 0 ? CMXH_OPERATION
+							   : (kind == 1 ? CMXH_V1_TOP : CMXH_ROLLBACK_CONTROL));
 		UT_ASSERT(
 			cluster_runtime_visibility_origin_plan_canonical_logical(&f.base.origin.plan, &tt));
 		UT_ASSERT_EQ(cluster_undo_block0_current_release_begin(&f.base.origin.guard, &failure),

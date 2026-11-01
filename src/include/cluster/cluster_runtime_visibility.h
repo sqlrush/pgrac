@@ -298,13 +298,14 @@ extern void cluster_runtime_visibility_operation_origin_read_cancel(
  * stage private values only. The caller
  * owns retention/admission, all releases and any LIVE CTRC touch under TT.
  * No ordering, peer publication or retirement permission is conferred here.
- * Canonical sampling requires independent original FullXid even for V1. */
+ * Canonical sampling requires independent original FullXid even for V1.
+ * Optional freeze record_out is provisional and cleared on failure. */
 extern ClusterRuntimeVisibilityOriginStep
 cluster_runtime_visibility_origin_plan_freeze_history_held(
 	const ClusterMxHistoryRequest *request, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
-	ClusterTxResolveReason *reason_out);
+	ClusterMxHistoryRecord *record_out, ClusterTxResolveReason *reason_out);
 extern bool cluster_runtime_visibility_origin_plan_sample_history_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, const ClusterMxHistoryRequest *request,
 	ClusterTxResolveMode mode, const ClusterSemanticAdmissionToken *admission,

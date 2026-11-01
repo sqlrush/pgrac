@@ -2423,6 +2423,50 @@ route_test_fill_origin_resolution(const ClusterTxLocator *locator,
 	return route_seam.candidate_outcome;
 }
 
+/* This route fixture supplies no history DATA/FullXid authority. The real
+ * held history provider has its own original-current integration tests. */
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_history_held(
+	const ClusterMxHistoryRequest *request pg_attribute_unused(),
+	ClusterTxResolveMode mode pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
+	ClusterRuntimeVisibilityOriginPlan *plan pg_attribute_unused(),
+	ClusterMxHistoryRecord *record pg_attribute_unused(), ClusterTxResolveReason *reason)
+{
+	*reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+}
+bool
+cluster_runtime_visibility_origin_plan_sample_history_held(
+	ClusterRuntimeVisibilityOriginPlan *plan pg_attribute_unused(),
+	const ClusterMxHistoryRequest *request pg_attribute_unused(),
+	ClusterTxResolveMode mode pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
+	ClusterTxResolution *top pg_attribute_unused(), ClusterTxResolveReason *reason)
+{
+	*reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	return false;
+}
+ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_copy_history_held(
+	ClusterRuntimeVisibilityOriginPlan *plan pg_attribute_unused(),
+	const ClusterMxHistoryRequest *request pg_attribute_unused(),
+	ClusterTxResolveMode mode pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
+	ClusterTxResolution *top pg_attribute_unused(),
+	ClusterMxHistoryRecord *record pg_attribute_unused(), uint32 *generation pg_attribute_unused(),
+	char page[BLCKSZ] pg_attribute_unused(), ClusterTxResolveReason *reason)
+{
+	*reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	return CLUSTER_TX_UNKNOWN;
+}
+
 ClusterRuntimeVisibilityOriginStep
 cluster_runtime_visibility_origin_plan_freeze_data_held(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,

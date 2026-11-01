@@ -15,6 +15,7 @@ static ResourceReleaseCallback history_resource_release;
 static void *history_resource_arg;
 static ClusterMxHistoryRequestWire sent_history;
 static int history_sends;
+static int history_sent_worker;
 static bool history_reentrant;
 static void history_deliver(const ClusterMxHistoryRequestWire *, int);
 bool cluster_lms_outbound_enqueue_cap_bound(int, uint8, uint32, const void *, uint16, uint32,
@@ -32,6 +33,7 @@ cluster_lms_outbound_enqueue_cap_bound(int worker, uint8 type, uint32 dest, cons
 									   uint16 length, uint32 caps, uint32 generation)
 {
 	if (length == 424) {
+		history_sent_worker = worker;
 		history_sends++;
 		memcpy(&sent_history, payload, 424);
 		UT_ASSERT_EQ(type, PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
@@ -476,8 +478,11 @@ UT_TEST(history_data_send_failure_only_retires_exact_attempt)
 	UT_ASSERT_EQ(cluster_gcs_block_r4_requester_count(), 0);
 }
 
+#ifndef HISTORY_BACKEND_TEST_MAIN
+#define HISTORY_BACKEND_TEST_MAIN main
+#endif
 int
-main(void)
+HISTORY_BACKEND_TEST_MAIN(void)
 {
 	UT_PLAN(16);
 	UT_RUN(history_publication_precedes_reentrant_reply);
