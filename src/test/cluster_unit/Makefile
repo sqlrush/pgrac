@@ -11541,3 +11541,33 @@ test_cluster_native_holder_itl.inc: $(top_srcdir)/src/backend/cluster/cluster_it
 	awk '/^cluster_itl_page_has_active_slot\(/ { print "bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0; exit } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+TESTS += test_cluster_native_holder_writeback
+all: test_cluster_native_holder_writeback
+test_cluster_native_holder_writeback: test_cluster_native_holder_writeback.c test_cluster_native_holder \
+		test_cluster_native_holder_writeback_fixture.inc test_cluster_native_holder_flush_guard.inc \
+		test_cluster_pcm_flush_owner.inc test_cluster_native_holder_content_release.inc $(CLUSTER_SCN_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(CLUSTER_SCN_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-holder-writeback
+.PHONY: clean-native-holder-writeback
+clean-native-holder-writeback:
+	rm -f test_cluster_native_holder_writeback test_cluster_native_holder_flush_guard.inc \
+		test_cluster_native_holder_flush_guard.inc.tmp test_cluster_native_holder_content_release.inc \
+		test_cluster_native_holder_content_release.inc.tmp
+
+test_cluster_native_holder_flush_guard.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_x_retained_image_locked\(/ { print "static inline bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_holder_content_release.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
+	awk '/^\tif \(lock->tranche == LWTRANCHE_BUFFER_CONTENT\)/ { print; getline; print; n++ } \
+	     END { if (n != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@

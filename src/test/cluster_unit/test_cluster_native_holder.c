@@ -50,10 +50,21 @@ static void holder_lock_release(LWLock *lock)
 		holder_interrupt_releases++;
 	}
 	LWLockRelease(lock);
+#ifdef NATIVE_HOLDER_WRITEBACK
+#include "test_cluster_native_holder_content_release.inc"
+#endif
 }
 /* Storage write is outside this clean-source composition. Never forge it. */
 static bool holder_write_error;
 static void holder_unexpected_write(void) { UT_ASSERT(holder_write_error); pg_re_throw(); }
+#ifdef NATIVE_HOLDER_WRITEBACK
+static void holder_flush(BufferDesc *, SMgrRelation, IOObject, IOContext);
+static void holder_flush_attempt(BufferDesc *, SMgrRelation, IOObject, IOContext, volatile bool *);
+static void holder_flush_recovery(BufferDesc *, SMgrRelation, IOObject, IOContext,
+	const struct ClusterSpaceRecoveryBatchV1 *, volatile bool *,
+	const struct ClusterPageWalBindingV1 *, volatile bool *);
+static void holder_output_abort(Buffer);
+#endif
 /* These clean MAIN cases never authorize a descriptor DROP or WAL/DATA
  * success. Keep an accidental dispatch an error, not a fabricated receipt. */
 static void holder_unexpected_drop(void) { UT_ASSERT(false); pg_re_throw(); }
@@ -77,11 +88,21 @@ bool cluster_ko_directory_io_end_v3(const ClusterKoDirectoryIoV3 *io)
 	UT_ASSERT_EQ(fake_lwlock_depth, 0); holder_io_ends++; if (holder_after_prepare != NULL) holder_after_prepare(); return true;
 }
 bool RecoveryInProgress(void) { return false; }
+#ifdef NATIVE_HOLDER_WRITEBACK
+static unsigned holder_wal_flushes;
+XLogRecPtr GetXLogInsertRecPtr(void) { return UINT64_MAX; }
+void XLogFlush(XLogRecPtr lsn) { UT_ASSERT(lsn <= GetXLogInsertRecPtr()); holder_wal_flushes++; }
+#else
 XLogRecPtr GetXLogInsertRecPtr(void) { holder_unexpected_write(); return InvalidXLogRecPtr; }
 void XLogFlush(XLogRecPtr lsn) { (void)lsn; holder_unexpected_write(); }
+#endif
 #define smgropen disk_open
 #define smgrread disk_read
+#ifdef NATIVE_HOLDER_WRITEBACK
+#define AbortBufferIO holder_output_abort
+#else
 #define AbortBufferIO wait_actual_abort
+#endif
 #define BufTableHashCode(tag) ((void)(tag), 0)
 #define BufMappingPartitionLock(hash) ((void)(hash), &holder_mapping_lock)
 #define BufTableLookup(lookup, hash) ((void)(hash), BufferTagsEqual(lookup, &request_buf.tag) ? 0 : -1)
@@ -93,12 +114,18 @@ void XLogFlush(XLogRecPtr lsn) { (void)lsn; holder_unexpected_write(); }
 #define LWLockRelease holder_lock_release
 #undef HOLD_INTERRUPTS
 #define HOLD_INTERRUPTS() holder_repair_interrupt_hold()
+#ifdef NATIVE_HOLDER_WRITEBACK
+#define FlushBufferWithRecovery holder_flush_recovery
+#define FlushBuffer holder_flush
+#define FlushBufferWithAttempt holder_flush_attempt
+#else
 #define FlushBufferWithRecovery(buf, rel, object, context, attempt, started, wal, owner) \
 	((void)(buf), (void)(rel), (void)(object), (void)(context), (void)(attempt), \
 	 (void)(started), (void)(wal), (void)(owner), holder_unexpected_write())
 #define FlushBuffer(...) holder_unexpected_write()
 #define FlushBufferWithAttempt(buf, rel, object, context, wrote) \
 	((void)(buf), (void)(rel), (void)(object), (void)(context), (void)(wrote), holder_unexpected_write())
+#endif
 #define InvalidateBufferCommitTailLocked(buf, tag, hash, lock, state, pcm, io) \
 	((void)(buf), (void)(tag), (void)(hash), (void)(lock), (void)(state), \
 	 (void)(pcm), (void)(io), holder_unexpected_drop())
@@ -183,6 +210,9 @@ static ErrorData holder_error = { .message = "controlled storage ERROR" };
 #undef CurrentMemoryContext
 #undef cluster_sf_peer_capability_word_sample
 
+#ifdef NATIVE_HOLDER_WRITEBACK
+#include "test_cluster_native_holder_writeback_fixture.inc"
+#endif
 
 typedef struct HolderFixture {
 	PublishFixture master;
@@ -884,7 +914,11 @@ UT_TEST(test_other_S_holder_corrupt_receipt_cannot_release_native_fence)
 		UT_ASSERT_EQ(holder_pins, 0); complete_idle();
 	}
 }
+#ifdef NATIVE_HOLDER_WRITEBACK
+int holder_clean_fixture_main(void)
+#else
 int main(void)
+#endif
 {
 	UT_PLAN(33);
 	UT_RUN(test_holder_capture_native_downgrade_and_original_pair);
