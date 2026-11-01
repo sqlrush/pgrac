@@ -330,6 +330,84 @@ sub run_full_preflight_cancellations
 	}
 }
 
+sub run_full_slot_deadlines
+{
+	my ($name, $owners, $chosen, $waiter, $before) = @_;
+	my $settings_sql = q{SELECT current_setting('lock_timeout')||'|'||current_setting('statement_timeout')};
+	my $original_settings = $waiter->{client}->query_safe($settings_sql);
+	$waiter->{client}->query_safe("\\set VERBOSITY verbose");
+	for my $case (['lock', 'lock_timeout', '55P03', 0],
+		['statement', 'statement_timeout', '57014', 1])
+	{
+		my ($kind, $setting, $state, $cancel_delta) = @$case;
+		my $label = "$name-deadline-$kind";
+		my $old_counters = counters();
+		$waiter->{transaction} = 1;
+		$waiter->{xid} = 0 + $waiter->{client}->query_safe(
+			"BEGIN; SET LOCAL lock_timeout=0; SET LOCAL statement_timeout=90000; "
+			. "SET LOCAL $setting=30000; SELECT pg_current_xact_id()::text");
+		$waiter->{pending} = 1;
+		my $sent = $waiter->{client}->query_until(qr/G_SLOT_SENT\r?\n/,
+			"\\echo G_SLOT_SENT\nUPDATE g_empty_undo SET value=999 WHERE false;\n"
+			. "\\echo G_SLOT_SQLSTATE :SQLSTATE\n");
+		save_json("$label-sent", {output => $sent, pid => $waiter->{pid}, xid => $waiter->{xid},
+			setting => $setting, deadline_ms => 30000, original_settings => $original_settings});
+		my $wait_activity = wait_witness($label, $waiter);
+		judge("$label-blocked", {stage => 'blocked', before => $before, after => census($owners),
+			counters_before => $old_counters, counters_after => counters(),
+			waiter_pid => $waiter->{pid}, waiter_xid => $waiter->{xid}, activity => $wait_activity,
+			locks => lock_rows($waiter->{pid}, $chosen->{pid})});
+		# No signal or owner completion: the caller's original native timer ends this wait.
+		my ($out, $error) = $waiter->{client}->query('');
+		my $stderr = $waiter->{client}{stderr};
+		save_json("$label-completion", {output => $out, error => $error, stderr => $stderr});
+		$waiter->{pending} = 0;
+		my @states = $out =~ /^G_SLOT_SQLSTATE ([A-Z0-9]{5})\r?$/mg;
+		my $reason = "$kind timeout";
+		die "native deadline did not preserve $state/$reason\n" unless
+		  $error == 1 && @states == 1 && $states[0] eq $state
+		  && $stderr =~ /ERROR:\s+$state: canceling statement due to $reason/;
+		$waiter->{client}{stderr} = '';
+		end_owner($waiter, 'ROLLBACK');
+		is($waiter->{client}->query_safe('SELECT pg_backend_pid()'), "$waiter->{pid}",
+			'deadline caller remains the same native backend') or die 'deadline backend changed';
+		is_deeply(binding($waiter), {available => JSON::PP::false, wait_scope => JSON::PP::false},
+			'deadline clears wait scope without a canonical binding') or die 'deadline binding leaked';
+		my $after = census($owners);
+		is_deeply($after, $before, 'deadline leaves all 48 original owners unchanged')
+		  or die 'deadline changed original owners';
+		my $new_counters = counters();
+		save_json("$label-after", {counters => $new_counters, census => $after});
+		stable_supply($old_counters, $new_counters);
+		# Reuse the original exact uint64 parser; 55P03 is not caller cancellation.
+		my $input = encode_json({before => $old_counters, after => $new_counters,
+			cancel_delta => $cancel_delta});
+		my ($stdout, $err) = ('', '');
+		my $code = q{import json,sys
+from undo_slot_wait import decimal
+r=json.load(sys.stdin)
+b,a=r['before'],r['after']
+assert b.keys()==a.keys()
+for key in b:
+    if key=='tt_slot_active_full_wait_count':
+        assert decimal(a[key])==decimal(b[key])+1
+    elif key=='tt_capacity_cancel_count':
+        assert decimal(a[key])==decimal(b[key])+r['cancel_delta']
+    else:
+        assert a[key]==b[key],key
+};
+		local $ENV{PYTHONPATH} = "$FindBin::RealBin/../pre2";
+		run([$ENV{PYTHON} // 'python3', '-c', $code], '<', \$input, '>', \$stdout,
+			'2>', \$err, timeout(10)) or die "native deadline counter mismatch: $err";
+		pass("$label preserves exact original deadline/cancellation counters");
+		my $restored = $waiter->{client}->query_safe($settings_sql);
+		save_json("$label-settings", {before => $original_settings, after => $restored});
+		is($restored, $original_settings, 'transaction-local deadline restores original settings')
+		  or die 'deadline settings leaked';
+	}
+	$waiter->{client}->query_safe("\\set VERBOSITY default");
+}
+
 sub wait_preflight_retirement
 {
 	my ($name, $entry, $offset) = @_;
@@ -409,6 +487,7 @@ sub run_case
 	{
 		# Reuse this cohort and backend; every cancelled preflight keeps all48 owners.
 		run_full_preflight_cancellations($name, \@owners, $chosen, $waiter, $before);
+		run_full_slot_deadlines($name, \@owners, $chosen, $waiter, $before);
 		$old_counters = counters();
 	}
 	$waiter->{trial} = $trial;
