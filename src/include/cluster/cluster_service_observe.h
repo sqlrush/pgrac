@@ -84,6 +84,26 @@ StaticAssertDecl(sizeof(ClusterServiceSnapshotObservation) <= 64,
 extern ClusterSemanticAdmissionObservationResult cluster_snapshot_service_observe(
 	uint64 expected_epoch, ClusterServiceSnapshotObservation *out);
 
+/* Same ordinary backend's snapshots plus the original shared token-return
+ * domain. Brackets the shared read with original private snapshot observations;
+ * rechecks the original gate and owner at return. Caller-owned, read-only,
+ * unlocked boundary only. No atomic cross-domain zero or producer seal.
+ * Always PENDING/STALE/REFUSED; absent, changed or contradictory samples are
+ * cleared. Neither a populated result nor an empty point is a receipt or
+ * ordinary/GCS permission. Existing auxiliary-owner entries stay unchanged. */
+typedef struct ClusterServiceBackendCollection {
+	ClusterServiceSnapshotObservation snapshots;
+	ClusterSemanticAdmissionObservation admission;
+	const char *reason;
+} ClusterServiceBackendCollection;
+StaticAssertDecl(sizeof(ClusterServiceBackendCollection)
+				 + sizeof(ClusterServiceSnapshotObservation)
+				 + sizeof(ClusterSemanticWaitGraphSnapshot) <= 1024,
+				 "backend collection uses bounded caller storage");
+extern ClusterSemanticAdmissionObservationResult cluster_service_backend_collect_return(
+	uint64 expected_epoch, uint64 expected_gate_epoch, uint64 expected_generation,
+	ClusterServiceBackendCollection *out);
+
 /* Same original actor, private/module plus shared admission point observations.
  * Caller-owned only: CURRENT does not seal either owner or grant permission.
  * No atomic cross-domain zero proof is implied; producer closure is separate. */

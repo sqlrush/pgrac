@@ -29,6 +29,8 @@ static void snapshot_return_read_barrier(void)
 #undef pg_read_barrier
 #define pg_read_barrier() snapshot_return_read_barrier()
 #include "../../backend/utils/time/snapmgr.c"
+#include "test_cluster_shared_admission_observe.inc"
+#include "test_cluster_backend_return_gate.inc"
 #undef pg_read_barrier
 #define pg_read_barrier() pg_read_barrier_impl()
 #include "test_cluster_snapshot_admission_horizon.inc"
@@ -1081,10 +1083,12 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 }
 
 #include "test_cluster_snapshot_return.inc"
+#include "test_cluster_backend_return.inc"
 
 int
 main(void)
 {
+	setvbuf(stdout, NULL, _IOLBF, 0);
 	MyProc = &proc;
 	proc.pid = 1234;
 	procArray = calloc(1, sizeof(ProcArrayStruct) + 2 * sizeof(int));
@@ -1102,7 +1106,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(96);
+	UT_PLAN(104);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1199,6 +1203,14 @@ main(void)
 	UT_RUN(snapshot_return_rejects_wrong_original_backend_identity);
 	UT_RUN(snapshot_return_rechecks_identity_without_keeping_stale_samples);
 	UT_RUN(snapshot_return_never_closes_an_empty_or_unknown_producer);
+	UT_RUN(backend_collection_retains_original_snapshots_after_gate_drains);
+	UT_RUN(backend_collection_keeps_active_catalog_and_evaluator_owners);
+	UT_RUN(backend_collection_preserves_all_original_shared_counter_cells);
+	UT_RUN(backend_collection_binds_original_gate_and_current_native_epochs);
+	UT_RUN(backend_collection_refuses_wrong_owner_scope_or_locked_context);
+	UT_RUN(backend_collection_discards_owner_and_gate_drift_at_return);
+	UT_RUN(backend_collection_discards_unknown_or_contended_shared_samples);
+	UT_RUN(backend_collection_never_retires_original_debt_or_grants_closure);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());

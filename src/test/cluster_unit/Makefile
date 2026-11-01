@@ -11394,7 +11394,14 @@ test_cluster_snapshot_import_compare.inc: $(top_srcdir)/src/backend/access/trans
 		emit { print } emit && /^}$$/ { emit=0 } \
 		END { if (emit || starts != 1) exit 1 }' $< > $@
 
+# Keep the actual return gate final recheck with the original snapshot owner.
+test_cluster_backend_return_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
+	awk '/^cluster_semantic_activation_wait_graph_snapshot\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
+		$(srcdir)/test_cluster_backend_return.inc test_cluster_shared_admission_observe.inc test_cluster_backend_return_gate.inc \
 		$(srcdir)/test_cluster_snapshot_return.inc $(top_srcdir)/src/include/cluster/cluster_service_observe.h \
 		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
 		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
