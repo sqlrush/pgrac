@@ -135,6 +135,12 @@ typedef enum ClusterMxHistoryStep {
 	CMXH_REQUALIFY = 3
 } ClusterMxHistoryStep;
 
+/* Route a private graph edge using actual backend/admission/capability state.
+ * COMPLETE means a reserved request, PENDING means local slot backpressure;
+ * unavailable identity is UNKNOWN. No DATA acquisition occurs here. */
+extern ClusterMxHistoryStep
+cluster_gcs_block_mx_history_prepare_routed(const ClusterMxHistoryRequest *edge,
+											ClusterMxHistoryRequestWire *out);
 /* Prepare reserves an original requester slot and allocates its original
  * request ID. The input ID must be zero. Call outside temporary ERROR-cleanup
  * brackets, after backend buffer-access initialization. Queue backpressure

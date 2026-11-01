@@ -29,6 +29,17 @@ extern bool cluster_mx_history_record_capture(const ClusterMxHistoryRequest *req
 											  const char page[BLCKSZ], char record_out[BLCKSZ],
 											  ClusterMxHistoryRecord *out);
 
+/* Recheck another incoming edge against the exact saved record bytes. This
+ * performs no DATA/TT acquisition and cannot manufacture a page or head. */
+extern bool cluster_mx_history_record_from_bytes(const ClusterMxHistoryRequest *request,
+												 const char *bytes, size_t length, uint16 offset,
+												 ClusterMxHistoryRecord *out);
+/* Separate peer binding: never converts a peer into a local TT resolution. */
+extern bool cluster_mx_history_record_bind_peer(const ClusterMxHistoryRequest *request,
+												const ClusterMxHistoryRecord *record,
+												const ClusterMxHistoryPeer *peer,
+												ClusterSavepointReaderIdentity *out);
+
 /* record is an unmodified capture/recheck result kept in the reader's scope.
  * top is the independently sampled local canonical TT result, never a peer
  * result. This comparison grants neither ordering, a LIVE grant, visibility,

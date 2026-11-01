@@ -5,7 +5,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "cluster/cluster_mx_history.h"
+#include "cluster/cluster_mx_history_graph.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "access/xact.h"
 #include "cluster/cluster_conf.h"
@@ -17,12 +17,18 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
+typedef struct HistoryCollectorDriver {
+	ClusterMxHistoryGraph *graph;
+	ClusterMxHistoryRequestWire request;
+	bool prepared, submitted, complete;
+} HistoryCollectorDriver;
+
 struct ClusterMxHistoryCollector {
 	ResourceOwner owner;
 	Snapshot snapshot;
 	ClusterMxHistoryCapture *capture;
+	HistoryCollectorDriver *driver;
 };
-
 static ClusterMxHistoryCollector *active_collector;
 static uint64 collector_serial;
 static bool cleanup_registered;
@@ -183,6 +189,14 @@ cluster_mx_history_cancel(ClusterMxHistoryCollector *collector)
 
 	if (collector == NULL || collector->capture == NULL)
 		return;
+	if (collector->driver != NULL) {
+		HistoryCollectorDriver *driver = collector->driver;
+		collector->driver = NULL;
+		if (driver->prepared)
+			cluster_gcs_block_mx_history_cancel(&driver->request);
+		cluster_mx_history_graph_destroy(driver->graph);
+		pfree(driver);
+	}
 	snapshot = collector->snapshot;
 	collector->snapshot = NULL;
 	pfree(collector->capture);
@@ -334,6 +348,95 @@ cluster_mx_history_capture_recheck(ClusterMxHistoryCollector *collector, Relatio
 	 * must advance beyond this bracket too, not merely the first capture. */
 	if (saved.read_only && saved.pcm.pcm_state == PCM_STATE_READ_IMAGE)
 		collector->capture->pcm = fresh.pcm;
+	return true;
+}
+ClusterMxHistoryStep
+cluster_mx_history_collect_poll(ClusterMxHistoryCollector *collector)
+{
+	ClusterMxHistoryCapture capture;
+	HistoryCollectorDriver *driver;
+	ClusterMxHistoryStep step;
+	ClusterMxHistoryRequest request;
+	bool needs_read;
+	BufferDesc *desc;
+
+	if (CritSectionCount != 0)
+		goto failed;
+	if (!cluster_mx_history_capture_read(collector, &capture))
+		return CMXH_UNKNOWN;
+	if (capture.buffer <= 0 || capture.buffer > NBuffers
+		|| !BufferIsPinnedByMe(capture.buffer))
+		goto failed;
+	desc = GetBufferDescriptor(capture.buffer - 1);
+	if (LWLockHeldByMeInMode(BufferDescriptorGetContentLock(desc), LW_EXCLUSIVE)
+		|| LWLockHeldByMeInMode(BufferDescriptorGetContentLock(desc), LW_SHARED))
+		goto failed;
+	driver = collector->driver;
+	if (driver == NULL) {
+		driver
+			= MemoryContextAllocExtended(TopTransactionContext, sizeof(*driver), MCXT_ALLOC_NO_OOM);
+		if (driver == NULL)
+			goto failed;
+		memset(driver, 0, sizeof(*driver));
+		collector->driver = driver;
+		driver->graph = cluster_mx_history_graph_create(&capture, TopTransactionContext);
+		if (driver->graph == NULL)
+			goto failed;
+	}
+	if (driver->complete)
+		return CMXH_COMPLETE;
+	if (driver->prepared) {
+		ClusterMxHistoryPeerResult result;
+		if (!driver->submitted)
+			driver->submitted = cluster_gcs_block_mx_history_submit(&driver->request);
+		/* Poll also distinguishes closed admission from enqueue backpressure.
+		 * A false enqueue cannot suppress scope/stream requalification. */
+		step = cluster_gcs_block_mx_history_poll(&driver->request, &result);
+		if (step == CMXH_PENDING)
+			return step;
+		if (step != CMXH_COMPLETE || !cluster_mx_history_graph_accept(driver->graph, &result))
+			goto failed;
+		driver->prepared = driver->submitted = false;
+		memset(&driver->request, 0, sizeof(driver->request));
+		return CMXH_PENDING;
+	}
+	step = cluster_mx_history_graph_next(driver->graph, &request, &needs_read);
+	if (step == CMXH_COMPLETE) {
+		driver->complete = true;
+		return step;
+	}
+	if (step != CMXH_PENDING)
+		goto failed;
+	if (!needs_read)
+		return CMXH_PENDING;
+	step = cluster_gcs_block_mx_history_prepare_routed(&request, &driver->request);
+	if (step == CMXH_PENDING)
+		return step;
+	if (step != CMXH_COMPLETE)
+		goto failed;
+	driver->prepared = true;
+	return CMXH_PENDING;
+failed:
+	cluster_mx_history_cancel(collector);
+	return CMXH_UNKNOWN;
+}
+
+bool
+cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *collector, Relation rel,
+										 Buffer buffer, HeapTuple tuple,
+										 const ClusterCurrentMxKey *mxkey,
+										 const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+										 const ClusterMxHistoryGraph **out)
+{
+	if (out == NULL)
+		return false;
+	*out = NULL;
+	if (collector == NULL || collector->driver == NULL || !collector->driver->complete)
+		return false;
+	if (!cluster_mx_history_capture_recheck(collector, rel, buffer, tuple, mxkey, members,
+											nmembers))
+		return false;
+	*out = collector->driver->graph;
 	return true;
 }
 #endif

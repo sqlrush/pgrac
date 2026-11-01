@@ -6,11 +6,41 @@ int snapshot_fixture_unused_main(void);
 #define main snapshot_fixture_unused_main
 #include "test_cluster_snapshot_admission.c"
 #undef main
-#include "cluster/cluster_mx_history.h"
+#include "cluster/cluster_mx_history_graph.h"
+#include "storage/backendid.h"
 #include "cluster/cluster_tt_local.h"
 #include "storage/ipc.h"
 #include "test_cluster_active_sample_types.inc"
 
+/* Transport is unavailable in this native snapshot fixture. It never returns
+ * a fabricated reserved request, landing, member proof or grant. The separate
+ * graph test drives the actual routed factory/queue/landing. */
+BackendId MyBackendId = 1;
+static unsigned route_attempts;
+ClusterMxHistoryStep
+cluster_gcs_block_mx_history_prepare_routed(const ClusterMxHistoryRequest *r,
+											ClusterMxHistoryRequestWire *out)
+{
+	route_attempts++;
+	memset(out, 0, sizeof(*out));
+	return CMXH_PENDING;
+}
+bool
+cluster_gcs_block_mx_history_submit(const ClusterMxHistoryRequestWire *r)
+{
+	abort();
+}
+ClusterMxHistoryStep
+cluster_gcs_block_mx_history_poll(const ClusterMxHistoryRequestWire *r,
+								  ClusterMxHistoryPeerResult *out)
+{
+	abort();
+}
+void
+cluster_gcs_block_mx_history_cancel(const ClusterMxHistoryRequestWire *r)
+{
+	abort();
+}
 static ClusterSemanticActivationShmem history_gate;
 static ClusterSemanticActivationShmem *SemanticActivationShmem = &history_gate;
 static const void *SemanticActivationDescriptors[64];
@@ -54,7 +84,7 @@ static ClusterCurrentMxKey mxkey = { 0, 0, 99, 7, 0 };
 static ClusterCurrentMxMemberDesc members[2]
 	= { { 101, MultiXactStatusForShare, { 0 } }, { 102, MultiXactStatusForKeyShare, { 0 } } };
 static ClusterSemanticAdmissionToken admission;
-static unsigned canonical_reads;
+static unsigned canonical_reads, owner_reads;
 
 void *
 MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
@@ -84,6 +114,7 @@ cluster_bufmgr_pcm_own_snapshot(BufferDesc *b, ClusterPcmOwnSnapshot *out)
 FullTransactionId
 GetTopFullTransactionIdIfAny(void)
 {
+	owner_reads++;
 	return top_source;
 }
 ClusterCanonicalTxnPublishState
@@ -165,7 +196,7 @@ setup(void)
 	top_source = InvalidFullTransactionId;
 	publication_source = CLUSTER_CANONICAL_TXN_NONE;
 	memset(&canonical_source, 0, sizeof(canonical_source));
-	canonical_reads = 0;
+	canonical_reads = owner_reads = 0;
 	serving = pinned = content_locked = exclusive = true;
 	oom = false;
 	CritSectionCount = 0;
@@ -614,6 +645,87 @@ malformed_descriptor_and_page_refused(void)
 		clean(c, s);
 	}
 }
+static void
+collector_empty_graph_requires_full_relock(void)
+{
+	for (unsigned changed = 0; changed < 2; ++changed) {
+		Snapshot s = setup();
+		ClusterMxHistoryCollector *c = NULL;
+		const ClusterMxHistoryGraph *g = (void *)1;
+		memset(ClusterPageGetItlSlots(BufferBlocks), 0, CLUSTER_ITL_SPECIAL_SIZE);
+		UT_ASSERT(begin(s, &c));
+		if (c) {
+			UT_ASSERT(!cluster_mx_history_collect_recheck_graph(c, &relation, 1, &tuple, &mxkey,
+																members, 2, &g));
+			UT_ASSERT(g == NULL);
+			content_locked = false;
+			for (unsigned n = 0; n < 8; ++n)
+				UT_ASSERT_EQ(cluster_mx_history_collect_poll(c), CMXH_PENDING);
+			UT_ASSERT_EQ(cluster_mx_history_collect_poll(c), CMXH_COMPLETE);
+			content_locked = true;
+			if (changed)
+				members[0].member_status = MultiXactStatusForKeyShare;
+			UT_ASSERT_EQ(cluster_mx_history_collect_recheck_graph(c, &relation, 1, &tuple, &mxkey,
+																  members, 2, &g),
+						 !changed);
+			if (changed) {
+				UT_ASSERT(g == NULL);
+				members[0].member_status = MultiXactStatusForShare;
+			} else {
+				UT_ASSERT(g != NULL);
+				UT_ASSERT_EQ(cluster_mx_history_graph_count(g), 0);
+			}
+		}
+		clean(c, s);
+	}
+}
+static void
+collector_pending_holds_snapshot_and_owner_cleanup(void)
+{
+	Snapshot s = setup();
+	ClusterMxHistoryCollector *c = NULL;
+	ClusterItlSlotData *root = ClusterPageGetItlSlots(BufferBlocks);
+	root[0].write_scn = 90;
+	root[0].undo_segment_head = uba_encode(1, 7, 3, 0);
+	route_attempts = 0;
+	UT_ASSERT(begin(s, &c));
+	if (c) {
+		content_locked = false;
+		for (unsigned n = 0; n < 25; ++n)
+			UT_ASSERT_EQ(cluster_mx_history_collect_poll(c), CMXH_PENDING);
+		UT_ASSERT(route_attempts > 0);
+		UT_ASSERT_EQ(remembered, 2);
+		cleanup_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, cleanup_argument);
+		UT_ASSERT_EQ(remembered, 1);
+		UT_ASSERT_EQ(cluster_mx_history_collect_poll(c), CMXH_UNKNOWN);
+	}
+	clean(c, s);
+}
+static void
+collector_never_waits_under_content_lock_or_without_pin(void)
+{
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		Snapshot s = setup();
+		ClusterMxHistoryCollector *c = NULL;
+		UT_ASSERT(begin(s, &c));
+		route_attempts = 0;
+		if (c) {
+			unsigned before = owner_reads;
+			content_locked = fault == 0;
+			if (fault == 1)
+				pinned = false;
+			if (fault == 2)
+				CritSectionCount = 1;
+			UT_ASSERT_EQ(cluster_mx_history_collect_poll(c), CMXH_UNKNOWN);
+			if (fault == 2)
+				UT_ASSERT_EQ(owner_reads, before);
+			UT_ASSERT_EQ(route_attempts, 0);
+			UT_ASSERT_EQ(remembered, 1);
+		}
+		CritSectionCount = 0;
+		clean(c, s);
+	}
+}
 int
 main(void)
 {
@@ -632,7 +744,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(real_capture_and_relock);
 	UT_RUN(snapshot_own_reference_keeps_original_floor);
 	UT_RUN(original_scope_restored_and_older_floor_preserved);
@@ -647,6 +759,9 @@ main(void)
 	UT_RUN(malformed_descriptor_and_page_refused);
 	UT_RUN(fresh_capture_never_reuses_lineage);
 	UT_RUN(native_current_image_shapes_and_invalid_images);
+	UT_RUN(collector_empty_graph_requires_full_relock);
+	UT_RUN(collector_pending_holds_snapshot_and_owner_cleanup);
+	UT_RUN(collector_never_waits_under_content_lock_or_without_pin);
 	free(procArray);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

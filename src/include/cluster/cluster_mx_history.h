@@ -59,6 +59,18 @@ extern bool cluster_mx_history_capture_recheck(ClusterMxHistoryCollector *collec
 											   const ClusterCurrentMxKey *mxkey,
 											   const ClusterCurrentMxMemberDesc *members,
 											   uint16 nmembers);
+typedef struct ClusterMxHistoryGraph ClusterMxHistoryGraph;
+/* Outside heap content locks: one bounded graph/transport step. COMPLETE
+ * means traversal only, never assembled member or SQL authority. */
+extern ClusterMxHistoryStep cluster_mx_history_collect_poll(ClusterMxHistoryCollector *collector);
+/* Full original heap relock comparison before borrowing completed private
+ * graph views. The caller retains that lock; cancellation expires the view. */
+extern bool cluster_mx_history_collect_recheck_graph(ClusterMxHistoryCollector *collector,
+													 Relation rel, Buffer buffer, HeapTuple tuple,
+													 const ClusterCurrentMxKey *mxkey,
+													 const ClusterCurrentMxMemberDesc *members,
+													 uint16 nmembers,
+													 const ClusterMxHistoryGraph **out);
 /* Idempotent until TopTransactionContext resets. No waiting or retirement.
  * The original ResourceOwner BEFORE_LOCKS/exit callbacks also cancel it. */
 extern void cluster_mx_history_cancel(ClusterMxHistoryCollector *collector);

@@ -699,6 +699,57 @@ cluster_mx_history_record_capture(const ClusterMxHistoryRequest *request, const 
 }
 
 bool
+cluster_mx_history_record_from_bytes(const ClusterMxHistoryRequest *request, const char *bytes,
+									 size_t length, uint16 offset, ClusterMxHistoryRecord *out)
+{
+	UndoRecordHeader header;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (bytes == NULL || out == NULL || length < sizeof(header) || length > BLCKSZ)
+		return false;
+	memcpy(&header, bytes, sizeof(header));
+	return history_record_decode(request, &header, bytes + sizeof(header), length, offset, out);
+}
+
+bool
+cluster_mx_history_record_bind_peer(const ClusterMxHistoryRequest *request,
+									const ClusterMxHistoryRecord *record,
+									const ClusterMxHistoryPeer *peer,
+									ClusterSavepointReaderIdentity *out)
+{
+	ClusterMxHistoryPeerWire checked;
+	ClusterSavepointReaderIdentity identity;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (request == NULL || record == NULL || peer == NULL || out == NULL
+		|| !cluster_mx_history_peer_encode(peer, &checked)
+		|| peer->proof_kind != CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG
+		|| peer->record_class != record->record_class || peer->record_class > CMXH_ROLLBACK_CONTROL
+		|| peer->effect != record->effect
+		|| !cluster_undo_record_uba_equal(peer->record, request->locator.uba)
+		|| !cluster_undo_record_uba_equal(peer->previous, record->header.prev_uba)
+		|| memcmp(&peer->canonical, &record->identity.canonical, sizeof(peer->canonical)) != 0
+		|| (record->canonical_generation_known
+			&& record->identity.canonical_generation != peer->canonical_generation)
+		|| (record->record_class != CMXH_V1_TOP
+			&& (!FullTransactionIdEquals(record->identity.top_fxid, peer->top_fxid)
+				|| !FullTransactionIdEquals(record->identity.operation_fxid, peer->operation_fxid)
+				|| record->identity.operation_sequence != peer->operation_sequence))
+		|| ((request->flags & CLUSTER_MX_HISTORY_EXPECT_OWNER)
+			&& (request->expected_owner_generation != peer->canonical_generation
+				|| !FullTransactionIdEquals(request->expected_top_fxid, peer->top_fxid)))
+		|| ((request->flags & CLUSTER_MX_HISTORY_EXPECT_DATA_GENERATION)
+			&& request->expected_data_generation != peer->data_generation))
+		return false;
+	identity = record->identity;
+	identity.top_fxid = peer->top_fxid;
+	identity.canonical_generation = peer->canonical_generation;
+	if (record->record_class == CMXH_V1_TOP)
+		identity.operation_fxid = identity.top_fxid;
+	*out = identity;
+	return true;
+}
+bool
 cluster_mx_history_record_bind_top(const ClusterMxHistoryRequest *request,
 								   const ClusterMxHistoryRecord *record,
 								   const ClusterTxResolution *top,

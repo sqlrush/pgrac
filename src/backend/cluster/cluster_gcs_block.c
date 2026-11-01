@@ -3951,6 +3951,82 @@ gcs_mx_history_resource_release(ResourceReleasePhase phase, bool isCommit, bool 
 		gcs_mx_history_cancel_all();
 }
 
+ClusterMxHistoryStep
+cluster_gcs_block_mx_history_prepare_routed(const ClusterMxHistoryRequest *edge,
+											ClusterMxHistoryRequestWire *out)
+{
+	ClusterMxHistoryRequest candidate;
+	ClusterSemanticAdmissionToken token;
+	ClusterGcsBlockBackendBlock *blk;
+	GcsBlockForwardPayload empty = { 0 };
+	uint32 segment, block, local = 0, peer = 0;
+	uint16 tt, row;
+	NodeId origin;
+	bool optional = false, capacity = false, exhausted;
+	volatile bool valid = false;
+
+	if (out == NULL)
+		return CMXH_UNKNOWN;
+	memset(out, 0, sizeof(*out));
+	if (edge == NULL || gcs_block_backend_blocks == NULL || !gcs_read_source_exit_registered
+		|| MyBackendId <= 0 || MyBackendId > MaxBackends
+		|| edge->backend_incarnation != (uint64)MyStartTimestamp
+		|| edge->requester_capability_generation != 0 || edge->origin_capability_generation != 0
+		|| memcmp(&edge->forward, &empty, sizeof(empty)) != 0
+		|| !uba_decode_record(edge->locator.uba, &segment, &block, &tt, &row)
+		|| (origin = uba_origin_node_id(edge->locator.uba)) == InvalidNodeId
+		|| edge->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1)
+		return CMXH_UNKNOWN;
+	if (cluster_semantic_activation_enter(edge->feature_bit, CLUSTER_SEMANTIC_TARGET_SIDE, &token)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return CMXH_REQUALIFY;
+	PG_TRY();
+	{
+		valid = token.record_generation == edge->admission_generation
+				&& token.formation_epoch == edge->read_epoch
+				&& gcs_block_r4_local_capability_generation(&token, R4_CR_REQUIRED_HELLO_CAPS, 0,
+															&optional, &local)
+				&& cluster_sf_peer_capability_family_sample(origin, R4_CR_REQUIRED_HELLO_CAPS, 0,
+															&optional, &peer)
+				&& cluster_semantic_activation_peer_open_matches(&token, origin,
+																 R4_CR_REQUIRED_HELLO_CAPS, peer)
+				&& cluster_semantic_activation_recheck(&token);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&token);
+	}
+	PG_END_TRY();
+	if (!valid)
+		return CMXH_UNKNOWN;
+	candidate = *edge;
+	candidate.forward.epoch = edge->read_epoch;
+	candidate.forward.original_requester_node = cluster_node_id;
+	candidate.forward.requester_backend_id = MyBackendId;
+	candidate.forward.master_node = origin;
+	candidate.forward.transition_id = PCM_TRANS_N_TO_S;
+	candidate.forward.tag = GcsBlockUndoFetchTagMake(segment, block);
+	candidate.requester_capability_generation = local;
+	candidate.origin_capability_generation = peer;
+	/* Only the backend reserves its own slots. Distinguish actual local
+	 * capacity from rejected identity; neither a timeout nor a new hop. */
+	blk = gcs_block_my_block();
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	for (int i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; ++i)
+		if (!blk->slots[i].in_use) {
+			capacity = true;
+			break;
+		}
+	exhausted = blk->next_request_id == 0 || blk->next_request_id > GCS_REQID_REQUESTER_SEQ_MASK;
+	LWLockRelease(&blk->lock.lock);
+	if (exhausted)
+		return CMXH_UNKNOWN;
+	if (!capacity)
+		return CMXH_PENDING;
+	/* The original prepare rechecks the full codec and entered scope and
+	 * allocates the original request ID. No authority is inferred above. */
+	return cluster_gcs_block_mx_history_prepare(&candidate, out) ? CMXH_COMPLETE : CMXH_UNKNOWN;
+}
 bool
 cluster_gcs_block_mx_history_prepare(const ClusterMxHistoryRequest *request,
 									 ClusterMxHistoryRequestWire *out)

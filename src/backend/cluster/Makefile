@@ -43,6 +43,7 @@ OBJS = \
 	cluster_savepoint_reader.o \
 	cluster_mx_history_wire.o \
 	cluster_mx_history.o \
+	cluster_mx_history_graph.o \
 	cluster_catalog_trace.o \
 	cluster_initdb_base.o \
 	cluster_initdb_config.o \
