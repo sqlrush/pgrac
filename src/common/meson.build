@@ -12,6 +12,9 @@ common_sources = files(
   'cluster_clog_wal.c',
   'cluster_hw_snapshot_codec.c',
   'cluster_recovery_file_identity.c',
+  'cluster_recovery_bootstrap.c',
+  'cluster_undo_segment_init.c',
+  'sha2.c',
   'cluster_relmap_init.c',
   'cluster_space_identity.c',
   'cluster_space_reservation.c',
@@ -62,7 +65,6 @@ else
     'hmac.c',
     'md5.c',
     'sha1.c',
-    'sha2.c',
   )
 endif
 

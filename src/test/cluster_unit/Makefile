@@ -3518,10 +3518,13 @@ UNDO_HEADER_INIT_DEPS = $(top_srcdir)/src/common/cluster_undo_segment_init.c \
 test_cluster_undo_segment_init_backend.o: $(UNDO_HEADER_INIT_DEPS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-test_cluster_undo_segment_init_frontend.o: $(UNDO_HEADER_INIT_DEPS)
+test_cluster_undo_segment_init_frontend.o: $(UNDO_HEADER_INIT_DEPS) Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND \
 		-Dcluster_undo_segment_make_header_bytes=test_frontend_undo_header_v1 \
 		-Dcluster_undo_segment_make_header_v2_bytes=test_frontend_undo_header_v2 \
+		-Dcluster_undo_segment_make_boot_header_v2_bytes=test_frontend_undo_boot_header_v2 \
+		-Dcluster_undo_segment_header_integrity=test_frontend_undo_header_integrity \
+		-Dcluster_undo_segment_header_seal=test_frontend_undo_header_seal \
 		-c $< -o $@
 
 test_cluster_undo_segment: test_cluster_undo_segment.c unit_test.h $(UNDO_HEADER_INIT_DEPS) \
@@ -11516,3 +11519,31 @@ test_cluster_clog_replay: test_cluster_clog_replay.c unit_test.h \
 clean: clean-clog-replay
 clean-clog-replay:
 	rm -f test_cluster_clog_replay test_cluster_clog_replay.d
+
+# Original CLOG/TT BOOT I/O: no bootstrap WAL or control publication.
+TESTS += test_cluster_recovery_bootstrap test_cluster_clog_bootstrap
+all: test_cluster_recovery_bootstrap test_cluster_clog_bootstrap
+BOOTSTRAP_TEST_SOURCES = $(top_srcdir)/src/common/cluster_clog_file.c \
+	$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+	$(top_srcdir)/src/common/cluster_undo_segment_init.c $(top_srcdir)/src/common/sha2.c
+BOOTSTRAP_TEST_DEPS = $(top_srcdir)/src/common/cluster_recovery_bootstrap.c \
+	$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+	$(top_srcdir)/src/include/access/clog_file.h \
+	$(top_srcdir)/src/common/sha2_int.h $(CLUSTER_UNIT_PORT_LIBS)
+test_cluster_recovery_bootstrap: test_cluster_recovery_bootstrap.c unit_test.h \
+		$(BOOTSTRAP_TEST_SOURCES) $(BOOTSTRAP_TEST_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(BOOTSTRAP_TEST_SOURCES) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+test_cluster_clog_bootstrap: test_cluster_clog_bootstrap.c unit_test.h \
+		$(BOOTSTRAP_TEST_SOURCES) $(BOOTSTRAP_TEST_DEPS) \
+		$(top_srcdir)/src/backend/access/transam/clog.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c $(BOOTSTRAP_TEST_SOURCES) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+.PHONY: clean-recovery-bootstrap
+clean: clean-recovery-bootstrap
+clean-recovery-bootstrap:
+	rm -f test_cluster_recovery_bootstrap test_cluster_recovery_bootstrap.d \
+		test_cluster_clog_bootstrap test_cluster_clog_bootstrap.d

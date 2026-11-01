@@ -57,6 +57,7 @@ OBJS_COMMON = \
 	cluster_clog_wal.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_recovery_file_identity.o \
+	cluster_recovery_bootstrap.o \
 	cluster_relmap_init.o \
 	cluster_space_identity.o \
 	cluster_space_reservation.o \
@@ -108,9 +109,12 @@ OBJS_COMMON += \
 	cryptohash.o \
 	hmac.o \
 	md5.o \
-	sha1.o \
-	sha2.o
+	sha1.o
 endif
+
+# BOOT file readback uses stack-based SHA-256 in frontend and backend,
+# including OpenSSL and disabled-cluster builds.
+OBJS_COMMON += sha2.o
 
 # A few files are currently only built for frontend, not server
 # (Mkvcbuild.pm has a copy of this list, too).  logging.c is excluded
@@ -129,17 +133,6 @@ OBJS_FRONTEND = \
 # foo.o, foo_shlib.o, and foo_srv.o are all built from foo.c
 OBJS_SHLIB = $(OBJS_FRONTEND_SHLIB:%.o=%_shlib.o)
 OBJS_SRV = $(OBJS_COMMON:%.o=%_srv.o)
-
-# PGRAC: CTRC certificates use the allocation-free, stack-based SHA-256
-# implementation while holding shared-state locks.  OpenSSL remains the
-# provider for pg_cryptohash; keep the existing certificate implementation
-# available in the cluster server archive as well.  The non-SSL branch above
-# already includes sha2.o, and disable-cluster keeps the upstream object set.
-ifeq ($(enable_pgrac_cluster),yes)
-ifeq ($(with_ssl),openssl)
-OBJS_SRV += sha2_srv.o
-endif
-endif
 
 # where to find gen_keywordlist.pl and subsidiary files
 TOOLSDIR = $(top_srcdir)/src/tools

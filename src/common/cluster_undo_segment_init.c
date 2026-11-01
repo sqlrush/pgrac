@@ -184,6 +184,28 @@ cluster_undo_segment_make_header_v2_bytes(uint32 segment_id, uint8 owner_instanc
 #endif
 }
 
+/* Only the actual initdb seed, never a runtime allocation or TT32 conversion.
+ * Runtime V2 helpers deliberately retain their segment0 refusal. */
+bool
+cluster_undo_segment_make_boot_header_v2_bytes(char *page)
+{
+#ifdef USE_PGRAC_CLUSTER
+	UndoSegmentHeaderDataV2 *header;
+
+	if (page == NULL)
+		return false;
+	cluster_undo_segment_make_header_bytes(0, 1, page);
+	header = (UndoSegmentHeaderDataV2 *)page;
+	header->tt_layout_version = CLUSTER_UNDO_TT_LAYOUT_V2;
+	header->tt_slot_bytes = CLUSTER_UNDO_TT_SLOT_V2_BYTES;
+	header->tt_layout_reserved = 0;
+	return true;
+#else
+	(void)page;
+	return false;
+#endif
+}
+
 /* Check a private aligned copy: the PG algorithm temporarily clears the
  * checksum field. Never modify an immutable recovery capture while checking. */
 ClusterUndoHeaderIntegrity

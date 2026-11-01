@@ -41,6 +41,9 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "common/cluster_recovery_bootstrap.h"
+#include "storage/fd.h"
+#include <sys/stat.h>
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
@@ -787,6 +790,72 @@ BootStrapCLOG(void)
 	Assert(!XactCtl->shared->page_dirty[slotno]);
 
 	LWLockRelease(XactSLRULock);
+}
+
+/* The original BootStrapXLOG caller supplies its independently allocated
+ * complete identity and actual initial nextXid. The creator, not these bytes,
+ * owns the unpublished directory and closed-writer context. No bootstrap WAL.
+ * Leave the cache empty: its later managed read must acquire file provenance. */
+bool
+BootStrapCLOGManagedV2(const ClusterRecoveryFileIdentityV2 *expected,
+					 FullTransactionId actual_initial_next, ClusterRecoveryBootFileV2 *out)
+{
+#if defined(USE_PGRAC_CLUSTER) && !defined(WIN32)
+	char path[MAXPGPATH];
+	uint8 reference[CLUSTER_RECOVERY_IDENTITY_REFERENCE_V2_BYTES];
+	ClusterRecoveryFileIdentityV2 captured;
+	ClusterRecoveryBootFileV2 observed;
+	volatile int fd = -1;
+	volatile bool ok = false;
+	uintptr_t a = (uintptr_t)expected;
+	uintptr_t b = (uintptr_t)out;
+
+	if (!IsBootstrapProcessingMode() || IsUnderPostmaster || InRecovery || !enableFsync
+		|| expected == NULL || out == NULL
+		|| (a <= b ? b - a < sizeof(*expected) : a - b < sizeof(*out))
+		|| expected->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 || expected->object_id != 0
+		|| expected->database_oid != 0 || expected->tablespace_oid != 0
+		|| expected->system_identifier != GetSystemIdentifier()
+		|| U64FromFullTransactionId(actual_initial_next) != FirstNormalTransactionId
+		|| !cluster_recovery_file_identity_encode_v2(expected, reference, sizeof(reference))
+		|| XactCtl->Dir[0] == '\0'
+		|| strnlen(XactCtl->Dir, sizeof(XactCtl->Dir)) == sizeof(XactCtl->Dir))
+		return false;
+	captured = *expected;
+	if (snprintf(path, sizeof(path), "%s/0000", XactCtl->Dir) >= sizeof(path))
+		return false;
+	PG_TRY();
+	{
+		fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY | O_NOFOLLOW);
+		if (fd >= 0) {
+			struct stat before, named;
+
+			ok = cluster_clog_bootstrap_v2(fd, &captured, actual_initial_next, &observed)
+				&& fstat(fd, &before) == 0;
+			if (ok) {
+				/* The whole file was synchronized and read back before the name
+				 * is made durable. Original owner excludes directory replacement. */
+				fsync_fname(XactCtl->Dir, true);
+				ok = lstat(path, &named) == 0 && S_ISREG(named.st_mode)
+					&& before.st_dev == named.st_dev && before.st_ino == named.st_ino
+					&& before.st_size == named.st_size;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (fd >= 0 && CloseTransientFile(fd) != 0)
+			ok = false;
+	}
+	PG_END_TRY();
+	if (!ok)
+		return false;
+	*out = observed;
+	return true;
+#else
+	(void)expected; (void)actual_initial_next; (void)out;
+	return false;
+#endif
 }
 
 /*
