@@ -1114,10 +1114,12 @@ UT_TEST(test_wait_graph_capability_table_is_owned_and_never_waits)
 	UT_ASSERT_EQ(cut.canary, UINT64_C(0x123456789abcdef0));
 }
 
+#include "test_cluster_foreign_mx_format.inc"
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(44);
 	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
 	UT_RUN(test_sf_stop_requires_initialized_store_even_when_disabled);
 	UT_RUN(test_sf_stop_real_install_and_durable_cut_are_read_only);
@@ -1152,6 +1154,16 @@ main(void)
 	UT_RUN(test_durable_publisher_stops_new_work_only_after_final_control_seal);
 	UT_RUN(test_durable_publisher_stops_at_all_member_checkpoint_cut);
 	UT_RUN(test_wait_graph_capability_table_is_owned_and_never_waits);
+	UT_RUN(test_foreign_mx_format_registration_is_distinct);
+	UT_RUN(test_foreign_mx_requires_every_capability_from_one_record);
+	UT_RUN(test_foreign_mx_samples_exact_connection_generation);
+	UT_RUN(test_foreign_mx_format_and_loaded_catalog_are_exact);
+	UT_RUN(test_foreign_mx_reconnect_invalidates_the_original_sample);
+	UT_RUN(test_foreign_mx_withdrawal_clears_the_positive_sample);
+	UT_RUN(test_foreign_mx_refuses_missing_or_exhausted_connection_identity);
+	UT_RUN(test_foreign_mx_does_not_reinterpret_current_v1_capability);
+	UT_RUN(test_registry_reservation_has_a_separate_format_identity);
+	UT_RUN(test_registry_reservation_refuses_old_versions_and_catalogs);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

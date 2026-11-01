@@ -353,7 +353,7 @@ test_cluster_resource_x_identity: test_cluster_resource_x_identity.c \
 
 test_cluster_resource_x_node_wire: test_cluster_resource_x_node_wire.c unit_test.h \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
-		$(top_srcdir)/src/include/cluster/cluster_ic.h
+		$(top_srcdir)/src/include/cluster/cluster_ic.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -9734,7 +9734,12 @@ $(CLUSTER_R4_SF_DEP_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c 
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_sf_dep: test_cluster_sf_dep.c unit_test.h $(top_srcdir)/src/backend/cluster/cluster_sf_dep.c \
-		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h
+		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
+		test_cluster_foreign_mx_format.inc \
+		$(top_srcdir)/src/include/cluster/cluster_foreign_mx_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_registry_reservation_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic.h \
+		$(top_srcdir)/src/include/catalog/catversion.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

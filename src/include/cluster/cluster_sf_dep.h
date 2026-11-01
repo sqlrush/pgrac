@@ -278,6 +278,17 @@ extern bool cluster_sf_peer_supports_pcm_x_rebase(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_source_floor(int32 peer_id);
 extern bool cluster_sf_peer_multixact_current_capability_generation(int32 peer_id,
 																	uint32 *generation_out);
+/* The caller supplies its original loaded control catalog, not peer input.
+ * Generation is the same CONTROL-owned connection lifetime as other peers;
+ * every non-OK sample clears the output, and the caller must recheck it. */
+extern bool cluster_sf_peer_foreign_mx_capability_sample_v1(int32 peer_id, uint32 format_id,
+															uint32 format_version,
+															uint32 control_catalog_version,
+															uint32 *generation_out);
+extern bool cluster_sf_peer_foreign_mx_capability_matches_v1(int32 peer_id, uint32 format_id,
+															 uint32 format_version,
+															 uint32 control_catalog_version,
+															 uint32 expected_generation);
 extern bool cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
 													  uint32 *generation_out);
 extern bool cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_capabilities,
