@@ -4308,6 +4308,9 @@ probe_unarmed_segment(ClusterCapacityObservationV1 *out)
 static unsigned capacity_sleeps, capacity_cancels;
 static bool capacity_subscribed, capacity_cancel;
 static uint32 capacity_wait_event, capacity_sleep_event;
+#ifdef CLUSTER_CTRC_REAL_ALLOCATOR_GC
+static void (*allocator_gc_wait_scheduler)(void);
+#endif
 uint32 *my_wait_event_info = &capacity_wait_event;
 int cluster_lmon_main_loop_interval = 2000;
 
@@ -4361,6 +4364,10 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long ti
 		pg_re_throw();
 #ifdef G320_CAPACITY_REAL_HISTORY
 	history_wait_scheduler();
+#endif
+#ifdef CLUSTER_CTRC_REAL_ALLOCATOR_GC
+	if (allocator_gc_wait_scheduler != NULL)
+		allocator_gc_wait_scheduler();
 #endif
 	pgstat_report_wait_end();
 	return true;
