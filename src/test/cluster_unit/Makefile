@@ -12074,3 +12074,44 @@ test_cluster_native_hot_block_owner.inc: $(top_srcdir)/src/backend/utils/resowne
          emit { print } /^}/ && emit { emit=0 } \
          END { if (arrays != 1 || owners != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# Keep native state through eight readers, a remote writer and its return image.
+TESTS += test_cluster_native_hot_cycle
+all: test_cluster_native_hot_cycle
+test_cluster_native_hot_cycle_roles.inc: test_cluster_native_three_role.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /NM_REQUIRE\(!holder_probe\(&next\)\); holder_content_busy = false;/ { \
+	       print "\t\tNM_REQUIRE(!holder_probe(&next)); hc_release_readers(); holder_content_busy = false;"; hooks++; next } \
+	     { print } END { if (stop != 1 || hooks != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_hot_cycle_remote.inc: test_cluster_native_remote_x.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_three_role_fixture.inc"/ { \
+	       print "#include \"test_cluster_native_hot_cycle_roles.inc\""; includes++; next } \
+	     { print } END { if (stop != 1 || includes != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_hot_cycle_successor.inc: test_cluster_native_s_read_successor.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_remote_x_fixture.inc"/ { \
+	       print "#include \"test_cluster_native_hot_cycle_remote.inc\""; includes++; next } \
+	     /nt_seed_holder = second \? ss_holder_kept : nm_parent_as;/ { \
+	       print "\tnt_seed_holder = second ? ss_holder_kept : hc_seed_eight;"; seeds++; next } \
+	     { print } END { if (stop != 1 || includes != 1 || seeds != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_hot_cycle: test_cluster_native_hot_cycle.c \
+        test_cluster_native_hot_cycle_roles.inc test_cluster_native_hot_cycle_remote.inc \
+        test_cluster_native_hot_cycle_successor.inc test_cluster_native_hot_block_owner.inc \
+        test_cluster_native_s_read_successor test_cluster_native_hot_block
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-hot-cycle
+.PHONY: clean-native-hot-cycle
+clean-native-hot-cycle:
+	rm -f test_cluster_native_hot_cycle $(addprefix test_cluster_native_hot_cycle_, \
+        roles.inc roles.inc.tmp remote.inc remote.inc.tmp successor.inc successor.inc.tmp)
