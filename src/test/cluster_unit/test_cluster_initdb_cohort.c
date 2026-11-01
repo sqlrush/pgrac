@@ -527,12 +527,206 @@ original_registered_child_receives_only_its_creator(void)
 	request.fd = 3; request.device = 7; request.inode = 8; request.bytes = 9;
 	request.sha256[0] = 10;
 	UT_ASSERT(cluster_initdb_cohort_relmap_prepare_v2(&config, &request, branch, data, shared, &ctx));
+	UT_ASSERT_EQ(ctx.boot_file_count, 2);
+	UT_ASSERT_EQ(ctx.boot_files[0].kind, CLUSTER_RECOVERY_FILE_CLOG_V2);
+	UT_ASSERT_EQ(ctx.boot_files[1].kind, CLUSTER_RECOVERY_FILE_UNDO_V2);
+	UT_ASSERT_EQ(ctx.boot_files[0].creation_generation, 5);
+	UT_ASSERT_EQ(ctx.boot_files[1].creation_generation, 6);
+	UT_ASSERT_EQ(ctx.boot_files[0].object_id + ctx.boot_files[1].object_id, 0);
 	snprintf(ad, sizeof(ad), "%d", data); snprintf(bd, sizeof(bd), "%d", shared);
 	run_child_registered(args, getppid(), &ctx);
 	UT_ASSERT(getenv(PGRAC_INITDB_RECOVERY_ENV) == NULL);
 	UT_ASSERT(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
 	UT_ASSERT(close(data) == 0 && close(shared) == 0);
 	UT_ASSERT(rmdir(a) == 0 && rmdir(b) == 0 && rmdir(temp) == 0);
+}
+
+/* Family codecs are controlled here; A's path/FD custody and complete original
+ * creator bodies run against real disposable files. F tests the physical codec. */
+static unsigned boot_fault, boot_reads;
+bool
+cluster_clog_bootstrap_read_v2(int fd, const ClusterRecoveryFileIdentityV2 *id,
+							   ClusterRecoveryBootFileV2 *out)
+{
+	struct stat st;
+	uint8 byte;
+	++boot_reads;
+	if (boot_fault == 1 || fstat(fd, &st) || pread(fd, &byte, 1, 0) != 1)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->identity = *id;
+	out->synced_bytes = st.st_size;
+	out->image_digest[0] = byte;
+	out->page.page_generation = 1;
+	out->page.birth_observed = id->kind == CLUSTER_RECOVERY_FILE_CLOG_V2;
+	out->page.birth_full_xid
+		= out->page.birth_observed ? FirstNormalFullTransactionId : FullTransactionIdFromU64(0);
+	if (boot_fault == 2)
+		++out->identity.creation_generation;
+	if (boot_fault == 3)
+		++out->page.page_generation;
+	return true;
+}
+bool
+cluster_undo_bootstrap_read_v2(int fd, const ClusterRecoveryFileIdentityV2 *id,
+							   ClusterRecoveryBootFileV2 *out)
+{
+	return cluster_clog_bootstrap_read_v2(fd, id, out);
+}
+static InitdbOrigin boot_origin;
+static char boot_temp[MAXPGPATH];
+static void
+boot_setup(void)
+{
+	ClusterSharedConfigRef c = { 0 };
+	PgracInitdbConfigContext r = { 0 };
+	uint8 branch[16] = { 2 };
+	int shared;
+	const char *dirs[] = { "pg_xact", "pg_undo", "pg_undo/instance_0" };
+	memset(&boot_origin, 0, sizeof(boot_origin));
+	strlcpy(boot_temp, "/tmp/pgrac-boot-custody-XXXXXX", sizeof(boot_temp));
+	UT_ASSERT(mkdtemp(boot_temp) != NULL);
+	boot_origin.data.parent = open(boot_temp, O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(!mkdirat(boot_origin.data.parent, "data", 0700));
+	snprintf(boot_origin.data.path, sizeof(boot_origin.data.path), "%s/data", boot_temp);
+	boot_origin.data.fd = openat(boot_origin.data.parent, "data", O_RDONLY | O_DIRECTORY);
+	strlcpy(boot_origin.data.name, "data", sizeof(boot_origin.data.name));
+	UT_ASSERT(!fstat(boot_origin.data.fd, &boot_origin.data.identity));
+	UT_ASSERT(!fstat(boot_origin.data.parent, &boot_origin.data.parent_identity));
+	for (unsigned i = 0; i < lengthof(dirs); ++i)
+		UT_ASSERT(!mkdirat(boot_origin.data.fd, dirs[i], 0700));
+	for (unsigned i = 0; i < 2; ++i) {
+		int fd = openat(boot_origin.data.fd, i ? "pg_undo/instance_0/seg_0.dat" : "pg_xact/0000",
+						O_CREAT | O_EXCL | O_RDWR, 0600);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(write(fd, "x", 1), 1);
+		UT_ASSERT(!ftruncate(fd, i ? UNDO_SEGMENT_SIZE_BYTES : 16448));
+		UT_ASSERT(!close(fd));
+	}
+	c.identity.system_identifier = 91;
+	c.identity.database_incarnation = 27;
+	c.identity.generation = 1;
+	c.identity.storage_uuid[0] = 1;
+	c.identity.configured[0] = 1;
+	c.sha256[0] = r.sha256[0] = 10;
+	r.fd = 3;
+	r.device = 7;
+	r.inode = 8;
+	r.bytes = 9;
+	UT_ASSERT(!mkdirat(boot_origin.data.fd, "shared", 0700));
+	shared = openat(boot_origin.data.fd, "shared", O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(shared >= 0);
+	UT_ASSERT(cluster_initdb_cohort_relmap_prepare_v2(&c, &r, branch, boot_origin.data.fd, shared,
+													  &boot_origin.relmap_registration));
+	UT_ASSERT(!close(shared));
+	boot_origin.managed_relmap = true;
+	boot_fault = boot_reads = 0;
+	side_sync_fault = false;
+}
+static void
+boot_cleanup(void)
+{
+	const char *files[] = { "pg_xact/0000", "pg_undo/instance_0/seg_0.dat", "pg_xact/old" };
+	for (unsigned i = 0; i < lengthof(files); ++i) {
+		int rc = unlinkat(boot_origin.data.fd, files[i], 0);
+		UT_ASSERT(!rc || errno == ENOENT);
+	}
+	UT_ASSERT(!unlinkat(boot_origin.data.fd, "pg_undo/instance_0", AT_REMOVEDIR));
+	UT_ASSERT(!unlinkat(boot_origin.data.fd, "pg_undo", AT_REMOVEDIR));
+	UT_ASSERT(!unlinkat(boot_origin.data.fd, "pg_xact", AT_REMOVEDIR));
+	UT_ASSERT(!unlinkat(boot_origin.data.fd, "shared", AT_REMOVEDIR));
+	UT_ASSERT(!close(boot_origin.data.fd));
+	UT_ASSERT(!unlinkat(boot_origin.data.parent, "data", AT_REMOVEDIR));
+	UT_ASSERT(!close(boot_origin.data.parent));
+	UT_ASSERT(!rmdir(boot_temp));
+	side_sync_fault = false;
+}
+static void
+complete_boot_capture_and_current_require_both_actual_files(void)
+{
+	boot_setup();
+	UT_ASSERT(creation_boot_current(&boot_origin, true));
+	UT_ASSERT_EQ(boot_reads, 2);
+	UT_ASSERT(creation_boot_current(&boot_origin, false));
+	UT_ASSERT_EQ(boot_reads, 4);
+	boot_cleanup();
+}
+static void
+failed_partial_boot_capture_never_installs_half_the_batch(void)
+{
+	ClusterRecoveryBootFileV2 empty[2] = { 0 };
+	boot_setup();
+	UT_ASSERT(!unlinkat(boot_origin.data.fd, "pg_undo/instance_0/seg_0.dat", 0));
+	UT_ASSERT(!creation_boot_current(&boot_origin, true));
+	UT_ASSERT(!memcmp(empty, boot_origin.boot_observations, sizeof(empty)));
+	boot_cleanup();
+	boot_setup();
+	side_sync_fault = true;
+	UT_ASSERT(!creation_boot_current(&boot_origin, true));
+	UT_ASSERT_EQ(boot_reads, 0);
+	UT_ASSERT(!memcmp(empty, boot_origin.boot_observations, sizeof(empty)));
+	side_sync_fault = false;
+	boot_cleanup();
+}
+static void
+changed_identity_bytes_or_inode_cannot_rebase_boot_observations(void)
+{
+	for (unsigned f = 1; f <= 5; ++f) {
+		boot_setup();
+		UT_ASSERT(creation_boot_current(&boot_origin, true));
+		if (f <= 3)
+			boot_fault = f;
+		if (f == 4) {
+			int fd = openat(boot_origin.data.fd, "pg_xact/0000", O_WRONLY);
+			UT_ASSERT(fd >= 0 && pwrite(fd, "y", 1, 0) == 1 && !close(fd));
+		}
+		if (f == 5) {
+			int fd;
+			UT_ASSERT(
+				!renameat(boot_origin.data.fd, "pg_xact/0000", boot_origin.data.fd, "pg_xact/old"));
+			fd = openat(boot_origin.data.fd, "pg_xact/0000", O_CREAT | O_EXCL | O_RDWR, 0600);
+			UT_ASSERT(fd >= 0 && write(fd, "x", 1) == 1 && !ftruncate(fd, 16448) && !close(fd));
+		}
+		UT_ASSERT(!creation_boot_current(&boot_origin, false));
+		boot_cleanup();
+	}
+}
+static void
+registry_requires_complete_exact_boot_family_without_duplicates(void)
+{
+	InitdbOrigin *origins = calloc(128, sizeof(*origins));
+	ClusterRecoveryRegistryV2 registry = { 0 };
+	ClusterRecoveryCheckpointFileV2 files[3] = { 0 };
+	UT_ASSERT(origins != NULL);
+	boot_setup();
+	UT_ASSERT(creation_boot_current(&boot_origin, true));
+	origins[0] = boot_origin;
+	registry.coverage.files = files;
+	registry.coverage.file_count = 2;
+	for (unsigned i = 0; i < 2; ++i) {
+		files[i].identity = boot_origin.boot_observations[i].identity;
+		files[i].copy_count = 1;
+		files[i].synced_bytes = boot_origin.boot_observations[i].synced_bytes;
+		files[i].page_count = i ? UNDO_SEGMENT_SIZE_BYTES / BLCKSZ : 1;
+		memcpy(files[i].image_digest, boot_origin.boot_observations[i].image_digest, 32);
+	}
+	UT_ASSERT(creation_boot_registry_valid(origins, &registry));
+	registry.coverage.file_count = 1;
+	UT_ASSERT(!creation_boot_registry_valid(origins, &registry));
+	registry.coverage.file_count = 3;
+	files[2] = files[1];
+	UT_ASSERT(!creation_boot_registry_valid(origins, &registry));
+	registry.coverage.file_count = 2;
+	++files[1].identity.creation_generation;
+	UT_ASSERT(!creation_boot_registry_valid(origins, &registry));
+	--files[1].identity.creation_generation;
+	files[0].image_digest[0] ^= 1;
+	UT_ASSERT(!creation_boot_registry_valid(origins, &registry));
+	files[0].image_digest[0] ^= 1;
+	origins[0].relmap_registration.boot_file_count = 0;
+	UT_ASSERT(!creation_boot_registry_valid(origins, &registry));
+	free(origins);
+	boot_cleanup();
 }
 
 int
@@ -596,7 +790,11 @@ main(int argc, char **argv)
 			pause();
 	}
 	strlcpy(executable, argv[0], sizeof(executable));
-	UT_PLAN(12);
+	UT_PLAN(16);
+	UT_RUN(complete_boot_capture_and_current_require_both_actual_files);
+	UT_RUN(failed_partial_boot_capture_never_installs_half_the_batch);
+	UT_RUN(changed_identity_bytes_or_inode_cannot_rebase_boot_observations);
+	UT_RUN(registry_requires_complete_exact_boot_family_without_duplicates);
 	UT_RUN(managed_child_cannot_select_the_legacy_root_publisher);
 	UT_RUN(original_registered_child_receives_only_its_creator);
 	UT_RUN(storage_contract_is_original_unverified_and_rechecked);

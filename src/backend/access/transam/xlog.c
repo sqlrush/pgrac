@@ -185,6 +185,10 @@
 #include <unistd.h>
 
 #include "access/clog.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "common/pgrac_initdb_recovery.h"
+#include "common/cluster_recovery_bootstrap.h"
+#endif
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
@@ -5804,6 +5808,40 @@ XLOGShmemInit(void)
  * This func must be called ONCE on system install.  It creates pg_control
  * and the initial XLOG segment.
  */
+#ifdef USE_PGRAC_CLUSTER
+/* Same original child/creation identity; BOOT has no normal WAL producer.
+ * Full family sync/readback precedes the creator's registry/ROOT publication. */
+static void
+BootStrapCLOGWithIdentity(const CheckPoint *checkpoint, uint64 system)
+{
+	const PgracInitdbRecoveryContext *request = cluster_wal_thread_initdb_recovery_context();
+	PgracInitdbRecoveryContext captured;
+	ClusterRecoveryFileIdentityV2 boot[2];
+	ClusterRecoveryBootFileV2 result;
+	if (request == NULL) {
+		BootStrapCLOG();
+		return;
+	}
+	captured = *request;
+	if (!checkpoint || !pgrac_initdb_recovery_boot_v2(&captured, boot)
+		|| captured.first.system_identifier != system
+		|| captured.first.redo_timeline != checkpoint->ThisTimeLineID
+		|| U64FromFullTransactionId(checkpoint->nextXid) != FirstNormalTransactionId)
+		ereport(FATAL,
+				(errmsg("INITDB_BOOT_CLOG: original identity differs from native checkpoint")));
+	if (!BootStrapCLOGManagedV2(&boot[0], checkpoint->nextXid, &result)
+		|| !cluster_recovery_boot_file_matches_v2(&boot[0], &result)
+		|| result.synced_bytes
+			   < CLUSTER_RECOVERY_CLOG_SEGMENT_HEADER_V2_BYTES + CLUSTER_RECOVERY_CLOG_PAGE_BYTES_V2
+		|| !result.page.birth_observed
+		|| U64FromFullTransactionId(result.page.birth_full_xid)
+			   != U64FromFullTransactionId(checkpoint->nextXid)
+		|| result.page.page_lsn != InvalidXLogRecPtr
+		|| memcmp(&captured, request, sizeof(captured)))
+		ereport(FATAL, (errmsg("INITDB_BOOT_CLOG: complete original file creation refused")));
+}
+#endif
+
 void
 BootStrapXLOG(void)
 {
@@ -5976,7 +6014,11 @@ BootStrapXLOG(void)
 	WriteControlFile();
 
 	/* Bootstrap the commit log, too */
+#ifdef USE_PGRAC_CLUSTER
+	BootStrapCLOGWithIdentity(&checkPoint, sysidentifier);
+#else
 	BootStrapCLOG();
+#endif
 	BootStrapCommitTs();
 	BootStrapSUBTRANS();
 	BootStrapMultiXact();

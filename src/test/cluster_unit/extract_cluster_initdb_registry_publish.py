@@ -14,7 +14,7 @@ parts.append("""static void creation_sources_current(const PgracInitdbCohortCont
  const ClusterInitdbTree *, const ClusterInitdbTree *, bool);""")
 for name in ["owned_directory", "same_directory", "parent_current", "directory_current",
              "creation_derived_current", "creation_legacy_format_current",
-             "creation_relmap_registry_valid", "creation_registry_valid", "creation_registry_current", "creation_root_publish"]:
+             "creation_relmap_registry_valid", "creation_boot_registry_valid", "creation_registry_valid", "creation_registry_current", "creation_root_publish"]:
     matches = re.findall(r"static (?:bool|void)\n" + name + r"\(.*?^\}", source, re.M | re.S)
     if len(matches) != 1:
         raise SystemExit("missing/duplicate function " + name)

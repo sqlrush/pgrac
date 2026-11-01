@@ -307,6 +307,8 @@ extern void cluster_wal_thread_init(void);
 extern void cluster_wal_thread_initdb_accept(bool bootstrap);
 struct PgracInitdbWalContext;
 extern const struct PgracInitdbWalContext *cluster_wal_thread_initdb_context(void);
+struct PgracInitdbRecoveryContext;
+extern const struct PgracInitdbRecoveryContext *cluster_wal_thread_initdb_recovery_context(void);
 extern uint64 cluster_wal_thread_initdb_system_identifier(void);
 extern uint16 cluster_wal_thread_initdb_stamp(void);
 

@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <setjmp.h>
 #include "common/pgrac_initdb_cohort.h"
+#include "common/cluster_recovery_bootstrap.h"
 #include "common/cluster_recovery_registry.h"
 #undef FRONTEND
 #include "cluster/cluster_shared_config.h"
@@ -117,6 +118,12 @@ pg_attribute_noreturn() refuse(const char *reason) {
 	abort();
 }
 #include "test_cluster_initdb_recovery_owner.inc"
+static bool
+creation_boot_current(InitdbOrigin *o, bool first)
+{
+	return o->relmap_registration.boot_file_count == 0;
+}
+
 static PgracInitdbCohortContext original_request;
 static ClusterSharedConfigRef original_configuration;
 static unsigned child_calls, control_calls, legacy_calls;
@@ -473,11 +480,154 @@ UT_TEST(observation_alias_and_wrong_creator_refuse_before_output) {
 	cleanup();
 }
 
+static void
+boot_inputs(ClusterRecoveryFileIdentityV2 b[2])
+{
+	b[0] = b[1] = first;
+	for (unsigned i = 0; i < 2; ++i) {
+		b[i].kind = i ? CLUSTER_RECOVERY_FILE_UNDO_V2 : CLUSTER_RECOVERY_FILE_CLOG_V2;
+		b[i].database_oid = b[i].tablespace_oid = 0;
+		b[i].object_id = 0;
+		b[i].creation_generation = 5 + i;
+	}
+}
+UT_TEST(complete_boot_files_survive_original_closed_pipe)
+{
+	PgracInitdbRecoveryContext ctx;
+	ClusterRecoveryFileIdentityV2 boot[2], actual[2];
+	setup_request();
+	boot_inputs(boot);
+	UT_ASSERT(
+		pgrac_initdb_recovery_prepare_files_v2(&first, boot, &config, source_fd, shared_fd, &ctx));
+	UT_ASSERT_EQ(ctx.boot_file_count, 2);
+	UT_ASSERT(pgrac_initdb_recovery_boot_v2(&ctx, actual));
+	UT_ASSERT(memcmp(boot, actual, sizeof(boot)) == 0);
+	UT_ASSERT_EQ(child_read(&ctx, 0, false), 0);
+	cleanup();
+}
+UT_TEST(boot_identity_set_rejects_wrong_kind_origin_branch_and_birth)
+{
+	PgracInitdbRecoveryContext ctx, saved;
+	ClusterRecoveryFileIdentityV2 boot[2];
+	setup_request();
+	memset(&ctx, 0xa5, sizeof(ctx));
+	saved = ctx;
+	for (unsigned i = 0; i < 8; ++i) {
+		boot_inputs(boot);
+		if (i == 0)
+			boot[0].kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+		if (i == 1)
+			boot[1].origin++;
+		if (i == 2)
+			boot[1].redo_branch_uuid[0]++;
+		if (i == 3)
+			boot[0].creation_generation = 1;
+		if (i == 4)
+			boot[1].creation_generation = boot[0].creation_generation;
+		if (i == 5)
+			boot[0].object_id = 1;
+		if (i == 6)
+			boot[1].database_incarnation++;
+		if (i == 7)
+			boot[0].registration_generation++;
+		UT_ASSERT(!pgrac_initdb_recovery_prepare_files_v2(&first, boot, &config, source_fd,
+														  shared_fd, &ctx));
+		UT_ASSERT(memcmp(&ctx, &saved, sizeof(ctx)) == 0);
+	}
+	cleanup();
+}
+UT_TEST(incomplete_boot_request_and_output_alias_never_publish)
+{
+	PgracInitdbRecoveryContext ctx, saved;
+	ClusterRecoveryFileIdentityV2 boot[2], out[2], original[2];
+	int fd = -1;
+	setup_request();
+	boot_inputs(boot);
+	UT_ASSERT(
+		pgrac_initdb_recovery_prepare_files_v2(&first, boot, &config, source_fd, shared_fd, &ctx));
+	saved = ctx;
+	UT_ASSERT(!pgrac_initdb_recovery_prepare_files_v2(&ctx.first, ctx.boot_files, &config,
+													  source_fd, shared_fd, &ctx));
+	UT_ASSERT(memcmp(&ctx, &saved, sizeof(ctx)) == 0);
+	memset(out, 0xa5, sizeof(out));
+	memcpy(original, out, sizeof(out));
+	ctx.boot_file_count = 1;
+	UT_ASSERT(!pgrac_initdb_recovery_boot_v2(&ctx, out));
+	UT_ASSERT(memcmp(out, original, sizeof(out)) == 0);
+	UT_ASSERT(!pgrac_initdb_recovery_pipe_v2(&ctx, &fd));
+	UT_ASSERT_EQ(fd, -1);
+	ctx = saved;
+	ctx.boot_files[1].system_identifier++;
+	UT_ASSERT(!pgrac_initdb_recovery_pipe_v2(&ctx, &fd));
+	cleanup();
+}
+
+UT_TEST(original_initdb_relays_full_identity_to_native_child)
+{
+	PgracInitdbRecoveryContext ctx;
+	ClusterRecoveryFileIdentityV2 boot[2];
+	int incoming, status;
+	pid_t frontend;
+	setup_request();
+	boot_inputs(boot);
+	UT_ASSERT(
+		pgrac_initdb_recovery_prepare_files_v2(&first, boot, &config, source_fd, shared_fd, &ctx));
+	UT_ASSERT(pgrac_initdb_recovery_pipe_v2(&ctx, &incoming));
+	frontend = fork();
+	UT_ASSERT(frontend >= 0);
+	if (frontend == 0) {
+		PgracInitdbRecoveryContext actual;
+		int outgoing, child_status;
+		pid_t native;
+		if (!pgrac_initdb_recovery_read_v2(incoming, &config, first.system_identifier,
+										   first.database_incarnation, first.storage_uuid,
+										   source_fd, shared_fd, &actual)
+			|| !pgrac_initdb_recovery_relay_v2(&actual, &outgoing))
+			_exit(1);
+		native = fork();
+		if (native == 0) {
+			PgracInitdbRecoveryContext child;
+			if (!pgrac_initdb_recovery_read_v2(outgoing, &config, first.system_identifier,
+											   first.database_incarnation, first.storage_uuid,
+											   source_fd, shared_fd, &child)
+				|| child.creator_pid != (uint64)getppid()
+				|| memcmp(child.boot_files, boot, sizeof(boot)))
+				_exit(2);
+			_exit(0);
+		}
+		if (native < 0 || close(outgoing) || waitpid(native, &child_status, 0) != native
+			|| !WIFEXITED(child_status))
+			_exit(3);
+		_exit(WEXITSTATUS(child_status));
+	}
+	UT_ASSERT(close(incoming) == 0);
+	UT_ASSERT(waitpid(frontend, &status, 0) == frontend);
+	UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	cleanup();
+}
+UT_TEST(relay_rejects_nonrecipient_and_incomplete_sets)
+{
+	PgracInitdbRecoveryContext ctx;
+	ClusterRecoveryFileIdentityV2 boot[2];
+	int fd = -1;
+	setup_request();
+	boot_inputs(boot);
+	UT_ASSERT(
+		pgrac_initdb_recovery_prepare_files_v2(&first, boot, &config, source_fd, shared_fd, &ctx));
+	UT_ASSERT(!pgrac_initdb_recovery_relay_v2(&ctx, &fd));
+	UT_ASSERT_EQ(fd, -1);
+	ctx.creator_pid = getppid();
+	ctx.boot_file_count = 0;
+	UT_ASSERT(!pgrac_initdb_recovery_relay_v2(&ctx, &fd));
+	UT_ASSERT_EQ(fd, -1);
+	cleanup();
+}
+
 int
 main(int argc, char **argv)
 {
 	pg_logging_init(argv[0]);
-	UT_PLAN(12);
+	UT_PLAN(17);
 	UT_RUN(original_creator_pipe_to_complete_managed_pairs);
 	UT_RUN(stale_binding_refuses_before_any_pair_creation);
 	UT_RUN(preregistration_rejects_bad_birth_and_alias_without_io);
@@ -490,6 +640,11 @@ main(int argc, char **argv)
 	UT_RUN(original_creator_retains_actual_pairs_through_registry_selection);
 	UT_RUN(original_creator_current_refuses_late_pair_change_without_rebase);
 	UT_RUN(original_creator_rejects_late_registration_and_preserves_legacy_entry);
+	UT_RUN(complete_boot_files_survive_original_closed_pipe);
+	UT_RUN(boot_identity_set_rejects_wrong_kind_origin_branch_and_birth);
+	UT_RUN(incomplete_boot_request_and_output_alias_never_publish);
+	UT_RUN(original_initdb_relays_full_identity_to_native_child);
+	UT_RUN(relay_rejects_nonrecipient_and_incomplete_sets);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

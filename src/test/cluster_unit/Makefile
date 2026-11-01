@@ -13362,7 +13362,9 @@ test_cluster_initdb_cohort: test_cluster_initdb_cohort.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
-		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o
+		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o \
+		$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
 		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
@@ -15822,7 +15824,9 @@ test_cluster_initdb_recovery: test_cluster_initdb_recovery.c test_cluster_initdb
 		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
 		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
 		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h \
-		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -DFRONTEND $< $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -15875,7 +15879,9 @@ test_cluster_initdb_registry_publish: test_cluster_initdb_registry_publish.c tes
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
-		$(top_srcdir)/src/common/file_perm.c cluster_control_registry_original.o cluster_registry_common_test.o
+		$(top_srcdir)/src/common/file_perm.c cluster_control_registry_original.o cluster_registry_common_test.o \
+		$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
@@ -15968,3 +15974,18 @@ clean: clean-relmap-control
 .PHONY: clean-relmap-control
 clean-relmap-control:
 	rm -f test_cluster_relmap_control test_cluster_relmap_control.d test_cluster_relmap_control_authority.o test_cluster_relmap_control_authority.d test_cluster_relmap_control_entries.inc test_cluster_relmap_control_entries.inc.tmp
+
+# Original BOOT dispatch with controlled family producers, no native activation.
+TESTS += test_cluster_initdb_boot
+all: test_cluster_initdb_boot
+test_cluster_initdb_boot_entries.inc: $(top_srcdir)/src/backend/access/transam/xlog.c $(top_srcdir)/src/bin/initdb/initdb.c $(top_srcdir)/src/backend/cluster/cluster_wal_thread.c $(srcdir)/extract_cluster_initdb_boot.py
+	python3 $(srcdir)/extract_cluster_initdb_boot.py $(word 1,$^) $(word 2,$^) $(word 3,$^) $@
+test_cluster_initdb_boot: test_cluster_initdb_boot.c test_cluster_initdb_boot_entries.inc unit_test.h \
+	$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h $(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+	$(top_srcdir)/src/common/pgrac_initdb_recovery.c $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-boot
+.PHONY: clean-initdb-boot
+clean-initdb-boot:
+	rm -f test_cluster_initdb_boot test_cluster_initdb_boot.d test_cluster_initdb_boot_entries.inc test_cluster_initdb_boot_entries.tmp

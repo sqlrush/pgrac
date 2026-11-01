@@ -5,6 +5,8 @@
 #include <dirent.h>
 #include <setjmp.h>
 #include "common/pgrac_initdb_cohort.h"
+#include "common/cluster_recovery_bootstrap.h"
+#include "cluster/cluster_undo_segment.h"
 #include "common/pgrac_initdb_recovery.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_initdb_config.h"
@@ -381,7 +383,7 @@ UT_TEST(managed_child_requires_its_complete_captured_relmap_inventory) {
 	cleanup();
 }
 UT_TEST(managed_registry_matches_each_captured_image_and_preallocated_identity) {
-	ClusterRecoveryCheckpointFileV2 complete[8], saved;
+	ClusterRecoveryCheckpointFileV2 complete[10] = { 0 }, saved;
 	ClusterRecoveryFileIdentityV2 ids[4];
 	PgracInitdbRecoveryContext *ctx;
 	setup();
@@ -412,6 +414,28 @@ UT_TEST(managed_registry_matches_each_captured_image_and_preallocated_identity) 
 	}
 	reg.coverage.files = complete;
 	reg.coverage.file_count = 8;
+	/* Captured relmaps alone no longer authorize a complete managed BOOT. */
+	UT_ASSERT(!creation_registry_valid(&original_config, origins, &root, &reg, 16384));
+	ctx->boot_file_count = 2;
+	for (unsigned i = 0; i < 2; ++i) {
+		ClusterRecoveryBootFileV2 *b = &origins[0].boot_observations[i];
+		ctx->boot_files[i] = ctx->first;
+		ctx->boot_files[i].kind = i ? CLUSTER_RECOVERY_FILE_UNDO_V2 : CLUSTER_RECOVERY_FILE_CLOG_V2;
+		ctx->boot_files[i].tablespace_oid = 0;
+		ctx->boot_files[i].creation_generation += 4 + i;
+		b->identity = ctx->boot_files[i];
+		b->page.page_generation = 1;
+		b->synced_bytes = i ? UNDO_SEGMENT_SIZE_BYTES : 16448;
+		b->image_digest[0] = i + 1;
+		complete[8 + i].identity = b->identity;
+		complete[8 + i].copy_count = 1;
+		complete[8 + i].synced_bytes = b->synced_bytes;
+		complete[8 + i].page_count = i ? UNDO_SEGMENT_SIZE_BYTES / BLCKSZ : 1;
+		memcpy(complete[8 + i].image_digest, b->image_digest, 32);
+		complete[8 + i].source_count = 2;
+		complete[8 + i].sources = intervals[0];
+	}
+	reg.coverage.file_count = 10;
 	UT_ASSERT(creation_registry_valid(&original_config, origins, &root, &reg, 16384));
 	for (unsigned i = 0; i < 8; ++i) {
 		saved = complete[i];
@@ -424,7 +448,7 @@ UT_TEST(managed_registry_matches_each_captured_image_and_preallocated_identity) 
 	}
 	reg.coverage.file_count = 6;
 	UT_ASSERT(!creation_registry_valid(&original_config, origins, &root, &reg, 16384));
-	reg.coverage.file_count = 8;
+	reg.coverage.file_count = 10;
 	UT_ASSERT(creation_registry_valid(&original_config, origins, &root, &reg, 16384));
 	cleanup();
 }

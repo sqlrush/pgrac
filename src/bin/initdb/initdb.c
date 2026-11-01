@@ -79,6 +79,7 @@
 #include "common/pgrac_initdb_wal.h"
 #include "common/pgrac_initdb_cohort.h"
 #include "common/pgrac_initdb_recovery.h"
+#include "common/cluster_recovery_bootstrap.h"
 #include <limits.h>
 #include "common/cryptohash.h"
 #include "datatype/timestamp.h"
@@ -211,6 +212,7 @@ static int pgrac_native_base_child_fd = -1;
 static char *pgrac_native_config_path;
 static PgracInitdbConfigContext pgrac_native_config;
 static int pgrac_native_config_child_fd = -1;
+static int pgrac_native_recovery_child_fd = -1;
 static bool pgrac_native_recovery_requested;
 static PgracInitdbRecoveryContext pgrac_native_recovery;
 static ClusterRecoveryFileIdentityV2 pgrac_native_relmap_identities[4];
@@ -3110,6 +3112,22 @@ warn_on_mount_point(int error)
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* F owns the original empty seed FD's TT40 write/sync/readback. */
+static bool
+pgrac_native_create_boot_undo(int fd)
+{
+	PgracInitdbRecoveryContext captured = pgrac_native_recovery;
+	ClusterRecoveryFileIdentityV2 boot[2];
+	ClusterRecoveryBootFileV2 result;
+	return pgrac_native_recovery_requested && pgrac_initdb_recovery_boot_v2(&captured, boot)
+		   && cluster_undo_bootstrap_v2(fd, &boot[1], &result)
+		   && cluster_recovery_boot_file_matches_v2(&boot[1], &result)
+		   && result.synced_bytes == UNDO_SEGMENT_SIZE_BYTES
+		   && memcmp(&captured, &pgrac_native_recovery, sizeof(captured)) == 0;
+}
+#endif
+
 void
 initialize_data_directory(void)
 {
@@ -3190,9 +3208,6 @@ initialize_data_directory(void)
 		if (ret < 0 || (size_t) ret >= sizeof(seed_path))
 			pg_fatal("undo seed segment path too long");
 
-		cluster_undo_segment_make_header_bytes(0,	/* segment_id */
-											   1,	/* owner_instance */
-											   page.data);
 
 		fd = open(seed_path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
 				  pg_file_create_mode);
@@ -3200,31 +3215,35 @@ initialize_data_directory(void)
 			pg_fatal("could not create undo seed segment \"%s\": %m",
 					 seed_path);
 
-		if (!cluster_undo_segment_header_seal(page.data)
-			|| write(fd, page.data, BLCKSZ) != BLCKSZ)
-		{
-			(void) close(fd);
-			pg_fatal("could not write undo seed segment header to \"%s\"",
-					 seed_path);
-		}
+		if (pgrac_native_recovery_requested && pgrac_native_recovery.boot_file_count != 0) {
+			if (!pgrac_native_create_boot_undo(fd))
+				pg_fatal("INITDB_BOOT_UNDO: complete original seed refused");
+		} else {
+			cluster_undo_segment_make_header_bytes(0, /* segment_id */
+												   1, /* owner_instance */
+												   page.data);
 
-		/*
+			if (!cluster_undo_segment_header_seal(page.data)
+				|| write(fd, page.data, BLCKSZ) != BLCKSZ) {
+				(void)close(fd);
+				pg_fatal("could not write undo seed segment header to \"%s\"", seed_path);
+			}
+
+			/*
 		 * Extend file to UNDO_SEGMENT_SIZE_BYTES (64 MB) via ftruncate.
 		 * Tail bytes are sparse zeros; allocator path will write actual
 		 * undo records lazily.
 		 */
-		if (ftruncate(fd, (off_t) UNDO_SEGMENT_SIZE_BYTES) != 0)
-		{
-			(void) close(fd);
-			pg_fatal("could not extend undo seed segment \"%s\" to %d bytes: %m",
-					 seed_path, UNDO_SEGMENT_SIZE_BYTES);
-		}
+			if (ftruncate(fd, (off_t)UNDO_SEGMENT_SIZE_BYTES) != 0) {
+				(void)close(fd);
+				pg_fatal("could not extend undo seed segment \"%s\" to %d bytes: %m", seed_path,
+						 UNDO_SEGMENT_SIZE_BYTES);
+			}
 
-		if (fsync(fd) != 0)
-		{
-			(void) close(fd);
-			pg_fatal("could not fsync undo seed segment \"%s\": %m",
-					 seed_path);
+			if (fsync(fd) != 0) {
+				(void)close(fd);
+				pg_fatal("could not fsync undo seed segment \"%s\": %m", seed_path);
+			}
 		}
 
 		if (close(fd) != 0)
@@ -3963,19 +3982,20 @@ pgrac_native_child_begin(bool bootstrap)
 
 		pgrac_native_sysid = context.system_identifier = control->system_identifier;
 		free(control);
-		if (pgrac_native_base_fd >= 0)
-		{
-			struct stat base_st;
-			pgrac_native_check_directory(pgrac_native_base_path, pgrac_native_base_fd, &base_st);
-			pgrac_native_base_child_fd = fcntl(pgrac_native_base_fd, F_DUPFD, 3);
-			if (pgrac_native_base_child_fd < 0)
-				pg_fatal("INITDB_BASE_CONTEXT: cannot pass original target: %m");
-			context.base_fd = pgrac_native_base_child_fd;
-			context.database_incarnation = pgrac_native_database_incarnation;
-			context.base_device = base_st.st_dev;
-			context.base_inode = base_st.st_ino;
-			memcpy(context.storage_uuid, pgrac_native_storage_bytes, sizeof(context.storage_uuid));
-		}
+	}
+	if ((!bootstrap
+		 || (pgrac_native_recovery_requested && pgrac_native_recovery.boot_file_count != 0))
+		&& pgrac_native_base_fd >= 0) {
+		struct stat base_st;
+		pgrac_native_check_directory(pgrac_native_base_path, pgrac_native_base_fd, &base_st);
+		pgrac_native_base_child_fd = fcntl(pgrac_native_base_fd, F_DUPFD, 3);
+		if (pgrac_native_base_child_fd < 0)
+			pg_fatal("INITDB_BASE_CONTEXT: cannot pass original target: %m");
+		context.base_fd = pgrac_native_base_child_fd;
+		context.database_incarnation = pgrac_native_database_incarnation;
+		context.base_device = base_st.st_dev;
+		context.base_inode = base_st.st_ino;
+		memcpy(context.storage_uuid, pgrac_native_storage_bytes, sizeof(context.storage_uuid));
 	}
 	/* Every original native child needs the same recovery parameters before
 	 * sizing/control initialization. Shared-base publication remains founder
@@ -3986,6 +4006,12 @@ pgrac_native_child_begin(bool bootstrap)
 		if (pgrac_native_config_child_fd < 3)
 			pg_fatal("INITDB_CONFIG_CONTEXT: cannot pass original configuration request: %m");
 		context.config.fd = pgrac_native_config_child_fd;
+	}
+	if (bootstrap && pgrac_native_recovery_requested && pgrac_native_recovery.boot_file_count) {
+		if (!pgrac_initdb_recovery_relay_v2(&pgrac_native_recovery, &pgrac_native_recovery_child_fd)
+			|| fcntl(pgrac_native_recovery_child_fd, F_SETFD, 0) != 0)
+			pg_fatal("INITDB_BOOT_CONTEXT: cannot relay original full BOOT identities");
+		context.recovery_fd = pgrac_native_recovery_child_fd;
 	}
 	if (pipe(descriptors) != 0)
 		pg_fatal("INITDB_WAL_CONTEXT: cannot create original child pipe: %m");
@@ -4004,6 +4030,12 @@ pgrac_native_child_started(int context_fd)
 	if (context_fd >= 0
 		&& (close(context_fd) != 0 || unsetenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != 0))
 		pg_fatal("INITDB_WAL_CONTEXT: cannot release original child pipe: %m");
+	if (pgrac_native_recovery_child_fd >= 0) {
+		if (close(pgrac_native_recovery_child_fd))
+			pg_fatal("INITDB_BOOT_CONTEXT: cannot release original child request");
+		pgrac_native_recovery_child_fd = -1;
+	}
+
 	if (pgrac_native_base_child_fd >= 0)
 	{
 		if (close(pgrac_native_base_child_fd) != 0)

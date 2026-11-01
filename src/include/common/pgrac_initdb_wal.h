@@ -44,7 +44,7 @@ typedef struct PgracInitdbWalContext
 	uint64 base_inode;
 	uint8 storage_uuid[16];
 	int32 base_fd;
-	uint32 reserved;
+	int32 recovery_fd; /* optional same-request relay, bootstrap only */
 	PgracInitdbConfigContext config;
 } PgracInitdbWalContext;
 
