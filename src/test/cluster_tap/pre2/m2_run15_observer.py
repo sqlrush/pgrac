@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import stat
 import subprocess
 import time
 
@@ -53,6 +54,53 @@ class Run15Observer(BaseObserver):
     def _complete_raw(raw, context):
         return BaseObserver._complete_raw(raw, context, reads=RUN15_READS)
 
+    def _listener(self, host, lines, evidence):
+        # The data-dir lock predates root-selected instance configuration.
+        # Socket locks are created at bind time with the effective port. Match
+        # PID, DATA, start time and directory; never choose by layout port.
+        matches = []
+        cut = evidence['listener'] = dict(candidates=[], port_source='socket_lock_and_live_SQL')
+        if not lines[2].isdigit() or int(lines[2]) <= 0:
+            raise ValueError('original postmaster start time unavailable')
+        with os.scandir(host) as entries:
+            for count, entry in enumerate(entries):
+                if count >= 64:
+                    raise ValueError('socket directory exceeds the bounded endpoint scan')
+                match = re.fullmatch(r'\.s\.PGSQL\.([0-9]{1,5})\.lock', entry.name)
+                if not match or not 0 < int(match[1]) < 65536:
+                    continue
+                path = Path(entry.path)
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid:
+                        raise ValueError('socket lock owner or file type unavailable')
+                    raw = os.read(fd, 4097)
+                finally:
+                    os.close(fd)
+                if len(raw) > 4096:
+                    raise ValueError('socket lock exceeds the endpoint evidence bound')
+                fields = raw.decode().splitlines()
+                socket_path = Path(str(path)[:-5])
+                socket_info = socket_path.lstat()
+                checks = dict(identity_matches=fields[:3] == lines[:3],
+                    port_matches=len(fields) >= 4 and fields[3] == match[1],
+                    directory_matches=len(fields) >= 5 and fields[4] == host,
+                    live_socket=stat.S_ISSOCK(socket_info.st_mode)
+                        and socket_info.st_uid == self.uid)
+                record = dict(path=str(path), text=raw.decode(), sha256=sha256(raw),
+                              socket=str(socket_path), port=int(match[1]), checks=checks)
+                cut['candidates'].append(record)
+                if all(checks.values()):
+                    matches.append(record)
+        cut['matching_listeners'] = len(matches)
+        if len(matches) != 1:
+            raise ValueError('original postmaster listener is missing or ambiguous')
+        chosen = matches[0]
+        cut.update(port=chosen['port'], socket=chosen['socket'],
+                   pidfile_port_matches=lines[3] == str(chosen['port']))
+        return chosen['port']
+
     def _endpoint(self, pid, evidence):
         # Search only the registered cohort layout level, never PGDATA contents.
         owned = self.run / 'testdata'
@@ -68,13 +116,13 @@ class Run15Observer(BaseObserver):
             raise ValueError('original node endpoint is ambiguous')
         node = nodes[0]
         data = Path(node['data_dir']).resolve(strict=True)
-        host, port = node['host'], node['port']
+        host = node['host']
         if (not data.is_relative_to(owned.resolve()) or not isinstance(host, str)
-                or not host.startswith('/') or type(port) is not int or not 0 < port < 65536):
+                or not host.startswith('/')):
             raise ValueError('original node endpoint is invalid')
         evidence.update(path=str(layout), sha256=sha256(raw), atomic=False,
-                        diagnostic_authority=False,
-                        expected=dict(data_dir=str(data), port=str(port), host=host))
+                        diagnostic_authority=False, layout_port_authoritative=False,
+                        expected=dict(data_dir=str(data), port=node.get('port'), host=host))
         pidfile = data / 'postmaster.pid'
         pid_raw = pidfile.read_bytes()
         evidence['postmaster_pidfile'] = dict(path=str(pidfile), sha256=sha256(pid_raw),
@@ -98,7 +146,8 @@ class Run15Observer(BaseObserver):
                         host=lines[4] if len(lines) > 4 else None)
         checks = dict(pidfile_complete=len(lines) >= 5, postmaster_pid_valid=pid_valid,
                       data_directory_matches=lines[1] == str(data) if len(lines) > 1 else None,
-                      port_matches=lines[3] == str(port) if len(lines) > 3 else None,
+                      port_valid=(lines[3].isdigit() and len(lines[3]) <= 5
+                                  and 0 < int(lines[3]) < 65536) if len(lines) > 3 else None,
                       socket_directory_matches=lines[4] == host if len(lines) > 4 else None,
                       producer_parent_valid=parent_pid is not None,
                       producer_parent_matches=parent_pid == postmaster_pid
@@ -109,7 +158,8 @@ class Run15Observer(BaseObserver):
         if not all(value is True for value in checks.values()):
             raise ValueError('producer and original postmaster endpoint disagree')
         evidence['postmaster_pid'] = postmaster_pid
-        return node, evidence
+        port = self._listener(host, lines, evidence)
+        return dict(node, host=host, port=port), evidence
 
     def _process_sample(self, pid):
         result = {}
@@ -146,7 +196,8 @@ class Run15Observer(BaseObserver):
             sql = ("SELECT row_to_json(s) FROM (SELECT pid,backend_start::text,query_start::text,"
                    "query,state,backend_xid::text,wait_event_type,wait_event,"
                    "pg_blocking_pids(pid) AS blockers,clock_timestamp()::text AS observed_at,"
-                   "current_setting('cluster.node_id')::int AS node FROM pg_stat_activity WHERE pid="
+                   "current_setting('cluster.node_id')::int AS node,"
+                   "current_setting('port')::int AS server_port FROM pg_stat_activity WHERE pid="
                    + str(pid) + ') s')
             command = [str(self.psql), '-XAtq', '-v', 'ON_ERROR_STOP=1', '-U',
                        pwd.getpwuid(self.uid).pw_name, '-h', node['host'], '-p', str(node['port']),
@@ -172,6 +223,8 @@ class Run15Observer(BaseObserver):
             row['activity'] = activity
             if (not isinstance(activity, dict) or type(activity.get('pid')) is not int
                     or activity['pid'] != pid or activity.get('node') != 0
+                    or type(activity.get('server_port')) is not int
+                    or activity['server_port'] != node['port']
                     or not activity.get('backend_start') or not activity.get('query_start')):
                 raise ValueError('producer activity identity unavailable')
             current = (activity['backend_start'], activity['query_start'], activity.get('query'))

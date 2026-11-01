@@ -1,5 +1,6 @@
 #!/usr/bin/env perl
 # Opt-in observer component test with two independent local postmasters.
+# Author: SqlRush <sqlrush@gmail.com>
 use strict;
 use warnings;
 use FindBin;
@@ -56,7 +57,10 @@ is($waiting, '1', 'real producer is executing the registered UPDATE');
 mkdir "$base/native-a08-once/testdata/cohort" or die $!;
 open my $layout, '>', "$base/native-a08-once/testdata/cohort/blackbox-layout.json" or die $!;
 print {$layout} encode_json({nodes => [map { my $id=$_; +{
-    id=>$id, data_dir=>$nodes[$id]->data_dir, host=>$nodes[$id]->host, port=>$nodes[$id]->port
+    # An advisory layout port is deliberately different from the dynamic
+    # port allocated by the same Cluster API used by TAP480.
+    id=>$id, data_dir=>$nodes[$id]->data_dir, host=>$nodes[$id]->host,
+    port=>$nodes[$id]->port == 65535 ? 65534 : $nodes[$id]->port + 1
 }} (1, 0)]});
 close $layout or die $!;
 for my $id (0, 1) {
@@ -77,6 +81,8 @@ my $result = decode_json($out);
 ok($ok, 'native observer component driver completed');
 ok($result->{positive_attach}, 'observer attached to the actual producer and retained its stack');
 ok($result->{correct_endpoint}, 'reversed multi-postmaster layout selects node0 by identity');
+ok($result->{actual_dynamic_port}, 'socket and live SQL confirm the original dynamic port');
+ok($result->{layout_ignored}, 'the advisory layout port cannot redirect the observer');
 ok($result->{negative_refusal}, 'node1 producer is refused against node0 with compared values retained');
 is($result->{attachments}, 1, 'only the one qualified capture was attached');
 
