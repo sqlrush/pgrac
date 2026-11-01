@@ -11,6 +11,24 @@ test_k_mx_g5_legacy_domain: test_k_mx_g5_legacy_domain.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a -o $@
 
+# Pure full-width plan over the original complete G2 operation; no G4 touch.
+K_MX_FULL_RECOMPOSE_O ?= $(top_builddir)/src/backend/cluster/cluster_multixact_recompose.o
+K_MX_FULL_RECOMPOSE_TRANSAM_O ?= test_k_mx_g5_full_recompose_transam.o
+K_MX_FULL_RECOMPOSE_CURRENT_O ?= test_k_mx_g5_full_recompose_current.o
+$(K_MX_FULL_RECOMPOSE_TRANSAM_O): $(top_srcdir)/src/backend/access/transam/transam.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+$(K_MX_FULL_RECOMPOSE_CURRENT_O): $(top_srcdir)/src/backend/cluster/cluster_multixact_current.c \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+test_k_mx_g5_full_recompose: test_k_mx_g5_full_recompose.c test_cluster_mx_composition.c \
+		unit_test.h $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
+		$(K_MX_FULL_RECOMPOSE_O) $(K_MX_FULL_RECOMPOSE_CURRENT_O) \
+		$(K_MX_FULL_RECOMPOSE_TRANSAM_O) $(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(MX_COMPOSITION_O) $(MX_RANGE_WIRE_O) \
+		$(K_MX_FULL_RECOMPOSE_O) $(K_MX_FULL_RECOMPOSE_CURRENT_O) \
+		$(K_MX_FULL_RECOMPOSE_TRANSAM_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
 test_k_mx_g5_service: test_k_mx_g5_service.c test_cluster_mx_native_range.c \
 		test_cluster_mx_composition.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/multixact.c \

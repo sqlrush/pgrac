@@ -127,6 +127,22 @@ cluster_mx_composition_accept_proofs(ClusterMxCompositionReceive **op,
 									 const ClusterMxProofReply *reply);
 extern const ClusterMxCompositionProofPage *
 cluster_mx_composition_proofs(const ClusterMxCompositionReceive *op, uint32 *total);
+/* Pure normalization plan from the same complete composition/proof operation.
+ * No allocation, touch, receipt, grant requalification or publication occurs.
+ * The caller supplies ceil(cap / PAGE_MEMBERS) distinct writable pages, each
+ * PAGE_MEMBERS long, with cap in [1, INT32_MAX]; only cap entries are cleared.
+ * All counts
+ * are global uint32, while canonical proof ordinals remain frame-local.
+ * Non-OK clears the entire declared output and count. SUPPORTED_LIMIT means
+ * this caller-provided buffer is too small, never an MX member-count gate.
+ * G4 must reserve production capacity before any proof-touch; this entry is
+ * not a reservation interface or permission to bypass the original final
+ * source/grant/tuple/fence checks. Input pages must remain immutable.
+ */
+extern ClusterMxRecomposeResult cluster_mx_composition_recompose(
+	const ClusterMxCompositionReceive *op, TransactionId requester_xid,
+	MultiXactStatus requester_status, MultiXactMember **normalized_pages,
+	uint32 normalized_cap, uint32 *normalized_count);
 extern void cluster_mx_composition_finish(ClusterMxCompositionReceive **op);
 
 #endif
