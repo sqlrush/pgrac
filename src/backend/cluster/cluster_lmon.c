@@ -37,6 +37,7 @@
 #include "postgres.h"
 #include "cluster/cluster_semantic_survivor_local.h"
 #include "cluster/cluster_semantic_survivor_targets.h"
+#include "cluster/cluster_semantic_survivor_close.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -1620,6 +1621,7 @@ LmonMain(void)
 				cluster_node_remove_lmon_tick();
 
 				cluster_reconfig_lmon_tick();
+				(void)cluster_semantic_survivor_close_begin();
 				cluster_semantic_activation_lmon_tick();
 				cluster_thread_recovery_lmon_tick();
 
@@ -2383,6 +2385,7 @@ LmonMain(void)
 				cluster_node_remove_lmon_tick();
 
 				cluster_reconfig_lmon_tick();
+				(void)cluster_semantic_survivor_close_begin();
 				cluster_semantic_activation_lmon_tick();
 				cluster_thread_recovery_lmon_tick();
 				/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */

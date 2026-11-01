@@ -113,3 +113,10 @@ cluster_semantic_survivor_local_process(void)
 /* Unrelated native-loop fixtures do not run the target-census consumer. */
 void cluster_semantic_survivor_targets_tick(void);
 void __attribute__((weak)) cluster_semantic_survivor_targets_tick(void) {}
+
+/* Unrelated loop fixtures have no reconfiguration event provider. Refusal
+ * cannot grant an admission, and close tests link the real implementation. */
+#include "cluster/cluster_semantic_survivor_close.h"
+ClusterSemanticAdmissionObservationResult __attribute__((weak))
+cluster_semantic_survivor_close_begin(void)
+{ return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED; }

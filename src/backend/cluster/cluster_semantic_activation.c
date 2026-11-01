@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_semantic_survivor_local.h"
+#include "cluster/cluster_semantic_survivor_close.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster_wal_inputs_job_private.h"
 
@@ -10806,6 +10807,8 @@ cluster_semantic_activation_shmem_init(void)
 		pg_atomic_init_u64(&m->word, 0);
 		pg_atomic_init_u64(&m->invalidated_generation, 0);
 		pg_atomic_init_u64(&m->reaped_generation, 0);
+		pg_atomic_init_u64(&((ClusterSurvivorCloseRecord *)(c->reserved
+			+ CLUSTER_SURVIVOR_CLOSE_OFFSET))->seq, 0);
 	}
 	SemanticActivationUtilityMailbox
 		= (ClusterSemanticActivationUtilityMailboxShmem *)ShmemInitStruct(

@@ -18,8 +18,8 @@ StaticAssertDecl(offsetof(ClusterSurvivorTargetCensus, target) == 80, "target cu
 StaticAssertDecl(offsetof(ClusterSurvivorTargetCensus, query_generation) == 112, "target cursor generation");
 StaticAssertDecl(offsetof(ClusterSurvivorControl, reserved) + CLUSTER_SURVIVOR_LOCAL_BYTES == 62752,
  "target cursor absolute offset");
-StaticAssertDecl(CLUSTER_SURVIVOR_LOCAL_BYTES + sizeof(ClusterSurvivorTargetCensus) + 2656
-	== sizeof(((ClusterSurvivorControl *)0)->reserved), "target cursor fits the original tail");
+StaticAssertDecl(CLUSTER_SURVIVOR_LOCAL_BYTES + sizeof(ClusterSurvivorTargetCensus) + 128 + 2528
+	== sizeof(((ClusterSurvivorControl *)0)->reserved), "target cursor leaves the close record and zero tail");
 /* Original unlocked LMON only; query/reply events advance at most one
  * outstanding owner. Diagnostic counts never qualify a producer closure. */
 extern void cluster_semantic_survivor_targets_tick(void);

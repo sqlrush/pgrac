@@ -111,6 +111,9 @@
  */
 
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_semantic_survivor_close.h"
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 #include "storage/ipc.h"
@@ -2572,6 +2575,8 @@ StartTransaction(void)
 	Assert(s->state == TRANS_DEFAULT);
 
 #ifdef USE_PGRAC_CLUSTER
+	/* No new transaction resources yet; old transaction cleanup is unchanged. */
+	cluster_semantic_survivor_ordinary_wait();
 	/* PGRAC: the real transaction boundary also covers AND CHAIN and several
 	 * transactions in one frontend message. Never apply protocol defaults in
 	 * the old transaction's cleanup or after new resources have been acquired.

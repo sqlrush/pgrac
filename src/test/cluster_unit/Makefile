@@ -13843,3 +13843,32 @@ test_cluster_wal_inputs_job_service: test_cluster_survivor_input_route_native.h 
  $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_targets.h \
  $(top_builddir)/src/common/libpgcommon_srv.a
 test_cluster_wal_inputs_job_service: CLUSTER_UNIT_PORT_LIBS += $(top_builddir)/src/common/libpgcommon_srv.a
+
+# Independent negative admission: actual event publication and xact prefix.
+TESTS += test_cluster_survivor_close
+all: test_cluster_survivor_close
+test_cluster_survivor_close_event.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
+	awk '/^cluster_reconfig_(get_last_event|publish_event)\(/ { if (++count > 2) exit; print "void"; emit=1 } emit { print } /^}/ { emit=0 } END { if (count < 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_survivor_close_xact.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^StartTransaction\(void\)/ { print "static void"; emit=1; count++ } emit { print } emit && /s->fullTransactionId = InvalidFullTransactionId/ { print "}"; emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_survivor_close: test_cluster_survivor_close.c test_cluster_survivor_local.c \
+ test_cluster_survivor_close_event.inc test_cluster_survivor_close_xact.inc \
+ test_cluster_survivor_pgsa.inc test_cluster_lmon_stop_service.inc \
+ test_cluster_lmon_producer_observe.inc test_cluster_lmon_producer_pause.inc \
+ test_cluster_shared_admission_observe.inc test_cluster_lmon_admission_pause.inc \
+ test_cluster_survivor_candidate_invalidation.inc test_cluster_backend_return_gate.inc \
+ test_cluster_survivor_shared.inc test_cluster_survivor_signal_types.inc \
+ test_cluster_survivor_signal.inc test_cluster_survivor_producer_fixture.h \
+ $(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
+ $(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	 $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_candidate.c \
+	 $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor.c \
+	 $(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) \
+	 $(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
+	 $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+test_cluster_survivor_close: $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_close.c \
+ $(top_srcdir)/src/include/cluster/cluster_semantic_survivor_close.h
