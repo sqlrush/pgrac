@@ -18974,3 +18974,38 @@ clean distclean maintainer-clean: clean-l1b-fsm-hints
 
 cluster_l1b_bufpage_unit.o: $(top_srcdir)/src/include/storage/bufpage.h \
 		$(top_srcdir)/src/include/storage/itemid.h $(top_builddir)/src/include/pg_config.h
+
+# Native tail rescans retain every non-unused line pointer before truncation.
+TESTS += test_cluster_l1b_tail_bounds
+all: test_cluster_l1b_tail_bounds
+
+test_cluster_l1b_tail_bounds.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^#define (REL_TRUNCATE_|VACUUM_TRUNCATE_|PREFETCH_SIZE)/ { print; constants++ } \
+	     /^typedef enum$$/ { emit=1; types++ } \
+	     /^typedef struct (LVRelState|LVSavedErrInfo)$$/ { emit=1; types++ } \
+	     /^should_attempt_truncation\(/ { print "static bool"; emit=1; functions++ } \
+	     /^count_nondeletable_pages\(/ { print "static BlockNumber"; emit=1; functions++ } \
+	     /^(lazy_truncate_heap|update_vacuum_error_info)\(/ { print "static void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     /^} LVSavedErrInfo;/ { print "static BlockNumber count_nondeletable_pages(LVRelState *, bool *);"; \
+	       print "static void update_vacuum_error_info(LVRelState *, LVSavedErrInfo *, int, BlockNumber, OffsetNumber);" } \
+	     END { if (constants != 6 || types != 3 || functions != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_l1b_tail_bounds: test_cluster_l1b_tail_bounds.c test_cluster_l1b_tail_bounds.inc \
+		cluster_l1b_bufpage_unit.o unit_test.h \
+		$(addprefix $(top_srcdir)/src/include/,access/heapam.h access/htup_details.h \
+		catalog/pg_class.h catalog/storage.h cluster/cluster_heap_freeze.h \
+		cluster/cluster_space_storage.h commands/progress.h commands/vacuum.h \
+		miscadmin.h portability/instr_time.h storage/bufmgr.h storage/latch.h \
+		storage/lmgr.h storage/bufpage.h storage/itemid.h utils/backend_progress.h \
+		utils/snapmgr.h utils/wait_event.h) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -ffunction-sections -fdata-sections $< \
+		$(filter %.o %.a,$^) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+.PHONY: clean-l1b-tail-bounds
+clean-l1b-tail-bounds:
+	rm -f test_cluster_l1b_tail_bounds.inc test_cluster_l1b_tail_bounds.inc.tmp \
+		test_cluster_l1b_tail_bounds
+clean distclean maintainer-clean: clean-l1b-tail-bounds
