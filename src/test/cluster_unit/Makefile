@@ -6422,6 +6422,42 @@ test_cluster_capacity_counter_srf: test_cluster_capacity_counter_srf.c test_clus
 		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Compose both TT statistics regions with the complete debug SRF.
+TESTS += test_cluster_tt_counter_srf
+all: test_cluster_tt_counter_srf
+test_cluster_tt_counter_srf.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_durable_stat.c Makefile
+	awk '/^#else \/\* !USE_PGRAC_CLUSTER \*\// { disabled=1; next } disabled { next } \
+	     /^typedef struct (ClusterUndoRecordShared|ClusterTTDurableShared) \{/ \
+	     { structure=1; types++ } structure { print } structure && /^} / { structure=0 } \
+	     /^static (ClusterUndoRecordShared \*UndoRecordShared|ClusterTTDurableShared \*TTDurableShared) = NULL;/ \
+	     { print; pointers++ } \
+	     /^cluster_undo_tt_retention_rollover_count\(/ { print "uint64"; emit=1; functions++ } \
+	     /^cluster_(undo_tt_retained_rollover_stats|tt_durable_locator_stats)_snapshot\(/ \
+	     { print "bool"; emit=1; functions++ } \
+	     /^cluster_tt_durable_count_locator_(call|result)\(/ \
+	     { print "void"; emit=1; functions++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (types != 2 || pointers != 2 || functions != 5 || emit || structure) exit 1 }' \
+	     $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_counter_srf: test_cluster_tt_counter_srf.c test_cluster_debug.c \
+		test_cluster_tt_counter_srf.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-tt-counter-srf
+.PHONY: clean-tt-counter-srf
+clean-tt-counter-srf:
+	rm -f test_cluster_tt_counter_srf test_cluster_tt_counter_srf.inc \
+		test_cluster_tt_counter_srf.inc.tmp
+
 # test_cluster_xnode_profile links cluster_xnode_profile.o standalone (spec-5.59
 # D10).  The test defines the GUC variable itself (cluster_guc.o is not
 # linked) and stubs ShmemInitStruct / cluster_shmem_register_region; the
