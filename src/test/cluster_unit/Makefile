@@ -15844,3 +15844,35 @@ clean: clean-control-file-selection
 .PHONY: clean-control-file-selection
 clean-control-file-selection:
 	rm -f test_cluster_control_file_selection test_cluster_control_file_selection.d
+
+# Original creator's last publication, with real immutable registry/object I/O.
+TESTS += test_cluster_initdb_registry_publish
+all: test_cluster_initdb_registry_publish
+test_cluster_initdb_registry_publish.inc: $(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c $(srcdir)/extract_cluster_initdb_registry_publish.py Makefile
+	python3 $(srcdir)/extract_cluster_initdb_registry_publish.py $< $@
+test_cluster_initdb_registry_publish: test_cluster_initdb_registry_publish.c test_cluster_initdb_registry_publish.inc \
+		test_cluster_control_registry.c test_cluster_recovery_registry.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/file_perm.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/common/file_perm.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_registry_common_test.o cluster_control_registry_original.o \
+		$(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-registry-publish
+.PHONY: clean-initdb-registry-publish
+clean-initdb-registry-publish:
+	rm -f test_cluster_initdb_registry_publish test_cluster_initdb_registry_publish.d test_cluster_initdb_registry_publish.inc test_cluster_initdb_registry_publish.inc.tmp
