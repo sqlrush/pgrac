@@ -23,3 +23,46 @@ test_cluster_k_p130_h27_resident.inc: test_cluster_native_resident_fill.c Makefi
 clean-k-p130-matrix-extra:
 	rm -f test_cluster_k_p130_h27 test_cluster_k_p130_h27_resident.inc \
 		test_cluster_k_p130_h27_resident.inc.tmp
+	rm -f test_cluster_k_p130_h28 test_cluster_k_p130_h28_visibility \
+		test_cluster_k_p130_h28_*.inc test_cluster_k_p130_h28_*.inc.tmp
+
+.PHONY: k-p130-h28-read-fixture k-p130-h28-visibility-fixture
+k-p130-h28-read-fixture:
+	$(MAKE) cluster_catalog_trace_test.o
+	$(MAKE) test_cluster_pcm_read_source
+
+k-p130-h28-visibility-fixture:
+	$(MAKE) cluster_catalog_trace_test.o
+	$(MAKE) test_cluster_visibility_admission
+
+test_cluster_k_p130_h28: test_cluster_k_p130_h28.c test_cluster_k_p130_h28_read_source.inc \
+		Makefile.p130_k_matrix_extra k-p130-h28-read-fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H28_CPPFLAGS) \
+		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
+		$< $(CLUSTER_PCM_OWN_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_k_p130_h28_visibility: test_cluster_k_p130_h28.c \
+		test_cluster_k_p130_h28_visibility.inc test_cluster_k_p130_h28_borrowed.inc \
+		test_cluster_k_p130_h28_exit.inc Makefile.p130_k_matrix_extra k-p130-h28-visibility-fixture
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(K_P130_H28_CPPFLAGS) -DK_P130_H28_VISIBILITY \
+		$< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_k_p130_h28_read_source.inc: test_cluster_pcm_read_source.c Makefile.p130_k_matrix_extra
+	awk '/^UT_TEST\(test_cancelled_first_fill_last_pin_closes_strict_stop\)/ { stop=1 } \
+	     !stop { print; lines++ } END { if (!stop || lines < 200) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h28_visibility.inc: test_cluster_visibility_admission.c Makefile.p130_k_matrix_extra
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+	     END { if (!stop || lines < 200) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h28_borrowed.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c Makefile.p130_k_matrix_extra
+	awk '/^cluster_runtime_visibility_resolve_exact_origin_admitted\(/ { print "ClusterTxOutcome"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_k_p130_h28_exit.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile.p130_k_matrix_extra
+	awk '/^semantic_activation_exit_cleanup\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
