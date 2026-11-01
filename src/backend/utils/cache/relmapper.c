@@ -1995,8 +1995,12 @@ cluster_copy_relmap_from_control(Oid dbid, Oid tsid, char *srcdbpath, char *dstd
 		HOLD_INTERRUPTS();
 		PG_TRY();
 		{
-			if (local_operation && LWLockHeldByMe(RelationMappingLock))
+			if (local_operation && LWLockHeldByMe(RelationMappingLock)) {
+				/* ERROR reset the acquisition holdoff; replace the one
+				 * consumed by release, as LWLockReleaseAll does. */
+				HOLD_INTERRUPTS();
 				LWLockRelease(RelationMappingLock);
+			}
 			if (owned_cf) {
 				owned_cf = false;
 				(void)cluster_cf_unlock_confirmed(ShareLock);
@@ -2004,7 +2008,9 @@ cluster_copy_relmap_from_control(Oid dbid, Oid tsid, char *srcdbpath, char *dstd
 		}
 		PG_FINALLY();
 		{
-			RESUME_INTERRUPTS();
+			/* A second ERROR in CF cleanup resets the count again. */
+			if (InterruptHoldoffCount > 0)
+				RESUME_INTERRUPTS();
 		}
 		PG_END_TRY();
 		PG_RE_THROW();
@@ -2812,50 +2818,132 @@ perform_relmap_update(bool shared, const RelMapFile *updates)
 /*
  * RELMAP resource manager's routines
  */
+static void
+relmap_redo_apply(xl_relmap_update *xlrec, RelMapFile *newmap)
+{
+	char *dbpath;
+
+	/* We need to construct the pathname for this database */
+	dbpath = GetDatabasePath(xlrec->dbid, xlrec->tsid);
+
+	/*
+	 * Write out the new map and send sinval, but of course don't write a
+	 * new WAL entry.  There's no surrounding transaction to tell to
+	 * preserve files, either.
+	 *
+	 * There shouldn't be anyone else updating relmaps during WAL replay,
+	 * but grab the lock to interlock against load_relmap_file().
+	 *
+	 * Note that we use the same WAL record for updating the relmap of an
+	 * existing database as we do for creating a new database. In the
+	 * latter case, taking the relmap log and sending sinval messages is
+	 * unnecessary, but harmless. If we wanted to avoid it, we could add a
+	 * flag to the WAL record to indicate which operation is being
+	 * performed.
+	 */
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+	write_relmap_file(newmap, false, true, false,
+					  xlrec->dbid, xlrec->tsid, dbpath);
+	LWLockRelease(RelationMappingLock);
+
+	pfree(dbpath);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* Legacy WAL has no managed creation identity. Only an explicitly selected
+ * original ROOTv3 may use its unchanged writer. Keep CF before MappingLock,
+ * and retain the original recovery owner/protections on every refusal.
+ * Spec: 2026-11-01-pre2-e1-format-closure-v1.2-path-c.md */
+static bool
+cluster_redo_relmap_from_control(xl_relmap_update *xlrec, RelMapFile *newmap)
+{
+	ClusterControlRelmapFormatV2 before, after;
+	volatile bool owned_cf = false;
+	volatile bool entered_io = false;
+	volatile bool ok = false;
+
+	if (CritSectionCount || LWLockHeldByMe(RelationMappingLock)
+		|| LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(XidGenLock))
+		return false;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock)) {
+		if (!cluster_cf_lock(ShareLock)) return false;
+		owned_cf = true;
+	}
+	PG_TRY();
+	{
+		ok = cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &before)
+			== CLUSTER_CONTROL_ROOT_OK_PRIMARY && before.root_version == 3;
+		if (ok) {
+			entered_io = true;
+			relmap_redo_apply(xlrec, newmap);
+			ok = cluster_control_root_relmap_format_locked_v2(MaxAllocSize, &after)
+				== CLUSTER_CONTROL_ROOT_OK_PRIMARY && !memcmp(&before, &after, sizeof(before));
+		}
+		if (owned_cf) {
+			owned_cf = false; /* Never retry an unconfirmed/error release. */
+			if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+				ok = false;
+		}
+	}
+	PG_CATCH();
+	{
+		HOLD_INTERRUPTS();
+		PG_TRY();
+		{
+			if (entered_io && LWLockHeldByMe(RelationMappingLock)) {
+				/* ERROR reset the acquisition holdoff; replace the one
+				 * consumed by release, as LWLockReleaseAll does. */
+				HOLD_INTERRUPTS();
+				LWLockRelease(RelationMappingLock);
+			}
+			if (owned_cf) {
+				owned_cf = false;
+				(void)cluster_cf_unlock_confirmed(ShareLock);
+			}
+		}
+		PG_FINALLY();
+		{
+			/* A second ERROR in CF cleanup resets the count again. */
+			if (InterruptHoldoffCount > 0)
+				RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return ok;
+}
+#endif
+
 void
 relmap_redo(XLogReaderState *record)
 {
-	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	xl_relmap_update header;
+	RelMapFile newmap;
 
-	/* Backup blocks are not used in relmap records */
-	Assert(!XLogRecHasAnyBlockRefs(record));
-
-	if (info == XLOG_RELMAP_UPDATE)
-	{
-		xl_relmap_update *xlrec = (xl_relmap_update *) XLogRecGetData(record);
-		RelMapFile	newmap;
-		char	   *dbpath;
-
-		if (xlrec->nbytes != sizeof(RelMapFile))
-			elog(PANIC, "relmap_redo: wrong size %u in relmap update record",
-				 xlrec->nbytes);
-		memcpy(&newmap, xlrec->data, sizeof(newmap));
-
-		/* We need to construct the pathname for this database */
-		dbpath = GetDatabasePath(xlrec->dbid, xlrec->tsid);
-
-		/*
-		 * Write out the new map and send sinval, but of course don't write a
-		 * new WAL entry.  There's no surrounding transaction to tell to
-		 * preserve files, either.
-		 *
-		 * There shouldn't be anyone else updating relmaps during WAL replay,
-		 * but grab the lock to interlock against load_relmap_file().
-		 *
-		 * Note that we use the same WAL record for updating the relmap of an
-		 * existing database as we do for creating a new database. In the
-		 * latter case, taking the relmap log and sending sinval messages is
-		 * unnecessary, but harmless. If we wanted to avoid it, we could add a
-		 * flag to the WAL record to indicate which operation is being
-		 * performed.
-		 */
-		LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
-		write_relmap_file(&newmap, false, true, false,
-						  xlrec->dbid, xlrec->tsid, dbpath);
-		LWLockRelease(RelationMappingLock);
-
-		pfree(dbpath);
-	}
-	else
+	if (info != XLOG_RELMAP_UPDATE)
 		elog(PANIC, "relmap_redo: unknown op code %u", info);
+	/* WAL lengths and backup-block refusal must hold in release builds too,
+	 * before dereferencing the header or selecting any target/control input. */
+	if (XLogRecHasAnyBlockRefs(record) || XLogRecGetData(record) == NULL
+		|| XLogRecGetDataLen(record) != MinSizeOfRelmapUpdate + sizeof(RelMapFile))
+		elog(PANIC, "relmap_redo: invalid relmap update record shape");
+	memcpy(&header, XLogRecGetData(record), MinSizeOfRelmapUpdate);
+	if (header.nbytes != sizeof(RelMapFile))
+		elog(PANIC, "relmap_redo: wrong size %u in relmap update record", header.nbytes);
+	memcpy(&newmap, XLogRecGetData(record) + MinSizeOfRelmapUpdate, sizeof(newmap));
+#ifdef USE_PGRAC_CLUSTER
+	/* The catalog GUC cannot bypass independently selected managed format.
+	 * A managed WAL intent still requires the original episode's bound consumer;
+	 * this legacy entry neither infers that input nor falls back to raw files. */
+	if (cluster_shared_config) {
+		if (!cluster_redo_relmap_from_control(&header, &newmap))
+			ereport(PANIC, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						 errmsg("relation map WAL has no unchanged legacy control selection")));
+		return;
+	}
+#endif
+	relmap_redo_apply(&header, &newmap);
 }
