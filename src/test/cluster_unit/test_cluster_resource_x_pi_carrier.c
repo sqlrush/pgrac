@@ -20,7 +20,8 @@ typedef struct PiFixture {
 } PiFixture;
 
 static bool
-pi_start_target(PiFixture *f, bool publish, int32 master, PcmState mode, PcmState target)
+pi_start_target_service(PiFixture *f, bool publish, int32 master, PcmState mode, PcmState target,
+	uint64 service_r4)
 {
 	CleanFixture *s = &f->source;
 	ResourceXDecodedFrame grant;
@@ -80,8 +81,14 @@ pi_start_target(PiFixture *f, bool publish, int32 master, PcmState mode, PcmStat
 	PageXLogRecPtrSet(((PageHeader)s->page.data)->pd_lsn, UINT64_C(144));
 	UT_ASSERT(PageSetLSNOrigin(s->page.data, 0));
 	((PageHeader)s->page.data)->pd_block_scn = 80;
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_prepare_exact(&s->block,
-		master, 7, &s->prepared, s->page.data, &f->last, 83, 61), RESOURCE_X_APPLY_APPLIED);
+	/* A nonzero service identity uses the real original LMS work producer;
+	 * native publication and later settlement remain the same fixture. */
+	if (service_r4 != 0)
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_service_prepare_exact(&s->block,
+			master, 7, &s->prepared, s->page.data, &f->last, 83, 61, service_r4, 61), RESOURCE_X_APPLY_APPLIED);
+	else
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_prepare_exact(&s->block,
+			master, 7, &s->prepared, s->page.data, &f->last, 83, 61), RESOURCE_X_APPLY_APPLIED);
 	if (publish) UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_publish_exact(
 		&s->block, master, 7, &s->prepared, &s->finished), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_status_exact(&s->block.common.logical_assertion,
@@ -127,6 +134,12 @@ pi_start_target(PiFixture *f, bool publish, int32 master, PcmState mode, PcmStat
 		}
 	}
 	return true;
+}
+
+static bool
+pi_start_target(PiFixture *f, bool publish, int32 master, PcmState mode, PcmState target)
+{
+	return pi_start_target_service(f, publish, master, mode, target, 0);
 }
 
 static bool
@@ -1030,10 +1043,170 @@ UT_TEST(test_local_PI_stop_census_keeps_valid_recovery_debt)
 	pi_end();
 }
 
+/* The claim is obtained from the real work probe after the original service
+ * producer/publication; no test writes an owner into a live entry. */
+static ResourceXSourceDrainWork *
+pi_service_live(const ResourceXSourceDrainWork *work)
+{
+	ResourceXSourceDrainWork *found = NULL; unsigned matches = 0;
+	for (long entry = 0; entry < fake_pcm_entry_count; entry++)
+		for (Size n = 0; n + sizeof(*work) <= fake_pcm_entrysize; n += 8)
+			if (memcmp(fake_pcm_entries.data[entry] + n, work, sizeof(*work)) == 0) {
+				found = (ResourceXSourceDrainWork *)(fake_pcm_entries.data[entry] + n); matches++;
+			}
+	UT_ASSERT_EQ(matches, 1); return matches == 1 ? found : NULL;
+}
+static bool
+pi_service_pending(PiFixture *f, ResourceXSourceDrainWork *work, PcmState mode)
+{
+	ResourceXDecodedFrame request;
+	if (!pi_start_target_service(f, true, 2, mode, PCM_STATE_S, 77)) return false;
+	if (!pi_capacity_claim(work)) { UT_ASSERT(false); return false; }
+	UT_ASSERT_EQ(work->attempt_generation & 1, 1);
+	request = pi_request(f);
+	if (clean_receive(&request) != RESOURCE_X_APPLY_LOCAL_WAIT) { UT_ASSERT(false); return false; }
+	UT_ASSERT_EQ(f->source.m.state->settlement_retry.pending, 1);
+	UT_ASSERT_EQ(f->source.m.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	return true;
+}
+/* Resume the frame retained by the actual local settlement owner, without
+ * another inbound frame, requester retry, direct cursor reset or wake. */
+static ResourceXApplyResult
+pi_service_resume(PiFixture *f)
+{
+	ResourceXIntentSlot slot; ResourceXAcquisitionRef delivery;
+	uint8 payload[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES]; uint32 examined;
+	BackendType saved = MyBackendType; bool found = false;
+	ResourceXDecodedFrame request; int32 master = -1; uint32 peer = 0;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_NOT_FOUND;
+	MyBackendType = B_LMS;
+	for (int n = 0; n < 256; n++) {
+		ResourceXIntentProbeResult probe = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
+			4, &slot, payload, sizeof(payload), &examined, &delivery);
+		UT_ASSERT(probe != RESOURCE_X_INTENT_PROBE_CORRUPT);
+		if (probe == RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT) { found = true; break; }
+		if (probe == RESOURCE_X_INTENT_PROBE_IDLE) break;
+	}
+	UT_ASSERT(found);
+	if (found) {
+		result = cluster_pcm_lock_resource_x_source_settlement_receive_snapshot_exact(&delivery,
+			&request, &master, &peer);
+		UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(master, f->source.block.body.acquire_decision.master_node); UT_ASSERT_EQ(peer, 61);
+		UT_ASSERT_EQ(request.common.authority_generation, f->source.block.common.authority_generation);
+		if (result == RESOURCE_X_APPLY_APPLIED) result = cluster_pcm_lock_resource_x_acquire_read_source_settlement_exact(
+			&request, master, peer);
+	}
+	MyBackendType = saved; return result;
+}
+UT_TEST(test_live_source_claim_orders_retained_settlement_without_new_frame)
+{
+	for (int mode = 0; mode < 2; mode++) for (int data_first = 0; data_first < 2; data_first++) {
+		PiFixture f; ResourceXSourceDrainWork work, *live;
+		ClusterPcmResourceXMasterState before; ClusterPcmLocalPiSnapshotV1 local, after;
+		if (!pi_service_pending(&f, &work, mode ? PCM_STATE_X : PCM_STATE_S)) { UT_ASSERT(false); return; }
+		live = pi_service_live(&work); if (!live) return;
+		if (data_first) { local_pi_covered = true; UT_ASSERT(pi_retire(&f, false)); }
+		UT_ASSERT_EQ(pi_service_resume(&f), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT(memcmp(live, &work, sizeof(work)) == 0);
+		UT_ASSERT_EQ(f.source.m.state->pi_carrier.transport_refs, 1);
+		UT_ASSERT_EQ(f.source.m.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+		UT_ASSERT_EQ(f.source.m.state->holder_image.valid, RESOURCE_X_HOLDER_PAIR_PUBLISHED);
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f.local.resource, &local));
+		before = *f.source.m.state;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work,
+			RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(live->r4_record_generation, 0);
+		UT_ASSERT_EQ(live->attempt_generation, work.attempt_generation + 1);
+		UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+		UT_ASSERT_EQ(pi_service_resume(&f), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(f.source.m.state->settlement_retry.pending, 0);
+		UT_ASSERT_EQ(f.source.m.state->holder_status_intent.slot.kind, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+		UT_ASSERT_EQ(f.source.m.state->holder_status_intent.slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+		UT_ASSERT_EQ(f.source.m.state->pi_carrier.pi_refs, data_first ? 0 : 1);
+		UT_ASSERT_EQ(f.source.m.state->pi_carrier.transport_refs, 0);
+		UT_ASSERT_EQ(f.source.m.state->holder_image.valid, data_first ? 0 : RESOURCE_X_HOLDER_PAIR_PUBLISHED);
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f.local.resource, &after));
+		UT_ASSERT(memcmp(&local, &after, sizeof(after)) == 0); pi_end();
+	}
+}
+UT_TEST(test_live_source_completion_rejects_every_changed_claim_byte)
+{
+	PiFixture f; ResourceXSourceDrainWork work, bad, *live;
+	ClusterPcmResourceXMasterState before;
+	if (!pi_service_pending(&f, &work, PCM_STATE_X)) { UT_ASSERT(false); return; }
+	live = pi_service_live(&work); if (!live) return; before = *f.source.m.state;
+	for (Size n = 0; n < sizeof(work); n++) {
+		ResourceXApplyResult result;
+		bad = work; ((uint8 *)&bad)[n] ^= 1;
+		result = cluster_pcm_lock_resource_x_source_drain_complete_exact(&bad, RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT(memcmp(live, &work, sizeof(work)) == 0);
+		UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0);
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work,
+		RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+	printf("# completion full-claim changed-byte refusals=%zu\n", sizeof(work)); pi_end();
+}
+UT_TEST(test_old_claim_return_cannot_take_real_successor_service)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		PiFixture f; ResourceXSourceDrainWork work, next, *live;
+		ResourceXDecodedFrame block; ClusterPcmResourceXMasterState before;
+		if (!pi_service_pending(&f, &work, mode ? PCM_STATE_X : PCM_STATE_S)) { UT_ASSERT(false); return; }
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work,
+			RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(pi_service_resume(&f), RESOURCE_X_APPLY_APPLIED);
+		clean_send(&f.source.m.state->holder_status_intent.slot);
+		block = pi_capacity_successor(&f);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(&block,
+			2, 77, 61), RESOURCE_X_APPLY_APPLIED);
+		/* Finish the old bounded scan before the next ordinary scan sees
+		 * the newly armed service; no synthetic release event is issued. */
+		if (!pi_capacity_claim(&next) && !pi_capacity_claim(&next)) { UT_ASSERT(false); pi_end(); return; }
+		live = pi_service_live(&next); if (!live) return; before = *f.source.m.state;
+		UT_ASSERT(next.attempt_generation > work.attempt_generation);
+		UT_ASSERT_EQ(next.request.authority_generation, block.common.authority_generation);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work,
+			RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_STALE);
+		UT_ASSERT(memcmp(live, &next, sizeof(next)) == 0);
+		UT_ASSERT(memcmp(&before, f.source.m.state, sizeof(before)) == 0); pi_end();
+	}
+}
+
+UT_TEST(test_master_head_waits_for_live_claim_and_original_settlement_ACK)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		PiFixture f; ResourceXSourceDrainWork work; ResourceXDecodedFrame request, ack;
+		ResourceXIntentSlot sent; ResourceXMasterSnapshot out; int requester;
+		if (!pi_start_target_service(&f, true, 0, mode ? PCM_STATE_X : PCM_STATE_S, PCM_STATE_S, 77)) {
+			UT_ASSERT(false); return;
+		}
+		if (!pi_capacity_claim(&work) && !pi_capacity_claim(&work)) { UT_ASSERT(false); pi_end(); return; }
+		if (!clean_arm(&f.source, &request)) { UT_ASSERT(false); pi_end(); return; }
+		sent = clean_stage(&f.source.m.state->source_settlement.intent.slot);
+		UT_ASSERT_EQ(clean_receive(&request), RESOURCE_X_APPLY_LOCAL_WAIT);
+		requester = request.common.logical_assertion.requester_node;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.source.m.work), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT(f.source.m.state->requests[requester].phase != RESOURCE_X_MASTER_NONE);
+		UT_ASSERT_EQ(f.source.m.state->acquire_settled_holders_bitmap, 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_drain_complete_exact(&work,
+			RESOURCE_X_APPLY_APPLIED), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(pi_service_resume(&f), RESOURCE_X_APPLY_APPLIED);
+		ack = clean_decode(f.source.m.state->holder_status_intent.payload, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.source.m.work), RESOURCE_X_APPLY_LOCAL_WAIT);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(&ack, 0, &out), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&sent, true, ++fake_pcm_clock_us));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_acquire_done_resume_exact(&f.source.m.work), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(f.source.m.state->requests[requester].phase, RESOURCE_X_MASTER_NONE);
+		UT_ASSERT_EQ(f.source.m.state->pi_carrier.pi_refs, 1); pi_end();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(35);
 	UT_RUN(test_pi_master_arms_settlement_without_retiring_pi);
 	UT_RUN(test_pi_transport_settlement_keeps_original_body_and_wal_scope);
 	UT_RUN(test_pi_retirement_after_transport_releases_body_with_ack_still_owned);
@@ -1065,6 +1238,10 @@ main(void)
 	UT_RUN(test_local_PI_only_typed_DATA_can_retire_the_sealed_body);
 	UT_RUN(test_local_PI_membership_freeze_preserves_the_original_debt);
 	UT_RUN(test_local_PI_stop_census_keeps_valid_recovery_debt);
+	UT_RUN(test_live_source_claim_orders_retained_settlement_without_new_frame);
+	UT_RUN(test_live_source_completion_rejects_every_changed_claim_byte);
+	UT_RUN(test_old_claim_return_cannot_take_real_successor_service);
+	UT_RUN(test_master_head_waits_for_live_claim_and_original_settlement_ACK);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
