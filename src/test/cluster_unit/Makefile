@@ -5409,7 +5409,7 @@ test_cluster_relmap_native_owner.o: test_cluster_relmap_native_owner.c \
 
 test_cluster_relmap_native_pin.o: test_cluster_relmap_native_pin.c \
 		test_cluster_relmap_native_pin.h test_cluster_relmap_native_pin_namespace.h \
-		test_cluster_wal_retention.c unit_test.h \
+		test_cluster_wal_retention.c test_cluster_wal_retention_startup_boundary.h unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_retention.c \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retention.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
