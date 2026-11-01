@@ -7,7 +7,8 @@
 #undef NATIVE_MASTER_HOLDER_COMPOSITION
 
 static ResourceXDecodedFrame nc_image, nc_request;
-static int nc_fd, nc_mode;
+static int nc_fd, nc_image_fd, nc_mode, nc_source_node;
+static uint64 nc_source_boot;
 static bool nc_decode(const uint8 *bytes, uint16 type, uint16 size, ResourceXDecodedFrame *out)
 {
 	ResourceXWireReject reject;
@@ -138,11 +139,11 @@ static void nc_deliver(void)
 	UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_commits, 0);
 	if (!nm_send(nc_fd, RESOURCE_X_MSG_ASSERT_X, &nc_request)) { UT_ASSERT(false); pg_re_throw(); }
 	cluster_lms_outbound_resource_x_send_complete(&ticket, true);
-	if (!nm_receive(nc_fd, RESOURCE_X_MSG_IMAGE_OR_GRANT, &nc_image)) { UT_ASSERT(false); pg_re_throw(); }
+	if (!nm_receive(nc_image_fd, RESOURCE_X_MSG_IMAGE_OR_GRANT, &nc_image)) { UT_ASSERT(false); pg_re_throw(); }
 	UT_ASSERT_EQ(nc_image.kind, RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	prepared_episode = nc_request.body.acquire_intent;
-	env.msg_type = RESOURCE_X_MSG_IMAGE_OR_GRANT; env.source_node_id = 0; env.dest_node_id = 1;
-	env.epoch = 17; env.payload_length = nc_image.payload_bytes; auth_peer_boot = 31;
+	env.msg_type = RESOURCE_X_MSG_IMAGE_OR_GRANT; env.source_node_id = nc_source_node; env.dest_node_id = 1;
+	env.epoch = 17; env.payload_length = nc_image.payload_bytes; auth_peer_boot = nc_source_boot;
 	ResourceXApplyResult result = gcs_block_resource_x_requester_join_ingress(&env, &nc_image, 61, &joined);
 	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED); if (result != RESOURCE_X_APPLY_APPLIED) pg_re_throw();
 	if (nc_mode == 3) UT_ASSERT_EQ(gcs_block_resource_x_requester_join_ingress(&env, &nc_image, 61, &joined), RESOURCE_X_APPLY_DUPLICATE);
@@ -167,12 +168,22 @@ static bool nc_requester_state(ClusterPcmResourceXMasterState **state)
 	}
 	NM_REQUIRE(matches == 1); return true;
 }
-static bool nc_parent(int fd, int mode)
+/* The original leaf reports one scalar boot for any remote node. Give each
+ * actually authenticated peer its own observed boot in this composition. */
+static void nc_auth_peer(int32 node, unsigned sample)
+{
+	(void)sample;
+	UT_ASSERT(node == 0 || node == nc_source_node);
+	auth_peer_boot = node == 0 ? 31 : nc_source_boot;
+}
+static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint64 source_boot)
 {
 	ClusterBufmgrFirstFill read; ClusterPcmResourceXMasterState *state = NULL;
 	ResourceXDecodedFrame done, consumed; ResourceXIntentSlot staged;
 	ClusterICEnvelope env = {0}; ResourceXRequesterJoinSnapshot joined;
-	ordinary_start(&read, 2); nc_fd = fd; nc_mode = mode;
+	ordinary_start(&read, 2); nc_fd = fd; nc_image_fd = image_fd; nc_mode = mode;
+	nc_source_node = source_node; nc_source_boot = source_boot;
+	auth_observation_hook = nc_auth_peer;
 	ordinary_delivery_transport = nc_deliver;
 	NM_REQUIRE(ordinary_run(&read));
 	UT_ASSERT_EQ(ordinary_sends, 1); UT_ASSERT_EQ(disk_reads, 0);
@@ -200,6 +211,7 @@ static bool nc_parent(int fd, int mode)
 	UT_ASSERT_EQ(complete_commits, 1); UT_ASSERT_EQ(ordinary_sends, 1);
 	complete_idle(); return true;
 }
+static bool nc_parent(int fd, int mode) { return nc_parent_from(fd, fd, mode, 0, 31); }
 UT_TEST(test_native_current_S_to_S_full_episode) { nm_run_roles(0, nc_master, nc_parent); }
 UT_TEST(test_native_current_X_to_S_full_episode) { nm_run_roles(1, nc_master, nc_parent); }
 UT_TEST(test_native_current_DONE_waits_independent_holder_ACK) { nm_run_roles(2, nc_master, nc_parent); }
