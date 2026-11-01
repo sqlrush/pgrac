@@ -13688,3 +13688,24 @@ test_cluster_wal_inputs_job_service test_cluster_snapshot_admission test_cluster
 
 # Original pending collection rejects local epoch/gate drift.
 test_cluster_survivor_candidate: test_cluster_survivor_candidate_invalidation.inc test_cluster_backend_return_gate.inc
+
+# Backend return tests compile the original buffer pin producer and releaser.
+test_cluster_survivor_buffer_type.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^typedef struct PrivateRefCountEntry/ { emit=1; n++ } emit { print } /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_survivor_buffer_native.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_snapshot_(post_state_locked|locked)\(/ { print "static inline void"; emit=1; snap++ } \
+	     /^cluster_buffer_backend_has_pins\(/ { print "bool"; emit=1; observe++ } \
+	     /^(ReservePrivateRefCountEntry|ForgetPrivateRefCountEntry)\(/ { print "static void"; emit=1; refs++ } \
+	     /^(NewPrivateRefCountEntry|GetPrivateRefCountEntry)\(/ { print "static PrivateRefCountEntry *"; emit=1; lookup++ } \
+	     /^PinBuffer\(/ { print "static bool"; emit=1; pin++ } \
+	     /^(UnpinBuffer|cluster_bufmgr_pcm_read_image_last_pin|cluster_bufmgr_failed_read_held_lock|cluster_bufmgr_failed_read_unpin_finish)\(/ { print "static void"; emit=1; unpin++ } \
+	     /^cluster_bufmgr_failed_read_unpin_lock\(/ { print "static LWLock *"; emit=1; release++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (snap != 2 || observe != 1 || refs != 2 || lookup != 2 || pin != 1 || unpin != 4 || release != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_snapshot_admission: test_cluster_survivor_buffer_fixture.h \
+ test_cluster_survivor_buffer_return.inc test_cluster_survivor_buffer_type.inc \
+ test_cluster_survivor_buffer_native.inc cluster_catalog_trace_test.o

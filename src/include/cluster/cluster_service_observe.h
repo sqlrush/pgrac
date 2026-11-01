@@ -84,7 +84,7 @@ StaticAssertDecl(sizeof(ClusterServiceSnapshotObservation) <= 64,
 extern ClusterSemanticAdmissionObservationResult cluster_snapshot_service_observe(
 	uint64 expected_epoch, ClusterServiceSnapshotObservation *out);
 
-/* Same ordinary backend's snapshots plus the original shared token-return
+/* Same ordinary backend's snapshots, original buffer pins and shared token-return
  * domain. Brackets the shared read with original private snapshot observations;
  * rechecks the original gate and owner at return. Caller-owned, read-only,
  * unlocked boundary only. No atomic cross-domain zero or producer seal.
@@ -94,6 +94,9 @@ extern ClusterSemanticAdmissionObservationResult cluster_snapshot_service_observ
 typedef struct ClusterServiceBackendCollection {
 	ClusterServiceSnapshotObservation snapshots;
 	ClusterSemanticAdmissionObservation admission;
+	/* Valid only with both observations known. Original shared/local pin predicate;
+	 * true also retains unknown local state, false is never closure or IO proof. */
+	bool buffer_pins_pending;
 	const char *reason;
 } ClusterServiceBackendCollection;
 StaticAssertDecl(sizeof(ClusterServiceBackendCollection)

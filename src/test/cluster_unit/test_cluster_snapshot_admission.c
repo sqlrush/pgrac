@@ -1086,6 +1086,8 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 #include "test_cluster_backend_return.inc"
 #include "test_cluster_survivor_producer_backend.inc"
 
+#include "test_cluster_survivor_buffer_fixture.h"
+#include "test_cluster_survivor_buffer_return.inc"
 int
 main(void)
 {
@@ -1107,7 +1109,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(106);
+	UT_PLAN(114);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1214,6 +1216,14 @@ main(void)
 	UT_RUN(backend_collection_never_retires_original_debt_or_grants_closure);
 	UT_RUN(survivor_backend_poll_keeps_actual_snapshot_and_original_gate);
 	UT_RUN(survivor_backend_poll_discards_final_owner_drift_and_leaf_stale);
+	UT_RUN(backend_collection_retains_original_buffer_pin_until_native_unpin);
+	UT_RUN(backend_collection_keeps_nested_native_pin_until_last_return);
+	UT_RUN(backend_collection_retains_original_overflow_pins_after_hot_array_drains);
+	UT_RUN(backend_collection_discards_pin_arrival_and_return_during_shared_observation);
+	UT_RUN(survivor_backend_poll_preserves_native_buffer_owner);
+	UT_RUN(backend_collection_preserves_snapshot_and_pin_responsibilities_together);
+	UT_RUN(backend_collection_never_converts_unknown_local_pin_array_to_clear);
+	UT_RUN(backend_collection_rejects_locked_or_changed_owner_without_returning_pin_sample);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
