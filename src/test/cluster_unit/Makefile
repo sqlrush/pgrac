@@ -11934,11 +11934,11 @@ test_cluster_clog_birth: test_cluster_clog_birth.c unit_test.h \
 # Actual original issuer/managed SLRU birth and first full-frame write.
 test_cluster_clog_native_birth.inc: $(top_srcdir)/src/backend/access/transam/clog.c Makefile
 	awk '/^#define (CLOG_(BITS_PER_XACT|XACTS_PER_BYTE|XACTS_PER_PAGE)|TransactionIdTo(Page|PgIndex))[ \t(]/ { print; constants++ } \
-	     /^CLOGNativeIORequired\(/ { print "static bool"; emit=1; found++ } \
+	     /^(CLOGNativeIORequired|CLOGNativeCreationFile)\(/ { print "static bool"; emit=1; found++ } \
 	     /^ZeroCLOGPage\(/ { print "static int"; emit=1; found++ } \
 	     /^(ExtendCLOGInternal|WriteZeroPageXlogRec)\(/ { print "static void"; emit=1; found++ } \
 	     /^ExtendCLOG(Full)?\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 6 || constants != 5) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 7 || constants != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 TESTS += test_cluster_clog_native_birth
 all: test_cluster_clog_native_birth

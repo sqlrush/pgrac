@@ -1620,14 +1620,46 @@ ExtendCLOGInternal(TransactionId newestXact, FullTransactionId birth)
 
 		PG_TRY();
 		{
-			(void) SimpleLruNativeClogZeroV2(XactCtl, birth);
+			if (cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2)
+			{
+				ClusterControlNativeTableInfoV2 selected, current;
+				ClusterClogPageIdentityV2 *page;
+
+				/* BOOT already created page zero, including its permanent xid 1
+				 * commit. The first SQL xid consumes that exact page; it cannot
+				 * zero it or borrow an online node's page-birth authority. */
+				if (!FullTransactionIdEquals(birth, FullTransactionIdFromU64(FirstNormalTransactionId))
+					|| !IsNormalProcessingMode() || InRecovery || RecoveryInProgress() || !enableFsync
+					|| !CLOGNativeCreationFile(pageno, &selected))
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("CLOG creation allocation requires its original BOOT page")));
+				slotno = SimpleLruReadPage(XactCtl, pageno, false, newestXact);
+				page = &XactCtl->shared->clog_page_identity[slotno];
+				if (!page->identity.birth_observed
+					|| page->identity.page_generation != U64FromFullTransactionId(birth)
+					|| !FullTransactionIdEquals(page->identity.birth_full_xid, birth)
+					|| !CLOGNativeCreationFile(pageno, &current)
+					|| current.table_generation != selected.table_generation
+					|| current.startup_generation != selected.startup_generation
+					|| memcmp(&current.creation, &selected.creation, sizeof(current.creation)) != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("CLOG creation page birth or selected identity changed")));
+			}
+			else
+				(void) SimpleLruNativeClogZeroV2(XactCtl, birth);
 			body_complete = true;
 		}
 		PG_FINALLY();
 		{
-			/* ERROR has reset the holdoff for this still-held family lock. */
-			if (!body_complete)
+			/* ERROR reset all holds; a reader's open catch may subsequently
+			 * reacquire this lock. Normalize before compensating its release,
+			 * as in the original native trim cleanup. */
+			if (!body_complete) {
+				InterruptHoldoffCount = 0;
 				HOLD_INTERRUPTS();
+			}
 			LWLockRelease(XactSLRULock);
 		}
 		PG_END_TRY();

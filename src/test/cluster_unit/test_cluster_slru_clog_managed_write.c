@@ -122,7 +122,13 @@ managed_fixture_pread(int fd, void *bytes, size_t length, off_t offset)
 		control_held = false;
 		io_held = true; /* Resume the managed reader's original ownership. */
 	}
-	if (read_throw) siglongjmp(*PG_exception_stack, 1);
+	if (read_throw) {
+#ifdef SLRU_FIXTURE_MANAGED_READ_ERROR
+		SLRU_FIXTURE_MANAGED_READ_ERROR();
+#else
+		siglongjmp(*PG_exception_stack, 1);
+#endif
+	}
 	return pread(fd, bytes, length, offset);
 }
 

@@ -1,6 +1,16 @@
 /* Original native CLOG creation-child trim/status/checkpoint chain. Selected
  * table, process authentication and WAL/lock scheduling are finite providers;
  * framed file bytes and full-page writeback are real. */
+#include "postgres.h"
+#include "storage/lwlock.h"
+static LWLock creation_issuer_lock;
+static bool creation_issuer_held;
+#undef XidGenLock
+#define XidGenLock (&creation_issuer_lock)
+#define SLRU_FIXTURE_ISSUER_HELD() creation_issuer_held
+/* Use the fixture's original ereport/errfinish ERROR-reset path for reads. */
+#define SLRU_FIXTURE_MANAGED_READ_ERROR() \
+	ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("injected creation read error")))
 #define CLOG_CHECKPOINT_MAIN creation_checkpoint_original_main
 int creation_checkpoint_original_main(void);
 #include "test_cluster_clog_checkpoint.c"
@@ -459,13 +469,172 @@ UT_TEST(creation_boot_checkpoint_io_failure_keeps_dirty_and_original_custody)
 	}
 }
 
+/* First SQL allocation uses the real ExtendCLOGFull entry, unlike a direct
+ * status/checkpoint call. The issuer lock is a finite provider; the selected
+ * BOOT frame, SLRU reader and later full-image WAL writer are original code. */
+static bool
+creation_extend(FullTransactionId birth, bool raw)
+{
+	volatile bool caught = false;
+
+	creation_issuer_held = true;
+	PG_TRY();
+	{
+		if (raw) ExtendCLOG(XidFromFullTransactionId(birth));
+		else ExtendCLOGFull(birth);
+	}
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	creation_issuer_held = false;
+	return !caught;
+}
+
+static void
+creation_sql_boot_page(bool cold)
+{
+	creation_boot_page();
+	/* The real BOOT transaction commits xid 1; xid 3 has not been issued. */
+	page.data[0] = TRANSACTION_STATUS_COMMITTED << 2;
+	creation_boot_page();
+	if (cold) {
+		states[0] = SLRU_PAGE_EMPTY;
+		memset(identities, 0, sizeof(identities));
+		memset(cached_bindings, 0, sizeof(cached_bindings));
+		memset(page.data, 0x7f, BLCKSZ);
+	}
+	control_held = false;
+}
+
+UT_TEST(creation_first_sql_issuer_consumes_boot_page_then_commits_with_wal)
+{
+	for (unsigned sample = 0; sample < 8; sample++) {
+		uint8 before[16448], after[16448], payload[8192];
+		ClusterClogPageIdentityV2 observed;
+		XLogRecPtr lsn;
+		bool extended;
+
+		creation_reset_origin(NormalProcessing, (sample % 2) * 127);
+		cluster_enabled = (sample & 2) != 0;
+		creation_sql_boot_page((sample & 4) != 0);
+		UT_ASSERT_EQ(pread(borrowed, before, sizeof(before), 0), sizeof(before));
+		extended = creation_extend(FullTransactionIdFromU64(3), false);
+		UT_ASSERT(extended);
+		UT_ASSERT(!control_held && !io_held && !dirty[0]);
+		UT_ASSERT_EQ(inserts + writes + queues + flushes, 0);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		UT_ASSERT_EQ(native_borrows, 0);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		UT_ASSERT_EQ(pread(borrowed, after, sizeof(after), 0), sizeof(after));
+		UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		if (!extended) { checkpoint_close(); continue; }
+		UT_ASSERT_EQ((uint8) page.data[0], 0x04);
+		UT_ASSERT_EQ(U64FromFullTransactionId(identities[0].identity.birth_full_xid), 3);
+		UT_ASSERT_EQ(identities[0].identity.page_generation, 3);
+		UT_ASSERT_EQ(identities[0].image_lsn, 0);
+		/* An exact retry preserves the same BOOT prefix and produces no WAL. */
+		UT_ASSERT(creation_extend(FullTransactionIdFromU64(3), false));
+		UT_ASSERT_EQ(inserts + writes, 0);
+		UT_ASSERT_EQ(TransactionIdGetStatus(3, &lsn), TRANSACTION_STATUS_IN_PROGRESS);
+		LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+		TransactionIdSetPageStatusInternal(3, 0, NULL, TRANSACTION_STATUS_COMMITTED,
+			InvalidXLogRecPtr, 0);
+		LWLockRelease(XactSLRULock);
+		CheckPointCLOG();
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT(!control_held && !io_held && !dirty[0]);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		UT_ASSERT_EQ(native_borrows, 0);
+		io_held = true;
+		UT_ASSERT(cluster_clog_storage_read_page_v2(borrowed, &binding, 0,
+			&observed, payload, sizeof(payload)));
+		io_held = false;
+		UT_ASSERT_EQ(payload[0], 0x44);
+		UT_ASSERT_EQ(observed.image_lsn, 1000);
+		UT_ASSERT_EQ(cluster_node_id, -1);
+		checkpoint_close();
+	}
+}
+
+UT_TEST(creation_issuer_rejects_other_births_and_contexts_without_page_effects)
+{
+	for (unsigned fault = 0; fault < 13; fault++) {
+		uint8 before[16448], after[16448];
+		PGAlignedBlock cached;
+		ClusterClogPageIdentityV2 identity;
+		FullTransactionId birth = FullTransactionIdFromU64(3);
+
+		creation_reset(NormalProcessing);
+		creation_sql_boot_page(false);
+		if (fault == 1) birth = FullTransactionIdFromEpochAndXid(1, 3);
+		if (fault == 2) birth = FullTransactionIdFromU64(32768);
+		if (fault == 3) Mode = BootstrapProcessing;
+		if (fault == 4) creation_has_request = false;
+		if (fault == 5) MyBackendType = B_STARTUP;
+		if (fault == 6) creation_info.startup_generation++;
+		if (fault == 7) identities[0].identity.page_generation++;
+		if (fault == 8) identities[0].identity.birth_full_xid = FullTransactionIdFromU64(4);
+		if (fault == 9) cached_bindings[0].identity.creation_generation++;
+		if (fault == 10) InRecovery = true;
+		if (fault == 11) enableFsync = false;
+		if (fault == 12) creation_drift_at = creation_info_reads + 2;
+		cached = page;
+		identity = identities[0];
+		UT_ASSERT_EQ(pread(borrowed, before, sizeof(before), 0), sizeof(before));
+		UT_ASSERT(!creation_extend(birth, fault == 0));
+		UT_ASSERT(!control_held && !io_held && !dirty[0]);
+		UT_ASSERT(!memcmp(&cached, &page, sizeof(page)));
+		UT_ASSERT(!memcmp(&identity, identities, sizeof(identity)));
+		UT_ASSERT_EQ(inserts + writes + queues + flushes, 0);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		UT_ASSERT_EQ(native_borrows, 0);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		UT_ASSERT_EQ(pread(borrowed, after, sizeof(after), 0), sizeof(after));
+		UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		checkpoint_close();
+	}
+}
+
+UT_TEST(creation_issuer_cold_read_error_balances_original_cleanup)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		uint8 before[16448], after[16448];
+
+		creation_reset(NormalProcessing);
+		creation_sql_boot_page(true);
+		native_open_throw = fault == 0;
+		read_throw = fault == 1;
+		native_open_drift = fault == 2;
+		UT_ASSERT_EQ(pread(borrowed, before, sizeof(before), 0), sizeof(before));
+		UT_ASSERT(!creation_extend(FullTransactionIdFromU64(3), false));
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		/* The open provider throws with zero holds, just as real ERROR
+		 * resets them after dropping ControlLock; its catch reacquires one.
+		 * The read provider uses original errfinish/reset while holding IO. */
+		UT_ASSERT(!control_held && !io_held && !dirty[0]);
+		UT_ASSERT_EQ(states[0], SLRU_PAGE_EMPTY);
+		UT_ASSERT_EQ(inserts + writes + queues + flushes, 0);
+		UT_ASSERT_EQ(native_opens, 1);
+		UT_ASSERT_EQ(native_borrows, 0);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		UT_ASSERT_EQ(proc.delayChkptFlags, 0);
+		UT_ASSERT_EQ(pread(borrowed, after, sizeof(after), 0), sizeof(after));
+		UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		UT_ASSERT(fcntl(borrowed, F_GETFD) >= 0);
+		/* Preserve the exact observed failed count in RED; the next reset
+		 * starts a separate fixture process model, not product cleanup. */
+		InterruptHoldoffCount = 0;
+		checkpoint_close();
+	}
+}
+
 int
 main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-creation-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(9);
+	UT_PLAN(12);
 	UT_RUN(creation_trim_status_checkpoint_keep_original_identity_and_wal);
 	UT_RUN(creation_checkpoint_rejects_unrelated_batch_before_wal_or_io);
 	UT_RUN(creation_frame_wal_uses_only_the_authenticated_batch_origin);
@@ -475,6 +644,9 @@ main(void)
 	UT_RUN(creation_boot_checkpoint_syncs_without_fabricating_wal);
 	UT_RUN(creation_boot_checkpoint_rejects_nonboot_identity_before_writes);
 	UT_RUN(creation_boot_checkpoint_io_failure_keeps_dirty_and_original_custody);
+	UT_RUN(creation_first_sql_issuer_consumes_boot_page_then_commits_with_wal);
+	UT_RUN(creation_issuer_rejects_other_births_and_contexts_without_page_effects);
+	UT_RUN(creation_issuer_cold_read_error_balances_original_cleanup);
 	rmdir(directory);
 	UT_DONE(); return ut_failed_count != 0;
 }
