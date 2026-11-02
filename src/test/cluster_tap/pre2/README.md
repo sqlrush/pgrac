@@ -87,6 +87,45 @@ positive physical reclamation, the retention/recovery matrix, the 16/48/64
 one-hour soak or the full build/stage acceptance matrix. Controller selftests
 (`test_m1_regression.py`) start no database and provide no native runtime credit.
 
+### Offline long-run commit ledger
+
+`m1_soak.sql` is a fixed simple-protocol workload for 16, 48 or 64 clients.
+Before each authorized run, create the same 64 independent tables
+`m1_soak_0` through `m1_soak_63`, each with columns `client_id integer PRIMARY KEY`
+and `value bigint NOT NULL`, and one row `(table suffix, 0)`. Each client updates
+only its own heap. Retain initial and final `client_id|value` rows from all four
+members, including the inactive heaps, using a UNION ALL over the 64 tables and
+ORDER BY client_id. Preserve the original four-member start/stop judges.
+
+The workload invocation uses `pgbench -n -M simple -j 2 -c CLIENTS -T 3600
+--max-tries=1 -l --log-prefix=CAPTURE/pgbench_log -f m1_soak.sql postgres`, with
+the authorized node's normal connection environment. Retain both raw per-thread
+log files, stdout, stderr, exit status and the exact SQL input. Do not sample,
+aggregate, throttle or retry transactions. These instructions grant no runtime
+authorization or microbenchmark qualification.
+
+Run `python3 m1_soak_ledger.py CAPTURE/manifest.json` to compare retained files.
+The JSON manifest has exactly these fields:
+
+| Field | Value |
+| --- | --- |
+| `version`, `clients`, `duration_seconds`, `pgbench_rc` | `1`, one of `16/48/64`, `3600`, `0` |
+| `workload`, `summary`, `stderr` | File descriptors for the SQL input and pgbench stdout/stderr |
+| `logs` | Two raw pgbench file descriptors, one per thread |
+| `before`, `after` | Four row-cut descriptors each, in declared member order 0–3 |
+
+A descriptor contains `path` (relative to the manifest), `size_bytes` and lowercase
+`sha256`. Inputs must be distinct regular files within the capture. The reader
+checks contiguous per-client commit sequences, successful raw records, summary
+totals and every final row against the independent ledger. Missing or changed
+files, errors, inactive-heap writes and discrepancies fail the subcheck.
+
+Exit zero certifies only this file comparison. `p07` and `stage_acceptance` remain
+`NOT_READY`: actual elapsed duration, candidate/cohort identity, generation
+progress, complete resource observations and original clean stop need separate
+evidence. The existing regression coordinator continues to list the soak as
+uncovered. `test_m1_soak_ledger.py` uses literal parser inputs and runs no database.
+
 ### Retained workload manifest intake
 
 Verify a retained four-node capture without contacting a server:
