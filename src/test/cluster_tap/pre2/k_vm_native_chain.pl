@@ -14,7 +14,7 @@ use Cwd qw(abs_path);
 my $cluster;
 my $stop_attempted = 0;
 my @clients;
-my $evidence = {version => 1, writer_node => 2, normal_stop => JSON::PP::false};
+my $evidence = {version => 2, writer_node => 2, ios => [], normal_stop => JSON::PP::false};
 my $directory = $ENV{TESTLOGDIR} // '.';
 my $judge = "$FindBin::RealBin/k_vm_native_chain.py";
 my $root = abs_path("$FindBin::RealBin/../../../..");
@@ -84,6 +84,23 @@ sub session
 	return $client;
 }
 
+sub record_ios
+{
+	my ($node, $ordinal, $stage) = @_;
+	# A separate backend also on the writer node must not see its uncommitted row.
+	my $client = session($node);
+	$client->query_safe('SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=on');
+	my $vm = decode_json($client->query_safe(q{SELECT row_to_json(v)
+		FROM pg_visibility_map('k_vm_native'::regclass, 0) AS v}));
+	my $plan = decode_json($client->query_safe(q{EXPLAIN
+		(ANALYZE, COSTS OFF, TIMING OFF, FORMAT JSON)
+		SELECT id FROM k_vm_native WHERE id=42}));
+	my $rows = $client->query_safe('SELECT id FROM k_vm_native WHERE id=42');
+	push @{$evidence->{ios}}, {node => $ordinal, stage => $stage,
+		vm => $vm, plan => $plan, rows => $rows};
+	save_evidence();
+}
+
 my ($ready, $source) = invoke_judge('', '--source-root', $root);
 $evidence->{source_precheck} = $source;
 save_evidence();
@@ -141,6 +158,10 @@ my $ok = eval {
 	require_true($evidence->{xid} =~ /^[1-9][0-9]*$/, 'original WAL transaction id');
 	$evidence->{uncommitted_count} = $reader->safe_psql('postgres', 'SELECT count(*) FROM k_vm_native');
 	$evidence->{cleared} = vm_flags($reader);
+	for my $ordinal (0 .. 3)
+	{
+		record_ios($nodes[$ordinal], $ordinal, 'uncommitted');
+	}
 	$writer->query_safe('COMMIT');
 	my $end = $writer->query_safe('SELECT pg_current_wal_insert_lsn()');
 	require_true($end =~ /^[0-9A-F]+\/[0-9A-F]+$/, 'native WAL end');
@@ -164,6 +185,10 @@ my $ok = eval {
 			plan => $client->query_safe('EXPLAIN(COSTS OFF) SELECT id,v FROM k_vm_native WHERE id=42'),
 			rows => $client->query_safe('SELECT id,v FROM k_vm_native WHERE id=42')};
 	}
+	for my $ordinal (0 .. 3)
+	{
+		record_ios($nodes[$ordinal], $ordinal, 'committed');
+	}
 	save_evidence();
 	close_clients();
 	$stop_attempted = 1;
@@ -175,8 +200,11 @@ my $ok = eval {
 	$evidence->{verdict} = $verdict;
 	save_evidence();
 	require_true($accepted, encode_json($verdict));
+	require_true($verdict->{status} eq 'NATIVE_CHAIN_IOS_FALLBACK_OBSERVED',
+		'IOS verdict cannot be replaced by legacy chain evidence');
 	pass('native remote VM X completion and clear precede exact heap/VM WAL, index WAL and COMMIT');
 	pass('uncommitted row stays hidden, all four ordinary index reads agree, original normal stop succeeds');
+	pass('all four IOS consumers hide the uncommitted row and fetch heap after VM clear');
 	1;
 };
 if (!$ok)

@@ -49,9 +49,44 @@ def source_precheck(root):
     return {"status": "SOURCE_RED" if missing else "SOURCE_ENTRIES_PRESENT", "missing": missing}
 
 
+def ios_fallbacks(evidence):
+    scans = evidence.get("ios")
+    require(isinstance(scans, list) and len(scans) == 8, "eight IOS observations required")
+    seen = set()
+    for scan in scans:
+        scan = mapping(scan)
+        node, stage = scan.get("node"), scan.get("stage")
+        require(type(node) is int and 0 <= node < 4, "wrong IOS node")
+        require(stage in ("uncommitted", "committed"), "wrong IOS stage")
+        require((node, stage) not in seen, "duplicate IOS observation")
+        seen.add((node, stage))
+        vm = mapping(scan.get("vm"))
+        require(vm.get("all_visible") is False and vm.get("all_frozen") is False,
+                "IOS must observe known clear VM flags")
+        plans = scan.get("plan")
+        require(isinstance(plans, list) and len(plans) == 1, "one JSON EXPLAIN required")
+        plan = mapping(mapping(plans[0]).get("Plan"))
+        require(plan.get("Node Type") == "Index Only Scan"
+                and plan.get("Relation Name") == "k_vm_native"
+                and plan.get("Index Name") == "k_vm_native_pkey"
+                and plan.get("Index Cond") == "(id = 42)"
+                and plan.get("Plans", []) == [], "exact leaf IOS plan required")
+        expected = 1 if stage == "committed" else 0
+        require(type(plan.get("Actual Loops")) is int and plan["Actual Loops"] == 1,
+                "IOS ANALYZE must execute once")
+        require(type(plan.get("Actual Rows")) is int and plan["Actual Rows"] == expected,
+                "wrong IOS ANALYZE visibility")
+        require(type(plan.get("Heap Fetches")) is int and 0 < plan["Heap Fetches"] <= 0xffffffffffffffff,
+                "cleared VM requires actual heap visibility")
+        require(scan.get("rows") == ("42" if expected else ""), "wrong IOS row visibility")
+    require(seen == {(node, stage) for node in range(4) for stage in ("uncommitted", "committed")},
+            "missing IOS member or stage")
+    return len(scans)
+
+
 def evaluate(evidence):
     e = mapping(evidence)
-    require(type(e.get("version")) is int and e["version"] == 1, "invalid evidence version")
+    require(type(e.get("version")) is int and e["version"] in (1, 2), "invalid evidence version")
     require(type(e.get("writer_node")) is int and e["writer_node"] == 2, "wrong writer node")
     heap = e.get("heap_tag", "")
     match = re.fullmatch(r"([1-9][0-9]*/[1-9][0-9]*/[1-9][0-9]*)/0/0", heap)
@@ -130,8 +165,12 @@ def evaluate(evidence):
         require(isinstance(peer.get("plan"), str) and re.search(
             r"^Index Scan using k_vm_native_pkey on k_vm_native(?:\s|$)", peer["plan"]), "ordinary index scan required")
     require(e.get("normal_stop") is True, "normal stop not proven")
-    return {"status": "NATIVE_CHAIN_OBSERVED", "heap_wal_lsn": h["start"],
-            "index_wal_lsn": i["start"], "commit_lsn": c["start"], "vm_deltas": delta}
+    result = {"status": "NATIVE_CHAIN_OBSERVED", "heap_wal_lsn": h["start"],
+              "index_wal_lsn": i["start"], "commit_lsn": c["start"], "vm_deltas": delta}
+    if e["version"] == 2:
+        result.update(status="NATIVE_CHAIN_IOS_FALLBACK_OBSERVED", ios_heap_fallbacks=ios_fallbacks(e),
+                      qualified_zero_heap_fetch="NOT_EXERCISED")
+    return result
 
 
 def main():
@@ -143,7 +182,8 @@ def main():
     except (ValueError, TypeError, OSError, KeyError) as error:
         result = {"status": "REFUSED", "reason": str(error)}
     print(json.dumps(result, sort_keys=True))
-    return 0 if result["status"] in ("NATIVE_CHAIN_OBSERVED", "SOURCE_ENTRIES_PRESENT") else 1
+    return 0 if result["status"] in ("NATIVE_CHAIN_OBSERVED", "NATIVE_CHAIN_IOS_FALLBACK_OBSERVED",
+                                    "SOURCE_ENTRIES_PRESENT") else 1
 
 
 if __name__ == "__main__":

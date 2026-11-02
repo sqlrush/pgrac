@@ -38,6 +38,98 @@ def sample():
     }
 
 
+def ios_sample():
+    evidence = sample()
+    evidence["version"] = 2
+    evidence["ios"] = [{"node": node, "stage": stage,
+        "vm": {"all_visible": False, "all_frozen": False},
+        "rows": "42" if stage == "committed" else "",
+        "plan": [{"Plan": {"Node Type": "Index Only Scan",
+            "Relation Name": "k_vm_native", "Index Name": "k_vm_native_pkey",
+            "Index Cond": "(id = 42)", "Actual Loops": 1,
+            "Actual Rows": 1 if stage == "committed" else 0, "Heap Fetches": 1}}]}
+        for stage in ("uncommitted", "committed") for node in range(4)]
+    return evidence
+
+
+class NativeIosFallbackJudge(unittest.TestCase):
+    def reject(self, evidence):
+        with self.assertRaises(ValueError):
+            evaluate(evidence)
+
+    def test_complete_ios_evidence_is_fallback_observation_only(self):
+        result = evaluate(ios_sample())
+        self.assertEqual(result["status"], "NATIVE_CHAIN_IOS_FALLBACK_OBSERVED")
+        self.assertEqual(result["ios_heap_fallbacks"], 8)
+        self.assertEqual(result["qualified_zero_heap_fetch"], "NOT_EXERCISED")
+
+    def test_legacy_chain_has_no_ios_qualification(self):
+        result = evaluate(sample())
+        self.assertEqual(result["status"], "NATIVE_CHAIN_OBSERVED")
+        self.assertNotIn("ios_heap_fallbacks", result)
+
+    def test_missing_unknown_and_partial_ios_evidence_refuses(self):
+        for value in (None, {}, [], ios_sample()["ios"][:-1]):
+            e = ios_sample(); e["ios"] = value; self.reject(e)
+        e = ios_sample(); del e["ios"]; self.reject(e)
+
+    def test_duplicate_wrong_node_or_stage_refuses(self):
+        for key, value in (("node", 1), ("node", True), ("node", "0"),
+                           ("node", 4), ("stage", "before"), ("stage", "committed")):
+            e = ios_sample(); e["ios"][0][key] = value; self.reject(e)
+        e = ios_sample(); e["ios"].append(copy.deepcopy(e["ios"][0])); self.reject(e)
+
+    def test_vm_clear_must_be_known_at_every_scan(self):
+        for stage in range(8):
+            for value in (None, {}, {"all_visible": True, "all_frozen": False},
+                          {"all_visible": False, "all_frozen": True},
+                          {"all_visible": "false", "all_frozen": False}):
+                e = ios_sample(); e["ios"][stage]["vm"] = value; self.reject(e)
+
+    def test_ios_has_exact_relation_index_condition_and_no_child_scan(self):
+        for key, value in (("Node Type", "Index Scan"), ("Node Type", "Seq Scan"),
+                           ("Relation Name", "k_vm_native_other"),
+                           ("Index Name", "k_vm_native_other_pkey"),
+                           ("Index Cond", "(id = 41)"),
+                           ("Plans", [{"Node Type": "Seq Scan"}])):
+            e = ios_sample(); e["ios"][0]["plan"][0]["Plan"][key] = value; self.reject(e)
+
+    def test_actual_analyze_required_without_coercion_or_skipped_execution(self):
+        for key in ("Actual Loops", "Actual Rows", "Heap Fetches"):
+            for value in (None, True, "1", -1, 1.5):
+                e = ios_sample(); e["ios"][0]["plan"][0]["Plan"][key] = value; self.reject(e)
+            e = ios_sample(); del e["ios"][0]["plan"][0]["Plan"][key]; self.reject(e)
+        for value in (0, 2):
+            e = ios_sample(); e["ios"][0]["plan"][0]["Plan"]["Actual Loops"] = value; self.reject(e)
+        for value in (None, [], {}, [{}, {}], [{"Plan": {}}]):
+            e = ios_sample(); e["ios"][0]["plan"] = value; self.reject(e)
+
+    def test_heap_fetch_and_visibility_are_checked_on_all_nodes(self):
+        for ordinal in range(8):
+            e = ios_sample(); e["ios"][ordinal]["plan"][0]["Plan"]["Heap Fetches"] = 0
+            self.reject(e)
+            e = ios_sample(); e["ios"][ordinal]["rows"] = "42" if ordinal < 4 else ""
+            self.reject(e)
+            e = ios_sample(); e["ios"][ordinal]["plan"][0]["Plan"]["Actual Rows"] = 1 if ordinal < 4 else 0
+            self.reject(e)
+
+    def test_ios_never_replaces_original_native_chain(self):
+        for key, value in (("normal_stop", False), ("uncommitted_count", "1"), ("wal", [])):
+            e = ios_sample(); e[key] = value; self.reject(e)
+        e = ios_sample(); e["after"]["vm_x_acquisition_completed_count"] = "0"; self.reject(e)
+
+    def test_cli_accepts_only_complete_new_evidence(self):
+        command = [sys.executable, "-B", str(Path(__file__).with_name("k_vm_native_chain.py"))]
+        e = ios_sample()
+        r = subprocess.run(command, input=json.dumps(e), text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(json.loads(r.stdout)["status"], "NATIVE_CHAIN_IOS_FALLBACK_OBSERVED")
+        e["ios"].pop()
+        r = subprocess.run(command, input=json.dumps(e), text=True, capture_output=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(json.loads(r.stdout)["status"], "REFUSED")
+
+
 class NativeChainJudge(unittest.TestCase):
     def reject(self, evidence):
         with self.assertRaises(ValueError):
@@ -131,7 +223,7 @@ class NativeChainJudge(unittest.TestCase):
         e = sample(); e["peers"].pop(); self.reject(e)
 
     def test_normal_stop_and_exact_input_domain_are_required(self):
-        for key, value in (("normal_stop", False), ("normal_stop", "true"), ("version", 2),
+        for key, value in (("normal_stop", False), ("normal_stop", "true"), ("version", 3),
                            ("writer_node", 0), ("heap_tag", "1663/5/900/0/1"),
                            ("vm_tag", "1663/5/900/0/0")):
             e = sample(); e[key] = value; self.reject(e)
