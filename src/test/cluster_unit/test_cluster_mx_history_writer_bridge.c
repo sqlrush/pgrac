@@ -203,6 +203,10 @@ UT_TEST(writer_successor_cannot_cross_reopened_same_Snapshot_scope)
 	mx_history_recursive_close(); UT_ASSERT_EQ(caller_enters, 2);
 	UT_ASSERT_EQ(caller_leaves, 2); UT_ASSERT_EQ(caller_inflight, 0); auth_clean(s);
 }
+#ifdef HISTORY_WRITER_PUBLICATION_FIXTURE
+int writer_publication_unused_bridge_main(void);
+#define main writer_publication_unused_bridge_main
+#endif
 int main(void)
 {
 	history_fixture_init(); UT_PLAN(9);
@@ -217,3 +221,6 @@ int main(void)
 	UT_RUN(writer_successor_cannot_cross_reopened_same_Snapshot_scope);
 	free(procArray); UT_DONE(); return ut_failed_count ? 1 : 0;
 }
+#ifdef HISTORY_WRITER_PUBLICATION_FIXTURE
+#undef main
+#endif
