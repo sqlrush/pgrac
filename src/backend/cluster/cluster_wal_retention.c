@@ -2969,6 +2969,33 @@ cluster_wal_retention_active_pin_present(void)
 	return active_pin != NULL;
 }
 
+/* Registration, not grant usability, defines this local census. In particular
+ * covers/revalidate can poison a pin and must not be called from an observer.
+ * No object is dereferenced: another ResourceOwner or uncertain cleanup stays
+ * present until its original owner actually retires it. */
+uint32
+cluster_wal_retention_history_local_pins_v1(void)
+{
+	uint32 present = 0;
+
+	if (CurrentResourceOwner == NULL || MyProcPid <= 0 || CritSectionCount != 0
+		|| proc_exit_inprogress)
+		return CLUSTER_WAL_HISTORY_LOCAL_UNAVAILABLE;
+	if (active_pin != NULL)
+		present |= CLUSTER_WAL_HISTORY_LOCAL_RETENTION_PIN;
+	if (active_read_pin != NULL)
+		present |= CLUSTER_WAL_HISTORY_LOCAL_READ_PIN;
+	if (active_root_publish_guard != NULL)
+		present |= CLUSTER_WAL_HISTORY_LOCAL_ROOT_GUARD;
+	if (active_reuse_guard != NULL)
+		present |= CLUSTER_WAL_HISTORY_LOCAL_REUSE_GUARD;
+	if (active_e1_context != NULL)
+		present |= CLUSTER_WAL_HISTORY_LOCAL_E1_CONTEXT;
+	if (active_action_context != NULL)
+		present |= CLUSTER_WAL_HISTORY_LOCAL_ACTION_CONTEXT;
+	return present;
+}
+
 ClusterWalReuseGuardResult
 cluster_wal_retention_action_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
 								   ClusterWalReuseDenyReason *out_reason)

@@ -2008,6 +2008,22 @@ UT_TEST(test_cold_borrow_preserves_the_original_owner_and_closed_phase)
 	}
 }
 
+/* This is a local registered-object census, never an SCN/COMPLETE proof.
+ * Its observer may not acquire/release grants or poison the original pin. */
+static void
+assert_local_history_pins(uint32 expected)
+{
+	unsigned acquired = fake_acquire_call_count;
+	unsigned released = fake_release_call_count;
+	unsigned native_released = fake_native_release_call_count;
+
+	UT_ASSERT_EQ(cluster_wal_retention_history_local_pins_v1(), expected);
+	UT_ASSERT_EQ(cluster_wal_retention_history_local_pins_v1(), expected);
+	UT_ASSERT_EQ(fake_acquire_call_count, acquired);
+	UT_ASSERT_EQ(fake_release_call_count, released);
+	UT_ASSERT_EQ(fake_native_release_call_count, native_released);
+}
+
 UT_TEST(test_pin_revalidation_drift_poisoned_until_release)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -2024,6 +2040,7 @@ UT_TEST(test_pin_revalidation_drift_poisoned_until_release)
 	fake_serial_result = CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
 	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_TRUE(cluster_wal_retention_active_pin_present());
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_RETENTION_PIN);
 	fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
 	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_STALE);
@@ -2056,6 +2073,8 @@ UT_TEST(test_sealed_pin_root_publish_requires_whole_root_token)
 		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
 		CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_NOT_NULL(publisher);
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_RETENTION_PIN
+		| CLUSTER_WAL_HISTORY_LOCAL_ROOT_GUARD);
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
@@ -2684,6 +2703,7 @@ UT_TEST(test_correctness_action_context_preflights_e2_without_pin)
 	fake_preflight_root_ready = true;
 
 	UT_ASSERT_EQ(cluster_wal_retention_action_begin(&context, 1, &reason), CLUSTER_WAL_GUARD_OK);
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_ACTION_CONTEXT);
 	UT_ASSERT_EQ(fake_acquire_call_count, 0);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_retention_action_preflight(&context, &file,
@@ -2697,6 +2717,8 @@ UT_TEST(test_correctness_action_context_preflights_e2_without_pin)
 	fake_acquire_result_count = 1;
 	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_ACTION_CONTEXT
+		| CLUSTER_WAL_HISTORY_LOCAL_REUSE_GUARD);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
 				 CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason), CLUSTER_WAL_GUARD_OK);
@@ -2775,6 +2797,7 @@ UT_TEST(test_e1_coarse_holds_x_across_strong_floor_then_releases)
 	UT_ASSERT_EQ(fold_result, CLUSTER_WAL_FOLD_BOUNDED);
 	UT_ASSERT_EQ(floor, 4);
 	UT_ASSERT(context.coarse_walr.held);
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_E1_CONTEXT);
 	UT_ASSERT_EQ(fake_acquire_call_count, 1);
 	UT_ASSERT_EQ(fake_acquire_requests[0].lockmode, ExclusiveLock);
 	UT_ASSERT(fake_acquire_requests[0].dontwait);
@@ -3742,6 +3765,7 @@ UT_TEST(test_read_pin_uncertain_release_is_cleanup_only)
 	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin),
 				 CLUSTER_WAL_PIN_RELEASE_UNCERTAIN);
 	UT_ASSERT_NOT_NULL(pin);
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_READ_PIN);
 	UT_ASSERT_FALSE(cluster_wal_read_pin_covers_v1(pin, 1));
 	UT_ASSERT_EQ(fake_native_release_call_count, 0);
 	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &other), CLUSTER_WAL_PIN_CAPACITY);
@@ -3749,6 +3773,7 @@ UT_TEST(test_read_pin_uncertain_release_is_cleanup_only)
 	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_NULL(pin);
+	assert_local_history_pins(0);
 	UT_ASSERT_EQ(fake_native_release_call_count, 1);
 	reset_pin_fakes();
 }
@@ -4390,6 +4415,54 @@ UT_TEST(test_read_owner_refuses_entire_native_owner_storage_alias)
 	reset_pin_fakes();
 }
 
+UT_TEST(test_history_local_observation_refuses_unusable_context)
+{
+	ResourceOwner owner = CurrentResourceOwner;
+	int pid = MyProcPid;
+
+	reset_pin_fakes();
+	assert_local_history_pins(0);
+	CurrentResourceOwner = NULL;
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_UNAVAILABLE);
+	CurrentResourceOwner = owner;
+	MyProcPid = 0;
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_UNAVAILABLE);
+	MyProcPid = pid;
+	CritSectionCount++;
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_UNAVAILABLE);
+	CritSectionCount--;
+	proc_exit_inprogress = true;
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_UNAVAILABLE);
+	proc_exit_inprogress = false;
+	assert_local_history_pins(0);
+}
+
+UT_TEST(test_history_local_read_pin_survives_owner_change_and_error_cleanup)
+{
+	uint16 thread = 1;
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalReadPinOwnerV1 borrowed;
+	ResourceOwner owner = CurrentResourceOwner;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(&thread, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT(cluster_wal_read_pin_owner_v1(pin, &borrowed));
+	UT_ASSERT(!cluster_wal_retention_active_pin_present());
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_READ_PIN);
+	CurrentResourceOwner = (ResourceOwner)(uintptr_t)0x2222;
+	assert_local_history_pins(CLUSTER_WAL_HISTORY_LOCAL_READ_PIN);
+	CurrentResourceOwner = owner;
+	/* The observer did not call a mutating revalidator while owner differed. */
+	UT_ASSERT(cluster_wal_read_pin_owner_current_v1(&borrowed));
+	fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+		fake_resource_release_arg);
+	UT_ASSERT(!cluster_wal_read_pin_owner_current_v1(&borrowed));
+	UT_ASSERT_EQ(fake_release_call_count, 1);
+	assert_local_history_pins(0);
+	reset_pin_fakes();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4398,7 +4471,9 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(95);
+	UT_PLAN(97);
+	UT_RUN(test_history_local_observation_refuses_unusable_context);
+	UT_RUN(test_history_local_read_pin_survives_owner_change_and_error_cleanup);
 	UT_RUN(test_read_owner_borrows_all_original_native_grants_without_acquiring);
 	UT_RUN(test_read_owner_never_rebinds_after_same_address_reacquisition);
 	UT_RUN(test_read_owner_checks_every_member_and_preserves_original_cleanup);

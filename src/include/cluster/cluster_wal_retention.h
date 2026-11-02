@@ -449,6 +449,23 @@ extern ClusterWalReuseGuardResult cluster_wal_retention_e1_preflight(
 	ClusterWalReuseActionGuard *guard, PgracExternalFenceNeedSetV1 **out_needs,
 	ClusterWalReuseDenyReason *out_reason);
 extern bool cluster_wal_retention_active_pin_present(void);
+
+/* Read-only current-process registration census only. A set bit means an
+ * original object still exists, including poisoned, incomplete, foreign-owner
+ * or release-uncertain objects; no current/revalidate callback is invoked.
+ * Zero is NOT a global empty-set/COMPLETE certificate or an SCN bound. These
+ * process-local bits are neither wire/format identities nor capabilities.
+ * Call outside page/content locks and CRIT; an unusable local context refuses.
+ * The existing active_pin_present predicate keeps its original borrow meaning. */
+#define CLUSTER_WAL_HISTORY_LOCAL_RETENTION_PIN UINT32_C(0x01)
+#define CLUSTER_WAL_HISTORY_LOCAL_READ_PIN UINT32_C(0x02)
+#define CLUSTER_WAL_HISTORY_LOCAL_ROOT_GUARD UINT32_C(0x04)
+#define CLUSTER_WAL_HISTORY_LOCAL_REUSE_GUARD UINT32_C(0x08)
+#define CLUSTER_WAL_HISTORY_LOCAL_E1_CONTEXT UINT32_C(0x10)
+#define CLUSTER_WAL_HISTORY_LOCAL_ACTION_CONTEXT UINT32_C(0x20)
+#define CLUSTER_WAL_HISTORY_LOCAL_UNAVAILABLE UINT32_C(0x80000000)
+extern uint32 cluster_wal_retention_history_local_pins_v1(void);
+
 extern ClusterWalReuseGuardResult
 cluster_wal_retention_action_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
 								   ClusterWalReuseDenyReason *out_reason);
