@@ -700,7 +700,7 @@ cluster_ctrc_capacity_probe_pool_v1(uint32 segment, SCN horizon, uint64 epoch,
 		if (test_segment_fault == 2)
 			observation->segment.current_segment++;
 		if (test_segment_fault == 3)
-			observation->segment.segment_generation = 0;
+			observation->segment.segment_generation = UINT32_MAX;
 		if (test_segment_fault == 4)
 			observation->segment.segment_id = segment;
 		if (test_segment_fault == 5)

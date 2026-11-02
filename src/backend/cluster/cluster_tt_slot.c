@@ -1223,7 +1223,7 @@ tt_slot_origin_segment(const ClusterCtrcTxnKeyV1 *key)
 		|| key->origin_node_id != cluster_node_id || key->owner_instance != cluster_node_id + 1
 		|| key->segment_id == 0 || key->segment_id > UINT16_MAX
 		|| cluster_tt_slot_segment_to_node(key->segment_id) != cluster_node_id
-		|| key->segment_generation == 0 || key->segment_generation == UINT32_MAX
+		|| key->segment_generation == UINT32_MAX
 		|| key->slot_offset >= TT_SLOTS_PER_SEGMENT || key->slot_wrap == TT_WRAP_INVALID
 		|| !TransactionIdIsNormal(key->xid))
 		return NULL;

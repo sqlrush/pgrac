@@ -558,7 +558,7 @@ undo_cleaner_capacity_segment_worker(uint32 current_segment, uint64 epoch,
 		|| identity->segment_id == current_segment || identity->current_segment != current_segment
 		|| identity->current_binding_generation == 0
 		|| identity->current_binding_generation == UINT64_MAX || identity->epoch != epoch
-		|| identity->segment_generation == 0 || identity->segment_generation == UINT32_MAX
+		|| identity->segment_generation == UINT32_MAX
 		|| identity->system_identifier == 0 || identity->origin_boot_incarnation == 0
 		|| identity->formation_epoch == 0 || identity->admission_record_generation == 0
 		|| identity->root_id == 0 || identity->root_generation == 0)

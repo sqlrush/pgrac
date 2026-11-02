@@ -187,6 +187,8 @@ static bool segment_inputs, segment_root_drift, segment_generation_drift;
 static uint32 segment_physical_id, segment_requested_id;
 static uint64 segment_current_binding;
 static unsigned segment_root_calls, segment_generation_calls;
+static bool sample_generation_known = true;
+static ClusterUndoBlock0Result sample_generation_result = CLUSTER_UNDO_BLOCK0_OK;
 static unsigned segment_reads[CLUSTER_UNDO_SEGS_PER_INSTANCE];
 static TransactionId segment_native_xids[TT_SLOTS_PER_SEGMENT];
 static uint8 segment_native_states[TT_SLOTS_PER_SEGMENT];
@@ -483,7 +485,9 @@ cluster_undo_block0_current_sample_generation(
 	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
 	ClusterUndoBlock0Generation *out)
 {
-	out->known = true;
+	if (sample_generation_result != CLUSTER_UNDO_BLOCK0_OK)
+		return sample_generation_result;
+	out->known = sample_generation_known;
 	out->value = history_inputs ? history_headers[segment_requested_id - 1].wrap_count
 								: sample_header.wrap_count;
 	if (segment_inputs && segment_generation_drift && ++segment_generation_calls > 1)
@@ -651,6 +655,8 @@ reset_capacity_sample(void)
 	segment_inputs = segment_root_drift = segment_generation_drift = false;
 	segment_current_binding = 9;
 	segment_root_calls = segment_generation_calls = 0;
+	sample_generation_known = true;
+	sample_generation_result = CLUSTER_UNDO_BLOCK0_OK;
 	MemSet(segment_reads, 0, sizeof(segment_reads));
 	return origin->key;
 }
@@ -4457,6 +4463,46 @@ reset_segment_wait(void)
 	capacity_sleep_event = 0;
 }
 
+UT_TEST(test_known_zero_segment_reaches_original_consumer_and_cv)
+{
+	ClusterCapacityObservationV1 observation;
+	unsigned worker = UINT_MAX;
+
+	reset_segment_wait();
+	/* No original transaction key remains. Only the canonical physical input
+	 * changes; producer, identity validation and original wait remain real. */
+	sample_header.wrap_count = 0;
+	UT_ASSERT_EQ(probe_unarmed_segment(&observation), CLUSTER_CAPACITY_OWNER_PROGRESS_POSSIBLE);
+	UT_ASSERT_EQ(observation.segment.segment_generation, 0);
+	UT_ASSERT(ctrc_bytes_zero(&observation.key, sizeof(observation.key)));
+	UT_ASSERT(undo_cleaner_capacity_segment_worker(1, test_cluster_epoch, &observation, &worker));
+	UT_ASSERT_EQ(worker, 1);
+
+	for (unsigned fault = 0; fault < 4; fault++) {
+		ClusterCtrcTxnKeyV1 continuation = { 0 };
+
+		reset_segment_wait();
+		sample_header.wrap_count = 0;
+		if (fault == 1)
+			sample_generation_known = false;
+		else if (fault == 2)
+			sample_generation_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		else if (fault == 3)
+			sample_header.wrap_count = UINT32_MAX;
+		UT_ASSERT_EQ(cluster_undo_cleaner_wait_for_capacity(1, &continuation), fault == 0);
+		UT_ASSERT(ctrc_bytes_zero(&continuation, sizeof(continuation)));
+		UT_ASSERT_EQ(capacity_sleeps, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(capacity_cancels, 1);
+		UT_ASSERT(!capacity_subscribed);
+		UT_ASSERT_EQ(native_cleaner_state.capacity_wait_entered, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(capacity_wait_event, 41);
+		UT_ASSERT_EQ(sample_admission_debt, 0);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
 UT_TEST(test_retired_admission_observation_reaches_original_cleaner_cv)
 {
 	ClusterCtrcTxnKeyV1 continuation = { 0 };
@@ -4673,6 +4719,7 @@ UT_TEST(test_unarmed_segment_keeps_policy_record_owner_and_canonical_gates)
 			break;
 		case 12:
 			sample_header.wrap_count = 0;
+			sample_generation_known = false;
 			break;
 		case 13:
 			sample_header.wrap_count = UINT32_MAX;
@@ -5463,6 +5510,55 @@ UT_TEST(test_history_copy_error_releases_original_guard_and_private_context)
 	test_cluster_epoch = 13;
 }
 
+UT_TEST(test_history_generation_presence_distinguishes_known_zero)
+{
+	for (unsigned variant = 0; variant < 5; variant++) {
+		ClusterUndoCapacityChangeFence fence;
+		ClusterCapacityHistoryPass pass = { 0 };
+		ClusterCapacityObservationV1 out;
+		bool valid = variant < 2;
+
+		test_cluster_epoch = 23;
+		history_fixture();
+		for (unsigned i = 0; i < 16; i++)
+			history_headers[i].wrap_count = variant == 1 ? 1 : 0;
+		if (variant == 2)
+			sample_generation_known = false;
+		else if (variant == 3)
+			sample_generation_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		else if (variant == 4)
+			history_headers[0].wrap_count = UINT32_MAX;
+		cluster_undo_capacity_fence_init(&fence);
+		cluster_undo_capacity_fence_attach(&fence);
+		for (unsigned calls = 0; calls < 256; calls++) {
+			unsigned holds = sample_holds, current_reads = segment_reads[0];
+
+			UT_ASSERT_EQ(cluster_ctrc_capacity_probe_history_v1(
+				1, 1000, test_cluster_epoch, NULL, &pass, &out),
+				CLUSTER_CAPACITY_UNPROVEN_OR_NO_OWNER);
+			UT_ASSERT(segment_reads[0] - current_reads <= TT_SLOTS_PER_SEGMENT);
+			UT_ASSERT(sample_holds - holds - (segment_reads[0] - current_reads) <= 16);
+			UT_ASSERT(ctrc_bytes_zero(&out.key, sizeof(out.key)));
+			if (!pass.progress || pass.complete)
+				break;
+		}
+		UT_ASSERT_EQ(pass.current_proven, valid);
+		UT_ASSERT_EQ(pass.complete, valid);
+		UT_ASSERT_EQ(pass.history_only, valid);
+		if (valid) {
+			UT_ASSERT_EQ(pass.covered_positions, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+			UT_ASSERT_EQ(pass.allocated_count, 16);
+		}
+		UT_ASSERT_EQ(sample_holds, sample_releases);
+		UT_ASSERT_EQ(sample_enters, sample_leaves);
+		UT_ASSERT_EQ(sample_admission_debt, 0);
+		UT_ASSERT_EQ(held_count, 0);
+		cluster_undo_capacity_fence_attach(NULL);
+		history_inputs = false;
+	}
+	test_cluster_epoch = 13;
+}
+
 UT_TEST(test_history_negative_requires_actual_current48_and_complete_physical_pool)
 {
 	ClusterUndoCapacityChangeFence fence;
@@ -5546,18 +5642,20 @@ int
 main(void)
 #endif
 {
-	UT_PLAN(110);
+	UT_PLAN(112);
 	UT_RUN(test_history_inventory_gc_drops_a_failed_ordinary_candidate_key);
 	UT_RUN(test_history_unknown_inventory_keeps_independent_original_gc_positive);
 	UT_RUN(test_history_unavailable_fence_preserves_actual_owner_positive);
 	UT_RUN(test_history_complete_negative_rechecks_all_original_identity_and_native_gates);
 	UT_RUN(test_history_exact_inventory_rechecks_no_retro_shrink_holes);
 	UT_RUN(test_history_copy_error_releases_original_guard_and_private_context);
+	UT_RUN(test_history_generation_presence_distinguishes_known_zero);
 	UT_RUN(test_history_negative_requires_actual_current48_and_complete_physical_pool);
 	UT_RUN(test_history_negative_never_hides_io_free_current_or_missing_release);
 	UT_RUN(test_actual_retention_rejections_reach_origin_observation_counts);
 	UT_RUN(test_actual_combined_retention_causes_count_each_observed_reason_once);
 	UT_RUN(test_actual_invalid_retention_identity_and_owner_work_do_not_count);
+	UT_RUN(test_known_zero_segment_reaches_original_consumer_and_cv);
 	UT_RUN(test_retired_admission_observation_reaches_original_cleaner_cv);
 	UT_RUN(test_original_cleaner_rejects_missing_retired_admission_identity);
 	UT_RUN(test_retired_admission_refusal_never_sleeps_or_retains_debt);

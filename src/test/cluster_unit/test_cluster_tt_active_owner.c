@@ -230,17 +230,20 @@ cluster_reconfig_self_join_gate_verdict(void)
 	return CLUSTER_JOIN_GATE_ALLOW;
 }
 
+static uint32 physical_fixture_generation = 4;
+
 static void
 select_physical_fixture(uint32 segment)
 {
 	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)g_canned_block;
 
 	g_current_segment = g_canned_block_segment = segment;
+	g_current_generation = (ClusterUndoBlock0Generation){ true, physical_fixture_generation };
 	cluster_undo_segment_make_header_bytes(segment, 1, g_canned_block);
 	disk->segment_id = segment;
 	disk->owner_instance = 1;
 	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
-	disk->wrap_count = 4;
+	disk->wrap_count = physical_fixture_generation;
 	if (cold_fixture && segment == 1)
 		disk->tt_slots[0] = cold_old_slot;
 	memcpy(g_current_resident, g_canned_block, BLCKSZ);
@@ -633,6 +636,7 @@ reset_active_owner(void)
 	cluster_shared_catalog = cluster_xid_striping = false;
 	ShmemVariableCache->nextXid = FullTransactionIdFromU64(300);
 	cold_successor = 2;
+	physical_fixture_generation = 4;
 	memset(&cold_old_slot, 0, sizeof(cold_old_slot));
 	cluster_tt_slot_rollover(0, 1, NULL);
 	reset_current_write_mock();
@@ -1682,6 +1686,67 @@ prepare_gc_origin_snapshot(bool committed, unsigned prefix, ClusterCtrcTxnKeyV1 
 		cluster_tt_slot_mark_aborted(1, key->slot_offset, key->xid, key->slot_wrap);
 }
 
+UT_TEST(test_zero_generation_keeps_original_terminal_slot_provenance)
+{
+	for (unsigned variant = 0; variant < 4; variant++) {
+		ClusterCanonicalTxnBinding published = { 0 };
+		ClusterCtrcTxnKeyV1 key, changed, observed;
+		ClusterTTSlotCurrentOwner owner;
+		ClusterTTSlotAllocPerSegment before;
+		FullTransactionId full = InvalidFullTransactionId;
+		uint64 binding = 0;
+		unsigned offset = variant < 2 ? 0 : 47;
+		bool committed = (variant & 1) != 0;
+
+		reset_active_owner();
+		physical_fixture_generation = 0;
+		for (unsigned i = 0; i < offset; i++)
+			UT_ASSERT_EQ(cluster_tt_slot_alloc(1, 1000 + i), i);
+		UT_ASSERT(cluster_tt_local_prepare_canonical_active(100, &published));
+		UT_ASSERT_EQ(published.publish_state, CLUSTER_CANONICAL_TXN_PUBLISHED);
+		UT_ASSERT_EQ(published.segment_generation, 0);
+		key = g_ctrc_original_reservation.key;
+		UT_ASSERT_EQ(key.segment_generation, 0);
+		UT_ASSERT_EQ(key.slot_offset, offset);
+		UT_ASSERT(cluster_tt_slot_origin_identity_read(&key, &full));
+		UT_ASSERT(FullTransactionIdEquals(full, g_ctrc_reserved_original_full));
+		UT_ASSERT(cluster_tt_slot_origin_identity_retain(&g_ctrc_original_reservation));
+		UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, offset, &observed, &owner,
+														 &binding));
+		changed = key;
+		changed.segment_generation = UINT32_MAX;
+		UT_ASSERT(!cluster_tt_slot_origin_identity_read(&changed, &full));
+		changed.segment_generation = 1;
+		UT_ASSERT(!cluster_tt_slot_origin_identity_read(&changed, &full));
+
+		g_ctrc_original_available = false;
+		if (committed)
+			cluster_tt_slot_mark_committed(1, offset, key.xid, key.slot_wrap, 91);
+		else
+			cluster_tt_slot_mark_aborted(1, offset, key.xid, key.slot_wrap);
+		before = allocator_storage.per_node[0];
+		UT_ASSERT(cluster_tt_slot_current_origin_snapshot(1, offset, &observed, &owner,
+														 &binding));
+		UT_ASSERT_EQ(memcmp(&observed, &key, sizeof(key)), 0);
+		UT_ASSERT_EQ(binding, before.binding_generation);
+		UT_ASSERT_EQ(owner.slot_offset, offset);
+		UT_ASSERT_EQ(owner.status, committed ? CTS_COMMITTED : CTS_ABORTED);
+		UT_ASSERT_EQ(owner.commit_scn, committed ? 91 : InvalidScn);
+		UT_ASSERT_EQ(memcmp(&before, &allocator_storage.per_node[0], sizeof(before)), 0);
+		UT_ASSERT(cluster_tt_slot_origin_identity_read(&key, &full));
+		UT_ASSERT(FullTransactionIdEquals(full, g_ctrc_reserved_original_full));
+		cluster_tt_slot_free(1, offset);
+		UT_ASSERT(!cluster_tt_slot_current_origin_snapshot(1, offset, &observed, &owner,
+														 &binding));
+		UT_ASSERT(!cluster_tt_slot_origin_identity_read(&key, &full));
+		UT_ASSERT_EQ(g_bind_emit_calls, 1);
+		UT_ASSERT_EQ(modifier_enters, modifier_leaves);
+		UT_ASSERT_EQ(g_current_pin_calls, g_current_unpin_calls);
+		UT_ASSERT_EQ(g_current_acquire_calls, g_current_cancel_calls);
+		UT_ASSERT_EQ(lock_depth, 0);
+	}
+}
+
 UT_TEST(test_current_origin_snapshot_uses_original_terminal_slot_provenance)
 {
 	for (unsigned variant = 0; variant < 4; variant++) {
@@ -1785,7 +1850,7 @@ UT_TEST(test_current_origin_snapshot_rejects_missing_or_malformed_original_ident
 			memset(identity, 0, sizeof(*identity));
 			break;
 		case 20:
-			identity->key.segment_generation = 0;
+			identity->key.segment_generation = UINT32_MAX;
 			break;
 		case 21:
 			segment->slots[0].wrap = TT_WRAP_INVALID;
@@ -2092,7 +2157,8 @@ int TT_ACTIVE_OWNER_FIXTURE_MAIN(void);
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(59);
+	UT_RUN(test_zero_generation_keeps_original_terminal_slot_provenance);
 	UT_RUN(test_current_origin_snapshot_uses_original_terminal_slot_provenance);
 	UT_RUN(test_current_origin_snapshot_rejects_missing_or_malformed_original_identity);
 	UT_RUN(test_current_origin_snapshot_never_initializes_or_outlives_original_slot);
