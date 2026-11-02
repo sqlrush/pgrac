@@ -211,3 +211,36 @@ UT_TEST(test_pending_only_plan_keeps_original_completion_behavior)
 	UT_ASSERT(cluster_cold_typed_relmap_ready_v1(&replay, (ClusterRecoveryFencePlan *)&replay));
 	cold_map_end();
 }
+
+UT_TEST(test_pending_input_preserves_original_receipt_without_consuming_creation)
+{
+	ClusterColdRelmapReplayReceiptV1 saved;
+	unsigned before;
+	cold_pending_mixed(true);
+	UT_ASSERT_EQ(cluster_cold_typed_relmap_pending_input_v1(&replay, 0).count, 0);
+	cold_pending_apply(); before = writes;
+	saved = cluster_cold_typed_relmap_pending_input_v1(&replay, 0);
+	UT_ASSERT_EQ(saved.count, 1);
+	UT_ASSERT_EQ(saved.index, 0);
+	UT_ASSERT_EQ(memcmp(&saved.input, &declared, sizeof(declared)), 0);
+	UT_ASSERT_EQ(cluster_cold_typed_relmap_replay_input_v1(&replay, 0).count, 0);
+	UT_ASSERT_EQ(cluster_cold_typed_relmap_pending_input_v1(&replay, 1).count, 0);
+	UT_ASSERT_EQ(replay.plan->relmap_create_count, 1);
+	UT_ASSERT(!cold_relmap_create_at(replay.plan, 0)->attempted);
+	UT_ASSERT_EQ(writes, before);
+	cold_map_end();
+}
+
+UT_TEST(test_pending_input_refuses_empty_or_changed_complete_source)
+{
+	cold_pending_mixed(false);
+	UT_ASSERT_EQ(cluster_cold_typed_relmap_pending_input_v1(&replay, 0).count, 0);
+	UT_ASSERT(!cold_relmap_create_at(replay.plan, 0)->attempted);
+	cold_map_end();
+	cold_pending_mixed(true); cold_pending_apply();
+	++replay.sources[0].claim.max_config_generation;
+	UT_ASSERT_EQ(cluster_cold_typed_relmap_pending_input_v1(&replay, 0).count, 0);
+	UT_ASSERT_EQ(cluster_cold_typed_relmap_pending_input_v1(NULL, 0).count, 0);
+	UT_ASSERT(writer_retention.pins[0].occupied && writer_retention.pins[0].may_be_staged);
+	cold_map_end();
+}

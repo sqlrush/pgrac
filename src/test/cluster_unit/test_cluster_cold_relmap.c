@@ -647,7 +647,7 @@ UT_TEST(test_creation_plan_cannot_borrow_pending_execution_or_completion)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(24);
 	UT_RUN(test_relmap_runs_between_other_source_pages_and_duplicate_does_not_write);
 	UT_RUN(test_relmap_without_declared_participant_keeps_structural_refusal);
 	UT_RUN(test_relmap_missing_capture_never_seals_or_writes);
@@ -670,6 +670,8 @@ main(void)
 	UT_RUN(test_pending_readiness_rejects_late_source_side_pin_or_pair_change);
 	UT_RUN(test_pending_readiness_owner_errors_are_sticky_without_rewrite);
 	UT_RUN(test_pending_only_plan_keeps_original_completion_behavior);
+	UT_RUN(test_pending_input_preserves_original_receipt_without_consuming_creation);
+	UT_RUN(test_pending_input_refuses_empty_or_changed_complete_source);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

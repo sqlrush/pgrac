@@ -722,6 +722,8 @@ UT_TEST(test_terminal_episode_late_ir_or_error_keeps_debt)
 	}
 }
 
+#include "test_cluster_cold_relmap_pending_terminal.inc"
+
 int main(int argc, char **argv)
 {
 	test_program_path = argv[0]; setup_fixture();
@@ -743,7 +745,7 @@ int main(int argc, char **argv)
 		UT_RUN(test_terminal_start_extent_alias_before_providers);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(15);
+	UT_PLAN(22);
 	UT_RUN(test_terminal_episode_after_scope_commit);
 	UT_RUN(test_terminal_episode_after_scope_abort);
 	UT_RUN(test_terminal_episode_requires_completed_current_ir);
@@ -759,5 +761,12 @@ int main(int argc, char **argv)
 	UT_RUN(test_terminal_failed_or_missing_receipt_aliases_are_untouched);
 	UT_RUN(test_terminal_duplicate_and_partial_error_are_one_shot);
 	UT_RUN(test_terminal_start_extent_alias_before_providers);
+	UT_RUN(test_pending_terminal_mixed_commit_abort_and_repeat);
+	UT_RUN(test_pending_terminal_does_not_open_legacy_mixed_gates);
+	UT_RUN(test_pending_terminal_empty_does_not_manufacture_qualification);
+	UT_RUN(test_pending_terminal_source_writer_and_pin_drift_stay_failed);
+	UT_RUN(test_pending_terminal_mutation_and_active_writer_keep_fd_debt);
+	UT_RUN(test_pending_terminal_capture_and_start_errors_keep_debt);
+	UT_RUN(test_pending_terminal_aliases_refuse_before_owner_or_output);
 	UT_DONE(); return ut_failed_count != 0;
 }

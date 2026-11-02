@@ -16461,3 +16461,6 @@ test_cluster_relmap_create_side_original.o: test_cluster_relmap_create_side_orig
         $(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
         $(top_srcdir)/src/include/common/cluster_relmap_create.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_ONLINE_TESTING -ffunction-sections -fdata-sections -c $< -o $@
+
+# Pending-only terminal cases reuse the original native CLOG/Start fixture.
+test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: test_cluster_cold_relmap_pending_terminal.inc

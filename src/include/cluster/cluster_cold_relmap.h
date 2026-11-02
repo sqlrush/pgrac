@@ -38,6 +38,17 @@ extern bool cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence);
 extern bool cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
 	ClusterColdRelmapTerminalCheckV1 *out);
+/* Pending-only counterpart for a mixed original plan. Requires at least one
+ * completed pending input; zero is NOT a terminal receipt. Creation count and
+ * receipts stay intact and require the owner's independent creation_ready gate.
+ * Capture uses the same one-shot latch, source/ROOT/SIDE checks and native held
+ * FDs. Recheck uses the original Start/installed-writer/mutation checks, output
+ * alias guard and sticky failure semantics. No new scope, pin, setter or grant.
+ * Old capture/recheck continue to reject every plan containing creation. */
+extern bool cluster_cold_relmap_pending_terminal_capture_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence);
+extern bool cluster_cold_relmap_pending_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdRelmapTerminalCheckV1 *out);
 /* Original Startup-only recovery path. No ordinary directory/lock may be
  * supplied. Full original source set must be passed, not a replay prefix.
  * A failed attempt retains its private carrier until joint transfer or exit. */
@@ -135,6 +146,11 @@ typedef struct ClusterColdRelmapReplayReceiptV1 {
 extern uint32 cluster_cold_typed_relmap_pending_count_v1(const ClusterColdTypedV1 *typed);
 extern bool cluster_cold_typed_relmap_pending_ready_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence);
+/* Same by-value replay receipt, restricted to pending inputs. Invalid,
+ * incomplete, empty and out-of-range inputs return the original zero value;
+ * no empty value is a terminal or creation qualification. */
+extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_pending_input_v1(
+	const ClusterColdTypedV1 *typed, uint32 index);
 extern uint32 cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed);
 extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_replay_input_v1(
 	const ClusterColdTypedV1 *typed, uint32 index);
@@ -149,6 +165,11 @@ extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_replay_input_v
  * Success is a current staging observation only, not terminal/era/lifetime
  * qualification, a reusable certificate, COMPLETE or a release permission. */
 extern bool cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start);
+
+/* Same staging recheck, for a nonempty pending component in a mixed plan.
+ * Zero pending still refuses; the original owner must separately handle that
+ * absence and creation_ready, never replace it with an empty terminal receipt. */
+extern bool cluster_cold_relmap_pending_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start);
 
 /* Explicit original-source adapter before pass-1. Whole-batch validation of
  * exact unstaged pins precedes any mutation. Recheck and arm every original
