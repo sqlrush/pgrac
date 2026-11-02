@@ -302,6 +302,32 @@ M1 acceptance remain separate. Raw xid ordering, stored cutoff equality and
 clean restart do not certify them or general crash recovery. Local selection
 tests and Perl syntax checks provide no native/product-path runtime credit.
 
+### Native MultiXact continuation after clean restart
+
+The opt-in `m1-mx-continuation` suite runs
+`t/486_pre2_multixact_continuation.pl` through the original four-member
+controller, retaining its 1200-second outer case budget. Use the native command
+above with `--suite m1-mx-continuation` after component readiness, candidate
+qualification and runtime authorization. Existing suites remain unchanged.
+
+Before and after original normal stop and same-DATA restart, two real local
+`FOR KEY SHARE` holders per origin create four MultiXacts on separate literal
+rows. The case records each holder's full/raw transaction ID and PID/birth,
+and requires both exact members in `keysh` mode. With all holders still live,
+one original `VACUUM (FREEZE, VERBOSE)` runs per origin. After each VACUUM,
+each origin must read its unchanged local MultiXact and both original members.
+All four members also read back every literal row. Holders must retain their
+original transaction identities, commit and exit before each full normal stop.
+
+Original OPEN/stop observations, holder identities, SQL output/status and
+first/cleanup errors are retained. No allocator, floor, horizon or SLRU state
+is assigned. Errors, refusals, corruption and cleanup debt fail the case.
+Exit zero covers only this continuation/live-member subcheck. Both controller
+and TAP retain `x04=NOT_READY` and `stage_acceptance=NOT_READY`: forced G>N,
+offset-page gap crossing, occupied-page preservation and exact allocator/VACUUM
+issuance overlap still require separate evidence. Selection selftests and Perl
+syntax checks run no database and provide no native runtime credit.
+
 ### Retained workload manifest intake
 
 Verify a retained four-node capture without contacting a server:

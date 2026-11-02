@@ -26,12 +26,14 @@ M1_CASES = ['t/431_pre2_start_stop_restart.pl', *MX_CASES,
 SOAK_CASE = 't/483_pre2_m1_soak_workload.pl'
 RETENTION_CASE = 't/484_pre2_retained_snapshot.pl'
 IDLE_FREEZE_CASE = 't/485_pre2_idle_freeze_restart.pl'
+MX_CONTINUATION_CASE = 't/486_pre2_multixact_continuation.pl'
 
 
 def select_cases(suite, cases):
     allowed = {'multixact': MX_CASES, 'm1': M1_CASES,
                'm1-soak-workload': [SOAK_CASE], 'm1-retention': [RETENTION_CASE],
-               'm1-idle-freeze': [IDLE_FREEZE_CASE]}[suite]
+               'm1-idle-freeze': [IDLE_FREEZE_CASE],
+               'm1-mx-continuation': [MX_CONTINUATION_CASE]}[suite]
     selected = list(MX_CASES[1:] if suite == 'multixact' else allowed) if cases is None else list(cases)
     if (not selected or len(set(selected)) != len(selected)
             or any(case not in allowed for case in selected)):
@@ -135,6 +137,9 @@ def run(args):
                        stage_acceptance='NOT_READY')
     if getattr(args, 'suite', 'multixact') == 'm1-idle-freeze':
         results.update(scope='tuple-freeze-and-clean-restart', p01='NOT_READY',
+                       stage_acceptance='NOT_READY')
+    if getattr(args, 'suite', 'multixact') == 'm1-mx-continuation':
+        results.update(scope='multixact-continuation-and-live-members', x04='NOT_READY',
                        stage_acceptance='NOT_READY')
     q = LocalQuorum(root/'quorum', args.vendor, 4, args.uid, args.gid)
     q.env['LD_LIBRARY_PATH'] += ':' + str(install/'lib')
@@ -288,7 +293,7 @@ def main():
     for key in ('source', 'install', 'output', 'vendor'):
         parser.add_argument('--'+key, type=Path, required=True)
     parser.add_argument('--suite', choices=['multixact', 'm1', 'm1-soak-workload', 'm1-retention',
-                                           'm1-idle-freeze'], default='multixact')
+                                           'm1-idle-freeze', 'm1-mx-continuation'], default='multixact')
     parser.add_argument('--cases', nargs='+')
     parser.add_argument('--fixture-install', type=Path)
     parser.add_argument('--expected-postgres-sha256')
