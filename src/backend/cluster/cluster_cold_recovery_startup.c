@@ -1614,7 +1614,7 @@ cluster_cold_typed_prepare_relmap_v1(ClusterRecoveryFencePlan *fence, uint16 own
 	XLogRecPtr own_redo, const ClusterColdRelmapInputV1 *inputs, uint32 count)
 {
 	/* Invalid declaration never falls back to the ordinary undeclared mode. */
-	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+	if (inputs == NULL || count == 0 || count == UINT32_MAX)
 		return NULL;
 	return cold_typed_prepare(fence, own_thread, own_redo, inputs, count, NULL, 0, false);
 }
@@ -1623,7 +1623,7 @@ ClusterColdTypedV1 *
 cluster_cold_typed_prepare_relmap_wal_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 	XLogRecPtr own_redo, const ClusterColdRelmapWalV1 *inputs, uint32 count)
 {
-	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+	if (inputs == NULL || count == 0 || count == UINT32_MAX)
 		return NULL;
 	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, inputs, count, false);
 }
@@ -1632,7 +1632,7 @@ ClusterColdTypedV1 *
 cluster_cold_typed_prepare_relmap_recovery_wal_v1(ClusterRecoveryFencePlan *fence,
 	uint16 own_thread, XLogRecPtr own_redo, const ClusterColdRelmapWalV1 *inputs, uint32 count)
 {
-	if (inputs == NULL || count == 0 || count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
+	if (inputs == NULL || count == 0 || count == UINT32_MAX)
 		return NULL;
 	return cold_typed_prepare(fence, own_thread, own_redo, NULL, 0, inputs, count, true);
 }

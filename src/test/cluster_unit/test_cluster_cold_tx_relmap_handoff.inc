@@ -27,7 +27,7 @@ relmap_start_fixture(void)
 	typed.participants[0].tail_end = 0x1000;
 	typed.sources[0] = observed_writer.ref;
 	relmap_start_plan.participant_count = typed.participant_count;
-	relmap_start_plan.relmap_count = 1;
+	relmap_start_plan.relmap_count = relmap_start_plan.relmap_input_capacity = 1;
 	relmap_start_plan.relmap_inputs = relmap_start_entries;
 	entry = &relmap_start_entries[0];
 	entry->captured = entry->attempted = entry->applied = true;

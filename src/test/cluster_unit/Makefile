@@ -16272,13 +16272,14 @@ test_cluster_control_relmap_creation: test_cluster_control_relmap_creation.c tes
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 		$(top_srcdir)/src/common/sha2_int.h \
 		$(top_srcdir)/src/common/cluster_recovery_registry.c \
-		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_control_relmap_creation.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
 		cluster_registry_common_test.o \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
-		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		cluster_control_registry_original.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 clean: clean-control-relmap-creation
@@ -16486,3 +16487,26 @@ test_cluster_relmap_create_scan_io.o: test_cluster_relmap_create_scan_io.c \
         $(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
         $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
+
+# Relmap recovery segments and complete-batch terminal pages.
+$(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_relmap test_cluster_cold_relmap_terminal \
+		test_cluster_cold_relmap_terminal_start test_cluster_relmap_original_start.o \
+		test_cluster_cold_relmap_terminal_product.o \
+		test_cluster_cold_startup_relmap_executor.o \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o: \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
+
+test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: \
+		test_cluster_cold_relmap_terminal_segments.inc
+
+# Private pending allocation and segment layout consumers must rebuild together.
+$(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_STARTUP_O) \
+		test_cluster_cold_recovery_plan_store_core.o \
+		test_cluster_cold_recovery_plan_seal_core.o \
+		test_cluster_cold_recovery_plan_space_core.o \
+		test_cluster_cold_recovery_plan_schedule_core.o \
+		cluster_control_registry_original.o test_cluster_relmap_original_start.o: \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery_internal.h
