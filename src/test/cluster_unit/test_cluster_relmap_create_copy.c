@@ -566,10 +566,20 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 #include "test_cluster_relmap_create_physical.inc"
 #include "test_cluster_relmap_create_actual_side.inc"
 #include "test_cluster_relmap_create_conjunct.inc"
+#include "test_cluster_relmap_create_scan.inc"
 
 int main(int argc,char **argv)
 {
 	(void)argc; (void)argv;
+ if(getenv("PGRAC_TEST_CREATE_SCAN")) {
+  UT_PLAN(4);
+  UT_RUN(creation_scan_real_decoder_and_side_execute_once_then_read_only);
+  UT_RUN(creation_scan_wrong_registration_or_native_bytes_never_write_target);
+  UT_RUN(creation_scan_missing_and_duplicate_declarations_cannot_seal);
+  UT_RUN(creation_scan_late_pair_change_keeps_original_receipt_and_debt);
+  UT_DONE(); return ut_failed_count!=0;
+ }
+ UT_PLAN(67);
 	UT_RUN(copy_source_committed_map_into_independent_registered_pair);
 	UT_RUN(existing_target_never_overwritten_and_attempt_never_retried);
 	UT_RUN(guards_and_copied_carrier_precede_native_effects);
@@ -633,5 +643,9 @@ int main(int argc,char **argv)
 	UT_RUN(creation_confirmed_receipt_cannot_complete_unconsumed_pending);
 	UT_RUN(creation_late_file_refusal_closes_pending_component_without_retry);
 	UT_RUN(creation_final_owner_error_keeps_both_components_closed);
+ UT_RUN(creation_scan_real_decoder_and_side_execute_once_then_read_only);
+ UT_RUN(creation_scan_wrong_registration_or_native_bytes_never_write_target);
+ UT_RUN(creation_scan_missing_and_duplicate_declarations_cannot_seal);
+ UT_RUN(creation_scan_late_pair_change_keeps_original_receipt_and_debt);
 	UT_DONE(); return ut_failed_count!=0;
 }
