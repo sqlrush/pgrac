@@ -49,16 +49,20 @@ typedef struct UndoCapacityRefusalRecord {
 	uint64 publication_sequence, membership_generation, local_boot;
 	uint64 admitted_lo, admitted_hi, local_report_sequence, first_report_sequence;
 	uint64 expected_coordinator, expected_worker;
+	size_t history_text_bytes;
 	UndoCapacityRouteTrace trace;
 } UndoCapacityRefusalRecord;
 
+static char undo_capacity_refusal_text[16384];
+static size_t undo_capacity_refusal_text_limit = sizeof(undo_capacity_refusal_text);
 /* Two disjoint history locals plus one nested CURRENT/pool candidate row. */
-StaticAssertDecl(sizeof(UndoCapacityRefusalRecord) + 3 * sizeof(UndoCapacityTraceRow) <= 16384,
+StaticAssertDecl(sizeof(UndoCapacityRefusalRecord) + 3 * sizeof(UndoCapacityTraceRow)
+				 + sizeof(undo_capacity_refusal_text_limit) <= 16384,
 				 "capacity refusal snapshot must remain bounded");
 static UndoCapacityRefusalRecord undo_capacity_refusal;
-static char undo_capacity_refusal_text[16384];
 StaticAssertDecl(sizeof(undo_capacity_refusal_text) <= 16384,
 				 "capacity refusal output must remain bounded");
+static void undo_capacity_refusal_history_sources(const ClusterHeapFreezeCohortObservation *history);
 
 void
 cluster_undo_cleaner_capacity_trace_reset(void)
@@ -216,6 +220,7 @@ undo_capacity_refusal_capture(const UndoCapacityRefusalInput *input)
 	record->input.history = record->input.first = NULL;
 	record->input.floor = NULL;
 	record->input.owners = NULL;
+	undo_capacity_refusal_history_sources(input->history);
 	record->valid = true;
 }
 
@@ -224,7 +229,7 @@ undo_capacity_refusal_append(size_t *used, const char *format, ...)
 {
 	va_list args;
 	int n;
-	size_t remaining = sizeof(undo_capacity_refusal_text) - *used;
+	size_t remaining = undo_capacity_refusal_text_limit - *used;
 
 	if (remaining <= 1)
 		return;
@@ -234,11 +239,59 @@ undo_capacity_refusal_append(size_t *used, const char *format, ...)
 	if (n < 0 || (size_t)n >= remaining) {
 		static const char marker[] = " truncated=1";
 
-		memcpy(undo_capacity_refusal_text + sizeof(undo_capacity_refusal_text) - sizeof(marker),
+		memcpy(undo_capacity_refusal_text + undo_capacity_refusal_text_limit - sizeof(marker),
 			   marker, sizeof(marker));
-		*used = sizeof(undo_capacity_refusal_text) - 1;
+		*used = undo_capacity_refusal_text_limit - 1;
 	} else
 		*used += n;
+}
+
+/* Render only the existing value copy while it is borrowed. Keep this section
+ * in the original output buffer; no second cohort or text buffer is retained. */
+static void
+undo_capacity_refusal_history_sources(const ClusterHeapFreezeCohortObservation *history)
+{
+	size_t used = 0;
+	unsigned matched = 0, emitted = 0;
+
+	undo_capacity_refusal_text_limit = 4096 - 96; /* reserve the count footer */
+	undo_capacity_refusal_append(&used, " h_sources_v1={known=%d", history != NULL);
+	if (history != NULL)
+		for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+			uint64 members = peer < 64 ? history->admitted_members_lo : history->admitted_members_hi;
+			bool local = peer == undo_capacity_refusal.node;
+			const ClusterHeapFreezeHistorySourceObservationV1 *source;
+			uint64 horizon, sequence;
+			int bytes;
+
+			if ((members & (UINT64CONST(1) << (peer % 64))) == 0)
+				continue;
+			horizon = local ? history->source_local_horizon_scn : history->source_peer_horizon_scn[peer];
+			if (scn_local(horizon) != scn_local(history->horizon_scn))
+				continue;
+			source = local ? &history->source_local_history : &history->source_peer_history[peer];
+			sequence = local ? history->source_local_report_sequence : history->source_peer_report_sequence[peer];
+			matched++;
+#define H_SOURCE_FORMAT ",source={node=%d,boot=" UINT64_FORMAT ",h=" UINT64_FORMAT \
+			",clock=" UINT64_FORMAT ",kind=%u,token=" UINT64_FORMAT ",report_sequence=" UINT64_FORMAT "}"
+#define H_SOURCE_VALUES peer, history->admission_fence.admitted_incarnation[peer], horizon, \
+			source->sample_clock_scn, (unsigned)source->contributor_kind, source->contributor_token, sequence
+			bytes = snprintf(NULL, 0, H_SOURCE_FORMAT, H_SOURCE_VALUES);
+			if (bytes < 0 || (size_t)bytes >= undo_capacity_refusal_text_limit - used)
+				continue;
+			undo_capacity_refusal_append(&used, H_SOURCE_FORMAT, H_SOURCE_VALUES);
+			emitted++;
+#undef H_SOURCE_FORMAT
+#undef H_SOURCE_VALUES
+		}
+	undo_capacity_refusal_text_limit = 4096;
+	if (history != NULL)
+		undo_capacity_refusal_append(&used, ",matched=%u,emitted=%u,dropped=%u,truncated=%d}",
+			matched, emitted, matched - emitted, matched != emitted);
+	else
+		undo_capacity_refusal_append(&used, "}");
+	undo_capacity_refusal.history_text_bytes = used;
+	undo_capacity_refusal_text_limit = sizeof(undo_capacity_refusal_text);
 }
 
 static void
@@ -341,11 +394,18 @@ cluster_undo_cleaner_capacity_refusal_detail(uint32 segment, TransactionId top_x
 	const UndoCapacityRefusalRecord *record = &undo_capacity_refusal;
 	const UndoCapacityRefusalInput *input = &record->input;
 	size_t used = 0;
+	size_t history_bytes = record->history_text_bytes;
 	bool valid = record->valid;
 
 	undo_capacity_refusal.valid = false;
 	if (!cluster_trace_undo_capacity_refusal || !valid || input->segment != segment)
 		return NULL;
+	if (history_bytes >= 4096)
+		return NULL;
+	/* Protect the captured section while formatting the original header. */
+	memmove(undo_capacity_refusal_text + sizeof(undo_capacity_refusal_text) - history_bytes,
+			undo_capacity_refusal_text, history_bytes);
+	undo_capacity_refusal_text_limit = sizeof(undo_capacity_refusal_text) - history_bytes;
 #define D_VALUE(value) input->values[value]
 	undo_capacity_refusal_append(&used,
 		"undo_capacity_first_refusal_v1 site=%s pid=%d node=%d segment=%u "
@@ -377,6 +437,11 @@ cluster_undo_cleaner_capacity_refusal_detail(uint32 segment, TransactionId top_x
 		record->expected_coordinator, record->expected_worker,
 		input->coordinator_generation, input->worker_generation);
 #undef D_VALUE
+	memmove(undo_capacity_refusal_text + used,
+			undo_capacity_refusal_text + sizeof(undo_capacity_refusal_text) - history_bytes, history_bytes);
+	used += history_bytes;
+	undo_capacity_refusal_text[used] = '\0';
+	undo_capacity_refusal_text_limit = sizeof(undo_capacity_refusal_text);
 	if (record->key_known)
 		undo_capacity_refusal_key(&used, "input_key", &record->key);
 	if (record->observation_known) {

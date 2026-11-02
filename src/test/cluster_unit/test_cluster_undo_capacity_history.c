@@ -29,24 +29,28 @@ history_no_mrp_bound(void)
 	return InvalidScn;
 }
 
-/* Only self is admitted in these cases. A remote capability query would be
- * an unexpected expansion of this actual local-publication test. */
+/* Remote capability and report contents are controlled input leaves. The
+ * original self-only cases still reject every remote-capability query. */
+static int history_peer = -1;
+static uint32 history_peer_generation;
+
 bool
-cluster_sf_peer_capability_word_sample(int32 peer pg_attribute_unused(),
-									   uint32 required pg_attribute_unused(),
-									   uint32 *word pg_attribute_unused(),
-									   uint32 *generation pg_attribute_unused())
+cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word,
+									   uint32 *generation)
 {
-	abort();
-	return false;
+	if (peer != history_peer || required != PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2
+		|| word == NULL || generation == NULL)
+		abort();
+	*word = required;
+	*generation = history_peer_generation;
+	return true;
 }
 bool
-cluster_sf_peer_capability_generation_matches(int32 peer pg_attribute_unused(),
-											  uint32 required pg_attribute_unused(),
-											  uint32 generation pg_attribute_unused())
+cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint32 generation)
 {
-	abort();
-	return false;
+	if (peer != history_peer || required != PGRAC_IC_HELLO_CAP_HEAP_FREEZE_REPORT_V2)
+		abort();
+	return generation != 0 && generation == history_peer_generation;
 }
 
 #undef SpinLockAcquire
@@ -87,6 +91,40 @@ history_publish(SCN h, uint32 kind)
 	if (!native_cleaner_sample(&active))
 		abort();
 	undo_horizon_publish_local_history(&active, &raw);
+}
+
+/* This is an accepted remote-input boundary, not an authenticated sender.
+ * Its original slot publisher and every subsequent consumer remain real. */
+static void
+history_publish_peer(uint64 sequence, SCN horizon, uint32 kind)
+{
+	ClusterUndoCleanerActiveSample active;
+	ClusterHeapFreezeReportV2 report = {0};
+	uint8 image[CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES];
+
+	if ((history_peer != 1 && history_peer != 65) || !native_cleaner_sample(&active))
+		abort();
+	report.version = CLUSTER_HEAP_FREEZE_REPORT_V2_VERSION;
+	report.length = CLUSTER_HEAP_FREEZE_REPORT_V2_BYTES;
+	report.sysid = active.admission_fence.system_identifier;
+	report.record_generation = active.admission_fence.record_generation;
+	report.formation_epoch = active.admission_fence.formation_epoch;
+	report.incarnation = active.admission_fence.admitted_incarnation[history_peer];
+	report.origin = history_peer;
+	report.report_sequence = sequence;
+	report.future_full_xid = U64FromFullTransactionId(active.scan.future_full);
+	report.active_full_xid_min = U64FromFullTransactionId(active.scan.min_full);
+	report.f_sample_id = active.sample_id;
+	report.horizon_scn = horizon;
+	report.h_sample_clock_scn = 3000;
+	report.h_contributor_kind = kind;
+	report.h_contributor_token = kind == CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK ? 0 : 91;
+	report.sender_interval_ms = cluster_lmon_main_loop_interval;
+	if (!cluster_heap_freeze_report_v2_encode(&report, image))
+		abort();
+	undo_horizon_v2_publish(&history_lmon.freeze_slots[history_peer], &report,
+							&active.admission_fence, history_peer_generation,
+							GetCurrentTimestamp(), false);
 }
 
 /* Exercise the actual shared reserve/cancel producers between complete passes.
@@ -439,6 +477,24 @@ UT_TEST(test_actual_history_writer_change_cannot_bridge_complete_pass)
 	UT_ASSERT_EQ(history_lmon.report_sequence, 3);
 	UT_ASSERT(pg_atomic_read_u64(&history_fence.change_sequence) > 0);
 	history_finish(2);
+}
+
+static void
+history_admit_peer(int peer)
+{
+	history_peer = peer;
+	history_peer_generation = 17;
+	if (peer < 64)
+		native_pass_source.admitted_members_lo |= UINT64CONST(1) << peer;
+	else
+		native_pass_source.admitted_members_hi |= UINT64CONST(1) << (peer - 64);
+	native_pass_source.admitted_incarnation[peer] = 1100 + peer;
+	do {
+		undo_cleaner_sample_active_pass();
+	} while (undo_cleaner_active_scan_pending);
+	pg_atomic_init_u32(&history_lmon.freeze_slots[peer].seq, 0);
+	history_publish(3000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_CLOCK);
+	history_publish_peer(1, 1000, CLUSTER_HEAP_FREEZE_REPORT_V2_CONTRIBUTOR_SNAPSHOT);
 }
 
 #ifdef UNDO_CAPACITY_HISTORY_FIXTURE_MAIN
