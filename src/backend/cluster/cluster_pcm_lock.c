@@ -2103,6 +2103,8 @@ static bool pcm_resource_x_holder_send_pair_valid(
 static bool pcm_resource_x_read_source_ack_send_valid(struct GrdEntry *entry,
 	const ClusterPcmResourceXMasterState *state, const ResourceXIntentSlot *slot, const uint8 *payload);
 static bool pcm_resource_x_s_source_empty(const ClusterPcmResourceXMasterState *state);
+static bool pcm_resource_x_acquire_settled_history_locked(struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state);
 static bool pcm_resource_x_pi_prior_settlement_locked(struct GrdEntry *entry,
 	const ClusterPcmResourceXMasterState *state, const ResourceXDecodedFrame *next,
 	ResourceXDecodedFrame *prior);
@@ -4506,6 +4508,7 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 	uint64 digest;
 	bool drained = false;
 	bool drained_pair_history = false;
+	bool settled_acquire_history;
 	int32 settled_terminal_node = -1;
 	int node;
 
@@ -4519,13 +4522,19 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 	empty_round.highest_attempt_floor = entry->resource_x_bootstrap_round.highest_attempt_floor;
 	empty_round.failed_attempt_floor = entry->resource_x_bootstrap_round.failed_attempt_floor;
 	empty_round.cancelled_attempt_floor = entry->resource_x_bootstrap_round.cancelled_attempt_floor;
+	settled_acquire_history = allow_stable_residency
+		&& pcm_resource_x_acquire_settled_history_locked(entry, state);
 	if (entry->resource_x_bootstrap_round.phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY) {
 		if (empty_round.highest_attempt_floor == UINT64_MAX
 			|| empty_round.failed_attempt_floor > empty_round.highest_attempt_floor
 			|| empty_round.cancelled_attempt_floor > empty_round.highest_attempt_floor
 			|| memcmp(&entry->resource_x_bootstrap_round, &empty_round, sizeof(empty_round)) != 0)
 			return pcm_protocol_refuse(diagnostic, 201, __LINE__, -1);
-	} else if (allow_stable_residency && entry->resource_x_bootstrap_round.send.pending == 0
+	} else if (settled_acquire_history)
+		;
+	else if (allow_stable_residency
+			   && !pcm_resource_x_acquire_retained(&entry->resource_x_bootstrap_round)
+			   && entry->resource_x_bootstrap_round.send.pending == 0
 			   && entry->resource_x_bootstrap_round.phase
 					  == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
 			   && pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
@@ -4559,7 +4568,8 @@ pcm_resource_x_terminal_state_locked(struct GrdEntry *entry,
 		|| state->deferred_settlement.present != 0
 		|| state->grant_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
-		|| !pcm_resource_x_requester_join_empty_locked(&state->requester_join)
+		|| (!settled_acquire_history
+			&& !pcm_resource_x_requester_join_empty_locked(&state->requester_join))
 		|| !pcm_resource_x_bootstrap_queue_empty(state))
 		return pcm_protocol_refuse(diagnostic, 205, __LINE__, -1);
 	if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, NULL)
@@ -10405,6 +10415,7 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 	ResourceXDecodedFrame join_image;
 	bool active = false;
 	bool drained_pair_history = false;
+	bool settled_acquire_history = false;
 	bool retained = false;
 	bool invalid = false;
 	uint32 lifecycle;
@@ -10436,9 +10447,6 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 	if (round->phase > RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
 		|| !pcm_resource_x_requester_acquire_valid_locked(round))
 		PCM_PROTOCOL_INVALID(104, -1);
-	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
-			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
-		active = true;
 
 	if (entry->registry_slot >= (uint32)pcm_grd_effective || cluster_pcm_resource_x_slots == NULL
 		|| cluster_pcm_resource_x_master_states == NULL
@@ -10454,6 +10462,8 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 	}
 
 	if (state != NULL) {
+		settled_acquire_history = !invalid
+			&& pcm_resource_x_acquire_settled_history_locked(entry, state);
 		if (!pcm_resource_x_pi_carrier_decode_locked(entry, state, NULL))
 			PCM_PROTOCOL_INVALID(146, -1);
 		if (state->pi_carrier.transport_refs || state->pi_carrier.pi_refs)
@@ -10483,7 +10493,8 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 			PCM_PROTOCOL_INVALID(107, -1);
 
 		if (!pcm_resource_x_requester_join_empty_locked(&state->requester_join)) {
-			retained = true;
+			if (!settled_acquire_history)
+				retained = true;
 			if (!pcm_resource_x_requester_join_decode_locked(&state->requester_join, &join_grant,
 															 &join_image))
 				PCM_PROTOCOL_INVALID(108, -1);
@@ -10529,6 +10540,10 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 		/* Once all current debt categories are empty, consume the one
 		 * complete terminal validity table.  This is what distinguishes
 		 * exact stable residency from malformed terminal residue. */
+		if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			&& round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+			&& !settled_acquire_history)
+			active = true;
 		if (!active && !retained && owner->state == RESOURCE_X_LOCAL_OWNER_EMPTY) {
 			uint64 terminal_count = 0;
 			uint64 digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
@@ -32665,6 +32680,100 @@ pcm_resource_x_acquire_resident_s_proof_locked(struct GrdEntry *entry)
 		&round->acquire_intent, &round->acquire_read_receipt, &frame,
 		round->acquire_read_handoff == 1) == RESOURCE_X_APPLY_APPLIED
 		&& pcm_resource_x_acquire_read_notice_retained_locked(entry, &frame);
+}
+
+/* The old X completion remains a distinct receipt after X->S. Its source
+ * service must have consumed the original full master settlement, including
+ * the old X holder's grant lineage, before that history can be quiescent.
+ * No current BufferDesc sample can substitute for this old-owner receipt. */
+static bool
+pcm_resource_x_acquire_x_source_history_locked(struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state)
+{
+	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	const ClusterPcmResourceXSettlementRetry *retry = &state->settlement_retry;
+	const ResourceXDecodedAcquireDecision *a;
+	ResourceXDecodedFrame receipt, grant;
+	ResourceXWireReject reject;
+
+	if (!pcm_resource_x_settlement_retry_decode_locked(entry, state, &receipt))
+		return false;
+	if (retry->generation == 0)
+		return true; /* No subsequent source service; the installed X proof applies. */
+	if (retry->pending || retry->running || !receipt.has_acquire_decision
+		|| (receipt.common.outcome != RESOURCE_X_OUTCOME_OK
+			&& receipt.common.outcome != RESOURCE_X_OUTCOME_QUIET
+			&& receipt.common.outcome != RESOURCE_X_OUTCOME_QUIET_NO_IMAGE)
+		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+			state->requester_join.grant_payload, state->requester_join.grant_payload_bytes,
+			&grant, &reject))
+		return false;
+	a = &receipt.body.acquire_completion.decision;
+	if (a->master_node != round->current_master_node
+		|| receipt.common.resource_formation != round->resource_formation
+		|| receipt.common.master_session_incarnation != round->master_session_incarnation
+		|| a->resource_binding != grant.body.acquire_decision.resource_binding
+		|| a->holders[cluster_node_id].boot_incarnation != cluster_qvotec_get_self_incarnation()
+		|| retry->retired_authority != receipt.common.authority_generation
+		|| retry->retired_resource_binding != a->resource_binding
+		|| retry->retired_formation != receipt.common.resource_formation
+		|| retry->retired_master_session != receipt.common.master_session_incarnation
+		|| retry->retired_master != a->master_node)
+		return false;
+	/* Source history survives a later local N->X episode. Compare only in
+	 * the same exact master authority domain; it is not that X's downgrade. */
+	if (receipt.common.authority_generation < round->terminal_authority_generation)
+		return a->holders[cluster_node_id].grant_generation < round->terminal_authority_generation;
+	return receipt.common.authority_generation > round->terminal_authority_generation
+		&& receipt.common.target_mode == PCM_STATE_S && a->directory_mode == PCM_STATE_X
+		&& a->source_node == cluster_node_id
+		&& a->holders[cluster_node_id].grant_generation == round->terminal_authority_generation;
+}
+
+/* A retained E/A/I is history only after the native handoff, the master's
+ * exact consumption, and the physical REQUEST/notice callbacks completed.
+ * This observes the original witnesses; it never clears a join or retires
+ * live source, PI, owner or transport responsibility. */
+static bool
+pcm_resource_x_acquire_settled_history_locked(struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterState *state)
+{
+	const ClusterPcmResourceXBootstrapRound *round = &entry->resource_x_bootstrap_round;
+	static const ResourceXIntentSlot empty_slot;
+	ResourceXSourceDrainWork empty_work = {0};
+	static const uint8 empty_reserved[6];
+	int node;
+
+	/* The original terminators retain only ABA floors, never a physical
+	 * owner. Compare against that complete typed EMPTY, without clearing or
+	 * borrowing any of its old authority/native fields. */
+	empty_work.attempt_generation = entry->resource_x_source_drain.attempt_generation;
+	if (state == NULL || cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| round->delivery_executor_purpose != RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED
+		|| round->acquire_read_handoff != 1 || round->send.pending != 0
+		|| round->send.sent != 1 || memcmp(round->send.reserved, empty_reserved, sizeof(empty_reserved)) != 0
+		|| round->send.authority_generation != round->request.base_authority_generation
+		|| memcmp(&state->requester_settlement_intent.slot, &empty_slot, sizeof(empty_slot)) != 0
+		|| memcmp(&state->grant_intent.slot, &empty_slot, sizeof(empty_slot)) != 0
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_status_intent.slot)
+		|| !pcm_resource_x_s_source_intent_empty(&state->holder_image_intent)
+		|| memcmp(&state->source_settlement.intent.slot, &empty_slot, sizeof(empty_slot)) != 0
+		|| empty_work.attempt_generation == UINT64_MAX
+		|| memcmp(&entry->resource_x_source_drain, &empty_work, sizeof(empty_work)) != 0
+		|| entry->resource_x_source_drain_release_generation != 0
+		|| !pcm_resource_x_acquire_resident_s_proof_locked(entry))
+		return false;
+	for (node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+		if (memcmp(&state->block_intents[node].slot, &empty_slot, sizeof(empty_slot)) != 0)
+			return false;
+	if (round->request.target_mode == PCM_STATE_S)
+		return round->resident_s_authorized == 1 && round->has_acquire_intent == 0
+			&& round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED;
+	return round->request.target_mode == PCM_STATE_X && round->resident_s_authorized == 0
+		&& pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(entry, round,
+			&round->terminal_ref, round->master_session_incarnation,
+			round->r4_record_generation, round->cached_ownership_generation)
+		&& pcm_resource_x_acquire_x_source_history_locked(entry, state);
 }
 
 /* The caller has proved exact installed E/A/I and whole-empty physical

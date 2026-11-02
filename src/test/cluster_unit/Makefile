@@ -12118,8 +12118,8 @@ clean-native-hot-cycle:
 
 
 # Read-only normal-stop cuts in original remote-cycle and cancellation bodies.
-TESTS += test_cluster_native_stop_cycle test_cluster_native_stop_cancel
-all: test_cluster_native_stop_cycle test_cluster_native_stop_cancel
+TESTS += test_cluster_native_stop_cycle test_cluster_native_stop_cancel test_cluster_native_stop_source_cancel
+all: test_cluster_native_stop_cycle test_cluster_native_stop_cancel test_cluster_native_stop_source_cancel
 test_cluster_native_stop_observer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_stop_held_lock\(/ { print "static void"; emit=1; held++ } \
 	     /^cluster_bufmgr_stop_poll\(/ { print "static ClusterNormalStopPollResult"; emit=1; scan++ } \
@@ -12183,9 +12183,25 @@ test_cluster_native_stop_cancel: test_cluster_native_stop_cancel.c test_cluster_
         test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
         $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
         $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_stop_source_cancel: test_cluster_native_stop_source_cancel.c \
+        test_cluster_native_stop_source_cancel.inc test_cluster_native_stop_census.h \
+        test_cluster_native_stop_observer.inc test_cluster_native_remote_read_cancel
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+        $(CLUSTER_SCN_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_stop_source_cancel.inc: test_cluster_native_remote_cancel.c Makefile
+	awk '/^UT_TEST\(/ { found++; exit } { print } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 clean distclean maintainer-clean: clean-native-stop-census
 .PHONY: clean-native-stop-census
 clean-native-stop-census:
-	rm -f test_cluster_native_stop_cycle test_cluster_native_stop_cancel \
+	rm -f test_cluster_native_stop_cycle test_cluster_native_stop_cancel test_cluster_native_stop_source_cancel \
+	    test_cluster_native_stop_source_cancel.inc test_cluster_native_stop_source_cancel.inc.tmp \
         $(addprefix test_cluster_native_stop_, observer.inc observer.inc.tmp roles.inc roles.inc.tmp \
         remote.inc remote.inc.tmp successor.inc successor.inc.tmp cycle.inc cycle.inc.tmp cancel.inc cancel.inc.tmp)
