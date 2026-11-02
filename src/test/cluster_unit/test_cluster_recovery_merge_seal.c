@@ -623,11 +623,22 @@ UT_TEST(test_commit_refusal_retains_exact_field_and_first_result)
 }
 
 #include "test_cluster_recovery_merge_deadline.h"
+#include "test_cluster_recovery_merge_suspend.h"
 
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(33);
+	UT_RUN(test_suspend_barrier_reads_original_root_token_native_cut_and_deadline);
+	UT_RUN(test_suspend_current_inside_cf_barrier_has_no_ir_and_resume_requires_cf_release);
+	UT_RUN(test_resume_late_grant_keeps_ir_debt_but_cannot_deliver_authority);
+	UT_RUN(test_suspend_zero_budget_is_same_episode_with_no_deadline_renewal);
+	UT_RUN(test_suspend_actor_loss_or_late_metadata_read_revokes_original_episode);
+	UT_RUN(test_suspend_keeps_original_pin_and_proofs_until_resume);
+	UT_RUN(test_suspend_source_drift_is_sticky_and_never_rebaselines);
+	UT_RUN(test_suspend_expiry_cannot_be_renewed_by_reload_or_resume);
+	UT_RUN(test_suspend_requires_exact_ir_release_and_keeps_cleanup_debt);
+	UT_RUN(test_suspend_rejects_foreign_episode_and_preserves_old_release);
 	UT_RUN(test_commit_refusal_retains_exact_field_and_first_result);
 	UT_RUN(test_commit_trace_identifies_original_snapshot_refusal_without_committing);
 	UT_RUN(test_pre2_need_set_refusal_reports_original_provider_predicate);

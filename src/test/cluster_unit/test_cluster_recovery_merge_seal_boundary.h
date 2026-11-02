@@ -65,6 +65,8 @@ uint32 *my_wait_event_info = &wait_event_sink;
 /* These metadata-only fixtures do not acquire a disk merge claim. */
 ResourceOwner CurrentResourceOwner;
 static uint64 fence_owner_boot;
+static bool suspended_cf_exclusive;
+static unsigned suspended_locked_reads;
 uint64 cluster_qvotec_get_self_incarnation(void) { return fence_owner_boot; }
 uint64 cluster_cf_owner_cookie(LOCKMODE mode pg_attribute_unused()) { return 0; }
 
@@ -83,20 +85,25 @@ bool
 LWLockHeldByMe(LWLock *lock)
 {
 	(void)lock;
-	abort();
+	return false;
 }
 bool
 cluster_cf_last_attempt_since(uint64 before, ClusterCfAttemptObservation *out)
 {
 	(void)before;
 	(void)out;
-	abort();
+	return false;
+}
+bool
+cluster_cf_acquire_pending(LOCKMODE mode pg_attribute_unused())
+{
+	return false;
 }
 bool
 cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *attempt)
 {
-	(void)attempt;
-	abort();
+	UT_ASSERT_EQ(attempt->sequence, 0);
+	return false;
 }
 bool
 cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller, ClusterCfRetirementSnapshot *out)
@@ -126,7 +133,7 @@ cluster_lock_owners_service_poll(void)
 bool
 cluster_recovery_transport_components_current(void)
 {
-	abort();
+	return true;
 }
 
 /* ---- fixture state ---- */
@@ -187,6 +194,8 @@ static bool deadline_serial_leaf;
 static int deadline_formation_budget[NODES + 1];
 static int deadline_admission_budget[NODES + 1];
 static int deadline_ir_budget, deadline_ir_release_budget;
+static void (*suspended_ir_grant_hook)(void);
+static const ClusterRecoverySerialGuardSet *suspended_read_watch;
 
 /* ---- ereport capture ---- */
 static jmp_buf fatal_jump;
@@ -374,9 +383,9 @@ cluster_cf_lock_deadline_v1(LOCKMODE mode, uint64 deadline_ns pg_attribute_unuse
 	return cluster_cf_lock(mode);
 }
 bool cluster_cf_held(LOCKMODE mode)
-{ return mode == ShareLock && cold_cf_held; }
+{ return mode == ExclusiveLock ? suspended_cf_exclusive : mode == ShareLock && cold_cf_held; }
 bool cluster_cf_held_is_clusterwide(LOCKMODE mode)
-{ return mode == ShareLock && cold_cf_held; }
+{ return cluster_cf_held(mode); }
 ClusterCfReleaseResult cluster_cf_unlock_confirmed(LOCKMODE mode)
 {
 	UT_ASSERT_EQ(mode, ShareLock); UT_ASSERT(cold_cf_held);
@@ -487,6 +496,40 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+static ClusterControlRootResult
+suspended_original_canonical_gate(void)
+{
+	bool auxiliary = false;
+
+#include "test_cluster_merge_barrier_cf_gate.inc"
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_read_thread_locked(const ClusterControlRootIdentity *self,
+	ControlRootImage *root, ControlFileData *native, ClusterControlRootFileToken *file)
+{
+	uint16 tid = self->origin_thread_id;
+
+	UT_ASSERT(suspended_cf_exclusive);
+	UT_ASSERT(suspended_read_watch != NULL && suspended_read_watch->count == 0);
+	UT_ASSERT_EQ(memcmp(self, &roots[tid].identity, sizeof(*self)), 0);
+	suspended_locked_reads++;
+	memset(root, 0, sizeof(*root));
+	memset(native, 0, sizeof(*native));
+	memset(file, 0, sizeof(*file));
+	root->records[tid - 1] = roots[tid];
+	root->present[tid - 1] = true;
+	root->record_crc32c[tid - 1] = tokens[tid].record_crc32c;
+	root->header.file_txn_seq = tokens[tid].file_txn_seq;
+	native->checkPointCopy.redo = redo[tid];
+#ifdef TEST_MERGE_DEADLINE
+	if (deadline_source_hook != NULL)
+		deadline_source_hook();
+#endif
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 ClusterControlRootResult
 cluster_control_root_read_canonical(uint16 origin_thread_id,
 									const ClusterControlRootIdentity *expected_identity,
@@ -494,6 +537,8 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 									ClusterControlRootSnapshot *out_snapshot,
 									ClusterControlRootReadToken *out_token)
 {
+	if (suspended_original_canonical_gate() != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	UT_ASSERT(origin_thread_id > 1 && origin_thread_id <= NODES);
 	UT_ASSERT_EQ(mode, CLUSTER_CONTROL_ROOT_READ_STRONG);
 	UT_ASSERT_EQ(
@@ -523,6 +568,8 @@ cluster_control_root_v3_read_canonical_deadline_v1(uint16 thread,
 												   ClusterControlRootReadToken *token,
 												   uint64 deadline_ns pg_attribute_unused())
 {
+	if (suspended_read_watch != NULL)
+		UT_ASSERT_EQ(suspended_read_watch->count, 0);
 	return cluster_control_root_read_canonical(thread, expected, CLUSTER_CONTROL_ROOT_READ_STRONG,
 											   snapshot, token);
 }
@@ -535,6 +582,8 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 {
 	uint16 tid = expected->identity.origin_thread_id;
 
+	if (suspended_original_canonical_gate() != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	UT_ASSERT(tid > 1 && tid <= NODES);
 #ifdef TEST_MERGE_DEADLINE
 	if (deadline_source_hook != NULL)
@@ -841,6 +890,20 @@ cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
 	return CLUSTER_WAL_PIN_OK;
 }
 
+ClusterWalPinResult
+cluster_wal_retention_pin_serial_suspended_current_v1(
+	ClusterWalRetentionPin *pin, const ClusterRecoverySerialGuardSet *set)
+{
+	UT_ASSERT(pin == (void *)&pin_obj);
+	UT_ASSERT_EQ(set->count, 0);
+	for (uint16 i = 0; i < NODES - 1; i++)
+		UT_ASSERT(!set->guards[i].held && !set->guards[i].release_uncertain);
+	for (uint16 tid = 2; tid <= NODES; tid++)
+		if (!fence_current[tid])
+			return CLUSTER_WAL_PIN_STALE;
+	return CLUSTER_WAL_PIN_OK;
+}
+
 /* ---- the completion handoff (cold completion tests) ---- */
 static ClusterThreadRecoveryAuthorityResultV1 authority_result[NODES + 1];
 static bool patch_refused[NODES + 1];
@@ -988,6 +1051,8 @@ cluster_recovery_serial_acquire_set(
 			set->guards[i].held = true;
 		}
 		*failed_index = CLUSTER_RECOVERY_SERIAL_SET_FAILED_NONE;
+		if (suspended_ir_grant_hook != NULL)
+			suspended_ir_grant_hook();
 		return CLUSTER_RECOVERY_SERIAL_GRANTED;
 	}
 	UNREACHED();
