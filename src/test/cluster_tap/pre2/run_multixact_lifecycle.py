@@ -17,7 +17,25 @@ import shutil
 import subprocess
 import sys
 
+MX_CASES = ['t/445_pre2_multixact_maintenance.pl',
+            't/447_pre2_multixact_restart.pl',
+            't/448_pre2_multixact_cleared_votes.pl']
+M1_CASES = ['t/431_pre2_start_stop_restart.pl', *MX_CASES,
+            't/453_pre2_vacuum_snapshot_cancel.pl',
+            't/482_pre2_undo_active_slots.pl']
 
+
+def select_cases(suite, cases):
+    allowed = {'multixact': MX_CASES, 'm1': M1_CASES}[suite]
+    selected = list(allowed if suite == 'm1' else MX_CASES[1:]) if cases is None else list(cases)
+    if (not selected or len(set(selected)) != len(selected)
+            or any(case not in allowed for case in selected)):
+        raise ValueError('only distinct supported native TAP cases are allowed')
+    negative, positive = MX_CASES[2], MX_CASES[1]
+    if negative in selected and (positive not in selected
+            or selected.index(positive) > selected.index(negative)):
+        raise ValueError('TAP448 requires this invocation to complete TAP447 first')
+    return selected
 
 def tap_result(output, rc):
     plans = [int(n) for n in re.findall(r'^1\.\.(\d+)\s*$', output, re.M)]
@@ -63,16 +81,7 @@ def run(args):
     account = pwd.getpwuid(args.uid)
     if account.pw_gid != args.gid:
         raise ValueError('database UID/GID identity differs')
-    allowed = {'t/445_pre2_multixact_maintenance.pl',
-               't/447_pre2_multixact_restart.pl',
-               't/448_pre2_multixact_cleared_votes.pl'}
-    if len(set(args.cases)) != len(args.cases) or any(case not in allowed for case in args.cases):
-        raise ValueError('only distinct native MultiXact TAP cases are supported')
-    negative_case = 't/448_pre2_multixact_cleared_votes.pl'
-    positive_case = 't/447_pre2_multixact_restart.pl'
-    if negative_case in args.cases and (positive_case not in args.cases
-            or args.cases.index(positive_case) > args.cases.index(negative_case)):
-        raise ValueError('TAP448 requires this invocation to complete TAP447 first')
+    args.cases = select_cases(getattr(args, 'suite', 'multixact'), args.cases)
     identity = json.loads(args.identity.read_text()) if args.identity else None
     if args.archive:
         with args.archive.open('rb') as archive:
@@ -245,7 +254,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ('source', 'install', 'output', 'vendor'):
         parser.add_argument('--'+key, type=Path, required=True)
-    parser.add_argument('--cases', nargs='+', default=['t/447_pre2_multixact_restart.pl', 't/448_pre2_multixact_cleared_votes.pl'])
+    parser.add_argument('--suite', choices=['multixact', 'm1'], default='multixact')
+    parser.add_argument('--cases', nargs='+')
     parser.add_argument('--fixture-install', type=Path)
     parser.add_argument('--expected-postgres-sha256')
     parser.add_argument('--uid', type=int, required=True)

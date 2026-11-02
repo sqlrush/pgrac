@@ -43,6 +43,50 @@ gate remain prerequisites for four-node workload runs. These scripts neither
 reserve a lab nor establish that gate. A native fixture smoke test or a mock
 adapter does not qualify a physical multi-node deployment.
 
+### Undo and maintenance regression
+
+Inspect the serial regression commands without creating files or starting a
+database (this also works on macOS):
+
+```sh
+python3 -B src/test/cluster_tap/pre2/m1_regression.py --plan \
+  --source /path/to/source --build /path/to/build \
+  --install /path/to/install --fixture-install /path/to/fixture-install \
+  --vendor /path/to/quorum-vendor --output /new/path/to/m1-results \
+  --uid 1000 --gid 1000 --expected-postgres-sha256 FULL_POSTGRES_SHA256
+```
+
+After the components and runtime prerequisites are qualified and a run is
+authorized, omit `--plan` in an isolated Linux root environment. The database
+UID/GID must name an existing nonroot account. `--build` supplies the matching
+`src/test/regress/pg_regress`; the install also needs its original pg_regress,
+and fixture-install supplies the candidate headers and formatter link inputs.
+An output directory must be new. External adapter/entry overrides and optimized
+Python are refused. All original DATA, votes, logs and failed assertions remain.
+
+The entry runs these original controllers in order and stops after a failed
+phase; it does not retry or change SQL, assertions or deadlines:
+
+| Controller | Exact TAP selection |
+| --- | --- |
+| Legacy `run_legacy.py --suite m1` | 222 undo cleaner, 270 undo record-segment reclaim, 402 stall retry |
+| Four-member `run_multixact_lifecycle.py --suite m1` | 431, 445, 447, 448, 453, 482 |
+| One-member `run_single_shared_vacuum.py` | 461 |
+
+The unrelated writeback TAP with prefix 270 is not selected. The four-member
+controller retains fresh per-case native fixtures and the 447-before-448 cold
+copy dependency. Its default MultiXact selection remains 447/448; the legacy
+controller's default clean-leave selection is unchanged.
+
+`result.json` reports only this selected regression. A phase requires successful
+original TAP, no skip/TODO, complete expected cases, the expected installed
+postgres bytes and no controller cleanup error. Source-file hashes and the
+binary hash are independent observations; `build_binding` stays `UNKNOWN`.
+`stage_acceptance` stays `NOT_READY`: this entry does not cover complete shared
+positive physical reclamation, the retention/recovery matrix, the 16/48/64
+one-hour soak or the full build/stage acceptance matrix. Controller selftests
+(`test_m1_regression.py`) start no database and provide no native runtime credit.
+
 ### Retained workload manifest intake
 
 Verify a retained four-node capture without contacting a server:
