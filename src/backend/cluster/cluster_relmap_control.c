@@ -1175,6 +1175,12 @@ relmap_create_apply(ClusterColdTypedV1 *typed,
 			cold_plan_release(plan, receipt_budget - saved);
 			entry->receipt_bytes = saved;
 			if (memcmp(&receipt->observation.creation.record, &original.creation, sizeof(original.creation))
+				/* Own confirmation changes the original control/table baseline.
+				 * Retain its receipt before the fallible typed-owner acceptance,
+				 * then recheck the original sources with that exact accepted link. */
+				|| (episode_id != 0 && !cluster_cold_typed_relmap_create_accept_confirmation_v2(
+					typed, fence, episode_id, &original.creation.identity,
+					original.creation.batch_uuid, receipt->recovery))
 				|| !relmap_create_sources_current(typed, fence, episode_id)
 				|| !relmap_create_batch_current(typed, entry, reader)
 				|| memcmp(&entry->input, &original, sizeof(original)) || plan->relmap_failed) break;

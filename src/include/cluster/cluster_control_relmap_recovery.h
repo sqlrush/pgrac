@@ -38,6 +38,13 @@ extern bool cluster_cold_typed_relmap_create_barrier_record_current_v2(
 extern bool cluster_cold_typed_relmap_create_barrier_record_held_v2(
 	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint64 episode_id,
 	uint32 participant, const ClusterWalSourceRef *, XLogRecPtr, XLogRecPtr);
+/* Original typed owner uniquely matches its prepare declaration by complete
+ * identity and batch, then accepts only its own completed confirmation delta.
+ * No caller-supplied token, declaration index or ROOT publication. */
+extern bool cluster_cold_typed_relmap_create_accept_confirmation_v2(
+	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint64 episode_id,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch_uuid[16],
+	const ClusterControlRelmapRecoveryCreateV2 *);
 /* Storage-only predicate for outputs borrowed beside the original carrier. */
 extern bool cluster_control_relmap_recovery_create_output_distinct_v2(
 	const ClusterControlRelmapRecoveryCreateV2 *, const void *, Size);

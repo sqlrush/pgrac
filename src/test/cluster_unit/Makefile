@@ -16516,4 +16516,5 @@ test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: \
 		test_cluster_relmap_terminal_batch_wal.inc test_cluster_cold_relmap_terminal_many.inc
 
 # Complete original creation barrier consumer and saved confirmation export.
-test_cluster_relmap_create_copy: test_cluster_relmap_create_barrier.inc test_cluster_relmap_create_barrier_boundary.h
+test_cluster_relmap_create_copy: test_cluster_relmap_create_barrier.inc test_cluster_relmap_create_barrier_boundary.h \
+	test_cluster_relmap_create_delta.inc

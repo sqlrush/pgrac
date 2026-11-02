@@ -568,10 +568,19 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 #include "test_cluster_relmap_create_conjunct.inc"
 #include "test_cluster_relmap_create_scan.inc"
 #include "test_cluster_relmap_create_barrier.inc"
+#include "test_cluster_relmap_create_delta.inc"
 
 int main(int argc,char **argv)
 {
 	(void)argc; (void)argv;
+ if(getenv("PGRAC_TEST_CREATE_DELTA")) {
+  UT_PLAN(4);
+  UT_RUN(creation_delta_accepts_before_first_postconfirm_source_check);
+  UT_RUN(creation_delta_refusal_and_error_retain_attached_receipt);
+  UT_RUN(creation_delta_repeat_and_ready_do_not_accept_again);
+  UT_RUN(creation_delta_does_not_hide_postaccept_source_change);
+  UT_DONE(); return ut_failed_count!=0;
+ }
  if(getenv("PGRAC_TEST_CREATE_SCAN")) {
   UT_PLAN(4);
   UT_RUN(creation_scan_real_decoder_and_side_execute_once_then_read_only);
@@ -591,7 +600,7 @@ int main(int argc,char **argv)
   UT_RUN(creation_barrier_owner_error_is_sticky_and_never_retries);
   UT_DONE(); return ut_failed_count!=0;
  }
- UT_PLAN(74);
+ UT_PLAN(78);
 	UT_RUN(copy_source_committed_map_into_independent_registered_pair);
 	UT_RUN(existing_target_never_overwritten_and_attempt_never_retried);
 	UT_RUN(guards_and_copied_carrier_precede_native_effects);
@@ -666,5 +675,9 @@ int main(int argc,char **argv)
  UT_RUN(creation_barrier_changed_pair_rejects_repeat_and_final_gate);
  UT_RUN(creation_barrier_receipt_outputs_reject_all_aliases_before_write);
  UT_RUN(creation_barrier_owner_error_is_sticky_and_never_retries);
+ UT_RUN(creation_delta_accepts_before_first_postconfirm_source_check);
+ UT_RUN(creation_delta_refusal_and_error_retain_attached_receipt);
+ UT_RUN(creation_delta_repeat_and_ready_do_not_accept_again);
+ UT_RUN(creation_delta_does_not_hide_postaccept_source_change);
 	UT_DONE(); return ut_failed_count!=0;
 }

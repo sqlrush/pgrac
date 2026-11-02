@@ -14,6 +14,8 @@ static bool barrier_enabled, barrier_error;
 static unsigned barrier_calls, barrier_fail_call, barrier_repeats;
 static ClusterControlRelmapRecoveryCreateV2 *barrier_confirmation;
 static bool barrier_output_ok=true;
+static bool barrier_delta_required, barrier_delta_accepted;
+static unsigned barrier_delta_calls, barrier_delta_fault;
 
 bool cluster_control_relmap_recovery_create_output_distinct_v2(
 	const ClusterControlRelmapRecoveryCreateV2 *c, const void *out, Size bytes)
@@ -31,7 +33,8 @@ bool cluster_cold_typed_relmap_create_barrier_current_v2(ClusterColdTypedV1 *typ
 	++barrier_calls;
 	if (barrier_error) { InterruptHoldoffCount=0; pg_re_throw(); }
 	return barrier_enabled && id==barrier_id && typed==&redo_typed && fence==redo_fence
-		&& owner_source_ok && !redo_failed && barrier_calls!=barrier_fail_call;
+		&& owner_source_ok && !redo_failed && barrier_calls!=barrier_fail_call
+		&& (!barrier_delta_required || !target_available() || barrier_delta_accepted);
 }
 ClusterControlNativeResultV2 cluster_control_relmap_recovery_create_begin_barrier_locked_v2(
 	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint64 id,
@@ -71,6 +74,8 @@ static bool barrier_setup(ClusterControlNativeRelmapCreateV2 **creator,
 	redo_typed.tx_fence=NULL; /* H has not handed over the serial fence. */
 	barrier_enabled=true; barrier_error=false; barrier_calls=barrier_fail_call=barrier_repeats=0;
 	barrier_confirmation=NULL; barrier_output_ok=true;
+	barrier_delta_required=barrier_delta_accepted=false;
+	barrier_delta_calls=barrier_delta_fault=0;
 	return true;
 }
 static bool barrier_apply(XLogReaderState *reader, uint64 id)
