@@ -565,6 +565,7 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 #include "test_cluster_relmap_create_owner.inc"
 #include "test_cluster_relmap_create_physical.inc"
 #include "test_cluster_relmap_create_actual_side.inc"
+#include "test_cluster_relmap_create_conjunct.inc"
 
 int main(int argc,char **argv)
 {
@@ -628,5 +629,9 @@ int main(int argc,char **argv)
 	UT_RUN(creation_actual_side_unsealed_or_other_declaration_refuses_before_write);
 	UT_RUN(creation_actual_side_native_byte_drift_preserves_attempt_and_debt);
 	UT_RUN(creation_actual_side_ready_refuses_valid_but_changed_files);
+	UT_RUN(creation_pending_empty_cannot_replace_confirmation_or_old_completion);
+	UT_RUN(creation_confirmed_receipt_cannot_complete_unconsumed_pending);
+	UT_RUN(creation_late_file_refusal_closes_pending_component_without_retry);
+	UT_RUN(creation_final_owner_error_keeps_both_components_closed);
 	UT_DONE(); return ut_failed_count!=0;
 }

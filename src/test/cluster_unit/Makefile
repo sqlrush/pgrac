@@ -16289,7 +16289,10 @@ clean-control-relmap-creation:
 # Original reserved target and actual managed source-to-pair creation.
 TESTS += test_cluster_relmap_create_copy
 all: test_cluster_relmap_create_copy
-test_cluster_relmap_create_copy: test_cluster_relmap_create_physical.inc test_cluster_relmap_create_owner.inc $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) $(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_relmap_create_side_original.o test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
+test_cluster_relmap_create_copy: test_cluster_relmap_create_conjunct.inc test_cluster_cold_relmap_executor.o \
+		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		test_cluster_relmap_create_physical.inc test_cluster_relmap_create_owner.inc $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) $(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_relmap_create_side_original.o test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c $(top_srcdir)/src/common/cluster_relmap_file_io.c $(top_srcdir)/src/include/cluster/cluster_relmap_control.h $(top_srcdir)/src/include/cluster/cluster_relmap_authority.h test_cluster_relmap_create_copy.c test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
 		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
@@ -16311,6 +16314,7 @@ test_cluster_relmap_create_copy: test_cluster_relmap_create_physical.inc test_cl
 		$(top_srcdir)/src/common/cluster_recovery_registry.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_relmap_create_copy.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		test_cluster_cold_relmap_executor.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) $(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_relmap_create_side_original.o test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
 		cluster_registry_common_test.o \
