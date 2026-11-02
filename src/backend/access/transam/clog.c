@@ -176,10 +176,71 @@ CLOGNativeIORequired(void)
 }
 
 static bool
+CLOGNativeCreationFile(int pageno, ClusterControlNativeTableInfoV2 *selected)
+{
+	const PgracInitdbRecoveryContext *creator;
+	const ClusterRecoveryFileIdentityV2 *expected;
+	uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+	/* The existing getter has authenticated the original closed creator pipe,
+	 * configuration and directories. A table row or processing mode alone is
+	 * insufficient, and the child remains outside online membership. Its
+	 * authenticated configuration may already set cluster.enabled. */
+	if (pageno < 0 || pageno >= 131072 || cluster_node_id != -1
+		|| MyBackendType != B_STANDALONE_BACKEND || IsUnderPostmaster
+		|| IsPostmasterEnvironment
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_CREATION_V2
+		|| (creator = cluster_wal_thread_initdb_recovery_context()) == NULL
+		|| creator->creator_pid == 0
+		|| !cluster_control_native_files_info_v2(selected)
+		|| selected->mode != CLUSTER_NATIVE_FILES_CREATION_V2
+		|| selected->table_generation == 0
+		|| selected->startup_generation != creator->creator_pid
+		|| memcmp(&selected->creation, creator, sizeof(*creator)) != 0
+		|| selected->creation.boot_file_count == 0
+		|| selected->creation.boot_file_count > PGRAC_INITDB_BOOT_FILES_V2)
+		return false;
+	expected = &selected->creation.boot_files[0];
+	return expected->kind == CLUSTER_RECOVERY_FILE_CLOG_V2
+		&& expected->origin < 128 && expected->database_oid == 0
+		&& expected->tablespace_oid == 0
+		&& expected->object_id == (uint64) pageno / SLRU_PAGES_PER_SEGMENT
+		&& cluster_recovery_file_identity_encode_v2(expected, reference, sizeof(reference));
+}
+
+static bool
 CLOGNativeFileAcquire(int pageno, ClusterControlNativeFileBorrowV2 *borrow)
 {
 	ClusterControlFileKeyV2 key = {0};
 
+	if (cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2)
+	{
+		ClusterControlNativeTableInfoV2 selected, current;
+		uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+		if (!CLOGNativeCreationFile(pageno, &selected))
+			return false;
+		key.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+		key.origin = selected.creation.boot_files[0].origin;
+		key.object_id = selected.creation.boot_files[0].object_id;
+		if (!cluster_control_native_file_acquire_v2(&key, borrow))
+			return false;
+		if (borrow->table_generation == selected.table_generation
+			&& borrow->startup_generation == selected.startup_generation
+			&& cluster_recovery_file_identity_encode_v2(&selected.creation.boot_files[0],
+				reference, sizeof(reference))
+			&& cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &borrow->expected)
+			&& cluster_control_native_file_current_v2(borrow)
+			&& CLOGNativeCreationFile(pageno, &current)
+			&& current.table_generation == selected.table_generation
+			&& current.startup_generation == selected.startup_generation
+			&& memcmp(&current.creation, &selected.creation, sizeof(current.creation)) == 0)
+			return true;
+		if (!cluster_control_native_file_release_v2(borrow))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not return CLOG creation file identity")));
+		return false;
+	}
 	if (pageno < 0 || pageno >= 131072 || cluster_node_id < 0 ||
 		cluster_node_id > PG_UINT16_MAX ||
 		cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_UNKNOWN_V2)
@@ -278,8 +339,40 @@ CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last,
 	ClusterClogAllocationV2 *value;
 
 	if (!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE)
-		|| !CLOGAllocationSegments(first, last, &begin, &gap, &total)
-		|| !CLOGAllocationPresence(begin, total))
+		|| !CLOGAllocationSegments(first, last, &begin, &gap, &total))
+		return false;
+	if (cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2)
+	{
+		ClusterControlNativeTableInfoV2 selected;
+		uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+		/* The original exclusive creation batch has already born page zero.
+		 * Its ordinary SQL child may consume that page, not register an online
+		 * gap/successor range or extend the unpublished file's birth authority.
+		 * The original ExtendCLOGFull still verifies the actual page birth. */
+		if (U64FromFullTransactionId(last) >= CLOG_XACTS_PER_PAGE
+			|| !CLOGNativeCreationFile(0, &selected))
+			return false;
+		value = *state;
+		if (!value) {
+			value = palloc0(offsetof(ClusterClogAllocationV2, files) + sizeof(value->files[0]));
+			value->first = 0;
+			value->count = 1;
+			*state = value;
+			if (!CLOGNativeFileAcquire(0, &value->files[0])) {
+				CLOGFinishAllocation(state);
+				return false;
+			}
+		}
+		return value->first == 0 && value->count == 1
+			&& value->files[0].table_generation == selected.table_generation
+			&& value->files[0].startup_generation == selected.startup_generation
+			&& cluster_recovery_file_identity_encode_v2(&selected.creation.boot_files[0],
+				reference, sizeof(reference))
+			&& cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &value->files[0].expected)
+			&& cluster_control_native_file_current_v2(&value->files[0]);
+	}
+	if (!CLOGAllocationPresence(begin, total))
 		return false;
 	value = *state;
 	if (!value) {
@@ -3567,6 +3660,54 @@ TrimCLOG(void)
 /*
  * Perform a checkpoint --- either during shutdown, or on-the-fly
  */
+#ifdef USE_PGRAC_CLUSTER
+static void
+CLOGCheckpointNative(void)
+{
+	ClusterControlNativeInventoryV2 *volatile inventory = NULL;
+	uint64 completed = 0;
+
+	PG_TRY();
+	{
+		if (cluster_node_id < 0 || cluster_node_id > PG_UINT16_MAX ||
+			cluster_control_native_files_inventory_v2(CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2,
+				(ClusterControlNativeInventoryV2 **) &inventory) != CLUSTER_NATIVE_FILES_OK_V2 ||
+			!cluster_control_native_files_inventory_current_v2(inventory))
+			ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CLOG checkpoint requires its complete selected native inventory")));
+		/* Preserve the original dirty-slot/WAL/re-dirty write protocol. */
+		SimpleLruWriteAll(XactCtl, true);
+		for (uint64 i = 0; i < inventory->info.count; i++)
+		{
+			const ClusterRecoveryFileIdentityV2 *expected = &inventory->files[i];
+			ClusterClogFileSyncV2 observed;
+
+			if (expected->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 ||
+				expected->origin != (uint16) cluster_node_id) continue;
+			if (!cluster_control_native_files_inventory_current_v2(inventory) ||
+				!SimpleLruNativeClogSyncFileV2(XactCtl, expected, &observed) ||
+				!cluster_control_native_files_inventory_current_v2(inventory))
+				ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("CLOG checkpoint file synchronization is unproven")));
+			completed++;
+		}
+		if (!completed || !cluster_control_native_files_inventory_current_v2(inventory))
+			ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CLOG checkpoint native inventory changed or has no local files")));
+		/* The original checkpoint owner must still conjoin full source/cut
+		 * and every file family before publishing control coverage. */
+	}
+	PG_FINALLY();
+	{
+		cluster_control_native_inventory_destroy_v2((ClusterControlNativeInventoryV2 **) &inventory);
+	}
+	PG_END_TRY();
+}
+#endif
+
 void
 CheckPointCLOG(void)
 {
@@ -3576,6 +3717,12 @@ CheckPointCLOG(void)
 	 * checkpoint.
 	 */
 	TRACE_POSTGRESQL_CLOG_CHECKPOINT_START(true);
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeIORequired() &&
+		cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_CREATION_V2)
+		CLOGCheckpointNative();
+	else
+#endif
 	SimpleLruWriteAll(XactCtl, true);
 	TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE(true);
 }

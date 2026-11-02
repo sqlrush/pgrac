@@ -403,6 +403,153 @@ SlruNativeClogAcquire(SlruCtl ctl, int pageno,
 		SlruNativeClogRefuse();
 }
 
+/* Same original namespace, with no file creation or CF lookup. */
+static int
+SlruNativeClogOpenDirectory(SlruCtl ctl)
+{
+	volatile int fd = -1;
+
+	LWLockRelease(ctl->shared->ControlLock);
+	PG_TRY();
+	{
+		fd = OpenTransientFile(ctl->Dir, O_RDONLY | PG_BINARY | O_DIRECTORY | O_NOFOLLOW);
+	}
+	PG_CATCH();
+	{
+		LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+	return fd;
+}
+
+bool
+SimpleLruNativeClogSyncFileV2(SlruCtl ctl,
+	const ClusterRecoveryFileIdentityV2 *expected, ClusterClogFileSyncV2 *out)
+{
+	typedef struct SlruClogSyncWork
+	{
+		ClusterControlNativeFileBorrowV2 borrow;
+		int fd, directory_fd;
+		bool control, borrowed;
+		bool io_locked[FLEXIBLE_ARRAY_MEMBER];
+	} SlruClogSyncWork;
+	SlruClogSyncWork *work;
+	SlruShared shared;
+	ClusterClogFileBindingV2 binding;
+	ClusterClogFileSyncV2 observed;
+	volatile bool ok = false, body_complete = false;
+	uintptr_t a = (uintptr_t) expected, b = (uintptr_t) out;
+
+	if (ctl == NULL || expected == NULL || out == NULL ||
+		(shared = ctl->shared) == NULL || shared->ControlLock == NULL ||
+		shared->num_slots <= 0 || shared->buffer_locks == NULL ||
+		!SlruNativeClogRequired(ctl) ||
+		LWLockHeldByMe(shared->ControlLock) ||
+		expected->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 || expected->object_id >= 4096 ||
+		(a <= b ? b - a < sizeof(*expected) : a - b < sizeof(*out)))
+		return false;
+	binding.identity = *expected;
+	binding.segment = (uint32) expected->object_id;
+	/* Allocate before acquiring any native lock. Cleanup state must survive
+	 * ERROR's longjmp and real zeroed interrupt holdoff count. */
+	work = palloc0(sizeof(*work) + (Size) shared->num_slots);
+	work->fd = work->directory_fd = -1;
+	PG_TRY();
+	{
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+		work->control = true;
+		SlruNativeClogAcquire(ctl, binding.segment * SLRU_PAGES_PER_SEGMENT, &work->borrow);
+		work->borrowed = true;
+		do {
+			ClusterClogFileBindingV2 selected;
+
+			selected.identity = work->borrow.expected;
+			selected.segment = binding.segment;
+			if (!SlruClogBindingMatches(&selected, &binding) ||
+				!ctl->clog_native_current(&work->borrow)) break;
+			work->fd = SlruNativeClogOpen(ctl, binding.segment * SLRU_PAGES_PER_SEGMENT, O_RDONLY);
+			if (work->fd < 0 || !ctl->clog_native_current(&work->borrow)) break;
+			work->directory_fd = SlruNativeClogOpenDirectory(ctl);
+			if (work->directory_fd < 0 || !ctl->clog_native_current(&work->borrow)) break;
+restart_sync:
+			/* Wait can replace any slot while dropping ControlLock. Restart
+			 * the complete file scan; never retain an old slot association. */
+			for (int i = 0; i < shared->num_slots; i++)
+			{
+				if (shared->page_status[i] != SLRU_PAGE_EMPTY &&
+					shared->page_number[i] / SLRU_PAGES_PER_SEGMENT == (int) binding.segment &&
+					(shared->page_status[i] == SLRU_PAGE_READ_IN_PROGRESS ||
+					 shared->page_status[i] == SLRU_PAGE_WRITE_IN_PROGRESS))
+				{
+					SimpleLruWaitIO(ctl, i);
+					goto restart_sync;
+				}
+			}
+			if (!ctl->clog_native_current(&work->borrow)) break;
+			for (int i = 0; i < shared->num_slots; i++)
+			{
+				if (shared->page_status[i] != SLRU_PAGE_EMPTY &&
+					shared->page_number[i] / SLRU_PAGES_PER_SEGMENT == (int) binding.segment)
+				{
+					if (!SlruClogBindingMatches(&shared->clog_file_binding[i], &binding))
+						goto sync_done;
+					LWLockAcquire(&shared->buffer_locks[i].lock, LW_EXCLUSIVE);
+					work->io_locked[i] = true;
+				}
+			}
+			/* Keeping ControlLock excludes every new same-file SLRU I/O,
+			 * including files with no resident slot. No WAL flush is needed. */
+			ok = cluster_clog_storage_sync_file_v2(work->fd, work->directory_fd, &binding, &observed)
+				&& ctl->clog_native_current(&work->borrow);
+		} while (0);
+sync_done:
+		body_complete = true;
+	}
+	PG_FINALLY();
+	{
+		if (!body_complete) InterruptHoldoffCount = 0;
+		PG_TRY(finish_sync);
+		{
+			bool finished = true;
+
+			for (int i = shared->num_slots - 1; i >= 0; i--)
+			{
+				if (work->io_locked[i])
+				{
+					if (!body_complete) HOLD_INTERRUPTS();
+					LWLockRelease(&shared->buffer_locks[i].lock);
+				}
+			}
+			if (work->fd >= 0 && CloseTransientFile(work->fd) != 0) finished = false;
+			if (work->directory_fd >= 0 && CloseTransientFile(work->directory_fd) != 0) finished = false;
+			if (work->borrowed && !ctl->clog_native_release(&work->borrow)) finished = false;
+			/* A refused cleanup cannot discard its address-bound borrow or
+			 * FD duty and return to a running checkpoint process. */
+			if (!finished)
+				ereport(PANIC, (errcode(ERRCODE_IO_ERROR),
+								errmsg("could not finish native CLOG checkpoint cleanup")));
+			if (work->control)
+			{
+				if (!body_complete) HOLD_INTERRUPTS();
+				LWLockRelease(shared->ControlLock);
+			}
+			if (!body_complete) InterruptHoldoffCount = 0;
+			pfree(work);
+		}
+		PG_CATCH(finish_sync);
+		{
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("error during native CLOG checkpoint cleanup")));
+		}
+		PG_END_TRY(finish_sync);
+	}
+	PG_END_TRY();
+	if (ok) *out = observed;
+	return ok;
+}
+
 /* Cleanup does not forget a refused release. A retains that original borrow
  * duty; no success is returned and no alternate table row is acquired. */
 static bool

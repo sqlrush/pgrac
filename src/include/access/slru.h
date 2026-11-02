@@ -14,7 +14,7 @@
 #define SLRU_H
 
 #include "access/xlogdefs.h"
-#include "access/clog_file.h"
+#include "access/clog_storage.h"
 #include "access/slrudefs.h"
 #include "storage/lwlock.h"
 #include "storage/sync.h"
@@ -173,6 +173,13 @@ typedef SlruCtlData *SlruCtl;
 extern int SimpleLruNativeClogZeroV2(SlruCtl ctl, FullTransactionId birth);
 extern int SimpleLruNativeClogReadV2(SlruCtl ctl, int pageno, bool write_ok);
 extern void SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint);
+/* Original local checkpoint owner only. No preowned ControlLock. Retains an
+ * exact AVAILABLE borrow across FD opens, waits original in-flight I/O, then
+ * holds ControlLock and matching resident I/O locks across full-file sync.
+ * Refusal/ERROR preserves caller state/output and retires only owned resources.
+ * The returned bytes are not source-cut coverage or a drain certificate. */
+extern bool SimpleLruNativeClogSyncFileV2(SlruCtl ctl,
+	const ClusterRecoveryFileIdentityV2 *expected, ClusterClogFileSyncV2 *out);
 /* Original Startup selected local PAGE_IMAGE replay; owns/retires its family
  * and IO locks, borrows existing AVAILABLE file, no segment creation or WAL. */
 extern void SimpleLruNativeClogReplayV2(SlruCtl ctl, const void *record, Size length,

@@ -9,6 +9,7 @@
 #include "cluster/cluster_recovery_format.h"
 #include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_wal_thread.h"
 #include "common/pgrac_initdb_recovery.h"
 
@@ -280,6 +281,34 @@ void
 cluster_control_native_files_shmem_register(void)
 {
 	cluster_shmem_register_region(&native_region);
+}
+
+/* The original initdb child skips the online cluster registry. Its closed
+ * creator request is already authenticated before PG sizes shared memory.
+ * Reserve/init only this existing table; never enable an online node here. */
+static bool
+native_creation_child(void)
+{
+	if (cluster_wal_thread_initdb_recovery_context() == NULL)
+		return false;
+	if (IsUnderPostmaster || IsPostmasterEnvironment
+		|| MyBackendType != B_STANDALONE_BACKEND || cluster_node_id != -1
+		|| !(IsBootstrapProcessingMode() || IsInitProcessingMode()))
+		ereport(FATAL, (errmsg("native creation table requires the original standalone child")));
+	return true;
+}
+
+Size
+cluster_control_native_files_creation_shmem_size_v2(void)
+{
+	return native_creation_child() ? native_size() : 0;
+}
+
+void
+cluster_control_native_files_creation_shmem_init_v2(void)
+{
+	if (native_creation_child())
+		native_init();
 }
 
 ClusterControlNativeModeV2

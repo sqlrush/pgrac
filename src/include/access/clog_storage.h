@@ -26,6 +26,38 @@ extern bool cluster_clog_storage_page_unwritten_v2(int fd,
 									 const ClusterClogFileBindingV2 *expected,
 									 uint64 logical_page);
 
+/* Complete byte observation for the original checkpoint/file owner. Extent
+ * slots include zero sparse frames; only materialized_pages identifies born
+ * pages. LSN maxima belong solely to this file's original source, and are not
+ * a source interval, checkpoint coverage or a transaction bound. */
+typedef struct ClusterClogFileSyncV2
+{
+	ClusterClogFileBindingV2 binding;
+	uint64 synced_bytes;
+	uint32 extent_pages;
+	uint32 materialized_pages;
+	XLogRecPtr max_page_lsn;
+	XLogRecPtr max_image_lsn;
+	uint8 image_digest[CLUSTER_RECOVERY_V2_DIGEST_BYTES];
+} ClusterClogFileSyncV2;
+
+/* Borrow both original FDs and independently selected expected identity.
+ * The caller continuously serializes ALL I/O/extension to this file, retains
+ * its original table/file/source/cut custody, and binds directory_fd to the
+ * selected namespace. After return it must recheck that same custody before
+ * publishing a receipt. This helper does not establish any of those rights.
+ *
+ * Validate/hash the entire complete framed extent, fsync file then directory,
+ * and read/validate/hash every byte again. Both observations and held inode/
+ * extent/header must agree. Fully zero sparse slots supply no page birth;
+ * partial/unknown/corrupt frames, an empty segment, disabled fsync and changes
+ * refuse. No open/close/write/repair/WAL/truncate or coverage publication.
+ * Refusal/ERROR retains outputs, both FDs and all original owner obligations.
+ * Input/output ranges must be distinct. */
+extern bool cluster_clog_storage_sync_file_v2(int fd, int directory_fd,
+									const ClusterClogFileBindingV2 *expected,
+									ClusterClogFileSyncV2 *out);
+
 /* Write a local frame. The original owner
  * holds file lifetime and page I/O serialization throughout, and supplies one
  * private control-lock snapshot of page identity, bytes and group-LSN maximum

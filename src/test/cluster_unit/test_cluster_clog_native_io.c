@@ -16,7 +16,12 @@ int managed_io_open(const char *path, int flags);
 /* The original CLOG lock is the same finite lock exercised by the real SLRU. */
 #undef XactSLRULock
 #define XactSLRULock (&control)
+#ifdef CLOG_NATIVE_IO_PRODUCT
+#include CLOG_NATIVE_IO_PRODUCT
+#else
 #include "../../backend/access/transam/clog.c"
+#endif
+#include "test_cluster_clog_creation_support.h"
 
 static unsigned native_borrows, native_acquires, native_releases, native_opens;
 static bool native_open_throw, native_open_drift;
@@ -25,6 +30,7 @@ static unsigned native_waits;
 static bool native_current = true, native_release_ok = true, native_missing;
 static ClusterControlNativeModeV2 native_mode = CLUSTER_NATIVE_FILES_MANAGED_V2;
 static uint64 native_generation = 41;
+static unsigned native_borrow_fault;
 
 ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void)
 { return native_mode; }
@@ -32,7 +38,7 @@ bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 	ClusterControlNativeFileBorrowV2 *out)
 {
 	if (!control_held || io_held || key->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 ||
-		key->origin != 0 || key->database_oid != 0 || key->tablespace_oid != 0 ||
+		key->origin != binding.identity.origin || key->database_oid != 0 || key->tablespace_oid != 0 ||
 		key->object_id != 0 || out->private_self != 0) abort();
 	if (native_missing) return false;
 	out->expected = binding.identity;
@@ -40,6 +46,9 @@ bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 	out->startup_generation = 1;
 	out->private_self = (uintptr_t) out;
 	out->private_pid = 1;
+	if (native_borrow_fault == 1) out->expected.creation_generation++;
+	if (native_borrow_fault == 2) out->table_generation++;
+	if (native_borrow_fault == 3) out->startup_generation++;
 	native_borrows++; native_acquires++;
 	return true;
 }
@@ -76,6 +85,7 @@ int OpenTransientFile(const char *path, int flags)
 static void native_reset(void)
 {
 	managed_reset();
+	creation_support_reset(); native_borrow_fault = 0;
 	CLOGConfigureManagedIO(&ctl);
 	*XactCtl = ctl;
 	native_borrows = native_acquires = native_releases = 0;
@@ -256,11 +266,116 @@ UT_TEST(native_redirty_stays_dirty_after_fullimage_wal)
 UT_TEST(native_creation_uses_selected_files_with_cluster_not_serving)
 {
 	native_reset(); dirty[0] = false;
-	cluster_enabled = false; native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
+	creation_support_select(&binding.identity, native_generation, 1);
+	native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
 	UT_ASSERT(!native_status_raises(true));
 	UT_ASSERT_EQ(native_acquires, 1);
 	UT_ASSERT_EQ(native_releases, 1);
 	UT_ASSERT_EQ(native_borrows, 0);
+	close(borrowed);
+}
+
+UT_TEST(native_creation_key_uses_batch_origin_not_online_node)
+{
+	for (unsigned origin = 0; origin < 128; origin += 127) {
+		ClusterControlNativeFileBorrowV2 value = {0};
+		native_reset(); binding.identity.origin = origin;
+		creation_support_select(&binding.identity, native_generation, 1);
+		native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
+		UT_ASSERT(CLOGNativeFileAcquire(3, &value));
+		UT_ASSERT_EQ(value.expected.origin, origin);
+		UT_ASSERT_EQ(cluster_node_id, -1);
+		UT_ASSERT(!cluster_enabled);
+		if (value.private_self)
+			UT_ASSERT(cluster_control_native_file_release_v2(&value));
+		UT_ASSERT_EQ(native_opens + inserts + writes, 0);
+		close(borrowed);
+	}
+}
+
+UT_TEST(native_creation_refuses_unrelated_context_before_borrow)
+{
+	for (unsigned fault = 0; fault < 14; fault++) {
+		ClusterControlNativeFileBorrowV2 value = {0};
+		native_reset();
+		creation_support_select(&binding.identity, native_generation, 1);
+		native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
+		switch (fault) {
+			case 0: creation_has_request = false; break;
+			case 1: creation_has_table = false; break;
+			case 2: MyBackendType = B_BACKEND; break;
+			case 3: IsUnderPostmaster = true; break;
+			case 4: IsPostmasterEnvironment = true; break;
+			case 5: cluster_node_id = 0; break;
+			case 6: creation_info.creation.creator_pid++; break;
+			case 7: creation_info.startup_generation++; break;
+			case 8: creation_info.table_generation = 0; break;
+			case 9: creation_context.boot_file_count = 0;
+				creation_info.creation = creation_context; break;
+			case 10: creation_info.mode = CLUSTER_NATIVE_FILES_MANAGED_V2; break;
+			case 11: native_mode = CLUSTER_NATIVE_FILES_UNKNOWN_V2; break;
+			case 12: native_mode = CLUSTER_NATIVE_FILES_MANAGED_V2; break;
+			case 13: creation_context.creator_pid = 0;
+				creation_info.startup_generation = 0;
+				creation_info.creation = creation_context; break;
+		}
+		UT_ASSERT(!CLOGNativeFileAcquire(3, &value));
+		UT_ASSERT_EQ(native_acquires + native_opens + inserts + writes, 0);
+		UT_ASSERT_EQ(value.private_self, 0);
+		if (value.private_self) (void) cluster_control_native_file_release_v2(&value);
+		close(borrowed);
+	}
+}
+
+UT_TEST(native_creation_borrow_rechecks_full_expected_and_table)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterControlNativeFileBorrowV2 value = {0};
+		native_reset();
+		creation_support_select(&binding.identity, native_generation, 1);
+		native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
+		if (fault < 3) native_borrow_fault = fault + 1;
+		if (fault == 3) creation_drift_at = 2;
+		if (fault == 4) native_current = false;
+		if (fault == 5) {
+			creation_context.boot_files[0].registration_generation++;
+			creation_info.creation = creation_context;
+		}
+		UT_ASSERT(!CLOGNativeFileAcquire(3, &value));
+		UT_ASSERT_EQ(native_acquires, 1);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		UT_ASSERT_EQ(native_borrows + native_opens + inserts + writes, 0);
+		UT_ASSERT_EQ(value.private_self, 0);
+		close(borrowed);
+	}
+}
+
+UT_TEST(native_creation_unregistered_segment_never_reaches_io)
+{
+	ClusterControlNativeFileBorrowV2 value = {0};
+	native_reset();
+	creation_support_select(&binding.identity, native_generation, 1);
+	native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
+	UT_ASSERT(!CLOGNativeFileAcquire(32, &value));
+	UT_ASSERT(!CLOGNativeFileAcquire(-1, &value));
+	UT_ASSERT(!CLOGNativeFileAcquire(131072, &value));
+	UT_ASSERT_EQ(native_acquires + native_opens + inserts + writes, 0);
+	close(borrowed);
+}
+
+UT_TEST(native_creation_status_write_keeps_original_fullimage_wal)
+{
+	native_reset(); dirty[0] = false;
+	creation_support_select(&binding.identity, native_generation, 1);
+	native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
+	UT_ASSERT(managed_read());
+	page.data[0] &= ~3;
+	UT_ASSERT(!native_status_raises(false));
+	UT_ASSERT(!write_raises(NULL));
+	UT_ASSERT(!dirty[0] && control_held && !io_held);
+	UT_ASSERT_EQ(inserts, 1);
+	UT_ASSERT_EQ(native_borrows, 0);
+	UT_ASSERT_EQ(native_acquires, native_releases);
 	close(borrowed);
 }
 
@@ -370,7 +485,7 @@ int NATIVE_CLOG_IO_MAIN(void)
 	strlcpy(directory, "/tmp/pgrac-clog-native-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(14);
+	UT_PLAN(19);
 	UT_RUN(native_status_reads_selected_managed_cache);
 	UT_RUN(native_status_update_keeps_managed_birth_and_wal_writer);
 	UT_RUN(native_status_miss_loads_complete_frame_not_file_header);
@@ -380,6 +495,11 @@ int NATIVE_CLOG_IO_MAIN(void)
 	UT_RUN(native_write_failures_keep_original_dirty_and_source);
 	UT_RUN(native_redirty_stays_dirty_after_fullimage_wal);
 	UT_RUN(native_creation_uses_selected_files_with_cluster_not_serving);
+	UT_RUN(native_creation_key_uses_batch_origin_not_online_node);
+	UT_RUN(native_creation_refuses_unrelated_context_before_borrow);
+	UT_RUN(native_creation_borrow_rechecks_full_expected_and_table);
+	UT_RUN(native_creation_unregistered_segment_never_reaches_io);
+	UT_RUN(native_creation_status_write_keeps_original_fullimage_wal);
 	UT_RUN(native_refused_release_does_not_report_success_or_clear_duty);
 	UT_RUN(native_raw_birth_refuses_before_slot_mutation);
 	UT_RUN(native_dirty_victim_writes_selected_frame_before_reuse);

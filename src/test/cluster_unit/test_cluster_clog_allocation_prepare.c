@@ -13,6 +13,10 @@ int clog_allocator_original_main(void);
 #include "access/clog_file.h"
 #include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_wal_thread.h"
+#define CLOG_CREATION_HAVE_POSTMASTER_ENV
+#include "test_cluster_clog_creation_support.h"
+#undef CLOG_CREATION_HAVE_POSTMASTER_ENV
 
 volatile uint32 CritSectionCount;
 static bool cf, cf_available, cf_release_ok, release_ok, post_error, bad_identity, change_on_wait;
@@ -35,7 +39,9 @@ file_identity(uint64 segment)
 	value.system_identifier = 77; value.database_incarnation = 1;
 	value.storage_uuid[0] = 1; value.redo_branch_uuid[0] = 2;
 	value.redo_branch_generation = 3; value.redo_timeline = 4;
-	value.origin = cluster_node_id; value.object_id = segment;
+	value.origin = mode == CLUSTER_NATIVE_FILES_CREATION_V2
+		? creation_context.boot_files[0].origin : cluster_node_id;
+	value.object_id = segment;
 	value.creation_generation = 7; value.registration_generation = 9;
 	return value;
 }
@@ -105,7 +111,9 @@ bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 	ClusterControlNativeFileBorrowV2 *out)
 {
 	UT_ASSERT(held || cf); UT_ASSERT_EQ(key->kind, CLUSTER_RECOVERY_FILE_CLOG_V2);
-	UT_ASSERT_EQ(key->origin, cluster_node_id); UT_ASSERT(key->object_id < 4096);
+	UT_ASSERT_EQ(key->origin, mode == CLUSTER_NATIVE_FILES_CREATION_V2
+		? creation_context.boot_files[0].origin : cluster_node_id);
+	UT_ASSERT(key->object_id < 4096);
 	if (!known[key->object_id] || !available[key->object_id]) return false;
 	return borrow_file(key->object_id, out);
 }
@@ -147,6 +155,7 @@ static void observe_wait(void)
 static void reset_native(void)
 {
 	reset_allocator(); reservation = true; limit_full = 8196;
+	creation_support_reset();
 	memset(known, 0, sizeof(known)); memset(available, 0, sizeof(available));
 	memset(asked_first, 0, sizeof(asked_first)); memset(asked_last, 0, sizeof(asked_last));
 	cf = post_error = bad_identity = change_on_wait = false;
@@ -269,9 +278,55 @@ UT_TEST(actual_managed_guc_off_still_prepares_and_legacy_stays_raw)
 	UT_ASSERT_EQ(U64FromFullTransactionId(GetNewTransactionId(false)), 2052);
 	UT_ASSERT_EQ(control_calls + acquired_files + cf_locks, 0);
 }
+
+static void
+select_creation(void)
+{
+	ClusterRecoveryFileIdentityV2 file = file_identity(0);
+	creation_support_select(&file, table_generation, startup_generation);
+	mode = CLUSTER_NATIVE_FILES_CREATION_V2;
+	known[0] = available[0] = true;
+}
+
+UT_TEST(actual_creation_original_allocator_borrows_registered_boot_page)
+{
+	ClusterControlNativeFileBorrowV2 sample = {0};
+	int caught;
+	reset_native(); select_creation();
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	UT_ASSERT(CLOGNativeFileAcquire(0, &sample));
+	if (sample.private_self) UT_ASSERT(cluster_control_native_file_release_v2(&sample));
+	LWLockRelease(XidGenLock);
+	allocation_error_expected = true;
+	caught = sigsetjmp(allocation_error_env, 1);
+	if (!caught) UT_ASSERT_EQ(U64FromFullTransactionId(GetNewTransactionId(false)), 2052);
+	allocation_error_expected = false;
+	UT_ASSERT_EQ(caught, 0);
+	UT_ASSERT_EQ(control_calls + cf_locks + reserved_files, 0);
+	UT_ASSERT_EQ(acquired_files, 2); UT_ASSERT_EQ(returned_files, 2);
+	UT_ASSERT_EQ(borrowed, 0); UT_ASSERT_EQ(cluster_node_id, -1);
+}
+
+UT_TEST(actual_creation_allocator_refuses_outside_born_page_before_effects)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		reset_native(); select_creation();
+		if (fault == 0) variables.nextXid = FullTransactionIdFromU64(32768);
+		if (fault == 1) variables.nextXid = FullTransactionIdFromU64(UINT64CONST(4294969348));
+		if (fault == 2) creation_has_request = false;
+		if (fault == 3) creation_info.table_generation++;
+		if (fault == 4) creation_info.creation.creator_pid++;
+		if (fault == 5) available[0] = false;
+		expect_native_error();
+		UT_ASSERT_EQ(control_calls + cf_locks + reserved_files, 0);
+		UT_ASSERT_EQ(borrowed, 0);
+		UT_ASSERT_EQ(U64FromFullTransactionId(variables.nextXid),
+			fault == 0 ? 32768 : fault == 1 ? UINT64CONST(4294969348) : 2052);
+	}
+}
 int main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(actual_cold_preparation_retains_gap_borrow_through_issue);
 	UT_RUN(actual_warm_available_gap_never_takes_cf);
 	UT_RUN(actual_full_gap_is_not_a_64_file_prefix);
@@ -283,5 +338,7 @@ int main(void)
 	UT_RUN(actual_partial_borrow_error_returns_only_its_prefix);
 	UT_RUN(actual_cleanup_refusal_keeps_unreturned_duty);
 	UT_RUN(actual_managed_guc_off_still_prepares_and_legacy_stays_raw);
+	UT_RUN(actual_creation_original_allocator_borrows_registered_boot_page);
+	UT_RUN(actual_creation_allocator_refuses_outside_born_page_before_effects);
 	UT_DONE(); return ut_failed_count != 0;
 }
