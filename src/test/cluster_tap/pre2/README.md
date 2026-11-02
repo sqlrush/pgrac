@@ -181,6 +181,25 @@ All four members supply initial/final row cuts. It retains the actual command,
 monotonic elapsed time, summary/stderr, unaggregated logs, hash-bound ledger
 manifest/result, original OPEN observations and original normal-stop receipt.
 
+After the original normal stop, `m1_soak_member_logs.py` scans the four closed
+member stderr files in node order. `member-logs.json` records each file's size,
+SHA256 and exact ERROR/FATAL/PANIC header counts. Each severity retains its first
+line number, byte offset, full length/hash and up to 4096 original bytes as hex;
+longer excerpts carry `raw_truncated=true`. The first severity token uses the
+existing standard-stderr grammar, so error words inside LOG/STATEMENT messages
+are not new headers. This does not cover arbitrary log formats or attest origin
+identity. Missing, aliased, nonregular, symlinked, changed, non-UTF8 or unterminated
+inputs fail the check. A member error or scan failure makes the final
+`execution.json` result fail while preserving business and cleanup errors. The
+original corruption/PANIC checks still run. No resource SQL is added.
+
+For an offline check, pass exactly four retained closed logs to
+`python3 -B m1_soak_member_logs.py NODE0.log NODE1.log NODE2.log NODE3.log`.
+Exit 0 means only that this file scan found no matching error headers; identity
+remains `DECLARED_ONLY`, and P07/stage acceptance remain `NOT_READY`. The extended
+regression captures the reader and its severity-grammar dependency in the same
+source hash checks as its other captured inputs.
+
 After component readiness, binary/source binding, applicable microbenchmark
 gates and runtime authorization, use the original Linux/root controller:
 

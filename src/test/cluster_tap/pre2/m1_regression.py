@@ -162,6 +162,8 @@ def preflight(args, selection):
     files = [tap/case for phase in selection['phases'] for case in phase['cases']]
     files += [tap/'pre2'/name for name in ('m1_regression.py', 'run_legacy.py',
               'run_multixact_lifecycle.py', 'run_single_shared_vacuum.py')]
+    if any(phase['name'] == 'soak' for phase in selection['phases']):
+        files += [tap/'pre2'/name for name in ('m1_soak_member_logs.py', 'workload_log.py')]
     return {str(path.relative_to(args.source)): sha(path) for path in files}
 
 

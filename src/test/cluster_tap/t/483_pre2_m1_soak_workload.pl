@@ -142,15 +142,39 @@ if (defined($cluster) && $cluster->{running} && !$stop_attempted)
 		1;
 	} or $cleanup_error .= $@;
 }
+my $member_logs_passed = 0;
+my $member_logs_error = '';
+if ($normal_stop)
+{
+	eval {
+		my @logs = map { $_->logfile } @nodes;
+		die 'four closed native member logs missing' unless @logs == 4;
+		my $checked = run([$python, "$helper/m1_soak_member_logs.py", @logs],
+			'>', "$evidence/member-logs.json", '2>', "$evidence/member-logs-stderr.txt", timeout(60));
+		my $result = decode_json(slurp_file("$evidence/member-logs.json"));
+		die 'closed native member error check rejected the logs; see member-logs.json'
+		  unless $checked && $result->{member_logs_clean}
+		  && $result->{p07} eq 'NOT_READY' && $result->{stage_acceptance} eq 'NOT_READY';
+		$member_logs_passed = 1;
+		pass('four closed native member logs contain no ERROR, FATAL or PANIC headers');
+		1;
+	} or $member_logs_error = $@;
+}
+else
+{
+	$member_logs_error = 'original normal stop did not close all four member logs';
+}
 save_json('execution.json', {workload_and_stop_passed =>
-	($execution && $normal_stop && $cleanup_error eq '') ? JSON::PP::true : JSON::PP::false,
+	($execution && $normal_stop && $cleanup_error eq '' && $member_logs_passed) ? JSON::PP::true : JSON::PP::false,
 	error => $first_error, cleanup_error => $cleanup_error,
+	member_logs_passed => $member_logs_passed ? JSON::PP::true : JSON::PP::false,
+	member_logs_error => $member_logs_error,
 	p07 => 'NOT_READY', stage_acceptance => 'NOT_READY',
 	missing_gates => ['real recycle generation progress', 'complete four-resource census']});
-if (!$execution || !$normal_stop || $cleanup_error ne '')
+if (!$execution || !$normal_stop || $cleanup_error ne '' || !$member_logs_passed)
 {
 	fail('native workload execution and original cleanup complete');
-	diag($first_error . $cleanup_error);
+	diag($first_error . $cleanup_error . $member_logs_error);
 }
 for my $node (@nodes)
 {
