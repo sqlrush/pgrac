@@ -17911,6 +17911,12 @@ typedef struct ClusterCurrentMxChainState
 	bool edge_consumed;
 	bool next_ready;
 	ClusterHeapSuccessorProof next;
+	/* One hop continues its original consume across preparatory unlocks.
+	 * Copy only the already-sealed image, never a post-write recapture. */
+	bool successor_continuation;
+	ClusterHeapSuccessorProof consumed_successor;
+	ClusterHeapSuccessorHistory consumed_image;
+	PGAlignedBlock consumed_page;
 	uint8 header[SizeofHeapTupleHeader] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 } ClusterCurrentMxChainState;
 
@@ -18253,6 +18259,36 @@ cluster_current_mx_transition_consume(Buffer buffer, HeapTuple tuple,
 		return 0;
 	t->state = 3;
 	return 1;
+}
+
+/* The native caller may unlock for undo reservation/PREPARE after consuming
+ * B. Recheck the exact original image and fresh authority within that hop;
+ * do not consume B again or make its one-use transition replayable. */
+static bool
+cluster_current_mx_chain_successor_recheck(Buffer buffer, HeapTuple tuple,
+	const ClusterHeapSuccessorProof *proof, ClusterCurrentMxLockScope *scope,
+	ClusterCurrentMxChainState *state)
+{
+	ClusterCurrentMxTransition *transition;
+
+	if (state == NULL || !state->successor_continuation) {
+		if (!cluster_current_mx_successor_matches(buffer, tuple, proof, scope))
+			return false;
+		transition = scope == NULL ? NULL : scope->transition;
+		if (state != NULL && proof->writer_valid && transition != NULL
+			&& transition->state == 3
+			&& memcmp(proof, &transition->successor, sizeof(*proof)) == 0) {
+			state->consumed_successor = *proof;
+			state->consumed_image = transition->image;
+			memcpy(state->consumed_page.data, transition->expected.data, BLCKSZ);
+			state->successor_continuation = true;
+		}
+		return true;
+	}
+	return memcmp(proof, &state->consumed_successor, sizeof(*proof)) == 0
+		&& cluster_current_mx_writer_successor_matches_image(buffer, tuple,
+			proof, scope, &state->consumed_image)
+		&& memcmp(state->consumed_page.data, BufferGetPage(buffer), BLCKSZ) == 0;
 }
 
 /* An edge consumes the complete already-validated B once. */
@@ -20736,6 +20772,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 			cluster_current_mx_operation_finish(&history_state->operation);
 			cluster_current_mx_stamp_cancel(&history_state->plan);
 			memset(&history_state->plan, 0, sizeof(history_state->plan));
+			history_state->successor_continuation = false;
 			cluster_current_mx_lock_scope_require(history_scope);
 		}
 #endif
@@ -20837,8 +20874,8 @@ l4:
 
 #ifdef USE_PGRAC_CLUSTER
 		if (expected_successor.valid
-			&& !cluster_current_mx_successor_matches(
-				buf, &mytup, &expected_successor, history_scope))
+			&& !cluster_current_mx_chain_successor_recheck(
+				buf, &mytup, &expected_successor, history_scope, history_state))
 			cluster_current_mx_failclosed(
 				NULL,
 				CCMH_FAIL_ABA_FENCE,

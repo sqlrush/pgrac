@@ -462,6 +462,13 @@ mx_history_recursive_open(Snapshot actual)
 	memset(&recursive_operation, 0, sizeof(recursive_operation));
 	recursive_scope = cluster_heap_lock_history_scope_begin(actual);
 }
+TM_Result
+mx_history_native_recursive(Relation rel, const ItemPointerData *tid,
+	const ClusterHeapSuccessorProof *expected)
+{
+	return heap_lock_updated_tuple_rec_scoped(rel, 96, tid, 145,
+		LockTupleKeyShare, 129, expected, recursive_scope);
+}
 int
 mx_history_recursive_authorize(Relation rel, Buffer buffer, HeapTuple tuple,
 	bool history, TransactionId requester, LockTupleMode mode, MxHeapReadout *out)

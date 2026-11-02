@@ -327,6 +327,10 @@ UT_TEST(second_hop_edge_remains_consume_once)
 	UT_ASSERT_EQ(publication_prepares, 2); UT_ASSERT_EQ(publication_applies, 2);
 	tuple = first; writer_clean(s, true);
 }
+#ifdef HISTORY_NATIVE_RECURSION_FIXTURE
+#define main history_two_hop_fixture_main
+int history_two_hop_fixture_main(void);
+#endif
 int main(void)
 {
 	history_fixture_init(); UT_PLAN(4);
