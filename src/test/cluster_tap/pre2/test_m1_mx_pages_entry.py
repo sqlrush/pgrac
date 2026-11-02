@@ -4,6 +4,7 @@ Author: SqlRush <sqlrush@gmail.com>
 Copyright (c) 2026, pgrac contributors
 """
 import argparse
+import json
 import re
 from pathlib import Path
 import subprocess
@@ -16,6 +17,45 @@ import run_multixact_lifecycle as native
 
 
 class MultiXactPagesEntryTests(unittest.TestCase):
+    def lock_plan(self, rows):
+        # Run the actual pure fixture planner, without SQL/client substitutes.
+        tap = Path(__file__).resolve().parent.parent/'t/487_pre2_multixact_offset_pages.pl'
+        match = re.search(r'(?ms)^sub page_lock_plan\n\{.*?^\}', tap.read_text())
+        self.assertIsNotNone(match, 'native lock schedule must retain both endpoint partners')
+        program = ('use strict; use warnings; use JSON::PP; '+match.group(0)
+                   +'; print JSON::PP->new->encode(page_lock_plan(decode_json($ARGV[0])));')
+        return subprocess.run(['perl', '-e', program, '--', json.dumps(rows)],
+                              text=True, capture_output=True)
+
+    def test_lock_schedule_keeps_two_live_endpoints_across_the_crossing(self):
+        for rows in (2, 3, 129, 513):
+            with self.subTest(rows=rows):
+                reply = self.lock_plan(rows)
+                self.assertEqual(reply.returncode, 0, reply.stderr)
+                steps = json.loads(reply.stdout)
+                self.assertEqual([step['row'] for step in steps], list(range(rows)))
+                active = set()
+                checked = []
+                for step in steps:
+                    partner = step['partner']
+                    self.assertNotIn(partner, active, 'BEGIN cannot replace a live endpoint transaction')
+                    active.add(partner)
+                    if step['check_members']:
+                        checked.append((step['row'], partner))
+                        self.assertFalse(step['commit'], 'an endpoint must still have two active members')
+                    if step['commit']:
+                        active.remove(partner)
+                self.assertEqual(checked, [(0, 'anchor'), (rows-1, 'rolling')])
+                self.assertEqual(active, {'anchor', 'rolling'})
+
+    def test_lock_schedule_rejects_missing_or_impossible_crossing_lengths(self):
+        for rows in (None, 0, 1, -1, 2.5, 'bad', 514):
+            with self.subTest(rows=rows):
+                reply = self.lock_plan(rows)
+                self.assertNotEqual(reply.returncode, 0)
+                self.assertIn('invalid native page-lock row count', reply.stderr)
+                self.assertEqual(reply.stdout, '')
+
     def test_member_expectations_sort_raw_xids_before_appending_the_mode(self):
         # Execute each actual TAP expression; no database/holder is simulated.
         tap = Path(__file__).resolve().parent.parent/'t'

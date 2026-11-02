@@ -94,24 +94,53 @@ sub begin_holder
 	return $full;
 }
 
+sub page_lock_plan
+{
+	my ($rows) = @_;
+	die 'invalid native page-lock row count' unless defined($rows)
+	  && $rows =~ /\A[0-9]+\z/ && $rows >= 2 && $rows <= 513;
+	return [map { {row => $_, partner => $_ == 0 ? 'anchor' : 'rolling',
+		commit => ($_ > 0 && $_ < $rows - 1) ? 1 : 0,
+		check_members => ($_ == 0 || $_ == $rows - 1) ? 1 : 0} } 0 .. $rows - 1];
+}
+
+sub check_live_holders
+{
+	my ($phase, @live) = @_;
+	for my $holder (@live)
+	{
+		die 'native endpoint holder already ended' if $holder->{closed} || !$holder->{transaction};
+		is(query_holder($holder, $identity_sql), $holder->{identity},
+			"$phase: $holder->{name} keeps its backend identity") or die 'native holder identity changed';
+		is(query_holder($holder, 'SELECT pg_current_xact_id_if_assigned()::text'), $holder->{full_xid},
+			"$phase: $holder->{name} keeps its original active transaction") or die 'native holder transaction changed';
+	}
+}
+
 sub page_round
 {
 	my ($node, $per_page) = @_;
 	my $a = make_holder($node, 'retained');
-	my $b = make_holder($node, 'rolling');
+	my $anchor = make_holder($node, 'anchor');
+	my $rolling = make_holder($node, 'rolling');
+	my $plan = page_lock_plan($rows_per_origin);
+	save_json("node$node-lock-plan", $plan);
 	begin_holder($a);
 	my $locked = query_holder($a, "SELECT id FROM g_m1_mx_pages WHERE origin=$node ORDER BY id FOR KEY SHARE");
 	is($locked, join("\n", 0 .. $rows_per_origin - 1), "node$node retains every literal key-share lock")
 	  or die 'retained holder rows differ';
-	my (@multis, %second_xids);
-	for my $row (0 .. $rows_per_origin - 1)
+	my (@multis, @anchors, %second_xids);
+	for my $step (@$plan)
 	{
+		my $row = $step->{row};
+		my $b = $step->{partner} eq 'anchor' ? $anchor : $rolling;
+		die 'native lock plan would replace a live transaction' if $b->{transaction};
 		my $full = begin_holder($b);
 		die 'rolling holder reused an original transaction' if $second_xids{$full}++;
 		die 'native member XIDs duplicated' if $a->{raw_xid} eq $b->{raw_xid};
 		my $value = $node * 100000 + $row;
 		is(query_holder($b, "SELECT v FROM g_m1_mx_pages WHERE origin=$node AND id=$row FOR KEY SHARE"),
-			"$value", "node$node rolling holder locks row$row") or die 'rolling lock failed';
+			"$value", "$b->{name} locks row$row") or die 'partner lock failed';
 		my $mx = sql($node, "SELECT xmax::text FROM g_m1_mx_pages WHERE origin=$node AND id=$row");
 		die 'native local MultiXact missing' unless $mx =~ /\A[1-9][0-9]*\z/
 		  && Math::BigInt->new($mx)->bmod(16)->numify == $node;
@@ -119,16 +148,25 @@ sub page_round
 		my $entry = {node => $node, row => $row, multi => $mx,
 			offset_page => Math::BigInt->new($mx)->bdiv($per_page)->numify,
 			retained_identity => $a->{identity}, retained_full_xid => $a->{full_xid},
-			rolling_identity => $b->{identity}, rolling_full_xid => $full,
+			partner => $step->{partner}, partner_identity => $b->{identity}, partner_full_xid => $full,
+			check_members => $step->{check_members},
 			expected_members => join("\n", map { "$_:keysh" } sort ($a->{raw_xid}, $b->{raw_xid}))};
 		push @multis, $entry;
+		push @anchors, $entry if $step->{check_members};
 		save_json("node$node-row$row-issued", $entry);
-		query_holder($b, 'COMMIT');
-		$b->{transaction} = 0;
+		if ($step->{commit})
+		{
+			query_holder($b, 'COMMIT');
+			$b->{transaction} = 0;
+		}
 	}
 	isnt($multis[0]{offset_page}, $multis[-1]{offset_page},
 		"node$node actually crosses a native offset-page boundary") or die 'offset page not crossed';
-	for my $entry (@multis)
+	is(scalar(@anchors), 2, "node$node checks both live endpoint vectors") or die 'live anchors missing';
+	check_live_holders('before member reads', $a, $anchor, $rolling);
+	# Intermediate partners have committed and may be legitimately removed.
+	# Only the two endpoints retain both original members for these exact reads.
+	for my $entry (@anchors)
 	{
 		my ($row, $mx) = @{$entry}{qw(row multi)};
 		is(sql($node, "SELECT xmax::text FROM g_m1_mx_pages WHERE origin=$node AND id=$row"),
@@ -147,18 +185,14 @@ sub page_round
 		is($members, $entry->{expected_members}, "node$node row$row keeps both exact native members")
 		  or die 'occupied offset-page members differ';
 	}
-	for my $holder ($a, $b)
-	{
-		is(query_holder($holder, $identity_sql), $holder->{identity}, "$holder->{name} keeps its backend identity")
-		  or die 'native holder identity changed';
-	}
-	is(query_holder($a, 'SELECT pg_current_xact_id_if_assigned()::text'), $a->{full_xid},
-		"node$node retains its original active transaction through all reads") or die 'retained transaction changed';
-	close_holder($b, 'COMMIT');
+	check_live_holders('after member reads', $a, $anchor, $rolling);
+	close_holder($rolling, 'COMMIT');
+	close_holder($anchor, 'COMMIT');
 	close_holder($a, 'COMMIT');
 	push @summaries, {node => $node, count => scalar(@multis),
 		first_multi => $multis[0]{multi}, first_page => $multis[0]{offset_page},
-		last_multi => $multis[-1]{multi}, last_page => $multis[-1]{offset_page}};
+		last_multi => $multis[-1]{multi}, last_page => $multis[-1]{offset_page},
+		live_anchor_rows => [map { $_->{row} } @anchors], checked_member_vectors => scalar(@anchors)};
 	save_json('origins', \@summaries);
 }
 

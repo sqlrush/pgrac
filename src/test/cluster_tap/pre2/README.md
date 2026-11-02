@@ -387,15 +387,21 @@ readiness, candidate qualification and runtime authorization. It also runs
 before the continuation subcheck in `--suite extended`; core stays unchanged.
 
 For each origin, one ordinary transaction retains key-share locks on a bounded
-set of independent rows. A second client starts a distinct transaction per row,
-takes a key-share lock and commits. Distinct member XIDs require distinct native
-MultiXacts. The case creates `block_size / 4 / 16 + 1` IDs per origin (129 with
-8KiB blocks), checks actual local MXIDs and requires an observed offset-page
-crossing. With the first holder still in its original transaction, fresh normal
-psql connections reread every original MX and its exact two native members.
-The original transaction and each observer have retained PID/birth evidence.
-Both clients must exit before the four-member row ledger and original full
-normal stop. First errors, cleanup failures and member-log errors fail the case.
+set of independent rows. A second client keeps a live transaction on the first
+row. A third client starts distinct transactions on subsequent rows, commits
+the intermediate ones and keeps its last transaction active. Distinct member
+XIDs require distinct native MultiXacts. The case creates
+`block_size / 4 / 16 + 1` IDs per origin (129 with 8KiB blocks), checks actual
+local MXIDs and requires an observed offset-page crossing.
+
+Fresh normal psql connections reread the first and last rows' original MXIDs
+and exact two native members while both original members of each endpoint
+remain active. Intermediate committed members may be removed or recomposed;
+their recorded MXIDs are issuance facts, with no unchanged-member assertion.
+All three holders' original PID/birth and assigned FullXids are checked before
+and after endpoint reads; each observer also records its PID/birth. All clients
+must exit before the four-member row ledger and original full normal stop.
+First errors, cleanup failures and member-log errors fail the case.
 
 No cursor/floor/SLRU assignment, allocator injection or new product probe is
 used. Native execution is not implied by selection, parser or syntax checks.
