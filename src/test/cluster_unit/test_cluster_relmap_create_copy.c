@@ -562,6 +562,7 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 #include "test_cluster_relmap_create_replay.inc"
 #include "test_cluster_relmap_recovery_create.inc"
 #include "test_cluster_relmap_create_receipt.inc"
+#include "test_cluster_relmap_create_owner.inc"
 
 int main(int argc,char **argv)
 {
@@ -603,5 +604,12 @@ int main(int argc,char **argv)
 	UT_RUN(creation_receipt_getters_reject_aliases_without_changing_saved_inputs);
 	UT_RUN(creation_receipt_false_and_error_never_publish_or_enable_retry);
 	UT_RUN(creation_receipt_saved_observation_does_not_claim_currentness);
+	UT_RUN(creation_owner_first_step_keeps_receipt_until_original_plan_destroy);
+	UT_RUN(creation_owner_duplicate_never_resyncs_or_confirms);
+	UT_RUN(creation_owner_whole_batch_and_original_step_precede_mutation);
+	UT_RUN(creation_owner_false_error_and_provider_reentry_lock_the_attempt);
+	UT_RUN(creation_owner_late_refusal_keeps_the_confirmed_receipt_and_debt);
+	UT_RUN(creation_owner_capacity_refuses_before_authority_or_native_io);
+	UT_RUN(creation_owner_saved_storage_rejects_plan_output_aliases);
 	UT_DONE(); return ut_failed_count!=0;
 }

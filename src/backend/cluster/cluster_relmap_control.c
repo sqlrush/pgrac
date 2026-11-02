@@ -15,6 +15,7 @@
 #include "cluster/cluster_relmap_control.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_relmap_authority.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "access/xlog.h"
@@ -368,12 +369,22 @@ relmap_create_receipt_owned(const ClusterRelmapRecoveryCreateReceiptV2 *r)
 	return r != NULL && r->self == (uintptr_t)r && r->pid == MyProcPid;
 }
 
+/* The original plan calls this storage-only predicate. Do not recurse into
+ * that plan's output predicate while inspecting an attached receipt. */
+static bool
+relmap_create_receipt_storage_distinct(const void *value, const void *out, Size n)
+{
+	const ClusterRelmapRecoveryCreateReceiptV2 *r = value;
+	return relmap_create_receipt_owned(r)
+		&& !relmap_control_overlap(r, sizeof(*r), out, n)
+		&& !relmap_control_overlap(r->cuts, r->observation.source_count * sizeof(*r->cuts), out, n)
+		&& !relmap_control_overlap(r->sources, r->observation.source_count * sizeof(*r->sources), out, n);
+}
+
 static bool
 relmap_create_receipt_alias(const ClusterRelmapRecoveryCreateReceiptV2 *r, const void *out, Size n)
 {
-	return relmap_control_overlap(r, sizeof(*r), out, n)
-		|| relmap_control_overlap(r->cuts, r->observation.source_count * sizeof(*r->cuts), out, n)
-		|| relmap_control_overlap(r->sources, r->observation.source_count * sizeof(*r->sources), out, n)
+	return !relmap_create_receipt_storage_distinct(r, out, n)
 		|| !cold_relmap_output_distinct(r->typed, out, n)
 		|| !cluster_control_native_files_output_distinct_v2(out, n);
 }
@@ -795,5 +806,134 @@ cluster_relmap_control_recovery_create_capture_v2(ClusterColdTypedV1 *typed,
 			 || relmap_control_overlap(XLogRecGetData(reader), XLogRecGetDataLen(reader), out, sizeof(*out))))
 		|| *out != NULL) return false;
 	return relmap_recovery_create(typed, fence, participant, source, reader, expected, batch, receipt_budget, out);
+}
+
+static void
+relmap_create_receipt_release(void *value)
+{
+	ClusterRelmapRecoveryCreateReceiptV2 *r = value;
+	cluster_relmap_recovery_create_destroy_v2(&r);
+}
+
+/* Check every original declaration and every selected SIDE plan, including
+ * sources declaring zero creations. A current record cannot stand in for the
+ * complete selected generation set or an earlier unfinished attempt. */
+static bool
+relmap_create_batch_current(const ClusterColdTypedV1 *typed,
+	const ColdRelmapCreateInput *current, const XLogReaderState *reader)
+{
+	const ClusterColdPlanV1 *plan = typed->plan;
+	if (typed->refusal != CLUSTER_COLD_OK || plan->relmap_failed || plan->phase != COLD_PHASE_SEALED
+		|| typed->participant_count == 0 || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->participant_count != plan->participant_count
+		|| typed->replay_count > typed->participant_count || plan->relmap_create_count == 0)
+		return false;
+	for (uint32 p = 0; p < typed->participant_count; ++p) {
+		uint32 expected = 0;
+		const RfSideOnlinePlanV1 *side = typed->side_plans[p];
+		if (!cold_relmap_cut_equal(&typed->participants[p],
+				&plan->participants[plan->canonical[p]].cut)
+			|| typed->sources[p].claim.identity.system_identifier != typed->system_identifier
+			|| !rf_side_online_plan_recovery_sources_match_v1(side, typed->sources, typed->participant_count))
+			return false;
+		for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+			const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+			const ClusterColdRelmapCreateInputV1 *in;
+			if (entry == NULL || !entry->captured) return false;
+			in = &entry->input;
+			if (in->participant >= typed->replay_count
+				|| (entry != current && entry->attempted && (!entry->applied || entry->receipt == NULL
+					|| entry->receipt_release == NULL || entry->receipt_output_distinct == NULL))) return false;
+			if (in->participant != p) continue;
+			if (!cold_relmap_cut_equal(&in->cut, &typed->participants[p])
+				|| memcmp(&in->source, &typed->sources[p], sizeof(in->source))
+				|| !rf_side_online_plan_relmap_create_input_matches_v1(side, in)) return false;
+			++expected;
+		}
+		if (rf_side_online_plan_relmap_create_count_v1(side, &typed->sources[p]) != expected) return false;
+	}
+	return !plan->relmap_failed && plan->phase == COLD_PHASE_SEALED
+		&& current->input.participant < typed->replay_count
+		&& rf_side_online_plan_relmap_create_matches_v1(typed->side_plans[current->input.participant],
+			&current->input.source, reader) && !plan->relmap_failed;
+}
+
+bool
+cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, const ClusterColdStepV1 *step,
+	XLogReaderState *reader, Size receipt_budget)
+{
+	ClusterColdPlanV1 *plan;
+	const ClusterColdRelmapCreateInputV1 *input;
+	ColdRelmapCreateInput *entry = NULL;
+	ClusterColdRelmapCreateInputV1 original;
+	volatile bool ok = false;
+
+	if (typed == NULL || (plan = typed->plan) == NULL || plan->magic != CLUSTER_COLD_PLAN_MAGIC)
+		return false;
+	input = cluster_cold_plan_relmap_create_step_v1(plan, step);
+	if (input != NULL)
+		for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+			ColdRelmapCreateInput *candidate = cold_relmap_create_at(plan, i);
+			if (candidate != NULL && &candidate->input == input) { entry = candidate; break; }
+		}
+	/* No current/side/allocator callback may precede this one-shot latch.
+	 * Repeats remain closed until the original confirmed read-only recheck
+	 * can replace this refusal; they must never execute create/confirm again. */
+	if (entry == NULL || entry->attempted || entry->receipt != NULL
+		|| plan->relmap_failed || plan->phase != COLD_PHASE_SEALED) goto failed;
+	entry->attempted = true;
+	original = *input;
+	PG_TRY();
+	{
+		do {
+			ClusterRelmapRecoveryCreateReceiptV2 *receipt = NULL;
+			Size saved;
+			if (fence == NULL || typed->tx_fence != fence || reader == NULL
+				|| receipt_budget < sizeof(*receipt) || !cold_plan_reserve(plan, receipt_budget)) break;
+			entry->receipt_bytes = receipt_budget;
+			if (!cluster_cold_typed_sources_current_v1(typed, fence)
+				|| !relmap_create_batch_current(typed, entry, reader)
+				|| memcmp(&entry->input, &original, sizeof(original)) || plan->relmap_failed) break;
+			if (!cluster_relmap_control_recovery_create_capture_v2(typed, fence, original.participant,
+				&original.source, reader, &original.creation.identity, original.creation.batch_uuid,
+				receipt_budget, &receipt)) break;
+			/* Attach BEFORE any fallible postcheck: a confirmed creation and
+			 * its original receipt survive a late refusal or ERROR together. */
+			entry->receipt = receipt;
+			entry->receipt_release = relmap_create_receipt_release;
+			entry->receipt_output_distinct = relmap_create_receipt_storage_distinct;
+			saved = sizeof(*receipt) + receipt->observation.source_count *
+				(sizeof(*receipt->cuts) + sizeof(*receipt->sources));
+			cold_plan_release(plan, receipt_budget - saved);
+			entry->receipt_bytes = saved;
+			if (memcmp(&receipt->observation.creation.record, &original.creation, sizeof(original.creation))
+				|| !cluster_cold_typed_sources_current_v1(typed, fence)
+				|| !relmap_create_batch_current(typed, entry, reader)
+				|| memcmp(&entry->input, &original, sizeof(original)) || plan->relmap_failed) break;
+			entry->applied = true;
+			ok = true;
+		} while (0);
+	}
+	PG_CATCH();
+	{
+		if (entry->receipt == NULL && entry->receipt_bytes != 0) {
+			cold_plan_release(plan, entry->receipt_bytes);
+			entry->receipt_bytes = 0;
+		}
+		cluster_cold_plan_relmap_invalidate_v1(plan);
+		cluster_cold_typed_relmap_create_failed_v2(typed);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (ok) return true;
+	if (entry->receipt == NULL && entry->receipt_bytes != 0) {
+		cold_plan_release(plan, entry->receipt_bytes);
+		entry->receipt_bytes = 0;
+	}
+failed:
+	cluster_cold_plan_relmap_invalidate_v1(plan);
+	cluster_cold_typed_relmap_create_failed_v2(typed);
+	return false;
 }
 #endif /* USE_PGRAC_CLUSTER */

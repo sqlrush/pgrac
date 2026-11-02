@@ -21,15 +21,19 @@ static bool redo_owner_error;
 static ClusterColdRecordFrameV1 redo_frame;
 static ClusterColdPlanV1 redo_plan;
 
+bool create_owner_original_frame_count(const ClusterColdPlanV1 *, uint32 *);
+bool create_owner_original_frame_at(const ClusterColdPlanV1 *, uint32, ClusterColdRecordFrameV1 *);
+
 bool cluster_cold_plan_input_frame_count_v1(const ClusterColdPlanV1 *plan, uint32 *count)
 {
-	if (plan!=redo_typed.plan) return false;
+	if (plan!=&redo_plan) return create_owner_original_frame_count(plan,count);
 	*count=1; return true;
 }
 bool cluster_cold_plan_input_frame_v1(const ClusterColdPlanV1 *plan, uint32 index,
 	ClusterColdRecordFrameV1 *out)
 {
-	if (plan!=redo_typed.plan || index) return false;
+	if (plan!=&redo_plan) return create_owner_original_frame_at(plan,index,out);
+	if (index) return false;
 	*out=redo_frame; return true;
 }
 

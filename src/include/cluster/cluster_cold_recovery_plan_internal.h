@@ -121,6 +121,12 @@ typedef struct ColdRelmapInput {
 typedef struct ColdRelmapCreateInput {
 	ClusterColdRelmapCreateInputV1 input;
 	bool captured;
+	bool attempted;
+	bool applied;
+	void *receipt; /* Original executor's local confirmed receipt only. */
+	Size receipt_bytes;
+	void (*receipt_release)(void *);
+	bool (*receipt_output_distinct)(const void *, const void *, Size);
 } ColdRelmapCreateInput;
 typedef struct ColdRelmapCreateChunk {
 	struct ColdRelmapCreateChunk *next;
@@ -365,14 +371,40 @@ cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Si
 		|| (plan->relmap_terminal != NULL && plan->relmap_terminal_bytes == 0))
 		return false;
 	for (const ColdRelmapCreateChunk *chunk = plan->relmap_creates;
-		chunk != NULL; chunk = chunk->next)
+		chunk != NULL; chunk = chunk->next) {
 		if (cold_relmap_storage_overlap(out, bytes, chunk, sizeof(*chunk))) return false;
+		for (uint32 i = 0; i < COLD_RELMAP_CREATE_SEGMENT; ++i) {
+			const ColdRelmapCreateInput *entry = &chunk->entries[i];
+			if (entry->receipt != NULL && (entry->receipt_output_distinct == NULL
+				|| !entry->receipt_output_distinct(entry->receipt, out, bytes))) return false;
+		}
+	}
 	return !cold_relmap_storage_overlap(out, bytes, plan->relmap_inputs,
 			(Size)plan->relmap_count * sizeof(ColdRelmapInput))
 		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_recovery,
 			sizeof(ClusterRelmapRecoveryPins))
 		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_terminal,
 			plan->relmap_terminal_bytes);
+}
+
+/* Only local saved metadata is retired here. Original files, registrations
+ * and recovery protections remain the original owner's responsibility. */
+static inline void
+cold_relmap_create_cleanup(ClusterColdPlanV1 *plan)
+{
+	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+		ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+		if (entry != NULL && entry->receipt != NULL && entry->receipt_release != NULL) {
+			void *receipt = entry->receipt;
+			void (*release)(void *) = entry->receipt_release;
+			entry->receipt = NULL;
+			entry->receipt_release = NULL;
+			entry->receipt_output_distinct = NULL;
+			entry->receipt_bytes = 0;
+			plan->relmap_failed = true;
+			release(receipt);
+		}
+	}
 }
 
 static inline void

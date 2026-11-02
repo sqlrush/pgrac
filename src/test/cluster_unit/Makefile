@@ -16288,7 +16288,8 @@ clean-control-relmap-creation:
 # Original reserved target and actual managed source-to-pair creation.
 TESTS += test_cluster_relmap_create_copy
 all: test_cluster_relmap_create_copy
-test_cluster_relmap_create_copy: $(top_srcdir)/src/backend/cluster/cluster_relmap_control.c $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c $(top_srcdir)/src/common/cluster_relmap_file_io.c $(top_srcdir)/src/include/cluster/cluster_relmap_control.h $(top_srcdir)/src/include/cluster/cluster_relmap_authority.h test_cluster_relmap_create_copy.c test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
+test_cluster_relmap_create_copy: test_cluster_relmap_create_owner.inc test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c $(top_srcdir)/src/common/cluster_relmap_file_io.c $(top_srcdir)/src/include/cluster/cluster_relmap_control.h $(top_srcdir)/src/include/cluster/cluster_relmap_authority.h test_cluster_relmap_create_copy.c test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
 		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
@@ -16309,6 +16310,7 @@ test_cluster_relmap_create_copy: $(top_srcdir)/src/backend/cluster/cluster_relma
 		$(top_srcdir)/src/common/cluster_recovery_registry.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_relmap_create_copy.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
 		cluster_registry_common_test.o \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
@@ -16425,5 +16427,17 @@ $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_relmap_side: \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
 
 # Original execution receipts retain their own complete source vector.
-test_cluster_relmap_create_copy test_cluster_relmap_control: $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
+test_cluster_relmap_create_copy test_cluster_relmap_control: $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
 test_cluster_relmap_create_copy: test_cluster_relmap_create_receipt.inc
+
+# Keep all original planner bodies; only two frame providers are namespaced.
+test_cluster_relmap_create_plan_original.o: test_cluster_relmap_create_plan_original.c \
+        $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
+clean: clean-relmap-create-plan-owner
+.PHONY: clean-relmap-create-plan-owner
+clean-relmap-create-plan-owner:
+	rm -f test_cluster_relmap_create_plan_original.o
