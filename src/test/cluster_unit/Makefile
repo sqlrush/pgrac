@@ -13404,13 +13404,17 @@ $(top_builddir)/src/backend/cluster/cluster_mx_history_member.o: \
 # Actual snapshot retention and exact capture lifecycle.
 TESTS += test_cluster_mx_history_capture
 all: test_cluster_mx_history_capture
+TESTS += test_cluster_mx_history_successor_sources
+all: test_cluster_mx_history_successor_sources
+
+test_cluster_mx_history_successor_sources: $(top_srcdir)/src/backend/storage/page/itemptr.c
 
 test_cluster_mx_history_admission.inc: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c Makefile
 	@awk '/^semantic_activation_snapshot\(/ { print "static bool"; emit=1; count++ } \
 	     emit { print } /^}$$/ { emit=0 } \
 	     END { if (count != 1 || emit) exit 1 }' $< > $@
 
-test_cluster_mx_history_capture: test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
+test_cluster_mx_history_capture test_cluster_mx_history_successor_sources: %: %.c test_cluster_mx_history_capture.c test_cluster_snapshot_admission.c unit_test.h \
 		test_cluster_mx_history_finish.inc test_cluster_mx_history_local_updater.inc test_cluster_mx_history_wait_capture.inc test_cluster_mx_history_successor.inc $(top_srcdir)/src/include/cluster/cluster_mx_history_member.h \
 		test_cluster_active_sample_types.inc test_cluster_heap_freeze_admission_current.inc \
 		test_cluster_mx_history_admission.inc $(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
