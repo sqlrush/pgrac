@@ -119,4 +119,8 @@ extern bool mx_history_transition_finish(Buffer buffer, bool whole, XLogRecPtr l
 extern void mx_history_transition_write_header(HeapTuple root, bool rf);
 extern void mx_history_transition_fault(unsigned fault);
 extern Size mx_history_transition_bytes(void);
+extern void mx_history_recursive_begin_hop(void);
+extern bool mx_history_transition_plan_at(Buffer buffer, HeapTuple root,
+	const ClusterHeapSuccessorProof *proof, const MxPublicationReadout *plan, bool rf,
+	UBA planned_uba, SCN write_scn);
 #endif

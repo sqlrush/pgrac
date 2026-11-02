@@ -490,6 +490,13 @@ mx_history_recursive_authorize(Relation rel, Buffer buffer, HeapTuple tuple,
 	return result;
 }
 void
+mx_history_recursive_begin_hop(void)
+{
+	/* Mirrors the native recursive iteration, without reopening the scope. */
+	recursive_edge_consumed = false;
+	cluster_current_mx_operation_finish(&recursive_operation);
+}
+void
 mx_history_recursive_close(void)
 {
 	cluster_current_mx_operation_finish(&recursive_operation);
@@ -523,8 +530,9 @@ static ClusterHeapCurrentMxExactPublication transition_publication;
 static RfPageProducerBatchV1 transition_versions;
 static bool transition_wrong_undo_handle;
 bool
-mx_history_transition_plan(Buffer buffer, HeapTuple root,
-	const ClusterHeapSuccessorProof *proof, const MxPublicationReadout *plan, bool rf)
+mx_history_transition_plan_at(Buffer buffer, HeapTuple root,
+	const ClusterHeapSuccessorProof *proof, const MxPublicationReadout *plan, bool rf,
+	UBA planned_uba, SCN write_scn)
 {
 	Page page = BufferGetPage(buffer);
 	transition_wrong_undo_handle = false;
@@ -533,12 +541,12 @@ mx_history_transition_plan(Buffer buffer, HeapTuple root,
 	memset(&transition_versions, 0, sizeof(transition_versions));
 	transition_undo.valid = transition_undo.lock_only = true;
 	transition_undo.buffer = buffer; transition_undo.slot_index = 7;
-	transition_undo.xid = 129; transition_undo.write_scn = 91;
-	transition_undo.planned_uba = uba_encode(257, 12, 3, 0);
+	transition_undo.xid = 129; transition_undo.write_scn = write_scn;
+	transition_undo.planned_uba = planned_uba;
 	transition_undo.history.block = BufferGetBlockNumber(buffer);
 	transition_undo.history.slot_index = 7;
 	transition_undo.history.after_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
-	transition_undo.history.after_write_scn = 91;
+	transition_undo.history.after_write_scn = write_scn;
 	transition_undo.history.prior = ClusterPageGetItlSlots(page)[7];
 	transition_publication.valid = true;
 	transition_publication.buffer = buffer; transition_publication.plan = &publication_plan;
@@ -562,6 +570,13 @@ mx_history_transition_plan(Buffer buffer, HeapTuple root,
 		&transition_publication, &transition_undo,
 		&publication_plan.handles[publication_plan.receipt_count - 1],
 		rf ? &transition_versions : NULL, true);
+}
+bool
+mx_history_transition_plan(Buffer buffer, HeapTuple root,
+	const ClusterHeapSuccessorProof *proof, const MxPublicationReadout *plan, bool rf)
+{
+	return mx_history_transition_plan_at(buffer, root, proof, plan, rf,
+		uba_encode(257, 12, 3, 0), 91);
 }
 bool
 mx_history_transition_finish(Buffer buffer, bool whole, XLogRecPtr lsn)

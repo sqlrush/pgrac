@@ -14,6 +14,7 @@
 #include "cluster/cluster_itl.h"
 
 static MultiXactMember publication_members[2];
+static MultiXactId publication_descriptor = 33;
 static unsigned publication_count, publication_prepares, publication_applies, publication_cancels;
 static bool publication_retry;
 static unsigned publication_retry_at;
@@ -70,12 +71,12 @@ MultiXactIdCreateLocalCurrentMembers(int count, MultiXactMember *members)
 	UT_ASSERT_EQ(count, 2);
 	memcpy(publication_members, members, count * sizeof(*members));
 	publication_count = count;
-	return 33; /* Original stripe arithmetic derives requester node1. */
+	return publication_descriptor; /* Original stripe arithmetic derives requester node1. */
 }
 int
 GetMultiXactIdMembers(MultiXactId id, MultiXactMember **out, bool upgrade, bool lockonly)
 {
-	UT_ASSERT_EQ(id, 33); UT_ASSERT(!upgrade && !lockonly);
+	UT_ASSERT_EQ(id, publication_descriptor); UT_ASSERT(!upgrade && !lockonly);
 	*out = malloc(publication_count * sizeof(**out));
 	memcpy(*out, publication_members, publication_count * sizeof(**out));
 	return publication_count;
@@ -118,6 +119,7 @@ static Snapshot
 publication_setup(MxHeapReadout *out)
 {
 	Snapshot s = writer_setup(CLUSTER_TX_IN_PROGRESS, true);
+	publication_descriptor = 33;
 	publication_count = publication_prepares = publication_applies = publication_cancels = 0;
 	publication_A_capability = 0; publication_retry = false; publication_retry_at = 0;
 	memset(&publication_applied_target, 0, sizeof(publication_applied_target));
@@ -434,6 +436,10 @@ UT_TEST(transition_WAL_return_requires_a_valid_coordinate_and_same_owner)
 		writer_clean(s, true);
 	}
 }
+#ifdef HISTORY_TWO_HOP_FIXTURE
+int publication_two_hop_unused_main(void);
+#define main publication_two_hop_unused_main
+#endif
 int main(void)
 {
 	history_fixture_init(); UT_PLAN(14);
