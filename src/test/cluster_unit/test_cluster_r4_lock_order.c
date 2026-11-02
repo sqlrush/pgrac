@@ -410,6 +410,7 @@ static ClusterUndoTTSlotRef ut_hot_successor_ref;
 static int ut_hot_pcm_snapshot_calls;
 static bool ut_prune_fixture_active;
 static bool ut_prune_self_origin_unknown;
+static int ut_prune_pcm_drift_axis;
 static uint8 ut_hot_last_pcm_snapshot_state;
 static bool ut_itl_census_force_pcm_n;
 static bool ut_itl_census_change_writer_activation_projection;
@@ -1054,6 +1055,20 @@ cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 		out->pcm_state = cluster_conf_has_peers() && !ut_itl_census_force_pcm_n
 							 ? (uint8)PCM_STATE_X
 							 : (uint8)PCM_STATE_N;
+	/* Change only the second descriptor sample, after original lock-free proof. */
+	if (ut_prune_fixture_active && ut_hot_pcm_snapshot_calls == 2) {
+		switch (ut_prune_pcm_drift_axis) {
+		case 1: out->generation++; break;
+		case 2: out->reservation_token++; break;
+		case 3: out->writer_activation_token++; break;
+		case 4: out->resource_x_activation_generation++; break;
+		case 5: out->semantic_buf_state ^= BM_DIRTY; break;
+		case 6: out->buffer_type++; break;
+		case 7: out->tag.blockNum++; break;
+		case 8: out->flags = PCM_OWN_FLAG_REVOKING; break;
+		case 9: out->pcm_state = PCM_STATE_N; break;
+		}
+	}
 	ut_hot_last_pcm_snapshot_state = out->pcm_state;
 	return CLUSTER_PCM_OWN_OK;
 }
@@ -2086,6 +2101,9 @@ static SnapshotData ut_prune_snapshot;
 static SCN ut_prune_peer_floor;
 static SCN ut_prune_local_floor;
 static bool ut_prune_peer_valid;
+static bool ut_prune_required_known;
+static int ut_prune_horizon_change;
+static int ut_prune_floor_reads;
 static bool ut_prune_epoch_drift;
 static bool ut_prune_pin_conflict;
 static bool ut_prune_page_drift;
@@ -2192,6 +2210,7 @@ SCN
 cluster_undo_retention_horizon(void)
 {
 	UT_ASSERT(!ut_hot_content_lock_held);
+	ut_prune_floor_reads++;
 	return ut_prune_local_floor;
 }
 
@@ -2222,7 +2241,7 @@ cluster_undo_horizon_required_members(uint8 *required, uint64 *epoch)
 	memset(required, 0, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	required[0] = ((1 << ut_cluster_conf.node_count) - 1) & ~1;
 	*epoch = cluster_r4_activation_test_current_epoch;
-	return true;
+	return ut_prune_required_known;
 }
 
 bool
@@ -2258,6 +2277,25 @@ cluster_undo_verdict_resolve(int origin, uint32 segment, TransactionId xid, uint
 	UT_ASSERT_EQ(authoritative, !ut_prune_recycled);
 	UT_ASSERT_EQ(read_scn, ut_prune_snapshot.read_scn);
 	ut_prune_resolve_calls++;
+	if (ut_prune_resolve_calls == 1) {
+		/* The captured H/PCM inputs must precede this unlocked origin seam. */
+		UT_ASSERT_EQ(ut_prune_floor_reads, 1);
+		UT_ASSERT_EQ(ut_prune_cleanup_calls, 1);
+		UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 1);
+		switch (ut_prune_horizon_change) {
+		case 1: ut_prune_local_floor = 200; break;
+		case 2: ut_prune_peer_floor = 200; break;
+		case 3: ut_prune_peer_floor = 199; break;
+		case 4: ut_prune_local_floor = InvalidScn; break;
+		case 5: ut_prune_peer_valid = false; break;
+		case 6: ut_prune_epoch_drift = true; break;
+		case 7: ut_prune_required_known = false; break;
+		case 8: ut_prune_peer_floor = 251; break;
+		case 9: ut_prune_peer_floor = 250; break;
+		case 10: ut_prune_local_floor = 251; break;
+		case 11: ut_prune_peer_floor = InvalidScn; break;
+		}
+	}
 	if (ut_prune_resolve_throws)
 		ereport(ERROR, (errmsg("injected prune authority error")));
 	if (ut_prune_page_drift && ut_prune_resolve_calls == 1)
@@ -6686,6 +6724,10 @@ ut_prune_begin(UtR4HotProductFixture *fixture, HeapHotSearchResult *hot, Relatio
 	ut_prune_local_floor = 400;
 	ut_prune_peer_floor = 300;
 	ut_prune_peer_valid = true;
+	ut_prune_required_known = true;
+	ut_prune_horizon_change = 0;
+	ut_prune_floor_reads = 0;
+	ut_prune_pcm_drift_axis = 0;
 	ut_prune_pin_conflict = false;
 	ut_prune_epoch_drift = false;
 	ut_prune_page_drift = false;
@@ -7094,6 +7136,98 @@ UT_TEST(test_recycled_hot_xid_uses_origin_bound_without_stamping_it_as_commit)
 	UT_ASSERT_EQ(memcmp(slots, ClusterPageGetItlSlots(page), sizeof(slots)), 0);
 	UT_ASSERT_EQ(ItemIdGetRedirect(PageGetItemId(page, 1)), 3);
 	ut_prune_end();
+}
+
+/* Model input changes during the original unlocked proof interval. This is
+ * not a real remote wait or new authority to reclaim another tuple shape. */
+UT_TEST(test_hot_prune_refolds_changed_horizon_after_unlocked_proof)
+{
+	int change;
+
+	for (change = 1; change <= 11; change++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		PGAlignedBlock before;
+		int locks;
+		bool floor_known = change <= 3 || (change >= 8 && change <= 10);
+		int reclaimed = change == 9 ? 1 : (change == 8 || change == 10 ? 2 : 0);
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		ut_prune_horizon_change = change;
+		locks = fixture.lock_calls;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		UT_ASSERT_EQ(ut_prune_resolve_calls, 2);
+		UT_ASSERT_EQ(ut_prune_floor_reads, 2);
+		UT_ASSERT_EQ(ut_prune_cleanup_calls, floor_known ? 2 : 1);
+		UT_ASSERT_EQ(fixture.lock_calls - locks, floor_known ? 4 : 2);
+		UT_ASSERT_EQ(fixture.lock_modes[locks], BUFFER_LOCK_EXCLUSIVE);
+		UT_ASSERT_EQ(fixture.lock_modes[locks + 1], BUFFER_LOCK_UNLOCK);
+		if (floor_known) {
+			UT_ASSERT_EQ(fixture.lock_modes[locks + 2], BUFFER_LOCK_EXCLUSIVE);
+			UT_ASSERT_EQ(fixture.lock_modes[locks + 3], BUFFER_LOCK_UNLOCK);
+		}
+		UT_ASSERT_EQ(ut_prune_reclaimed, reclaimed);
+		UT_ASSERT_EQ(ut_prune_wal_records, reclaimed > 0 ? 1 : 0);
+		if (reclaimed == 0)
+			UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		else {
+			Page page = (Page)fixture.live_page;
+
+			UT_ASSERT(ItemIdIsRedirected(PageGetItemId(page, 1)));
+			UT_ASSERT_EQ(ItemIdGetRedirect(PageGetItemId(page, 1)), change == 9 ? 2 : 3);
+			UT_ASSERT(ItemIdIsNormal(PageGetItemId(page, 3)));
+			UT_ASSERT_EQ(ut_prune_wal.nredirected, 1);
+			UT_ASSERT_EQ(ut_prune_wal.ndead, 0);
+			UT_ASSERT_EQ(ut_prune_wal_offsets[0], 1);
+			UT_ASSERT_EQ(ut_prune_wal_offsets[1], change == 9 ? 2 : 3);
+			UT_ASSERT_EQ(ut_prune_wal_offset_bytes,
+						 (change == 9 ? 2 : 3) * sizeof(OffsetNumber));
+			if (change == 9)
+				UT_ASSERT(ItemIdIsNormal(PageGetItemId(page, 2)));
+			else {
+				UT_ASSERT(!ItemIdIsUsed(PageGetItemId(page, 2)));
+				UT_ASSERT_EQ(ut_prune_wal_offsets[2], 2);
+			}
+		}
+		ut_prune_end();
+	}
+}
+
+UT_TEST(test_hot_prune_rechecks_each_pcm_axis_after_unlocked_proof)
+{
+	int axis;
+
+	for (axis = 0; axis <= 9; axis++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		PGAlignedBlock before;
+		int locks;
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		ut_prune_pcm_drift_axis = axis;
+		locks = fixture.lock_calls;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		UT_ASSERT_EQ(ut_prune_resolve_calls, 2);
+		UT_ASSERT_EQ(ut_prune_floor_reads, 2);
+		UT_ASSERT_EQ(ut_prune_cleanup_calls, 2);
+		UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 2);
+		UT_ASSERT_EQ(fixture.lock_calls - locks, 4);
+		UT_ASSERT_EQ(fixture.lock_modes[locks], BUFFER_LOCK_EXCLUSIVE);
+		UT_ASSERT_EQ(fixture.lock_modes[locks + 1], BUFFER_LOCK_UNLOCK);
+		UT_ASSERT_EQ(fixture.lock_modes[locks + 2], BUFFER_LOCK_EXCLUSIVE);
+		UT_ASSERT_EQ(fixture.lock_modes[locks + 3], BUFFER_LOCK_UNLOCK);
+		UT_ASSERT_EQ(ut_prune_reclaimed, axis == 0 ? 2 : 0);
+		UT_ASSERT_EQ(ut_prune_wal_records, axis == 0 ? 1 : 0);
+		if (axis != 0)
+			UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		ut_prune_end();
+	}
 }
 
 UT_TEST(test_hot_prune_initial_four_member_epoch_is_not_unknown)
@@ -7616,7 +7750,7 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(155);
+	UT_PLAN(157);
 	UT_RUN(test_prune_trace_off_keeps_real_prune_quiet);
 	UT_RUN(test_prune_trace_on_records_real_redirect_unused_and_actual_tag);
 	UT_RUN(test_prune_trace_capture_refusal_never_reads_unknown_image);
@@ -7667,6 +7801,8 @@ main(void)
 	UT_RUN(test_hot_prune_rejects_secondary_hot_target_shapes_before_resolution);
 	UT_RUN(test_hot_prune_four_member_graph_preserves_original_root_and_wal);
 	UT_RUN(test_hot_prune_rejects_page_drift_and_member_loss_during_resolution);
+	UT_RUN(test_hot_prune_refolds_changed_horizon_after_unlocked_proof);
+	UT_RUN(test_hot_prune_rechecks_each_pcm_axis_after_unlocked_proof);
 	UT_RUN(test_hot_prune_initial_four_member_epoch_is_not_unknown);
 	UT_RUN(test_hot_prune_authority_error_unwinds_before_caller_receives_error);
 	UT_RUN(test_hot_prune_reuses_intermediate_slot_and_preserves_index_root);
