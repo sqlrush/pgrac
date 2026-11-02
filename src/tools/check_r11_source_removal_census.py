@@ -23,8 +23,8 @@ L3_COMMIT = "cc1c5a554276542a05c15f5f1e0e0c7317fba66e"
 L3_TREE = "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5"
 CURRENT_PRODUCT_SNAPSHOT = {
     "algorithm": "sha256-canonical-path-blob-v1",
-    "path_count": 2496,
-    "sha256": "976769e9e581b4984afa9e9d0804f6cc7f134d5a3495966300a0aee8f4121d3e"
+    "path_count": 2497,
+    "sha256": "6e232bf3fd8448da3318f21b7464d58009a8ac47c7b53198e4e02880f777eeda"
 }
 
 
@@ -222,7 +222,7 @@ def tree_text(source_root: pathlib.Path, commit: str) -> tuple[list[str], str]:
     paths = [
         name
         for name in names
-        if name.endswith((".c", ".h")) or pathlib.PurePosixPath(name).name == "Makefile"
+        if name.endswith((".c", ".h", ".inc")) or pathlib.PurePosixPath(name).name == "Makefile"
     ]
     chunks = []
     for path in paths:
@@ -248,7 +248,7 @@ def current_product_text(
     chunks = []
     for path in sorted(set(names)):
         if not (
-            path.endswith((".c", ".h"))
+            path.endswith((".c", ".h", ".inc"))
             or pathlib.PurePosixPath(path).name == "Makefile"
         ):
             continue
