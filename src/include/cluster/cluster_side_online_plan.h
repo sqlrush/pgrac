@@ -249,7 +249,10 @@ typedef struct RfSideUndoHeaderImageV1 {
 typedef RfSideUndoHeaderImageV1 RfSideUndoBlockImageV1;
 /* Reconstruct only the referenced DATA before this exact SET_HEAD record.
  * Requires a retained FPI in that segment incarnation; never reads DATA or
- * grants permission to install a header or a later source image. */
+ * grants permission to install a header or a later source image. Operation
+ * heads additionally require a whole-block typed parse and an exact active
+ * control/tail binding. This is not cursor WAL coverage or terminal proof.
+ * No output change on refusal. */
 extern RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 											   const RfPageOnlineRecordIdentityV1 *identity,

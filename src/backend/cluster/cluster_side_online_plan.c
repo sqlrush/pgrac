@@ -20,6 +20,7 @@
 #include "replication/origin.h"
 #include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_recovery_undo_scan.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_native_startup.h"
@@ -2315,6 +2316,37 @@ rf_side_online_plan_prepare_undo_record_input_header_v1(
 	return side_plan_prepare_undo_record(plan, index, identity, base, true, true, out);
 }
 
+/* Keep the typed reader and its candidate copies out of the legacy branch's
+ * stack frame. This binds bytes only; the original owner still owes source,
+ * generation, retained-chain/WAL coverage and installation authority. */
+static pg_noinline RfPageProofDetailV1
+side_plan_prepare_operation_head_block(const RfSideOnlinePlanV1 *plan, uint32 index,
+									   const ClusterUndoDecoded *head, uint32 segment,
+									   uint32 block, RfSideUndoBlockImageV1 *out)
+{
+	RfSideUndoBlockImageV1 prepared;
+	ClusterRecoveryUndoRecord record;
+	xl_undo_tt_slot_set_head_operation carrier;
+	RfPageProofDetailV1 detail;
+	/* Include both live candidates, nested block folding and parser scratch. */
+	Size scratch = sizeof(prepared) + sizeof(record) + 3 * BLCKSZ;
+
+	if (scratch > plan->memory_budget || plan->memory_used > plan->memory_budget - scratch)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	detail = side_plan_prepare_undo_block(plan, head->instance, segment, block, index, &prepared);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	if (!cluster_undo_head_operation_from_decoded(head, &carrier)
+		|| cluster_recovery_undo_record_read_typed(prepared.page.data, BLCKSZ, segment, block,
+													   head->instance, head->first_undo_block, &record)
+			   != CLUSTER_RECOVERY_UNDO_ENTRY
+		|| !cluster_undo_head_operation_matches_control(&carrier, &record.header, record.payload,
+														  record.header.payload_length))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	*out = prepared;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 											   const RfPageOnlineRecordIdentityV1 *identity,
@@ -2339,6 +2371,8 @@ rf_side_online_plan_prepare_undo_head_block_v1(const RfSideOnlinePlanV1 *plan, u
 		|| !cluster_undo_preflight(&op->undo)
 		|| !uba_decode_record(op->undo.first_undo_block, &segment, &block, &slot, &row))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (op->undo.flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG)
+		return side_plan_prepare_operation_head_block(plan, index, &op->undo, segment, block, out);
 	return side_plan_prepare_undo_block(plan, op->undo.instance, segment, block, index, out);
 }
 
