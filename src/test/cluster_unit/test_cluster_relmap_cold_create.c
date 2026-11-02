@@ -219,7 +219,16 @@ UT_TEST(reusing_decode_cannot_reuse_a_prior_creation_carrier)
 int
 main(void)
 {
-	UT_PLAN(13);
+	if (getenv("PGRAC_TEST_CREATE_BIND")) {
+		UT_PLAN(4);
+		UT_RUN(create_predeclared_record_binds_after_original_noop);
+		UT_RUN(create_binding_requires_every_independent_identity_field_and_batch);
+		UT_RUN(create_binding_refuses_duplicate_before_or_after_capture);
+		UT_RUN(create_predeclaration_requires_whole_valid_independent_batch_before_feed);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+	UT_PLAN(17);
 	UT_RUN(canonical_creation_keeps_complete_by_value_carrier);
 	UT_RUN(creation_has_no_native_noop_page_or_pending_execution_route);
 	UT_RUN(original_plan_refuses_undeclared_creation_after_native_redo);
@@ -228,11 +237,15 @@ main(void)
 	UT_RUN(reusing_decode_cannot_reuse_a_prior_creation_carrier);
 	UT_RUN(create_declaration_captures_whole_values_and_original_step);
 	UT_RUN(create_steps_keep_original_cross_source_merge_order);
-	UT_RUN(create_declaration_validates_whole_batch_before_copy);
+	UT_RUN(create_binding_validates_source_cut_and_shape);
 	UT_RUN(create_capture_rejects_changed_frame_and_complete_image);
 	UT_RUN(create_plan_refuses_missing_or_repeated_obligations);
 	UT_RUN(create_declarations_cross_segments_without_a_64_item_limit);
 	UT_RUN(create_budget_and_sealed_state_refuse_without_publication);
+	UT_RUN(create_predeclared_record_binds_after_original_noop);
+	UT_RUN(create_binding_requires_every_independent_identity_field_and_batch);
+	UT_RUN(create_binding_refuses_duplicate_before_or_after_capture);
+	UT_RUN(create_predeclaration_requires_whole_valid_independent_batch_before_feed);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

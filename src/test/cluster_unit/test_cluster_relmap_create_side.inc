@@ -9,6 +9,8 @@
  *    Spec: 2026-11-01-pre2-e1-format-closure-v1.2-path-c.md
  *-------------------------------------------------------------------------
  */
+#include "test_cluster_relmap_create_declaration.h"
+
 #include "common/cluster_relmap_create.h"
 
 static void
@@ -81,7 +83,8 @@ UT_TEST(test_creation_side_owns_original_captured_values_and_bytes)
 	record.relmap_dbid = 2000; record.relmap_tsid = DEFAULTTABLESPACE_OID;
 	record.relmap_create = &in.creation;
 	UT_ASSERT_EQ(cluster_cold_plan_create_v1(&in.cut, 1, 1048576, &cold), 0);
-	UT_ASSERT_EQ(cluster_cold_plan_relmap_create_declare_v1(cold, &in, 1), 0);
+	UT_ASSERT_EQ(test_create_predeclare(cold, &in, 1), 0);
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_create_bind_v1(cold, 0, &in.source, &record), 0);
 	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(cold, 0, &record), 0);
 	captured = cluster_cold_plan_relmap_create_captured_v1(cold, 0, &record);
 	UT_ASSERT_NOT_NULL(captured);

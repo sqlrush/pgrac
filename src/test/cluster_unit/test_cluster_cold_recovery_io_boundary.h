@@ -353,6 +353,10 @@ static int relmap_capture_calls;
 static bool relmap_capture_throw;
 static const ClusterColdRelmapInputV1 *decode_relmap;
 static ClusterColdRelmapInputV1 captured_relmap;
+static const ClusterRelmapCreateWalV1 *decode_create;
+static bool decode_create_repeat;
+static unsigned create_capture_calls;
+static ClusterColdRelmapCreateInputV1 captured_create;
 static RfPageOnlineRecordIdentityV1 captured_identity[4];
 static RfPageProofDetailV1 side_capture_refusal;
 
@@ -383,6 +387,20 @@ rf_side_online_plan_feed_relmap_v1(RfSideOnlinePlanV1 *plan, const RfDetachedRec
 			siglongjmp(*PG_exception_stack, 1);
 		return result;
 	}
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_feed_relmap_create_v1(RfSideOnlinePlanV1 *plan,
+	const RfDetachedRecordPlanV1 *record, const RfPageOnlineRecordIdentityV1 *identity,
+	const ClusterColdRelmapCreateInputV1 *input)
+{
+	RfPageProofDetailV1 result;
+	UT_ASSERT_NOT_NULL(input);
+	++create_capture_calls;
+	captured_create = *input;
+	result = rf_side_online_plan_feed_record_v1(plan, record, identity);
+	if (relmap_capture_throw) siglongjmp(*PG_exception_stack, 1);
+	return result;
 }
 
 ClusterControlRootResult
@@ -452,6 +470,15 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 		out->record.relmap_image = &decode_relmap->staged.pending;
 		out->record.relmap_dbid = decode_relmap->staged.identity.dbid;
 		out->record.relmap_tsid = GLOBALTABLESPACE_OID;
+	}
+	if (decode_create != NULL && (reader->ReadRecPtr == 0x1100
+		|| (decode_create_repeat && reader->ReadRecPtr == 0x1200))) {
+		out->record.rmid = RM_RELMAP_ID;
+		out->record.info = XLOG_RELMAP_CREATE_V1;
+		out->record.relmap_create = decode_create;
+		out->record.relmap_dbid = decode_create->identity.database_oid;
+		out->record.relmap_tsid = decode_create->identity.tablespace_oid;
+		out->record.record_flags = CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED;
 	}
 	out->xid_input = decode_xid_input[i];
 	out->detached.source_record = reader;

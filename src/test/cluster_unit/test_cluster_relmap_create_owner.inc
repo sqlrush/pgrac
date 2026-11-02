@@ -12,6 +12,7 @@
 #include "cluster/cluster_side_online_plan.h"
 #include "test_cluster_relmap_create_side_original.h"
 static ClusterColdRelmapCreateInputV1 owner_declaration;
+static ClusterColdRelmapCreateExpectedV1 owner_expected;
 static ClusterWalSourceRef owner_source_snapshot;
 static ClusterColdStepV1 owner_step;
 static bool owner_side_ok, owner_source_ok, owner_side_error, owner_reentry;
@@ -80,6 +81,9 @@ static bool owner_setup(ClusterControlNativeRelmapCreateV2 **creator,
 	copy_begin();
 	if(!reserve_copy(creator) || !creation_replay_record(*creator,reader,decoded)) return false;
 	recovery_copy_enter();
+	memset(&owner_expected, 0, sizeof(owner_expected));
+	owner_expected.expected = (*creator)->expected;
+	memcpy(owner_expected.batch_uuid, (*creator)->batch_uuid, 16);
 	memset(&owner_declaration,0,sizeof(owner_declaration));
 	owner_declaration.source=redo_source;
 	owner_declaration.cut=(ClusterColdParticipantV1){1,0,1,
@@ -88,13 +92,14 @@ static bool owner_setup(ClusterControlNativeRelmapCreateV2 **creator,
 	owner_declaration.frame=redo_frame;
 	if(!cluster_relmap_create_decode_v1(wal_bytes,sizeof(wal_bytes),&owner_declaration.creation)
 		|| cluster_cold_plan_create_v1(&owner_declaration.cut,1,4*1024*1024,&plan)!=0
-		|| cluster_cold_plan_relmap_create_declare_v1(plan,&owner_declaration,1)!=0) return false;
+		|| cluster_cold_plan_relmap_create_predeclare_v1(plan,&owner_expected,1)!=0) return false;
 	record.read_rec_ptr=reader->ReadRecPtr; record.end_rec_ptr=reader->EndRecPtr;
 	record.record_crc=redo_frame.record_crc; record.rmid=RM_RELMAP_ID; record.info=CLUSTER_RELMAP_CREATE_WAL_INFO_V1;
 	record.record_flags=CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED;
 	record.relmap_dbid=owner_declaration.creation.identity.database_oid;
 	record.relmap_tsid=DEFAULTTABLESPACE_OID; record.relmap_create=&owner_declaration.creation;
-	if(cluster_cold_plan_feed_v1(plan,0,&record)!=0
+	if(cluster_cold_plan_relmap_create_bind_v1(plan,0,&owner_declaration.source,&record)!=0
+		|| cluster_cold_plan_feed_v1(plan,0,&record)!=0
 		|| cluster_cold_plan_seal_v1(plan,owner_no_pages,NULL,NULL)!=0
 		|| !cluster_cold_plan_step_v1(plan,0,&owner_step)) return false;
 	redo_typed.plan=plan; redo_typed.participant_count=redo_typed.replay_count=1;

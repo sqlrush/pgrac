@@ -47,7 +47,7 @@ static bool creation_with_unconsumed_pending(XLogReaderState *reader)
 	pending.retention = &unconsumed;
 	pending.retention_lock = &unconsumed_lock;
 	if (cluster_cold_plan_create_v1(&owner_declaration.cut, 1, 4*1024*1024, &redo_typed.plan) != 0
-		|| cluster_cold_plan_relmap_create_declare_v1(redo_typed.plan, &owner_declaration, 1) != 0
+		|| cluster_cold_plan_relmap_create_predeclare_v1(redo_typed.plan, &owner_expected, 1) != 0
 		|| cluster_cold_plan_relmap_declare_v1(redo_typed.plan, &pending, 1) != 0) return false;
 	record.read_rec_ptr = reader->ReadRecPtr;
 	record.end_rec_ptr = reader->EndRecPtr;
@@ -59,7 +59,8 @@ static bool creation_with_unconsumed_pending(XLogReaderState *reader)
 	record.relmap_dbid = owner_declaration.creation.identity.database_oid;
 	record.relmap_tsid = DEFAULTTABLESPACE_OID;
 	record.relmap_create = &owner_declaration.creation;
-	if (cluster_cold_plan_feed_v1(redo_typed.plan, 0, &record) != 0) return false;
+	if (cluster_cold_plan_relmap_create_bind_v1(redo_typed.plan, 0, &owner_declaration.source, &record) != 0
+		|| cluster_cold_plan_feed_v1(redo_typed.plan, 0, &record) != 0) return false;
 	memset(&record, 0, sizeof(record));
 	record.read_rec_ptr = pending.frame.read_rec_ptr;
 	record.end_rec_ptr = pending.frame.end_rec_ptr;

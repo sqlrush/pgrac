@@ -192,8 +192,8 @@ relmap_create_record_matches(const ClusterColdRelmapCreateInputV1 *in,
 }
 
 ClusterColdDetailV1
-cluster_cold_plan_relmap_create_declare_v1(ClusterColdPlanV1 *plan,
-	const ClusterColdRelmapCreateInputV1 *inputs, uint32 count)
+cluster_cold_plan_relmap_create_predeclare_v1(ClusterColdPlanV1 *plan,
+	const ClusterColdRelmapCreateExpectedV1 *inputs, uint32 count)
 {
 	ColdRelmapCreateChunk *head = NULL, *tail = NULL;
 	uint32 chunks;
@@ -205,21 +205,25 @@ cluster_cold_plan_relmap_create_declare_v1(ClusterColdPlanV1 *plan,
 	chunks = (count - 1) / COLD_RELMAP_CREATE_SEGMENT + 1;
 	if (chunks > plan->memory_budget / sizeof(*head)) return CLUSTER_COLD_CAPACITY;
 	bytes = (Size)chunks * sizeof(*head);
-	/* Validate the WHOLE batch before allocation or visible declaration. */
+	/* Validate independent registrations before allocation/publication. No
+	 * source, cut, frame or map can be supplied by this entry point. */
 	for (uint32 i = 0; i < count; ++i) {
-		const ClusterColdRelmapCreateInputV1 *in = &inputs[i];
-		if (!relmap_create_input_valid(plan, in)) return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		const ClusterRecoveryFileIdentityV2 *id = &inputs[i].expected;
+		uint8 canonical[CLUSTER_RECOVERY_IDENTITY_REFERENCE_V2_BYTES];
+		if (id->kind != CLUSTER_RECOVERY_FILE_RELMAP_V2
+			|| !OidIsValid(id->database_oid) || !OidIsValid(id->tablespace_oid)
+			|| id->tablespace_oid == GLOBALTABLESPACE_OID || id->object_id != 0
+			|| !bytes_nonzero(inputs[i].batch_uuid, 16)
+			|| !cluster_recovery_file_identity_encode_v2(id, canonical, sizeof(canonical)))
+			return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 		for (uint32 j = 0; j < i; ++j)
-			if ((inputs[j].creation.identity.database_oid == in->creation.identity.database_oid
-				&& inputs[j].creation.identity.tablespace_oid == in->creation.identity.tablespace_oid)
-				|| (inputs[j].participant == in->participant
-					&& (inputs[j].frame.read_rec_ptr == in->frame.read_rec_ptr
-						|| memcmp(&inputs[j].source, &in->source, sizeof(in->source)))))
+			if (inputs[j].expected.database_oid == id->database_oid
+				&& inputs[j].expected.tablespace_oid == id->tablespace_oid)
 				return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 		for (uint32 j = 0; j < plan->relmap_count; ++j)
 			if (!plan->relmap_inputs[j].input.staged.identity.shared
-				&& in->creation.identity.tablespace_oid == DEFAULTTABLESPACE_OID
-				&& plan->relmap_inputs[j].input.staged.identity.dbid == in->creation.identity.database_oid)
+				&& id->tablespace_oid == DEFAULTTABLESPACE_OID
+				&& plan->relmap_inputs[j].input.staged.identity.dbid == id->database_oid)
 				return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 	}
 	if (!cold_plan_reserve(plan, bytes)) return CLUSTER_COLD_CAPACITY;
@@ -234,11 +238,66 @@ cluster_cold_plan_relmap_create_declare_v1(ClusterColdPlanV1 *plan,
 			if (tail) tail->next = next; else head = next;
 			tail = next;
 		}
-		tail->entries[i % COLD_RELMAP_CREATE_SEGMENT].input = inputs[i];
+		/* A zero frame is unbound; valid RMC1 frames always have a nonzero
+		 * end. captured remains the separate original feed receipt. */
+		tail->entries[i % COLD_RELMAP_CREATE_SEGMENT].input.participant = CLUSTER_COLD_NO_INDEX;
+		tail->entries[i % COLD_RELMAP_CREATE_SEGMENT].input.creation.identity = inputs[i].expected;
+		memcpy(tail->entries[i % COLD_RELMAP_CREATE_SEGMENT].input.creation.batch_uuid,
+			inputs[i].batch_uuid, 16);
 	}
 	plan->relmap_creates = head;
 	plan->relmap_create_count = count;
 	return CLUSTER_COLD_OK;
+}
+
+/* Match independently registered identity/batch before retaining this original
+ * scanner frame. The source/cut/map remain observations, not new authority. */
+ClusterColdDetailV1
+cluster_cold_plan_relmap_create_bind_v1(ClusterColdPlanV1 *plan,
+	uint32 participant, const ClusterWalSourceRef *source, const ClusterColdRecordV1 *record)
+{
+	ClusterColdRelmapCreateInputV1 input = {0};
+	uint8 canonical[CLUSTER_RECOVERY_IDENTITY_REFERENCE_V2_BYTES];
+	ColdRelmapCreateInput *match = NULL;
+
+	if (!plan_valid(plan)) return CLUSTER_COLD_INVALID_ARGUMENT;
+	if (plan->phase != COLD_PHASE_FEEDING || plan->relmap_failed) return CLUSTER_COLD_STATE;
+	if (source == NULL || record == NULL || participant >= plan->participant_count
+		|| record->relmap_create == NULL) goto refused;
+	input.participant = participant;
+	input.cut = plan->participants[plan->canonical[participant]].cut;
+	input.source = *source;
+	input.frame = (ClusterColdRecordFrameV1){record->read_rec_ptr, record->end_rec_ptr,
+		record->record_crc, participant, record->source_xid, record->source_top_xid,
+		record->component_count, record->space_count, record->rmid, record->info, false};
+	input.creation = *record->relmap_create;
+	if (!relmap_create_input_valid(plan, &input)
+		|| !relmap_create_record_matches(&input, participant, record)
+		|| !cluster_recovery_file_identity_encode_v2(&input.creation.identity, canonical, sizeof(canonical)))
+		goto refused;
+	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+		ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+		if (entry == NULL) goto refused;
+		if (entry->input.frame.end_rec_ptr != InvalidXLogRecPtr
+			&& entry->input.participant == participant
+			&& (entry->input.frame.read_rec_ptr == record->read_rec_ptr
+				|| memcmp(&entry->input.source, source, sizeof(*source)))) goto refused;
+		if (cluster_recovery_file_identity_matches_v2(canonical, sizeof(canonical),
+				&entry->input.creation.identity)
+			&& !memcmp(entry->input.creation.batch_uuid, input.creation.batch_uuid, 16)) {
+			if (match != NULL || entry->input.frame.end_rec_ptr != InvalidXLogRecPtr) goto refused;
+			match = entry;
+		}
+	}
+	if (match == NULL) goto refused;
+	match->input = input;
+	return CLUSTER_COLD_OK;
+refused:
+	/* Even an undeclared RMC1 must poison the entered plan, so callers
+	 * cannot ignore the refusal and seal another subset of the cut. */
+	plan->relmap_failed = true;
+	plan->phase = COLD_PHASE_FAILED;
+	return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 }
 
 static uint32
@@ -318,7 +377,11 @@ cluster_cold_plan_relmap_required_v1(const ClusterColdPlanV1 *plan, uint32 parti
 			return true;
 	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
 		const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
-		if (entry != NULL && entry->input.participant == participant) return true;
+		/* Before binding, source membership is not inferred from an origin
+		 * number. All original visitors must retain structural carriers;
+		 * only bind() can match the complete identity to the actual source. */
+		if (entry != NULL && (entry->input.frame.end_rec_ptr == InvalidXLogRecPtr
+			|| entry->input.participant == participant)) return true;
 	}
 	return false;
 }

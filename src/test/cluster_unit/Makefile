@@ -16464,3 +16464,7 @@ test_cluster_relmap_create_side_original.o: test_cluster_relmap_create_side_orig
 
 # Pending-only terminal cases reuse the original native CLOG/Start fixture.
 test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: test_cluster_cold_relmap_pending_terminal.inc
+
+# Creation registrations precede scanning; bind original frames during pass-1.
+test_cluster_relmap_cold_create test_cluster_cold_relmap_side \
+		test_cluster_cold_relmap: test_cluster_relmap_create_declaration.h

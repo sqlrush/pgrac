@@ -10,6 +10,8 @@
  *     Spec: 2026-11-01-pre2-e1-format-closure-v1.2-path-c.md
  *-------------------------------------------------------------------------
  */
+#include "test_cluster_relmap_create_declaration.h"
+
 
 /* Real declarations/feed/seal, with a distinct creation namespace. Creation
  * stays unconsumed: successful pending checks must not complete that family. */
@@ -61,12 +63,13 @@ cold_pending_mixed(bool pending)
 	record.relmap_create = &create.creation;
 	record.relmap_dbid = 2000;
 	record.relmap_tsid = DEFAULTTABLESPACE_OID;
-	UT_ASSERT_EQ(cluster_cold_plan_relmap_create_declare_v1(replay.plan, &create, 1), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(test_create_predeclare(replay.plan, &create, 1), CLUSTER_COLD_OK);
 	if (pending) {
 		UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, &declared, 1), CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(cluster_cold_plan_feed_v1(replay.plan, 0, &records[0][0]), CLUSTER_COLD_OK);
 		replay.side_plans[0] = cold_map_side(&declared, true);
 	}
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_create_bind_v1(replay.plan, p, &create.source, &record), 0);
 	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(replay.plan, p, &record), CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(replay.plan, cold_map_observe, NULL, NULL), CLUSTER_COLD_OK);
 }

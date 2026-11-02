@@ -86,11 +86,21 @@ typedef struct ClusterColdRelmapInputV1 {
 	struct LWLock *retention_lock;
 } ClusterColdRelmapInputV1;
 
-/* Clean creation is a separate declared obligation, never a staged pin.
- * The original episode supplies its independently selected identity/batch,
- * full selected source/cut and scanner frame before pass-1. Values are copied
- * in budgeted segments. Declaration/capture/ordering grants no RESERVED,
- * execution, AVAILABLE, receipt or joint completion qualification. */
+/* Independent registration only: the original Start supplies the complete
+ * expected identity and creation batch, never values discovered from WAL.
+ * Predeclare the nonempty WHOLE batch before the first feed (create() already
+ * enters FEEDING). The original scanner then binds each matching RMC1 once,
+ * before feeding that exact decoded record. Missing/extra/duplicate records
+ * refuse the plan; neither stage grants execution or completion authority. */
+typedef struct ClusterColdRelmapCreateExpectedV1 {
+	ClusterRecoveryFileIdentityV2 expected;
+	uint8 batch_uuid[16];
+} ClusterColdRelmapCreateExpectedV1;
+extern ClusterColdDetailV1 cluster_cold_plan_relmap_create_predeclare_v1(
+	ClusterColdPlanV1 *, const ClusterColdRelmapCreateExpectedV1 *, uint32 count);
+extern ClusterColdDetailV1 cluster_cold_plan_relmap_create_bind_v1(
+	ClusterColdPlanV1 *, uint32 participant, const ClusterWalSourceRef *, const ClusterColdRecordV1 *);
+
 typedef struct ClusterColdRelmapCreateInputV1 {
 	uint32 participant;
 	ClusterColdParticipantV1 cut;
@@ -98,8 +108,6 @@ typedef struct ClusterColdRelmapCreateInputV1 {
 	ClusterColdRecordFrameV1 frame;
 	ClusterRelmapCreateWalV1 creation;
 } ClusterColdRelmapCreateInputV1;
-extern ClusterColdDetailV1 cluster_cold_plan_relmap_create_declare_v1(
-	ClusterColdPlanV1 *, const ClusterColdRelmapCreateInputV1 *, uint32 count);
 /* Borrowed immutable plan values. Capture is visible only during pass-1;
  * step lookup only after seal and for the exact original merged step. Neither
  * getter performs execution or makes a saved observation current. */
