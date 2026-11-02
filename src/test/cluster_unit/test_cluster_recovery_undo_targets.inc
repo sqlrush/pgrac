@@ -145,6 +145,155 @@ find_undo_target(ClusterRecoveryRootSet *roots, uint32 segment)
 	return NULL;
 }
 
+static xl_undo_tt_slot_set_head_operation
+operation_head_fixture(uint32 physical_segment, uint32 block)
+{
+	xl_undo_tt_slot_set_head_operation r = {0};
+
+	r.head.segment_id = 257; r.head.instance = 2; r.head.slot_offset = 6;
+	r.head.xid = 4195136; r.head.wrap = 1;
+	r.head._pad[0] = CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG;
+	r.head.first_undo_block = uba_encode(physical_segment, block, 6, 0);
+	r.operation = (UndoOperationTrailer){ .version = 1, .length = 48,
+		.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE,
+		.canonical_top_fxid = (UINT64CONST(7) << 32) | 4195136,
+		.operation_fxid = (UINT64CONST(7) << 32) | 4195137,
+		.operation_sequence = 11, .canonical_segment_generation = 3,
+		.command_id = 4, .subid = 8 };
+	wal_fixture(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD, sizeof(r), 0);
+	memcpy(wal_payload.bytes, &r, sizeof(r));
+	return r;
+}
+
+UT_TEST(test_operation_head_keeps_canonical_and_physical_roots_distinct)
+{
+	const uint32 segments[] = {257, 258, 512};
+	int fd = new_root();
+
+	for (unsigned i = 0; i < lengthof(segments); i++) {
+		ClusterRecoveryRootSet *roots = begin_roots(fd, 1024 * 1024);
+		ClusterRecoveryWalTargetsDiag diag;
+		const ClusterRecoveryRootEntry *canonical, *physical;
+		ClusterUndoDecoded decoded;
+		bool accepted;
+
+		operation_head_fixture(segments[i], 7);
+		/* The real codec already accepts this carrier; the census must keep
+		 * its independently named TT and physical data files. */
+		UT_ASSERT(cluster_undo_decode(&native_reader, &decoded));
+		UT_ASSERT(cluster_undo_inspect_pi(&decoded));
+		accepted = collect(roots, &diag); UT_ASSERT(accepted);
+		if (accepted) {
+			UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+			canonical = find_undo_target(roots, 257); physical = find_undo_target(roots, segments[i]);
+			UT_ASSERT(canonical != NULL && physical != NULL);
+			if (canonical && physical) {
+				UT_ASSERT_EQ(canonical->required_blocks, segments[i] == 257 ? 8 : 1);
+				UT_ASSERT_EQ(physical->required_blocks, 8);
+				UT_ASSERT_EQ(canonical->file.undo_owner_instance, 2);
+				UT_ASSERT_EQ(physical->file.undo_owner_instance, 2);
+				UT_ASSERT_EQ(physical->origins, CLUSTER_RECOVERY_ROOT_FROM_WAL);
+			}
+			UT_ASSERT_EQ(diag.undo_targets, segments[i] == 257 ? 1 : 2);
+			UT_ASSERT_EQ(diag.unowned_records, 1);
+		}
+		cluster_recovery_root_set_destroy(roots);
+	}
+	remove_root(fd);
+}
+
+UT_TEST(test_operation_head_union_keeps_short_missing_and_maximum_extents)
+{
+	int fd = new_root();
+	ClusterRecoveryRootSet *roots;
+	ClusterRecoveryWalTargetsDiag diag;
+	const ClusterRecoveryRootEntry *entry;
+
+	UT_ASSERT_EQ(mkdirat(fd, "pg_undo", 0700), 0);
+	UT_ASSERT_EQ(mkdirat(fd, "pg_undo/instance_1", 0700), 0);
+	root_file(fd, "pg_undo/instance_1/seg_257.dat", "", 0);
+	root_file(fd, "pg_undo/instance_1/seg_259.dat", wal_image, BLCKSZ);
+	root_file(fd, "pg_undo/instance_1/seg_260.dat", wal_image, BLCKSZ);
+	roots = begin_roots(fd, 1024 * 1024);
+	undo_wal_fixture(9, 257); UT_ASSERT(collect(roots, &diag));
+	for (unsigned i = 0; i < 3; i++) {
+		operation_head_fixture(i == 2 ? 258 : 259, i == 0 ? 11 : 7);
+		UT_ASSERT(collect(roots, &diag));
+	}
+	UT_ASSERT_EQ(finish_roots(roots, NULL), CLUSTER_RECOVERY_ROOTS_OBSERVED);
+	entry = find_undo_target(roots, 257); UT_ASSERT(entry != NULL);
+	if (entry) { UT_ASSERT_EQ(entry->required_blocks, 8); UT_ASSERT_EQ(entry->file.size, 0); }
+	entry = find_undo_target(roots, 259); UT_ASSERT(entry != NULL);
+	if (entry) {
+		UT_ASSERT_EQ(entry->required_blocks, 12); UT_ASSERT_EQ(entry->file.size, BLCKSZ);
+		UT_ASSERT_EQ(entry->origins, CLUSTER_RECOVERY_ROOT_FROM_WAL | CLUSTER_RECOVERY_ROOT_PHYSICAL);
+	}
+	entry = find_undo_target(roots, 258); UT_ASSERT(entry != NULL);
+	if (entry) { UT_ASSERT_EQ(entry->required_blocks, 8); UT_ASSERT_EQ(entry->origins, CLUSTER_RECOVERY_ROOT_FROM_WAL); }
+	entry = find_undo_target(roots, 260); UT_ASSERT(entry != NULL);
+	if (entry) UT_ASSERT_EQ(entry->origins, CLUSTER_RECOVERY_ROOT_PHYSICAL);
+	cluster_recovery_root_set_destroy(roots); remove_root(fd);
+}
+
+UT_TEST(test_operation_head_bad_identity_or_capacity_revokes_the_whole_union)
+{
+	int fd = new_root();
+
+	for (unsigned fault = 0; fault < 11; fault++) {
+		ClusterRecoveryRootSet *roots = begin_roots(fd, 1024 * 1024);
+		ClusterRecoveryWalTargetsDiag diag;
+		xl_undo_tt_slot_set_head_operation r;
+		uint8 digest[32];
+
+		undo_wal_fixture(9, 257); UT_ASSERT(collect(roots, &diag));
+		r = operation_head_fixture(258, 7);
+		switch (fault) {
+		case 0: r.head.first_undo_block = uba_encode(513, 7, 6, 0); break;
+		case 1: r.head.first_undo_block = uba_encode(258, 7, 5, 0); break;
+		case 2: r.operation.canonical_top_fxid++; break;
+		case 3: r.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_DISCARDED; break;
+		case 4: r.operation.canonical_segment_generation = PG_UINT32_MAX; break;
+		case 5: r.head._pad[0] = 0; break;
+		case 6: native_reader.record->main_data_len--; break;
+		case 7: native_reader.record->main_data_len++; break;
+		case 8: native_source.claim.database_incarnation++; break;
+		case 9: r.head.first_undo_block = uba_encode(258, 0, 6, 0); break;
+		case 10: roots->capacity = roots->count; break;
+		}
+		memcpy(wal_payload.bytes, &r, sizeof(r));
+		UT_ASSERT(!collect(roots, &diag)); UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+		/* The canonical file already exists; the second, physical append
+		 * must revoke the entire union when its capacity is exhausted. */
+		if (fault == 10) UT_ASSERT_EQ(diag.roots_result, CLUSTER_RECOVERY_ROOTS_CAPACITY);
+		UT_ASSERT(finish_roots(roots, NULL) > CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		cluster_recovery_root_set_destroy(roots);
+	}
+	remove_root(fd);
+}
+
+UT_TEST(test_legacy_head_keeps_its_single_segment_gate)
+{
+	int fd = new_root();
+
+	for (unsigned cross = 0; cross <= 1; cross++) {
+		ClusterRecoveryRootSet *roots = begin_roots(fd, 1024 * 1024);
+		ClusterRecoveryWalTargetsDiag diag;
+		xl_undo_tt_slot_set_head r;
+		uint8 digest[32];
+
+		undo_wal_fixture(9, 257); memcpy(&r, wal_payload.bytes, sizeof(r));
+		if (cross) r.first_undo_block = uba_encode(258, 7, 0, 0);
+		memcpy(wal_payload.bytes, &r, sizeof(r));
+		UT_ASSERT_EQ(collect(roots, &diag), cross == 0);
+		if (cross) {
+			UT_ASSERT(!cluster_recovery_root_set_digest(roots, digest));
+			UT_ASSERT(finish_roots(roots, NULL) > CLUSTER_RECOVERY_ROOTS_OBSERVED);
+		} else { UT_ASSERT_EQ(diag.undo_targets, 1); UT_ASSERT_EQ(diag.unowned_records, 1); }
+		cluster_recovery_root_set_destroy(roots);
+	}
+	remove_root(fd);
+}
+
 UT_TEST(test_undo_wal_all_shapes_preserve_segment_targets)
 {
 	int fd = new_root();

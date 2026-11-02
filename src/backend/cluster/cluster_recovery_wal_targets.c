@@ -112,12 +112,14 @@ targets_undo(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 {
 	ClusterUndoDecoded undo;
 	uint64 required = 1;
+	uint32 target_segment;
 
 	/* The original pure historical classifier accepts generation zero.
 	 * Reusing its syntax checks does not create a PI plan or permit apply.
 	 * Full payload/lifecycle effects remain unowned graph obligations. */
 	if (!cluster_undo_decode(reader, &undo) || !cluster_undo_inspect_pi(&undo))
 		return false;
+	target_segment = undo.segment_id;
 	if (undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
 		|| undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
 		required = (uint64)undo.block_no + 1;
@@ -126,13 +128,27 @@ targets_undo(ClusterRecoveryRootSet *roots, XLogReaderState *reader,
 		uint16 slot, row;
 
 		if (!uba_decode_record(undo.first_undo_block, &segment, &block, &slot, &row)
-			|| segment != undo.segment_id || slot != undo.slot_offset)
+			|| slot != undo.slot_offset)
 			return false;
+		if (segment != undo.segment_id) {
+			/* Only the typed carrier names a separate, same-origin head.
+			 * Keep canonical block zero independently of the data extent. */
+			if (undo.flags != CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG)
+				return false;
+			diag->roots_result = cluster_recovery_root_set_add_undo(
+				roots, source->claim.identity.system_identifier,
+				source->claim.database_incarnation, source->claim.identity.storage_uuid,
+				undo.instance, undo.segment_id, 1);
+			if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
+				return false;
+			diag->undo_targets++;
+			target_segment = segment;
+		}
 		required = (uint64)block + 1;
 	}
 	diag->roots_result = cluster_recovery_root_set_add_undo(
 		roots, source->claim.identity.system_identifier, source->claim.database_incarnation,
-		source->claim.identity.storage_uuid, undo.instance, undo.segment_id, required);
+		source->claim.identity.storage_uuid, undo.instance, target_segment, required);
 	if (diag->roots_result != CLUSTER_RECOVERY_ROOTS_MORE)
 		return false;
 	diag->undo_targets++;

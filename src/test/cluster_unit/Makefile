@@ -12127,11 +12127,13 @@ test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
 		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_UBA_O) \
 		$(top_builddir)/src/backend/cluster/cluster_page_stable_base.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_UBA_O) \
 		$(top_builddir)/src/backend/cluster/cluster_page_stable_base.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

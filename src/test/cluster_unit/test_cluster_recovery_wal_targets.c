@@ -468,7 +468,7 @@ UT_TEST(test_bad_edge_mixed_side_and_unclassified_opcode_do_not_finish_roots)
 int
 main(void)
 {
-	UT_PLAN(56);
+	UT_PLAN(60);
 	UT_RUN(test_page_and_rebuildable_fsm_keep_all_file_targets);
 	UT_RUN(test_typed_structure_keeps_all_forks_and_space_pages);
 	UT_RUN(test_native_create_and_truncate_do_not_invent_page_requirements);
@@ -525,6 +525,10 @@ main(void)
 	UT_RUN(test_relmap_empty_keeps_missing_short_and_untouched_copies);
 	UT_RUN(test_relmap_target_failures_revoke_entire_union);
 	UT_RUN(test_relmap_mapping_requires_exact_original_array_and_ordinal);
+	UT_RUN(test_operation_head_keeps_canonical_and_physical_roots_distinct);
+	UT_RUN(test_operation_head_union_keeps_short_missing_and_maximum_extents);
+	UT_RUN(test_operation_head_bad_identity_or_capacity_revokes_the_whole_union);
+	UT_RUN(test_legacy_head_keeps_its_single_segment_gate);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
