@@ -202,7 +202,7 @@ TESTS = test_cluster_clog_write_snapshot test_cluster_clog_file test_cluster_tt_
         test_cluster_undo_gcs \
         test_cluster_undo_verdict \
 		test_cluster_vis_undo_verdict_map \
-		test_cluster_undo_horizon test_cluster_snapshot_admission test_cluster_vacuum_native_window test_cluster_subtrans_watermark \
+		test_cluster_undo_horizon test_cluster_snapshot_admission test_cluster_vacuum_native_window test_cluster_subtrans_watermark test_cluster_xid_limits \
 		test_cluster_lms_shard \
 		test_cluster_gcs_block_dedup test_cluster_gcs_block_dedup_r4_route \
         test_cluster_gcs_block_shard
@@ -10619,6 +10619,24 @@ test_cluster_snapshot_admission: test_cluster_snapshot_admission.c unit_test.h \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: execute the real native maintenance entry, with catalogue/I/O leaves.
+test_cluster_xid_limits.inc: $(top_srcdir)/src/backend/access/transam/varsup.c Makefile
+	@awk '/^SetTransactionIdLimit\(/ { print "void"; emit=1; starts++ } \
+		/^ForceTransactionIdLimitUpdate\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 2) exit 1 }' $< > $@
+
+test_cluster_xid_limits_order.inc: $(top_srcdir)/src/backend/access/transam/transam.c Makefile
+	@awk '/^TransactionIdFollowsOrEquals\(/ { print "bool"; emit=1; starts++ } \
+		emit { print } emit && /^}$$/ { emit=0 } \
+		END { if (emit || starts != 1) exit 1 }' $< > $@
+
+test_cluster_xid_limits: test_cluster_xid_limits.c unit_test.h \
+		test_cluster_xid_limits.inc test_cluster_xid_limits_order.inc $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/include/cluster/cluster_mode.h \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_XID_STRIPE_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_vacuum_native_window_xid.inc: $(top_srcdir)/src/backend/access/transam/transam.c Makefile
 	@awk '/^TransactionIdPrecedes\(/ { print "bool"; emit=1; starts++ } \
 		emit { print } emit && /^}$$/ { emit=0 } \
@@ -10657,6 +10675,7 @@ clean distclean maintainer-clean: clean-vacuum-native-window
 
 .PHONY: clean-vacuum-native-window
 clean-vacuum-native-window:
+	rm -f test_cluster_xid_limits.inc test_cluster_xid_limits_order.inc
 	rm -f test_cluster_vacuum_native_window.inc test_cluster_vacuum_native_window_xid.inc
 	rm -f test_cluster_subtrans_watermark.inc
 

@@ -68,6 +68,7 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC (spec-6.14 D6): shared-catalog OID lease path for GetNewObjectId. */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_oid_lease.h"
 #endif
 
@@ -638,8 +639,15 @@ SetTransactionIdLimit(TransactionId oldest_datfrozenxid, Oid oldest_datoid)
 	TransactionId xidStopLimit;
 	TransactionId xidWrapLimit;
 	TransactionId curXid;
+#ifdef USE_PGRAC_CLUSTER
+	/* Checkpoint restoration retains its original native owner and counters. */
+	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog &&
+		IsNormalProcessingMode() && !AmStartupProcess() && !InRecovery;
 
+	Assert(shared_xid || TransactionIdIsNormal(oldest_datfrozenxid));
+#else
 	Assert(TransactionIdIsNormal(oldest_datfrozenxid));
+#endif
 
 	/*
 	 * The place where we actually get into deep trouble is halfway around
@@ -703,12 +711,55 @@ SetTransactionIdLimit(TransactionId oldest_datfrozenxid, Oid oldest_datoid)
 
 	/* Grab lock for just long enough to set the new limit values */
 	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	if (shared_xid)
+	{
+		FullTransactionId legal_next;
+		FullTransactionId oldest;
+		ClusterXidStripeSampleFence fence;
+		uint64		next_value;
+		uint64		oldest_value;
+
+		/* The original allocation promise supplies age, never the DB cut. */
+		if (!cluster_xid_striping ||
+			!cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+												 &legal_next, &fence) ||
+			!FullTransactionIdIsValid(legal_next) ||
+			!TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) ||
+			U64FromFullTransactionId(legal_next) == UINT64_MAX)
+		{
+			LWLockRelease(XidGenLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared transaction ID limits require a legal allocation window")));
+		}
+		oldest = cluster_xid_widen(oldest_datfrozenxid, legal_next);
+		next_value = U64FromFullTransactionId(legal_next);
+		oldest_value = U64FromFullTransactionId(oldest);
+		if (!TransactionIdIsNormal(oldest_datfrozenxid) ||
+			!FullTransactionIdIsValid(oldest) || oldest_value > next_value ||
+			next_value - oldest_value >= UINT64CONST(0x80000000))
+		{
+			LWLockRelease(XidGenLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("shared database freeze boundary is outside the legal allocation window"),
+					 errdetail("Database %u: oldest XID %u, legal next %llu.",
+							   oldest_datoid, oldest_datfrozenxid,
+							   (unsigned long long) next_value)));
+		}
+		curXid = XidFromFullTransactionId(legal_next);
+	}
+#endif
 	ShmemVariableCache->oldestXid = oldest_datfrozenxid;
 	ShmemVariableCache->xidVacLimit = xidVacLimit;
 	ShmemVariableCache->xidWarnLimit = xidWarnLimit;
 	ShmemVariableCache->xidStopLimit = xidStopLimit;
 	ShmemVariableCache->xidWrapLimit = xidWrapLimit;
 	ShmemVariableCache->oldestXidDB = oldest_datoid;
+#ifdef USE_PGRAC_CLUSTER
+	if (!shared_xid)
+#endif
 	curXid = XidFromFullTransactionId(ShmemVariableCache->nextXid);
 	LWLockRelease(XidGenLock);
 
@@ -782,6 +833,11 @@ ForceTransactionIdLimitUpdate(void)
 	TransactionId xidVacLimit;
 	TransactionId oldestXid;
 	Oid			oldestXidDB;
+#ifdef USE_PGRAC_CLUSTER
+	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog &&
+		IsNormalProcessingMode() && !AmStartupProcess() && !InRecovery;
+	bool		legal = true;
+#endif
 
 	/* Locking is probably not really necessary, but let's be careful */
 	LWLockAcquire(XidGenLock, LW_SHARED);
@@ -789,8 +845,38 @@ ForceTransactionIdLimitUpdate(void)
 	xidVacLimit = ShmemVariableCache->xidVacLimit;
 	oldestXid = ShmemVariableCache->oldestXid;
 	oldestXidDB = ShmemVariableCache->oldestXidDB;
+#ifdef USE_PGRAC_CLUSTER
+	if (shared_xid)
+	{
+		FullTransactionId legal_next;
+		ClusterXidStripeSampleFence fence;
+
+		legal = cluster_xid_striping &&
+			cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+												 &legal_next, &fence) &&
+			FullTransactionIdIsValid(legal_next) &&
+			TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) &&
+			U64FromFullTransactionId(legal_next) != UINT64_MAX;
+		if (legal)
+		{
+			FullTransactionId oldest = cluster_xid_widen(oldestXid, legal_next);
+			uint64		next_value = U64FromFullTransactionId(legal_next);
+			uint64		oldest_value = U64FromFullTransactionId(oldest);
+
+			legal = TransactionIdIsNormal(oldestXid) &&
+				FullTransactionIdIsValid(oldest) && oldest_value <= next_value &&
+				next_value - oldest_value < UINT64CONST(0x80000000);
+			nextXid = XidFromFullTransactionId(legal_next);
+		}
+	}
+#endif
 	LWLockRelease(XidGenLock);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Ask the original updater to revalidate; unknown grants no new limit. */
+	if (!legal)
+		return true;
+#endif
 	if (!TransactionIdIsNormal(oldestXid))
 		return true;			/* shouldn't happen, but just in case */
 	if (!TransactionIdIsValid(xidVacLimit))
