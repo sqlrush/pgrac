@@ -217,6 +217,8 @@ static bool pgrac_native_recovery_requested;
 static PgracInitdbRecoveryContext pgrac_native_recovery;
 static ClusterRecoveryFileIdentityV2 pgrac_native_relmap_identities[4];
 static void pgrac_native_bind_creation(void);
+static void pgrac_native_read_registration(void);
+static void pgrac_native_check_directory(const char *path, int fd, struct stat *held);
 static int pgrac_native_child_begin(bool bootstrap);
 static void pgrac_native_child_started(int context_fd);
 #endif
@@ -3798,6 +3800,7 @@ pgrac_native_prepare_paths(void)
 	char *wal_abs;
 	const char *paths[3];
 	int count = pgrac_native_base_path == NULL ? 2 : 3;
+	bool borrowed_shared = false;
 
 	if (pgrac_native_thread < 0)
 		return;
@@ -3812,6 +3815,7 @@ pgrac_native_prepare_paths(void)
 		pg_fatal("INITDB_WAL_PATH: original data and WAL must be distinct canonical directories");
 	free(data_abs);
 	free(wal_abs);
+	pgrac_native_config_check(true);
 	/* Both checks precede creation of either directory.  An occupied target
 	 * never causes partial changes to the other member of the pair. */
 	paths[0] = pgrac_native_data_path;
@@ -3830,8 +3834,27 @@ pgrac_native_prepare_paths(void)
 		for (int i = 0; i < 2; ++i)
 			if (pgrac_hw_path_contains(paths[i], paths[2]) || pgrac_hw_path_contains(paths[2], paths[i]))
 				pg_fatal("INITDB_BASE_PATH: original DATA, WAL and shared base must not overlap");
+		/* A registered peer borrows the founder's shared directory. Consume
+		 * its complete closed request before either empty-directory gate,
+		 * and retain these original descriptors through bind and child use. */
+		if (pgrac_native_thread != 1 && getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL)
+		{
+			struct stat held;
+
+			pgrac_native_data_fd = open(paths[0], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+			pgrac_native_wal_fd = open(paths[1], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+			pgrac_native_base_fd = open(paths[2], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+			pgrac_native_check_directory(paths[0], pgrac_native_data_fd, &held);
+			pgrac_native_check_directory(paths[1], pgrac_native_wal_fd, &held);
+			pgrac_native_check_directory(paths[2], pgrac_native_base_fd, &held);
+			pgrac_native_read_registration();
+			pgrac_native_check_directory(paths[0], pgrac_native_data_fd, &held);
+			pgrac_native_check_directory(paths[1], pgrac_native_wal_fd, &held);
+			pgrac_native_check_directory(paths[2], pgrac_native_base_fd, &held);
+			borrowed_shared = pgrac_native_recovery_requested;
+		}
 		state = pg_check_dir(paths[2]);
-		if (state != 0 && state != 1)
+		if (state != 0 && state != 1 && !(borrowed_shared && state == 4))
 			pg_fatal("INITDB_BASE_PATH: shared base must be empty and accessible");
 	}
 	for (int i = 0; i < count; ++i)
@@ -3840,7 +3863,7 @@ pgrac_native_prepare_paths(void)
 		char parent[MAXPGPATH];
 		struct stat st;
 
-		if (state != 0 && state != 1)
+		if (state != 0 && state != 1 && !(i == 2 && borrowed_shared && state == 4))
 			pg_fatal("INITDB_WAL_PATH: original data and WAL directories must be empty and accessible");
 		/* The creator persists exactly these two new directory entries. */
 		strlcpy(parent, paths[i], sizeof(parent));
@@ -3848,7 +3871,6 @@ pgrac_native_prepare_paths(void)
 		if (lstat(parent, &st) != 0 || !S_ISDIR(st.st_mode))
 			pg_fatal("INITDB_WAL_PATH: original data and WAL parents must already exist");
 	}
-	pgrac_native_config_check(true);
 }
 
 static void
@@ -3887,27 +3909,84 @@ pgrac_native_check_directories(struct stat *data_st, struct stat *wal_st)
 }
 
 static void
+pgrac_native_read_registration(void)
+{
+	const char *value = getenv(PGRAC_INITDB_RECOVERY_ENV);
+	ClusterRecoveryFileIdentityV2 boot[PGRAC_INITDB_BOOT_FILES_V2];
+	struct stat data, shared;
+
+	if (!pgrac_native_recovery_requested && value == NULL)
+		return;
+	if (!pgrac_native_recovery_requested)
+	{
+		char *end;
+		long descriptor;
+
+		errno = 0;
+		descriptor = strtol(value, &end, 10);
+		if (*value == '\0' || strspn(value, "0123456789") != strlen(value) || errno != 0 ||
+			*end != '\0' || descriptor < 3 || descriptor > INT_MAX ||
+			!pgrac_initdb_recovery_read_v2(descriptor, &pgrac_native_config, pgrac_native_sysid,
+				pgrac_native_database_incarnation, pgrac_native_storage_bytes,
+				pgrac_native_data_fd, pgrac_native_base_fd, &pgrac_native_recovery) ||
+			unsetenv(PGRAC_INITDB_RECOVERY_ENV) != 0)
+			pg_fatal("INITDB_RECOVERY_CONTEXT: original precreation registration refused");
+	}
+	else if (value != NULL)
+		pg_fatal("INITDB_RECOVERY_CONTEXT: original registration was already consumed");
+	/* Repeat the original identity checks at bind, without reopening or
+	 * reading another request. A local cached flag alone is not custody. */
+	if (pgrac_native_recovery.creator_pid != (uint64)getppid() ||
+		pgrac_native_recovery.first.system_identifier != pgrac_native_sysid ||
+		pgrac_native_recovery.first.database_incarnation != pgrac_native_database_incarnation ||
+		memcmp(pgrac_native_recovery.first.storage_uuid, pgrac_native_storage_bytes, 16) ||
+		pgrac_native_recovery.config.device != pgrac_native_config.device ||
+		pgrac_native_recovery.config.inode != pgrac_native_config.inode ||
+		pgrac_native_recovery.config.bytes != pgrac_native_config.bytes ||
+		memcmp(pgrac_native_recovery.config.sha256, pgrac_native_config.sha256, 32) ||
+		((pgrac_native_recovery.cohort[0] || pgrac_native_recovery.cohort[1])
+			? pgrac_native_recovery.cohort_origin != (uint64)(pgrac_native_thread - 1)
+			: pgrac_native_thread != 1) ||
+		(pgrac_native_thread != 1 && !pgrac_initdb_recovery_boot_v2(&pgrac_native_recovery, boot)) ||
+		!pgrac_initdb_recovery_relmaps_v2(&pgrac_native_recovery, pgrac_native_relmap_identities) ||
+		fstat(pgrac_native_data_fd, &data) || fstat(pgrac_native_base_fd, &shared) ||
+		pgrac_native_recovery.data_device != data.st_dev ||
+		pgrac_native_recovery.data_inode != data.st_ino ||
+		pgrac_native_recovery.shared_device != shared.st_dev ||
+		pgrac_native_recovery.shared_inode != shared.st_ino)
+		pg_fatal("INITDB_RECOVERY_CONTEXT: original registration identity changed");
+	pgrac_native_config_check(false);
+	pgrac_native_recovery_requested = true;
+	/* Managed BOOT must sync/read back before registry/ROOT publication. */
+	boot_options = "-c fsync=on -c log_checkpoints=false";
+	backend_options = "--single -O -j -c fsync=on -c search_path=pg_catalog -c exit_on_error=true -c log_checkpoints=false";
+}
+
+static void
 pgrac_native_bind_creation(void)
 {
 	struct stat data_st, wal_st;
+	bool borrowed_shared = pgrac_native_thread != 1 && pgrac_native_recovery_requested;
 
 	if (pgrac_native_thread < 0)
 		return;
 	if (!(made_new_pgdata || found_existing_pgdata)
 		|| !(made_new_xlogdir || found_existing_xlogdir))
 		pg_fatal("INITDB_WAL_IDENTITY: only the original directory creator can bind a writer");
-	pgrac_native_data_fd = open(pgrac_native_data_path,
-								 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-	pgrac_native_wal_fd = open(pgrac_native_wal_path,
-								O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-	if (pgrac_native_data_fd < 0 || pgrac_native_wal_fd < 0)
-		pg_fatal("INITDB_WAL_IDENTITY: cannot pin original directories: %m");
-	if (pgrac_native_base_path != NULL)
+	if (!borrowed_shared)
+	{
+		pgrac_native_data_fd = open(pgrac_native_data_path,
+			O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		pgrac_native_wal_fd = open(pgrac_native_wal_path,
+			O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (pgrac_native_data_fd < 0 || pgrac_native_wal_fd < 0)
+			pg_fatal("INITDB_WAL_IDENTITY: cannot pin original directories: %m");
+	}
+	if (pgrac_native_base_path != NULL && !borrowed_shared)
 	{
 		if (mkdir(pgrac_native_base_path, pg_dir_create_mode) != 0 && errno != EEXIST)
 			pg_fatal("INITDB_BASE_PATH: cannot create original shared base: %m");
-		if (pg_check_dir(pgrac_native_base_path) != 1 &&
-			!(pgrac_native_thread != 1 && getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL))
+		if (pg_check_dir(pgrac_native_base_path) != 1)
 			pg_fatal("INITDB_BASE_PATH: new shared base is no longer empty");
 		pgrac_native_base_fd = open(pgrac_native_base_path,
 			O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -3915,34 +3994,7 @@ pgrac_native_bind_creation(void)
 			pg_fatal("INITDB_BASE_PATH: cannot pin original shared base: %m");
 	}
 	pgrac_native_check_directories(&data_st, &wal_st);
-	{
-		const char *value = getenv(PGRAC_INITDB_RECOVERY_ENV);
-		if (value != NULL) {
-			char *end;
-			long descriptor;
-			errno = 0;
-			descriptor = strtol(value, &end, 10);
-			if (*value == '\0' || strspn(value, "0123456789") != strlen(value) || errno != 0 ||
-				*end != '\0' || descriptor < 3 || descriptor > INT_MAX ||
-				!pgrac_initdb_recovery_read_v2(descriptor, &pgrac_native_config, pgrac_native_sysid,
-											   pgrac_native_database_incarnation,
-											   pgrac_native_storage_bytes, pgrac_native_data_fd,
-											   pgrac_native_base_fd, &pgrac_native_recovery) ||
-				((pgrac_native_recovery.cohort[0] || pgrac_native_recovery.cohort[1])
-					 ? pgrac_native_recovery.cohort_origin != (uint64)(pgrac_native_thread - 1)
-					 : pgrac_native_thread != 1) ||
-				!pgrac_initdb_recovery_relmaps_v2(&pgrac_native_recovery,
-												  pgrac_native_relmap_identities) ||
-				unsetenv(PGRAC_INITDB_RECOVERY_ENV) != 0)
-				pg_fatal("INITDB_RECOVERY_CONTEXT: original precreation registration refused");
-			pgrac_native_recovery_requested = true;
-			/* Managed BOOT must sync/read back before registry/ROOT publication.
-			 * The ordinary initdb -F shortcut cannot qualify these files. */
-			boot_options = "-c fsync=on -c log_checkpoints=false";
-			backend_options = "--single -O -j -c fsync=on -c search_path=pg_catalog -c exit_on_error=true -c log_checkpoints=false";
-			pgrac_native_config_check(false);
-		}
-	}
+	pgrac_native_read_registration();
 }
 
 static ControlFileData *

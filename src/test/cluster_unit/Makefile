@@ -17438,3 +17438,20 @@ all: test_cluster_undo_tt_checkpoint
 clean: clean-undo-tt-checkpoint
 clean-undo-tt-checkpoint:
 	rm -f test_cluster_undo_tt_checkpoint test_cluster_undo_tt_checkpoint.d test_cluster_undo_tt_checkpoint.inc
+
+# Original creator pipe must be authenticated before a peer borrows shared data.
+TESTS += test_cluster_initdb_paths
+all: test_cluster_initdb_paths
+test_cluster_initdb_paths_entries.inc: $(top_srcdir)/src/bin/initdb/initdb.c $(srcdir)/extract_cluster_initdb_paths.py
+	python3 $(srcdir)/extract_cluster_initdb_paths.py $< $@
+test_cluster_initdb_paths: test_cluster_initdb_paths.c test_cluster_initdb_paths_entries.inc unit_test.h \
+	$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+	$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+	$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -DFRONTEND $< $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-paths
+.PHONY: clean-initdb-paths
+clean-initdb-paths:
+	rm -f test_cluster_initdb_paths test_cluster_initdb_paths.d test_cluster_initdb_paths_entries.inc test_cluster_initdb_paths_entries.inc.tmp
