@@ -9385,6 +9385,16 @@ typedef struct ClusterCurrentMxHistoryBatch
 	ItemPointerData successor;
 } ClusterCurrentMxHistoryBatch;
 
+static void
+cluster_current_mx_history_batch_release(ClusterCurrentMxHistoryBatch **batch)
+{
+	if (*batch != NULL) {
+		cluster_mx_history_cancel((*batch)->collector);
+		pfree(*batch);
+		*batch = NULL;
+	}
+}
+
 /* Complete capture -> unlock -> wait -> relock -> typed consume bracket.
  * Caller passes its actual live Snapshot, immutable descriptor and native
  * request options. Its input top/CID/shape values supply no authority. Normal
@@ -9397,7 +9407,8 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
 	const ClusterCurrentMxRequestContext *requested, const ClusterCurrentMxOperationState *operation,
 	ClusterCurrentMxHeapResult *heap_result, ClusterCurrentMxDecision *decision,
-	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace,
+	ClusterCurrentMxHistoryBatch **retained)
 {
 	ClusterCurrentMxHistoryBatch *batch;
 	volatile ClusterMxHistoryStep step = CMXH_UNKNOWN;
@@ -9405,6 +9416,8 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 	int updater = -1;
 	bool have_challenge;
 
+	if (retained != NULL)
+		*retained = NULL;
 	if (decision != NULL)
 		*decision = CMDL_UNKNOWN;
 	if (wait_key != NULL)
@@ -9598,8 +9611,11 @@ cluster_current_mx_history_collect_mode(Relation relation, Buffer buffer, HeapTu
 	PG_FINALLY();
 	{
 		/* The last typed/receipt consumer runs while the native lease is held. */
-		cluster_mx_history_cancel(batch->collector);
-		pfree(batch);
+		if (step == CMXH_COMPLETE && retained != NULL
+			&& heap_result->result == TM_Ok && heap_result->successor_proof.writer_valid)
+			*retained = batch; /* Original capture/registration and complete A+B. */
+		else
+			cluster_current_mx_history_batch_release(&batch);
 		if (step != CMXH_COMPLETE) {
 			memset(heap_result, 0, sizeof(*heap_result));
 			heap_result->result = TM_BeingModified;
@@ -9621,7 +9637,7 @@ cluster_current_mx_history_decide(Relation relation, Buffer buffer, HeapTuple tu
 	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
 {
 	return cluster_current_mx_history_collect_mode(relation, buffer, tuple, false, actual,
-		admission, key, members, nmembers, requested, operation, heap_result, decision, wait_key, trace);
+		admission, key, members, nmembers, requested, operation, heap_result, decision, wait_key, trace, NULL);
 }
 
 /*
@@ -9782,7 +9798,7 @@ cluster_current_mx_hot_updater_for_chain_scoped(
 		ClusterMxHistoryStep step;
 
 		step = cluster_current_mx_history_collect_mode(relation, buffer, tuple, true, actual,
-			admission, &key, members, nmembers, NULL, operation, &result, &decision, &wait_key, NULL);
+			admission, &key, members, nmembers, NULL, operation, &result, &decision, &wait_key, NULL, NULL);
 		if (step == CMXH_REQUALIFY) {
 			cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
 			cluster_current_mx_operation_restart(operation);
@@ -10222,7 +10238,8 @@ cluster_current_mx_authorize_scoped(Relation relation, Buffer buffer, HeapTuple 
 							 LockWaitPolicy wait_policy, bool wait_for_conflict,
 							 bool follow_updates,
 							 ClusterCurrentMxHeapResult *heap_result,
-							 ClusterCurrentMxOperationState *operation)
+							 ClusterCurrentMxOperationState *operation,
+							 ClusterCurrentMxHistoryBatch **retained)
 {
 	ClusterCurrentMxHeapFingerprint before;
 	ClusterCurrentMxHeapFingerprint live;
@@ -10354,9 +10371,9 @@ cluster_current_mx_authorize_scoped(Relation relation, Buffer buffer, HeapTuple 
 		ctx.action = (uint8)action;
 		ctx.follow_updates = follow_updates;
 		ctx.wait_for_conflict = wait_for_conflict;
-		step = cluster_current_mx_history_decide(relation, buffer, tuple,
+		step = cluster_current_mx_history_collect_mode(relation, buffer, tuple, false,
 			actual, admission, &key, members, nmembers, &ctx, operation,
-			heap_result, &decision, &wait_key, &decision_trace);
+			heap_result, &decision, &wait_key, &decision_trace, retained);
 		if (step == CMXH_REQUALIFY) {
 			memset(heap_result, 0, sizeof(*heap_result));
 			heap_result->result = TM_BeingModified;
@@ -10653,17 +10670,18 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 {
 	return cluster_current_mx_authorize_scoped(relation, buffer, tuple, false, NULL, NULL,
 		requester_xid, action, lock_mode, is_update, wait_policy, wait_for_conflict,
-		follow_updates, heap_result, operation);
+		follow_updates, heap_result, operation, NULL);
 }
 
 /* Selected only together with the complete operation-aware wire family.
  * Keep an explicit mode: a missing Snapshot/token must never select legacy. */
 static ClusterCurrentMxHeapDisposition pg_attribute_unused()
-cluster_current_mx_history_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
+cluster_current_mx_history_authorize_retained(Relation relation, Buffer buffer, HeapTuple tuple,
 	Snapshot actual, const ClusterSemanticAdmissionToken *admission, TransactionId requester_xid,
 	ClusterCurrentTupleAction action, LockTupleMode lock_mode, bool is_update,
 	LockWaitPolicy wait_policy, bool wait_for_conflict, bool follow_updates,
-	ClusterCurrentMxHeapResult *heap_result, ClusterCurrentMxOperationState *operation)
+	ClusterCurrentMxHeapResult *heap_result, ClusterCurrentMxOperationState *operation,
+	ClusterCurrentMxHistoryBatch **retained)
 {
 	volatile ClusterCurrentMxHeapDisposition result = CCMH_NOT_APPLICABLE;
 
@@ -10671,7 +10689,7 @@ cluster_current_mx_history_authorize(Relation relation, Buffer buffer, HeapTuple
 	{
 		result = cluster_current_mx_authorize_scoped(relation, buffer, tuple, true, actual,
 			admission, requester_xid, action, lock_mode, is_update, wait_policy,
-			wait_for_conflict, follow_updates, heap_result, operation);
+			wait_for_conflict, follow_updates, heap_result, operation, retained);
 	}
 	PG_CATCH();
 	{
@@ -10683,6 +10701,18 @@ cluster_current_mx_history_authorize(Relation relation, Buffer buffer, HeapTuple
 	}
 	PG_END_TRY();
 	return result;
+}
+
+static ClusterCurrentMxHeapDisposition
+cluster_current_mx_history_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
+	Snapshot actual, const ClusterSemanticAdmissionToken *admission, TransactionId requester_xid,
+	ClusterCurrentTupleAction action, LockTupleMode lock_mode, bool is_update,
+	LockWaitPolicy wait_policy, bool wait_for_conflict, bool follow_updates,
+	ClusterCurrentMxHeapResult *heap_result, ClusterCurrentMxOperationState *operation)
+{
+	return cluster_current_mx_history_authorize_retained(relation, buffer, tuple, actual,
+		admission, requester_xid, action, lock_mode, is_update, wait_policy,
+		wait_for_conflict, follow_updates, heap_result, operation, NULL);
 }
 
 /* Container membership and original retention evidence precede descriptor
@@ -10849,7 +10879,7 @@ static ClusterCurrentMxHeapDisposition
 cluster_current_mx_chain_authorize(ClusterCurrentMxLockScope *scope,
 	Relation relation, Buffer buffer, HeapTuple tuple, TransactionId requester,
 	LockTupleMode mode, ClusterCurrentMxHeapResult *current,
-	ClusterCurrentMxOperationState *operation)
+	ClusterCurrentMxOperationState *operation, ClusterCurrentMxHistoryBatch **retained)
 {
 	if (scope != NULL) {
 		ClusterCurrentMxHeapDisposition disposition;
@@ -10857,9 +10887,9 @@ cluster_current_mx_chain_authorize(ClusterCurrentMxLockScope *scope,
 		memset(current, 0, sizeof(*current));
 		current->result = TM_BeingModified;
 		cluster_current_mx_lock_scope_require(scope);
-		disposition = cluster_current_mx_history_authorize(relation, buffer, tuple,
+		disposition = cluster_current_mx_history_authorize_retained(relation, buffer, tuple,
 			scope->actual, &scope->admission, requester, CCM_ACTION_LOCK, mode,
-			false, LockWaitBlock, true, true, current, operation);
+			false, LockWaitBlock, true, true, current, operation, retained);
 		cluster_current_mx_lock_scope_require(scope);
 		cluster_current_mx_bind_writer_scope(scope, current);
 		return disposition;
@@ -17906,6 +17936,12 @@ typedef struct ClusterCurrentMxChainState
 	ClusterCurrentMxOperationState operation;
 	ClusterCurrentMxHeapResult current;
 	ClusterCurrentMxStampPlan plan;
+	ClusterCurrentMxHistoryBatch *history;
+	ClusterCurrentMxHeapFingerprint history_image;
+	PGAlignedBlock history_page;
+	uint64 history_scope;
+	TransactionId history_requester;
+	LockTupleMode history_mode;
 	ResourceXAuxiliaryAcquireContext vm_context;
 	bool handled;
 	bool edge_consumed;
@@ -17919,6 +17955,84 @@ typedef struct ClusterCurrentMxChainState
 	PGAlignedBlock consumed_page;
 	uint8 header[SizeofHeapTupleHeader] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 } ClusterCurrentMxChainState;
+
+/* A reservation/PREPARE relock consumes the delivered set in the same hop.
+ * The original capture owns all A keys/effects/capabilities and independent B;
+ * this private continuation cannot serve another operation or attempt. */
+static ClusterCurrentMxHeapDisposition
+cluster_current_mx_chain_hop_authorize(ClusterCurrentMxLockScope *scope,
+	Relation relation, Buffer buffer, HeapTuple tuple, TransactionId requester,
+	LockTupleMode mode, ClusterCurrentMxChainState *state)
+{
+	ClusterCurrentMxHistoryBatch *b = state->history;
+	ClusterCurrentMxHeapResult *current = &state->current;
+	ClusterCurrentMxOperationState *operation = &state->operation;
+	ClusterCurrentMxHeapFingerprint live;
+	HeapTupleData candidate;
+	ClusterCurrentMxHeapDisposition disposition;
+
+	cluster_current_mx_lock_scope_require(scope);
+	if (b != NULL && (current->operation_id != operation->operation_id
+		|| operation->restarts == UINT32_MAX
+		|| current->attempt_generation != operation->restarts + 1)) {
+		/* Only an explicit proven-zero retry may replace this set. */
+		cluster_current_mx_history_batch_release(&state->history);
+		b = NULL;
+	}
+	if (b != NULL) {
+		bool exact = state->history_scope == scope->binding_id
+			&& state->history_requester == requester && state->history_mode == mode
+			&& current->result == TM_Ok && current->successor_proof.writer_valid
+			&& b->capture.nmembers > 0
+			&& b->capture.nmembers <= CLUSTER_CURRENT_MX_MAX_MEMBERS
+			&& cluster_current_mx_capture(buffer, tuple, &live)
+			&& cluster_current_mx_capture_equal(&state->history_image, &live)
+			&& memcmp(state->history_page.data, BufferGetPage(buffer), BLCKSZ) == 0
+			&& cluster_mx_history_capture_recheck(b->collector, relation, buffer, tuple,
+				&b->capture.mxkey, b->capture.members, b->capture.nmembers)
+			&& cluster_mx_history_validate_successor(&b->capture, b->keys, b->proofs,
+				&b->fresh_target, &b->typed_successor);
+
+		/* A's LIVE canonical grant is independent of B's grant, even for
+		 * the same top. Neither an echo nor B can establish A freshness. */
+		for (uint16 i = 0; exact && i < b->capture.nmembers; i++) {
+			ClusterCurrentMemberOperationProof *a = &b->proofs[i];
+			ClusterCtrcTxnKeyV1 key;
+			ClusterCtrcParticipantIdentity participant;
+
+			if (a->base.state == CCM_ACTIVE && (a->flags == 0
+				|| a->effect_state == CLUSTER_SAVEPOINT_EFFECT_LIVE))
+				exact = b->capabilities[i] != 0
+					&& ClusterCurrentMemberProofGetCtrcGrant(&a->base) != 0
+					&& cluster_runtime_visibility_active_proof_ctrc_identity_exact(&a->base.key,
+						ClusterCurrentMemberProofGetCtrcGrant(&a->base), b->capabilities[i],
+						&key, &participant);
+		}
+		exact = exact && cluster_current_mx_history_candidate(buffer,
+			&current->successor_proof.tid, tuple->t_tableOid, &candidate)
+			&& cluster_current_mx_writer_successor_matches_image(buffer, &candidate,
+				&current->successor_proof, scope, &current->successor_proof.history);
+		if (!exact) {
+			cluster_current_mx_history_batch_release(&state->history);
+			memset(current, 0, sizeof(*current));
+			cluster_current_mx_failclosed(operation, CCMH_FAIL_MEMBER_PROOF,
+				"the original recursive A+B capture or grants changed before reuse");
+		}
+		return CCMH_DECIDED;
+	}
+	disposition = cluster_current_mx_chain_authorize(scope, relation, buffer, tuple,
+		requester, mode, current, operation, &state->history);
+	if (state->history != NULL) {
+		if (!cluster_current_mx_capture(buffer, tuple, &state->history_image))
+			cluster_current_mx_failclosed(operation, CCMH_FAIL_MEMBER_PROOF,
+				"the delivered recursive A+B has no exact current image");
+		memcpy(state->history_page.data, BufferGetPage(buffer), BLCKSZ);
+		state->history_scope = scope->binding_id;
+		state->history_requester = requester;
+		state->history_mode = mode;
+	}
+	return disposition;
+}
 
 /* LOCK_UPDATED preserves the forward link, cid and tuple ITL index. Its
  * WAL record only changes xmax and the two xmax hint masks. */
@@ -20771,6 +20885,7 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 		if (history_state != NULL) {
 			cluster_current_mx_operation_finish(&history_state->operation);
 			cluster_current_mx_stamp_cancel(&history_state->plan);
+			cluster_current_mx_history_batch_release(&history_state->history);
 			memset(&history_state->plan, 0, sizeof(history_state->plan));
 			history_state->successor_continuation = false;
 			cluster_current_mx_lock_scope_require(history_scope);
@@ -20833,7 +20948,8 @@ l4:
 			history_state->edge_consumed = false;
 			history_state->next_ready = false;
 			memset(&history_state->next, 0, sizeof(history_state->next));
-			memset(&history_state->current, 0, sizeof(history_state->current));
+			if (history_state->history == NULL)
+				memset(&history_state->current, 0, sizeof(history_state->current));
 			cluster_current_mx_lock_scope_require(history_scope);
 		}
 #endif
@@ -20943,8 +21059,8 @@ l4:
 		if (history_state != NULL) {
 			ClusterCurrentMxHeapDisposition disposition;
 
-			disposition = cluster_current_mx_chain_authorize(history_scope, rel, buf,
-				&mytup, xid, mode, &history_state->current, &history_state->operation);
+			disposition = cluster_current_mx_chain_hop_authorize(history_scope, rel, buf,
+				&mytup, xid, mode, history_state);
 			if (disposition == CCMH_RESTART) {
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 				goto l4;
@@ -20965,7 +21081,7 @@ l4:
 		/* NULL scope retains the original current-MX guard. A scoped
 		 * current MX also cannot fall through on NOT_APPLICABLE. */
 		(void)cluster_current_mx_chain_authorize(NULL, rel, buf, &mytup,
-			xid, mode, NULL, NULL);
+			xid, mode, NULL, NULL, NULL);
 
 		/*
 		 * PGRAC: spec-7.1a D5 -- the same foreign-class floor for the chain
@@ -21759,6 +21875,7 @@ heap_lock_updated_tuple_rec_scoped(Relation rel, TransactionId prior_xmax,
 	{
 		cluster_current_mx_operation_finish(&state->operation);
 		cluster_current_mx_stamp_cancel(&state->plan);
+		cluster_current_mx_history_batch_release(&state->history);
 		pfree(state);
 	}
 	PG_END_TRY();

@@ -66,6 +66,7 @@ static Snapshot native_setup(ClusterHeapSuccessorProof *next)
 	relation.rd_rel = &native_class; native_snapshot = s;
 	native_reads = native_releases = native_visibility = native_reserves = 0;
 	native_prepared_checks = native_fault = native_pins = 0;
+	native_retry_limit = native_requalifications = 0; publication_A_grant_revoked = false;
 	UT_ASSERT_EQ(writer_scoped_call(&out), 2);
 	UT_ASSERT(two_publish(&out, &tuple, 0, next));
 	bridge_lock_override = native_lock;
@@ -92,6 +93,9 @@ UT_TEST(native_recursive_reservation_relock_preserves_consumed_B)
 	UT_ASSERT_EQ(error_code, ERRCODE_QUERY_CANCELED);
 	UT_ASSERT_EQ(native_reserves, 1); UT_ASSERT_EQ(native_prepared_checks, 1);
 	UT_ASSERT_EQ(native_reads, 1); UT_ASSERT_EQ(native_visibility, 1);
+	UT_ASSERT_EQ(finish_requests, 13); UT_ASSERT_EQ(finish_reads, 13);
+	for (unsigned i = 0; i < 6; i++) UT_ASSERT_EQ(two_records[i].reads, 2);
+	UT_ASSERT_EQ(two_records[6].reads, 1);
 	UT_ASSERT_EQ(publication_applies, 2); /* First controlled hop only. */
 	UT_ASSERT_EQ(publication_cancels, 0);
 	native_clean(s);
@@ -125,7 +129,7 @@ UT_TEST(native_recursive_new_invocation_cannot_replay_consumed_B)
 	UT_ASSERT_EQ(native_call(&next), -1);
 	UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT);
 	UT_ASSERT_EQ(native_prepared_checks, 1); UT_ASSERT_EQ(native_reserves, 1);
-	UT_ASSERT_EQ(finish_requests, 20); UT_ASSERT_EQ(publication_applies, 2);
+	UT_ASSERT_EQ(finish_requests, 13); UT_ASSERT_EQ(publication_applies, 2);
 	native_clean(s);
 }
 UT_TEST(native_recursive_missing_proved_B_cannot_return_vacuum_success)
@@ -141,12 +145,60 @@ UT_TEST(native_recursive_missing_proved_B_cannot_return_vacuum_success)
 	UT_ASSERT_EQ(finish_requests, 6); UT_ASSERT_EQ(publication_applies, 2);
 	native_clean(s);
 }
+UT_TEST(native_recursive_same_hop_repeated_prepare_relocks_do_not_reread)
+{
+	ClusterHeapSuccessorProof next;
+	Snapshot s = native_setup(&next);
+	native_retry_limit = 3;
+	UT_ASSERT_EQ(native_call(&next), -1);
+	printf("# repeated error=%d requalifications=%u requests=%u reads=%u\n",
+		error_code, native_requalifications, finish_requests, finish_reads);
+	UT_ASSERT_EQ(error_code, ERRCODE_QUERY_CANCELED);
+	UT_ASSERT_EQ(native_prepared_checks, 3); UT_ASSERT_EQ(native_requalifications, 2);
+	UT_ASSERT_EQ(native_reserves, 1);
+	UT_ASSERT_EQ(finish_requests, 13); UT_ASSERT_EQ(finish_reads, 13);
+	for (unsigned i = 0; i < 6; i++) UT_ASSERT_EQ(two_records[i].reads, 2);
+	UT_ASSERT_EQ(two_records[6].reads, 1);
+	UT_ASSERT_EQ(publication_applies, 2); native_clean(s);
+}
+UT_TEST(native_recursive_A_grant_revocation_invalidates_complete_pair)
+{
+	ClusterHeapSuccessorProof next;
+	Snapshot s = native_setup(&next);
+	native_fault = 8; /* B capability 55 stays fresh; revoke only A 21. */
+	UT_ASSERT_EQ(native_call(&next), -1);
+	UT_ASSERT_EQ(error_code, ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT);
+	UT_ASSERT_EQ(native_reserves, 1); UT_ASSERT_EQ(native_prepared_checks, 0);
+	UT_ASSERT_EQ(finish_requests, 13); UT_ASSERT_EQ(publication_applies, 2);
+	native_clean(s);
+}
+UT_TEST(native_recursive_zero_effect_attempt_restart_drops_original_pair)
+{
+	for (unsigned change = 1; change <= 2; change++) {
+		ClusterHeapSuccessorProof next;
+		Snapshot s = native_setup(&next);
+		volatile int result = -1;
+		native_retry_limit = 2; native_fault = 8 + change;
+		error_code = 0;
+		PG_TRY(); { result = mx_history_native_attempt(&relation, &next.tid, &next); }
+		PG_CATCH(); { result = -1; }
+		PG_END_TRY();
+		UT_ASSERT_EQ(result, -1); UT_ASSERT_EQ(error_code, ERRCODE_QUERY_CANCELED);
+		UT_ASSERT_EQ(native_prepared_checks, 2); UT_ASSERT_EQ(native_requalifications, 1);
+		/* Two distinct attempts: the second acquires its own complete pair. */
+		UT_ASSERT_EQ(finish_requests, 20); UT_ASSERT_EQ(finish_reads, 20);
+		UT_ASSERT_EQ(publication_applies, 2); native_clean(s);
+	}
+}
 int main(void)
 {
-	setbuf(stdout, NULL); history_fixture_init(); UT_PLAN(4);
+	setbuf(stdout, NULL); history_fixture_init(); UT_PLAN(7);
 	UT_RUN(native_recursive_reservation_relock_preserves_consumed_B);
 	UT_RUN(native_recursive_relock_rejects_late_page_PCM_scope_and_grant_drift);
 	UT_RUN(native_recursive_new_invocation_cannot_replay_consumed_B);
 	UT_RUN(native_recursive_missing_proved_B_cannot_return_vacuum_success);
+	UT_RUN(native_recursive_same_hop_repeated_prepare_relocks_do_not_reread);
+	UT_RUN(native_recursive_A_grant_revocation_invalidates_complete_pair);
+	UT_RUN(native_recursive_zero_effect_attempt_restart_drops_original_pair);
 	free(procArray); UT_DONE(); return ut_failed_count ? 1 : 0;
 }

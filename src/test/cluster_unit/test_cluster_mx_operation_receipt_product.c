@@ -469,6 +469,39 @@ mx_history_native_recursive(Relation rel, const ItemPointerData *tid,
 	return heap_lock_updated_tuple_rec_scoped(rel, 96, tid, 145,
 		LockTupleKeyShare, 129, expected, recursive_scope);
 }
+/* Directed attempt-change fixture runs the original native body. The normal
+ * native test above continues through the original scoped wrapper. */
+static ClusterCurrentMxChainState *native_attempt_state;
+void
+mx_history_native_attempt_change(bool new_operation)
+{
+	if (native_attempt_state == NULL)
+		elog(ERROR, "directed native attempt state is absent");
+	if (new_operation)
+		cluster_current_mx_operation_init(&native_attempt_state->operation);
+	else
+		cluster_current_mx_operation_restart(&native_attempt_state->operation);
+}
+TM_Result
+mx_history_native_attempt(Relation rel, const ItemPointerData *tid,
+	const ClusterHeapSuccessorProof *expected)
+{
+	ClusterCurrentMxChainState *state = palloc0(sizeof(*state));
+	volatile TM_Result result = TM_BeingModified;
+	native_attempt_state = state;
+	PG_TRY(); {
+		result = heap_lock_updated_tuple_rec(rel, 96, tid, 145,
+			LockTupleKeyShare, 129, expected, recursive_scope, state);
+	}
+	PG_FINALLY(); {
+		cluster_current_mx_operation_finish(&state->operation);
+		cluster_current_mx_stamp_cancel(&state->plan);
+		cluster_current_mx_history_batch_release(&state->history);
+		native_attempt_state = NULL; pfree(state);
+	}
+	PG_END_TRY(); return result;
+}
+
 int
 mx_history_recursive_authorize(Relation rel, Buffer buffer, HeapTuple tuple,
 	bool history, TransactionId requester, LockTupleMode mode, MxHeapReadout *out)
@@ -480,7 +513,7 @@ mx_history_recursive_authorize(Relation rel, Buffer buffer, HeapTuple tuple,
 	PG_TRY();
 	{
 		result = cluster_current_mx_chain_authorize(history ? recursive_scope : NULL,
-			rel, buffer, tuple, requester, mode, &receipt_result, &recursive_operation);
+			rel, buffer, tuple, requester, mode, &receipt_result, &recursive_operation, NULL);
 	}
 	PG_FINALLY();
 	{

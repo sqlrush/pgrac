@@ -2,6 +2,7 @@
  * Any unexpected legacy authority, VM/census/RF or mutation leaf aborts. */
 static unsigned native_reads, native_releases, native_visibility, native_reserves, native_prepared_checks, native_fault, native_pins;
 static Snapshot native_snapshot;
+static unsigned native_retry_limit, native_requalifications;
 BackendType MyBackendType = B_BACKEND;
 int wal_level = WAL_LEVEL_REPLICA;
 static void recursive_unexpected(const char *name) pg_attribute_noreturn();
@@ -108,7 +109,12 @@ cluster_undo_record_receipt_last_reason(void)
 { recursive_unexpected("cluster_undo_record_receipt_last_reason"); }
 ClusterUndoRecordPrepareResult
 cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt * p0, uint16 p1, bool p2)
-{ recursive_unexpected("cluster_undo_record_requalify_for_retry"); }
+{ UT_ASSERT(!content_locked && p0->ctrc_applied_mask == 0 && native_retry_limit != 0);
+  native_requalifications++;
+  if (native_fault == 9 || native_fault == 10) {
+    mx_history_native_attempt_change(native_fault == 10); native_fault = 0;
+  }
+  return CLUSTER_UNDO_RECORD_PREPARE_READY; }
 uint64
 cluster_undo_record_prepare_deadline_us(void)
 { UT_ASSERT(!content_locked); return 5000000; }
@@ -117,10 +123,11 @@ cluster_undo_record_prepare(uint8 p0, uint16 p1, uint16 p2, uint16 p3, UBA p4, u
 { UT_ASSERT(!content_locked); UT_ASSERT_EQ(p0, UNDO_RECORD_ITL); UT_ASSERT_EQ(p2, 257); UT_ASSERT_EQ(p3, 3); UT_ASSERT_EQ(p5, 5000000); memset(p6, 0, sizeof(*p6)); p6->record_type = p0; p6->payload_capacity = p1; p6->tt_slot_segment_id = p2; p6->tt_slot_offset = p3; native_reserves++; if (native_fault == 1) two_tuple(2).t_data->t_infomask2++; if (native_fault == 2) pcm_source.generation++; if (native_fault == 3) CurrentResourceOwner = (ResourceOwner)2; if (native_fault == 4) writer_grant_ok = false;
 	if (native_fault == 5) BufferBlocks[((PageHeader)BufferBlocks)->pd_lower] ^= 1;
 	if (native_fault == 6) native_snapshot->read_epoch++;
-	if (native_fault == 7) pg_atomic_write_u32(&history_gate.transition_closed, 1); return CLUSTER_UNDO_RECORD_PREPARE_READY; }
+	if (native_fault == 7) pg_atomic_write_u32(&history_gate.transition_closed, 1);
+	if (native_fault == 8) publication_A_grant_revoked = true; return CLUSTER_UNDO_RECORD_PREPARE_READY; }
 bool
 cluster_undo_record_prepared_recheck(const ClusterUndoRecordPrepareReceipt * p0, uint16 p1)
-{ UT_ASSERT(content_locked && exclusive); native_prepared_checks++; ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("directed cancellation at prepared storage recheck"))); return false; }
+{ UT_ASSERT(content_locked && exclusive); native_prepared_checks++; if (native_prepared_checks < native_retry_limit) return false; ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("directed cancellation at prepared storage recheck"))); return false; }
 bool
 cluster_undo_record_prepared_uba_exact(const ClusterUndoRecordPrepareReceipt * p0, uint16 p1, UBA * p2)
 { recursive_unexpected("cluster_undo_record_prepared_uba_exact"); }

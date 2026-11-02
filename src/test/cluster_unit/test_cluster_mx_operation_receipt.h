@@ -105,6 +105,9 @@ extern void mx_history_lock_window_close(void);
 extern void mx_history_recursive_open(Snapshot actual);
 extern TM_Result mx_history_native_recursive(Relation rel, const ItemPointerData *tid,
 	const ClusterHeapSuccessorProof *expected);
+extern TM_Result mx_history_native_attempt(Relation rel, const ItemPointerData *tid,
+	const ClusterHeapSuccessorProof *expected);
+extern void mx_history_native_attempt_change(bool new_operation);
 extern int mx_history_recursive_authorize(Relation rel, Buffer buffer, HeapTuple tuple,
 	bool history, TransactionId requester, LockTupleMode mode, MxHeapReadout *out);
 extern void mx_history_recursive_close(void);

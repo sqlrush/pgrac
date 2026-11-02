@@ -17,6 +17,7 @@ static MultiXactMember publication_members[2];
 static MultiXactId publication_descriptor = 33;
 static unsigned publication_count, publication_prepares, publication_applies, publication_cancels;
 static bool publication_retry;
+static bool publication_A_grant_revoked;
 static unsigned publication_retry_at;
 static uint32 publication_A_capability;
 static ClusterCtrcTargetV1 publication_applied_target;
@@ -52,7 +53,7 @@ cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 	UT_ASSERT_EQ(key->local_xid, 80); UT_ASSERT_EQ(grant, 47);
 	UT_ASSERT(capability == 21 || capability == 55);
 	publication_identity(80, capability, ctrc, participant);
-	return writer_grant_ok;
+	return writer_grant_ok && !(capability == 21 && publication_A_grant_revoked);
 }
 bool
 cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(TransactionId xid,
