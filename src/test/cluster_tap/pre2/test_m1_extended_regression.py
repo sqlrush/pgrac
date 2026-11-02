@@ -29,9 +29,11 @@ class ExtendedRegressionTests(unittest.TestCase):
             extended = m1.plan(self.args(root, 'extended'))
             self.assertEqual(extended['phases'][:3], core['phases'])
             self.assertEqual([p['name'] for p in extended['phases']],
-                ['legacy', 'four-member', 'single-member', 'idle-freeze', 'retention', 'soak'])
+                ['legacy', 'four-member', 'single-member', 'mx-continuation',
+                 'idle-freeze', 'retention', 'soak'])
             for phase, suite in zip(extended['phases'][3:],
-                                   ['m1-idle-freeze', 'm1-retention', 'm1-soak-workload']):
+                                   ['m1-mx-continuation', 'm1-idle-freeze',
+                                    'm1-retention', 'm1-soak-workload']):
                 command = phase['command']
                 self.assertEqual(command[command.index('--suite')+1], suite)
                 self.assertEqual(command[command.index('--output')+1],
@@ -41,7 +43,10 @@ class ExtendedRegressionTests(unittest.TestCase):
                 self.assertNotIn('--cases', command)
             self.assertEqual(extended['status'], 'NOT_RUN')
             self.assertEqual(extended['stage_acceptance'], 'NOT_READY')
-            self.assertEqual(extended['subcheck_gates'], dict(p01='NOT_READY', p02='NOT_READY', p07='NOT_READY'))
+            self.assertEqual(extended['subcheck_gates'],
+                             dict(x04='NOT_READY', p01='NOT_READY', p02='NOT_READY', p07='NOT_READY'))
+            self.assertIn('complete X04 gap/occupied-page/concurrent issuance evidence',
+                          extended['not_covered'])
             self.assertFalse((root/'results').exists())
 
     def test_extended_cli_is_explicit_and_plan_starts_no_runtime(self):
@@ -54,7 +59,7 @@ class ExtendedRegressionTests(unittest.TestCase):
                 command += ['--'+name.replace('_', '-'), str(getattr(args, name))]
             reply = subprocess.run(command, text=True, capture_output=True)
             self.assertEqual(reply.returncode, 0, reply.stderr)
-            self.assertEqual(len(json.loads(reply.stdout)['phases']), 6)
+            self.assertEqual(len(json.loads(reply.stdout)['phases']), 7)
             self.assertFalse((root/'results').exists())
             with self.assertRaises(ValueError):
                 m1.plan(self.args(root, 'unknown'))
@@ -62,7 +67,8 @@ class ExtendedRegressionTests(unittest.TestCase):
     def artifact(self, root, suite, output):
         # Literal result schema and actual prove parser output, not a server.
         runs = native.case_runs(suite, None)
-        scopes = {'m1-idle-freeze': ('tuple-freeze-and-clean-restart', 'p01'),
+        scopes = {'m1-mx-continuation': ('multixact-continuation-and-live-members', 'x04'),
+                  'm1-idle-freeze': ('tuple-freeze-and-clean-restart', 'p01'),
                   'm1-retention': ('retained-reader-values-and-normal-stop', 'p02'),
                   'm1-soak-workload': ('workload-ledger-and-normal-stop', 'p07')}
         scope, gate = scopes[suite]
@@ -89,7 +95,8 @@ class ExtendedRegressionTests(unittest.TestCase):
         return reply.stdout
 
     def test_new_phase_readers_reject_identity_scope_debt_and_gate_claims(self):
-        for name, suite in [('idle-freeze', 'm1-idle-freeze'), ('retention', 'm1-retention'),
+        for name, suite in [('mx-continuation', 'm1-mx-continuation'),
+                            ('idle-freeze', 'm1-idle-freeze'), ('retention', 'm1-retention'),
                             ('soak', 'm1-soak-workload')]:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -107,6 +114,37 @@ class ExtendedRegressionTests(unittest.TestCase):
                     changed['cases'][0][key] = value
                     (root/'result.json').write_text(json.dumps(changed))
                     self.assertFalse(m1.phase_passed(name, root, 0, 'a'*64), key)
+
+    def test_multixact_phase_requires_its_exact_original_case(self):
+        self.assertIn('mx-continuation', m1.EXTENDED_NATIVE,
+                      'extended regression must consume the original MultiXact continuation case')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result, _, _ = self.artifact(root, 'm1-mx-continuation', self.prove_output(root))
+            self.assertTrue(m1.phase_passed('mx-continuation', root, 0, 'a'*64))
+            for cases in [[], result['cases']*2,
+                          [dict(result['cases'][0], case='t/447_pre2_multixact_restart.pl')],
+                          [dict(result['cases'][0], clients=16)]]:
+                (root/'result.json').write_text(json.dumps(dict(result, cases=cases)))
+                self.assertFalse(m1.phase_passed('mx-continuation', root, 0, 'a'*64))
+
+    def test_multixact_phase_needs_complete_original_prove_output(self):
+        self.assertIn('mx-continuation', m1.EXTENDED_NATIVE,
+                      'extended regression must check the actual MultiXact continuation TAP')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self.prove_output(root)
+            _, runs, _ = self.artifact(root, 'm1-mx-continuation', output)
+            target = root/runs[0]['directory']/'prove.log'
+            for text in ['', output.replace('ok 1', 'not ok 1'),
+                         output.replace('ok 1 -', 'ok 1 # SKIP missing member -'),
+                         output.replace('ok 1 -', 'ok 1 # TODO missing member -'),
+                         output.replace('1..1', ''), output+'\nBail out! member mismatch\n']:
+                target.write_text(text)
+                self.assertFalse(m1.phase_passed('mx-continuation', root, 0, 'a'*64))
+            target.unlink()
+            with self.assertRaises(OSError):
+                m1.phase_passed('mx-continuation', root, 0, 'a'*64)
 
     def test_soak_requires_distinct_16_48_64_points_and_each_original_tap(self):
         with tempfile.TemporaryDirectory() as directory:

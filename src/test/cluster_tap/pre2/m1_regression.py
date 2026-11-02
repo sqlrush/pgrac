@@ -23,6 +23,7 @@ from run_multixact_lifecycle import M1_CASES as FOUR_MEMBER, case_runs, tap_resu
 LEGACY = ['t/'+name for name in LEGACY_NAMES.values()]
 SINGLE_MEMBER = ['t/461_pre2_single_shared_vacuum.pl']
 EXTENDED_NATIVE = {
+    'mx-continuation': ('m1-mx-continuation', 'multixact-continuation-and-live-members', 'x04'),
     'idle-freeze': ('m1-idle-freeze', 'tuple-freeze-and-clean-restart', 'p01'),
     'retention': ('m1-retention', 'retained-reader-values-and-normal-stop', 'p02'),
     'soak': ('m1-soak-workload', 'workload-ledger-and-normal-stop', 'p07'),
@@ -79,8 +80,9 @@ def plan(args):
             selection['phases'].append(dict(name=name, scope=scope,
                 cases=[run['case'] for run in case_runs(native_suite, None)], command=command))
         selection.update(suite='extended',
-            subcheck_gates=dict(p01='NOT_READY', p02='NOT_READY', p07='NOT_READY'),
+            subcheck_gates=dict(x04='NOT_READY', p01='NOT_READY', p02='NOT_READY', p07='NOT_READY'),
             not_covered=['shared positive physical reclamation',
+                         'complete X04 gap/occupied-page/concurrent issuance evidence',
                          'full-width F/H and catalog cutoff qualification',
                          'recycle progression after final reader release',
                          'complete P07 resource/generation acceptance',

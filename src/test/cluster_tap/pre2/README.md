@@ -99,6 +99,7 @@ original phases followed by the prepared native subchecks:
 
 | Phase | Original native controller suite |
 | --- | --- |
+| `mx-continuation` | `m1-mx-continuation`, TAP486 |
 | `idle-freeze` | `m1-idle-freeze`, TAP485 |
 | `retention` | `m1-retention`, TAP484 |
 | `soak` | `m1-soak-workload`, TAP483 at 16, 48 and 64 clients |
@@ -113,12 +114,18 @@ Each new phase needs its exact scope, complete case/client list, expected
 postgres bytes, successful original prove output and no cleanup debt. The soak
 reader requires all three distinct client directories and validates each TAP;
 the repeated TAP filename does not combine the three points into one result.
-P01/P02/P07 and stage markers must remain `NOT_READY` in these subcheck results.
+X04/P01/P02/P07 and stage markers must remain `NOT_READY` in these subcheck results.
+The MultiXact phase requires its original TAP486 and
+`multixact-continuation-and-live-members` scope; the older restart case cannot
+substitute for it. Its captured TAP input is included in the same source checks
+before and after every phase. Original native cases retain their 1200-second
+envelopes, and the soak remains last with its original per-point budget.
 
 Exit zero covers only the selected regression subchecks. Full-width F/H and
 catalog cutoff qualification, reader-release recycle progress, complete soak
-resource/generation evidence, shared physical reclaim, general recovery and
-the full build/stage matrix remain separate. `--plan --suite extended` starts
+resource/generation evidence, full MultiXact gap/occupied-page/concurrent
+issuance coverage, shared physical reclaim, general recovery and the full
+build/stage matrix remain separate. `--plan --suite extended` starts
 no processes and reserves no runtime. Executing the extended plan still needs
 component readiness, candidate qualification and explicit runtime authorization.
 The parser/planner tests in `test_m1_extended_regression.py` use file inputs and
