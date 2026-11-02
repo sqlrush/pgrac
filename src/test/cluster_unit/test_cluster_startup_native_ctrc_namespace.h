@@ -197,4 +197,6 @@
 #define cluster_shared_config startup_native_ctrc_cluster_shared_config
 #define cluster_smgr_which_for startup_native_ctrc_cluster_smgr_which_for
 #define cluster_trace_normal_stop startup_native_ctrc_cluster_trace_normal_stop
+/* Keep the original display formatter inside this native fixture family. */
+#define psprintf startup_native_ctrc_psprintf
 #endif

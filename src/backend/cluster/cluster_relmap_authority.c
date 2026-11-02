@@ -1190,3 +1190,51 @@ cluster_relmap_authority_managed_checkpoint_v2(const ClusterRecoveryFileIdentity
 {
 	return relmap_managed_observe(identity, output, true);
 }
+
+/* Original creator/replayer supplies the independent target registration and
+ * file duty before entering under global X and MappingLock-X. */
+static bool
+relmap_managed_create(const ClusterRecoveryFileIdentityV2 *identity,
+	const RelMapFile *committed, ClusterRelmapFilePairV2 *output, bool replay)
+{
+	RelmapV2Directory dirs;
+	ClusterRecoveryFileIdentityV2 bound;
+	ClusterRelmapV2Namespace ns;
+	ClusterRelmapFilePairV2 pair;
+	bool ok = false;
+	uintptr_t a = (uintptr_t)identity, b = (uintptr_t)output, c = (uintptr_t)committed;
+
+	if (!identity || !committed || !output || !enableFsync
+		|| (a <= b ? b - a < sizeof(*identity) : a - b < sizeof(*output))
+		|| (c <= b ? b - c < sizeof(*committed) : c - b < sizeof(*output))
+		|| !cluster_relmap_authority_x_held()
+		|| !LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE))
+		return false;
+	bound = *identity;
+	ns = (ClusterRelmapV2Namespace){bound.system_identifier,
+		bound.database_incarnation, bound.database_oid, bound.database_oid == InvalidOid};
+	if (relmap_v2_open_dirs(&ns, &dirs))
+		ok = (replay ? cluster_relmap_file_pair_replay_create_v2(dirs.map, &bound, committed, &pair)
+			: cluster_relmap_file_pair_create_v2(dirs.map, &bound, committed, &pair))
+			&& relmap_v2_dirs_current(&dirs);
+	if (!relmap_v2_close_dirs(&dirs)) ok = false;
+	if (ok) ok = !memcmp(identity, &bound, sizeof(bound)) && enableFsync
+		&& cluster_relmap_authority_x_held()
+		&& LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE);
+	if (ok) *output = pair;
+	return ok;
+}
+
+bool
+cluster_relmap_authority_managed_create_v2(const ClusterRecoveryFileIdentityV2 *identity,
+	const RelMapFile *committed, ClusterRelmapFilePairV2 *output)
+{
+	return relmap_managed_create(identity, committed, output, false);
+}
+
+bool
+cluster_relmap_authority_managed_replay_create_v2(const ClusterRecoveryFileIdentityV2 *identity,
+	const RelMapFile *committed, ClusterRelmapFilePairV2 *output)
+{
+	return relmap_managed_create(identity, committed, output, true);
+}

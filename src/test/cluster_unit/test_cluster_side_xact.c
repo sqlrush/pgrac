@@ -12847,13 +12847,20 @@ int
 main(void)
 {
 #ifdef TEST_CLUSTER_COLD_RELMAP_SIDE
-	UT_PLAN(6);
+	UT_PLAN(13);
 	UT_RUN(test_declared_relmap_capture_keeps_complete_side_bytes);
 	UT_RUN(test_relmap_carrier_refuses_missing_owner_and_keeps_original_refusal);
 	UT_RUN(test_relmap_carrier_rejects_source_frame_cut_payload_and_purpose_drift);
 	UT_RUN(test_relmap_carrier_charges_original_budget_and_duplicate_is_sticky);
 	UT_RUN(test_relmap_carrier_checks_entire_header_main_and_source_after_seal);
 	UT_RUN(test_relmap_and_clog_coexist_but_side_cannot_publish_whole_source);
+	UT_RUN(test_creation_side_owns_original_captured_values_and_bytes);
+	UT_RUN(test_creation_side_refuses_wrong_owner_source_frame_and_envelope);
+	UT_RUN(test_creation_side_matches_complete_native_bytes_and_declared_values);
+	UT_RUN(test_creation_side_budget_and_duplicate_refusal_are_sticky);
+	UT_RUN(test_creation_side_cannot_use_ordinary_or_online_route);
+	UT_RUN(test_creation_pending_clog_coexist_without_whole_source_completion);
+	UT_RUN(test_creation_side_streams_more_than_sixty_four_records);
 	UT_DONE();
 	return ut_failed_count != 0;
 #endif

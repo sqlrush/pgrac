@@ -9,6 +9,7 @@
 #include "cluster/cluster_recovery_format.h"
 #include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_wal_thread.h"
 #include "common/pgrac_initdb_recovery.h"
 
@@ -250,14 +251,17 @@ native_init(void)
 		NativeFileBank *next = palloc0(sizeof(*next));
 		PG_TRY();
 		{
+			unsigned relmaps = 4;
+			if ((creation->cohort[0] || creation->cohort[1]) && creation->cohort_origin != 0)
+				relmaps = 0;
 			next->info.mode = CLUSTER_NATIVE_FILES_CREATION_V2;
 			next->info.startup_generation = creation->creator_pid;
 			next->info.creation = *creation;
 			next->info.registry_byte_budget = CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2;
-			next->info.count = 6;
-			if (!pgrac_initdb_recovery_relmaps_v2(creation, next->files)
-				|| !pgrac_initdb_recovery_boot_v2(creation, next->files + 4)
-				|| !native_canonical(next) || native_install(next, NULL, creation) != 0)
+			next->info.count = relmaps + creation->boot_file_count;
+			if ((relmaps && !pgrac_initdb_recovery_relmaps_v2(creation, next->files)) ||
+				!pgrac_initdb_recovery_boot_v2(creation, next->files + relmaps) ||
+				!native_canonical(next) || native_install(next, NULL, creation) != 0)
 				ereport(FATAL, (errmsg("cannot install original native creation file identities")));
 		}
 		PG_FINALLY();
@@ -277,6 +281,34 @@ void
 cluster_control_native_files_shmem_register(void)
 {
 	cluster_shmem_register_region(&native_region);
+}
+
+/* The original initdb child skips the online cluster registry. Its closed
+ * creator request is already authenticated before PG sizes shared memory.
+ * Reserve/init only this existing table; never enable an online node here. */
+static bool
+native_creation_child(void)
+{
+	if (cluster_wal_thread_initdb_recovery_context() == NULL)
+		return false;
+	if (IsUnderPostmaster || IsPostmasterEnvironment
+		|| MyBackendType != B_STANDALONE_BACKEND || cluster_node_id != -1
+		|| !(IsBootstrapProcessingMode() || IsInitProcessingMode()))
+		ereport(FATAL, (errmsg("native creation table requires the original standalone child")));
+	return true;
+}
+
+Size
+cluster_control_native_files_creation_shmem_size_v2(void)
+{
+	return native_creation_child() ? native_size() : 0;
+}
+
+void
+cluster_control_native_files_creation_shmem_init_v2(void)
+{
+	if (native_creation_child())
+		native_init();
 }
 
 ClusterControlNativeModeV2
@@ -300,6 +332,112 @@ cluster_control_native_files_info_v2(ClusterControlNativeTableInfoV2 *out)
 	out->borrowed = native_files->borrowed;
 	SpinLockRelease(&native_files->lock);
 	return true;
+}
+static bool
+native_inventory_size(const ClusterControlNativeTableInfoV2 *info, Size *bytes, Size *offset)
+{
+	Size prefix = MAXALIGN(sizeof(ClusterControlNativeInventoryV2));
+	if (info->count > CLUSTER_NATIVE_FILES_CAPACITY_V2
+		|| info->reservation_count > CLUSTER_NATIVE_RESERVATIONS_CAPACITY_V2)
+		return false;
+	*offset = prefix + MAXALIGN(info->count * sizeof(ClusterRecoveryFileIdentityV2));
+	*bytes = *offset + info->reservation_count * sizeof(ClusterRecoveryFileReservationV1);
+	return *bytes <= CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2;
+}
+/* Caller holds the original short table lock, not CF or a family I/O lock. */
+static bool
+native_inventory_info_same(const ClusterControlNativeTableInfoV2 *saved)
+{
+	ClusterControlNativeTableInfoV2 current
+		= native_files->banks[native_files->active].info;
+	current.borrowed = native_files->borrowed;
+	return !native_files->publishing && !memcmp(saved, &current, sizeof(current));
+}
+ClusterControlNativeResultV2
+cluster_control_native_files_inventory_v2(Size budget, ClusterControlNativeInventoryV2 **out)
+{
+	ClusterControlNativeTableInfoV2 info;
+	ClusterControlNativeInventoryV2 *value;
+	ClusterControlNativeResultV2 result = CLUSTER_NATIVE_FILES_REFUSED_V2;
+	Size bytes, offset;
+	if (!native_files || !native_distinct(out, sizeof(*out)) || *out)
+		return result;
+	SpinLockAcquire(&native_files->lock);
+	if (native_files->publishing) {
+		SpinLockRelease(&native_files->lock);
+		return CLUSTER_NATIVE_FILES_BUSY_V2;
+	}
+	info = native_files->banks[native_files->active].info;
+	info.borrowed = native_files->borrowed;
+	SpinLockRelease(&native_files->lock);
+	if (info.mode != CLUSTER_NATIVE_FILES_MANAGED_V2 || !info.table_generation
+		|| info.table_generation == UINT64_MAX || !info.startup_generation
+		|| info.startup_generation == UINT64_MAX)
+		return result;
+	if (!native_inventory_size(&info, &bytes, &offset) || bytes > budget
+		|| budget > CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2)
+		return CLUSTER_NATIVE_FILES_CAPACITY_EXCEEDED_V2;
+	/* No allocation while holding the shared lock. Publication between these
+	 * two observations refuses; it does not restart against the new table. */
+	value = palloc0(bytes);
+	value->info = info;
+	value->private_bytes = bytes;
+	value->private_self = (uintptr_t)value;
+	value->private_pid = MyProcPid;
+	value->files = (void *)((char *)value + MAXALIGN(sizeof(*value)));
+	value->reservations = (void *)((char *)value + offset);
+	SpinLockAcquire(&native_files->lock);
+	if (native_inventory_info_same(&info)) {
+		NativeFileBank *bank = &native_files->banks[native_files->active];
+		memcpy((void *)value->files, bank->files, info.count * sizeof(*value->files));
+		memcpy((void *)value->reservations, bank->reservations,
+			   info.reservation_count * sizeof(*value->reservations));
+		result = CLUSTER_NATIVE_FILES_OK_V2;
+	}
+	SpinLockRelease(&native_files->lock);
+	if (result == CLUSTER_NATIVE_FILES_OK_V2)
+		*out = value;
+	else
+		pfree(value);
+	return result;
+}
+bool
+cluster_control_native_files_inventory_current_v2(const ClusterControlNativeInventoryV2 *value)
+{
+	Size bytes, offset;
+	bool current = false;
+	if (!native_files || !native_distinct(value, sizeof(*value))
+		|| value->private_self != (uintptr_t)value || value->private_pid != MyProcPid
+		|| value->info.mode != CLUSTER_NATIVE_FILES_MANAGED_V2
+		|| !native_inventory_size(&value->info, &bytes, &offset)
+		|| value->private_bytes != bytes || (uintptr_t)value > UINTPTR_MAX - bytes
+		|| value->files != (void *)((char *)value + MAXALIGN(sizeof(*value)))
+		|| value->reservations != (void *)((char *)value + offset))
+		return false;
+	SpinLockAcquire(&native_files->lock);
+	if (native_inventory_info_same(&value->info)) {
+		NativeFileBank *bank = &native_files->banks[native_files->active];
+		current = !memcmp(value->files, bank->files, value->info.count * sizeof(*value->files))
+			&& !memcmp(value->reservations, bank->reservations,
+					   value->info.reservation_count * sizeof(*value->reservations));
+	}
+	SpinLockRelease(&native_files->lock);
+	return current;
+}
+void
+cluster_control_native_inventory_destroy_v2(ClusterControlNativeInventoryV2 **out)
+{
+	ClusterControlNativeInventoryV2 *value;
+	if (!native_distinct(out, sizeof(*out)) || !(value = *out)
+		|| !native_distinct(value, sizeof(*value)) || value->private_self != (uintptr_t)value
+		|| value->private_pid != MyProcPid || value->private_bytes < sizeof(*value)
+		|| value->private_bytes > CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2
+		|| (uintptr_t)value > UINTPTR_MAX - value->private_bytes
+		|| ((uintptr_t)out < (uintptr_t)value + value->private_bytes
+			&& (uintptr_t)value < (uintptr_t)out + sizeof(*out)))
+		return;
+	*out = NULL;
+	pfree(value);
 }
 static bool
 native_borrow_valid(const ClusterControlNativeFileBorrowV2 *b)
@@ -625,6 +763,17 @@ cluster_control_native_clog_range_destroy_v2(ClusterControlNativeClogRangeV2 **o
 {
 	ClusterControlNativeClogRangeV2 *value;
 	if (!native_distinct(out, sizeof(*out)) || !(value = *out))
+		return;
+	*out = NULL;
+	pfree(value);
+}
+void
+cluster_control_native_relmap_create_destroy_v2(ClusterControlNativeRelmapCreateV2 **out)
+{
+	ClusterControlNativeRelmapCreateV2 *value;
+	if (!native_distinct(out, sizeof(*out)) || !(value = *out)
+		|| value->private_self != (uintptr_t)value || value->private_pid != MyProcPid
+		|| native_overlap(out, sizeof(*out), value, sizeof(*value)))
 		return;
 	*out = NULL;
 	pfree(value);

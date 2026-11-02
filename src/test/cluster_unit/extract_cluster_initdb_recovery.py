@@ -10,6 +10,7 @@ for name in ["InitdbDirectory", "InitdbOrigin"]:
         raise SystemExit("missing/duplicate " + name)
     parts += found
 parts.append("""
+static bool creation_boot_current(InitdbOrigin *, bool);
 static void request_current(const PgracInitdbCohortContext *, const ClusterSharedConfigRef *);
 static void run_child_registered(char **, uint64, const PgracInitdbRecoveryContext *);
 static void run_child(char **, uint64);

@@ -5,6 +5,16 @@
 #include "test_cluster_recovery_root_set.c"
 #include "test_cluster_recovery_relmap_fixture.h"
 #include "cluster/cluster_control_file_identity.h"
+/* This independent target does not link the SIDE error runtime. */
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
 /* This legacy fixture never supplies managed control custody. Unexpected
  * managed selection is fatal; the managed companion has its own real selector. */
 bool cluster_control_root_relmap_selection_output_distinct_v4(const ClusterControlRelmapSelectionV2 *s,
@@ -27,6 +37,7 @@ bool cluster_control_root_relmap_selection_lookup_v4(ClusterControlRelmapSelecti
 {
 	abort();
 }
+#include "test_cluster_recovery_relmap_table_unavailable.h"
 #include "../../backend/cluster/cluster_recovery_relmap_scan.c"
 
 static RelMapFile

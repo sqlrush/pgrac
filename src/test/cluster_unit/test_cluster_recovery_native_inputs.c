@@ -90,7 +90,35 @@ static ClusterRecoveryNativeRecordObservationV1 census_native_test_record(
  ClusterRecoveryNativeInventory *, uint64);
 #define cluster_recovery_native_inventory_record_v1 census_native_test_record
 #undef cluster_wal_inputs_census_sources_v1
+#include "test_cluster_recovery_managed_census_fixture.h"
 #include "../../backend/cluster/cluster_recovery_census.c"
+#undef cluster_control_root_relmap_selection_output_distinct_v4
+#undef cluster_control_root_relmap_selection_reference_v4
+#undef cluster_control_root_relmap_selection_recheck_locked_v4
+#undef cluster_control_root_relmap_selection_lookup_v4
+#undef cluster_recovery_relmap_scan_begin
+#undef cluster_recovery_relmap_scan_begin_managed_v2
+#undef cluster_recovery_relmap_scan_next
+#undef cluster_recovery_relmap_scan_diag
+#undef cluster_recovery_relmap_scan_destroy
+#undef cluster_control_native_files_shmem_register
+#undef cluster_control_native_files_mode_v2
+#undef cluster_control_native_files_info_v2
+#undef cluster_control_native_files_clog_range_v2
+#undef cluster_control_native_files_publish_locked_v2
+#undef cluster_control_native_files_preregister_locked_v2
+#undef cluster_control_native_file_acquire_v2
+#undef cluster_control_native_file_borrow_by_address_v2
+#undef cluster_control_native_file_current_v2
+#undef cluster_control_native_file_release_v2
+#undef s_lock
+#undef s_unlock
+#undef perform_spin_delay
+#undef finish_spin_delay
+#undef set_spins_per_delay
+#undef update_spins_per_delay
+#undef cluster_recovery_relmap_scan_begin_native_v2
+#undef cluster_recovery_relmap_scan_output_distinct_v2
 #undef cluster_recovery_native_inventory_record_v1
 #undef cluster_recovery_reference_graph_dependency_find
 #undef cluster_recovery_root_set_read_current_relation
@@ -1215,6 +1243,7 @@ cluster_clog_relmap_base_release_v1(ClusterRelmapClogBaseHandleV1 **held)
 #include "test_cluster_recovery_page_raw.inc"
 
 #include "test_cluster_recovery_online_inventory.inc"
+#include "test_cluster_recovery_managed_census.inc"
 
 int
 main(int argc, char **argv)
@@ -1224,6 +1253,27 @@ main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	test_program_path = argv[0];
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_MANAGED_SHARED_RED") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_managed_census_keeps_full_pair_before_original_final_manifest);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_MANAGED_CENSUS") != NULL) {
+		UT_PLAN(12);
+		UT_RUN(test_managed_census_keeps_full_pair_before_original_final_manifest);
+		UT_RUN(test_managed_census_binding_is_once_before_any_scan);
+		UT_RUN(test_managed_census_never_falls_back_to_raw_or_partial_pairs);
+		UT_RUN(test_managed_census_control_remains_bound_after_relmap_drain);
+		UT_RUN(test_managed_census_original_final_physical_and_source_checks_remain_mandatory);
+		UT_RUN(test_managed_census_first_error_is_sticky_without_releasing_original_owners);
+		UT_RUN(test_managed_census_outputs_never_clear_borrowed_control_or_local_state);
+	UT_RUN(test_managed_census_shared_table_needs_no_cf_but_original_cf_guards_remain);
+	UT_RUN(test_managed_census_missing_table_and_unregistered_or_ambiguous_address_refuse);
+	UT_RUN(test_managed_census_two_namespaces_retire_each_original_borrow);
+	UT_RUN(test_managed_census_exported_scan_storage_cannot_be_output);
+	UT_RUN(test_managed_census_failed_release_keeps_original_borrow_without_retry);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_PAGE_RAW") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
@@ -1688,7 +1738,7 @@ main(int argc, char **argv)
 	UT_RUN(test_census_native_records_original_final_wal_rewrite_refuses_whole_view);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(325);
+	UT_PLAN(337);
 	UT_RUN(test_page_raw_keeps_full_original_file_bytes_after_both_passes);
 	UT_RUN(test_page_raw_borrowed_byte_change_revokes_whole_inventory_without_rebase);
 	UT_RUN(test_page_raw_complete_copy_is_charged_before_any_prefix_publication);
@@ -2018,6 +2068,18 @@ main(int argc, char **argv)
 	UT_RUN(test_census_images_changed_full_bytes_identity_or_source_revoke_whole_view);
 	UT_RUN(test_census_images_capacity_failure_never_exports_a_prefix);
 	UT_RUN(test_census_images_manifest_error_retains_original_input_custody);
+	UT_RUN(test_managed_census_keeps_full_pair_before_original_final_manifest);
+	UT_RUN(test_managed_census_binding_is_once_before_any_scan);
+	UT_RUN(test_managed_census_never_falls_back_to_raw_or_partial_pairs);
+	UT_RUN(test_managed_census_control_remains_bound_after_relmap_drain);
+	UT_RUN(test_managed_census_original_final_physical_and_source_checks_remain_mandatory);
+	UT_RUN(test_managed_census_first_error_is_sticky_without_releasing_original_owners);
+	UT_RUN(test_managed_census_outputs_never_clear_borrowed_control_or_local_state);
+	UT_RUN(test_managed_census_shared_table_needs_no_cf_but_original_cf_guards_remain);
+	UT_RUN(test_managed_census_missing_table_and_unregistered_or_ambiguous_address_refuse);
+	UT_RUN(test_managed_census_two_namespaces_retire_each_original_borrow);
+	UT_RUN(test_managed_census_exported_scan_storage_cannot_be_output);
+	UT_RUN(test_managed_census_failed_release_keeps_original_borrow_without_retry);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

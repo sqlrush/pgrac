@@ -136,7 +136,7 @@ TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_rea
         test_cluster_ts \
         test_cluster_ko \
         test_cluster_hw_snapshot \
-        test_cluster_cf_authority \
+        test_cluster_cf_authority test_cluster_startup_relcache_owner \
 		test_cluster_control_request \
 		test_cluster_control_retire \
 		test_cluster_control_retire_master \
@@ -439,6 +439,7 @@ TESTS += test_cluster_tt_locator_family
 # objects (the test files stub the PG backend symbols those
 # objects reference).
 SIMPLE_TESTS = $(filter-out test_cluster_shared_fs_page test_cluster_ctrc_native_fpi test_cluster_ctrc_page_cache test_cluster_merge_claim test_cluster_native_itl_trace test_cluster_shared_fs_recovery_root test_cluster_d0_native_reader test_cluster_tt_checkpoint_native test_cluster_cold_tt_redo test_cluster_cold_tt_base test_cluster_tt_checkpoint_cuts test_cluster_recovery_c0_plan test_cluster_checkpoint_stamp test_cluster_recovery_stamp test_cluster_recovery_tt_record test_cluster_recovery_ctrc_record test_cluster_recovery_tt_io test_cluster_grd_capacity test_cluster_grd_dsa test_cluster_cr_shared_route test_cluster_tt_rollback_entry test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_cold_recovery_validate test_cluster_cold_recovery_io test_cluster_cold_recovery_complete test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete test_cluster_typed_redo test_cluster_cold_recovery_space test_cluster_cold_recovery_space_refail test_cluster_cold_recovery_refail test_cluster_cold_recovery_replay test_cluster_cold_recovery_plan test_cluster_cold_recovery_decode test_cluster_cold_recovery_effects test_cluster_cold_recovery_startup test_cluster_update_trace test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_authority_storage test_cluster_serving_sample test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_groups test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_write_fence_durable test_cluster_write_fence_cache test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_recovery_serial test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_control_root test_cluster_recovery_duty test_cluster_formation_witness test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_undo_block0 test_cluster_undo_smgr_publication test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_cr_walk test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_relation_size test_cluster_catalog_trace test_cluster_wait_resources test_cluster_content_trace test_cluster_content_trace_exec test_cluster_pcm_service_trace test_cluster_tx_identity_trace test_cluster_pcm_wait_exit,$(TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_startup_relcache_owner,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tx_publication_pause test_cluster_tt_terminal_trace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_startup_cf_entry,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_itl_retry,$(SIMPLE_TESTS))
@@ -6394,6 +6395,32 @@ test_cluster_cf_authority: test_cluster_cf_authority.c unit_test.h \
 		$(CLUSTER_CF_AUTHORITY_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Exercise the exact pre-transaction initialization block with backend crypto
+# and the complete ResourceOwner implementation, rather than frontend hashes.
+test_cluster_startup_relcache_owner.inc: $(top_srcdir)/src/backend/utils/init/postinit.c Makefile
+	awk '/Load relcache entries for the shared system catalogs/ { start++; emit=1; next } \
+	     emit && !body && /\*\// { body=1; next } \
+	     emit && /Set up process-exit callback/ { end++; emit=0 } \
+	     emit && body { lines[++n]=$$0 } \
+	     END { if (start!=1 || end!=1 || n<3) exit 1; \
+	           for (i=1;i<=n-2;i++) print lines[i] }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_relcache_owner: test_cluster_startup_relcache_owner.c \
+		test_cluster_startup_relcache_owner.inc test_cluster_cf_authority.c unit_test.h \
+		$(top_srcdir)/src/backend/utils/resowner/resowner.c \
+		$(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+clean: clean-startup-relcache-owner
+.PHONY: clean-startup-relcache-owner
+clean-startup-relcache-owner:
+	rm -f test_cluster_startup_relcache_owner test_cluster_startup_relcache_owner.d \
+		test_cluster_startup_relcache_owner.inc test_cluster_startup_relcache_owner.inc.tmp
 
 CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_root.o \
 	$(top_builddir)/src/backend/cluster/cluster_relmap_checkpoint.o
@@ -15104,7 +15131,7 @@ test_cluster_cold_recovery_plan: test_cluster_cold_recovery_plan.c unit_test.h \
 		test_cluster_cold_recovery_plan_fixture.h $(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_plan_store_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan_store.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
@@ -15130,14 +15157,14 @@ test_cluster_cold_recovery_space: test_cluster_cold_recovery_space.c unit_test.h
 		test_cluster_cold_recovery_space_fixture.h $(CLUSTER_COLD_PLAN_O) \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_space_refail: test_cluster_cold_recovery_space_refail.c unit_test.h \
 		test_cluster_cold_recovery_space_gen.h test_cluster_cold_recovery_space_sim.h \
 		$(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 CLUSTER_COLD_DECODE_O = test_cluster_cold_recovery_decode_core.o
 
@@ -15159,7 +15186,7 @@ test_cluster_cold_recovery_xid: test_cluster_cold_recovery_xid.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< test_cluster_cold_recovery_xid_core.o \
 		test_cluster_cold_recovery_replay_core.o $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 $(CLUSTER_COLD_DECODE_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_decode.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
@@ -15416,7 +15443,7 @@ test_cluster_cold_recovery_refail_plan_core.o: $(top_srcdir)/src/backend/cluster
 test_cluster_cold_recovery_refail: test_cluster_cold_recovery_refail.c unit_test.h $(D_COLD_REFAIL_O) \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(D_COLD_REFAIL_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 D_COLD_REPLAY_O = test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 
@@ -15434,7 +15461,7 @@ test_cluster_cold_recovery_replay_plan_core.o: $(top_srcdir)/src/backend/cluster
 test_cluster_cold_recovery_replay: test_cluster_cold_recovery_replay.c unit_test.h $(D_COLD_REPLAY_O) \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(D_COLD_REPLAY_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # Native reader and typed block consumer; storage is an explicit fixture.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -15484,7 +15511,7 @@ test_cluster_cold_recovery_validate: test_cluster_cold_recovery_validate.c unit_
 		$(CLUSTER_COLD_PLAN_O) cluster_unit_port_stubs.o \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_cold_recovery_io_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_io.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h \
@@ -15712,8 +15739,15 @@ test_cluster_recovery_relmap_scan: test_cluster_recovery_relmap_scan.c test_clus
 		$(top_srcdir)/src/include/cluster/cluster_recovery_root_set.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_namespace.c \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_namespace.h \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_recovery_namespace: test_cluster_recovery_namespace.c unit_test.h \
@@ -15773,7 +15807,22 @@ test_cluster_recovery_native_scan: $(top_srcdir)/src/include/access/twophase_rmg
 
 test_cluster_recovery_native_scan: test_cluster_recovery_prepare_fixture.h test_cluster_recovery_prepare_effects.inc
 
-test_cluster_recovery_native_scan: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_effects.inc
+test_cluster_recovery_native_scan: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_effects.inc test_cluster_recovery_relmap_create_fixture.h test_cluster_recovery_relmap_create_effects.inc
+
+# Native creation and ROOT fixtures reuse the canonical RMC1 codec. Keep the
+# archive before its original port dependencies; no duplicated decoder/stub.
+RECOVERY_RELMAP_CODEC_TESTS = test_cluster_recovery_native_scan \
+		test_cluster_recovery_root_set test_cluster_recovery_slru_scan \
+		test_cluster_recovery_relmap_scan test_cluster_recovery_relation_scan \
+		test_cluster_recovery_undo_store test_cluster_recovery_native_roots \
+		test_cluster_recovery_wal_targets test_cluster_recovery_final_namespace \
+		test_cluster_recovery_managed_relmap_scan test_cluster_relmap_retention_census \
+		test_cluster_relmap_census_side
+test_cluster_recovery_native_scan test_cluster_recovery_root_set test_cluster_recovery_slru_scan \
+		test_cluster_recovery_native_roots test_cluster_recovery_final_namespace: CLUSTER_UNIT_PORT_LIBS := $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+$(RECOVERY_RELMAP_CODEC_TESTS): $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
 
 test_cluster_recovery_native_scan: test_cluster_recovery_native_scan.c test_cluster_recovery_undo_effects.inc test_cluster_recovery_multixact_effects.inc test_cluster_recovery_slru_effects.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_native_scan.c \
@@ -15804,7 +15853,7 @@ test_cluster_recovery_native_roots: test_cluster_recovery_native_roots.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-test_cluster_recovery_wal_targets: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_targets.inc
+test_cluster_recovery_wal_targets: test_cluster_recovery_relmap_fixture.h test_cluster_recovery_relmap_targets.inc test_cluster_recovery_relmap_create_fixture.h test_cluster_recovery_relmap_create_targets.inc
 
 test_cluster_recovery_wal_targets: test_cluster_recovery_wal_targets.c \
 		test_cluster_recovery_undo_targets.inc test_cluster_recovery_multixact_targets.inc \
@@ -17521,6 +17570,7 @@ test_cluster_startup_native_ctrc_owner.inc: test_cluster_ctrc_local_empty.c Make
 test_cluster_startup_native_ctrc.o: test_cluster_startup_native_ctrc.c \
 		test_cluster_startup_native_ctrc.h test_cluster_startup_native_ctrc_namespace.h \
 		test_cluster_startup_native_ctrc_owner.inc test_cluster_ctrc_cleaner.c \
+		test_cluster_ctrc_counter_display.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_ctrc_native_exit.inc \
 		test_cluster_ctrc_native_group_exit.inc test_cluster_ctrc_native_prepare.inc \
 		test_cluster_ctrc_worker_sample.inc test_cluster_ctrc_read_scope.inc \
@@ -17793,6 +17843,7 @@ test_cluster_typed_pass2_select.inc: $(top_srcdir)/src/backend/cluster/cluster_w
 
 # Original cold declaration and SIDE input coexistence; no live activation.
 test_cluster_cold_relmap_side: $(CLUSTER_COLD_PLAN_O) $(CLUSTER_WAL_CLAIM_O) test_cluster_cold_relmap_side.inc \
+		test_cluster_relmap_create_side.inc \
 		$(top_srcdir)/src/include/cluster/cluster_cold_relmap.h
 .PHONY: clean-cold-relmap-side
 clean: clean-cold-relmap-side
@@ -18416,13 +18467,16 @@ clean-recovery-identity-codec:
 	rm -f test_cluster_recovery_file_identity test_cluster_recovery_file_identity.d
 
 # Managed envelope: real pair I/O, while control registration remains external.
-test_cluster_relmap_file: test_cluster_relmap_file.c test_cluster_relmap_wal_intent.inc unit_test.h \
+test_cluster_relmap_file: test_cluster_relmap_file.c test_cluster_relmap_wal_intent.inc test_cluster_relmap_file_replay_create.inc unit_test.h \
+		test_cluster_relmap_file_create_wal.inc $(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
 		$(top_srcdir)/src/common/cluster_relmap_file_io.c \
 		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(top_srcdir)/src/common/cluster_relmap_file.c $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
@@ -18587,6 +18641,27 @@ clean: clean-initdb-recovery
 .PHONY: clean-initdb-recovery
 clean-initdb-recovery:
 	rm -f test_cluster_initdb_recovery_owner.inc test_cluster_initdb_recovery_owner.inc.tmp test_cluster_initdb_recovery test_cluster_initdb_recovery.d test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_recovery_fixture.inc.tmp test_cluster_initdb_recovery_dispatch.inc test_cluster_initdb_recovery_dispatch.inc.tmp
+
+# Original authenticated initdb binding selects both native child options.
+TESTS += test_cluster_initdb_child_sync
+all: test_cluster_initdb_child_sync
+test_cluster_initdb_child_sync_original.inc: $(top_srcdir)/src/bin/initdb/initdb.c
+	awk '/^static const char \*(boot_options|backend_options) = / { print; d++ } /^pgrac_native_bind_creation\(void\)/ { print "static void"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(d!=2 || n!=1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_initdb_child_sync: test_cluster_initdb_child_sync.c test_cluster_initdb_child_sync_original.inc test_cluster_initdb_recovery_fixture.inc test_cluster_initdb_relmap.c unit_test.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -DFRONTEND $< $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-child-sync
+.PHONY: clean-initdb-child-sync
+clean-initdb-child-sync:
+	rm -f test_cluster_initdb_child_sync_original.inc test_cluster_initdb_child_sync_original.inc.tmp test_cluster_initdb_child_sync test_cluster_initdb_child_sync.d
 
 TESTS += test_cluster_control_file_selection
 all: test_cluster_control_file_selection
@@ -19163,3 +19238,284 @@ clean: clean-control-clog-preparation
 .PHONY: clean-control-clog-preparation
 clean-control-clog-preparation:
 	rm -f test_cluster_control_clog_preparation test_cluster_control_clog_preparation.d
+
+# Original full census plus managed relmap scratch and real shared table.
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: \
+        test_cluster_recovery_managed_census_fixture.h test_cluster_recovery_managed_census.inc \
+        $(top_srcdir)/src/backend/cluster/cluster_recovery_relmap_scan.c \
+        $(top_srcdir)/src/include/cluster/cluster_control_file_identity.h
+
+test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: \
+        $(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+        $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+        $(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_relmap_scan.h
+
+test_cluster_recovery_relmap_scan test_cluster_recovery_managed_relmap_scan: \
+        test_cluster_recovery_relmap_table_unavailable.h \
+        $(top_srcdir)/src/include/cluster/cluster_control_native_files.h
+
+TESTS += test_cluster_control_relmap_creation
+all: test_cluster_control_relmap_creation
+test_cluster_control_relmap_creation: test_cluster_control_relmap_creation.c test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_control_relmap_creation.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-relmap-creation
+.PHONY: clean-control-relmap-creation
+clean-control-relmap-creation:
+	rm -f test_cluster_control_relmap_creation test_cluster_control_relmap_creation.d
+
+# Original target control owner and actual managed pair checkpoint receipts.
+TESTS += test_cluster_control_relmap_creation_files
+all: test_cluster_control_relmap_creation_files
+test_cluster_control_relmap_creation_files: test_cluster_control_relmap_creation_files.c $(top_srcdir)/src/common/cluster_relmap_file_io.c $(top_srcdir)/src/include/storage/fd.h test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_control_relmap_creation_files.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-relmap-creation-files
+.PHONY: clean-control-relmap-creation-files
+clean-control-relmap-creation-files:
+	rm -f test_cluster_control_relmap_creation_files test_cluster_control_relmap_creation_files.d
+
+# Original reserved target and actual managed source-to-pair creation.
+TESTS += test_cluster_relmap_create_copy
+all: test_cluster_relmap_create_copy
+test_cluster_relmap_create_copy: test_cluster_relmap_create_physical.inc test_cluster_relmap_create_owner.inc test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c $(top_srcdir)/src/common/cluster_relmap_file_io.c $(top_srcdir)/src/include/cluster/cluster_relmap_control.h $(top_srcdir)/src/include/cluster/cluster_relmap_authority.h test_cluster_relmap_create_copy.c test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_relmap_create_copy.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(top_srcdir)/src/common/cluster_relmap_v2.c \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-relmap-create-copy
+.PHONY: clean-relmap-create-copy
+clean-relmap-create-copy:
+	rm -f test_cluster_relmap_create_copy test_cluster_relmap_create_copy.d
+
+# Both consumers use the original address-bound creation carrier layout.
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_control_native_files.h
+test_cluster_relmap_create_copy: $(top_srcdir)/src/include/common/cluster_relmap_file.h \
+        $(top_srcdir)/src/include/cluster/cluster_relmap_lock.h \
+        $(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+        $(top_srcdir)/src/include/storage/fd.h
+
+# Recovery authorization shares the original real ROOT/registry creator target.
+test_cluster_control_relmap_creation: test_cluster_control_relmap_recovery.inc $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h
+
+test_cluster_cold_recovery_startup: test_cluster_cold_relmap_create_record.inc $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+
+cluster_registry_common_test.o test_cluster_recovery_registry test_cluster_recovery_reservations: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h $(top_srcdir)/src/include/common/cluster_recovery_registry.h
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h
+
+# Original Main dispatch and complete cohort registration; family leaves controlled.
+TESTS += test_cluster_initdb_main
+all: test_cluster_initdb_main
+test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc: test_cluster_initdb_main.stamp
+	@test -f $@
+test_cluster_initdb_main.stamp: $(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c $(srcdir)/extract_cluster_initdb_main.py
+	python3 $(srcdir)/extract_cluster_initdb_main.py $< test_cluster_initdb_main
+	touch $@
+test_cluster_initdb_main: test_cluster_initdb_main.c test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc unit_test.h \
+ $(top_srcdir)/src/include/common/pgrac_initdb_recovery.h $(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+ $(top_srcdir)/src/common/cluster_recovery_file_identity.c $(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+ $(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+ $(top_srcdir)/src/backend/cluster/cluster_initdb_common_private.h $(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
+ $(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
+ $(top_srcdir)/src/include/common/cluster_recovery_registry.h cluster_registry_common_test.o \
+ $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -I$(top_srcdir)/src/backend/cluster -I$(top_srcdir)/src/bin/initdb -ffunction-sections -fdata-sections $< \
+ $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+ cluster_registry_common_test.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+ $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-main
+.PHONY: clean-initdb-main
+clean-initdb-main:
+	rm -f test_cluster_initdb_main test_cluster_initdb_main.d test_cluster_initdb_main.stamp test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc
+# Independent CREATE bytes are shared by the original copy consumer and replay.
+test_cluster_relmap_create_copy: test_cluster_relmap_create_replay.inc \
+        $(top_srcdir)/src/include/common/cryptohash.h
+test_cluster_relmap_create_copy test_cluster_relmap_control: \
+        $(top_srcdir)/src/include/common/cluster_relmap_create.h \
+        $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+        $(top_srcdir)/src/include/access/xlog.h $(top_srcdir)/src/include/access/xloginsert.h
+
+# Recovery authorization shares the original real ROOT/registry creator target.
+test_cluster_control_relmap_creation: test_cluster_control_relmap_recovery.inc $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h
+
+test_cluster_cold_recovery_startup: test_cluster_cold_relmap_create_record.inc $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h $(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+
+cluster_registry_common_test.o test_cluster_recovery_registry test_cluster_recovery_reservations: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h $(top_srcdir)/src/include/common/cluster_recovery_registry.h
+cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_recovery_coverage_format.h
+
+test_cluster_relmap_create_copy: test_cluster_relmap_recovery_create.inc \
+        $(top_srcdir)/src/include/cluster/cluster_control_relmap_recovery.h \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
+
+# Relmap diagnostics use the same frontend codecs as pg_waldump.
+TESTS += test_cluster_relmap_wal_desc
+all: test_cluster_relmap_wal_desc
+test_cluster_relmap_wal_desc: test_cluster_relmap_wal_desc.c unit_test.h \
+		$(top_srcdir)/src/backend/access/rmgrdesc/relmapdesc.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c \
+		$(top_srcdir)/src/include/utils/relmapper.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/backend/access/rmgrdesc/relmapdesc.c \
+		$(top_srcdir)/src/common/cluster_relmap_file.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-relmap-wal-desc
+.PHONY: clean-relmap-wal-desc
+clean-relmap-wal-desc:
+	rm -f test_cluster_relmap_wal_desc test_cluster_relmap_wal_desc.d
+
+# Complete RMC1 observations keep the original cold structural refusal.
+TESTS += test_cluster_relmap_cold_create
+all: test_cluster_relmap_cold_create
+test_cluster_relmap_cold_create: test_cluster_relmap_cold_create.c test_cluster_relmap_create_plan.inc test_cluster_cold_recovery_effects.c unit_test.h test_cluster_cold_dependency.inc \
+		test_cluster_cold_abort_replay.inc test_cluster_cold_effects_consumer.h \
+		test_cluster_cold_effects_consumer.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o \
+		$(CLUSTER_COLD_PLAN_SPLIT_O) \
+		$(CLUSTER_COLD_DECODE_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
+		test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o \
+		$(CLUSTER_COLD_PLAN_SPLIT_O) \
+		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_SIDE_XACT_O) \
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) \
+		$(SIDE_XACT_XACTDESC_O) $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -o $@
+
+$(CLUSTER_COLD_DECODE_O) test_cluster_relmap_cold_create: \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+.PHONY: clean-relmap-cold-create
+clean: clean-relmap-cold-create
+clean-relmap-cold-create:
+	rm -f test_cluster_relmap_cold_create test_cluster_relmap_cold_create.d
+
+# Creation declarations validate through the original canonical common codec.
+test_cluster_cold_recovery_plan \
+test_cluster_cold_recovery_replay \
+test_cluster_cold_recovery_space \
+test_cluster_cold_recovery_space_refail \
+test_cluster_cold_recovery_validate \
+test_cluster_cold_recovery_xid: $(top_builddir)/src/common/libpgcommon.a
+test_cluster_cold_recovery_refail: $(top_builddir)/src/common/libpgcommon.a
+
+# Canonical creation bytes in the original sealed external SIDE carrier.
+$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_relmap_side: \
+		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+
+# Original execution receipts retain their own complete source vector.
+test_cluster_relmap_create_copy test_cluster_relmap_control: $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
+test_cluster_relmap_create_copy: test_cluster_relmap_create_receipt.inc
+
+# Keep all original planner bodies; only two frame providers are namespaced.
+test_cluster_relmap_create_plan_original.o: test_cluster_relmap_create_plan_original.c \
+        $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+        $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
+clean: clean-relmap-create-plan-owner
+.PHONY: clean-relmap-create-plan-owner
+clean-relmap-create-plan-owner:
+	rm -f test_cluster_relmap_create_plan_original.o
+
+# Original Start table snapshot fixtures are included by this actual consumer.
+test_cluster_cold_tx_start: test_cluster_cold_start_native_table.inc

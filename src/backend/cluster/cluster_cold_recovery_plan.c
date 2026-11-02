@@ -92,6 +92,15 @@ cold_relmap_inputs_valid(const ClusterColdPlanV1 *plan,
 			|| !bytes_nonzero(source->claim.identity.storage_uuid, 16)
 			|| !bytes_nonzero(source->claim.claim_sha256, 32))
 			return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		/* A clean creation and a staged update cannot borrow each other's
+		 * namespace/receipt, regardless of declaration order. */
+		for (uint32 k = 0; k < plan->relmap_create_count; ++k) {
+			const ColdRelmapCreateInput *created = cold_relmap_create_at(plan, k);
+			if (created == NULL || (!image->identity.shared
+				&& created->input.creation.identity.tablespace_oid == DEFAULTTABLESPACE_OID
+				&& created->input.creation.identity.database_oid == image->identity.dbid))
+				return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		}
 		/* One pending pair per namespace. Multiple writes to that pair need
 		 * the original terminal owner, never an implicit stage overwrite. */
 		for (uint32 k = 0; k < i; ++k)
@@ -132,6 +141,152 @@ cluster_cold_plan_relmap_declare_v1(ClusterColdPlanV1 *plan,
 	return CLUSTER_COLD_OK;
 }
 
+/* Values are only declarations. Original Startup independently authenticates
+ * the durable expected identity/batch and continuous full-source authority. */
+static bool
+relmap_create_input_valid(const ClusterColdPlanV1 *plan,
+	const ClusterColdRelmapCreateInputV1 *in)
+{
+	const ClusterRecoveryFileIdentityV2 *id = &in->creation.identity;
+	const ClusterWalSourceRef *source = &in->source;
+	uint8 canonical[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1];
+
+	return in->participant < plan->participant_count
+		&& cold_relmap_cut_equal(&in->cut, &plan->participants[plan->canonical[in->participant]].cut)
+		&& in->frame.participant == in->participant && !in->frame.history
+		&& in->frame.rmid == RM_RELMAP_ID && in->frame.info == XLOG_RELMAP_CREATE_V1
+		&& !in->frame.page_components && !in->frame.space_effects
+		&& in->frame.read_rec_ptr >= in->cut.native_redo
+		&& in->frame.read_rec_ptr < in->frame.end_rec_ptr && in->frame.end_rec_ptr <= in->cut.tail_end
+		&& source->timeline == in->cut.timeline
+		&& source->claim.identity.origin_thread_id == in->cut.thread_id
+		&& source->claim.identity.origin_owner_incarnation == in->cut.owner_incarnation
+		&& source->claim.identity.origin_node_id == id->origin
+		&& source->claim.identity.system_identifier == id->system_identifier
+		&& source->claim.database_incarnation == id->database_incarnation
+		&& source->claim.identity.origin_owner_incarnation == id->creation_generation
+		&& !memcmp(source->claim.identity.storage_uuid, id->storage_uuid, 16)
+		&& source->claim.max_config_generation != 0 && bytes_nonzero(source->claim.claim_sha256, 32)
+		&& cluster_relmap_create_encode_v1(id, in->creation.batch_uuid, &in->creation.committed,
+			canonical, sizeof(canonical));
+}
+
+static bool
+relmap_create_record_matches(const ClusterColdRelmapCreateInputV1 *in,
+	uint32 participant, const ClusterColdRecordV1 *record)
+{
+	uint8 declared[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1], observed[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1];
+	const ClusterRelmapCreateWalV1 *value = record->relmap_create;
+
+	return in->participant == participant && cold_relmap_frame_equal(&in->frame, record)
+		&& record->relmap_image == NULL && value != NULL
+		&& record->relmap_dbid == in->creation.identity.database_oid
+		&& record->relmap_tsid == in->creation.identity.tablespace_oid
+		&& (record->record_flags == CLUSTER_COLD_RECORD_STRUCTURAL
+			|| record->record_flags == (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED))
+		&& cluster_relmap_create_encode_v1(&in->creation.identity, in->creation.batch_uuid,
+			&in->creation.committed, declared, sizeof(declared))
+		&& cluster_relmap_create_encode_v1(&value->identity, value->batch_uuid,
+			&value->committed, observed, sizeof(observed))
+		&& !memcmp(declared, observed, sizeof(declared));
+}
+
+ClusterColdDetailV1
+cluster_cold_plan_relmap_create_declare_v1(ClusterColdPlanV1 *plan,
+	const ClusterColdRelmapCreateInputV1 *inputs, uint32 count)
+{
+	ColdRelmapCreateChunk *head = NULL, *tail = NULL;
+	uint32 chunks;
+	Size bytes;
+
+	if (!plan_valid(plan) || inputs == NULL || count == 0) return CLUSTER_COLD_INVALID_ARGUMENT;
+	if (plan->phase != COLD_PHASE_FEEDING || plan->input_frame_count || plan->relmap_creates != NULL)
+		return CLUSTER_COLD_STATE;
+	chunks = (count - 1) / COLD_RELMAP_CREATE_SEGMENT + 1;
+	if (chunks > plan->memory_budget / sizeof(*head)) return CLUSTER_COLD_CAPACITY;
+	bytes = (Size)chunks * sizeof(*head);
+	/* Validate the WHOLE batch before allocation or visible declaration. */
+	for (uint32 i = 0; i < count; ++i) {
+		const ClusterColdRelmapCreateInputV1 *in = &inputs[i];
+		if (!relmap_create_input_valid(plan, in)) return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		for (uint32 j = 0; j < i; ++j)
+			if ((inputs[j].creation.identity.database_oid == in->creation.identity.database_oid
+				&& inputs[j].creation.identity.tablespace_oid == in->creation.identity.tablespace_oid)
+				|| (inputs[j].participant == in->participant
+					&& (inputs[j].frame.read_rec_ptr == in->frame.read_rec_ptr
+						|| memcmp(&inputs[j].source, &in->source, sizeof(in->source)))))
+				return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		for (uint32 j = 0; j < plan->relmap_count; ++j)
+			if (!plan->relmap_inputs[j].input.staged.identity.shared
+				&& in->creation.identity.tablespace_oid == DEFAULTTABLESPACE_OID
+				&& plan->relmap_inputs[j].input.staged.identity.dbid == in->creation.identity.database_oid)
+				return CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+	}
+	if (!cold_plan_reserve(plan, bytes)) return CLUSTER_COLD_CAPACITY;
+	for (uint32 i = 0; i < count; ++i) {
+		if (i % COLD_RELMAP_CREATE_SEGMENT == 0) {
+			ColdRelmapCreateChunk *next = cold_alloc0(sizeof(*next));
+			if (next == NULL) {
+				while (head) { next = head->next; cold_free(head); head = next; }
+				cold_plan_release(plan, bytes);
+				return CLUSTER_COLD_OOM;
+			}
+			if (tail) tail->next = next; else head = next;
+			tail = next;
+		}
+		tail->entries[i % COLD_RELMAP_CREATE_SEGMENT].input = inputs[i];
+	}
+	plan->relmap_creates = head;
+	plan->relmap_create_count = count;
+	return CLUSTER_COLD_OK;
+}
+
+static uint32
+relmap_create_capture(ClusterColdPlanV1 *plan, uint32 participant,
+	const ClusterColdRecordV1 *record)
+{
+	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+		ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+		if (entry != NULL && !entry->captured
+			&& relmap_create_record_matches(&entry->input, participant, record)) {
+			entry->captured = true;
+			return i;
+		}
+	}
+	return CLUSTER_COLD_NO_INDEX;
+}
+
+const ClusterColdRelmapCreateInputV1 *
+cluster_cold_plan_relmap_create_captured_v1(const ClusterColdPlanV1 *plan,
+	uint32 participant, const ClusterColdRecordV1 *record)
+{
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_FEEDING || plan->relmap_failed
+		|| record == NULL || participant >= plan->participant_count) return NULL;
+	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+		const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+		if (entry != NULL && entry->captured
+			&& relmap_create_record_matches(&entry->input, participant, record)) return &entry->input;
+	}
+	return NULL;
+}
+
+const ClusterColdRelmapCreateInputV1 *
+cluster_cold_plan_relmap_create_step_v1(const ClusterColdPlanV1 *plan,
+	const ClusterColdStepV1 *step)
+{
+	ClusterColdStepV1 expected;
+	const ColdRecord *record;
+	const ColdRelmapCreateInput *entry;
+	if (!plan_valid(plan) || plan->relmap_failed || step == NULL
+		|| !cluster_cold_plan_step_v1(plan, step->step_index, &expected)
+		|| expected.step_kind != CLUSTER_COLD_STEP_RELMAP || memcmp(step, &expected, sizeof(expected)))
+		return NULL;
+	record = cold_record(plan, plan->schedule[step->step_index]);
+	if (!(record->flags & COLD_RECORD_RELMAP_CREATE)) return NULL;
+	entry = cold_relmap_create_at(plan, record->first_component);
+	return entry != NULL && entry->captured ? &entry->input : NULL;
+}
+
 static uint32
 relmap_capture(ClusterColdPlanV1 *plan, uint32 participant, const ClusterColdRecordV1 *record)
 {
@@ -161,13 +316,17 @@ cluster_cold_plan_relmap_required_v1(const ClusterColdPlanV1 *plan, uint32 parti
 	for (uint32 i = 0; i < plan->relmap_count; ++i)
 		if (plan->relmap_inputs[i].input.participant == participant)
 			return true;
+	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+		const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+		if (entry != NULL && entry->input.participant == participant) return true;
+	}
 	return false;
 }
 
 void
 cluster_cold_plan_relmap_invalidate_v1(ClusterColdPlanV1 *plan)
 {
-	if (plan_valid(plan) && plan->relmap_count != 0) {
+	if (plan_valid(plan) && (plan->relmap_count != 0 || plan->relmap_create_count != 0)) {
 		plan->relmap_failed = true;
 		plan->phase = COLD_PHASE_FAILED;
 	}
@@ -663,7 +822,9 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		detail = record_cursor_check(owner, record);
 		if (detail == CLUSTER_COLD_OK && record->rmid == RM_RELMAP_ID
 			&& record->end_rec_ptr > owner->cut.native_redo)
-			relmap = relmap_capture(plan, participant, record);
+			relmap = record->info == XLOG_RELMAP_CREATE_V1
+				? relmap_create_capture(plan, participant, record)
+				: relmap_capture(plan, participant, record);
 		/* C0 names a separate target. The writer's checkpoint is not
 		 * target coverage, including an entirely historical source. */
 		if (detail == CLUSTER_COLD_OK && record->rmid == RM_CLUSTER_UNDO_ID
@@ -717,6 +878,7 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		if (detail == CLUSTER_COLD_OK && relmap != CLUSTER_COLD_NO_INDEX) {
 			ColdRecord *stored = cold_record(plan, previous_records);
 			stored->flags |= COLD_RECORD_RELMAP;
+			if (record->info == XLOG_RELMAP_CREATE_V1) stored->flags |= COLD_RECORD_RELMAP_CREATE;
 			stored->first_component = relmap;
 		}
 		if (detail == CLUSTER_COLD_OK)
@@ -1051,6 +1213,7 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 	if (plan->magic != CLUSTER_COLD_PLAN_MAGIC)
 		return;
 	cold_relmap_terminal_cleanup(plan);
+	cold_relmap_create_cleanup(plan);
 	/* Untransferred recovery debt outlives failed cleanup. */
 	if (plan->relmap_recovery != NULL && plan->relmap_recovery->count != 0
 		&& !plan->relmap_recovery->transferred)
@@ -1092,6 +1255,11 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 	cold_plan_intern_free(&plan->segments);
 	if (plan->relmap_inputs != NULL)
 		cold_free(plan->relmap_inputs);
+	while (plan->relmap_creates != NULL) {
+		ColdRelmapCreateChunk *next = plan->relmap_creates->next;
+		cold_free(plan->relmap_creates);
+		plan->relmap_creates = next;
+	}
 	cold_free(plan->canonical);
 	cold_free(plan->participants);
 	cold_free(plan);

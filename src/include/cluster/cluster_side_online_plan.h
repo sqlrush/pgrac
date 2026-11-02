@@ -162,6 +162,20 @@ extern bool rf_side_online_plan_relmap_matches_v1(const RfSideOnlinePlanV1 *plan
  * and lock. Compares values rather than transient structure padding. */
 extern bool rf_side_online_plan_relmap_input_matches_v1(const RfSideOnlinePlanV1 *plan,
 	const struct ClusterColdRelmapInputV1 *input);
+/* Complete clean creation is another external structural obligation. Only
+ * the original cold declaration may feed it, under the bound RECOVERY source
+ * and budget. The saved native bytes grant no execution or control authority.
+ * Sealed count/matchers are observations; ordinary and whole-SIDE apply refuse. */
+struct ClusterColdRelmapCreateInputV1;
+extern RfPageProofDetailV1 rf_side_online_plan_feed_relmap_create_v1(RfSideOnlinePlanV1 *,
+	const RfDetachedRecordPlanV1 *, const RfPageOnlineRecordIdentityV1 *,
+	const struct ClusterColdRelmapCreateInputV1 *);
+extern uint32 rf_side_online_plan_relmap_create_count_v1(const RfSideOnlinePlanV1 *,
+	const ClusterWalSourceRef *);
+extern bool rf_side_online_plan_relmap_create_matches_v1(const RfSideOnlinePlanV1 *,
+	const ClusterWalSourceRef *, const XLogReaderState *);
+extern bool rf_side_online_plan_relmap_create_input_matches_v1(const RfSideOnlinePlanV1 *,
+	const struct ClusterColdRelmapCreateInputV1 *);
 /* Exact same-source native MAIN CREATE / typed CREATE pair. This is an
  * immutable dependency lookup, never an execution or file-existence proof. */
 extern bool rf_side_online_plan_native_creation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,

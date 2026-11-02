@@ -14,6 +14,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_control_file_identity.h"
+#include "cluster/cluster_control_native_files.h"
 #include "common/cluster_relmap_file.h"
 typedef struct ClusterRecoveryRelmapScan ClusterRecoveryRelmapScan;
 typedef enum ClusterRecoveryRelmapResult {
@@ -82,6 +83,24 @@ extern ClusterRecoveryRelmapResult
 cluster_recovery_relmap_scan_begin_managed_v2(ClusterRecoveryRootSet *roots,
 	ClusterControlRelmapSelectionV2 *selection, size_t memory_budget,
 	ClusterRecoveryRelmapScan **out);
+
+/* Original Start's complete published table, copied under its narrow CF-X.
+ * Caller has released CF before traversal; all original episode/IR/WALR/ROOT
+ * duties remain. Pin no new owner: borrow each unique AVAILABLE address from
+ * this exact table generation, through both copies and their rereads. Retire
+ * that local borrow before the next namespace, or at destroy. A changed table
+ * invalidates the cursor even between borrows. Same complete-pair/count/fork
+ * checks as the explicit scanner; no raw fallback or managed permission.
+ * A failed borrow release is an unretired duty and PANICs without retry/free.
+ * Table input is copied, not borrowed. Output aliases refuse before writes. */
+extern ClusterRecoveryRelmapResult
+cluster_recovery_relmap_scan_begin_native_v2(ClusterRecoveryRootSet *roots,
+											 const ClusterControlNativeTableInfoV2 *table,
+											 size_t memory_budget, ClusterRecoveryRelmapScan **out);
+/* Pure bounds check for composite readers, including exported image storage.
+ * No current/CF/I/O call; valid even after cursor failure. */
+extern bool cluster_recovery_relmap_scan_output_distinct_v2(const ClusterRecoveryRelmapScan *,
+															const void *out, Size length);
 
 /* At most 128 metadata candidates, one target file read (plus managed control
  * rechecks described above), or one mapping/

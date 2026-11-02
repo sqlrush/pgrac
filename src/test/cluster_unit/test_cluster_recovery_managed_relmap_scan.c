@@ -39,6 +39,7 @@ static ssize_t managed_scan_pread(int fd, void *bytes, size_t n, off_t at)
 #define pread managed_scan_pread
 #include "../../backend/cluster/cluster_recovery_root_set.c"
 #undef pread
+#include "test_cluster_recovery_relmap_table_unavailable.h"
 #include "../../backend/cluster/cluster_recovery_relmap_scan.c"
 
 static char physical_path[100];

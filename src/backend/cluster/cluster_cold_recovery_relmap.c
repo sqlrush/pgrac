@@ -450,7 +450,9 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 		|| expected.step_kind != CLUSTER_COLD_STEP_RELMAP || memcmp(step, &expected, sizeof(expected)) != 0)
 		return false;
 	record = cold_record(plan, plan->schedule[step->step_index]);
-	if (record->first_component >= plan->relmap_count)
+	/* A clean creation cannot be executed through a pending-stage slot. */
+	if ((record->flags & COLD_RECORD_RELMAP_CREATE) != 0
+		|| record->first_component >= plan->relmap_count)
 		return false;
 	entry = &plan->relmap_inputs[record->first_component];
 	input = &entry->input;
@@ -506,7 +508,8 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 	if (typed == NULL || fence == NULL || !plan_valid(typed->plan))
 		return false;
 	plan = typed->plan;
-	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed)
+	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed
+		|| plan->relmap_create_count != 0)
 		return false;
 	for (uint32 i = 0; i < plan->relmap_count; ++i)
 		if (!plan->relmap_inputs[i].captured || !plan->relmap_inputs[i].applied)
@@ -541,6 +544,7 @@ cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
 		return UINT32_MAX;
 	plan = typed->plan;
 	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed
+		|| plan->relmap_create_count != 0
 		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
 		return UINT32_MAX;
 	if (plan->relmap_count == 0)
