@@ -388,6 +388,12 @@ main(int argc, char **argv)
 	UT_RUN(recovery_drift_and_partial_pair_poison_without_publication);
 	UT_RUN(recovery_error_preserves_persistent_creation_debt);
 	UT_RUN(recovery_cf_change_and_mapping_lock_entry_refuse);
+	UT_RUN(recovery_confirmed_pair_rechecks_without_reconfirm_or_publication);
+	UT_RUN(recovery_confirmed_requires_original_successful_once_confirmation);
+	UT_RUN(recovery_confirmed_exact_pair_and_complete_sources_refuse_changed_or_aliased_inputs);
+	UT_RUN(recovery_confirmed_context_and_selected_table_drift_poison_without_reselection);
+	UT_RUN(recovery_confirmed_late_source_false_or_error_releases_only_its_local_borrow);
+	UT_RUN(recovery_confirmed_failure_preserves_an_existing_native_file_borrow);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
