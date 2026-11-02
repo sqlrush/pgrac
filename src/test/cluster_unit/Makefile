@@ -4741,10 +4741,10 @@ test_cluster_serving_sample: test_cluster_serving_sample.c test_cluster_serving_
 
 # Exercise the actual pre-send gate with the real authority/storage consumer.
 test_cluster_gcs_serving_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^cluster_gcs_send_block_request_and_wait\(/ { requester=1 } \
+	awk '/^gcs_send_block_request_and_wait\(/ { requester=1 } \
 	     requester && /^\tif \(cluster_authority_readiness_managed\(\)/ { emit=1; begin++ } \
 	     emit && /^\t\/\*$$/ { emit=0; requester=0; end++ } \
-	     emit { print } \
+	     emit { print } /^}/ { requester=0 } \
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -7975,7 +7975,7 @@ test_cluster_index_exhaustion.inc: $(top_srcdir)/src/backend/access/index/indexa
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc test_cluster_index_exhaustion.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
+test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_maintenance_policy.inc test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc test_cluster_index_exhaustion.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
