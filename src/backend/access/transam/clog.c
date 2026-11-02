@@ -240,6 +240,28 @@ CLOGConfigureManagedIO(SlruCtl ctl)
 	ctl->clog_native_write = SimpleLruNativeClogWriteV2;
 }
 
+static bool
+CLOGNativeCreationTruncateNoop(TransactionId oldestXact)
+{
+	ClusterControlNativeTableInfoV2 selected, current;
+
+	/* The unpublished creator owns only the selected initial CLOG segment.
+	 * A cutoff inside that segment cannot remove any selected file. This is
+	 * a read-only return, not permission to scan or truncate raw filenames. */
+	if (!IsNormalProcessingMode() || InRecovery
+		|| !TransactionIdIsNormal(oldestXact)
+		|| TransactionIdToPage(oldestXact) >= SLRU_PAGES_PER_SEGMENT
+		|| !CLOGNativeCreationFile(0, &selected))
+		return false;
+	for (uint32 i = 1; i < selected.creation.boot_file_count; i++)
+		if (selected.creation.boot_files[i].kind == CLUSTER_RECOVERY_FILE_CLOG_V2)
+			return false;
+	return CLOGNativeCreationFile(0, &current)
+		&& current.table_generation == selected.table_generation
+		&& current.startup_generation == selected.startup_generation
+		&& memcmp(&current.creation, &selected.creation, sizeof(current.creation)) == 0;
+}
+
 /* These lifecycle callers still need their original complete selected-range
  * owner. A raw record, cutoff or segno-only request cannot supply it. */
 static void
@@ -1727,6 +1749,8 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	int			cutoffPage;
 
 #ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeCreationTruncateNoop(oldestXact))
+		return;
 	CLOGRequireLegacyLifecycle();
 #endif
 	/*

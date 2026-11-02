@@ -628,13 +628,116 @@ UT_TEST(creation_issuer_cold_read_error_balances_original_cleanup)
 	}
 }
 
+/* Destructive legacy providers are deliberately unreachable for this selected
+ * creation range. Keep the real TruncateCLOG and SLRU directory caller; any
+ * attempted scan, watermark advance or deletion fails this fixture. */
+DIR *AllocateDir(const char *path pg_attribute_unused()) { abort(); }
+struct dirent *ReadDir(DIR *dir pg_attribute_unused(), const char *path pg_attribute_unused())
+{ abort(); }
+int FreeDir(DIR *dir pg_attribute_unused()) { abort(); }
+void AdvanceOldestClogXid(TransactionId xid pg_attribute_unused()) { abort(); }
+
+static bool
+creation_truncate_raises(TransactionId oldest)
+{
+	volatile bool caught = false;
+
+	PG_TRY(); { TruncateCLOG(oldest, 123); }
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	return caught;
+}
+
+UT_TEST(creation_vacuum_initial_segment_retains_all_native_bytes)
+{
+	for (unsigned variant = 0; variant < 16; variant++) {
+		uint8 before[16448], after[16448];
+		PGAlignedBlock cached;
+		ClusterClogPageIdentityV2 identity;
+		TransactionId oldest = variant % 2 ? 1048575 : FirstNormalTransactionId;
+
+		creation_reset_origin(NormalProcessing, variant / 2 % 2 ? 127 : 0);
+		cluster_enabled = variant % 8 >= 4;
+		if (variant >= 8) {
+			/* The original non-cohort creation also selects its initial TT
+			 * file; unrelated families do not create an older CLOG segment. */
+			creation_context.boot_file_count = 2;
+			creation_context.boot_files[1] = creation_context.boot_files[0];
+			creation_context.boot_files[1].kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+			creation_context.boot_files[1].creation_generation++;
+			creation_info.creation = creation_context;
+		}
+		cached = page; identity = identities[0];
+		UT_ASSERT_EQ(pread(borrowed, before, sizeof(before), 0), sizeof(before));
+		UT_ASSERT(!creation_truncate_raises(oldest));
+		UT_ASSERT(!memcmp(&cached, &page, sizeof(page)));
+		UT_ASSERT(!memcmp(&identity, identities, sizeof(identity)));
+		UT_ASSERT_EQ(inserts + writes + queues + flushes + native_opens, 0);
+		UT_ASSERT_EQ(native_acquires + native_releases, 0);
+		UT_ASSERT(!control_held && !io_held && !dirty[0]);
+		UT_ASSERT_EQ(pread(borrowed, after, sizeof(after), 0), sizeof(after));
+		UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		checkpoint_close();
+	}
+}
+
+UT_TEST(creation_vacuum_truncate_refuses_other_owners_or_selected_ranges)
+{
+	for (unsigned fault = 0; fault < 24; fault++) {
+		uint8 before[16448], after[16448];
+		TransactionId oldest = FirstNormalTransactionId;
+
+		creation_reset(NormalProcessing);
+		if (fault == 0) oldest = 1048576;
+		if (fault == 1) oldest = InvalidTransactionId;
+		if (fault == 2) oldest = BootstrapTransactionId;
+		if (fault == 3) oldest = FrozenTransactionId;
+		if (fault == 4) creation_has_request = false;
+		if (fault == 5) creation_has_table = false;
+		if (fault == 6) creation_info.startup_generation++;
+		if (fault == 7) creation_info.table_generation = 0;
+		if (fault == 8) creation_info.creation.creator_pid++;
+		if (fault == 9) creation_drift_at = creation_info_reads + 2;
+		if (fault == 10) MyBackendType = B_STARTUP;
+		if (fault == 11) IsUnderPostmaster = true;
+		if (fault == 12) IsPostmasterEnvironment = true;
+		if (fault == 13) InRecovery = true;
+		if (fault == 14) Mode = BootstrapProcessing;
+		if (fault == 15) Mode = InitProcessing;
+		if (fault == 16) cluster_node_id = 0;
+		if (fault == 17) native_mode = CLUSTER_NATIVE_FILES_MANAGED_V2;
+		if (fault == 18) native_mode = CLUSTER_NATIVE_FILES_UNKNOWN_V2;
+		if (fault == 19) {
+			creation_context.boot_file_count = 2;
+			creation_context.boot_files[1] = creation_context.boot_files[0];
+			creation_context.boot_files[1].object_id = 4095;
+			creation_info.creation = creation_context;
+		}
+		if (fault >= 20) {
+			if (fault == 20) creation_context.boot_files[0].object_id = 1;
+			if (fault == 21) creation_context.boot_file_count = 0;
+			if (fault == 22) creation_context.boot_file_count = PGRAC_INITDB_BOOT_FILES_V2 + 1;
+			if (fault == 23) creation_context.boot_files[0].creation_generation = 0;
+			creation_info.creation = creation_context;
+		}
+		UT_ASSERT_EQ(pread(borrowed, before, sizeof(before), 0), sizeof(before));
+		UT_ASSERT(creation_truncate_raises(oldest));
+		UT_ASSERT_EQ(inserts + writes + queues + flushes + native_opens, 0);
+		UT_ASSERT_EQ(native_acquires + native_releases, 0);
+		UT_ASSERT(!control_held && !io_held && !dirty[0]);
+		UT_ASSERT_EQ(pread(borrowed, after, sizeof(after), 0), sizeof(after));
+		UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		checkpoint_close();
+	}
+}
+
 int
 main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-creation-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(creation_trim_status_checkpoint_keep_original_identity_and_wal);
 	UT_RUN(creation_checkpoint_rejects_unrelated_batch_before_wal_or_io);
 	UT_RUN(creation_frame_wal_uses_only_the_authenticated_batch_origin);
@@ -647,6 +750,8 @@ main(void)
 	UT_RUN(creation_first_sql_issuer_consumes_boot_page_then_commits_with_wal);
 	UT_RUN(creation_issuer_rejects_other_births_and_contexts_without_page_effects);
 	UT_RUN(creation_issuer_cold_read_error_balances_original_cleanup);
+	UT_RUN(creation_vacuum_initial_segment_retains_all_native_bytes);
+	UT_RUN(creation_vacuum_truncate_refuses_other_owners_or_selected_ranges);
 	rmdir(directory);
 	UT_DONE(); return ut_failed_count != 0;
 }
