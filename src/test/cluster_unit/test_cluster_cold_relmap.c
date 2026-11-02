@@ -301,6 +301,8 @@ cold_map_end(void)
 	cleanup();
 }
 
+#include "test_cluster_relmap_create_declaration.h"
+
 UT_TEST(test_relmap_runs_between_other_source_pages_and_duplicate_does_not_write)
 {
 	ClusterColdStepV1 step;
@@ -619,7 +621,7 @@ UT_TEST(test_creation_plan_cannot_borrow_pending_execution_or_completion)
 	record.relmap_dbid = 2000;
 	record.relmap_tsid = DEFAULTTABLESPACE_OID;
 	UT_ASSERT_EQ(cluster_cold_plan_create_v1(&create.cut, 1, 4194304, &replay.plan), CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(cluster_cold_plan_relmap_create_declare_v1(replay.plan, &create, 1), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(test_create_predeclare(replay.plan, &create, 1), CLUSTER_COLD_OK);
 	{
 		ClusterColdRelmapInputV1 pending = declared;
 		pending.staged.identity.shared = false;
@@ -627,6 +629,7 @@ UT_TEST(test_creation_plan_cannot_borrow_pending_execution_or_completion)
 		UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, &pending, 1),
 			CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
 	}
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_create_bind_v1(replay.plan, 0, &create.source, &record), 0);
 	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(replay.plan, 0, &record), CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(replay.plan, cold_map_observe, NULL, NULL), CLUSTER_COLD_OK);
 	UT_ASSERT(cluster_cold_plan_step_v1(replay.plan, 0, &step));
