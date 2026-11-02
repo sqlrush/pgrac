@@ -11960,8 +11960,9 @@ test_cluster_recovery_reference_graph: test_cluster_recovery_reference_graph.c u
 		$(top_srcdir)/src/include/cluster/cluster_recovery_undo_scan.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
 		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
-		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		test_cluster_heap_small_scn.inc cluster_unit_port_stubs.o test_cluster_undo_segment_init.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_undo_segment_init.o \
+		$(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Independent upstream checksum implementation for integrity fixtures.
 cluster_unit_page_checksum.o: $(top_srcdir)/src/backend/storage/page/checksum.c

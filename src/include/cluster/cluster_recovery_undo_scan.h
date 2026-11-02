@@ -63,6 +63,8 @@ typedef struct ClusterRecoveryUndoRecord {
 	UndoRecordHeader header;
 	uint16 body_length;
 	UndoItlHistoryTrailer history;
+	UndoOperationTrailer operation;
+	UndoSavepointRollbackPayload rollback;
 	uint8 payload[BLCKSZ - sizeof(UndoBlockHeader) - sizeof(UndoSlotDirEntry)
 				  - sizeof(UndoRecordHeader)];
 } ClusterRecoveryUndoRecord;
@@ -78,6 +80,17 @@ extern ClusterRecoveryUndoResult
 cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expected_segment,
 								  uint32 expected_block, uint8 expected_owner, UBA address,
 								  ClusterRecoveryUndoRecord *out);
+
+/* Explicit opt-in for operation/control syntax. Owns the raw child and the
+ * separately decoded top identity/progress; none supplies terminal authority.
+ * The original entry remains top-only, including other records in the block.
+ * The cold owner must still prove source, canonical TT/generation, retained
+ * chain, WAL coverage and isolation before applying or completing anything.
+ * Absent extensions are zero. Refusal clears the entire output. */
+extern ClusterRecoveryUndoResult
+cluster_recovery_undo_record_read_typed(const void *page, size_t length, uint32 expected_segment,
+										uint32 expected_block, uint8 expected_owner, UBA address,
+										ClusterRecoveryUndoRecord *out);
 
 #endif
 #endif

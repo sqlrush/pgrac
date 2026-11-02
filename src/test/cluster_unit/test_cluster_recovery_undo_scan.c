@@ -598,10 +598,244 @@ UT_TEST(test_torn_header_is_not_a_stable_qualified_base)
 	cluster_recovery_undo_scan_destroy(scan);
 }
 
+static UndoOperationTrailer
+typed_operation(uint8 effect)
+{
+	UndoOperationTrailer operation = {
+		.version = 1, .length = 48, .effect_state = effect,
+		.canonical_top_fxid = (UINT64CONST(7) << 32) | 40,
+		.operation_fxid = (UINT64CONST(7) << 32) | 42,
+		.operation_sequence = 9, .canonical_segment_generation = 3,
+		.command_id = 5, .subid = 8
+	};
+	return operation;
+}
+
+/* Independent on-disk shapes, not the decoder/encoder under test. */
+static uint16
+typed_data(uint8 type, uint8 effect, UndoRecordHeader *header, char *payload)
+{
+	UndoItlHistoryTrailer history = { .magic = UNDO_ITL_HISTORY_MAGIC,
+		.version = 1, .count = 1 };
+	UndoOperationTrailer operation = typed_operation(effect);
+	uint16 length;
+
+	*header = record_header(type);
+	header->flags = UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_ITL_HISTORY
+		| UNDO_REC_FLAG_HAS_OPERATION;
+	if (type == UNDO_RECORD_INSERT) {
+		UndoInsertPayload value = { 32, 0 };
+		length = sizeof(value); memcpy(payload, &value, length);
+	} else if (type == UNDO_RECORD_UPDATE) {
+		UndoUpdatePayload value = { .new_block = 19, .new_offset = 4,
+			.old_tuple_length = 5, .old_tuple_offset = sizeof(value) };
+		length = sizeof(value) + 5; memcpy(payload, &value, sizeof(value));
+		memcpy(payload + sizeof(value), "tuple", 5);
+	} else if (type == UNDO_RECORD_DELETE) {
+		UndoDeletePayload value = { .full_tuple_length = 5,
+			.full_tuple_offset = sizeof(value) };
+		length = sizeof(value) + 5; memcpy(payload, &value, sizeof(value));
+		memcpy(payload + sizeof(value), "tuple", 5);
+	} else {
+		UndoItlPayload value = { .itl_slot_idx = 2,
+			.new_flags = ITL_FLAG_LOCK_ONLY_ACTIVE, .lock_xid = 42 };
+		length = sizeof(value); memcpy(payload, &value, length);
+	}
+	history.entries[0].block = 19; history.entries[0].slot_index = 2;
+	history.entries[0].after_kind = type == UNDO_RECORD_ITL
+		? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE;
+	history.entries[0].after_write_scn = 100;
+	memcpy(payload + length, &history, sizeof(history));
+	memcpy(payload + length + sizeof(history), &operation, sizeof(operation));
+	return length + sizeof(history) + sizeof(operation);
+}
+
+static void
+typed_control(uint8 phase, UndoRecordHeader *header, char *payload)
+{
+	UndoSavepointRollbackPayload body = { .version = 1, .length = 96,
+		.phase = phase, .rollback_sequence = 11,
+		.scope_child_fxid = (UINT64CONST(7) << 32) | 42 };
+	UndoOperationTrailer operation = typed_operation(CLUSTER_SAVEPOINT_EFFECT_LIVE);
+
+	*header = record_header(UNDO_RECORD_SAVEPOINT_ROLLBACK);
+	header->flags = UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_OPERATION;
+	header->target_locator = (RelFileLocator){0}; header->target_block = 0;
+	header->target_offset = 0; header->target_fork = 0;
+	if (phase != UNDO_SAVEPOINT_ROLLBACK_RESERVED) {
+		header->flags &= ~UNDO_REC_FLAG_FIRST_IN_TX;
+		header->prev_uba = body.start_uba = uba_encode(257, 8, 6, 0);
+		body.stop_uba = uba_encode(257, 7, 6, 0); body.next_uba = body.start_uba;
+		if (phase != UNDO_SAVEPOINT_ROLLBACK_PENDING) {
+			body.next_uba = phase == UNDO_SAVEPOINT_ROLLBACK_COMPLETE
+				? body.stop_uba : uba_encode(258, 4, 6, 0);
+			body.visited_count = 2; body.last_effect_wal_lsn = UINT64CONST(0x2003000);
+		}
+	}
+	memcpy(payload, &body, sizeof(body));
+	memcpy(payload + sizeof(body), &operation, sizeof(operation));
+}
+
+UT_TEST(test_typed_data_keeps_child_top_and_effect_independent)
+{
+	for (unsigned type = UNDO_RECORD_INSERT; type <= UNDO_RECORD_ITL; type++)
+		for (unsigned effect = 1; effect <= 2; effect++) {
+			char storage[BLCKSZ + 1], payload[256] = {0};
+			char *page = storage + 1;
+			UndoRecordHeader header;
+			ClusterRecoveryUndoRecord out;
+			uint16 n = typed_data(type, effect, &header, payload);
+
+			record_page(page); record_append(page, header, payload, n);
+			UT_ASSERT_EQ(cluster_recovery_undo_record_read_typed(page, BLCKSZ, 258, 9, 2,
+				uba_encode(258, 9, 6, 1), &out), CLUSTER_RECOVERY_UNDO_ENTRY);
+			UT_ASSERT_EQ(out.header.xid, 42); UT_ASSERT_EQ(out.header.tt_slot_segment_id, 257);
+			UT_ASSERT_EQ(out.operation.canonical_top_fxid, (UINT64CONST(7) << 32) | 40);
+			UT_ASSERT_EQ(out.operation.operation_fxid, (UINT64CONST(7) << 32) | 42);
+			UT_ASSERT_EQ(out.operation.effect_state, effect);
+			UT_ASSERT_EQ(out.operation.canonical_segment_generation, 3);
+			UT_ASSERT_EQ(out.body_length, n - 184); UT_ASSERT_EQ(out.history.count, 1);
+			UT_ASSERT_EQ(out.header.tt_wrap_plus1, 2); UT_ASSERT_EQ(out.rollback.phase, 0);
+			UT_ASSERT_EQ(memcmp(out.payload, payload, n), 0);
+			memset(page, 0xff, BLCKSZ); UT_ASSERT_EQ(out.operation.operation_sequence, 9);
+		}
+}
+
+UT_TEST(test_typed_control_preserves_all_phases_without_completion_authority)
+{
+	for (unsigned phase = 1; phase <= 4; phase++) {
+		char page[BLCKSZ], payload[144];
+		UndoRecordHeader header;
+		ClusterRecoveryUndoRecord out;
+
+		typed_control(phase, &header, payload); record_page_init(page);
+		record_append(page, header, payload, sizeof(payload));
+		UT_ASSERT_EQ(cluster_recovery_undo_record_read_typed(page, BLCKSZ, 258, 9, 2,
+			uba_encode(258, 9, 6, 0), &out), CLUSTER_RECOVERY_UNDO_ENTRY);
+		UT_ASSERT_EQ(out.header.xid, 42); UT_ASSERT_EQ(out.operation.effect_state, 1);
+		UT_ASSERT_EQ(out.rollback.phase, phase); UT_ASSERT_EQ(out.rollback.rollback_sequence, 11);
+		UT_ASSERT_EQ(out.body_length, 96); UT_ASSERT_EQ(out.history.count, 0);
+		UT_ASSERT_EQ(out.rollback.scope_child_fxid, (UINT64CONST(7) << 32) | 42);
+		UT_ASSERT_EQ(out.rollback.visited_count, phase <= 2 ? 0 : 2);
+		UT_ASSERT_EQ(out.rollback.last_effect_wal_lsn, phase <= 2 ? 0 : UINT64CONST(0x2003000));
+		UT_ASSERT_EQ(memcmp(out.payload, payload, sizeof(payload)), 0);
+	}
+}
+
+UT_TEST(test_original_entry_rejects_extensions_even_when_selecting_legacy)
+{
+	for (unsigned control = 0; control <= 1; control++) {
+		char page[BLCKSZ], payload[256];
+		UndoRecordHeader header;
+		ClusterRecoveryUndoRecord out;
+		uint16 n;
+
+		if (control) { typed_control(2, &header, payload); n = 144; }
+		else n = typed_data(UNDO_RECORD_ITL, 1, &header, payload);
+		record_page(page); record_append(page, header, payload, n);
+		for (unsigned row = 0; row <= 1; row++) {
+			memset(&out, 0xff, sizeof(out));
+			UT_ASSERT_EQ(cluster_recovery_undo_record_read(page, BLCKSZ, 258, 9, 2,
+				uba_encode(258, 9, 6, row), &out), CLUSTER_RECOVERY_UNDO_UNSUPPORTED);
+			UT_ASSERT(record_zero(&out));
+		}
+		memset(&out, 0xff, sizeof(out));
+		UT_ASSERT_EQ(cluster_recovery_undo_record_read_typed(page, BLCKSZ, 258, 9, 2,
+			uba_encode(258, 9, 6, 0), &out), CLUSTER_RECOVERY_UNDO_ENTRY);
+		UT_ASSERT_EQ(out.header.xid, 42); UT_ASSERT_EQ(out.operation.version, 0);
+		UT_ASSERT_EQ(out.rollback.version, 0); UT_ASSERT_EQ(out.body_length, 4);
+	}
+}
+
+UT_TEST(test_typed_corrupt_sibling_cannot_export_valid_selected_prefix)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		char page[BLCKSZ], payload[256];
+		UndoRecordHeader header;
+		UndoOperationTrailer operation;
+		ClusterRecoveryUndoRecord out;
+		uint16 n = typed_data(UNDO_RECORD_INSERT, 1, &header, payload);
+
+		record_page_init(page); record_append(page, header, payload, n);
+		memcpy(&operation, payload + n - 48, sizeof(operation));
+		switch (fault) {
+		case 0: operation.version = 2; break;
+		case 1: operation.length = 47; break;
+		case 2: operation.effect_state = 0; break;
+		case 3: operation.operation_fxid++; break;
+		case 4: operation.canonical_segment_generation = PG_UINT32_MAX; break;
+		case 5: operation.operation_sequence = 0; break;
+		case 6: header.flags |= 0x80; break;
+		case 7: header.flags &= ~UNDO_REC_FLAG_HAS_ITL_HISTORY; break;
+		case 8: operation.reserved_end = 1; break;
+		case 9: operation.canonical_top_fxid = operation.operation_fxid; break;
+		case 10: payload[4] ^= 1; break; /* ITL history magic. */
+		case 11: header.record_type = 99; break;
+		}
+		memcpy(payload + n - 48, &operation, sizeof(operation));
+		record_append(page, header, payload, n); memset(&out, 0xff, sizeof(out));
+		UT_ASSERT(cluster_recovery_undo_record_read_typed(page, BLCKSZ, 258, 9, 2,
+			uba_encode(258, 9, 6, 0), &out) != CLUSTER_RECOVERY_UNDO_ENTRY);
+		UT_ASSERT(record_zero(&out));
+	}
+}
+
+UT_TEST(test_typed_control_contradictions_clear_every_output)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		char page[BLCKSZ], payload[144];
+		UndoRecordHeader header;
+		UndoSavepointRollbackPayload body;
+		UndoOperationTrailer operation;
+		ClusterRecoveryUndoRecord out;
+
+		typed_control(3, &header, payload); memcpy(&body, payload, sizeof(body));
+		memcpy(&operation, payload + 96, sizeof(operation));
+		switch (fault) {
+		case 0: body.phase = 0; break;
+		case 1: header.target_locator.relNumber = 16385; break;
+		case 2: operation.effect_state = 2; break;
+		case 3: body.scope_child_fxid++; break;
+		case 4: body.last_effect_wal_lsn = 0; break;
+		case 5: body.phase = 4; break; /* next != stop. */
+		case 6: body.reserved[1] = 1; break;
+		case 7: body.next_uba = uba_encode(513, 4, 6, 0); break;
+		case 8: header.flags &= ~UNDO_REC_FLAG_HAS_OPERATION; break;
+		case 9: body.phase = 1; break; /* RESERVED cannot own live progress. */
+		}
+		memcpy(payload, &body, sizeof(body)); memcpy(payload + 96, &operation, sizeof(operation));
+		record_page_init(page); record_append(page, header, payload, sizeof(payload));
+		memset(&out, 0xff, sizeof(out));
+		UT_ASSERT(cluster_recovery_undo_record_read_typed(page, BLCKSZ, 258, 9, 2,
+			uba_encode(258, 9, 6, 0), &out) != CLUSTER_RECOVERY_UNDO_ENTRY);
+		UT_ASSERT(record_zero(&out));
+	}
+}
+
+UT_TEST(test_typed_entry_retains_exact_read_key_and_argument_checks)
+{
+	char page[BLCKSZ], payload[256];
+	UndoRecordHeader header;
+	ClusterRecoveryUndoRecord out;
+	uint16 n = typed_data(UNDO_RECORD_INSERT, 1, &header, payload);
+
+	record_page_init(page); record_append(page, header, payload, n);
+	for (unsigned fault = 0; fault < 6; fault++) {
+		memset(&out, 0xff, sizeof(out));
+		UT_ASSERT(cluster_recovery_undo_record_read_typed(fault == 0 ? NULL : page,
+			fault == 1 ? BLCKSZ - 1 : BLCKSZ, fault == 2 ? 257 : 258,
+			fault == 3 ? 10 : 9, fault == 4 ? 1 : 2,
+			uba_encode(258, 9, fault == 5 ? 7 : 6, 0), &out) != CLUSTER_RECOVERY_UNDO_ENTRY);
+		UT_ASSERT(record_zero(&out));
+	}
+	UT_ASSERT_EQ(cluster_recovery_undo_record_read_typed(page, BLCKSZ, 258, 9, 2,
+		uba_encode(258, 9, 6, 0), NULL), CLUSTER_RECOVERY_UNDO_INVALID);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(20);
 	UT_RUN(test_protected_header_rejects_single_byte_damage_before_export);
 	UT_RUN(test_torn_header_is_not_a_stable_qualified_base);
 	UT_RUN(test_original_initializer_and_generation_zero);
@@ -616,6 +850,12 @@ main(void)
 	UT_RUN(test_corrupt_block_or_directory_clears_record);
 	UT_RUN(test_record_identity_must_match_the_independent_read_key);
 	UT_RUN(test_payload_unknown_flags_and_slot_header_disagreement_refuse);
+	UT_RUN(test_typed_data_keeps_child_top_and_effect_independent);
+	UT_RUN(test_typed_control_preserves_all_phases_without_completion_authority);
+	UT_RUN(test_original_entry_rejects_extensions_even_when_selecting_legacy);
+	UT_RUN(test_typed_corrupt_sibling_cannot_export_valid_selected_prefix);
+	UT_RUN(test_typed_control_contradictions_clear_every_output);
+	UT_RUN(test_typed_entry_retains_exact_read_key_and_argument_checks);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -97,15 +97,17 @@ cluster_recovery_undo_scan_destroy(ClusterRecoveryUndoScan *scan)
 	free(scan);
 }
 
-ClusterRecoveryUndoResult
-cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expected_segment,
-								  uint32 expected_block, uint8 expected_owner, UBA address,
-								  ClusterRecoveryUndoRecord *out)
+static ClusterRecoveryUndoResult
+recovery_undo_record_read(const void *page, size_t length, uint32 expected_segment,
+						  uint32 expected_block, uint8 expected_owner, UBA address,
+						  ClusterRecoveryUndoRecord *out, bool typed)
 {
 	UndoBlockHeader block;
 	UndoSlotDirEntry selected = { 0 };
 	UndoRecordHeader selected_header = { 0 };
 	UndoItlHistoryTrailer selected_history = { 0 };
+	UndoOperationTrailer selected_operation = { 0 };
+	UndoSavepointRollbackPayload selected_rollback = { 0 };
 	uint16 selected_body = 0;
 	uint32 segment, blockno;
 	uint16 tt_slot, row;
@@ -137,8 +139,12 @@ cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expect
 		UndoSlotDirEntry slot;
 		UndoRecordHeader header;
 		UndoItlHistoryTrailer history;
+		UndoOperationTrailer operation = { 0 };
+		UndoSavepointRollbackPayload rollback = { 0 };
 		uint16 body_length;
 		uint32 end;
+		const uint8 allowed = UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_ITL_HISTORY
+			| (typed ? UNDO_REC_FLAG_HAS_OPERATION : 0);
 
 		memcpy(&slot, bytes + UNDO_SLOT_DIR_OFFSET(i), sizeof(slot));
 		if (!cluster_undo_record_slot_range_valid(block.slot_count, i, slot.record_offset,
@@ -156,8 +162,9 @@ cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expect
 			occupied[offset >> 3] |= mask;
 		}
 		memcpy(&header, bytes + slot.record_offset, sizeof(header));
-		if (header.record_type < UNDO_RECORD_INSERT || header.record_type > UNDO_RECORD_ITL
-			|| (header.flags & ~(UNDO_REC_FLAG_FIRST_IN_TX | UNDO_REC_FLAG_HAS_ITL_HISTORY)) != 0)
+		if (header.record_type < UNDO_RECORD_INSERT
+			|| header.record_type > (typed ? UNDO_RECORD_SAVEPOINT_ROLLBACK : UNDO_RECORD_ITL)
+			|| (header.flags & ~allowed) != 0)
 			return CLUSTER_RECOVERY_UNDO_UNSUPPORTED;
 		if (header.payload_length != slot.record_length - sizeof(header)
 			|| slot.record_type != header.record_type || slot.flags != header.flags)
@@ -168,14 +175,28 @@ cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expect
 			|| header.tt_slot_id == 0 || header.tt_slot_id > TT_SLOTS_PER_SEGMENT
 			|| (i == row && header.tt_slot_id != (uint32)tt_slot + 1))
 			return CLUSTER_RECOVERY_UNDO_IDENTITY;
-		if (!cluster_undo_record_decode_payload(&header,
-												bytes + slot.record_offset + sizeof(header),
-												header.payload_length, &body_length, &history))
+		if (typed && header.record_type == UNDO_RECORD_SAVEPOINT_ROLLBACK) {
+			if (!cluster_undo_record_decode_rollback_payload(&header,
+					bytes + slot.record_offset + sizeof(header), header.payload_length,
+					&rollback, &operation))
+				return CLUSTER_RECOVERY_UNDO_CORRUPT;
+			body_length = sizeof(rollback);
+			memset(&history, 0, sizeof(history));
+		} else if (typed && (header.flags & UNDO_REC_FLAG_HAS_OPERATION) != 0) {
+			if (!cluster_undo_record_decode_operation_payload(&header,
+					bytes + slot.record_offset + sizeof(header), header.payload_length,
+					&body_length, &history, &operation))
+				return CLUSTER_RECOVERY_UNDO_CORRUPT;
+		} else if (!cluster_undo_record_decode_payload(&header,
+				bytes + slot.record_offset + sizeof(header), header.payload_length,
+				&body_length, &history))
 			return CLUSTER_RECOVERY_UNDO_CORRUPT;
 		if (i == row) {
 			selected = slot;
 			selected_header = header;
 			selected_history = history;
+			selected_operation = operation;
+			selected_rollback = rollback;
 			selected_body = body_length;
 		}
 	}
@@ -187,10 +208,30 @@ cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expect
 	out->directory = selected;
 	out->header = selected_header;
 	out->history = selected_history;
+	out->operation = selected_operation;
+	out->rollback = selected_rollback;
 	out->body_length = selected_body;
 	memcpy(out->payload, bytes + selected.record_offset + sizeof(selected_header),
 		   selected_header.payload_length);
 	return CLUSTER_RECOVERY_UNDO_ENTRY;
+}
+
+ClusterRecoveryUndoResult
+cluster_recovery_undo_record_read(const void *page, size_t length, uint32 expected_segment,
+								  uint32 expected_block, uint8 expected_owner, UBA address,
+								  ClusterRecoveryUndoRecord *out)
+{
+	return recovery_undo_record_read(page, length, expected_segment,
+		expected_block, expected_owner, address, out, false);
+}
+
+ClusterRecoveryUndoResult
+cluster_recovery_undo_record_read_typed(const void *page, size_t length, uint32 expected_segment,
+										uint32 expected_block, uint8 expected_owner, UBA address,
+										ClusterRecoveryUndoRecord *out)
+{
+	return recovery_undo_record_read(page, length, expected_segment,
+		expected_block, expected_owner, address, out, true);
 }
 
 #endif
