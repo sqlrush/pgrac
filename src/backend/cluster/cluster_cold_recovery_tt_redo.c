@@ -1479,8 +1479,8 @@ cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 p
 	if (rf_side_online_plan_prepare_undo_block_v1(typed->side_plans[participant], owner, segment,
 												  block_no, &block)
 			!= RF_PAGE_PROOF_DETAIL_OK
-		|| cluster_recovery_undo_record_read(block.page.data, BLCKSZ, segment, block_no, owner,
-											 address, out)
+		|| cluster_recovery_undo_record_read_typed(block.page.data, BLCKSZ, segment, block_no,
+												   owner, address, out)
 			   != CLUSTER_RECOVERY_UNDO_ENTRY)
 		return false;
 	*generation = ((const UndoSegmentHeaderData *)header.page.data)->wrap_count;
@@ -1596,8 +1596,8 @@ cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed, uint32 pa
 		|| !cluster_cold_tt_base_block_v1(typed, segment_index, block_no, &block,
 										  &captured_generation)
 		|| !cold_tt_undo_base_redo_block(typed, participant, plan, owner, segment, block_no, &block)
-		|| cluster_recovery_undo_record_read(block.data, BLCKSZ, segment, block_no, owner, address,
-											 &record)
+		|| cluster_recovery_undo_record_read_typed(block.data, BLCKSZ, segment, block_no, owner,
+												   address, &record)
 			   != CLUSTER_RECOVERY_UNDO_ENTRY)
 		return false;
 	*out = record;

@@ -1440,7 +1440,10 @@ extern bool cluster_cold_typed_tt_active_identity_v1(const ClusterColdTypedV1 *t
  * isolation and final rechecks remain required. This creates no canonical
  * transaction, FullXid/epoch/top, checkpoint coverage, complete-chain, loser
  * or C0/OPEN proof. History, C0 and prepared inputs retain the header fold's
- * refusal. Failure clears available outputs; successful output owns bytes. */
+ * refusal. Operation/control syntax is returned as separate raw candidate
+ * fields; it supplies no actor, FullXid, progress or disposition authority.
+ * The original graph adapters retain their strict record checks.
+ * Failure clears available outputs; successful output owns bytes. */
 extern bool cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed,
 												   uint32 participant, uint32 segment_index,
 												   UBA address,
@@ -1450,7 +1453,8 @@ extern bool cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typ
 /* Distinct original-base input: same captured generation, no INIT/REUSE,
  * and a nonzero base block LSN no later than this source's native redo start.
  * Cache and reread the entire original block, fold ordinary sealed redo in a
- * private copy, then parse. No fallback or change to the FPI-only reader or
+ * private copy, then parse the same operation/control candidate syntax.
+ * No fallback or change to the FPI-only source selection or
  * graph. Final base/source checks, isolation and all transaction proofs remain
  * the original owner's duty. Failure clears available outputs. */
 extern bool cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed,
