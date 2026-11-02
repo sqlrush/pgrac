@@ -1898,7 +1898,11 @@ side_plan_slot_step(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV
 
 		if (d->slot_offset >= TT_SLOTS_PER_SEGMENT)
 			return CLUSTER_UNDO_HEADER_BLOCKED;
-		if ((d->kind == CLUSTER_UNDO_KIND_TT_COMMIT || d->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+		/* Operation heads retain an ACTIVE top. Their exact generation/wrap
+		 * transition below must not pass the legacy ABORTED-only head gate. */
+		if ((d->kind == CLUSTER_UNDO_KIND_TT_COMMIT
+			 || (d->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+				 && d->flags != CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG)
 			 || (d->kind == CLUSTER_UNDO_KIND_TT_ABORT && d->format_version == 0))
 			&& cluster_undo_preflight_legacy_slot_v1(d, &h->tt_slots[d->slot_offset])
 				   == CLUSTER_UNDO_TARGET_BLOCKED)
@@ -1917,6 +1921,12 @@ side_plan_slot_anchor(const RfSideOnlineOperationV1 *op, TTSlot *slot)
 
 	if (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO && op->undo.kind == CLUSTER_UNDO_KIND_TT_BIND)
 		memset(slot, 0, sizeof(*slot));
+	else if (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO
+			 && op->undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+			 && op->undo.flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG)
+		/* A first operation head has no predecessor UBA in its carrier.
+		 * Start at the empty head; nonempty DATA must match a source result. */
+		slot->first_undo_block = invalid_head;
 	else if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT
 			 || op->undo.kind == CLUSTER_UNDO_KIND_TT_COMMIT
 			 || op->undo.kind == CLUSTER_UNDO_KIND_TT_ABORT) {
@@ -1962,6 +1972,14 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 s
 						result = side_plan_slot_step(plan, op, observed, scratch.data);
 						proved = result == CLUSTER_UNDO_HEADER_APPLY
 								 || result == CLUSTER_UNDO_HEADER_ALREADY;
+						/* The typed transition can replace any ACTIVE head. That
+						 * alone cannot prove that a nonempty observed head belongs
+						 * to this prefix, especially a later publication. */
+						if (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO
+							&& op->undo.kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
+							&& op->undo.flags == CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG
+							&& !UBA_is_invalid(original->tt_slots[s].first_undo_block))
+							proved = false;
 					}
 					memcpy(scratch.data, base, BLCKSZ);
 					side_plan_slot_anchor(op, &candidate->tt_slots[s]);

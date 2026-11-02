@@ -12805,10 +12805,275 @@ UT_TEST(test_native_terminal_witness_rejects_unbound_plan)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+/* Only private source-prefix bytes are prepared here. DATA qualification,
+ * original-source authority, installation and terminal closure stay separate. */
+static xl_undo_tt_slot_set_head_operation
+operation_prefix_head(uint32 block, uint64 sequence)
+{
+	xl_undo_tt_slot_set_head_operation value = { 0 };
+
+	value.head.instance = 3;
+	value.head.segment_id = 513;
+	value.head.slot_offset = 4;
+	value.head.wrap = 7;
+	value.head.xid = 802;
+	value.head._pad[0] = CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG;
+	value.head.first_undo_block = uba_encode(514, block, 4, 0);
+	value.operation.version = UNDO_OPERATION_TRAILER_VERSION;
+	value.operation.length = UNDO_OPERATION_TRAILER_LENGTH;
+	value.operation.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
+	value.operation.canonical_top_fxid = (UINT64_C(5) << 32) | 802;
+	value.operation.operation_fxid = (UINT64_C(5) << 32) | 803;
+	value.operation.operation_sequence = sequence;
+	value.operation.canonical_segment_generation = 13;
+	value.operation.command_id = 7;
+	value.operation.subid = 2;
+	UT_ASSERT(cluster_undo_head_operation_valid(&value));
+	return value;
+}
+
+static void
+operation_prefix_base(PGAlignedBlock *base)
+{
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)base->data;
+
+	cluster_undo_segment_make_header_bytes(513, 3, base->data);
+	header->wrap_count = 13;
+	header->tt_slots[4].xid = 802;
+	header->tt_slots[4].wrap = 7;
+	header->tt_slots[4].status = TT_SLOT_ACTIVE;
+	header->tt_slots[4].first_undo_block = (UBA)InvalidUba_init;
+	UT_ASSERT(cluster_undo_segment_header_seal(base->data));
+}
+
+static RfSideOnlinePlanV1 *
+operation_prefix_plan(bool history, bool legacy, uint32 count)
+{
+	XLogRecPtr redo = 100 + count * 100;
+	RfSideOnlinePlanV1 *plan = space_online_plan_redo(redo, history ? &redo : NULL);
+	FakeXactRecord fake;
+
+	for (uint32 i = 0; i < count; i++) {
+		xl_undo_tt_slot_set_head_operation value = operation_prefix_head(9 + i, 31 + i);
+
+		if (legacy) {
+			value.head._pad[0] = 0;
+			/* Original32B heads cannot refer to a different physical segment. */
+			value.head.first_undo_block = uba_encode(513, 9 + i, 4, 0);
+		}
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD, &value,
+							   legacy ? sizeof(value.head) : sizeof(value));
+		undo_header_feed(plan, &fake, 100 + i * 100);
+	}
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_operation_head_prefix_uses_active_typed_transition)
+{
+	RfSideOnlinePlanV1 *plan = operation_prefix_plan(false, false, 1);
+	RfSideOnlineOperationV1 op;
+	RfSideUndoHeaderImageV1 out = { 0 };
+	PGAlignedBlock base, saved, expected;
+	xl_undo_tt_slot_set_head_operation value = operation_prefix_head(9, 31);
+
+	operation_prefix_base(&base);
+	saved = expected = base;
+	((UndoSegmentHeaderData *)expected.data)->tt_slots[4].first_undo_block
+		= value.head.first_undo_block;
+	UT_ASSERT(cluster_undo_segment_header_seal(expected.data));
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+	UT_ASSERT_EQ(op.undo.flags, CLUSTER_UNDO_TT_SET_HEAD_OPERATION_FLAG);
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, 0, &op.identity, base.data, &out),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(out.page.data, expected.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(out.source_index, 0);
+	UT_ASSERT_EQ(out.operation_count, 1);
+	UT_ASSERT(memcmp(base.data, saved.data, BLCKSZ) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_operation_heads_keep_source_order_and_selected_prefix)
+{
+	RfSideOnlinePlanV1 *plan = operation_prefix_plan(false, false, 2);
+	RfSideOnlineOperationV1 first, last;
+	RfSideUndoHeaderImageV1 out = { 0 }, early = { 0 }, final = { 0 }, sentinel;
+	PGAlignedBlock base;
+	xl_undo_tt_slot_set_head_operation a = operation_prefix_head(9, 31);
+	xl_undo_tt_slot_set_head_operation b = operation_prefix_head(10, 32);
+
+	operation_prefix_base(&base);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &first));
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &last));
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, 0, &first.identity, base.data,
+														 &early), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(cluster_undo_record_uba_equal(
+		((UndoSegmentHeaderData *)early.page.data)->tt_slots[4].first_undo_block,
+		a.head.first_undo_block));
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &final),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(cluster_undo_record_uba_equal(
+		((UndoSegmentHeaderData *)final.page.data)->tt_slots[4].first_undo_block,
+		b.head.first_undo_block));
+	UT_ASSERT_EQ(final.operation_count, 2);
+	UT_ASSERT_EQ(final.source_index, 1);
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, 1, &last.identity,
+														 early.page.data, &out), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(out.page.data, final.page.data, BLCKSZ) == 0);
+	/* Idempotence still requires exact source-prefix membership. */
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, 1, &last.identity,
+														 final.page.data, &out), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(out.page.data, final.page.data, BLCKSZ) == 0);
+	memset(&out, 0x5a, sizeof(out));
+	sentinel = out;
+	UT_ASSERT_NE(rf_side_online_plan_prepare_undo_record_v1(plan, 0, &first.identity,
+														 final.page.data, &out), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(&out, &sentinel, sizeof(out)) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_operation_head_prefix_refuses_stale_or_unproved_slot)
+{
+	RfSideOnlinePlanV1 *plan = operation_prefix_plan(false, false, 1);
+	RfSideOnlineOperationV1 op;
+
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+	for (int fault = 0; fault < 12; fault++) {
+		PGAlignedBlock base, saved;
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)base.data;
+		TTSlot *slot = &header->tt_slots[4];
+		RfSideUndoHeaderImageV1 out, sentinel;
+
+		operation_prefix_base(&base);
+		switch (fault) {
+		case 0: header->wrap_count--; break;
+		case 1: header->wrap_count++; break;
+		case 2: slot->wrap--; break;
+		case 3: slot->wrap++; break;
+		case 4: slot->xid++; break;
+		case 5: slot->status = TT_SLOT_COMMITTED; slot->commit_scn = 99; break;
+		case 6: slot->status = TT_SLOT_ABORTED; break;
+		case 7: slot->status = TT_SLOT_UNUSED; break;
+		case 8: slot->status = TT_SLOT_RECYCLABLE; break;
+		case 9: slot->flags = UINT8_MAX; break;
+		case 10: slot->commit_scn = 99; break;
+		case 11: slot->first_undo_block = uba_encode(514, 20, 4, 0); break;
+		}
+		UT_ASSERT(cluster_undo_segment_header_seal(base.data));
+		saved = base;
+		memset(&out, 0x5a, sizeof(out));
+		sentinel = out;
+		UT_ASSERT_NE(rf_side_online_plan_prepare_undo_record_v1(plan, 0, &op.identity,
+															 base.data, &out), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(&out, &sentinel, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(base.data, saved.data, BLCKSZ) == 0);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_operation_head_history_prepares_input_without_replay_authority)
+{
+	RfSideOnlinePlanV1 *plan = operation_prefix_plan(true, false, 1);
+	RfSideOnlineOperationV1 op;
+	RfSideUndoHeaderImageV1 out = { 0 }, sentinel;
+	PGAlignedBlock base;
+	xl_undo_tt_slot_set_head_operation value = operation_prefix_head(9, 31);
+
+	operation_prefix_base(&base);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+	UT_ASSERT(op.history_only);
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_input_header_v1(
+					 plan, 0, &op.identity, base.data, &out), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(cluster_undo_record_uba_equal(
+		((UndoSegmentHeaderData *)out.page.data)->tt_slots[4].first_undo_block,
+		value.head.first_undo_block));
+	memset(&out, 0x5a, sizeof(out));
+	sentinel = out;
+	UT_ASSERT_NE(rf_side_online_plan_prepare_undo_record_v1(plan, 0, &op.identity, base.data, &out),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(&out, &sentinel, sizeof(out)) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_operation_head_retired_prefix_cannot_borrow_reuse_image)
+{
+	for (int wrong_generation = 0; wrong_generation < 2; wrong_generation++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(500);
+		FakeXactRecord fake;
+		xl_undo_tt_slot_set_head_operation head = operation_prefix_head(9, 31);
+		xl_undo_tt_slot_abort_exact terminal = { .instance = 3, .segment_id = 513,
+			.segment_generation = 13, .slot_offset = 4, .wrap = 7, .xid = 802,
+			.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION };
+		struct {
+			xl_undo_segment_reuse record;
+			char page[BLCKSZ];
+		} reuse = { 0 };
+		PGAlignedBlock base, saved;
+		RfSideUndoHeaderImageV1 out, sentinel;
+
+		head.operation.canonical_segment_generation -= wrong_generation;
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD, &head,
+							   sizeof(head));
+		undo_header_feed(plan, &fake, 100);
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT, &terminal,
+							   sizeof(terminal));
+		undo_header_feed(plan, &fake, 200);
+		reuse.record.instance = 3;
+		reuse.record.segment_id = 513;
+		reuse.record.old_generation = 13;
+		reuse.record.new_generation = 14;
+		cluster_undo_segment_make_header_bytes(513, 3, reuse.page);
+		((UndoSegmentHeaderData *)reuse.page)->wrap_count = 14;
+		memcpy(base.data, reuse.page, BLCKSZ);
+		UT_ASSERT(cluster_undo_segment_header_seal(base.data));
+		saved = base;
+		make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_REUSE, &reuse,
+							   sizeof(reuse));
+		undo_header_feed(plan, &fake, 300);
+		undo_header_bind(&fake, 14);
+		undo_header_feed(plan, &fake, 400);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		memset(&out, 0x5a, sizeof(out));
+		sentinel = out;
+		/* The ordinary terminal carrier cannot clear a retained operation
+		 * head. A later REUSE image cannot qualify that unsupported suffix. */
+		UT_ASSERT_NE(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &out),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(memcmp(&out, &sentinel, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(base.data, saved.data, BLCKSZ) == 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_legacy_head_prefix_keeps_aborted_only_contract)
+{
+	RfSideOnlinePlanV1 *plan = operation_prefix_plan(false, true, 1);
+	RfSideOnlineOperationV1 op;
+	RfSideUndoHeaderImageV1 out, sentinel;
+	PGAlignedBlock base;
+
+	operation_prefix_base(&base);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+	UT_ASSERT_EQ(op.undo.flags, 0);
+	memset(&out, 0x5a, sizeof(out));
+	sentinel = out;
+	UT_ASSERT_NE(rf_side_online_plan_prepare_undo_record_v1(plan, 0, &op.identity, base.data, &out),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(&out, &sentinel, sizeof(out)) == 0);
+	((UndoSegmentHeaderData *)base.data)->tt_slots[4].status = TT_SLOT_ABORTED;
+	UT_ASSERT(cluster_undo_segment_header_seal(base.data));
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_record_v1(plan, 0, &op.identity, base.data, &out),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(cluster_undo_record_uba_equal(
+		((UndoSegmentHeaderData *)out.page.data)->tt_slots[4].first_undo_block,
+		op.undo.first_undo_block));
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(191);
+	UT_PLAN(197);
 	UT_RUN(test_recovery_single_source_uses_complete_original_bound_origin);
 	UT_RUN(test_native_terminal_witness_uses_original_bound_plan_budget);
 	UT_RUN(test_native_terminal_witness_rejects_duplicate_physical_raw_terminal);
@@ -13000,6 +13265,12 @@ main(void)
 	UT_RUN(test_cold_history_abort_identity_does_not_authorize_replay);
 	UT_RUN(test_cold_owner_abort_requires_durable_tt_and_native_clog_before_projection);
 	UT_RUN(test_cold_whole_source_barrier_precedes_every_native_effect);
+	UT_RUN(test_operation_head_prefix_uses_active_typed_transition);
+	UT_RUN(test_operation_heads_keep_source_order_and_selected_prefix);
+	UT_RUN(test_operation_head_prefix_refuses_stale_or_unproved_slot);
+	UT_RUN(test_operation_head_history_prepares_input_without_replay_authority);
+	UT_RUN(test_operation_head_retired_prefix_cannot_borrow_reuse_image);
+	UT_RUN(test_legacy_head_prefix_keeps_aborted_only_contract);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
