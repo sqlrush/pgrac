@@ -8117,6 +8117,41 @@ test_cluster_tt_startup_local_owner.inc: $(top_srcdir)/src/backend/access/transa
 	     emit { print } END { if (found != 1 || ended != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Complete production creation checker and post-start dispatch. The initial
+# TT file read uses the same full-image BOOT reader as the original producer.
+test_cluster_native_creation_check.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c Makefile
+	awk '/^cluster_undo_smgr_creation_startup_v2\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_creation_dispatch.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ClusterTTStartupPostJobs\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+CREATION_INITDB_RECOVERY_SOURCE ?= $(top_srcdir)/src/common/pgrac_initdb_recovery.c
+TESTS += test_cluster_native_creation_startup
+all: test_cluster_native_creation_startup
+test_cluster_native_creation_startup: test_cluster_native_creation_startup.c unit_test.h \
+		test_cluster_native_creation_check.inc test_cluster_native_creation_dispatch.inc \
+		test_cluster_tt_startup_local_owner.inc $(CREATION_INITDB_RECOVERY_SOURCE) \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c \
+		test_cluster_undo_segment_init_backend.o $(CLUSTER_UBA_O) \
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/common -ffunction-sections -fdata-sections \
+		$< $(CREATION_INITDB_RECOVERY_SOURCE) \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		test_cluster_undo_segment_init_backend.o $(CLUSTER_UBA_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+clean: clean-native-creation-startup
+.PHONY: clean-native-creation-startup
+clean-native-creation-startup:
+	rm -f test_cluster_native_creation_startup test_cluster_native_creation_startup.d \
+		test_cluster_native_creation_check.inc test_cluster_native_creation_dispatch.inc
+
 test_cluster_tt_startup_local: test_cluster_tt_startup_local.c test_cluster_undo_block0.c \
 		cluster_unit_no_native_files.h \
 		unit_test.h test_cluster_tt_startup_local_owner.inc $(CLUSTER_TT_DURABLE_O) \
@@ -8553,6 +8588,7 @@ clean: clean-undo-native-tt-probe
 
 test_cluster_clog_native_transam: test_cluster_clog_native_transam.c \
 		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_no_creation.h \
 		test_cluster_clog_write_snapshot.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/transam.c \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
@@ -8580,6 +8616,7 @@ clean: clean-clog-native-transam
 
 test_cluster_clog_native_status: test_cluster_clog_native_status.c \
 		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_no_creation.h \
 		test_cluster_clog_write_snapshot.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
@@ -11702,6 +11739,7 @@ test_cluster_clog_write_snapshot: test_cluster_clog_write_snapshot.c unit_test.h
 TESTS += test_cluster_slru_clog_managed_write
 all: test_cluster_slru_clog_managed_write
 test_cluster_slru_clog_managed_write: test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_no_creation.h \
 		test_cluster_clog_write_snapshot.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/backend/access/transam/clog_write.c \
@@ -11812,6 +11850,7 @@ clean-clog-storage-sync:
 TESTS += test_cluster_clog_write
 all: test_cluster_clog_write
 test_cluster_clog_write: test_cluster_clog_write.c unit_test.h \
+		test_cluster_clog_no_creation.h \
 		$(top_srcdir)/src/backend/access/transam/clog_write.c \
 		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
 		$(top_srcdir)/src/common/cluster_clog_file.c \
@@ -11837,6 +11876,7 @@ clean-clog-storage-write:
 TESTS += test_cluster_clog_initialize
 all: test_cluster_clog_initialize
 test_cluster_clog_initialize: test_cluster_clog_initialize.c unit_test.h \
+		test_cluster_clog_no_creation.h \
 		$(top_srcdir)/src/backend/access/transam/clog_write.c \
 		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
 		$(top_srcdir)/src/common/cluster_clog_file.c \
@@ -11904,6 +11944,7 @@ TESTS += test_cluster_clog_native_birth
 all: test_cluster_clog_native_birth
 test_cluster_clog_native_birth: test_cluster_clog_native_birth.c \
 		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
+		test_cluster_clog_no_creation.h \
 		test_cluster_clog_native_birth.inc unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/backend/access/transam/clog_write.c \
@@ -11979,6 +12020,7 @@ all: test_cluster_clog_native_io
 test_cluster_clog_native_io: test_cluster_clog_native_io.c \
 		test_cluster_clog_creation_support.h \
 		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
+		test_cluster_clog_no_creation.h \
 		$(top_srcdir)/src/include/access/slru.h \
 		$(top_srcdir)/src/include/access/clog_file.h \
 		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
@@ -12005,6 +12047,7 @@ all: test_cluster_clog_checkpoint
 test_cluster_clog_checkpoint: test_cluster_clog_checkpoint.c unit_test.h \
 		test_cluster_clog_creation_support.h \
 		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_no_creation.h \
 		test_cluster_clog_write_snapshot.c \
 		$(top_srcdir)/src/include/access/slru.h \
 		$(top_srcdir)/src/include/access/clog_storage.h \
@@ -12036,6 +12079,7 @@ all: test_cluster_clog_creation
 test_cluster_clog_creation: test_cluster_clog_creation.c test_cluster_clog_checkpoint.c unit_test.h \
 		test_cluster_clog_creation_support.h \
 		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_no_creation.h \
 		test_cluster_clog_write_snapshot.c \
 		$(top_srcdir)/src/include/access/slru.h \
 		$(top_srcdir)/src/include/access/clog_storage.h \
@@ -12066,6 +12110,7 @@ TESTS += test_cluster_clog_native_redo
 all: test_cluster_clog_native_redo
 test_cluster_clog_native_redo: test_cluster_clog_native_redo.c unit_test.h \
 		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
+		test_cluster_clog_no_creation.h \
 		$(top_srcdir)/src/backend/access/transam/clog.c \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/backend/access/transam/clog_replay.c \
@@ -12100,6 +12145,7 @@ TESTS += test_cluster_clog_native_trim
 all: test_cluster_clog_native_trim
 test_cluster_clog_native_trim: test_cluster_clog_native_trim.c \
 		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
+		test_cluster_clog_no_creation.h \
 		test_cluster_clog_native_trim.inc unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/slru.c \
 		$(top_srcdir)/src/backend/access/transam/clog_write.c \

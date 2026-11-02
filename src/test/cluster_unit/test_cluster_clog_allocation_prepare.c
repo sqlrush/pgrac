@@ -284,6 +284,7 @@ select_creation(void)
 {
 	ClusterRecoveryFileIdentityV2 file = file_identity(0);
 	creation_support_select(&file, table_generation, startup_generation);
+	cluster_enabled = true;
 	mode = CLUSTER_NATIVE_FILES_CREATION_V2;
 	known[0] = available[0] = true;
 }
@@ -305,6 +306,7 @@ UT_TEST(actual_creation_original_allocator_borrows_registered_boot_page)
 	UT_ASSERT_EQ(control_calls + cf_locks + reserved_files, 0);
 	UT_ASSERT_EQ(acquired_files, 2); UT_ASSERT_EQ(returned_files, 2);
 	UT_ASSERT_EQ(borrowed, 0); UT_ASSERT_EQ(cluster_node_id, -1);
+	UT_ASSERT(cluster_enabled);
 }
 
 UT_TEST(actual_creation_allocator_refuses_outside_born_page_before_effects)

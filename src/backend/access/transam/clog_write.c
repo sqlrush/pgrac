@@ -14,8 +14,54 @@
 #include "storage/fd.h"
 #include "storage/proc.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_wal_thread.h"
 #endif
+
+/* Resolve a creation child's WAL source from its authenticated original batch,
+ * never from an online node number or the target file. The caller still holds
+ * the original selected-file borrow and rechecks it after I/O. */
+static int
+clog_write_origin(const ClusterClogFileBindingV2 *binding)
+{
+	int origin = 0;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled)
+		origin = cluster_node_id;
+	if (cluster_node_id == -1 && cluster_control_native_files_mode_v2() ==
+		CLUSTER_NATIVE_FILES_CREATION_V2)
+	{
+		const PgracInitdbRecoveryContext *creator;
+		ClusterControlNativeTableInfoV2 selected;
+		const ClusterRecoveryFileIdentityV2 *expected;
+		uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+		if (MyBackendType != B_STANDALONE_BACKEND || IsUnderPostmaster ||
+			IsPostmasterEnvironment ||
+			(creator = cluster_wal_thread_initdb_recovery_context()) == NULL ||
+			creator->creator_pid == 0 ||
+			!cluster_control_native_files_info_v2(&selected) ||
+			selected.mode != CLUSTER_NATIVE_FILES_CREATION_V2 ||
+			selected.table_generation == 0 ||
+			selected.startup_generation != creator->creator_pid ||
+			memcmp(&selected.creation, creator, sizeof(*creator)) != 0 ||
+			creator->boot_file_count == 0 ||
+			creator->boot_file_count > PGRAC_INITDB_BOOT_FILES_V2)
+			return -1;
+		expected = &selected.creation.boot_files[0];
+		if (expected->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 ||
+			expected->origin >= 128 || expected->database_oid != 0 ||
+			expected->tablespace_oid != 0 || expected->object_id != binding->segment ||
+			!cluster_recovery_file_identity_encode_v2(expected, reference, sizeof(reference)) ||
+			!cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &binding->identity))
+			return -1;
+		origin = expected->origin;
+	}
+#endif
+	return origin;
+}
 
 static bool
 clog_write_overlap(const void *left, Size left_bytes,
@@ -154,16 +200,12 @@ cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expec
 	XLogRecPtr end = InvalidXLogRecPtr;
 	uint64 offset;
 	bool own_delay, success = false, fresh = false;
-	int origin = 0;
+	int origin;
 #ifndef WIN32
 	int flags;
 #endif
 	ssize_t written;
 
-#ifdef USE_PGRAC_CLUSTER
-	if (cluster_enabled)
-		origin = cluster_node_id;
-#endif
 	if (fd < 0 || expected == NULL || page == NULL || payload == NULL ||
 		last_end == NULL || payload_length != sizeof(checked_payload) ||
 		clog_write_overlap(last_end, sizeof(*last_end), expected, sizeof(*expected)) ||
@@ -175,6 +217,7 @@ cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expec
 	}
 	binding = *expected;
 	snapshot = *page;
+	origin = clog_write_origin(&binding);
 	/* These checks exclude local WAL for foreign/recovery/bootstrap writes.
 	 * They do not replace the caller's original registration/source custody. */
 	if (proc == NULL || !enableFsync || InRecovery || RecoveryInProgress() || IsBootstrapProcessingMode() ||

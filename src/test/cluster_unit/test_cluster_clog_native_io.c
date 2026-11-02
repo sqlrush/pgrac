@@ -6,6 +6,7 @@
  * open is instead protected by the original table borrow across ControlLock's
  * gap; keep that distinction observable without changing the old fixture. */
 #define SLRU_FIXTURE_OPEN managed_io_open
+#define CLOG_FIXTURE_CREATION_PROVIDED
 #define CLOG_MANAGED_MAIN managed_fixture_main
 int managed_fixture_main(void);
 int managed_io_open(const char *path, int flags);
@@ -277,15 +278,17 @@ UT_TEST(native_creation_uses_selected_files_with_cluster_not_serving)
 
 UT_TEST(native_creation_key_uses_batch_origin_not_online_node)
 {
-	for (unsigned origin = 0; origin < 128; origin += 127) {
+	for (unsigned sample = 0; sample < 4; sample++) {
+		unsigned origin = (sample % 2) * 127;
 		ClusterControlNativeFileBorrowV2 value = {0};
 		native_reset(); binding.identity.origin = origin;
 		creation_support_select(&binding.identity, native_generation, 1);
+		cluster_enabled = sample >= 2;
 		native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
 		UT_ASSERT(CLOGNativeFileAcquire(3, &value));
 		UT_ASSERT_EQ(value.expected.origin, origin);
 		UT_ASSERT_EQ(cluster_node_id, -1);
-		UT_ASSERT(!cluster_enabled);
+		UT_ASSERT_EQ(cluster_enabled, sample >= 2);
 		if (value.private_self)
 			UT_ASSERT(cluster_control_native_file_release_v2(&value));
 		UT_ASSERT_EQ(native_opens + inserts + writes, 0);
@@ -295,10 +298,12 @@ UT_TEST(native_creation_key_uses_batch_origin_not_online_node)
 
 UT_TEST(native_creation_refuses_unrelated_context_before_borrow)
 {
-	for (unsigned fault = 0; fault < 14; fault++) {
+	for (unsigned sample = 0; sample < 28; sample++) {
+		unsigned fault = sample % 14;
 		ClusterControlNativeFileBorrowV2 value = {0};
 		native_reset();
 		creation_support_select(&binding.identity, native_generation, 1);
+		cluster_enabled = sample >= 14;
 		native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
 		switch (fault) {
 			case 0: creation_has_request = false; break;

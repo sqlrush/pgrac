@@ -49,6 +49,14 @@
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoPathIntent (D2-2) */
 
+#ifdef USE_PGRAC_CLUSTER
+/* Original unpublished standalone creation child only: validate the complete
+ * creator/table batch and any explicitly registered pristine BOOT TT file.
+ * No request outside CREATION returns false. Partial/changed creation state
+ * throws before any recovery job; never grants Startup, redo or online owner.
+ * Reads only, retaining the original creator directory/file custody. */
+extern bool cluster_undo_smgr_creation_startup_v2(void);
+#endif
 
 /*
  * spec-5.22b D2-2: the block / header I/O entries take an explicit

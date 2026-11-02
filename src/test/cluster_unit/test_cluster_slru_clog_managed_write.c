@@ -19,7 +19,11 @@ static ssize_t managed_fixture_pread(int fd, void *bytes, size_t length, off_t o
 #define pg_pread managed_fixture_pread
 #include "../../backend/access/transam/clog_storage.c"
 void XLogFlush(XLogRecPtr lsn);
+#ifdef CLOG_WRITE_TEST_SOURCE
+#include CLOG_WRITE_TEST_SOURCE
+#else
 #include "../../backend/access/transam/clog_write.c"
+#endif
 
 #ifdef CLOG_SLRU_REFUSING_SCAFFOLD
 #include CLOG_SLRU_REFUSING_SCAFFOLD
@@ -32,6 +36,9 @@ bool enableFsync;
 bool cluster_enabled;
 int cluster_node_id;
 #endif
+#define CLOG_FIXTURE_HAVE_UNDER_POSTMASTER
+#include "test_cluster_clog_no_creation.h"
+#undef CLOG_FIXTURE_HAVE_UNDER_POSTMASTER
 static PGPROC proc;
 static ClusterClogFileBindingV2 binding;
 static ClusterClogFileBindingV2 cached_bindings[1];

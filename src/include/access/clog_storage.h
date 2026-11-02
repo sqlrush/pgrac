@@ -76,6 +76,8 @@ extern bool cluster_clog_storage_sync_file_v2(int fd, int directory_fd,
  * partial/nonzero/corrupt targets are never repaired or replaced as new pages.
  * Other pages may extend under their own I/O serialization. Header creation,
  * foreign/recovery write, fsync-disabled or bootstrap phony WAL is refused here.
+ * An authenticated creation child uses its original batch's complete matching
+ * file identity for the local WAL origin, retaining its disabled node identity.
  *
  * The borrowed FD, inputs, preowned checkpoint-delay flag and last_end output
  * are retained on failure. Partial writes/material are never rolled back or

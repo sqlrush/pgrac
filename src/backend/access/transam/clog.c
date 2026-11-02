@@ -147,8 +147,9 @@ CLOGNativeCreationFile(int pageno, ClusterControlNativeTableInfoV2 *selected)
 
 	/* The existing getter has authenticated the original closed creator pipe,
 	 * configuration and directories. A table row or processing mode alone is
-	 * insufficient, and the child remains outside online membership. */
-	if (pageno < 0 || pageno >= 131072 || cluster_node_id != -1 || cluster_enabled
+	 * insufficient, and the child remains outside online membership even when
+	 * its creation configuration already has cluster.enabled set. */
+	if (pageno < 0 || pageno >= 131072 || cluster_node_id != -1
 		|| MyBackendType != B_STANDALONE_BACKEND || IsUnderPostmaster
 		|| IsPostmasterEnvironment
 		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_CREATION_V2

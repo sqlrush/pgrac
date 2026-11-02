@@ -14,6 +14,7 @@ int trim_snapshot_open(const char *, int);
 #define SLRU_FIXTURE_ERROR_RESET() trim_error_reset()
 #define SLRU_FIXTURE_OPEN trim_snapshot_open
 #define CLOG_MANAGED_MAIN trim_managed_fixture_main
+#define CLOG_FIXTURE_CREATION_PROVIDED
 int trim_managed_fixture_main(void);
 #include "test_cluster_slru_clog_managed_write.c"
 #include "access/clog.h"
