@@ -811,12 +811,29 @@ static FILE *
 popen_check(const char *command, const char *mode)
 {
 	FILE	   *cmdfd;
+#if defined(USE_PGRAC_CLUSTER) && !defined(WIN32)
+	char	   *native_command = NULL;
+
+	/* A redirection can keep popen's shell alive as the backend's parent.
+	 * The closed creator request requires initdb to remain that parent. */
+	if (pgrac_native_thread >= 1)
+	{
+		size_t bytes = strlen(command) + sizeof("exec ");
+
+		native_command = pg_malloc(bytes);
+		snprintf(native_command, bytes, "exec %s", command);
+		command = native_command;
+	}
+#endif
 
 	fflush(NULL);
 	errno = 0;
 	cmdfd = popen(command, mode);
 	if (cmdfd == NULL)
 		pg_log_error("could not execute command \"%s\": %m", command);
+#if defined(USE_PGRAC_CLUSTER) && !defined(WIN32)
+	pg_free(native_command);
+#endif
 	return cmdfd;
 }
 
