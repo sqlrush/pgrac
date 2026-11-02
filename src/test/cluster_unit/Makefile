@@ -12014,7 +12014,7 @@ all: test_cluster_source_coverage
 test_cluster_source_coverage: test_cluster_source_coverage.c test_cluster_resource_x_pi_replace \
 		test_cluster_source_coverage_replace.inc \
 		test_cluster_source_coverage_types.inc test_cluster_source_coverage_job.inc \
-		test_cluster_source_coverage_gcs.inc
+		test_cluster_source_coverage_gcs.inc $(top_builddir)/src/common/libpgcommon.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
@@ -12022,7 +12022,8 @@ test_cluster_source_coverage: test_cluster_source_coverage.c test_cluster_resour
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_WAL_CLAIM_O) test_cluster_pi_replace_pcm.o \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(filter -lcrypto,$(LIBS)) -o $@
 test_cluster_source_coverage_types.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
 	awk '/^#define WB_RETRY_US/ { emit=1 } /^static WritebackBatch \*wb_batch;/ { emit=0; next } emit { print }' $< > $@.tmp
 	mv $@.tmp $@
