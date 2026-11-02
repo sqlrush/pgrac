@@ -1,4 +1,13 @@
 # Standalone legacy-domain gates; intentionally outside the default test list.
+test_k_mx_g5_range_dump: test_k_mx_g5_range_dump.c test_cluster_debug.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current_stats.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_MULTIXACT_CURRENT_STATS_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) \
+		$(CLUSTER_STARTUP_PHASE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_MULTIXACT_CURRENT_STATS_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_k_mx_g5_legacy_domain: test_k_mx_g5_legacy_domain.c \
 		test_cluster_multixact_current.c unit_test.h \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
