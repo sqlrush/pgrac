@@ -53,6 +53,21 @@ test_k_mx_g5_full_decision: test_k_mx_g5_full_decision.c test_k_mx_g5_full_recom
 		$(K_MX_FULL_DECISION_LOCK_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
+# Original ResourceOwner dispatcher and range cleanup; no G4 proof service.
+K_MX_RESOURCE_OWNER_O ?= $(top_builddir)/src/backend/cluster/cluster_multixact_range.o \
+	$(top_builddir)/src/backend/cluster/cluster_multixact_range_wire.o \
+	$(top_builddir)/src/backend/cluster/cluster_multixact_current_stats.o \
+	$(top_builddir)/src/backend/cluster/cluster_multixact_composition.o
+test_k_mx_g5_resource_owner: test_k_mx_g5_resource_owner.c test_k_mx_g5_service.c \
+		test_cluster_mx_native_range.c test_cluster_mx_composition.c unit_test.h Makefile.k_mx_g5 \
+		$(top_srcdir)/src/backend/utils/resowner/resowner.c \
+		$(top_srcdir)/src/include/utils/resowner.h \
+		$(top_srcdir)/src/include/utils/resowner_private.h \
+		$(top_srcdir)/src/backend/access/transam/multixact.c $(K_MX_RESOURCE_OWNER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(K_MX_RESOURCE_OWNER_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/port/libpgport_srv.a -o $@
+
 test_k_mx_g5_service: test_k_mx_g5_service.c test_cluster_mx_native_range.c \
 		test_cluster_mx_composition.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/multixact.c \
