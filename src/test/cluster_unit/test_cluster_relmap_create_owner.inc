@@ -10,6 +10,7 @@
  *-------------------------------------------------------------------------
  */
 #include "cluster/cluster_side_online_plan.h"
+#include "test_cluster_relmap_create_side_original.h"
 static ClusterColdRelmapCreateInputV1 owner_declaration;
 static ClusterWalSourceRef owner_source_snapshot;
 static ClusterColdStepV1 owner_step;
@@ -41,23 +42,27 @@ bool rf_side_online_plan_recovery_sources_match_v1(const RfSideOnlinePlanV1 *sid
 		owner_reentry=false;
 		(void)cluster_cold_typed_relmap_create_apply_v2(&redo_typed,redo_fence,&owner_step,owner_reader,65536);
 	}
+	if(side!=owner_side) return owner_side_ok && create_side_original_sources(side,selected,count);
 	return owner_side_ok && side==owner_side && count==1
 		&& !memcmp(selected,&owner_source_snapshot,sizeof(*selected));
 }
 uint32 rf_side_online_plan_relmap_create_count_v1(const RfSideOnlinePlanV1 *side,
 	const ClusterWalSourceRef *source)
 {
+	if(side!=owner_side) return owner_side_ok ? create_side_original_count(side,source) : UINT32_MAX;
 	return side==owner_side && owner_side_ok && !memcmp(source,&owner_source_snapshot,sizeof(*source)) ? 1 : UINT32_MAX;
 }
 bool rf_side_online_plan_relmap_create_input_matches_v1(const RfSideOnlinePlanV1 *side,
 	const ClusterColdRelmapCreateInputV1 *input)
 {
+	if(side!=owner_side) return owner_side_ok && create_side_original_input(side,input);
 	return side==owner_side && owner_side_ok && !memcmp(input,&owner_declaration,sizeof(*input));
 }
 bool rf_side_online_plan_relmap_create_matches_v1(const RfSideOnlinePlanV1 *side,
 	const ClusterWalSourceRef *source,const XLogReaderState *reader)
 {
 	ClusterRelmapCreateReplayV1 value;
+	if(side!=owner_side) return owner_side_ok && create_side_original_record(side,source,reader);
 	return side==owner_side && owner_side_ok && source
 		&& !memcmp(source,&owner_source_snapshot,sizeof(*source))
 		&& cluster_relmap_control_create_redo_input_v1((XLogReaderState *)reader,

@@ -16288,7 +16288,7 @@ clean-control-relmap-creation:
 # Original reserved target and actual managed source-to-pair creation.
 TESTS += test_cluster_relmap_create_copy
 all: test_cluster_relmap_create_copy
-test_cluster_relmap_create_copy: test_cluster_relmap_create_physical.inc test_cluster_relmap_create_owner.inc test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
+test_cluster_relmap_create_copy: test_cluster_relmap_create_physical.inc test_cluster_relmap_create_owner.inc $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) $(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_relmap_create_side_original.o test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c $(top_srcdir)/src/common/cluster_relmap_file_io.c $(top_srcdir)/src/include/cluster/cluster_relmap_control.h $(top_srcdir)/src/include/cluster/cluster_relmap_authority.h test_cluster_relmap_create_copy.c test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
 		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
@@ -16310,7 +16310,7 @@ test_cluster_relmap_create_copy: test_cluster_relmap_create_physical.inc test_cl
 		$(top_srcdir)/src/common/cluster_recovery_registry.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_relmap_create_copy.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
-		test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
+		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) $(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_relmap_create_side_original.o test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
 		cluster_registry_common_test.o \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
@@ -16323,7 +16323,7 @@ test_cluster_relmap_create_copy: test_cluster_relmap_create_physical.inc test_cl
 clean: clean-relmap-create-copy
 .PHONY: clean-relmap-create-copy
 clean-relmap-create-copy:
-	rm -f test_cluster_relmap_create_copy test_cluster_relmap_create_copy.d
+	rm -f test_cluster_relmap_create_copy test_cluster_relmap_create_copy.d test_cluster_relmap_create_side_original.o test_cluster_relmap_create_side_original.d
 
 # Both consumers use the original address-bound creation carrier layout.
 cluster_control_registry_original.o: $(top_srcdir)/src/include/cluster/cluster_control_native_files.h
@@ -16441,3 +16441,18 @@ clean: clean-relmap-create-plan-owner
 .PHONY: clean-relmap-create-plan-owner
 clean-relmap-create-plan-owner:
 	rm -f test_cluster_relmap_create_plan_original.o
+
+# Original SIDE is linked only to the creation owner target; four fixture names
+# are isolated without changing any provider body or product implementation.
+test_cluster_relmap_create_copy: test_cluster_relmap_create_actual_side.inc \
+        test_cluster_relmap_create_side_original.h
+
+test_cluster_relmap_create_side_original.o: test_cluster_relmap_create_side_original.c \
+        $(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
+        $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+        $(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
+        $(top_srcdir)/src/backend/cluster/cluster_side_online_plan_internal.h \
+        $(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+        $(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
+        $(top_srcdir)/src/include/common/cluster_relmap_create.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_ONLINE_TESTING -ffunction-sections -fdata-sections -c $< -o $@
