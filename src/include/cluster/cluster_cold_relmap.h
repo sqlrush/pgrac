@@ -124,6 +124,17 @@ typedef struct ClusterColdRelmapReplayReceiptV1 {
  * original selected source/cut. UINT32_MAX means invalid/incomplete; zero
  * means no declared participant. No replay-window check, I/O, acquire,
  * cancellation, source revalidation or new lifetime/retention grant. */
+/* Pending-only component for the original owner's conjunction with independent
+ * creation readiness, ACTIVE census and original effects/source/fence gates.
+ * Zero counts pending obligations only; it never waives creation. Count is
+ * immutable receipt/metadata inspection, not a current physical certificate.
+ * Readiness uses original sources, sealed SIDE, pins and complete staged pairs;
+ * entered failure/ERROR is sticky and retains all original protection/debt.
+ * Neither API publishes, transfers pins or grants terminal/lifetime authority.
+ * The older ready/count/input APIs continue to reject every creation plan. */
+extern uint32 cluster_cold_typed_relmap_pending_count_v1(const ClusterColdTypedV1 *typed);
+extern bool cluster_cold_typed_relmap_pending_ready_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence);
 extern uint32 cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed);
 extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_replay_input_v1(
 	const ClusterColdTypedV1 *typed, uint32 index);

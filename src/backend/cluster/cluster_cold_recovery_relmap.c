@@ -499,8 +499,8 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 	return ok;
 }
 
-bool
-cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
+static bool
+relmap_ready(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, bool pending_only)
 {
 	ClusterColdPlanV1 *plan;
 	bool ok = true;
@@ -509,7 +509,7 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 		return false;
 	plan = typed->plan;
 	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed
-		|| plan->relmap_create_count != 0)
+		|| (!pending_only && plan->relmap_create_count != 0))
 		return false;
 	for (uint32 i = 0; i < plan->relmap_count; ++i)
 		if (!plan->relmap_inputs[i].captured || !plan->relmap_inputs[i].applied)
@@ -535,8 +535,8 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 
 /* The original plan owns these immutable saved values across EOR. Reading
  * them cannot reuse pass-2's expired replay window as current authority. */
-uint32
-cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
+static uint32
+relmap_replay_count(const ClusterColdTypedV1 *typed, bool pending_only)
 {
 	const ClusterColdPlanV1 *plan;
 
@@ -544,7 +544,7 @@ cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
 		return UINT32_MAX;
 	plan = typed->plan;
 	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed
-		|| plan->relmap_create_count != 0
+		|| (!pending_only && plan->relmap_create_count != 0)
 		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
 		return UINT32_MAX;
 	if (plan->relmap_count == 0)
@@ -567,6 +567,33 @@ cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
 			return UINT32_MAX;
 	}
 	return plan->relmap_count;
+}
+
+/* Pending and creation remain separate conjuncts. Sharing their original
+ * pending checks does not let older consumers accept a creation obligation. */
+bool
+cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_ready(typed, fence, false);
+}
+
+bool
+cluster_cold_typed_relmap_pending_ready_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_ready(typed, fence, true);
+}
+
+uint32
+cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
+{
+	return relmap_replay_count(typed, false);
+}
+
+uint32
+cluster_cold_typed_relmap_pending_count_v1(const ClusterColdTypedV1 *typed)
+{
+	return relmap_replay_count(typed, true);
 }
 
 ClusterColdRelmapReplayReceiptV1

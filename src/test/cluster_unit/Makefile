@@ -894,7 +894,8 @@ test_cluster_cold_relmap_executor.o: $(top_srcdir)/src/backend/cluster/cluster_c
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_PGRAC_CLUSTER -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_cold_relmap: test_cluster_cold_relmap.c test_cluster_relmap_v2_storage.c \
+test_cluster_cold_relmap: test_cluster_cold_relmap.c test_cluster_cold_relmap_pending.inc \
+		test_cluster_relmap_v2_storage.c \
 		unit_test.h $(top_srcdir)/src/include/cluster/cluster_cold_relmap.h \
 		$(CLUSTER_COLD_PLAN_O) test_cluster_cold_recovery_replay_core.o \
 		test_cluster_cold_relmap_executor.o test_cluster_relmap_v2_storage_product.o \

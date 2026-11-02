@@ -21,7 +21,7 @@ PRODUCT_COMMIT = "fe68024a0f79d5a1d187e9f1885cbe9ac441153b"
 PRODUCT_TREE = "dd51f830614f1f3ec82658f8806ac3eaf1275a8a"
 L3_COMMIT = "cc1c5a554276542a05c15f5f1e0e0c7317fba66e"
 L3_TREE = "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5"
-CURRENT_PRODUCT_SNAPSHOT = {'algorithm': 'sha256-canonical-path-blob-v1', 'path_count': 2479, 'sha256': 'b54011338e39e9f7eed45f135d8345185f25e206d89983d15144312305eb7cad'}
+CURRENT_PRODUCT_SNAPSHOT = {'algorithm': 'sha256-canonical-path-blob-v1', 'path_count': 2479, 'sha256': 'aa402c5d2e56ea59d2b3fde46b2b8f36ac19e18328f59f7df4ab6e440e639b22'}
 
 
 LAYERS = {
