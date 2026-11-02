@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_relmap_retention.h"
+#include "cluster/cluster_relmap_recovery_internal.h"
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_tt_slot.h"
 #include "unit_test.h"
@@ -894,11 +895,75 @@ UT_TEST(test_prepare_snapshot_alias_refusal_preserves_original_storage)
 	UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &key, NULL, false, 0), OK);
 	UT_ASSERT_NE(cluster_relmap_retention_prepare_matches(&d, &key, &zero, false, 0), OK);
 }
+/* A pending batch may exceed the ordinary active directory capacity. */
+static void recovery_segment_case(uint32 count)
+{
+	ClusterRelmapRecoveryPins *pins = calloc(1, sizeof(*pins));
+	ClusterRelmapV2Image wanted = {0};
+#ifdef CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS
+	ClusterRelmapRecoverySegment *segment = NULL;
+#endif
+	pins->state = CLUSTER_RELMAP_RETENTION_BUILDING;
+	pins->expected = pins->count = count;
+	pins->restored = true;
+	wanted.identity = key_for(42, BASE + 100).identity;
+	wanted.pending_generation = 8;
+	wanted.pending_owner.top_full_xid = BASE + 100;
+#ifdef CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS
+	if (count > CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS) {
+		segment = calloc(1, sizeof(*segment));
+		pins->segments = segment;
+		if (count > 2 * CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS)
+			segment->next = calloc(1, sizeof(*segment));
+	}
+	for (uint32 i = 0; i < count; ++i) {
+		ClusterRelmapV2Image *image = cluster_relmap_recovery_image_at(pins, i);
+		UT_ASSERT(image != NULL);
+		*image = wanted;
+		image->identity.dbid += i;
+	}
+#else
+	for (uint32 i = 0; i < count && i < CLUSTER_RELMAP_RETENTION_CAPACITY; ++i) {
+		pins->images[i] = wanted;
+		pins->images[i].identity.dbid += i;
+	}
+#endif
+	UT_ASSERT(cluster_relmap_recovery_check(pins, &wanted));
+#ifdef CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS
+	wanted.identity.dbid += count - 1;
+	UT_ASSERT(cluster_relmap_recovery_stage_start(pins, &wanted));
+	UT_ASSERT(!cluster_relmap_recovery_stage_start(pins, &wanted));
+	UT_ASSERT(cluster_relmap_recovery_stage_finish(pins, &wanted));
+	UT_ASSERT(!cluster_relmap_recovery_stage_finish(pins, &wanted));
+	if (segment != NULL) {
+		ClusterRelmapRetentionDirectory *targets[1] = {NULL};
+		ClusterRelmapV2Image saved = segment->images[0];
+		UT_ASSERT(!cluster_relmap_recovery_output_distinct(pins, &segment->images[0], sizeof(saved)));
+		UT_ASSERT(cluster_relmap_recovery_output_distinct(pins, &wanted, sizeof(wanted)));
+		UT_ASSERT(!cluster_relmap_recovery_transfer(pins, targets, count));
+		segment->images[0] = pins->images[0];
+		UT_ASSERT(!cluster_relmap_recovery_check(pins, &pins->images[0]));
+		segment->images[0] = saved;
+		UT_ASSERT(cluster_relmap_recovery_check(pins, &pins->images[0]));
+		free(segment->next);
+		pins->segments = NULL;
+		UT_ASSERT(!cluster_relmap_recovery_check(pins, &pins->images[0]));
+		free(segment);
+	}
+#endif
+	UT_ASSERT(!pins->transferred);
+	free(pins);
+}
+UT_TEST(test_recovery_batch_64_keeps_original_attempts) { recovery_segment_case(64); }
+UT_TEST(test_recovery_batch_65_keeps_last_segment_debt) { recovery_segment_case(65); }
+UT_TEST(test_recovery_batch_128_keeps_whole_batch) { recovery_segment_case(128); }
+UT_TEST(test_recovery_batch_129_traverses_two_overflow_segments) { recovery_segment_case(129); }
+
 
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(45);
 	UT_RUN(test_unknown_and_building_cannot_authorize_consumers);
 	UT_RUN(test_complete_empty_census_allows_normal_progress);
 	UT_RUN(test_begin_first_clamps_native_truncate_to_pin);
@@ -940,6 +1005,10 @@ main(void)
 	UT_RUN(test_prepare_snapshot_copies_actual_pin_and_allows_exact_stage_only);
 	UT_RUN(test_prepare_snapshot_refuses_every_original_binding_field_change);
 	UT_RUN(test_prepare_snapshot_alias_refusal_preserves_original_storage);
+	UT_RUN(test_recovery_batch_64_keeps_original_attempts);
+	UT_RUN(test_recovery_batch_65_keeps_last_segment_debt);
+	UT_RUN(test_recovery_batch_128_keeps_whole_batch);
+	UT_RUN(test_recovery_batch_129_traverses_two_overflow_segments);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

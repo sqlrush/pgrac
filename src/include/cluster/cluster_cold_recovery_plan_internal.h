@@ -301,6 +301,8 @@ struct ClusterColdPlanV1 {
 	ColdRelmapCreateChunk *relmap_creates;
 	uint32 relmap_create_count;
 	bool relmap_failed;
+	/* Original allocation extent; checked before pending input traversal. */
+	uint32 relmap_input_capacity;
 };
 
 static inline ColdRelmapCreateInput *
@@ -367,6 +369,14 @@ cold_relmap_storage_overlap(const void *out, Size bytes, const void *value, Size
 }
 
 static inline bool
+cold_relmap_inputs_bounded(const ClusterColdPlanV1 *plan)
+{
+	return plan->relmap_count != UINT32_MAX
+		&& plan->relmap_count == plan->relmap_input_capacity
+		&& (plan->relmap_count == 0 ? plan->relmap_inputs == NULL : plan->relmap_inputs != NULL);
+}
+
+static inline bool
 cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Size bytes)
 {
 	const ClusterColdPlanV1 *plan;
@@ -384,7 +394,7 @@ cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Si
 	if (plan == NULL) return true;
 	if (cold_relmap_storage_overlap(out, bytes, plan, sizeof(*plan))
 		|| plan->magic != CLUSTER_COLD_PLAN_MAGIC
-		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS
+		|| !cold_relmap_inputs_bounded(plan)
 		|| (plan->relmap_terminal != NULL && plan->relmap_terminal_bytes == 0))
 		return false;
 	for (const ColdRelmapCreateChunk *chunk = plan->relmap_creates;
@@ -398,8 +408,7 @@ cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Si
 	}
 	return !cold_relmap_storage_overlap(out, bytes, plan->relmap_inputs,
 			(Size)plan->relmap_count * sizeof(ColdRelmapInput))
-		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_recovery,
-			sizeof(ClusterRelmapRecoveryPins))
+		&& cluster_relmap_recovery_output_distinct(plan->relmap_recovery, out, bytes)
 		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_terminal,
 			plan->relmap_terminal_bytes);
 }

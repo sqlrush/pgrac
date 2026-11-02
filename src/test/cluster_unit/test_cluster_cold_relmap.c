@@ -646,11 +646,54 @@ UT_TEST(test_creation_plan_cannot_borrow_pending_execution_or_completion)
 }
 
 #include "test_cluster_cold_relmap_pending.inc"
+UT_TEST(test_relmap_large_declaration_is_whole_and_budgeted)
+{
+	for (unsigned count = 64; count <= 128; count += count == 64 ? 1 : 63) {
+		ClusterColdRelmapInputV1 *batch = calloc(count, sizeof(*batch));
+		cold_map_setup();
+		for (uint32 i = 0; i < count; ++i) {
+			batch[i] = declared;
+			batch[i].staged.identity.shared = false;
+			batch[i].staged.identity.dbid = 1000 + i;
+		}
+		UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, batch, count), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(replay.plan->relmap_count, count);
+		if (replay.plan->relmap_count == count)
+			UT_ASSERT_EQ(replay.plan->relmap_inputs[count - 1].input.staged.identity.dbid, 999 + count);
+		free(batch);
+		cold_map_end();
+	}
+}
+
+UT_TEST(test_relmap_large_batch_rejects_whole_tail_and_budget_before_copy)
+{
+	const uint32 count = 65;
+	ClusterColdRelmapInputV1 *batch = calloc(count, sizeof(*batch));
+	Size used;
+	cold_map_setup();
+	used = replay.plan->memory_used;
+	for (uint32 i = 0; i < count; ++i) {
+		batch[i] = declared;
+		batch[i].staged.identity.shared = false;
+		batch[i].staged.identity.dbid = 1000 + i;
+	}
+	batch[count - 1].staged.pending_owner.boot_incarnation = 0;
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, batch, count), CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	UT_ASSERT(replay.plan->relmap_inputs == NULL && replay.plan->relmap_count == 0);
+	UT_ASSERT_EQ(replay.plan->memory_used, used);
+	batch[count - 1].staged.pending_owner = declared.staged.pending_owner;
+	replay.plan->memory_budget = used + count * sizeof(ColdRelmapInput) - 1;
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, batch, count), CLUSTER_COLD_CAPACITY);
+	UT_ASSERT(replay.plan->relmap_inputs == NULL && replay.plan->relmap_count == 0);
+	UT_ASSERT_EQ(replay.plan->memory_used, used);
+	free(batch); cold_map_end();
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(26);
 	UT_RUN(test_relmap_runs_between_other_source_pages_and_duplicate_does_not_write);
 	UT_RUN(test_relmap_without_declared_participant_keeps_structural_refusal);
 	UT_RUN(test_relmap_missing_capture_never_seals_or_writes);
@@ -675,6 +718,8 @@ main(void)
 	UT_RUN(test_pending_only_plan_keeps_original_completion_behavior);
 	UT_RUN(test_pending_input_preserves_original_receipt_without_consuming_creation);
 	UT_RUN(test_pending_input_refuses_empty_or_changed_complete_source);
+	UT_RUN(test_relmap_large_declaration_is_whole_and_budgeted);
+	UT_RUN(test_relmap_large_batch_rejects_whole_tail_and_budget_before_copy);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

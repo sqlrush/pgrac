@@ -314,12 +314,12 @@ UT_TEST(test_pending_staging_legacy_mixed_and_empty_still_refuse)
 		pending_recheck_begin(); plan = startup_relmap_replay.typed->plan;
 		saved = plan->relmap_inputs;
 		before = test_cold_relmap_storage_stats();
-		if (empty) { plan->relmap_count = 0; plan->relmap_inputs = NULL; }
+		if (empty) { plan->relmap_count = plan->relmap_input_capacity = 0; plan->relmap_inputs = NULL; }
 		UT_ASSERT(!(empty ? cluster_cold_relmap_pending_replay_recheck_v1(recheck_start)
 			: cluster_cold_relmap_replay_recheck_v1(recheck_start)));
 		UT_ASSERT(recheck_revoked && plan->relmap_failed && plan->relmap_create_count == 1);
 		UT_ASSERT_EQ(test_cold_relmap_storage_stats().reads, before.reads);
-		plan->relmap_count = 1; plan->relmap_inputs = saved;
+		plan->relmap_count = plan->relmap_input_capacity = 1; plan->relmap_inputs = saved;
 		recheck_end();
 	}
 }

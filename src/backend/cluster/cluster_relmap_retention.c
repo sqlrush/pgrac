@@ -600,6 +600,73 @@ cluster_relmap_retention_allocation_observe(ClusterRelmapRetentionDirectory *dir
 	return result;
 }
 
+/* The first segment remains inline for the ordinary small recovery case. */
+static bool
+recovery_segments_valid(const ClusterRelmapRecoveryPins *pins)
+{
+	const ClusterRelmapRecoverySegment *segment;
+	uint32 remaining;
+	if (pins == NULL || pins->expected == 0 || pins->count > pins->expected)
+		return false;
+	remaining = (pins->expected - 1) / CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS;
+	segment = pins->segments;
+	while (remaining-- != 0) {
+		if (segment == NULL) return false;
+		segment = segment->next;
+	}
+	return segment == NULL;
+}
+
+static const ClusterRelmapRecoverySegment *
+recovery_segment_at(const ClusterRelmapRecoveryPins *pins, uint32 index)
+{
+	const ClusterRelmapRecoverySegment *segment = pins->segments;
+	uint32 number = index / CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS;
+	while (number > 1 && segment != NULL) { segment = segment->next; --number; }
+	return segment;
+}
+
+ClusterRelmapV2Image *
+cluster_relmap_recovery_image_at(ClusterRelmapRecoveryPins *pins, uint32 index)
+{
+	const ClusterRelmapRecoverySegment *segment;
+	if (!recovery_segments_valid(pins) || index >= pins->expected) return NULL;
+	if (index < CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS) return &pins->images[index];
+	segment = recovery_segment_at(pins, index);
+	return (ClusterRelmapV2Image *)&segment->images[index % CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS];
+}
+
+bool
+cluster_relmap_recovery_output_distinct(const ClusterRelmapRecoveryPins *pins,
+	const void *out, Size bytes)
+{
+	const ClusterRelmapRecoverySegment *segment;
+	if (pins == NULL) return true;
+	if (!recovery_segments_valid(pins)
+		|| snapshot_overlaps(pins, sizeof(*pins), out, bytes)) return false;
+	for (segment = pins->segments; segment != NULL; segment = segment->next)
+		if (snapshot_overlaps(segment, sizeof(*segment), out, bytes)) return false;
+	return true;
+}
+
+static const ClusterRelmapV2Image *
+recovery_image_at(const ClusterRelmapRecoveryPins *pins, uint32 index)
+{
+	if (index < CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS) return &pins->images[index];
+	return &recovery_segment_at(pins, index)->images[index % CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS];
+}
+
+static bool *
+recovery_flag_at(ClusterRelmapRecoveryPins *pins, uint32 index, bool staged)
+{
+	ClusterRelmapRecoverySegment *segment;
+	if (index < CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS)
+		return staged ? &pins->staged[index] : &pins->attempted[index];
+	segment = (ClusterRelmapRecoverySegment *)recovery_segment_at(pins, index);
+	index %= CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS;
+	return staged ? &segment->staged[index] : &segment->attempted[index];
+}
+
 /* Recovery custody is deliberately independent of the ordinary directory FSM.
  * The original coordinator authenticates source/cut/full batch, not this core. */
 bool
@@ -609,10 +676,10 @@ cluster_relmap_recovery_check(const ClusterRelmapRecoveryPins *pins,
 	unsigned found = 0;
 	if (pins == NULL || image == NULL || pins->state != CLUSTER_RELMAP_RETENTION_BUILDING
 		|| !pins->restored || pins->transferred || pins->expected == 0
-		|| pins->expected > CLUSTER_RELMAP_RETENTION_CAPACITY || pins->count != pins->expected)
+		|| pins->count != pins->expected || !recovery_segments_valid(pins))
 		return false;
 	for (uint32 i = 0; i < pins->count; ++i)
-		if (memcmp(&pins->images[i], image, sizeof(*image)) == 0)
+		if (memcmp(recovery_image_at(pins, i), image, sizeof(*image)) == 0)
 			++found;
 	return found == 1;
 }
@@ -623,9 +690,9 @@ cluster_relmap_recovery_stage_start(ClusterRelmapRecoveryPins *pins,
 {
 	if (!cluster_relmap_recovery_check(pins, image)) return false;
 	for (uint32 i = 0; i < pins->count; ++i)
-		if (memcmp(&pins->images[i], image, sizeof(*image)) == 0) {
-			if (pins->attempted[i]) return false;
-			pins->attempted[i] = true; /* Before the first fallible file call. */
+		if (memcmp(recovery_image_at(pins, i), image, sizeof(*image)) == 0) {
+			if (*recovery_flag_at(pins, i, false)) return false;
+			*recovery_flag_at(pins, i, false) = true; /* Before the first fallible file call. */
 			return true;
 		}
 	return false;
@@ -637,9 +704,9 @@ cluster_relmap_recovery_stage_finish(ClusterRelmapRecoveryPins *pins,
 {
 	if (!cluster_relmap_recovery_check(pins, image)) return false;
 	for (uint32 i = 0; i < pins->count; ++i)
-		if (memcmp(&pins->images[i], image, sizeof(*image)) == 0) {
-			if (!pins->attempted[i] || pins->staged[i]) return false;
-			pins->staged[i] = true; /* Only after pair readback AND close. */
+		if (memcmp(recovery_image_at(pins, i), image, sizeof(*image)) == 0) {
+			if (!*recovery_flag_at(pins, i, false) || *recovery_flag_at(pins, i, true)) return false;
+			*recovery_flag_at(pins, i, true) = true; /* Only after pair readback AND close. */
 			return true;
 		}
 	return false;
@@ -652,11 +719,11 @@ cluster_relmap_recovery_transfer(ClusterRelmapRecoveryPins *pins,
 	unsigned slots[CLUSTER_RELMAP_RETENTION_CAPACITY];
 	ClusterRelmapRetentionKey keys[CLUSTER_RELMAP_RETENTION_CAPACITY];
 	if (pins == NULL || targets == NULL || count == 0 || count != pins->count
-		|| count > CLUSTER_RELMAP_RETENTION_CAPACITY
+		|| count > CLUSTER_RELMAP_RETENTION_CAPACITY || !recovery_segments_valid(pins)
 		|| snapshot_overlaps(pins, sizeof(*pins), targets, (Size)count * sizeof(*targets)))
 		return false;
 	for (uint32 i = 0; i < count; ++i) {
-		const ClusterRelmapV2Image *image = &pins->images[i];
+		const ClusterRelmapV2Image *image = recovery_image_at(pins, i);
 		const ClusterRelmapV2Owner *owner = &image->pending_owner;
 		ClusterRelmapRetentionDirectory *dir = targets[i];
 		unsigned chosen = CLUSTER_RELMAP_RETENTION_CAPACITY;
@@ -664,7 +731,7 @@ cluster_relmap_recovery_transfer(ClusterRelmapRecoveryPins *pins,
 		keys[i] = (ClusterRelmapRetentionKey){image->identity, image->pending_generation,
 			owner->node, owner->top_full_xid, owner->membership_epoch,
 			owner->admitted_incarnation, owner->boot_incarnation};
-		if (!cluster_relmap_recovery_check(pins, image) || !pins->attempted[i] || !pins->staged[i]
+		if (!cluster_relmap_recovery_check(pins, image) || !*recovery_flag_at(pins, i, false) || !*recovery_flag_at(pins, i, true)
 			|| dir == NULL
 			|| snapshot_overlaps(pins, sizeof(*pins), dir, sizeof(*dir))
 			|| snapshot_overlaps(targets, (Size)count * sizeof(*targets), dir, sizeof(*dir))
@@ -702,7 +769,7 @@ cluster_relmap_recovery_transfer(ClusterRelmapRecoveryPins *pins,
 		if (!pin->occupied) {
 			memset(pin, 0, sizeof(*pin));
 			pin->key = keys[i];
-			pin->wal_end = pins->images[i].pending_owner.wal_end;
+			pin->wal_end = recovery_image_at(pins, i)->pending_owner.wal_end;
 			pin->may_be_staged = true;
 			pin->occupied = true;
 		}

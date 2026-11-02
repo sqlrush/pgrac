@@ -4227,12 +4227,13 @@ main(void)
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_CARRIER") != NULL) {
-		UT_PLAN(5);
+		UT_PLAN(6);
 		UT_RUN(test_recovery_carrier_stages_without_publishing_ordinary_directory);
 		UT_RUN(test_recovery_carrier_half_write_and_error_keep_debt);
 		UT_RUN(test_recovery_carrier_refuses_generation_or_source_drift);
 		UT_RUN(test_recovery_does_not_relax_unknown_or_building_ordinary_admission);
 		UT_RUN(test_recovery_transfer_preflights_all_targets_before_retiring_any_pin);
+		UT_RUN(test_recovery_segments_budget_whole_batch_before_first_file_read);
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_CLOG_STORAGE") != NULL) {
@@ -4326,7 +4327,7 @@ main(void)
 		UT_RUN(test_pending_staging_first_owner_and_native_errors_keep_debt);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(217);
+	UT_PLAN(218);
 	UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
 	UT_RUN(test_terminal_original_episode_refuses_changed_whole_source_or_owner);
 	UT_RUN(test_pass2_source_drift_waits_for_post_ir_and_never_replays);
@@ -4538,6 +4539,7 @@ main(void)
 	UT_RUN(test_recovery_carrier_refuses_generation_or_source_drift);
 	UT_RUN(test_recovery_does_not_relax_unknown_or_building_ordinary_admission);
 	UT_RUN(test_recovery_transfer_preflights_all_targets_before_retiring_any_pin);
+	UT_RUN(test_recovery_segments_budget_whole_batch_before_first_file_read);
 	UT_RUN(test_recovery_create_record_borrows_original_whole_episode);
 	UT_RUN(test_recovery_create_record_refuses_positions_source_and_lost_protection);
 	UT_RUN(test_recovery_create_record_refuses_wrong_kind_or_history);

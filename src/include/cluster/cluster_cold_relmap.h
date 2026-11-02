@@ -17,6 +17,7 @@
 #include "common/cluster_relmap_v2.h"
 #include "access/clog.h"
 
+/* Bounded output page, not a whole-plan input limit. */
 #define CLUSTER_COLD_RELMAP_MAX_INPUTS 64
 /* Checked values only; neither polarity is a publication/release grant. */
 typedef struct ClusterColdRelmapTerminalEntryV1 {
@@ -27,7 +28,8 @@ typedef struct ClusterColdRelmapTerminalEntryV1 {
 	ClusterRelmapV2Image staged;
 } ClusterColdRelmapTerminalEntryV1;
 typedef struct ClusterColdRelmapTerminalCheckV1 {
-	uint32 count;
+	uint32 count, total_count, offset;
+	uint8 digest[32]; /* Complete ordered batch; local observation only. */
 	ClusterColdRelmapTerminalEntryV1 entries[CLUSTER_COLD_RELMAP_MAX_INPUTS];
 } ClusterColdRelmapTerminalCheckV1;
 struct ClusterRecoveryStartV1;
@@ -49,6 +51,15 @@ extern bool cluster_cold_relmap_pending_terminal_capture_v1(ClusterColdTypedV1 *
 	struct ClusterRecoveryFencePlan *fence);
 extern bool cluster_cold_relmap_pending_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
 	ClusterColdRelmapTerminalCheckV1 *out);
+/* Every page rechecks the ENTIRE original batch and carries its total/digest.
+ * Offset must name an entry (zero for an empty legacy batch). Legacy recheck
+ * refuses batches larger than one page; neither API grants prefix completion.
+ * The pending-only variant preserves independent creation obligations and
+ * refuses zero pending; the other variant still refuses all creation. */
+extern bool cluster_cold_relmap_terminal_recheck_segment_v1(const struct ClusterRecoveryStartV1 *start,
+	uint32 offset, ClusterColdRelmapTerminalCheckV1 *out);
+extern bool cluster_cold_relmap_pending_terminal_recheck_segment_v1(const struct ClusterRecoveryStartV1 *start,
+	uint32 offset, ClusterColdRelmapTerminalCheckV1 *out);
 /* Original Startup-only recovery path. No ordinary directory/lock may be
  * supplied. Full original source set must be passed, not a replay prefix.
  * A failed attempt retains its private carrier until joint transfer or exit. */

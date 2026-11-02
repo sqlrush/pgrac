@@ -72,7 +72,7 @@ UT_TEST(test_pending_terminal_empty_does_not_manufacture_qualification)
 {
 	ClusterColdRelmapTerminalCheckV1 *out = calloc(1, sizeof(*out));
 	pending_terminal_setup(false);
-	terminal_plan.relmap_count = 0; terminal_plan.relmap_inputs = NULL;
+	terminal_plan.relmap_count = terminal_plan.relmap_input_capacity = 0; terminal_plan.relmap_inputs = NULL;
 	UT_ASSERT_EQ(cluster_cold_typed_relmap_pending_count_v1(&terminal_typed), 0);
 	UT_ASSERT(!cluster_cold_relmap_pending_terminal_capture_v1(&terminal_typed, terminal_fence));
 	UT_ASSERT(terminal_plan.relmap_terminal_attempted && terminal_plan.relmap_failed);
