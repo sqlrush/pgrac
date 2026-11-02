@@ -4532,12 +4532,21 @@ dump_multixact_current(ReturnSetInfo *rsinfo)
 		[CMX_STAT_FOREIGN_SLRU_GUARD] = "foreign_slru_guard_count",
 		[CMX_STAT_UPDATER_PROVENANCE_CROSS_SEGMENT_MATCH]
 		= "updater_provenance_cross_segment_match_count",
+		[CMX_STAT_RANGE_SCAN_STARTED] = "range_scan_started_count",
+		[CMX_STAT_RANGE_SCAN_COMPLETE] = "range_scan_complete_count",
+		[CMX_STAT_RANGE_SCAN_UNKNOWN] = "range_scan_unknown_count",
+		[CMX_STAT_RANGE_SCAN_ERROR] = "range_scan_error_count",
+		[CMX_STAT_RANGE_SCAN_RESTART] = "range_scan_restart_requested_count",
+		[CMX_STAT_RANGE_SCAN_RESTART_MAX] = "range_scan_restart_requested_max",
 	};
 	int i;
 
-	for (i = 0; i < CMX_STAT_COUNT; i++)
+	for (i = 0; i < CMX_STAT_COUNT; i++) {
+		uint64 value = cluster_multixact_current_stats_get(i);
+
 		emit_row(rsinfo, "multixact_current", names[i],
-				 fmt_int64((int64)cluster_multixact_current_stats_get(i)));
+				 i >= CMX_STAT_RANGE_SCAN_STARTED ? fmt_uint64(value) : fmt_int64((int64)value));
+	}
 }
 
 static void

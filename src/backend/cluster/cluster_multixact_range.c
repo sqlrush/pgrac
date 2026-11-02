@@ -482,6 +482,7 @@ cluster_multixact_current_describe_full(const ClusterCurrentMxKey *key,
 			GetControlFileCatalogVersion(), &generation)) return false;
 	owned = range_owned_begin();
 	if (owned == NULL) return false;
+	cluster_multixact_current_stats_bump(CMX_STAT_RANGE_SCAN_STARTED);
 	unknown_before = stats->unknown_results;
 	restart_before = stats->restart_requests;
 	request.key = *key; request.target = *target; request.snapshot = *snapshot;
@@ -544,11 +545,13 @@ cluster_multixact_current_describe_full(const ClusterCurrentMxKey *key,
 	}
 	PG_CATCH();
 	{
+		cluster_multixact_current_stats_bump(CMX_STAT_RANGE_SCAN_ERROR);
 		range_owned_end(owned);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	if (complete) {
+		cluster_multixact_current_stats_bump(CMX_STAT_RANGE_SCAN_COMPLETE);
 		owned->describe_request_id = request.route.request_id;
 		*op = owned->op; return true;
 	}
@@ -559,6 +562,9 @@ cluster_multixact_current_describe_full(const ClusterCurrentMxKey *key,
 		stats->unknown_results++;
 	if (stats->restart_requests == restart_before && restart_before != UINT64_MAX)
 		stats->restart_requests++;
+	cluster_multixact_current_stats_bump(CMX_STAT_RANGE_SCAN_UNKNOWN);
+	cluster_multixact_current_stats_bump(CMX_STAT_RANGE_SCAN_RESTART);
+	cluster_multixact_current_stats_record_range_restarts(stats->restart_requests);
 	return false;
 }
 

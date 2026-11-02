@@ -151,6 +151,20 @@ cluster_multixact_current_stats_record_restarts(uint32 restarts)
 }
 
 void
+cluster_multixact_current_stats_record_range_restarts(uint64 restarts)
+{
+	uint64 expected;
+
+	if (ClusterCurrentMxStats == NULL)
+		return;
+	expected = pg_atomic_read_u64(&ClusterCurrentMxStats->counters[CMX_STAT_RANGE_SCAN_RESTART_MAX]);
+	while (expected < restarts
+		   && !pg_atomic_compare_exchange_u64(
+			   &ClusterCurrentMxStats->counters[CMX_STAT_RANGE_SCAN_RESTART_MAX], &expected, restarts))
+		;
+}
+
+void
 cluster_multixact_current_stats_alert_sample(void)
 {
 	static const ClusterCurrentMxStatId alert_stats[]

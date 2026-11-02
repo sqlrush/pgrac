@@ -63,6 +63,13 @@ typedef enum ClusterCurrentMxStatId {
 	CMX_STAT_RESTART_MAX,
 	CMX_STAT_FOREIGN_SLRU_GUARD,
 	CMX_STAT_UPDATER_PROVENANCE_CROSS_SEGMENT_MATCH,
+	/* Full composition SCAN only; COMPLETE grants no proof/visibility authority. */
+	CMX_STAT_RANGE_SCAN_STARTED,
+	CMX_STAT_RANGE_SCAN_COMPLETE,
+	CMX_STAT_RANGE_SCAN_UNKNOWN,
+	CMX_STAT_RANGE_SCAN_ERROR,
+	CMX_STAT_RANGE_SCAN_RESTART,
+	CMX_STAT_RANGE_SCAN_RESTART_MAX,
 	CMX_STAT_COUNT
 } ClusterCurrentMxStatId;
 
@@ -82,6 +89,7 @@ extern uint64 cluster_multixact_current_stats_get(ClusterCurrentMxStatId stat);
 extern TimestampTz cluster_multixact_current_stats_since(void);
 extern ClusterCurrentMxStatId cluster_multixact_current_restart_bucket(uint32 restarts);
 extern void cluster_multixact_current_stats_record_restarts(uint32 restarts);
+extern void cluster_multixact_current_stats_record_range_restarts(uint64 restarts);
 extern void cluster_multixact_current_stats_alert_sample(void);
 extern bool cluster_multixact_current_stats_snapshot(uint32 node_id, uint64 cluster_epoch,
 													 ClusterCurrentMxStatsSnapshot *snapshot);
