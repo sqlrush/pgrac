@@ -516,3 +516,77 @@ mx_history_recursive_header(HeapTuple tuple, TransactionId xmax,
 {
 	return cluster_current_mx_chain_plan_header(tuple, xmax, infomask, infomask2, output);
 }
+
+/* Explicitly controlled undo/exact-target and whole-boundary leaves. */
+static ClusterHeapPreparedUndoTargetPlan transition_undo;
+static ClusterHeapCurrentMxExactPublication transition_publication;
+static RfPageProducerBatchV1 transition_versions;
+static bool transition_wrong_undo_handle;
+bool
+mx_history_transition_plan(Buffer buffer, HeapTuple root,
+	const ClusterHeapSuccessorProof *proof, const MxPublicationReadout *plan, bool rf)
+{
+	Page page = BufferGetPage(buffer);
+	transition_wrong_undo_handle = false;
+	memset(&transition_undo, 0, sizeof(transition_undo));
+	memset(&transition_publication, 0, sizeof(transition_publication));
+	memset(&transition_versions, 0, sizeof(transition_versions));
+	transition_undo.valid = transition_undo.lock_only = true;
+	transition_undo.buffer = buffer; transition_undo.slot_index = 7;
+	transition_undo.xid = 129; transition_undo.write_scn = 91;
+	transition_undo.planned_uba = uba_encode(257, 12, 3, 0);
+	transition_undo.history.block = BufferGetBlockNumber(buffer);
+	transition_undo.history.slot_index = 7;
+	transition_undo.history.after_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	transition_undo.history.after_write_scn = 91;
+	transition_undo.history.prior = ClusterPageGetItlSlots(page)[7];
+	transition_publication.valid = true;
+	transition_publication.buffer = buffer; transition_publication.plan = &publication_plan;
+	transition_publication.offnum = ItemPointerGetOffsetNumber(&root->t_self);
+	transition_publication.line_pointer = *PageGetItemId(page, transition_publication.offnum);
+	if (!cluster_current_mx_chain_plan_header(root, plan->descriptor, plan->infomask,
+			plan->infomask2, transition_publication.planned_header))
+		return false;
+	transition_publication.final_target.kind = CTRC_TARGET_EXACT_TID;
+	transition_publication.final_target.block_number = BufferGetBlockNumber(buffer);
+	transition_publication.final_target.offset_number = transition_publication.offnum;
+	transition_publication.final_target.multixact_id = plan->descriptor;
+	transition_publication.final_target.descriptor_hash = plan->descriptor_hash;
+	if (rf) {
+		transition_versions.prepared = true; transition_versions.result_token = 201;
+		transition_versions.entry_count = 1; transition_versions.ordinary_pages[0] = page;
+		transition_versions.entries[0].page_class = RF_PAGE_CLASS_ORDINARY;
+		transition_versions.entries[0].before.mutation_token = (uint64)((PageHeader)page)->pd_block_scn;
+	}
+	return cluster_current_mx_transition_plan(recursive_scope, buffer, root, proof,
+		&transition_publication, &transition_undo,
+		&publication_plan.handles[publication_plan.receipt_count - 1],
+		rf ? &transition_versions : NULL, true);
+}
+bool
+mx_history_transition_finish(Buffer buffer, bool whole, XLogRecPtr lsn)
+{
+	/* Deliberately not a native undo APPLY claim. The MX plan above is real. */
+	transition_undo.applied_handle = publication_plan.handles[publication_plan.receipt_count - 1];
+	if (transition_wrong_undo_handle) transition_undo.applied_handle.receipt_index++;
+	return cluster_current_mx_transition_complete(recursive_scope, buffer, whole, lsn);
+}
+void
+mx_history_transition_write_header(HeapTuple root, bool rf)
+{
+	if (rf) {
+		((PageHeader)BufferGetPage(1))->pd_block_scn = transition_versions.result_token;
+		transition_versions.stamped = true;
+	}
+	memcpy(root->t_data, transition_publication.planned_header, SizeofHeapTupleHeader);
+}
+void
+mx_history_transition_fault(unsigned fault)
+{
+	if (fault == 0) publication_plan.descriptor_hash++;
+	if (fault == 1) publication_plan.handles[0].key.xid++;
+	if (fault == 2) transition_undo.planned_uba.raw[0]++;
+	if (fault == 3) transition_versions.result_token++;
+	if (fault == 4) transition_wrong_undo_handle = true;
+}
+Size mx_history_transition_bytes(void) { return sizeof(ClusterCurrentMxTransition); }

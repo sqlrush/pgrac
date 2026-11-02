@@ -112,4 +112,11 @@ extern bool mx_history_recursive_header(HeapTuple tuple, TransactionId xmax,
 	uint16 infomask, uint16 infomask2, uint8 output[SizeofHeapTupleHeader]);
 extern bool mx_history_writer_matches(Buffer buffer, HeapTuple tuple,
 	const ClusterHeapSuccessorProof *proof, bool scoped);
+/* Local transition core; native boundary/source inputs remain explicit. */
+extern bool mx_history_transition_plan(Buffer buffer, HeapTuple root,
+	const ClusterHeapSuccessorProof *proof, const MxPublicationReadout *plan, bool rf);
+extern bool mx_history_transition_finish(Buffer buffer, bool whole, XLogRecPtr lsn);
+extern void mx_history_transition_write_header(HeapTuple root, bool rf);
+extern void mx_history_transition_fault(unsigned fault);
+extern Size mx_history_transition_bytes(void);
 #endif

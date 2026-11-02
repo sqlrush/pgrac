@@ -8340,10 +8340,15 @@ typedef struct ClusterCurrentMxLockScope
 	ClusterSemanticAdmissionToken admission;
 	ClusterSnapshotReadScopeV1 evaluation;
 	bool evaluation_entered;
+	struct ClusterCurrentMxTransition *transition;
 	ClusterCurrentMxOperationState operation;
 } ClusterCurrentMxLockScope;
 
 static void cluster_current_mx_lock_scope_require(ClusterCurrentMxLockScope *scope);
+static void cluster_current_mx_transition_clear(ClusterCurrentMxLockScope *scope);
+static int cluster_current_mx_transition_consume(Buffer buffer, HeapTuple tuple,
+	const ClusterHeapSuccessorProof *proof, ClusterCurrentMxLockScope *scope);
+
 
 typedef enum ClusterCurrentMxStampKind
 {
@@ -9017,8 +9022,9 @@ cluster_current_mx_successor_key_matches(
 /* Exact writer image, not a read proof promotion. Any intervening page or
  * root write requalifies the original attempt; never rebase a saved proof. */
 static bool
-cluster_current_mx_writer_successor_matches(Buffer buffer, HeapTuple tuple,
-	const ClusterHeapSuccessorProof *proof, ClusterCurrentMxLockScope *scope)
+cluster_current_mx_writer_successor_matches_image(Buffer buffer, HeapTuple tuple,
+	const ClusterHeapSuccessorProof *proof, ClusterCurrentMxLockScope *scope,
+	const ClusterHeapSuccessorHistory *image)
 {
 	const ClusterHeapSuccessorWriter *w = &proof->writer;
 	const ClusterCurrentMemberProofKey *key = &w->member.base.key;
@@ -9073,15 +9079,24 @@ cluster_current_mx_writer_successor_matches(Buffer buffer, HeapTuple tuple,
 		|| !cluster_pcm_x_activation_fence_open(live.pcm.writer_activation_token,
 			live.pcm.resource_x_activation_generation)
 		|| !cluster_heap_pcm_authority_equal(&proof->history.pcm, &live.pcm)
-		|| proof->history.page_lsn != live.page_lsn || proof->history.tuple_len != live.tuple_len
-		|| memcmp(&proof->history.line_pointer, &live.line_pointer, sizeof(live.line_pointer)) != 0
-		|| memcmp(proof->history.tuple_header, live.tuple_header, sizeof(live.tuple_header)) != 0
-		|| memcmp(proof->history.roots, live.itl_slots, sizeof(live.itl_slots)) != 0)
+		|| image->page_lsn != live.page_lsn || image->tuple_len != live.tuple_len
+		|| memcmp(&image->line_pointer, &live.line_pointer, sizeof(live.line_pointer)) != 0
+		|| memcmp(image->tuple_header, live.tuple_header, sizeof(live.tuple_header)) != 0
+		|| memcmp(image->roots, live.itl_slots, sizeof(live.itl_slots)) != 0)
 		return false;
 	return w->member.base.state != CCM_ACTIVE
 		|| cluster_runtime_visibility_active_proof_ctrc_identity_exact(key,
 			ClusterCurrentMemberProofGetCtrcGrant(&w->member.base), w->capability_generation,
 			&ctrc, &participant);
+}
+
+/* No-transition callers retain the original strict image gate. */
+static bool
+cluster_current_mx_writer_successor_matches(Buffer buffer, HeapTuple tuple,
+	const ClusterHeapSuccessorProof *proof, ClusterCurrentMxLockScope *scope)
+{
+	return cluster_current_mx_writer_successor_matches_image(buffer, tuple,
+		proof, scope, &proof->history);
 }
 
 static bool
@@ -9091,8 +9106,12 @@ cluster_current_mx_successor_matches(
 {
 	ClusterPcmOwnSnapshot pcm;
 
-	if (proof != NULL && proof->writer_valid)
+	if (proof != NULL && proof->writer_valid) {
+		int transition = cluster_current_mx_transition_consume(buffer, tuple, proof, scope);
+		if (transition >= 0)
+			return transition != 0;
 		return cluster_current_mx_writer_successor_matches(buffer, tuple, proof, scope);
+	}
 	return proof != NULL && !proof->history_valid
 		&& cluster_current_mx_successor_key_matches(buffer, tuple, proof)
 		&& cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1),
@@ -10690,6 +10709,7 @@ cluster_current_mx_caller_snapshot(Snapshot actual, uint64 *identity)
 static void
 cluster_current_mx_lock_scope_begin(ClusterCurrentMxLockScope *scope, Snapshot actual)
 {
+	scope->transition = NULL;
 	if (actual == NULL && ActiveSnapshotSet())
 		actual = GetActiveSnapshot();
 	if (CritSectionCount != 0 || CurrentResourceOwner == NULL
@@ -10752,6 +10772,7 @@ cluster_current_mx_bind_writer_scope(ClusterCurrentMxLockScope *scope,
 static void
 cluster_current_mx_lock_scope_end(ClusterCurrentMxLockScope *scope)
 {
+	cluster_current_mx_transition_clear(scope);
 	cluster_current_mx_operation_finish(&scope->operation);
 	scope->binding_id = 0;
 	if (scope->evaluation_entered) {
@@ -11688,7 +11709,12 @@ cluster_current_mx_stamp_apply_exact_publication(
 			if (token.valid)
 				continue;
 		}
-		cluster_current_mx_stamp_cancel(plan);
+		/* Once any original boundary leg applied, keep every receipt
+		 * with its original retirement owner; this attempt is terminal. */
+		if (*any_applied)
+			plan->active = false;
+		else
+			cluster_current_mx_stamp_cancel(plan);
 		return !*any_applied
 			&& result == CLUSTER_CTRC_APPLY_RETRY_REQUIRED
 			? CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY
@@ -11697,7 +11723,12 @@ cluster_current_mx_stamp_apply_exact_publication(
 	if (!cluster_multixact_current_heap_publish_transition(
 			plan->stage, CMX_HEAP_EVENT_APPLY, &next_stage))
 	{
-		cluster_current_mx_stamp_cancel(plan);
+		/* Once any original boundary leg applied, keep every receipt
+		 * with its original retirement owner; this attempt is terminal. */
+		if (*any_applied)
+			plan->active = false;
+		else
+			cluster_current_mx_stamp_cancel(plan);
 		return CLUSTER_HEAP_BOUNDARY_REFUSED;
 	}
 	plan->stage = next_stage;
@@ -17853,6 +17884,270 @@ cluster_current_mx_chain_plan_header(HeapTuple tuple, TransactionId xmax,
 	planned->t_infomask |= infomask;
 	planned->t_infomask2 |= infomask2;
 	return true;
+}
+
+/* One local causal witness. Neither B nor its grant is rewritten. The full
+ * expected page is derived before APPLY; only the native WAL return is filled
+ * at completion. No current-page recapture can mint a continuation.
+ * Producer wiring belongs to the original unified publication boundary. */
+typedef struct ClusterCurrentMxTransition
+{
+	ClusterHeapSuccessorProof successor;
+	ClusterHeapSuccessorHistory image;
+	ClusterHeapCurrentMxExactPublication publication;
+	ClusterHeapPreparedUndoTargetPlan undo;
+	ClusterCurrentMxStampPlan mx;
+	ClusterCtrcReceiptHandle undo_handle;
+	RfPageProducerBatchV1 versions;
+	const ClusterHeapCurrentMxExactPublication *publication_source;
+	const ClusterHeapPreparedUndoTargetPlan *undo_source;
+	RfPageProducerBatchV1 *versions_source;
+	uint64 scope_id;
+	bool wal_required;
+	uint8 state; /* 1 planned, 2 ready, 3 consumed, 4 refused */
+	PGAlignedBlock before;
+	PGAlignedBlock expected;
+} ClusterCurrentMxTransition;
+
+static void
+cluster_current_mx_transition_clear(ClusterCurrentMxLockScope *scope)
+{
+	if (scope->transition != NULL) {
+		pfree(scope->transition);
+		scope->transition = NULL;
+	}
+}
+
+/* The terminal-lock projection below can visit any tuple, so validate every
+ * line before invoking that original page-local helper, also in release. */
+static bool
+cluster_current_mx_transition_page_sane(Page page)
+{
+	PageHeader ph = (PageHeader)page;
+	OffsetNumber off;
+
+	if (ph->pd_lower < SizeOfPageHeaderData || ph->pd_lower > ph->pd_upper
+		|| ph->pd_upper > ph->pd_special || ph->pd_special > BLCKSZ)
+		return false;
+	for (off = FirstOffsetNumber; off <= PageGetMaxOffsetNumber(page); off++) {
+		ItemId lp = PageGetItemId(page, off);
+		HeapTupleHeader header;
+		if (!ItemIdIsNormal(lp))
+			continue;
+		if (ItemIdGetLength(lp) < SizeofHeapTupleHeader
+			|| ItemIdGetOffset(lp) < ph->pd_upper
+			|| (Size)ItemIdGetOffset(lp) + ItemIdGetLength(lp) > ph->pd_special)
+			return false;
+		header = (HeapTupleHeader)PageGetItem(page, lp);
+		if (header->t_hoff < SizeofHeapTupleHeader || header->t_hoff > ItemIdGetLength(lp))
+			return false;
+	}
+	return true;
+}
+
+static bool pg_attribute_unused()
+cluster_current_mx_transition_plan(ClusterCurrentMxLockScope *scope,
+	Buffer buffer, HeapTuple root, const ClusterHeapSuccessorProof *successor,
+	const ClusterHeapCurrentMxExactPublication *publication,
+	const ClusterHeapPreparedUndoTargetPlan *undo,
+	const ClusterCtrcReceiptHandle *undo_prepared_handle,
+	RfPageProducerBatchV1 *versions, bool wal_required)
+{
+	ClusterCurrentMxTransition *t;
+	HeapTupleData candidate;
+	Page page;
+	ItemId lp;
+	ClusterItlSlotData *slot;
+	uint8 header[SizeofHeapTupleHeader] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+	HeapTupleHeader planned;
+	unsigned matched = 0;
+
+	if (CritSectionCount != 0 || scope == NULL || root == NULL || root->t_data == NULL || successor == NULL
+		|| publication == NULL || undo == NULL || !publication->valid
+		|| publication->plan == NULL || !publication->plan->active
+		|| publication->plan->apply_started
+		|| publication->plan->stage != CMX_HEAP_STAGE_RECEIPT_PREPARED
+		|| publication->plan->receipt_count == 0
+		|| publication->plan->receipt_count > CLUSTER_CURRENT_MX_MAX_MEMBERS
+		|| !undo->valid || !undo->lock_only || undo->applied_handle.valid
+		|| undo_prepared_handle == NULL || !undo_prepared_handle->valid
+		|| undo_prepared_handle->key.xid != undo->xid
+		|| undo->slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| !TransactionIdIsNormal(undo->xid) || !SCN_VALID(undo->write_scn)
+		|| UBA_is_invalid(undo->planned_uba)
+		|| publication->buffer != buffer || undo->buffer != buffer
+		|| publication->offnum != ItemPointerGetOffsetNumber(&root->t_self)
+		|| ItemPointerEquals(&root->t_self, (ItemPointer)&successor->tid)
+		|| !cluster_current_mx_history_candidate(buffer, &successor->tid,
+			root->t_tableOid, &candidate)
+		|| !cluster_current_mx_writer_successor_matches(buffer, &candidate, successor, scope))
+		return false;
+	if (scope->transition != NULL && scope->transition->state != 3)
+		return false;
+	page = BufferGetPage(buffer);
+	if (!cluster_current_mx_transition_page_sane(page)
+		|| ItemPointerGetBlockNumber(&root->t_self) != BufferGetBlockNumber(buffer)
+		|| publication->offnum < FirstOffsetNumber
+		|| publication->offnum > PageGetMaxOffsetNumber(page))
+		return false;
+	lp = PageGetItemId(page, publication->offnum);
+	if (!ItemIdIsNormal(lp) || PageGetItem(page, lp) != (char *)root->t_data
+		|| memcmp(lp, &publication->line_pointer, sizeof(*lp)) != 0
+		|| publication->final_target.kind != CTRC_TARGET_EXACT_TID
+		|| publication->final_target.block_number != BufferGetBlockNumber(buffer)
+		|| publication->final_target.offset_number != publication->offnum
+		|| publication->final_target.multixact_id != publication->plan->descriptor_mxid
+		|| publication->final_target.descriptor_hash != publication->plan->descriptor_hash
+		|| undo->history.block != BufferGetBlockNumber(buffer)
+		|| undo->history.slot_index != undo->slot_index
+		|| undo->history.after_kind != ITL_FLAG_LOCK_ONLY_ACTIVE
+		|| undo->history.after_write_scn != undo->write_scn
+		|| memcmp(&undo->history.prior, &ClusterPageGetItlSlots(page)[undo->slot_index],
+			sizeof(undo->history.prior)) != 0)
+		return false;
+	planned = (HeapTupleHeader)publication->planned_header;
+	if (!cluster_current_mx_chain_plan_header(root, publication->plan->descriptor_mxid,
+			planned->t_infomask & HEAP_XMAX_BITS,
+			planned->t_infomask2 & HEAP_KEYS_UPDATED, header)
+		|| memcmp(header, publication->planned_header, sizeof(header)) != 0)
+		return false;
+	if (versions != NULL) {
+		if (!versions->prepared || versions->stamped || versions->result_token == 0
+			|| versions->entry_count == 0
+			|| versions->entry_count > RF_PAGE_PRODUCER_MAX_COMPONENTS)
+			return false;
+		for (unsigned i = 0; i < versions->entry_count; i++)
+			if (versions->ordinary_pages[i] == page) {
+				if (versions->entries[i].page_class != RF_PAGE_CLASS_ORDINARY
+					|| versions->entries[i].before.mutation_token != (uint64)((PageHeader)page)->pd_block_scn)
+					return false;
+				matched++;
+			}
+		if (matched != 1)
+			return false;
+	}
+	cluster_current_mx_transition_clear(scope);
+	t = palloc0(sizeof(*t)); /* Before APPLY, outside CRIT; bounded to this scope. */
+	scope->transition = t;
+	t->successor = *successor;
+	t->image = successor->history;
+	t->scope_id = scope->binding_id;
+	t->publication = *publication;
+	t->undo = *undo;
+	t->mx = *publication->plan;
+	t->undo_handle = *undo_prepared_handle;
+	t->publication_source = publication;
+	t->undo_source = undo;
+	t->versions_source = versions;
+	t->wal_required = wal_required;
+	if (versions != NULL)
+		t->versions = *versions;
+	memcpy(t->before.data, page, BLCKSZ);
+	memcpy(t->expected.data, page, BLCKSZ);
+	page = t->expected.data;
+	if (versions != NULL)
+		((PageHeader)page)->pd_block_scn = (SCN)versions->result_token;
+	memcpy(PageGetItem(page, PageGetItemId(page, publication->offnum)),
+		publication->planned_header, SizeofHeapTupleHeader);
+	slot = &ClusterPageGetItlSlots(page)[undo->slot_index];
+	if (ITL_FLAG_IS_LOCK_ONLY_COMPLETED(slot->flags))
+		(void)cluster_itl_clear_terminal_lock_refs(page, slot);
+	if (slot->flags != ITL_FLAG_FREE
+		&& !(slot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE && slot->xid == undo->xid))
+		slot->wrap++;
+	slot->xid = undo->xid;
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->lock_count = 0;
+	slot->undo_segment_head = undo->planned_uba;
+	slot->commit_scn = InvalidScn;
+	slot->write_scn = undo->write_scn;
+	slot->first_change_lsn = InvalidXLogRecPtr;
+	if (!cluster_shared_config && scn_time_cmp(undo->write_scn, ((PageHeader)page)->pd_block_scn) > 0)
+		((PageHeader)page)->pd_block_scn = undo->write_scn;
+	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(&successor->tid));
+	t->image.line_pointer = *lp;
+	t->image.tuple_len = ItemIdGetLength(lp);
+	memcpy(t->image.tuple_header, PageGetItem(page, lp), sizeof(t->image.tuple_header));
+	memcpy(t->image.roots, ClusterPageGetItlSlots(page), sizeof(t->image.roots));
+	t->state = 1;
+	return true;
+}
+
+static bool pg_attribute_unused()
+cluster_current_mx_transition_complete(ClusterCurrentMxLockScope *scope, Buffer buffer,
+	bool whole_boundary_applied, XLogRecPtr actual_wal_lsn)
+{
+	ClusterCurrentMxTransition *t = scope == NULL ? NULL : scope->transition;
+	ClusterCurrentMxStampPlan mx;
+	ClusterHeapPreparedUndoTargetPlan undo;
+	RfPageProducerBatchV1 versions;
+
+	if (t == NULL || t->state != 1)
+		return false;
+	t->state = 4; /* A failed or late completion can never be retried. */
+	cluster_current_mx_lock_scope_require(scope);
+	if (!whole_boundary_applied || scope->binding_id != t->scope_id
+		|| buffer != t->publication.buffer
+		|| memcmp(&t->publication, t->publication_source, sizeof(t->publication)) != 0
+		|| !t->undo_source->applied_handle.valid
+		|| memcmp(&t->undo_source->applied_handle, &t->undo_handle,
+			sizeof(t->undo_handle)) != 0)
+		return false;
+	mx = t->mx;
+	mx.apply_started = true;
+	mx.stage = CMX_HEAP_STAGE_RECEIPT_APPLIED;
+	if (memcmp(&mx, t->publication_source->plan, sizeof(mx)) != 0)
+		return false;
+	undo = *t->undo_source;
+	memset(&undo.applied_handle, 0, sizeof(undo.applied_handle));
+	if (memcmp(&undo, &t->undo, sizeof(undo)) != 0)
+		return false;
+	if (t->versions_source != NULL) {
+		versions = t->versions;
+		versions.stamped = true;
+		if (memcmp(&versions, t->versions_source, sizeof(versions)) != 0)
+			return false;
+	}
+	if (t->wal_required) {
+		if (actual_wal_lsn == InvalidXLogRecPtr
+			|| actual_wal_lsn <= PageGetLSN(t->before.data))
+			return false;
+		PageXLogRecPtrSet(((PageHeader)t->expected.data)->pd_lsn, actual_wal_lsn);
+	} else if (actual_wal_lsn != PageGetLSN(t->before.data))
+		return false;
+	if (memcmp(t->expected.data, BufferGetPage(buffer), BLCKSZ) != 0)
+		return false;
+	t->image.page_lsn = PageGetLSN(t->expected.data);
+	t->state = 2;
+	return true;
+}
+
+/* -1 means no witness applies. A present witness is terminal on its first
+ * consume attempt, including scope/grant/page refusal or ERROR. */
+static int
+cluster_current_mx_transition_consume(Buffer buffer, HeapTuple tuple,
+	const ClusterHeapSuccessorProof *proof, ClusterCurrentMxLockScope *scope)
+{
+	ClusterCurrentMxTransition *t = scope == NULL ? NULL : scope->transition;
+	uint8 state;
+
+	if (t == NULL)
+		return -1;
+	if (t->state == 3 && memcmp(proof, &t->successor, sizeof(*proof)) != 0)
+		return -1; /* A subsequent independently captured edge uses its own gate. */
+	state = t->state;
+	t->state = 4;
+	if (state != 2 || scope->binding_id != t->scope_id
+		|| buffer != t->publication.buffer
+		|| memcmp(proof, &t->successor, sizeof(*proof)) != 0)
+		return 0;
+	cluster_current_mx_lock_scope_require(scope);
+	if (!cluster_current_mx_writer_successor_matches_image(buffer, tuple,
+			proof, scope, &t->image)
+		|| memcmp(t->expected.data, BufferGetPage(buffer), BLCKSZ) != 0)
+		return 0;
+	t->state = 3;
+	return 1;
 }
 
 /* An edge consumes the complete already-validated B once. */

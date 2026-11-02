@@ -16,6 +16,7 @@
 static MultiXactMember publication_members[2];
 static unsigned publication_count, publication_prepares, publication_applies, publication_cancels;
 static bool publication_retry;
+static unsigned publication_retry_at;
 static uint32 publication_A_capability;
 static ClusterCtrcTargetV1 publication_applied_target;
 
@@ -109,7 +110,8 @@ cluster_ctrc_receipt_apply_shared(const ClusterCtrcReceiptHandle *handle,
 	UT_ASSERT_EQ(target->kind, CTRC_TARGET_EXACT_TID);
 	publication_applies++; publication_applied_target = *target;
 	memset(token, 0, sizeof(*token));
-	if (publication_retry) return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
+	if (publication_retry || publication_retry_at == publication_applies)
+		return CLUSTER_CTRC_APPLY_RETRY_REQUIRED;
 	token->valid = true; return CLUSTER_CTRC_APPLY_APPLIED;
 }
 static Snapshot
@@ -117,7 +119,7 @@ publication_setup(MxHeapReadout *out)
 {
 	Snapshot s = writer_setup(CLUSTER_TX_IN_PROGRESS, true);
 	publication_count = publication_prepares = publication_applies = publication_cancels = 0;
-	publication_A_capability = 0; publication_retry = false;
+	publication_A_capability = 0; publication_retry = false; publication_retry_at = 0;
 	memset(&publication_applied_target, 0, sizeof(publication_applied_target));
 	UT_ASSERT_EQ(writer_scoped_call(out), 2);
 	return s;
@@ -143,6 +145,21 @@ publication_apply(MxPublicationReadout *plan)
 		.offset_number = 1, .multixact_id = plan->descriptor,
 		.descriptor_hash = plan->descriptor_hash };
 	return mx_publication_apply(&target, false, plan);
+}
+/* Full boundary/undo qualification is controlled; PREPARE/APPLY and the
+ * ITL publisher are actual product bodies. A real WAL-return input is
+ * substituted here, never inferred from a post-write capture. */
+static bool
+transition_plan(MxHeapReadout *out, MxPublicationReadout *plan, bool rf)
+{
+	return mx_history_transition_plan(1, &tuple, &out->successor, plan, rf);
+}
+static void
+transition_write(bool rf)
+{
+	mx_history_transition_write_header(&tuple, rf);
+	cluster_itl_stamp_lock_active_with_history(1, 7, 129, 91, uba_encode(257, 12, 3, 0));
+	PageXLogRecPtrSet(((PageHeader)BufferBlocks)->pd_lsn, UINT64CONST(129));
 }
 UT_TEST(child_A_receipts_and_B_remain_independent_through_APPLY)
 {
@@ -186,7 +203,11 @@ UT_TEST(child_same_page_successor_progress_after_own_publication)
 		UT_ASSERT(false); writer_clean(s, true); return;
 	}
 	UT_ASSERT(mx_history_recursive_next(&tuple, &next)); /* Original pre-APPLY saved edge. */
+	if (!transition_plan(&out, &plan, false)) {
+		UT_ASSERT(false); mx_publication_cancel(&plan); writer_clean(s, true); return;
+	}
 	UT_ASSERT_EQ(publication_apply(&plan), 0); UT_ASSERT(plan.any_applied);
+	mx_history_transition_write_header(&tuple, false);
 	/* The actual native publisher changes another ITL slot on the same page.
 	 * The candidate's complete tuple header and immutable B are unchanged. */
 	cluster_itl_stamp_lock_active_with_history(1, 7, 129, 91, uba_encode(257, 12, 3, 0));
@@ -195,7 +216,10 @@ UT_TEST(child_same_page_successor_progress_after_own_publication)
 	UT_ASSERT_EQ(ClusterPageGetItlSlots(BufferBlocks)[7].xid, 129);
 	UT_ASSERT_EQ(ClusterPageGetItlSlots(BufferBlocks)[7].flags, ITL_FLAG_LOCK_ONLY_ACTIVE);
 	UT_ASSERT_EQ(publication_prepares, 2); UT_ASSERT_EQ(publication_applies, 2);
-	UT_ASSERT_EQ(writer_match(&candidate, &next, true), 1); /* Acceptance RED. */
+	UT_ASSERT(mx_history_transition_finish(1, true, UINT64CONST(129)));
+	UT_ASSERT_EQ(memcmp(&next, &out.successor, sizeof(next)), 0); /* Immutable B. */
+	UT_ASSERT_EQ(writer_match(&candidate, &next, true), 1);
+	UT_ASSERT_EQ(writer_match(&candidate, &next, true), 0); /* Consume once. */
 	UT_ASSERT_EQ(finish_reads, 3); UT_ASSERT_EQ(publication_cancels, 0);
 	mx_publication_cancel(&plan); writer_clean(s, true);
 }
@@ -210,12 +234,144 @@ UT_TEST(unapplied_same_page_change_cannot_authorize_old_B)
 	UT_ASSERT_EQ(publication_prepares, 0); UT_ASSERT_EQ(publication_applies, 0);
 	UT_ASSERT_EQ(finish_reads, 3); writer_clean(s, true);
 }
+
+UT_TEST(transition_pre_APPLY_plan_and_receipt_bindings_cannot_drift)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		MxHeapReadout out; MxPublicationReadout plan;
+		Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+		if (!publication_prepare(&plan) || !transition_plan(&out, &plan, true)) {
+			UT_ASSERT(false); mx_publication_cancel(&plan); writer_clean(s, true); continue;
+		}
+		UT_ASSERT_EQ(publication_apply(&plan), 0);
+		transition_write(true);
+		mx_history_transition_fault(fault);
+		UT_ASSERT(!mx_history_transition_finish(1, true, 129));
+		UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
+		UT_ASSERT_EQ(publication_cancels, 0); writer_clean(s, true);
+	}
+}
+UT_TEST(transition_no_or_partial_APPLY_has_no_continuation)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		MxHeapReadout out; MxPublicationReadout plan;
+		Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+		if (!publication_prepare(&plan) || !transition_plan(&out, &plan, false)) {
+			UT_ASSERT(false); mx_publication_cancel(&plan); writer_clean(s, true); continue;
+		}
+		if (fault != 0) {
+			publication_retry_at = 2;
+			UT_ASSERT_EQ(publication_apply(&plan), 2);
+			UT_ASSERT(plan.any_applied);
+		}
+		transition_write(false); /* An unqualified physical write proves nothing. */
+		UT_ASSERT(!mx_history_transition_finish(1, fault != 2, 129));
+		UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
+		if (fault != 0) UT_ASSERT_EQ(publication_cancels, 0);
+		writer_clean(s, true);
+	}
+}
+UT_TEST(transition_exact_page_rejects_extra_changes_before_and_after_finish)
+{
+	for (unsigned when = 0; when < 2; when++)
+		for (unsigned fault = 0; fault < 4; fault++) {
+			MxHeapReadout out; MxPublicationReadout plan;
+			Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+			if (!publication_prepare(&plan) || !transition_plan(&out, &plan, false)) {
+				UT_ASSERT(false); mx_publication_cancel(&plan); writer_clean(s, true); continue;
+			}
+			UT_ASSERT_EQ(publication_apply(&plan), 0); transition_write(false);
+			if (when) UT_ASSERT(mx_history_transition_finish(1, true, 129));
+			if (fault == 0) candidate.t_data->t_infomask2++;
+			if (fault == 1) ClusterPageGetItlSlots(BufferBlocks)[0].write_scn++;
+			if (fault == 2) ((PageHeader)BufferBlocks)->pd_prune_xid++;
+			if (fault == 3) PageXLogRecPtrSet(((PageHeader)BufferBlocks)->pd_lsn, UINT64CONST(130));
+			if (!when) UT_ASSERT(!mx_history_transition_finish(1, true, 129));
+			UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
+			UT_ASSERT_EQ(publication_cancels, 0); writer_clean(s, true);
+		}
+}
+UT_TEST(transition_live_scope_owner_grant_and_B_are_required)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		MxHeapReadout out; MxPublicationReadout plan; int result;
+		Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+		ResourceOwner original_owner = CurrentResourceOwner;
+		if (!publication_prepare(&plan) || !transition_plan(&out, &plan, false)) {
+			UT_ASSERT(false); mx_publication_cancel(&plan); writer_clean(s, true); continue;
+		}
+		UT_ASSERT_EQ(publication_apply(&plan), 0); transition_write(false);
+		UT_ASSERT(mx_history_transition_finish(1, true, 129));
+		if (fault == 0) CurrentResourceOwner = (ResourceOwner) 2;
+		if (fault == 1) pcm_source.generation++;
+		if (fault == 2) writer_grant_ok = false;
+		if (fault == 3) out.successor.writer.capability_generation++;
+		if (fault == 4) s->read_scn++;
+		result = writer_match(&candidate, &out.successor, true);
+		UT_ASSERT(result == 0 || result == -1);
+		CurrentResourceOwner = original_owner;
+		UT_ASSERT_EQ(publication_cancels, 0); writer_clean(s, true);
+	}
+}
+UT_TEST(transition_late_plan_cross_page_and_reopened_scope_refuse)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		MxHeapReadout out; MxPublicationReadout plan;
+		Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+		UT_ASSERT(publication_prepare(&plan));
+		if (fault == 0) {
+			UT_ASSERT_EQ(publication_apply(&plan), 0);
+			UT_ASSERT(!transition_plan(&out, &plan, false));
+		} else {
+			if (!transition_plan(&out, &plan, false)) {
+				UT_ASSERT(false); mx_publication_cancel(&plan); writer_clean(s, true); continue;
+			}
+			UT_ASSERT_EQ(publication_apply(&plan), 0); transition_write(false);
+			UT_ASSERT(mx_history_transition_finish(1, true, 129));
+			if (fault == 1) {
+				descriptor.bufferdesc.tag.blockNum++;
+				candidate.t_self.ip_blkid.bi_lo++;
+				UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
+				descriptor.bufferdesc.tag.blockNum--;
+			} else {
+				mx_history_recursive_close(); mx_history_recursive_open(s);
+				UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
+				mx_history_recursive_close(); auth_clean(s);
+				UT_ASSERT_EQ(caller_enters, 2); UT_ASSERT_EQ(caller_leaves, 2);
+				continue;
+			}
+		}
+		UT_ASSERT_EQ(publication_cancels, 0); writer_clean(s, true);
+	}
+}
+UT_TEST(transition_RF_delta_is_planned_and_completion_cannot_be_replayed)
+{
+	MxHeapReadout out; MxPublicationReadout plan;
+	Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+	if (!publication_prepare(&plan) || !transition_plan(&out, &plan, true)) {
+		UT_ASSERT(false); mx_publication_cancel(&plan); writer_clean(s, true); return;
+	}
+	UT_ASSERT_EQ(publication_apply(&plan), 0); transition_write(true);
+	UT_ASSERT(mx_history_transition_finish(1, true, 129));
+	UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 1);
+	UT_ASSERT(!mx_history_transition_finish(1, true, 129));
+	UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
+	UT_ASSERT_EQ(finish_reads, 3); UT_ASSERT_EQ(publication_cancels, 0);
+	printf("# local transition layout=%zu; no native two-hop/SQL claim\n", mx_history_transition_bytes());
+	writer_clean(s, true);
+}
 int main(void)
 {
-	history_fixture_init(); UT_PLAN(4);
+	history_fixture_init(); UT_PLAN(10);
 	UT_RUN(child_A_receipts_and_B_remain_independent_through_APPLY);
 	UT_RUN(zero_APPLY_refusal_preserves_unpublished_successor);
 	UT_RUN(child_same_page_successor_progress_after_own_publication);
 	UT_RUN(unapplied_same_page_change_cannot_authorize_old_B);
+	UT_RUN(transition_pre_APPLY_plan_and_receipt_bindings_cannot_drift);
+	UT_RUN(transition_no_or_partial_APPLY_has_no_continuation);
+	UT_RUN(transition_exact_page_rejects_extra_changes_before_and_after_finish);
+	UT_RUN(transition_live_scope_owner_grant_and_B_are_required);
+	UT_RUN(transition_late_plan_cross_page_and_reopened_scope_refuse);
+	UT_RUN(transition_RF_delta_is_planned_and_completion_cannot_be_replayed);
 	free(procArray); UT_DONE(); return ut_failed_count ? 1 : 0;
 }
