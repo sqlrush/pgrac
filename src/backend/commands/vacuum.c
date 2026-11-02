@@ -1521,25 +1521,49 @@ vac_update_relstats(Relation relation,
 #ifdef USE_PGRAC_CLUSTER
 	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
 	FullTransactionId legal_next = InvalidFullTransactionId;
+	uint64		freeze_bound = 0;
+	bool		shared_frozen_update = false;
 
 	/*
 	 * Capture the existing durable allocation bound before the inplace lock:
 	 * neither XidGenLock nor the stripe fence belongs under a content lock.
-	 * This retained bound only rejects unprovable catalogue advances.  It is
-	 * not F, a tuple-freeze certificate, or a new permission to advance one.
+	 * Retain the current F candidate as an additional upper bound, outside
+	 * both locks. Neither observation supplies the scan's proposed value or
+	 * grants permission to freeze a tuple.
 	 */
-	if (shared_xid && TransactionIdIsNormal(frozenxid) && cluster_xid_striping &&
-		ShmemVariableCache != NULL)
+	if (shared_xid && TransactionIdIsNormal(frozenxid))
 	{
 		ClusterXidStripeSampleFence fence;
-		bool		sampled;
+		ClusterHeapFreezeWatermark watermark;
+		bool		sampled = false;
 
-		LWLockAcquire(XidGenLock, LW_SHARED);
-		sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
-												 &legal_next, &fence);
-		LWLockRelease(XidGenLock);
-		if (!sampled || !cluster_xid_stripe_sample_fence_current(&fence))
-			legal_next = InvalidFullTransactionId;
+		if (cluster_xid_striping && ShmemVariableCache != NULL)
+		{
+			LWLockAcquire(XidGenLock, LW_SHARED);
+			sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+													 &legal_next, &fence);
+			LWLockRelease(XidGenLock);
+			if (!sampled)
+				legal_next = InvalidFullTransactionId;
+		}
+		if (!FullTransactionIdIsValid(legal_next) ||
+			U64FromFullTransactionId(legal_next) == UINT64_MAX ||
+			!TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) ||
+			!cluster_heap_freeze_watermark_sample(&watermark) ||
+			watermark.active_full_xid_min == 0 ||
+			watermark.active_full_xid_min == UINT64_MAX ||
+			!TransactionIdIsNormal((TransactionId) watermark.active_full_xid_min) ||
+			watermark.active_full_xid_min > U64FromFullTransactionId(legal_next) ||
+			U64FromFullTransactionId(legal_next) - watermark.active_full_xid_min >=
+			UINT64CONST(0x80000000) ||
+			/* Finish F's observers before the last allocation-identity check. */
+			!cluster_xid_stripe_sample_fence_current(&fence))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared heap freeze boundary is not established"),
+					 errdetail("Relation %u has no current F in its legal XID window.", relid),
+					 errhint("Wait for a complete shared freeze sample; preserve the relation.")));
+		freeze_bound = watermark.active_full_xid_min;
 	}
 #endif
 
@@ -1556,6 +1580,35 @@ vac_update_relstats(Relation relation,
 		elog(ERROR, "pg_class entry for relid %u vanished during vacuuming",
 			 relid);
 	pgcform = (Form_pg_class) GETSTRUCT(ctup);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (shared_xid && TransactionIdIsNormal(frozenxid))
+	{
+		FullTransactionId current_full = cluster_xid_widen(pgcform->relfrozenxid, legal_next);
+		FullTransactionId proposed_full = cluster_xid_widen(frozenxid, legal_next);
+		uint64		next = U64FromFullTransactionId(legal_next);
+		uint64		current = U64FromFullTransactionId(current_full);
+		uint64		proposed = U64FromFullTransactionId(proposed_full);
+
+		/* Validate even an equal proposal against the actual locked tuple.
+		 * Do not repair shared metadata using this node's local nextXid. */
+		if (!TransactionIdIsNormal(pgcform->relfrozenxid) ||
+			!FullTransactionIdIsValid(current_full) ||
+			!FullTransactionIdIsValid(proposed_full) ||
+			current > next || proposed > next ||
+			next - current >= UINT64CONST(0x80000000) ||
+			next - proposed >= UINT64CONST(0x80000000) ||
+			current > freeze_bound || proposed > freeze_bound)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("shared relation freeze metadata exceeds its proven XID boundary"),
+					 errdetail("Relation %u: current %u, proposed %u, F %llu, legal next %llu.",
+							   relid, pgcform->relfrozenxid, frozenxid,
+							   (unsigned long long) freeze_bound, (unsigned long long) next),
+					 errhint("Preserve the relation and WAL; do not lower shared freeze metadata.")));
+		shared_frozen_update = current < proposed;
+	}
+#endif
 
 	/* Apply statistical updates, if any, to copied tuple */
 
@@ -1616,8 +1669,8 @@ vac_update_relstats(Relation relation,
 	 * local nextXid.  Do not use that local bound to lower the value reread
 	 * under the original current-X/inplace lock.  Both shared values must
 	 * fit the captured durable FullXid window before a monotone merge.  A
-	 * missing or ambiguous window leaves the XID alone; statistics and MX
-	 * still follow their independent original paths.
+	 * missing boundary or conflicting metadata refuses before tuple changes.
+	 * Stats-only calls and MX retain their independent original paths.
 	 */
 	oldfrozenxid = pgcform->relfrozenxid;
 	futurexid = false;
@@ -1629,22 +1682,7 @@ vac_update_relstats(Relation relation,
 
 #ifdef USE_PGRAC_CLUSTER
 		if (shared_xid)
-		{
-			FullTransactionId current_full = cluster_xid_widen(oldfrozenxid, legal_next);
-			FullTransactionId proposed_full = cluster_xid_widen(frozenxid, legal_next);
-			uint64		next = U64FromFullTransactionId(legal_next);
-			uint64		current = U64FromFullTransactionId(current_full);
-			uint64		proposed = U64FromFullTransactionId(proposed_full);
-
-			if (FullTransactionIdIsValid(legal_next) &&
-				TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) &&
-				FullTransactionIdIsValid(current_full) &&
-				FullTransactionIdIsValid(proposed_full) &&
-				current <= next && proposed <= next &&
-				next - current < UINT64CONST(0x80000000) &&
-				next - proposed < UINT64CONST(0x80000000))
-				update = current < proposed;
-		}
+			update = shared_frozen_update;
 		else
 #endif
 		if (TransactionIdPrecedes(oldfrozenxid, frozenxid))

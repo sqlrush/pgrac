@@ -1315,7 +1315,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(94);
+	UT_PLAN(98);
 	SNAPSHOT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	SNAPSHOT_RUN(export_original_registration_preserves_other_older_snapshot);
 	SNAPSHOT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -1404,6 +1404,10 @@ main(void)
 	SNAPSHOT_RUN(vacuum_database_scan_rejects_invalid_seed_before_fold);
 	SNAPSHOT_RUN(vacuum_database_scan_nontarget_keeps_native_future_refusal);
 	SNAPSHOT_RUN(vacuum_database_scan_keeps_mx_future_refusal);
+	SNAPSHOT_RUN(vacuum_relstats_requires_ready_f_before_catalogue_mutation);
+	SNAPSHOT_RUN(vacuum_relstats_checks_proposal_and_locked_equal_current_against_f);
+	SNAPSHOT_RUN(vacuum_relstats_uses_f_only_as_bound_and_keeps_locked_max);
+	SNAPSHOT_RUN(vacuum_relstats_stats_only_and_nontarget_do_not_require_f);
 	UT_ASSERT_EQ(remembered, 0);
 	SNAPSHOT_RUN(sampled_h_refuses_a_later_unprotected_older_registration);
 	SNAPSHOT_RUN(older_registration_error_preserves_original_published_snapshot);
