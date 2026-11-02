@@ -122,6 +122,7 @@ original phases followed by the prepared native subchecks:
 
 | Phase | Original native controller suite |
 | --- | --- |
+| `mx-pages` | `m1-mx-pages`, TAP487 |
 | `mx-continuation` | `m1-mx-continuation`, TAP486 |
 | `idle-freeze` | `m1-idle-freeze`, TAP485 |
 | `retention` | `m1-retention`, TAP484 |
@@ -376,6 +377,32 @@ and TAP retain `x04=NOT_READY` and `stage_acceptance=NOT_READY`: forced G>N,
 offset-page gap crossing, occupied-page preservation and exact allocator/VACUUM
 issuance overlap still require separate evidence. Selection selftests and Perl
 syntax checks run no database and provide no native runtime credit.
+
+### Native MultiXact offset-page member preservation
+
+The opt-in `m1-mx-pages` suite runs `t/487_pre2_multixact_offset_pages.pl`
+through the original four-member controller and its 1200-second case budget.
+Use the native command above with `--suite m1-mx-pages` only after component
+readiness, candidate qualification and runtime authorization. It also runs
+before the continuation subcheck in `--suite extended`; core stays unchanged.
+
+For each origin, one ordinary transaction retains key-share locks on a bounded
+set of independent rows. A second client starts a distinct transaction per row,
+takes a key-share lock and commits. Distinct member XIDs require distinct native
+MultiXacts. The case creates `block_size / 4 / 16 + 1` IDs per origin (129 with
+8KiB blocks), checks actual local MXIDs and requires an observed offset-page
+crossing. With the first holder still in its original transaction, fresh normal
+psql connections reread every original MX and its exact two native members.
+The original transaction and each observer have retained PID/birth evidence.
+Both clients must exit before the four-member row ledger and original full
+normal stop. First errors, cleanup failures and member-log errors fail the case.
+
+No cursor/floor/SLRU assignment, allocator injection or new product probe is
+used. Native execution is not implied by selection, parser or syntax checks.
+`x04=NOT_READY` and `stage_acceptance=NOT_READY` remain: natural G>N qualification,
+raw page-image/redo proof, exact allocator/VACUUM overlap, general recovery and
+full M1 acceptance are separate. This subcheck observes member continuity across
+offset pages; it does not certify a raw physical page image or all X04 branches.
 
 ### Retained workload manifest intake
 

@@ -29,10 +29,10 @@ class ExtendedRegressionTests(unittest.TestCase):
             extended = m1.plan(self.args(root, 'extended'))
             self.assertEqual(extended['phases'][:3], core['phases'])
             self.assertEqual([p['name'] for p in extended['phases']],
-                ['legacy', 'four-member', 'single-member', 'mx-continuation',
+                ['legacy', 'four-member', 'single-member', 'mx-pages', 'mx-continuation',
                  'idle-freeze', 'retention', 'soak'])
             for phase, suite in zip(extended['phases'][3:],
-                                   ['m1-mx-continuation', 'm1-idle-freeze',
+                                   ['m1-mx-pages', 'm1-mx-continuation', 'm1-idle-freeze',
                                     'm1-retention', 'm1-soak-workload']):
                 command = phase['command']
                 self.assertEqual(command[command.index('--suite')+1], suite)
@@ -59,7 +59,7 @@ class ExtendedRegressionTests(unittest.TestCase):
                 command += ['--'+name.replace('_', '-'), str(getattr(args, name))]
             reply = subprocess.run(command, text=True, capture_output=True)
             self.assertEqual(reply.returncode, 0, reply.stderr)
-            self.assertEqual(len(json.loads(reply.stdout)['phases']), 7)
+            self.assertEqual(len(json.loads(reply.stdout)['phases']), 8)
             self.assertFalse((root/'results').exists())
             with self.assertRaises(ValueError):
                 m1.plan(self.args(root, 'unknown'))
@@ -67,7 +67,8 @@ class ExtendedRegressionTests(unittest.TestCase):
     def artifact(self, root, suite, output):
         # Literal result schema and actual prove parser output, not a server.
         runs = native.case_runs(suite, None)
-        scopes = {'m1-mx-continuation': ('multixact-continuation-and-live-members', 'x04'),
+        scopes = {'m1-mx-pages': ('multixact-offset-page-live-members', 'x04'),
+                  'm1-mx-continuation': ('multixact-continuation-and-live-members', 'x04'),
                   'm1-idle-freeze': ('tuple-freeze-and-clean-restart', 'p01'),
                   'm1-retention': ('retained-reader-values-and-normal-stop', 'p02'),
                   'm1-soak-workload': ('workload-ledger-and-normal-stop', 'p07')}
@@ -95,7 +96,8 @@ class ExtendedRegressionTests(unittest.TestCase):
         return reply.stdout
 
     def test_new_phase_readers_reject_identity_scope_debt_and_gate_claims(self):
-        for name, suite in [('mx-continuation', 'm1-mx-continuation'),
+        for name, suite in [('mx-pages', 'm1-mx-pages'),
+                            ('mx-continuation', 'm1-mx-continuation'),
                             ('idle-freeze', 'm1-idle-freeze'), ('retention', 'm1-retention'),
                             ('soak', 'm1-soak-workload')]:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:

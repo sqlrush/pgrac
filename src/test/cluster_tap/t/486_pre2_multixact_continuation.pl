@@ -94,7 +94,7 @@ sub member_cut
 			$mx, "$phase: node$node retains the original live MultiXact")
 		  or die 'live MultiXact replaced';
 		my $members = sql($node, "SELECT xid::text || ':' || mode "
-			. "FROM pg_get_multixact_members('$mx') ORDER BY xid::text, mode");
+			. "FROM pg_get_multixact_members('$mx') ORDER BY xid::text COLLATE \"C\", mode");
 		save_json("$phase-node$node-members", {node => $node, row => $row,
 			multi => $mx, members => $members, expected_members => $entry->{expected_members}});
 		is($members, $entry->{expected_members},
@@ -142,7 +142,7 @@ sub live_round
 		  && Math::BigInt->new($mx)->bmod(16)->numify == $node;
 		die 'MultiXact reissued in this bounded lifecycle' if $issued{$mx}++;
 		push @multis, {node => $node, row => $row, multi => $mx,
-			expected_members => join("\n", sort map { "$_:keysh" } @raw)};
+			expected_members => join("\n", map { "$_:keysh" } sort @raw)};
 		save_json("$phase-multis", \@multis);
 	}
 	member_cut("$phase-before-vacuum", \@multis);

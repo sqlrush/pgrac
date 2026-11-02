@@ -24,6 +24,7 @@ from run_multixact_lifecycle import M1_CASES as FOUR_MEMBER, case_runs, tap_resu
 LEGACY = ['t/'+name for name in LEGACY_NAMES.values()]
 SINGLE_MEMBER = ['t/461_pre2_single_shared_vacuum.pl']
 EXTENDED_NATIVE = {
+    'mx-pages': ('m1-mx-pages', 'multixact-offset-page-live-members', 'x04'),
     'mx-continuation': ('m1-mx-continuation', 'multixact-continuation-and-live-members', 'x04'),
     'idle-freeze': ('m1-idle-freeze', 'tuple-freeze-and-clean-restart', 'p01'),
     'retention': ('m1-retention', 'retained-reader-values-and-normal-stop', 'p02'),
