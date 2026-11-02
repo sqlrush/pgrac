@@ -301,8 +301,21 @@ CLUSTER_RESOURCE_X_IDENTITY_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_identity.o
 CLUSTER_RESOURCE_X_NODE_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_node_wire.o
+# Decoded frames embed identity and PAGE/WAL proofs by value. Both sides of
+# the codec call must rebuild when those layouts change.
+CLUSTER_RESOURCE_X_WIRE_LAYOUT_HEADERS = \
+	$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h \
+	$(top_srcdir)/src/include/cluster/cluster_resource_x_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_buffer_desc.h \
+	$(top_srcdir)/src/include/storage/buf_internals.h \
+	$(top_srcdir)/src/include/cluster/cluster_page_wal.h \
+	$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_source.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
+	$(top_srcdir)/src/include/cluster/cluster_control_root.h \
+	$(top_srcdir)/src/include/storage/relfilelocator.h
 $(CLUSTER_RESOURCE_X_NODE_WIRE_O) test_cluster_pcm_lock_clock_product.o: \
-		$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h
+		$(CLUSTER_RESOURCE_X_WIRE_LAYOUT_HEADERS)
 CLUSTER_RESOURCE_X_RETRY_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_retry.o
 CLUSTER_IC_TIER1_O = $(top_builddir)/src/backend/cluster/cluster_ic_tier1.o
@@ -373,6 +386,16 @@ test_cluster_gcs_block_dedup: test_cluster_gcs_block_dedup.c unit_test.h $(CLUST
 # + cluster_lms_shard.o so the route == shard_for_tag agreement is asserted
 # against both real objects.  libpgcommon_srv.a for hash_bytes_extended.
 CLUSTER_GCS_BLOCK_SHARD_O = $(top_builddir)/src/backend/cluster/cluster_gcs_block_shard.o
+# Keep the real decoder caller in step with its payload layouts even when
+# compiler-generated header dependencies are disabled.
+$(CLUSTER_GCS_BLOCK_SHARD_O): \
+		$(CLUSTER_RESOURCE_X_WIRE_LAYOUT_HEADERS) \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic_envelope.h \
+		$(top_srcdir)/src/include/cluster/cluster_lms_shard.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current_wire.h \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h
 test_cluster_gcs_block_shard: test_cluster_gcs_block_shard.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_GCS_BLOCK_SHARD_O) $(CLUSTER_LMS_SHARD_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O)
