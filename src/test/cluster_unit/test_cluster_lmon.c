@@ -42,6 +42,7 @@
 
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_qvotec.h"
@@ -109,6 +110,17 @@ static int test_pcm_reclaim_ticks = 0;
 static ClusterCleanLeaveSharedState test_stop_region;
 static ClusterLeaveState *cl_state = &test_stop_region.leave;
 static ClusterNormalStopState *cl_normal_stop;
+static unsigned test_deadline_calls;
+static uint32 test_deadline_reason;
+
+/* Record the real failure hook; graph export has separate collector tests. */
+void
+cluster_content_trace_deadline_dump(uint32 reason)
+{
+	test_deadline_reason = reason;
+	test_deadline_calls++;
+}
+
 static uint32 cl_normal_stop_service_depth, cl_normal_stop_service_bit;
 AuxProcType MyAuxProcType = LmonProcess;
 sigjmp_buf *PG_exception_stack;
@@ -2539,10 +2551,26 @@ UT_TEST(test_postmaster_ready_busy_and_suppression_are_nonblocking)
 	cluster_lmon_shmem_init();
 }
 
+UT_TEST(test_stop_deadline_preserves_failure_and_exports_reason)
+{
+	memset(&test_stop_region, 0, sizeof(test_stop_region));
+	cl_normal_stop = &test_stop_region.normal_stop;
+	pg_atomic_init_u32(&cl_normal_stop->failure_reason, CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	test_deadline_calls = test_deadline_reason = 0;
+	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(test_deadline_calls, 1);
+	UT_ASSERT_EQ(test_deadline_reason, CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(test_deadline_calls, 1);
+	cl_normal_stop = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(46);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -2588,6 +2616,7 @@ main(void)
 	UT_RUN(test_stop_drains_dispatch_created_work_before_post_dispatch_idle);
 	UT_RUN(test_stop_control_debt_survives_until_service_completion);
 	UT_RUN(test_postmaster_ready_busy_and_suppression_are_nonblocking);
+	UT_RUN(test_stop_deadline_preserves_failure_and_exports_reason);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
