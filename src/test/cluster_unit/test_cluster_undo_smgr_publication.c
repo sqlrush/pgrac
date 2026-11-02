@@ -103,11 +103,13 @@ errmsg_internal(const char *fmt, ...)
 {
 	return 0;
 }
+#ifndef UNDO_PUBLICATION_ERROR_PROVIDER
 void
 errfinish(const char *file, int line, const char *function)
 {
 	abort();
 }
+#endif
 
 void
 cluster_undo_record_note_smgr_open(void)
@@ -1082,6 +1084,7 @@ UT_TEST(test_torn_header_range_write_remains_corrupt_and_blocks_next_patch)
 	remove_if_present(path);
 }
 
+#ifndef UNDO_PUBLICATION_NO_MAIN
 int
 main(void)
 {
@@ -1129,3 +1132,5 @@ main(void)
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
+
+#endif /* UNDO_PUBLICATION_NO_MAIN */

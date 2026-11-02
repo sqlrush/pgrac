@@ -52,6 +52,7 @@ ClusterControlNativeModeV2 cluster_control_native_files_mode_v2(void)
 #ifndef UNDO_NATIVE_TT_STARTUP_GENERATION
 #define UNDO_NATIVE_TT_STARTUP_GENERATION 1
 #endif
+#ifndef UNDO_NATIVE_TT_INVENTORY_TEST
 bool cluster_control_native_file_acquire_v2(const ClusterControlFileKeyV2 *key,
 	ClusterControlNativeFileBorrowV2 *borrow)
 {
@@ -89,6 +90,7 @@ bool cluster_control_native_file_release_v2(ClusterControlNativeFileBorrowV2 *bo
 	memset(borrow, 0, sizeof(*borrow));
 	return true;
 }
+#endif
 
 static void reset_selected(PGAlignedBlock *page, char path[MAXPGPATH])
 {

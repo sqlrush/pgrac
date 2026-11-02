@@ -62,6 +62,10 @@
 #include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_undo_segment_init.h"
+#include "cluster/cluster_wal_thread.h"
+#include "common/cluster_recovery_bootstrap.h"
+#include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #endif
 
 
@@ -295,6 +299,107 @@ undo_recovery_read(int fd, uint64 size, uint32 block, char out[BLCKSZ])
 }
 
 #ifdef USE_PGRAC_CLUSTER
+/* An unpublished creation child has no crash-left runtime TT to resolve.
+ * Validate the COMPLETE original BOOT batch instead. Only an explicitly
+ * registered initial TT is read, through the original smgr path and one
+ * address-bound native borrow; the cohort's unregistered local seg_0 seed is
+ * never opened. This grants neither a runtime/redo owner nor a TT writer. */
+bool
+cluster_undo_smgr_creation_startup_v2(void)
+{
+	const PgracInitdbRecoveryContext *creator = cluster_wal_thread_initdb_recovery_context();
+	ClusterControlNativeTableInfoV2 selected, current;
+	ClusterRecoveryFileIdentityV2 boot[PGRAC_INITDB_BOOT_FILES_V2];
+	ClusterControlNativeModeV2 mode = cluster_control_native_files_mode_v2();
+	uint64 relmaps;
+
+	if (creator == NULL && mode != CLUSTER_NATIVE_FILES_CREATION_V2)
+		return false;
+	if (creator == NULL || mode != CLUSTER_NATIVE_FILES_CREATION_V2
+		|| MyBackendType != B_STANDALONE_BACKEND || IsUnderPostmaster
+		|| IsPostmasterEnvironment || cluster_node_id != -1
+		|| !(IsBootstrapProcessingMode() || IsInitProcessingMode())
+		|| RecoveryInProgress() || HotStandbyActive()
+		|| !cluster_control_native_files_info_v2(&selected)
+		|| selected.mode != CLUSTER_NATIVE_FILES_CREATION_V2
+		|| selected.table_generation == 0 || creator->creator_pid == 0
+		|| selected.startup_generation != creator->creator_pid
+		|| selected.reservation_count != 0
+		|| memcmp(&selected.creation, creator, sizeof(*creator)) != 0
+		|| !pgrac_initdb_recovery_boot_v2(&selected.creation, boot))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("native creation startup requires its original complete BOOT batch")));
+	relmaps = (selected.creation.cohort[0] || selected.creation.cohort[1])
+		&& selected.creation.cohort_origin != 0 ? 0 : 4;
+	if (selected.count != relmaps + selected.creation.boot_file_count)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("native creation startup has an incomplete file inventory")));
+	for (unsigned i = 0; i < selected.creation.boot_file_count; i++) {
+		ClusterControlNativeFileBorrowV2 borrow = {0};
+		ClusterControlFileKeyV2 key = {0};
+		uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+		volatile int fd = -1;
+		volatile bool ok = false;
+
+		key.kind = boot[i].kind;
+		key.origin = boot[i].origin;
+		key.object_id = boot[i].object_id;
+		if (!cluster_control_native_file_acquire_v2(&key, &borrow))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("native creation BOOT file is not registered")));
+		PG_TRY();
+		{
+			ok = borrow.table_generation == selected.table_generation
+				&& borrow.startup_generation == selected.startup_generation
+				&& cluster_recovery_file_identity_encode_v2(&boot[i], reference, sizeof(reference))
+				&& cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &borrow.expected)
+				&& cluster_control_native_file_current_v2(&borrow);
+			if (ok && boot[i].kind == CLUSTER_RECOVERY_FILE_UNDO_V2) {
+				ClusterRecoveryBootFileV2 observed;
+				char path[MAXPGPATH];
+				struct stat before, after, named;
+
+				/* The creator parser admits only its explicit initial TT0 here.
+				 * The BOOT reader compares its full pristine TT40 image and
+				 * zero tail, not a terminal bit or a fabricated local owner. */
+				ok = cluster_undo_path_resolve(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL,
+					boot[i].origin + 1, boot[i].object_id, path, sizeof(path)) == 0
+					&& (fd = BasicOpenFile(path, O_RDONLY | PG_BINARY | O_NOFOLLOW)) >= 0
+					&& fstat(fd, &before) == 0
+					&& cluster_control_native_file_current_v2(&borrow)
+					&& cluster_undo_bootstrap_read_v2(fd, &boot[i], &observed)
+					&& fstat(fd, &after) == 0
+					&& fstatat(AT_FDCWD, path, &named, AT_SYMLINK_NOFOLLOW) == 0
+					&& before.st_dev == after.st_dev && before.st_ino == after.st_ino
+					&& before.st_size == after.st_size && after.st_dev == named.st_dev
+					&& after.st_ino == named.st_ino && after.st_size == named.st_size
+					&& cluster_control_native_file_current_v2(&borrow);
+			}
+		}
+		PG_FINALLY();
+		{
+			if (fd >= 0 && close(fd) != 0)
+				ok = false;
+			if (!cluster_control_native_file_release_v2(&borrow))
+				ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+								errmsg("could not return native creation BOOT file borrow")));
+		}
+		PG_END_TRY();
+		if (!ok)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("native creation BOOT file does not match its initial identity")));
+	}
+	if (creator != cluster_wal_thread_initdb_recovery_context()
+		|| !cluster_control_native_files_info_v2(&current)
+		|| current.mode != selected.mode || current.table_generation != selected.table_generation
+		|| current.startup_generation != selected.startup_generation
+		|| current.count != selected.count || current.reservation_count != 0
+		|| memcmp(&current.creation, &selected.creation, sizeof(current.creation)) != 0)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("native creation startup batch changed during validation")));
+	return true;
+}
+
 /* The original recovery scope still owns source/cut/path authority. Bind each
  * read to its independently selected file, and bind subsequent reads to the
  * first by-value observation as well as the original inode/size. Absence is

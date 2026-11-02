@@ -50,8 +50,10 @@
 
 #include "postgres.h"
 
+#include "access/clog_file.h"
 #include "access/xlog.h"			/* XLogFlush — WAL-before-data on write-back (D2b) */
 #include "cluster/cluster_conf.h"	/* cluster_conf_has_peers — single-node gate (D2b) */
+#include "cluster/cluster_control_native_files.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h" /* spec-4.8ab D1 boundary-guard injection points */
 #include "cluster/cluster_shmem.h"
@@ -995,6 +997,86 @@ cluster_undo_buf_unlock_ref(int slot)
  * pointer durable, because redo no longer restores it once the checkpoint
  * completes.  Runs after the checkpoint's DELAY_CHKPT_START wait.
  */
+/* The header-debt recorder is not a complete file inventory: a selected TT
+ * may have no resident slot in this shared-memory lifetime. Keep the original
+ * checkpoint/WAL owner and same-FD SMGR sync, but bind every local AVAILABLE
+ * TT to one complete selected table. This adds no coverage/source-cut proof,
+ * file permission or right to clear a different generation's pending debt. */
+static void
+undo_buf_sync_native_headers(void)
+{
+	ClusterControlNativeInventoryV2 *volatile inventory = NULL;
+	ClusterControlNativeModeV2 mode = cluster_control_native_files_mode_v2();
+
+	/* Unpublished creation files are synced by their original creator. */
+	if (mode == CLUSTER_NATIVE_FILES_CREATION_V2
+		|| (mode == CLUSTER_NATIVE_FILES_UNKNOWN_V2 && !cluster_enabled))
+		return;
+	PG_TRY();
+	{
+		if (mode != CLUSTER_NATIVE_FILES_MANAGED_V2 || cluster_node_id < 0
+			|| cluster_node_id >= UNDO_OWNER_INSTANCE_MAX
+			|| cluster_control_native_files_inventory_v2(CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2,
+				(ClusterControlNativeInventoryV2 **)&inventory) != CLUSTER_NATIVE_FILES_OK_V2
+			|| !cluster_control_native_files_inventory_current_v2(inventory))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("TT checkpoint requires its complete selected native inventory")));
+		for (uint64 i = 0; i < inventory->info.count; i++) {
+			const ClusterRecoveryFileIdentityV2 *expected = &inventory->files[i];
+			ClusterControlFileKeyV2 key = {0};
+			ClusterControlNativeFileBorrowV2 borrow = {0};
+			uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+			volatile bool synced = false;
+
+			if (expected->kind != CLUSTER_RECOVERY_FILE_UNDO_V2
+				|| expected->origin != cluster_node_id)
+				continue;
+			key.kind = expected->kind;
+			key.origin = expected->origin;
+			key.object_id = expected->object_id;
+			if (!cluster_control_native_files_inventory_current_v2(inventory)
+				|| !cluster_control_native_file_acquire_v2(&key, &borrow))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("TT checkpoint selected file is unavailable")));
+			PG_TRY();
+			{
+				synced = expected->database_oid == 0 && expected->tablespace_oid == 0
+					&& expected->object_id > 0 && expected->object_id <= UINT16_MAX
+					&& (expected->object_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE
+						== expected->origin
+					&& borrow.table_generation == inventory->info.table_generation
+					&& borrow.startup_generation == inventory->info.startup_generation
+					&& cluster_recovery_file_identity_encode_v2(expected, reference, sizeof(reference))
+					&& cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &borrow.expected)
+					&& cluster_control_native_file_current_v2(&borrow)
+					&& cluster_undo_smgr_fsync_header(CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+						expected->object_id, expected->origin + 1)
+					&& cluster_control_native_file_current_v2(&borrow);
+			}
+			PG_FINALLY();
+			{
+				if (!cluster_control_native_file_release_v2(&borrow))
+					ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+									errmsg("could not return TT checkpoint file identity borrow")));
+			}
+			PG_END_TRY();
+			/* The inventory includes the observed borrow count. Return both
+			 * this borrow and SMGR's inner borrow before the full recheck. */
+			if (!synced || !cluster_control_native_files_inventory_current_v2(inventory))
+				ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								errmsg("TT checkpoint selected file synchronization is unproven")));
+		}
+		if (!cluster_control_native_files_inventory_current_v2(inventory))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("TT checkpoint native inventory changed during synchronization")));
+	}
+	PG_FINALLY();
+	{
+		cluster_control_native_inventory_destroy_v2((ClusterControlNativeInventoryV2 **)&inventory);
+	}
+	PG_END_TRY();
+}
+
 static void
 undo_buf_sync_headers(void)
 {
@@ -1032,6 +1114,7 @@ undo_buf_sync_headers(void)
 		}
 		PG_END_TRY();
 	}
+	undo_buf_sync_native_headers();
 }
 
 void

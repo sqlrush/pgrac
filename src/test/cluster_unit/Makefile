@@ -17333,3 +17333,108 @@ test_cluster_clog_creation: test_cluster_clog_creation.c test_cluster_clog_check
 clean: clean-clog-creation
 clean-clog-creation:
 	rm -f test_cluster_clog_creation test_cluster_clog_creation.d
+
+# Composed creation-child prerequisites; retain all existing recipes.
+test_cluster_clog_native_transam: test_cluster_clog_no_creation.h
+test_cluster_clog_native_status: test_cluster_clog_no_creation.h
+test_cluster_clog_write: test_cluster_clog_no_creation.h
+test_cluster_clog_initialize: test_cluster_clog_no_creation.h
+test_cluster_clog_native_birth: test_cluster_clog_no_creation.h
+test_cluster_clog_native_io: test_cluster_clog_no_creation.h
+test_cluster_clog_checkpoint: test_cluster_clog_no_creation.h
+test_cluster_clog_creation: test_cluster_clog_no_creation.h
+test_cluster_clog_native_redo: test_cluster_clog_no_creation.h
+test_cluster_clog_native_trim: test_cluster_clog_no_creation.h
+test_cluster_slru_clog_managed_write: test_cluster_clog_no_creation.h
+
+# Complete production creation checker and post-start dispatch. The initial
+# TT file read uses the same full-image BOOT reader as the original producer.
+test_cluster_native_creation_check.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c Makefile
+	awk '/^cluster_undo_smgr_creation_startup_v2\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_creation_dispatch.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ClusterTTStartupPostJobs\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+CREATION_INITDB_RECOVERY_SOURCE ?= $(top_srcdir)/src/common/pgrac_initdb_recovery.c
+TESTS += test_cluster_native_creation_startup
+all: test_cluster_native_creation_startup
+test_cluster_native_creation_startup: test_cluster_native_creation_startup.c unit_test.h \
+		test_cluster_native_creation_check.inc test_cluster_native_creation_dispatch.inc \
+		test_cluster_tt_startup_local_owner.inc $(CREATION_INITDB_RECOVERY_SOURCE) \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c \
+		test_cluster_undo_segment_init_backend.o $(CLUSTER_UBA_O) \
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/common -ffunction-sections -fdata-sections \
+		$< $(CREATION_INITDB_RECOVERY_SOURCE) \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		test_cluster_undo_segment_init_backend.o $(CLUSTER_UBA_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+clean: clean-native-creation-startup
+.PHONY: clean-native-creation-startup
+clean-native-creation-startup:
+	rm -f test_cluster_native_creation_startup test_cluster_native_creation_startup.d \
+		test_cluster_native_creation_check.inc test_cluster_native_creation_dispatch.inc
+
+
+TESTS += test_cluster_startup_relcache_owner
+all: test_cluster_startup_relcache_owner
+# Exercise the exact pre-transaction initialization block with backend crypto
+# and the complete ResourceOwner implementation, rather than frontend hashes.
+test_cluster_startup_relcache_owner.inc: $(top_srcdir)/src/backend/utils/init/postinit.c Makefile
+	awk '/Load relcache entries for the shared system catalogs/ { start++; emit=1; next } \
+	     emit && !body && /\*\// { body=1; next } \
+	     emit && /Set up process-exit callback/ { end++; emit=0 } \
+	     emit && body { lines[++n]=$$0 } \
+	     END { if (start!=1 || end!=1 || n<3) exit 1; \
+	           for (i=1;i<=n-2;i++) print lines[i] }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_relcache_owner: test_cluster_startup_relcache_owner.c \
+		test_cluster_startup_relcache_owner.inc test_cluster_cf_authority.c unit_test.h \
+		$(top_srcdir)/src/backend/utils/resowner/resowner.c \
+		$(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+clean: clean-startup-relcache-owner
+.PHONY: clean-startup-relcache-owner
+clean-startup-relcache-owner:
+	rm -f test_cluster_startup_relcache_owner test_cluster_startup_relcache_owner.d \
+		test_cluster_startup_relcache_owner.inc test_cluster_startup_relcache_owner.inc.tmp
+
+
+# Complete TT inventory at the original header-checkpoint stage. Both bodies
+# are extracted verbatim; the native SMGR file I/O remains the actual CU.
+test_cluster_undo_tt_checkpoint.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_buf.c \
+		extract_vacuum_mx_fixture.py Makefile
+	PYTHONPATH="$(srcdir)" python3 -c 'import pathlib,re,sys; from extract_vacuum_mx_fixture import function; s=pathlib.Path(sys.argv[1]).read_text(); names=("undo_buf_sync_native_headers","undo_buf_sync_headers"); assert all(len(re.findall(r"^"+n+r"\(",s,re.M))==1 for n in names); print("\n".join(function(s,n,"static void") for n in names))' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_undo_tt_checkpoint: test_cluster_undo_tt_checkpoint.c test_cluster_undo_tt_checkpoint.inc \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+TESTS += test_cluster_undo_tt_checkpoint
+all: test_cluster_undo_tt_checkpoint
+.PHONY: clean-undo-tt-checkpoint
+clean: clean-undo-tt-checkpoint
+clean-undo-tt-checkpoint:
+	rm -f test_cluster_undo_tt_checkpoint test_cluster_undo_tt_checkpoint.d test_cluster_undo_tt_checkpoint.inc

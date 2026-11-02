@@ -29,6 +29,7 @@ int birth_managed_original_main(void);
 #define SLRU_FIXTURE_BIRTH_FLUSH(l) birth_flush(l)
 #define SLRU_FIXTURE_OPEN birth_snapshot_open
 #define CLOG_MANAGED_MAIN birth_managed_original_main
+#define CLOG_FIXTURE_NATIVE_MODE_PROVIDED
 #include "test_cluster_slru_clog_managed_write.c"
 #include "access/clog.h"
 static void WriteZeroPageXlogRec(int);

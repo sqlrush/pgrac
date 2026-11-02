@@ -11,14 +11,18 @@ VariableCache ShmemVariableCache = &creation_variables;
 bool cluster_shared_config;
 
 static void
-creation_reset(ProcessingMode processing)
+creation_reset_origin(ProcessingMode processing, uint16 origin)
 {
+	uint8 header[8192];
 	uint8 frame[8256];
 
 	checkpoint_reset(1);
 	CLOGConfigureManagedIO(&ctl);
 	*XactCtl = ctl;
+	binding.identity.origin = origin;
+	cached_bindings[0] = binding;
 	creation_support_select(&binding.identity, native_generation, 1);
+	cluster_enabled = true;
 	native_mode = CLUSTER_NATIVE_FILES_CREATION_V2;
 	Mode = processing;
 	cluster_shared_config = false;
@@ -28,10 +32,18 @@ creation_reset(ProcessingMode processing)
 	identities[0].identity.birth_full_xid = FullTransactionIdFromU64(3);
 	memset(page.data, 0, BLCKSZ);
 	page.data[0] = TRANSACTION_STATUS_COMMITTED << 6;
-	if (!cluster_clog_file_page_encode_v2(&binding, identities, (uint8 *) page.data,
+	if (!cluster_clog_file_header_encode_v2(&binding, header, sizeof(header)) ||
+		pwrite(borrowed, header, sizeof(header), 0) != sizeof(header) ||
+		!cluster_clog_file_page_encode_v2(&binding, identities, (uint8 *) page.data,
 		BLCKSZ, frame, sizeof(frame)) || ftruncate(borrowed, 8192 + 8256)
 		|| pwrite(borrowed, frame, sizeof(frame), 8192) != sizeof(frame)) abort();
 	dirty[0] = false;
+}
+
+static void
+creation_reset(ProcessingMode processing)
+{
+	creation_reset_origin(processing, 0);
 }
 
 UT_TEST(creation_trim_status_checkpoint_keep_original_identity_and_wal)
@@ -73,7 +85,7 @@ UT_TEST(creation_trim_status_checkpoint_keep_original_identity_and_wal)
 		UT_ASSERT_EQ(native_acquires, native_releases);
 		UT_ASSERT_EQ(native_borrows, 0);
 		UT_ASSERT_EQ(cluster_node_id, -1);
-		UT_ASSERT(!cluster_enabled && !dirty[0]);
+		UT_ASSERT(cluster_enabled && !dirty[0]);
 		control_held = false; io_held = true;
 		UT_ASSERT(cluster_clog_storage_read_page_v2(borrowed, &binding, 0,
 			&observed, payload, sizeof(payload)));
@@ -148,16 +160,76 @@ UT_TEST(creation_enabled_configuration_keeps_original_child_custody)
 	checkpoint_close();
 }
 
+UT_TEST(creation_frame_wal_uses_only_the_authenticated_batch_origin)
+{
+	for (unsigned sample = 0; sample < 60; sample++) {
+		unsigned fault = sample % 15;
+		uint8 before[16448], after[16448];
+		ClusterClogWalObservationV2 record = {0};
+		XLogRecPtr end = 777;
+		bool ok;
+
+		creation_reset_origin(NormalProcessing, (sample / 15 % 2) * 127);
+		cluster_enabled = sample >= 30;
+		if (fault == 1) creation_has_request = false;
+		if (fault == 2) creation_has_table = false;
+		if (fault == 3) MyBackendType = B_BACKEND;
+		if (fault == 4) IsUnderPostmaster = true;
+		if (fault == 5) IsPostmasterEnvironment = true;
+		if (fault == 6) creation_info.mode = CLUSTER_NATIVE_FILES_MANAGED_V2;
+		if (fault == 7) creation_context.creator_pid = 0;
+		if (fault == 8) creation_info.startup_generation++;
+		if (fault == 9) creation_info.table_generation = 0;
+		if (fault == 10) {
+			creation_context.boot_file_count = 0;
+			creation_info.creation = creation_context;
+		}
+		if (fault == 11) {
+			creation_context.boot_files[0].kind = CLUSTER_RECOVERY_FILE_UNDO_V2;
+			creation_info.creation = creation_context;
+		}
+		if (fault == 12) creation_info.creation.creator_pid++;
+		if (fault == 13) binding.identity.registration_generation++;
+		if (fault == 14) {
+			creation_context.boot_files[0].origin = 128;
+			creation_info.creation = creation_context;
+		}
+		UT_ASSERT_EQ(pread(borrowed, before, sizeof(before), 0), sizeof(before));
+		io_held = true;
+		ok = cluster_clog_storage_write_page_v2(borrowed, &binding, identities,
+			page.data, BLCKSZ, &end);
+		io_held = false;
+		UT_ASSERT_EQ(ok, fault == 0);
+		if (fault == 0) {
+			UT_ASSERT_EQ(inserts, 1);
+			UT_ASSERT_EQ(end, 1000);
+			UT_ASSERT(cluster_clog_wal_decode_v2(0x50, native_record,
+				sizeof(native_record), &record));
+			UT_ASSERT_EQ(record.binding.identity.origin, sample / 15 % 2 * 127);
+		} else {
+			UT_ASSERT_EQ(inserts + writes + reads, 0);
+			UT_ASSERT_EQ(end, 777);
+			UT_ASSERT_EQ(pread(borrowed, after, sizeof(after), 0), sizeof(after));
+			UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		}
+		UT_ASSERT_EQ(proc.delayChkptFlags, 0);
+		UT_ASSERT_EQ(cluster_node_id, -1);
+		UT_ASSERT_EQ(cluster_enabled, sample >= 30);
+		checkpoint_close();
+	}
+}
+
 int
 main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-creation-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(creation_trim_status_checkpoint_keep_original_identity_and_wal);
 	UT_RUN(creation_checkpoint_rejects_unrelated_batch_before_wal_or_io);
 	UT_RUN(creation_enabled_configuration_keeps_original_child_custody);
+	UT_RUN(creation_frame_wal_uses_only_the_authenticated_batch_origin);
 	rmdir(directory);
 	UT_DONE(); return ut_failed_count != 0;
 }

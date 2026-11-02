@@ -5,6 +5,7 @@
 #define SLRU_FIXTURE_ERROR_LOCKS() true
 #define SLRU_FIXTURE_ERROR_RESET() (InterruptHoldoffCount = 0)
 #define CLOG_MANAGED_MAIN redo_managed_main
+#define CLOG_FIXTURE_NATIVE_MODE_PROVIDED
 int redo_managed_main(void);
 int redo_unused_open(const char *, int);
 #include "test_cluster_slru_clog_managed_write.c"
