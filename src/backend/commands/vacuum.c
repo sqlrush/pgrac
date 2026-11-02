@@ -1825,8 +1825,8 @@ vac_update_datfrozenxid_internal(void)
 	bool		shared_xid = cluster_storage_mode_enabled() && cluster_shared_catalog;
 	FullTransactionId legal_next = InvalidFullTransactionId;
 	FullTransactionId newFrozenFull = InvalidFullTransactionId;
+	uint64		freeze_bound = 0;
 	ClusterXidStripeSampleFence fence;
-	bool sampled = false;
 #endif
 
 	/*
@@ -1862,27 +1862,54 @@ vac_update_datfrozenxid_internal(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
-	 * PGRAC: another node's relfrozenxid can exceed local nextXid.  Fold
-	 * shared XIDs against one legal FullXid sample, without holding the
-	 * allocator lock across catalogue I/O.  An unknown seed/window cannot
-	 * advance datfrozenxid, but does not prevent the independent MX scan.
+	 * PGRAC: capture the legal allocation window and READY F outside the
+	 * catalogue content lock.  F bounds each stored horizon; it does not
+	 * replace the original oldest seed or the minimum from the full scan.
 	 */
-	if (shared_xid && cluster_xid_striping && ShmemVariableCache != NULL) {
-		uint64 next_value;
-		uint64 seed_value;
+	if (shared_xid)
+	{
+		ClusterHeapFreezeWatermark watermark;
+		bool		sampled = false;
+		uint64		next_value;
+		uint64		seed_value;
 
-		LWLockAcquire(XidGenLock, LW_SHARED);
-		sampled
-			= cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid, &legal_next, &fence);
-		LWLockRelease(XidGenLock);
-		newFrozenFull = cluster_xid_widen(newFrozenXid, legal_next);
+		if (cluster_xid_striping && ShmemVariableCache != NULL)
+		{
+			LWLockAcquire(XidGenLock, LW_SHARED);
+			sampled = cluster_xid_stripe_sample_future(ShmemVariableCache->nextXid,
+													 &legal_next, &fence);
+			LWLockRelease(XidGenLock);
+		}
 		next_value = U64FromFullTransactionId(legal_next);
+		if (!sampled || !FullTransactionIdIsValid(legal_next) ||
+			next_value == UINT64_MAX ||
+			!TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) ||
+			!cluster_heap_freeze_watermark_sample(&watermark) ||
+			watermark.active_full_xid_min == 0 ||
+			watermark.active_full_xid_min == UINT64_MAX ||
+			!TransactionIdIsNormal((TransactionId) watermark.active_full_xid_min) ||
+			watermark.active_full_xid_min > next_value ||
+			next_value - watermark.active_full_xid_min >= UINT64CONST(0x80000000))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared heap freeze boundary is not established"),
+					 errdetail("Database %u has no current F in its legal XID window.", MyDatabaseId),
+					 errhint("Wait for a complete shared freeze sample; preserve the database.")));
+		freeze_bound = watermark.active_full_xid_min;
+		lastSaneFrozenXid = (TransactionId) freeze_bound;
+
+		/* The seed may exceed F before eligible relations lower the minimum. */
+		newFrozenFull = cluster_xid_widen(newFrozenXid, legal_next);
 		seed_value = U64FromFullTransactionId(newFrozenFull);
-		if (!sampled || !FullTransactionIdIsValid(legal_next)
-			|| !TransactionIdIsNormal(XidFromFullTransactionId(legal_next))
-			|| !FullTransactionIdIsValid(newFrozenFull) || seed_value > next_value
-			|| next_value - seed_value >= UINT64CONST(0x80000000))
-			legal_next = InvalidFullTransactionId;
+		if (!TransactionIdIsNormal(newFrozenXid) ||
+			!FullTransactionIdIsValid(newFrozenFull) || seed_value > next_value ||
+			next_value - seed_value >= UINT64CONST(0x80000000))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("shared database freeze metadata exceeds its proven XID boundary"),
+					 errdetail("Database %u: oldest seed %u, legal next %llu.",
+							   MyDatabaseId, newFrozenXid, (unsigned long long) next_value),
+					 errhint("Preserve the database and WAL; do not lower shared freeze metadata.")));
 	}
 #endif
 
@@ -1931,40 +1958,48 @@ vac_update_datfrozenxid_internal(void)
 		 * before those relations have been scanned and cleaned up.
 		 */
 
+#ifdef USE_PGRAC_CLUSTER
+		if (shared_xid)
+		{
+			FullTransactionId relfull = cluster_xid_widen(relfrozenxid, legal_next);
+			uint64		next_value = U64FromFullTransactionId(legal_next);
+			uint64		rel_value = U64FromFullTransactionId(relfull);
+
+			/* Unknown shared horizons cannot be skipped, including temp/TOAST. */
+			if (!TransactionIdIsNormal(relfrozenxid) ||
+				!FullTransactionIdIsValid(relfull) || rel_value > next_value ||
+				next_value - rel_value >= UINT64CONST(0x80000000) ||
+				rel_value > freeze_bound)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("shared relation freeze metadata exceeds its proven XID boundary"),
+						 errdetail("Relation %u: current %u, F %llu, legal next %llu.",
+								   classForm->oid, relfrozenxid,
+								   (unsigned long long) freeze_bound,
+								   (unsigned long long) next_value),
+						 errhint("Preserve the relation and WAL; do not lower shared freeze metadata.")));
+			if (rel_value < U64FromFullTransactionId(newFrozenFull))
+			{
+				newFrozenFull = relfull;
+				newFrozenXid = relfrozenxid;
+			}
+		}
+		else
+#endif
 		if (TransactionIdIsValid(relfrozenxid))
 		{
-#ifdef USE_PGRAC_CLUSTER
-			if (shared_xid) {
-				if (FullTransactionIdIsValid(legal_next)) {
-					FullTransactionId relfull = cluster_xid_widen(relfrozenxid, legal_next);
-					uint64 next_value = U64FromFullTransactionId(legal_next);
-					uint64 rel_value = U64FromFullTransactionId(relfull);
+			Assert(TransactionIdIsNormal(relfrozenxid));
 
-					if (!FullTransactionIdIsValid(relfull) || rel_value > next_value
-						|| next_value - rel_value >= UINT64CONST(0x80000000)) {
-						bogus = true;
-						break;
-					}
-					if (rel_value < U64FromFullTransactionId(newFrozenFull)) {
-						newFrozenFull = relfull;
-						newFrozenXid = relfrozenxid;
-					}
-				}
-			} else
-#endif
+			/* check for values in the future */
+			if (TransactionIdPrecedes(lastSaneFrozenXid, relfrozenxid))
 			{
-				Assert(TransactionIdIsNormal(relfrozenxid));
-
-				/* check for values in the future */
-				if (TransactionIdPrecedes(lastSaneFrozenXid, relfrozenxid)) {
-					bogus = true;
-					break;
-				}
-
-				/* determine new horizon */
-				if (TransactionIdPrecedes(relfrozenxid, newFrozenXid))
-					newFrozenXid = relfrozenxid;
+				bogus = true;
+				break;
 			}
+
+			/* determine new horizon */
+			if (TransactionIdPrecedes(relfrozenxid, newFrozenXid))
+				newFrozenXid = relfrozenxid;
 		}
 
 		if (MultiXactIdIsValid(relminmxid))
@@ -1995,8 +2030,13 @@ vac_update_datfrozenxid_internal(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: the same lease identity must still cover the completed scan. */
-	if (sampled && !cluster_xid_stripe_sample_fence_current(&fence))
-		legal_next = InvalidFullTransactionId;
+	if (shared_xid && !cluster_xid_stripe_sample_fence_current(&fence))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared heap freeze boundary is not established"),
+				 errdetail("Database %u lost its legal XID window during the catalogue scan.",
+						   MyDatabaseId),
+				 errhint("Wait for a complete shared freeze sample; preserve the database.")));
 #endif
 
 	/* Now fetch the pg_database tuple we need to update. */
@@ -2022,44 +2062,39 @@ vac_update_datfrozenxid_internal(void)
 	dbform = (Form_pg_database) GETSTRUCT(tuple);
 
 	/*
-	 * As in vac_update_relstats(), we ordinarily don't want to let
-	 * datfrozenxid go backward; but if it's "in the future" then it must be
-	 * corrupt and it seems best to overwrite it.
-	 *
-	 * PGRAC: another node may have advanced the shared tuple after our scan.
-	 * Preserve that locked value even when it exceeds our local scan bound.
+	 * Merge against the actual locked tuple, including equal candidates.
+	 * Shared metadata cannot be repaired using this node's local nextXid.
 	 */
-	if (dbform->datfrozenxid != newFrozenXid)
-	{
 #ifdef USE_PGRAC_CLUSTER
-		if (shared_xid)
-		{
-			/*
-			 * PGRAC: keep an unknown, future or ambiguous locked value.
-			 * Only merge two values inside the same proven legal window.
-			 */
-			FullTransactionId current = cluster_xid_widen(dbform->datfrozenxid,
-															 legal_next);
-			FullTransactionId proposed = cluster_xid_widen(newFrozenXid, legal_next);
-			uint64		next_value = U64FromFullTransactionId(legal_next);
-			uint64		current_value = U64FromFullTransactionId(current);
-			uint64		proposed_value = U64FromFullTransactionId(proposed);
+	if (shared_xid)
+	{
+		FullTransactionId current = cluster_xid_widen(dbform->datfrozenxid, legal_next);
+		uint64		next_value = U64FromFullTransactionId(legal_next);
+		uint64		current_value = U64FromFullTransactionId(current);
+		uint64		proposed_value = U64FromFullTransactionId(newFrozenFull);
 
-			if (FullTransactionIdIsValid(legal_next) &&
-				TransactionIdIsNormal(XidFromFullTransactionId(legal_next)) &&
-				FullTransactionIdIsValid(current) &&
-				FullTransactionIdIsValid(proposed) &&
-				current_value <= next_value && proposed_value <= next_value &&
-				next_value - current_value < UINT64CONST(0x80000000) &&
-				next_value - proposed_value < UINT64CONST(0x80000000))
-				update_frozen = current_value < proposed_value;
-		}
-		else
-#endif
-		if (TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid) ||
-			TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid))
-			update_frozen = true;
+		if (!TransactionIdIsNormal(dbform->datfrozenxid) ||
+			!FullTransactionIdIsValid(current) ||
+			current_value > next_value || proposed_value > next_value ||
+			next_value - current_value >= UINT64CONST(0x80000000) ||
+			next_value - proposed_value >= UINT64CONST(0x80000000) ||
+			current_value > freeze_bound || proposed_value > freeze_bound)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("shared database freeze metadata exceeds its proven XID boundary"),
+					 errdetail("Database %u: current %u, proposed %u, F %llu, legal next %llu.",
+							   MyDatabaseId, dbform->datfrozenxid, newFrozenXid,
+							   (unsigned long long) freeze_bound,
+							   (unsigned long long) next_value),
+					 errhint("Preserve the database and WAL; do not lower shared freeze metadata.")));
+		update_frozen = current_value < proposed_value;
 	}
+	else
+#endif
+	if (dbform->datfrozenxid != newFrozenXid &&
+		(TransactionIdPrecedes(dbform->datfrozenxid, newFrozenXid) ||
+		 TransactionIdPrecedes(lastSaneFrozenXid, dbform->datfrozenxid)))
+		update_frozen = true;
 	if (update_frozen)
 	{
 		dbform->datfrozenxid = newFrozenXid;
