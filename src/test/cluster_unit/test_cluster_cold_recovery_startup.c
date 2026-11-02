@@ -4207,10 +4207,20 @@ UT_TEST(test_prepare_ready_and_zero_budget_complete_every_phase)
 }
 
 #include "test_cluster_cold_relmap_create_record.inc"
+#include "test_cluster_cold_relmap_create_barrier.inc"
 
 int
 main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CREATE_BARRIER") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_create_barrier_matches_original_frames_without_old_serial_grant);
+		UT_RUN(test_create_barrier_held_checks_do_not_perform_profile_or_root_reads);
+		UT_RUN(test_create_barrier_wrong_episode_and_whole_source_drift_stick);
+		UT_RUN(test_create_barrier_current_error_revokes_original_episode);
+		UT_RUN(test_create_barrier_full_current_refuses_family_lock_before_root_io);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_CREATE_RECORD") != NULL) {
 		UT_PLAN(5);
 		UT_RUN(test_recovery_create_record_borrows_original_whole_episode);
@@ -4327,7 +4337,7 @@ main(void)
 		UT_RUN(test_pending_staging_first_owner_and_native_errors_keep_debt);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(218);
+	UT_PLAN(223);
 	UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
 	UT_RUN(test_terminal_original_episode_refuses_changed_whole_source_or_owner);
 	UT_RUN(test_pass2_source_drift_waits_for_post_ir_and_never_replays);
@@ -4549,6 +4559,11 @@ main(void)
 	UT_RUN(test_pending_staging_legacy_mixed_and_empty_still_refuse);
 	UT_RUN(test_pending_staging_late_source_pin_and_pair_changes_fail_closed);
 	UT_RUN(test_pending_staging_first_owner_and_native_errors_keep_debt);
+	UT_RUN(test_create_barrier_matches_original_frames_without_old_serial_grant);
+	UT_RUN(test_create_barrier_held_checks_do_not_perform_profile_or_root_reads);
+	UT_RUN(test_create_barrier_wrong_episode_and_whole_source_drift_stick);
+	UT_RUN(test_create_barrier_current_error_revokes_original_episode);
+	UT_RUN(test_create_barrier_full_current_refuses_family_lock_before_root_io);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

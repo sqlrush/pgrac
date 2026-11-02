@@ -506,10 +506,13 @@ bool LWLockHeldByMe(LWLock *lock)
 /* Saved-receipt readers remain real. The physical recheck boundary is
  * controlled here; the Startup storage component exercises its full body. */
 bool test_start_unused_relmap_recheck(const struct ClusterRecoveryStartV1 *start);
+bool test_start_unused_pending_relmap_recheck(const struct ClusterRecoveryStartV1 *start);
 #if !defined(TEST_CLUSTER_STARTUP_RELMAP_FILES) && !defined(TEST_CLUSTER_STARTUP_RELMAP_TERMINAL)
 #define cluster_cold_relmap_replay_recheck_v1 test_start_unused_relmap_recheck
+#define cluster_cold_relmap_pending_replay_recheck_v1 test_start_unused_pending_relmap_recheck
 #include "../../backend/cluster/cluster_cold_recovery_relmap.c"
 #undef cluster_cold_relmap_replay_recheck_v1
+#undef cluster_cold_relmap_pending_replay_recheck_v1
 #endif
 #include "test_cluster_cold_tx_owner.inc"
 #include "test_cluster_cold_tx_xid_maximum.inc"
@@ -3236,7 +3239,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(471);
+	UT_PLAN(472);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3247,7 +3250,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(460);
+	UT_PLAN(461);
 #endif
 	UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
 	UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
@@ -3279,7 +3282,7 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(432);
+	UT_PLAN(433);
 #endif
 	UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
 	UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
@@ -3400,6 +3403,7 @@ int main(void)
 	UT_RUN(test_ctrc_relmap_gate_cannot_replace_original_terminals);
 	UT_RUN(test_ctrc_relmap_gate_withdraws_old_observation_during_recheck);
 	UT_RUN(test_start_automatically_keeps_replayed_relmap_in_joint_obligation);
+	UT_RUN(test_start_mixed_creation_keeps_pending_receipt_without_old_count_bypass);
 	UT_RUN(test_start_refuses_incomplete_or_failed_relmap_receipts);
 	UT_RUN(test_start_cannot_silently_drop_relmap_source_or_cut);
 	UT_RUN(test_start_relmap_receipt_is_complete_by_value_and_bound_to_original_owner);

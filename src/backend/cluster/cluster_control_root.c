@@ -14527,16 +14527,33 @@ cluster_control_root_reserved_file_locked_v4(ClusterControlRelmapSelectionV2 *s,
 	*out = value;
 	return true;
 }
+typedef struct ControlRecoveryCreateDeltaV2 {
+	ClusterControlRelmapReferenceV2 before, after;
+	ClusterControlNativeTableInfoV2 table_before, table_after;
+	ClusterControlRootReadToken root_before[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
+	ClusterControlRootReadToken root_after[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
+	bool present[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
+	bool active, candidate_ready, primary_read_back, complete;
+	ClusterRecoveryCheckpointFileV2 files[2];
+	Size bytes;
+	ClusterRecoveryCheckpointFileSourceV2 sources[FLEXIBLE_ARRAY_MEMBER];
+} ControlRecoveryCreateDeltaV2;
+typedef bool (*ControlRecoveryCreateCheckV2)(ClusterControlRelmapRecoveryCreateV2 *);
 struct ClusterControlRelmapRecoveryCreateV2 {
 	ClusterColdTypedV1 *typed;
 	ClusterRecoveryFencePlan *fence;
 	ClusterControlRelmapReferenceV2 control;
 	ClusterControlRelmapSelectionV2 *selection;
+	ControlRecoveryCreateDeltaV2 *delta;
 	ClusterWalSourceRef source;
 	ClusterRecoveryFileIdentityV2 expected;
 	uint8 batch_uuid[16];
 	XLogRecPtr read, end;
 	uint64 cf_sequence, epoch, startup_generation;
+	uint64 barrier_episode_id;
+	/* Only these fixed original-owner functions are installed below. No
+	 * caller-supplied callback can create a recovery authorization. */
+	ControlRecoveryCreateCheckV2 held_check, current_check;
 	uintptr_t self;
 	int pid;
 	uint32 participant;
@@ -14544,16 +14561,50 @@ struct ClusterControlRelmapRecoveryCreateV2 {
 };
 
 static bool
-control_recovery_create_local_v2(ClusterControlRelmapRecoveryCreateV2 *c)
+control_recovery_create_serial_held_v2(ClusterControlRelmapRecoveryCreateV2 *c)
+{
+	return cluster_cold_typed_relmap_create_record_held_v2(c->typed, c->fence,
+		c->participant, &c->source, c->read, c->end);
+}
+static bool
+control_recovery_create_serial_current_v2(ClusterControlRelmapRecoveryCreateV2 *c)
+{
+	return cluster_cold_typed_relmap_create_record_current_v2(c->typed, c->fence,
+		c->participant, &c->source, c->read, c->end);
+}
+static bool
+control_recovery_create_barrier_held_v2(ClusterControlRelmapRecoveryCreateV2 *c)
+{
+	return c->barrier_episode_id && cluster_cold_typed_relmap_create_barrier_record_held_v2(
+		c->typed, c->fence, c->barrier_episode_id, c->participant, &c->source, c->read, c->end);
+}
+static bool
+control_recovery_create_barrier_current_v2(ClusterControlRelmapRecoveryCreateV2 *c)
+{
+	if (!c->barrier_episode_id) return false;
+	if (c->delta && (c->delta->active || c->delta->complete))
+		return cluster_cold_typed_relmap_create_barrier_confirmation_current_v2(
+			c->typed, c->fence, c->barrier_episode_id, c,
+			c->participant, &c->source, c->read, c->end);
+	return cluster_cold_typed_relmap_create_barrier_record_current_v2(
+		c->typed, c->fence, c->barrier_episode_id, c->participant, &c->source, c->read, c->end);
+}
+static bool
+control_recovery_create_actor_v2(ClusterControlRelmapRecoveryCreateV2 *c, bool first_cf)
 {
 	return c != NULL && c->self == (uintptr_t)c && c->pid == MyProcPid && !c->failed
 		   && MyBackendType == B_STARTUP && RecoveryInProgress()
 		   && cluster_cf_held_is_clusterwide(ExclusiveLock)
-		   && c->cf_sequence == cluster_cf_attempt_sequence()
+		   && (!first_cf || c->cf_sequence == cluster_cf_attempt_sequence())
 		   && c->epoch == cluster_epoch_get_current()
 		   && c->startup_generation == cluster_qvotec_get_self_incarnation()
-		   && cluster_cold_typed_relmap_create_record_held_v2(c->typed, c->fence, c->participant,
-															  &c->source, c->read, c->end);
+		   && c->held_check != NULL && c->current_check != NULL && c->held_check(c);
+}
+static bool
+control_recovery_create_local_v2(ClusterControlRelmapRecoveryCreateV2 *c)
+{
+	/* First authorization/confirmation remains tied to its one CF acquisition. */
+	return control_recovery_create_actor_v2(c, true);
 }
 static ClusterControlRootResult
 control_registry_batch_owner_v4(ClusterControlRelmapSelectionV2 *s, uint64 epoch,
@@ -14567,9 +14618,7 @@ control_registry_batch_owner_v4(ClusterControlRelmapSelectionV2 *s, uint64 epoch
 		|| s->work.root.header.v2.database_incarnation != recovery->expected.database_incarnation
 		|| memcmp(s->work.expected.identity.storage_uuid, recovery->expected.storage_uuid, 16)
 		|| memcmp(&s->work.expected, &recovery->control.config, sizeof(s->work.expected))
-		|| !cluster_cold_typed_relmap_create_record_current_v2(
-			recovery->typed, recovery->fence, recovery->participant, &recovery->source,
-			recovery->read, recovery->end))
+		|| !recovery->current_check(recovery))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -14828,6 +14877,21 @@ control_registry_batch_publish_v4(ClusterControlRelmapSelectionV2 *s,
 		? control_registry_clog_complete_build_v4(s, change, w, epoch)
 		: control_registry_batch_build_v4(s, change, w, epoch, recovery)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (recovery && recovery->delta) {
+		ControlRecoveryCreateDeltaV2 *d = recovery->delta;
+		if (!d->active || d->candidate_ready
+			|| !cluster_control_root_registry_decode_v4(w->root, sizeof(w->root),
+				s->work.expected.identity.storage_uuid,
+				s->work.expected.identity.system_identifier, &w->candidate))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		for (unsigned i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++i) {
+			if (d->present[i] != w->candidate.present[i])
+				return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			if (d->present[i])
+				make_read_token(&w->candidate, i + 1, CONTROL_ROOT_SOURCE_PRIMARY, &d->root_after[i]);
+		}
+		d->candidate_ready = true;
+	}
 	next = cluster_recovery_registry_view_v3(w->frozen);
 	if (!cluster_recovery_registry_create_v3(s->work.directory, next, s->budget, reference)
 		|| memcmp(reference, w->reference, sizeof(reference)))
@@ -14862,6 +14926,11 @@ control_registry_batch_publish_v4(ClusterControlRelmapSelectionV2 *s,
 		|| memcmp(s->work.recheck, w->root, 66560)
 		|| memcmp(s->work.recheck + 66560, s->work.pair, 66560))
 		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	/* This phase is produced only after BOTH actual files match the exact
+	 * original backup and this builder's primary candidate, above. */
+	if (recovery && recovery->delta) {
+		recovery->delta->primary_read_back = true;
+	}
 	result = control_file_dependencies_v4(&s->work.expected, &s->work);
 	if (result != 0)
 		return result;
@@ -15796,6 +15865,202 @@ cluster_control_relmap_recovery_create_confirmed_current_v2(
 	PG_END_TRY();
 	return valid;
 }
+bool
+cluster_control_relmap_recovery_create_confirmed_barrier_current_v2(
+	ClusterControlRelmapRecoveryCreateV2 *c, uint64 episode_id, const ClusterRecoveryCheckpointFileV2 *receipts,
+	uint64 count)
+{
+	struct {
+		ClusterControlNativeFileBorrowV2 borrow;
+		ClusterControlNativeTableInfoV2 before, after;
+		ClusterControlRelmapReferenceV2 reference;
+		ClusterControlRelmapSelectionV2 *selection;
+	} *volatile w = NULL;
+	volatile bool valid = false;
+	if (c == NULL)
+		return false;
+	PG_TRY();
+	{
+		do {
+			ClusterControlRelmapSelectionV2 *s;
+			const ClusterRecoveryRegistryV2 *registry;
+			ClusterControlFileKeyV2 key = {0};
+			if (!control_relmap_create_locks_v4() || !c->attempted || !c->confirmed
+				|| !episode_id || c->barrier_episode_id != episode_id
+				|| !c->available || !control_recovery_create_actor_v2(c, false)
+				|| !c->current_check(c) || bytes_are_zero(c->batch_uuid, 16))
+				break;
+			w = palloc0(sizeof(*w));
+			if (cluster_control_root_relmap_selection_read_locked_v4(&c->control.config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &w->selection) != 0) break;
+			s = w->selection;
+			registry = control_file_registry_v4(&s->work);
+			if (!registry || count != 2 || !receipts
+				|| !control_relmap_distinct_v4(s, receipts, 2 * sizeof(*receipts))
+				|| history_ranges_overlap(c, sizeof(*c), receipts, 2 * sizeof(*receipts))
+				|| !cold_relmap_output_distinct(c->typed, receipts, 2 * sizeof(*receipts))
+				|| !cluster_control_native_files_output_distinct_v2(receipts, 2 * sizeof(*receipts)))
+				break;
+			for (unsigned i = 0; i < 2; i++) {
+				const ClusterRecoveryCheckpointFileV2 *r = &receipts[i];
+				Size bytes;
+				if (!r->source_count || r->source_count != registry->coverage.source_count
+					|| r->source_count > s->budget / sizeof(*r->sources))
+					goto done;
+				bytes = r->source_count * sizeof(*r->sources);
+				if (!control_relmap_distinct_v4(s, r->sources, bytes)
+					|| history_ranges_overlap(c, sizeof(*c), r->sources, bytes)
+					|| history_ranges_overlap(receipts, 2 * sizeof(*receipts), r->sources, bytes)
+					|| !cold_relmap_output_distinct(c->typed, r->sources, bytes)
+					|| !cluster_control_native_files_output_distinct_v2(r->sources, bytes))
+					goto done;
+			}
+			if (!control_recovery_create_binding_v2(s, c, receipts))
+				break;
+			if (!cluster_control_root_relmap_selection_reference_v4(s, &w->reference)
+				|| !cluster_control_native_files_info_v2(&w->before)
+				|| w->before.mode != CLUSTER_NATIVE_FILES_MANAGED_V2
+				|| !w->before.table_generation
+				|| w->before.startup_generation != c->startup_generation
+				|| memcmp(&w->before.control, &w->reference, sizeof(w->reference)))
+				break;
+			key.kind = c->expected.kind;
+			key.origin = c->expected.origin;
+			key.database_oid = c->expected.database_oid;
+			key.tablespace_oid = c->expected.tablespace_oid;
+			key.object_id = c->expected.object_id;
+			if (!cluster_control_native_file_acquire_v2(&key, &w->borrow)
+				|| !control_registry_identity_v4(&w->borrow.expected, &c->expected)
+				|| w->borrow.table_generation != w->before.table_generation
+				|| w->borrow.startup_generation != w->before.startup_generation
+				|| !cluster_control_native_file_current_v2(&w->borrow)
+				|| !c->current_check(c)
+				|| cluster_control_root_relmap_selection_recheck_locked_v4(s) != 0
+				|| !c->current_check(c)
+				|| !control_recovery_create_binding_v2(s, c, receipts)
+				|| !cluster_control_native_files_info_v2(&w->after)
+				|| w->after.mode != w->before.mode
+				|| w->after.table_generation != w->before.table_generation
+				|| w->after.startup_generation != w->before.startup_generation
+				|| memcmp(&w->after.control, &w->before.control, sizeof(w->after.control))
+				|| !cluster_control_native_file_current_v2(&w->borrow)
+				|| !control_recovery_create_actor_v2(c, false))
+				break;
+			valid = true;
+		} while (0);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		if (w != NULL) {
+			if (w->borrow.private_self && !cluster_control_native_file_release_v2(&w->borrow)) {
+				cluster_control_relmap_recovery_create_fail_v2(c);
+				ereport(PANIC, (errmsg("could not return original confirmed relmap file borrow")));
+			}
+			cluster_control_root_relmap_selection_destroy_v4(&w->selection);
+			pfree(w);
+		}
+		if (!valid)
+			cluster_control_relmap_recovery_create_fail_v2(c);
+	}
+	PG_END_TRY();
+	return valid;
+}
+bool
+cluster_control_relmap_recovery_create_output_distinct_v2(
+	const ClusterControlRelmapRecoveryCreateV2 *c, const void *out, Size length)
+{
+	return c != NULL && out != NULL && length != 0
+		&& !history_ranges_overlap(c, sizeof(*c), out, length)
+		&& (c->delta == NULL || !history_ranges_overlap(c->delta, c->delta->bytes, out, length))
+		&& (c->selection == NULL
+			|| cluster_control_root_relmap_selection_output_distinct_v4(c->selection, out, length));
+}
+bool
+cluster_control_relmap_recovery_create_root_delta_v2(
+	const ClusterControlRelmapRecoveryCreateV2 *c, const ClusterColdTypedV1 *typed,
+	const ClusterRecoveryFencePlan *fence, uint64 episode_id,
+	const ClusterControlRootReadToken *before, ClusterControlRootReadToken *out)
+{
+	const ControlRecoveryCreateDeltaV2 *d;
+	uint16 thread;
+	if (!c || c->self != (uintptr_t)c || c->pid != MyProcPid || c->failed
+		|| !episode_id || c->barrier_episode_id != episode_id || c->typed != typed
+		|| c->fence != fence || !(d = c->delta) || (!d->active && !d->complete)
+		|| !before || !out || !cluster_control_relmap_recovery_create_output_distinct_v2(
+			c, out, sizeof(*out))
+		|| history_ranges_overlap(before, sizeof(*before), out, sizeof(*out))
+		|| !(thread = before->origin_thread_id) || thread > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| !d->present[thread - 1]
+		|| memcmp(before, &d->root_before[thread - 1], sizeof(*before))
+		|| (d->active && (MyBackendType != B_STARTUP
+			|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+			|| c->epoch != cluster_epoch_get_current()
+			|| c->startup_generation != cluster_qvotec_get_self_incarnation()
+			|| c->cf_sequence != cluster_cf_attempt_sequence())))
+		return false;
+	*out = d->primary_read_back ? d->root_after[thread - 1] : d->root_before[thread - 1];
+	return true;
+}
+bool
+cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+	const ClusterControlRelmapRecoveryCreateV2 *c, const ClusterColdTypedV1 *typed,
+	const ClusterRecoveryFencePlan *fence, uint64 episode_id)
+{
+	/* Observation only. In particular do not call the carrier's current or
+	 * held callbacks: H invokes this from its original current proof. */
+	return c && c->self == (uintptr_t)c && c->pid == MyProcPid && !c->failed
+		&& episode_id && c->barrier_episode_id == episode_id && c->typed == typed
+		&& c->fence == fence && c->attempted && c->confirmed && c->available
+		&& c->delta && c->delta->complete && !c->delta->active;
+}
+bool
+cluster_control_relmap_recovery_create_confirmed_root_delta_v2(
+	const ClusterControlRelmapRecoveryCreateV2 *c, const ClusterColdTypedV1 *typed,
+	const ClusterRecoveryFencePlan *fence, uint64 episode_id,
+	const ClusterControlRootReadToken *before, ClusterControlRootReadToken *out)
+{
+	return cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+			c, typed, fence, episode_id)
+		&& cluster_control_relmap_recovery_create_root_delta_v2(
+			c, typed, fence, episode_id, before, out);
+}
+bool
+cluster_control_relmap_recovery_create_control_delta_v2(
+	const ClusterControlRelmapRecoveryCreateV2 *c, const ClusterColdTypedV1 *typed,
+	const ClusterRecoveryFencePlan *fence, uint64 episode_id,
+	const ClusterRecoveryFileIdentityV2 *expected_identity, const uint8 batch[16],
+	const ClusterControlRelmapReferenceV2 *before,
+	const ClusterControlNativeTableInfoV2 *table_before,
+	ClusterControlRelmapReferenceV2 *after, ClusterControlNativeTableInfoV2 *table_after)
+{
+	const ControlRecoveryCreateDeltaV2 *d;
+	ClusterControlNativeTableInfoV2 expected, actual;
+	if (!c || c->self != (uintptr_t)c || c->pid != MyProcPid || c->failed
+		|| !episode_id || c->barrier_episode_id != episode_id || c->typed != typed
+		|| c->fence != fence || !c->confirmed || !(d = c->delta) || !d->complete
+		|| !expected_identity || !batch
+		|| !control_registry_identity_v4(expected_identity, &c->expected)
+		|| memcmp(batch, c->batch_uuid, 16)
+		|| !before || !table_before || !after || !table_after
+		|| !cluster_control_relmap_recovery_create_output_distinct_v2(c, after, sizeof(*after))
+		|| !cluster_control_relmap_recovery_create_output_distinct_v2(
+			c, table_after, sizeof(*table_after))
+		|| history_ranges_overlap(after, sizeof(*after), table_after, sizeof(*table_after))
+		|| history_ranges_overlap(before, sizeof(*before), after, sizeof(*after))
+		|| history_ranges_overlap(before, sizeof(*before), table_after, sizeof(*table_after))
+		|| history_ranges_overlap(table_before, sizeof(*table_before), after, sizeof(*after))
+		|| history_ranges_overlap(table_before, sizeof(*table_before), table_after, sizeof(*table_after))
+		|| memcmp(before, &d->before, sizeof(*before)))
+		return false;
+	expected = d->table_before;
+	actual = *table_before;
+	expected.borrowed = actual.borrowed = 0;
+	if (memcmp(&expected, &actual, sizeof(actual))) return false;
+	*after = d->after;
+	*table_after = d->table_after;
+	return true;
+}
 void
 cluster_control_relmap_recovery_create_destroy_v2(ClusterControlRelmapRecoveryCreateV2 **p)
 {
@@ -15806,11 +16071,14 @@ cluster_control_relmap_recovery_create_destroy_v2(ClusterControlRelmapRecoveryCr
 		cluster_control_relmap_recovery_create_fail_v2(c);
 	*p = NULL;
 	cluster_control_root_relmap_selection_destroy_v4(&c->selection);
+	if (c->delta) pfree(c->delta);
 	c->self = 0;
 	pfree(c);
 }
-ClusterControlNativeResultV2
-cluster_control_relmap_recovery_create_begin_locked_v2(
+static ClusterControlNativeResultV2
+control_recovery_create_begin_v2(
+	uint64 episode_id, ControlRecoveryCreateCheckV2 held_check,
+	ControlRecoveryCreateCheckV2 current_check,
 	ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, uint32 participant,
 	const ClusterWalSourceRef *source, XLogRecPtr read, XLogRecPtr end,
 	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
@@ -15839,6 +16107,9 @@ cluster_control_relmap_recovery_create_begin_locked_v2(
 		return result;
 	c = palloc0(sizeof(*c));
 	c->typed = typed;
+	c->barrier_episode_id = episode_id;
+	c->held_check = held_check;
+	c->current_check = current_check;
 	c->fence = fence;
 	c->participant = participant;
 	c->source = *source;
@@ -15856,8 +16127,7 @@ cluster_control_relmap_recovery_create_begin_locked_v2(
 		do {
 			ClusterControlRelmapSelectionV2 *s;
 			if (!c->epoch || !c->startup_generation || !control_recovery_create_local_v2(c)
-				|| !cluster_cold_typed_relmap_create_record_current_v2(typed, fence, participant,
-																	   &c->source, read, end)
+				|| !c->current_check(c)
 				|| cluster_control_root_relmap_format_locked_v2(
 					   CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &format)
 					   != 0
@@ -15891,6 +16161,29 @@ cluster_control_relmap_recovery_create_begin_locked_v2(
 	}
 	PG_END_TRY();
 	return result;
+}
+ClusterControlNativeResultV2
+cluster_control_relmap_recovery_create_begin_locked_v2(
+	ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, uint32 participant,
+	const ClusterWalSourceRef *source, XLogRecPtr read, XLogRecPtr end,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	ClusterControlRelmapRecoveryCreateV2 **out)
+{
+	return control_recovery_create_begin_v2(0, control_recovery_create_serial_held_v2,
+		control_recovery_create_serial_current_v2, typed, fence, participant,
+		source, read, end, expected, batch, out);
+}
+ClusterControlNativeResultV2
+cluster_control_relmap_recovery_create_begin_barrier_locked_v2(
+	ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, uint64 episode_id,
+	uint32 participant, const ClusterWalSourceRef *source, XLogRecPtr read, XLogRecPtr end,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	ClusterControlRelmapRecoveryCreateV2 **out)
+{
+	if (!episode_id) return CLUSTER_NATIVE_FILES_REFUSED_V2;
+	return control_recovery_create_begin_v2(episode_id, control_recovery_create_barrier_held_v2,
+		control_recovery_create_barrier_current_v2, typed, fence, participant,
+		source, read, end, expected, batch, out);
 }
 ClusterControlNativeResultV2
 cluster_control_relmap_recovery_create_confirm_locked_v2(
@@ -15936,6 +16229,40 @@ cluster_control_relmap_recovery_create_confirm_locked_v2(
 				|| control_registry_batch_owner_v4(s, c->epoch, c->startup_generation, false, c)
 					   != 0)
 				break;
+			if (c->barrier_episode_id) {
+				ControlRecoveryCreateDeltaV2 *d;
+				Size intervals = receipts[0].source_count + receipts[1].source_count;
+				Size bytes;
+				if (c->delta || intervals >
+						(s->budget - Min(s->budget, sizeof(*d))) / sizeof(*d->sources))
+					break;
+				bytes = sizeof(*d) + intervals * sizeof(*d->sources);
+				if (bytes > s->budget) break;
+				d = palloc0(bytes);
+				d->bytes = bytes;
+				c->delta = d;
+				d->before = d->after = c->control;
+				if (!cluster_control_native_files_info_v2(&d->table_before)
+					|| memcmp(&d->table_before.control, &c->control, sizeof(c->control))) break;
+				d->table_after = d->table_before;
+				for (unsigned i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++i) {
+					d->present[i] = s->work.root.present[i];
+					if (d->present[i]) {
+						make_read_token(&s->work.root, i + 1, CONTROL_ROOT_SOURCE_PRIMARY,
+							&d->root_before[i]);
+						d->root_after[i] = d->root_before[i];
+					}
+				}
+				intervals = 0;
+				for (unsigned i = 0; i < 2; ++i) {
+					d->files[i] = receipts[i];
+					d->files[i].sources = d->sources + intervals;
+					memcpy(d->sources + intervals, receipts[i].sources,
+						receipts[i].source_count * sizeof(*d->sources));
+					intervals += receipts[i].source_count;
+				}
+				d->active = true;
+			}
 			if (c->available) {
 				result = CLUSTER_NATIVE_FILES_OK_V2;
 				break;
@@ -15971,6 +16298,12 @@ cluster_control_relmap_recovery_create_confirm_locked_v2(
 					   != 0
 				|| !control_recovery_create_local_v2(c))
 				break;
+			if (c->delta && (!cluster_control_root_relmap_selection_reference_v4(
+					c->selection, &c->delta->after)
+				|| !cluster_control_native_files_info_v2(&c->delta->table_after)
+				|| memcmp(&c->delta->after, &c->delta->table_after.control,
+					sizeof(c->delta->after))))
+				break;
 			result = CLUSTER_NATIVE_FILES_OK_V2;
 		} while (0);
 	done:;
@@ -15981,8 +16314,11 @@ cluster_control_relmap_recovery_create_confirm_locked_v2(
 			control_clog_preview_free_v4(preview);
 		if (result != CLUSTER_NATIVE_FILES_OK_V2)
 			cluster_control_relmap_recovery_create_fail_v2(c);
-		else
+		else {
 			c->confirmed = true;
+			if (c->delta) c->delta->complete = true;
+		}
+		if (c->delta) c->delta->active = false;
 	}
 	PG_END_TRY();
 	return result;

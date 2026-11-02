@@ -45,6 +45,7 @@ ClusterControlRootResult cluster_control_root_relmap_format_locked_v2(Size budge
 	memcpy(out->config.identity.storage_uuid, roots[1].identity.storage_uuid, 16);
 	memcpy(out->config.identity.authority_uuid, roots[1].identity.authority_uuid, 16);
 	registry_reference.config = out->config;
+	memcpy(out->root_sha256, registry_reference.root_pair_sha256, 32);
 	if (registry_error) pg_re_throw();
 	return registry_ok ? 0 : CLUSTER_CONTROL_ROOT_IO_ERROR;
 }
@@ -120,4 +121,47 @@ void cluster_control_native_inventory_destroy_v2(ClusterControlNativeInventoryV2
 {
 	if (*out) pfree(*out);
 	*out = NULL;
+}
+
+static unsigned confirm_fixture;
+static ClusterColdTypedV1 *confirm_typed;
+static ClusterControlNativeTableInfoV2 confirm_before, confirm_after;
+static bool confirm_metadata_ok;
+static bool confirm_install_ok = true, confirm_install_error;
+static unsigned confirm_installs;
+bool
+cluster_recovery_merge_fence_plan_confirm_delta_v1(ClusterRecoveryFencePlan *f,
+	uint64 id, const ClusterColdTypedV1 *typed,
+	const ClusterControlRelmapRecoveryCreateV2 *c)
+{
+	UT_ASSERT(registry_cf_held);
+	UT_ASSERT(c == (void *)&confirm_fixture && typed == confirm_typed
+		&& f == (void *)&fixture_context && id == 73);
+	confirm_installs++;
+	if (confirm_install_error) pg_re_throw();
+	return confirm_install_ok;
+}
+bool
+cluster_control_native_files_info_v2(ClusterControlNativeTableInfoV2 *out)
+{
+	*out = confirm_after;
+	return registry_ok;
+}
+bool
+cluster_control_relmap_recovery_create_control_delta_v2(
+	const ClusterControlRelmapRecoveryCreateV2 *c, const ClusterColdTypedV1 *typed,
+	const struct ClusterRecoveryFencePlan *f, uint64 id,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	const ClusterControlRelmapReferenceV2 *before, const ClusterControlNativeTableInfoV2 *table,
+	ClusterControlRelmapReferenceV2 *after, ClusterControlNativeTableInfoV2 *after_table)
+{
+	if (!confirm_metadata_ok || c != (void *)&confirm_fixture || typed != confirm_typed
+		|| f != (void *)&fixture_context || id != 73
+		|| memcmp(expected, &registry_entries[0].expected, sizeof(*expected))
+		|| memcmp(batch, registry_entries[0].batch_uuid, 16)
+		|| memcmp(before, &confirm_before.control, sizeof(*before))
+		|| memcmp(table, &confirm_before, sizeof(*table))) return false;
+	*after = confirm_after.control;
+	*after_table = confirm_after;
+	return true;
 }

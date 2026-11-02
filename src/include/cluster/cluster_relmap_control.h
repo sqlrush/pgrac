@@ -133,6 +133,35 @@ extern bool cluster_relmap_recovery_create_recheck_v2(
 	ClusterRelmapRecoveryCreateReceiptV2 *, ClusterColdTypedV1 *,
 	struct ClusterRecoveryFencePlan *);
 
+/* Creation-only original typed/H barrier. First execution keeps one CF-X
+ * acquisition; repetitions compare the original source and both files before
+ * A's independent read-only confirmation check under the current CF-X.
+ * Nonzero episode_id is saved once. No generic serial or tx_fence substitution. */
+extern bool cluster_relmap_control_recovery_create_capture_barrier_v2(
+	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint64 episode_id,
+	uint32 participant, const ClusterWalSourceRef *, XLogReaderState *,
+	const ClusterRecoveryFileIdentityV2 *, const uint8 batch_uuid[16],
+	Size receipt_byte_budget, ClusterRelmapRecoveryCreateReceiptV2 **out);
+extern bool cluster_relmap_recovery_create_recheck_barrier_v2(
+	ClusterRelmapRecoveryCreateReceiptV2 *, ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *, uint64 episode_id);
+extern bool cluster_relmap_recovery_create_physical_recheck_barrier_v2(
+	ClusterRelmapRecoveryCreateReceiptV2 *, ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *, uint64 episode_id);
+extern bool cluster_cold_typed_relmap_create_apply_barrier_v2(ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *, uint64 episode_id, const ClusterColdStepV1 *,
+	XLogReaderState *, Size receipt_byte_budget);
+extern bool cluster_cold_typed_relmap_create_ready_barrier_v2(ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *, uint64 episode_id);
+/* Borrow the SAME successful D receipt and A confirmation, valid only until
+ * original plan destruction. Saved inputs only: no I/O/currentness or delta
+ * publication. Reject aliases before touching either output; refusal leaves
+ * both outputs unchanged. Failed/incomplete executions are never exported. */
+extern bool cluster_cold_typed_relmap_create_receipt_at_barrier_v2(
+	ClusterColdTypedV1 *, uint64 episode_id, uint32 index,
+	const ClusterRelmapRecoveryCreateReceiptV2 **receipt,
+	const ClusterControlRelmapRecoveryCreateV2 **confirmation);
+
 
 
 /* Original checkpoint-local copies, never CF custody or a coverage grant.

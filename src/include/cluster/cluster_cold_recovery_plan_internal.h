@@ -35,10 +35,18 @@
 #include "cluster/cluster_relmap_recovery_internal.h"
 #include "cluster/cluster_control_native_files.h"
 
+struct ClusterControlRelmapRecoveryCreateV2;
+typedef struct ColdNativeConfirmV2 {
+	uint32 index;
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation;
+} ColdNativeConfirmV2;
 typedef struct ClusterColdNativeRegistryV2 {
 	ClusterControlRelmapFormatV2 format;
 	ClusterControlNativeInventoryV2 *inventory;
 	ClusterColdRelmapCreateExpectedV1 *entries;
+	ColdNativeConfirmV2 *confirms;
+	struct ClusterRecoveryFencePlan *confirm_fence;
+	uint64 confirm_episode, confirm_count;
 	uint64 count;
 	Size bytes;
 } ClusterColdNativeRegistryV2;
@@ -387,6 +395,8 @@ cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Si
 		if (cold_relmap_storage_overlap(out, bytes, s, sizeof(*s))
 			|| cold_relmap_storage_overlap(out, bytes, s->entries,
 				s->count * sizeof(*s->entries))
+			|| cold_relmap_storage_overlap(out, bytes, s->confirms,
+				s->count * sizeof(*s->confirms))
 			|| (s->inventory && cold_relmap_storage_overlap(out, bytes, s->inventory,
 				s->inventory->private_bytes))) return false;
 	}

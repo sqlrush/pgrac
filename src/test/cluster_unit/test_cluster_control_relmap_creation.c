@@ -394,9 +394,331 @@ UT_TEST(pre_scan_projection_preserves_reserved_to_available_original_batch)
 	batch_end();
 }
 
+/* Explicit creation barrier provider: the full Startup/H implementation is
+ * exercised by its own original-source fixture, not invented by this leaf. */
+static uint64 recovery_barrier_episode = 73;
+static bool recovery_barrier_current = true;
+static bool recovery_barrier_exact_root;
+static ClusterControlRootReadToken recovery_barrier_before;
+static bool actual_root_token(uint16, ClusterControlRootReadToken *);
+bool
+cluster_cold_typed_relmap_create_barrier_record_current_v2(ClusterColdTypedV1 *t,
+	struct ClusterRecoveryFencePlan *f, uint64 id, uint32 p,
+	const ClusterWalSourceRef *source, XLogRecPtr read, XLogRecPtr end)
+{
+	ClusterControlRootReadToken current;
+	return recovery_barrier_current && id == recovery_barrier_episode
+		&& cluster_cold_typed_relmap_create_record_current_v2(t, f, p, source, read, end)
+		&& (!recovery_barrier_exact_root || (actual_root_token(1, &current)
+			&& !memcmp(&current, &recovery_barrier_before, sizeof(current))));
+}
+bool
+cluster_cold_typed_relmap_create_barrier_record_held_v2(ClusterColdTypedV1 *t,
+	struct ClusterRecoveryFencePlan *f, uint64 id, uint32 p,
+	const ClusterWalSourceRef *source, XLogRecPtr read, XLogRecPtr end)
+{
+	return recovery_barrier_current && id == recovery_barrier_episode
+		&& cluster_cold_typed_relmap_create_record_held_v2(t, f, p, source, read, end);
+}
+
+bool cluster_cold_typed_relmap_create_barrier_confirmation_current_v2(
+	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint64,
+	const ClusterControlRelmapRecoveryCreateV2 *, uint32,
+	const ClusterWalSourceRef *, XLogRecPtr, XLogRecPtr);
+bool
+cluster_cold_typed_relmap_create_barrier_confirmation_current_v2(
+	ClusterColdTypedV1 *t, struct ClusterRecoveryFencePlan *f, uint64 id,
+	const ClusterControlRelmapRecoveryCreateV2 *c, uint32 p,
+	const ClusterWalSourceRef *source, XLogRecPtr read, XLogRecPtr end)
+{
+	ClusterControlRootReadToken effective, actual;
+	if (recovery_barrier_exact_root) {
+		ClusterControlRootReadToken untouched = {0}, final = {0};
+		/* This callback runs inside confirm, before final success/table
+		 * publication. Its temporary phase is never final delta authority. */
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+			c, t, f, id));
+		UT_ASSERT(!cluster_control_relmap_recovery_create_confirmed_root_delta_v2(
+			c, t, f, id, &recovery_barrier_before, &final));
+		UT_ASSERT(!memcmp(&untouched, &final, sizeof(final)));
+		cf_held = false;
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_v2(
+			c, t, f, id, &recovery_barrier_before, &final));
+		UT_ASSERT(!memcmp(&untouched, &final, sizeof(final)));
+		cf_held = true;
+	}
+	return recovery_barrier_current && id == recovery_barrier_episode
+		&& cluster_cold_typed_relmap_create_record_current_v2(t, f, p, source, read, end)
+		&& (!recovery_barrier_exact_root
+			|| (cluster_control_relmap_recovery_create_root_delta_v2(
+				c, t, f, id, &recovery_barrier_before, &effective)
+				&& actual_root_token(1, &actual) && !memcmp(&effective, &actual, sizeof(actual))));
+}
+static bool
+barrier_confirmed_setup(bool already_available, ClusterControlNativeRelmapCreateV2 **original,
+	ClusterControlRelmapRecoveryCreateV2 **receipt, ClusterRecoveryCheckpointFileV2 files[2])
+{
+	table_reset(); owner_begin();
+	recovery_barrier_current = true;
+	if (reserve_target(original) != 0 || !*original) return false;
+	recovery_pair_receipts(*original, files);
+	if (already_available && cluster_control_native_files_complete_relmap_create_locked_v2(
+			*original, files, 2) != 0) return false;
+	recovery_enter();
+	return cluster_control_relmap_recovery_create_begin_barrier_locked_v2(
+		&recovery_typed, recovery_fence, recovery_barrier_episode, 0, &recovery_source,
+		0x200, 0x280, &(*original)->expected, (*original)->batch_uuid, receipt) == 0
+		&& cluster_control_relmap_recovery_create_confirm_locked_v2(*receipt, files, 2) == 0;
+}
+UT_TEST(repeated_creation_barrier_rechecks_same_original_batch_after_fresh_cf)
+{
+	for (unsigned available = 0; available < 2; ++available) {
+		ClusterControlNativeRelmapCreateV2 *original = NULL;
+		ClusterControlRelmapRecoveryCreateV2 *receipt = NULL;
+		ClusterRecoveryCheckpointFileV2 files[2];
+		bool ready = barrier_confirmed_setup(available, &original, &receipt, files);
+		unsigned publications = root_renames;
+		UT_ASSERT(ready);
+		if (!ready) { recovery_confirmed_cleanup(&original, &receipt); return; }
+		UT_ASSERT(cluster_control_relmap_recovery_create_confirmed_barrier_current_v2(
+			receipt, recovery_barrier_episode, files, 2));
+		cf_held = false; cf_sequence++; cf_held = true;
+		UT_ASSERT(cluster_control_relmap_recovery_create_confirmed_barrier_current_v2(
+			receipt, recovery_barrier_episode, files, 2));
+		UT_ASSERT_EQ(root_renames, publications);
+		recovery_confirmed_cleanup(&original, &receipt);
+	}
+}
+UT_TEST(first_creation_barrier_authorization_still_refuses_fresh_cf)
+{
+	ClusterControlNativeRelmapCreateV2 *original = NULL;
+	ClusterControlRelmapRecoveryCreateV2 *receipt = NULL;
+	ClusterRecoveryCheckpointFileV2 files[2];
+	table_reset(); owner_begin(); recovery_barrier_current = true;
+	UT_ASSERT_EQ(reserve_target(&original), 0);
+	if (!original) { batch_end(); return; }
+	recovery_pair_receipts(original, files); recovery_enter();
+	UT_ASSERT_EQ(cluster_control_relmap_recovery_create_begin_barrier_locked_v2(
+		&recovery_typed, recovery_fence, recovery_barrier_episode, 0, &recovery_source,
+		0x200, 0x280, &original->expected, original->batch_uuid, &receipt), 0);
+	cf_held = false; cf_sequence++; cf_held = true;
+	UT_ASSERT(!cluster_control_relmap_recovery_create_current_v2(receipt));
+	UT_ASSERT(cluster_control_relmap_recovery_create_confirm_locked_v2(receipt, files, 2) != 0);
+	UT_ASSERT_EQ(root_renames, 2);
+	recovery_confirmed_cleanup(&original, &receipt);
+}
+UT_TEST(repeated_barrier_wrong_episode_or_source_cannot_reselect)
+{
+	for (unsigned which = 0; which < 3; ++which) {
+		ClusterControlNativeRelmapCreateV2 *original = NULL;
+		ClusterControlRelmapRecoveryCreateV2 *receipt = NULL;
+		ClusterRecoveryCheckpointFileV2 files[2];
+		bool ready = barrier_confirmed_setup(false, &original, &receipt, files);
+		unsigned publications = root_renames;
+		UT_ASSERT(ready);
+		if (!ready) { recovery_confirmed_cleanup(&original, &receipt); return; }
+		cf_held = false; cf_sequence++; cf_held = true;
+		if (which == 1) recovery_barrier_current = false;
+		if (which == 2) files[1].image_digest[0] ^= 1;
+		UT_ASSERT(!cluster_control_relmap_recovery_create_confirmed_barrier_current_v2(
+			receipt, recovery_barrier_episode + (which == 0), files, 2));
+		UT_ASSERT(recovery_failed != 0);
+		UT_ASSERT_EQ(root_renames, publications);
+		recovery_confirmed_cleanup(&original, &receipt);
+	}
+}
+
+static bool
+actual_root_token(uint16 thread, ClusterControlRootReadToken *token)
+{
+	ControlRootImage *image = calloc(1, sizeof(*image));
+	uint8 *pair = malloc(133120);
+	bool ok = image && pair && cluster_control_root_registry_capture_v4(
+		selection_dir, root.header.storage_uuid, 11, pair, image)
+		&& thread && thread <= CLUSTER_CONTROL_ROOT_RECORD_COUNT && image->present[thread - 1];
+	if (ok) {
+		const ClusterControlRootSnapshot *r = &image->records[thread - 1];
+		memset(token, 0, sizeof(*token));
+		memcpy(token->authority_uuid, r->identity.authority_uuid, 16);
+		token->origin_thread_id = thread;
+		token->source = 1; /* actual selected primary */
+		token->lifecycle = r->lifecycle;
+		token->root_lineage_seq = r->identity.root_lineage_seq;
+		token->file_txn_seq = image->header.file_txn_seq;
+		token->root_publish_seq = r->root_publish_seq;
+		token->record_crc32c = image->record_crc32c[thread - 1];
+		token->root_flags = r->root_flags;
+	}
+	free(pair); free(image); return ok;
+}
+UT_TEST(original_confirm_keeps_full_root_checks_during_own_publication)
+{
+	ClusterControlNativeRelmapCreateV2 *original = NULL;
+	ClusterControlRelmapRecoveryCreateV2 *receipt = NULL;
+	ClusterRecoveryCheckpointFileV2 files[2];
+	table_reset(); owner_begin(); recovery_barrier_current = true;
+	UT_ASSERT_EQ(reserve_target(&original), 0);
+	if (!original) { batch_end(); return; }
+	recovery_pair_receipts(original, files);
+	UT_ASSERT(actual_root_token(1, &recovery_barrier_before));
+	recovery_barrier_exact_root = true;
+	recovery_enter();
+	UT_ASSERT_EQ(cluster_control_relmap_recovery_create_begin_barrier_locked_v2(
+		&recovery_typed, recovery_fence, recovery_barrier_episode, 0, &recovery_source,
+		0x200, 0x280, &original->expected, original->batch_uuid, &receipt), 0);
+	UT_ASSERT(receipt != NULL);
+	if (receipt)
+		UT_ASSERT_EQ(cluster_control_relmap_recovery_create_confirm_locked_v2(receipt, files, 2), 0);
+	recovery_barrier_exact_root = false;
+	recovery_confirmed_cleanup(&original, &receipt);
+}
+UT_TEST(original_confirm_delta_carries_exact_root_without_rebasing)
+{
+	for (unsigned available = 0; available < 2; ++available) {
+		ClusterControlNativeRelmapCreateV2 *original = NULL;
+		ClusterControlRelmapRecoveryCreateV2 *receipt = NULL;
+		ClusterRecoveryCheckpointFileV2 files[2];
+		ClusterControlRootReadToken before, after, observed, untouched;
+		ClusterControlNativeTableInfoV2 before_table, after_table, actual_table;
+		ClusterControlRelmapReferenceV2 after_control, bad_control;
+		table_reset(); owner_begin(); recovery_barrier_current = true;
+		UT_ASSERT_EQ(reserve_target(&original), 0);
+		if (!original) { batch_end(); return; }
+		recovery_pair_receipts(original, files);
+		if (available) UT_ASSERT_EQ(cluster_control_native_files_complete_relmap_create_locked_v2(
+			original, files, 2), 0);
+		UT_ASSERT(actual_root_token(1, &before));
+		UT_ASSERT(cluster_control_native_files_info_v2(&before_table));
+		recovery_enter();
+		UT_ASSERT_EQ(cluster_control_relmap_recovery_create_begin_barrier_locked_v2(
+			&recovery_typed, recovery_fence, recovery_barrier_episode, 0, &recovery_source,
+			0x200, 0x280, &original->expected, original->batch_uuid, &receipt), 0);
+		UT_ASSERT(receipt != NULL);
+		if (!receipt) { recovery_confirmed_cleanup(&original, &receipt); return; }
+		memset(&after, 0x5c, sizeof(after)); untouched = after;
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode, &before, &after));
+		UT_ASSERT(!memcmp(&after, &untouched, sizeof(after)));
+		UT_ASSERT_EQ(cluster_control_relmap_recovery_create_confirm_locked_v2(receipt, files, 2), 0);
+		UT_ASSERT(actual_root_token(1, &observed));
+		UT_ASSERT(cluster_control_relmap_recovery_create_root_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode, &before, &after));
+		UT_ASSERT(cluster_control_relmap_recovery_create_confirmed_root_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode, &before, &after));
+		UT_ASSERT(!memcmp(&after, &observed, sizeof(after)));
+		UT_ASSERT_EQ(after.file_txn_seq, before.file_txn_seq + !available);
+		UT_ASSERT(cluster_control_relmap_recovery_create_control_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode,
+			&original->expected, original->batch_uuid,
+			&before_table.control, &before_table, &after_control, &after_table));
+		UT_ASSERT(cluster_control_native_files_info_v2(&actual_table));
+		UT_ASSERT(!memcmp(&after_control, &actual_table.control, sizeof(after_control)));
+		UT_ASSERT(!memcmp(&after_table, &actual_table, sizeof(after_table)));
+		bad_control = before_table.control; bad_control.registry_reference[0] ^= 1;
+		UT_ASSERT(!cluster_control_relmap_recovery_create_control_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode,
+			&original->expected, original->batch_uuid,
+			&bad_control, &before_table, &after_control, &after_table));
+		cf_sequence++;
+		UT_ASSERT(cluster_control_relmap_recovery_create_root_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode, &before, &after));
+		before.record_crc32c ^= 1; untouched = after;
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode, &before, &after));
+		UT_ASSERT(!memcmp(&after, &untouched, sizeof(after)));
+		before.record_crc32c ^= 1;
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode + 1, &before, &after));
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode, &before, (void *)receipt));
+		cluster_control_relmap_recovery_create_fail_v2(receipt);
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_v2(receipt,
+			&recovery_typed, recovery_fence, recovery_barrier_episode, &before, &after));
+		recovery_confirmed_cleanup(&original, &receipt);
+	}
+}
+UT_TEST(original_confirmation_storage_aliases_refuse_after_failure_without_io)
+{
+	ClusterControlNativeRelmapCreateV2 *original = NULL;
+	ClusterControlRelmapRecoveryCreateV2 *receipt = NULL;
+	ClusterRecoveryCheckpointFileV2 files[2];
+	void *independent = NULL;
+	bool ready = barrier_confirmed_setup(false, &original, &receipt, files);
+	unsigned reads = dependencies, writes = root_renames;
+	UT_ASSERT(ready);
+	if (!ready) { recovery_confirmed_cleanup(&original, &receipt); return; }
+	UT_ASSERT(cluster_control_relmap_recovery_create_output_distinct_v2(
+		receipt, &independent, sizeof(independent)));
+	UT_ASSERT(!cluster_control_relmap_recovery_create_output_distinct_v2(
+		receipt, receipt, sizeof(independent)));
+	UT_ASSERT(!cluster_control_relmap_recovery_create_output_distinct_v2(
+		receipt, (char *)receipt + 1, sizeof(independent)));
+	cluster_control_relmap_recovery_create_fail_v2(receipt);
+	cf_held = false;
+	UT_ASSERT(cluster_control_relmap_recovery_create_output_distinct_v2(
+		receipt, &independent, sizeof(independent)));
+	UT_ASSERT(!cluster_control_relmap_recovery_create_output_distinct_v2(
+		receipt, receipt, sizeof(independent)));
+	UT_ASSERT(!cluster_control_relmap_recovery_create_output_distinct_v2(
+		receipt, &independent, 0));
+	UT_ASSERT_EQ(dependencies, reads);
+	UT_ASSERT_EQ(root_renames, writes);
+	cf_held = true;
+	recovery_confirmed_cleanup(&original, &receipt);
+}
+UT_TEST(final_confirmation_state_is_pure_and_same_episode_only)
+{
+	for (unsigned available = 0; available < 2; ++available) {
+		ClusterControlNativeRelmapCreateV2 *original = NULL;
+		ClusterControlRelmapRecoveryCreateV2 *receipt = NULL;
+		ClusterRecoveryCheckpointFileV2 files[2];
+		unsigned reads, writes;
+		bool ready = barrier_confirmed_setup(available, &original, &receipt, files);
+		UT_ASSERT(ready);
+		if (!ready) { recovery_confirmed_cleanup(&original, &receipt); return; }
+		reads = dependencies; writes = root_renames;
+		UT_ASSERT(cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+			receipt, &recovery_typed, recovery_fence, recovery_barrier_episode));
+		/* Read-only repetition uses a new CF acquisition, never first-CF
+		 * authorization. The outer H entry still checks its original guards. */
+		cf_sequence++;
+		UT_ASSERT(cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+			receipt, &recovery_typed, recovery_fence, recovery_barrier_episode));
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+			receipt, NULL, recovery_fence, recovery_barrier_episode));
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+			receipt, &recovery_typed, NULL, recovery_barrier_episode));
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+			receipt, &recovery_typed, recovery_fence, recovery_barrier_episode + 1));
+		cluster_control_relmap_recovery_create_fail_v2(receipt);
+		UT_ASSERT(!cluster_control_relmap_recovery_create_root_delta_confirmed_v2(
+			receipt, &recovery_typed, recovery_fence, recovery_barrier_episode));
+		UT_ASSERT_EQ(dependencies, reads);
+		UT_ASSERT_EQ(root_renames, writes);
+		recovery_confirmed_cleanup(&original, &receipt);
+	}
+}
+
+#ifdef TEST_CONTROL_CONFIRM_MERGE
+int fixture_control_creation_main(int argc, char **argv);
+#define main fixture_control_creation_main
+#endif
 int
 main(int argc, char **argv)
 {
+	if (argc > 1 && !strcmp(argv[1], "barrier-red")) {
+		UT_PLAN(7);
+		UT_RUN(repeated_creation_barrier_rechecks_same_original_batch_after_fresh_cf);
+		UT_RUN(first_creation_barrier_authorization_still_refuses_fresh_cf);
+		UT_RUN(repeated_barrier_wrong_episode_or_source_cannot_reselect);
+		UT_RUN(original_confirm_keeps_full_root_checks_during_own_publication);
+		UT_RUN(original_confirm_delta_carries_exact_root_without_rebasing);
+		UT_RUN(original_confirmation_storage_aliases_refuse_after_failure_without_io);
+		UT_RUN(final_confirmation_state_is_pure_and_same_episode_only);
+		UT_DONE();
+		return ut_failed_count != 0;
+	}
+
 	if (argc > 1 && !strcmp(argv[1], "--original"))
 		return original_native_reservations_main(1, argv);
 	UT_RUN(independent_target_persists_before_creator_borrow);
@@ -423,6 +745,16 @@ main(int argc, char **argv)
 	UT_RUN(recovery_confirmed_late_source_false_or_error_releases_only_its_local_borrow);
 	UT_RUN(recovery_confirmed_failure_preserves_an_existing_native_file_borrow);
 	UT_RUN(pre_scan_projection_preserves_reserved_to_available_original_batch);
+	UT_RUN(repeated_creation_barrier_rechecks_same_original_batch_after_fresh_cf);
+	UT_RUN(first_creation_barrier_authorization_still_refuses_fresh_cf);
+	UT_RUN(repeated_barrier_wrong_episode_or_source_cannot_reselect);
+	UT_RUN(original_confirmation_storage_aliases_refuse_after_failure_without_io);
+	UT_RUN(original_confirm_delta_carries_exact_root_without_rebasing);
+	UT_RUN(original_confirm_keeps_full_root_checks_during_own_publication);
+	UT_RUN(final_confirmation_state_is_pure_and_same_episode_only);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
+#ifdef TEST_CONTROL_CONFIRM_MERGE
+#undef main
+#endif

@@ -1497,6 +1497,47 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 	return true;
 }
 
+/* Compare from the original prepare inventory each time. No observed current
+ * table or ROOT can become a baseline; every link comes from its original
+ * completed control writer and the original declaration index. */
+static bool
+cold_registry_effective(const ClusterColdTypedV1 *typed,
+	const ClusterControlRelmapRecoveryCreateV2 *append, uint32 index,
+	ClusterRecoveryFencePlan *fence, uint64 episode_id,
+	ClusterControlRelmapReferenceV2 *reference, ClusterControlNativeTableInfoV2 *table)
+{
+	const ClusterColdNativeRegistryV2 *s = typed ? typed->native_registry : NULL;
+	ClusterControlRelmapReferenceV2 next_ref;
+	ClusterControlNativeTableInfoV2 next_table;
+	uint64 count;
+	if (!s || !s->inventory || s->confirm_count > s->count
+		|| (s->confirm_count && (!s->confirms || !s->confirm_fence || !s->confirm_episode)))
+		return false;
+	*reference = s->inventory->info.control;
+	*table = s->inventory->info;
+	count = s->confirm_count + (append != NULL);
+	for (uint64 i = 0; i < count; ++i) {
+		uint32 at = i == s->confirm_count ? index : s->confirms[i].index;
+		const ClusterControlRelmapRecoveryCreateV2 *c = i == s->confirm_count
+			? append : s->confirms[i].confirmation;
+		if (at >= s->count || !c
+			|| !cluster_control_relmap_recovery_create_control_delta_v2(c, typed,
+				append ? fence : s->confirm_fence, append ? episode_id : s->confirm_episode,
+				&s->entries[at].expected, s->entries[at].batch_uuid,
+				reference, table, &next_ref, &next_table)) return false;
+		*reference = next_ref;
+		*table = next_table;
+	}
+	return true;
+}
+static bool
+cold_registry_table_matches(const ClusterControlNativeTableInfoV2 *expected)
+{
+	ClusterControlNativeTableInfoV2 actual, saved = *expected;
+	if (!cluster_control_native_files_info_v2(&actual)) return false;
+	actual.borrowed = saved.borrowed = 0;
+	return !memcmp(&actual, &saved, sizeof(actual));
+}
 /* The original prepare owns these local copies; the shared AVAILABLE table
  * remains identity-only. Reacquired CF is used to compare, never to rebase. */
 bool
@@ -1508,19 +1549,29 @@ cluster_cold_typed_native_registry_current_locked_v2(const ClusterColdTypedV1 *t
 	ClusterControlRelmapReferenceV2 reference;
 	volatile bool matched = false;
 	uint64 count;
-	if (!saved || !cluster_cf_held_is_clusterwide(ExclusiveLock)) return false;
+	ClusterControlRelmapReferenceV2 effective;
+	ClusterControlNativeTableInfoV2 table;
+	if (!saved || typed->refusal != CLUSTER_COLD_OK
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock)) return false;
+	if (saved->confirm_count && !cold_registry_effective(
+			typed, NULL, 0, NULL, 0, &effective, &table)) return false;
 	PG_TRY();
 	{
 		matched = cluster_control_root_relmap_format_locked_v2(
 			CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &format) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& !memcmp(&format, &saved->format, sizeof(format));
+			&& format.root_version == saved->format.root_version
+			&& !memcmp(&format.config, &saved->format.config, sizeof(format.config))
+			&& !memcmp(format.root_sha256, saved->confirm_count
+				? effective.root_pair_sha256 : saved->format.root_sha256, 32);
 		if (matched && format.root_version == 4) {
 			matched = saved->inventory != NULL
-				&& cluster_control_native_files_inventory_current_v2(saved->inventory)
+				&& (saved->confirm_count ? cold_registry_table_matches(&table)
+					: cluster_control_native_files_inventory_current_v2(saved->inventory))
 				&& cluster_control_root_relmap_selection_read_locked_v4(&format.config,
 					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &selection) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				&& cluster_control_root_relmap_selection_reference_v4(selection, &reference)
-				&& !memcmp(&reference, &saved->inventory->info.control, sizeof(reference))
+				&& !memcmp(&reference, saved->confirm_count
+					? &effective : &saved->inventory->info.control, sizeof(reference))
 				&& cluster_control_root_relmap_creation_count_v4(selection, &count)
 				&& count == saved->count;
 			for (uint64 i = 0; matched && i < saved->count; ++i) {
@@ -1530,7 +1581,8 @@ cluster_cold_typed_native_registry_current_locked_v2(const ClusterColdTypedV1 *t
 					&& !memcmp(&value, &saved->entries[i], sizeof(value));
 			}
 			matched = matched && cluster_control_root_relmap_selection_recheck_locked_v4(selection)
-				== CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+				== CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& (!saved->confirm_count || cold_registry_table_matches(&table));
 		}
 	}
 	PG_FINALLY();
@@ -1546,9 +1598,18 @@ cluster_cold_typed_native_table_v2(const ClusterColdTypedV1 *typed,
 	ClusterControlNativeTableInfoV2 *out)
 {
 	const ClusterColdNativeRegistryV2 *s = typed ? typed->native_registry : NULL;
-	if (!s || typed->refusal != CLUSTER_COLD_OK || !s->inventory || !out || !cold_relmap_output_distinct(typed, out, sizeof(*out))
-		|| !cluster_control_native_files_inventory_current_v2(s->inventory)) return false;
-	*out = s->inventory->info;
+	ClusterControlRelmapReferenceV2 reference;
+	ClusterControlNativeTableInfoV2 table;
+	if (!s || typed->refusal != CLUSTER_COLD_OK || !s->inventory || !out
+		|| !cold_relmap_output_distinct(typed, out, sizeof(*out))) return false;
+	if (s->confirm_count) {
+		if (!cold_registry_effective(typed, NULL, 0, NULL, 0, &reference, &table)
+			|| !cold_registry_table_matches(&table)) return false;
+	} else {
+		if (!cluster_control_native_files_inventory_current_v2(s->inventory)) return false;
+		table = s->inventory->info;
+	}
+	*out = table;
 	out->borrowed = 0;
 	return true;
 }
@@ -1593,10 +1654,12 @@ cold_registry_capture(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence
 					&& cluster_control_root_relmap_selection_reference_v4(selection, &reference)
 					&& cluster_control_root_relmap_creation_count_v4(selection, &s->count)
 					&& s->count <= UINT32_MAX
-					&& s->count <= (budget - s->bytes) / sizeof(*s->entries);
+					&& s->count <= (budget - s->bytes) /
+						(sizeof(*s->entries) + sizeof(*s->confirms));
 				if (matched && s->count) {
 					s->entries = palloc0(s->count * sizeof(*s->entries));
-					s->bytes += s->count * sizeof(*s->entries);
+					s->confirms = palloc0(s->count * sizeof(*s->confirms));
+					s->bytes += s->count * (sizeof(*s->entries) + sizeof(*s->confirms));
 					for (uint64 i = 0; matched && i < s->count; ++i)
 						matched = cluster_control_root_relmap_creation_at_v4(selection, i,
 							&s->entries[i].expected, s->entries[i].batch_uuid);
@@ -1849,6 +1912,16 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 		cluster_wal_inputs_release_v1(&typed->inputs);
 	cold_side_destroy(typed);
 	cluster_cold_tt_base_destroy_v1(typed);
+	/* Confirmed creation receipts are borrowed by the original fence. Keep
+	 * their owning plan alive until that fence is completely retired. */
+	if (typed->tx_fence != NULL && typed->native_registry != NULL
+		&& typed->native_registry->confirm_count != 0) {
+		if (!cluster_recovery_merge_fence_plan_release_serial(typed->tx_fence))
+			elog(FATAL, "could not release original cold input retention owner");
+		cluster_recovery_merge_fence_plan_destroy(&typed->tx_fence);
+		if (typed->tx_fence != NULL)
+			elog(FATAL, "could not release original cold transaction fence owner");
+	}
 	if (typed->plan != NULL)
 		cluster_cold_plan_destroy_v1(&typed->plan);
 	if (typed->replay_roots != NULL) {
@@ -1865,6 +1938,7 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	if (typed->native_registry) {
 		cluster_control_native_inventory_destroy_v2(&typed->native_registry->inventory);
 		if (typed->native_registry->entries) pfree(typed->native_registry->entries);
+		if (typed->native_registry->confirms) pfree(typed->native_registry->confirms);
 		pfree(typed->native_registry);
 		typed->native_registry = NULL;
 	}
@@ -2827,6 +2901,254 @@ cluster_cold_typed_relmap_create_record_current_v2(ClusterColdTypedV1 *typed,
 	PG_END_TRY();
 	return valid;
 }
+/* Same immutable input, under H's suspended episode; this held variant
+ * performs no ROOT/profile I/O and grants no original serial authority. */
+bool
+cluster_cold_typed_relmap_create_barrier_record_held_v2(ClusterColdTypedV1 *typed,
+												ClusterRecoveryFencePlan *fence, uint64 episode_id, uint32 participant,
+												const ClusterWalSourceRef *source, XLogRecPtr read,
+												XLogRecPtr end)
+{
+	ClusterWalSourceRef restart;
+	ClusterColdRecordFrameV1 frame;
+	uint32 count = 0, matches = 0;
+	bool matched = false;
+	volatile bool valid = false;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK)
+		return false;
+	PG_TRY();
+	{
+		do {
+			if (MyBackendType != B_STARTUP || !RecoveryInProgress() || source == NULL
+				|| !cluster_cold_replay_window_active_v1() || participant >= typed->replay_count
+				|| participant >= CLUSTER_COLD_MAX_PARTICIPANTS
+				|| !cold_source_ref_matches(source, &typed->sources[participant])
+				|| read == InvalidXLogRecPtr || end <= read
+				|| read < typed->participants[participant].native_redo
+				|| end > typed->participants[participant].tail_end
+				|| !cold_captured_sources_match(typed, fence)
+				|| !cluster_recovery_merge_fence_plan_suspended_held_current_v1(fence, episode_id)
+				|| !cold_side_source_matches(typed, participant))
+				break;
+			if (participant == typed->own_participant) {
+				if (!cluster_wal_thread_restart_v2_ref(&restart)
+					|| !cold_source_ref_matches(&restart, source))
+					break;
+			}
+			if (!cluster_cold_plan_input_frame_count_v1(typed->plan, &count))
+				break;
+			for (uint32 i = 0; i < count; i++) {
+				if (!cluster_cold_plan_input_frame_v1(typed->plan, i, &frame))
+					break;
+				if (frame.participant == participant && frame.read_rec_ptr == read
+					&& frame.end_rec_ptr == end && !frame.history && frame.rmid == RM_RELMAP_ID
+					&& (frame.info & ~XLR_INFO_MASK) == CLUSTER_RELMAP_CREATE_WAL_INFO_V1
+					&& !frame.page_components && !frame.space_effects)
+					matches++;
+				if (i + 1 == count)
+					matched = matches == 1;
+			}
+			valid = matched && cold_captured_sources_match(typed, fence)
+					&& cluster_recovery_merge_fence_plan_suspended_held_current_v1(fence, episode_id);
+		} while (0);
+	}
+	PG_FINALLY();
+	{
+		if (!valid)
+			cold_execution_inputs_failed(typed);
+	}
+	PG_END_TRY();
+	return valid;
+}
+/* The suspended plan owns the same WALR/proofs while H has surrendered IR.
+ * This is creation-only: the generic serial current predicate above is never
+ * replaced or temporarily granted. All physical checks stay outside locks. */
+static bool
+cold_create_barrier_current(ClusterColdTypedV1 *typed,
+	ClusterRecoveryFencePlan *fence, uint64 episode_id,
+	const ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	volatile bool valid = false;
+	ClusterWalSourceRef restart;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK) return false;
+	PG_TRY();
+	{
+		valid = episode_id != 0 && MyBackendType == B_STARTUP && RecoveryInProgress()
+			&& cluster_cf_held_is_clusterwide(ExclusiveLock)
+			&& !CritSectionCount && !LWLockHeldByMe(ControlFileLock)
+			&& !LWLockHeldByMe(RelationMappingLock) && !LWLockHeldByMe(XidGenLock)
+			&& !LWLockHeldByMe(XactSLRULock) && !LWLockHeldByMe(XactTruncationLock)
+			&& cluster_cold_replay_window_active_v1() && fence != NULL
+			&& typed->own_participant == 0 && typed->replay_count != 0
+			&& typed->replay_count <= typed->participant_count
+			&& typed->participant_count <= CLUSTER_COLD_MAX_PARTICIPANTS
+			&& typed->replay_roots != NULL && typed->plan != NULL
+			&& (confirmation
+				? cluster_recovery_merge_fence_plan_suspended_confirm_current_v1(
+					fence, episode_id, typed, confirmation)
+				: cluster_recovery_merge_fence_plan_suspended_current_v1(fence, episode_id))
+			&& cold_captured_sources_match(typed, fence)
+			&& cluster_wal_thread_restart_v2_ref(&restart)
+			&& cold_source_ref_matches(&restart, &typed->sources[0])
+			&& cold_native_profiles_match(typed)
+			&& (confirmation || cluster_cold_typed_native_registry_current_locked_v2(typed))
+			&& cold_captured_sources_match(typed, fence)
+			&& (confirmation
+				? cluster_recovery_merge_fence_plan_suspended_confirm_current_v1(
+					fence, episode_id, typed, confirmation)
+				: cluster_recovery_merge_fence_plan_suspended_current_v1(fence, episode_id));
+	}
+	PG_FINALLY();
+	{
+		if (!valid) cold_execution_inputs_failed(typed);
+	}
+	PG_END_TRY();
+	return valid;
+}
+bool
+cluster_cold_typed_relmap_create_barrier_current_v2(ClusterColdTypedV1 *typed,
+	ClusterRecoveryFencePlan *fence, uint64 episode_id)
+{
+	return cold_create_barrier_current(typed, fence, episode_id, NULL);
+}
+bool
+cluster_cold_typed_relmap_create_barrier_confirmation_current_v2(
+	ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, uint64 episode_id,
+	const ClusterControlRelmapRecoveryCreateV2 *confirmation, uint32 participant,
+	const ClusterWalSourceRef *source, XLogRecPtr read, XLogRecPtr end)
+{
+	volatile bool valid = false;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK) return false;
+	PG_TRY();
+	{
+		valid = confirmation != NULL
+			&& cold_create_barrier_current(typed, fence, episode_id, confirmation)
+			&& cluster_cold_typed_relmap_create_barrier_record_held_v2(
+				typed, fence, episode_id, participant, source, read, end)
+			&& cold_create_barrier_current(typed, fence, episode_id, confirmation);
+	}
+	PG_FINALLY();
+	{
+		if (!valid) cold_execution_inputs_failed(typed);
+	}
+	PG_END_TRY();
+	return valid;
+}
+
+bool
+cluster_cold_typed_relmap_create_accept_delta_v2(ClusterColdTypedV1 *typed,
+	ClusterRecoveryFencePlan *fence, uint64 episode_id, uint32 index,
+	const ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	ClusterColdNativeRegistryV2 *s = typed ? typed->native_registry : NULL;
+	ClusterControlRelmapReferenceV2 reference;
+	ClusterControlNativeTableInfoV2 table;
+	volatile bool valid = false;
+	bool existing = false;
+	if (!typed || typed->refusal != CLUSTER_COLD_OK) return false;
+	PG_TRY();
+	{
+		do {
+			if (!s || !confirmation || !s->confirms || index >= s->count
+				|| !episode_id || !cluster_cf_held_is_clusterwide(ExclusiveLock)
+				|| (s->confirm_count && (s->confirm_fence != fence
+					|| s->confirm_episode != episode_id))
+				|| !cold_create_barrier_current(typed, fence, episode_id, confirmation)) break;
+			for (uint64 i = 0; i < s->confirm_count; ++i) {
+				if (s->confirms[i].index == index || s->confirms[i].confirmation == confirmation) {
+					if (s->confirms[i].index != index
+						|| s->confirms[i].confirmation != confirmation) goto done;
+					existing = true;
+				}
+			}
+			if ((!existing && s->confirm_count >= s->count)
+				|| !cold_registry_effective(typed, existing ? NULL : confirmation,
+					index, fence, episode_id, &reference, &table)
+				|| !cold_registry_table_matches(&table)) break;
+			/* Complete exact control/source checks before installing the local
+			 * link. All capacity was reserved at prepare, before any scan. */
+			{
+				ClusterControlRelmapSelectionV2 *selection = NULL;
+				ClusterControlRelmapReferenceV2 observed;
+				PG_TRY();
+				{
+					valid = cluster_control_root_relmap_selection_read_locked_v4(&s->format.config,
+						CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &selection) == 0
+						&& cluster_control_root_relmap_selection_reference_v4(selection, &observed)
+						&& !memcmp(&observed, &reference, sizeof(reference))
+						&& cluster_control_root_relmap_selection_recheck_locked_v4(selection) == 0
+						&& cold_registry_table_matches(&table)
+						&& cold_create_barrier_current(typed, fence, episode_id, confirmation);
+				}
+				PG_FINALLY();
+				{ cluster_control_root_relmap_selection_destroy_v4(&selection); }
+				PG_END_TRY();
+			}
+			if (valid && !existing) {
+				/* No fallible operation follows a successful H installation.
+				 * Clear valid first so an ERROR still revokes this typed owner. */
+				valid = false;
+				valid = cluster_recovery_merge_fence_plan_confirm_delta_v1(
+					fence, episode_id, typed, confirmation);
+			}
+			if (valid && !existing) {
+				s->confirm_fence = fence;
+				s->confirm_episode = episode_id;
+				s->confirms[s->confirm_count++] = (ColdNativeConfirmV2){index, confirmation};
+			}
+		} while (0);
+	done:;
+	}
+	PG_FINALLY();
+	{ if (!valid) cold_execution_inputs_failed(typed); }
+	PG_END_TRY();
+	return valid;
+}
+bool
+cluster_cold_typed_relmap_create_accept_confirmation_v2(ClusterColdTypedV1 *typed,
+	ClusterRecoveryFencePlan *fence, uint64 episode_id,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	const ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	const ClusterColdNativeRegistryV2 *s = typed ? typed->native_registry : NULL;
+	uint32 index = UINT32_MAX;
+	if (!typed || typed->refusal != CLUSTER_COLD_OK) return false;
+	if (!s || !expected || !batch || s->count > UINT32_MAX || !s->entries) goto failed;
+	for (uint32 i = 0; i < s->count; ++i) {
+		if (memcmp(expected, &s->entries[i].expected, sizeof(*expected))
+			|| memcmp(batch, s->entries[i].batch_uuid, 16)) continue;
+		if (index != UINT32_MAX) goto failed;
+		index = i;
+	}
+	if (index != UINT32_MAX)
+		return cluster_cold_typed_relmap_create_accept_delta_v2(
+			typed, fence, episode_id, index, confirmation);
+failed:
+	cold_execution_inputs_failed(typed);
+	return false;
+}
+bool
+cluster_cold_typed_relmap_create_barrier_record_current_v2(ClusterColdTypedV1 *typed,
+	ClusterRecoveryFencePlan *fence, uint64 episode_id, uint32 participant,
+	const ClusterWalSourceRef *source, XLogRecPtr read, XLogRecPtr end)
+{
+	volatile bool valid = false;
+	if (typed == NULL || typed->refusal != CLUSTER_COLD_OK) return false;
+	PG_TRY();
+	{
+		valid = cluster_cold_typed_relmap_create_barrier_current_v2(typed, fence, episode_id)
+			&& cluster_cold_typed_relmap_create_barrier_record_held_v2(
+				typed, fence, episode_id, participant, source, read, end)
+			&& cluster_cold_typed_relmap_create_barrier_current_v2(typed, fence, episode_id);
+	}
+	PG_FINALLY();
+	{
+		if (!valid) cold_execution_inputs_failed(typed);
+	}
+	PG_END_TRY();
+	return valid;
+}
+
 void
 cluster_cold_typed_relmap_create_failed_v2(ClusterColdTypedV1 *typed)
 {

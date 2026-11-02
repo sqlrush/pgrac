@@ -31,6 +31,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
+#include "cluster/cluster_control_relmap_delta.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster_control_root_private.h"
 #include "portability/instr_time.h"
@@ -75,7 +76,9 @@ typedef struct ClusterWalPinThread {
 	ClusterWalRetentionInterval *intervals;
 	uint32 nintervals;
 	ClusterRecoveryDutyKey duty;
-	ClusterControlRootReadToken root_read;
+	ClusterControlRootReadToken root_read; /* current exact execution token */
+	ClusterControlRootReadToken original_root_read; /* immutable acquisition baseline */
+	ClusterControlRootReadToken confirmation_before;
 	ClusterControlPendingToken pending;
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *needs;
@@ -95,6 +98,10 @@ struct ClusterWalRetentionPin {
 	bool handed_off;
 	ClusterRecoverySerialGuardSet *serial_set;
 	ClusterWalPinThread *threads;
+	const struct ClusterControlRelmapRecoveryCreateV2 *last_confirmation;
+	const struct ClusterColdTypedV1 *confirmation_typed;
+	const struct ClusterRecoveryFencePlan *confirmation_plan;
+	uint64 confirmation_episode;
 	uint16 nreaders;
 	ClusterWalPinLock *readers; /* retained inputs without recovery authority */
 };
@@ -1190,6 +1197,7 @@ pin_acquire_inputs(const ClusterWalRetentionPinThreadRequest *requests, uint16 n
 		thread->nintervals = requests[i].nintervals;
 		thread->duty = requests[i].duty;
 		thread->root_read = requests[i].root_read;
+		thread->original_root_read = thread->root_read;
 		thread->pending = requests[i].pending;
 		thread->formation = requests[i].formation;
 		thread->needs = requests[i].needs;
@@ -1416,6 +1424,77 @@ cluster_wal_retention_pin_serial_suspended_current_v1(
 		}
 	}
 	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_confirm_delta_v1(ClusterWalRetentionPin *pin,
+	const ClusterRecoverySerialGuardSet *released_set, const struct ClusterColdTypedV1 *typed,
+	const struct ClusterRecoveryFencePlan *plan, uint64 episode_id,
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	ClusterControlRootReadToken after[CLUSTER_WAL_RETENTION_MAX_THREADS];
+	volatile bool valid = false;
+
+	if (!pin_valid(pin))
+		return CLUSTER_WAL_PIN_INVALID;
+	PG_TRY();
+	{
+		do {
+			bool repeated = pin->last_confirmation == confirmation;
+			bool matches = true;
+
+			if (typed == NULL || plan == NULL || confirmation == NULL || episode_id == 0
+				|| (pin->last_confirmation != NULL
+					&& (typed != pin->confirmation_typed || plan != pin->confirmation_plan
+						|| episode_id != pin->confirmation_episode))
+				|| cluster_wal_retention_pin_serial_suspended_current_v1(pin, released_set)
+					!= CLUSTER_WAL_PIN_OK)
+				break;
+			for (uint16 i = 0; i < pin->nthreads; i++) {
+				const ClusterWalPinThread *thread = &pin->threads[i];
+				const ClusterControlRootReadToken *before = repeated
+					? &thread->confirmation_before : &thread->root_read;
+				ClusterControlRootReadToken same;
+
+				if (!cluster_control_relmap_recovery_create_confirmed_root_delta_v2(
+					confirmation, typed, plan, episode_id, before, &after[i])) {
+					matches = false;
+					break;
+				}
+				same = after[i];
+				same.file_txn_seq = before->file_txn_seq;
+				if (!after[i].file_txn_seq || after[i].file_txn_seq < before->file_txn_seq
+					|| memcmp(&same, before, sizeof(same))
+					|| (repeated && memcmp(&after[i], &thread->root_read, sizeof(after[i])))) {
+					matches = false;
+					break;
+				}
+			}
+			if (!matches)
+				break;
+			/* Getter is pure; still check every retained guard before changing
+			 * any thread. No waits or grants are introduced by this operation. */
+			valid = cluster_wal_retention_pin_serial_suspended_current_v1(pin, released_set)
+				== CLUSTER_WAL_PIN_OK;
+			if (valid && !repeated) {
+				for (uint16 i = 0; i < pin->nthreads; i++) {
+					pin->threads[i].confirmation_before = pin->threads[i].root_read;
+					pin->threads[i].root_read = after[i];
+				}
+				pin->last_confirmation = confirmation;
+				pin->confirmation_typed = typed;
+				pin->confirmation_plan = plan;
+				pin->confirmation_episode = episode_id;
+			}
+		} while (0);
+	}
+	PG_FINALLY();
+	{
+		if (!valid)
+			pin->poisoned = true;
+	}
+	PG_END_TRY();
+	return valid ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
 }
 
 ClusterWalPinResult

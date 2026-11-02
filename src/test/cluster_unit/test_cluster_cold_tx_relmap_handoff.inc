@@ -53,6 +53,23 @@ UT_TEST(test_start_automatically_keeps_replayed_relmap_in_joint_obligation)
 	UT_ASSERT(claim_held);
 }
 
+UT_TEST(test_start_mixed_creation_keeps_pending_receipt_without_old_count_bypass)
+{
+	ClusterColdRelmapReplayReceiptV1 input;
+	relmap_start_fixture();
+	/* This is saved-plan custody, not a successful creation/terminal leaf. */
+	relmap_start_plan.relmap_create_count = 1;
+	UT_ASSERT_EQ(cluster_cold_typed_relmap_replay_count_v1(&typed), UINT32_MAX);
+	UT_ASSERT(ClusterBeginColdRecoveryTx(&info));
+	UT_ASSERT(ClusterColdRecoveryRelmapCurrent(info.cluster_tx_start));
+	input = ClusterColdRecoveryRelmapReplayInput(info.cluster_tx_start, 0);
+	UT_ASSERT_EQ(input.count, 1);
+	UT_ASSERT_EQ(input.input.staged.pending_generation, 8);
+	UT_ASSERT(window_region.checkpoint_owner.relmap_required);
+	UT_ASSERT(!cluster_recovery_checkpoint_handoff_v1(info.cluster_tx_start));
+	UT_ASSERT_EQ(input_destroys, relmap_start_destroyed);
+}
+
 UT_TEST(test_start_refuses_incomplete_or_failed_relmap_receipts)
 {
 	for (unsigned fault = 0; fault < 7; ++fault) {

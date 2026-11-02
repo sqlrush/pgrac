@@ -264,14 +264,161 @@ UT_TEST(original_prepare_error_revokes_without_scanning_or_retry)
 	cluster_cold_typed_destroy_v1(&prepare_probe_typed);
 	registry_fault = 0;
 }
+/* Control metadata remains a leaf here; the actual ROOT publisher and exact
+ * token/control receipt producer run in test_cluster_control_relmap_creation. */
+static ClusterColdTypedV1 *prepare_confirm_delta(void)
+{
+	ClusterColdTypedV1 *t = real_prepare(true);
+	InRecovery = true;
+	restart_ref = t->sources[0];
+	cluster_cold_replay_window_enter_v1();
+	confirm_typed = t;
+	UT_ASSERT_EQ(t->refusal, CLUSTER_COLD_OK);
+	confirm_before = t->native_registry->inventory->info;
+	confirm_after = confirm_before;
+	confirm_after.table_generation++;
+	confirm_after.control.root_pair_sha256[0] = 0x91;
+	confirm_after.control.registry_reference[0] = 0x92;
+	registry_reference = confirm_after.control;
+	registry_drift = true;
+	registry_cf_held = true;
+	create_barrier_suspended = create_barrier_probe_active = true;
+	confirm_metadata_ok = true;
+	confirm_install_ok = true;
+	confirm_install_error = false;
+	confirm_installs = 0;
+	return t;
+}
+static void finish_confirm_delta(ClusterColdTypedV1 **typed)
+{
+	create_barrier_suspended = create_barrier_probe_active = false;
+	registry_cf_held = false;
+	cluster_cold_replay_window_leave_v1();
+	InRecovery = false;
+	cluster_cold_typed_destroy_v1(typed);
+}
+UT_TEST(post_confirm_exact_delta_keeps_original_prepare_baseline)
+{
+	ClusterColdTypedV1 *typed = prepare_confirm_delta();
+	ClusterControlRelmapReferenceV2 original = typed->native_registry->inventory->info.control;
+	ClusterControlNativeTableInfoV2 table;
+	UT_ASSERT(!cluster_cold_typed_native_registry_current_locked_v2(typed));
+	UT_ASSERT(cluster_cold_typed_relmap_create_accept_confirmation_v2(typed,
+		(void *)&fixture_context, 73, &registry_entries[0].expected,
+		registry_entries[0].batch_uuid, (void *)&confirm_fixture));
+	UT_ASSERT_EQ(confirm_installs, 1);
+	UT_ASSERT(cluster_cold_typed_native_registry_current_locked_v2(typed));
+	UT_ASSERT(cluster_cold_typed_native_table_v2(typed, &table));
+	UT_ASSERT_EQ(table.table_generation, 18);
+	UT_ASSERT(!memcmp(&original, &typed->native_registry->inventory->info.control, sizeof(original)));
+	UT_ASSERT(cluster_cold_typed_relmap_create_accept_confirmation_v2(typed,
+		(void *)&fixture_context, 73, &registry_entries[0].expected,
+		registry_entries[0].batch_uuid, (void *)&confirm_fixture));
+	UT_ASSERT_EQ(confirm_installs, 1);
+	registry_reference.registry_reference[1] ^= 1;
+	UT_ASSERT(!cluster_cold_typed_native_registry_current_locked_v2(typed));
+	UT_ASSERT(!memcmp(&original, &typed->native_registry->inventory->info.control, sizeof(original)));
+	finish_confirm_delta(&typed);
+}
+UT_TEST(unproved_confirm_delta_revokes_without_rebasing)
+{
+	ClusterColdTypedV1 *typed = prepare_confirm_delta();
+	ClusterControlRelmapReferenceV2 original = typed->native_registry->inventory->info.control;
+	confirm_metadata_ok = false;
+	UT_ASSERT(!cluster_cold_typed_relmap_create_accept_delta_v2(typed,
+		(void *)&fixture_context, 73, 0, (void *)&confirm_fixture));
+	UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+	UT_ASSERT(!memcmp(&original, &typed->native_registry->inventory->info.control, sizeof(original)));
+	finish_confirm_delta(&typed);
+}
+UT_TEST(confirmation_requires_original_exact_identity_and_batch)
+{
+	for (unsigned fault = 0; fault < 2; ++fault) {
+		ClusterColdTypedV1 *typed = prepare_confirm_delta();
+		ClusterColdRelmapCreateExpectedV1 original = registry_entries[0], changed = original;
+		if (fault) changed.batch_uuid[0] ^= 1;
+		else changed.expected.object_id++;
+		UT_ASSERT(!cluster_cold_typed_relmap_create_accept_confirmation_v2(typed,
+			(void *)&fixture_context, 73, &changed.expected, changed.batch_uuid,
+			(void *)&confirm_fixture));
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(typed->native_registry->confirm_count, 0);
+		UT_ASSERT(!memcmp(&typed->native_registry->entries[0], &original, sizeof(original)));
+		finish_confirm_delta(&typed);
+	}
+}
+UT_TEST(final_install_refusal_or_error_cannot_append_confirmation)
+{
+	for (unsigned error = 0; error < 2; ++error) {
+		ClusterColdTypedV1 *typed = prepare_confirm_delta();
+		ClusterControlRelmapReferenceV2 original = typed->native_registry->inventory->info.control;
+		volatile bool threw = false, accepted = false;
+		confirm_install_ok = false;
+		confirm_install_error = error != 0;
+		PG_TRY();
+		{
+			accepted = cluster_cold_typed_relmap_create_accept_confirmation_v2(typed,
+				(void *)&fixture_context, 73, &registry_entries[0].expected,
+				registry_entries[0].batch_uuid, (void *)&confirm_fixture);
+		}
+		PG_CATCH(); { threw = true; } PG_END_TRY();
+		UT_ASSERT(!accepted);
+		UT_ASSERT_EQ(threw, error != 0);
+		UT_ASSERT_EQ(confirm_installs, 1);
+		UT_ASSERT(typed->refusal != CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(typed->native_registry->confirm_count, 0);
+		UT_ASSERT(!memcmp(&original, &typed->native_registry->inventory->info.control, sizeof(original)));
+		/* Reentry cannot call H again or consume the borrowed confirmation. */
+		UT_ASSERT(!cluster_cold_typed_relmap_create_accept_confirmation_v2(typed,
+			(void *)&fixture_context, 73, &registry_entries[0].expected,
+			registry_entries[0].batch_uuid, (void *)&confirm_fixture));
+		UT_ASSERT_EQ(confirm_installs, 1);
+		finish_confirm_delta(&typed);
+	}
+}
+UT_TEST(confirmed_receipts_outlive_original_fence_cleanup)
+{
+	for (unsigned fault = 0; fault < 2; ++fault) {
+		ClusterColdTypedV1 *typed = prepare_confirm_delta();
+		volatile bool threw = false;
+		unsigned destroyed = tx_fences_destroyed;
+		UT_ASSERT(cluster_cold_typed_relmap_create_accept_confirmation_v2(typed,
+			(void *)&fixture_context, 73, &registry_entries[0].expected,
+			registry_entries[0].batch_uuid, (void *)&confirm_fixture));
+		typed->tx_fence = (void *)&fixture_context;
+		tx_fence_confirm_cleanup_observer = typed;
+		tx_fence_confirm_release_ok = fault == 0;
+		PG_TRY(); { cluster_cold_typed_destroy_v1(&typed); }
+		PG_CATCH(); { threw = true; } PG_END_TRY();
+		UT_ASSERT_EQ(threw, fault != 0);
+		if (fault) {
+			UT_ASSERT(typed != NULL && typed->plan != NULL && typed->replay_roots != NULL);
+			UT_ASSERT_EQ(typed->native_registry->confirm_count, 1);
+			UT_ASSERT_EQ(tx_fences_destroyed, destroyed);
+			/* The fixture alone retires the fake owner after simulated FATAL. */
+			typed->tx_fence = NULL;
+		} else {
+			UT_ASSERT(typed == NULL);
+			UT_ASSERT_EQ(tx_fences_destroyed, destroyed + 1);
+		}
+		tx_fence_confirm_cleanup_observer = NULL;
+		tx_fence_confirm_release_ok = true;
+		finish_confirm_delta(&typed);
+	}
+}
 int main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(10);
+	UT_RUN(confirmed_receipts_outlive_original_fence_cleanup);
+	UT_RUN(final_install_refusal_or_error_cannot_append_confirmation);
+	UT_RUN(confirmation_requires_original_exact_identity_and_batch);
 	UT_RUN(original_prepare_real_scan_control);
 	UT_RUN(original_prepare_complete_creation);
 	UT_RUN(original_prepare_registry_drift_refuses_without_rebase);
 	UT_RUN(original_prepare_missing_registration_and_uncertain_release_keep_debt);
 	UT_RUN(original_prepare_error_revokes_without_scanning_or_retry);
+	UT_RUN(post_confirm_exact_delta_keeps_original_prepare_baseline);
+	UT_RUN(unproved_confirm_delta_revokes_without_rebasing);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

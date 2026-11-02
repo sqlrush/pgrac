@@ -85,9 +85,12 @@ ProcessInterrupts(void)
 {
 	abort();
 }
+static bool create_barrier_probe_active;
+static LWLock *create_barrier_probe_lock;
 bool
 LWLockHeldByMe(LWLock *lock pg_attribute_unused())
 {
+	if (create_barrier_probe_active) return lock == create_barrier_probe_lock;
 	abort();
 }
 void
@@ -500,6 +503,9 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ro
 	return result;
 }
 
+static bool create_barrier_suspended;
+static unsigned create_barrier_full_checks, create_barrier_held_checks;
+static unsigned create_barrier_error_after;
 bool
 cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
 {
@@ -507,9 +513,26 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *pl
 		siglongjmp(*PG_exception_stack, 1);
 	/* Real revalidation also requires the pass-2 serial set. Pass 1
 	 * may compare exact ROOT inputs, but cannot use execution authority. */
-	return plan != NULL && fence_current && cluster_cold_replay_window_active_v1();
+	return !create_barrier_suspended && plan != NULL && fence_current && cluster_cold_replay_window_active_v1();
 }
 
+/* H owns the actual pin/IR implementation; this original Startup fixture
+ * supplies only the explicit nonserial boundary, without granting old IR. */
+bool
+cluster_recovery_merge_fence_plan_suspended_held_current_v1(ClusterRecoveryFencePlan *plan, uint64 id)
+{
+	++create_barrier_held_checks;
+	return create_barrier_suspended && plan != NULL && id == 73 && fence_current
+		&& cluster_cold_replay_window_active_v1();
+}
+bool
+cluster_recovery_merge_fence_plan_suspended_current_v1(ClusterRecoveryFencePlan *plan, uint64 id)
+{
+	++create_barrier_full_checks;
+	if (create_barrier_error_after && --create_barrier_error_after == 0)
+		siglongjmp(*PG_exception_stack, 1);
+	return cluster_recovery_merge_fence_plan_suspended_held_current_v1(plan, id);
+}
 static void source_sync_history_drift(int fault);
 
 ClusterControlRootResult
@@ -573,10 +596,19 @@ static unsigned tx_fences_released;
 static int tx_fence_expected_census_releases;
 static int *tx_fence_census_release_observer;
 static ClusterColdTypedV1 *tx_fence_cleanup_observer;
+static ClusterColdTypedV1 *tx_fence_confirm_cleanup_observer;
+static bool tx_fence_confirm_release_ok = true;
 bool
 cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
 {
 	UT_ASSERT(plan != NULL);
+	if (tx_fence_confirm_cleanup_observer != NULL) {
+		ClusterColdTypedV1 *typed = tx_fence_confirm_cleanup_observer;
+		UT_ASSERT(typed->tx_fence == plan);
+		UT_ASSERT(typed->plan != NULL && typed->replay_roots != NULL);
+		UT_ASSERT(typed->native_registry != NULL);
+		UT_ASSERT_EQ(typed->native_registry->confirm_count, 1);
+	}
 	if (tx_fence_cleanup_observer != NULL) {
 		ClusterColdTypedV1 *typed = tx_fence_cleanup_observer;
 
@@ -588,12 +620,20 @@ cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
 		UT_ASSERT_EQ(*tx_fence_census_release_observer, tx_fence_expected_census_releases);
 	}
 	tx_fences_released++;
+	if (!tx_fence_confirm_release_ok)
+		pg_re_throw();
 	return true;
 }
 
 void
 cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan)
 {
+	if (tx_fence_confirm_cleanup_observer != NULL) {
+		ClusterColdTypedV1 *typed = tx_fence_confirm_cleanup_observer;
+		UT_ASSERT(typed->tx_fence == *plan);
+		UT_ASSERT(typed->plan != NULL && typed->replay_roots != NULL);
+		UT_ASSERT_EQ(typed->native_registry->confirm_count, 1);
+	}
 	if (tx_fence_census_release_observer != NULL)
 		UT_ASSERT_EQ(*tx_fence_census_release_observer, tx_fence_expected_census_releases);
 	if (*plan != NULL) tx_fences_destroyed++;
@@ -1933,5 +1973,17 @@ cluster_cold_scan_root_deadline_v1(ClusterColdPlanV1 *plan, uint32 participant,
 }
 
 #include "test_cluster_cold_registry_boundary.h"
+
+/* Controlled H boundary here; exact physical ROOT delta is exercised by the
+ * original control/registry fixture and actual merge producer tests. */
+bool
+cluster_recovery_merge_fence_plan_suspended_confirm_current_v1(
+	ClusterRecoveryFencePlan *plan, uint64 episode_id,
+	const struct ClusterColdTypedV1 *typed,
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	return typed != NULL && confirmation != NULL
+		&& cluster_recovery_merge_fence_plan_suspended_current_v1(plan, episode_id);
+}
 
 #endif /* TEST_CLUSTER_COLD_RECOVERY_STARTUP_BOUNDARY_H */
