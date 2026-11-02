@@ -17904,6 +17904,7 @@ typedef struct ClusterCurrentMxTransition
 	RfPageProducerBatchV1 *versions_source;
 	uint64 scope_id;
 	bool wal_required;
+	int wal_origin;
 	uint8 state; /* 1 planned, 2 ready, 3 consumed, 4 refused */
 	PGAlignedBlock before;
 	PGAlignedBlock expected;
@@ -17963,6 +17964,8 @@ cluster_current_mx_transition_plan(ClusterCurrentMxLockScope *scope,
 	unsigned matched = 0;
 
 	if (CritSectionCount != 0 || scope == NULL || root == NULL || root->t_data == NULL || successor == NULL
+		|| (wal_required && (cluster_node_id < 0
+			|| cluster_node_id > PGRAC_PAGE_LSN_ORIGIN_MAX))
 		|| publication == NULL || undo == NULL || !publication->valid
 		|| publication->plan == NULL || !publication->plan->active
 		|| publication->plan->apply_started
@@ -18040,11 +18043,14 @@ cluster_current_mx_transition_plan(ClusterCurrentMxLockScope *scope,
 	t->undo_source = undo;
 	t->versions_source = versions;
 	t->wal_required = wal_required;
+	t->wal_origin = cluster_node_id;
 	if (versions != NULL)
 		t->versions = *versions;
 	memcpy(t->before.data, page, BLCKSZ);
 	memcpy(t->expected.data, page, BLCKSZ);
 	page = t->expected.data;
+	if (wal_required)
+		(void)PageSetLSNOrigin(page, t->wal_origin);
 	if (versions != NULL)
 		((PageHeader)page)->pd_block_scn = (SCN)versions->result_token;
 	memcpy(PageGetItem(page, PageGetItemId(page, publication->offnum)),
@@ -18109,8 +18115,13 @@ cluster_current_mx_transition_complete(ClusterCurrentMxLockScope *scope, Buffer 
 			return false;
 	}
 	if (t->wal_required) {
+		int origin;
+		bool foreign = PageGetLSNOrigin(t->before.data, &origin)
+			&& origin != t->wal_origin;
+
 		if (actual_wal_lsn == InvalidXLogRecPtr
-			|| actual_wal_lsn <= PageGetLSN(t->before.data))
+			|| cluster_node_id != t->wal_origin
+			|| (!foreign && actual_wal_lsn <= PageGetLSN(t->before.data)))
 			return false;
 		PageXLogRecPtrSet(((PageHeader)t->expected.data)->pd_lsn, actual_wal_lsn);
 	} else if (actual_wal_lsn != PageGetLSN(t->before.data))

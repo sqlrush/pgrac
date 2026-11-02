@@ -159,7 +159,7 @@ transition_write(bool rf)
 {
 	mx_history_transition_write_header(&tuple, rf);
 	cluster_itl_stamp_lock_active_with_history(1, 7, 129, 91, uba_encode(257, 12, 3, 0));
-	PageXLogRecPtrSet(((PageHeader)BufferBlocks)->pd_lsn, UINT64CONST(129));
+	PageSetLSN(BufferBlocks, UINT64CONST(129));
 }
 UT_TEST(child_A_receipts_and_B_remain_independent_through_APPLY)
 {
@@ -211,7 +211,7 @@ UT_TEST(child_same_page_successor_progress_after_own_publication)
 	/* The actual native publisher changes another ITL slot on the same page.
 	 * The candidate's complete tuple header and immutable B are unchanged. */
 	cluster_itl_stamp_lock_active_with_history(1, 7, 129, 91, uba_encode(257, 12, 3, 0));
-	PageXLogRecPtrSet(((PageHeader)BufferBlocks)->pd_lsn, UINT64CONST(129));
+	PageSetLSN(BufferBlocks, UINT64CONST(129));
 	UT_ASSERT_EQ(memcmp(before, candidate.t_data, sizeof(before)), 0);
 	UT_ASSERT_EQ(ClusterPageGetItlSlots(BufferBlocks)[7].xid, 129);
 	UT_ASSERT_EQ(ClusterPageGetItlSlots(BufferBlocks)[7].flags, ITL_FLAG_LOCK_ONLY_ACTIVE);
@@ -229,7 +229,7 @@ UT_TEST(unapplied_same_page_change_cannot_authorize_old_B)
 	Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
 	UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 1);
 	cluster_itl_stamp_lock_active_with_history(1, 7, 129, 91, uba_encode(257, 12, 3, 0));
-	PageXLogRecPtrSet(((PageHeader)BufferBlocks)->pd_lsn, UINT64CONST(129));
+	PageSetLSN(BufferBlocks, UINT64CONST(129));
 	UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
 	UT_ASSERT_EQ(publication_prepares, 0); UT_ASSERT_EQ(publication_applies, 0);
 	UT_ASSERT_EQ(finish_reads, 3); writer_clean(s, true);
@@ -360,9 +360,83 @@ UT_TEST(transition_RF_delta_is_planned_and_completion_cannot_be_replayed)
 	printf("# local transition layout=%zu; no native two-hop/SQL claim\n", mx_history_transition_bytes());
 	writer_clean(s, true);
 }
+/* Native PageSetLSN has an origin side effect absent from raw LSN fixtures. */
+bool cluster_recmerge_window_active;
+uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
+bool cluster_recmerge_apply_foreign;
+UT_TEST(transition_native_WAL_origin_is_part_of_the_pre_APPLY_delta)
+{
+	MxHeapReadout out; MxPublicationReadout plan;
+	Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+	if (!publication_prepare(&plan) || !transition_plan(&out, &plan, false)) {
+		UT_ASSERT(false); writer_clean(s, true); return;
+	}
+	UT_ASSERT_EQ(publication_apply(&plan), 0); transition_write(false);
+	PageSetLSN(BufferBlocks, UINT64CONST(129));
+	UT_ASSERT(mx_history_transition_finish(1, true, 129));
+	UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 1);
+	writer_clean(s, true);
+}
+UT_TEST(transition_foreign_WAL_coordinate_does_not_order_the_local_return)
+{
+	MxHeapReadout out; MxPublicationReadout plan;
+	Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+	/* Independently requalify B before planning; this is input capture, not
+	 * post-publication proof rebasing. Foreign LSN1000 precedes local129. */
+	PageXLogRecPtrSet(((PageHeader)BufferBlocks)->pd_lsn, UINT64CONST(1000));
+	UT_ASSERT(PageSetLSNOrigin(BufferBlocks, 0));
+	UT_ASSERT_EQ(writer_scoped_call(&out), 2);
+	if (!publication_prepare(&plan) || !transition_plan(&out, &plan, false)) {
+		UT_ASSERT(false); writer_clean(s, true); return;
+	}
+	UT_ASSERT_EQ(publication_apply(&plan), 0); transition_write(false);
+	PageSetLSN(BufferBlocks, UINT64CONST(129));
+	UT_ASSERT(mx_history_transition_finish(1, true, 129));
+	UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 1);
+	writer_clean(s, true);
+}
+UT_TEST(transition_extra_WAL_origin_cannot_be_laundered_at_completion)
+{
+	MxHeapReadout out; MxPublicationReadout plan;
+	Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+	if (!publication_prepare(&plan) || !transition_plan(&out, &plan, false)) {
+		UT_ASSERT(false); writer_clean(s, true); return;
+	}
+	UT_ASSERT_EQ(publication_apply(&plan), 0); transition_write(false);
+	PageSetLSN(BufferBlocks, UINT64CONST(129));
+	UT_ASSERT(PageSetLSNOrigin(BufferBlocks, 2));
+	UT_ASSERT(!mx_history_transition_finish(1, true, 129));
+	UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
+	writer_clean(s, true);
+}
+UT_TEST(transition_WAL_return_requires_a_valid_coordinate_and_same_owner)
+{
+	const XLogRecPtr returned[] = {128, 127, 0, 129, 129};
+	for (unsigned fault = 0; fault < lengthof(returned); fault++) {
+		MxHeapReadout out; MxPublicationReadout plan;
+		Snapshot s = publication_setup(&out); HeapTupleData candidate = hot_candidate();
+		UT_ASSERT(PageSetLSNOrigin(BufferBlocks, 1));
+		PageXLogRecPtrSet(((PageHeader)BufferBlocks)->pd_lsn, UINT64CONST(128));
+		if (fault == 3) {
+			PageClearLSNOrigin(BufferBlocks);
+			PageXLogRecPtrSet(((PageHeader)BufferBlocks)->pd_lsn, UINT64CONST(1000));
+		}
+		UT_ASSERT_EQ(writer_scoped_call(&out), 2);
+		if (!publication_prepare(&plan) || !transition_plan(&out, &plan, false)) {
+			UT_ASSERT(false); writer_clean(s, true); continue;
+		}
+		UT_ASSERT_EQ(publication_apply(&plan), 0); transition_write(false);
+		PageSetLSN(BufferBlocks, returned[fault]);
+		if (fault == 4) cluster_node_id = 2;
+		UT_ASSERT(!mx_history_transition_finish(1, true, returned[fault]));
+		cluster_node_id = 1;
+		UT_ASSERT_EQ(writer_match(&candidate, &out.successor, true), 0);
+		writer_clean(s, true);
+	}
+}
 int main(void)
 {
-	history_fixture_init(); UT_PLAN(10);
+	history_fixture_init(); UT_PLAN(14);
 	UT_RUN(child_A_receipts_and_B_remain_independent_through_APPLY);
 	UT_RUN(zero_APPLY_refusal_preserves_unpublished_successor);
 	UT_RUN(child_same_page_successor_progress_after_own_publication);
@@ -373,5 +447,9 @@ int main(void)
 	UT_RUN(transition_live_scope_owner_grant_and_B_are_required);
 	UT_RUN(transition_late_plan_cross_page_and_reopened_scope_refuse);
 	UT_RUN(transition_RF_delta_is_planned_and_completion_cannot_be_replayed);
+	UT_RUN(transition_native_WAL_origin_is_part_of_the_pre_APPLY_delta);
+	UT_RUN(transition_foreign_WAL_coordinate_does_not_order_the_local_return);
+	UT_RUN(transition_extra_WAL_origin_cannot_be_laundered_at_completion);
+	UT_RUN(transition_WAL_return_requires_a_valid_coordinate_and_same_owner);
 	free(procArray); UT_DONE(); return ut_failed_count ? 1 : 0;
 }
