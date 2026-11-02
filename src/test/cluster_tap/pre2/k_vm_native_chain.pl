@@ -115,8 +115,32 @@ my $ok = eval {
 	$cluster->start_cluster;
 	my @nodes = $cluster->nodes;
 	my ($publisher, $reader, $writer_node) = @nodes[0, 1, 2];
-	$publisher->safe_psql('postgres', q{CREATE EXTENSION pg_visibility;
-		CREATE EXTENSION pg_walinspect;
+	# Shared mode does not install extension objects. Bind only the two original
+	# diagnostic entry points; their modules must already be installed.
+	$publisher->safe_psql('postgres', q{
+		CREATE FUNCTION pg_visibility_map(regclass, blkno bigint,
+			all_visible OUT boolean, all_frozen OUT boolean)
+		RETURNS record
+		AS '$libdir/pg_visibility', 'pg_visibility_map'
+		LANGUAGE C STRICT;
+		REVOKE ALL ON FUNCTION pg_visibility_map(regclass, bigint) FROM PUBLIC;
+		CREATE FUNCTION pg_get_wal_records_info(IN start_lsn pg_lsn,
+			IN end_lsn pg_lsn,
+			OUT start_lsn pg_lsn,
+			OUT end_lsn pg_lsn,
+			OUT prev_lsn pg_lsn,
+			OUT xid xid,
+			OUT resource_manager text,
+			OUT record_type text,
+			OUT record_length int4,
+			OUT main_data_length int4,
+			OUT fpi_length int4,
+			OUT description text,
+			OUT block_ref text)
+		RETURNS SETOF record
+		AS '$libdir/pg_walinspect', 'pg_get_wal_records_info'
+		LANGUAGE C STRICT PARALLEL SAFE;
+		REVOKE EXECUTE ON FUNCTION pg_get_wal_records_info(pg_lsn, pg_lsn) FROM PUBLIC;
 		CREATE TABLE k_vm_native(id int PRIMARY KEY, v int);
 		INSERT INTO k_vm_native VALUES(1,1);
 		DELETE FROM k_vm_native WHERE id=1});
