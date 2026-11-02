@@ -18,10 +18,15 @@ import subprocess
 import sys
 
 from run_legacy import M1_CASES as LEGACY_NAMES
-from run_multixact_lifecycle import M1_CASES as FOUR_MEMBER, tap_result
+from run_multixact_lifecycle import M1_CASES as FOUR_MEMBER, case_runs, tap_result
 
 LEGACY = ['t/'+name for name in LEGACY_NAMES.values()]
 SINGLE_MEMBER = ['t/461_pre2_single_shared_vacuum.pl']
+EXTENDED_NATIVE = {
+    'idle-freeze': ('m1-idle-freeze', 'tuple-freeze-and-clean-restart', 'p01'),
+    'retention': ('m1-retention', 'retained-reader-values-and-normal-stop', 'p02'),
+    'soak': ('m1-soak-workload', 'workload-ledger-and-normal-stop', 'p07'),
+}
 
 
 def validate_environment(env):
@@ -41,6 +46,9 @@ def strict_tap(output, rc):
 
 
 def plan(args):
+    suite = getattr(args, 'suite', 'core')
+    if suite not in ('core', 'extended'):
+        raise ValueError('unsupported M1 regression suite')
     scripts = args.source.resolve()/'src/test/cluster_tap/pre2'
     output = args.output.resolve()
     common = ['--source', str(args.source.resolve()), '--install', str(args.install.resolve()),
@@ -57,12 +65,27 @@ def plan(args):
               '--source', str(args.source.resolve()), '--build', str(args.build.resolve()),
               '--install', str(args.install.resolve()), '--output', str(output/'legacy'),
               '--suite', 'm1', '--expected-postgres-sha256', args.expected_postgres_sha256]
-    return dict(status='NOT_RUN', stage_acceptance='NOT_READY', phases=[
+    selection = dict(status='NOT_RUN', stage_acceptance='NOT_READY', phases=[
         dict(name='legacy', cases=LEGACY, command=legacy),
         dict(name='four-member', cases=FOUR_MEMBER, command=four),
         dict(name='single-member', cases=SINGLE_MEMBER, command=single)],
         not_covered=['shared positive physical reclamation', 'retention/recovery matrix',
                      '16/48/64 one-hour soak', 'full build and stage acceptance'])
+    if suite == 'extended':
+        for name, (native_suite, scope, _) in EXTENDED_NATIVE.items():
+            command = list(four)
+            command[command.index('--output')+1] = str(output/name)
+            command[command.index('--suite')+1] = native_suite
+            selection['phases'].append(dict(name=name, scope=scope,
+                cases=[run['case'] for run in case_runs(native_suite, None)], command=command))
+        selection.update(suite='extended',
+            subcheck_gates=dict(p01='NOT_READY', p02='NOT_READY', p07='NOT_READY'),
+            not_covered=['shared positive physical reclamation',
+                         'full-width F/H and catalog cutoff qualification',
+                         'recycle progression after final reader release',
+                         'complete P07 resource/generation acceptance',
+                         'general recovery matrix', 'full build and stage acceptance'])
+    return selection
 
 
 def phase_passed(name, root, rc, expected_sha=None):
@@ -83,6 +106,22 @@ def phase_passed(name, root, rc, expected_sha=None):
                 and [c['case'] for c in cases] == FOUR_MEMBER
                 and all(c['passed'] and strict_tap(
                     (root/Path(c['case']).stem/'prove.log').read_text(), c['rc']) for c in cases))
+    if name in EXTENDED_NATIVE:
+        native_suite, scope, gate = EXTENDED_NATIVE[name]
+        runs = case_runs(native_suite, None)
+        cases = result.get('cases', [])
+        if (not isinstance(expected_sha, str) or not re.fullmatch('[0-9a-f]{64}', expected_sha)
+                or result.get('complete') is not True
+                or result.get('binary_sha256') != expected_sha or result.get('scope') != scope
+                or result.get(gate) != 'NOT_READY' or result.get('stage_acceptance') != 'NOT_READY'
+                or len(cases) != len(runs)):
+            return False
+        for case, run in zip(cases, runs):
+            if (case.get('case') != run['case'] or case.get('clients') != run['clients']
+                    or case.get('passed') is not True or case.get('rc') != 0
+                    or not strict_tap((root/run['directory']/'prove.log').read_text(), case['rc'])):
+                return False
+        return True
     if name == 'single-member':
         return (result.get('postgres_sha256') == expected_sha
                 and strict_tap((root/'prove.log').read_text(), result.get('rc')))
@@ -136,6 +175,8 @@ def run(args):
     result = dict(status='FAIL', stage_acceptance='NOT_READY', phases=[],
                   postgres_sha256=args.expected_postgres_sha256, source_sha256=source_hashes,
                   build_binding='UNKNOWN', error=None, not_covered=selection['not_covered'])
+    if 'subcheck_gates' in selection:
+        result.update(suite=selection['suite'], subcheck_gates=selection['subcheck_gates'])
     try:
         for phase in selection['phases']:
             if sha(args.install/'bin/postgres') != args.expected_postgres_sha256:
@@ -171,6 +212,7 @@ def main():
     for key in ('uid', 'gid'):
         parser.add_argument('--'+key, type=int, required=True)
     parser.add_argument('--expected-postgres-sha256', required=True)
+    parser.add_argument('--suite', choices=['core', 'extended'], default='core')
     parser.add_argument('--plan', action='store_true')
     try:
         return run(parser.parse_args())

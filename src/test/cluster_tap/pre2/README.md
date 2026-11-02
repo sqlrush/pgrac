@@ -87,6 +87,38 @@ positive physical reclamation, the retention/recovery matrix, the 16/48/64
 one-hour soak or the full build/stage acceptance matrix. Controller selftests
 (`test_m1_regression.py`) start no database and provide no native runtime credit.
 
+### Extended serial regression preparation
+
+Add `--suite extended` to the regression command above to select all three
+original phases followed by the prepared native subchecks:
+
+| Phase | Original native controller suite |
+| --- | --- |
+| `idle-freeze` | `m1-idle-freeze`, TAP485 |
+| `retention` | `m1-retention`, TAP484 |
+| `soak` | `m1-soak-workload`, TAP483 at 16, 48 and 64 clients |
+
+The default remains `--suite core`, with the exact original ten TAP cases.
+Extended phases use separate output directories, the same expected postgres
+hash and the original controllers, which own formation, deadlines and cleanup.
+All phases run serially. The first failed or incomplete phase stops the entry;
+no later phase is counted as passed and no automatic retry is added.
+
+Each new phase needs its exact scope, complete case/client list, expected
+postgres bytes, successful original prove output and no cleanup debt. The soak
+reader requires all three distinct client directories and validates each TAP;
+the repeated TAP filename does not combine the three points into one result.
+P01/P02/P07 and stage markers must remain `NOT_READY` in these subcheck results.
+
+Exit zero covers only the selected regression subchecks. Full-width F/H and
+catalog cutoff qualification, reader-release recycle progress, complete soak
+resource/generation evidence, shared physical reclaim, general recovery and
+the full build/stage matrix remain separate. `--plan --suite extended` starts
+no processes and reserves no runtime. Executing the extended plan still needs
+component readiness, candidate qualification and explicit runtime authorization.
+The parser/planner tests in `test_m1_extended_regression.py` use file inputs and
+small actual prove results; they run no database and certify no native result.
+
 ### Offline long-run commit ledger
 
 `m1_soak.sql` is a fixed simple-protocol workload for 16, 48 or 64 clients.
