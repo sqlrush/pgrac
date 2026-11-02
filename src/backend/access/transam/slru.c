@@ -160,6 +160,9 @@ static int	slru_errno;
 static void SimpleLruZeroLSNs(SlruCtl ctl, int slotno);
 static void SimpleLruWaitIO(SlruCtl ctl, int slotno);
 static void SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata);
+static bool SlruWriteClogPage(SlruCtl ctl, int slotno, int fd,
+							  const ClusterClogFileBindingV2 *expected,
+							  bool bootstrap, XLogRecPtr *end_out);
 static bool SlruPhysicalReadPage(SlruCtl ctl, int pageno, int slotno);
 static bool SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno,
 								  SlruWriteAll fdata,
@@ -1048,9 +1051,11 @@ SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint)
 		if (shared->page_number[slotno] == pageno &&
 			shared->page_status[slotno] == SLRU_PAGE_VALID && shared->page_dirty[slotno])
 		{
-			XLogRecPtr end = SimpleLruWriteClogPageV2(ctl, slotno, fd, &binding);
+			XLogRecPtr end = InvalidXLogRecPtr;
+			bool written = SlruWriteClogPage(ctl, slotno, fd, &binding,
+											 IsBootstrapProcessingMode(), &end);
 
-			if (XLogRecPtrIsInvalid(end) || !ctl->clog_native_current(&borrow))
+			if (!written || !ctl->clog_native_current(&borrow))
 			{
 				if (shared->page_number[slotno] == pageno)
 					shared->page_dirty[slotno] = true;
@@ -1603,9 +1608,10 @@ SimpleLruReadClogPageV2(SlruCtl ctl, int slotno, int pageno, int fd,
 /* A managed write uses the same slot/ControlLock/per-buffer I/O protocol, but
  * its full-image WAL can raise ERROR and its durable file is generation-bound.
  * Keep it separate from the raw writer and its segno-only sync queue. */
-XLogRecPtr
-SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
-						  const ClusterClogFileBindingV2 *expected)
+static bool
+SlruWriteClogPage(SlruCtl ctl, int slotno, int fd,
+						  const ClusterClogFileBindingV2 *expected,
+				  bool bootstrap, XLogRecPtr *end_out)
 {
 	SlruShared shared;
 	SlruWriteSnapshot snapshot;
@@ -1627,7 +1633,7 @@ SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
 		shared->clog_file_binding == NULL ||
 		shared->group_lsn == NULL || shared->lsn_groups_per_page <= 0 ||
 		!LWLockHeldByMeInMode(shared->ControlLock, LW_EXCLUSIVE))
-		return InvalidXLogRecPtr;
+		return false;
 	pageno = shared->page_number[slotno];
 	while (shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS &&
 		   shared->page_number[slotno] == pageno)
@@ -1635,7 +1641,7 @@ SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
 	if (!shared->page_dirty[slotno] || shared->page_status[slotno] != SLRU_PAGE_VALID ||
 		shared->page_number[slotno] != pageno || pageno < 0 ||
 		shared->page_buffer[slotno] == NULL)
-		return InvalidXLogRecPtr;
+		return false;
 
 	/* Validate the complete by-value snapshot before changing any slot state.
 	 * In particular, a raw page number or an LSN cannot supply missing birth. */
@@ -1649,7 +1655,7 @@ SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
 		!cluster_clog_file_page_encode_v2(&binding, &snapshot.clog_page,
 										 snapshot.page.data, BLCKSZ,
 										 checked_frame, sizeof(checked_frame)))
-		return InvalidXLogRecPtr;
+		return false;
 
 	/* Only the original unwritten birth may first bind the independent
 	 * expected file. Keep that responsibility even when the first I/O fails. */
@@ -1664,8 +1670,12 @@ SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
 	{
 		pgstat_count_slru_page_written(shared->slru_stats_idx);
 		pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
-		ok = cluster_clog_storage_write_page_v2(fd, &binding, &snapshot.clog_page,
-												 snapshot.page.data, BLCKSZ, &end);
+		if (bootstrap)
+			ok = cluster_clog_storage_bootstrap_write_page_v2(fd, &binding,
+					&snapshot.clog_page, snapshot.page.data, BLCKSZ);
+		else
+			ok = cluster_clog_storage_write_page_v2(fd, &binding, &snapshot.clog_page,
+												  snapshot.page.data, BLCKSZ, &end);
 		pgstat_report_wait_end();
 	}
 	PG_CATCH();
@@ -1703,7 +1713,21 @@ SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
 		shared->page_dirty[slotno] = true;
 	shared->page_status[slotno] = SLRU_PAGE_VALID;
 	LWLockRelease(&shared->buffer_locks[slotno].lock);
-	return ok ? end : InvalidXLogRecPtr;
+	if (ok)
+		*end_out = end;
+	return ok;
+}
+
+/* The external WAL writer retains its original nonzero-record-end contract.
+ * Only the managed native caller may select authenticated BOOT writeback. */
+XLogRecPtr
+SimpleLruWriteClogPageV2(SlruCtl ctl, int slotno, int fd,
+					   const ClusterClogFileBindingV2 *expected)
+{
+	XLogRecPtr end = InvalidXLogRecPtr;
+
+	return SlruWriteClogPage(ctl, slotno, fd, expected, false, &end)
+		? end : InvalidXLogRecPtr;
 }
 
 /*

@@ -318,19 +318,163 @@ UT_TEST(creation_bootstrap_commit_preserves_conflicting_terminal_bits)
 	checkpoint_close();
 }
 
+/* Original BOOT file: one already-born page, no native WAL yet. */
+static void
+creation_boot_page(void)
+{
+	uint8 frame[8256];
+
+	identities[0].identity.page_generation = 3;
+	identities[0].identity.page_lsn = identities[0].image_lsn = InvalidXLogRecPtr;
+	lsns[0] = lsns[1] = InvalidXLogRecPtr;
+	if (!cluster_clog_file_page_encode_v2(&binding, identities, (uint8 *) page.data,
+		BLCKSZ, frame, sizeof(frame)) ||
+		pwrite(borrowed, frame, sizeof(frame), 8192) != sizeof(frame)) abort();
+}
+
+UT_TEST(creation_boot_checkpoint_syncs_without_fabricating_wal)
+{
+	for (unsigned sample = 0; sample < 4; sample++) {
+		volatile bool caught = false;
+		ClusterClogPageIdentityV2 observed;
+		uint8 payload[8192];
+
+		creation_reset_origin(BootstrapProcessing, (sample % 2) * 127);
+		creation_boot_page();
+		cluster_enabled = sample >= 2;
+		proc.xid = BootstrapTransactionId;
+		PG_TRY();
+		{
+			LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+			TransactionIdSetPageStatusInternal(BootstrapTransactionId, 0, NULL,
+				TRANSACTION_STATUS_COMMITTED, InvalidXLogRecPtr, 0);
+			LWLockRelease(XactSLRULock);
+			CheckPointCLOG(); /* Real shutdown checkpoint remains in BOOT. */
+			CheckPointCLOG();
+		}
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		if (caught) {
+			HOLD_INTERRUPTS();
+			LWLockRelease(XactSLRULock);
+			checkpoint_close();
+			UT_ASSERT(!caught);
+			return;
+		}
+		UT_ASSERT(!caught);
+		UT_ASSERT(!dirty[0] && !control_held && !io_held);
+		UT_ASSERT_EQ(inserts + flushes + queues, 0);
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT_EQ(written_offset, 8192);
+		UT_ASSERT_EQ(written_length, 8256);
+		UT_ASSERT_EQ(native_borrows, 0);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		control_held = false; io_held = true;
+		UT_ASSERT(cluster_clog_storage_read_page_v2(borrowed, &binding, 0,
+			&observed, payload, sizeof(payload)));
+		io_held = false;
+		UT_ASSERT_EQ((uint8) payload[0], 0x44);
+		UT_ASSERT(!memcmp(payload, page.data, sizeof(payload)));
+		UT_ASSERT_EQ(observed.image_lsn, 0);
+		UT_ASSERT_EQ(observed.identity.page_lsn, 0);
+		UT_ASSERT_EQ(U64FromFullTransactionId(observed.identity.birth_full_xid), 3);
+		/* The subsequent SQL child returns to the original full-image WAL path. */
+		Mode = NormalProcessing;
+		LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+		TransactionIdSetPageStatusInternal(4, 0, NULL, TRANSACTION_STATUS_COMMITTED,
+			InvalidXLogRecPtr, 0);
+		LWLockRelease(XactSLRULock);
+		CheckPointCLOG();
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(identities[0].image_lsn, 1000);
+		UT_ASSERT(!dirty[0] && !control_held && !io_held);
+		UT_ASSERT_EQ(cluster_node_id, -1);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		checkpoint_close();
+	}
+}
+
+UT_TEST(creation_boot_checkpoint_rejects_nonboot_identity_before_writes)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		uint8 before[16448], after[16448];
+
+		creation_reset(BootstrapProcessing);
+		creation_boot_page();
+		dirty[0] = true;
+		if (fault == 0) creation_has_request = false;
+		if (fault == 1) creation_info.startup_generation++;
+		if (fault == 2) identities[0].identity.page_lsn = 10;
+		if (fault == 3) identities[0].image_lsn = 10;
+		if (fault == 4) lsns[0] = 10;
+		if (fault == 5) identities[0].identity.birth_full_xid = FullTransactionIdFromU64(4);
+		if (fault == 6) identities[0].identity.page_generation++;
+		if (fault == 7) enableFsync = false;
+		if (fault == 8) InRecovery = true;
+		if (fault == 9) {
+			uint8 frame[8256];
+			ClusterClogPageIdentityV2 disk_identity = identities[0];
+
+			disk_identity.image_lsn = 10;
+			UT_ASSERT(cluster_clog_file_page_encode_v2(&binding, &disk_identity,
+				(uint8 *) page.data, BLCKSZ, frame, sizeof(frame)));
+			UT_ASSERT_EQ(pwrite(borrowed, frame, sizeof(frame), 8192), sizeof(frame));
+		}
+		UT_ASSERT_EQ(pread(borrowed, before, sizeof(before), 0), sizeof(before));
+		UT_ASSERT(checkpoint_raises());
+		UT_ASSERT(dirty[0] && control_held && !io_held);
+		UT_ASSERT_EQ(writes + inserts + flushes, 0);
+		UT_ASSERT_EQ(native_borrows, 0);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		UT_ASSERT_EQ(pread(borrowed, after, sizeof(after), 0), sizeof(after));
+		UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		HOLD_INTERRUPTS();
+		LWLockRelease(XactSLRULock);
+		checkpoint_close();
+	}
+}
+
+UT_TEST(creation_boot_checkpoint_io_failure_keeps_dirty_and_original_custody)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		creation_reset(BootstrapProcessing);
+		creation_boot_page();
+		dirty[0] = true;
+		fail_write = fault == 0;
+		short_write = fault == 1;
+		fail_sync = fault == 2;
+		UT_ASSERT(checkpoint_raises());
+		UT_ASSERT(dirty[0] && control_held && !io_held);
+		UT_ASSERT_EQ(inserts + flushes + queues, 0);
+		UT_ASSERT_EQ(native_borrows, 0);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		UT_ASSERT_EQ(proc.delayChkptFlags, 0);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+		HOLD_INTERRUPTS();
+		LWLockRelease(XactSLRULock);
+		checkpoint_close();
+		UT_ASSERT_EQ(writes, 1);
+	}
+}
+
 int
 main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-creation-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(6);
+	UT_PLAN(9);
 	UT_RUN(creation_trim_status_checkpoint_keep_original_identity_and_wal);
 	UT_RUN(creation_checkpoint_rejects_unrelated_batch_before_wal_or_io);
 	UT_RUN(creation_frame_wal_uses_only_the_authenticated_batch_origin);
 	UT_RUN(creation_bootstrap_commit_keeps_the_original_page_and_checkpoint);
 	UT_RUN(creation_bootstrap_status_refuses_other_contexts_before_page_effects);
 	UT_RUN(creation_bootstrap_commit_preserves_conflicting_terminal_bits);
+	UT_RUN(creation_boot_checkpoint_syncs_without_fabricating_wal);
+	UT_RUN(creation_boot_checkpoint_rejects_nonboot_identity_before_writes);
+	UT_RUN(creation_boot_checkpoint_io_failure_keeps_dirty_and_original_custody);
 	rmdir(directory);
 	UT_DONE(); return ut_failed_count != 0;
 }
