@@ -5,6 +5,14 @@
 #define Z_WB_NO_MAIN 1
 #include "test_cluster_drop_z_wb.c"
 #include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_content_trace.h"
+
+/* This allocation-free DROP/PCM slice cannot allocate PAGE plans or export a
+ * native DEADLINE snapshot. Unexpected entry must fail, never become a stubbed
+ * success or pull in frontend palloc/pfree aliases over the tracked allocator. */
+void *palloc(Size size pg_attribute_unused()) { abort(); }
+void cluster_content_trace_deadline_dump(uint32 reason pg_attribute_unused()) { abort(); }
+
 void z_pcm_bridge_setup(RelFileLocator,RelFileLocator,uint64);
 bool z_pcm_bridge_ok(void);
 ClusterPcmPiRelationScanV2 z_pcm_bridge_scan(RelFileLocator,uint64,uint32,uint32 *);

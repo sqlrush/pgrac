@@ -5674,6 +5674,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 RESOURCE_X_PCM_TEST_O = test_cluster_pcm_lock_clock_product.o
+RESOURCE_X_PCM_TEST_COMMON_LIB = $(top_builddir)/src/common/libpgcommon_srv.a
 test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_disk_x_done test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_local_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement test_cluster_resource_x_pi_replace: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
@@ -5699,7 +5700,7 @@ test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv te
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_VERSION_O) $(RESOURCE_X_PCM_TEST_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(LDFLAGS) $(RESOURCE_X_PCM_TEST_COMMON_LIB) $(filter -lcrypto,$(LIBS)) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_pcm_stop_cv: $(top_srcdir)/src/backend/storage/lmgr/condition_variable.c
@@ -11552,8 +11553,12 @@ test_cluster_resource_x_pi_replace: test_cluster_pi_replace_pcm.o test_cluster_r
 		test_cluster_resource_x_source_ack_fixture.inc test_cluster_resource_x_master_done_ingress.inc \
 		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
 		test_cluster_resource_x_acquire_candidate.inc test_cluster_resource_x_decision_owner_layout.inc \
-		cluster_unit_port_stubs.o cluster_catalog_trace_test.o $(CLUSTER_PAGE_ONLINE_PLAN_O)
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o $(CLUSTER_PAGE_ONLINE_PLAN_O) \
+		$(top_builddir)/src/common/libpgcommon.a
 # This component executes the actual immutable PAGE plan together with PCM.
+# Hash bytes with the real frontend implementation: this standalone fixture
+# supplies its own tracked allocator and has no backend ResourceOwner lifetime.
+test_cluster_resource_x_pi_replace: RESOURCE_X_PCM_TEST_COMMON_LIB = $(top_builddir)/src/common/libpgcommon.a
 test_cluster_resource_x_pi_replace: CLUSTER_VERSION_O += $(CLUSTER_PAGE_ONLINE_PLAN_O)
 test_cluster_resource_x_pi_replace: RESOURCE_X_PCM_TEST_O = test_cluster_pi_replace_pcm.o
 test_cluster_pi_replace_pcm.o: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile \
