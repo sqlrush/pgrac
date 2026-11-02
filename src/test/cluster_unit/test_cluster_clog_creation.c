@@ -180,16 +180,157 @@ UT_TEST(creation_frame_wal_uses_only_the_authenticated_batch_origin)
 	}
 }
 
+UT_TEST(creation_bootstrap_commit_keeps_the_original_page_and_checkpoint)
+{
+	for (unsigned sample = 0; sample < 4; sample++) {
+		volatile bool caught = false;
+		PGAlignedBlock expected;
+		ClusterClogPageIdentityV2 observed;
+		uint8 payload[8192];
+
+		creation_reset_origin(BootstrapProcessing, (sample % 2) * 127);
+		cluster_enabled = sample >= 2;
+		proc.xid = BootstrapTransactionId;
+		expected = page;
+		/* Bootstrap's permanent xid is 1; the original normal xid 3 stays
+		 * committed. Only bits 2..3 of byte zero may change (0x40 -> 0x44). */
+		expected.data[0] = 0x44;
+		control_held = false;
+		PG_TRY();
+		{
+			LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+			TransactionIdSetPageStatusInternal(BootstrapTransactionId, 0, NULL,
+				TRANSACTION_STATUS_COMMITTED, InvalidXLogRecPtr, 0);
+			LWLockRelease(XactSLRULock);
+			UT_ASSERT(dirty[0]);
+			UT_ASSERT(!memcmp(&expected, &page, sizeof(page)));
+			/* The exact original commit is idempotent. */
+			LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+			TransactionIdSetPageStatusInternal(BootstrapTransactionId, 0, NULL,
+				TRANSACTION_STATUS_COMMITTED, InvalidXLogRecPtr, 0);
+			LWLockRelease(XactSLRULock);
+			/* BOOT itself has no local CLOG frame-WAL writer. Exercise
+			 * the later native writer without relaxing that original gate. */
+			Mode = NormalProcessing;
+			CheckPointCLOG();
+		}
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		UT_ASSERT(!caught);
+		UT_ASSERT(!memcmp(&expected, &page, sizeof(page)));
+		UT_ASSERT(!dirty[0] && !control_held && !io_held);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(native_borrows, 0);
+		UT_ASSERT_EQ(native_acquires, native_releases);
+		control_held = false; io_held = true;
+		UT_ASSERT(cluster_clog_storage_read_page_v2(borrowed, &binding, 0,
+			&observed, payload, sizeof(payload)));
+		io_held = false;
+		UT_ASSERT(!memcmp(expected.data, payload, sizeof(payload)));
+		UT_ASSERT_EQ(observed.image_lsn, 1000);
+		UT_ASSERT_EQ(U64FromFullTransactionId(observed.identity.birth_full_xid), 3);
+		UT_ASSERT_EQ(cluster_node_id, -1);
+		checkpoint_close();
+	}
+}
+
+UT_TEST(creation_bootstrap_status_refuses_other_contexts_before_page_effects)
+{
+	for (unsigned fault = 0; fault < 23; fault++) {
+		volatile bool caught = false;
+		PGAlignedBlock before;
+		ClusterClogPageIdentityV2 identity;
+		TransactionId xid = BootstrapTransactionId, child = 4;
+		XidStatus status = TRANSACTION_STATUS_COMMITTED;
+		XLogRecPtr lsn = InvalidXLogRecPtr;
+		int children = 0, pageno = 0;
+
+		creation_reset(BootstrapProcessing);
+		proc.xid = BootstrapTransactionId;
+		switch (fault) {
+			case 0: Mode = NormalProcessing; break;
+			case 1: Mode = InitProcessing; break;
+			case 2: InRecovery = true; break;
+			case 3: native_mode = CLUSTER_NATIVE_FILES_MANAGED_V2; break;
+			case 4: native_mode = CLUSTER_NATIVE_FILES_UNKNOWN_V2; break;
+			case 5: creation_has_request = false; break;
+			case 6: creation_has_table = false; break;
+			case 7: creation_info.creation.creator_pid++; break;
+			case 8: creation_info.startup_generation++; break;
+			case 9: creation_info.table_generation = 0; break;
+			case 10: MyBackendType = B_BACKEND; break;
+			case 11: IsUnderPostmaster = true; break;
+			case 12: IsPostmasterEnvironment = true; break;
+			case 13: cluster_node_id = 0; break;
+			case 14: proc.xid = 4; break;
+			case 15: MyProc = NULL; break;
+			case 16: xid = FrozenTransactionId; break;
+			case 17: status = TRANSACTION_STATUS_ABORTED; break;
+			case 18: status = TRANSACTION_STATUS_SUB_COMMITTED; break;
+			case 19: lsn = 10; break;
+			case 20: children = 1; break;
+			case 21: pageno = 1; break;
+			case 22: creation_context.boot_files[0].object_id = 1;
+				creation_info.creation = creation_context; break;
+		}
+		before = page; identity = identities[0];
+		LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+		PG_TRY();
+		{
+			TransactionIdSetPageStatusInternal(xid, children, &child, status, lsn, pageno);
+		}
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(!memcmp(&before, &page, sizeof(page)));
+		UT_ASSERT(!memcmp(&identity, identities, sizeof(identity)));
+		UT_ASSERT(!dirty[0] && control_held && !io_held);
+		UT_ASSERT_EQ(native_borrows + native_opens + inserts + writes + reads, 0);
+		/* ERROR reset the interrupt holdoff; retire the original caller lock. */
+		HOLD_INTERRUPTS();
+		LWLockRelease(XactSLRULock);
+		checkpoint_close();
+	}
+}
+
+UT_TEST(creation_bootstrap_commit_preserves_conflicting_terminal_bits)
+{
+	volatile bool caught = false;
+	PGAlignedBlock before;
+
+	creation_reset(BootstrapProcessing);
+	proc.xid = BootstrapTransactionId;
+	page.data[0] = 0x48; /* xid 1 ABORTED; xid 3 COMMITTED. */
+	before = page;
+	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		TransactionIdSetPageStatusInternal(BootstrapTransactionId, 0, NULL,
+			TRANSACTION_STATUS_COMMITTED, InvalidXLogRecPtr, 0);
+	}
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(!memcmp(&before, &page, sizeof(page)) && !dirty[0]);
+	UT_ASSERT_EQ(native_borrows + native_opens + inserts + writes, 0);
+	HOLD_INTERRUPTS();
+	LWLockRelease(XactSLRULock);
+	checkpoint_close();
+}
+
 int
 main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-creation-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
 	snprintf(filename, sizeof(filename), "%s/0000", directory);
-	UT_PLAN(3);
+	UT_PLAN(6);
 	UT_RUN(creation_trim_status_checkpoint_keep_original_identity_and_wal);
 	UT_RUN(creation_checkpoint_rejects_unrelated_batch_before_wal_or_io);
 	UT_RUN(creation_frame_wal_uses_only_the_authenticated_batch_origin);
+	UT_RUN(creation_bootstrap_commit_keeps_the_original_page_and_checkpoint);
+	UT_RUN(creation_bootstrap_status_refuses_other_contexts_before_page_effects);
+	UT_RUN(creation_bootstrap_commit_preserves_conflicting_terminal_bits);
 	rmdir(directory);
 	UT_DONE(); return ut_failed_count != 0;
 }

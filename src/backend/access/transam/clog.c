@@ -172,6 +172,21 @@ CLOGNativeCreationFile(int pageno, ClusterControlNativeTableInfoV2 *selected)
 }
 
 static bool
+CLOGNativeBootstrapCommit(TransactionId xid, XidStatus status, XLogRecPtr lsn)
+{
+	ClusterControlNativeTableInfoV2 selected;
+
+	/* PG assigns its permanent xid 1 to the original bootstrap transaction.
+	 * It still commits through CLOG. This exception belongs only to the
+	 * authenticated, unpublished creator; it grants no online/recovery xid. */
+	return xid == BootstrapTransactionId
+		&& status == TRANSACTION_STATUS_COMMITTED
+		&& XLogRecPtrIsInvalid(lsn) && IsBootstrapProcessingMode() && !InRecovery
+		&& MyProc != NULL && MyProc->xid == BootstrapTransactionId
+		&& CLOGNativeCreationFile(0, &selected);
+}
+
+static bool
 CLOGNativeFileAcquire(int pageno, ClusterControlNativeFileBorrowV2 *borrow)
 {
 	ClusterControlFileKeyV2 key = {0};
@@ -676,11 +691,11 @@ TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 #ifdef USE_PGRAC_CLUSTER
 /* Check before any bit or group LSN on the page changes. */
 static void
-CLOGCheckNativeStatus(TransactionId xid, XidStatus status, int slotno)
+CLOGCheckNativeStatus(TransactionId xid, XidStatus status, XLogRecPtr lsn, int slotno)
 {
 	XidStatus	current;
 
-	if (!TransactionIdIsNormal(xid) ||
+	if ((!TransactionIdIsNormal(xid) && !CLOGNativeBootstrapCommit(xid, status, lsn)) ||
 		(status != TRANSACTION_STATUS_COMMITTED &&
 		 status != TRANSACTION_STATUS_ABORTED &&
 		 status != TRANSACTION_STATUS_SUB_COMMITTED) ||
@@ -731,7 +746,9 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 			nsubxids < 0 || nsubxids > CLOG_XACTS_PER_PAGE ||
 			(nsubxids > 0 && subxids == NULL) ||
 			(TransactionIdIsValid(xid) &&
-			 (!TransactionIdIsNormal(xid) || TransactionIdToPage(xid) != pageno)))
+			 ((!TransactionIdIsNormal(xid) &&
+			   (nsubxids != 0 || !CLOGNativeBootstrapCommit(xid, status, lsn))) ||
+			  TransactionIdToPage(xid) != pageno)))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid managed CLOG page status request")));
@@ -764,12 +781,12 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 	if (native)
 	{
 		if (TransactionIdIsValid(xid))
-			CLOGCheckNativeStatus(xid, status, slotno);
+			CLOGCheckNativeStatus(xid, status, lsn, slotno);
 		for (i = 0; i < nsubxids; i++)
 		{
 			if (TransactionIdIsValid(xid) && status == TRANSACTION_STATUS_COMMITTED)
-				CLOGCheckNativeStatus(subxids[i], TRANSACTION_STATUS_SUB_COMMITTED, slotno);
-			CLOGCheckNativeStatus(subxids[i], status, slotno);
+				CLOGCheckNativeStatus(subxids[i], TRANSACTION_STATUS_SUB_COMMITTED, lsn, slotno);
+			CLOGCheckNativeStatus(subxids[i], status, lsn, slotno);
 		}
 	}
 #endif
@@ -1044,7 +1061,7 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 
 #ifdef USE_PGRAC_CLUSTER
 	if (CLOGNativeIORequired())
-		CLOGCheckNativeStatus(xid, status, slotno);
+		CLOGCheckNativeStatus(xid, status, lsn, slotno);
 #endif
 
 	byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
