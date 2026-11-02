@@ -232,6 +232,39 @@ reader exits still needs separate proof. Successful VACUUM or reader release
 does not supply it. Native execution requires readiness and runtime approval;
 local selection tests and Perl syntax checks supply no native runtime credit.
 
+### Native idle freeze and clean restart
+
+The opt-in `m1-idle-freeze` suite runs `t/485_pre2_idle_freeze_restart.pl`
+through the original four-member controller, with the original 1200-second
+outer case budget. Use the native command above with `--suite m1-idle-freeze`
+after component readiness, candidate qualification and runtime authorization.
+The original `pageinspect` library and extension files must already be in
+that candidate's installation. The case registers the extension in its fresh
+database. Missing files fail the case; no build/install step or skip is added.
+
+Four native origin writers insert sixteen literal rows. The test records their
+FullXids and checks the unfrozen tuple xmin, CTID and payload through original
+`get_raw_page`, `heap_page_items` and `heap_tuple_infomask_flags`. After ten
+seconds without business SQL, one original `VACUUM (FREEZE, VERBOSE)` must
+actually set every target tuple's `HEAP_XMIN_FROZEN` flag. Elapsed time and a
+successful VACUUM command do not supply this proof. All four members must read
+the frozen tuples and expected row values. Original full normal stop and
+same-DATA restart then precede another four-member readback and final normal
+stop. Original startup/stop identity checks and deadlines remain unchanged.
+
+Raw page images, tuple observations, row cuts, actual writer identities,
+monotonic idle interval, VACUUM output, target catalog observations and both
+stop receipts are retained. No xid/floor/report/clock assignment, resource
+polling, workload retry or test adapter is introduced. The first error remains
+a failure, including cleanup errors and unexpected member ERROR/FATAL/PANIC.
+
+Exit zero certifies only target tuple freezing and data/catalog preservation
+across clean restart. Reports always retain `p01=NOT_READY` and
+`stage_acceptance=NOT_READY`: the full-width F/H/catalog cutoff proof and full
+M1 acceptance remain separate. Raw xid ordering, stored cutoff equality and
+clean restart do not certify them or general crash recovery. Local selection
+tests and Perl syntax checks provide no native/product-path runtime credit.
+
 ### Retained workload manifest intake
 
 Verify a retained four-node capture without contacting a server:
