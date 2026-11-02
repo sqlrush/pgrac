@@ -357,6 +357,8 @@ struct ClusterRelmapRecoveryCreateReceiptV2
 	int pid;
 	bool failed, checking;
 	ClusterColdTypedV1 *typed;
+	struct ClusterRecoveryFencePlan *barrier_fence;
+	uint64 barrier_episode_id;
 	ClusterControlRelmapRecoveryCreateV2 *recovery;
 	ClusterRelmapRecoveryCreateObservationV2 observation;
 	ClusterRecoveryCheckpointSourceV2 *cuts;
@@ -653,9 +655,20 @@ relmap_recovery_create_frame(const ClusterColdTypedV1 *typed, uint32 participant
 	return true;
 }
 
+/* Only the creation consumer can replace serial custody with the original H
+ * episode. Ordinary pending and generic source validation keep their own gates. */
+static bool
+relmap_create_sources_current(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint64 episode_id)
+{
+	return episode_id != 0
+		? cluster_cold_typed_relmap_create_barrier_current_v2(typed, fence, episode_id)
+		: cluster_cold_typed_sources_current_v1(typed, fence);
+}
+
 static bool
 relmap_recovery_create(ClusterColdTypedV1 *typed,
-	struct ClusterRecoveryFencePlan *fence, uint32 participant, const ClusterWalSourceRef *source,
+	struct ClusterRecoveryFencePlan *fence, uint64 episode_id, uint32 participant, const ClusterWalSourceRef *source,
 	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
 	Size receipt_budget, ClusterRelmapRecoveryCreateReceiptV2 **fresh)
 {
@@ -683,6 +696,8 @@ relmap_recovery_create(ClusterColdTypedV1 *typed,
 				w->receipt->self = (uintptr_t)w->receipt;
 				w->receipt->pid = MyProcPid;
 				w->receipt->typed = typed;
+				w->receipt->barrier_fence = episode_id ? fence : NULL;
+				w->receipt->barrier_episode_id = episode_id;
 				w->receipt->observation.participant = participant;
 				w->receipt->observation.source = *source;
 			}
@@ -692,8 +707,11 @@ relmap_recovery_create(ClusterColdTypedV1 *typed,
 			if (!cluster_relmap_control_create_redo_input_v1(reader, expected, batch, &w->creation)
 				|| !relmap_recovery_create_frame(typed, participant, source, reader,
 					w->receipt != NULL ? &w->receipt->observation.frame : NULL)
-				|| cluster_control_relmap_recovery_create_begin_locked_v2(typed, fence, participant,
-					source, reader->ReadRecPtr, w->creation.actual_end, expected, batch, &w->recovery) != 0
+				|| (episode_id != 0
+					? cluster_control_relmap_recovery_create_begin_barrier_locked_v2(typed, fence, episode_id,
+						participant, source, reader->ReadRecPtr, w->creation.actual_end, expected, batch, &w->recovery)
+					: cluster_control_relmap_recovery_create_begin_locked_v2(typed, fence, participant,
+						source, reader->ReadRecPtr, w->creation.actual_end, expected, batch, &w->recovery)) != 0
 				|| cluster_control_root_relmap_format_locked_v2(
 					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &format) != 0
 				|| format.root_version != 4
@@ -783,12 +801,12 @@ cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence, uint32 participant, const ClusterWalSourceRef *source,
 	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16])
 {
-	return relmap_recovery_create(typed, fence, participant, source, reader, expected, batch, 0, NULL);
+	return relmap_recovery_create(typed, fence, 0, participant, source, reader, expected, batch, 0, NULL);
 }
 
-bool
-cluster_relmap_control_recovery_create_capture_v2(ClusterColdTypedV1 *typed,
-	struct ClusterRecoveryFencePlan *fence, uint32 participant, const ClusterWalSourceRef *source,
+static bool
+relmap_recovery_create_capture(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint64 episode_id, uint32 participant, const ClusterWalSourceRef *source,
 	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
 	Size receipt_budget, ClusterRelmapRecoveryCreateReceiptV2 **out)
 {
@@ -806,7 +824,27 @@ cluster_relmap_control_recovery_create_capture_v2(ClusterColdTypedV1 *typed,
 			(relmap_control_overlap(reader->record, Max(sizeof(*reader->record), reader->record->size), out, sizeof(*out))
 			 || relmap_control_overlap(XLogRecGetData(reader), XLogRecGetDataLen(reader), out, sizeof(*out))))
 		|| *out != NULL) return false;
-	return relmap_recovery_create(typed, fence, participant, source, reader, expected, batch, receipt_budget, out);
+	return relmap_recovery_create(typed, fence, episode_id, participant, source, reader, expected, batch, receipt_budget, out);
+}
+
+bool
+cluster_relmap_control_recovery_create_capture_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint32 participant, const ClusterWalSourceRef *source,
+	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	Size budget, ClusterRelmapRecoveryCreateReceiptV2 **out)
+{
+	return relmap_recovery_create_capture(typed, fence, 0, participant, source, reader, expected, batch, budget, out);
+}
+
+bool
+cluster_relmap_control_recovery_create_capture_barrier_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint64 episode_id, uint32 participant,
+	const ClusterWalSourceRef *source, XLogReaderState *reader,
+	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	Size budget, ClusterRelmapRecoveryCreateReceiptV2 **out)
+{
+	return episode_id != 0 && relmap_recovery_create_capture(typed, fence, episode_id,
+		participant, source, reader, expected, batch, budget, out);
 }
 
 static void
@@ -821,12 +859,14 @@ relmap_create_observation_failed(ClusterRelmapRecoveryCreateReceiptV2 *r)
 static bool
 relmap_create_saved_owner(const ClusterRelmapRecoveryCreateReceiptV2 *r,
 	const ClusterColdTypedV1 *typed, const struct ClusterRecoveryFencePlan *fence,
-	const ClusterColdPlanV1 *plan)
+	const ClusterColdPlanV1 *plan, uint64 episode_id)
 {
 	const ClusterRelmapRecoveryCreateObservationV2 *o = &r->observation;
 	uint32 matches = 0, p = o->participant;
 	if (r->failed || !r->checking || r->typed != typed || r->recovery == NULL
-		|| typed->tx_fence != fence || typed->plan != plan || plan->magic != CLUSTER_COLD_PLAN_MAGIC
+		|| r->barrier_episode_id != episode_id
+		|| (episode_id != 0 ? r->barrier_fence != fence : typed->tx_fence != fence)
+		|| typed->plan != plan || plan->magic != CLUSTER_COLD_PLAN_MAGIC
 		|| plan->phase != COLD_PHASE_SEALED || plan->relmap_failed || typed->refusal != CLUSTER_COLD_OK
 		|| !typed->participant_count || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
 		|| plan->participant_count != typed->participant_count || !typed->replay_count
@@ -881,7 +921,7 @@ relmap_create_saved_sources(const ClusterRelmapRecoveryCreateReceiptV2 *r,
 
 static bool
 relmap_create_receipt_recheck(ClusterRelmapRecoveryCreateReceiptV2 *r,
-	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, bool confirmed)
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint64 episode_id, bool confirmed)
 {
 	ClusterColdPlanV1 *plan;
 	RelmapCreateWork *volatile work = NULL;
@@ -900,7 +940,7 @@ relmap_create_receipt_recheck(ClusterRelmapRecoveryCreateReceiptV2 *r,
 			ClusterControlRelmapFormatV2 format;
 			uint8 digest[32];
 			if (typed == NULL || fence == NULL || plan == NULL
-				|| !relmap_create_saved_owner(r, typed, fence, plan)
+				|| !relmap_create_saved_owner(r, typed, fence, plan, episode_id)
 				|| !cluster_relmap_authority_x_held() || !cluster_cf_held_is_clusterwide(ExclusiveLock)
 				|| CritSectionCount || !enableFsync || !RecoveryInProgress() || MyBackendType != B_STARTUP
 				|| LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(RelationMappingLock)
@@ -922,8 +962,8 @@ relmap_create_receipt_recheck(ClusterRelmapRecoveryCreateReceiptV2 *r,
 				memcpy(w->receipts, r->files, sizeof(w->receipts));
 				for (unsigned i = 0; i < 2; ++i) w->receipts[i].sources = w->sources;
 			}
-			if (!cluster_cold_typed_sources_current_v1(typed, fence)
-				|| !relmap_create_saved_owner(r, typed, fence, plan)
+			if (!relmap_create_sources_current(typed, fence, episode_id)
+				|| !relmap_create_saved_owner(r, typed, fence, plan, episode_id)
 				|| !cluster_relmap_create_encode_v1(&r->observation.creation.record.identity,
 					r->observation.creation.record.batch_uuid, &r->observation.creation.record.committed,
 					w->creation_wal, sizeof(w->creation_wal))
@@ -948,16 +988,19 @@ relmap_create_receipt_recheck(ClusterRelmapRecoveryCreateReceiptV2 *r,
 			}
 			LWLockRelease(RelationMappingLock);
 			w->mapping = false;
-			ok = cluster_cold_typed_sources_current_v1(typed, fence)
-				&& relmap_create_saved_owner(r, typed, fence, plan)
+			ok = relmap_create_sources_current(typed, fence, episode_id)
+				&& relmap_create_saved_owner(r, typed, fence, plan, episode_id)
 				&& relmap_create_saved_sources(r, w->selection)
 				&& cluster_control_root_relmap_selection_recheck_locked_v4(w->selection) == 0
-				&& relmap_create_saved_owner(r, typed, fence, plan)
+				&& relmap_create_saved_owner(r, typed, fence, plan, episode_id)
 				&& cluster_relmap_authority_x_held() && cluster_cf_held_is_clusterwide(ExclusiveLock);
 			if (ok && confirmed)
-				ok = cluster_control_relmap_recovery_create_confirmed_current_v2(r->recovery, w->receipts, 2)
-					&& cluster_cold_typed_sources_current_v1(typed, fence)
-					&& relmap_create_saved_owner(r, typed, fence, plan)
+				ok = (episode_id != 0
+					? cluster_control_relmap_recovery_create_confirmed_barrier_current_v2(
+						r->recovery, episode_id, w->receipts, 2)
+					: cluster_control_relmap_recovery_create_confirmed_current_v2(r->recovery, w->receipts, 2))
+					&& relmap_create_sources_current(typed, fence, episode_id)
+					&& relmap_create_saved_owner(r, typed, fence, plan, episode_id)
 					&& relmap_create_saved_sources(r, w->selection)
 					&& cluster_control_root_relmap_selection_recheck_locked_v4(w->selection) == 0;
 		} while (0);
@@ -990,14 +1033,28 @@ bool
 cluster_relmap_recovery_create_physical_recheck_v2(ClusterRelmapRecoveryCreateReceiptV2 *r,
 	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
 {
-	return relmap_create_receipt_recheck(r, typed, fence, false);
+	return relmap_create_receipt_recheck(r, typed, fence, 0, false);
 }
 
 bool
 cluster_relmap_recovery_create_recheck_v2(ClusterRelmapRecoveryCreateReceiptV2 *r,
 	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
 {
-	return relmap_create_receipt_recheck(r, typed, fence, true);
+	return relmap_create_receipt_recheck(r, typed, fence, 0, true);
+}
+
+bool
+cluster_relmap_recovery_create_physical_recheck_barrier_v2(ClusterRelmapRecoveryCreateReceiptV2 *r,
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint64 episode_id)
+{
+	return episode_id != 0 && relmap_create_receipt_recheck(r, typed, fence, episode_id, false);
+}
+
+bool
+cluster_relmap_recovery_create_recheck_barrier_v2(ClusterRelmapRecoveryCreateReceiptV2 *r,
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, uint64 episode_id)
+{
+	return episode_id != 0 && relmap_create_receipt_recheck(r, typed, fence, episode_id, true);
 }
 
 static void
@@ -1051,9 +1108,9 @@ relmap_create_batch_current(const ClusterColdTypedV1 *typed,
 		&& !plan->relmap_failed;
 }
 
-bool
-cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *typed,
-	struct ClusterRecoveryFencePlan *fence, const ClusterColdStepV1 *step,
+static bool
+relmap_create_apply(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint64 episode_id, const ClusterColdStepV1 *step,
 	XLogReaderState *reader, Size receipt_budget)
 {
 	ClusterColdPlanV1 *plan;
@@ -1075,9 +1132,9 @@ cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *typed,
 		if (!entry->applied || entry->receipt == NULL) goto failed;
 		PG_TRY();
 		{
-			ok = fence != NULL && typed->tx_fence == fence && reader != NULL
+			ok = fence != NULL && (episode_id != 0 || typed->tx_fence == fence) && reader != NULL
 				&& relmap_create_batch_current(typed, entry, reader)
-				&& cluster_relmap_recovery_create_recheck_v2(entry->receipt, typed, fence)
+				&& relmap_create_receipt_recheck(entry->receipt, typed, fence, episode_id, true)
 				&& relmap_create_batch_current(typed, entry, reader);
 		}
 		PG_CATCH();
@@ -1099,13 +1156,13 @@ cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *typed,
 		do {
 			ClusterRelmapRecoveryCreateReceiptV2 *receipt = NULL;
 			Size saved;
-			if (fence == NULL || typed->tx_fence != fence || reader == NULL
+			if (fence == NULL || (episode_id == 0 && typed->tx_fence != fence) || reader == NULL
 				|| receipt_budget < sizeof(*receipt) || !cold_plan_reserve(plan, receipt_budget)) break;
 			entry->receipt_bytes = receipt_budget;
-			if (!cluster_cold_typed_sources_current_v1(typed, fence)
+			if (!relmap_create_sources_current(typed, fence, episode_id)
 				|| !relmap_create_batch_current(typed, entry, reader)
 				|| memcmp(&entry->input, &original, sizeof(original)) || plan->relmap_failed) break;
-			if (!cluster_relmap_control_recovery_create_capture_v2(typed, fence, original.participant,
+			if (!relmap_recovery_create_capture(typed, fence, episode_id, original.participant,
 				&original.source, reader, &original.creation.identity, original.creation.batch_uuid,
 				receipt_budget, &receipt)) break;
 			/* Attach BEFORE any fallible postcheck: a confirmed creation and
@@ -1118,7 +1175,7 @@ cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *typed,
 			cold_plan_release(plan, receipt_budget - saved);
 			entry->receipt_bytes = saved;
 			if (memcmp(&receipt->observation.creation.record, &original.creation, sizeof(original.creation))
-				|| !cluster_cold_typed_sources_current_v1(typed, fence)
+				|| !relmap_create_sources_current(typed, fence, episode_id)
 				|| !relmap_create_batch_current(typed, entry, reader)
 				|| memcmp(&entry->input, &original, sizeof(original)) || plan->relmap_failed) break;
 			entry->applied = true;
@@ -1147,20 +1204,21 @@ failed:
 	return false;
 }
 
-bool
-cluster_cold_typed_relmap_create_ready_v2(ClusterColdTypedV1 *typed,
-	struct ClusterRecoveryFencePlan *fence)
+static bool
+relmap_create_ready(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint64 episode_id)
 {
 	ClusterColdPlanV1 *plan;
 	volatile bool ok = false;
-	if (typed == NULL || fence == NULL || typed->tx_fence != fence || typed->refusal != CLUSTER_COLD_OK
+	if (typed == NULL || fence == NULL || (episode_id == 0 && typed->tx_fence != fence) || typed->refusal != CLUSTER_COLD_OK
 		|| (plan = typed->plan) == NULL || plan->magic != CLUSTER_COLD_PLAN_MAGIC
 		|| !typed->participant_count || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
 		|| typed->participant_count != plan->participant_count || !typed->replay_count
 		|| typed->replay_count > typed->participant_count
 		|| plan->phase != COLD_PHASE_SEALED || plan->relmap_failed) return false;
 	/* An incomplete batch is not consumed, and never implies an empty one. */
-	if (plan->relmap_create_count == 0) return true;
+	if (plan->relmap_create_count == 0)
+		return episode_id == 0 || relmap_create_sources_current(typed, fence, episode_id);
 	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
 		const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
 		if (entry == NULL || !entry->captured || !entry->attempted || !entry->applied
@@ -1172,11 +1230,11 @@ cluster_cold_typed_relmap_create_ready_v2(ClusterColdTypedV1 *typed,
 		for (uint32 i = 0; i < plan->relmap_create_count && ok; ++i) {
 			const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
 			ok = relmap_create_batch_current(typed, entry, NULL)
-				&& cluster_relmap_recovery_create_recheck_v2(entry->receipt, typed, fence);
+				&& relmap_create_receipt_recheck(entry->receipt, typed, fence, episode_id, true);
 		}
 		for (uint32 i = 0; i < plan->relmap_create_count && ok; ++i)
 			ok = relmap_create_batch_current(typed, cold_relmap_create_at(plan, i), NULL);
-		ok = ok && cluster_cold_typed_sources_current_v1(typed, fence) && !plan->relmap_failed;
+		ok = ok && relmap_create_sources_current(typed, fence, episode_id) && !plan->relmap_failed;
 	}
 	PG_CATCH();
 	{
@@ -1190,5 +1248,67 @@ cluster_cold_typed_relmap_create_ready_v2(ClusterColdTypedV1 *typed,
 		cluster_cold_typed_relmap_create_failed_v2(typed);
 	}
 	return ok;
+}
+
+bool
+cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, const ClusterColdStepV1 *step,
+	XLogReaderState *reader, Size budget)
+{
+	return relmap_create_apply(typed, fence, 0, step, reader, budget);
+}
+
+bool
+cluster_cold_typed_relmap_create_apply_barrier_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint64 episode_id, const ClusterColdStepV1 *step,
+	XLogReaderState *reader, Size budget)
+{
+	return episode_id != 0 && relmap_create_apply(typed, fence, episode_id, step, reader, budget);
+}
+
+bool
+cluster_cold_typed_relmap_create_ready_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_create_ready(typed, fence, 0);
+}
+
+bool
+cluster_cold_typed_relmap_create_ready_barrier_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint64 episode_id)
+{
+	return episode_id != 0 && relmap_create_ready(typed, fence, episode_id);
+}
+
+bool
+cluster_cold_typed_relmap_create_receipt_at_barrier_v2(ClusterColdTypedV1 *typed,
+	uint64 episode_id, uint32 index, const ClusterRelmapRecoveryCreateReceiptV2 **receipt,
+	const ClusterControlRelmapRecoveryCreateV2 **confirmation)
+{
+	ClusterColdPlanV1 *plan;
+	const ColdRelmapCreateInput *entry;
+	const ClusterRelmapRecoveryCreateReceiptV2 *r;
+	if (typed == NULL || episode_id == 0 || receipt == NULL || confirmation == NULL
+		|| (plan = typed->plan) == NULL || plan->magic != CLUSTER_COLD_PLAN_MAGIC
+		|| plan->phase != COLD_PHASE_SEALED || plan->relmap_failed || typed->refusal != CLUSTER_COLD_OK
+		|| !cold_relmap_output_distinct(typed, receipt, sizeof(*receipt))
+		|| !cold_relmap_output_distinct(typed, confirmation, sizeof(*confirmation))
+		|| !cluster_control_native_files_output_distinct_v2(receipt, sizeof(*receipt))
+		|| !cluster_control_native_files_output_distinct_v2(confirmation, sizeof(*confirmation))
+		|| relmap_control_overlap(receipt, sizeof(*receipt), confirmation, sizeof(*confirmation))
+		|| (entry = cold_relmap_create_at(plan, index)) == NULL
+		|| !entry->captured || !entry->attempted || !entry->applied || entry->receipt == NULL)
+		return false;
+	r = entry->receipt;
+	if (!relmap_create_receipt_owned(r) || r->failed || r->checking || r->typed != typed
+		|| r->barrier_episode_id != episode_id || r->barrier_fence == NULL || r->recovery == NULL
+		|| relmap_create_receipt_alias(r, receipt, sizeof(*receipt))
+		|| relmap_create_receipt_alias(r, confirmation, sizeof(*confirmation))
+		|| !cluster_control_relmap_recovery_create_output_distinct_v2(r->recovery, receipt, sizeof(*receipt))
+		|| !cluster_control_relmap_recovery_create_output_distinct_v2(r->recovery, confirmation, sizeof(*confirmation)))
+		return false;
+	*receipt = r;
+	*confirmation = r->recovery;
+	return true;
 }
 #endif /* USE_PGRAC_CLUSTER */

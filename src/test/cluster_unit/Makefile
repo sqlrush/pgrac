@@ -16319,7 +16319,7 @@ test_cluster_relmap_create_copy: test_cluster_relmap_create_scan.inc test_cluste
 		$(top_srcdir)/src/common/sha2_int.h \
 		$(top_srcdir)/src/common/cluster_recovery_registry.c \
 		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_relmap_create_copy.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -include $(srcdir)/test_cluster_relmap_create_barrier_boundary.h -ffunction-sections -fdata-sections $(srcdir)/test_cluster_relmap_create_copy.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
 		test_cluster_cold_relmap_executor.o $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
 		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
 		test_cluster_relmap_create_scan_io.o $(CLUSTER_COLD_DECODE_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
@@ -16514,3 +16514,6 @@ $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_STARTUP_O) \
 # Full multi-page native WAL is selected only by terminal batch fixtures.
 test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: \
 		test_cluster_relmap_terminal_batch_wal.inc test_cluster_cold_relmap_terminal_many.inc
+
+# Complete original creation barrier consumer and saved confirmation export.
+test_cluster_relmap_create_copy: test_cluster_relmap_create_barrier.inc test_cluster_relmap_create_barrier_boundary.h

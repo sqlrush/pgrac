@@ -16,6 +16,31 @@ extern ClusterControlNativeResultV2 cluster_control_relmap_recovery_create_begin
 	const ClusterWalSourceRef *, XLogRecPtr read_rec_ptr, XLogRecPtr end_rec_ptr,
 	const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch_uuid[16],
 	ClusterControlRelmapRecoveryCreateV2 **out);
+/* Creation-only suspended episode. The first authorization still belongs to
+ * this exact CF-X acquisition. The original generic/serial entry is unchanged. */
+extern ClusterControlNativeResultV2 cluster_control_relmap_recovery_create_begin_barrier_locked_v2(
+	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint64 episode_id,
+	uint32 participant, const ClusterWalSourceRef *, XLogRecPtr, XLogRecPtr,
+	const ClusterRecoveryFileIdentityV2 *, const uint8 batch_uuid[16],
+	ClusterControlRelmapRecoveryCreateV2 **out);
+/* Independent read-only repetition in a fresh CF-X acquisition of the SAME
+ * typed/H episode. It selects current persistent facts only for comparison
+ * against original batch/complete receipts; it never revives the old selection
+ * or allows the original authorization/current/confirm to run again. */
+extern bool cluster_control_relmap_recovery_create_confirmed_barrier_current_v2(
+	ClusterControlRelmapRecoveryCreateV2 *, uint64 episode_id,
+	const ClusterRecoveryCheckpointFileV2 *, uint64 count);
+extern bool cluster_cold_typed_relmap_create_barrier_current_v2(
+	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint64 episode_id);
+extern bool cluster_cold_typed_relmap_create_barrier_record_current_v2(
+	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint64 episode_id,
+	uint32 participant, const ClusterWalSourceRef *, XLogRecPtr, XLogRecPtr);
+extern bool cluster_cold_typed_relmap_create_barrier_record_held_v2(
+	ClusterColdTypedV1 *, struct ClusterRecoveryFencePlan *, uint64 episode_id,
+	uint32 participant, const ClusterWalSourceRef *, XLogRecPtr, XLogRecPtr);
+/* Storage-only predicate for outputs borrowed beside the original carrier. */
+extern bool cluster_control_relmap_recovery_create_output_distinct_v2(
+	const ClusterControlRelmapRecoveryCreateV2 *, const void *, Size);
 /* Local-only check under the original MappingLock/I/O lifetime; no ROOT I/O.
  * A copy of the opaque carrier is never authority. */
 extern bool

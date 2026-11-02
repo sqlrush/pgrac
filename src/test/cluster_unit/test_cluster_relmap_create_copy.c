@@ -567,6 +567,7 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 #include "test_cluster_relmap_create_actual_side.inc"
 #include "test_cluster_relmap_create_conjunct.inc"
 #include "test_cluster_relmap_create_scan.inc"
+#include "test_cluster_relmap_create_barrier.inc"
 
 int main(int argc,char **argv)
 {
@@ -579,7 +580,18 @@ int main(int argc,char **argv)
   UT_RUN(creation_scan_late_pair_change_keeps_original_receipt_and_debt);
   UT_DONE(); return ut_failed_count!=0;
  }
- UT_PLAN(67);
+ if(getenv("PGRAC_TEST_CREATE_BARRIER")) {
+  UT_PLAN(7);
+  UT_RUN(creation_barrier_without_serial_executes_once_and_exports_original_receipts);
+  UT_RUN(creation_barrier_fresh_cf_rechecks_without_execution_or_confirmation);
+  UT_RUN(creation_barrier_wrong_episode_source_frame_or_fence_refuses);
+  UT_RUN(creation_barrier_late_failure_keeps_attached_receipt_and_debt);
+  UT_RUN(creation_barrier_changed_pair_rejects_repeat_and_final_gate);
+  UT_RUN(creation_barrier_receipt_outputs_reject_all_aliases_before_write);
+  UT_RUN(creation_barrier_owner_error_is_sticky_and_never_retries);
+  UT_DONE(); return ut_failed_count!=0;
+ }
+ UT_PLAN(74);
 	UT_RUN(copy_source_committed_map_into_independent_registered_pair);
 	UT_RUN(existing_target_never_overwritten_and_attempt_never_retried);
 	UT_RUN(guards_and_copied_carrier_precede_native_effects);
@@ -647,5 +659,12 @@ int main(int argc,char **argv)
  UT_RUN(creation_scan_wrong_registration_or_native_bytes_never_write_target);
  UT_RUN(creation_scan_missing_and_duplicate_declarations_cannot_seal);
  UT_RUN(creation_scan_late_pair_change_keeps_original_receipt_and_debt);
+ UT_RUN(creation_barrier_without_serial_executes_once_and_exports_original_receipts);
+ UT_RUN(creation_barrier_fresh_cf_rechecks_without_execution_or_confirmation);
+ UT_RUN(creation_barrier_wrong_episode_source_frame_or_fence_refuses);
+ UT_RUN(creation_barrier_late_failure_keeps_attached_receipt_and_debt);
+ UT_RUN(creation_barrier_changed_pair_rejects_repeat_and_final_gate);
+ UT_RUN(creation_barrier_receipt_outputs_reject_all_aliases_before_write);
+ UT_RUN(creation_barrier_owner_error_is_sticky_and_never_retries);
 	UT_DONE(); return ut_failed_count!=0;
 }
