@@ -8,9 +8,11 @@ int wal_level = WAL_LEVEL_REPLICA;
 static void recursive_unexpected(const char *name) pg_attribute_noreturn();
 static void recursive_unexpected(const char *name)
 { fprintf(stderr, "unexpected native leaf: %s\n", name); abort(); }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 SCN
 cluster_scn_advance(void)
 { recursive_unexpected("cluster_scn_advance"); }
+#endif
 bool
 TransactionIdDidCommit(TransactionId p0)
 { recursive_unexpected("TransactionIdDidCommit"); }
@@ -29,9 +31,11 @@ ReleaseBuffer(Buffer p0)
 void
 UnlockReleaseBuffer(Buffer p0)
 { UT_ASSERT(content_locked); LockBuffer(p0, BUFFER_LOCK_UNLOCK); ReleaseBuffer(p0); }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 void
 MarkBufferDirty(Buffer p0)
 { recursive_unexpected("MarkBufferDirty"); }
+#endif
 void
 BufferGetTag(Buffer p0, RelFileLocator * p1, ForkNumber * p2, BlockNumber * p3)
 { recursive_unexpected("BufferGetTag"); }
@@ -68,9 +72,11 @@ cluster_semantic_activation_recovered_open_current(void)
 void
 cluster_vis_evidence_note(ClusterVisEvidenceMetric p0)
 { recursive_unexpected("cluster_vis_evidence_note"); }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 void
 cluster_tt_local_record_active(TransactionId p0)
 { recursive_unexpected("cluster_tt_local_record_active"); }
+#endif
 void
 cluster_runtime_visibility_ensure_exit_hooks(void)
 { recursive_unexpected("cluster_runtime_visibility_ensure_exit_hooks"); }
@@ -95,18 +101,25 @@ MultiXactIdExpand(MultiXactId p0, TransactionId p1, MultiXactStatus p2)
 bool
 MultiXactIdIsRunning(MultiXactId p0, bool p1)
 { recursive_unexpected("MultiXactIdIsRunning"); }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_ctrc_sha256_exact(const void * p0, Size p1, uint8 * p2)
 { recursive_unexpected("cluster_ctrc_sha256_exact"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 void
 cluster_ctrc_note_publication_after_apply(const ClusterCtrcReceiptHandle * p0, bool p1)
 { recursive_unexpected("cluster_ctrc_note_publication_after_apply"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_ctrc_receipt_itl_reuse_candidate_shared(const ClusterCtrcReceiptHandle * p0, const ClusterCtrcTargetV1 * p1, const ClusterCtrcItlTargetIdentity * p2, const uint8 * p3)
 { recursive_unexpected("cluster_ctrc_receipt_itl_reuse_candidate_shared"); }
+#endif
 const char *
 cluster_undo_record_receipt_last_reason(void)
 { recursive_unexpected("cluster_undo_record_receipt_last_reason"); }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 ClusterUndoRecordPrepareResult
 cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt * p0, uint16 p1, bool p2)
 { UT_ASSERT(!content_locked && p0->ctrc_applied_mask == 0 && native_retry_limit != 0);
@@ -115,9 +128,11 @@ cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt * p0, ui
     mx_history_native_attempt_change(native_fault == 10); native_fault = 0;
   }
   return CLUSTER_UNDO_RECORD_PREPARE_READY; }
+#endif
 uint64
 cluster_undo_record_prepare_deadline_us(void)
 { UT_ASSERT(!content_locked); return 5000000; }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 ClusterUndoRecordPrepareResult
 cluster_undo_record_prepare(uint8 p0, uint16 p1, uint16 p2, uint16 p3, UBA p4, uint64 p5, ClusterUndoRecordPrepareReceipt * p6)
 { UT_ASSERT(!content_locked); UT_ASSERT_EQ(p0, UNDO_RECORD_ITL); UT_ASSERT_EQ(p2, 257); UT_ASSERT_EQ(p3, 3); UT_ASSERT_EQ(p5, 5000000); memset(p6, 0, sizeof(*p6)); p6->record_type = p0; p6->payload_capacity = p1; p6->tt_slot_segment_id = p2; p6->tt_slot_offset = p3; native_reserves++; if (native_fault == 1) two_tuple(2).t_data->t_infomask2++; if (native_fault == 2) pcm_source.generation++; if (native_fault == 3) CurrentResourceOwner = (ResourceOwner)2; if (native_fault == 4) writer_grant_ok = false;
@@ -125,51 +140,80 @@ cluster_undo_record_prepare(uint8 p0, uint16 p1, uint16 p2, uint16 p3, UBA p4, u
 	if (native_fault == 6) native_snapshot->read_epoch++;
 	if (native_fault == 7) pg_atomic_write_u32(&history_gate.transition_closed, 1);
 	if (native_fault == 8) publication_A_grant_revoked = true; return CLUSTER_UNDO_RECORD_PREPARE_READY; }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_prepared_recheck(const ClusterUndoRecordPrepareReceipt * p0, uint16 p1)
 { UT_ASSERT(content_locked && exclusive); native_prepared_checks++; if (native_prepared_checks < native_retry_limit) return false; ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("directed cancellation at prepared storage recheck"))); return false; }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_prepared_uba_exact(const ClusterUndoRecordPrepareReceipt * p0, uint16 p1, UBA * p2)
 { recursive_unexpected("cluster_undo_record_prepared_uba_exact"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_stage_history(ClusterUndoRecordPrepareReceipt * p0, uint8 p1, const UndoItlHistoryEntry * p2)
 { recursive_unexpected("cluster_undo_record_stage_history"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_history_matches(const ClusterUndoRecordPrepareReceipt * p0, uint8 p1, const UndoItlHistoryEntry * p2)
 { recursive_unexpected("cluster_undo_record_history_matches"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_ctrc_stage_pending(ClusterUndoRecordPrepareReceipt * p0, uint8 p1, const ClusterCtrcTargetV1 * p2)
 { recursive_unexpected("cluster_undo_record_ctrc_stage_pending"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt * p0, uint8 p1)
 { recursive_unexpected("cluster_undo_record_ctrc_prepare_pending"); }
+#endif
 bool
 cluster_undo_record_ctrc_stage_reuse(ClusterUndoRecordPrepareReceipt * p0, uint8 p1, const ClusterCtrcReceiptHandle * p2)
 { recursive_unexpected("cluster_undo_record_ctrc_stage_reuse"); }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_ctrc_pending_matches(const ClusterUndoRecordPrepareReceipt * p0, uint8 p1, const ClusterCtrcTargetV1 * p2)
 { recursive_unexpected("cluster_undo_record_ctrc_pending_matches"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_ctrc_pending_recheck(const ClusterUndoRecordPrepareReceipt * p0, uint8 p1, const ClusterCtrcTargetV1 * p2)
 { recursive_unexpected("cluster_undo_record_ctrc_pending_recheck"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_ctrc_required_prepared(const ClusterUndoRecordPrepareReceipt * p0, uint8 p1)
 { recursive_unexpected("cluster_undo_record_ctrc_required_prepared"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 ClusterCtrcApplyResult
 cluster_undo_record_ctrc_apply_prepared(ClusterUndoRecordPrepareReceipt * p0, uint8 p1, const ClusterCtrcTargetV1 * p2, ClusterCtrcApplyToken * p3)
 { recursive_unexpected("cluster_undo_record_ctrc_apply_prepared"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 void
 cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt * p0)
 { recursive_unexpected("cluster_undo_record_cancel_prepared"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_undo_record_release_zero_effect_preflight(ClusterUndoRecordPrepareReceipt * p0)
 { recursive_unexpected("cluster_undo_record_release_zero_effect_preflight"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 ClusterUndoRecordConsumePreflightResult
 cluster_undo_record_consume_preflight(ClusterUndoRecordPrepareReceipt * p0, uint16 p1)
 { recursive_unexpected("cluster_undo_record_consume_preflight"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 ClusterUndoRecordConsumeResult
 cluster_undo_record_consume_prepared(ClusterUndoRecordPrepareReceipt * p0, const ClusterUndoRecordTarget * p1, const void * p2, uint16 p3, UBA * p4)
 { recursive_unexpected("cluster_undo_record_consume_prepared"); }
+#endif
 ClusterBufmgrItlRecycleGuardResult
 cluster_bufmgr_itl_recycle_guard_arm(Buffer p0, const ClusterPcmOwnSnapshot * p1)
 { recursive_unexpected("cluster_bufmgr_itl_recycle_guard_arm"); }
@@ -209,18 +253,26 @@ visibilitymap_pin_ok(BlockNumber p0, Buffer p1)
 uint8
 visibilitymap_get_status(Relation p0, BlockNumber p1, Buffer * p2)
 { recursive_unexpected("visibilitymap_get_status"); }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 void
 XLogBeginInsert(void)
 { recursive_unexpected("XLogBeginInsert"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 XLogRecPtr
 XLogInsert(RmgrId p0, uint8 p1)
 { recursive_unexpected("XLogInsert"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 void
 XLogRegisterData(char * p0, uint32 p1)
 { recursive_unexpected("XLogRegisterData"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 void
 XLogRegisterBuffer(uint8 p0, Buffer p1, uint8 p2)
 { recursive_unexpected("XLogRegisterBuffer"); }
+#endif
 void
 XactLockTableWait(TransactionId p0, Relation p1, ItemPointer p2, XLTW_Oper p3)
 { recursive_unexpected("XactLockTableWait"); }
@@ -254,12 +306,16 @@ cluster_gcs_block_cr_fetch_projection(BufferTag p0, SCN p1, char * p2, ClusterR4
 bool
 cluster_bufmgr_block_write_permitted(Buffer p0)
 { return p0 == 1 && content_locked && exclusive && pcm_source.pcm_state == PCM_STATE_X && pcm_source.flags == 0; }
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 void
 cluster_itl_touch_register_exact_ctrc(const ClusterItlTouchHandle * p0, Buffer p1, TransactionId p2, const ClusterCtrcReceiptHandle * p3, const ClusterSpaceIdentity * p4)
 { recursive_unexpected("cluster_itl_touch_register_exact_ctrc"); }
+#endif
+#ifndef HISTORY_NATIVE_APPLY_FIXTURE
 bool
 cluster_itl_touch_lookup_reusable_ctrc(const ClusterItlTouchHandle * p0, Buffer p1, TransactionId p2, ClusterCtrcReceiptHandle * p3)
 { recursive_unexpected("cluster_itl_touch_lookup_reusable_ctrc"); }
+#endif
 bool
 rf_page_producer_stamp_v1(RfPageProducerBatchV1 * p0)
 { recursive_unexpected("rf_page_producer_stamp_v1"); }

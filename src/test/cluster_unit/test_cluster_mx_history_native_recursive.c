@@ -190,6 +190,10 @@ UT_TEST(native_recursive_zero_effect_attempt_restart_drops_original_pair)
 		UT_ASSERT_EQ(publication_applies, 2); native_clean(s);
 	}
 }
+#ifdef HISTORY_NATIVE_APPLY_FIXTURE
+#define main history_native_recursive_fixture_main
+int history_native_recursive_fixture_main(void);
+#endif
 int main(void)
 {
 	setbuf(stdout, NULL); history_fixture_init(); UT_PLAN(7);
