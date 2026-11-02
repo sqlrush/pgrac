@@ -312,6 +312,24 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 }
 
 /* ---- memory and strings ---- */
+/* The episode's derived links must outlive a per-record caller context. */
+static char plan_memory_context;
+static unsigned confirm_context_allocations;
+MemoryContext
+GetMemoryChunkContext(void *pointer)
+{
+	UT_ASSERT(pointer != NULL);
+	return (MemoryContext)&plan_memory_context;
+}
+
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	UT_ASSERT(context == (MemoryContext)&plan_memory_context);
+	confirm_context_allocations++;
+	return calloc(1, size);
+}
+
 void *palloc(Size size)
 {
 	void *p = malloc(size);
@@ -904,6 +922,55 @@ cluster_wal_retention_pin_serial_suspended_current_v1(
 	return CLUSTER_WAL_PIN_OK;
 }
 
+static bool confirm_pin_drops_cf;
+
+/* Retention is a service leaf in merge tests. Its actual pin mutation and
+ * subsequent serial matching are exercised by test_cluster_wal_retention. */
+ClusterWalPinResult
+cluster_wal_retention_pin_confirm_delta_v1(ClusterWalRetentionPin *pin,
+	const ClusterRecoverySerialGuardSet *set, const struct ClusterColdTypedV1 *typed,
+	const ClusterRecoveryFencePlan *plan, uint64 episode,
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	ClusterWalPinResult result = cluster_wal_retention_pin_serial_suspended_current_v1(pin, set);
+
+	if (result != CLUSTER_WAL_PIN_OK)
+		return result;
+	for (uint16 i = 0; i < plan->origin_count; i++) {
+		ClusterControlRootReadToken after;
+		if (!cluster_control_relmap_recovery_create_confirmed_root_delta_v2(confirmation,
+			typed, plan, episode, recovery_fence_effective_token(plan, i), &after)
+			|| memcmp(&after, &tokens[plan->origins[i].origin_thread], sizeof(after)))
+			return CLUSTER_WAL_PIN_STALE;
+	}
+	if (confirm_pin_drops_cf)
+		suspended_cf_exclusive = false;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+#ifndef TEST_MERGE_CONFIRM_DELTA
+/* Completion-only suite never creates a confirmation. */
+bool
+cluster_control_relmap_recovery_create_root_delta_v2(
+	const struct ClusterControlRelmapRecoveryCreateV2 *c pg_attribute_unused(),
+	const struct ClusterColdTypedV1 *typed pg_attribute_unused(),
+	const ClusterRecoveryFencePlan *plan pg_attribute_unused(), uint64 episode pg_attribute_unused(),
+	const ClusterControlRootReadToken *before pg_attribute_unused(),
+	ClusterControlRootReadToken *after pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_control_relmap_recovery_create_confirmed_root_delta_v2(
+	const struct ClusterControlRelmapRecoveryCreateV2 *c,
+	const struct ClusterColdTypedV1 *typed, const ClusterRecoveryFencePlan *plan, uint64 episode,
+	const ClusterControlRootReadToken *before, ClusterControlRootReadToken *after)
+{
+	return cluster_control_relmap_recovery_create_root_delta_v2(c, typed, plan, episode, before, after);
+}
+#endif
+
 /* ---- the completion handoff (cold completion tests) ---- */
 static ClusterThreadRecoveryAuthorityResultV1 authority_result[NODES + 1];
 static bool patch_refused[NODES + 1];
@@ -1049,6 +1116,12 @@ cluster_recovery_serial_acquire_set(
 		for (uint16 i = 0; i < count; i++) {
 			UT_ASSERT_EQ(requests[i].acquire_timeout_ms, overall_acquire_timeout_ms);
 			set->guards[i].held = true;
+			set->guards[i].mode = requests[i].mode;
+			set->guards[i].duty = requests[i].duty;
+			set->guards[i].root_read_token = requests[i].expected_root_token;
+			set->guards[i].formation = requests[i].formation;
+			set->guards[i].fence_need_set = requests[i].fence_need_set;
+			set->guards[i].fence_admission_set = requests[i].fence_admission_set;
 		}
 		*failed_index = CLUSTER_RECOVERY_SERIAL_SET_FAILED_NONE;
 		if (suspended_ir_grant_hook != NULL)

@@ -4609,6 +4609,8 @@ UT_TEST(test_prepare_read_pin_zero_ready_and_expired_never_renew)
 	reset_pin_fakes();
 }
 
+#include "test_cluster_wal_retention_confirm_delta.h"
+
 int
 main(int argc, char **argv)
 {
@@ -4617,7 +4619,10 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(102);
+	UT_PLAN(105);
+	UT_RUN(test_pin_confirmation_error_keeps_original_debt_cleanup_only);
+	UT_RUN(test_confirmed_pin_resumes_same_binding_with_exact_new_tokens);
+	UT_RUN(test_pin_confirm_refuses_incomplete_proof_and_partial_or_foreign_delta);
 	UT_RUN(test_suspended_pin_retains_same_binding_without_root_or_serial_authority);
 	UT_RUN(test_suspended_pin_refuses_every_proof_and_retained_reader_loss);
 	UT_RUN(test_suspended_pin_rejects_replacement_guard_storage_and_unbound_state);

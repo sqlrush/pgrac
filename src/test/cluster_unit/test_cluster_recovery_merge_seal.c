@@ -27,6 +27,7 @@
  *-------------------------------------------------------------------------
  */
 #define USE_PGRAC_CLUSTER 1
+#define TEST_MERGE_CONFIRM_DELTA 1
 
 #include "postgres.h"
 
@@ -624,11 +625,19 @@ UT_TEST(test_commit_refusal_retains_exact_field_and_first_result)
 
 #include "test_cluster_recovery_merge_deadline.h"
 #include "test_cluster_recovery_merge_suspend.h"
+#include "test_cluster_recovery_merge_confirm_delta.h"
 
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(43);
+	UT_RUN(test_confirmation_read_expiry_and_later_receipt_failure_prevent_resume);
+	UT_RUN(test_confirmation_chain_never_changes_typed_owner_or_uses_revoked_receipts);
+	UT_RUN(test_publishing_phase_is_not_final_install_or_resume_authority);
+	UT_RUN(test_prior_confirm_recheck_uses_chain_tip_without_replaying_or_rebasing);
+	UT_RUN(test_confirm_current_follows_exact_writer_phase_without_changing_baseline);
+	UT_RUN(test_confirm_delta_carries_exact_tokens_to_resume_but_origin_stays_original);
+	UT_RUN(test_confirm_delta_requires_original_final_proof_and_rejects_other_token_changes);
 	UT_RUN(test_suspended_held_current_never_reads_root_or_grants_serial);
 	UT_RUN(test_suspended_held_current_failure_is_sticky_without_metadata_io);
 	UT_RUN(test_suspended_held_current_does_not_replace_full_source_check);
