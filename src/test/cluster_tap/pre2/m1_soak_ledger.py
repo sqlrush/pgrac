@@ -8,6 +8,7 @@ Copyright (c) 2026, pgrac contributors
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -120,14 +121,43 @@ def row_cut(lines):
     return [rows[i] for i in range(64)]
 
 
+def invocation_interval(lines):
+    record = json.loads(''.join(lines), object_pairs_hook=unique_object)
+    require(type(record) is dict and set(record) == {
+        'start_monotonic_seconds', 'end_monotonic_seconds', 'elapsed_seconds',
+        'wait_status', 'completed', 'error'}, 'incomplete or unknown invocation fields')
+    start, end, elapsed = (record[key] for key in (
+        'start_monotonic_seconds', 'end_monotonic_seconds', 'elapsed_seconds'))
+    try:
+        finite = all(type(value) in (int, float) and math.isfinite(value)
+                     for value in (start, end, elapsed))
+    except OverflowError:
+        finite = False
+    require(finite, 'invocation times must be finite JSON numbers')
+    require(record['completed'] is True and type(record['wait_status']) is int
+            and record['wait_status'] == 0 and record['error'] == '',
+            'invocation did not complete normally')
+    interval = end-start
+    require(start >= 0 and interval >= 3600 and elapsed >= 3600,
+            'invocation does not cover the full monotonic hour')
+    # JSON floating-point roundtrip tolerance never reduces the hour minimum.
+    require(math.isclose(interval, elapsed, rel_tol=0, abs_tol=0.000001),
+            'saved elapsed duration differs from its monotonic endpoints')
+    return interval
+
+
 def read_ledger(manifest_path):
     manifest_path = Path(manifest_path)
     request = json.loads(manifest_path.read_text(), object_pairs_hook=unique_object)
-    require(type(request) is dict and set(request) == {
+    require(type(request) is dict and type(request.get('version')) is int
+            and request['version'] in (1, 2), 'unsupported ledger manifest version')
+    fields = {
         'version', 'clients', 'duration_seconds', 'pgbench_rc', 'workload', 'summary',
-        'stderr', 'logs', 'before', 'after'}, 'incomplete or unknown ledger manifest fields')
-    require(type(request['version']) is int and request['version'] == 1
-            and type(request['clients']) is int and request['clients'] in (16, 48, 64)
+        'stderr', 'logs', 'before', 'after'}
+    if request['version'] == 2:
+        fields.add('invocation')
+    require(set(request) == fields, 'incomplete or unknown ledger manifest fields')
+    require(type(request['clients']) is int and request['clients'] in (16, 48, 64)
             and type(request['duration_seconds']) is int and request['duration_seconds'] == 3600
             and type(request['pgbench_rc']) is int and request['pgbench_rc'] == 0,
             'not a successful fixed one-hour workload invocation')
@@ -142,6 +172,8 @@ def read_ledger(manifest_path):
     total = files.read(request['summary'], lambda lines: summary_fields(lines, clients))
     require(not files.read(request['stderr'], lambda lines: ''.join(lines)).strip(),
             'pgbench stderr is not empty')
+    interval = (files.read(request['invocation'], invocation_interval)
+                if request['version'] == 2 else None)
     counts, owners = [0]*clients, [None]*clients
 
     def raw_log(lines, log_index):
@@ -168,10 +200,15 @@ def read_ledger(manifest_path):
     for descriptor in request['after']:
         require(files.read(descriptor, row_cut) == expected,
                 'member final values differ from the independent per-client ledger')
-    return dict(workload_ledger_passed=True, p07='NOT_READY', stage_acceptance='NOT_READY',
+    result = dict(workload_ledger_passed=True, p07='NOT_READY', stage_acceptance='NOT_READY',
                 missing_gates=MISSING, clients=clients, configured_duration_seconds=3600,
                 total_commits=total, commits_by_client=counts, verified_files=files.observed,
                 identity_binding='DECLARED_NOT_ATTESTED')
+    if interval is not None:
+        result.update(elapsed_duration_passed=True, elapsed_seconds=interval,
+            invocation_binding='DECLARED_MONOTONIC_NOT_ATTESTED',
+            missing_gates=[gate for gate in MISSING if gate != 'actual elapsed duration'])
+    return result
 
 
 def main():

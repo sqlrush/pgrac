@@ -113,8 +113,9 @@ my $execution = eval {
 	closedir $dir or die $!;
 	die 'expected original two-thread pgbench log pair' unless @logs == 2
 	  && $logs[0] =~ /^pgbench_log\.[1-9][0-9]*$/ && $logs[1] eq "$logs[0].1";
-	my $manifest = {version => 1, clients => 0 + $clients, duration_seconds => 3600,
+	my $manifest = {version => 2, clients => 0 + $clients, duration_seconds => 3600,
 		pgbench_rc => 0, workload => descriptor('workload.sql'),
+		invocation => descriptor('invocation.json'),
 		summary => descriptor('summary.txt'), stderr => descriptor('stderr.txt'),
 		logs => [map { descriptor($_) } @logs], before => $before, after => $after};
 	save_json('manifest.json', $manifest);
@@ -123,6 +124,7 @@ my $execution = eval {
 	die 'independent raw commit ledger rejected the native workload' unless $checked;
 	my $ledger = decode_json(slurp_file("$evidence/ledger.json"));
 	die 'ledger scope differs' unless $ledger->{workload_ledger_passed}
+	  && $ledger->{elapsed_duration_passed}
 	  && $ledger->{p07} eq 'NOT_READY' && $ledger->{stage_acceptance} eq 'NOT_READY';
 	pass('all four row cuts agree with the independent per-client raw commit ledger');
 	1;

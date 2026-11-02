@@ -55,6 +55,76 @@ class SoakLedgerTests(unittest.TestCase):
         path.write_text(json.dumps(manifest))
         return ledger.read_ledger(path)
 
+    def invocation(self):
+        return dict(start_monotonic_seconds=42.125, end_monotonic_seconds=3642.625,
+                    elapsed_seconds=3600.5, wait_status=0, completed=True, error='')
+
+    def timed_capture(self, invocation=None):
+        manifest = self.capture()
+        manifest.update(version=2, invocation=self.file('invocation.json', json.dumps(
+            self.invocation() if invocation is None else invocation)))
+        return manifest
+
+    def test_retained_monotonic_invocation_covers_a_full_hour_without_stage_credit(self):
+        for start, end, elapsed in [(42.125, 3642.625, 3600.5), (0, 3600, 3600),
+                                     (42.125, 3642.625, 3600.5000001)]:
+            with self.subTest(start=start, end=end, elapsed=elapsed):
+                invocation = dict(self.invocation(), start_monotonic_seconds=start,
+                    end_monotonic_seconds=end, elapsed_seconds=elapsed)
+                try:
+                    result = self.check(self.timed_capture(invocation))
+                except ValueError as error:
+                    self.fail('original timed invocation intake is missing: '+str(error))
+                self.assertTrue(result['elapsed_duration_passed'])
+                self.assertEqual(result['elapsed_seconds'], end-start)
+                self.assertEqual(result['invocation_binding'], 'DECLARED_MONOTONIC_NOT_ATTESTED')
+                self.assertNotIn('actual elapsed duration', result['missing_gates'])
+                self.assertIn('candidate/cohort identity', result['missing_gates'])
+                self.assertIn('real recycle generation progress', result['missing_gates'])
+                self.assertEqual(result['p07'], 'NOT_READY')
+                self.assertEqual(result['stage_acceptance'], 'NOT_READY')
+                self.assertEqual(len(result['verified_files']), 14)
+                self.assertIn('invocation.json', [f['path'] for f in result['verified_files']])
+
+    def test_invocation_reader_rejects_short_failed_and_invalid_time_records(self):
+        changes = [dict(end_monotonic_seconds=3642.124999), dict(elapsed_seconds=3599.999999),
+            dict(end_monotonic_seconds=41), dict(start_monotonic_seconds=-1),
+            dict(elapsed_seconds=3601), dict(start_monotonic_seconds=True),
+            dict(end_monotonic_seconds='3642.625'), dict(elapsed_seconds=False),
+            dict(end_monotonic_seconds=float('inf')), dict(elapsed_seconds=float('nan')),
+            dict(start_monotonic_seconds=float('-inf')), dict(completed=False),
+            dict(completed=1), dict(wait_status=256), dict(wait_status=False),
+            dict(error='client timed out'), dict(error=0), dict(clock='epoch')]
+        records = [json.dumps(dict(self.invocation(), **change)) for change in changes]
+        records += [json.dumps({k: v for k, v in self.invocation().items() if k != field})
+                    for field in self.invocation()]
+        records += ['[]', json.dumps(self.invocation())[:-1]+', "wait_status": 0}']
+        for record in records:
+            with self.subTest(record=record):
+                reader = getattr(ledger, 'invocation_interval', None)
+                self.assertTrue(callable(reader), 'original monotonic invocation reader is missing')
+                with self.assertRaises(ValueError):
+                    reader(iter([record]))
+
+    def test_timed_cli_binds_invocation_bytes_and_legacy_keeps_missing_time(self):
+        old = self.check(self.capture())
+        self.assertIn('actual elapsed duration', old['missing_gates'])
+        self.assertNotIn('elapsed_duration_passed', old)
+        manifest = self.timed_capture()
+        path = self.root/'manifest.json'
+        path.write_text(json.dumps(manifest))
+        command = [sys.executable, '-B', str(Path(ledger.__file__)), str(path)]
+        reply = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(reply.returncode, 0, reply.stdout+reply.stderr)
+        self.assertTrue(json.loads(reply.stdout)['elapsed_duration_passed'])
+        # Same valid values, different retained bytes: exercise the descriptor.
+        (self.root/'invocation.json').write_text(json.dumps(self.invocation(), indent=2))
+        reply = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(reply.returncode, 1)
+        self.assertFalse(json.loads(reply.stdout)['workload_ledger_passed'])
+        self.assertEqual(json.loads(reply.stdout)['p07'], 'NOT_READY')
+        self.assertIn('size or SHA256 differs', json.loads(reply.stdout)['error'])
+
     def test_raw_ledger_matches_all_members_at_each_client_count(self):
         for clients in (16, 48, 64):
             with self.subTest(clients=clients):
@@ -110,7 +180,7 @@ class SoakLedgerTests(unittest.TestCase):
             with self.subTest(change=before), self.assertRaises(ValueError):
                 self.check(manifest)
         for field, value in [('pgbench_rc', 1), ('clients', True), ('clients', 32),
-                             ('duration_seconds', 180), ('version', 2)]:
+                             ('duration_seconds', 180), ('version', 3)]:
             manifest = self.capture()
             manifest[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):

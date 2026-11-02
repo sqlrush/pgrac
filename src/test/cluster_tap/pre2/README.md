@@ -173,14 +173,15 @@ aggregate, throttle or retry transactions. These instructions grant no runtime
 authorization or microbenchmark qualification.
 
 Run `python3 m1_soak_ledger.py CAPTURE/manifest.json` to compare retained files.
-The JSON manifest has exactly these fields:
+The JSON manifest has these fields; version 2 adds the invocation descriptor:
 
 | Field | Value |
 | --- | --- |
-| `version`, `clients`, `duration_seconds`, `pgbench_rc` | `1`, one of `16/48/64`, `3600`, `0` |
+| `version`, `clients`, `duration_seconds`, `pgbench_rc` | `1` or `2`, one of `16/48/64`, `3600`, `0` |
 | `workload`, `summary`, `stderr` | File descriptors for the SQL input and pgbench stdout/stderr |
 | `logs` | Two raw pgbench file descriptors, one per thread |
 | `before`, `after` | Four row-cut descriptors each, in declared member order 0–3 |
+| `invocation` | Version 2 only: descriptor for the original monotonic invocation JSON |
 
 A descriptor contains `path` (relative to the manifest), `size_bytes` and lowercase
 `sha256`. Inputs must be distinct regular files within the capture. The reader
@@ -188,11 +189,24 @@ checks contiguous per-client commit sequences, successful raw records, summary
 totals and every final row against the independent ledger. Missing or changed
 files, errors, inactive-heap writes and discrepancies fail the subcheck.
 
+Version 2 requires the existing invocation fields `start_monotonic_seconds`,
+`end_monotonic_seconds`, `elapsed_seconds`, `wait_status`, `completed` and `error`.
+Times must be finite JSON numbers; the start is nonnegative. Both the recomputed
+end-minus-start interval and saved elapsed value must cover at least 3600 seconds.
+Their difference may be at most one microsecond for numeric serialization;
+neither hour minimum is reduced. Completion must be `true`, raw wait status `0`
+and error empty. Duplicate/extra/missing fields or failed invocations fail the
+check. These are the same declared monotonic clock values, with no subtraction
+from pgbench epoch timestamps. Results label the binding
+`DECLARED_MONOTONIC_NOT_ATTESTED`; files alone do not authenticate the clock or
+bind it to a candidate/cohort. Version 1 remains readable and keeps actual
+elapsed duration in its missing evidence.
+
 Exit zero certifies only this file comparison. `p07` and `stage_acceptance` remain
-`NOT_READY`: actual elapsed duration, candidate/cohort identity, generation
-progress, complete resource observations and original clean stop need separate
-evidence. The existing regression coordinator continues to list the soak as
-uncovered. `test_m1_soak_ledger.py` uses literal parser inputs and runs no database.
+`NOT_READY`: candidate/cohort identity, generation progress, complete resource
+observations and original clean stop need separate evidence. The regression
+coordinator continues to list complete P07 as uncovered. `test_m1_soak_ledger.py`
+uses literal parser inputs and runs no database.
 
 ### Native soak workload and normal-stop preparation
 
@@ -204,6 +218,8 @@ heaps on node 0, the same configuration/SQL and a full 3600-second pgbench run.
 All four members supply initial/final row cuts. It retains the actual command,
 monotonic elapsed time, summary/stderr, unaggregated logs, hash-bound ledger
 manifest/result, original OPEN observations and original normal-stop receipt.
+The native case writes a version-2 manifest and requires its offline elapsed
+check in addition to the original one-hour TAP assertion.
 
 After the original normal stop, `m1_soak_member_logs.py` scans the four closed
 member stderr files in node order. `member-logs.json` records each file's size,
