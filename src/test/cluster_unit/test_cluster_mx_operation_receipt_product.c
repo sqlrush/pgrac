@@ -605,3 +605,83 @@ mx_history_transition_fault(unsigned fault)
 	if (fault == 4) transition_wrong_undo_handle = true;
 }
 Size mx_history_transition_bytes(void) { return sizeof(ClusterCurrentMxTransition); }
+
+/* Controlled reservation/CTRC storage is outside this adapter. Page/PCM guards,
+ * exact target construction, all boundary rechecks/APPLY/consume are native. */
+static ClusterHeapPreparedUndoTargetPlan boundary_undo;
+static ClusterHeapCurrentMxExactPublication boundary_publication;
+static ClusterUndoRecordPrepareReceipt boundary_receipt;
+static ClusterUndoRecordTarget boundary_target;
+static UndoItlPayload boundary_payload;
+bool
+mx_history_boundary_prepare(Relation rel, Buffer buffer, HeapTuple root,
+	uint8 ordinal, const ClusterCtrcReceiptHandle *handle)
+{
+	TransactionId xmax;
+	uint16 infomask, infomask2;
+	uint8 header[SizeofHeapTupleHeader] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+	ClusterHeapPreparedUndoTargetPlan *u = &boundary_undo;
+	ClusterUndoRecordPrepareReceipt *r = &boundary_receipt;
+	memset(u, 0, sizeof(*u)); memset(r, 0, sizeof(*r));
+	memset(&boundary_target, 0, sizeof(boundary_target));
+	memset(&boundary_payload, 0, sizeof(boundary_payload));
+	if (ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS || handle == NULL)
+		return false;
+	if (!cluster_current_mx_stamp_prepare_existing(rel, buffer, root,
+			&receipt_result, 145, CCMH_STAMP_TEMP_LOCK, LockTupleKeyShare,
+			&publication_plan, &xmax, &infomask, &infomask2)
+		|| !cluster_current_mx_chain_plan_header(root, xmax, infomask, infomask2, header)
+		|| !cluster_current_mx_stamp_prepare_exact_publication(rel, buffer,
+			ItemPointerGetOffsetNumber(&root->t_self),
+			PageGetItemId(BufferGetPage(buffer), ItemPointerGetOffsetNumber(&root->t_self)),
+			header, &publication_plan, &boundary_publication))
+		return false;
+	r->record_type = UNDO_RECORD_ITL;
+	r->payload_capacity = sizeof(boundary_payload);
+	r->ctrc_pending_mask = r->ctrc_prepared_mask = UINT8_C(1) << ordinal;
+	r->ctrc_handles[ordinal] = *handle;
+	u->buffer = buffer; u->slot_index = 7; u->xid = 129;
+	u->write_scn = 91; u->target_ordinal = ordinal;
+	u->payload_len = sizeof(boundary_payload);
+	if (!cluster_heap_dml_authority_guard_capture(buffer, root, &u->guard)
+		|| !cluster_heap_dml_authority_guard_bind_itl_slot(buffer, 7, &u->guard)
+		|| !cluster_heap_ctrc_pending_itl_target(rel, buffer, &u->guard,
+			r->record_type, &r->ctrc_pending_targets[ordinal])
+		|| !cluster_heap_ctrc_final_itl_target(buffer, u->xid, true, r, ordinal,
+			u->payload_len, u->slot_index, u->write_scn, &u->final_target, &u->planned_uba))
+		return false;
+	u->history.block = BufferGetBlockNumber(buffer);
+	u->history.slot_index = 7; u->history.after_kind = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	u->history.after_write_scn = 91; u->history.prior = u->guard.itl_slot;
+	r->itl_history[ordinal] = u->history; r->itl_history_mask = UINT8_C(1) << ordinal;
+	u->valid = u->lock_only = true;
+	boundary_target.blockno = BufferGetBlockNumber(buffer);
+	boundary_target.offnum = ItemPointerGetOffsetNumber(&root->t_self);
+	return true;
+}
+int
+mx_history_boundary_apply(Relation rel, Buffer buffer, HeapTuple root,
+	const ClusterHeapSuccessorProof *next, bool *planned)
+{
+	UBA undo = InvalidUba_init;
+	return cluster_current_mx_chain_apply_boundary(recursive_scope, rel, buffer,
+		root, next, &boundary_receipt, &boundary_undo, &boundary_target,
+		&boundary_payload, sizeof(boundary_payload), &undo,
+		&boundary_publication, NULL, planned);
+}
+void
+mx_history_boundary_write(HeapTuple root)
+{
+	memcpy(root->t_data, boundary_publication.planned_header, SizeofHeapTupleHeader);
+}
+bool
+mx_history_boundary_complete(Buffer buffer, bool whole, XLogRecPtr lsn)
+{
+	return cluster_current_mx_transition_complete(recursive_scope, buffer, whole, lsn);
+}
+unsigned
+mx_history_boundary_transition_state(void)
+{
+	return recursive_scope == NULL || recursive_scope->transition == NULL
+		? 0 : recursive_scope->transition->state;
+}

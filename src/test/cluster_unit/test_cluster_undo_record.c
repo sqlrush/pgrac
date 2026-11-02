@@ -2292,7 +2292,7 @@ UT_TEST(test_prepared_consume_lock_precedes_first_receipt_apply)
 
 	boundary = strstr(heap_source, "/* One caller-owned final boundary.");
 	boundary
-		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_preflight(");
 	boundary_end = boundary == NULL ? NULL : strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
 	boundary_preflight
 		= boundary == NULL ? NULL : strstr(boundary, "cluster_undo_record_consume_preflight(");
@@ -2382,7 +2382,7 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 
 	boundary = strstr(source, "/* One caller-owned final boundary.");
 	boundary
-		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_preflight(");
 	boundary_end = boundary == NULL ? NULL : strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
 	boundary_recheck
 		= boundary == NULL ? NULL : strstr(boundary, "cluster_heap_boundary_undo_target_recheck(");
@@ -2632,7 +2632,7 @@ UT_TEST(test_inlock_consume_preserves_retry_required_for_heap_unwind)
 
 	boundary = strstr(source, "/* One caller-owned final boundary.");
 	boundary
-		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+		= boundary == NULL ? NULL : strstr(boundary, "\ncluster_heap_no_retry_boundary_preflight(");
 	boundary_end = boundary == NULL ? NULL : strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
 	preflight
 		= boundary == NULL ? NULL : strstr(boundary, "cluster_undo_record_consume_preflight(");

@@ -123,4 +123,12 @@ extern void mx_history_recursive_begin_hop(void);
 extern bool mx_history_transition_plan_at(Buffer buffer, HeapTuple root,
 	const ClusterHeapSuccessorProof *proof, const MxPublicationReadout *plan, bool rf,
 	UBA planned_uba, SCN write_scn);
+/* Actual heap boundary, with independently prepared undo storage inputs. */
+extern bool mx_history_boundary_prepare(Relation rel, Buffer buffer, HeapTuple root,
+	uint8 ordinal, const ClusterCtrcReceiptHandle *handle);
+extern int mx_history_boundary_apply(Relation rel, Buffer buffer, HeapTuple root,
+	const ClusterHeapSuccessorProof *next, bool *planned);
+extern void mx_history_boundary_write(HeapTuple root);
+extern bool mx_history_boundary_complete(Buffer buffer, bool whole, XLogRecPtr lsn);
+extern unsigned mx_history_boundary_transition_state(void);
 #endif

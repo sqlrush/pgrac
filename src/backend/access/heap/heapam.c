@@ -11889,18 +11889,25 @@ cluster_heap_boundary_consume_undo(
 #endif
 
 
-/* One caller-owned final boundary.  Every page/tuple/ITL/current-MX target is
- * rechecked before the first APPLY.  A zero-APPLY drift may retry; once any
- * receipt is APPLIED, every later failure is terminal for this attempt. */
+/* One caller-owned final boundary. Preflight and APPLY remain ordered;
+ * a same-page typed continuation may be sealed between them. Other
+ * callers use the unchanged combined boundary below. No receipt is applied
+ * by the preflight helper, despite its successful legacy result name. */
+typedef struct ClusterHeapBoundaryPreflight
+{
+	bool any_applied;
+	UBA planned_uba;
+} ClusterHeapBoundaryPreflight;
+
 static ClusterHeapNoRetryBoundaryResult
-cluster_heap_no_retry_boundary_apply(
+cluster_heap_no_retry_boundary_preflight(
 	Relation relation,
 	ClusterUndoRecordPrepareReceipt *undo_receipt,
 	ClusterHeapPreparedUndoTargetPlan *undo_plans, uint8 undo_plan_count,
 	const ClusterUndoRecordTarget *undo_target, void *undo_payload,
 	uint16 undo_payload_len, UBA *undo_uba_out,
 	ClusterHeapCurrentMxExactPublication *mx_publications,
-	uint8 mx_publication_count)
+	uint8 mx_publication_count, ClusterHeapBoundaryPreflight *checked)
 {
 	bool any_applied = false;
 	UBA planned_uba = InvalidUba_init;
@@ -11975,6 +11982,25 @@ cluster_heap_no_retry_boundary_apply(
 				: CLUSTER_HEAP_BOUNDARY_REFUSED;
 	}
 
+	checked->any_applied = any_applied;
+	checked->planned_uba = planned_uba;
+	return CLUSTER_HEAP_BOUNDARY_APPLIED;
+}
+
+static ClusterHeapNoRetryBoundaryResult
+cluster_heap_no_retry_boundary_apply_preflighted(
+	Relation relation,
+	ClusterUndoRecordPrepareReceipt *undo_receipt,
+	ClusterHeapPreparedUndoTargetPlan *undo_plans, uint8 undo_plan_count,
+	const ClusterUndoRecordTarget *undo_target, void *undo_payload,
+	uint16 undo_payload_len, UBA *undo_uba_out,
+	ClusterHeapCurrentMxExactPublication *mx_publications,
+	uint8 mx_publication_count, const ClusterHeapBoundaryPreflight *checked)
+{
+	bool any_applied = checked->any_applied;
+	UBA planned_uba = checked->planned_uba;
+	uint8 i;
+
 	for (i = 0; i < undo_plan_count; i++)
 	{
 		ClusterCtrcApplyResult result;
@@ -12004,6 +12030,32 @@ cluster_heap_no_retry_boundary_apply(
 			!= CLUSTER_HEAP_PREPARED_UNDO_APPLIED)
 		return CLUSTER_HEAP_BOUNDARY_REFUSED;
 	return CLUSTER_HEAP_BOUNDARY_APPLIED;
+}
+
+/* One caller-owned final boundary: zero-effect drift alone may retry. */
+static ClusterHeapNoRetryBoundaryResult
+cluster_heap_no_retry_boundary_apply(
+	Relation relation,
+	ClusterUndoRecordPrepareReceipt *undo_receipt,
+	ClusterHeapPreparedUndoTargetPlan *undo_plans, uint8 undo_plan_count,
+	const ClusterUndoRecordTarget *undo_target, void *undo_payload,
+	uint16 undo_payload_len, UBA *undo_uba_out,
+	ClusterHeapCurrentMxExactPublication *mx_publications,
+	uint8 mx_publication_count)
+{
+	ClusterHeapBoundaryPreflight checked;
+	ClusterHeapNoRetryBoundaryResult result;
+
+	result = cluster_heap_no_retry_boundary_preflight(
+		relation, undo_receipt, undo_plans, undo_plan_count,
+		undo_target, undo_payload, undo_payload_len, undo_uba_out,
+		mx_publications, mx_publication_count, &checked);
+	if (result != CLUSTER_HEAP_BOUNDARY_APPLIED)
+		return result;
+	return cluster_heap_no_retry_boundary_apply_preflighted(
+		relation, undo_receipt, undo_plans, undo_plan_count,
+		undo_target, undo_payload, undo_payload_len, undo_uba_out,
+		mx_publications, mx_publication_count, &checked);
 }
 
 
@@ -17946,7 +17998,7 @@ cluster_current_mx_transition_page_sane(Page page)
 	return true;
 }
 
-static bool pg_attribute_unused()
+static bool
 cluster_current_mx_transition_plan(ClusterCurrentMxLockScope *scope,
 	Buffer buffer, HeapTuple root, const ClusterHeapSuccessorProof *successor,
 	const ClusterHeapCurrentMxExactPublication *publication,
@@ -18079,7 +18131,7 @@ cluster_current_mx_transition_plan(ClusterCurrentMxLockScope *scope,
 	return true;
 }
 
-static bool pg_attribute_unused()
+static bool
 cluster_current_mx_transition_complete(ClusterCurrentMxLockScope *scope, Buffer buffer,
 	bool whole_boundary_applied, XLogRecPtr actual_wal_lsn)
 {
@@ -18131,6 +18183,48 @@ cluster_current_mx_transition_complete(ClusterCurrentMxLockScope *scope, Buffer 
 	t->image.page_lsn = PageGetLSN(t->expected.data);
 	t->state = 2;
 	return true;
+}
+
+/* The native recursive publication owns these source plans through WAL.
+ * Only an independent typed same-page B needs a private delta witness. */
+static ClusterHeapNoRetryBoundaryResult
+cluster_current_mx_chain_apply_boundary(ClusterCurrentMxLockScope *scope,
+	Relation relation, Buffer buffer, HeapTuple root,
+	const ClusterHeapSuccessorProof *next,
+	ClusterUndoRecordPrepareReceipt *receipt,
+	ClusterHeapPreparedUndoTargetPlan *undo,
+	const ClusterUndoRecordTarget *target, void *payload, uint16 payload_len,
+	UBA *uba_out, ClusterHeapCurrentMxExactPublication *publication,
+	RfPageProducerBatchV1 *versions, bool *transition_planned)
+{
+	ClusterHeapBoundaryPreflight checked;
+	ClusterHeapNoRetryBoundaryResult result;
+
+	*transition_planned = false;
+	if (next == NULL || !next->valid || !next->writer_valid || next->history_valid
+		|| ItemPointerGetBlockNumber(&next->tid) != BufferGetBlockNumber(buffer))
+		return cluster_heap_no_retry_boundary_apply(relation, receipt, undo, 1,
+			target, payload, payload_len, uba_out, publication, 1);
+	result = cluster_heap_no_retry_boundary_preflight(relation, receipt, undo, 1,
+		target, payload, payload_len, uba_out, publication, 1, &checked);
+	if (result != CLUSTER_HEAP_BOUNDARY_APPLIED)
+		return result;
+	/* Preflight established the ordinal bounds and original PREPARED mask.
+	 * Seal the independent undo handle before consume clears the receipt. */
+	if (!cluster_current_mx_transition_plan(scope, buffer, root, next, publication,
+			undo, &receipt->ctrc_handles[undo->target_ordinal], versions,
+			RelationNeedsWAL(relation)))
+		return CLUSTER_HEAP_BOUNDARY_REFUSED;
+	*transition_planned = true;
+	result = cluster_heap_no_retry_boundary_apply_preflighted(relation, receipt,
+		undo, 1, target, payload, payload_len, uba_out, publication, 1, &checked);
+	if (result == CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY) {
+		/* Only the original boundary's proven zero-effect branch may retry.
+		 * It owns reservation requalification; drop just our private witness. */
+		cluster_current_mx_transition_clear(scope);
+		*transition_planned = false;
+	}
+	return result;
 }
 
 /* -1 means no witness applies. A present witness is terminal on its first
@@ -20613,6 +20707,10 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 	ClusterUndoRecordPrepareReceipt cluster_chain_receipt = {0};
 	ClusterCtrcReceiptHandle cluster_chain_ctrc_handle = {0};
 	ClusterHeapSuccessorProof expected_successor;
+	ClusterHeapPreparedUndoTargetPlan cluster_chain_undo_plan;
+	ClusterHeapCurrentMxExactPublication cluster_chain_mx_publication;
+	bool cluster_chain_transition_planned = false;
+	XLogRecPtr cluster_chain_wal_return = InvalidXLogRecPtr;
 #endif
 
 	ItemPointerCopy(tid, &tupid);
@@ -20650,6 +20748,8 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 #ifdef USE_PGRAC_CLUSTER
 		Assert(!cluster_chain_receipt_owned);
 		cluster_chain_lock_stamp = false;
+		cluster_chain_transition_planned = false;
+		cluster_chain_wal_return = InvalidXLogRecPtr;
 		cluster_chain_needs_itl = false;
 		cluster_chain_vm_locked = false;
 		cluster_chain_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
@@ -21188,8 +21288,6 @@ history_compute:
 			}
 
 			{
-				ClusterHeapPreparedUndoTargetPlan undo_plan;
-				ClusterHeapCurrentMxExactPublication mx_publication;
 				uint8 mx_count = 0;
 				ClusterUndoRecordTarget undo_target;
 				ClusterHeapNoRetryBoundaryResult boundary_result;
@@ -21197,8 +21295,8 @@ history_compute:
 				UndoItlPayload undo_payload;
 				UBA undo_uba = InvalidUba_init;
 
-				MemSet(&undo_plan, 0, sizeof(undo_plan));
-				MemSet(&mx_publication, 0, sizeof(mx_publication));
+				MemSet(&cluster_chain_undo_plan, 0, sizeof(cluster_chain_undo_plan));
+				MemSet(&cluster_chain_mx_publication, 0, sizeof(cluster_chain_mx_publication));
 				MemSet(&undo_target, 0, sizeof(undo_target));
 				MemSet(&undo_payload, 0, sizeof(undo_payload));
 				undo_target.locator
@@ -21217,7 +21315,7 @@ history_compute:
 				plan_result = cluster_heap_itl_plan_prepared_undo_target(
 					rel, buf, &mytup, canonical_xid, true, false,
 					&cluster_chain_receipt, 0, &undo_payload,
-					sizeof(undo_payload), &undo_plan);
+					sizeof(undo_payload), &cluster_chain_undo_plan);
 				if (plan_result
 					== CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED)
 					boundary_result = CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY;
@@ -21243,15 +21341,26 @@ history_compute:
 						exact = cluster_current_mx_stamp_prepare_exact_publication(rel, buf,
 							ItemPointerGetOffsetNumber(&mytup.t_self),
 							PageGetItemId(BufferGetPage(buf), ItemPointerGetOffsetNumber(&mytup.t_self)),
-							history_state->header, &history_state->plan, &mx_publication);
+							history_state->header, &history_state->plan, &cluster_chain_mx_publication);
 						mx_count = exact ? 1 : 0;
 					}
 					cluster_current_mx_lock_scope_require(history_scope);
-					boundary_result = !exact ? CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY
-						: cluster_heap_no_retry_boundary_apply(
-							rel, &cluster_chain_receipt, &undo_plan, 1,
+					cluster_chain_wal_return = PageGetLSN(BufferGetPage(buf));
+					if (!exact)
+						boundary_result = CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY;
+					else if (mx_count != 0)
+						boundary_result = cluster_current_mx_chain_apply_boundary(
+							history_scope, rel, buf, &mytup, &history_state->next,
+							&cluster_chain_receipt, &cluster_chain_undo_plan,
 							&undo_target, &undo_payload, sizeof(undo_payload),
-							&undo_uba, mx_count != 0 ? &mx_publication : NULL, mx_count);
+							&undo_uba, &cluster_chain_mx_publication,
+							cluster_page_versioned ? &cluster_page_versions : NULL,
+							&cluster_chain_transition_planned);
+					else
+						boundary_result = cluster_heap_no_retry_boundary_apply(
+							rel, &cluster_chain_receipt, &cluster_chain_undo_plan, 1,
+							&undo_target, &undo_payload, sizeof(undo_payload),
+							&undo_uba, NULL, 0);
 				}
 
 				if (boundary_result
@@ -21300,10 +21409,10 @@ history_compute:
 						 errdetail("PGRAC_FAMILY=UNDO_RECEIPT PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
 								   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								   cluster_node_id)));
-				cluster_chain_slot_idx = undo_plan.slot_index;
-				cluster_chain_write_scn = undo_plan.write_scn;
+				cluster_chain_slot_idx = cluster_chain_undo_plan.slot_index;
+				cluster_chain_write_scn = cluster_chain_undo_plan.write_scn;
 				cluster_chain_uba = undo_uba;
-				cluster_chain_ctrc_handle = undo_plan.applied_handle;
+				cluster_chain_ctrc_handle = cluster_chain_undo_plan.applied_handle;
 				cluster_chain_lock_stamp = true;
 			}
 		}
@@ -21441,6 +21550,9 @@ history_compute:
 			}
 #endif
 			recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_LOCK_UPDATED);
+#ifdef USE_PGRAC_CLUSTER
+			cluster_chain_wal_return = recptr; /* Actual return, never a recapture. */
+#endif
 
 			PageSetLSN(page, recptr);
 #ifdef USE_PGRAC_CLUSTER
@@ -21452,7 +21564,8 @@ history_compute:
 		END_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
-		if (history_state != NULL && history_state->handled)
+		if (!cluster_chain_transition_planned
+			&& history_state != NULL && history_state->handled)
 			cluster_current_mx_stamp_published(&history_state->plan);
 		if (cluster_chain_vm_locked)
 		{
@@ -21481,6 +21594,18 @@ history_compute:
 				cluster_heap_ctrc_retained_handle(
 					&cluster_chain_ctrc_handle),
 				cluster_page_versioned ? &cluster_page_identity : NULL);
+		}
+		if (cluster_chain_transition_planned) {
+			/* Retain the original APPLIED handle's census duty even if the
+			 * completion's scope check raises ERROR. Source plans remain live
+			 * until this comparison, before stamp_published retires the MX. */
+			bool completed = cluster_current_mx_transition_complete(
+				history_scope, buf, true, cluster_chain_wal_return);
+
+			cluster_current_mx_stamp_published(&history_state->plan);
+			if (!completed)
+				cluster_current_mx_failclosed(&history_state->operation,
+					CCMH_FAIL_RECOMPOSE, "the recursive publication delta is unproven");
 		}
 #endif
 
