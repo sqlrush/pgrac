@@ -6034,7 +6034,6 @@ ctrc_capacity_segment_read(CtrcCapacitySegmentSample *sample, SCN horizon)
 													  &sample->generation), &sample->generation)
 			!= CLUSTER_UNDO_BLOCK0_OK)
 			|| capacity_trace_failed(trace, "segment.generation_known", !sample->generation.known)
-			|| capacity_trace_failed(trace, "segment.generation_zero", sample->generation.value == 0)
 			|| capacity_trace_failed(trace, "segment.generation_max", sample->generation.value == UINT32_MAX)
 			|| capacity_trace_failed(trace, "segment.copy", cluster_undo_block0_current_copy_resident(&sample->guard, &sample->root,
 													 &sample->generation, sample->page.data)
