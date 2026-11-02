@@ -136,6 +136,12 @@ def sha(path):
     return digest.hexdigest()
 
 
+def verify_source_inputs(source, expected):
+    for name, digest in expected.items():
+        if sha(source/name) != digest:
+            raise ValueError('regression source input changed: '+name)
+
+
 def preflight(args, selection):
     validate_environment(os.environ)
     if not re.fullmatch('[0-9a-f]{64}', args.expected_postgres_sha256):
@@ -179,6 +185,7 @@ def run(args):
         result.update(suite=selection['suite'], subcheck_gates=selection['subcheck_gates'])
     try:
         for phase in selection['phases']:
+            verify_source_inputs(args.source, source_hashes)
             if sha(args.install/'bin/postgres') != args.expected_postgres_sha256:
                 raise ValueError('installed postgres changed before regression phase')
             # Existing controllers own their processes, deadlines and cleanup.
@@ -187,6 +194,7 @@ def run(args):
                                        env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
             record = dict(name=phase['name'], rc=reply.returncode, passed=False)
             result['phases'].append(record)
+            verify_source_inputs(args.source, source_hashes)
             passed = phase_passed(phase['name'], root/phase['name'], reply.returncode,
                                   args.expected_postgres_sha256)
             if sha(args.install/'bin/postgres') != args.expected_postgres_sha256:

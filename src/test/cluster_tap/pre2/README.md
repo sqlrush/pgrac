@@ -82,6 +82,11 @@ controller's default clean-leave selection is unchanged.
 original TAP, no skip/TODO, complete expected cases, the expected installed
 postgres bytes and no controller cleanup error. Source-file hashes and the
 binary hash are independent observations; `build_binding` stays `UNKNOWN`.
+The captured TAP/controller files are checked against their original hashes
+before and after every phase. A changed or missing captured input stops the
+regression with the original child log and return code retained; hashes are
+never rebased. These boundary checks bind captured bytes, not an atomic
+filesystem view or every transitive source dependency.
 `stage_acceptance` stays `NOT_READY`: this entry does not cover complete shared
 positive physical reclamation, the retention/recovery matrix, the 16/48/64
 one-hour soak or the full build/stage acceptance matrix. Controller selftests
