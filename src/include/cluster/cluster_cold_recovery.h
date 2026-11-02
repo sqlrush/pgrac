@@ -904,6 +904,8 @@ struct ClusterColdTtBaseV1;
 struct UndoSegmentHeaderData;
 struct ClusterControlRootSnapshot;
 struct ClusterWalRecoveryCheckpointV1;
+struct ClusterColdNativeRegistryV2;
+struct ClusterControlNativeTableInfoV2;
 
 typedef struct ClusterColdTypedV1 {
 	MemoryContext context;
@@ -916,6 +918,9 @@ typedef struct ClusterColdTypedV1 {
 	/* Original checkpoints for all participants; only [0, replay_root_count)
 	 * have the original ROOT tokens permitting replay-source revalidation. */
 	struct ClusterColdReplayRootV1 *replay_roots;
+	/* Original pre-scan selection, including local original creation batches.
+	 * No shared AVAILABLE layout change and no new file/episode authority. */
+	struct ClusterColdNativeRegistryV2 *native_registry;
 	uint32 replay_root_count;
 	struct ClusterColdTtBaseV1 *tt_base; /* raw original-owner input, no outcome authority */
 	struct ClusterColdTtBaseV1 *tt_after_redo; /* separate physical input, same TT budget */
@@ -959,6 +964,13 @@ typedef struct ClusterColdTypedV1 {
 	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdTypedV1;
+
+/* Original post-replay Start checks the saved pre-scan selection under its
+ * existing CF interval; it may not replace the baseline. The table copy is
+ * local observation only, checked against the complete current inventory. */
+extern bool cluster_cold_typed_native_registry_current_locked_v2(const ClusterColdTypedV1 *);
+extern bool cluster_cold_typed_native_table_v2(const ClusterColdTypedV1 *,
+	struct ClusterControlNativeTableInfoV2 *);
 
 /* Original merged CREATE step. Caller keeps SAME global X -> CF-X and the
  * complete typed/fence/source custody. The first call latches its attempt and

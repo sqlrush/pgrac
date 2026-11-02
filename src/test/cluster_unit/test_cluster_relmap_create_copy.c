@@ -564,6 +564,7 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 #include "test_cluster_relmap_create_receipt.inc"
 #include "test_cluster_relmap_create_owner.inc"
 #include "test_cluster_relmap_create_physical.inc"
+#include "test_cluster_relmap_create_actual_side.inc"
 
 int main(int argc,char **argv)
 {
@@ -623,5 +624,9 @@ int main(int argc,char **argv)
 	UT_RUN(creation_confirmed_readiness_requires_all_original_receipts);
 	UT_RUN(creation_confirmed_duplicate_rejects_changed_record_and_control);
 	UT_RUN(creation_confirmed_full_recheck_keeps_late_refusal_sticky);
+	UT_RUN(creation_actual_side_executes_once_and_rechecks_original_pair);
+	UT_RUN(creation_actual_side_unsealed_or_other_declaration_refuses_before_write);
+	UT_RUN(creation_actual_side_native_byte_drift_preserves_attempt_and_debt);
+	UT_RUN(creation_actual_side_ready_refuses_valid_but_changed_files);
 	UT_DONE(); return ut_failed_count!=0;
 }

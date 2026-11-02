@@ -14340,6 +14340,75 @@ cluster_control_root_native_files_copy_v4(ClusterControlRelmapSelectionV2 *s,
 	return true;
 }
 
+/* Complete independent creation projection. Never recover a batch from WAL or
+ * a current file. Both AVAILABLE copies retain the original persistent batch;
+ * RESERVED stays separate from coverage and never becomes ordinary admission. */
+static bool
+control_relmap_creation_v4(ClusterControlRelmapSelectionV2 *s, uint64 at,
+	ClusterRecoveryFileIdentityV2 *identity, uint8 batch[16], uint64 *total)
+{
+	const ClusterRecoveryRegistryV2 *r = control_file_registry_v4(&s->work);
+	const ClusterRecoveryCheckpointCoverageV2 *c = &r->coverage;
+	const ClusterRecoveryRegistryV3 *v = cluster_recovery_registry_view_v3(s->work.reservations);
+	uint64 n = 0;
+	static const uint8 zero[16] = {0};
+	for (uint64 i = 0; i < c->file_count; ++i) {
+		const ClusterRecoveryCheckpointFileV2 *f = &c->files[i];
+		unsigned copies = 0;
+		if (!control_relmap_first_v4(c, i) || !OidIsValid(f->identity.database_oid)) continue;
+		for (uint64 j = i; j < c->file_count; ++j) {
+			const ClusterRecoveryCheckpointFileV2 *p = &c->files[j];
+			if (!control_relmap_address_v4(&f->identity, &p->identity)) continue;
+			if (memcmp(f->creation_batch_uuid, p->creation_batch_uuid, 16)
+				|| p->copy_index >= 2 || (copies & (1U << p->copy_index))) return false;
+			copies |= 1U << p->copy_index;
+		}
+		if (copies != 3) return false;
+		if (!memcmp(f->creation_batch_uuid, zero, 16)) continue;
+		if (n++ == at && identity) {
+			*identity = f->identity;
+			memcpy(batch, f->creation_batch_uuid, 16);
+		}
+	}
+	if (v) for (uint64 i = 0; i < v->reservation_count; ++i) {
+		const ClusterRecoveryFileReservationV1 *f = &v->reservations[i];
+		if (f->expected.kind != CLUSTER_RECOVERY_FILE_RELMAP_V2) continue;
+		if (!OidIsValid(f->expected.database_oid) || !OidIsValid(f->expected.tablespace_oid)
+			|| f->expected.tablespace_oid == GLOBALTABLESPACE_OID || f->expected.object_id
+			|| !memcmp(f->batch_uuid, zero, 16)) return false;
+		if (n++ == at && identity) {
+			*identity = f->expected;
+			memcpy(batch, f->batch_uuid, 16);
+		}
+	}
+	*total = n;
+	return true;
+}
+bool
+cluster_control_root_relmap_creation_count_v4(ClusterControlRelmapSelectionV2 *s, uint64 *out)
+{
+	uint64 count;
+	if (!control_relmap_live_v4(s) || !control_relmap_distinct_v4(s, out, sizeof(*out))
+		|| !control_relmap_creation_v4(s, UINT64_MAX, NULL, NULL, &count)) return false;
+	*out = count;
+	return true;
+}
+bool
+cluster_control_root_relmap_creation_at_v4(ClusterControlRelmapSelectionV2 *s, uint64 at,
+	ClusterRecoveryFileIdentityV2 *out, uint8 batch[16])
+{
+	ClusterRecoveryFileIdentityV2 value;
+	uint8 uuid[16];
+	uint64 count;
+	if (!control_relmap_live_v4(s) || !control_relmap_distinct_v4(s, out, sizeof(*out))
+		|| !control_relmap_distinct_v4(s, batch, 16)
+		|| history_ranges_overlap(out, sizeof(*out), batch, 16)
+		|| !control_relmap_creation_v4(s, at, &value, uuid, &count) || at >= count) return false;
+	*out = value;
+	memcpy(batch, uuid, 16);
+	return true;
+}
+
 /* Runtime batch updates retain the original CF-X owner and physical writer. */
 static ClusterControlRootResult
 control_registry_owner_v4(ClusterControlRelmapSelectionV2 *s, uint64 epoch, uint64 incarnation,

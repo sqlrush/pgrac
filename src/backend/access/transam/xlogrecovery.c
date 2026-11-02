@@ -5841,7 +5841,7 @@ static bool
 cluster_recovery_cold_native_files_publish(struct ClusterRecoveryStartV1 *start)
 {
 	ClusterControlRelmapFormatV2 before, after;
-	ClusterControlNativeTableInfoV2 table;
+	ClusterControlNativeTableInfoV2 table, prepared;
 	volatile bool attempted = false, selected = false, managed = false;
 
 	if (!cluster_recovery_cold_ctrc_replays_actor()
@@ -5864,11 +5864,13 @@ cluster_recovery_cold_native_files_publish(struct ClusterRecoveryStartV1 *start)
 			&& ClusterColdRecoveryTxCurrent(start)) {
 			/* An explicit ROOTv3 keeps its original path. Unknown never
 			 * falls back; ROOTv4 must install the complete selected table. */
-			selected = before.root_version == 3
+			selected = (start->inputs->native_registry == NULL
+				|| cluster_cold_typed_native_registry_current_locked_v2(start->inputs))
+				&& (before.root_version == 3
 				|| (before.root_version == 4
 					&& cluster_control_native_files_publish_locked_v2(&before.config,
 						CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, start->owner_boot)
-						== CLUSTER_NATIVE_FILES_OK_V2);
+						== CLUSTER_NATIVE_FILES_OK_V2));
 			selected = selected && ClusterColdRecoveryTxCurrent(start)
 				&& cluster_control_root_relmap_format_locked_v2(
 					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &after) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -5883,6 +5885,11 @@ cluster_recovery_cold_native_files_publish(struct ClusterRecoveryStartV1 *start)
 					&& table.startup_generation == start->owner_boot
 					&& !memcmp(&table.control.config, &before.config, sizeof(before.config))
 					&& ClusterColdRecoveryTxCurrent(start);
+				if (selected && start->inputs->native_registry != NULL) {
+					selected = cluster_cold_typed_native_table_v2(start->inputs, &prepared);
+					table.borrowed = 0;
+					selected = selected && !memcmp(&table, &prepared, sizeof(table));
+				}
 				managed = selected;
 			}
 		}

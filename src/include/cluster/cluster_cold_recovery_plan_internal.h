@@ -33,6 +33,15 @@
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_relmap_recovery_internal.h"
+#include "cluster/cluster_control_native_files.h"
+
+typedef struct ClusterColdNativeRegistryV2 {
+	ClusterControlRelmapFormatV2 format;
+	ClusterControlNativeInventoryV2 *inventory;
+	ClusterColdRelmapCreateExpectedV1 *entries;
+	uint64 count;
+	Size bytes;
+} ClusterColdNativeRegistryV2;
 
 #ifdef USE_CLUSTER_UNIT
 #define cold_alloc0(size_) calloc(1, (size_))
@@ -363,6 +372,14 @@ cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Si
 	const ClusterColdPlanV1 *plan;
 	if (typed == NULL) return true;
 	if (cold_relmap_storage_overlap(out, bytes, typed, sizeof(*typed))) return false;
+	if (typed->native_registry != NULL) {
+		const ClusterColdNativeRegistryV2 *s = typed->native_registry;
+		if (cold_relmap_storage_overlap(out, bytes, s, sizeof(*s))
+			|| cold_relmap_storage_overlap(out, bytes, s->entries,
+				s->count * sizeof(*s->entries))
+			|| (s->inventory && cold_relmap_storage_overlap(out, bytes, s->inventory,
+				s->inventory->private_bytes))) return false;
+	}
 	plan = typed->plan;
 	if (plan == NULL) return true;
 	if (cold_relmap_storage_overlap(out, bytes, plan, sizeof(*plan))

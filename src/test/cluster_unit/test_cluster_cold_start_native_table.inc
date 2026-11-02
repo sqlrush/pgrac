@@ -384,3 +384,33 @@ start_managed_census_tests(void)
 	UT_RUN(test_start_explicit_legacy_ignores_an_unrelated_managed_table);
 	reset();
 }
+
+/* New prepare selection is tested through the real prepare/scan target.
+ * These Start-only leaves test that publication consumes rather than replaces it. */
+bool cluster_cold_typed_native_registry_current_locked_v2(const ClusterColdTypedV1 *inputs)
+{
+	UT_ASSERT(inputs == &typed && start_table_cf_held);
+	return start_table_fault != 14;
+}
+bool cluster_cold_typed_native_table_v2(const ClusterColdTypedV1 *inputs,
+	ClusterControlNativeTableInfoV2 *out)
+{
+	UT_ASSERT(inputs == &typed && start_table_cf_held);
+	*out = start_table_view;
+	out->borrowed = 0;
+	if (start_table_fault == 15) out->table_generation++;
+	return true;
+}
+UT_TEST(test_start_cannot_rebase_prepared_registry_or_table)
+{
+	for (unsigned fault = 14; fault <= 15; ++fault) {
+		reset(); retain(); start_table_version = 4; start_table_fault = fault;
+		typed.native_registry = (void *)&start_table_bound;
+		UT_ASSERT(!ClusterBeginColdRecoveryTx(&info));
+		UT_ASSERT(info.cluster_tx_start == NULL && info.cluster_cold_inputs == &typed);
+		UT_ASSERT_EQ(start_table_publishes, fault == 14 ? 0 : 1);
+		UT_ASSERT_EQ(start_table_releases, 1);
+		UT_ASSERT(!start_table_cf_held);
+		typed.native_registry = NULL;
+	}
+}

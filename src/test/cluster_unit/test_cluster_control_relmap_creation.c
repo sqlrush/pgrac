@@ -366,6 +366,34 @@ UT_TEST(complete_error_after_primary_preserves_pair_and_once_latch)
 	batch_end();
 }
 #include "test_cluster_control_relmap_recovery.inc"
+UT_TEST(pre_scan_projection_preserves_reserved_to_available_original_batch)
+{
+	ClusterControlNativeRelmapCreateV2 *c = NULL;
+	ClusterControlRelmapSelectionV2 *s = NULL;
+	ClusterRecoveryCheckpointFileV2 receipts[2];
+	ClusterRecoveryFileIdentityV2 expected;
+	uint8 batch[16];
+	uint64 count = 0;
+	table_reset(); owner_begin();
+	UT_ASSERT_EQ(reserve_target(&c), 0);
+	if (!c) { batch_end(); return; }
+	for (unsigned phase = 0; phase < 2; ++phase) {
+		UT_ASSERT(created_selection(&s));
+		UT_ASSERT(cluster_control_root_relmap_creation_count_v4(s, &count));
+		UT_ASSERT_EQ(count, 1);
+		UT_ASSERT(cluster_control_root_relmap_creation_at_v4(s, 0, &expected, batch));
+		UT_ASSERT(identity_same(&expected, &c->expected));
+		UT_ASSERT(!memcmp(batch, c->batch_uuid, 16));
+		cluster_control_root_relmap_selection_destroy_v4(&s);
+		if (!phase) {
+			pair_receipts(c, receipts);
+			UT_ASSERT_EQ(cluster_control_native_files_complete_relmap_create_locked_v2(c, receipts, 2), 0);
+		}
+	}
+	cluster_control_native_relmap_create_destroy_v2(&c);
+	batch_end();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -394,6 +422,7 @@ main(int argc, char **argv)
 	UT_RUN(recovery_confirmed_context_and_selected_table_drift_poison_without_reselection);
 	UT_RUN(recovery_confirmed_late_source_false_or_error_releases_only_its_local_borrow);
 	UT_RUN(recovery_confirmed_failure_preserves_an_existing_native_file_borrow);
+	UT_RUN(pre_scan_projection_preserves_reserved_to_available_original_batch);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -322,9 +322,55 @@ UT_TEST(test_copied_checkpoint_reference_does_not_revive_cf_authority)
 }
 
 #ifndef TEST_CONTROL_RELMAP_CONSUMER
+UT_TEST(test_creation_projection_keeps_original_batch_and_excludes_boot)
+{
+	ClusterControlRelmapSelectionV2 *s = NULL;
+	ClusterRecoveryFileIdentityV2 id;
+	uint8 batch[16];
+	uint64 count = 99;
+	inventory_begin(3);
+	memset(inventory[2].creation_batch_uuid, 0x51, 16);
+	memset(inventory[3].creation_batch_uuid, 0x51, 16);
+	inventory_write();
+	UT_ASSERT(inventory_read(&s));
+	UT_ASSERT(cluster_control_root_relmap_creation_count_v4(s, &count));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(cluster_control_root_relmap_creation_at_v4(s, 0, &id, batch));
+	UT_ASSERT(identity_same(&id, &inventory[2].identity));
+	UT_ASSERT(memcmp(batch, inventory[2].creation_batch_uuid, 16) == 0);
+	UT_ASSERT(!cluster_control_root_relmap_creation_at_v4(s, 1, &id, batch));
+	cluster_control_root_relmap_selection_destroy_v4(&s);
+	selection_end();
+}
+UT_TEST(test_creation_projection_refuses_disagreeing_copies_and_aliases)
+{
+	ClusterControlRelmapSelectionV2 *s = NULL;
+	ClusterRecoveryFileIdentityV2 id;
+	uint8 batch[16];
+	uint64 count = 99;
+	inventory_begin(2);
+	memset(inventory[2].creation_batch_uuid, 0x51, 16);
+	/* The original strict registry codec already rejects inconsistent pairs. */
+	{
+		Size n;
+		UT_ASSERT(!cluster_recovery_registry_size_v2(&reg, 65536, &n));
+	}
+	UT_ASSERT_EQ(count, 99);
+	memset(inventory[3].creation_batch_uuid, 0x51, 16);
+	inventory_write();
+	UT_ASSERT(inventory_read(&s));
+	UT_ASSERT(!cluster_control_root_relmap_creation_count_v4(s, (void *)s));
+	UT_ASSERT(!cluster_control_root_relmap_creation_at_v4(s, 0, &id, (void *)&id));
+	UT_ASSERT(!cluster_control_root_relmap_creation_at_v4(s, 0, (void *)s, batch));
+	cf_sequence++;
+	UT_ASSERT(!cluster_control_root_relmap_creation_count_v4(s, &count));
+	cluster_control_root_relmap_selection_destroy_v4(&s);
+	selection_end();
+}
+
 int main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(test_original_codec_v4_extent_and_exact_reference);
 	UT_RUN(test_v4_refuses_forged_reference_and_record);
 	UT_RUN(test_selected_root_registry_real_files_and_late_change);
@@ -344,6 +390,8 @@ int main(void)
 	UT_RUN(test_post_io_named_directory_remains_original);
 	UT_RUN(test_actual_pair_sync_readback_then_complete_control_recheck);
 	UT_RUN(test_copied_checkpoint_reference_does_not_revive_cf_authority);
+	UT_RUN(test_creation_projection_keeps_original_batch_and_excludes_boot);
+	UT_RUN(test_creation_projection_refuses_disagreeing_copies_and_aliases);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

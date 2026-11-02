@@ -37,6 +37,8 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "utils/resowner.h"
+#include "cluster/cluster_control_native_files.h"
+static bool registry_probe_active, registry_cf_held;
 
 /* This driver-only suite does not run a Startup process. Its original ROOT
  * reader is a leaf; CF waiting is exercised with actual CF/CONTROL in
@@ -69,7 +71,7 @@ cluster_grd_redeclare_generation(void)
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	if (!prepare_probe_active)
+	if (!prepare_probe_active && !registry_probe_active && !cluster_shared_config)
 		abort();
 	return 1;
 }
@@ -127,7 +129,8 @@ cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *attempt pg_attr
 bool
 cluster_cf_held(LOCKMODE mode pg_attribute_unused())
 {
-	abort();
+	if (!prepare_probe_active && !registry_probe_active && !cluster_shared_config) abort();
+	return registry_cf_held;
 }
 bool
 cluster_cf_release_completed(LOCKMODE mode pg_attribute_unused(),
@@ -1928,5 +1931,7 @@ cluster_cold_scan_root_deadline_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	return cluster_cold_scan_root_v1(plan, participant, root, token, space_active, foreign,
 									 side_plan, result);
 }
+
+#include "test_cluster_cold_registry_boundary.h"
 
 #endif /* TEST_CLUSTER_COLD_RECOVERY_STARTUP_BOUNDARY_H */

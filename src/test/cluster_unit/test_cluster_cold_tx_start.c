@@ -2601,7 +2601,8 @@ int main(void)
 	return test_ctrc_relmap_files_main();
 #endif
 	if (getenv("PGRAC_PRE2_TEST_START_MANAGED_CENSUS") != NULL) {
-		UT_PLAN(5); start_managed_census_tests();
+		UT_PLAN(6); start_managed_census_tests();
+	UT_RUN(test_start_cannot_rebase_prepared_registry_or_table);
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_TABLE") != NULL) {
@@ -3235,7 +3236,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(470);
+	UT_PLAN(471);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3246,7 +3247,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(459);
+	UT_PLAN(460);
 #endif
 	UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
 	UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
@@ -3278,7 +3279,7 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(431);
+	UT_PLAN(432);
 #endif
 	UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
 	UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
@@ -3723,6 +3724,7 @@ int main(void)
 	UT_RUN(test_start_images_error_or_late_owner_drift_preserve_original_cleanup);
 	start_native_table_tests();
 	start_managed_census_tests();
+	UT_RUN(test_start_cannot_rebase_prepared_registry_or_table);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

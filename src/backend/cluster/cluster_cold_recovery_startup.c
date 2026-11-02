@@ -1497,6 +1497,183 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 	return true;
 }
 
+/* The original prepare owns these local copies; the shared AVAILABLE table
+ * remains identity-only. Reacquired CF is used to compare, never to rebase. */
+bool
+cluster_cold_typed_native_registry_current_locked_v2(const ClusterColdTypedV1 *typed)
+{
+	ClusterColdNativeRegistryV2 *saved = typed ? typed->native_registry : NULL;
+	ClusterControlRelmapSelectionV2 *selection = NULL;
+	ClusterControlRelmapFormatV2 format;
+	ClusterControlRelmapReferenceV2 reference;
+	volatile bool matched = false;
+	uint64 count;
+	if (!saved || !cluster_cf_held_is_clusterwide(ExclusiveLock)) return false;
+	PG_TRY();
+	{
+		matched = cluster_control_root_relmap_format_locked_v2(
+			CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &format) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& !memcmp(&format, &saved->format, sizeof(format));
+		if (matched && format.root_version == 4) {
+			matched = saved->inventory != NULL
+				&& cluster_control_native_files_inventory_current_v2(saved->inventory)
+				&& cluster_control_root_relmap_selection_read_locked_v4(&format.config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &selection) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& cluster_control_root_relmap_selection_reference_v4(selection, &reference)
+				&& !memcmp(&reference, &saved->inventory->info.control, sizeof(reference))
+				&& cluster_control_root_relmap_creation_count_v4(selection, &count)
+				&& count == saved->count;
+			for (uint64 i = 0; matched && i < saved->count; ++i) {
+				ClusterColdRelmapCreateExpectedV1 value = {0};
+				matched = cluster_control_root_relmap_creation_at_v4(selection, i,
+					&value.expected, value.batch_uuid)
+					&& !memcmp(&value, &saved->entries[i], sizeof(value));
+			}
+			matched = matched && cluster_control_root_relmap_selection_recheck_locked_v4(selection)
+				== CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_control_root_relmap_selection_destroy_v4(&selection);
+	}
+	PG_END_TRY();
+	return matched;
+}
+
+bool
+cluster_cold_typed_native_table_v2(const ClusterColdTypedV1 *typed,
+	ClusterControlNativeTableInfoV2 *out)
+{
+	const ClusterColdNativeRegistryV2 *s = typed ? typed->native_registry : NULL;
+	if (!s || typed->refusal != CLUSTER_COLD_OK || !s->inventory || !out || !cold_relmap_output_distinct(typed, out, sizeof(*out))
+		|| !cluster_control_native_files_inventory_current_v2(s->inventory)) return false;
+	*out = s->inventory->info;
+	out->borrowed = 0;
+	return true;
+}
+
+/* No IR has been acquired at this original prepare point. CF is returned
+ * before source/cohort revalidation and before any WAL visitor or SIDE feed. */
+static bool
+cold_registry_capture(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+	const uint64 *deadline, Size budget)
+{
+	ClusterColdNativeRegistryV2 *s;
+	ClusterControlRelmapSelectionV2 *selection = NULL;
+	ClusterControlRelmapReferenceV2 reference;
+	volatile bool attempted = false, matched = false;
+	uint64 startup;
+	if (!cluster_shared_config) return true;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cold_sources_match(typed, fence, deadline)
+		|| !(startup = cluster_qvotec_get_self_incarnation()) || startup == UINT64_MAX
+		|| budget <= sizeof(*s)) return false;
+	s = palloc0(sizeof(*s));
+	typed->native_registry = s;
+	s->bytes = sizeof(*s);
+	PG_TRY();
+	{
+		cold_prepare_deadline_check(deadline);
+		attempted = true;
+		if ((deadline ? cluster_cf_lock_deadline_v1(ExclusiveLock, *deadline)
+			: cluster_cf_lock(ExclusiveLock)) && cluster_cf_held_is_clusterwide(ExclusiveLock)
+			&& cluster_control_root_relmap_format_locked_v2(
+				CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &s->format) == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			const ClusterWalThreadClaimRefV2 *own = &typed->sources[typed->own_participant].claim;
+			const ClusterSharedConfigIdentity *id = &s->format.config.identity;
+			matched = id->system_identifier == own->identity.system_identifier
+				&& id->database_incarnation == own->database_incarnation
+				&& id->generation >= own->max_config_generation
+				&& !memcmp(id->storage_uuid, own->identity.storage_uuid, 16)
+				&& !memcmp(id->authority_uuid, own->identity.authority_uuid, 16);
+			if (matched && s->format.root_version == 4) {
+				matched = cluster_control_root_relmap_selection_read_locked_v4(&s->format.config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &selection) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					&& cluster_control_root_relmap_selection_reference_v4(selection, &reference)
+					&& cluster_control_root_relmap_creation_count_v4(selection, &s->count)
+					&& s->count <= UINT32_MAX
+					&& s->count <= (budget - s->bytes) / sizeof(*s->entries);
+				if (matched && s->count) {
+					s->entries = palloc0(s->count * sizeof(*s->entries));
+					s->bytes += s->count * sizeof(*s->entries);
+					for (uint64 i = 0; matched && i < s->count; ++i)
+						matched = cluster_control_root_relmap_creation_at_v4(selection, i,
+							&s->entries[i].expected, s->entries[i].batch_uuid);
+				}
+				matched = matched
+					&& cluster_control_native_files_publish_locked_v2(&s->format.config,
+						CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, startup) == CLUSTER_NATIVE_FILES_OK_V2
+					&& cluster_control_native_files_inventory_v2(
+						Min(budget - s->bytes, CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2), &s->inventory)
+						== CLUSTER_NATIVE_FILES_OK_V2
+					&& s->inventory->info.startup_generation == startup
+					&& !memcmp(&reference, &s->inventory->info.control, sizeof(reference));
+				if (s->inventory) s->bytes += s->inventory->private_bytes;
+			} else matched = matched && s->format.root_version == 3;
+			matched = matched && cluster_cold_typed_native_registry_current_locked_v2(typed);
+		}
+		cold_prepare_deadline_check(deadline);
+	}
+	PG_FINALLY();
+	{
+		cluster_control_root_relmap_selection_destroy_v4(&selection);
+		if (attempted && cluster_cf_unlock_confirmed(ExclusiveLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+			matched = false;
+	}
+	PG_END_TRY();
+	return matched && cold_sources_match(typed, fence, deadline)
+		&& (!s->inventory || cluster_control_native_files_inventory_current_v2(s->inventory));
+}
+
+static bool
+cold_registry_recheck(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+	const uint64 *deadline)
+{
+	volatile bool attempted = false, matched = false;
+	if (!typed->native_registry) return !cluster_shared_config;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cold_sources_match(typed, fence, deadline)) return false;
+	PG_TRY();
+	{
+		cold_prepare_deadline_check(deadline);
+		attempted = true;
+		matched = (deadline ? cluster_cf_lock_deadline_v1(ExclusiveLock, *deadline)
+			: cluster_cf_lock(ExclusiveLock))
+			&& cluster_cold_typed_native_registry_current_locked_v2(typed);
+		cold_prepare_deadline_check(deadline);
+	}
+	PG_FINALLY();
+	{
+		if (attempted && cluster_cf_unlock_confirmed(ExclusiveLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+			matched = false;
+	}
+	PG_END_TRY();
+	return matched && cold_sources_match(typed, fence, deadline);
+}
+
+/* New control providers may throw. The original episode becomes sticky
+ * failed even when its caller catches ERROR, without cancelling publication. */
+static bool
+cold_registry_checked(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence,
+	const uint64 *deadline, Size budget, bool capture)
+{
+	volatile bool valid = false;
+	PG_TRY();
+	{
+		valid = capture ? cold_registry_capture(typed, fence, deadline, budget)
+			: cold_registry_recheck(typed, fence, deadline);
+	}
+	PG_CATCH();
+	{
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "original registry observation failed");
+		if (typed->plan) cluster_cold_plan_relmap_invalidate_v1(typed->plan);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return valid;
+}
+
 static ClusterColdTypedV1 *
 cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 	XLogRecPtr own_redo, const ClusterColdRelmapInputV1 *relmap, uint32 relmap_count,
@@ -1508,6 +1685,7 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 	ColdRoot *roots;
 	ClusterColdDetailV1 detail;
 	uint64 deadline_ns;
+	Size plan_budget;
 	const uint64 *deadline = NULL;
 
 	context = AllocSetContextCreate(TopMemoryContext, "cluster cold replay plan",
@@ -1539,11 +1717,15 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 	if (!cold_own_restart(typed, own_thread, own_redo) || !cold_census(typed, roots, deadline))
 		goto done;
 	typed->system_identifier = roots[0].root.identity.system_identifier;
+	plan_budget = (Size)cluster_cold_recovery_plan_memory * 1024
+		- cold_side_budget(typed) * typed->participant_count - cold_tt_budget();
+	if (!cold_registry_checked(typed, fence, deadline, plan_budget, true)) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "pre-scan control selection refused");
+		goto done;
+	}
+	if (typed->native_registry) plan_budget -= typed->native_registry->bytes;
 	detail = cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
-										 (Size)cluster_cold_recovery_plan_memory * 1024
-											 - cold_side_budget(typed) * typed->participant_count
-											 - cold_tt_budget(),
-										 &typed->plan);
+		plan_budget, &typed->plan);
 	if (detail != CLUSTER_COLD_OK) {
 		cold_refuse(typed, detail, "plan creation refused: %s", cold_detail_name(detail));
 		goto done;
@@ -1591,8 +1773,22 @@ cold_typed_prepare(ClusterRecoveryFencePlan *fence, uint16 own_thread,
 			}
 		}
 	}
-	if (cold_scan_and_seal(typed, roots, fence, deadline))
-		typed->refusal = CLUSTER_COLD_OK;
+	if (typed->native_registry && typed->native_registry->count) {
+		detail = cluster_cold_plan_relmap_create_predeclare_v1(typed->plan,
+			typed->native_registry->entries, (uint32)typed->native_registry->count);
+		if (detail != CLUSTER_COLD_OK) {
+			cold_refuse(typed, detail, "independent creation predeclaration refused");
+			goto done;
+		}
+	}
+	if (!cold_registry_checked(typed, fence, deadline, 0, false)) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "control selection changed before scan");
+		goto done;
+	}
+	if (cold_scan_and_seal(typed, roots, fence, deadline)) {
+		if (cold_registry_checked(typed, fence, deadline, 0, false)) typed->refusal = CLUSTER_COLD_OK;
+		else cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP, "control selection changed after scan");
+	}
 
 done:
 	if (typed->refusal != CLUSTER_COLD_OK) {
@@ -1665,6 +1861,12 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 		cluster_recovery_merge_fence_plan_destroy(&typed->tx_fence);
 		if (typed->tx_fence != NULL)
 			elog(FATAL, "could not release original cold transaction fence owner");
+	}
+	if (typed->native_registry) {
+		cluster_control_native_inventory_destroy_v2(&typed->native_registry->inventory);
+		if (typed->native_registry->entries) pfree(typed->native_registry->entries);
+		pfree(typed->native_registry);
+		typed->native_registry = NULL;
 	}
 	*typed_address = NULL;
 	MemoryContextDelete(typed->context);
