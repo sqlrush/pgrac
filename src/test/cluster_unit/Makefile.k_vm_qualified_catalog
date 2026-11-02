@@ -1,0 +1,8 @@
+# Select alongside Makefile; use the original VM fixture dependencies.
+test_k_vm_qualified_catalog test_k_vm_qualified_catalog_noassert: \
+		test_k_vm_qualified_catalog.c test_cluster_vm_qualified_ios.c $(VM_QUALIFIED_FIXTURE_DEPS) \
+		Makefile.k_vm_qualified_catalog
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(if $(filter %_noassert,$@),-DFIXTURE_NO_ASSERTS) $< \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@

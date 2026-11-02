@@ -715,9 +715,10 @@
  * Fresh homogeneous databases only; no in-place or rolling format upgrade. */
 #define CATALOG_VERSION_NO 202611010
 
-/* Minimum loaded catalog admitting qualified shared VM bits. Zero keeps
- * the shortcut disabled until the integrated catalog identity is assigned. */
-#define PGRAC_VM_QUALIFIED_CATALOG_VERSION 0
+/* Reserved qualified-VM catalog. Keep this floor above CATALOG_VERSION_NO
+ * while the corresponding guarded publication batch is held. Registration
+ * alone must not qualify VM bits written by an older catalog. */
+#define PGRAC_VM_QUALIFIED_CATALOG_VERSION 202611012
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

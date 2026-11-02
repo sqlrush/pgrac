@@ -16,11 +16,12 @@ int vm_publisher_inherited_main(void);
 #include "cluster/cluster_undo_horizon.h"
 
 /* Exercise a qualified test catalog without enabling an old product catalog.
- * Production keeps 0 until the minimum catalog is assigned at integration. */
+ * Assigned-only mode never substitutes a test floor. */
 #if defined(FIXTURE_UNASSIGNED_CATALOG)
 #undef PGRAC_VM_QUALIFIED_CATALOG_VERSION
 #define PGRAC_VM_QUALIFIED_CATALOG_VERSION 0
-#elif !defined(PGRAC_VM_QUALIFIED_CATALOG_VERSION) || PGRAC_VM_QUALIFIED_CATALOG_VERSION == 0
+#elif !defined(FIXTURE_ASSIGNED_CATALOG_ONLY) && \
+	(!defined(PGRAC_VM_QUALIFIED_CATALOG_VERSION) || PGRAC_VM_QUALIFIED_CATALOG_VERSION == 0)
 #undef PGRAC_VM_QUALIFIED_CATALOG_VERSION
 #define PGRAC_VM_QUALIFIED_CATALOG_VERSION UINT32_C(202610999)
 #define FIXTURE_PENDING_CATALOG_ASSIGNMENT 1
