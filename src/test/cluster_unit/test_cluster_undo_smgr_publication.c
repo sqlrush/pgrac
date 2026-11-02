@@ -74,11 +74,13 @@ errmsg_internal(const char *fmt, ...)
 {
 	return 0;
 }
+#ifndef UNDO_PUBLICATION_ERROR_PROVIDER
 void
 errfinish(const char *file, int line, const char *function)
 {
 	abort();
 }
+#endif
 
 void
 cluster_undo_record_note_smgr_open(void)

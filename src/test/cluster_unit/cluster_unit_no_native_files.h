@@ -16,4 +16,12 @@ bool cluster_control_native_file_current_v2(const ClusterControlNativeFileBorrow
 { (void) borrow; abort(); }
 bool cluster_control_native_file_release_v2(ClusterControlNativeFileBorrowV2 *borrow)
 { (void) borrow; abort(); }
+ClusterControlNativeResultV2 cluster_control_native_files_inventory_v2(
+	Size budget, ClusterControlNativeInventoryV2 **fresh)
+{ (void) budget; (void) fresh; abort(); }
+bool cluster_control_native_files_inventory_current_v2(
+	const ClusterControlNativeInventoryV2 *inventory)
+{ (void) inventory; abort(); }
+void cluster_control_native_inventory_destroy_v2(ClusterControlNativeInventoryV2 **inventory)
+{ (void) inventory; abort(); }
 #endif

@@ -12073,6 +12073,33 @@ clean: clean-clog-checkpoint
 clean-clog-checkpoint:
 	rm -f test_cluster_clog_checkpoint test_cluster_clog_checkpoint.d
 
+# Complete TT inventory at the original header-checkpoint stage. Both bodies
+# are extracted verbatim; the native SMGR file I/O remains the actual CU.
+test_cluster_undo_tt_checkpoint.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_buf.c \
+		extract_vacuum_mx_fixture.py Makefile
+	python3 -c 'import pathlib,re,sys; from extract_vacuum_mx_fixture import function; s=pathlib.Path(sys.argv[1]).read_text(); names=("undo_buf_sync_native_headers","undo_buf_sync_headers"); assert all(len(re.findall(r"^"+n+r"\(",s,re.M))==1 for n in names); print("\n".join(function(s,n,"static void") for n in names))' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_undo_tt_checkpoint: test_cluster_undo_tt_checkpoint.c test_cluster_undo_tt_checkpoint.inc \
+		test_cluster_undo_native_tt_read.c test_cluster_undo_smgr_publication.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/cluster_undo_segment_init.c \
+		test_cluster_undo_publication_alloc_product.o \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+TESTS += test_cluster_undo_tt_checkpoint
+all: test_cluster_undo_tt_checkpoint
+.PHONY: clean-undo-tt-checkpoint
+clean: clean-undo-tt-checkpoint
+clean-undo-tt-checkpoint:
+	rm -f test_cluster_undo_tt_checkpoint test_cluster_undo_tt_checkpoint.d test_cluster_undo_tt_checkpoint.inc
+
 # Original authenticated creation child through trim/status/checkpoint.
 TESTS += test_cluster_clog_creation
 all: test_cluster_clog_creation
