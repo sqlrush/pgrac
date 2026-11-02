@@ -7187,8 +7187,16 @@ test_cluster_initdb_relmap: test_cluster_initdb_relmap.c unit_test.h \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_initdb_side: test_cluster_initdb_side.c unit_test.h \
-		$(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_side.h
+		$(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_side.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 

@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include "common/logging.h"
 #include "unit_test.h"
+#include "common/cluster_recovery_bootstrap.h"
+#include "access/clog_file.h"
 
 UT_DEFINE_GLOBALS();
 enum Fault { NONE, WRITE_FAIL, SYNC_FAIL, CORRUPT, SHORT_READ };
@@ -255,11 +257,215 @@ UT_TEST(peer_failed_write_cannot_be_adopted)
 	cleanup();
 }
 
+static ClusterRecoveryFileIdentityV2
+managed_source(uint16 origin)
+{
+	ClusterRecoveryFileIdentityV2 id = {0};
+	ClusterRecoveryBootFileV2 observed;
+	int fd;
+
+	id.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+	id.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+	id.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+	id.system_identifier = 101;
+	id.database_incarnation = 103;
+	id.storage_uuid[0] = 5; id.redo_branch_uuid[0] = 6;
+	id.redo_branch_generation = 107; id.redo_timeline = 2;
+	id.creation_generation = 109; id.registration_generation = 113;
+	id.origin = origin;
+	fd = openat(source_fd, "pg_xact/0000", O_RDWR | O_TRUNC | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0 && cluster_clog_bootstrap_v2(fd, &id,
+		FullTransactionIdFromU64(3), &observed));
+	UT_ASSERT_EQ(observed.synced_bytes, 16448);
+	UT_ASSERT(close(fd) == 0);
+	return id;
+}
+
+UT_TEST(managed_clog_copies_complete_framed_file)
+{
+	ClusterRecoveryFileIdentityV2 id;
+	ClusterRecoveryBootFileV2 source = {0}, target = {0};
+	int fd;
+
+	prepare();
+	id = managed_source(0);
+	UT_ASSERT(pgrac_initdb_side_create_v2(source_fd, shared_fd, &id));
+	fd = openat(source_fd, "pg_xact/0000", O_RDONLY | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0 && cluster_clog_bootstrap_read_v2(fd, &id, &source));
+	UT_ASSERT(close(fd) == 0);
+	fd = openat(shared_fd, "native_side/origin_0/pg_xact/0000", O_RDONLY | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0 && cluster_clog_bootstrap_read_v2(fd, &id, &target));
+	UT_ASSERT(close(fd) == 0);
+	UT_ASSERT_EQ(target.synced_bytes, 16448);
+	UT_ASSERT(memcmp(source.image_digest, target.image_digest, 32) == 0);
+	UT_ASSERT_EQ(writes, 6);
+	UT_ASSERT_EQ(file_syncs, 4);
+	cleanup();
+}
+
+UT_TEST(managed_peer_keeps_its_selected_origin_identity)
+{
+	ClusterRecoveryFileIdentityV2 founder, peer;
+	ClusterRecoveryBootFileV2 observed;
+	int native, fd;
+
+	prepare();
+	founder = managed_source(0);
+	UT_ASSERT(pgrac_initdb_side_create_v2(source_fd, shared_fd, &founder));
+	native = open_directory(shared_fd, "native_side");
+	UT_ASSERT(native >= 0);
+	peer = managed_source(127);
+	UT_ASSERT(!pgrac_initdb_side_origin_create_v2(source_fd, native, 127, &founder));
+	UT_ASSERT(pgrac_initdb_side_origin_create_v2(source_fd, native, 127, &peer));
+	fd = openat(native, "origin_127/pg_xact/0000", O_RDONLY | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0 && cluster_clog_bootstrap_read_v2(fd, &peer, &observed));
+	UT_ASSERT(!cluster_clog_bootstrap_read_v2(fd, &founder, &observed));
+	UT_ASSERT(close(fd) == 0);
+	fd = openat(native, "origin_0/pg_xact/0000", O_RDONLY | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0 && cluster_clog_bootstrap_read_v2(fd, &founder, &observed));
+	UT_ASSERT(close(fd) == 0);
+	writes = 0;
+	UT_ASSERT(!pgrac_initdb_side_origin_create_v2(source_fd, native, 127, &peer));
+	UT_ASSERT(!pgrac_initdb_side_origin_create_v2(source_fd, native, 0, &founder));
+	UT_ASSERT(!pgrac_initdb_side_origin_create_v2(source_fd, native, 128, &peer));
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT(close(native) == 0);
+	cleanup();
+}
+
+UT_TEST(managed_expected_and_framing_refuse_before_creation)
+{
+	for (unsigned variant = 0; variant < 24; variant++)
+	{
+		ClusterRecoveryFileIdentityV2 id;
+		int fd;
+
+		prepare();
+		id = managed_source(0);
+		fd = openat(source_fd, "pg_xact/0000", O_RDWR | O_NOFOLLOW);
+		UT_ASSERT(fd >= 0);
+		switch (variant)
+		{
+			case 0: id.kind = CLUSTER_RECOVERY_FILE_UNDO_V2; break;
+			case 1: id.format_id++; break;
+			case 2: id.format_version++; break;
+			case 3: id.system_identifier++; break;
+			case 4: id.database_incarnation++; break;
+			case 5: id.storage_uuid[15]++; break;
+			case 6: id.redo_branch_uuid[15]++; break;
+			case 7: id.redo_branch_generation++; break;
+			case 8: id.redo_timeline++; break;
+			case 9: id.database_oid++; break;
+			case 10: id.tablespace_oid++; break;
+			case 11: id.origin++; break;
+			case 12: id.object_id++; break;
+			case 13: id.creation_generation++; break;
+			case 14: id.registration_generation++; break;
+			case 15: UT_ASSERT(ftruncate(fd, 16447) == 0); break;
+			case 16: UT_ASSERT(ftruncate(fd, 16449) == 0); break;
+			case 17: UT_ASSERT(pwrite(fd, "X", 1, 0) == 1); break;
+			case 18: UT_ASSERT(pwrite(fd, "X", 1, 8192 + 63) == 1); break;
+			case 19: UT_ASSERT(pwrite(fd, "X", 1, 16447) == 1); break;
+			case 20: UT_ASSERT(unlinkat(source_fd, "pg_xact/0000", 0) == 0); break;
+			case 21: UT_ASSERT(linkat(source_fd, "pg_xact/0000", source_fd, "alias", 0) == 0); break;
+			case 22:
+				UT_ASSERT(renameat(source_fd, "pg_xact/0000", source_fd, "original") == 0);
+				UT_ASSERT(symlinkat("../original", source_fd, "pg_xact/0000") == 0);
+				break;
+			case 23:
+			{
+				int extra = openat(source_fd, "pg_xact/0001", O_WRONLY | O_CREAT | O_EXCL, 0600);
+				UT_ASSERT(extra >= 0 && write(extra, "x", 1) == 1 && close(extra) == 0);
+				break;
+			}
+		}
+		UT_ASSERT(close(fd) == 0);
+		UT_ASSERT(!pgrac_initdb_side_create_v2(source_fd, shared_fd, &id));
+		UT_ASSERT(!pgrac_initdb_side_create_v2(source_fd, shared_fd, NULL));
+		UT_ASSERT(target_absent() && writes == 0);
+		cleanup();
+	}
+}
+
+UT_TEST(managed_io_failure_preserves_source_and_unadoptable_target)
+{
+	static const enum Fault faults[] = {WRITE_FAIL, SYNC_FAIL, CORRUPT, SHORT_READ};
+
+	for (unsigned i = 0; i < lengthof(faults); i++)
+	{
+		ClusterRecoveryFileIdentityV2 id;
+		ClusterRecoveryBootFileV2 before, after;
+		int fd;
+
+		prepare();
+		id = managed_source(0);
+		fd = openat(source_fd, "pg_xact/0000", O_RDONLY | O_NOFOLLOW);
+		UT_ASSERT(fd >= 0 && cluster_clog_bootstrap_read_v2(fd, &id, &before));
+		fault = faults[i];
+		UT_ASSERT(!pgrac_initdb_side_create_v2(source_fd, shared_fd, &id));
+		UT_ASSERT(writes > 0);
+		UT_ASSERT(cluster_clog_bootstrap_read_v2(fd, &id, &after));
+		UT_ASSERT(memcmp(before.image_digest, after.image_digest, 32) == 0);
+		UT_ASSERT(close(fd) == 0);
+		fault = NONE;
+		writes = 0;
+		UT_ASSERT(!pgrac_initdb_side_create_v2(source_fd, shared_fd, &id));
+		UT_ASSERT_EQ(writes, 0);
+		cleanup();
+	}
+}
+
+UT_TEST(managed_postbootstrap_frame_and_local_seed_boundary)
+{
+	ClusterRecoveryFileIdentityV2 id;
+	ClusterClogFileBindingV2 binding = {0};
+	ClusterClogPageIdentityV2 page;
+	uint8 frame[CLUSTER_CLOG_FRAME_BYTES], payload[CLUSTER_CLOG_PAGE_BYTES];
+	struct stat st;
+	int fd, seed;
+
+	prepare();
+	id = managed_source(0);
+	binding.identity = id;
+	fd = openat(source_fd, "pg_xact/0000", O_RDWR | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0 && pread(fd, frame, sizeof(frame), 8192) == sizeof(frame));
+	UT_ASSERT(cluster_clog_file_page_decode_v2(&binding, 0, frame, sizeof(frame),
+		&page, payload, sizeof(payload)));
+	payload[0] = 0x44;
+	page.identity.page_lsn = page.image_lsn = 100;
+	UT_ASSERT(cluster_clog_file_page_encode_v2(&binding, &page, payload, sizeof(payload),
+		frame, sizeof(frame)));
+	UT_ASSERT(pwrite(fd, frame, sizeof(frame), 8192) == sizeof(frame) && fsync(fd) == 0);
+	UT_ASSERT(close(fd) == 0);
+	UT_ASSERT(mkdirat(source_fd, "pg_undo", 0700) == 0);
+	seed = openat(source_fd, "pg_undo/seed", O_CREAT | O_EXCL | O_WRONLY, 0600);
+	UT_ASSERT(seed >= 0 && write(seed, "local TT seed", 13) == 13 && close(seed) == 0);
+	writes = file_syncs = 0;
+	UT_ASSERT(!pgrac_initdb_side_create(source_fd, shared_fd));
+	UT_ASSERT(target_absent() && writes == 0);
+	UT_ASSERT(pgrac_initdb_side_create_v2(source_fd, shared_fd, &id));
+	fd = openat(shared_fd, "native_side/origin_0/pg_xact/0000", O_RDONLY | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0 && pread(fd, frame, sizeof(frame), 8192) == sizeof(frame));
+	UT_ASSERT(cluster_clog_file_page_decode_v2(&binding, 0, frame, sizeof(frame),
+		&page, payload, sizeof(payload)));
+	UT_ASSERT_EQ(payload[0], 0x44);
+	UT_ASSERT_EQ(page.identity.page_lsn, 100);
+	UT_ASSERT_EQ(page.identity.page_generation, 3);
+	UT_ASSERT_EQ(U64FromFullTransactionId(page.identity.birth_full_xid), 3);
+	UT_ASSERT(close(fd) == 0);
+	UT_ASSERT(fstatat(shared_fd, "native_side/origin_0/pg_undo", &st, 0) != 0 && errno == ENOENT);
+	cleanup();
+	prepare();
+	UT_ASSERT(!pgrac_initdb_side_create_v2(source_fd, shared_fd, &id));
+	UT_ASSERT(target_absent() && writes == 0);
+	cleanup();
+}
+
 int
 main(int argc, char **argv)
 {
 	pg_logging_init(argv[0]);
-	UT_PLAN(12);
+	UT_PLAN(17);
 	UT_RUN(actual_copy_sync_and_readback);
 	UT_RUN(existing_namespace_is_unchanged);
 	UT_RUN(source_alias_refuses_before_mutation);
@@ -272,5 +478,11 @@ main(int argc, char **argv)
 	UT_RUN(peer_copies_its_own_original_source);
 	UT_RUN(peer_alias_is_not_adopted);
 	UT_RUN(peer_failed_write_cannot_be_adopted);
+	UT_RUN(managed_clog_copies_complete_framed_file);
+	UT_RUN(managed_peer_keeps_its_selected_origin_identity);
+	UT_RUN(managed_expected_and_framing_refuse_before_creation);
+	UT_RUN(managed_io_failure_preserves_source_and_unadoptable_target);
+	UT_RUN(managed_postbootstrap_frame_and_local_seed_boundary);
 	UT_DONE();
+	return ut_failed_count == 0 ? 0 : 1;
 }
