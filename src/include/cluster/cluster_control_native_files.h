@@ -24,7 +24,8 @@ typedef enum ClusterControlNativeResultV2 {
 	CLUSTER_NATIVE_FILES_BUSY_V2,
 	CLUSTER_NATIVE_FILES_NOT_FOUND_V2,
 	CLUSTER_NATIVE_FILES_AMBIGUOUS_V2,
-	CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2
+	CLUSTER_NATIVE_FILES_NOT_AVAILABLE_V2,
+	CLUSTER_NATIVE_FILES_REGISTRATION_DEBT_V2
 } ClusterControlNativeResultV2;
 /* Local, address-bound borrow. Zero-initialize; never copy a live borrow.
  * expected is immutable by-value. Keep it with the ORIGINAL slot/FD/I/O duty
@@ -111,4 +112,31 @@ extern ClusterControlNativeResultV2 cluster_control_native_files_publish_locked_
 extern ClusterControlNativeResultV2 cluster_control_native_files_preregister_locked_v2(
 	const ClusterSharedConfigRef *, Size registry_byte_budget, uint64 startup_generation,
 	uint16 origin, uint64 first_segment, uint64 last_segment);
+/* Original OPEN control producer; SAME original CF-X, before family locks.
+ * Whole inclusive predicted gap plus successors, never a truncated prefix.
+ * Missing keys receive control-issued identities in one persistent RESERVE,
+ * followed by the original complete table publication. Existing identities and
+ * creator batches are preserved. ERROR or REGISTRATION_DEBT after entering the
+ * one-shot publication retains the original creation duty: no rollback/retry.
+ * Other refusals precede registration. No file I/O permission or activation.
+ * Fresh *out must be NULL. Local metadata only; destroy never retires debt. */
+typedef struct ClusterControlNativeClogEntryV2 {
+	ClusterRecoveryFileIdentityV2 expected;
+	uint8 batch_uuid[16];
+	bool reserved;
+} ClusterControlNativeClogEntryV2;
+typedef struct ClusterControlNativeClogRangeV2 {
+	ClusterSharedConfigRef config;
+	uint64 startup_generation, table_generation;
+	uint64 first_segment, last_segment, count;
+	ClusterControlNativeClogEntryV2 entries[FLEXIBLE_ARRAY_MEMBER];
+} ClusterControlNativeClogRangeV2;
+extern ClusterControlNativeResultV2
+cluster_control_native_files_reserve_clog_range_locked_v2(uint16 origin, uint64 first_segment,
+														  uint64 last_segment,
+														  ClusterControlNativeClogRangeV2 **fresh);
+extern void cluster_control_native_clog_range_destroy_v2(ClusterControlNativeClogRangeV2 **);
+/* Pure storage predicate for the control producer's output; no table read,
+ * borrow, I/O or authority. */
+extern bool cluster_control_native_files_output_distinct_v2(const void *, Size);
 #endif

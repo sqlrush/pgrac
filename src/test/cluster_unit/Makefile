@@ -19127,3 +19127,39 @@ test_cluster_relmap_xid_order: test_cluster_relmap_native_root_identity.inc \
 clean-relmap-native-root-identity:
 	rm -f test_cluster_relmap_native_root_identity.inc
 clean distclean maintainer-clean: clean-relmap-native-root-identity
+
+# Full persistent reservation projection and original creator borrowing.
+TESTS += test_cluster_control_clog_preparation
+all: test_cluster_control_clog_preparation
+test_cluster_control_clog_preparation: test_cluster_control_clog_preparation.c test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
+		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		test_cluster_control_file_selection.c unit_test.h test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/include/common/cluster_relmap_file.h \
+		$(top_srcdir)/src/include/common/cluster_relmap_v2.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/common/sha2_int.h \
+		$(top_srcdir)/src/common/cluster_recovery_registry.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_control_registry_original.o cluster_registry_common_test.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $(srcdir)/test_cluster_control_clog_preparation.c $(top_srcdir)/src/backend/storage/lmgr/s_lock.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-clog-preparation
+.PHONY: clean-control-clog-preparation
+clean-control-clog-preparation:
+	rm -f test_cluster_control_clog_preparation test_cluster_control_clog_preparation.d

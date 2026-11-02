@@ -370,6 +370,10 @@ UT_TEST(full_reservation_vector_exceeds_pin_array_and_reports_copy_cost)
 	UT_ASSERT(!memcmp(&before, &info, sizeof(info)));
 	batch_end();
 }
+#ifdef TEST_CONTROL_CLOG_PREPARATION
+int original_native_reservations_main(int argc, char **argv);
+#define main original_native_reservations_main
+#endif
 int
 main(int argc, char **argv)
 {

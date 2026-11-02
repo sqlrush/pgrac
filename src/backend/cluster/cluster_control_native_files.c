@@ -613,3 +613,19 @@ cluster_control_native_files_preregister_locked_v2(const ClusterSharedConfigRef 
 {
 	return native_publish(expected, budget, startup, true, origin, first, last);
 }
+
+/* Control producer alias check; no table state or authority is observed. */
+bool
+cluster_control_native_files_output_distinct_v2(const void *p, Size n)
+{
+	return native_distinct(p, n);
+}
+void
+cluster_control_native_clog_range_destroy_v2(ClusterControlNativeClogRangeV2 **out)
+{
+	ClusterControlNativeClogRangeV2 *value;
+	if (!native_distinct(out, sizeof(*out)) || !(value = *out))
+		return;
+	*out = NULL;
+	pfree(value);
+}
