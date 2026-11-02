@@ -104,9 +104,11 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	}
 	if (native_history_enabled && lock == ProcArrayLock) {
 		UT_ASSERT(!native_history_locked && !native_xid_locked);
-		UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+		UT_ASSERT(mode == LW_EXCLUSIVE || mode == LW_SHARED);
 		native_history_locked = true;
-		native_history_cuts++;
+		native_history_promise_lock = mode == LW_SHARED;
+		if (native_history_promise_lock) native_history_promise_reads++;
+		else native_history_cuts++;
 		return true;
 	}
 	UT_ASSERT(lock == XidGenLock && !native_xid_locked);
@@ -127,7 +129,9 @@ LWLockRelease(LWLock *lock)
 	if (native_history_enabled && lock == ProcArrayLock) {
 		UT_ASSERT(native_history_locked && !native_xid_locked);
 		native_history_locked = false;
-		native_history_unlocks++;
+		if (native_history_promise_lock) native_history_promise_unlocks++;
+		else native_history_unlocks++;
+		native_history_promise_lock = false;
 		return;
 	}
 	UT_ASSERT(lock == XidGenLock && native_xid_locked);
@@ -530,6 +534,15 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 	test_horizon_now += test_cohort_clock_shift;
 	test_cohort_clock_shift = 0;
 	return test_retention_sample_valid;
+}
+/* Old horizon/peer fixtures retain their explicit controlled H boundary;
+ * opt-in composition cases execute the actual native promise accessor. */
+bool
+cluster_undo_retention_horizon_covers(SCN horizon)
+{
+	if (native_history_enabled)
+		return native_history_covers(horizon);
+	return SCN_VALID(horizon) && horizon != (SCN)UINT64_MAX;
 }
 bool
 cluster_mrp_should_start(void)

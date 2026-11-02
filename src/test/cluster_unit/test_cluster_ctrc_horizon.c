@@ -125,6 +125,16 @@ cluster_sf_peer_capability_generation_matches(int32 peer, uint32 required, uint3
 	return generation == test_capability_generation;
 }
 
+/* Existing controlled H boundary; the native promise accessor is
+ * exercised by retention_sample and the native H owner composition. */
+bool
+cluster_undo_retention_horizon_covers(SCN horizon)
+{
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT(!native_lock_held && !native_cleaner_lock_held && !sender_maintenance_held);
+	return SCN_VALID(horizon) && horizon != (SCN)UINT64_MAX;
+}
+
 ClusterICSendResult
 cluster_ic_send_envelope(uint8 type, int32 destination, const void *payload, uint32 length)
 {

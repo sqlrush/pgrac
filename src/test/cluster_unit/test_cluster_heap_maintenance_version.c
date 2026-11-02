@@ -1604,6 +1604,16 @@ cohort_peer_generation_current(int32 peer, uint32 capability, uint32 generation)
 	return generation == cohort_live_generation[peer];
 }
 
+/* Existing controlled H boundary; the native promise accessor is
+ * exercised by retention_sample and the native H owner composition. */
+bool
+cluster_undo_retention_horizon_covers(SCN horizon)
+{
+	UT_ASSERT(!local_x && !local_share && backend_pin_count == fixture_expected_backend_pins());
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return SCN_VALID(horizon) && horizon != (SCN)UINT64_MAX;
+}
+
 static TimestampTz
 cohort_current_end_clock(void)
 {
