@@ -10356,15 +10356,16 @@ test_cluster_xid_clog_preparation: test_cluster_xid_clog_preparation.c \
 test_cluster_clog_allocation_prepare.inc: $(top_srcdir)/src/backend/access/transam/clog.c Makefile
 	awk '/^#define CLOG_(BITS_PER_XACT|XACTS_PER_BYTE|XACTS_PER_PAGE)[ \t]/ { print; constants++ } \
 	     /^struct ClusterClogAllocationV2 / { emit=1; types++ } \
-	     /^CLOG(NativeIORequired|AllocationSegments|AllocationPresence)\(/ { print "static bool"; emit=1; found++ } \
+	     /^CLOG(NativeIORequired|NativeCreationFile|NativeFileAcquire|AllocationSegments|AllocationPresence)\(/ { print "static bool"; emit=1; found++ } \
 	     /^CLOG(AllocationRequired|AllocationRangeReady)\(/ { print "bool"; emit=1; found++ } \
 	     /^CLOG(FinishAllocation|PrepareForAllocation)\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 7 || types != 1 || constants != 3) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 9 || types != 1 || constants != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 TESTS += test_cluster_clog_allocation_prepare
 all: test_cluster_clog_allocation_prepare
 test_cluster_clog_allocation_prepare: test_cluster_clog_allocation_prepare.c \
+		test_cluster_clog_creation_support.h \
 		test_cluster_xid_allocation.c unit_test.h test_cluster_xid_allocation.inc \
 		test_cluster_xid_allocation_stripe.inc test_cluster_pgproc_active_types.inc \
 		test_cluster_clog_allocation_prepare.inc $(top_srcdir)/src/include/access/clog.h \
@@ -11976,6 +11977,7 @@ clean-recovery-bootstrap:
 TESTS += test_cluster_clog_native_io
 all: test_cluster_clog_native_io
 test_cluster_clog_native_io: test_cluster_clog_native_io.c \
+		test_cluster_clog_creation_support.h \
 		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c \
 		$(top_srcdir)/src/include/access/slru.h \
 		$(top_srcdir)/src/include/access/clog_file.h \
@@ -12001,6 +12003,7 @@ clean-clog-native-io:
 TESTS += test_cluster_clog_checkpoint
 all: test_cluster_clog_checkpoint
 test_cluster_clog_checkpoint: test_cluster_clog_checkpoint.c unit_test.h \
+		test_cluster_clog_creation_support.h \
 		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
 		test_cluster_clog_write_snapshot.c \
 		$(top_srcdir)/src/include/access/slru.h \
@@ -12026,6 +12029,37 @@ test_cluster_clog_checkpoint: test_cluster_clog_checkpoint.c unit_test.h \
 clean: clean-clog-checkpoint
 clean-clog-checkpoint:
 	rm -f test_cluster_clog_checkpoint test_cluster_clog_checkpoint.d
+
+# Original authenticated creation child through trim/status/checkpoint.
+TESTS += test_cluster_clog_creation
+all: test_cluster_clog_creation
+test_cluster_clog_creation: test_cluster_clog_creation.c test_cluster_clog_checkpoint.c unit_test.h \
+		test_cluster_clog_creation_support.h \
+		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_sync.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+.PHONY: clean-clog-creation
+clean: clean-clog-creation
+clean-clog-creation:
+	rm -f test_cluster_clog_creation test_cluster_clog_creation.d
 
 # Original Startup CLOG PAGE_IMAGE rmgr to selected SLRU full-frame replay.
 TESTS += test_cluster_clog_native_redo

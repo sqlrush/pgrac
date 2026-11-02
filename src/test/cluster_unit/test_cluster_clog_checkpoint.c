@@ -365,8 +365,11 @@ UT_TEST(checkpoint_failed_cleanup_cannot_forget_address_bound_borrow)
 	}
 }
 
+#ifndef CLOG_CHECKPOINT_MAIN
+#define CLOG_CHECKPOINT_MAIN main
+#endif
 int
-main(void)
+CLOG_CHECKPOINT_MAIN(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-checkpoint-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
