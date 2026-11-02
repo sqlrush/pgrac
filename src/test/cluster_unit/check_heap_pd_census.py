@@ -24,6 +24,7 @@ EXPECTED = collections.Counter({
     (APPLY, "apply_heap_insert"): 1,
     (APPLY, "apply_heap_visible"): 1,
 })
+TOKEN = re.compile(r"\bPageSetAllVisible\b")
 CALL = re.compile(r"\bPageSetAllVisible\s*\(")
 
 
@@ -31,7 +32,7 @@ def audit(source):
     errors = vm_audit(source)
     edges, table = collections.Counter(), {}
     for path, text in source.items():
-        if not CALL.search(text) and "PD_ALL_VISIBLE" not in text:
+        if not TOKEN.search(text) and "PD_ALL_VISIBLE" not in text:
             continue
         functions = bodies(text)
         table[path] = functions
@@ -40,7 +41,11 @@ def audit(source):
             if "PD_ALL_VISIBLE" in body and (path != HEADER or owner not in {
                     "PageIsAllVisible", "PageSetAllVisible", "PageClearAllVisible"}):
                 errors.append("unregistered direct PD access: " + path + ":" + owner)
-        for call in CALL.finditer(clean(text)):
+        cleaned = clean(text)
+        for token in TOKEN.finditer(cleaned):
+            if not re.match(r"\s*\(", cleaned[token.end():]):
+                errors.append("indirect PD publisher: " + path)
+        for call in CALL.finditer(cleaned):
             if not any(start <= call.start() < end for _, start, end in functions.values()):
                 errors.append("unowned PD publisher: " + path)
         for token in re.finditer(r"\bPD_ALL_VISIBLE\b", clean(text)):
@@ -108,6 +113,29 @@ def run(root):
         tests.append(("reject unregistered " + label,
                       any(e.startswith(("unowned PD publisher:", "unregistered PD publisher edges:",
                                         "unregistered direct PD access:", "unowned direct PD access:")) for e in found), found))
+    for label, text in [
+        ("function alias", "#define PUBLISH_PD PageSetAllVisible\n"),
+        ("continued alias", "#define PUBLISH_PD \\\nPageSetAllVisible\n"),
+        ("function pointer", "void (*publish_pd)(Page) = PageSetAllVisible;\n"),
+        ("parenthesized call", "void\nnew_pd_writer(Page page)\n{\n(PageSetAllVisible)(page);\n}\n"),
+        ("address reference", "void (*publish_pd)(Page) = &PageSetAllVisible;\n"),
+    ]:
+        changed = dict(source)
+        changed["contrib/new_pd/new_pd.h"] = text
+        found = audit(changed)
+        tests.append(("reject indirect PD publisher: " + label,
+                      "indirect PD publisher: contrib/new_pd/new_pd.h" in found, found))
+    changed = dict(source)
+    changed["contrib/new_pd/new_pd.c"] = (
+        "/* PageSetAllVisible and PD_ALL_VISIBLE are documented here. */\n"
+        "const char *note = \"PageSetAllVisible(page)\";\n"
+        "// PD_ALL_VISIBLE is documentation, not an access.\n")
+    found = audit(changed)
+    tests.append(("ignore PD publisher names in comments and strings", not found, found))
+    changed = dict(source)
+    changed["contrib/new_pd/new_pd.c"] = "void\nPageSetAllVisibleCount(void)\n{\n}\n"
+    found = audit(changed)
+    tests.append(("ignore unrelated identifiers sharing the PD publisher prefix", not found, found))
     changed = dict(source)
     changed[HEAP] = source[HEAP].replace("all_frozen_set = true", "all_frozen_set = arbitrary")
     found = audit(changed)
