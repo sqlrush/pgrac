@@ -561,6 +561,7 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 
 #include "test_cluster_relmap_create_replay.inc"
 #include "test_cluster_relmap_recovery_create.inc"
+#include "test_cluster_relmap_create_receipt.inc"
 
 int main(int argc,char **argv)
 {
@@ -596,5 +597,11 @@ int main(int argc,char **argv)
 	UT_RUN(recovery_creation_confirmation_error_preserves_durable_pair_and_debt);
 	UT_RUN(recovery_creation_original_lock_and_fsync_guards_precede_effects);
 	UT_RUN(recovery_creation_requires_the_original_sealed_native_frame);
+	UT_RUN(creation_receipt_keeps_real_pair_and_complete_original_sources);
+	UT_RUN(creation_receipt_small_budget_refuses_before_target_effects);
+	UT_RUN(creation_receipt_nonempty_and_input_aliases_never_execute);
+	UT_RUN(creation_receipt_getters_reject_aliases_without_changing_saved_inputs);
+	UT_RUN(creation_receipt_false_and_error_never_publish_or_enable_retry);
+	UT_RUN(creation_receipt_saved_observation_does_not_claim_currentness);
 	UT_DONE(); return ut_failed_count!=0;
 }

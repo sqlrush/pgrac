@@ -16423,3 +16423,7 @@ test_cluster_cold_recovery_refail: $(top_builddir)/src/common/libpgcommon.a
 $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) test_cluster_cold_relmap_side: \
 		$(top_srcdir)/src/include/common/cluster_relmap_create.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_create_format.h
+
+# Original execution receipts retain their own complete source vector.
+test_cluster_relmap_create_copy test_cluster_relmap_control: $(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h
+test_cluster_relmap_create_copy: test_cluster_relmap_create_receipt.inc

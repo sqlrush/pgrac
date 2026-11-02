@@ -13,6 +13,7 @@
 #include "postgres.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_relmap_control.h"
+#include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_relmap_authority.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_cf_enqueue.h"
@@ -346,8 +347,91 @@ cluster_relmap_control_create_redo_input_v1(XLogReaderState *reader,
 		expected, batch, reader->EndRecPtr, out);
 }
 
+/* One successful original execution owns these LOCAL saved observations.
+ * Keep the exact confirmed authorization for A's later read-only recheck;
+ * neither a saved digest nor a copied observation is current authority. */
+struct ClusterRelmapRecoveryCreateReceiptV2
+{
+	uintptr_t self;
+	int pid;
+	ClusterColdTypedV1 *typed;
+	ClusterControlRelmapRecoveryCreateV2 *recovery;
+	ClusterRelmapRecoveryCreateObservationV2 observation;
+	ClusterRecoveryCheckpointSourceV2 *cuts;
+	ClusterRecoveryCheckpointFileSourceV2 *sources;
+	ClusterRecoveryCheckpointFileV2 files[2];
+};
+
+static bool
+relmap_create_receipt_owned(const ClusterRelmapRecoveryCreateReceiptV2 *r)
+{
+	return r != NULL && r->self == (uintptr_t)r && r->pid == MyProcPid;
+}
+
+static bool
+relmap_create_receipt_alias(const ClusterRelmapRecoveryCreateReceiptV2 *r, const void *out, Size n)
+{
+	return relmap_control_overlap(r, sizeof(*r), out, n)
+		|| relmap_control_overlap(r->cuts, r->observation.source_count * sizeof(*r->cuts), out, n)
+		|| relmap_control_overlap(r->sources, r->observation.source_count * sizeof(*r->sources), out, n)
+		|| !cold_relmap_output_distinct(r->typed, out, n)
+		|| !cluster_control_native_files_output_distinct_v2(out, n);
+}
+
+void
+cluster_relmap_recovery_create_destroy_v2(ClusterRelmapRecoveryCreateReceiptV2 **out)
+{
+	ClusterRelmapRecoveryCreateReceiptV2 *r;
+	if (out == NULL || (r = *out) == NULL || !relmap_create_receipt_owned(r)
+		|| relmap_create_receipt_alias(r, out, sizeof(*out))) return;
+	*out = NULL;
+	r->self = 0;
+	cluster_control_relmap_recovery_create_destroy_v2(&r->recovery);
+	if (r->cuts) pfree(r->cuts);
+	if (r->sources) pfree(r->sources);
+	pfree(r);
+}
+
+/* These are saved-input getters, deliberately not a currentness check. */
+static bool
+relmap_create_receipt_output(const ClusterRelmapRecoveryCreateReceiptV2 *r, void *out, Size n)
+{
+	return out != NULL && relmap_create_receipt_owned(r) && r->recovery != NULL
+		&& r->observation.source_count != 0 && r->cuts != NULL && r->sources != NULL
+		&& !relmap_create_receipt_alias(r, out, n);
+}
+
+bool
+cluster_relmap_recovery_create_observation_v2(const ClusterRelmapRecoveryCreateReceiptV2 *r,
+	ClusterRelmapRecoveryCreateObservationV2 *out)
+{
+	if (!relmap_create_receipt_output(r, out, sizeof(*out))) return false;
+	*out = r->observation;
+	return true;
+}
+
+bool
+cluster_relmap_recovery_create_file_at_v2(const ClusterRelmapRecoveryCreateReceiptV2 *r,
+	uint32 index, ClusterRecoveryCheckpointFileV2 *out)
+{
+	if (!relmap_create_receipt_output(r, out, sizeof(*out)) || index >= 2) return false;
+	*out = r->files[index];
+	return true;
+}
+
+bool
+cluster_relmap_recovery_create_source_at_v2(const ClusterRelmapRecoveryCreateReceiptV2 *r,
+	uint64 index, ClusterRecoveryCheckpointSourceV2 *out)
+{
+	if (!relmap_create_receipt_output(r, out, sizeof(*out)) || index >= r->observation.source_count)
+		return false;
+	*out = r->cuts[index];
+	return true;
+}
+
 typedef struct RelmapCreateWork
 {
+	ClusterRelmapRecoveryCreateReceiptV2 *receipt;
 	ClusterControlRelmapSelectionV2 *selection;
 	ClusterControlRelmapRecoveryCreateV2 *recovery;
 	ClusterControlNativeFileBorrowV2 source, target;
@@ -386,6 +470,7 @@ relmap_create_cleanup(RelmapCreateWork *w, bool error_cleanup)
 		w->mapping = false;
 		LWLockRelease(RelationMappingLock);
 	}
+	cluster_relmap_recovery_create_destroy_v2(&w->receipt);
 	cluster_control_relmap_recovery_create_destroy_v2(&w->recovery);
 	cluster_control_root_relmap_selection_destroy_v4(&w->selection);
 	if (w->hash) pg_cryptohash_free(w->hash);
@@ -527,9 +612,10 @@ finished:;
  * or a valid inner RMC1 CRC. Original XLogReader owns native CRC validation. */
 static bool
 relmap_recovery_create_frame(const ClusterColdTypedV1 *typed, uint32 participant,
-	const ClusterWalSourceRef *source, const XLogReaderState *reader)
+	const ClusterWalSourceRef *source, const XLogReaderState *reader,
+	ClusterColdRecordFrameV1 *out)
 {
-	ClusterColdRecordFrameV1 frame;
+	ClusterColdRecordFrameV1 frame, found;
 	uint32 count, matches = 0;
 	if (!typed->plan || typed->refusal != CLUSTER_COLD_OK || !reader->record
 		|| reader->cluster_record_crc_failed
@@ -547,17 +633,22 @@ relmap_recovery_create_frame(const ClusterColdTypedV1 *typed, uint32 participant
 			|| frame.record_crc != reader->record->header.xl_crc
 			|| frame.source_xid != XLogRecGetXid(reader)
 			|| frame.source_top_xid != XLogRecGetTopXid(reader)) return false;
+		found = frame;
 		++matches;
 	}
-	return matches == 1;
+	if (matches != 1) return false;
+	if (out != NULL) *out = found;
+	return true;
 }
 
-bool
-cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *typed,
+static bool
+relmap_recovery_create(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence, uint32 participant, const ClusterWalSourceRef *source,
-	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16])
+	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	Size receipt_budget, ClusterRelmapRecoveryCreateReceiptV2 **fresh)
 {
 	RelmapCreateWork *w;
+	ClusterRelmapRecoveryCreateReceiptV2 *retained = NULL;
 	ClusterControlRelmapFormatV2 format;
 	ClusterRecoveryCheckpointSourceV2 cut;
 	ClusterRelmapCreateReplayV1 reread;
@@ -575,11 +666,20 @@ cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *typed,
 	{
 		do {
 			uint64 count;
+			if (fresh != NULL) {
+				w->receipt = palloc0(sizeof(*w->receipt));
+				w->receipt->self = (uintptr_t)w->receipt;
+				w->receipt->pid = MyProcPid;
+				w->receipt->typed = typed;
+				w->receipt->observation.participant = participant;
+				w->receipt->observation.source = *source;
+			}
 			/* No runtime creator, current-file batch inference or new scope.
 			 * The original Startup owner independently authenticates the sealed
 			 * record and durable RESERVED/AVAILABLE registration before I/O. */
 			if (!cluster_relmap_control_create_redo_input_v1(reader, expected, batch, &w->creation)
-				|| !relmap_recovery_create_frame(typed, participant, source, reader)
+				|| !relmap_recovery_create_frame(typed, participant, source, reader,
+					w->receipt != NULL ? &w->receipt->observation.frame : NULL)
 				|| cluster_control_relmap_recovery_create_begin_locked_v2(typed, fence, participant,
 					source, reader->ReadRecPtr, w->creation.actual_end, expected, batch, &w->recovery) != 0
 				|| cluster_control_root_relmap_format_locked_v2(
@@ -589,10 +689,19 @@ cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *typed,
 					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &w->selection) != 0) break;
 			count = cluster_control_root_relmap_selection_source_count_v4(w->selection);
 			if (!count || count > CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2 / sizeof(*w->sources)) break;
+			/* Reserve the COMPLETE saved vectors before the first target write.
+			 * The original selection/authorization keeps its existing budget. */
+			if (w->receipt != NULL) {
+				if (count > (receipt_budget - sizeof(*w->receipt)) /
+					(sizeof(*w->receipt->cuts) + sizeof(*w->sources))) break;
+				w->receipt->observation.source_count = count;
+				w->receipt->cuts = palloc0(count * sizeof(*w->receipt->cuts));
+			}
 			w->sources = palloc0(count * sizeof(*w->sources));
 			for (uint64 i = 0; i < count; ++i) {
 				if (!cluster_control_root_relmap_selection_source_at_v4(w->selection, i, &cut)) goto done;
 				w->sources[i] = (ClusterRecoveryCheckpointFileSourceV2){i, cut.redo_start, cut.replay_end};
+				if (w->receipt != NULL) w->receipt->cuts[i] = cut;
 			}
 			if (!cluster_control_relmap_recovery_create_current_v2(w->recovery)
 				|| !cluster_relmap_authority_x_held()) break;
@@ -626,7 +735,7 @@ cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *typed,
 			if (!cluster_control_relmap_recovery_create_current_v2(w->recovery)
 				|| !cluster_relmap_authority_x_held() || !enableFsync
 				|| !cluster_relmap_control_create_redo_input_v1(reader, expected, batch, &reread)
-				|| !relmap_recovery_create_frame(typed, participant, source, reader)
+				|| !relmap_recovery_create_frame(typed, participant, source, reader, NULL)
 				|| memcmp(&reread, &w->creation, sizeof(reread))
 				|| cluster_control_root_relmap_selection_recheck_locked_v4(w->selection) != 0) break;
 			ok = cluster_control_relmap_recovery_create_confirm_locked_v2(w->recovery, w->receipts, 2) == 0
@@ -642,7 +751,49 @@ done:;
 	}
 	PG_END_TRY();
 	if (!ok) cluster_cold_typed_relmap_create_failed_v2(typed);
+	if (ok && fresh != NULL) {
+		retained = w->receipt;
+		retained->observation.creation = w->creation;
+		memcpy(retained->files, w->receipts, sizeof(retained->files));
+		/* Move the ORIGINAL confirmed carrier and vector, never dangling
+		 * scratch pointers or a reconstruction obtained by replaying again. */
+		retained->sources = w->sources; w->sources = NULL;
+		retained->recovery = w->recovery; w->recovery = NULL;
+		w->receipt = NULL;
+	}
 	relmap_create_cleanup(w, false);
+	if (retained != NULL) *fresh = retained;
 	return ok;
+}
+
+bool
+cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint32 participant, const ClusterWalSourceRef *source,
+	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16])
+{
+	return relmap_recovery_create(typed, fence, participant, source, reader, expected, batch, 0, NULL);
+}
+
+bool
+cluster_relmap_control_recovery_create_capture_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, uint32 participant, const ClusterWalSourceRef *source,
+	XLogReaderState *reader, const ClusterRecoveryFileIdentityV2 *expected, const uint8 batch[16],
+	Size receipt_budget, ClusterRelmapRecoveryCreateReceiptV2 **out)
+{
+	/* Reject overlaps BEFORE looking at *out or acquiring original authority.
+	 * Neither a NULL field inside the reader nor a plan slot is a fresh output. */
+	if (out == NULL || typed == NULL || reader == NULL || source == NULL || expected == NULL || batch == NULL
+		|| receipt_budget < sizeof(ClusterRelmapRecoveryCreateReceiptV2)
+		|| !cold_relmap_output_distinct(typed, out, sizeof(*out))
+		|| !cluster_control_native_files_output_distinct_v2(out, sizeof(*out))
+		|| relmap_control_overlap(source, sizeof(*source), out, sizeof(*out))
+		|| relmap_control_overlap(expected, sizeof(*expected), out, sizeof(*out))
+		|| relmap_control_overlap(batch, 16, out, sizeof(*out))
+		|| relmap_control_overlap(reader, sizeof(*reader), out, sizeof(*out))
+		|| (reader->record != NULL &&
+			(relmap_control_overlap(reader->record, Max(sizeof(*reader->record), reader->record->size), out, sizeof(*out))
+			 || relmap_control_overlap(XLogRecGetData(reader), XLogRecGetDataLen(reader), out, sizeof(*out))))
+		|| *out != NULL) return false;
+	return relmap_recovery_create(typed, fence, participant, source, reader, expected, batch, receipt_budget, out);
 }
 #endif /* USE_PGRAC_CLUSTER */

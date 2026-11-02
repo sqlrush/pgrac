@@ -81,6 +81,39 @@ extern bool cluster_relmap_control_recovery_create_v2(ClusterColdTypedV1 *,
 	struct ClusterRecoveryFencePlan *, uint32 participant, const ClusterWalSourceRef *,
 	XLogReaderState *, const ClusterRecoveryFileIdentityV2 *, const uint8 batch_uuid[16]);
 
+/* Capture the successful original execution, never execute it again to obtain
+ * receipts. Reserve the complete saved receipt and its vectors under the given
+ * receipt_byte_budget before the first target write. Fresh *out is NULL; refusal/ERROR preserves it. The original
+ * merged caller still owns its attempted latch and must destroy this local
+ * receipt before the original typed/fence lifetime ends. A nonempty slot cannot
+ * be reused. The old bool entry is unchanged and supplies no duplicate grant.
+ * These getters expose SAVED inputs only, including borrowed file.sources valid
+ * until destroy. They do no I/O/current/confirmed recheck and grant no OPEN.
+ * The later duplicate/final consumer must recheck original source+physical pair
+ * before A's separate confirmed recheck; it must not call create/confirm again.
+ * Destroy frees local copies and the original confirmed authorization only;
+ * original files, reservations, locks, pins and debt remain with their owner. */
+typedef struct ClusterRelmapRecoveryCreateReceiptV2 ClusterRelmapRecoveryCreateReceiptV2;
+typedef struct ClusterRelmapRecoveryCreateObservationV2
+{
+	uint32 participant;
+	ClusterWalSourceRef source;
+	ClusterColdRecordFrameV1 frame;
+	ClusterRelmapCreateReplayV1 creation;
+	uint64 source_count;
+} ClusterRelmapRecoveryCreateObservationV2;
+extern bool cluster_relmap_control_recovery_create_capture_v2(ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *, uint32 participant, const ClusterWalSourceRef *,
+	XLogReaderState *, const ClusterRecoveryFileIdentityV2 *, const uint8 batch_uuid[16],
+	Size receipt_byte_budget, ClusterRelmapRecoveryCreateReceiptV2 **out);
+extern bool cluster_relmap_recovery_create_observation_v2(const ClusterRelmapRecoveryCreateReceiptV2 *,
+	ClusterRelmapRecoveryCreateObservationV2 *out);
+extern bool cluster_relmap_recovery_create_file_at_v2(const ClusterRelmapRecoveryCreateReceiptV2 *,
+	uint32 index, ClusterRecoveryCheckpointFileV2 *out);
+extern bool cluster_relmap_recovery_create_source_at_v2(const ClusterRelmapRecoveryCreateReceiptV2 *,
+	uint64 index, ClusterRecoveryCheckpointSourceV2 *out);
+extern void cluster_relmap_recovery_create_destroy_v2(ClusterRelmapRecoveryCreateReceiptV2 **);
+
 /* Original checkpoint-local copies, never CF custody or a coverage grant.
  * The later original publisher reads a NEW selection under its own CF interval
  * and checks every saved reference/key/source before its ALL-family/source-cut,
