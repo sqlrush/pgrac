@@ -12187,11 +12187,11 @@ test_cluster_native_stop_observer.inc: $(top_srcdir)/src/backend/storage/buffer/
 	mv $@.tmp $@
 test_cluster_native_stop_roles.inc: test_cluster_native_three_role.c Makefile
 	awk '/^UT_TEST\(/ { stop=1; exit } \
-	     /NM_REQUIRE\(nm_master_admit\(&f, &request\)\);/ { print; print "\tns_cut(0);"; live++; next } \
+	     /NM_REQUIRE\(nm_master_admit\(&f, &request\)\);/ { print; print "\tns_cut(0, &request.common.logical_assertion.resource);"; live++; next } \
 	     /NM_REQUIRE\(!holder_probe\(&next\)\); holder_content_busy = false;/ { \
-	       print "\t\tNM_REQUIRE(!holder_probe(&next)); ns_cut(1); hc_release_readers(); holder_content_busy = false;"; parks++; next } \
-	     /NM_REQUIRE\(nc_stage\(&state->holder_status_intent.slot, &proof_send\)\);/ { print "\tns_cut(2);"; acks++ } \
-	     { print } /NM_REQUIRE\(nc_callback\(&proof_send\)\);/ { print "\tns_cut(3);"; sent++ } \
+	       print "\t\tNM_REQUIRE(!holder_probe(&next)); ns_cut(1, &request_buf.tag); hc_release_readers(); holder_content_busy = false;"; parks++; next } \
+	     /NM_REQUIRE\(nc_stage\(&state->holder_status_intent.slot, &proof_send\)\);/ { print "\tns_cut(2, &request_buf.tag);"; acks++ } \
+	     { print } /NM_REQUIRE\(nc_callback\(&proof_send\)\);/ { print "\tns_cut(3, &request_buf.tag);"; sent++ } \
 	     END { if (stop != 1 || live != 1 || parks != 1 || acks != 1 || sent != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_native_stop_remote.inc: test_cluster_native_remote_x.c Makefile

@@ -1,7 +1,10 @@
 /* Observe original stop gates inside a real two-transfer ownership cycle.
  * Settled terminal acceptance requires the original completion proof.
  * Author: SqlRush <sqlrush@gmail.com> */
-static void ns_cut(unsigned kind);
+#include "postgres.h"
+#include "storage/buf_internals.h"
+static void ns_cut(unsigned kind, const BufferTag *resource);
+#define NATIVE_STOP_IPC_DIAGNOSTICS
 #include "test_cluster_native_stop_cycle.inc"
 #include "test_cluster_native_stop_census.h"
 #if defined(NATIVE_STOP_EXPECT_ASSERT_OFF) && defined(USE_ASSERT_CHECKING)
@@ -11,6 +14,7 @@ static void ns_cut(unsigned kind);
 enum { NS_LIVE, NS_PARK, NS_ACK, NS_ACK_SENT, NS_CUT_COUNT };
 static unsigned ns_seen[NS_CUT_COUNT];
 static bool ns_successor_x;
+static BufferTag ns_master_resource;
 static const char *ns_names[] = { "master-live", "holder-parked", "holder-ACK-unoffered", "holder-ACK-callback" };
 
 /* Find the actual retained join by its decoded original assertion. No
@@ -99,11 +103,12 @@ static bool ns_settled_boundaries(void)
 	return true;
 }
 
-static void ns_cut(unsigned kind)
+static void ns_cut(unsigned kind, const BufferTag *resource)
 {
 	UT_ASSERT(kind < NS_CUT_COUNT); if (kind >= NS_CUT_COUNT) return;
 	ns_seen[kind]++;
-	UT_ASSERT_EQ(ns_pcm(ns_names[kind]), CLUSTER_NORMAL_STOP_PENDING);
+	if (kind == NS_LIVE) ns_master_resource = *resource;
+	UT_ASSERT_EQ(ns_pcm_tag(ns_names[kind], resource), CLUSTER_NORMAL_STOP_PENDING);
 	if (kind == NS_PARK || kind == NS_ACK || kind == NS_ACK_SENT)
 		ns_buffer_pending(ns_names[kind]);
 }
@@ -157,7 +162,7 @@ static bool ns_master(int reader, int writer, int mode)
 		ns_roles(true); NM_REQUIRE(nt_master(reader, writer, mode));
 	} else NM_REQUIRE(hc_master(reader, writer, mode));
 	UT_ASSERT_EQ(ns_seen[NS_LIVE], 2);
-	UT_ASSERT_EQ(ns_pcm("master-settled"), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(ns_pcm_tag("master-settled", &ns_master_resource), CLUSTER_NORMAL_STOP_READY);
 	return true;
 }
 static bool ns_reader(int master, int writer, int mode, int source, uint64 boot)

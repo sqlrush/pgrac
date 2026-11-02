@@ -27,18 +27,25 @@ ns_buffer(ClusterBufferStopObservation *out, const char **reason)
 }
 
 static ClusterNormalStopPollResult
-ns_pcm(const char *cut)
+ns_pcm_tag(const char *cut, const BufferTag *resource)
 {
 	BufferTag tag; uint32 slot; const char *reason;
 	PcmGrdProtocolDebtStats debt;
 	ClusterNormalStopPollResult result;
-	ClusterPcmResourceXBootstrapRound before = request_entry()->resource_x_bootstrap_round;
+	struct StopPcmEntryLayout *entry = hash_search((HTAB *)&fake_pcm_htab_token,
+		resource, HASH_FIND, NULL);
+	ClusterPcmResourceXBootstrapRound before;
 	ClusterPcmOwnEntry own = request_own;
 	uint32 header = pg_atomic_read_u32(&request_buf.state);
+
+	/* A master observes its received resource, without a requester buffer. */
+	UT_ASSERT(entry != NULL);
+	if (entry == NULL) return CLUSTER_NORMAL_STOP_INVALID;
+	before = entry->resource_x_bootstrap_round;
 	UT_ASSERT_EQ(fake_lwlock_depth, 0);
 	result = stop_pcm_poll(false, &tag, &slot, &reason);
 	cluster_pcm_grd_protocol_debt_snapshot(&debt);
-	UT_ASSERT(memcmp(&before, &request_entry()->resource_x_bootstrap_round, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&before, &entry->resource_x_bootstrap_round, sizeof(before)) == 0);
 	UT_ASSERT(memcmp(&own, &request_own, sizeof(own)) == 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state), header);
 	UT_ASSERT_EQ(fake_lwlock_depth, 0);
@@ -52,6 +59,12 @@ ns_pcm(const char *cut)
 		(header & BM_IO_IN_PROGRESS) != 0);
 	UT_ASSERT_EQ(debt.invalid_entry_count, 0);
 	return result;
+}
+
+static ClusterNormalStopPollResult
+ns_pcm(const char *cut)
+{
+	return ns_pcm_tag(cut, &request_prepared.common.logical_assertion.resource);
 }
 
 static void

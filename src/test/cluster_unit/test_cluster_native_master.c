@@ -28,6 +28,54 @@
 #include <poll.h>
 #include <signal.h>
 
+#ifdef NATIVE_STOP_IPC_DIAGNOSTICS
+/* Observe actual host calls without changing the errno used by the caller. */
+static void
+nm_ipc_syscall(const char *operation, int fd, bool output, size_t bytes,
+			   long result, short revents)
+{
+	int saved_errno = errno;
+	struct timespec now = {0};
+	int clock_result = clock_gettime(CLOCK_MONOTONIC, &now);
+
+	printf("# native-ipc pid=%ld op=%s fd=%d output=%d bytes=%zu rc=%ld errno=%d errno_valid=%d revents=%u timeout=%d clock_known=%d sec=%lld nsec=%ld\n",
+		   (long)getpid(), operation, fd, output, bytes, result, saved_errno,
+		   result < 0, (unsigned short)revents,
+		   strcmp(operation, "poll") == 0 && result == 0, clock_result == 0,
+		   (long long)now.tv_sec, now.tv_nsec);
+	errno = saved_errno;
+}
+
+static void
+nm_ipc_header(int fd, uint16 expected, const uint16 header[2], size_t capacity)
+{
+	int saved_errno = errno;
+
+	printf("# native-ipc pid=%ld op=header fd=%d expected=%u type=%u bytes=%u capacity=%zu\n",
+		   (long)getpid(), fd, (unsigned)expected, (unsigned)header[0],
+		   (unsigned)header[1], capacity);
+	errno = saved_errno;
+}
+
+static void
+nm_ipc_child(const char *phase, pid_t child, pid_t reaped, int status)
+{
+	int saved_errno = errno;
+	bool valid = reaped == child;
+
+	printf("# native-ipc pid=%ld op=child phase=%s child=%ld reaped=%ld status=%d status_valid=%d exit=%d signal=%d errno=%d errno_valid=%d\n",
+		   (long)getpid(), phase, (long)child, (long)reaped, status, valid,
+		   valid && WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+		   valid && WIFSIGNALED(status) ? WTERMSIG(status) : 0,
+		   saved_errno, reaped < 0);
+	errno = saved_errno;
+}
+#else
+#define nm_ipc_syscall(...) ((void)0)
+#define nm_ipc_header(...) ((void)0)
+#define nm_ipc_child(...) ((void)0)
+#endif
+
 /* Frame bytes, not a copy of a different role's in-memory state, cross this
  * boundary. Every wait is bounded so a failed child cannot hang the suite. */
 static bool nm_transfer(int fd, void *data, size_t size, bool output)
@@ -37,12 +85,15 @@ static bool nm_transfer(int fd, void *data, size_t size, bool output)
 		struct pollfd event = { .fd = fd, .events = output ? POLLOUT : POLLIN };
 		ssize_t n;
 		int ready = poll(&event, 1, 5000);
+		nm_ipc_syscall("poll", fd, output, size, ready, event.revents);
 		if (ready < 0 && errno == EINTR) continue;
 		if (ready <= 0) return false;
 #ifdef MSG_NOSIGNAL
 		n = output ? send(fd, cursor, size, MSG_NOSIGNAL) : read(fd, cursor, size);
+		nm_ipc_syscall(output ? "send" : "read", fd, output, size, n, 0);
 #else
 		n = output ? write(fd, cursor, size) : read(fd, cursor, size);
+		nm_ipc_syscall(output ? "write" : "read", fd, output, size, n, 0);
 #endif
 		if (n < 0 && errno == EINTR) continue;
 		if (n <= 0) return false;
@@ -62,8 +113,9 @@ static bool nm_receive(int fd, uint16 type, ResourceXDecodedFrame *frame)
 {
 	uint8 bytes[RESOURCE_X_ACQUIRE_IMAGE_V4_BYTES];
 	uint16 header[2]; ResourceXWireReject reject;
-	return nm_transfer(fd, header, sizeof(header), false)
-		&& header[0] == (uint16)type && header[1] <= sizeof(bytes)
+	if (!nm_transfer(fd, header, sizeof(header), false)) return false;
+	nm_ipc_header(fd, type, header, sizeof(bytes));
+	return header[0] == (uint16)type && header[1] <= sizeof(bytes)
 		&& nm_transfer(fd, bytes, header[1], false)
 		&& cluster_resource_x_wire_decode(type, bytes, header[1], frame, &reject);
 }
@@ -262,7 +314,11 @@ static void nm_wait_child(pid_t child)
 		reaped = waitpid(child, &status, WNOHANG);
 		if (reaped == 0) poll(NULL, 0, 50);
 	}
-	if (reaped == 0) { kill(child, SIGKILL); reaped = waitpid(child, &status, 0); UT_ASSERT(false); }
+	if (reaped == 0) {
+		nm_ipc_child("before-force", child, reaped, status);
+		kill(child, SIGKILL); reaped = waitpid(child, &status, 0); UT_ASSERT(false);
+	}
+	nm_ipc_child("final", child, reaped, status);
 	UT_ASSERT_EQ(reaped, child);
 	UT_ASSERT(WIFEXITED(status)); if (WIFEXITED(status)) UT_ASSERT_EQ(WEXITSTATUS(status), 0);
 }
