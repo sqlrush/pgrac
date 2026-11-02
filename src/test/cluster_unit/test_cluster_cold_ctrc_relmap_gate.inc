@@ -28,6 +28,12 @@ cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start
 	return relmap_observe_allowed;
 }
 
+bool
+cluster_cold_relmap_pending_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	return cluster_cold_relmap_replay_recheck_v1(start);
+}
+
 static void
 relmap_observation_ready(void)
 {

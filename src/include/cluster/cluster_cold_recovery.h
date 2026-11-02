@@ -49,6 +49,7 @@
 #define CLUSTER_COLD_RECOVERY_H
 
 #include "common/relmap.h"
+#include "common/cluster_relmap_create.h"
 
 #include "access/xlogrecord.h"
 #include "cluster/cluster_page_stable_base.h"
@@ -193,6 +194,9 @@ typedef struct ClusterColdRecordV1 {
 	Oid relmap_dbid;
 	Oid relmap_tsid;
 	const RelMapFile *relmap_image;
+	/* Independent clean creation observation. Never a pending pin/image,
+	 * execution grant or substitute for original RESERVED/batch authority. */
+	const ClusterRelmapCreateWalV1 *relmap_create;
 } ClusterColdRecordV1;
 
 /* Original record frame metadata, not an ownership or effects proof. */
@@ -674,6 +678,7 @@ typedef struct ClusterColdDecodedV1 {
 	ClusterColdSpaceOpV1 *space_ops;
 	uint32 space_capacity;
 	RelMapFile relmap_image;
+	ClusterRelmapCreateWalV1 relmap_create;
 } ClusterColdDecodedV1;
 
 /* Classify one decoded record of the exact source namespace. Reserved raw/top
@@ -899,6 +904,8 @@ struct ClusterColdTtBaseV1;
 struct UndoSegmentHeaderData;
 struct ClusterControlRootSnapshot;
 struct ClusterWalRecoveryCheckpointV1;
+struct ClusterColdNativeRegistryV2;
+struct ClusterControlNativeTableInfoV2;
 
 typedef struct ClusterColdTypedV1 {
 	MemoryContext context;
@@ -911,6 +918,9 @@ typedef struct ClusterColdTypedV1 {
 	/* Original checkpoints for all participants; only [0, replay_root_count)
 	 * have the original ROOT tokens permitting replay-source revalidation. */
 	struct ClusterColdReplayRootV1 *replay_roots;
+	/* Original pre-scan selection, including local original creation batches.
+	 * No shared AVAILABLE layout change and no new file/episode authority. */
+	struct ClusterColdNativeRegistryV2 *native_registry;
 	uint32 replay_root_count;
 	struct ClusterColdTtBaseV1 *tt_base; /* raw original-owner input, no outcome authority */
 	struct ClusterColdTtBaseV1 *tt_after_redo; /* separate physical input, same TT budget */
@@ -954,6 +964,28 @@ typedef struct ClusterColdTypedV1 {
 	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdTypedV1;
+
+/* Original post-replay Start checks the saved pre-scan selection under its
+ * existing CF interval; it may not replace the baseline. The table copy is
+ * local observation only, checked against the complete current inventory. */
+extern bool cluster_cold_typed_native_registry_current_locked_v2(const ClusterColdTypedV1 *);
+extern bool cluster_cold_typed_native_table_v2(const ClusterColdTypedV1 *,
+	struct ClusterControlNativeTableInfoV2 *);
+
+/* Original merged CREATE step. Caller keeps SAME global X -> CF-X and the
+ * complete typed/fence/source custody. The first call latches its attempt and
+ * reserves saved metadata before providers or target writes; success or late
+ * failure receipts remain owned by the original plan until local destruction.
+ * Repeated applied steps validate the original SIDE/source/physical pair and
+ * confirmed control receipt without executing create/sync/confirm again.
+ * Batch readiness rechecks every saved creation receipt and the entire selected
+ * declaration set before returning an observation for the original joint gate.
+ * Neither entry publishes completion, releases protection or activates rmgr. */
+extern bool cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *, const ClusterColdStepV1 *, XLogReaderState *,
+	Size receipt_byte_budget);
+extern bool cluster_cold_typed_relmap_create_ready_v2(ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *);
 
 /* After the original durability barrier, reread each surviving replay PAGE
  * frontier through the physical DATA observer. This grants no C0 authority. */

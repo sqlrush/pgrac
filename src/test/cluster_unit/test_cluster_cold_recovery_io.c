@@ -333,6 +333,7 @@ static void
 scan_reset(void)
 {
 	decode_relmap = NULL;
+	decode_create = NULL; decode_create_repeat = false; create_capture_calls = 0;
 	relmap_capture_calls = 0;
 	relmap_capture_throw = false;
 	visit_count = 2;
@@ -1576,10 +1577,129 @@ UT_TEST(test_historical_undeclared_relmap_keeps_original_optional_side_refusal)
 
 #include "test_cluster_cold_io_checkpoint_publisher.inc"
 
+/* Original ROOT visitor, decode boundary and SIDE leaf; no second visit. */
+static void
+scan_creation_fixture(ClusterRelmapCreateWalV1 *creation,
+	ClusterColdRelmapCreateExpectedV1 *expected, ClusterControlRootSnapshot *root)
+{
+	ClusterWalSourceRef *source;
+	scan_reset(); side_capture_calls = side_capture_fail_at = 0;
+	memset(creation, 0, sizeof(*creation));
+	expected->expected = (ClusterRecoveryFileIdentityV2){0};
+	expected->expected.kind = CLUSTER_RECOVERY_FILE_RELMAP_V2;
+	expected->expected.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+	expected->expected.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+	expected->expected.system_identifier = 77;
+	expected->expected.database_incarnation = 9;
+	memset(expected->expected.storage_uuid, 5, 16);
+	expected->expected.redo_branch_uuid[0] = 9;
+	expected->expected.redo_branch_generation = 1;
+	expected->expected.redo_timeline = 1;
+	expected->expected.database_oid = 2000;
+	expected->expected.tablespace_oid = DEFAULTTABLESPACE_OID;
+	expected->expected.origin = 1;
+	expected->expected.creation_generation = 12;
+	expected->expected.registration_generation = 41;
+	memset(expected->batch_uuid, 7, 16);
+	creation->identity = expected->expected;
+	memcpy(creation->batch_uuid, expected->batch_uuid, 16);
+	creation->committed.magic = RELMAPPER_FILEMAGIC;
+	creation->committed.num_mappings = 1;
+	creation->committed.mappings[0] = (RelMapping){1259, 9001};
+	INIT_CRC32C(creation->committed.crc);
+	COMP_CRC32C(creation->committed.crc, &creation->committed, offsetof(RelMapFile, crc));
+	FIN_CRC32C(creation->committed.crc);
+	source = &selected_checkpoint.source;
+	source->timeline = 1;
+	source->claim.database_incarnation = 9; source->claim.max_config_generation = 1;
+	source->claim.identity.system_identifier = 77;
+	source->claim.identity.origin_thread_id = 2;
+	source->claim.identity.origin_node_id = 1;
+	source->claim.identity.origin_owner_incarnation = 12;
+	memset(source->claim.identity.storage_uuid, 5, 16);
+	memset(source->claim.claim_sha256, 6, 32);
+	memset(root, 0, sizeof(*root)); root->identity = source->claim.identity;
+	root->checkpoint_tli = 1; root->checkpoint_lower_lsn = 0x1000;
+	root->validated_tail_lsn_exclusive = 0x1300;
+	decode_create = creation;
+}
+
+static bool scan_creation_no_pages(void *arg pg_attribute_unused(),
+	const RfPageIdentityV1 *page pg_attribute_unused(), ClusterColdDataV1 *out pg_attribute_unused())
+{
+	abort();
+}
+
+UT_TEST(test_original_scan_binds_predeclared_creation_after_checkpoint)
+{
+	ClusterColdPlanV1 *plan = scan_plan();
+	ClusterRelmapCreateWalV1 creation;
+	ClusterColdRelmapCreateExpectedV1 expected;
+	ClusterControlRootSnapshot root;
+	ClusterControlRootReadToken token = {0};
+	ClusterColdScanResultV1 result;
+	ClusterColdStepV1 step;
+	scan_creation_fixture(&creation, &expected, &root);
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_create_predeclare_v1(plan, &expected, 1), 0);
+	UT_ASSERT_EQ(cluster_cold_scan_root_v1(plan, 0, &root, &token, false, true,
+		(RfSideOnlinePlanV1 *)&side_capture_token, &result), 0);
+	UT_ASSERT_EQ(result.records, 2);
+	UT_ASSERT_EQ(create_capture_calls, 1); UT_ASSERT_EQ(side_capture_calls, 2);
+	UT_ASSERT_EQ(memcmp(&captured_create.creation, &creation, sizeof(creation)), 0);
+	UT_ASSERT_EQ(memcmp(&captured_create.source, &selected_checkpoint.source,
+		sizeof(selected_checkpoint.source)), 0);
+	UT_ASSERT_EQ(captured_create.frame.read_rec_ptr, 0x1100);
+	UT_ASSERT_EQ(captured_create.cut.native_redo, 0x1000);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, scan_creation_no_pages, NULL, NULL), 0);
+	UT_ASSERT(cluster_cold_plan_step_v1(plan, 0, &step));
+	UT_ASSERT_EQ(step.info, XLOG_RELMAP_CREATE_V1);
+	cluster_cold_plan_destroy_v1(&plan); decode_create = NULL;
+}
+
+UT_TEST(test_original_scan_rejects_unmatched_missing_duplicate_and_failed_create_carriers)
+{
+	for (unsigned fault = 0; fault < 7; ++fault) {
+		ClusterColdPlanV1 *plan = scan_plan();
+		ClusterRelmapCreateWalV1 creation;
+		ClusterColdRelmapCreateExpectedV1 expected;
+		ClusterControlRootSnapshot root;
+		ClusterControlRootReadToken token = {0};
+		ClusterColdScanResultV1 result;
+		volatile ClusterColdDetailV1 detail = CLUSTER_COLD_STATE;
+		volatile bool caught = false;
+		scan_creation_fixture(&creation, &expected, &root);
+		if (fault != 0) UT_ASSERT_EQ(cluster_cold_plan_relmap_create_predeclare_v1(plan, &expected, 1), 0);
+		switch (fault) {
+		case 1: ++creation.identity.registration_generation; break;
+		case 2: selected_checkpoint.source.claim.identity.origin_owner_incarnation++; break;
+		case 3: decode_create = NULL; break;
+		case 4:
+			visit_count = 3; visit_end[1] = 0x1200;
+			visit_read[2] = 0x1200; visit_end[2] = 0x1300;
+			decode_create_repeat = true; break;
+		case 5: side_capture_fail_at = 2; side_capture_refusal = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH; break;
+		case 6: relmap_capture_throw = true; break;
+		default: break;
+		}
+		PG_TRY(); {
+			detail = cluster_cold_scan_root_v1(plan, 0, &root, &token, false, true,
+				(RfSideOnlinePlanV1 *)&side_capture_token, &result);
+		} PG_CATCH(); { caught = true; } PG_END_TRY();
+		relmap_capture_throw = false;
+		UT_ASSERT_EQ(caught, fault == 6);
+		if (fault == 3) {
+			UT_ASSERT_EQ(detail, 0);
+			UT_ASSERT_NE(cluster_cold_plan_seal_v1(plan, scan_creation_no_pages, NULL, NULL), 0);
+		} else if (!caught) UT_ASSERT_NE(detail, 0);
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+		cluster_cold_plan_destroy_v1(&plan); decode_create = NULL;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(37);
 	UT_RUN(test_declared_relmap_scan_keeps_side_and_refuses_carrier_failure);
 	UT_RUN(test_historical_undeclared_relmap_keeps_original_optional_side_refusal);
 	UT_RUN(test_original_checkpointer_window_survives_both_complete_io_routes);
@@ -1615,6 +1735,8 @@ main(void)
 	UT_RUN(test_scan_lifecycle_plan_refusal_keeps_exact_raw_info);
 	UT_RUN(test_scan_checkpoint_refusal_observes_header_without_decoding);
 	UT_RUN(test_scan_unavailable_header_and_new_attempt_clear_observation);
+	UT_RUN(test_original_scan_binds_predeclared_creation_after_checkpoint);
+	UT_RUN(test_original_scan_rejects_unmatched_missing_duplicate_and_failed_create_carriers);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -40,6 +40,7 @@ terminal_batch_setup(bool aborted, bool reverse)
 	}
 	terminal_plan.relmap_inputs = terminal_batch;
 	terminal_plan.relmap_count = 2;
+	terminal_plan.relmap_input_capacity = lengthof(terminal_batch);
 	terminal_pins.count = terminal_pins.expected = 2;
 	for (unsigned i = 0; i < 2; ++i) {
 		terminal_pins.attempted[i] = terminal_pins.staged[i] = true;

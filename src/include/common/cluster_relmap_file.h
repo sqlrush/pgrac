@@ -72,4 +72,21 @@ extern bool cluster_relmap_file_pair_read_v2(int directory,
 extern bool cluster_relmap_file_pair_checkpoint_v2(int directory,
 								const ClusterRecoveryFileIdentityV2 *identity,
 								ClusterRelmapFilePairV2 *output);
+/* Fresh target only: encode a clean generation-one image before creating
+ * either O_EXCL name. Sync both held files and directory, reread every byte,
+ * and close before publishing output. Failure never unlinks/replaces a name;
+ * the original creator retains every partial-file/registration obligation. */
+extern bool cluster_relmap_file_pair_create_v2(int directory,
+	const ClusterRecoveryFileIdentityV2 *identity, const RelMapFile *committed,
+	ClusterRelmapFilePairV2 *output);
+/* Creation redo's storage step only. The original replay owner independently
+ * authenticates the complete creation record/batch and actual EndRecPtr,
+ * retains target registration and file protection, and later confirms its
+ * receipts. Both missing names may be created exclusively; a complete exact
+ * generation-one pair is only synced/read back. Partial, foreign, changed or
+ * later images refuse without replacement, repair or publication. No recovery,
+ * transaction, AVAILABLE or coverage authority is granted by these bytes. */
+extern bool cluster_relmap_file_pair_replay_create_v2(int directory,
+	const ClusterRecoveryFileIdentityV2 *identity, const RelMapFile *committed,
+	ClusterRelmapFilePairV2 *output);
 #endif

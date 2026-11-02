@@ -68,6 +68,7 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
+#include "utils/relmapper.h"
 
 struct ClusterColdReaderV1 {
 	ClusterWalSourceRef source;
@@ -369,10 +370,20 @@ cold_declared_side_capture(ColdScanWork *work, const RfPageOnlineRecordIdentityV
 	RfPageProofDetailV1 captured;
 	PG_TRY();
 	{
-		captured = input != NULL
-			? rf_side_online_plan_feed_relmap_v1(work->side_plan, &work->decoded.detached,
-				identity, input)
-			: rf_side_online_plan_feed_record_v1(work->side_plan, &work->decoded.detached, identity);
+		const ClusterColdRecordV1 *record = &work->decoded.record;
+		if (record->rmid == RM_RELMAP_ID && record->info == XLOG_RELMAP_CREATE_V1
+			&& record->end_rec_ptr > work->checkpoint.checkpoint.redo) {
+			const ClusterColdRelmapCreateInputV1 *created =
+				cluster_cold_plan_relmap_create_captured_v1(work->plan, work->participant, record);
+			captured = created != NULL
+				? rf_side_online_plan_feed_relmap_create_v1(work->side_plan,
+					&work->decoded.detached, identity, created)
+				: RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		} else
+			captured = input != NULL
+				? rf_side_online_plan_feed_relmap_v1(work->side_plan, &work->decoded.detached,
+					identity, input)
+				: rf_side_online_plan_feed_record_v1(work->side_plan, &work->decoded.detached, identity);
 	}
 	PG_CATCH();
 	{
@@ -436,6 +447,14 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 	work->detail
 		= cluster_cold_recovery_decode_v1(reader, work->system_identifier, work->storage_uuid,
 										  work->space_active, work->foreign, &work->decoded);
+	/* The control registration was fixed before scanning. Bind only this
+	 * original decoded post-redo RMC1, then let the original feed/cut proof
+	 * consume it. No second scan or retained pre-feed record batch. */
+	if (work->detail == CLUSTER_COLD_OK && work->decoded.record.rmid == RM_RELMAP_ID
+		&& work->decoded.record.info == XLOG_RELMAP_CREATE_V1
+		&& work->decoded.record.end_rec_ptr > work->checkpoint.checkpoint.redo)
+		work->detail = cluster_cold_plan_relmap_create_bind_v1(work->plan,
+			work->participant, &work->checkpoint.source, &work->decoded.record);
 	if (work->detail == CLUSTER_COLD_OK)
 		work->detail
 			= cluster_cold_plan_feed_v1(work->plan, work->participant, &work->decoded.record);

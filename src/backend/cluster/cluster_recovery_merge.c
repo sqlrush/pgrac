@@ -46,6 +46,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_control_relmap_delta.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_external_fence.h"
@@ -75,6 +76,7 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "utils/errcodes.h"
+#include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/wait_event.h"
 
@@ -109,6 +111,15 @@ typedef struct ClusterRecoveryFenceOrigin {
 	ClusterWalSourceRef tx_source; /* original retained source, never a new duty */
 } ClusterRecoveryFenceOrigin;
 
+/* Original completed confirmations, retained only for this local episode.
+ * The prepare baseline stays in origins[]; these exact links never rebase it. */
+typedef struct RecoveryFenceConfirmDelta {
+	struct RecoveryFenceConfirmDelta *next;
+	const struct ClusterColdTypedV1 *typed;
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation;
+	ClusterControlRootReadToken tokens[FLEXIBLE_ARRAY_MEMBER]; /* before[], after[] */
+} RecoveryFenceConfirmDelta;
+
 struct ClusterRecoveryFencePlan {
 	uint32 magic;
 	int32 owner_pid;
@@ -122,7 +133,13 @@ struct ClusterRecoveryFencePlan {
 	bool tx_inputs_bound;
 	bool completed;
 	bool tx_stale;
-	uint8 reserved[2];
+	bool serial_suspended;
+	bool episode_revoked;
+	uint64 episode_id;
+	uint64 episode_epoch;
+	uint64 episode_generation;
+	PGPROC *episode_proc;
+	Latch *episode_latch;
 	int acquire_timeout_ms_snapshot;
 	int merge_wait_timeout_ms_snapshot;
 	uint64 merge_deadline_ns;
@@ -134,7 +151,18 @@ struct ClusterRecoveryFencePlan {
 	ClusterRecoverySerialGuardSet serial_guards;
 	ClusterWalRetentionPin *retention_pin;
 	ClusterWalReadPinOwnerV1 tx_owner;
+	RecoveryFenceConfirmDelta *confirmed_deltas;
+	ClusterControlRootReadToken effective_tokens[CLUSTER_WAL_STATE_SLOT_COUNT];
 };
+
+static const ClusterControlRootReadToken *
+recovery_fence_effective_token(const ClusterRecoveryFencePlan *plan, uint16 index)
+{
+	return plan->confirmed_deltas != NULL ? &plan->effective_tokens[index]
+		: &plan->origins[index].root_token;
+}
+
+static uint64 recovery_fence_episode_id;
 
 typedef struct RecoveryFenceCfContext {
 	PGPROC *proc;
@@ -2737,6 +2765,11 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	plan->owner_pid = MyProcPid;
 	plan->owner = CurrentResourceOwner;
 	plan->owner_boot = cluster_qvotec_get_self_incarnation();
+	plan->episode_id = recovery_fence_episode_id == UINT64_MAX ? 0 : ++recovery_fence_episode_id;
+	plan->episode_epoch = cluster_epoch_get_current();
+	plan->episode_generation = cluster_grd_redeclare_generation();
+	plan->episode_proc = MyProc;
+	plan->episode_latch = MyLatch;
 	plan->own_thread = own_thread;
 	plan->acquire_timeout_ms_snapshot = cluster_external_fence_acquire_timeout_ms;
 	recovery_fence_deadline_begin(plan);
@@ -3559,6 +3592,7 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *pl
 	uint16 i;
 
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || !plan->serial_held
+		|| plan->serial_suspended || plan->episode_revoked
 		|| plan->origin_count == 0 || plan->serial_guards.count != plan->origin_count)
 		return recovery_fence_refused(plan, "revalidate_state", 0, -1, 0);
 	if (cluster_shared_config) {
@@ -3593,6 +3627,490 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *pl
 	return true;
 }
 
+static bool
+recovery_fence_episode_actor_current(const ClusterRecoveryFencePlan *plan, uint64 episode_id)
+{
+	return recovery_fence_plan_valid(plan) && plan->sealed && plan->committed
+		&& !plan->completed && !plan->episode_revoked && episode_id != 0
+		&& episode_id == plan->episode_id && plan->owner != NULL
+		&& plan->owner == CurrentResourceOwner && plan->owner_boot != 0
+		&& plan->owner_boot == cluster_qvotec_get_self_incarnation()
+		&& plan->episode_proc != NULL && plan->episode_proc == MyProc
+		&& plan->episode_latch != NULL && plan->episode_latch == MyLatch
+		&& plan->episode_epoch != 0 && plan->episode_epoch == cluster_epoch_get_current()
+		&& plan->episode_generation != 0
+		&& plan->episode_generation == cluster_grd_redeclare_generation()
+		&& plan->origin_count > 0 && plan->origin_count <= CLUSTER_WAL_STATE_SLOT_COUNT
+		&& cluster_enabled && cluster_shared_config
+		&& cluster_controlfile_shared_authority && MyBackendType == B_STARTUP
+		&& AmStartupProcess() && InRecovery && !ShutdownRequestPending && CritSectionCount == 0
+		&& cluster_recovery_transport_components_current();
+}
+
+static bool
+recovery_fence_suspended_guards_current(ClusterRecoveryFencePlan *plan, uint64 episode_id)
+{
+	return recovery_fence_episode_actor_current(plan, episode_id) && plan->serial_suspended
+		&& !plan->serial_held && plan->serial_guards.count == 0
+		&& recovery_fence_deadline_current(plan) && plan->retention_pin != NULL
+		&& cluster_wal_retention_pin_serial_suspended_current_v1(
+			   plan->retention_pin, &plan->serial_guards) == CLUSTER_WAL_PIN_OK;
+}
+
+/* Only without IR: re-read the original source union and every original ROOT
+ * cut. Never install any observed input into the plan. A CF wait restarts this
+ * read, under the same original pin, actor and absolute deadline. */
+static bool
+recovery_fence_suspended_locked_sources_current(ClusterRecoveryFencePlan *plan, uint64 episode_id,
+	const ClusterControlRootReadToken *phase)
+{
+	ControlRootImage *root;
+	volatile bool current = false;
+
+	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return false;
+	root = palloc(sizeof(*root));
+	PG_TRY();
+	{
+		current = true;
+		for (uint16 i = 0; i < plan->origin_count; i++) {
+			const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+			const ClusterControlRootReadToken *expected = phase != NULL ? &phase[i]
+				: recovery_fence_effective_token(plan, i);
+			ControlFileData native;
+			ClusterControlRootFileToken file;
+			ClusterControlRootResult result;
+			uint32 index = origin->origin_thread - 1;
+
+			if (!recovery_fence_suspended_guards_current(plan, episode_id)) {
+				current = false;
+				break;
+			}
+			/* This original reader borrows CF-X and authenticates the selected
+			 * generation claim and native anchor. Canonical readers own CF-S
+			 * themselves and must never be nested inside this barrier. */
+			result = cluster_control_root_v3_read_thread_locked(&origin->duty, root, &native, &file);
+			if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+				|| !recovery_fence_suspended_guards_current(plan, episode_id)
+				|| !cluster_cf_held_is_clusterwide(ExclusiveLock) || !root->present[index]
+				|| root->startup[index].generation != 0
+				|| memcmp(&root->records[index], &origin->root_snapshot,
+						  sizeof(origin->root_snapshot)) != 0
+				|| root->header.file_txn_seq != expected->file_txn_seq
+				|| root->record_crc32c[index] != expected->record_crc32c
+				|| native.checkPointCopy.redo != plan->start_lsn[origin->origin_thread]) {
+				current = false;
+				break;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		pfree(root);
+	}
+	PG_END_TRY();
+	return current;
+}
+
+/* Only file_txn_seq can move for a registry-only confirmation. The value is
+ * taken from the original owner, never synthesized from a range or ROOT. */
+static bool
+recovery_fence_confirm_token(const ClusterControlRootReadToken *before,
+	const ClusterControlRootReadToken *after)
+{
+	ClusterControlRootReadToken same = *after;
+
+	same.file_txn_seq = before->file_txn_seq;
+	return after->file_txn_seq != 0 && after->file_txn_seq >= before->file_txn_seq
+		&& memcmp(before, &same, sizeof(same)) == 0;
+}
+
+static RecoveryFenceConfirmDelta *
+recovery_fence_confirm_find(const ClusterRecoveryFencePlan *plan,
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	for (RecoveryFenceConfirmDelta *d = plan->confirmed_deltas; d != NULL; d = d->next)
+		if (d->confirmation == confirmation)
+			return d;
+	return NULL;
+}
+
+/* Repeated/older receipts remain proofs of their original links, not a new
+ * tip. Every accepted link must still be the same completed owner receipt. */
+static bool
+recovery_fence_confirm_chain_current(const ClusterRecoveryFencePlan *plan)
+{
+	for (const RecoveryFenceConfirmDelta *d = plan->confirmed_deltas; d != NULL; d = d->next)
+		for (uint16 i = 0; i < plan->origin_count; i++) {
+			ClusterControlRootReadToken after;
+
+			if (!cluster_control_relmap_recovery_create_confirmed_root_delta_v2(
+				d->confirmation, d->typed, plan, plan->episode_id, &d->tokens[i], &after)
+				|| memcmp(&after, &d->tokens[plan->origin_count + i], sizeof(after)))
+				return false;
+		}
+	return true;
+}
+
+/* The original CF-X reader checks sources/cuts against phase facts without
+ * storing them. An accepted receipt is rechecked against the latest tip. */
+static bool
+recovery_fence_confirm_current(ClusterRecoveryFencePlan *plan, uint64 episode_id,
+	const struct ClusterColdTypedV1 *typed,
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation, bool final,
+	ClusterControlRootReadToken *phase)
+{
+	RecoveryFenceConfirmDelta *accepted;
+
+	if (typed == NULL || confirmation == NULL
+		|| (plan->confirmed_deltas != NULL && typed != plan->confirmed_deltas->typed)
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| !recovery_fence_suspended_guards_current(plan, episode_id)
+		|| !recovery_fence_confirm_chain_current(plan))
+		return false;
+	accepted = recovery_fence_confirm_find(plan, confirmation);
+	if (accepted != NULL && accepted->typed != typed)
+		return false;
+	for (uint16 i = 0; i < plan->origin_count; i++) {
+		const ClusterControlRootReadToken *before = accepted != NULL ? &accepted->tokens[i]
+			: recovery_fence_effective_token(plan, i);
+		ClusterControlRootReadToken after;
+		bool valid;
+
+		valid = final || accepted != NULL
+			? cluster_control_relmap_recovery_create_confirmed_root_delta_v2(
+				confirmation, typed, plan, episode_id, before, &after)
+			: cluster_control_relmap_recovery_create_root_delta_v2(
+				confirmation, typed, plan, episode_id, before, &after);
+		if (!valid || !recovery_fence_confirm_token(before, &after)
+			|| (accepted != NULL && memcmp(&after,
+				&accepted->tokens[plan->origin_count + i], sizeof(after))))
+			return false;
+		phase[i] = accepted != NULL ? *recovery_fence_effective_token(plan, i) : after;
+	}
+	return recovery_fence_suspended_locked_sources_current(plan, episode_id, phase)
+		&& recovery_fence_suspended_guards_current(plan, episode_id);
+}
+
+bool
+cluster_recovery_merge_fence_plan_suspended_confirm_current_v1(ClusterRecoveryFencePlan *plan,
+	uint64 episode_id, const struct ClusterColdTypedV1 *typed,
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	ClusterControlRootReadToken phase[CLUSTER_WAL_STATE_SLOT_COUNT];
+	volatile bool current = false;
+
+	if (!recovery_fence_plan_valid(plan))
+		return false;
+	PG_TRY();
+	{
+		current = recovery_fence_confirm_current(plan, episode_id, typed, confirmation, false, phase);
+	}
+	PG_FINALLY();
+	{
+		if (!current) {
+			plan->episode_revoked = true;
+			(void)recovery_fence_refused(plan, "confirmation_phase", 0, -1, 0);
+		}
+	}
+	PG_END_TRY();
+	return current;
+}
+
+bool
+cluster_recovery_merge_fence_plan_confirm_delta_v1(ClusterRecoveryFencePlan *plan,
+	uint64 episode_id, const struct ClusterColdTypedV1 *typed,
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	ClusterControlRootReadToken phase[CLUSTER_WAL_STATE_SLOT_COUNT];
+	RecoveryFenceConfirmDelta *volatile delta = NULL;
+	volatile bool current = false;
+
+	if (!recovery_fence_plan_valid(plan))
+		return false;
+	PG_TRY();
+	{
+		if (recovery_fence_confirm_current(plan, episode_id, typed, confirmation, true, phase)) {
+			if (recovery_fence_confirm_find(plan, confirmation) != NULL)
+				current = true; /* Read-only repetition; never reinstall an older link. */
+			else {
+				delta = MemoryContextAllocZero(GetMemoryChunkContext(plan),
+					offsetof(RecoveryFenceConfirmDelta, tokens)
+						+ 2 * plan->origin_count * sizeof(*phase));
+				delta->typed = typed;
+				delta->confirmation = confirmation;
+				for (uint16 i = 0; i < plan->origin_count; i++) {
+					delta->tokens[i] = *recovery_fence_effective_token(plan, i);
+					delta->tokens[plan->origin_count + i] = phase[i];
+				}
+				if (cluster_wal_retention_pin_confirm_delta_v1(plan->retention_pin,
+					&plan->serial_guards, typed, plan, episode_id, confirmation) == CLUSTER_WAL_PIN_OK
+					&& recovery_fence_suspended_guards_current(plan, episode_id)
+					&& cluster_cf_held_is_clusterwide(ExclusiveLock)) {
+					/* No wait/I/O/allocation from the final check through installation.
+					 * The same pin/guard storage is retained for serial resume. */
+					memcpy(plan->effective_tokens, phase, plan->origin_count * sizeof(*phase));
+					delta->next = plan->confirmed_deltas;
+					plan->confirmed_deltas = delta;
+					delta = NULL;
+					current = true;
+				}
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (delta != NULL)
+			pfree(delta);
+		if (!current) {
+			plan->episode_revoked = true;
+			(void)recovery_fence_refused(plan, "confirmation_delta", 0, -1, 0);
+		}
+	}
+	PG_END_TRY();
+	return current;
+}
+
+static bool
+recovery_fence_suspended_sources_current(ClusterRecoveryFencePlan *plan, uint64 episode_id)
+{
+	RecoveryFenceCfContext context = { .proc = MyProc, .latch = MyLatch,
+		.owner = CurrentResourceOwner, .pin = plan->retention_pin, .pid = MyProcPid,
+		.boot = plan->owner_boot, .epoch = plan->episode_epoch,
+		.generation = plan->episode_generation, .recovery = InRecovery };
+	bool clear_at_entry = !cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock);
+
+	if (!recovery_fence_confirm_chain_current(plan))
+		return false;
+	if (cluster_cf_held(ExclusiveLock))
+		return recovery_fence_suspended_locked_sources_current(plan, episode_id, NULL);
+	if (!clear_at_entry)
+		return false;
+	for (;;) {
+		uint64 replay[2] = { 0, 0 };
+		XLogRecPtr start[CLUSTER_WAL_STATE_SLOT_COUNT + 1] = { 0 };
+		ClusterCfAttemptObservation retry;
+		ClusterMergeEngage engage;
+		bool restart = false;
+
+		if (!recovery_fence_suspended_guards_current(plan, episode_id))
+			return false;
+		engage = recovery_merge_project_attempt(plan->own_thread,
+			plan->start_lsn[plan->own_thread], replay, start, &retry, &plan->merge_deadline_ns);
+		if (clear_at_entry && cluster_cf_attempt_wait_slice(&retry)) {
+			if (!recovery_fence_wait_own_cf(plan, &context, &retry))
+				return false;
+			continue;
+		}
+		if (engage != CLUSTER_MERGE_ENGAGE
+			|| memcmp(replay, plan->replay_thread_bitmap, sizeof(replay)) != 0
+			|| memcmp(start, plan->start_lsn, sizeof(start)) != 0)
+			return false;
+		for (uint16 i = 0; i < plan->origin_count; i++) {
+			const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+			ClusterControlRootSnapshot root;
+			ClusterControlRootReadToken token;
+			ClusterControlRootResult result;
+			uint64 before = cluster_cf_attempt_sequence();
+
+			if (!recovery_fence_suspended_guards_current(plan, episode_id))
+				return false;
+			result = cluster_control_root_v3_read_canonical_deadline_v1(origin->origin_thread,
+				&origin->duty, &root, &token, plan->merge_deadline_ns);
+			if (clear_at_entry && result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+				&& cluster_cf_last_attempt_since(before, &retry)
+				&& cluster_cf_attempt_wait_slice(&retry)) {
+				if (!recovery_fence_wait_own_cf(plan, &context, &retry))
+					return false;
+				restart = true;
+				break;
+			}
+			if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+				|| memcmp(&root, &origin->root_snapshot, sizeof(root)) != 0
+				|| memcmp(&token, recovery_fence_effective_token(plan, i), sizeof(token)) != 0)
+				return false;
+		}
+		if (!restart)
+			return recovery_fence_suspended_guards_current(plan, episode_id);
+	}
+}
+
+bool
+cluster_recovery_merge_fence_plan_suspended_held_current_v1(ClusterRecoveryFencePlan *plan,
+	uint64 episode_id)
+{
+	volatile bool current = false;
+
+	if (!recovery_fence_plan_valid(plan))
+		return false;
+	PG_TRY();
+	{
+		current = recovery_fence_suspended_guards_current(plan, episode_id);
+	}
+	PG_FINALLY();
+	{
+		if (!current)
+			plan->episode_revoked = true;
+	}
+	PG_END_TRY();
+	return current;
+}
+
+bool
+cluster_recovery_merge_fence_plan_suspended_current_v1(ClusterRecoveryFencePlan *plan,
+	uint64 episode_id)
+{
+	volatile bool current = false;
+
+	if (!recovery_fence_plan_valid(plan))
+		return false;
+	PG_TRY();
+	{
+		current = recovery_fence_suspended_guards_current(plan, episode_id)
+			&& recovery_fence_suspended_sources_current(plan, episode_id);
+	}
+	PG_FINALLY();
+	{
+		if (!current) {
+			plan->episode_revoked = true;
+			(void)recovery_fence_refused(plan, "suspended_episode", 0, -1, 0);
+		}
+	}
+	PG_END_TRY();
+	return current;
+}
+
+bool
+cluster_recovery_merge_fence_plan_suspend_serial_v1(ClusterRecoveryFencePlan *plan,
+	uint64 *out_episode_id)
+{
+	volatile bool suspended = false;
+
+	if (!recovery_fence_plan_valid(plan) || out_episode_id == NULL)
+		return false;
+	/* Never let an output alias change the retained episode itself. */
+	if ((uintptr_t)out_episode_id <= (uintptr_t)plan
+		? (uintptr_t)plan - (uintptr_t)out_episode_id < sizeof(*out_episode_id)
+		: (uintptr_t)out_episode_id - (uintptr_t)plan < sizeof(*plan))
+		return false;
+	if (*out_episode_id != 0)
+		return false;
+	PG_TRY();
+	{
+		if (recovery_fence_episode_actor_current(plan, plan->episode_id)
+			&& !cluster_cf_held(ShareLock) && !cluster_cf_held(ExclusiveLock)
+			&& recovery_fence_deadline_current(plan)
+			&& cluster_recovery_merge_fence_plan_revalidate_nowait(plan)) {
+			/* Surrender execution before any release can yield or raise ERROR. */
+			plan->serial_held = false;
+			plan->serial_suspended = true;
+			if (cluster_recovery_serial_release_set(&plan->serial_guards)
+					== CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
+				&& cluster_recovery_merge_fence_plan_suspended_current_v1(plan, plan->episode_id)) {
+				*out_episode_id = plan->episode_id;
+				suspended = true;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (!suspended) {
+			plan->episode_revoked = true;
+			(void)recovery_fence_refused(plan, "suspend_serial", 0, -1, 0);
+		}
+	}
+	PG_END_TRY();
+	return suspended;
+}
+
+bool
+cluster_recovery_merge_fence_plan_resume_serial_v1(ClusterRecoveryFencePlan *plan, uint64 episode_id)
+{
+	ClusterRecoverySerialRequest *requests;
+	RecoveryFenceCfContext context;
+	volatile bool resumed = false;
+
+	if (!recovery_fence_plan_valid(plan))
+		return false;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)) {
+		plan->episode_revoked = true;
+		return recovery_fence_refused(plan, "resume_cf_held", 0, -1, 0);
+	}
+	if (!cluster_recovery_merge_fence_plan_suspended_current_v1(plan, episode_id))
+		return false;
+	context = (RecoveryFenceCfContext){ .proc = MyProc, .latch = MyLatch,
+		.owner = CurrentResourceOwner, .pin = plan->retention_pin, .pid = MyProcPid,
+		.boot = plan->owner_boot, .epoch = plan->episode_epoch,
+		.generation = plan->episode_generation, .recovery = InRecovery };
+	requests = palloc0(sizeof(*requests) * plan->origin_count);
+	PG_TRY();
+	{
+		for (uint16 i = 0; i < plan->origin_count; i++) {
+			const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+
+			requests[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+			requests[i].duty = origin->duty;
+			requests[i].expected_root_token = *recovery_fence_effective_token(plan, i);
+			requests[i].formation = origin->formation;
+			requests[i].fence_need_set = origin->needs;
+			requests[i].fence_admission_set = origin->admissions;
+			requests[i].release_timeout_ms = plan->acquire_timeout_ms_snapshot;
+		}
+		for (;;) {
+			ClusterCfAttemptObservation retry;
+			ClusterRecoverySerialAcquireResult result;
+			uint16 failed_index = UINT16_MAX;
+			int budget = recovery_fence_acquire_budget(plan, plan->acquire_timeout_ms_snapshot);
+			uint64 before;
+
+			if (budget <= 0)
+				break;
+			for (uint16 i = 0; i < plan->origin_count; i++)
+				requests[i].acquire_timeout_ms = budget;
+			before = cluster_cf_attempt_sequence();
+			result = cluster_recovery_serial_acquire_set_deadline_v1(requests, plan->origin_count,
+				budget, &plan->serial_guards, &failed_index, plan->merge_deadline_ns);
+			if (result == CLUSTER_RECOVERY_SERIAL_GRANTED) {
+				/* Bound pin pointers still address these same original guard slots.
+				 * Revalidate only in memory while IR is held; never rebind the pin. */
+				if (recovery_fence_episode_actor_current(plan, episode_id)
+					&& recovery_fence_deadline_current(plan)
+					&& plan->serial_guards.count == plan->origin_count
+					&& cluster_wal_retention_pin_revalidate(plan->retention_pin) == CLUSTER_WAL_PIN_OK) {
+					plan->serial_suspended = false;
+					plan->serial_held = true;
+					resumed = true;
+				}
+				break;
+			}
+			if (failed_index >= plan->origin_count
+				|| (result != CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE
+					&& result != CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE)
+				|| !cluster_cf_last_attempt_since(before, &retry)
+				|| retry.mode != ShareLock || !cluster_cf_attempt_wait_slice(&retry))
+				break;
+			if (plan->serial_guards.count != 0)
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT),
+					errmsg("cold recovery resume IR rollback was not confirmed before CF wait")));
+			if (!recovery_fence_wait_own_cf(plan, &context, &retry)
+				|| !cluster_recovery_merge_fence_plan_suspended_current_v1(plan, episode_id))
+				break;
+		}
+	}
+	PG_FINALLY();
+	{
+		pfree(requests);
+		if (!resumed) {
+			plan->episode_revoked = true;
+			(void)recovery_fence_refused(plan, "resume_serial", 0, -1, 0);
+		}
+	}
+	PG_END_TRY();
+	return resumed;
+}
+
 /* Borrow only the exact original owners; an origin number or COLD_FORMED
  * enum alone cannot authorize a canonical SIDE/PAGE mutation. */
 bool
@@ -3614,7 +4132,7 @@ cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint
 	memset(&authority, 0, sizeof(authority));
 	authority.duty = &origin->duty;
 	authority.root_snapshot = &origin->root_snapshot;
-	authority.root_token = &origin->root_token;
+	authority.root_token = recovery_fence_effective_token(plan, (uint16)index);
 	authority.formation = origin->formation;
 	authority.fence_need_set = origin->needs;
 	authority.fence_admission_set = origin->admissions;
@@ -3954,6 +4472,11 @@ cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan)
 	if (!recovery_fence_plan_valid(owned) || owned->serial_held || owned->serial_guards.count != 0
 		|| owned->retention_pin != NULL)
 		return;
+	while (owned->confirmed_deltas != NULL) {
+		RecoveryFenceConfirmDelta *delta = owned->confirmed_deltas;
+		owned->confirmed_deltas = delta->next;
+		pfree(delta);
+	}
 	recovery_fence_plan_release_members(owned);
 	MemSet(owned, 0, sizeof(*owned));
 	pfree(owned);

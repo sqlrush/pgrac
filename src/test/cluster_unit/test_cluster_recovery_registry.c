@@ -294,9 +294,96 @@ UT_TEST(test_complete_registry_exceeds_active_pin_capacity_and_keeps_birth_regis
 	UT_ASSERT(!cluster_recovery_registry_encode_v2(&reg, bytes, 19520, ref));
 	free(bytes);
 }
+UT_TEST(test_creation_batch_roundtrip_preserves_old_record_prefix)
+{
+	ClusterRecoveryRegistryDecodedV2 *decoded = NULL;
+	const ClusterRecoveryRegistryV2 *view;
+	Size old_size = 0, size = 0;
+	uint8 old[4096], bytes[4096], ref[128], oldref[128], batch[16];
+	fixture();
+	UT_ASSERT(cluster_recovery_registry_size_v2(&reg, sizeof(old), &old_size));
+	UT_ASSERT(cluster_recovery_registry_encode_v2(&reg, old, old_size, oldref));
+	memset(batch, 0x71, sizeof(batch));
+	for (unsigned i = 0; i < 2; i++) memcpy(files[i].creation_batch_uuid, batch, 16);
+	UT_ASSERT(cluster_recovery_registry_size_v2(&reg, sizeof(bytes), &size));
+	UT_ASSERT_EQ(size, old_size + 32); /* two exact 224B records */
+	UT_ASSERT(cluster_recovery_registry_encode_v2(&reg, bytes, size, ref));
+	if (size == old_size + 32) {
+		UT_ASSERT_EQ(memcmp(old + 832, bytes + 832, 208), 0);
+		UT_ASSERT_EQ(memcmp(old + 1040, bytes + 1056, 208), 0);
+	}
+	UT_ASSERT(cluster_recovery_registry_decode_v2(bytes, size, ref, sizeof(bytes), &decoded));
+	view = cluster_recovery_registry_view_v2(decoded);
+	UT_ASSERT(view != NULL);
+	if (view != NULL) for (unsigned i = 0; i < 2; i++)
+		UT_ASSERT_EQ(memcmp(view->coverage.files[i].creation_batch_uuid, batch, 16), 0);
+	cluster_recovery_registry_destroy_v2(&decoded);
+	UT_ASSERT(cluster_recovery_registry_decode_v2(old, old_size, oldref, sizeof(old), &decoded));
+	view = cluster_recovery_registry_view_v2(decoded);
+	memset(batch, 0, sizeof(batch));
+	if (view != NULL) for (unsigned i = 0; i < 2; i++)
+		UT_ASSERT_EQ(memcmp(view->coverage.files[i].creation_batch_uuid, batch, 16), 0);
+	cluster_recovery_registry_destroy_v2(&decoded);
+}
+UT_TEST(test_creation_batch_partial_pair_and_unknown_extent_refuse)
+{
+	Size n = 0;
+	uint8 bytes[4096], before[4096], ref[128];
+	fixture();
+	memset(files[0].creation_batch_uuid, 0x72, 16);
+	memset(bytes, 0xa5, sizeof(bytes)); memcpy(before, bytes, sizeof(bytes));
+	UT_ASSERT(!cluster_recovery_registry_size_v2(&reg, sizeof(bytes), &n));
+	UT_ASSERT(!cluster_recovery_registry_encode_v2(&reg, bytes, sizeof(bytes), ref));
+	UT_ASSERT_EQ(memcmp(bytes, before, sizeof(bytes)), 0);
+	memset(files[1].creation_batch_uuid, 0x73, 16);
+	UT_ASSERT(!cluster_recovery_registry_size_v2(&reg, sizeof(bytes), &n));
+	memcpy(files[1].creation_batch_uuid, files[0].creation_batch_uuid, 16);
+	UT_ASSERT(cluster_recovery_registry_size_v2(&reg, sizeof(bytes), &n));
+	UT_ASSERT(cluster_recovery_registry_encode_v2(&reg, bytes, n, ref));
+	UT_ASSERT(!cluster_recovery_registry_matches_v2(bytes, n - 16, &reg, ref));
+	bytes[832 + 208] ^= 1;
+	UT_ASSERT(!cluster_recovery_registry_matches_v2(bytes, n, &reg, ref));
+}
+UT_TEST(test_explicit_coverage_family_is_not_guessed_or_downgraded)
+{
+	ClusterRecoveryRegistryDecodedV2 *d = NULL;
+	const ClusterRecoveryRegistryV2 *v;
+	uint8 old[4096], bytes[4096], ref[128], oldref[128], again[4096], againref[128];
+	Size oldn = 0, n = 0, nextn = 0;
+	fixture();
+	UT_ASSERT(cluster_recovery_registry_size_v2(&reg, sizeof(old), &oldn));
+	UT_ASSERT(cluster_recovery_registry_encode_v2(&reg, old, oldn, oldref));
+	reg.coverage_format_version = 4;
+	UT_ASSERT(cluster_recovery_registry_size_v2(&reg, sizeof(bytes), &n));
+	UT_ASSERT_EQ(n, oldn + 32);
+	UT_ASSERT(cluster_recovery_registry_encode_v2(&reg, bytes, n, ref));
+	UT_ASSERT_EQ(memcmp(bytes, "PRCREG4", 8), 0);
+	UT_ASSERT_EQ(memcmp(ref, "PRCREF4", 8), 0);
+	UT_ASSERT(cluster_recovery_registry_decode_v2(bytes, n, ref, sizeof(bytes), &d));
+	v = cluster_recovery_registry_view_v2(d);
+	UT_ASSERT(v != NULL);
+	if (v) {
+		UT_ASSERT_EQ(v->coverage_format_version, 4);
+		UT_ASSERT(cluster_recovery_registry_size_v2(v, sizeof(again), &nextn));
+		UT_ASSERT_EQ(n, nextn);
+		UT_ASSERT(cluster_recovery_registry_encode_v2(v, again, nextn, againref));
+		UT_ASSERT_EQ(memcmp(bytes, again, n), 0);
+		UT_ASSERT_EQ(memcmp(ref, againref, 128), 0);
+	}
+	cluster_recovery_registry_destroy_v2(&d);
+	UT_ASSERT(!cluster_recovery_registry_decode_v2(old, oldn, ref, sizeof(old), &d));
+	UT_ASSERT(!cluster_recovery_registry_decode_v2(bytes, n, oldref, sizeof(bytes), &d));
+	UT_ASSERT(!cluster_recovery_registry_decode_v2(bytes, n + 1, ref, sizeof(bytes), &d));
+	reg.coverage_format_version = 2;
+	memset(files[0].creation_batch_uuid, 0x51, 16);
+	memset(files[1].creation_batch_uuid, 0x51, 16);
+	UT_ASSERT(!cluster_recovery_registry_size_v2(&reg, sizeof(old), &oldn));
+	reg.coverage_format_version = 3;
+	UT_ASSERT(!cluster_recovery_registry_size_v2(&reg, sizeof(old), &oldn));
+}
 int main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(test_complete_vectors_and_explicit_offsets);
 	UT_RUN(test_complete_cohort_and_creation_binding);
 	UT_RUN(test_damage_trailing_and_reference_refuse);
@@ -305,6 +392,9 @@ int main(void)
 	UT_RUN(test_real_immutable_file_and_selected_read);
 	UT_RUN(test_sync_failure_and_late_cohort_change_preserve_reference);
 	UT_RUN(test_complete_registry_exceeds_active_pin_capacity_and_keeps_birth_registration);
+	UT_RUN(test_creation_batch_roundtrip_preserves_old_record_prefix);
+	UT_RUN(test_creation_batch_partial_pair_and_unknown_extent_refuse);
+	UT_RUN(test_explicit_coverage_family_is_not_guessed_or_downgraded);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

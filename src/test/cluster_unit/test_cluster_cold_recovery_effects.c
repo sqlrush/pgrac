@@ -25,6 +25,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_tt_durable.h"
@@ -46,6 +47,18 @@ void
 ExceptionalCondition(const char *condition, const char *file, int line)
 {
 	printf("# unexpected Assert: %s at %s:%d\n", condition, file, line);
+	abort();
+}
+
+/* Relmap execution belongs to test_cluster_cold_relmap. This effect-only
+ * fixture has no declaration or staging owner; dispatching one is a test
+ * error rather than a successful authority provider. */
+bool
+cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed pg_attribute_unused(),
+	struct ClusterRecoveryFencePlan *fence pg_attribute_unused(),
+	const ClusterColdStepV1 *step pg_attribute_unused(),
+	XLogReaderState *reader pg_attribute_unused())
+{
 	abort();
 }
 

@@ -90,6 +90,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_shmem.h"	/* PGRAC: cluster_init_shmem() */
+#include "cluster/cluster_control_native_files.h"
 #include "cluster/storage/cluster_shared_fs.h"	/* PGRAC: cluster_shared_fs_init() */
 #include "cluster/cluster_wal_thread.h"			/* PGRAC: cluster_wal_thread_init() (spec-4.1) */
 #endif
@@ -192,6 +193,10 @@ CalculateShmemSize(int *num_semaphores)
 
 	/* include additional requested shmem from preload libraries */
 	size = add_size(size, total_addin_request);
+#ifdef USE_PGRAC_CLUSTER
+	/* Original creation children do not run the online shmem request hook. */
+	size = add_size(size, cluster_control_native_files_creation_shmem_size_v2());
+#endif
 
 	/* might as well round it off to a multiple of a typical page size */
 	size = add_size(size, 8192 - (size % 8192));
@@ -352,6 +357,7 @@ CreateSharedMemoryAndSemaphores(void)
 	 * and before shmem_startup_hook so user preload libraries see
 	 * ClusterShmem fully initialised when their hook fires.
 	 */
+	cluster_control_native_files_creation_shmem_init_v2();
 	cluster_init_shmem();
 
 	/*

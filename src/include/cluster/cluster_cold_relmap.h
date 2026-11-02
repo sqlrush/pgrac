@@ -17,6 +17,7 @@
 #include "common/cluster_relmap_v2.h"
 #include "access/clog.h"
 
+/* Bounded output page, not a whole-plan input limit. */
 #define CLUSTER_COLD_RELMAP_MAX_INPUTS 64
 /* Checked values only; neither polarity is a publication/release grant. */
 typedef struct ClusterColdRelmapTerminalEntryV1 {
@@ -27,7 +28,8 @@ typedef struct ClusterColdRelmapTerminalEntryV1 {
 	ClusterRelmapV2Image staged;
 } ClusterColdRelmapTerminalEntryV1;
 typedef struct ClusterColdRelmapTerminalCheckV1 {
-	uint32 count;
+	uint32 count, total_count, offset;
+	uint8 digest[32]; /* Complete ordered batch; local observation only. */
 	ClusterColdRelmapTerminalEntryV1 entries[CLUSTER_COLD_RELMAP_MAX_INPUTS];
 } ClusterColdRelmapTerminalCheckV1;
 struct ClusterRecoveryStartV1;
@@ -38,6 +40,26 @@ extern bool cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence);
 extern bool cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
 	ClusterColdRelmapTerminalCheckV1 *out);
+/* Pending-only counterpart for a mixed original plan. Requires at least one
+ * completed pending input; zero is NOT a terminal receipt. Creation count and
+ * receipts stay intact and require the owner's independent creation_ready gate.
+ * Capture uses the same one-shot latch, source/ROOT/SIDE checks and native held
+ * FDs. Recheck uses the original Start/installed-writer/mutation checks, output
+ * alias guard and sticky failure semantics. No new scope, pin, setter or grant.
+ * Old capture/recheck continue to reject every plan containing creation. */
+extern bool cluster_cold_relmap_pending_terminal_capture_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence);
+extern bool cluster_cold_relmap_pending_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdRelmapTerminalCheckV1 *out);
+/* Every page rechecks the ENTIRE original batch and carries its total/digest.
+ * Offset must name an entry (zero for an empty legacy batch). Legacy recheck
+ * refuses batches larger than one page; neither API grants prefix completion.
+ * The pending-only variant preserves independent creation obligations and
+ * refuses zero pending; the other variant still refuses all creation. */
+extern bool cluster_cold_relmap_terminal_recheck_segment_v1(const struct ClusterRecoveryStartV1 *start,
+	uint32 offset, ClusterColdRelmapTerminalCheckV1 *out);
+extern bool cluster_cold_relmap_pending_terminal_recheck_segment_v1(const struct ClusterRecoveryStartV1 *start,
+	uint32 offset, ClusterColdRelmapTerminalCheckV1 *out);
 /* Original Startup-only recovery path. No ordinary directory/lock may be
  * supplied. Full original source set must be passed, not a replay prefix.
  * A failed attempt retains its private carrier until joint transfer or exit. */
@@ -75,6 +97,36 @@ typedef struct ClusterColdRelmapInputV1 {
 	struct LWLock *retention_lock;
 } ClusterColdRelmapInputV1;
 
+/* Independent registration only: the original Start supplies the complete
+ * expected identity and creation batch, never values discovered from WAL.
+ * Predeclare the nonempty WHOLE batch before the first feed (create() already
+ * enters FEEDING). The original scanner then binds each matching RMC1 once,
+ * before feeding that exact decoded record. Missing/extra/duplicate records
+ * refuse the plan; neither stage grants execution or completion authority. */
+typedef struct ClusterColdRelmapCreateExpectedV1 {
+	ClusterRecoveryFileIdentityV2 expected;
+	uint8 batch_uuid[16];
+} ClusterColdRelmapCreateExpectedV1;
+extern ClusterColdDetailV1 cluster_cold_plan_relmap_create_predeclare_v1(
+	ClusterColdPlanV1 *, const ClusterColdRelmapCreateExpectedV1 *, uint32 count);
+extern ClusterColdDetailV1 cluster_cold_plan_relmap_create_bind_v1(
+	ClusterColdPlanV1 *, uint32 participant, const ClusterWalSourceRef *, const ClusterColdRecordV1 *);
+
+typedef struct ClusterColdRelmapCreateInputV1 {
+	uint32 participant;
+	ClusterColdParticipantV1 cut;
+	ClusterWalSourceRef source;
+	ClusterColdRecordFrameV1 frame;
+	ClusterRelmapCreateWalV1 creation;
+} ClusterColdRelmapCreateInputV1;
+/* Borrowed immutable plan values. Capture is visible only during pass-1;
+ * step lookup only after seal and for the exact original merged step. Neither
+ * getter performs execution or makes a saved observation current. */
+extern const ClusterColdRelmapCreateInputV1 *cluster_cold_plan_relmap_create_captured_v1(
+	const ClusterColdPlanV1 *, uint32 participant, const ClusterColdRecordV1 *);
+extern const ClusterColdRelmapCreateInputV1 *cluster_cold_plan_relmap_create_step_v1(
+	const ClusterColdPlanV1 *, const ClusterColdStepV1 *);
+
 /* Original owner pin plus a complete decoded WAL record. The owner supplies
  * its actual FullXid/era and pin generation, never an epoch inferred from WAL.
  * owner.wal_end must be zero: the producer takes the actual record end.
@@ -102,6 +154,22 @@ typedef struct ClusterColdRelmapReplayReceiptV1 {
  * original selected source/cut. UINT32_MAX means invalid/incomplete; zero
  * means no declared participant. No replay-window check, I/O, acquire,
  * cancellation, source revalidation or new lifetime/retention grant. */
+/* Pending-only component for the original owner's conjunction with independent
+ * creation readiness, ACTIVE census and original effects/source/fence gates.
+ * Zero counts pending obligations only; it never waives creation. Count is
+ * immutable receipt/metadata inspection, not a current physical certificate.
+ * Readiness uses original sources, sealed SIDE, pins and complete staged pairs;
+ * entered failure/ERROR is sticky and retains all original protection/debt.
+ * Neither API publishes, transfers pins or grants terminal/lifetime authority.
+ * The older ready/count/input APIs continue to reject every creation plan. */
+extern uint32 cluster_cold_typed_relmap_pending_count_v1(const ClusterColdTypedV1 *typed);
+extern bool cluster_cold_typed_relmap_pending_ready_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence);
+/* Same by-value replay receipt, restricted to pending inputs. Invalid,
+ * incomplete, empty and out-of-range inputs return the original zero value;
+ * no empty value is a terminal or creation qualification. */
+extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_pending_input_v1(
+	const ClusterColdTypedV1 *typed, uint32 index);
 extern uint32 cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed);
 extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_replay_input_v1(
 	const ClusterColdTypedV1 *typed, uint32 index);
@@ -116,6 +184,11 @@ extern ClusterColdRelmapReplayReceiptV1 cluster_cold_typed_relmap_replay_input_v
  * Success is a current staging observation only, not terminal/era/lifetime
  * qualification, a reusable certificate, COMPLETE or a release permission. */
 extern bool cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start);
+
+/* Same staging recheck, for a nonempty pending component in a mixed plan.
+ * Zero pending still refuses; the original owner must separately handle that
+ * absence and creation_ready, never replace it with an empty terminal receipt. */
+extern bool cluster_cold_relmap_pending_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start);
 
 /* Explicit original-source adapter before pass-1. Whole-batch validation of
  * exact unstaged pins precedes any mutation. Recheck and arm every original

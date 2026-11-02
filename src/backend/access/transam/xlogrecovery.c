@@ -207,6 +207,10 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
 #include "cluster/cluster_cold_relmap.h"
+#include "cluster/cluster_relmap_control.h"
+#include "cluster/cluster_relmap_lock.h"
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
 #include "cluster/cluster_terminal_ref_census.h"
@@ -745,6 +749,9 @@ struct ClusterRecoveryStartV1 {
 	bool effects_fixed;
 	ClusterColdEffectsReceiptV1 effects_receipt;
 	bool relmap_declared;
+	/* Original Start selection, retained after its narrow CF is released. */
+	bool managed_relmap_table;
+	ClusterControlNativeTableInfoV2 relmap_table;
 	bool ctrc_observation_started, ctrc_observation_complete;
 	bool ctrc_page_plan_started;
 	RfPageOnlinePlanV1 *ctrc_page_plan;
@@ -1032,19 +1039,19 @@ ClusterColdRecoveryRelmapReplayInput(const struct ClusterRecoveryStartV1 *start,
 	 * on entered failure; never close its original plan, pins or dependents. */
 	PG_TRY();
 	{
-		uint32 count = cluster_cold_typed_relmap_replay_count_v1(start->inputs);
+		uint32 count = cluster_cold_typed_relmap_pending_count_v1(start->inputs);
 
 		if (!ClusterColdRecoveryRelmapCurrent(start) || count == UINT32_MAX)
 			ClusterColdRecoveryRelmapFail(start);
 		else if (index < count) {
 			ClusterColdRelmapReplayReceiptV1 confirmed;
 
-			value = cluster_cold_typed_relmap_replay_input_v1(start->inputs, index);
+			value = cluster_cold_typed_relmap_pending_input_v1(start->inputs, index);
 			if (!ClusterColdRecoveryRelmapCurrent(start)) {
 				value = empty;
 				ClusterColdRecoveryRelmapFail(start);
 			} else {
-				confirmed = cluster_cold_typed_relmap_replay_input_v1(start->inputs, index);
+				confirmed = cluster_cold_typed_relmap_pending_input_v1(start->inputs, index);
 				if (value.count != count || memcmp(&value, &confirmed, sizeof(value)) != 0) {
 					value = empty;
 					ClusterColdRecoveryRelmapFail(start);
@@ -1244,7 +1251,7 @@ cluster_recovery_cold_relmap_recheck(struct ClusterRecoveryStartV1 *start)
 {
 	if (!start->relmap_declared)
 		return true;
-	if (cluster_cold_relmap_replay_recheck_v1(start) && ClusterColdRecoveryRelmapCurrent(start))
+	if (cluster_cold_relmap_pending_replay_recheck_v1(start) && ClusterColdRecoveryRelmapCurrent(start))
 		return true;
 	ClusterColdRecoveryRelmapFail(start);
 	cluster_recovery_cold_observation_refuse(start, "relmap_staging", 0);
@@ -1359,6 +1366,12 @@ ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *start, Size 
 					memory_budget - bytes - physical_bytes, &state->ctrc_observation_census);
 				if (result != CLUSTER_RECOVERY_CENSUS_MORE) {
 					cluster_recovery_cold_observation_refuse(state, "census_begin", (int)result);
+					break;
+				}
+				if (state->managed_relmap_table
+					&& !cluster_recovery_census_bind_managed_relmap_v2(
+						state->ctrc_observation_census, &state->relmap_table)) {
+					cluster_recovery_cold_observation_refuse(state, "relmap_table", 0);
 					break;
 				}
 				for (;;) {
@@ -3908,6 +3921,30 @@ cluster_recovery_cold_page_tuple_fields(const ClusterRecoveryCensusReferenceV1 *
 	return count;
 }
 
+/* Each bounded terminal page certifies the same whole ordered batch. Retain
+ * all pages across PAGE graph work; a later page is never prefix completion. */
+static bool
+cluster_recovery_cold_relmap_terminals(const struct ClusterRecoveryStartV1 *start,
+	uint32 total, ClusterColdRelmapTerminalCheckV1 *saved,
+	ClusterColdRelmapTerminalCheckV1 *current, bool capture)
+{
+	uint32 offset = 0, page = 0;
+	if (!total || total == UINT32_MAX || !saved || !current) return false;
+	while (offset < total) {
+		ClusterColdRelmapTerminalCheckV1 *value = capture ? saved + page : current;
+		uint32 count = Min(total - offset, CLUSTER_COLD_RELMAP_MAX_INPUTS);
+		if (!ClusterColdRecoveryRelmapCurrent(start)
+			|| !cluster_cold_relmap_pending_terminal_recheck_segment_v1(start, offset, value)
+			|| value->offset != offset || value->total_count != total || value->count != count
+			|| memcmp(value->digest, saved[0].digest, sizeof(value->digest))
+			|| (!capture && memcmp(value, saved + page, sizeof(*value)))
+			|| !ClusterColdRecoveryRelmapCurrent(start)) return false;
+		offset += count;
+		page++;
+	}
+	return true;
+}
+
 static RfPageCtrcOwnerGraphV1
 cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *start, Size memory_budget, bool projected)
 {
@@ -3942,6 +3979,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	uint32 unresolved_count = 0;
 	bool ready = false;
 	bool relmap_declared;
+	uint32 relmap_total = 0, relmap_pages = 0;
 
 	out.detail = RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	if (start == NULL || start != cluster_recovery_cold_start || !cluster_recovery_cold_ctrc_replays_actor()
@@ -3954,6 +3992,11 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 	wal_count = start->ctrc_page_wal_count; work = start->ctrc_observation_work; scope = start->ctrc_observation_inputs;
 	if (work == NULL) return out;
 	relmap_declared = start->relmap_declared;
+	if (relmap_declared) {
+		relmap_total = cluster_cold_typed_relmap_pending_count_v1(start->inputs);
+		if (!relmap_total || relmap_total == UINT32_MAX) return out;
+		relmap_pages = 1 + (relmap_total - 1) / CLUSTER_COLD_RELMAP_MAX_INPUTS;
+	}
 	terminal_count = projected ? work->counts.subject_count : 0;
 	out.detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	if (owner_count == 0 || source_count == 0 || source_count > RF_PAGE_STABLE_MAX_PARTICIPANTS) goto refused;
@@ -4008,7 +4051,7 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, owner_count * source_count, sizeof(uint32), &indexes_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, reference_count, stride, &data_offset)
 		|| !cluster_recovery_cold_page_reference_reserve(&bytes, terminal_count, sizeof(*terminals), &terminal_offset)
-		|| (relmap_declared && !cluster_recovery_cold_page_reference_reserve(&bytes, 2,
+		|| (relmap_declared && !cluster_recovery_cold_page_reference_reserve(&bytes, relmap_pages + 1,
 			sizeof(*relmap_saved), &relmap_offset))
 		|| (projected && (!cluster_recovery_cold_page_reference_reserve(&bytes, 2 * reference_count, sizeof(*nodes), &graph_node_offset)
 			|| !cluster_recovery_cold_page_reference_reserve(&bytes, 3 * reference_count, sizeof(*edges), &graph_edge_offset)
@@ -4034,14 +4077,14 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 			terminals = (ClusterColdTtSlotInputV1 *)((char *)entries + terminal_offset);
 			relmap_saved = relmap_declared
 				? (ClusterColdRelmapTerminalCheckV1 *)((char *)entries + relmap_offset) : NULL;
-			relmap_current = relmap_declared ? relmap_saved + 1 : NULL;
+			relmap_current = relmap_declared ? relmap_saved + relmap_pages : NULL;
 			/* Capture happened in the original replay scope. This same Start
 			 * only rechecks its immutable terminal values and FD/mutation
 			 * identity; neither polarity supplies a PAGE or relmap completion. */
 			valid = !relmap_declared
-				|| (cluster_cold_relmap_terminal_recheck_v1(start, relmap_saved)
-					&& relmap_saved->count != 0
-					&& relmap_saved->count == cluster_cold_typed_relmap_replay_count_v1(start->inputs));
+				|| (cluster_recovery_cold_relmap_terminals(start, relmap_total,
+					relmap_saved, relmap_current, true)
+					&& relmap_total == cluster_cold_typed_relmap_pending_count_v1(start->inputs));
 			memcpy(sources, start->ctrc_page_sources, (Size)source_count * sizeof(*sources));
 			memcpy(fixed_references, references->entries, (Size)reference_count * sizeof(*fixed_references));
 			tuple_offsets = (Size *)((char *)entries + tuple_offsets_offset);
@@ -4303,8 +4346,9 @@ cluster_recovery_cold_page_owner_graph(const struct ClusterRecoveryStartV1 *star
 						fixed_references, reference_count, tuple_offsets, tuple_bytes))
 					&& start->relmap_declared == relmap_declared
 					&& (!relmap_declared
-						|| (cluster_cold_relmap_terminal_recheck_v1(start, relmap_current)
-							&& memcmp(relmap_saved, relmap_current, sizeof(*relmap_saved)) == 0));
+						|| (cluster_recovery_cold_relmap_terminals(start, relmap_total,
+							relmap_saved, relmap_current, false)
+							&& relmap_total == cluster_cold_typed_relmap_pending_count_v1(start->inputs)));
 			}
 		}
 	}
@@ -5823,6 +5867,86 @@ ClusterColdRecoveryTxC0Reserve(const struct ClusterRecoveryStartV1 *start,
 	return true;
 }
 
+/* One narrow original CF interval, before any post-replay read scope or new
+ * target IR. The table is control input only; it carries no file lifetime,
+ * native recovery, checkpoint or joint completion permission. */
+static bool
+cluster_recovery_cold_native_files_publish(struct ClusterRecoveryStartV1 *start)
+{
+	ClusterControlRelmapFormatV2 before, after;
+	ClusterControlNativeTableInfoV2 table, prepared;
+	volatile bool attempted = false, selected = false, managed = false;
+
+	if (!cluster_recovery_cold_ctrc_replays_actor()
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	PG_TRY();
+	{
+		attempted = true; /* Preserve exact CF cleanup even if acquire throws. */
+		if (cluster_cf_lock(ExclusiveLock)
+			&& cluster_cf_held_is_clusterwide(ExclusiveLock)
+			&& ClusterColdRecoveryTxCurrent(start)
+			&& cluster_control_root_relmap_format_locked_v2(
+				CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &before) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& before.config.identity.system_identifier == start->writer.ref.claim.identity.system_identifier
+			&& before.config.identity.database_incarnation == start->writer.ref.claim.database_incarnation
+			&& before.config.identity.generation >= start->writer.ref.claim.max_config_generation
+			&& !memcmp(before.config.identity.storage_uuid, start->writer.ref.claim.identity.storage_uuid, 16)
+			&& !memcmp(before.config.identity.authority_uuid, start->writer.ref.claim.identity.authority_uuid, 16)
+			&& ClusterColdRecoveryTxCurrent(start)) {
+			/* An explicit ROOTv3 keeps its original path. Unknown never
+			 * falls back; ROOTv4 must install the complete selected table. */
+			selected = (start->inputs->native_registry == NULL
+				|| cluster_cold_typed_native_registry_current_locked_v2(start->inputs))
+				&& (before.root_version == 3
+				|| (before.root_version == 4
+					&& cluster_control_native_files_publish_locked_v2(&before.config,
+						CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, start->owner_boot)
+						== CLUSTER_NATIVE_FILES_OK_V2));
+			selected = selected && ClusterColdRecoveryTxCurrent(start)
+				&& cluster_control_root_relmap_format_locked_v2(
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &after) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !memcmp(&before, &after, sizeof(before))
+				&& ClusterColdRecoveryTxCurrent(start);
+			if (selected && before.root_version == 4) {
+				/* Save this exact publication under the same CF, never choose
+				 * a later table when the original census is opened. */
+				selected = cluster_control_native_files_info_v2(&table)
+					&& table.mode == CLUSTER_NATIVE_FILES_MANAGED_V2
+					&& table.table_generation != 0
+					&& table.startup_generation == start->owner_boot
+					&& !memcmp(&table.control.config, &before.config, sizeof(before.config))
+					&& ClusterColdRecoveryTxCurrent(start);
+				if (selected && start->inputs->native_registry != NULL) {
+					selected = cluster_cold_typed_native_table_v2(start->inputs, &prepared);
+					table.borrowed = 0;
+					selected = selected && !memcmp(&table, &prepared, sizeof(table));
+				}
+				managed = selected;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (attempted) {
+			ClusterCfReleaseResult released = cluster_cf_unlock_confirmed(ExclusiveLock);
+			if (released != CLUSTER_CF_RELEASE_CONFIRMED)
+				selected = false; /* Unconfirmed CF remains original cleanup debt. */
+		}
+	}
+	PG_END_TRY();
+	/* No CF is carried into the original WAL/namespace/census entries. */
+	if (!selected || !ClusterColdRecoveryTxCurrent(start))
+		return false;
+	if (managed) {
+		table.borrowed = 0; /* Local borrow traffic is not a new selection. */
+		start->relmap_table = table;
+		start->managed_relmap_table = true;
+	}
+	return true;
+}
+
 bool
 ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 {
@@ -5842,6 +5966,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		|| cluster_recovery_cold_start != NULL || info->cluster_tx_start != NULL
 		|| cluster_recovery_cold_inputs->inputs != NULL
 		|| cluster_recovery_cold_inputs->plan == NULL
+		|| cluster_recovery_cold_inputs->refusal != CLUSTER_COLD_OK
 		|| cluster_recovery_cold_inputs->participant_count == 0
 		|| cluster_recovery_cold_inputs->top_tx_census == NULL
 		|| cluster_recovery_cold_inputs->top_tx_census->plan != cluster_recovery_cold_inputs->plan
@@ -5852,7 +5977,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 		return false;
 	/* The original replay participant must not depend on a later optional
 	 * Declare call. This is saved input only, never physical qualification. */
-	relmap_count = cluster_cold_typed_relmap_replay_count_v1(cluster_recovery_cold_inputs);
+	relmap_count = cluster_cold_typed_relmap_pending_count_v1(cluster_recovery_cold_inputs);
 	if (relmap_count == UINT32_MAX)
 		return false;
 	/* Original retained recovery is still serialized by its exact creator.
@@ -5884,6 +6009,29 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 	start->writer = writer;
 	memcpy(start->operation_uuid, operation_uuid, 16);
 	cluster_recovery_cold_start = start;
+	{
+		volatile bool published = false;
+		PG_TRY();
+		{
+			published = cluster_recovery_cold_native_files_publish(start);
+		}
+		PG_CATCH();
+		{
+			cluster_recovery_cold_inputs->refusal = CLUSTER_COLD_SOURCE_GAP;
+			cluster_recovery_checkpoint_revoke_v1(start);
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (!published) {
+			cluster_recovery_cold_inputs->refusal = CLUSTER_COLD_SOURCE_GAP;
+			cluster_recovery_checkpoint_revoke_v1(start);
+			cluster_recovery_cold_start = NULL;
+			pfree(start);
+			return false;
+		}
+	}
 	if (relmap_count == 0) {
 		if (!ClusterColdRecoveryTxCurrent(start)
 			|| !cluster_recovery_checkpoint_register_v1(start)) {
@@ -5899,7 +6047,7 @@ ClusterBeginColdRecoveryTx(EndOfWalRecoveryInfo *info)
 			declared = ClusterColdRecoveryTxCurrent(start)
 				&& cluster_recovery_checkpoint_register_v1(start)
 				&& ClusterColdRecoveryRelmapDeclare(start)
-				&& relmap_count == cluster_cold_typed_relmap_replay_count_v1(start->inputs);
+				&& relmap_count == cluster_cold_typed_relmap_pending_count_v1(start->inputs);
 		}
 		PG_CATCH();
 		{
@@ -8521,7 +8669,10 @@ cluster_recovery_typed_fail(ClusterRecoveryFencePlan **fence_plan, ClusterColdTy
 		if (released)
 			cluster_recovery_merge_fence_plan_destroy(fence_plan);
 	}
-	cluster_cold_typed_destroy_v1(typed);
+	/* A suspended fence may still borrow this plan's confirmations.  Keep
+	 * them and their original custody if its release/destruction is uncertain. */
+	if (released && (fence_plan == NULL || *fence_plan == NULL))
+		cluster_cold_typed_destroy_v1(typed);
 	ereport(FATAL,
 			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 			 errmsg("%s", message),
@@ -8606,7 +8757,84 @@ typedef struct ClusterColdTypedReplay
 	ClusterColdEffectsProofV1 effects;	/* complete pass-2 ordinary-effect coverage */
 	ClusterColdDecodedV1 decoded;	/* scratch for unscheduled records */
 	ClusterColdTouchedV1 touched;	/* files pass 2 changed, made durable before completion */
+	uint64 creation_episode_id;	/* same suspended merge episode across creation barriers */
 } ClusterColdTypedReplay;
+
+/* The sequencer is synchronous: all preceding consumers have returned here.
+ * Retain the original WALR/proofs while releasing IR before X -> CF-X. */
+static bool
+cluster_typed_replay_create_barrier(ClusterColdTypedReplay *rep,
+								  const ClusterColdStepV1 *step, XLogReaderState *reader)
+{
+	ClusterColdTypedV1 *typed = rep->typed;
+	ClusterRecoveryFencePlan *plan = *rep->fence_plan;
+	uint64 episode_id = 0, deadline;
+	volatile bool valid = false, finished = false;
+	volatile bool x_owned = false, x_attempted = false;
+	volatile bool cf_attempted = false, cf_acquired = false;
+	Size budget;
+
+	if (!typed || !typed->plan || typed->refusal != CLUSTER_COLD_OK || !plan
+		|| (step == NULL) != (reader == NULL)) return false;
+	if (!typed->plan->relmap_create_count) return step == NULL;
+	if (cluster_relmap_authority_x_held() || cluster_cf_held(ExclusiveLock)
+		|| typed->plan->memory_used >= typed->plan->memory_budget
+		|| !cluster_recovery_merge_fence_plan_deadline_v1(plan, &deadline)) {
+		cluster_cold_typed_relmap_create_failed_v2(typed);
+		return false;
+	}
+	budget = typed->plan->memory_budget - typed->plan->memory_used;
+	PG_TRY();
+	{
+		PG_TRY();
+		{
+			do {
+				if (!cluster_recovery_merge_fence_plan_suspend_serial_v1(plan, &episode_id)
+					|| !episode_id || (rep->creation_episode_id
+						&& rep->creation_episode_id != episode_id)) break;
+				rep->creation_episode_id = episode_id;
+				if (cluster_relmap_authority_x_held()) break;
+				x_attempted = true;
+				x_owned = cluster_relmap_authority_x_lock();
+				if (!x_owned || cluster_cf_held(ExclusiveLock)) break;
+				cf_attempted = true;
+				cf_acquired = cluster_cf_lock_deadline_v1(ExclusiveLock, deadline);
+				if (!cf_acquired || !cluster_cf_held_is_clusterwide(ExclusiveLock)
+					|| !cluster_cold_typed_relmap_create_barrier_current_v2(typed, plan, episode_id)
+					|| !(step ? cluster_cold_typed_relmap_create_apply_barrier_v2(
+							typed, plan, episode_id, step, reader, budget)
+						: cluster_cold_typed_relmap_create_ready_barrier_v2(typed, plan, episode_id))
+					|| !cluster_cold_typed_relmap_create_barrier_current_v2(typed, plan, episode_id)) break;
+				valid = true;
+			} while (0);
+		}
+		PG_FINALLY();
+		{
+			bool release_x = !cf_attempted;
+			if (cf_attempted) {
+				ClusterCfReleaseResult released;
+				cf_attempted = false; /* Never retry an uncertain release. */
+				released = cluster_cf_unlock_confirmed(ExclusiveLock);
+				release_x = released == CLUSTER_CF_RELEASE_CONFIRMED
+					|| (released == CLUSTER_CF_RELEASE_NOT_HELD && !cf_acquired);
+				if (released != CLUSTER_CF_RELEASE_CONFIRMED) valid = false;
+			}
+			if (x_attempted && release_x && cluster_relmap_authority_x_held()) {
+				x_attempted = false;
+				cluster_relmap_authority_x_unlock();
+			}
+		}
+		PG_END_TRY();
+		if (valid) valid = cluster_recovery_merge_fence_plan_resume_serial_v1(plan, episode_id);
+		finished = valid;
+	}
+	PG_FINALLY();
+	{
+		if (!finished) cluster_cold_typed_relmap_create_failed_v2(typed);
+	}
+	PG_END_TRY();
+	return valid;
+}
 
 static bool
 cluster_typed_replay_xid_begin(ClusterColdTypedReplay *rep)
@@ -8985,7 +9213,9 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 	switch (action)
 	{
 		case CLUSTER_COLD_RELMAP_STEP:
-			if (!cluster_cold_typed_relmap_record_v1(typed, *rep->fence_plan, step, r))
+			if (!(cluster_cold_plan_relmap_create_step_v1(typed->plan, step)
+				? cluster_typed_replay_create_barrier(rep, step, r)
+				: cluster_cold_typed_relmap_record_v1(typed, *rep->fence_plan, step, r)))
 				cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 					"a declared relmap participant did not consume its complete image");
 			if (is_own)
@@ -9205,15 +9435,16 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdRepla
 		cluster_typed_replay_unpublished(
 			thread, "Native durability, PAGE readback or source counter endpoints are incomplete",
 			(int)rep->typed->refusal);
-	if (!cluster_cold_typed_relmap_ready_v1(rep->typed, plan))
+	if (!cluster_typed_replay_create_barrier(rep, NULL, NULL)
+		|| !cluster_cold_typed_relmap_pending_ready_v1(rep->typed, plan))
 		cluster_typed_replay_unpublished(thread,
 			"Declared relmap receipts or their original protection are incomplete", 0);
-	/* The real terminal reader needs the original replay scope, before its
-	 * IR release and the later installed writer exist. Keep only its typed
-	 * receipt/FD across that boundary; Start binds the successor once. */
-	relmap_count = cluster_cold_typed_relmap_replay_count_v1(rep->typed);
+	/* Capture pending terminals in this original replay episode before its
+	 * IR release. Clean creation has its independent confirmed receipt and
+	 * cannot borrow a pending terminal or satisfy an ACTIVE obligation. */
+	relmap_count = cluster_cold_typed_relmap_pending_count_v1(rep->typed);
 	if (relmap_count == UINT32_MAX
-		|| (relmap_count != 0 && !cluster_cold_relmap_terminal_capture_v1(rep->typed, plan)))
+		|| (relmap_count != 0 && !cluster_cold_relmap_pending_terminal_capture_v1(rep->typed, plan)))
 		cluster_typed_replay_unpublished(thread,
 			"Declared relmap terminal inputs could not be retained", 0);
 	/* Retain read-only ACTIVE inputs before the original pass-2 authority

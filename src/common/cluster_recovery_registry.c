@@ -6,6 +6,7 @@
 #endif
 #include "common/cluster_recovery_registry.h"
 #include "common/cluster_recovery_reservations.h"
+#include "cluster/cluster_recovery_coverage_format.h"
 #include "sha2_int.h"
 #include "port/pg_crc32c.h"
 
@@ -60,14 +61,14 @@ static bool extend(Size *n, uint64 count, Size width, Size budget)
 	*n += (Size)count * width;
 	return true;
 }
-static bool dimensions(const ClusterRecoveryRegistryV2 *r, Size budget, Size *n)
+static bool dimensions_width(const ClusterRecoveryRegistryV2 *r, Size budget, Size *n, Size file_bytes)
 {
 	Size size = 256;
 	const ClusterRecoveryCheckpointCoverageV2 *c;
 	if (!r || !(c = &r->coverage)->sources || !c->files || !c->source_count || !c->file_count ||
 		c->source_count > SIZE_MAX / sizeof(*c->sources) ||
 		c->file_count > SIZE_MAX / sizeof(*c->files) ||
-		!extend(&size, c->source_count, 288, budget) || !extend(&size, c->file_count, 208, budget))
+		!extend(&size, c->source_count, 288, budget) || !extend(&size, c->file_count, file_bytes, budget))
 		return false;
 	for (uint64 i = 0; i < c->file_count; i++)
 		if (!c->files[i].sources || !c->files[i].source_count ||
@@ -77,6 +78,41 @@ static bool dimensions(const ClusterRecoveryRegistryV2 *r, Size budget, Size *n)
 			return false;
 	*n = size;
 	return true;
+}
+/* Selection is made from caller-owned records only after the complete
+ * minimum-width bounds check; a decoder selects from exact family bytes. */
+static Size file_record_bytes(const ClusterRecoveryRegistryV2 *r)
+{
+	if (r->coverage_format_version == 2)
+		return CLUSTER_RECOVERY_CHECKPOINT_FILE_V2_BYTES;
+	if (r->coverage_format_version == CLUSTER_RECOVERY_COVERAGE_FORMAT_VERSION_V4)
+		return CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES;
+	if (r->coverage_format_version) return 0;
+	for (uint64 i = 0; i < r->coverage.file_count; i++)
+		if (nonzero(r->coverage.files[i].creation_batch_uuid, 16))
+			return CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES;
+	return CLUSTER_RECOVERY_CHECKPOINT_FILE_V2_BYTES;
+}
+static bool dimensions(const ClusterRecoveryRegistryV2 *r, Size budget, Size *n)
+{
+	Size base;
+	if (!dimensions_width(r, budget, &base, CLUSTER_RECOVERY_CHECKPOINT_FILE_V2_BYTES))
+		return false;
+	return file_record_bytes(r) != 0
+		&& dimensions_width(r, budget, n, file_record_bytes(r));
+}
+static Size family_width(const uint8 *p, bool reference)
+{
+	if (!p) return 0;
+	if (!memcmp(p, reference ? "PRCREF2\0" : "PRCREG2\0", 8)
+		&& get(p, 8, 4) == CLUSTER_RECOVERY_FORMAT_ID_V2 && get(p, 12, 4) == 2)
+		return CLUSTER_RECOVERY_CHECKPOINT_FILE_V2_BYTES;
+	if (!memcmp(p, reference ? CLUSTER_RECOVERY_COVERAGE_ROOT_REFERENCE_MAGIC_V4
+			: CLUSTER_RECOVERY_COVERAGE_HEADER_MAGIC_V4, 8)
+		&& cluster_recovery_coverage_format_registered_v4(get(p, 8, 4), get(p, 12, 4),
+			CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES, CATALOG_VERSION_NO))
+		return CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES;
+	return 0;
 }
 static void source_bytes(const ClusterRecoveryCheckpointSourceV2 *s, uint8 p[288])
 {
@@ -124,12 +160,13 @@ static void source_bytes(const ClusterRecoveryCheckpointSourceV2 *s, uint8 p[288
 }
 /* Bounds and complete-key checks precede allocation/output or any I/O. */
 /* File birth registration stays immutable across later complete registries. */
-static bool valid(const ClusterRecoveryRegistryV2 *r, Size n)
+static bool valid_width(const ClusterRecoveryRegistryV2 *r, Size n, Size file_bytes)
 {
 	const ClusterRecoveryCheckpointCoverageV2 *c = &r->coverage;
 	uint8 a[288], b[288], id[128], prior[128];
 	Size actual;
-	if (!dimensions(r, n, &actual) || actual != n || !counter(r->system_identifier) ||
+	if ((r->coverage_format_version && file_record_bytes(r) != file_bytes)
+		|| !dimensions_width(r, n, &actual, file_bytes) || actual != n || !counter(r->system_identifier) ||
 		!counter(r->database_incarnation) || !counter(r->redo_branch_generation) ||
 		!nonzero(r->storage_uuid, 16) || !nonzero(r->redo_branch_uuid, 16) ||
 		!counter(c->control_generation) || !counter(c->registration_generation) ||
@@ -165,7 +202,9 @@ static bool valid(const ClusterRecoveryRegistryV2 *r, Size n)
 	{
 		const ClusterRecoveryCheckpointFileV2 *f = &c->files[i];
 		uint64 copies = 0;
-		if (!cluster_recovery_file_identity_encode_v2(&f->identity, id, 128) ||
+		if ((file_bytes == CLUSTER_RECOVERY_CHECKPOINT_FILE_V2_BYTES
+			 && nonzero(f->creation_batch_uuid, 16)) ||
+			!cluster_recovery_file_identity_encode_v2(&f->identity, id, 128) ||
 			f->identity.system_identifier != r->system_identifier ||
 			f->identity.database_incarnation != r->database_incarnation ||
 			memcmp(f->identity.storage_uuid, r->storage_uuid, 16) ||
@@ -182,7 +221,8 @@ static bool valid(const ClusterRecoveryRegistryV2 *r, Size n)
 				return false;
 			if (!memcmp(id, prior, 128))
 			{
-				if (c->files[j].copy_count != f->copy_count ||
+				if (memcmp(c->files[j].creation_batch_uuid, f->creation_batch_uuid, 16) ||
+					c->files[j].copy_count != f->copy_count ||
 					(i != j && c->files[j].copy_index == f->copy_index))
 					return false;
 				copies++;
@@ -207,6 +247,12 @@ static bool valid(const ClusterRecoveryRegistryV2 *r, Size n)
 	}
 	return true;
 }
+static bool valid(const ClusterRecoveryRegistryV2 *r, Size n)
+{
+	Size actual;
+	return dimensions(r, n, &actual) && actual == n
+		&& valid_width(r, n, file_record_bytes(r));
+}
 static bool aliases(const ClusterRecoveryRegistryV2 *r, const void *out, Size n)
 {
 	const ClusterRecoveryCheckpointCoverageV2 *c = &r->coverage;
@@ -228,16 +274,20 @@ bool cluster_recovery_registry_size_v2(const ClusterRecoveryRegistryV2 *r, Size 
 	*n = size;
 	return true;
 }
-static bool build(const ClusterRecoveryRegistryV2 *r, uint8 *p, Size n, uint8 ref[128])
+static bool build(const ClusterRecoveryRegistryV2 *r, uint8 *p, Size n, uint8 ref[128],
+	Size file_bytes)
 {
 	const ClusterRecoveryCheckpointCoverageV2 *c = &r->coverage;
-	Size file = 256 + c->source_count * 288, interval = file + c->file_count * 208, at = interval;
+	Size file = 256 + c->source_count * 288, interval = file + c->file_count * file_bytes, at = interval;
 	uint64 first = 0;
 	memset(p, 0, n);
 	memset(ref, 0, 128);
-	memcpy(p, "PRCREG2\0", 8);
-	put(p, 8, CLUSTER_RECOVERY_FORMAT_ID_V2, 4);
-	put(p, 12, 2, 4);
+	memcpy(p, file_bytes == CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES
+		? CLUSTER_RECOVERY_COVERAGE_HEADER_MAGIC_V4 : "PRCREG2\0", 8);
+	put(p, 8, file_bytes == CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES
+		? CLUSTER_RECOVERY_COVERAGE_FORMAT_ID_V4 : CLUSTER_RECOVERY_FORMAT_ID_V2, 4);
+	put(p, 12, file_bytes == CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES
+		? CLUSTER_RECOVERY_COVERAGE_FORMAT_VERSION_V4 : 2, 4);
 	put(p, 16, 256, 4);
 	put(p, 24, r->system_identifier, 8);
 	put(p, 32, r->database_incarnation, 8);
@@ -260,7 +310,7 @@ static bool build(const ClusterRecoveryRegistryV2 *r, uint8 *p, Size n, uint8 re
 	for (uint64 i = 0; i < c->file_count; i++)
 	{
 		const ClusterRecoveryCheckpointFileV2 *f = &c->files[i];
-		uint8 *q = p + file + i * 208;
+		uint8 *q = p + file + i * file_bytes;
 		if (!cluster_recovery_file_identity_encode_v2(&f->identity, q, 128))
 			return false;
 		put(q, 128, f->synced_bytes, 8);
@@ -271,6 +321,9 @@ static bool build(const ClusterRecoveryRegistryV2 *r, uint8 *p, Size n, uint8 re
 		memcpy(q + 160, f->image_digest, 32);
 		put(q, 192, f->source_count, 8);
 		put(q, 200, first, 8);
+		if (file_bytes == CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES)
+			memcpy(q + CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_CREATION_BATCH_UUID_OFFSET,
+				f->creation_batch_uuid, 16);
 		first += f->source_count;
 		for (uint64 j = 0; j < f->source_count; j++, at += 24)
 		{
@@ -283,9 +336,10 @@ static bool build(const ClusterRecoveryRegistryV2 *r, uint8 *p, Size n, uint8 re
 		return false;
 	put(p, 232, crc(p + 256, n - 256), 4);
 	put(p, 236, crc(p, 256), 4);
-	memcpy(ref, "PRCREF2\0", 8);
-	put(ref, 8, CLUSTER_RECOVERY_FORMAT_ID_V2, 4);
-	put(ref, 12, 2, 4);
+	memcpy(ref, file_bytes == CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES
+		? CLUSTER_RECOVERY_COVERAGE_ROOT_REFERENCE_MAGIC_V4 : "PRCREF2\0", 8);
+	put(ref, 8, get(p, 8, 4), 4);
+	put(ref, 12, get(p, 12, 4), 4);
 	memcpy(ref + 16, p + 80, 32);
 	put(ref, 48, n, 8);
 	put(ref, 56, c->source_count, 8);
@@ -306,7 +360,7 @@ bool cluster_recovery_registry_encode_v2(const ClusterRecoveryRegistryV2 *r, uin
 	tmp = malloc(n);
 	if (!tmp)
 		return false;
-	ok = build(r, tmp, n, reference);
+	ok = build(r, tmp, n, reference, file_record_bytes(r));
 	if (ok)
 	{
 		memcpy(out, tmp, n);
@@ -318,10 +372,9 @@ bool cluster_recovery_registry_encode_v2(const ClusterRecoveryRegistryV2 *r, uin
 bool cluster_recovery_registry_reference_valid_v2(const uint8 ref[128])
 {
 	uint8 tmp[128];
-	Size minimum = 256;
+	Size minimum = 256, file_bytes = family_width(ref, true);
 	uint64 size;
-	if (!ref || memcmp(ref, "PRCREF2\0", 8) || get(ref, 8, 4) != CLUSTER_RECOVERY_FORMAT_ID_V2 ||
-		get(ref, 12, 4) != 2 || nonzero(ref + 108, 20) || !nonzero(ref + 72, 32))
+	if (!file_bytes || nonzero(ref + 108, 20) || !nonzero(ref + 72, 32))
 		return false;
 	for (int i = 16; i < 48; i += 8)
 		if (!counter(get(ref, i, 8)))
@@ -329,7 +382,7 @@ bool cluster_recovery_registry_reference_valid_v2(const uint8 ref[128])
 	size = get(ref, 48, 8);
 	if (size > SIZE_MAX || !get(ref, 56, 8) || !get(ref, 64, 8) ||
 		!extend(&minimum, get(ref, 56, 8), 288, (Size)size) ||
-		!extend(&minimum, get(ref, 64, 8), 232, (Size)size))
+		!extend(&minimum, get(ref, 64, 8), file_bytes + 24, (Size)size))
 		return false;
 	memcpy(tmp, ref, 128);
 	memset(tmp + 104, 0, 4);
@@ -339,15 +392,17 @@ bool cluster_recovery_registry_matches_v2(const uint8 *p, Size n,
 										  const ClusterRecoveryRegistryV2 *r, const uint8 ref[128])
 {
 	uint8 *expected, reference[128];
+	Size file_bytes = family_width(ref, true);
 	bool ok;
-	if (!p || !r || !cluster_recovery_registry_reference_valid_v2(ref) || !valid(r, n) ||
+	if (!p || !r || !cluster_recovery_registry_reference_valid_v2(ref) || n < 256
+		|| family_width(p, false) != file_bytes || !valid_width(r, n, file_bytes) ||
 		aliases(r, p, n) || aliases(r, ref, 128) || overlap(p, n, ref, 128))
 		return false;
 	expected = malloc(n);
 	if (!expected)
 		return false;
 	ok =
-		build(r, expected, n, reference) && !memcmp(p, expected, n) && !memcmp(ref, reference, 128);
+		build(r, expected, n, reference, file_bytes) && !memcmp(p, expected, n) && !memcmp(ref, reference, 128);
 	free(expected);
 	return ok;
 }
@@ -427,17 +482,19 @@ cluster_recovery_registry_decode_v2(const uint8 *p, Size n, const uint8 ref[128]
 	ClusterRecoveryRegistryDecodedV2 *d = NULL;
 	ClusterRecoveryRegistryV2 *r;
 	uint64 ns, nf, ni, first = 0;
-	Size file = 256, interval;
+	Size file = 256, interval, file_bytes;
 	bool ok = false;
 	if (!out || !p || !ref || n < 256 || n > budget || overlap(p, n, out, sizeof(*out))
 		|| overlap(ref, 128, out, sizeof(*out)) || *out
 		|| !cluster_recovery_registry_reference_valid_v2(ref) || get(ref, 48, 8) != n)
 		return false;
+	file_bytes = family_width(ref, true);
+	if (!file_bytes || family_width(p, false) != file_bytes) return false;
 	ns = get(p, 112, 8);
 	nf = get(p, 120, 8);
 	ni = get(p, 128, 8);
 	if (!ns || !nf || !ni || ns != get(ref, 56, 8) || nf != get(ref, 64, 8)
-		|| !extend(&file, ns, 288, n) || !(interval = file) || !extend(&interval, nf, 208, n)
+		|| !extend(&file, ns, 288, n) || !(interval = file) || !extend(&interval, nf, file_bytes, n)
 		|| ni != (n - interval) / 24 || (n - interval) % 24 || get(p, 136, 8) != 256
 		|| get(p, 144, 8) != file || get(p, 152, 8) != interval
 		|| ns > SIZE_MAX / sizeof(*d->sources) || nf > SIZE_MAX / sizeof(*d->files)
@@ -452,6 +509,7 @@ cluster_recovery_registry_decode_v2(const uint8 *p, Size n, const uint8 ref[128]
 	if (!d->sources || !d->files || !d->intervals)
 		goto done;
 	r = &d->registry;
+	r->coverage_format_version = (uint32)get(p, 12, 4);
 	r->system_identifier = get(p, 24, 8);
 	r->database_incarnation = get(p, 32, 8);
 	memcpy(r->storage_uuid, p + 40, 16);
@@ -475,7 +533,7 @@ cluster_recovery_registry_decode_v2(const uint8 *p, Size n, const uint8 ref[128]
 	}
 	for (uint64 i = 0; i < nf; i++) {
 		ClusterRecoveryCheckpointFileV2 *f = &d->files[i];
-		const uint8 *q = p + file + i * 208;
+		const uint8 *q = p + file + i * file_bytes;
 		uint64 count = get(q, 192, 8);
 		if (!cluster_recovery_file_identity_decode_v2(q, 128, &f->identity) || !count || count > ns
 			|| first > ni || count > ni - first || get(q, 200, 8) != first)
@@ -486,6 +544,9 @@ cluster_recovery_registry_decode_v2(const uint8 *p, Size n, const uint8 ref[128]
 		f->copy_index = get(q, 152, 4);
 		f->copy_count = get(q, 156, 4);
 		memcpy(f->image_digest, q + 160, 32);
+		if (file_bytes == CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_BYTES)
+			memcpy(f->creation_batch_uuid,
+				q + CLUSTER_RECOVERY_CHECKPOINT_FILE_V4_CREATION_BATCH_UUID_OFFSET, 16);
 		f->source_count = count;
 		f->sources = d->intervals + first;
 		first += count;
@@ -599,7 +660,7 @@ static bool registry_io(int global, const ClusterRecoveryRegistryV2 *r, Size bud
 		return false;
 	bytes = malloc(n);
 	readback = malloc(n);
-	if (!bytes || !readback || !build(r, bytes, n, ref) || (!writing && memcmp(ref, selected, 128)))
+	if (!bytes || !readback || !build(r, bytes, n, ref, file_record_bytes(r)) || (!writing && memcmp(ref, selected, 128)))
 		goto done;
 	if (writing && mkdirat(global, "pgrac_recovery_registry", 0700) != 0 && errno != EEXIST)
 		goto done;

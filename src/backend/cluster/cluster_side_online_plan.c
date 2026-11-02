@@ -23,6 +23,7 @@
 #include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_cold_relmap.h"
+#include "common/cluster_relmap_create.h"
 #include "utils/relmapper.h"
 #include "cluster_side_online_plan_internal.h"
 #include "cluster/cluster_uba.h"
@@ -77,6 +78,16 @@ typedef struct SideNativeRelmapWitness {
 	uint8 payload[MinSizeOfRelmapUpdate + sizeof(RelMapFile)];
 } SideNativeRelmapWitness;
 
+/* Clean creation has no staged owner/pin and cannot borrow an UPDATE
+ * witness. Keep the entire native record under the original SIDE budget. */
+typedef struct SideNativeRelmapCreateWitness {
+	struct SideNativeRelmapCreateWitness *next;
+	ClusterColdRelmapCreateInputV1 input;
+	RfPageOnlineRecordIdentityV1 identity;
+	XLogRecord header;
+	uint8 payload[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1];
+} SideNativeRelmapCreateWitness;
+
 struct RfSideOnlinePlanV1 {
 	uint32 magic;
 	bool sealed;
@@ -107,6 +118,7 @@ struct RfSideOnlinePlanV1 {
 	SideNativeTerminalWitness *native_terminals;
 	SideNativeClogWitness *native_clog;
 	SideNativeRelmapWitness *native_relmaps;
+	SideNativeRelmapCreateWitness *native_relmap_creates;
 };
 
 /* A rejected binding cannot leave an earlier sealed view consumable. */
@@ -1551,6 +1563,188 @@ rf_side_online_plan_relmap_input_matches_v1(const RfSideOnlinePlanV1 *plan,
 			|| memcmp(&w->input.staged.committed, &input->staged.committed, sizeof(RelMapFile)) != 0
 			|| memcmp(&w->input.staged.pending, &input->staged.pending, sizeof(RelMapFile)) != 0
 			|| !SAME(retention) || !SAME(retention_lock))
+			continue;
+#undef SAME
+		if (found)
+			return false;
+		found = true;
+	}
+	return found;
+}
+
+/* Revalidate the complete native envelope and canonical declaration. The
+ * original control owner still authenticates the durable creation batch. */
+static bool
+side_relmap_create_native_matches(const ClusterColdRelmapCreateInputV1 *in,
+	const RfPageOnlineRecordIdentityV1 *identity, const XLogReaderState *reader)
+{
+	const ClusterColdRecordFrameV1 *frame;
+	const ClusterRecoveryFileIdentityV2 *id;
+	uint8 canonical[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1];
+
+	if (in == NULL || identity == NULL || reader == NULL || reader->record == NULL)
+		return false;
+	frame = &in->frame;
+	id = &in->creation.identity;
+	return !reader->cluster_record_crc_failed && !frame->history
+		&& frame->participant == in->participant && !frame->page_components && !frame->space_effects
+		&& frame->rmid == RM_RELMAP_ID && frame->info == XLOG_RELMAP_CREATE_V1
+		&& frame->read_rec_ptr >= in->cut.native_redo
+		&& frame->read_rec_ptr < frame->end_rec_ptr && frame->end_rec_ptr <= in->cut.tail_end
+		&& reader->system_identifier == in->source.claim.identity.system_identifier
+		&& reader->cluster_expected_thread_id == in->cut.thread_id && reader->seg.ws_tli == in->cut.timeline
+		&& reader->ReadRecPtr == frame->read_rec_ptr && reader->EndRecPtr == frame->end_rec_ptr
+		&& reader->record->lsn == frame->read_rec_ptr && reader->record->next_lsn == frame->end_rec_ptr
+		&& XLogRecGetRmid(reader) == frame->rmid && XLogRecGetInfo(reader) == frame->info
+		&& reader->record->header.xl_crc == frame->record_crc
+		&& reader->record->header.xl_xid == frame->source_xid
+		&& reader->record->toplevel_xid == frame->source_top_xid
+		&& !XLogRecHasAnyBlockRefs(reader) && !reader->record->has_page_version_edge
+		&& XLogRecGetOrigin(reader) == InvalidRepOriginId
+		&& XLogRecGetData(reader) != NULL && XLogRecGetDataLen(reader) == sizeof(canonical)
+		&& identity->reserved_zero == 0 && identity->record.reserved_zero == 0
+		&& identity->record.reserved_zero2 == 0
+		&& identity->record.system_identifier == reader->system_identifier
+		&& memcmp(identity->record.storage_uuid, in->source.claim.identity.storage_uuid, 16) == 0
+		&& identity->record.origin_thread == in->cut.thread_id && identity->record.timeline_id == in->cut.timeline
+		&& identity->record.read_rec_ptr == frame->read_rec_ptr && identity->record.end_rec_ptr == frame->end_rec_ptr
+		&& identity->record.record_crc == frame->record_crc
+		&& identity->record.rmid == frame->rmid && identity->record.info == frame->info
+		&& id->system_identifier == reader->system_identifier
+		&& id->database_incarnation == in->source.claim.database_incarnation
+		&& id->origin == in->source.claim.identity.origin_node_id
+		&& id->creation_generation == in->source.claim.identity.origin_owner_incarnation
+		&& memcmp(id->storage_uuid, in->source.claim.identity.storage_uuid, 16) == 0
+		&& cluster_relmap_create_encode_v1(id, in->creation.batch_uuid, &in->creation.committed,
+			canonical, sizeof(canonical))
+		&& memcmp(canonical, XLogRecGetData(reader), sizeof(canonical)) == 0;
+}
+
+/* Capture only an explicit, original-source-bound external obligation.
+ * Poison before allocation so ERROR cannot leave a usable partial prefix. */
+RfPageProofDetailV1
+rf_side_online_plan_feed_relmap_create_v1(RfSideOnlinePlanV1 *plan,
+	const RfDetachedRecordPlanV1 *record_plan, const RfPageOnlineRecordIdentityV1 *identity,
+	const ClusterColdRelmapCreateInputV1 *input)
+{
+	RfPageProofDetailV1 detail;
+	const RfContributorStreamCutV1 *cut;
+	SideNativeRelmapCreateWitness *witness;
+	uint32 source_index;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed || plan->failed)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	detail = side_record_identity_validate(plan, record_plan, identity);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		goto refuse;
+	cut = &plan->physical_cuts[identity->participant_index];
+	source_index = side_cut_source(cut, plan->sources, plan->source_count);
+	if (plan->purpose != RF_SIDE_PLAN_RECOVERY || plan->database_incarnation == 0
+		|| input == NULL || source_index == UINT32_MAX
+		|| memcmp(&plan->sources[source_index], &input->source, sizeof(input->source)) != 0
+		|| input->cut.thread_id != cut->failed_thread
+		|| input->cut.owner_incarnation != cut->origin_owner_incarnation
+		|| input->cut.timeline != cut->timeline_id || input->cut.reserved_zero != 0
+		|| input->cut.physical_lower != cut->scan_begin_inclusive
+		|| input->cut.tail_end != cut->scan_end_exclusive
+		|| input->cut.native_redo != plan->redo_starts[identity->participant_index]
+		|| record_plan->component_count != 0
+		|| record_plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED
+		|| record_plan->route.rmid != RM_RELMAP_ID
+		|| record_plan->route.normalized_info != XLOG_RELMAP_CREATE_V1
+		|| record_plan->route.codec_id != RF_ROUTE_CODEC_SIDE_STANDARD
+		|| !side_relmap_create_native_matches(input, identity, record_plan->source_record)) {
+		detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		goto refuse;
+	}
+	for (witness = plan->native_relmap_creates; witness != NULL; witness = witness->next)
+		if ((witness->identity.participant_index == identity->participant_index
+			&& witness->identity.record.read_rec_ptr == identity->record.read_rec_ptr)
+			|| (witness->input.creation.identity.database_oid == input->creation.identity.database_oid
+				&& witness->input.creation.identity.tablespace_oid == input->creation.identity.tablespace_oid)) {
+			detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			goto refuse;
+		}
+	if (sizeof(*witness) > plan->memory_budget || !side_plan_reserve(plan, sizeof(*witness))) {
+		detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		goto refuse;
+	}
+	plan->failed = true;
+	witness = side_alloc0(sizeof(*witness));
+	if (witness == NULL)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	witness->input = *input;
+	witness->identity = *identity;
+	memcpy(&witness->header, &record_plan->source_record->record->header, SizeOfXLogRecord);
+	memcpy(witness->payload, XLogRecGetData(record_plan->source_record), sizeof(witness->payload));
+	witness->next = plan->native_relmap_creates;
+	plan->native_relmap_creates = witness;
+	plan->participant_seen[identity->participant_index] = true;
+	plan->last_record_end[identity->participant_index] = identity->record.end_rec_ptr;
+	plan->failed = false;
+	return RF_PAGE_PROOF_DETAIL_OK;
+refuse:
+	(void)side_source_bind_failed(plan);
+	return detail;
+}
+
+/* Sealed saved-input count only; never evidence that creation ran. */
+uint32
+rf_side_online_plan_relmap_create_count_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source)
+{
+	uint32 count = 0;
+	if (!rf_side_online_plan_recovery_claim_matches_v1(plan, source))
+		return UINT32_MAX;
+	for (const SideNativeRelmapCreateWitness *w = plan->native_relmap_creates; w != NULL; w = w->next)
+		if (memcmp(&w->input.source, source, sizeof(*source)) == 0)
+			++count;
+	return count;
+}
+
+/* Require the unique complete saved native header and MAIN image. */
+bool
+rf_side_online_plan_relmap_create_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *source, const XLogReaderState *reader)
+{
+	const SideNativeRelmapCreateWitness *found = NULL;
+	if (rf_side_online_plan_relmap_create_count_v1(plan, source) == UINT32_MAX)
+		return false;
+	for (const SideNativeRelmapCreateWitness *w = plan->native_relmap_creates; w != NULL; w = w->next) {
+		if (memcmp(&w->input.source, source, sizeof(*source)) != 0
+			|| !side_relmap_create_native_matches(&w->input, &w->identity, reader)
+			|| memcmp(&w->header, &reader->record->header, SizeOfXLogRecord) != 0
+			|| memcmp(w->payload, XLogRecGetData(reader), sizeof(w->payload)) != 0)
+			continue;
+		if (found != NULL)
+			return false;
+		found = w;
+	}
+	return found != NULL;
+}
+
+/* Compare declaration values without relying on native structure padding. */
+bool
+rf_side_online_plan_relmap_create_input_matches_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterColdRelmapCreateInputV1 *input)
+{
+	bool found = false;
+	uint8 canonical[CLUSTER_RELMAP_CREATE_WAL_SIZE_V1];
+	if (input == NULL || rf_side_online_plan_relmap_create_count_v1(plan, &input->source) == UINT32_MAX
+		|| !cluster_relmap_create_encode_v1(&input->creation.identity, input->creation.batch_uuid,
+			&input->creation.committed, canonical, sizeof(canonical)))
+		return false;
+	for (const SideNativeRelmapCreateWitness *w = plan->native_relmap_creates; w != NULL; w = w->next) {
+#define SAME(field_) (w->input.field_ == input->field_)
+		if (!SAME(participant) || !SAME(cut.thread_id) || !SAME(cut.reserved_zero)
+			|| !SAME(cut.timeline) || !SAME(cut.owner_incarnation) || !SAME(cut.physical_lower)
+			|| !SAME(cut.native_redo) || !SAME(cut.tail_end)
+			|| memcmp(&w->input.source, &input->source, sizeof(input->source)) != 0
+			|| !SAME(frame.read_rec_ptr) || !SAME(frame.end_rec_ptr) || !SAME(frame.record_crc)
+			|| !SAME(frame.participant) || !SAME(frame.source_xid) || !SAME(frame.source_top_xid)
+			|| !SAME(frame.page_components) || !SAME(frame.space_effects)
+			|| !SAME(frame.rmid) || !SAME(frame.info) || !SAME(frame.history)
+			|| memcmp(w->payload, canonical, sizeof(canonical)) != 0)
 			continue;
 #undef SAME
 		if (found)
@@ -4143,7 +4337,7 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineA
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	/* External structural effects require the original merged replay and
 	 * its joint receipt gate; a whole-SIDE apply cannot retire this source. */
-	if (plan->native_relmaps != NULL)
+	if (plan->native_relmaps != NULL || plan->native_relmap_creates != NULL)
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	if (rf_side_online_plan_origin_operation_count_v1(plan, ops->source_thread) == 0)
 		return RF_PAGE_PROOF_DETAIL_OK;
@@ -4267,6 +4461,11 @@ rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 	while (plan->native_relmaps != NULL) {
 		SideNativeRelmapWitness *witness = plan->native_relmaps;
 		plan->native_relmaps = witness->next;
+		side_free(witness);
+	}
+	while (plan->native_relmap_creates != NULL) {
+		SideNativeRelmapCreateWitness *witness = plan->native_relmap_creates;
+		plan->native_relmap_creates = witness->next;
 		side_free(witness);
 	}
 	memset(plan, 0, sizeof(*plan));

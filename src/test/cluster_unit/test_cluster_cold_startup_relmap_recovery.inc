@@ -249,3 +249,48 @@ UT_TEST(test_recovery_transfer_preflights_all_targets_before_retiring_any_pin)
 	startup_relmap_real_side = false;
 	test_cold_relmap_storage_end();
 }
+
+UT_TEST(test_recovery_segments_budget_whole_batch_before_first_file_read)
+{
+	const uint32 counts[] = {64, 65, 128, 129};
+	for (unsigned c = 0; c < lengthof(counts); ++c) {
+		uint32 count = counts[c], segments = 0;
+		ClusterColdRelmapWalV1 *wal = calloc(count, sizeof(*wal));
+		ClusterColdPlanV1 *plan;
+		ClusterRelmapRecoverySegment *segment;
+		TestColdRelmapStorageStats before, after;
+		Size needed, used;
+		startup_relmap_replay_fixture();
+		wal[0] = startup_recovery_wal();
+		for (uint32 i = 1; i < count; ++i) wal[i] = wal[0];
+		plan = startup_relmap_producer_plan();
+		before = test_cold_relmap_storage_stats();
+		/* Deliberate duplicate namespace: reject the whole shape after
+		 * allocating every bounded segment, before any baseline read. */
+		UT_ASSERT_EQ(cluster_cold_plan_relmap_from_recovery_wal_v1(plan,
+			&startup_relmap_replay.input.source, 1, 1, wal, count), CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+		UT_ASSERT_NOT_NULL(plan->relmap_recovery);
+		if (plan->relmap_recovery != NULL) {
+			for (segment = plan->relmap_recovery->segments; segment != NULL; segment = segment->next) ++segments;
+			UT_ASSERT_EQ(segments, (count - 1) / CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS);
+			UT_ASSERT_EQ(plan->relmap_recovery->count, 0);
+		}
+		after = test_cold_relmap_storage_stats();
+		UT_ASSERT_EQ(after.reads, before.reads);
+		UT_ASSERT_EQ(after.writes, before.writes);
+		cluster_cold_plan_destroy_v1(&plan);
+		UT_ASSERT_NULL(plan);
+		plan = startup_relmap_producer_plan();
+		used = plan->memory_used;
+		needed = sizeof(ClusterRelmapRecoveryPins) + (Size)segments * sizeof(ClusterRelmapRecoverySegment)
+			+ (Size)count * (sizeof(ClusterColdRelmapInputV1) + sizeof(ColdRelmapInput));
+		plan->memory_budget = used + needed - 1;
+		UT_ASSERT_EQ(cluster_cold_plan_relmap_from_recovery_wal_v1(plan,
+			&startup_relmap_replay.input.source, 1, 1, wal, count), CLUSTER_COLD_CAPACITY);
+		UT_ASSERT(plan->relmap_recovery == NULL && plan->relmap_inputs == NULL);
+		UT_ASSERT_EQ(plan->memory_used, used);
+		cluster_cold_plan_destroy_v1(&plan);
+		UT_ASSERT_NULL(plan);
+		free(wal); startup_recovery_end();
+	}
+}

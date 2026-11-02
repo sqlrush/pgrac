@@ -278,3 +278,5 @@ UT_TEST(test_relmap_and_clog_coexist_but_side_cannot_publish_whole_source)
 	UT_ASSERT(!owner.protected_set_complete);
 	clog_applied_done(&side);
 }
+
+#include "test_cluster_relmap_create_side.inc"

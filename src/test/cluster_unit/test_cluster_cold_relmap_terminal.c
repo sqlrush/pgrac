@@ -2,6 +2,7 @@
  * Start, declared relmap SIDE witnesses and installed-writer leaves remain
  * controlled. Author: SqlRush <sqlrush@gmail.com> */
 int terminal_retained_fixture_main(int argc, char **argv);
+#define TEST_TERMINAL_NAMESPACE_BATCH
 #define TEST_RELMAP_RETAINED_MAIN terminal_retained_fixture_main
 #include "test_cluster_relmap_retained_wal.c"
 #include "cluster/cluster_cold_recovery_plan_internal.h"
@@ -248,7 +249,7 @@ static void terminal_setup(bool aborted)
 	terminal_plan.phase = COLD_PHASE_SEALED;
 	terminal_plan.participant_count = 1;
 	terminal_plan.memory_budget = 4 * 1024 * 1024;
-	terminal_plan.relmap_count = 1;
+	terminal_plan.relmap_count = terminal_plan.relmap_input_capacity = 1;
 	terminal_plan.relmap_inputs = &terminal_input;
 	terminal_plan.relmap_recovery = &terminal_pins;
 	terminal_input.captured = terminal_input.attempted = terminal_input.applied = true;
@@ -531,7 +532,7 @@ UT_TEST(test_terminal_duplicate_and_partial_error_are_one_shot)
 	ColdRelmapInput batch[2]; volatile bool threw = false;
 	terminal_setup(false);
 	batch[0] = batch[1] = terminal_input;
-	terminal_plan.relmap_inputs = batch; terminal_plan.relmap_count = 2;
+	terminal_plan.relmap_inputs = batch; terminal_plan.relmap_count = terminal_plan.relmap_input_capacity = 2;
 	UT_ASSERT(!cluster_cold_relmap_terminal_capture_v1(&terminal_typed, terminal_fence));
 	UT_ASSERT_EQ(test_relmap_native_clog_stats().calls, 0);
 	UT_ASSERT(terminal_plan.relmap_failed && !terminal_pins.transferred);
@@ -542,7 +543,7 @@ UT_TEST(test_terminal_duplicate_and_partial_error_are_one_shot)
 	batch[0] = batch[1] = terminal_input;
 	batch[1].input.staged.identity.shared = true;
 	batch[1].input.staged.identity.dbid = InvalidOid;
-	terminal_plan.relmap_inputs = batch; terminal_plan.relmap_count = 2;
+	terminal_plan.relmap_inputs = batch; terminal_plan.relmap_count = terminal_plan.relmap_input_capacity = 2;
 	terminal_pins.count = terminal_pins.expected = 2;
 	terminal_pins.images[1] = batch[1].input.staged;
 	{
@@ -727,11 +728,15 @@ UT_TEST(test_terminal_episode_late_ir_or_error_keeps_debt)
 	}
 }
 
+#include "test_cluster_cold_relmap_pending_terminal.inc"
+#include "test_cluster_cold_relmap_terminal_segments.inc"
+#include "test_cluster_cold_relmap_terminal_many.inc"
+
 int main(int argc, char **argv)
 {
 	test_program_path = argv[0]; setup_fixture();
 #ifdef TEST_TERMINAL_REAL_START
-	UT_PLAN(16);
+	UT_PLAN(20);
 	UT_RUN(test_terminal_episode_after_scope_commit);
 	UT_RUN(test_terminal_episode_after_scope_abort);
 	UT_RUN(test_terminal_episode_requires_completed_current_ir);
@@ -748,6 +753,11 @@ int main(int argc, char **argv)
 	UT_RUN(test_start_staging_refusal_does_not_borrow_valid_terminal);
 	UT_RUN(test_start_terminal_refusal_does_not_borrow_valid_staging);
 	UT_RUN(test_start_staging_repeat_rereads_the_second_copy);
+	UT_RUN(test_terminal_many_complete_pages_commit_abort);
+	UT_RUN(test_terminal_many_tail_failure_revokes_prefix);
+	UT_RUN(test_terminal_many_prefix_failure_refuses_tail);
+	UT_RUN(test_terminal_many_partial_capture_error_keeps_all_debt);
+
 	UT_DONE(); return ut_failed_count != 0;
 #endif
 	if (argc > 1 && strcmp(argv[1], "handoff") == 0) {
@@ -756,7 +766,23 @@ int main(int argc, char **argv)
 		UT_RUN(test_terminal_start_extent_alias_before_providers);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(15);
+	if (argc > 1 && strcmp(argv[1], "segments") == 0) {
+		UT_PLAN(4);
+	UT_RUN(test_pending_segment_preserves_batch_and_terminal_polarity);
+	UT_RUN(test_pending_segment_invalid_offset_revokes_without_prefix);
+	UT_RUN(test_pending_segment_alias_in_overflow_storage_precedes_providers);
+	UT_RUN(test_segment_old_gate_and_late_mutation_keep_creation_and_fd_debt);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (argc > 1 && strcmp(argv[1], "many") == 0) {
+		UT_PLAN(4);
+		UT_RUN(test_terminal_many_complete_pages_commit_abort);
+		UT_RUN(test_terminal_many_tail_failure_revokes_prefix);
+		UT_RUN(test_terminal_many_prefix_failure_refuses_tail);
+		UT_RUN(test_terminal_many_partial_capture_error_keeps_all_debt);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	UT_PLAN(30);
 	UT_RUN(test_terminal_episode_after_scope_commit);
 	UT_RUN(test_terminal_episode_after_scope_abort);
 	UT_RUN(test_terminal_episode_requires_completed_current_ir);
@@ -772,5 +798,20 @@ int main(int argc, char **argv)
 	UT_RUN(test_terminal_failed_or_missing_receipt_aliases_are_untouched);
 	UT_RUN(test_terminal_duplicate_and_partial_error_are_one_shot);
 	UT_RUN(test_terminal_start_extent_alias_before_providers);
+	UT_RUN(test_pending_terminal_mixed_commit_abort_and_repeat);
+	UT_RUN(test_pending_terminal_does_not_open_legacy_mixed_gates);
+	UT_RUN(test_pending_terminal_empty_does_not_manufacture_qualification);
+	UT_RUN(test_pending_terminal_source_writer_and_pin_drift_stay_failed);
+	UT_RUN(test_pending_terminal_mutation_and_active_writer_keep_fd_debt);
+	UT_RUN(test_pending_terminal_capture_and_start_errors_keep_debt);
+	UT_RUN(test_pending_terminal_aliases_refuse_before_owner_or_output);
+	UT_RUN(test_pending_segment_preserves_batch_and_terminal_polarity);
+	UT_RUN(test_pending_segment_invalid_offset_revokes_without_prefix);
+	UT_RUN(test_pending_segment_alias_in_overflow_storage_precedes_providers);
+	UT_RUN(test_segment_old_gate_and_late_mutation_keep_creation_and_fd_debt);
+	UT_RUN(test_terminal_many_complete_pages_commit_abort);
+	UT_RUN(test_terminal_many_tail_failure_revokes_prefix);
+	UT_RUN(test_terminal_many_prefix_failure_refuses_tail);
+	UT_RUN(test_terminal_many_partial_capture_error_keeps_all_debt);
 	UT_DONE(); return ut_failed_count != 0;
 }

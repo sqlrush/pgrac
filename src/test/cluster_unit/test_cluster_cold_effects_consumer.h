@@ -118,6 +118,14 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep pg_attribute_unused(
 	abort();
 }
 
+static bool
+cluster_typed_replay_create_barrier(ClusterColdTypedReplay *rep pg_attribute_unused(),
+	const ClusterColdStepV1 *step pg_attribute_unused(), XLogReaderState *reader pg_attribute_unused())
+{
+	/* These effect-only cuts have no independent creation declaration. */
+	abort();
+}
+
 void
 AdvanceNextFullTransactionIdPastXid(TransactionId xid)
 {

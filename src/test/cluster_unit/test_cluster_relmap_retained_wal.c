@@ -2187,6 +2187,9 @@ custody_image_init(const ClusterControlRootSnapshot *snapshot, uint64 dbinc)
 static uint64 custody_era_offset, custody_next_override;
 /* New producer composition only; all original fixtures keep the NULL path. */
 static bool (*custody_original_owner_capture)(const ClusterWalSourceRef *, ClusterRelmapV2Owner *);
+#ifdef TEST_TERMINAL_NAMESPACE_BATCH
+#include "test_cluster_relmap_terminal_batch_wal.inc"
+#endif
 static ClusterWalInputsV1 *
 terminal_prefix_fixture(bool aborting, unsigned fault)
 {
@@ -2232,6 +2235,9 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(int));
 	if (fault == 28)
 		at += MAXALIGN(SizeOfXLogRecord + 2 + sizeof(xl_clog_truncate));
+#ifdef TEST_TERMINAL_NAMESPACE_BATCH
+	if (terminal_namespace_count > 1) at = terminal_namespace_checkpoint(lower, terminal_bytes);
+#endif
 	a->state = DB_IN_PRODUCTION;
 	a->checkpoint = at;
 	a->checkpoint_copy.redo
@@ -2280,6 +2286,13 @@ terminal_prefix_fixture(bool aborting, unsigned fault)
 			custody_second_image.pending_owner.wal_end = custody_second_record.exclusive_end;
 			pending = custody_second_record;
 		}
+#ifdef TEST_TERMINAL_NAMESPACE_BATCH
+		if (terminal_namespace_count > 1) {
+			pending = terminal_namespace_pending(&source, pending);
+			terminal = terminal_namespace_record(&source, pending.exclusive_end, pending.record_start,
+				RM_XACT_ID, terminal_info, 99, terminal_data, terminal_bytes);
+		} else
+#endif
 		terminal = terminal_test_record(&source, pending.exclusive_end, pending.record_start,
 										RM_XACT_ID, terminal_info, 99, terminal_data, terminal_bytes);
 	} else if (fault == 14 || fault == 28) {

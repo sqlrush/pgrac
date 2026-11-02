@@ -346,7 +346,8 @@ UT_TEST(test_relmap_counter_input_preserves_structural_effect_obligation)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(35);
+	UT_RUN(test_startup_publish_conjoins_creation_pending_active_and_original_effects);
 	UT_RUN(test_relmap_counter_input_preserves_structural_effect_obligation);
 	UT_RUN(test_startup_publish_requires_both_original_and_relmap_receipts);
 	UT_RUN(test_startup_publish_captures_declared_terminal_before_scope_handoff);

@@ -420,6 +420,22 @@ cluster_wal_retention_pin_preflight_revalidate_wait_v1(ClusterWalRetentionPin *p
 extern ClusterWalPinResult
 cluster_wal_retention_pin_preflight_deadline_v1(ClusterWalRetentionPin *pin, uint64 deadline_ns);
 extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin);
+/* Read-only retention/proof check after exact release of the original bound
+ * serial set. No ROOT I/O, new pin, serial grant or root-publication seal. */
+extern ClusterWalPinResult cluster_wal_retention_pin_serial_suspended_current_v1(
+	ClusterWalRetentionPin *pin, const ClusterRecoverySerialGuardSet *released_set);
+struct ClusterColdTypedV1;
+struct ClusterRecoveryFencePlan;
+struct ClusterControlRelmapRecoveryCreateV2;
+/* Same original released serial set and WALR pin only. Consume final facts
+ * directly from the original confirmation owner; no caller-supplied tokens,
+ * rebind, new grant, seal, ROOT I/O or resume permission. All threads are
+ * checked before any effective token changes. Refusal poisons execution,
+ * retaining the original grants for their ordinary confirmed release. */
+extern ClusterWalPinResult cluster_wal_retention_pin_confirm_delta_v1(
+	ClusterWalRetentionPin *, const ClusterRecoverySerialGuardSet *,
+	const struct ClusterColdTypedV1 *, const struct ClusterRecoveryFencePlan *, uint64 episode_id,
+	const struct ClusterControlRelmapRecoveryCreateV2 *);
 /* Borrow the current ResourceOwner's complete bound COLD_FORMED set. This
  * neither acquires nor transfers ownership and cannot qualify DATA by itself.
  * The consumer still checks its startup phase, exact ROOT/native source and

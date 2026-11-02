@@ -103,6 +103,8 @@ test_relmap_native_clog_setup(const char *root, int origin, TransactionId xid, X
 	base_fixture = authority = true;
 	relmap_native_calls = relmap_native_fault = relmap_native_on_call = 0;
 	syncs = dirsyncs = writes = ut_current_failed = 0;
+	/* This wrapper bypasses the included fixture's main initialization. */
+	MainLWLockArray = own_main_locks;
 	LWLockInitialize(XidGenLock, LWTRANCHE_XACT_BUFFER);
 	LWLockInitialize(XactTruncationLock, LWTRANCHE_XACT_BUFFER);
 	LWLockInitialize(XactSLRULock, LWTRANCHE_XACT_BUFFER);

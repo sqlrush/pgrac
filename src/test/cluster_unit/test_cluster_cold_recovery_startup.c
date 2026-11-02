@@ -38,6 +38,8 @@
 #include "storage/standbydefs.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_control_relmap_recovery.h"
+#include "cluster/cluster_relmap_create_format.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
 #include "utils/relmapper.h"
@@ -4204,9 +4206,30 @@ UT_TEST(test_prepare_ready_and_zero_budget_complete_every_phase)
 	}
 }
 
+#include "test_cluster_cold_relmap_create_record.inc"
+#include "test_cluster_cold_relmap_create_barrier.inc"
+
 int
 main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_CREATE_BARRIER") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_create_barrier_matches_original_frames_without_old_serial_grant);
+		UT_RUN(test_create_barrier_held_checks_do_not_perform_profile_or_root_reads);
+		UT_RUN(test_create_barrier_wrong_episode_and_whole_source_drift_stick);
+		UT_RUN(test_create_barrier_current_error_revokes_original_episode);
+		UT_RUN(test_create_barrier_full_current_refuses_family_lock_before_root_io);
+		UT_DONE(); return ut_failed_count != 0;
+	}
+	if (getenv("PGRAC_PRE2_TEST_CREATE_RECORD") != NULL) {
+		UT_PLAN(5);
+		UT_RUN(test_recovery_create_record_borrows_original_whole_episode);
+		UT_RUN(test_recovery_create_record_refuses_positions_source_and_lost_protection);
+		UT_RUN(test_recovery_create_record_refuses_wrong_kind_or_history);
+		UT_RUN(test_recovery_create_record_profile_error_poison_is_sticky);
+		UT_RUN(test_recovery_create_record_final_fence_error_is_sticky);
+		UT_DONE(); return ut_failed_count != 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_TERMINAL_EPISODE") != NULL) {
 		UT_PLAN(2);
 		UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
@@ -4214,12 +4237,13 @@ main(void)
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_RECOVERY_CARRIER") != NULL) {
-		UT_PLAN(5);
+		UT_PLAN(6);
 		UT_RUN(test_recovery_carrier_stages_without_publishing_ordinary_directory);
 		UT_RUN(test_recovery_carrier_half_write_and_error_keep_debt);
 		UT_RUN(test_recovery_carrier_refuses_generation_or_source_drift);
 		UT_RUN(test_recovery_does_not_relax_unknown_or_building_ordinary_admission);
 		UT_RUN(test_recovery_transfer_preflights_all_targets_before_retiring_any_pin);
+		UT_RUN(test_recovery_segments_budget_whole_batch_before_first_file_read);
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_NATIVE_CLOG_STORAGE") != NULL) {
@@ -4298,7 +4322,7 @@ main(void)
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_RECHECK") != NULL) {
-		UT_PLAN(8);
+		UT_PLAN(12);
 		UT_RUN(test_relmap_start_recheck_reads_staged_pair_after_replay_window);
 		UT_RUN(test_relmap_start_recheck_preflights_original_receipt_and_side_before_io);
 		UT_RUN(test_relmap_start_recheck_original_pin_drift_refuses_before_io);
@@ -4307,9 +4331,13 @@ main(void)
 		UT_RUN(test_relmap_start_recheck_first_owner_pin_and_read_error_revoke);
 		UT_RUN(test_relmap_start_recheck_caller_preconditions_do_not_consume_receipts);
 		UT_RUN(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io);
+		UT_RUN(test_pending_staging_mixed_reads_both_copies_and_preserves_creation);
+		UT_RUN(test_pending_staging_legacy_mixed_and_empty_still_refuse);
+		UT_RUN(test_pending_staging_late_source_pin_and_pair_changes_fail_closed);
+		UT_RUN(test_pending_staging_first_owner_and_native_errors_keep_debt);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(208);
+	UT_PLAN(223);
 	UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
 	UT_RUN(test_terminal_original_episode_refuses_changed_whole_source_or_owner);
 	UT_RUN(test_pass2_source_drift_waits_for_post_ir_and_never_replays);
@@ -4521,6 +4549,21 @@ main(void)
 	UT_RUN(test_recovery_carrier_refuses_generation_or_source_drift);
 	UT_RUN(test_recovery_does_not_relax_unknown_or_building_ordinary_admission);
 	UT_RUN(test_recovery_transfer_preflights_all_targets_before_retiring_any_pin);
+	UT_RUN(test_recovery_segments_budget_whole_batch_before_first_file_read);
+	UT_RUN(test_recovery_create_record_borrows_original_whole_episode);
+	UT_RUN(test_recovery_create_record_refuses_positions_source_and_lost_protection);
+	UT_RUN(test_recovery_create_record_refuses_wrong_kind_or_history);
+	UT_RUN(test_recovery_create_record_profile_error_poison_is_sticky);
+	UT_RUN(test_recovery_create_record_final_fence_error_is_sticky);
+	UT_RUN(test_pending_staging_mixed_reads_both_copies_and_preserves_creation);
+	UT_RUN(test_pending_staging_legacy_mixed_and_empty_still_refuse);
+	UT_RUN(test_pending_staging_late_source_pin_and_pair_changes_fail_closed);
+	UT_RUN(test_pending_staging_first_owner_and_native_errors_keep_debt);
+	UT_RUN(test_create_barrier_matches_original_frames_without_old_serial_grant);
+	UT_RUN(test_create_barrier_held_checks_do_not_perform_profile_or_root_reads);
+	UT_RUN(test_create_barrier_wrong_episode_and_whole_source_drift_stick);
+	UT_RUN(test_create_barrier_current_error_revokes_original_episode);
+	UT_RUN(test_create_barrier_full_current_refuses_family_lock_before_root_io);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

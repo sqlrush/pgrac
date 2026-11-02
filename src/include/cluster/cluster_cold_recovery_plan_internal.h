@@ -33,6 +33,23 @@
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_relmap_retention.h"
 #include "cluster/cluster_relmap_recovery_internal.h"
+#include "cluster/cluster_control_native_files.h"
+
+struct ClusterControlRelmapRecoveryCreateV2;
+typedef struct ColdNativeConfirmV2 {
+	uint32 index;
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation;
+} ColdNativeConfirmV2;
+typedef struct ClusterColdNativeRegistryV2 {
+	ClusterControlRelmapFormatV2 format;
+	ClusterControlNativeInventoryV2 *inventory;
+	ClusterColdRelmapCreateExpectedV1 *entries;
+	ColdNativeConfirmV2 *confirms;
+	struct ClusterRecoveryFencePlan *confirm_fence;
+	uint64 confirm_episode, confirm_count;
+	uint64 count;
+	Size bytes;
+} ClusterColdNativeRegistryV2;
 
 #ifdef USE_CLUSTER_UNIT
 #define cold_alloc0(size_) calloc(1, (size_))
@@ -112,6 +129,26 @@ typedef struct ColdRelmapInput {
 	bool has_retention_snapshot;
 	ClusterRelmapRetentionSnapshot retention_snapshot;
 } ColdRelmapInput;
+
+/* Creation has no pending/terminal pin. Fixed segments use the SAME plan
+ * budget, without imposing the legacy pending carrier's 64-entry array. */
+#define COLD_RELMAP_CREATE_SEGMENT 16
+#define COLD_RECORD_RELMAP_CREATE 0x20
+
+typedef struct ColdRelmapCreateInput {
+	ClusterColdRelmapCreateInputV1 input;
+	bool captured;
+	bool attempted;
+	bool applied;
+	void *receipt; /* Original executor's local confirmed receipt only. */
+	Size receipt_bytes;
+	void (*receipt_release)(void *);
+	bool (*receipt_output_distinct)(const void *, const void *, Size);
+} ColdRelmapCreateInput;
+typedef struct ColdRelmapCreateChunk {
+	struct ColdRelmapCreateChunk *next;
+	ColdRelmapCreateInput entries[COLD_RELMAP_CREATE_SEGMENT];
+} ColdRelmapCreateChunk;
 
 /* Shared shape validation; caller has validated plan/count/storage. */
 extern ClusterColdDetailV1 cold_relmap_inputs_valid(const ClusterColdPlanV1 *plan,
@@ -269,8 +306,24 @@ struct ClusterColdPlanV1 {
 	ClusterRelmapRecoveryPins *relmap_recovery;
 	ColdRelmapInput *relmap_inputs;
 	uint32 relmap_count;
+	ColdRelmapCreateChunk *relmap_creates;
+	uint32 relmap_create_count;
 	bool relmap_failed;
+	/* Original allocation extent; checked before pending input traversal. */
+	uint32 relmap_input_capacity;
 };
+
+static inline ColdRelmapCreateInput *
+cold_relmap_create_at(const ClusterColdPlanV1 *plan, uint32 index)
+{
+	ColdRelmapCreateChunk *chunk = plan->relmap_creates;
+	if (index >= plan->relmap_create_count) return NULL;
+	while (chunk != NULL && index >= COLD_RELMAP_CREATE_SEGMENT) {
+		chunk = chunk->next;
+		index -= COLD_RELMAP_CREATE_SEGMENT;
+	}
+	return chunk == NULL ? NULL : &chunk->entries[index];
+}
 
 static inline bool
 cold_relmap_cut_equal(const ClusterColdParticipantV1 *a, const ClusterColdParticipantV1 *b)
@@ -324,24 +377,70 @@ cold_relmap_storage_overlap(const void *out, Size bytes, const void *value, Size
 }
 
 static inline bool
+cold_relmap_inputs_bounded(const ClusterColdPlanV1 *plan)
+{
+	return plan->relmap_count != UINT32_MAX
+		&& plan->relmap_count == plan->relmap_input_capacity
+		&& (plan->relmap_count == 0 ? plan->relmap_inputs == NULL : plan->relmap_inputs != NULL);
+}
+
+static inline bool
 cold_relmap_output_distinct(const ClusterColdTypedV1 *typed, const void *out, Size bytes)
 {
 	const ClusterColdPlanV1 *plan;
 	if (typed == NULL) return true;
 	if (cold_relmap_storage_overlap(out, bytes, typed, sizeof(*typed))) return false;
+	if (typed->native_registry != NULL) {
+		const ClusterColdNativeRegistryV2 *s = typed->native_registry;
+		if (cold_relmap_storage_overlap(out, bytes, s, sizeof(*s))
+			|| cold_relmap_storage_overlap(out, bytes, s->entries,
+				s->count * sizeof(*s->entries))
+			|| cold_relmap_storage_overlap(out, bytes, s->confirms,
+				s->count * sizeof(*s->confirms))
+			|| (s->inventory && cold_relmap_storage_overlap(out, bytes, s->inventory,
+				s->inventory->private_bytes))) return false;
+	}
 	plan = typed->plan;
 	if (plan == NULL) return true;
 	if (cold_relmap_storage_overlap(out, bytes, plan, sizeof(*plan))
 		|| plan->magic != CLUSTER_COLD_PLAN_MAGIC
-		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS
+		|| !cold_relmap_inputs_bounded(plan)
 		|| (plan->relmap_terminal != NULL && plan->relmap_terminal_bytes == 0))
 		return false;
+	for (const ColdRelmapCreateChunk *chunk = plan->relmap_creates;
+		chunk != NULL; chunk = chunk->next) {
+		if (cold_relmap_storage_overlap(out, bytes, chunk, sizeof(*chunk))) return false;
+		for (uint32 i = 0; i < COLD_RELMAP_CREATE_SEGMENT; ++i) {
+			const ColdRelmapCreateInput *entry = &chunk->entries[i];
+			if (entry->receipt != NULL && (entry->receipt_output_distinct == NULL
+				|| !entry->receipt_output_distinct(entry->receipt, out, bytes))) return false;
+		}
+	}
 	return !cold_relmap_storage_overlap(out, bytes, plan->relmap_inputs,
 			(Size)plan->relmap_count * sizeof(ColdRelmapInput))
-		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_recovery,
-			sizeof(ClusterRelmapRecoveryPins))
+		&& cluster_relmap_recovery_output_distinct(plan->relmap_recovery, out, bytes)
 		&& !cold_relmap_storage_overlap(out, bytes, plan->relmap_terminal,
 			plan->relmap_terminal_bytes);
+}
+
+/* Only local saved metadata is retired here. Original files, registrations
+ * and recovery protections remain the original owner's responsibility. */
+static inline void
+cold_relmap_create_cleanup(ClusterColdPlanV1 *plan)
+{
+	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+		ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+		if (entry != NULL && entry->receipt != NULL && entry->receipt_release != NULL) {
+			void *receipt = entry->receipt;
+			void (*release)(void *) = entry->receipt_release;
+			entry->receipt = NULL;
+			entry->receipt_release = NULL;
+			entry->receipt_output_distinct = NULL;
+			entry->receipt_bytes = 0;
+			plan->relmap_failed = true;
+			release(receipt);
+		}
+	}
 }
 
 static inline void

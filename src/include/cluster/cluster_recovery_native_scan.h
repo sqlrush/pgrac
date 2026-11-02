@@ -62,7 +62,8 @@ typedef enum ClusterRecoveryNativeKind {
 	CLUSTER_RECOVERY_NATIVE_PREPARE_ABORT_STATS,
 	CLUSTER_RECOVERY_NATIVE_PREPARE_INVALIDATION,
 	CLUSTER_RECOVERY_NATIVE_PREPARE_RESOURCE,
-	CLUSTER_RECOVERY_NATIVE_PREPARE_END
+	CLUSTER_RECOVERY_NATIVE_PREPARE_END,
+	CLUSTER_RECOVERY_NATIVE_RELMAP_CREATE /* complete RMC1, not an UPDATE */
 } ClusterRecoveryNativeKind;
 
 /* Exact observed source and bytes, not a claim/cut authentication. Keep this
@@ -178,6 +179,8 @@ cluster_recovery_native_effect_owner_families_v1(const ClusterRecoveryNativeEffe
 	case CLUSTER_RECOVERY_NATIVE_RELMAP_UPDATE:
 	case CLUSTER_RECOVERY_NATIVE_RELMAP_ENTRY:
 		return CLUSTER_RECOVERY_OWNER_RELMAP;
+	case CLUSTER_RECOVERY_NATIVE_RELMAP_CREATE:
+		return CLUSTER_RECOVERY_OWNER_RELMAP | CLUSTER_RECOVERY_OWNER_CREATE;
 	case CLUSTER_RECOVERY_NATIVE_PREPARE:
 	case CLUSTER_RECOVERY_NATIVE_PREPARE_SUBXACT:
 	case CLUSTER_RECOVERY_NATIVE_PREPARE_COMMIT_RELATION:
@@ -234,6 +237,13 @@ extern ClusterRecoveryNativeResult cluster_recovery_native_scan_effects_v1(
  * RELMAP_ENTRY exposes each active original mapping with its exact ordinal.
  * Image CRC/shape acceptance is not authority-format compatibility, pending
  * publication, invalidation completion or RESET proof. */
+
+/* RELMAP_CREATE owns the whole canonical RMC1 header/batch/clean generation-one
+ * image as one effect. The complete file creation/registration identity remains
+ * in its payload; database/tablespace/count are only checked summaries. It has
+ * no legacy ENTRY projection and grants no RESERVED/AVAILABLE, actual creation,
+ * lifetime or replay authority. The original owner must bind the sealed frame,
+ * independent registration, actual end and complete source before execution. */
 
 /* PREPARE keeps both possible outcome arrays separately and every original
  * rmgr header/body/padding. RESOURCE bytes include the native on-disk header

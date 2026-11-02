@@ -95,4 +95,14 @@ extern ClusterControlRootResult cluster_control_root_relmap_format_locked_v2(
  * Includes all file families and copies. No target-file identity inference. */
 extern bool cluster_control_root_native_files_copy_v4(ClusterControlRelmapSelectionV2 *,
 	ClusterRecoveryFileIdentityV2 *out, uint64 capacity, uint64 *count);
+/* Same live selection/CF: independent creation registrations only. RESERVED
+ * plus AVAILABLE nonshared relmaps with the SAME nonzero original batch in
+ * both coverage copies. BOOT/legacy zero batches are not creation evidence.
+ * All values are copies, with no file/episode/creation permission. A malformed
+ * pair refuses the entire projection, preserving outputs. Loss of CF poisons
+ * the original selection; a new selection cannot revive it. */
+extern bool cluster_control_root_relmap_creation_count_v4(ClusterControlRelmapSelectionV2 *,
+	uint64 *count);
+extern bool cluster_control_root_relmap_creation_at_v4(ClusterControlRelmapSelectionV2 *,
+	uint64 index, ClusterRecoveryFileIdentityV2 *expected, uint8 batch_uuid[16]);
 #endif

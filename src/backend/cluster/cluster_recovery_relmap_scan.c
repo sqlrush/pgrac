@@ -14,6 +14,9 @@
 typedef struct ManagedRelmapScan {
 	ClusterControlRelmapSelectionV2 *selection; /* borrowed, never destroyed */
 	ClusterControlRelmapReferenceV2 reference;
+	ClusterControlNativeTableInfoV2 table;
+	ClusterControlNativeFileBorrowV2 native;
+	bool shared_table, release_attempted;
 	ClusterRecoveryFileIdentityV2 identity, pair_identity;
 	ClusterRelmapV2Image image;
 	uint8 copies[2][CLUSTER_RELMAP_FILE_SIZE_V2];
@@ -96,6 +99,30 @@ fail:
 	return result;
 }
 
+/* No CF or I/O: borrowed count is local activity, not table identity. */
+static bool
+relmap_table_current(const ClusterControlNativeTableInfoV2 *table)
+{
+	ClusterControlNativeTableInfoV2 now, expected = *table;
+	if (!cluster_control_native_files_info_v2(&now))
+		return false;
+	now.borrowed = expected.borrowed = 0;
+	return memcmp(&now, &expected, sizeof(now)) == 0;
+}
+
+static void
+relmap_native_release(ManagedRelmapScan *m)
+{
+	if (m->native.private_self == 0)
+		return;
+	if (m->release_attempted)
+		ereport(PANIC, (errmsg("managed relation map scan has an unfinished file borrow release")));
+	m->release_attempted = true;
+	if (!cluster_control_native_file_release_v2(&m->native))
+		ereport(PANIC, (errmsg("cannot release managed relation map scan file borrow")));
+	m->release_attempted = false;
+}
+
 /* The reference getter checks original continuous CF custody without I/O. */
 static bool
 relmap_control_current(const ClusterRecoveryRelmapScan *scan, bool reread)
@@ -104,6 +131,10 @@ relmap_control_current(const ClusterRecoveryRelmapScan *scan, bool reread)
 	ClusterControlRelmapReferenceV2 now;
 	if (m == NULL)
 		return true;
+	if (m->shared_table)
+		return !m->release_attempted && relmap_table_current(&m->table)
+			   && (m->native.private_self == 0
+				   || cluster_control_native_file_current_v2(&m->native));
 	if (reread && cluster_control_root_relmap_selection_recheck_locked_v4(m->selection)
 		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return false;
@@ -166,6 +197,65 @@ fail:
 	return result;
 }
 
+ClusterRecoveryRelmapResult
+cluster_recovery_relmap_scan_begin_native_v2(ClusterRecoveryRootSet *roots,
+											 const ClusterControlNativeTableInfoV2 *table,
+											 size_t memory_budget, ClusterRecoveryRelmapScan **out)
+{
+	ClusterRecoveryRelmapScan *volatile scan = NULL;
+	ClusterRecoveryRelmapResult result = CLUSTER_RECOVERY_RELMAP_INVALID;
+	if (table == NULL || !cluster_recovery_root_set_output_distinct(roots, out, sizeof(*out))
+		|| *out != NULL
+		|| ((uintptr_t)table <= (uintptr_t)out ? (uintptr_t)out - (uintptr_t)table < sizeof(*table)
+											   : (uintptr_t)table - (uintptr_t)out < sizeof(*out)))
+		goto fail;
+	PG_TRY();
+	{
+		if (memory_budget < sizeof(ManagedRelmapScan) + sizeof(*scan) + 1024)
+			result = CLUSTER_RECOVERY_RELMAP_CAPACITY;
+		else if (table->mode == CLUSTER_NATIVE_FILES_MANAGED_V2 && table->table_generation
+				 && table->startup_generation && table->control.logical_count
+				 && table->control.logical_count <= UINT64_MAX / 2
+				 && table->control.logical_count <= table->count && table->count <= table->capacity
+				 && relmap_table_current(table)) {
+			ClusterRecoveryRelmapScan *created = NULL;
+			result = cluster_recovery_relmap_scan_begin(
+				roots, table->control.config.identity.system_identifier,
+				table->control.config.identity.database_incarnation,
+				table->control.config.identity.storage_uuid,
+				memory_budget - sizeof(ManagedRelmapScan), &created);
+			scan = created;
+			if (scan != NULL) {
+				scan->managed = calloc(1, sizeof(ManagedRelmapScan));
+				if (scan->managed == NULL)
+					result = CLUSTER_RECOVERY_RELMAP_CAPACITY;
+				else {
+					scan->managed->shared_table = true;
+					scan->managed->table = *table;
+					scan->managed->reference = table->control;
+					if (!relmap_control_current(scan, false) || !relmap_roots_current(scan))
+						result = CLUSTER_RECOVERY_RELMAP_CHANGED;
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_recovery_relmap_scan_destroy(scan);
+		cluster_recovery_root_set_invalidate(roots);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_RECOVERY_RELMAP_MORE) {
+		*out = scan;
+		return result;
+	}
+	cluster_recovery_relmap_scan_destroy(scan);
+fail:
+	cluster_recovery_root_set_invalidate(roots);
+	return result;
+}
+
 static bool
 relmap_same_file(const ClusterRecoveryFileIdentityV2 *a, const ClusterRecoveryFileIdentityV2 *b)
 {
@@ -186,10 +276,32 @@ relmap_managed_select(ClusterRecoveryRelmapScan *scan, const ClusterRecoveryRoot
 		|| !((entry->file.locator.spcOid == GLOBALTABLESPACE_OID
 			  && entry->file.locator.dbOid == InvalidOid)
 			 || (entry->file.locator.spcOid == DEFAULTTABLESPACE_OID
-				 && OidIsValid(entry->file.locator.dbOid)))
-		|| !cluster_control_root_relmap_selection_lookup_v4(m->selection,
-			entry->file.locator.dbOid, entry->file.locator.spcOid, 0, &identity)
-		|| identity.system_identifier != scan->key.system_identifier
+				 && OidIsValid(entry->file.locator.dbOid))))
+		return relmap_fail(scan, CLUSTER_RECOVERY_RELMAP_CORRUPT);
+	if (m->shared_table) {
+		if (!backup) {
+			if (m->await_backup || m->completed_copies / 2 >= m->reference.logical_count)
+				return relmap_fail(scan, CLUSTER_RECOVERY_RELMAP_BASE_REQUIRED);
+			relmap_native_release(m);
+			if (cluster_control_native_file_borrow_by_address_v2(
+					CLUSTER_RECOVERY_FILE_RELMAP_V2, entry->file.locator.dbOid,
+					entry->file.locator.spcOid, 0, &m->native)
+				!= CLUSTER_NATIVE_FILES_OK_V2)
+				return relmap_fail(scan, CLUSTER_RECOVERY_RELMAP_BASE_REQUIRED);
+		}
+		if (!relmap_control_current(scan, false)
+			|| m->native.table_generation != m->table.table_generation
+			|| m->native.startup_generation != m->table.startup_generation)
+			return relmap_fail(scan, CLUSTER_RECOVERY_RELMAP_CHANGED);
+		identity = m->native.expected;
+		if (identity.database_oid != entry->file.locator.dbOid
+			|| identity.tablespace_oid != entry->file.locator.spcOid || identity.object_id != 0)
+			return relmap_fail(scan, CLUSTER_RECOVERY_RELMAP_CORRUPT);
+	} else if (!cluster_control_root_relmap_selection_lookup_v4(
+				   m->selection, entry->file.locator.dbOid, entry->file.locator.spcOid, 0,
+				   &identity))
+		return relmap_fail(scan, CLUSTER_RECOVERY_RELMAP_CORRUPT);
+	if (identity.system_identifier != scan->key.system_identifier
 		|| identity.database_incarnation != scan->key.database_incarnation
 		|| memcmp(identity.storage_uuid, scan->key.storage_uuid, 16))
 		return relmap_fail(scan, CLUSTER_RECOVERY_RELMAP_CORRUPT);
@@ -437,15 +549,25 @@ relmap_overlap(const void *a, size_t an, const void *b, size_t bn)
 	return a != NULL && b != NULL && (x <= y ? y - x < an : x - y < bn);
 }
 
+bool
+cluster_recovery_relmap_scan_output_distinct_v2(const ClusterRecoveryRelmapScan *scan,
+												const void *out, Size length)
+{
+	return out != NULL && length != 0
+		   && (scan == NULL
+			   || (cluster_recovery_root_set_output_distinct(scan->roots, out, length)
+				   && (scan->managed == NULL || scan->managed->selection == NULL
+					   || cluster_control_root_relmap_selection_output_distinct_v4(
+						   scan->managed->selection, out, length))
+				   && !relmap_overlap(out, length, scan, sizeof(*scan))
+				   && !relmap_overlap(out, length, scan->managed, sizeof(ManagedRelmapScan))));
+}
+
 ClusterRecoveryRelmapResult
 cluster_recovery_relmap_scan_next(ClusterRecoveryRelmapScan *scan, ClusterRecoveryRelmapEntry *out)
 {
 	ClusterRecoveryRelmapResult result = CLUSTER_RECOVERY_RELMAP_INVALID;
-	if (scan != NULL && (!cluster_recovery_root_set_output_distinct(scan->roots, out, sizeof(*out))
-		|| (scan->managed != NULL && !cluster_control_root_relmap_selection_output_distinct_v4(
-			scan->managed->selection, out, sizeof(*out)))
-		|| relmap_overlap(out, sizeof(*out), scan, sizeof(*scan))
-		|| relmap_overlap(out, sizeof(*out), scan->managed, sizeof(ManagedRelmapScan))))
+	if (!cluster_recovery_relmap_scan_output_distinct_v2(scan, out, sizeof(*out)))
 		return relmap_fail(scan, CLUSTER_RECOVERY_RELMAP_INVALID);
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -479,12 +601,9 @@ cluster_recovery_relmap_scan_diag(const ClusterRecoveryRelmapScan *scan,
 								  ClusterRecoveryRelmapDiag *out)
 {
 	bool current = false;
-	if (scan != NULL && (!cluster_recovery_root_set_output_distinct(scan->roots, out, sizeof(*out))
-		|| (scan->managed != NULL && !cluster_control_root_relmap_selection_output_distinct_v4(
-			scan->managed->selection, out, sizeof(*out)))
-		|| relmap_overlap(out, sizeof(*out), scan, sizeof(*scan))
-		|| relmap_overlap(out, sizeof(*out), scan->managed, sizeof(ManagedRelmapScan)))) {
-		cluster_recovery_root_set_invalidate(scan->roots);
+	if (!cluster_recovery_relmap_scan_output_distinct_v2(scan, out, sizeof(*out))) {
+		if (scan != NULL)
+			cluster_recovery_root_set_invalidate(scan->roots);
 		return false;
 	}
 	if (out != NULL)
@@ -512,8 +631,11 @@ cluster_recovery_relmap_scan_diag(const ClusterRecoveryRelmapScan *scan,
 void
 cluster_recovery_relmap_scan_destroy(ClusterRecoveryRelmapScan *scan)
 {
-	if (scan != NULL)
+	if (scan != NULL && scan->managed != NULL) {
+		if (scan->managed->shared_table)
+			relmap_native_release(scan->managed);
 		free(scan->managed);
+	}
 	free(scan);
 }
 #endif

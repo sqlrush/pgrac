@@ -37,6 +37,8 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "utils/resowner.h"
+#include "cluster/cluster_control_native_files.h"
+static bool registry_probe_active, registry_cf_held;
 
 /* This driver-only suite does not run a Startup process. Its original ROOT
  * reader is a leaf; CF waiting is exercised with actual CF/CONTROL in
@@ -69,7 +71,7 @@ cluster_grd_redeclare_generation(void)
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	if (!prepare_probe_active)
+	if (!prepare_probe_active && !registry_probe_active && !cluster_shared_config)
 		abort();
 	return 1;
 }
@@ -83,9 +85,12 @@ ProcessInterrupts(void)
 {
 	abort();
 }
+static bool create_barrier_probe_active;
+static LWLock *create_barrier_probe_lock;
 bool
 LWLockHeldByMe(LWLock *lock pg_attribute_unused())
 {
+	if (create_barrier_probe_active) return lock == create_barrier_probe_lock;
 	abort();
 }
 void
@@ -127,7 +132,8 @@ cluster_cf_attempt_wait_slice(const ClusterCfAttemptObservation *attempt pg_attr
 bool
 cluster_cf_held(LOCKMODE mode pg_attribute_unused())
 {
-	abort();
+	if (!prepare_probe_active && !registry_probe_active && !cluster_shared_config) abort();
+	return registry_cf_held;
 }
 bool
 cluster_cf_release_completed(LOCKMODE mode pg_attribute_unused(),
@@ -288,6 +294,8 @@ static uint64 data_token;
 static uint64 database_incarnation[NROOTS + 1];
 static uint32 scan_space_offset;
 static bool scan_space_drop;
+static bool scan_create_frame; /* decoded metadata seam only, never decoder admission */
+static unsigned create_record_fence_error_after;
 static bool scan_space;					/* thread 2 extends relation 300 before its page record */
 static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
 static bool restart_ref_present;
@@ -495,14 +503,36 @@ cluster_control_root_recovery_checkpoint_v1(const ClusterControlRootSnapshot *ro
 	return result;
 }
 
+static bool create_barrier_suspended;
+static unsigned create_barrier_full_checks, create_barrier_held_checks;
+static unsigned create_barrier_error_after;
 bool
 cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
 {
+	if (create_record_fence_error_after && --create_record_fence_error_after == 0)
+		siglongjmp(*PG_exception_stack, 1);
 	/* Real revalidation also requires the pass-2 serial set. Pass 1
 	 * may compare exact ROOT inputs, but cannot use execution authority. */
-	return plan != NULL && fence_current && cluster_cold_replay_window_active_v1();
+	return !create_barrier_suspended && plan != NULL && fence_current && cluster_cold_replay_window_active_v1();
 }
 
+/* H owns the actual pin/IR implementation; this original Startup fixture
+ * supplies only the explicit nonserial boundary, without granting old IR. */
+bool
+cluster_recovery_merge_fence_plan_suspended_held_current_v1(ClusterRecoveryFencePlan *plan, uint64 id)
+{
+	++create_barrier_held_checks;
+	return create_barrier_suspended && plan != NULL && id == 73 && fence_current
+		&& cluster_cold_replay_window_active_v1();
+}
+bool
+cluster_recovery_merge_fence_plan_suspended_current_v1(ClusterRecoveryFencePlan *plan, uint64 id)
+{
+	++create_barrier_full_checks;
+	if (create_barrier_error_after && --create_barrier_error_after == 0)
+		siglongjmp(*PG_exception_stack, 1);
+	return cluster_recovery_merge_fence_plan_suspended_held_current_v1(plan, id);
+}
 static void source_sync_history_drift(int fault);
 
 ClusterControlRootResult
@@ -566,10 +596,19 @@ static unsigned tx_fences_released;
 static int tx_fence_expected_census_releases;
 static int *tx_fence_census_release_observer;
 static ClusterColdTypedV1 *tx_fence_cleanup_observer;
+static ClusterColdTypedV1 *tx_fence_confirm_cleanup_observer;
+static bool tx_fence_confirm_release_ok = true;
 bool
 cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
 {
 	UT_ASSERT(plan != NULL);
+	if (tx_fence_confirm_cleanup_observer != NULL) {
+		ClusterColdTypedV1 *typed = tx_fence_confirm_cleanup_observer;
+		UT_ASSERT(typed->tx_fence == plan);
+		UT_ASSERT(typed->plan != NULL && typed->replay_roots != NULL);
+		UT_ASSERT(typed->native_registry != NULL);
+		UT_ASSERT_EQ(typed->native_registry->confirm_count, 1);
+	}
 	if (tx_fence_cleanup_observer != NULL) {
 		ClusterColdTypedV1 *typed = tx_fence_cleanup_observer;
 
@@ -581,12 +620,20 @@ cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
 		UT_ASSERT_EQ(*tx_fence_census_release_observer, tx_fence_expected_census_releases);
 	}
 	tx_fences_released++;
+	if (!tx_fence_confirm_release_ok)
+		pg_re_throw();
 	return true;
 }
 
 void
 cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan)
 {
+	if (tx_fence_confirm_cleanup_observer != NULL) {
+		ClusterColdTypedV1 *typed = tx_fence_confirm_cleanup_observer;
+		UT_ASSERT(typed->tx_fence == *plan);
+		UT_ASSERT(typed->plan != NULL && typed->replay_roots != NULL);
+		UT_ASSERT_EQ(typed->native_registry->confirm_count, 1);
+	}
 	if (tx_fence_census_release_observer != NULL)
 		UT_ASSERT_EQ(*tx_fence_census_release_observer, tx_fence_expected_census_releases);
 	if (*plan != NULL) tx_fences_destroyed++;
@@ -863,6 +910,12 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	record.components = &component;
 	if (startup_relmap_real_side)
 		record.scn = thread == 2 ? 10 : 30;
+	if (scan_create_frame) {
+		record.rmid = RM_RELMAP_ID;
+		record.info = CLUSTER_RELMAP_CREATE_WAL_INFO_V1;
+		record.component_count = 0;
+		record.components = NULL;
+	}
 	if (scan_relmap_input != NULL && scan_relmap_input->participant == participant) {
 		if (scan_relmap_require_early_binding && (side_plan == NULL || !side_plan->bound))
 			return CLUSTER_COLD_SIDE_OWNER_MISSING;
@@ -1917,6 +1970,20 @@ cluster_cold_scan_root_deadline_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	UT_ASSERT_EQ(deadline_ns, prepare_probe_deadline);
 	return cluster_cold_scan_root_v1(plan, participant, root, token, space_active, foreign,
 									 side_plan, result);
+}
+
+#include "test_cluster_cold_registry_boundary.h"
+
+/* Controlled H boundary here; exact physical ROOT delta is exercised by the
+ * original control/registry fixture and actual merge producer tests. */
+bool
+cluster_recovery_merge_fence_plan_suspended_confirm_current_v1(
+	ClusterRecoveryFencePlan *plan, uint64 episode_id,
+	const struct ClusterColdTypedV1 *typed,
+	const struct ClusterControlRelmapRecoveryCreateV2 *confirmation)
+{
+	return typed != NULL && confirmation != NULL
+		&& cluster_recovery_merge_fence_plan_suspended_current_v1(plan, episode_id);
 }
 
 #endif /* TEST_CLUSTER_COLD_RECOVERY_STARTUP_BOUNDARY_H */

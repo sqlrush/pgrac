@@ -29,6 +29,10 @@ static bool replay_census_ok;
 static bool replay_relmap_ok;
 static uint32 replay_relmap_count;
 static unsigned replay_terminal_capture_calls;
+static bool replay_has_creation, replay_create_ok;
+struct ClusterColdTypedReplay;
+static bool cluster_typed_replay_create_barrier(struct ClusterColdTypedReplay *,
+	const ClusterColdStepV1 *, XLogReaderState *);
 
 /* The original publish function must stop before handing off any failed cut. */
 static bool replay_ready_ok, replay_fatal_armed;
@@ -44,6 +48,15 @@ static unsigned replay_event_count;
  * Here it is a fail-able participant at the original joint publish gate. */
 bool
 cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	UT_ASSERT(typed == &replay_typed);
+	UT_ASSERT(fence == (struct ClusterRecoveryFencePlan *)&replay_fence);
+	return replay_relmap_ok && !replay_has_creation;
+}
+
+bool
+cluster_cold_typed_relmap_pending_ready_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence)
 {
 	UT_ASSERT(typed == &replay_typed);
@@ -71,6 +84,9 @@ cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
 	return replay_relmap_count;
 }
 
+uint32 cluster_cold_typed_relmap_pending_count_v1(const ClusterColdTypedV1 *typed)
+{ return cluster_cold_typed_relmap_replay_count_v1(typed); }
+
 bool
 cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence)
@@ -81,6 +97,10 @@ cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	replay_event('T');
 	return false;
 }
+
+bool cluster_cold_relmap_pending_terminal_capture_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{ return cluster_cold_relmap_terminal_capture_v1(typed, fence); }
 
 bool
 errstart(int elevel, const char *domain)
@@ -339,6 +359,15 @@ cluster_cold_typed_source_drained_v1(ClusterColdTypedV1 *typed,
 #include "test_cluster_cold_xid_replay.inc"
 #undef cluster_cold_typed_effects_complete_v1
 
+static bool
+cluster_typed_replay_create_barrier(ClusterColdTypedReplay *rep,
+	const ClusterColdStepV1 *step, XLogReaderState *reader)
+{
+	UT_ASSERT(rep->typed == &replay_typed && !step && !reader);
+	if (replay_has_creation) replay_event('K');
+	return replay_create_ok;
+}
+
 static ClusterColdTypedReplay replay_adapter;
 static struct ClusterRecoveryFencePlan *replay_fence_plan;
 
@@ -410,6 +439,7 @@ replay_xid_reset(int count)
 	replay_effects_calls = 0;
 	replay_census_calls = 0;
 	replay_relmap_count = replay_terminal_capture_calls = 0;
+	replay_has_creation = false; replay_create_ok = true;
 	replay_census_ok = true;
 	replay_ready_calls = replay_complete_calls = replay_external_calls = 0;
 	replay_fatal_calls = replay_log_calls = 0;
@@ -735,6 +765,27 @@ UT_TEST(test_startup_publish_captures_declared_terminal_before_scope_handoff)
 		UT_ASSERT_EQ(replay_complete_calls, 0);
 		UT_ASSERT_EQ(replay_external_calls, 0);
 		UT_ASSERT(strcmp(replay_events, invalid ? "ECBRX" : "ECBRXT") == 0);
+	}
+}
+
+UT_TEST(test_startup_publish_conjoins_creation_pending_active_and_original_effects)
+{
+	for (unsigned state = 0; state < 5; ++state) {
+		ClusterColdReplayResultV1 result = {.detail = CLUSTER_COLD_REPLAY_OK};
+		bool refused = false;
+		replay_xid_reset(1);
+		replay_has_creation = true;
+		if (state == 1) replay_create_ok = false;
+		if (state == 2) replay_relmap_ok = false;
+		if (state == 3) replay_census_ok = false;
+		if (state == 4) replay_readback_ok = false;
+		replay_fatal_armed = true;
+		if (setjmp(replay_fatal) == 0) cluster_typed_replay_publish(&replay_adapter, &result);
+		else refused = true;
+		replay_fatal_armed = false;
+		UT_ASSERT_EQ(refused, state != 0);
+		UT_ASSERT_EQ(replay_complete_calls, state == 0);
+		UT_ASSERT_EQ(replay_terminal_capture_calls, 0);
 	}
 }
 

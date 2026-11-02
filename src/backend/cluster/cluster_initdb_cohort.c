@@ -21,6 +21,8 @@
 #include "common/file_perm.h"
 #include "common/cryptohash.h"
 #include "common/pgrac_initdb_cohort.h"
+#include "common/cluster_recovery_bootstrap.h"
+#include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_recovery_format.h"
 #include "catalog/pg_tablespace_d.h"
 #include "miscadmin.h"
@@ -60,8 +62,11 @@ typedef struct InitdbOrigin {
 	struct stat storage_contract_identity, storage_contract_directory;
 	bool side_routed;
 	bool managed_relmap;
+	bool managed_boot;
 	PgracInitdbRecoveryContext relmap_registration;
 	ClusterRecoveryCheckpointFileV2 relmap_observations[8];
+	ClusterRecoveryBootFileV2 boot_observations[PGRAC_INITDB_BOOT_FILES_V2];
+	struct stat boot_file_identity[PGRAC_INITDB_BOOT_FILES_V2];
 	struct stat side_archive;
 	struct stat side_sources[4], side_targets[4], side_links[4];
 	int side_link_fds[4];
@@ -430,7 +435,7 @@ cluster_initdb_cohort_relmap_prepare_v2(const ClusterSharedConfigRef *config,
 	const PgracInitdbConfigContext *request, const uint8 branch[16],
 	int data_fd, int shared_fd, PgracInitdbRecoveryContext *out)
 {
-	ClusterRecoveryFileIdentityV2 first = {0};
+	ClusterRecoveryFileIdentityV2 first = { 0 }, boot[PGRAC_INITDB_BOOT_FILES_V2];
 	uintptr_t output = (uintptr_t)out;
 	uintptr_t inputs[3] = {(uintptr_t)config, (uintptr_t)request, (uintptr_t)branch};
 	size_t lengths[3] = {sizeof(*config), sizeof(*request), 16};
@@ -452,7 +457,45 @@ cluster_initdb_cohort_relmap_prepare_v2(const ClusterSharedConfigRef *config,
 	first.tablespace_oid = GLOBALTABLESPACE_OID;
 	first.creation_generation = 1;
 	first.registration_generation = 1;
-	return pgrac_initdb_recovery_prepare_v2(&first, request, data_fd, shared_fd, out);
+	/* The original creator assigns distinct births before either child starts.
+	 * Four relmaps occupy generations 1..4; CLOG0 and the actual local undo
+	 * seed are separate original objects, never inferred from a current file. */
+	for (unsigned i = 0; i < PGRAC_INITDB_BOOT_FILES_V2; ++i) {
+		boot[i] = first;
+		boot[i].kind = i == 0 ? CLUSTER_RECOVERY_FILE_CLOG_V2 : CLUSTER_RECOVERY_FILE_UNDO_V2;
+		boot[i].tablespace_oid = 0;
+		boot[i].creation_generation = 5 + i;
+	}
+	return pgrac_initdb_recovery_prepare_files_v2(&first, boot, request, data_fd, shared_fd, out);
+}
+
+bool cluster_initdb_cohort_prepare_v2(const ClusterSharedConfigRef *config,
+									  const PgracInitdbConfigContext *request,
+									  const uint8 branch[16], uint16 origin, int data_fd,
+									  int shared_fd, PgracInitdbRecoveryContext *out)
+{
+	PgracInitdbRecoveryContext founder;
+	ClusterRecoveryFileIdentityV2 clog;
+	uintptr_t output = (uintptr_t)out;
+	const void *inputs[3] = {config, request, branch};
+	const Size sizes[3] = {sizeof(*config), sizeof(*request), 16};
+	for (unsigned i = 0; out && i < 3; i++)
+	{
+		uintptr_t input = (uintptr_t)inputs[i];
+		if (output <= input ? input - output < sizeof(*out) : output - input < sizes[i])
+			return false;
+	}
+	if (!out || !config || !request || !branch || origin >= 128 ||
+		!(config->identity.configured[origin / 64] & (UINT64CONST(1) << (origin % 64))) ||
+		!cluster_initdb_cohort_relmap_prepare_v2(config, request, branch, data_fd, shared_fd,
+												 &founder))
+		return false;
+	clog = founder.boot_files[0];
+	clog.origin = origin;
+	clog.creation_generation = 5 + origin;
+	return pgrac_initdb_recovery_prepare_cohort_v2(&founder.first, &clog,
+												   config->identity.configured, origin, request,
+												   data_fd, shared_fd, out);
 }
 
 static void
@@ -535,6 +578,117 @@ run_child(char *const *args, uint64 creator_pid)
 	run_child_registered(args, creator_pid, NULL);
 }
 
+/* Read only the two actual original BOOT objects. The CLOG directory moves
+ * to the original archive during SIDE routing; never follow its new symlink or
+ * infer an expected identity from file contents. All local FDs close on false. */
+static bool
+creation_boot_read(const InitdbOrigin *origin, unsigned index, bool sync,
+				   ClusterRecoveryBootFileV2 *out, struct stat *identity)
+{
+	ClusterRecoveryFileIdentityV2 expected[PGRAC_INITDB_BOOT_FILES_V2];
+	ClusterRecoveryBootFileV2 observed = { 0 };
+	struct stat dirs[3], before, after, named;
+	const char *parts[3], *name = index == 0 ? "0000" : "seg_0.dat";
+	unsigned count = 0;
+	int fds[3] = { -1, -1, -1 }, parent = origin->data.fd, fd = -1;
+	bool ok = false;
+	if (index >= PGRAC_INITDB_BOOT_FILES_V2
+		|| !pgrac_initdb_recovery_boot_v2(&origin->relmap_registration, expected))
+		return false;
+	if (index == 0) {
+		if (origin->side_routed)
+			parts[count++] = INITDB_SIDE_ARCHIVE;
+		parts[count++] = "pg_xact";
+	} else {
+		parts[count++] = "pg_undo";
+		parts[count++] = "instance_0";
+	}
+	for (unsigned i = 0; i < count; ++i) {
+		fds[i] = openat(parent, parts[i], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (fds[i] < 0 || fstat(fds[i], &dirs[i]) || !owned_directory(&dirs[i]))
+			goto done;
+		parent = fds[i];
+	}
+	fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &before) || !S_ISREG(before.st_mode) || before.st_uid != geteuid()
+		|| before.st_nlink != 1 || (before.st_mode & 0022) || before.st_size <= 0
+		|| (sync && fsync(fd)))
+		goto done;
+	if (!(index == 0 ? cluster_clog_bootstrap_read_v2(fd, &expected[index], &observed)
+					 : cluster_undo_bootstrap_read_v2(fd, &expected[index], &observed))
+		|| !cluster_recovery_boot_file_matches_v2(&expected[index], &observed)
+		|| observed.synced_bytes != (uint64)before.st_size
+		|| (index == 1 && observed.synced_bytes != UNDO_SEGMENT_SIZE_BYTES)
+		|| (index == 0
+			&& (!observed.page.birth_observed
+				|| !FullTransactionIdEquals(observed.page.birth_full_xid,
+											FirstNormalFullTransactionId)))
+		|| fstat(fd, &after) || fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW)
+		|| before.st_dev != after.st_dev || before.st_ino != after.st_ino
+		|| before.st_size != after.st_size || before.st_mode != after.st_mode
+		|| before.st_uid != after.st_uid || after.st_nlink != 1 || after.st_dev != named.st_dev
+		|| after.st_ino != named.st_ino || after.st_size != named.st_size
+		|| after.st_mode != named.st_mode || named.st_nlink != 1)
+		goto done;
+	for (unsigned i = 0; i < count; ++i) {
+		int p = i == 0 ? origin->data.fd : fds[i - 1];
+		if (fstatat(p, parts[i], &named, AT_SYMLINK_NOFOLLOW) || !same_directory(&dirs[i], &named)
+			|| (sync && fsync(fds[i])))
+			goto done;
+	}
+	ok = true;
+done:
+	if (fd >= 0 && close(fd))
+		ok = false;
+	for (unsigned i = 0; i < count; ++i)
+		if (fds[i] >= 0 && close(fds[i]))
+			ok = false;
+	if (ok) {
+		*out = observed;
+		*identity = before;
+	}
+	return ok;
+}
+
+static bool
+creation_boot_current(InitdbOrigin *origin, bool first)
+{
+	ClusterRecoveryBootFileV2 observed[PGRAC_INITDB_BOOT_FILES_V2];
+	struct stat identities[PGRAC_INITDB_BOOT_FILES_V2];
+	PgracInitdbRecoveryContext captured = origin->relmap_registration;
+	if (captured.boot_file_count == 0)
+		return true; /* legacy explicit relmap-only request */
+	directory_current(&origin->data);
+	for (unsigned i = 0; i < captured.boot_file_count; ++i)
+	{
+		const ClusterRecoveryBootFileV2 *old = &origin->boot_observations[i];
+		if (!creation_boot_read(origin, i, first, &observed[i], &identities[i]))
+			return false;
+		if (!first
+			&& (identities[i].st_dev != origin->boot_file_identity[i].st_dev
+				|| identities[i].st_ino != origin->boot_file_identity[i].st_ino
+				|| observed[i].synced_bytes != old->synced_bytes
+				|| memcmp(observed[i].image_digest, old->image_digest, 32)
+				|| observed[i].page.logical_page != old->page.logical_page
+				|| observed[i].page.page_generation != old->page.page_generation
+				|| observed[i].page.birth_observed != old->page.birth_observed
+				|| !FullTransactionIdEquals(observed[i].page.birth_full_xid,
+											old->page.birth_full_xid)
+				|| observed[i].page.page_lsn != old->page.page_lsn
+				|| observed[i].page.metadata_crc != old->page.metadata_crc
+				|| observed[i].page.payload_crc != old->page.payload_crc))
+			return false;
+	}
+	directory_current(&origin->data);
+	if (memcmp(&captured, &origin->relmap_registration, sizeof(captured)))
+		return false;
+	if (first) {
+		memcpy(origin->boot_observations, observed, sizeof(observed));
+		memcpy(origin->boot_file_identity, identities, sizeof(identities));
+	}
+	return true;
+}
+
 static void
 run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 					   const ClusterSharedConfigRef *config, const char *shared,
@@ -585,7 +739,8 @@ run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 	args[count++] = thread;
 	args[count++] = system;
 	args[count++] = configuration;
-	if (node == 0) {
+	if (node == 0 || registration != NULL)
+	{
 		args[count++] = base;
 		args[count++] = storage;
 		args[count++] = incarnation;
@@ -594,7 +749,11 @@ run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 	Assert(count < lengthof(args));
 	if (registration != NULL) {
 		ClusterRecoveryFileIdentityV2 identities[4];
-		if (node != 0 || registration->creator_pid != (uint64)getpid() ||
+		if ((registration->cohort[0] || registration->cohort[1]
+				 ? registration->cohort_origin != node ||
+					   memcmp(registration->cohort, config->identity.configured, 16)
+				 : node != 0) ||
+			registration->creator_pid != (uint64)getpid() ||
 			registration->first.system_identifier != config->identity.system_identifier ||
 			registration->first.database_incarnation != config->identity.database_incarnation ||
 			memcmp(registration->first.storage_uuid, config->identity.storage_uuid, 16) != 0 ||
@@ -609,16 +768,19 @@ run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 	control_read(origin, node + 1, config->identity.system_identifier, true);
 	if (registration != NULL) {
 		int fd = open(shared, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-		bool ok =
-			fd >= 0 &&
-			memcmp(registration, &origin->relmap_registration, sizeof(*registration)) == 0 &&
-			pgrac_initdb_recovery_relmap_observe_v2(
-				&origin->relmap_registration, origin->data.fd, fd, origin->relmap_observations);
+		bool ok = fd >= 0 &&
+				  memcmp(registration, &origin->relmap_registration, sizeof(*registration)) == 0 &&
+				  (node != 0 || pgrac_initdb_recovery_relmap_observe_v2(
+									&origin->relmap_registration, origin->data.fd, fd,
+									origin->relmap_observations));
 		if (fd >= 0 && close(fd))
 			ok = false;
 		if (!ok)
 			refuse("original managed relmap creation cannot be captured completely");
-		origin->managed_relmap = true;
+		if (!creation_boot_current(origin, true))
+			refuse("original BOOT files cannot be synchronized and captured completely");
+		origin->managed_relmap = node == 0;
+		origin->managed_boot = true;
 	}
 }
 
@@ -1080,6 +1242,9 @@ creation_sources_current(const PgracInitdbCohortContext *request,
 													 origins[node].data.fd, roots[1].fd,
 													 origins[node].relmap_observations))
 			refuse("original managed relmap creation changed before ROOT publication");
+		if ((origins[node].managed_boot || origins[node].managed_relmap) &&
+			!creation_boot_current(&origins[node], false))
+			refuse("original BOOT file identity or bytes changed before ROOT publication");
 	}
 	creation_tree_recheck(roots[1].fd, derived, data);
 	creation_tree_recheck(roots[3].fd, false, undo);
@@ -1120,7 +1285,7 @@ static void
 creation_legacy_format_current(const InitdbOrigin *origins)
 {
 	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node)
-		if (origins[node].managed_relmap)
+		if (origins[node].managed_relmap || origins[node].managed_boot)
 			refuse("managed creation requires complete ROOTv4 file registration");
 }
 
@@ -1137,7 +1302,7 @@ creation_relmap_registry_valid(const InitdbOrigin *origins,
 		if (origins[node].managed_relmap)
 			return false;
 	if (!o->managed_relmap)
-		return true;
+		return !(o->relmap_registration.cohort[0] || o->relmap_registration.cohort[1]);
 	if (!pgrac_initdb_recovery_relmaps_v2(&o->relmap_registration, identities))
 		return false;
 	for (unsigned j = 0; j < 8; ++j) {
@@ -1180,6 +1345,95 @@ creation_relmap_registry_valid(const InitdbOrigin *origins,
 	}
 	return found == 255;
 }
+/* A relmap-only child cannot become a complete managed creation. Every
+ * initial CLOG/TT entry must be the original producer's complete observation. */
+static bool
+creation_boot_registry_valid(const InitdbOrigin *origins, const ClusterRecoveryRegistryV2 *r)
+{
+	const InitdbOrigin *o = &origins[0];
+	ClusterRecoveryFileIdentityV2 expected[PGRAC_INITDB_BOOT_FILES_V2];
+	unsigned found = 0;
+	if (o->relmap_registration.cohort[0] || o->relmap_registration.cohort[1])
+	{
+		unsigned expected_count = 0, found_count = 0;
+		bool seen[128] = {false};
+		const uint64 *cohort = o->relmap_registration.cohort;
+		for (unsigned n = 0; n < 128; n++)
+		{
+			bool selected = (cohort[n / 64] & (UINT64CONST(1) << (n % 64))) != 0;
+			const InitdbOrigin *child = &origins[n];
+			ClusterRecoveryFileIdentityV2 ids[2];
+			if (!selected)
+			{
+				if (child->managed_boot)
+					return false;
+				continue;
+			}
+			if (!child->managed_boot || child->relmap_registration.cohort_origin != n ||
+				memcmp(child->relmap_registration.cohort, cohort, 16) ||
+				!pgrac_initdb_recovery_boot_v2(&child->relmap_registration, ids) ||
+				!cluster_recovery_boot_file_matches_v2(&ids[0], &child->boot_observations[0]))
+				return false;
+			expected_count++;
+		}
+		for (uint64 i = 0; i < r->coverage.file_count; i++)
+		{
+			const ClusterRecoveryCheckpointFileV2 *f = &r->coverage.files[i];
+			const ClusterRecoveryBootFileV2 *b;
+			uint8 encoded[128];
+			unsigned n = f->identity.origin;
+			if (f->identity.kind == CLUSTER_RECOVERY_FILE_RELMAP_V2)
+				continue;
+			if (f->identity.kind != CLUSTER_RECOVERY_FILE_CLOG_V2 || n >= 128 || seen[n] ||
+				!(cohort[n / 64] & (UINT64CONST(1) << (n % 64))))
+				return false;
+			b = &origins[n].boot_observations[0];
+			if (!cluster_recovery_file_identity_encode_v2(&b->identity, encoded, sizeof(encoded)) ||
+				!cluster_recovery_file_identity_matches_v2(encoded, sizeof(encoded),
+														   &f->identity) ||
+				f->copy_index || f->copy_count != 1 || f->page_count != 1 || f->first_page ||
+				f->synced_bytes != b->synced_bytes || memcmp(f->image_digest, b->image_digest, 32))
+				return false;
+			seen[n] = true;
+			found_count++;
+		}
+		return found_count == expected_count;
+	}
+
+	if (!o->managed_relmap)
+		return true;
+	if (!pgrac_initdb_recovery_boot_v2(&o->relmap_registration, expected))
+		return false;
+	for (unsigned i = 0; i < PGRAC_INITDB_BOOT_FILES_V2; ++i)
+		if (!cluster_recovery_boot_file_matches_v2(&expected[i], &o->boot_observations[i]))
+			return false;
+	for (uint64 i = 0; i < r->coverage.file_count; ++i) {
+		const ClusterRecoveryCheckpointFileV2 *f = &r->coverage.files[i];
+		uint8 encoded[128];
+		unsigned j;
+		if (f->identity.kind != CLUSTER_RECOVERY_FILE_CLOG_V2
+			&& f->identity.kind != CLUSTER_RECOVERY_FILE_UNDO_V2)
+			continue;
+		for (j = 0; j < PGRAC_INITDB_BOOT_FILES_V2; ++j) {
+			const ClusterRecoveryBootFileV2 *b = &o->boot_observations[j];
+			if (!cluster_recovery_file_identity_encode_v2(&expected[j], encoded, sizeof(encoded))
+				|| !cluster_recovery_file_identity_matches_v2(encoded, sizeof(encoded),
+															  &f->identity))
+				continue;
+			if ((found & (1U << j)) || f->copy_index != 0 || f->copy_count != 1
+				|| f->synced_bytes != b->synced_bytes || f->first_page != b->page.logical_page
+				|| f->page_count != (j == 0 ? 1 : UNDO_SEGMENT_SIZE_BYTES / BLCKSZ)
+				|| memcmp(f->image_digest, b->image_digest, 32))
+				return false;
+			found |= 1U << j;
+			break;
+		}
+		if (j == PGRAC_INITDB_BOOT_FILES_V2)
+			return false;
+	}
+	return found == 3;
+}
+
 /* First registration only, from the original complete creation cohort. File
  * observations must already be supplied by that creator's managed producers;
  * neither this predicate nor the registry codec supplies their custody. Bounds
@@ -1207,7 +1461,8 @@ creation_registry_valid(const ClusterSharedConfigRef *config, const InitdbOrigin
 		|| memcmp(root->header.v2.config_sha256, config->sha256, 32)
 		|| r->redo_branch_generation != 1 || r->coverage.control_generation != 1
 		|| r->coverage.registration_generation != 1 || r->coverage.checkpoint_generation != 1
-		|| r->coverage.commit_generation != 1 || !creation_relmap_registry_valid(origins, r))
+		|| r->coverage.commit_generation != 1 || !creation_relmap_registry_valid(origins, r)
+		|| !creation_boot_registry_valid(origins, r))
 		return false;
 	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node) {
 		const InitdbOrigin *o = &origins[node];
@@ -1287,6 +1542,94 @@ creation_registry_valid(const ClusterSharedConfigRef *config, const InitdbOrigin
 	return true;
 }
 
+typedef struct InitdbRegistration
+{
+	ClusterRecoveryRegistryV2 registry;
+	ClusterRecoveryCheckpointSourceV2 sources[128];
+	ClusterRecoveryCheckpointFileSourceV2 intervals[128];
+	ClusterRecoveryCheckpointFileV2 files[8 + 128];
+} InitdbRegistration;
+
+static bool creation_registration_build(const ClusterSharedConfigRef *config,
+										const InitdbOrigin *origins, const uint8 branch[16],
+										InitdbRegistration *out, Size budget)
+{
+	InitdbRegistration *result = palloc0(sizeof(*result));
+	ClusterRecoveryRegistryV2 *r = &result->registry;
+	bool ok = false;
+	Size length;
+	r->system_identifier = config->identity.system_identifier;
+	r->database_incarnation = config->identity.database_incarnation;
+	memcpy(r->storage_uuid, config->identity.storage_uuid, 16);
+	memcpy(r->redo_branch_uuid, branch, 16);
+	r->redo_branch_generation = 1;
+	r->coverage_format_version = 4;
+	r->coverage.control_generation = r->coverage.registration_generation = 1;
+	r->coverage.checkpoint_generation = r->coverage.commit_generation = 1;
+	r->coverage.sources = result->sources;
+	r->coverage.files = result->files;
+	for (unsigned n = 0; n < 128; n++)
+	{
+		const InitdbOrigin *o = &origins[n];
+		ClusterRecoveryCheckpointSourceV2 *v;
+		uint64 at = r->coverage.source_count;
+		if (!(config->identity.configured[n / 64] & (UINT64CONST(1) << (n % 64))))
+			continue;
+		if (!o->managed_boot || o->relmap_registration.cohort_origin != n ||
+			memcmp(o->relmap_registration.cohort, config->identity.configured, 16) ||
+			memcmp(o->relmap_registration.first.redo_branch_uuid, branch, 16))
+			goto done;
+		v = &result->sources[at];
+		v->source.claim.identity = o->input.snapshot.identity;
+		v->source.claim.database_incarnation = r->database_incarnation;
+		v->source.claim.max_config_generation = 1;
+		memcpy(v->source.claim.claim_sha256, o->input.refs.claim_sha256, 32);
+		v->source.timeline = o->control.checkPointCopy.ThisTimeLineID;
+		v->checkpoint = o->control.checkPointCopy;
+		v->checkpoint_start = o->checkpoint.checkpoint_start;
+		v->checkpoint_end = o->checkpoint.checkpoint_end;
+		v->redo_start = v->checkpoint.redo;
+		v->replay_end = v->checkpoint_end;
+		result->intervals[at].source_index = at;
+		result->intervals[at].redo_start = v->redo_start;
+		result->intervals[at].replay_end = v->replay_end;
+		r->coverage.source_count++;
+	}
+	for (unsigned i = 0; i < 8; i++)
+		result->files[i] = origins[0].relmap_observations[i];
+	r->coverage.file_count = 8;
+	for (unsigned n = 0; n < 128; n++)
+	{
+		const ClusterRecoveryBootFileV2 *b = &origins[n].boot_observations[0];
+		ClusterRecoveryCheckpointFileV2 *f;
+		if (!(config->identity.configured[n / 64] & (UINT64CONST(1) << (n % 64))))
+			continue;
+		f = &result->files[r->coverage.file_count++];
+		f->identity = b->identity;
+		f->synced_bytes = b->synced_bytes;
+		f->copy_count = 1;
+		f->page_count = 1;
+		memcpy(f->image_digest, b->image_digest, 32);
+	}
+	for (uint64 i = 0; i < r->coverage.file_count; i++)
+	{
+		result->files[i].source_count = r->coverage.source_count;
+		result->files[i].sources = result->intervals;
+	}
+	if (!creation_relmap_registry_valid(origins, r) || !creation_boot_registry_valid(origins, r) ||
+		!cluster_recovery_registry_size_v2(r, budget, &length))
+		goto done;
+	*out = *result;
+	out->registry.coverage.sources = out->sources;
+	out->registry.coverage.files = out->files;
+	for (uint64 i = 0; i < out->registry.coverage.file_count; i++)
+		out->files[i].sources = out->intervals;
+	ok = true;
+done:
+	pfree(result);
+	return ok;
+}
+
 static void
 creation_registry_current(const InitdbDirectory *global, const ClusterSharedConfigRef *config,
 						  const InitdbOrigin *origins, const ControlRootImage *root,
@@ -1302,9 +1645,10 @@ creation_registry_current(const InitdbDirectory *global, const ClusterSharedConf
 
 /* Same creator, same source/derived revalidation and exclusive object writes.
  * The optional complete managed registration is dormant until all original
- * family producers supply it. Main continues to pass NULL, retaining its v3
- * refusal for a managed child. No startup/admission/coverage authority escapes.
- * FATAL terminates this dedicated creator; uncertain objects are never erased. */
+ * family producers supply it. The original Main supplies the complete cohort;
+ * an isolated NULL caller retains its v3 refusal for a managed child. No startup/admission/coverage
+ * authority escapes. FATAL terminates this dedicated creator; uncertain objects are never erased.
+ */
 static void
 creation_root_publish(const PgracInitdbCohortContext *request, const ClusterSharedConfigRef *config,
 					  InitdbDirectory roots[4], InitdbOrigin *origins,
@@ -1553,6 +1897,9 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	ClusterInitdbCommon common;
 	char initdb[MAXPGPATH], generation[64], name[32];
 	uint64 incarnation;
+	uint8 branch[16];
+	InitdbRegistration *registration;
+	const Size registry_budget = 1024 * 1024;
 	const char *paths[4];
 
 	if (argc != 2 || IsUnderPostmaster)
@@ -1589,6 +1936,11 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	for (int i = 0; i < 4; i++)
 		create_directory(&roots[i]);
 	origins = palloc0(sizeof(*origins) * CLUSTER_CONTROL_ROOT_RECORD_COUNT);
+	registration = palloc0(sizeof(*registration));
+	if (!pg_strong_random(branch, sizeof(branch)))
+		refuse("cannot allocate original redo branch");
+	branch[6] = (branch[6] & 0x0f) | 0x40;
+	branch[8] = (branch[8] & 0x3f) | 0x80;
 	/* Create and hold the entire requested namespace before starting a child. */
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
 		InitdbOrigin *origin = &origins[node];
@@ -1601,9 +1953,13 @@ ClusterInitdbCohortMain(int argc, char **argv)
 		create_child(&origin->thread, generation, &origin->wal);
 	}
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		PgracInitdbRecoveryContext child;
 		if (!(ref->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64))))
 			continue;
-		run_origin(initdb, &request, ref, roots[1].path, &origins[node], node, NULL);
+		if (!cluster_initdb_cohort_prepare_v2(ref, &request.config, branch, node,
+											  origins[node].data.fd, roots[1].fd, &child))
+			refuse("cannot bind complete original BOOT inventory");
+		run_origin(initdb, &request, ref, roots[1].path, &origins[node], node, &child);
 		for (int i = 0; i < 4; i++)
 			directory_current(&roots[i]);
 	}
@@ -1630,7 +1986,10 @@ ClusterInitdbCohortMain(int argc, char **argv)
 			refuse("cannot persist original cohort directory entries");
 	}
 	request_current(&request, ref);
-	create_root_objects(&request, roots, origins, ref, &common, incarnation, NULL, 0);
+	if (!creation_registration_build(ref, origins, branch, registration, registry_budget))
+		refuse("cannot build complete original BOOT registration");
+	create_root_objects(&request, roots, origins, ref, &common, incarnation,
+						&registration->registry, registry_budget);
 	printf("Shared cohort created; shared startup remains closed.\n");
 	exit(0);
 }

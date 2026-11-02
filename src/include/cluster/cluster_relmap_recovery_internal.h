@@ -13,6 +13,16 @@
 #define CLUSTER_RELMAP_RECOVERY_INTERNAL_H
 #include "cluster/cluster_relmap_retention.h"
 
+/* One bounded allocation per segment; the coordinator reserves the complete
+ * chain against its original plan budget before any file I/O. */
+#define CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS 64
+typedef struct ClusterRelmapRecoverySegment {
+	struct ClusterRelmapRecoverySegment *next;
+	bool attempted[CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS];
+	bool staged[CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS];
+	ClusterRelmapV2Image images[CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS];
+} ClusterRelmapRecoverySegment;
+
 /* Private plan-owned storage, never registered as an ordinary directory.
  * Count is conservative debt even after refusal/ERROR. It remains BUILDING
  * forever; restored only means this entire declared batch has been copied.
@@ -21,10 +31,16 @@ typedef struct ClusterRelmapRecoveryPins {
 	ClusterRelmapRetentionState state;
 	uint32 expected, count;
 	bool restored, transferred;
-	bool attempted[CLUSTER_RELMAP_RETENTION_CAPACITY];
-	bool staged[CLUSTER_RELMAP_RETENTION_CAPACITY];
-	ClusterRelmapV2Image images[CLUSTER_RELMAP_RETENTION_CAPACITY];
+	bool attempted[CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS];
+	bool staged[CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS];
+	ClusterRelmapV2Image images[CLUSTER_RELMAP_RECOVERY_SEGMENT_ITEMS];
+	ClusterRelmapRecoverySegment *segments;
 } ClusterRelmapRecoveryPins;
+
+extern ClusterRelmapV2Image *cluster_relmap_recovery_image_at(
+	ClusterRelmapRecoveryPins *pins, uint32 index);
+extern bool cluster_relmap_recovery_output_distinct(const ClusterRelmapRecoveryPins *pins,
+	const void *out, Size bytes);
 
 extern bool cluster_relmap_recovery_check(const ClusterRelmapRecoveryPins *pins,
 	const ClusterRelmapV2Image *image);

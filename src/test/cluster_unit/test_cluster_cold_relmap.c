@@ -301,6 +301,8 @@ cold_map_end(void)
 	cleanup();
 }
 
+#include "test_cluster_relmap_create_declaration.h"
+
 UT_TEST(test_relmap_runs_between_other_source_pages_and_duplicate_does_not_write)
 {
 	ClusterColdStepV1 step;
@@ -579,10 +581,119 @@ UT_TEST(test_relmap_final_receipt_refuses_missing_or_substituted_side)
 	}
 }
 
+/* A planned creation cannot become an empty pending batch or invoke the
+ * legacy stage executor while its independent one-shot receipt is missing. */
+UT_TEST(test_creation_plan_cannot_borrow_pending_execution_or_completion)
+{
+	ClusterColdRelmapCreateInputV1 create = {0};
+	ClusterColdRecordV1 record;
+	ClusterColdStepV1 step;
+	const ClusterColdRelmapCreateInputV1 *saved;
+	unsigned before;
+	cold_map_setup();
+	cluster_cold_plan_destroy_v1(&replay.plan);
+	replay.participant_count = replay.replay_count = 1;
+	create.cut = replay.participants[0];
+	create.source = replay.sources[0];
+	create.frame = declared.frame;
+	create.frame.info = XLOG_RELMAP_CREATE_V1;
+	create.creation.identity = (ClusterRecoveryFileIdentityV2){0};
+	create.creation.identity.kind = CLUSTER_RECOVERY_FILE_RELMAP_V2;
+	create.creation.identity.format_id = CLUSTER_RECOVERY_FORMAT_ID_V2;
+	create.creation.identity.format_version = CLUSTER_RECOVERY_FORMAT_VERSION_V2;
+	create.creation.identity.system_identifier = identity.system_identifier;
+	create.creation.identity.database_incarnation = identity.database_incarnation;
+	memcpy(create.creation.identity.storage_uuid, create.source.claim.identity.storage_uuid, 16);
+	create.creation.identity.redo_branch_uuid[0] = 9;
+	create.creation.identity.redo_branch_generation = 1;
+	create.creation.identity.redo_timeline = 1;
+	create.creation.identity.database_oid = 2000;
+	create.creation.identity.tablespace_oid = DEFAULTTABLESPACE_OID;
+	create.creation.identity.origin = 3;
+	create.creation.identity.creation_generation = 101;
+	create.creation.identity.registration_generation = 1;
+	create.creation.batch_uuid[0] = 7;
+	create.creation.committed = declared.staged.pending;
+	record = records[0][0];
+	record.info = XLOG_RELMAP_CREATE_V1;
+	record.relmap_image = NULL;
+	record.relmap_create = &create.creation;
+	record.relmap_dbid = 2000;
+	record.relmap_tsid = DEFAULTTABLESPACE_OID;
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(&create.cut, 1, 4194304, &replay.plan), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(test_create_predeclare(replay.plan, &create, 1), CLUSTER_COLD_OK);
+	{
+		ClusterColdRelmapInputV1 pending = declared;
+		pending.staged.identity.shared = false;
+		pending.staged.identity.dbid = 2000;
+		UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, &pending, 1),
+			CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	}
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_create_bind_v1(replay.plan, 0, &create.source, &record), 0);
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(replay.plan, 0, &record), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(replay.plan, cold_map_observe, NULL, NULL), CLUSTER_COLD_OK);
+	UT_ASSERT(cluster_cold_plan_step_v1(replay.plan, 0, &step));
+	saved = cluster_cold_plan_relmap_create_step_v1(replay.plan, &step);
+	UT_ASSERT_NOT_NULL(saved);
+	UT_ASSERT(!cold_relmap_output_distinct(&replay, saved, sizeof(*saved)));
+	before = writes;
+	UT_ASSERT(!cluster_cold_typed_relmap_record_v1(&replay,
+		(ClusterRecoveryFencePlan *)&replay, &step, &map_reader));
+	UT_ASSERT(!cluster_cold_typed_relmap_ready_v1(&replay, (ClusterRecoveryFencePlan *)&replay));
+	UT_ASSERT_EQ(cluster_cold_typed_relmap_replay_count_v1(&replay), UINT32_MAX);
+	UT_ASSERT_EQ(writes, before);
+	cold_map_end();
+}
+
+#include "test_cluster_cold_relmap_pending.inc"
+UT_TEST(test_relmap_large_declaration_is_whole_and_budgeted)
+{
+	for (unsigned count = 64; count <= 128; count += count == 64 ? 1 : 63) {
+		ClusterColdRelmapInputV1 *batch = calloc(count, sizeof(*batch));
+		cold_map_setup();
+		for (uint32 i = 0; i < count; ++i) {
+			batch[i] = declared;
+			batch[i].staged.identity.shared = false;
+			batch[i].staged.identity.dbid = 1000 + i;
+		}
+		UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, batch, count), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(replay.plan->relmap_count, count);
+		if (replay.plan->relmap_count == count)
+			UT_ASSERT_EQ(replay.plan->relmap_inputs[count - 1].input.staged.identity.dbid, 999 + count);
+		free(batch);
+		cold_map_end();
+	}
+}
+
+UT_TEST(test_relmap_large_batch_rejects_whole_tail_and_budget_before_copy)
+{
+	const uint32 count = 65;
+	ClusterColdRelmapInputV1 *batch = calloc(count, sizeof(*batch));
+	Size used;
+	cold_map_setup();
+	used = replay.plan->memory_used;
+	for (uint32 i = 0; i < count; ++i) {
+		batch[i] = declared;
+		batch[i].staged.identity.shared = false;
+		batch[i].staged.identity.dbid = 1000 + i;
+	}
+	batch[count - 1].staged.pending_owner.boot_incarnation = 0;
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, batch, count), CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	UT_ASSERT(replay.plan->relmap_inputs == NULL && replay.plan->relmap_count == 0);
+	UT_ASSERT_EQ(replay.plan->memory_used, used);
+	batch[count - 1].staged.pending_owner = declared.staged.pending_owner;
+	replay.plan->memory_budget = used + count * sizeof(ColdRelmapInput) - 1;
+	UT_ASSERT_EQ(cluster_cold_plan_relmap_declare_v1(replay.plan, batch, count), CLUSTER_COLD_CAPACITY);
+	UT_ASSERT(replay.plan->relmap_inputs == NULL && replay.plan->relmap_count == 0);
+	UT_ASSERT_EQ(replay.plan->memory_used, used);
+	free(batch); cold_map_end();
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(26);
 	UT_RUN(test_relmap_runs_between_other_source_pages_and_duplicate_does_not_write);
 	UT_RUN(test_relmap_without_declared_participant_keeps_structural_refusal);
 	UT_RUN(test_relmap_missing_capture_never_seals_or_writes);
@@ -598,6 +709,17 @@ main(void)
 	UT_RUN(test_relmap_complete_sealed_native_header_is_required_before_stage);
 	UT_RUN(test_relmap_side_or_header_late_loss_cannot_retry_durable_pair);
 	UT_RUN(test_relmap_final_receipt_refuses_missing_or_substituted_side);
+	UT_RUN(test_creation_plan_cannot_borrow_pending_execution_or_completion);
+	UT_RUN(test_pending_conjunct_does_not_complete_unconsumed_creation);
+	UT_RUN(test_creation_only_has_empty_pending_component_and_old_gates_refuse);
+	UT_RUN(test_pending_count_requires_complete_original_receipts_and_metadata);
+	UT_RUN(test_pending_readiness_rejects_late_source_side_pin_or_pair_change);
+	UT_RUN(test_pending_readiness_owner_errors_are_sticky_without_rewrite);
+	UT_RUN(test_pending_only_plan_keeps_original_completion_behavior);
+	UT_RUN(test_pending_input_preserves_original_receipt_without_consuming_creation);
+	UT_RUN(test_pending_input_refuses_empty_or_changed_complete_source);
+	UT_RUN(test_relmap_large_declaration_is_whole_and_budgeted);
+	UT_RUN(test_relmap_large_batch_rejects_whole_tail_and_budget_before_copy);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

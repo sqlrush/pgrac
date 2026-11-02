@@ -78,10 +78,12 @@ UT_TEST(managed_intent_descriptor_reports_complete_identity)
 
 UT_TEST(legacy_update_descriptor_and_identity_remain_unchanged)
 {
+	char legacy_bytes[MinSizeOfRelmapUpdate + sizeof(RelMapFile)] = {0};
 	xl_relmap_update legacy = {0};
 	prepare(false); legacy.dbid = 42; legacy.tsid = 1663; legacy.nbytes = 524;
 	decoded.header.xl_info = XLOG_RELMAP_UPDATE;
-	decoded.main_data = (char *)&legacy; decoded.main_data_len = MinSizeOfRelmapUpdate;
+	memcpy(legacy_bytes, &legacy, MinSizeOfRelmapUpdate);
+	decoded.main_data = legacy_bytes; decoded.main_data_len = sizeof(legacy_bytes);
 	relmap_desc(&description, &reader);
 	UT_ASSERT(strcmp(desc_text, "database 42 tablespace 1663 size 524") == 0);
 	UT_ASSERT(strcmp(relmap_identify(0), "UPDATE") == 0);
@@ -132,8 +134,8 @@ UT_TEST(managed_block_or_page_edge_records_are_invalid)
 
 UT_TEST(unknown_opcode_stays_unknown_without_partial_description)
 {
-	prepare_wal_intent(); decoded.header.xl_info = 0x20; relmap_desc(&description, &reader);
-	UT_ASSERT_EQ(description.len, 0); UT_ASSERT(relmap_identify(0x20) == NULL);
+	prepare_wal_intent(); decoded.header.xl_info = 0x30; relmap_desc(&description, &reader);
+	UT_ASSERT_EQ(description.len, 0); UT_ASSERT(relmap_identify(0x30) == NULL);
 }
 
 int
