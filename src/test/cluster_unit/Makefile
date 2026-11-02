@@ -19182,6 +19182,31 @@ test_cluster_control_registry_batches: test_cluster_control_relmap_selection.c \
 	test_cluster_control_file_selection.c \
 	$(top_srcdir)/src/backend/cluster/cluster_recovery_anchor_private.h
 
+# Canonical PREPARED bytes are tested separately from owner admission/publication.
+TESTS += test_cluster_control_debt_wire
+all: test_cluster_control_debt_wire
+test_cluster_control_debt_wire: test_cluster_control_debt_wire.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_reservations.h cluster_registry_common_test.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-debt-wire
+.PHONY: clean-control-debt-wire
+clean-control-debt-wire:
+	rm -f test_cluster_control_debt_wire test_cluster_control_debt_wire.d
+
+cluster_control_registry_original.o: $(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+
 # Full persistent reservation projection and original creator borrowing.
 TESTS += test_cluster_control_native_reservations
 all: test_cluster_control_native_reservations
