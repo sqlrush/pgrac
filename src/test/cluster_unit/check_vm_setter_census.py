@@ -15,6 +15,7 @@ VAC = "src/backend/access/heap/vacuumlazy.c"
 APIS = ("visibilitymap_set", "visibilitymap_set_retry_aware", "visibilitymap_set_empty",
         "visibilitymap_set_locked", "visibilitymap_set_versioned_redo", "vm_image_versioned_redo",
         "log_heap_visible")
+TOKEN = re.compile(r"\b(" + "|".join(APIS) + r")\b")
 CALL = re.compile(r"\b(" + "|".join(APIS) + r")\s*\(")
 DECLARATION = re.compile(r"(?m)^(?:extern|static)\s+(?:void|bool|XLogRecPtr)\s+(?:"
                          + "|".join(APIS) + r")\([^;{}]*\);\s*$")
@@ -58,7 +59,7 @@ def bodies(text):
 def audit(sources):
     errors, edges, table = [], collections.Counter(), {}
     for path, source in sources.items():
-        if not CALL.search(source) and path != VM:
+        if not TOKEN.search(source) and path != VM:
             continue
         functions = bodies(source)
         table[path] = functions
@@ -69,6 +70,9 @@ def audit(sources):
         # This also rejects a new inline/single-line body or continued macro
         # rather than silently omitting it from the closed owner list.
         text = clean(source)
+        for token in TOKEN.finditer(text):
+            if not re.match(r"\s*\(", text[token.end():]):
+                errors.append("indirect setter: " + path + ":" + token[1])
         declarations = [(m.start(), m.end()) for m in DECLARATION.finditer(text)]
         for call in CALL.finditer(text):
             if not any(start <= call.start() < end for _, start, end in functions.values()) \
@@ -164,6 +168,34 @@ def run(root):
         bad = audit(changed)
         tests.append(("reject an unowned setter in a " + label,
                       any(e.startswith("unowned setter:") for e in bad), bad))
+    # Every publisher API must remain visible to the closed owner census.
+    # An indirect reference cannot be certified by its eventual call spelling.
+    for label, template in [
+        ("function alias", "#define PUBLISH_ALIAS {api}\n"),
+        ("continued alias", "#define PUBLISH_ALIAS \\\n{api}\n"),
+        ("function pointer", "void (*publish_alias)(void) = {api};\n"),
+        ("parenthesized call", "void\nnew_publisher(void)\n{{\n({api})(0);\n}}\n"),
+        ("address reference", "void *publish_alias = &{api};\n"),
+    ]:
+        failures = []
+        for api in APIS:
+            changed = dict(source)
+            changed["contrib/new_publisher/new_publisher.h"] = template.format(api=api)
+            bad = audit(changed)
+            if "indirect setter: contrib/new_publisher/new_publisher.h:" + api not in bad:
+                failures.append("accepted indirect publisher: " + api)
+        tests.append(("reject indirect publisher references: " + label, not failures, failures))
+    changed = dict(source)
+    changed["contrib/new_publisher/new_publisher.c"] = (
+        "/* visibilitymap_set_empty is documentation, not a call. */\n"
+        "const char *note = \"visibilitymap_set_locked\";\n"
+        "// log_heap_visible is documentation too.\n")
+    bad = audit(changed)
+    tests.append(("ignore publisher names in comments and strings", not bad, bad))
+    changed = dict(source)
+    changed["contrib/new_publisher/new_publisher.h"] = "extern void visibilitymap_set(void);\n"
+    bad = audit(changed)
+    tests.append(("retain ordinary publisher declarations", not bad, bad))
     changed = dict(source)
     changed[VM] += "\nvoid\nunregistered_vm_write(void)\n{\nmap[byte] |= flags;\n}\n"
     bad = audit(changed)
