@@ -234,6 +234,7 @@ UT_TEST(test_t18_l176_amend_symbol_present)
 int
 main(void)
 {
+	UT_PLAN(18);
 	UT_RUN(test_t1_hint_msg_sizeof_32);
 	UT_RUN(test_t2_key_offset_8);
 	UT_RUN(test_t3_msg_version_v1);
