@@ -2480,11 +2480,17 @@ cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, PcmLockMode requested_m
 						out_base->resource_x_activation_generation))
 			result = CLUSTER_PCM_OWN_BUSY;
 		else if (requested_mode == PCM_LOCK_MODE_S && out_base->pcm_state == PCM_STATE_N
-				 && ((out_base->semantic_buf_state & BM_IO_IN_PROGRESS) != 0
-					 || (pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) != 0))
+				 && ((pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) != 0
+					 || ((out_base->semantic_buf_state & BM_IO_IN_PROGRESS) != 0
+						 && ((out_base->semantic_buf_state & BM_VALID) != 0
+							 || out_base->buffer_type != BUF_TYPE_CURRENT
+							 || !ResourceOwnerHasBufferIO(CurrentResourceOwner,
+								 BufferDescriptorGetBuffer(buf))))))
 		{
-			/* The existing physical writer owns this IO. Wait before making
-			 * our GP, so cancellation cannot adopt or abort somebody else's IO. */
+			/* StartBufferIO registers our first input IO before source admission.
+			 * Only that exact owner may carry its invalid CURRENT buffer into GP.
+			 * A physical write or anybody else's IO must finish first, so our
+			 * cancellation cannot adopt or abort that IO. */
 			result = CLUSTER_PCM_OWN_BUSY;
 			*wait_reason = CLUSTER_PCM_GRANT_WAIT_LIVE_RESERVATION;
 		}

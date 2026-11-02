@@ -289,6 +289,88 @@ UT_TEST(test_cancel_waiting_for_existing_write_does_not_touch_its_native_IO)
 	UT_ASSERT_EQ(ordinary_sends, 0); UT_ASSERT_EQ(ordinary_panics, 0);
 	rl_release();
 }
+UT_TEST(test_first_fill_reserves_while_owning_its_original_input_IO)
+{
+	ClusterPcmOwnSnapshot base;
+	ClusterPcmGrantBeginWaitReason reason;
+	ClusterPcmOwnResult result;
+	uint64 token = 0, prior_token;
+	uint32 state;
+	bool covered = true;
+
+	rl_start(1, 2);
+	UT_ASSERT_EQ(request_buf.buffer_type, BUF_TYPE_CURRENT);
+	pg_atomic_fetch_and_u32(&request_buf.state, ~BM_VALID);
+	pg_atomic_fetch_or_u32(&request_buf.state, BM_IO_IN_PROGRESS);
+	ResourceOwnerEnlargeBufferIOs(CurrentResourceOwner);
+	ResourceOwnerRememberBufferIO(CurrentResourceOwner, 1);
+	state = pg_atomic_read_u32(&request_buf.state);
+	prior_token = pg_atomic_read_u64(&request_own.reservation_token);
+	result = cluster_pcm_own_begin_grant_reservation(&request_buf, PCM_LOCK_MODE_S,
+		&base, &token, &covered, &reason);
+	UT_ASSERT_EQ(result, CLUSTER_PCM_OWN_OK);
+	UT_ASSERT(!covered);
+	UT_ASSERT_EQ(token, prior_token + 1);
+	UT_ASSERT_EQ(reason, CLUSTER_PCM_GRANT_WAIT_NONE);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state), state);
+	UT_ASSERT(ResourceOwnerHasBufferIO(original_io_owner, 1));
+	if (result == CLUSTER_PCM_OWN_OK) {
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
+		UT_ASSERT_EQ(cluster_pcm_own_abort_grant_reservation(&request_buf, &base, token),
+			CLUSTER_PCM_OWN_OK);
+		/* Retiring a reservation neither completes nor adopts native IO. */
+		UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state), state);
+		UT_ASSERT(ResourceOwnerHasBufferIO(original_io_owner, 1));
+	}
+	ResourceOwnerForgetBufferIO(original_io_owner, 1);
+	rl_release();
+}
+UT_TEST(test_first_fill_never_adopts_foreign_IO_writeback_or_live_reservations)
+{
+	for (unsigned scenario = 0; scenario < 9; scenario++) {
+		ClusterPcmOwnSnapshot base;
+		ClusterPcmGrantBeginWaitReason reason;
+		ClusterPcmOwnEntry before;
+		uint64 token = 0;
+		uint32 state;
+		bool covered = true;
+
+		rl_start(1, 2);
+		pg_atomic_fetch_and_u32(&request_buf.state, ~BM_VALID);
+		pg_atomic_fetch_or_u32(&request_buf.state, BM_IO_IN_PROGRESS);
+		ResourceOwnerEnlargeBufferIOs(original_io_owner);
+		ResourceOwnerRememberBufferIO(original_io_owner, 1);
+		if (scenario == 0) CurrentResourceOwner = NULL;
+		if (scenario == 1 || scenario == 2) {
+			/* A parent's registration is not this child's IO ownership. */
+			CurrentResourceOwner = ResourceOwnerCreate(original_io_owner, "other-IO-owner");
+			if (scenario == 2) {
+				ResourceOwnerEnlargeBufferIOs(CurrentResourceOwner);
+				ResourceOwnerRememberBufferIO(CurrentResourceOwner, 2);
+			}
+		}
+		if (scenario == 3 || scenario == 4)
+			pg_atomic_fetch_or_u32(&request_buf.state, BM_VALID);
+		if (scenario == 3 || scenario == 5)
+			pg_atomic_write_u64(&request_own.write_io_generation, 1);
+		if (scenario == 6)
+			pg_atomic_write_u32(&request_own.flags, PCM_OWN_FLAG_GRANT_PENDING);
+		if (scenario == 7)
+			pg_atomic_write_u32(&request_own.flags, PCM_OWN_FLAG_REVOKING);
+		if (scenario == 8) request_buf.buffer_type = BUF_TYPE_PI;
+		before = request_own; state = pg_atomic_read_u32(&request_buf.state);
+		UT_ASSERT_EQ(cluster_pcm_own_begin_grant_reservation(&request_buf, PCM_LOCK_MODE_S,
+			&base, &token, &covered, &reason), CLUSTER_PCM_OWN_BUSY);
+		UT_ASSERT(!covered); UT_ASSERT_EQ(token, 0);
+		UT_ASSERT_EQ(reason, CLUSTER_PCM_GRANT_WAIT_LIVE_RESERVATION);
+		request_native_unchanged(&before, state);
+		UT_ASSERT(ResourceOwnerHasBufferIO(original_io_owner, 1));
+		if (scenario == 2) ResourceOwnerForgetBufferIO(CurrentResourceOwner, 2);
+		CurrentResourceOwner = original_io_owner;
+		ResourceOwnerForgetBufferIO(original_io_owner, 1);
+		rl_release();
+	}
+}
 UT_TEST(test_PI_wait_cancel_keeps_original_PI_and_quiets_prepared_E)
 {
 	ClusterPcmLocalPiSnapshotV1 after;
@@ -352,7 +434,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(15);
+	UT_PLAN(17);
 	UT_RUN(test_ordinary_resident_sources_install_before_content_share);
 	UT_RUN(test_cached_S_and_X_read_without_request_or_input_IO);
 	UT_RUN(test_cached_cover_lost_before_content_requalifies_before_one_request);
@@ -364,6 +446,8 @@ main(void)
 	UT_RUN(test_error_after_C_finishes_original_IO_without_new_request);
 	UT_RUN(test_resident_read_waits_for_existing_write_before_reserving_or_requesting);
 	UT_RUN(test_cancel_waiting_for_existing_write_does_not_touch_its_native_IO);
+	UT_RUN(test_first_fill_reserves_while_owning_its_original_input_IO);
+	UT_RUN(test_first_fill_never_adopts_foreign_IO_writeback_or_live_reservations);
 	UT_RUN(test_PI_wait_cancel_keeps_original_PI_and_quiets_prepared_E);
 	UT_RUN(test_optional_cache_off_still_uses_resident_S_and_X_read_authority);
 	UT_RUN(test_missing_native_owner_is_rejected_before_reservation);

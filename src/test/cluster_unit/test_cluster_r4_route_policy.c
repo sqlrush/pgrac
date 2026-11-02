@@ -59,6 +59,7 @@
 #include "storage/latch.h"
 #include "storage/ipc.h"
 #include "storage/buf_internals.h"
+#include "utils/resowner_private.h"
 
 #undef printf
 
@@ -115,6 +116,16 @@ extern ClusterCrBuildResult cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, S
 /* Backend globals reached by the narrow production route section. */
 sigjmp_buf *PG_exception_stack = NULL;
 MemoryContext CurrentMemoryContext = (MemoryContext)0x1;
+ResourceOwner CurrentResourceOwner = NULL;
+/* This legacy route fixture has no native IO registrations. The native
+ * first-fill composition exercises the real ResourceOwner implementation. */
+bool
+ResourceOwnerHasBufferIO(ResourceOwner owner, Buffer buffer pg_attribute_unused())
+{
+	if (owner != NULL)
+		abort();
+	return false;
+}
 ErrorContextCallback *error_context_stack = NULL;
 volatile sig_atomic_t InterruptPending = false;
 volatile sig_atomic_t QueryCancelPending = false;
