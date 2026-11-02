@@ -23,7 +23,7 @@
  *	  L8  cluster_pcm_grd_max_entries=0:  cluster_pcm_is_active()=false → skipped
  *	  L9  unlock without prior PCM ownership skips PCM release
  *
- *	  Links cluster_pcm_lock.o so the real acquire/release behavior is
+ *	  Links the sectioned PCM product source so real acquire/release behavior is
  *	  exercised;  PG-runtime stubs (ShmemInit*, LWLock*, hash_*, CV*) mirror
  *	  the same stub family used by test_cluster_pcm_lock.c.
  *
@@ -44,6 +44,7 @@
 
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_buffer_desc.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
@@ -52,6 +53,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_page_stable_base.h"
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_shmem.h"
@@ -61,6 +63,7 @@
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -74,6 +77,8 @@
 
 UT_DEFINE_GLOBALS();
 
+#include "test_cluster_bufmgr_pcm_identity.inc"
+
 
 /* ============================================================
  * PG-runtime stubs + fake shared HTAB (mirrors test_cluster_pcm_lock.c).
@@ -81,6 +86,9 @@ UT_DEFINE_GLOBALS();
 
 int cluster_node_id = 0;
 int NBuffers = 0;
+int MaxBackends = 1; /* No native read-grant episode in this tag-only fixture. */
+PROC_HDR *ProcGlobal = NULL;
+int cluster_lms_workers = 1; /* Real shard mapper, one local wake destination. */
 int cluster_injection_armed_count = 0;
 int cluster_gcs_reply_timeout_ms = 1;
 bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
@@ -90,6 +98,22 @@ AuxProcType MyAuxProcType = NotAnAuxProcess;
 volatile sig_atomic_t ProcDiePending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;
+
+/* Observation is OFF; no content-owner registry is supplied by this fixture. */
+void
+cluster_content_trace_wait_set(ClusterContentTraceWait kind pg_attribute_unused(),
+							 const ClusterWaitTrace *row pg_attribute_unused())
+{
+	abort(); /* Enabling observation needs the real owner/registry fixture. */
+}
+
+void
+cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
+{
+	/* Normal PCM wait-context cleanup also clears an unarmed observation. */
+	UT_ASSERT_EQ(kind, CLCONTENT_PCM);
+	UT_ASSERT(!cluster_trace_tx_identity);
+}
 
 /* No shared reconfiguration or DATA receipt is supplied by this lock-order
  * fixture. Actual receipt/physical owners run in test_cluster_page_data. */
