@@ -19187,6 +19187,7 @@ TESTS += test_cluster_control_debt_wire
 all: test_cluster_control_debt_wire
 test_cluster_control_debt_wire: test_cluster_control_debt_wire.c test_cluster_recovery_registry.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_debt.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
