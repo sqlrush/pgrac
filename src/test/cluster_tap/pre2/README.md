@@ -80,8 +80,9 @@ controller's default clean-leave selection is unchanged.
 
 `result.json` reports only this selected regression. A phase requires successful
 original TAP, no skip/TODO, complete expected cases, the expected installed
-postgres bytes and no controller cleanup error. Source-file hashes and the
-binary hash are independent observations; `build_binding` stays `UNKNOWN`.
+postgres bytes and no controller cleanup error. Without `--build-matrix`,
+source-file hashes and the binary hash remain independent observations and
+`build_binding` stays `UNKNOWN`.
 All regular files under `src/test/cluster_tap` and `src/test/perl` are captured
 before execution, including the original Perl modules and indirect helpers.
 Their inventory and hashes are checked before and after every phase. Added,
@@ -95,6 +96,24 @@ product build provenance or a Git commit.
 positive physical reclamation, the retention/recovery matrix, the 16/48/64
 one-hour soak or the full build/stage acceptance matrix. Controller selftests
 (`test_m1_regression.py`) start no database and provide no native runtime credit.
+
+An optional `--build-matrix /path/to/completed-matrix` links an existing
+four-profile `m1_build_matrix.py` output before any native phase starts. Keep
+the original source and all four build trees in place. `--source` must match
+the matrix's complete file inventory and `--build` must select exactly one
+enabled profile with the expected installed postgres hash. The reader checks
+the original profile configuration, command coverage, return codes, raw log
+hashes and original unit/SQL judges for every profile. Missing, failed, changed
+or symlink receipt inputs are refused. The same receipt identity is rechecked
+at the original phase boundaries; it is never rebased or rerun automatically.
+`--plan` only records the requested receipt path and need not open it.
+
+A match reports `build_binding=SOURCE_AND_BINARY_RECEIPT_MATCH` and retains
+`source_commit=NOT_ATTESTED`. This is agreement between retained observations,
+not attested compilation, complete tool/library provenance, a Git commit or an
+atomic filesystem view. R01 and stage qualification remain incomplete. The
+option does not run a build matrix, install files, change native deadlines or
+grant runtime authorization. Receipt-reader selftests execute no server.
 
 ### Extended serial regression preparation
 

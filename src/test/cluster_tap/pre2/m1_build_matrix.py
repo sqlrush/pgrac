@@ -143,6 +143,92 @@ def units_passed(output, rc):
                               output, re.I | re.M))
 
 
+def receipt_binding(args):
+    requested = getattr(args, 'build_matrix', None)
+    if requested is None:
+        return None
+    if requested.is_symlink():
+        raise ValueError('build matrix receipt root is a symlink')
+    root = requested.resolve(strict=True)
+    files = {}
+
+    def read(name):
+        path = root
+        for part in Path(name).parts:
+            path /= part
+            if path.is_symlink():
+                raise ValueError('build matrix receipt input is a symlink: '+name)
+        if not path.is_file():
+            raise ValueError('build matrix receipt input is not regular: '+name)
+        raw = path.read_bytes()
+        files[name] = hashlib.sha256(raw).hexdigest()
+        return raw
+
+    try:
+        saved = json.loads(read('plan.json'))
+        result = json.loads(read('result.json'))
+        snapshot = json.loads(read('source-sha256.json'))
+        if (not isinstance(saved, dict) or not isinstance(result, dict)
+                or result.get('matrix_passed') is not True or result.get('error') is not None
+                or result.get('r01') != 'NOT_READY' or result.get('stage_acceptance') != 'NOT_READY'
+                or result.get('source_commit') != 'NOT_ATTESTED'
+                or result.get('build_binding') != 'GENERATED_CONFIG_AND_COMMAND_ONLY'
+                or not isinstance(saved.get('profiles'), list)
+                or len(saved['profiles']) != len(PROFILES)):
+            raise ValueError('build matrix is incomplete or has an unsupported qualification')
+        selection_args = argparse.Namespace(source=args.source, output=root)
+        for profile, (name, _, _) in zip(saved['profiles'], PROFILES):
+            if profile['profile'] != name:
+                raise ValueError('build matrix profile order differs')
+            setattr(selection_args, name.replace('-', '_'), Path(profile['build']))
+        selection = plan(selection_args)
+        if saved != selection or snapshot != source_fingerprint(args.source):
+            raise ValueError('build matrix plan or complete source snapshot differs')
+        records = result.get('profiles')
+        if not isinstance(records, list) or len(records) != len(PROFILES):
+            raise ValueError('build matrix profile results are incomplete')
+        selected = []
+        for profile, record in zip(selection['profiles'], records):
+            name, build = profile['profile'], Path(profile['build'])
+            if (record['profile'] != name or record.get('passed') is not True
+                    or record['identity'] != profile_identity(build, args.source,
+                        profile['cluster'], profile['cassert'])
+                    or not isinstance(record.get('stages'), list)
+                    or len(record['stages']) != len(profile['stages'])):
+                raise ValueError('build matrix configured profile or stages differ: '+name)
+            postgres = build/'src/backend/postgres'
+            if (not postgres.is_file() or not os.access(postgres, os.X_OK)
+                    or record['postgres_sha256'] != sha(postgres)):
+                raise ValueError('build matrix postgres differs: '+name)
+            for stage, recorded in zip(profile['stages'], record['stages']):
+                kind = stage['kind']
+                if (recorded['kind'] != kind or recorded['command'] != stage['command']
+                        or type(recorded.get('rc')) is not int or recorded['rc'] != 0
+                        or recorded.get('passed') is not True):
+                    raise ValueError('original build matrix stage did not pass: '+name+'/'+kind)
+                log_name = name+'/'+kind+'.log'
+                text = read(log_name).decode(errors='replace')
+                if recorded['log_sha256'] != files[log_name]:
+                    raise ValueError('build matrix log hash differs: '+log_name)
+                passed = (kind == 'build' or
+                    (units_passed(text, 0) if kind == 'cluster-unit' else
+                     sql_passed(text, 0, selection[
+                         'cluster_tests' if kind == 'cluster-sql' else 'pg_tests'])))
+                if not passed:
+                    raise ValueError('original build matrix log judge failed: '+log_name)
+            if build.resolve() == args.build.resolve():
+                if (not profile['cluster']
+                        or record['postgres_sha256'] != args.expected_postgres_sha256):
+                    raise ValueError('native build must match an enabled matrix postgres')
+                selected.append(name)
+        if len(selected) != 1:
+            raise ValueError('native build does not select exactly one matrix profile')
+        return dict(profile=selected[0], postgres_sha256=args.expected_postgres_sha256,
+            source_commit='NOT_ATTESTED', files_sha256=files, root=str(root))
+    except (KeyError, TypeError, IndexError) as error:
+        raise ValueError('incomplete build matrix receipt fields') from error
+
+
 def run(args):
     validate_environment(os.environ)
     selection = plan(args)

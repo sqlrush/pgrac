@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 
+from m1_build_matrix import receipt_binding
 from run_legacy import M1_CASES as LEGACY_NAMES
 from run_multixact_lifecycle import M1_CASES as FOUR_MEMBER, case_runs, tap_result
 
@@ -88,6 +89,8 @@ def plan(args):
                          'recycle progression after final reader release',
                          'complete P07 resource/generation acceptance',
                          'general recovery matrix', 'full build and stage acceptance'])
+    if getattr(args, 'build_matrix', None) is not None:
+        selection['build_matrix'] = str(args.build_matrix.resolve())
     return selection
 
 
@@ -176,6 +179,11 @@ def verify_source_inputs(source, expected):
         raise ValueError('regression source input inventory changed')
 
 
+def verify_matrix_binding(args, expected):
+    if receipt_binding(args) != expected:
+        raise ValueError('build matrix receipt binding changed')
+
+
 def preflight(args, selection):
     validate_environment(os.environ)
     if not re.fullmatch('[0-9a-f]{64}', args.expected_postgres_sha256):
@@ -216,6 +224,7 @@ def run(args):
     if pwd.getpwuid(args.uid).pw_gid != args.gid:
         raise ValueError('database UID/GID identity differs')
     source_hashes = preflight(args, selection)
+    matrix_binding = receipt_binding(args)
     root = args.output.resolve()
     root.mkdir(mode=0o700)
     os.chown(root, args.uid, args.gid)
@@ -226,9 +235,13 @@ def run(args):
                   build_binding='UNKNOWN', error=None, not_covered=selection['not_covered'])
     if 'subcheck_gates' in selection:
         result.update(suite=selection['suite'], subcheck_gates=selection['subcheck_gates'])
+    if matrix_binding is not None:
+        result.update(build_matrix=matrix_binding,
+                      build_binding='SOURCE_AND_BINARY_RECEIPT_MATCH', source_commit='NOT_ATTESTED')
     try:
         for phase in selection['phases']:
             verify_source_inputs(args.source, source_hashes)
+            verify_matrix_binding(args, matrix_binding)
             if sha(args.install/'bin/postgres') != args.expected_postgres_sha256:
                 raise ValueError('installed postgres changed before regression phase')
             # Existing controllers own their processes, deadlines and cleanup.
@@ -238,6 +251,7 @@ def run(args):
             record = dict(name=phase['name'], rc=reply.returncode, passed=False)
             result['phases'].append(record)
             verify_source_inputs(args.source, source_hashes)
+            verify_matrix_binding(args, matrix_binding)
             passed = phase_passed(phase['name'], root/phase['name'], reply.returncode,
                                   args.expected_postgres_sha256)
             if sha(args.install/'bin/postgres') != args.expected_postgres_sha256:
@@ -263,6 +277,7 @@ def main():
     for key in ('uid', 'gid'):
         parser.add_argument('--'+key, type=int, required=True)
     parser.add_argument('--expected-postgres-sha256', required=True)
+    parser.add_argument('--build-matrix', type=Path)
     parser.add_argument('--suite', choices=['core', 'extended'], default='core')
     parser.add_argument('--plan', action='store_true')
     try:
