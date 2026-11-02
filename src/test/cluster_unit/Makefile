@@ -16510,3 +16510,7 @@ $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_STARTUP_O) \
 		cluster_control_registry_original.o test_cluster_relmap_original_start.o: \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_recovery_internal.h
+
+# Full multi-page native WAL is selected only by terminal batch fixtures.
+test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: \
+		test_cluster_relmap_terminal_batch_wal.inc test_cluster_cold_relmap_terminal_many.inc
