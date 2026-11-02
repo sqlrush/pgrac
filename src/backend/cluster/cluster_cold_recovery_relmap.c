@@ -499,8 +499,8 @@ cluster_cold_typed_relmap_record_v1(ClusterColdTypedV1 *typed,
 	return ok;
 }
 
-bool
-cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
+static bool
+relmap_ready(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, bool pending_only)
 {
 	ClusterColdPlanV1 *plan;
 	bool ok = true;
@@ -509,7 +509,7 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 		return false;
 	plan = typed->plan;
 	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed
-		|| plan->relmap_create_count != 0)
+		|| (!pending_only && plan->relmap_create_count != 0))
 		return false;
 	for (uint32 i = 0; i < plan->relmap_count; ++i)
 		if (!plan->relmap_inputs[i].captured || !plan->relmap_inputs[i].applied)
@@ -535,8 +535,8 @@ cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterReco
 
 /* The original plan owns these immutable saved values across EOR. Reading
  * them cannot reuse pass-2's expired replay window as current authority. */
-uint32
-cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
+static uint32
+relmap_replay_count(const ClusterColdTypedV1 *typed, bool pending_only)
 {
 	const ClusterColdPlanV1 *plan;
 
@@ -544,7 +544,7 @@ cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
 		return UINT32_MAX;
 	plan = typed->plan;
 	if (plan->phase != COLD_PHASE_SEALED || plan->relmap_failed
-		|| plan->relmap_create_count != 0
+		|| (!pending_only && plan->relmap_create_count != 0)
 		|| plan->relmap_count > CLUSTER_COLD_RELMAP_MAX_INPUTS)
 		return UINT32_MAX;
 	if (plan->relmap_count == 0)
@@ -569,11 +569,38 @@ cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
 	return plan->relmap_count;
 }
 
-ClusterColdRelmapReplayReceiptV1
-cluster_cold_typed_relmap_replay_input_v1(const ClusterColdTypedV1 *typed, uint32 index)
+/* Pending and creation remain separate conjuncts. Sharing their original
+ * pending checks does not let older consumers accept a creation obligation. */
+bool
+cluster_cold_typed_relmap_ready_v1(ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_ready(typed, fence, false);
+}
+
+bool
+cluster_cold_typed_relmap_pending_ready_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_ready(typed, fence, true);
+}
+
+uint32
+cluster_cold_typed_relmap_replay_count_v1(const ClusterColdTypedV1 *typed)
+{
+	return relmap_replay_count(typed, false);
+}
+
+uint32
+cluster_cold_typed_relmap_pending_count_v1(const ClusterColdTypedV1 *typed)
+{
+	return relmap_replay_count(typed, true);
+}
+
+static ClusterColdRelmapReplayReceiptV1
+relmap_replay_input(const ClusterColdTypedV1 *typed, uint32 index, bool pending_only)
 {
 	ClusterColdRelmapReplayReceiptV1 value = {0};
-	uint32 count = cluster_cold_typed_relmap_replay_count_v1(typed);
+	uint32 count = relmap_replay_count(typed, pending_only);
 
 	if (count == UINT32_MAX || index >= count)
 		return value;
@@ -581,6 +608,18 @@ cluster_cold_typed_relmap_replay_input_v1(const ClusterColdTypedV1 *typed, uint3
 	value.index = index;
 	memcpy(&value.input, &typed->plan->relmap_inputs[index].input, sizeof(value.input));
 	return value;
+}
+
+ClusterColdRelmapReplayReceiptV1
+cluster_cold_typed_relmap_replay_input_v1(const ClusterColdTypedV1 *typed, uint32 index)
+{
+	return relmap_replay_input(typed, index, false);
+}
+
+ClusterColdRelmapReplayReceiptV1
+cluster_cold_typed_relmap_pending_input_v1(const ClusterColdTypedV1 *typed, uint32 index)
+{
+	return relmap_replay_input(typed, index, true);
 }
 
 typedef struct RelmapReplayCheck {
@@ -629,8 +668,8 @@ relmap_recheck_current(const RelmapReplayCheck *check)
 	return true;
 }
 
-bool
-cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start)
+static bool
+relmap_replay_recheck(const struct ClusterRecoveryStartV1 *start, bool pending_only)
 {
 	RelmapReplayCheck check = {0};
 	ColdRelmapInput *volatile saved = NULL;
@@ -651,7 +690,7 @@ cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start
 				break;
 			check.start = start;
 			check.typed = ClusterColdRecoveryTxInputs(start);
-			check.count = cluster_cold_typed_relmap_replay_count_v1(check.typed);
+			check.count = relmap_replay_count(check.typed, pending_only);
 			if (check.typed == NULL || !plan_valid(check.typed->plan))
 				break;
 			check.plan = cleanup_plan = check.typed->plan;
@@ -714,6 +753,19 @@ cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start
 		ClusterColdRecoveryRelmapFail(start);
 	return ok;
 }
+
+bool
+cluster_cold_relmap_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	return relmap_replay_recheck(start, false);
+}
+
+bool
+cluster_cold_relmap_pending_replay_recheck_v1(const struct ClusterRecoveryStartV1 *start)
+{
+	return relmap_replay_recheck(start, true);
+}
+
 /* Immutable evidence lives in the original typed plan, not in Start's output.
  * All FD custody is local; failure never retires the original pin carrier. */
 typedef struct ColdRelmapTerminalEntry {
@@ -910,9 +962,9 @@ relmap_episode_visit(void *arg, ClusterUndoRecoveryCheckpointVisitorV1 visitor, 
 		&& relmap_episode_current(arg, NULL);
 }
 
-bool
-cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
-	struct ClusterRecoveryFencePlan *fence)
+static bool
+relmap_terminal_capture(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence, bool pending_only)
 {
 	ClusterColdPlanV1 *plan;
 	ColdRelmapTerminal *receipt;
@@ -926,11 +978,12 @@ cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	plan = typed->plan;
 	if (plan->relmap_terminal_attempted)
 		return false;
-	count = cluster_cold_typed_relmap_replay_count_v1(typed);
+	count = relmap_replay_count(typed, pending_only);
 	/* Lock the attempt before any provider/allocation; partial capture never
 	 * becomes an empty successful batch and cannot be retried. */
 	plan->relmap_terminal_attempted = true;
-	if (count == UINT32_MAX || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+	if (count == UINT32_MAX || (pending_only && count == 0)
+		|| typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
 		|| (typed->tx_fence != NULL && typed->tx_fence != fence)
 		|| MyBackendType != B_STARTUP || !RecoveryInProgress() || CritSectionCount != 0) {
 		plan->relmap_failed = true;
@@ -974,7 +1027,7 @@ cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 		ok = true;
 		for (uint32 p = 0; p < receipt->participants && ok; ++p)
 			ok = cluster_cold_typed_checkpoint_v1(typed, p, &receipt->roots[p], &receipt->checkpoints[p]);
-		ok = ok && cluster_cold_typed_relmap_ready_v1(typed, fence);
+		ok = ok && relmap_ready(typed, fence, pending_only);
 		plan->relmap_failed = true;
 		ok = ok && relmap_terminal_inputs(receipt);
 		for (uint32 i = 0; i < count && ok; ++i) {
@@ -1038,13 +1091,14 @@ cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
 	return ok;
 }
 
-bool
-cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
-	ClusterColdRelmapTerminalCheckV1 *out)
+static bool
+relmap_terminal_recheck(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdRelmapTerminalCheckV1 *out, bool pending_only)
 {
 	const ClusterColdTypedV1 *typed;
 	ColdRelmapTerminal *volatile receipt = NULL;
 	ClusterRecoveryCheckpointOwnerV1 owner = {0};
+	uint32 count;
 	volatile bool ok = false;
 	bool held = false;
 
@@ -1065,7 +1119,13 @@ cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *sta
 			receipt = typed->plan->relmap_terminal;
 			if (receipt == NULL || receipt->failed || !receipt->sealed || typed->plan->relmap_failed)
 				break;
+			/* A pending-only capture must never open the older mixed-plan gate.
+			 * Count the same complete receipts before latching this recheck;
+			 * empty pending components have no terminal qualification. */
+			count = relmap_replay_count(typed, pending_only);
 			receipt->failed = true; typed->plan->relmap_failed = true;
+			if (count == UINT32_MAX || count != receipt->count || (pending_only && count == 0))
+				break;
 			ForEachLWLockHeldByMe(relmap_recheck_held_lock, &held);
 			if (held || MyBackendType != B_STARTUP || RecoveryInProgress() || CritSectionCount != 0)
 				break;
@@ -1104,5 +1164,33 @@ cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *sta
 		ClusterColdRecoveryRelmapFail(start);
 	}
 	return ok;
+}
+
+bool
+cluster_cold_relmap_terminal_capture_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_terminal_capture(typed, fence, false);
+}
+
+bool
+cluster_cold_relmap_pending_terminal_capture_v1(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_terminal_capture(typed, fence, true);
+}
+
+bool
+cluster_cold_relmap_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdRelmapTerminalCheckV1 *out)
+{
+	return relmap_terminal_recheck(start, out, false);
+}
+
+bool
+cluster_cold_relmap_pending_terminal_recheck_v1(const struct ClusterRecoveryStartV1 *start,
+	ClusterColdRelmapTerminalCheckV1 *out)
+{
+	return relmap_terminal_recheck(start, out, true);
 }
 #endif

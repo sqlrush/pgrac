@@ -4311,7 +4311,7 @@ main(void)
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_STARTUP_RELMAP_RECHECK") != NULL) {
-		UT_PLAN(8);
+		UT_PLAN(12);
 		UT_RUN(test_relmap_start_recheck_reads_staged_pair_after_replay_window);
 		UT_RUN(test_relmap_start_recheck_preflights_original_receipt_and_side_before_io);
 		UT_RUN(test_relmap_start_recheck_original_pin_drift_refuses_before_io);
@@ -4320,9 +4320,13 @@ main(void)
 		UT_RUN(test_relmap_start_recheck_first_owner_pin_and_read_error_revoke);
 		UT_RUN(test_relmap_start_recheck_caller_preconditions_do_not_consume_receipts);
 		UT_RUN(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io);
+		UT_RUN(test_pending_staging_mixed_reads_both_copies_and_preserves_creation);
+		UT_RUN(test_pending_staging_legacy_mixed_and_empty_still_refuse);
+		UT_RUN(test_pending_staging_late_source_pin_and_pair_changes_fail_closed);
+		UT_RUN(test_pending_staging_first_owner_and_native_errors_keep_debt);
 		UT_DONE(); return ut_failed_count != 0;
 	}
-	UT_PLAN(213);
+	UT_PLAN(217);
 	UT_RUN(test_terminal_original_episode_requires_full_replay_and_held_ir);
 	UT_RUN(test_terminal_original_episode_refuses_changed_whole_source_or_owner);
 	UT_RUN(test_pass2_source_drift_waits_for_post_ir_and_never_replays);
@@ -4539,6 +4543,10 @@ main(void)
 	UT_RUN(test_recovery_create_record_refuses_wrong_kind_or_history);
 	UT_RUN(test_recovery_create_record_profile_error_poison_is_sticky);
 	UT_RUN(test_recovery_create_record_final_fence_error_is_sticky);
+	UT_RUN(test_pending_staging_mixed_reads_both_copies_and_preserves_creation);
+	UT_RUN(test_pending_staging_legacy_mixed_and_empty_still_refuse);
+	UT_RUN(test_pending_staging_late_source_pin_and_pair_changes_fail_closed);
+	UT_RUN(test_pending_staging_first_owner_and_native_errors_keep_debt);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

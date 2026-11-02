@@ -268,3 +268,96 @@ UT_TEST(test_relmap_start_recheck_whole_scratch_budget_refuses_before_io)
 	recheck_debt_and_no_retry(before, used);
 	recheck_end();
 }
+
+/* The creation leaf is deliberately unconsumed; only pending file/FD paths
+ * are exercised here. Keep its count and values intact through every gate. */
+static void
+pending_recheck_begin(void)
+{
+	ClusterColdPlanV1 *plan;
+	ColdRelmapCreateChunk *chunk;
+	recheck_begin(true); plan = startup_relmap_replay.typed->plan;
+	chunk = cold_plan_scratch(plan, sizeof(*chunk), NULL);
+	UT_ASSERT_NOT_NULL(chunk);
+	chunk->entries[0].captured = true;
+	chunk->entries[0].input.creation.identity.database_oid = 2000;
+	chunk->entries[0].input.creation.identity.tablespace_oid = DEFAULTTABLESPACE_OID;
+	plan->relmap_creates = chunk; plan->relmap_create_count = 1;
+}
+
+UT_TEST(test_pending_staging_mixed_reads_both_copies_and_preserves_creation)
+{
+	TestColdRelmapStorageStats before;
+	ClusterColdRelmapReplayReceiptV1 saved;
+	Size used;
+	pending_recheck_begin();
+	used = startup_relmap_replay.typed->plan->memory_used;
+	saved = cluster_cold_typed_relmap_pending_input_v1(recheck_inputs, 0);
+	UT_ASSERT_EQ(saved.count, 1);
+	before = test_cold_relmap_storage_stats();
+	UT_ASSERT(cluster_cold_relmap_pending_replay_recheck_v1(recheck_start));
+	UT_ASSERT(test_cold_relmap_storage_stats().reads > before.reads);
+	UT_ASSERT_EQ(test_cold_relmap_storage_stats().writes, before.writes);
+	UT_ASSERT_EQ(startup_relmap_replay.typed->plan->memory_used, used);
+	UT_ASSERT_EQ(startup_relmap_replay.typed->plan->relmap_create_count, 1);
+	UT_ASSERT(!cold_relmap_create_at(startup_relmap_replay.typed->plan, 0)->attempted);
+	UT_ASSERT(!recheck_revoked && test_cold_relmap_storage_stats().pin_retained);
+	recheck_end();
+}
+
+UT_TEST(test_pending_staging_legacy_mixed_and_empty_still_refuse)
+{
+	for (unsigned empty = 0; empty < 2; ++empty) {
+		TestColdRelmapStorageStats before;
+		ColdRelmapInput *saved;
+		ClusterColdPlanV1 *plan;
+		pending_recheck_begin(); plan = startup_relmap_replay.typed->plan;
+		saved = plan->relmap_inputs;
+		before = test_cold_relmap_storage_stats();
+		if (empty) { plan->relmap_count = 0; plan->relmap_inputs = NULL; }
+		UT_ASSERT(!(empty ? cluster_cold_relmap_pending_replay_recheck_v1(recheck_start)
+			: cluster_cold_relmap_replay_recheck_v1(recheck_start)));
+		UT_ASSERT(recheck_revoked && plan->relmap_failed && plan->relmap_create_count == 1);
+		UT_ASSERT_EQ(test_cold_relmap_storage_stats().reads, before.reads);
+		plan->relmap_count = 1; plan->relmap_inputs = saved;
+		recheck_end();
+	}
+}
+
+UT_TEST(test_pending_staging_late_source_pin_and_pair_changes_fail_closed)
+{
+	for (unsigned fault = 0; fault < 4; ++fault) {
+		TestColdRelmapStorageStats before;
+		Size used;
+		pending_recheck_begin(); used = startup_relmap_replay.typed->plan->memory_used;
+		before = test_cold_relmap_storage_stats();
+		if (fault == 3) test_cold_relmap_storage_damage_copy(1);
+		else { recheck_fault = fault; test_cold_relmap_storage_read_hook(recheck_change_during_read); }
+		UT_ASSERT(!cluster_cold_relmap_pending_replay_recheck_v1(recheck_start));
+		test_cold_relmap_storage_read_hook(NULL);
+		recheck_debt_and_no_retry(before, used);
+		UT_ASSERT(!cluster_cold_relmap_pending_replay_recheck_v1(recheck_start));
+		UT_ASSERT_EQ(startup_relmap_replay.typed->plan->relmap_create_count, 1);
+		recheck_end();
+	}
+}
+
+UT_TEST(test_pending_staging_first_owner_and_native_errors_keep_debt)
+{
+	for (unsigned fault = 0; fault < 2; ++fault) {
+		volatile bool caught = false;
+		TestColdRelmapStorageStats before;
+		Size used;
+		pending_recheck_begin(); used = startup_relmap_replay.typed->plan->memory_used;
+		before = test_cold_relmap_storage_stats();
+		if (fault == 0) recheck_error_at = 1;
+		else { recheck_fault = 6; test_cold_relmap_storage_read_hook(recheck_change_during_read); }
+		PG_TRY(); { (void)cluster_cold_relmap_pending_replay_recheck_v1(recheck_start); }
+		PG_CATCH(); { caught = true; } PG_END_TRY();
+		recheck_error_at = 0; test_cold_relmap_storage_read_hook(NULL);
+		UT_ASSERT(caught);
+		recheck_debt_and_no_retry(before, used);
+		UT_ASSERT(!cluster_cold_relmap_pending_replay_recheck_v1(recheck_start));
+		recheck_end();
+	}
+}
