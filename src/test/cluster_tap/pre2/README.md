@@ -162,6 +162,45 @@ does not replace full P07, R01, network-isolation testing or stage acceptance;
 the regression coordinator continues to list the complete soak as uncovered.
 Planning selftests and Perl syntax checks provide no native runtime credit.
 
+### Original build and SQL regression matrix
+
+`m1_build_matrix.py` drives four externally configured, separate VPATH trees:
+cluster enabled/disabled, each with cassert on/off. Every tree must refer to the
+same source directory. It checks actual generated configuration, runs original
+`make all`, enabled-only full `cluster_unit check` and `cluster_regress check`,
+and top-level `make check` in all four profiles. Disabled no-op cluster targets
+are marked inapplicable; they supply no passing cluster tests.
+
+```bash
+python3 -B src/test/cluster_tap/pre2/m1_build_matrix.py --plan \
+  --source /absolute/source --output /absolute/new-matrix-output \
+  --enabled-assert /absolute/build-enabled-assert \
+  --enabled-release /absolute/build-enabled-release \
+  --disabled-assert /absolute/build-disabled-assert \
+  --disabled-release /absolute/build-disabled-release
+```
+
+`--plan` reads the original schedules and starts no processes or builds. Remove
+it only in an authorized nonroot regression environment. Source, four build
+trees and new output must be distinct and nonoverlapping. Source snapshots
+must contain regular files/directories, without symlinks; `.git` metadata is
+excluded. No configure, install, cleanup, retry, deadline override or test
+subset is added. Make/test override environment variables must be unset.
+
+The current original schedules contain 219 PG and 13 cluster SQL tests; changed
+coverage requires requalification. SQL success needs the complete original
+names, sequence, plan, summary and return code. Full unit success needs the
+original all-binary loop and census binary. Raw stage logs, commands, codes,
+source/config hashes and actual profile postgres hashes are retained. The
+first failed stage stops the matrix, with later stages not counted as passed.
+
+Exit 0 certifies only this build/regression subcheck. Generated configuration
+and command evidence do not attest a source commit, installed artifact or
+native cohort: results keep `source_commit=NOT_ATTESTED`, `r01=NOT_READY` and
+`stage_acceptance=NOT_READY`. Native lifecycle, full retention/recovery and
+complete soak gates remain separate. Local planner/config/parser selftests
+provide no product build, SQL or native runtime credit.
+
 ### Retained workload manifest intake
 
 Verify a retained four-node capture without contacting a server:
