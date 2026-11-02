@@ -28,6 +28,7 @@ EXTENDED_NATIVE = {
     'retention': ('m1-retention', 'retained-reader-values-and-normal-stop', 'p02'),
     'soak': ('m1-soak-workload', 'workload-ledger-and-normal-stop', 'p07'),
 }
+SOURCE_INPUT_TREES = ('src/test/cluster_tap', 'src/test/perl')
 
 
 def validate_environment(env):
@@ -138,10 +139,41 @@ def sha(path):
     return digest.hexdigest()
 
 
+def capture_source_inputs(source):
+    source = source.resolve(strict=True)
+    result = {}
+    for name in SOURCE_INPUT_TREES:
+        directory = source
+        for part in Path(name).parts:
+            directory /= part
+            if directory.is_symlink():
+                raise ValueError('regression source input is a symlink: '+str(directory))
+        if not directory.is_dir():
+            raise ValueError('regression source input tree is missing: '+name)
+        pending, count = [directory], 0
+        while pending:
+            for path in sorted(pending.pop().iterdir()):
+                if path.is_symlink():
+                    raise ValueError('regression source input is a symlink: '+str(path))
+                if path.is_dir():
+                    pending.append(path)
+                elif path.is_file():
+                    result[str(path.relative_to(source))] = sha(path)
+                    count += 1
+                else:
+                    raise ValueError('regression source input is not regular: '+str(path))
+        if not count:
+            raise ValueError('regression source input tree is empty: '+name)
+    return dict(sorted(result.items()))
+
+
 def verify_source_inputs(source, expected):
+    actual = capture_source_inputs(source)
     for name, digest in expected.items():
-        if sha(source/name) != digest:
+        if actual.get(name) != digest:
             raise ValueError('regression source input changed: '+name)
+    if actual.keys() != expected.keys():
+        raise ValueError('regression source input inventory changed')
 
 
 def preflight(args, selection):
@@ -158,13 +190,19 @@ def preflight(args, selection):
             raise ValueError('required installed/build test tool is missing: '+str(path))
     if not args.vendor.is_dir():
         raise ValueError('native quorum vendor directory is missing')
+    if args.output.resolve().is_relative_to(args.source.resolve()):
+        raise ValueError('regression output must be outside the source tree')
     tap = args.source/'src/test/cluster_tap'
     files = [tap/case for phase in selection['phases'] for case in phase['cases']]
     files += [tap/'pre2'/name for name in ('m1_regression.py', 'run_legacy.py',
               'run_multixact_lifecycle.py', 'run_single_shared_vacuum.py')]
     if any(phase['name'] == 'soak' for phase in selection['phases']):
         files += [tap/'pre2'/name for name in ('m1_soak_member_logs.py', 'workload_log.py')]
-    return {str(path.relative_to(args.source)): sha(path) for path in files}
+    snapshot = capture_source_inputs(args.source)
+    for path in files:
+        if str(path.relative_to(args.source)) not in snapshot:
+            raise ValueError('required regression source input is missing: '+str(path))
+    return snapshot
 
 
 def run(args):
@@ -184,6 +222,7 @@ def run(args):
     (root/'plan.json').write_text(json.dumps(selection, indent=2)+'\n')
     result = dict(status='FAIL', stage_acceptance='NOT_READY', phases=[],
                   postgres_sha256=args.expected_postgres_sha256, source_sha256=source_hashes,
+                  source_input_trees=list(SOURCE_INPUT_TREES),
                   build_binding='UNKNOWN', error=None, not_covered=selection['not_covered'])
     if 'subcheck_gates' in selection:
         result.update(suite=selection['suite'], subcheck_gates=selection['subcheck_gates'])
