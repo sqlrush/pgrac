@@ -303,6 +303,7 @@ UT_TEST(test_t33_v1_v2_v3_slot_idx_same_offset)
 int
 main(void)
 {
+	UT_PLAN(33);
 	UT_RUN(test_t1_delta_sizeof_24);
 	UT_RUN(test_t2_delta_slot_idx_offset_0);
 	UT_RUN(test_t3_delta_flags_after_offset_2);

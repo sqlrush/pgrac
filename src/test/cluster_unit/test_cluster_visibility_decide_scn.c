@@ -296,6 +296,7 @@ UT_TEST(test_t22_cleaned_out_mock_visible)
 int
 main(void)
 {
+	UT_PLAN(22);
 	UT_RUN(test_t1_enum_values_stable);
 	UT_RUN(test_t2_invalid_commit_scn_unknown);
 	UT_RUN(test_t3_invalid_read_scn_unknown);

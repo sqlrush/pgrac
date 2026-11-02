@@ -714,6 +714,7 @@ UT_TEST(test_unscheduled_record_handling)
 int
 main(void)
 {
+	UT_PLAN(10);
 	UT_RUN(test_replay_follows_schedule_and_drains);
 	UT_RUN(test_replay_page_actions);
 	UT_RUN(test_replay_scheduled_record_must_match);

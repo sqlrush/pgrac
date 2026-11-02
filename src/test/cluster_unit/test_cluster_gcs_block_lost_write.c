@@ -468,6 +468,7 @@ UT_TEST(test_pi_note_ring_api_prototypes_linkable)
 int
 main(void)
 {
+	UT_PLAN(27);
 	UT_RUN(test_denied_lost_write_status_is_12);
 	UT_RUN(test_reply_status_enum_no_gap_continuation_up_to_12);
 	UT_RUN(test_grd_entry_sizeof_locked_to_264_via_static_assert);

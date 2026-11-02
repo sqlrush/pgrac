@@ -509,6 +509,7 @@ UT_TEST(test_ext_record_crc_rejections)
 int
 main(void)
 {
+	UT_PLAN(19);
 	UT_RUN(test_origin_slot_floored_basic);
 	UT_RUN(test_origin_slot_floored_invalid_args);
 	UT_RUN(test_origin_slot_floored_wrap_spanning);

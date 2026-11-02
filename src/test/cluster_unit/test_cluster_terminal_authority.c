@@ -185,6 +185,7 @@ UT_TEST(test_reason_names_are_stable)
 int
 main(void)
 {
+	UT_PLAN(7);
 	UT_RUN(test_committed_requires_matching_durable_scn);
 	UT_RUN(test_unknown_and_nonterminal_fail_closed);
 	UT_RUN(test_epoch_and_ownership_are_mandatory);

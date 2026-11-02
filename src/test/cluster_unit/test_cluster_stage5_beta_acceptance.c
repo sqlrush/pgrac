@@ -249,6 +249,7 @@ UT_TEST(test_beta_seven_rac_core_present)
 int
 main(void)
 {
+	UT_PLAN(6);
 	UT_RUN(test_beta_catversion_floor);
 	UT_RUN(test_beta_undo_opcodes_preserved_and_info_mask_clear);
 	UT_RUN(test_beta_stage5_wait_event_roster);

@@ -791,7 +791,7 @@ UT_TEST(test_mrp_shmem_tracks_term_validity_and_drain)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 
 	UT_RUN(test_tracker_init_bounds);
 	UT_RUN(test_barrier_min_publishes_after_all_threads);

@@ -308,6 +308,7 @@ UT_TEST(test_stage4_dead_bitmap_bit_convention_roundtrip)
 int
 main(void)
 {
+	UT_PLAN(10);
 	UT_RUN(test_stage4_catversion_at_or_above_spec_4_x);
 	UT_RUN(test_stage4_undo_opcodes_preserved_and_info_mask_clear);
 	UT_RUN(test_stage4_recovery_dump_category_names);

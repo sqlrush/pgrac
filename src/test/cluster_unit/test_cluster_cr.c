@@ -934,7 +934,7 @@ UT_TEST(test_prune_skips_invalid_xmin)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(37);
+	UT_PLAN(38);
 
 	UT_RUN(test_sqlstate_53R9F);
 	UT_RUN(test_sqlstate_53R9G);

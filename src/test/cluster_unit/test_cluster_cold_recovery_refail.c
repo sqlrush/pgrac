@@ -753,6 +753,7 @@ UT_TEST(test_refail_with_anchor_restores_and_replays_forward)
 int
 main(void)
 {
+	UT_PLAN(3);
 	UT_RUN(test_refail_without_anchor_applies_only_the_suffix);
 	UT_RUN(test_refail_with_anchor_restores_and_replays_forward);
 	UT_RUN(test_refail_converges_from_any_prefix);

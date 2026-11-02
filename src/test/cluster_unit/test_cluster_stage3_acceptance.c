@@ -464,6 +464,7 @@ UT_TEST(test_stage3_bind_opcode_reserved)
 int
 main(void)
 {
+	UT_PLAN(12);
 	UT_RUN(test_stage3_catversion_at_or_above_spec_3_16);
 	UT_RUN(test_stage3_undo_opcodes_registered_and_info_mask_clear);
 	UT_RUN(test_stage3_undo_block_write_wal_abi);

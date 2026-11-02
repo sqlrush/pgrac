@@ -274,6 +274,7 @@ int cluster_shmem_max_regions = 80;
 int
 main(void)
 {
+	UT_PLAN(8);
 	UT_RUN(test_stage2_catversion_at_or_above_spec_2_39);
 	UT_RUN(test_stage2_msg_types_cumulative_registration);
 	UT_RUN(test_stage2_capability_counter_symbols_linkable);

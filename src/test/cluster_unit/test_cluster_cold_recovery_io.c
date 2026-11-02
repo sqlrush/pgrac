@@ -717,6 +717,7 @@ UT_TEST(test_scan_input_proves_the_cut)
 int
 main(void)
 {
+	UT_PLAN(11);
 	UT_RUN(test_observe_absent_and_present);
 	UT_RUN(test_observe_identity_overlay);
 	UT_RUN(test_observe_identity_cached_per_relation);

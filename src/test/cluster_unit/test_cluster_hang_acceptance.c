@@ -333,6 +333,7 @@ UT_TEST(test_hang_accept_actionable_truth_table)
 int
 main(void)
 {
+	UT_PLAN(6);
 	UT_RUN(test_hang_accept_guc_roster);
 	UT_RUN(test_hang_accept_dump_category_key_snapshot);
 	UT_RUN(test_hang_accept_sql_fn_oids);
