@@ -54,6 +54,8 @@ snapshot_import_begin(void)
 	UT_ASSERT(!FirstSnapshotSet && FirstXactSnapshot == NULL);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(ActiveSnapshot == NULL && CatalogSnapshot == NULL);
+	/* Each independently constructed source models a new ProcArray boot. */
+	procArray->cluster_read_scn_floor = InvalidScn;
 	memset(exporter, 0, sizeof(*exporter));
 	pg_atomic_init_u64(&exporter->cluster_read_scn_atomic, 40);
 	exporter->pid = 5678;

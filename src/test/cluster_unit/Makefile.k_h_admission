@@ -1,0 +1,29 @@
+# Hand-selected native H/snapshot composition; shared recipes stay authoritative.
+include Makefile
+.DEFAULT_GOAL := test_cluster_k_h_admission
+
+test_cluster_k_h_admission: test_cluster_k_h_admission.c test_cluster_snapshot_admission.c unit_test.h \
+		test_cluster_retention_publish.inc \
+		test_cluster_space_identity_observation_available.inc $(top_srcdir)/src/include/cluster/cluster_space_storage.h \
+		test_cluster_vm_snapshot_read.inc test_cluster_vm_native_chain.inc \
+		$(top_srcdir)/src/include/access/visibilitymap.h \
+		test_cluster_snapshot_import_xmin.inc test_cluster_snapshot_import_compare.inc \
+		$(srcdir)/test_cluster_snapshot_import_fixture.inc \
+		$(srcdir)/test_cluster_snapshot_export_fixture.inc \
+		test_cluster_pgproc_active_types.inc test_cluster_retention_sample.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_retention.h $(CLUSTER_UNDO_RETENTION_O) \
+		$(srcdir)/test_cluster_snapshot_vacuum_fixture.inc test_cluster_snapshot_admission_vacuum.inc \
+		test_cluster_snapshot_admission_horizon.inc test_cluster_snapshot_admission_refresh.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_horizon.h \
+		$(top_srcdir)/src/include/cluster/cluster_sf_dep.h \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe.h \
+		$(top_srcdir)/src/include/cluster/cluster_xid_stripe_boot.h $(CLUSTER_XID_STRIPE_O) \
+		$(top_srcdir)/src/backend/utils/time/snapmgr.c $(top_srcdir)/src/include/utils/snapmgr.h \
+		$(top_builddir)/src/backend/lib/pairingheap.o \
+		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
+		$(top_builddir)/src/common/psprintf_srv.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/backend/lib/pairingheap.o $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNDO_RETENTION_O) \
+		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
+		$(top_builddir)/src/common/psprintf_srv.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
