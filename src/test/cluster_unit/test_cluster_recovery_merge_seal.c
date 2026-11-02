@@ -628,7 +628,10 @@ UT_TEST(test_commit_refusal_retains_exact_field_and_first_result)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(36);
+	UT_RUN(test_suspended_held_current_never_reads_root_or_grants_serial);
+	UT_RUN(test_suspended_held_current_failure_is_sticky_without_metadata_io);
+	UT_RUN(test_suspended_held_current_does_not_replace_full_source_check);
 	UT_RUN(test_suspend_barrier_reads_original_root_token_native_cut_and_deadline);
 	UT_RUN(test_suspend_current_inside_cf_barrier_has_no_ir_and_resume_requires_cf_release);
 	UT_RUN(test_resume_late_grant_keeps_ir_debt_but_cannot_deliver_authority);

@@ -3753,6 +3753,27 @@ recovery_fence_suspended_sources_current(ClusterRecoveryFencePlan *plan, uint64 
 }
 
 bool
+cluster_recovery_merge_fence_plan_suspended_held_current_v1(ClusterRecoveryFencePlan *plan,
+	uint64 episode_id)
+{
+	volatile bool current = false;
+
+	if (!recovery_fence_plan_valid(plan))
+		return false;
+	PG_TRY();
+	{
+		current = recovery_fence_suspended_guards_current(plan, episode_id);
+	}
+	PG_FINALLY();
+	{
+		if (!current)
+			plan->episode_revoked = true;
+	}
+	PG_END_TRY();
+	return current;
+}
+
+bool
 cluster_recovery_merge_fence_plan_suspended_current_v1(ClusterRecoveryFencePlan *plan,
 	uint64 episode_id)
 {

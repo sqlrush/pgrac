@@ -544,6 +544,13 @@ extern bool cluster_recovery_merge_fence_plan_suspend_serial_v1(
 	ClusterRecoveryFencePlan *plan, uint64 *out_episode_id);
 extern bool cluster_recovery_merge_fence_plan_suspended_current_v1(
 	ClusterRecoveryFencePlan *plan, uint64 episode_id);
+/* Local guard/pin observation for the original suspended episode under a
+ * native family lock. No ROOT/source I/O, CF acquisition or wait. Full source
+ * checks must surround that lock's lifetime; this grants no serial or source
+ * authority. A refusal/ERROR revokes the episode without logging under the
+ * caller's lock. Original pin/owner and cleanup responsibilities are retained. */
+extern bool cluster_recovery_merge_fence_plan_suspended_held_current_v1(
+	ClusterRecoveryFencePlan *plan, uint64 episode_id);
 extern bool cluster_recovery_merge_fence_plan_resume_serial_v1(
 	ClusterRecoveryFencePlan *plan, uint64 episode_id);
 extern uint16 cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan);

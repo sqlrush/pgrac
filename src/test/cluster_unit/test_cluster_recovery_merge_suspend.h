@@ -263,3 +263,98 @@ UT_TEST(test_suspend_barrier_reads_original_root_token_native_cut_and_deadline)
 		suspended_read_watch = NULL;
 	}
 }
+
+UT_TEST(test_suspended_held_current_never_reads_root_or_grants_serial)
+{
+	ClusterRecoveryFencePlan *plan = suspend_fixture(25);
+	ClusterWalRetentionPin *pin = plan->retention_pin;
+	uint64 episode = 0;
+	unsigned reads, origins, locked, releases;
+	int sources[NODES + 1];
+
+	UT_ASSERT(cluster_recovery_merge_fence_plan_suspend_serial_v1(plan, &episode));
+	suspended_cf_exclusive = true;
+	reads = cold_cf_reads;
+	origins = cold_origin_reads;
+	locked = suspended_locked_reads;
+	releases = cold_cf_releases;
+	memcpy(sources, source_calls, sizeof(sources));
+	UT_ASSERT(cluster_recovery_merge_fence_plan_suspended_held_current_v1(plan, episode));
+	UT_ASSERT_EQ(cold_cf_reads, reads);
+	UT_ASSERT_EQ(cold_origin_reads, origins);
+	UT_ASSERT_EQ(suspended_locked_reads, locked);
+	UT_ASSERT_EQ(cold_cf_releases, releases);
+	UT_ASSERT_EQ(memcmp(sources, source_calls, sizeof(sources)), 0);
+	UT_ASSERT(plan->retention_pin == pin && plan->serial_suspended);
+	UT_ASSERT(!plan->serial_held && plan->serial_guards.count == 0);
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_revalidate_nowait(plan));
+	suspended_cf_exclusive = false;
+	UT_ASSERT(cluster_recovery_merge_fence_plan_resume_serial_v1(plan, episode));
+	UT_ASSERT(cluster_recovery_merge_fence_plan_release_serial(plan));
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+	suspended_read_watch = NULL;
+}
+
+UT_TEST(test_suspended_held_current_failure_is_sticky_without_metadata_io)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterRecoveryFencePlan *plan = suspend_fixture(25);
+		uint64 episode = 0, query_episode;
+		ResourceOwner owner = CurrentResourceOwner;
+		PGPROC *proc = MyProc;
+		unsigned reads, locked;
+
+		UT_ASSERT(cluster_recovery_merge_fence_plan_suspend_serial_v1(plan, &episode));
+		suspended_cf_exclusive = true;
+		reads = cold_cf_reads;
+		locked = suspended_locked_reads;
+		query_episode = episode;
+		if (fault == 0) query_episode++;
+		if (fault == 1) CurrentResourceOwner = NULL;
+		if (fault == 2) MyProc = NULL;
+		if (fault == 3) fence_owner_boot++;
+		if (fault == 4) cold_cohort.local_epoch++;
+		if (fault == 5) fence_current[2] = false;
+		if (fault == 6) deadline_clock_ns += INT64CONST(25000000);
+		if (fault == 7) ShutdownRequestPending = true;
+		UT_ASSERT(!cluster_recovery_merge_fence_plan_suspended_held_current_v1(plan,
+			query_episode));
+		UT_ASSERT_EQ(cold_cf_reads, reads);
+		UT_ASSERT_EQ(suspended_locked_reads, locked);
+		CurrentResourceOwner = owner;
+		MyProc = proc;
+		fence_owner_boot = plan->owner_boot;
+		cold_cohort.local_epoch = plan->episode_epoch;
+		fence_current[2] = true;
+		ShutdownRequestPending = false;
+		UT_ASSERT(!cluster_recovery_merge_fence_plan_suspended_held_current_v1(plan, episode));
+		suspended_cf_exclusive = false;
+		UT_ASSERT(!cluster_recovery_merge_fence_plan_resume_serial_v1(plan, episode));
+		UT_ASSERT(cluster_recovery_merge_fence_plan_release_serial(plan));
+		cluster_recovery_merge_fence_plan_destroy(&plan);
+		suspended_read_watch = NULL;
+	}
+}
+
+UT_TEST(test_suspended_held_current_does_not_replace_full_source_check)
+{
+	ClusterRecoveryFencePlan *plan = suspend_fixture(25);
+	uint64 episode = 0;
+	unsigned locked;
+
+	UT_ASSERT(cluster_recovery_merge_fence_plan_suspend_serial_v1(plan, &episode));
+	suspended_cf_exclusive = true;
+	locked = suspended_locked_reads;
+	tokens[2].file_txn_seq++;
+	UT_ASSERT(cluster_recovery_merge_fence_plan_suspended_held_current_v1(plan, episode));
+	UT_ASSERT_EQ(suspended_locked_reads, locked);
+	/* Metadata freshness belongs to the surrounding full checks. A held
+	 * guard observation cannot authorize or hide a changed source token. */
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_suspended_current_v1(plan, episode));
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_suspended_held_current_v1(plan, episode));
+	suspended_cf_exclusive = false;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_resume_serial_v1(plan, episode));
+	UT_ASSERT(cluster_recovery_merge_fence_plan_release_serial(plan));
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+	suspended_read_watch = NULL;
+}
