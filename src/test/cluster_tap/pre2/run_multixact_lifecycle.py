@@ -24,11 +24,12 @@ M1_CASES = ['t/431_pre2_start_stop_restart.pl', *MX_CASES,
             't/453_pre2_vacuum_snapshot_cancel.pl',
             't/482_pre2_undo_active_slots.pl']
 SOAK_CASE = 't/483_pre2_m1_soak_workload.pl'
+RETENTION_CASE = 't/484_pre2_retained_snapshot.pl'
 
 
 def select_cases(suite, cases):
     allowed = {'multixact': MX_CASES, 'm1': M1_CASES,
-               'm1-soak-workload': [SOAK_CASE]}[suite]
+               'm1-soak-workload': [SOAK_CASE], 'm1-retention': [RETENTION_CASE]}[suite]
     selected = list(MX_CASES[1:] if suite == 'multixact' else allowed) if cases is None else list(cases)
     if (not selected or len(set(selected)) != len(selected)
             or any(case not in allowed for case in selected)):
@@ -126,6 +127,9 @@ def run(args):
                    cases=[], complete=False, error=None, cleanup_errors=[])
     if getattr(args, 'suite', 'multixact') == 'm1-soak-workload':
         results.update(scope='workload-ledger-and-normal-stop', p07='NOT_READY',
+                       stage_acceptance='NOT_READY')
+    if getattr(args, 'suite', 'multixact') == 'm1-retention':
+        results.update(scope='retained-reader-values-and-normal-stop', p02='NOT_READY',
                        stage_acceptance='NOT_READY')
     q = LocalQuorum(root/'quorum', args.vendor, 4, args.uid, args.gid)
     q.env['LD_LIBRARY_PATH'] += ':' + str(install/'lib')
@@ -278,7 +282,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ('source', 'install', 'output', 'vendor'):
         parser.add_argument('--'+key, type=Path, required=True)
-    parser.add_argument('--suite', choices=['multixact', 'm1', 'm1-soak-workload'], default='multixact')
+    parser.add_argument('--suite', choices=['multixact', 'm1', 'm1-soak-workload', 'm1-retention'], default='multixact')
     parser.add_argument('--cases', nargs='+')
     parser.add_argument('--fixture-install', type=Path)
     parser.add_argument('--expected-postgres-sha256')

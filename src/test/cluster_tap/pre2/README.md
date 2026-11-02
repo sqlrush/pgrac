@@ -201,6 +201,37 @@ native cohort: results keep `source_commit=NOT_ATTESTED`, `r01=NOT_READY` and
 complete soak gates remain separate. Local planner/config/parser selftests
 provide no product build, SQL or native runtime credit.
 
+### Native retained readers and snapshot import
+
+The opt-in `m1-retention` native suite runs `t/484_pre2_retained_snapshot.pl`
+through the original four-member controller. It leaves the default M1,
+MultiXact and soak selections unchanged. Use the same authorized Linux/root
+controller arguments as above, replacing `--suite m1-soak-workload` with
+`--suite m1-retention`; its outer case budget is the original 1200 seconds.
+
+Four real repeatable-read readers pin the initial rows. Node 0 exports its
+snapshot to two importers on that same instance. One importer requests parallel
+execution, and actual `EXPLAIN ANALYZE` workers plus query results are required.
+Four origin-striped writers each commit one row update; a fifth update rolls
+back. Ordinary `VACUUM (FREEZE, VERBOSE)` runs while readers remain and after
+their staged release. Exporter/direct readers exit first, ordinary importer
+next, parallel importer last. Held values must stay unchanged; fresh reads on
+all four members must match the independent literal committed values.
+
+The test retains original exported snapshot bytes, actor PID/birth observations,
+writer FullXids/origins, actual row cuts, parallel plans, VACUUM output and the
+original normal-stop receipt. These are separate observations, not an atomic
+wait graph or full PGPROC-generation proof. First failure and cleanup errors
+remain failures; no forced xid, floor, clock, horizon, report or allocator state
+is used. Original normal-stop and corruption/PANIC checks remain required.
+
+Exit 0 certifies only retained values, exercised parallel reads and normal stop.
+Controller and TAP reports keep `p02=NOT_READY` and
+`stage_acceptance=NOT_READY`: recycle/frozen-horizon advancement after the final
+reader exits still needs separate proof. Successful VACUUM or reader release
+does not supply it. Native execution requires readiness and runtime approval;
+local selection tests and Perl syntax checks supply no native runtime credit.
+
 ### Retained workload manifest intake
 
 Verify a retained four-node capture without contacting a server:
