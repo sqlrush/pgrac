@@ -154,13 +154,18 @@ decision_send_snapshot(DecisionSendFixture *f)
 UT_TEST(test_decision_send_exact_container_capacity)
 {
 	UT_ASSERT_EQ(sizeof(((ClusterPcmResourceXMasterState *)0)->block_intents[0].payload), 736);
-	UT_ASSERT_EQ(sizeof(((ClusterPcmResourceXMasterState *)0)->grant_intent.payload), 736);
-	/* Unrelated completion/control owners retain their original capacity. */
+	/* The original grant and read-settlement owners also retain the complete
+	 * 776-byte source receipt; conditional decision frames remain 736 bytes. */
+	UT_ASSERT_EQ(sizeof(((ClusterPcmResourceXMasterState *)0)->grant_intent.payload), 776);
+	/* Unrelated control and requester-join capacities remain unchanged. */
 	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXControlIntent), 408);
-	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXSourceSettlement), 432);
+	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXSourceSettlement), 896);
 	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXRequesterJoin), 13680);
-	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXMasterState), 83128);
+	UT_ASSERT_EQ(sizeof(ClusterPcmResourceXMasterState), 86432);
 	reset_fake_pcm_runtime(24);
+	/* Check the real allocation against the existing cohort budget even when
+	 * the ShmemInitStruct fixture's Assert is compiled out. */
+	UT_ASSERT(fake_pcm_header_requested_size <= sizeof(fake_pcm_header.data));
 	printf("# master_state_bytes=%zu header24_requested=%zu fixture_capacity=%zu\n",
 		sizeof(ClusterPcmResourceXMasterState), fake_pcm_header_requested_size, sizeof(fake_pcm_header.data));
 }
