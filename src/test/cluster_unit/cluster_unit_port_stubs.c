@@ -9,7 +9,8 @@
  * otherwise need no backend error machinery still link the real selector.
  * Existing per-fixture error handlers take precedence over these weak
  * defaults. Only the selector's DEBUG1 message is ignored; any unexpected
- * severity aborts the test, never becoming a successful operation.
+ * severity or assertion failure aborts the test, never becoming a successful
+ * operation.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -21,6 +22,13 @@
 #include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_storage_quorum.h"
+
+void __attribute__((weak))
+ExceptionalCondition(const char *condition pg_attribute_unused(),
+					 const char *file pg_attribute_unused(), int line pg_attribute_unused())
+{
+	abort();
+}
 
 /* Profiling-aware product objects can link without a diagnostic backend.
  * Dedicated trace tests override these defaults with the real collector. */

@@ -321,7 +321,7 @@ UT_TEST(test_header_mutation_roundtrip)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 
 	UT_RUN(test_undo_segment_state_enum);
 	UT_RUN(test_undo_segment_flag_constants);

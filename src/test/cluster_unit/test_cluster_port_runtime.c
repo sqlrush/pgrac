@@ -56,13 +56,33 @@ UT_TEST(test_unexpected_error_and_warning_abort)
 	}
 }
 
+UT_TEST(test_assertion_failure_aborts)
+{
+	pid_t pid = fork();
+	int status = 0;
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		struct rlimit limit = { 0, 0 };
+		if (setrlimit(RLIMIT_CORE, &limit) != 0)
+			_exit(2);
+		ExceptionalCondition("standalone assertion failure", __FILE__, __LINE__);
+	}
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFSIGNALED(status));
+	UT_ASSERT_EQ(WTERMSIG(status), SIGABRT);
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	setvbuf(stdout, NULL, _IONBF, 0);
+	UT_PLAN(4);
 	UT_RUN(test_crc32c_known_answer);
 	UT_RUN(test_only_crc_debug_message_is_ignored);
 	UT_RUN(test_unexpected_error_and_warning_abort);
+	UT_RUN(test_assertion_failure_aborts);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

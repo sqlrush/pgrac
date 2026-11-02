@@ -821,6 +821,7 @@ UT_TEST(test_s19_recovery_terminal_resolves_native_owner_without_new_wal)
 int
 main(void)
 {
+	UT_PLAN(20);
 	UT_RUN(test_s1_roundtrip_single_binding);
 	UT_RUN(test_s2_roundtrip_multi_with_sublinks);
 	UT_RUN(test_s3_roundtrip_empty);
