@@ -563,6 +563,7 @@ UT_TEST(native_creation_input_rejects_wrong_envelope_and_output_alias)
 #include "test_cluster_relmap_recovery_create.inc"
 #include "test_cluster_relmap_create_receipt.inc"
 #include "test_cluster_relmap_create_owner.inc"
+#include "test_cluster_relmap_create_physical.inc"
 
 int main(int argc,char **argv)
 {
@@ -605,11 +606,22 @@ int main(int argc,char **argv)
 	UT_RUN(creation_receipt_false_and_error_never_publish_or_enable_retry);
 	UT_RUN(creation_receipt_saved_observation_does_not_claim_currentness);
 	UT_RUN(creation_owner_first_step_keeps_receipt_until_original_plan_destroy);
-	UT_RUN(creation_owner_duplicate_never_resyncs_or_confirms);
+	UT_RUN(creation_owner_duplicate_rechecks_without_resync_or_confirmation);
 	UT_RUN(creation_owner_whole_batch_and_original_step_precede_mutation);
 	UT_RUN(creation_owner_false_error_and_provider_reentry_lock_the_attempt);
 	UT_RUN(creation_owner_late_refusal_keeps_the_confirmed_receipt_and_debt);
 	UT_RUN(creation_owner_capacity_refuses_before_authority_or_native_io);
 	UT_RUN(creation_owner_saved_storage_rejects_plan_output_aliases);
+	UT_RUN(creation_physical_recheck_reads_only_original_pair_and_sources);
+	UT_RUN(creation_physical_recheck_rejects_missing_changed_and_later_images);
+	UT_RUN(creation_physical_recheck_source_and_saved_coordinates_fail_sticky);
+	UT_RUN(creation_physical_recheck_errors_preserve_receipt_and_clean_local_lock);
+	UT_RUN(creation_physical_recheck_reentry_cannot_adopt_outer_success);
+	UT_RUN(creation_physical_recheck_capacity_precedes_providers_and_file_reads);
+	UT_RUN(creation_physical_recheck_requires_original_owner_and_custody);
+	UT_RUN(creation_confirmed_ready_and_repeat_are_read_only);
+	UT_RUN(creation_confirmed_readiness_requires_all_original_receipts);
+	UT_RUN(creation_confirmed_duplicate_rejects_changed_record_and_control);
+	UT_RUN(creation_confirmed_full_recheck_keeps_late_refusal_sticky);
 	UT_DONE(); return ut_failed_count!=0;
 }

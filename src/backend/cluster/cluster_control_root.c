@@ -15436,6 +15436,105 @@ cluster_control_relmap_recovery_create_current_v2(ClusterControlRelmapRecoveryCr
 		cluster_control_relmap_recovery_create_fail_v2(c);
 	return current;
 }
+/* Re-observe the same successful publication. The caller has already checked
+ * its original physical pair; this entry neither touches those files nor
+ * re-enters the one-shot creator/registry publication path. */
+bool
+cluster_control_relmap_recovery_create_confirmed_current_v2(
+	ClusterControlRelmapRecoveryCreateV2 *c, const ClusterRecoveryCheckpointFileV2 *receipts,
+	uint64 count)
+{
+	struct {
+		ClusterControlNativeFileBorrowV2 borrow;
+		ClusterControlNativeTableInfoV2 before, after;
+		ClusterControlRelmapReferenceV2 reference;
+	} *volatile w = NULL;
+	volatile bool valid = false;
+	if (c == NULL)
+		return false;
+	PG_TRY();
+	{
+		do {
+			ClusterControlRelmapSelectionV2 *s;
+			const ClusterRecoveryRegistryV2 *registry;
+			ClusterControlFileKeyV2 key = {0};
+			if (!control_relmap_create_locks_v4() || !c->attempted || !c->confirmed
+				|| !c->available || !control_recovery_create_local_v2(c)
+				|| !control_relmap_live_v4(c->selection) || bytes_are_zero(c->batch_uuid, 16))
+				break;
+			s = c->selection;
+			registry = control_file_registry_v4(&s->work);
+			if (!registry || count != 2 || !receipts
+				|| !control_relmap_distinct_v4(s, receipts, 2 * sizeof(*receipts))
+				|| history_ranges_overlap(c, sizeof(*c), receipts, 2 * sizeof(*receipts))
+				|| !cold_relmap_output_distinct(c->typed, receipts, 2 * sizeof(*receipts))
+				|| !cluster_control_native_files_output_distinct_v2(receipts, 2 * sizeof(*receipts)))
+				break;
+			for (unsigned i = 0; i < 2; i++) {
+				const ClusterRecoveryCheckpointFileV2 *r = &receipts[i];
+				Size bytes;
+				if (!r->source_count || r->source_count != registry->coverage.source_count
+					|| r->source_count > s->budget / sizeof(*r->sources))
+					goto done;
+				bytes = r->source_count * sizeof(*r->sources);
+				if (!control_relmap_distinct_v4(s, r->sources, bytes)
+					|| history_ranges_overlap(c, sizeof(*c), r->sources, bytes)
+					|| history_ranges_overlap(receipts, 2 * sizeof(*receipts), r->sources, bytes)
+					|| !cold_relmap_output_distinct(c->typed, r->sources, bytes)
+					|| !cluster_control_native_files_output_distinct_v2(r->sources, bytes))
+					goto done;
+			}
+			if (!control_recovery_create_binding_v2(s, c, receipts))
+				break;
+			w = palloc0(sizeof(*w));
+			if (!cluster_control_root_relmap_selection_reference_v4(s, &w->reference)
+				|| !cluster_control_native_files_info_v2(&w->before)
+				|| w->before.mode != CLUSTER_NATIVE_FILES_MANAGED_V2
+				|| !w->before.table_generation
+				|| w->before.startup_generation != c->startup_generation
+				|| memcmp(&w->before.control, &w->reference, sizeof(w->reference)))
+				break;
+			key.kind = c->expected.kind;
+			key.origin = c->expected.origin;
+			key.database_oid = c->expected.database_oid;
+			key.tablespace_oid = c->expected.tablespace_oid;
+			key.object_id = c->expected.object_id;
+			if (!cluster_control_native_file_acquire_v2(&key, &w->borrow)
+				|| !control_registry_identity_v4(&w->borrow.expected, &c->expected)
+				|| w->borrow.table_generation != w->before.table_generation
+				|| w->borrow.startup_generation != w->before.startup_generation
+				|| !cluster_control_native_file_current_v2(&w->borrow)
+				|| control_registry_batch_owner_v4(s, c->epoch, c->startup_generation, false, c) != 0
+				|| cluster_control_root_relmap_selection_recheck_locked_v4(s) != 0
+				|| control_registry_batch_owner_v4(s, c->epoch, c->startup_generation, false, c) != 0
+				|| !control_recovery_create_binding_v2(s, c, receipts)
+				|| !cluster_control_native_files_info_v2(&w->after)
+				|| w->after.mode != w->before.mode
+				|| w->after.table_generation != w->before.table_generation
+				|| w->after.startup_generation != w->before.startup_generation
+				|| memcmp(&w->after.control, &w->before.control, sizeof(w->after.control))
+				|| !cluster_control_native_file_current_v2(&w->borrow)
+				|| !control_recovery_create_local_v2(c))
+				break;
+			valid = true;
+		} while (0);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		if (w != NULL) {
+			if (w->borrow.private_self && !cluster_control_native_file_release_v2(&w->borrow)) {
+				cluster_control_relmap_recovery_create_fail_v2(c);
+				ereport(PANIC, (errmsg("could not return original confirmed relmap file borrow")));
+			}
+			pfree(w);
+		}
+		if (!valid)
+			cluster_control_relmap_recovery_create_fail_v2(c);
+	}
+	PG_END_TRY();
+	return valid;
+}
 void
 cluster_control_relmap_recovery_create_destroy_v2(ClusterControlRelmapRecoveryCreateV2 **p)
 {

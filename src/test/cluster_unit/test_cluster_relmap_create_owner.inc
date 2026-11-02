@@ -15,6 +15,8 @@ static ClusterWalSourceRef owner_source_snapshot;
 static ClusterColdStepV1 owner_step;
 static bool owner_side_ok, owner_source_ok, owner_side_error, owner_reentry;
 static unsigned owner_source_calls, owner_fail_call;
+static bool owner_source_error, owner_physical_reentry;
+static ClusterRelmapRecoveryCreateReceiptV2 *owner_physical_receipt;
 static XLogReaderState *owner_reader;
 static RfSideOnlinePlanV1 *const owner_side=(void *)0x5678;
 
@@ -23,6 +25,11 @@ bool cluster_cold_typed_sources_current_v1(ClusterColdTypedV1 *typed,
 	struct ClusterRecoveryFencePlan *fence)
 {
 	++owner_source_calls;
+	if(owner_source_error) { InterruptHoldoffCount=0; pg_re_throw(); }
+	if(owner_physical_reentry) {
+		owner_physical_reentry=false;
+		(void)cluster_relmap_recovery_create_physical_recheck_v2(owner_physical_receipt,typed,fence);
+	}
 	return typed==&redo_typed && fence==redo_fence && owner_source_ok && !redo_failed
 		&& owner_source_calls!=owner_fail_call;
 }
@@ -90,6 +97,7 @@ static bool owner_setup(ClusterControlNativeRelmapCreateV2 **creator,
 	redo_typed.sources[0]=redo_source; redo_typed.participants[0]=owner_declaration.cut;
 	redo_typed.side_plans[0]=owner_side; redo_typed.tx_fence=redo_fence;
 	owner_source_snapshot=redo_source; owner_side_ok=owner_source_ok=true;
+	owner_source_error=owner_physical_reentry=false; owner_physical_receipt=NULL;
 	owner_side_error=owner_reentry=false; owner_source_calls=owner_fail_call=0; owner_reader=reader;
 	return true;
 }
@@ -119,15 +127,15 @@ UT_TEST(creation_owner_first_step_keeps_receipt_until_original_plan_destroy)
 	owner_done(&creator);
 	UT_ASSERT(copy_syncs==syncs && root_renames==renames && !redo_failed && !InterruptHoldoffCount);
 }
-UT_TEST(creation_owner_duplicate_never_resyncs_or_confirms)
+UT_TEST(creation_owner_duplicate_rechecks_without_resync_or_confirmation)
 {
 	ClusterControlNativeRelmapCreateV2 *creator=NULL;
 	XLogReaderState reader; DecodedXLogRecord decoded;
 	unsigned syncs,renames;
 	UT_ASSERT(owner_setup(&creator,&reader,&decoded)); UT_ASSERT(owner_apply(&reader,65536));
 	syncs=copy_syncs; renames=root_renames;
-	UT_ASSERT(!owner_apply(&reader,65536));
-	UT_ASSERT(redo_typed.plan->relmap_failed && redo_failed && copy_syncs==syncs && root_renames==renames);
+	UT_ASSERT(owner_apply(&reader,65536));
+	UT_ASSERT(!redo_typed.plan->relmap_failed && !redo_failed && copy_syncs==syncs && root_renames==renames);
 	UT_ASSERT(cold_relmap_create_at(redo_typed.plan,0)->receipt);
 	owner_done(&creator);
 }

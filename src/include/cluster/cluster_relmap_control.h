@@ -113,6 +113,27 @@ extern bool cluster_relmap_recovery_create_file_at_v2(const ClusterRelmapRecover
 extern bool cluster_relmap_recovery_create_source_at_v2(const ClusterRelmapRecoveryCreateReceiptV2 *,
 	uint64 index, ClusterRecoveryCheckpointSourceV2 *out);
 extern void cluster_relmap_recovery_create_destroy_v2(ClusterRelmapRecoveryCreateReceiptV2 **);
+/* Original plan-owned creation, source and whole-pair observation only. The caller
+ * keeps the same typed/fence, CF-X/global X and original target lifetime. A
+ * complete scratch allocation is charged to the original plan before current
+ * providers or I/O. Read both files under MappingLock, compare every byte and
+ * original digest, and recheck the original source vector outside that lock.
+ * No creation, sync, confirmation, new protection or completion is performed.
+ * Entered false/ERROR/reentry permanently poisons this receipt and episode;
+ * its saved metadata and original files/pins/debt remain until local destroy.
+ * A successful observation still needs the independent confirmed-control
+ * recheck before duplicate dispatch or any joint completion can be accepted. */
+extern bool cluster_relmap_recovery_create_physical_recheck_v2(
+	ClusterRelmapRecoveryCreateReceiptV2 *, ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *);
+/* Complete original receipt observation: the physical/source checks above,
+ * followed outside MappingLock by confirmed-control revalidation using copies
+ * of the ORIGINAL saved receipts, never reconstructed file observations. */
+extern bool cluster_relmap_recovery_create_recheck_v2(
+	ClusterRelmapRecoveryCreateReceiptV2 *, ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *);
+
+
 
 /* Original checkpoint-local copies, never CF custody or a coverage grant.
  * The later original publisher reads a NEW selection under its own CF interval

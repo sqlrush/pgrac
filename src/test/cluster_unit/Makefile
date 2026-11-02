@@ -16288,7 +16288,7 @@ clean-control-relmap-creation:
 # Original reserved target and actual managed source-to-pair creation.
 TESTS += test_cluster_relmap_create_copy
 all: test_cluster_relmap_create_copy
-test_cluster_relmap_create_copy: test_cluster_relmap_create_owner.inc test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
+test_cluster_relmap_create_copy: test_cluster_relmap_create_physical.inc test_cluster_relmap_create_owner.inc test_cluster_relmap_create_plan_original.o $(CLUSTER_COLD_PLAN_SPLIT_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_relmap_control.c $(top_srcdir)/src/backend/cluster/cluster_relmap_authority.c $(top_srcdir)/src/common/cluster_relmap_file_io.c $(top_srcdir)/src/include/cluster/cluster_relmap_control.h $(top_srcdir)/src/include/cluster/cluster_relmap_authority.h test_cluster_relmap_create_copy.c test_cluster_control_native_reservations.c test_cluster_control_relmap_selection.c test_cluster_control_registry_batches.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_native_files.c \
 		$(top_srcdir)/src/backend/storage/lmgr/s_lock.c \

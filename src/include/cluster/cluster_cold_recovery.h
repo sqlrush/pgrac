@@ -960,17 +960,20 @@ typedef struct ClusterColdTypedV1 {
 	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdTypedV1;
 
-/* Original merged CREATE step, dormant until the Startup dispatcher adopts it.
- * Latch its attempt before any provider, reserve the complete receipt budget
- * in the original plan, then execute D's original creation capture only once.
- * The plan retains success or late-failure receipts and destroys local metadata
- * before its typed/fence lifetime ends. This is first-execution handling only:
- * repeats and ready/final completion remain closed until original source/pair
- * checks and A's independent confirmed recheck are connected. No retry or new
- * scope/pin/admission; caller keeps original global X -> CF-X custody. */
+/* Original merged CREATE step. Caller keeps SAME global X -> CF-X and the
+ * complete typed/fence/source custody. The first call latches its attempt and
+ * reserves saved metadata before providers or target writes; success or late
+ * failure receipts remain owned by the original plan until local destruction.
+ * Repeated applied steps validate the original SIDE/source/physical pair and
+ * confirmed control receipt without executing create/sync/confirm again.
+ * Batch readiness rechecks every saved creation receipt and the entire selected
+ * declaration set before returning an observation for the original joint gate.
+ * Neither entry publishes completion, releases protection or activates rmgr. */
 extern bool cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *,
 	struct ClusterRecoveryFencePlan *, const ClusterColdStepV1 *, XLogReaderState *,
 	Size receipt_byte_budget);
+extern bool cluster_cold_typed_relmap_create_ready_v2(ClusterColdTypedV1 *,
+	struct ClusterRecoveryFencePlan *);
 
 /* After the original durability barrier, reread each surviving replay PAGE
  * frontier through the physical DATA observer. This grants no C0 authority. */

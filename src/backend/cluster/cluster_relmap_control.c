@@ -355,6 +355,7 @@ struct ClusterRelmapRecoveryCreateReceiptV2
 {
 	uintptr_t self;
 	int pid;
+	bool failed, checking;
 	ClusterColdTypedV1 *typed;
 	ClusterControlRelmapRecoveryCreateV2 *recovery;
 	ClusterRelmapRecoveryCreateObservationV2 observation;
@@ -809,6 +810,197 @@ cluster_relmap_control_recovery_create_capture_v2(ClusterColdTypedV1 *typed,
 }
 
 static void
+relmap_create_observation_failed(ClusterRelmapRecoveryCreateReceiptV2 *r)
+{
+	if (!relmap_create_receipt_owned(r)) return;
+	r->failed = true;
+	if (r->typed != NULL) cluster_cold_plan_relmap_invalidate_v1(r->typed->plan);
+	cluster_control_relmap_recovery_create_fail_v2(r->recovery);
+}
+
+static bool
+relmap_create_saved_owner(const ClusterRelmapRecoveryCreateReceiptV2 *r,
+	const ClusterColdTypedV1 *typed, const struct ClusterRecoveryFencePlan *fence,
+	const ClusterColdPlanV1 *plan)
+{
+	const ClusterRelmapRecoveryCreateObservationV2 *o = &r->observation;
+	uint32 matches = 0, p = o->participant;
+	if (r->failed || !r->checking || r->typed != typed || r->recovery == NULL
+		|| typed->tx_fence != fence || typed->plan != plan || plan->magic != CLUSTER_COLD_PLAN_MAGIC
+		|| plan->phase != COLD_PHASE_SEALED || plan->relmap_failed || typed->refusal != CLUSTER_COLD_OK
+		|| !typed->participant_count || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| plan->participant_count != typed->participant_count || !typed->replay_count
+		|| typed->replay_count > typed->participant_count || p >= typed->replay_count
+		|| typed->system_identifier != o->source.claim.identity.system_identifier
+		|| memcmp(&o->source, &typed->sources[p], sizeof(o->source))) return false;
+	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+		const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+		const ClusterColdRelmapCreateInputV1 *in;
+		if (entry == NULL) return false;
+		if (entry->receipt != r) continue;
+		in = &entry->input;
+		if (!entry->captured || !entry->attempted || !entry->applied
+			|| entry->receipt_release == NULL || entry->receipt_output_distinct == NULL
+			|| in->participant != p || !cold_relmap_cut_equal(&in->cut, &typed->participants[p])
+			|| memcmp(&in->source, &o->source, sizeof(in->source))
+			|| memcmp(&in->frame, &o->frame, sizeof(in->frame))
+			|| memcmp(&in->creation, &o->creation.record, sizeof(in->creation))) return false;
+		++matches;
+	}
+	return matches == 1;
+}
+
+static bool
+relmap_create_saved_sources(const ClusterRelmapRecoveryCreateReceiptV2 *r,
+	ClusterControlRelmapSelectionV2 *selection)
+{
+	const ClusterRelmapRecoveryCreateObservationV2 *o = &r->observation;
+	ClusterRecoveryCheckpointSourceV2 source;
+	ClusterRecoveryFileIdentityV2 identity;
+	if (!o->source_count || !r->cuts || !r->sources
+		|| cluster_control_root_relmap_selection_source_count_v4(selection) != o->source_count
+		|| !cluster_control_root_relmap_selection_lookup_v4(selection,
+			o->creation.record.identity.database_oid, o->creation.record.identity.tablespace_oid,
+			o->creation.record.identity.object_id, &identity)
+		|| memcmp(&identity, &o->creation.record.identity, sizeof(identity))) return false;
+	for (uint64 j = 0; j < o->source_count; ++j) {
+		if (!cluster_control_root_relmap_selection_source_at_v4(selection, j, &source)
+			|| memcmp(&source, &r->cuts[j], sizeof(source)) || r->sources[j].source_index != j
+			|| r->sources[j].redo_start != source.redo_start
+			|| r->sources[j].replay_end != source.replay_end) return false;
+	}
+	for (unsigned i = 0; i < 2; ++i) {
+		const ClusterRecoveryCheckpointFileV2 *file = &r->files[i];
+		if (memcmp(&file->identity, &identity, sizeof(identity)) || file->copy_index != i
+			|| file->copy_count != 2 || file->synced_bytes != CLUSTER_RELMAP_FILE_SIZE_V2
+			|| file->first_page || file->page_count != 1 || file->source_count != o->source_count
+			|| file->sources != r->sources) return false;
+	}
+	return true;
+}
+
+static bool
+relmap_create_receipt_recheck(ClusterRelmapRecoveryCreateReceiptV2 *r,
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence, bool confirmed)
+{
+	ClusterColdPlanV1 *plan;
+	RelmapCreateWork *volatile work = NULL;
+	volatile bool charged = false, ok = false;
+	volatile Size bytes = sizeof(RelmapCreateWork);
+	if (!relmap_create_receipt_owned(r)) return false;
+	if (r->failed || r->checking) { relmap_create_observation_failed(r); return false; }
+	/* Latch before the first provider/allocation. An interrupted or reentrant
+	 * check never turns the saved successful execution into retry permission. */
+	r->checking = true;
+	plan = r->typed != NULL ? r->typed->plan : NULL;
+	PG_TRY();
+	{
+		do {
+			RelmapCreateWork *w;
+			ClusterControlRelmapFormatV2 format;
+			uint8 digest[32];
+			if (typed == NULL || fence == NULL || plan == NULL
+				|| !relmap_create_saved_owner(r, typed, fence, plan)
+				|| !cluster_relmap_authority_x_held() || !cluster_cf_held_is_clusterwide(ExclusiveLock)
+				|| CritSectionCount || !enableFsync || !RecoveryInProgress() || MyBackendType != B_STARTUP
+				|| LWLockHeldByMe(ControlFileLock) || LWLockHeldByMe(RelationMappingLock)
+				|| LWLockHeldByMe(XidGenLock) || LWLockHeldByMe(XactSLRULock)
+				|| LWLockHeldByMe(XactTruncationLock)) break;
+			if (confirmed) {
+				if (!r->sources || !r->cuts || !r->observation.source_count || r->observation.source_count >
+					(CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2 - bytes) / sizeof(*w->sources)) break;
+				bytes += r->observation.source_count * sizeof(*w->sources);
+			}
+			if (!cold_plan_reserve(plan, bytes)) break;
+			charged = true;
+			work = w = palloc0(sizeof(*w));
+			if (confirmed) {
+				/* The confirmed reader forbids aliases with original plan storage.
+				 * Copy its ORIGINAL immutable receipts, not new file-derived ones. */
+				w->sources = palloc(bytes - sizeof(*w));
+				memcpy(w->sources, r->sources, bytes - sizeof(*w));
+				memcpy(w->receipts, r->files, sizeof(w->receipts));
+				for (unsigned i = 0; i < 2; ++i) w->receipts[i].sources = w->sources;
+			}
+			if (!cluster_cold_typed_sources_current_v1(typed, fence)
+				|| !relmap_create_saved_owner(r, typed, fence, plan)
+				|| !cluster_relmap_create_encode_v1(&r->observation.creation.record.identity,
+					r->observation.creation.record.batch_uuid, &r->observation.creation.record.committed,
+					w->creation_wal, sizeof(w->creation_wal))
+				|| cluster_control_root_relmap_format_locked_v2(CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2,
+					&format) != 0 || format.root_version != 4
+				|| cluster_control_root_relmap_selection_read_locked_v4(&format.config,
+					CLUSTER_NATIVE_FILES_REGISTRY_BUDGET_V2, &w->selection) != 0
+				|| !relmap_create_saved_sources(r, w->selection)) break;
+			LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
+			w->mapping = true;
+			if (!cluster_relmap_authority_managed_read_v2(&r->observation.creation.record.identity,
+				&w->target_pair)) break;
+			for (unsigned i = 0; i < 2; ++i) {
+				if (memcmp(w->target_pair.bytes[i], w->creation_wal + CLUSTER_RELMAP_CREATE_HEADER_SIZE_V1,
+					CLUSTER_RELMAP_FILE_SIZE_V2)) goto checked;
+				w->hash = pg_cryptohash_create(PG_SHA256);
+				if (!w->hash || pg_cryptohash_init(w->hash) < 0
+					|| pg_cryptohash_update(w->hash, w->target_pair.bytes[i], sizeof(w->target_pair.bytes[i])) < 0
+					|| pg_cryptohash_final(w->hash, digest, sizeof(digest)) < 0
+					|| memcmp(digest, r->files[i].image_digest, sizeof(digest))) goto checked;
+				pg_cryptohash_free(w->hash); w->hash = NULL;
+			}
+			LWLockRelease(RelationMappingLock);
+			w->mapping = false;
+			ok = cluster_cold_typed_sources_current_v1(typed, fence)
+				&& relmap_create_saved_owner(r, typed, fence, plan)
+				&& relmap_create_saved_sources(r, w->selection)
+				&& cluster_control_root_relmap_selection_recheck_locked_v4(w->selection) == 0
+				&& relmap_create_saved_owner(r, typed, fence, plan)
+				&& cluster_relmap_authority_x_held() && cluster_cf_held_is_clusterwide(ExclusiveLock);
+			if (ok && confirmed)
+				ok = cluster_control_relmap_recovery_create_confirmed_current_v2(r->recovery, w->receipts, 2)
+					&& cluster_cold_typed_sources_current_v1(typed, fence)
+					&& relmap_create_saved_owner(r, typed, fence, plan)
+					&& relmap_create_saved_sources(r, w->selection)
+					&& cluster_control_root_relmap_selection_recheck_locked_v4(w->selection) == 0;
+		} while (0);
+checked:
+		if (work != NULL) {
+			RelmapCreateWork *cleanup = work;
+			work = NULL; /* A cleanup ERROR must not use freed scratch again. */
+			relmap_create_cleanup(cleanup, false);
+		}
+		if (charged) { cold_plan_release(plan, bytes); charged = false; }
+	}
+	PG_CATCH();
+	{
+		relmap_create_observation_failed(r);
+		if (work != NULL) {
+			RelmapCreateWork *cleanup = work;
+			work = NULL;
+			relmap_create_cleanup(cleanup, true);
+		}
+		if (charged) cold_plan_release(plan, bytes);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	r->checking = false;
+	if (!ok) relmap_create_observation_failed(r);
+	return ok;
+}
+
+bool
+cluster_relmap_recovery_create_physical_recheck_v2(ClusterRelmapRecoveryCreateReceiptV2 *r,
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_create_receipt_recheck(r, typed, fence, false);
+}
+
+bool
+cluster_relmap_recovery_create_recheck_v2(ClusterRelmapRecoveryCreateReceiptV2 *r,
+	ClusterColdTypedV1 *typed, struct ClusterRecoveryFencePlan *fence)
+{
+	return relmap_create_receipt_recheck(r, typed, fence, true);
+}
+
+static void
 relmap_create_receipt_release(void *value)
 {
 	ClusterRelmapRecoveryCreateReceiptV2 *r = value;
@@ -854,8 +1046,9 @@ relmap_create_batch_current(const ClusterColdTypedV1 *typed,
 	}
 	return !plan->relmap_failed && plan->phase == COLD_PHASE_SEALED
 		&& current->input.participant < typed->replay_count
-		&& rf_side_online_plan_relmap_create_matches_v1(typed->side_plans[current->input.participant],
-			&current->input.source, reader) && !plan->relmap_failed;
+		&& (reader == NULL || rf_side_online_plan_relmap_create_matches_v1(
+			typed->side_plans[current->input.participant], &current->input.source, reader))
+		&& !plan->relmap_failed;
 }
 
 bool
@@ -877,11 +1070,28 @@ cluster_cold_typed_relmap_create_apply_v2(ClusterColdTypedV1 *typed,
 			ColdRelmapCreateInput *candidate = cold_relmap_create_at(plan, i);
 			if (candidate != NULL && &candidate->input == input) { entry = candidate; break; }
 		}
-	/* No current/side/allocator callback may precede this one-shot latch.
-	 * Repeats remain closed until the original confirmed read-only recheck
-	 * can replace this refusal; they must never execute create/confirm again. */
-	if (entry == NULL || entry->attempted || entry->receipt != NULL
-		|| plan->relmap_failed || plan->phase != COLD_PHASE_SEALED) goto failed;
+	if (entry == NULL || plan->relmap_failed || plan->phase != COLD_PHASE_SEALED) goto failed;
+	if (entry->attempted) {
+		if (!entry->applied || entry->receipt == NULL) goto failed;
+		PG_TRY();
+		{
+			ok = fence != NULL && typed->tx_fence == fence && reader != NULL
+				&& relmap_create_batch_current(typed, entry, reader)
+				&& cluster_relmap_recovery_create_recheck_v2(entry->receipt, typed, fence)
+				&& relmap_create_batch_current(typed, entry, reader);
+		}
+		PG_CATCH();
+		{
+			cluster_cold_plan_relmap_invalidate_v1(plan);
+			cluster_cold_typed_relmap_create_failed_v2(typed);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (ok) return true;
+		goto failed;
+	}
+	/* No current/side/allocator callback may precede the first-attempt latch. */
+	if (entry->receipt != NULL) goto failed;
 	entry->attempted = true;
 	original = *input;
 	PG_TRY();
@@ -935,5 +1145,50 @@ failed:
 	cluster_cold_plan_relmap_invalidate_v1(plan);
 	cluster_cold_typed_relmap_create_failed_v2(typed);
 	return false;
+}
+
+bool
+cluster_cold_typed_relmap_create_ready_v2(ClusterColdTypedV1 *typed,
+	struct ClusterRecoveryFencePlan *fence)
+{
+	ClusterColdPlanV1 *plan;
+	volatile bool ok = false;
+	if (typed == NULL || fence == NULL || typed->tx_fence != fence || typed->refusal != CLUSTER_COLD_OK
+		|| (plan = typed->plan) == NULL || plan->magic != CLUSTER_COLD_PLAN_MAGIC
+		|| !typed->participant_count || typed->participant_count > CLUSTER_COLD_MAX_PARTICIPANTS
+		|| typed->participant_count != plan->participant_count || !typed->replay_count
+		|| typed->replay_count > typed->participant_count
+		|| plan->phase != COLD_PHASE_SEALED || plan->relmap_failed) return false;
+	/* An incomplete batch is not consumed, and never implies an empty one. */
+	if (plan->relmap_create_count == 0) return true;
+	for (uint32 i = 0; i < plan->relmap_create_count; ++i) {
+		const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+		if (entry == NULL || !entry->captured || !entry->attempted || !entry->applied
+			|| entry->receipt == NULL) return false;
+	}
+	PG_TRY();
+	{
+		ok = true;
+		for (uint32 i = 0; i < plan->relmap_create_count && ok; ++i) {
+			const ColdRelmapCreateInput *entry = cold_relmap_create_at(plan, i);
+			ok = relmap_create_batch_current(typed, entry, NULL)
+				&& cluster_relmap_recovery_create_recheck_v2(entry->receipt, typed, fence);
+		}
+		for (uint32 i = 0; i < plan->relmap_create_count && ok; ++i)
+			ok = relmap_create_batch_current(typed, cold_relmap_create_at(plan, i), NULL);
+		ok = ok && cluster_cold_typed_sources_current_v1(typed, fence) && !plan->relmap_failed;
+	}
+	PG_CATCH();
+	{
+		cluster_cold_plan_relmap_invalidate_v1(plan);
+		cluster_cold_typed_relmap_create_failed_v2(typed);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!ok) {
+		cluster_cold_plan_relmap_invalidate_v1(plan);
+		cluster_cold_typed_relmap_create_failed_v2(typed);
+	}
+	return ok;
 }
 #endif /* USE_PGRAC_CLUSTER */

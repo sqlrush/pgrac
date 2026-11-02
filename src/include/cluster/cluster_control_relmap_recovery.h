@@ -28,6 +28,17 @@ cluster_control_relmap_recovery_create_current_v2(ClusterControlRelmapRecoveryCr
  * backfill. A confirmation grants no recovery/OPEN/lifetime qualification. */
 extern ClusterControlNativeResultV2 cluster_control_relmap_recovery_create_confirm_locked_v2(
 	ClusterControlRelmapRecoveryCreateV2 *, const ClusterRecoveryCheckpointFileV2 *, uint64 count);
+/* Read-only after successful confirmation, with the SAME original CF-X,
+ * complete typed/fence sources and continuous IR/WALR. Call only after releasing
+ * MappingLock and other native family locks. The original nonzero batch and
+ * both complete saved pair receipts must match persistent AVAILABLE coverage;
+ * the exact published native table is borrowed/current-checked across the
+ * original source/ROOT rechecks. No CF acquisition, target-pair read/sync/create,
+ * registration, confirmation, new scope/pin or completion is performed.
+ * false/ERROR revokes this episode and retains the original creation debt.
+ * A successful call does not consume the receipt; repetitions recheck it. */
+extern bool cluster_control_relmap_recovery_create_confirmed_current_v2(
+	ClusterControlRelmapRecoveryCreateV2 *, const ClusterRecoveryCheckpointFileV2 *, uint64 count);
 /* Failure/destroy retire local metadata only; no cancellation or file removal.
  * Destroy an unconfirmed authorization also fails the original episode. */
 extern void cluster_control_relmap_recovery_create_fail_v2(ClusterControlRelmapRecoveryCreateV2 *);
