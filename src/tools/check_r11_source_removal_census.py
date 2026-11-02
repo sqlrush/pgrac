@@ -24,7 +24,7 @@ L3_TREE = "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5"
 CURRENT_PRODUCT_SNAPSHOT = {
     "algorithm": "sha256-canonical-path-blob-v1",
     "path_count": 2362,
-    "sha256": "cc6ecab4d7d82970cf5e24df639728048aa43eb8fd657bc53af186d33fd33f76"
+    "sha256": "f182a436f54592533240854660cdda1e162bc6054eea24b396d953447f4f23cf"
 }
 
 
