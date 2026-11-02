@@ -420,6 +420,10 @@ cluster_wal_retention_pin_preflight_revalidate_wait_v1(ClusterWalRetentionPin *p
 extern ClusterWalPinResult
 cluster_wal_retention_pin_preflight_deadline_v1(ClusterWalRetentionPin *pin, uint64 deadline_ns);
 extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin);
+/* Read-only retention/proof check after exact release of the original bound
+ * serial set. No ROOT I/O, new pin, serial grant or root-publication seal. */
+extern ClusterWalPinResult cluster_wal_retention_pin_serial_suspended_current_v1(
+	ClusterWalRetentionPin *pin, const ClusterRecoverySerialGuardSet *released_set);
 /* Borrow the current ResourceOwner's complete bound COLD_FORMED set. This
  * neither acquires nor transfers ownership and cannot qualify DATA by itself.
  * The consumer still checks its startup phase, exact ROOT/native source and

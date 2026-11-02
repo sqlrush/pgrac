@@ -1386,6 +1386,39 @@ cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
 }
 
 ClusterWalPinResult
+cluster_wal_retention_pin_serial_suspended_current_v1(
+	ClusterWalRetentionPin *pin, const ClusterRecoverySerialGuardSet *released_set)
+{
+	if (!pin_valid(pin) || released_set == NULL || released_set->count != 0
+		|| (pin->state != CLUSTER_WAL_PIN_STATE_BOUND_ONE
+			&& pin->state != CLUSTER_WAL_PIN_STATE_BOUND_SET)
+		|| (pin->state == CLUSTER_WAL_PIN_STATE_BOUND_SET && pin->serial_set != released_set))
+		return CLUSTER_WAL_PIN_INVALID;
+	if (pin->poisoned)
+		return CLUSTER_WAL_PIN_STALE;
+	if (!pin_readers_current(pin))
+		return CLUSTER_WAL_PIN_STALE;
+	for (uint16 i = 0; i < pin->nthreads; i++) {
+		const ClusterWalPinThread *thread = &pin->threads[i];
+		PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+
+		if (thread->serial != &released_set->guards[i] || thread->serial->held
+			|| thread->serial->release_uncertain || thread->pending.generation != 0
+			|| thread->nintervals != 1 || !pin_thread_walr_current(pin, thread)
+			|| cluster_formation_witness_revalidate_nowait(thread->formation)
+				   != CLUSTER_FORMATION_WITNESS_READY
+			|| !cluster_external_fence_need_set_revalidate_nowait(thread->needs, thread->formation,
+																  &reason)
+			|| !cluster_external_fence_revalidate_set_nowait(thread->admissions, thread->needs,
+															 thread->formation, &reason)) {
+			pin->poisoned = true;
+			return CLUSTER_WAL_PIN_STALE;
+		}
+	}
+	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterWalPinResult
 cluster_wal_retention_pin_borrow_cold_v1(ClusterWalRetentionPin **out_pin,
 										 ClusterRecoverySerialGuard **guards, uint16 capacity,
 										 uint16 *out_count)

@@ -15556,7 +15556,16 @@ test_cluster_recovery_claim_ref.inc: $(top_srcdir)/src/backend/cluster/cluster_w
 	     emit { print } /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_merge_barrier_cf_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^read_canonical_version\(/ { owner=1 } \
+	     owner && /^\tif \(cluster_cf_held\(ExclusiveLock\)/ { emit=1; gates++ } \
+	     emit { print; lines++ } \
+	     emit && /return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;/ { exit } \
+	     END { if (gates != 1 || lines != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c unit_test.h \
+		test_cluster_merge_barrier_cf_gate.inc \
 		test_cluster_recovery_claim_ref.inc \
 		$(top_srcdir)/src/include/cluster/cluster_external_fence.h \
 		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
@@ -15566,6 +15575,7 @@ test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c un
 		test_cluster_recovery_duty_compare.inc \
 		test_cluster_recovery_merge_seal_boundary.h test_cluster_recovery_merge_cold_fixture.h \
 		test_cluster_recovery_merge_deadline.h \
+		test_cluster_recovery_merge_suspend.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_duty.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_worker.h \
 		$(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c \

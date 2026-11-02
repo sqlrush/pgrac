@@ -532,6 +532,27 @@ extern bool cluster_recovery_merge_commit_plan_inputs_v1(ClusterRecoveryFencePla
 extern const char *
 cluster_recovery_merge_fence_plan_refusal_v1(const ClusterRecoveryFencePlan *plan);
 extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan);
+#define CLUSTER_RECOVERY_MERGE_SERIAL_SUSPEND_V1 1
+/* Same process-local episode only. Suspend confirms IR release but retains
+ * the original WALR pin and proof owners. A failed operation revokes execution
+ * until normal release/destroy; it never replaces the original input cut.
+ * Currentness may read ROOT/source metadata without IR, including under the
+ * caller's existing CF barrier. It grants no serial/replay authority. Resume
+ * must be called after releasing CF and uses the original absolute deadline.
+ * The output id must be separate caller storage, initially zero. */
+extern bool cluster_recovery_merge_fence_plan_suspend_serial_v1(
+	ClusterRecoveryFencePlan *plan, uint64 *out_episode_id);
+extern bool cluster_recovery_merge_fence_plan_suspended_current_v1(
+	ClusterRecoveryFencePlan *plan, uint64 episode_id);
+/* Local guard/pin observation for the original suspended episode under a
+ * native family lock. No ROOT/source I/O, CF acquisition or wait. Full source
+ * checks must surround that lock's lifetime; this grants no serial or source
+ * authority. A refusal/ERROR revokes the episode without logging under the
+ * caller's lock. Original pin/owner and cleanup responsibilities are retained. */
+extern bool cluster_recovery_merge_fence_plan_suspended_held_current_v1(
+	ClusterRecoveryFencePlan *plan, uint64 episode_id);
+extern bool cluster_recovery_merge_fence_plan_resume_serial_v1(
+	ClusterRecoveryFencePlan *plan, uint64 episode_id);
 extern uint16 cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan);
 struct ClusterControlRootSnapshot;
 struct ClusterControlRootReadToken;

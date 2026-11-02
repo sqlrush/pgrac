@@ -1974,6 +1974,109 @@ UT_TEST(test_unbound_pin_has_pre_ir_slow_revalidation_only)
 	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
+UT_TEST(test_suspended_pin_retains_same_binding_without_root_or_serial_authority)
+{
+	for (uint16 n = 1; n <= 2; n++) {
+		ClusterWalRetentionInterval intervals[2]
+			= { { 1, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 },
+				{ 2, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 } };
+		ClusterWalRetentionPinThreadRequest requests[2]
+			= { make_pin_request(1, &intervals[0], 1), make_pin_request(2, &intervals[1], 1) };
+		ClusterRecoverySerialGuardSet set = { 0 };
+		ClusterWalRetentionPin *pin = NULL;
+		uint16 readers[] = { 1, 2, 3 };
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		set.count = n;
+		for (uint16 i = 0; i < n; i++) {
+			set.guards[i] = make_serial_guard(&requests[i]);
+			set.guards[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		}
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(requests, n, readers, n + 1, &pin),
+			CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(n == 1 ? cluster_wal_retention_pin_bind_one(pin, &set.guards[0])
+			: cluster_wal_retention_pin_bind_set(pin, &set), CLUSTER_WAL_PIN_OK);
+		memset(&set, 0, sizeof(set)); /* explicit confirmed IR-release service leaf */
+		/* This seam checks the retained owner/proofs, not ROOT or IR. */
+		fake_root_current = false;
+		fake_serial_result = CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_serial_suspended_current_v1(pin, &set),
+			CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(fake_acquire_call_count, n + 1);
+		UT_ASSERT_EQ(fake_release_call_count, 0);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &set.guards[0]),
+			CLUSTER_WAL_PIN_INVALID);
+		fake_root_current = true;
+		fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
+		set.count = n;
+		for (uint16 i = 0; i < n; i++) {
+			set.guards[i] = make_serial_guard(&requests[i]);
+			set.guards[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		}
+		UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+}
+
+UT_TEST(test_suspended_pin_refuses_every_proof_and_retained_reader_loss)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterWalRetentionInterval interval = { 1, 0, 1, TEST_WAL_SEG_SIZE,
+			TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+		ClusterRecoverySerialGuardSet set = { 0 };
+		ClusterWalRetentionPin *pin = NULL;
+		uint16 readers[] = { 1, 2 };
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		set.count = 1;
+		set.guards[0] = make_serial_guard(&request);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire_inputs_v1(&request, 1, readers, 2, &pin),
+			CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &set.guards[0]), CLUSTER_WAL_PIN_OK);
+		memset(&set, 0, sizeof(set));
+		if (fault == 0) fake_formation_current = false;
+		if (fault == 1) fake_need_current = false;
+		if (fault == 2) fake_admission_current = false;
+		if (fault == 3) fake_control_owner_stale_thread = 1;
+		if (fault == 4) fake_control_owner_stale_thread = 2;
+		if (fault == 5) set.guards[0].release_uncertain = true;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_serial_suspended_current_v1(pin, &set),
+			CLUSTER_WAL_PIN_STALE);
+		fake_formation_current = fake_need_current = fake_admission_current = true;
+		fake_control_owner_stale_thread = 0;
+		set.guards[0].release_uncertain = false;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_serial_suspended_current_v1(pin, &set),
+			CLUSTER_WAL_PIN_STALE);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+}
+
+UT_TEST(test_suspended_pin_rejects_replacement_guard_storage_and_unbound_state)
+{
+	ClusterWalRetentionInterval interval = { 1, 0, 1, TEST_WAL_SEG_SIZE,
+		TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuardSet set = { 0 }, replacement = { 0 };
+	ClusterWalRetentionPin *pin = NULL;
+
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_serial_suspended_current_v1(pin, &set),
+		CLUSTER_WAL_PIN_INVALID);
+	set.count = 1;
+	set.guards[0] = make_serial_guard(&request);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &set.guards[0]), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_serial_suspended_current_v1(pin, &set),
+		CLUSTER_WAL_PIN_INVALID);
+	memset(&set, 0, sizeof(set));
+	UT_ASSERT_EQ(cluster_wal_retention_pin_serial_suspended_current_v1(pin, &replacement),
+		CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+}
+
 UT_TEST(test_cold_borrow_returns_original_complete_set_without_acquiring)
 {
 	for (uint16 n = 1; n <= 2; n++) {
@@ -4746,7 +4849,10 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(102);
+	UT_PLAN(105);
+	UT_RUN(test_suspended_pin_retains_same_binding_without_root_or_serial_authority);
+	UT_RUN(test_suspended_pin_refuses_every_proof_and_retained_reader_loss);
+	UT_RUN(test_suspended_pin_rejects_replacement_guard_storage_and_unbound_state);
 	UT_RUN(test_post_ir_current_requires_sealed_pin_exact_release_and_original_walr);
 	UT_RUN(test_prepare_read_pin_uses_one_budget_across_all_members);
 	UT_RUN(test_prepare_read_pin_late_reply_cleans_up_without_publishing);
