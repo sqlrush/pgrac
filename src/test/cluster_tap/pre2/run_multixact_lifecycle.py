@@ -23,11 +23,13 @@ MX_CASES = ['t/445_pre2_multixact_maintenance.pl',
 M1_CASES = ['t/431_pre2_start_stop_restart.pl', *MX_CASES,
             't/453_pre2_vacuum_snapshot_cancel.pl',
             't/482_pre2_undo_active_slots.pl']
+SOAK_CASE = 't/483_pre2_m1_soak_workload.pl'
 
 
 def select_cases(suite, cases):
-    allowed = {'multixact': MX_CASES, 'm1': M1_CASES}[suite]
-    selected = list(allowed if suite == 'm1' else MX_CASES[1:]) if cases is None else list(cases)
+    allowed = {'multixact': MX_CASES, 'm1': M1_CASES,
+               'm1-soak-workload': [SOAK_CASE]}[suite]
+    selected = list(MX_CASES[1:] if suite == 'multixact' else allowed) if cases is None else list(cases)
     if (not selected or len(set(selected)) != len(selected)
             or any(case not in allowed for case in selected)):
         raise ValueError('only distinct supported native TAP cases are allowed')
@@ -36,6 +38,19 @@ def select_cases(suite, cases):
             or selected.index(positive) > selected.index(negative)):
         raise ValueError('TAP448 requires this invocation to complete TAP447 first')
     return selected
+
+
+def case_runs(suite, cases):
+    selected = select_cases(suite, cases)
+    if suite == 'm1-soak-workload':
+        # Envelope includes formation, eight row cuts, log verification and
+        # cleanup. The workload stays 3600s and original stop keeps its budget.
+        return [dict(case=SOAK_CASE, clients=clients, timeout=5400,
+                     directory=Path(SOAK_CASE).stem+'-'+str(clients))
+                for clients in (16, 48, 64)]
+    return [dict(case=case, clients=None, timeout=1200, directory=Path(case).stem)
+            for case in selected]
+
 
 def tap_result(output, rc):
     plans = [int(n) for n in re.findall(r'^1\.\.(\d+)\s*$', output, re.M)]
@@ -81,7 +96,7 @@ def run(args):
     account = pwd.getpwuid(args.uid)
     if account.pw_gid != args.gid:
         raise ValueError('database UID/GID identity differs')
-    args.cases = select_cases(getattr(args, 'suite', 'multixact'), args.cases)
+    invocations = case_runs(getattr(args, 'suite', 'multixact'), args.cases)
     identity = json.loads(args.identity.read_text()) if args.identity else None
     if args.archive:
         with args.archive.open('rb') as archive:
@@ -109,6 +124,9 @@ def run(args):
     drop = ['setpriv', '--reuid', str(args.uid), '--regid', str(args.gid), '--init-groups']
     results = dict(source_identity=identity, binary_sha256=hashlib.sha256((bindir/'postgres').read_bytes()).hexdigest(),
                    cases=[], complete=False, error=None, cleanup_errors=[])
+    if getattr(args, 'suite', 'multixact') == 'm1-soak-workload':
+        results.update(scope='workload-ledger-and-normal-stop', p07='NOT_READY',
+                       stage_acceptance='NOT_READY')
     q = LocalQuorum(root/'quorum', args.vendor, 4, args.uid, args.gid)
     q.env['LD_LIBRARY_PATH'] += ':' + str(install/'lib')
     formatter = root/'native_vote'
@@ -126,8 +144,9 @@ def run(args):
         with (root/'probe-build.log').open('x') as log:
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
         q.start()
-        for case in args.cases:
-            directory = root/Path(case).stem
+        for invocation in invocations:
+            case = invocation['case']
+            directory = root/invocation['directory']
             for path in (directory, directory/'log', directory/'data'):
                 path.mkdir(mode=0o700)
                 os.chown(path, args.uid, args.gid)
@@ -186,9 +205,12 @@ def run(args):
             if cold_layout:
                 command.insert(command.index('prove'), 'PGRAC_PRE2_COLD_LAYOUT='+str(cold_layout))
                 command = q.ns(0, command)
+            if invocation['clients'] is not None:
+                command.insert(command.index('prove'),
+                               'PGRAC_PRE2_SOAK_CLIENTS='+str(invocation['clients']))
             (directory/'command.json').write_text(json.dumps(command, indent=2)+'\n')
             try:
-                reply = q.run(command, check=False, cwd=directory, timeout=1200)
+                reply = q.run(command, check=False, cwd=directory, timeout=invocation['timeout'])
                 output, rc = reply.stdout + reply.stderr, reply.returncode
             except subprocess.TimeoutExpired as error:
                 def decoded(value):
@@ -197,6 +219,8 @@ def run(args):
                 rc = 124
             (directory/'prove.log').write_text(output)
             verdict = dict(case=case, **tap_result(output, rc))
+            if invocation['clients'] is not None:
+                verdict['clients'] = invocation['clients']
             if negative:
                 after_votes = {path: sha(path) for path in original_votes}
                 unchanged = original_votes == after_votes
@@ -254,7 +278,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ('source', 'install', 'output', 'vendor'):
         parser.add_argument('--'+key, type=Path, required=True)
-    parser.add_argument('--suite', choices=['multixact', 'm1'], default='multixact')
+    parser.add_argument('--suite', choices=['multixact', 'm1', 'm1-soak-workload'], default='multixact')
     parser.add_argument('--cases', nargs='+')
     parser.add_argument('--fixture-install', type=Path)
     parser.add_argument('--expected-postgres-sha256')

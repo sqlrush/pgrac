@@ -126,6 +126,42 @@ progress, complete resource observations and original clean stop need separate
 evidence. The existing regression coordinator continues to list the soak as
 uncovered. `test_m1_soak_ledger.py` uses literal parser inputs and runs no database.
 
+### Native soak workload and normal-stop preparation
+
+`m1_soak_workload.py` prints the fixed plan without creating files or starting
+processes. The opt-in native controller suite `m1-soak-workload` runs
+`t/483_pre2_m1_soak_workload.pl` three times, with 16/48/64 clients, sequentially
+in separate original four-member formations. Each point uses64 fresh independent
+heaps on node 0, the same configuration/SQL and a full 3600-second pgbench run.
+All four members supply initial/final row cuts. It retains the actual command,
+monotonic elapsed time, summary/stderr, unaggregated logs, hash-bound ledger
+manifest/result, original OPEN observations and original normal-stop receipt.
+
+After component readiness, binary/source binding, applicable microbenchmark
+gates and runtime authorization, use the original Linux/root controller:
+
+```bash
+python3 -B src/test/cluster_tap/pre2/run_multixact_lifecycle.py \
+  --suite m1-soak-workload --source /absolute/source --install /absolute/install \
+  --fixture-install /absolute/fixture-install --vendor /absolute/vendor \
+  --output /absolute/new-soak-output --uid DATABASE_UID --gid DATABASE_GID \
+  --expected-postgres-sha256 INSTALLED_POSTGRES_SHA256
+```
+
+No duration, client-count or retry override is provided. The 5400-second outer
+envelope per point includes formation, bounded data cuts and offline log
+verification; it does not extend the original normal-stop deadline. Existing
+native cases retain their 1200-second envelopes. The first failed point stops
+the matrix; original cleanup still runs and all DATA/raw evidence are retained.
+
+Exit 0 certifies only this workload/ledger/normal-stop subcheck. Controller and
+TAP evidence always state `p07=NOT_READY` and `stage_acceptance=NOT_READY`:
+real recycle-generation progress and complete four-resource non-exhaustion
+evidence are still missing. No resource-polling SQL is introduced. This suite
+does not replace full P07, R01, network-isolation testing or stage acceptance;
+the regression coordinator continues to list the complete soak as uncovered.
+Planning selftests and Perl syntax checks provide no native runtime credit.
+
 ### Retained workload manifest intake
 
 Verify a retained four-node capture without contacting a server:
