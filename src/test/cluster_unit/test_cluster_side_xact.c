@@ -13348,10 +13348,50 @@ UT_TEST(test_operation_head_control_accounts_for_nested_private_scratch)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_operation_head_cursor_mark_precedes_exact_source_page_cut)
+{
+	static const XLogRecPtr marks[] = { 199, 200, 201, 300, UINT64_MAX };
+
+	for (uint8 phase = 3; phase <= 4; phase++)
+		for (unsigned i = 0; i < lengthof(marks); i++) {
+			PGAlignedBlock page;
+			UndoSavepointRollbackPayload body;
+			xl_undo_tt_slot_set_head_operation head = operation_prefix_head(9, 31);
+			RfSideOnlineOperationV1 op;
+			RfSideUndoBlockImageV1 out, sentinel, later;
+			RfSideOnlinePlanV1 *plan;
+			RfPageProofDetailV1 detail;
+			char *payload = page.data + sizeof(UndoBlockHeader) + sizeof(UndoRecordHeader);
+
+			head_control_image(&page, phase);
+			memcpy(&body, payload, sizeof(body));
+			body.last_effect_wal_lsn = marks[i];
+			memcpy(payload, &body, sizeof(body));
+			head_control_check(&page); /* Syntax alone cannot prove the source bound. */
+			plan = head_control_plan(&page, &page, &head, 0);
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &op));
+			if (i == 3) {
+				UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_block_v1(plan, 3, 514, 9, &later),
+					RF_PAGE_PROOF_DETAIL_OK);
+				UT_ASSERT_EQ(((UndoBlockHeader *)later.page.data)->block_lsn, 400);
+			}
+			memset(&sentinel, 0x57, sizeof(sentinel));
+			out = sentinel;
+			detail = rf_side_online_plan_prepare_undo_head_block_v1(plan, 1, &op.identity, &out);
+			UT_ASSERT_EQ(detail, i == 0 ? RF_PAGE_PROOF_DETAIL_OK
+				: RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+			if (i == 0)
+				UT_ASSERT_EQ(((UndoBlockHeader *)out.page.data)->block_lsn, 200);
+			else
+				UT_ASSERT(memcmp(&out, &sentinel, sizeof(out)) == 0);
+			rf_side_online_plan_destroy_v1(&plan);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(203);
+	UT_PLAN(204);
 	UT_RUN(test_recovery_single_source_uses_complete_original_bound_origin);
 	UT_RUN(test_native_terminal_witness_uses_original_bound_plan_budget);
 	UT_RUN(test_native_terminal_witness_rejects_duplicate_physical_raw_terminal);
@@ -13555,6 +13595,7 @@ main(void)
 	UT_RUN(test_operation_head_control_validates_row_type_and_entire_block);
 	UT_RUN(test_operation_head_control_cannot_borrow_later_correct_fpi);
 	UT_RUN(test_operation_head_control_accounts_for_nested_private_scratch);
+	UT_RUN(test_operation_head_cursor_mark_precedes_exact_source_page_cut);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

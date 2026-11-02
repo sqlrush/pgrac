@@ -9366,10 +9366,65 @@ UT_TEST(tt_redo_savepoint_syntax_never_opens_the_legacy_transaction_graph)
 		}
 }
 
+UT_TEST(tt_redo_savepoint_cursor_mark_precedes_original_source_page_cut)
+{
+	static const XLogRecPtr marks[] = { 199, 200, 201, 300, UINT64_MAX };
+
+	for (unsigned base = 0; base < 2; base++)
+		for (unsigned shape = 4; shape <= 5; shape++)
+			for (unsigned i = 0; i < lengthof(marks); i++) {
+				TtRedoFixture f;
+				PGAlignedBlock original, page;
+				UndoSavepointRollbackPayload body;
+				UndoSlotDirEntry directory;
+				ClusterRecoveryUndoRecord out, zero = { 0 };
+				uint32 generation = UINT32_MAX;
+				char *payload;
+				bool accepted;
+
+				tt_redo_fixture(&f, 200, RF_SIDE_PLAN_RECOVERY);
+				if (base) {
+					tt_redo_savepoint_page(&original, 2);
+					((UndoBlockHeader *)original.data)->block_lsn = 90;
+					tt_redo_base_page(&original);
+				}
+				tt_redo_savepoint_page(&page, shape);
+				memcpy(&directory, page.data + UNDO_SLOT_DIR_OFFSET(0), sizeof(directory));
+				payload = page.data + directory.record_offset + sizeof(UndoRecordHeader);
+				memcpy(&body, payload, sizeof(body));
+				body.last_effect_wal_lsn = marks[i];
+				memcpy(payload, &body, sizeof(body));
+				UT_ASSERT_EQ(cluster_recovery_undo_record_read_typed(page.data, BLCKSZ,
+					513, 9, 3, tt_redo_record_address(513, 9, 0), &out),
+					CLUSTER_RECOVERY_UNDO_ENTRY);
+				tt_redo_feed_record_page_frame_at(&f, 100, 513, 9, &page, !base, 803, 802);
+				tt_redo_seal(&f);
+				memset(&out, 0x57, sizeof(out));
+				accepted = tt_redo_savepoint_read(&f, base, tt_redo_record_address(513, 9, 0),
+					&out, &generation);
+				UT_ASSERT_EQ(accepted, i == 0);
+				if (i == 0) {
+					UT_ASSERT_EQ(out.rollback.last_effect_wal_lsn, 199);
+					UT_ASSERT_EQ(out.block_header.block_lsn, 200);
+					UT_ASSERT_EQ(generation, 0);
+				} else {
+					UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+					UT_ASSERT_EQ(generation, 0);
+				}
+				if (base) {
+					UT_ASSERT_NOT_NULL(f.typed.tt_base->blocks);
+					if (f.typed.tt_base->blocks != NULL)
+						UT_ASSERT(memcmp(f.typed.tt_base->blocks->bytes.data,
+							original.data, BLCKSZ) == 0);
+				}
+				tt_redo_destroy(&f);
+			}
+}
+
 int
 main(void)
 {
-	UT_PLAN(203);
+	UT_PLAN(204);
 	UT_RUN(tt_ctrc_work_generation_cannot_wrap_or_reuse_a_published_version);
 	UT_RUN(tt_ctrc_work_retains_exact_first_last_and_unreleased_native_inputs);
 	UT_RUN(tt_ctrc_work_keeps_history_and_headerless_qualification_debt);
@@ -9573,6 +9628,7 @@ main(void)
 	UT_RUN(tt_redo_savepoint_rejects_malformed_sibling_and_clears_every_output);
 	UT_RUN(tt_redo_savepoint_keeps_exact_source_and_seal_refusals);
 	UT_RUN(tt_redo_savepoint_syntax_never_opens_the_legacy_transaction_graph);
+	UT_RUN(tt_redo_savepoint_cursor_mark_precedes_original_source_page_cut);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

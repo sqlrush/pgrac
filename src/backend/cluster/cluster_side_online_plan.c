@@ -2343,6 +2343,12 @@ side_plan_prepare_operation_head_block(const RfSideOnlinePlanV1 *plan, uint32 in
 		|| !cluster_undo_head_operation_matches_control(&carrier, &record.header, record.payload,
 														  record.header.payload_length))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	/* Cursor publication follows its mark in this same source thread.
+	 * A later page in the plan cannot repair this exact prefix. This bound
+	 * does not prove that the mark or its complete chain was retained. */
+	if (!XLogRecPtrIsInvalid(record.rollback.last_effect_wal_lsn)
+		&& record.rollback.last_effect_wal_lsn >= record.block_header.block_lsn)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	*out = prepared;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }

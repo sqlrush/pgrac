@@ -1483,6 +1483,13 @@ cluster_cold_typed_undo_redo_record_v1(const ClusterColdTypedV1 *typed, uint32 p
 												   owner, address, out)
 			   != CLUSTER_RECOVERY_UNDO_ENTRY)
 		return false;
+	/* Both values are from the original source thread. The cursor write
+	 * must follow its mark; this necessary bound is not mark/chain proof. */
+	if (!XLogRecPtrIsInvalid(out->rollback.last_effect_wal_lsn)
+		&& out->rollback.last_effect_wal_lsn >= out->block_header.block_lsn) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
 	*generation = ((const UndoSegmentHeaderData *)header.page.data)->wrap_count;
 	return true;
 }
@@ -1599,6 +1606,11 @@ cluster_cold_typed_undo_base_redo_record_v1(ClusterColdTypedV1 *typed, uint32 pa
 		|| cluster_recovery_undo_record_read_typed(block.data, BLCKSZ, segment, block_no, owner,
 												   address, &record)
 			   != CLUSTER_RECOVERY_UNDO_ENTRY)
+		return false;
+	/* A captured base plus redo obeys the same original-thread ordering;
+	 * neither the recoverer's LSN nor a later unrelated block is a bound. */
+	if (!XLogRecPtrIsInvalid(record.rollback.last_effect_wal_lsn)
+		&& record.rollback.last_effect_wal_lsn >= record.block_header.block_lsn)
 		return false;
 	*out = record;
 	*generation = captured_generation;
