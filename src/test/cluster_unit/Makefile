@@ -16018,9 +16018,14 @@ test_cluster_initdb_catalog: test_cluster_initdb_catalog.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_catalog.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_catalog_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
-		$(top_srcdir)/src/common/cluster_catalog_init.c cluster_unit_port_stubs.o
+		$(top_srcdir)/src/common/cluster_catalog_init.c \
+		$(top_srcdir)/src/common/file_perm.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_file.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/common/cluster_catalog_init.c $(top_srcdir)/src/common/file_perm.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exact private bootstrap observation layout shared by backend and fixture.
@@ -19772,3 +19777,50 @@ clean: clean-initdb-paths
 .PHONY: clean-initdb-paths
 clean-initdb-paths:
 	rm -f test_cluster_initdb_paths test_cluster_initdb_paths.d test_cluster_initdb_paths_entries.inc test_cluster_initdb_paths_entries.inc.tmp
+
+# Original catalog outputs from the creator's independently selected BOOT file.
+TESTS += test_cluster_initdb_managed_catalog
+all: test_cluster_initdb_managed_catalog
+test_cluster_initdb_managed_catalog: test_cluster_initdb_managed_catalog.c test_cluster_initdb_catalog.c unit_test.h \
+        $(top_srcdir)/src/include/access/clog_file.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+        $(top_srcdir)/src/backend/cluster/cluster_initdb_catalog.c \
+        $(top_srcdir)/src/backend/cluster/cluster_initdb_catalog_private.h \
+        $(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+        $(top_srcdir)/src/common/cluster_catalog_init.c \
+        $(top_srcdir)/src/common/file_perm.c \
+        $(top_srcdir)/src/common/cluster_clog_file.c \
+        $(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(top_srcdir)/src/common/cluster_catalog_init.c $(top_srcdir)/src/common/file_perm.c \
+        $(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Pure CLOG framing only; TT40 identity readers remain in their held batch.
+TESTS += test_cluster_clog_frame
+all: test_cluster_clog_frame
+test_cluster_clog_frame: test_cluster_clog_frame.c unit_test.h \
+        $(top_srcdir)/src/common/cluster_clog_file.c \
+        $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+        $(top_srcdir)/src/include/access/clog_file.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(top_srcdir)/src/common/cluster_clog_file.c \
+        $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Directly compiled codec inputs do not acquire automatic binary dependencies.
+test_cluster_initdb_catalog test_cluster_initdb_managed_catalog test_cluster_clog_frame: \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+        $(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+        $(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h \
+        $(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+.PHONY: clean-initdb-managed-catalog clean-clog-frame
+clean: clean-initdb-managed-catalog clean-clog-frame
+clean-initdb-managed-catalog:
+	rm -f test_cluster_initdb_managed_catalog test_cluster_initdb_managed_catalog.d
+clean-clog-frame:
+	rm -f test_cluster_clog_frame test_cluster_clog_frame.d

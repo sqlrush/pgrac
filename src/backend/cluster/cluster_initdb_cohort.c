@@ -1128,15 +1128,34 @@ create_catalog_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
 		InitdbDirectory archive, clog;
 		uint8 *bytes = NULL;
 		Size length = 0;
+		const ClusterRecoveryFileIdentityV2 *expected = NULL;
 		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64))))
 			continue;
 		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
 		creation_side_current(shared, &origins[node], node);
+		if (origins[node].managed_boot) {
+			const PgracInitdbRecoveryContext *r = &origins[node].relmap_registration;
+			if (r->boot_file_count == 0 || r->boot_file_count > PGRAC_INITDB_BOOT_FILES_V2)
+				refuse("invalid original catalog BOOT inventory");
+			for (uint64 i = 0; i < r->boot_file_count; ++i)
+				if (r->boot_files[i].kind == CLUSTER_RECOVERY_FILE_CLOG_V2) {
+					if (expected != NULL || r->boot_files[i].origin != node
+						|| r->boot_files[i].system_identifier != config->identity.system_identifier
+						|| r->boot_files[i].database_incarnation != config->identity.database_incarnation)
+						refuse("original catalog CLOG identity disagrees with its creator");
+					expected = &r->boot_files[i];
+				}
+			if (expected == NULL)
+				refuse("original catalog CLOG identity is missing");
+		}
 		open_original_child(&origins[node].data, INITDB_SIDE_ARCHIVE, &archive);
 		open_original_child(&archive, "pg_xact", &clog);
-		if (!cluster_initdb_catalog_read_clog(
+		if (!(origins[node].managed_boot
+			? cluster_initdb_catalog_read_managed_clog_v2(clog.fd, expected,
+				U64FromFullTransactionId(origins[node].control.checkPointCopy.nextXid), &bytes, &length)
+			: cluster_initdb_catalog_read_clog(
 				clog.fd, U64FromFullTransactionId(origins[node].control.checkPointCopy.nextXid),
-				&bytes, &length))
+				&bytes, &length)))
 			refuse("cannot read original native catalog transaction history");
 		if (node == 0) {
 			founder = bytes;
