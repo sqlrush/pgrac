@@ -522,3 +522,297 @@ done:
 	control_debt_wire_destroy_v1(&w); cluster_recovery_registry_destroy_v3(&decoded);
 	return ok;
 }
+
+/* Immutable storage only, under the original borrowed global directory.
+ * No entry point here acquires CF, chooses/replaces ROOT, transfers a pin or
+ * admits a consumer. The original owner must retain its protections and exact
+ * selection before/after these calls. A failed attempt is never retryable and
+ * no uncertain object is removed, including when no reference was returned. */
+typedef struct ControlDebtStoreAttemptV1 { bool attempted; } ControlDebtStoreAttemptV1;
+
+#ifndef WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifndef FRONTEND
+#include "miscadmin.h"
+#include "storage/fd.h"
+#endif
+#ifndef CONTROL_DEBT_STORE_SYNC
+#ifdef FRONTEND
+#define CONTROL_DEBT_STORE_SYNC(fd) fsync(fd)
+#else
+#define CONTROL_DEBT_STORE_SYNC(fd) (enableFsync ? pg_fsync(fd) : -1)
+#endif
+#endif
+#ifndef CONTROL_DEBT_STORE_PREAD
+#define CONTROL_DEBT_STORE_PREAD pread
+#endif
+#ifndef CONTROL_DEBT_STORE_PWRITE
+#define CONTROL_DEBT_STORE_PWRITE pwrite
+#endif
+static inline void debt_store_name(const uint8 hash[32], bool registry, char name[96])
+{
+	static const char hex[] = "0123456789abcdef";
+	memcpy(name, registry ? "rdb1-" : "dpg1-", 5);
+	for (unsigned i = 0; i < 32; i++) {
+		name[5 + i * 2] = hex[hash[i] >> 4]; name[6 + i * 2] = hex[hash[i] & 15];
+	}
+	name[69] = '\0';
+}
+static inline bool debt_store_stat_same(const struct stat *a, const struct stat *b)
+{
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_mode == b->st_mode
+		&& a->st_uid == b->st_uid && a->st_nlink == b->st_nlink && a->st_size == b->st_size
+		&& a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime;
+}
+static inline bool debt_store_directory_safe(int fd)
+{
+	struct stat s;
+	return fstat(fd, &s) == 0 && S_ISDIR(s.st_mode) && s.st_uid == geteuid() && !(s.st_mode & 0022);
+}
+static inline bool debt_store_directory_current(int global, int dir)
+{
+	struct stat a, b;
+	return debt_store_directory_safe(global) && debt_store_directory_safe(dir)
+		&& fstat(dir, &a) == 0
+		&& fstatat(global, "pgrac_recovery_registry", &b, AT_SYMLINK_NOFOLLOW) == 0
+		&& debt_store_stat_same(&a, &b);
+}
+static inline bool debt_store_file_current(int dir, const char *name, int fd, Size n)
+{
+	struct stat a, b;
+	return fstat(fd, &a) == 0 && fstatat(dir, name, &b, AT_SYMLINK_NOFOLLOW) == 0
+		&& S_ISREG(a.st_mode) && a.st_uid == geteuid() && a.st_nlink == 1
+		&& !(a.st_mode & 0022) && a.st_size >= 0 && (uint64)a.st_size == n
+		&& debt_store_stat_same(&a, &b);
+}
+static inline bool debt_store_io(int fd, uint8 *p, Size n, bool writing)
+{
+	Size done = 0;
+	while (done < n) {
+		ssize_t result = writing ? CONTROL_DEBT_STORE_PWRITE(fd, p + done, n - done, done)
+			: CONTROL_DEBT_STORE_PREAD(fd, p + done, n - done, done);
+		if (result < 0 && errno == EINTR) continue;
+		if (result <= 0 || (Size)result > n - done) return false;
+		done += (Size)result;
+	}
+	return true;
+}
+/* scratch is reserved before the first possible write. Read the complete file
+ * twice through this same descriptor and recheck its original named identity. */
+static inline bool debt_store_object(int dir, const char *name, uint8 *bytes, Size n,
+	uint8 *scratch, bool writing, bool expected)
+{
+	struct stat before, after;
+	int fd;
+	bool ok = false;
+	if (n > PG_INT64_MAX) return false;
+	fd = openat(dir, name, (writing ? O_RDWR | O_CREAT | O_EXCL : O_RDONLY)
+		| O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY, 0600);
+	if (fd < 0) return false;
+	if (writing && (!debt_store_io(fd, bytes, n, true) || CONTROL_DEBT_STORE_SYNC(fd))) goto done;
+	if (!debt_store_file_current(dir, name, fd, n) || fstat(fd, &before)) goto done;
+	for (unsigned pass = 0; pass < 2; pass++) {
+		if (!debt_store_io(fd, scratch, n, false)) goto done;
+		if (writing || expected || pass) { if (memcmp(bytes, scratch, n)) goto done; }
+		else memcpy(bytes, scratch, n);
+		if (!debt_store_file_current(dir, name, fd, n) || fstat(fd, &after)
+			|| !debt_store_stat_same(&before, &after)) goto done;
+	}
+	ok = true;
+done:
+	if (close(fd)) ok = false;
+	return ok && fstatat(dir, name, &after, AT_SYMLINK_NOFOLLOW) == 0
+		&& debt_store_stat_same(&before, &after);
+}
+static inline void debt_store_basis_name(const uint8 ref[128], char name[96])
+{
+	snprintf(name, 96, "%016llx-%016llx-%016llx.v3",
+		(unsigned long long)debt_get(ref, 24, 8), (unsigned long long)debt_get(ref, 32, 8),
+		(unsigned long long)debt_get(ref, 40, 8));
+}
+/* Read an existing basis without allocating or reconstructing it from current
+ * metadata. The canonical old codec was already checked by the wire validator. */
+static inline bool debt_store_basis_matches(int dir, const ControlDebtWireBatchV1 *b,
+	uint8 *scratch)
+{
+	char name[96];
+	struct stat before, after;
+	bool ok = false;
+	int fd;
+	debt_store_basis_name(b->basis_ref, name);
+	fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY);
+	if (fd < 0) return false;
+	if (!debt_store_file_current(dir, name, fd, b->basis_bytes) || fstat(fd, &before)) goto done;
+	for (unsigned pass = 0; pass < 2; pass++)
+		if (!debt_store_io(fd, scratch, b->basis_bytes, false)
+			|| memcmp(scratch, b->basis, b->basis_bytes)
+			|| !debt_store_file_current(dir, name, fd, b->basis_bytes)
+			|| fstat(fd, &after) || !debt_store_stat_same(&before, &after)) goto done;
+	ok = true;
+done:
+	if (close(fd)) ok = false;
+	return ok && fstatat(dir, name, &after, AT_SYMLINK_NOFOLLOW) == 0
+		&& debt_store_stat_same(&before, &after);
+}
+static inline bool control_debt_store_create_v1(int global, const ControlDebtWireImageV1 *w,
+	const ControlDebtWireBatchV1 *basis, uint64 nb, Size budget,
+	ControlDebtStoreAttemptV1 *attempt, uint8 output[128])
+{
+	uint8 *scratch = NULL;
+	Size scratch_n = 33024, work = 0;
+	int dir = -1;
+	char name[96];
+	bool ok = false;
+	if (!w || !attempt || !output || !basis || !nb || nb > budget / sizeof(*basis)
+		|| debt_overlap(output, 128, attempt, sizeof(*attempt))
+		|| debt_overlap(w, sizeof(*w), attempt, sizeof(*attempt))
+		|| debt_overlap(w, sizeof(*w), output, 128)
+		|| debt_overlap(w->registry, w->registry_bytes, attempt, sizeof(*attempt))
+		|| debt_overlap(w->registry, w->registry_bytes, output, 128)
+		|| debt_overlap(w->pages, w->page_bytes, attempt, sizeof(*attempt))
+		|| debt_overlap(w->pages, w->page_bytes, output, 128)
+		|| debt_overlap(basis, (Size)nb * sizeof(*basis), output, 128)
+		|| debt_overlap(basis, (Size)nb * sizeof(*basis), attempt, sizeof(*attempt))) return false;
+	for (uint64 i = 0; i < nb; i++) {
+		if (debt_overlap(basis[i].basis, basis[i].basis_bytes, output, 128)
+			|| debt_overlap(basis[i].basis, basis[i].basis_bytes, attempt, sizeof(*attempt))
+			|| basis[i].entry_count > SIZE_MAX / sizeof(*basis[i].entries)
+			|| debt_overlap(basis[i].entries, (Size)basis[i].entry_count * sizeof(*basis[i].entries), output, 128)
+			|| debt_overlap(basis[i].entries, (Size)basis[i].entry_count * sizeof(*basis[i].entries), attempt, sizeof(*attempt)))
+			return false;
+		scratch_n = Max(scratch_n, basis[i].basis_bytes);
+	}
+	scratch_n = Max(scratch_n, w->registry_bytes);
+	if (attempt->attempted || w->registry_bytes > PG_INT64_MAX
+		|| !debt_store_directory_safe(global)
+		|| !debt_add(&work, w->registry_bytes, 1, budget)
+		|| !debt_add(&work, w->page_bytes, 1, budget) || !debt_add(&work, scratch_n, 1, budget)
+		|| !control_debt_wire_validate_v1(w->registry, w->registry_bytes, w->reference,
+			w->pages, w->page_bytes, basis, nb, budget - scratch_n)) return false;
+	scratch = malloc(scratch_n);
+	if (!scratch) return false;
+	dir = openat(global, "pgrac_recovery_registry", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (dir < 0 || !debt_store_directory_current(global, dir)) goto done;
+	/* This read-only preflight grants no new authority. Once mutation starts,
+	 * any later failure preserves files and the latched original attempt. */
+	attempt->attempted = true;
+	for (uint64 i = 0; i < nb; i++)
+		if (!debt_store_basis_matches(dir, basis + i, scratch)) goto done;
+	for (Size at = 0; at < w->page_bytes; at += 33024) {
+		uint8 hash[32]; debt_sha(w->pages + at, 33024, hash); debt_store_name(hash, false, name);
+		if (!debt_store_object(dir, name, w->pages + at, 33024, scratch, true, true)) goto done;
+	}
+	debt_store_name(w->reference + 64, true, name);
+	if (!debt_store_object(dir, name, w->registry, w->registry_bytes, scratch, true, true)
+		|| CONTROL_DEBT_STORE_SYNC(dir) || CONTROL_DEBT_STORE_SYNC(global)) goto done;
+	/* Entire set revisited after every durable create, not a successful prefix. */
+	for (Size at = 0; at < w->page_bytes; at += 33024) {
+		uint8 hash[32]; debt_sha(w->pages + at, 33024, hash); debt_store_name(hash, false, name);
+		if (!debt_store_object(dir, name, w->pages + at, 33024, scratch, false, true)) goto done;
+	}
+	debt_store_name(w->reference + 64, true, name);
+	if (!debt_store_object(dir, name, w->registry, w->registry_bytes, scratch, false, true)) goto done;
+	for (uint64 i = 0; i < nb; i++)
+		if (!debt_store_basis_matches(dir, basis + i, scratch)) goto done;
+	ok = debt_store_directory_current(global, dir);
+done:
+	if (dir >= 0 && close(dir)) ok = false;
+	free(scratch);
+	if (ok) memcpy(output, w->reference, 128);
+	return ok;
+}
+static inline bool control_debt_store_load_v1(int global, const uint8 ref[128], Size budget,
+	ControlDebtWireImageV1 **out)
+{
+	ControlDebtWireImageV1 *w = NULL;
+	ControlDebtWireBatchV1 *basis = NULL;
+	ClusterRecoveryRegistryDecodedV3 *decoded = NULL;
+	uint8 *scratch = NULL;
+	Size n, pn, scratch_n, work = sizeof(*w);
+	uint64 nb, np, ne;
+	int dir = -1;
+	char name[96];
+	bool ok = false;
+	if (!ref || !out || debt_overlap(ref, 128, out, sizeof(*out)) || *out
+		|| debt_get(ref, 0, 4) != CLUSTER_RECOVERY_DEBT_ROOT_REF_FORMAT_ID_V1
+		|| debt_get(ref, 4, 4) != 1 || debt_get(ref, 8, 4) != 128
+		|| debt_get(ref, 12, 4) != CATALOG_VERSION_NO || !debt_counter(debt_get(ref, 16, 8))
+		|| !debt_zero(ref + 96, 28) || debt_get(ref, 124, 4) != debt_crc(ref, 124)
+		|| debt_get(ref, 24, 8) < 256 || debt_get(ref, 24, 8) > budget
+		|| debt_get(ref, 24, 8) > PG_INT64_MAX
+		|| !debt_store_directory_safe(global)) return false;
+	n = (Size)debt_get(ref, 24, 8); nb = debt_get(ref, 40, 8);
+	np = debt_get(ref, 48, 8); ne = debt_get(ref, 56, 8);
+	if (!nb || !np || !ne || nb > ne || np > ne
+		|| np > SIZE_MAX / 33024 || !debt_add(&work, n, 10, budget)
+		|| !debt_add(&work, np, 2 * 33024, budget)
+		|| !debt_add(&work, nb, sizeof(*basis) + sizeof(ControlDebtBatchKeyV1), budget)
+		|| !debt_add(&work, ne, sizeof(ControlDebtWireKeyV1), budget)) return false;
+	pn = (Size)np * 33024; scratch_n = Max(n, (Size)33024);
+	w = calloc(1, sizeof(*w)); basis = calloc((Size)nb, sizeof(*basis));
+	scratch = malloc(scratch_n);
+	if (!w || !basis || !scratch) goto done;
+	w->registry_bytes = n; w->page_bytes = pn; w->batch_count = nb;
+	w->registry = malloc(n); w->pages = malloc(pn); memcpy(w->reference, ref, 128);
+	if (!w->registry || !w->pages) goto done;
+	dir = openat(global, "pgrac_recovery_registry", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	debt_store_name(ref + 64, true, name);
+	if (dir < 0 || !debt_store_directory_current(global, dir)
+		|| !debt_store_object(dir, name, w->registry, n, scratch, false, false)
+		|| !debt_sha_matches(w->registry, n, ref + 64)) goto done;
+	/* Check the entire table layout and reserve ALL basis storage before its
+	 * traversal. No count from disk can select a prefix or bypass the budget. */
+	{
+		uint64 embedded = debt_get(w->registry, 104, 8);
+		Size extent = 256;
+		if (!debt_add(&extent, embedded, 1, n) || debt_get(ref, 32, 8) != embedded
+			|| debt_get(w->registry, 112, 8) != extent
+			|| !debt_add(&extent, nb, 384, n) || debt_get(w->registry, 136, 8) != extent
+			|| !debt_add(&extent, np, 128, n) || extent != n) goto done;
+	}
+	for (uint64 i = 0; i < nb; i++) {
+		const uint8 *b = w->registry + debt_get(w->registry, 112, 8) + (Size)i * 384;
+		Size bn;
+		if (!cluster_recovery_registry_reference_valid_v3(b + 184, CATALOG_VERSION_NO)
+			|| debt_get(b + 184, 48, 8) > SIZE_MAX) goto done;
+		bn = (Size)debt_get(b + 184, 48, 8);
+		if (!debt_add(&work, bn, 12, budget)) goto done;
+		basis[i].basis_bytes = bn;
+		scratch_n = Max(scratch_n, bn);
+	}
+	free(scratch); scratch = malloc(scratch_n);
+	if (!scratch) goto done;
+	for (uint64 i = 0; i < nb; i++) {
+		const uint8 *b = w->registry + debt_get(w->registry, 112, 8) + (Size)i * 384;
+		uint8 actual[128], *bytes = malloc(basis[i].basis_bytes);
+		basis[i].basis = bytes; memcpy(basis[i].basis_ref, b + 184, 128);
+		basis[i].episode = debt_get(b, 16, 8); basis[i].prepare = debt_get(b, 32, 8);
+		basis[i].entry_count = debt_get(b, 56, 8);
+		if (!bytes || !cluster_recovery_registry_load_selected_v3(global, b + 184,
+			CATALOG_VERSION_NO, basis[i].basis_bytes * 8, &decoded)
+			|| !cluster_recovery_registry_encode_v3(cluster_recovery_registry_view_v3(decoded),
+				bytes, basis[i].basis_bytes, actual) || memcmp(actual, b + 184, 128)) goto done;
+		cluster_recovery_registry_destroy_v3(&decoded);
+	}
+	for (Size i = 0; i < (Size)np; i++) {
+		const uint8 *pr = w->registry + debt_get(w->registry, 136, 8) + i * 128;
+		debt_store_name(pr + 64, false, name);
+		if (!debt_store_object(dir, name, w->pages + i * 33024, 33024, scratch, false, false)) goto done;
+	}
+	for (uint64 i = 0; i < nb; i++)
+		if (!debt_store_basis_matches(dir, basis + i, scratch)) goto done;
+	debt_store_name(ref + 64, true, name);
+	if (!debt_store_object(dir, name, w->registry, n, scratch, false, true)) goto done;
+	ok = control_debt_wire_validate_v1(w->registry, n, ref, w->pages, pn, basis, nb, budget)
+		&& debt_store_directory_current(global, dir);
+done:
+	if (dir >= 0 && close(dir)) ok = false;
+	if (basis) for (uint64 i = 0; i < nb; i++) free((void *)basis[i].basis);
+	free(basis); free(scratch); cluster_recovery_registry_destroy_v3(&decoded);
+	if (ok) { *out = w; w = NULL; }
+	control_debt_wire_destroy_v1(&w);
+	return ok;
+}
+#endif /* !WIN32: no unsupported-platform storage admission */

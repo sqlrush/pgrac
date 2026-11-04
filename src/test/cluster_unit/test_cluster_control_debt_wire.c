@@ -332,7 +332,10 @@ UT_TEST(debt_wire_preserves_original_zero_membership_epoch)
 	}
 	control_debt_wire_destroy_v1(&w); debt_fixture_end();
 }
-int main(void)
+#ifndef DEBT_WIRE_TEST_MAIN
+#define DEBT_WIRE_TEST_MAIN main
+#endif
+int DEBT_WIRE_TEST_MAIN(void)
 {
 	UT_PLAN(10);
 	UT_RUN(debt_wire_pages_are_not_a_batch_cap);

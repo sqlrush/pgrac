@@ -19202,6 +19202,28 @@ clean: clean-control-debt-wire
 clean-control-debt-wire:
 	rm -f test_cluster_control_debt_wire test_cluster_control_debt_wire.d
 
+# Exact private owner storage code; no production admission or ROOT publisher.
+TESTS += test_cluster_control_debt_store
+all: test_cluster_control_debt_store
+test_cluster_control_debt_store: test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
+		test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_reservations.h cluster_registry_common_test.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-debt-store
+.PHONY: clean-control-debt-store
+clean-control-debt-store:
+	rm -f test_cluster_control_debt_store test_cluster_control_debt_store.d
+
 cluster_control_registry_original.o: $(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_debt.h \
