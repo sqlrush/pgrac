@@ -27,3 +27,9 @@ test_cluster_k_h_admission: test_cluster_k_h_admission.c test_cluster_snapshot_a
 		$(top_builddir)/src/backend/nodes/list.o $(top_builddir)/src/common/stringinfo_srv.o \
 		$(top_builddir)/src/common/psprintf_srv.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_k_h_history: test_cluster_k_h_history.c test_cluster_retention_sample.c \
+		test_cluster_retention_history.inc test_cluster_retention_sample
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_UNDO_RETENTION_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@

@@ -56,6 +56,15 @@ typedef struct ClusterUndoRetentionSample {
  * it is not a global F/H or producer-lifetime certificate. */
 extern bool cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out);
 
+/* Original history owners register before their first historical grant.
+ * No SCN proof means entry refuses after A has been retained. Entry uses a
+ * single CAS, no LWLock/remote wait/spin. A successful entry sets the caller's
+ * initially false token; only that owner may leave after confirmed release.
+ * Uncertain release retains it. Neither zero count nor this local interlock
+ * establishes complete/global coverage or a protected-H lifetime handle. */
+extern bool cluster_undo_retention_unknown_source_enter(bool *registered);
+extern bool cluster_undo_retention_unknown_source_leave(bool *registered);
+
 /* True only for a finite H covered by this ProcArray boot's retained native
  * promise. Read-only SH lock, no reader/clock resample or PGPROC token. The
  * original boot/admission and every required peer still need validation;

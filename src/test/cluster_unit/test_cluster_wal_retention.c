@@ -36,6 +36,7 @@
 #include "../../backend/cluster/cluster_control_root_private.h"
 
 UT_DEFINE_GLOBALS();
+#include "test_cluster_wal_h_history_fixture.inc"
 
 #define TEST_WAL_SEG_SIZE (16 * 1024 * 1024)
 #define UT_ASSERT_TRUE(condition) UT_ASSERT(condition)
@@ -268,6 +269,7 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *request)
 		fake_acquire_requests[fake_acquire_call_count] = *request;
 	if (fake_acquire_call_count < fake_acquire_result_count)
 		result = fake_acquire_results[fake_acquire_call_count];
+	history_observe_first_grant();
 	fake_acquire_call_count++;
 	if (fake_acquire_call_count == fake_acquire_error_at)
 		pg_re_throw();
@@ -558,6 +560,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 static void
 reset_pin_fakes(void)
 {
+	if (procArray == NULL) history_new_boot();
 	cluster_trace_control_config = false;
 	CritSectionCount = 0;
 	proc_exit_inprogress = false;
@@ -4463,6 +4466,163 @@ UT_TEST(test_history_local_read_pin_survives_owner_change_and_error_cleanup)
 	reset_pin_fakes();
 }
 
+
+UT_TEST(k_wal_history_source_precedes_each_original_grant)
+{
+	for (int reader = 0; reader < 2; reader++) {
+		ClusterUndoRetentionSample cut;
+		uint16 tid = 1;
+		ClusterWalReadPinV1 *read = NULL;
+		ClusterWalRetentionPin *pin = NULL;
+		ClusterWalRetentionInterval interval = { .thread_id = 1, .tli = 1,
+			.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+
+		reset_pin_fakes(); history_new_boot(); cluster_shared_config = true;
+		history_sample_at_grant = true;
+		UT_ASSERT_EQ(reader ? cluster_wal_read_pin_acquire_v1(&tid, 1, &read)
+			: cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(history_grant_observations, 1);
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&cut));
+		UT_ASSERT_EQ(reader ? cluster_wal_read_pin_release_v1(&read)
+			: cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT(cluster_undo_retention_horizon_sample(&cut));
+		UT_ASSERT_EQ(cut.horizon_scn, 700);
+	}
+	history_new_boot();
+}
+
+UT_TEST(k_wal_unknown_history_after_h_refuses_before_original_grant)
+{
+	for (int reader = 0; reader < 2; reader++) {
+		ClusterUndoRetentionSample cut;
+		uint16 tid = 1;
+		ClusterWalReadPinV1 *read = NULL;
+		ClusterWalRetentionPin *pin = NULL;
+		ClusterWalRetentionInterval interval = { .thread_id = 1, .tli = 1,
+			.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+
+		reset_pin_fakes(); history_new_boot(); cluster_shared_config = true;
+		UT_ASSERT(cluster_undo_retention_horizon_sample(&cut));
+		UT_ASSERT_EQ(reader ? cluster_wal_read_pin_acquire_v1(&tid, 1, &read)
+			: cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_UNAVAILABLE);
+		UT_ASSERT(read == NULL && pin == NULL);
+		UT_ASSERT_EQ(fake_acquire_call_count, 0);
+		UT_ASSERT_EQ(fake_native_acquire_call_count, 0);
+		UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+		/* Exact-parent admission must still be retired for the next method. */
+		if (read != NULL) (void)cluster_wal_read_pin_release_v1(&read);
+		if (pin != NULL) (void)cluster_wal_retention_pin_release(&pin);
+	}
+	history_new_boot();
+}
+
+UT_TEST(k_wal_unconfirmed_history_exit_keeps_h_closed)
+{
+	for (int reader = 0; reader < 2; reader++) {
+		ClusterUndoRetentionSample cut;
+		uint16 tid = 1;
+		ClusterWalReadPinV1 *read = NULL;
+		ClusterWalRetentionPin *pin = NULL;
+		ClusterWalRetentionInterval interval = { .thread_id = 1, .tli = 1,
+			.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+
+		reset_pin_fakes(); history_new_boot(); cluster_shared_config = true;
+		UT_ASSERT_EQ(reader ? cluster_wal_read_pin_acquire_v1(&tid, 1, &read)
+			: cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+		fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		UT_ASSERT_EQ(reader ? cluster_wal_read_pin_release_v1(&read)
+			: cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_UNCONFIRMED);
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&cut));
+		UT_ASSERT_EQ(procArray->cluster_read_scn_floor, InvalidScn);
+		fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		UT_ASSERT_EQ(reader ? cluster_wal_read_pin_release_v1(&read)
+			: cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT(cluster_undo_retention_horizon_sample(&cut));
+	}
+	history_new_boot();
+}
+
+UT_TEST(k_wal_error_cleanup_retires_only_confirmed_history_owner)
+{
+	for (int reader = 0; reader < 2; reader++) {
+		ClusterUndoRetentionSample cut;
+		uint16 threads[] = {1, 2};
+		ClusterWalReadPinV1 *read = NULL;
+		ClusterWalRetentionPin *pin = NULL;
+		ClusterWalRetentionInterval interval = { .thread_id = 1, .tli = 1,
+			.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+		volatile bool caught = false;
+
+		reset_pin_fakes(); history_new_boot(); cluster_shared_config = true;
+		fake_acquire_error_at = reader ? 2 : 1;
+		PG_TRY(); {
+			if (reader) (void)cluster_wal_read_pin_acquire_v1(threads, 2, &read);
+			else (void)cluster_wal_retention_pin_acquire(&request, 1, &pin);
+		} PG_CATCH(); { caught = true; } PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(!cluster_undo_retention_horizon_sample(&cut));
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+			fake_resource_release_arg);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&procArray->cluster_unknown_history_sources), 0);
+		UT_ASSERT(cluster_undo_retention_horizon_sample(&cut));
+	}
+	history_new_boot();
+}
+
+UT_TEST(k_wal_borrowed_history_stays_registered_through_original_scope)
+{
+	ClusterUndoRetentionSample cut;
+	uint16 tid = 1;
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ClusterWalRetentionInterval interval = { .thread_id = 1, .tli = 1,
+		.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ResourceOwner saved = CurrentResourceOwner;
+
+	reset_pin_fakes(); history_new_boot(); cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(&tid, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&request.root_read, false,
+		&publisher), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&procArray->cluster_unknown_history_sources), 1);
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_INVALID);
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&cut));
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher), CLUSTER_WALR_RELEASE_CONFIRMED);
+	CurrentResourceOwner = (ResourceOwner)(uintptr_t)2;
+	fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+		fake_resource_release_arg);
+	UT_ASSERT(!cluster_undo_retention_horizon_sample(&cut));
+	CurrentResourceOwner = saved;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&cut));
+	history_new_boot();
+}
+
+UT_TEST(k_wal_physical_writer_guards_remain_usable_after_h)
+{
+	ClusterUndoRetentionSample cut;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ClusterWalRetentionInterval interval = { .thread_id = 1, .tli = 1,
+		.start_lsn = TEST_WAL_SEG_SIZE, .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+
+	reset_pin_fakes(); history_new_boot(); cluster_shared_config = true;
+	UT_ASSERT(cluster_undo_retention_horizon_sample(&cut));
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&request.root_read, false,
+		&publisher), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher), CLUSTER_WALR_RELEASE_CONFIRMED);
+	/* These original methods exercise E1 and action/reuse physical callers. */
+	test_e1_coarse_holds_x_across_strong_floor_then_releases();
+	test_correctness_action_context_preflights_e2_without_pin();
+	UT_ASSERT_EQ(procArray->cluster_read_scn_floor, 700);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&procArray->cluster_unknown_history_sources), 0);
+	history_new_boot();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4471,7 +4631,8 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(97);
+	history_new_boot();
+	UT_PLAN(103);
 	UT_RUN(test_history_local_observation_refuses_unusable_context);
 	UT_RUN(test_history_local_read_pin_survives_owner_change_and_error_cleanup);
 	UT_RUN(test_read_owner_borrows_all_original_native_grants_without_acquiring);
@@ -4569,6 +4730,13 @@ main(int argc, char **argv)
 	UT_RUN(test_pending_pin_protects_input_without_fake_checkpoint_interval);
 	UT_RUN(test_pending_pin_refuses_stale_or_mixed_inputs_before_retaining_owner);
 	UT_RUN(test_pin_storage_distinct_checks_interior_without_changing_owner);
+	UT_RUN(k_wal_history_source_precedes_each_original_grant);
+	UT_RUN(k_wal_unknown_history_after_h_refuses_before_original_grant);
+	UT_RUN(k_wal_unconfirmed_history_exit_keeps_h_closed);
+	UT_RUN(k_wal_error_cleanup_retires_only_confirmed_history_owner);
+	UT_RUN(k_wal_borrowed_history_stays_registered_through_original_scope);
+	UT_RUN(k_wal_physical_writer_guards_remain_usable_after_h);
+	free(procArray);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

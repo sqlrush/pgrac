@@ -24,6 +24,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
+#include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster_control_root_private.h"
 #include "portability/instr_time.h"
@@ -76,6 +77,7 @@ struct ClusterWalRetentionPin {
 	uint16 nthreads;
 	uint8 state;
 	bool poisoned;
+	bool unknown_history_registered;
 	ClusterRecoverySerialGuardSet *serial_set;
 	ClusterWalPinThread *threads;
 	uint16 nreaders;
@@ -114,6 +116,7 @@ struct ClusterWalReadPinV1 {
 	ResourceOwner owner;
 	uint16 nthreads;
 	bool poisoned;
+	bool unknown_history_registered;
 	ClusterWalPinLock locks[FLEXIBLE_ARRAY_MEMBER];
 };
 
@@ -602,6 +605,15 @@ pin_valid(const ClusterWalRetentionPin *pin)
 		   && pin->state <= CLUSTER_WAL_PIN_STATE_SEALED;
 }
 
+/* All original grants are confirmed released before withdrawing history.
+ * An unconfirmed native release never reaches this helper. */
+static void
+wal_history_source_end(bool *registered)
+{
+	if (*registered && !cluster_undo_retention_unknown_source_leave(registered))
+		elog(FATAL, "could not confirm WAL history source retirement");
+}
+
 static void
 pin_free(ClusterWalRetentionPin *pin)
 {
@@ -617,6 +629,7 @@ pin_free(ClusterWalRetentionPin *pin)
 	}
 	if (pin->readers != NULL)
 		pfree(pin->readers);
+	wal_history_source_end(&pin->unknown_history_registered);
 	explicit_bzero(pin, sizeof(*pin));
 	pfree(pin);
 }
@@ -866,6 +879,9 @@ pin_acquire_inputs(const ClusterWalRetentionPinThreadRequest *requests, uint16 n
 		}
 	/* Register the complete owner before any actual grant, including ERROR. */
 	active_pin = pin;
+	if (cluster_shared_config &&
+		!cluster_undo_retention_unknown_source_enter(&pin->unknown_history_registered))
+		return pin_fail_after_locks(pin, CLUSTER_WAL_PIN_UNAVAILABLE, out_pin);
 	for (uint16 tid = 1; tid <= CLUSTER_WAL_RETENTION_MAX_THREADS; tid++) {
 		ClusterWalPinLock *walr = pin_walr_for_thread(pin, tid);
 		ClusterLockAcquireResult result;
@@ -1300,6 +1316,7 @@ cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin)
 	if (uncertain)
 		return CLUSTER_WALR_RELEASE_UNCONFIRMED;
 	active_read_pin = NULL;
+	wal_history_source_end(&(*pin)->unknown_history_registered);
 	explicit_bzero(*pin, offsetof(ClusterWalReadPinV1, locks)
 							 + (Size)(*pin)->nthreads * sizeof(ClusterWalPinLock));
 	pfree(*pin);
@@ -1337,6 +1354,8 @@ cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads, ClusterW
 	pin->poisoned = true;
 	/* Register before the first grant so ERROR cleanup owns earlier grants. */
 	active_read_pin = pin;
+	if (!cluster_undo_retention_unknown_source_enter(&pin->unknown_history_registered))
+		goto failed;
 	for (uint16 i = 0; i < nthreads; i++) {
 		ClusterWalPinLock *lock = &pin->locks[i];
 

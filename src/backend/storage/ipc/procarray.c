@@ -121,6 +121,9 @@ typedef struct ProcArrayStruct
 #ifdef USE_PGRAC_CLUSTER
 	/* Successful local H cuts and later reader publications share this lock. */
 	SCN			cluster_read_scn_floor;
+	/* Unknown history sources share the original A publication cut. Counts
+	 * below MAX are registered sources; MAX is its short commit reservation. */
+	pg_atomic_uint32 cluster_unknown_history_sources;
 #endif
 
 	/* indexes into allProcs[], has PROCARRAY_MAXPROCS entries */
@@ -472,6 +475,7 @@ CreateSharedProcArray(void)
 		procArray->replication_slot_catalog_xmin = InvalidTransactionId;
 #ifdef USE_PGRAC_CLUSTER
 		procArray->cluster_read_scn_floor = InvalidScn;
+		pg_atomic_init_u32(&procArray->cluster_unknown_history_sources, 0);
 #endif
 		ShmemVariableCache->xactCompletionCount = 1;
 	}
@@ -2280,6 +2284,55 @@ ProcArrayReplicationFeedbackAllowed(TransactionId xmin, TransactionId catalog_xm
 	return !SCN_VALID(procArray->cluster_read_scn_floor);
 }
 
+/* Register an unqualified history source before its original first grant.
+ * The source count and A's commit reservation exclude each other without
+ * acquiring ProcArrayLock under a control/retention lock. One CAS only:
+ * contention is NOT_READY, not a spin or a new wait-for edge. */
+bool
+cluster_undo_retention_unknown_source_enter(bool *registered)
+{
+	ProcArrayStruct *arrayP = procArray;
+	uint32 count;
+
+	if (registered == NULL || *registered || cluster_node_id < 0 || arrayP == NULL)
+		return false;
+	count = pg_atomic_read_u32(&arrayP->cluster_unknown_history_sources);
+	if (count >= UINT32_MAX - 1 ||
+		!pg_atomic_compare_exchange_u32(&arrayP->cluster_unknown_history_sources,
+									  &count, count + 1))
+		return false;
+	/* This reservation excludes every A writer until we withdraw it. A
+	 * retained promise cannot admit a source with no qualified read SCN. */
+	if (SCN_VALID(arrayP->cluster_read_scn_floor))
+	{
+		pg_atomic_fetch_sub_u32(&arrayP->cluster_unknown_history_sources, 1);
+		return false;
+	}
+	*registered = true;
+	return true;
+}
+
+/* Only the original source owner may withdraw its own successful entry,
+ * after confirmed native release. ERROR/cancel uses that same cleanup;
+ * uncertainty retains the registration until original recovery rebuilds. */
+bool
+cluster_undo_retention_unknown_source_leave(bool *registered)
+{
+	ProcArrayStruct *arrayP = procArray;
+	uint32 count;
+
+	if (registered == NULL || !*registered || arrayP == NULL)
+		return false;
+	count = pg_atomic_read_u32(&arrayP->cluster_unknown_history_sources);
+	if (count == 0 || count == UINT32_MAX)
+		return false;
+	/* A valid outstanding entry prevents zero and therefore a simultaneous
+	 * commit reservation. Other source exits cannot consume this entry. */
+	pg_atomic_fetch_sub_u32(&arrayP->cluster_unknown_history_sources, 1);
+	*registered = false;
+	return true;
+}
+
 /*
  * cluster_undo_retention_horizon_sample -- spec-3.12 D1, typed H observation.
  *
@@ -2407,12 +2460,24 @@ cluster_undo_retention_horizon_sample(ClusterUndoRetentionSample *out)
 	}
 	if (SCN_VALID(sample.horizon_scn))
 	{
+		uint32 expected = 0;
+
+		/* ProcArrayLock already excludes the other A writers. Complete all
+		 * comparisons before taking the short raw-source reservation. */
 		if (arrayP->cluster_read_scn_floor == (SCN) UINT64_MAX ||
 			(SCN_VALID(arrayP->cluster_read_scn_floor) &&
 			 scn_time_cmp(sample.horizon_scn, arrayP->cluster_read_scn_floor) < 0))
 			sample.horizon_scn = InvalidScn;
+		else if (!pg_atomic_compare_exchange_u32(&arrayP->cluster_unknown_history_sources,
+												&expected, UINT32_MAX))
+			sample.horizon_scn = InvalidScn;
 		else
+		{
+			/* Only a scalar write and full-barrier unlock while reserved.
+			 * A raw reader winning the next CAS must see this floor. */
 			arrayP->cluster_read_scn_floor = sample.horizon_scn;
+			pg_atomic_exchange_u32(&arrayP->cluster_unknown_history_sources, 0);
+		}
 	}
 	LWLockRelease(ProcArrayLock);
 

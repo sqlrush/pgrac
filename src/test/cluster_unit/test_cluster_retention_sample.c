@@ -464,6 +464,7 @@ reset_fixture(void)
 	procArray = calloc(1, sizeof(ProcArrayStruct) + lengthof(entries) * sizeof(int));
 	if (procArray == NULL)
 		abort();
+	pg_atomic_init_u32(&procArray->cluster_unknown_history_sources, 0);
 	procArray->maxProcs = lengthof(entries);
 	MemSet(entries, 0, sizeof(entries));
 	for (unsigned i = 0; i < lengthof(entries); i++) {
