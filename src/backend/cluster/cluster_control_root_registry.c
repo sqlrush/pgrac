@@ -70,7 +70,8 @@ static bool decode(const uint8 *p, Size n, uint64 sysid, const uint8 storage[16]
 		!zero(p + 640, 380) || get_le(p, 1020, 4) != root_crc(p, 1020) ||
 		get_le(p, 96, 4) != root_crc(p + 1024, 65536) ||
 		(!cluster_recovery_registry_reference_valid_v2(p + 512) &&
-		 !cluster_recovery_registry_reference_valid_v3(p + 512, CATALOG_VERSION_NO)) ||
+		 !cluster_recovery_registry_reference_valid_v3(p + 512, CATALOG_VERSION_NO) &&
+		 !cluster_recovery_registry_debt_reference_valid_v1(p + 512, CATALOG_VERSION_NO)) ||
 		get_be(p + 512, 16, 8) != get_le(p, 16, 8))
 		return false;
 	target = get_le(p, 188, 8);

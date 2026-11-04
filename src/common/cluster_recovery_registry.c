@@ -7,6 +7,7 @@
 #include "common/cluster_recovery_registry.h"
 #include "common/cluster_recovery_reservations.h"
 #include "cluster/cluster_recovery_coverage_format.h"
+#include "cluster/cluster_recovery_debt_format.h"
 #include "sha2_int.h"
 #include "port/pg_crc32c.h"
 
@@ -914,6 +915,23 @@ bool cluster_recovery_registry_encode_v3(const ClusterRecoveryRegistryV3 *r, uin
 	if (ok) { memcpy(p, bytes, n); memcpy(ref, reference, 128); }
 	free(bytes);
 	return ok;
+}
+bool cluster_recovery_registry_debt_reference_valid_v1(const uint8 ref[128], uint32 catalog)
+{
+	Size n = 256;
+	uint64 bytes, embedded, batches, pages, entries;
+	if (!ref || get(ref, 0, 4) != CLUSTER_RECOVERY_DEBT_ROOT_REF_FORMAT_ID_V1 ||
+		!cluster_recovery_debt_format_registered_v1(CLUSTER_RECOVERY_DEBT_REGISTRY_FORMAT_ID_V1,
+			get(ref, 4, 4), catalog) || get(ref, 8, 4) != 128 ||
+		get(ref, 12, 4) != catalog || !counter(get(ref, 16, 8)) ||
+		!nonzero(ref + 64, 32) || nonzero(ref + 96, 28) || get(ref, 124, 4) != crc(ref, 124))
+		return false;
+	bytes = get(ref, 24, 8); embedded = get(ref, 32, 8);
+	batches = get(ref, 40, 8); pages = get(ref, 48, 8); entries = get(ref, 56, 8);
+	return bytes <= SIZE_MAX && bytes <= PG_INT64_MAX && embedded >= 512 && batches &&
+		batches <= pages && pages <= entries && entries / 64 + (entries % 64 != 0) <= pages &&
+		extend(&n, embedded, 1, (Size)bytes) && extend(&n, batches, 384, (Size)bytes) &&
+		extend(&n, pages, 128, (Size)bytes) && n == bytes;
 }
 bool cluster_recovery_registry_reference_valid_v3(const uint8 ref[128], uint32 catalog)
 {

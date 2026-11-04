@@ -736,10 +736,7 @@ static inline bool control_debt_store_load_v1(int global, const uint8 ref[128], 
 	char name[96];
 	bool ok = false;
 	if (!ref || !out || debt_overlap(ref, 128, out, sizeof(*out)) || *out
-		|| debt_get(ref, 0, 4) != CLUSTER_RECOVERY_DEBT_ROOT_REF_FORMAT_ID_V1
-		|| debt_get(ref, 4, 4) != 1 || debt_get(ref, 8, 4) != 128
-		|| debt_get(ref, 12, 4) != CATALOG_VERSION_NO || !debt_counter(debt_get(ref, 16, 8))
-		|| !debt_zero(ref + 96, 28) || debt_get(ref, 124, 4) != debt_crc(ref, 124)
+		|| !cluster_recovery_registry_debt_reference_valid_v1(ref, CATALOG_VERSION_NO)
 		|| debt_get(ref, 24, 8) < 256 || debt_get(ref, 24, 8) > budget
 		|| debt_get(ref, 24, 8) > PG_INT64_MAX
 		|| !debt_store_directory_safe(global)) return false;
@@ -811,6 +808,61 @@ done:
 	if (dir >= 0 && close(dir)) ok = false;
 	if (basis) for (uint64 i = 0; i < nb; i++) free((void *)basis[i].basis);
 	free(basis); free(scratch); cluster_recovery_registry_destroy_v3(&decoded);
+	if (ok) { *out = w; w = NULL; }
+	control_debt_wire_destroy_v1(&w);
+	return ok;
+}
+
+#include "cluster_control_root_registry_private.h"
+#include "cluster/cluster_cf_enqueue.h"
+/* Private storage observation for the SAME original captured ROOT pair. This
+ * neither creates a selection nor publishes/adopts one. Its owner must still
+ * hold the original episode, complete dependencies and failure protections.
+ * DRF1 never becomes an ordinary coverage/AVAILABLE view through this path. */
+static inline bool
+control_debt_store_load_selected_v4(int global, const uint8 *expected, Size length,
+	const uint8 storage[16], uint64 system, Size budget, ControlDebtWireImageV1 **out)
+{
+	ControlDebtWireImageV1 *w = NULL;
+	ClusterRecoveryRegistryDecodedV3 *embedded = NULL;
+	ControlRootImage *root = NULL;
+	uint8 *pair = NULL, *captured = NULL;
+	uint8 original_storage[16];
+	uint64 sequence;
+	Size reserve = 0;
+	bool ok = false;
+	if (!expected || length != 133120 || !storage || !system || !out
+		|| debt_overlap(expected, length, out, sizeof(*out))
+		|| debt_overlap(storage, 16, out, sizeof(*out)) || *out
+		|| !debt_add(&reserve, 3, 133120, budget)
+		|| !debt_add(&reserve, 1, 66560, budget)
+		|| !debt_add(&reserve, 3, sizeof(*root), budget)) return false;
+	sequence = cluster_cf_attempt_sequence();
+	if (!debt_counter(sequence)) return false;
+	pair = malloc(133120); captured = malloc(133120); root = malloc(sizeof(*root));
+	if (!pair || !captured || !root) goto done;
+	memcpy(captured, expected, length); memcpy(original_storage, storage, 16);
+	if (!cluster_control_root_registry_capture_v4(global, original_storage, system, pair, root)
+		|| memcmp(pair, captured, length)
+		|| !cluster_recovery_registry_debt_reference_valid_v1(pair + 512, CATALOG_VERSION_NO)
+		|| !control_debt_store_load_v1(global, pair + 512, budget - reserve, &w)) goto done;
+	if (debt_get(w->registry, 16, 8) != system || memcmp(w->registry + 32, original_storage, 16)
+		|| debt_get(w->registry, 24, 8) != root->header.v2.database_incarnation
+		|| debt_get(w->registry, 72, 8) != root->header.file_txn_seq
+		|| !debt_old_open(w->registry + 256, debt_get(w->registry, 104, 8), NULL,
+			budget - reserve, &embedded)) goto done;
+	{
+		const ClusterRecoveryRegistryV2 *r = &cluster_recovery_registry_view_v3(embedded)->available;
+		for (uint64 i = 0; i < r->coverage.source_count; i++)
+			if (memcmp(r->coverage.sources[i].source.claim.identity.authority_uuid,
+				root->header.authority_uuid, 16)) goto done;
+	}
+	ok = cluster_cf_attempt_sequence() == sequence
+		&& cluster_control_root_registry_capture_v4(global, original_storage, system, pair, root)
+		&& !memcmp(pair, captured, length) && !memcmp(expected, captured, length)
+		&& !memcmp(storage, original_storage, 16) && cluster_cf_attempt_sequence() == sequence;
+done:
+	free(captured); free(pair); free(root); cluster_recovery_registry_destroy_v3(&embedded);
 	if (ok) { *out = w; w = NULL; }
 	control_debt_wire_destroy_v1(&w);
 	return ok;

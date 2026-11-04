@@ -19224,6 +19224,41 @@ clean: clean-control-debt-store
 clean-control-debt-store:
 	rm -f test_cluster_control_debt_store test_cluster_control_debt_store.d
 
+TESTS += test_cluster_control_debt_selected
+all: test_cluster_control_debt_selected
+test_cluster_control_debt_selected: test_cluster_control_debt_selected.c \
+		test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
+		test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		cluster_registry_common_test.o cluster_control_registry_original.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-debt-selected
+.PHONY: clean-control-debt-selected
+clean-control-debt-selected:
+	rm -f test_cluster_control_debt_selected test_cluster_control_debt_selected.d
+
+test_cluster_control_debt_wire test_cluster_control_debt_store test_cluster_control_debt_selected: \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+cluster_registry_common_test.o: $(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h
+
 cluster_control_registry_original.o: $(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_debt.h \
