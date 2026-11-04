@@ -17491,3 +17491,21 @@ test_cluster_clog_checkpoint_boundary: test_cluster_clog_checkpoint_boundary_pre
 clean: clean-clog-checkpoint-boundary
 clean-clog-checkpoint-boundary:
 	rm -f test_cluster_clog_checkpoint_boundary test_cluster_clog_checkpoint_boundary.d test_cluster_clog_checkpoint_boundary_*.inc
+
+# Original catalog outputs from the creator's independently selected BOOT file.
+TESTS += test_cluster_initdb_managed_catalog
+all: test_cluster_initdb_managed_catalog
+test_cluster_initdb_managed_catalog: test_cluster_initdb_managed_catalog.c test_cluster_initdb_catalog.c unit_test.h \
+        $(top_srcdir)/src/include/access/clog_file.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+        $(top_srcdir)/src/backend/cluster/cluster_initdb_catalog.c \
+        $(top_srcdir)/src/backend/cluster/cluster_initdb_catalog_private.h \
+        $(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+        $(top_srcdir)/src/common/cluster_catalog_init.c \
+        $(top_srcdir)/src/common/cluster_clog_file.c \
+        $(top_srcdir)/src/common/cluster_recovery_file_identity.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+        $(top_srcdir)/src/common/cluster_catalog_init.c $(top_srcdir)/src/common/file_perm.c \
+        $(top_srcdir)/src/common/cluster_clog_file.c $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@

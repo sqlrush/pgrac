@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "access/slru.h"
+#include "access/clog_file.h"
 #include "cluster/cluster_xid_authority.h"
 #include "cluster_initdb_catalog_private.h"
 #include "cluster_initdb_origin_private.h"
@@ -85,6 +86,75 @@ done:
 	}
 	*bytes = result;
 	*length = needed;
+	return true;
+}
+
+bool
+cluster_initdb_catalog_read_managed_clog_v2(
+	int directory, const ClusterRecoveryFileIdentityV2 *expected, uint64 native_hw,
+	uint8 **bytes, Size *length)
+{
+	struct stat parent, file;
+	ClusterClogFileBindingV2 binding = {0};
+	ClusterClogPageIdentityV2 page;
+	uint8 image[CLUSTER_CLOG_FILE_HEADER_BYTES + CLUSTER_CLOG_FRAME_BYTES];
+	uint8 *result = NULL;
+	Size used = 0;
+	int fd = -1;
+	bool ok = false;
+
+	if (bytes == NULL || length == NULL)
+		return false;
+	*bytes = NULL;
+	*length = 0;
+	if (expected == NULL || expected->kind != CLUSTER_RECOVERY_FILE_CLOG_V2
+		|| expected->object_id != 0 || expected->database_oid != 0
+		|| expected->tablespace_oid != 0 || native_hw < FirstNormalTransactionId
+		|| native_hw > CLUSTER_CLOG_PAGE_BYTES * 4
+		|| !catalog_directory(directory, &parent))
+		return false;
+	binding.identity = *expected;
+	result = malloc(CLUSTER_CLOG_PAGE_BYTES);
+	if (result == NULL)
+		return false;
+	fd = openat(directory, "0000", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &file) != 0 || !S_ISREG(file.st_mode)
+		|| file.st_uid != geteuid() || file.st_nlink != 1 || (file.st_mode & 0022) != 0
+		|| file.st_size != sizeof(image))
+		goto done;
+	while (used < sizeof(image)) {
+		ssize_t n = pread(fd, image + used, sizeof(image) - used, used);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto done;
+		used += n;
+	}
+	if (!cluster_clog_file_header_matches_v2(image, CLUSTER_CLOG_FILE_HEADER_BYTES, &binding)
+		|| !cluster_clog_file_page_decode_v2(&binding, 0,
+			image + CLUSTER_CLOG_FILE_HEADER_BYTES, CLUSTER_CLOG_FRAME_BYTES,
+			&page, result, CLUSTER_CLOG_PAGE_BYTES)
+		|| page.identity.page_generation != FirstNormalTransactionId
+		|| !FullTransactionIdEquals(page.identity.birth_full_xid, FirstNormalFullTransactionId))
+		goto done;
+	if (close(fd) != 0) {
+		fd = -1;
+		goto done;
+	}
+	fd = -1;
+	if (!cluster_initdb_object_recheck(directory, "0000", image, sizeof(image), &file)
+		|| !catalog_directory_current(directory, &parent))
+		goto done;
+	ok = true;
+done:
+	if (fd >= 0 && close(fd) != 0)
+		ok = false;
+	if (!ok) {
+		free(result);
+		return false;
+	}
+	*bytes = result;
+	*length = CLUSTER_CLOG_PAGE_BYTES;
 	return true;
 }
 
