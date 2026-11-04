@@ -17455,3 +17455,39 @@ clean: clean-initdb-paths
 .PHONY: clean-initdb-paths
 clean-initdb-paths:
 	rm -f test_cluster_initdb_paths test_cluster_initdb_paths.d test_cluster_initdb_paths_entries.inc test_cluster_initdb_paths_entries.inc.tmp
+
+# Original shutdown boundary with real CLOG full-frame writeback.
+TESTS += test_cluster_clog_checkpoint_boundary
+all: test_cluster_clog_checkpoint_boundary
+test_cluster_clog_checkpoint_boundary: test_cluster_clog_checkpoint_boundary.c test_cluster_clog_creation.c test_cluster_clog_checkpoint.c unit_test.h \
+		test_cluster_clog_creation_support.h \
+		test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(wildcard $(top_srcdir)/src/include/cluster/cluster_control_native_files.h) \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_sync.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_clog_checkpoint_boundary_prelude.inc: $(top_srcdir)/src/backend/access/transam/xlog.c $(srcdir)/extract_cluster_clog_checkpoint_boundary.py
+	python3 $(srcdir)/extract_cluster_clog_checkpoint_boundary.py $< test_cluster_clog_checkpoint_boundary
+test_cluster_clog_checkpoint_boundary_check.inc test_cluster_clog_checkpoint_boundary_guts.inc: test_cluster_clog_checkpoint_boundary_prelude.inc
+test_cluster_clog_checkpoint_boundary: test_cluster_clog_checkpoint_boundary_prelude.inc test_cluster_clog_checkpoint_boundary_check.inc test_cluster_clog_checkpoint_boundary_guts.inc test_cluster_clog_no_creation.h
+.PHONY: clean-clog-checkpoint-boundary
+clean: clean-clog-checkpoint-boundary
+clean-clog-checkpoint-boundary:
+	rm -f test_cluster_clog_checkpoint_boundary test_cluster_clog_checkpoint_boundary.d test_cluster_clog_checkpoint_boundary_*.inc

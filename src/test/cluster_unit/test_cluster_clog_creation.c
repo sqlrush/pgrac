@@ -498,8 +498,11 @@ UT_TEST(creation_boot_checkpoint_io_failure_keeps_dirty_and_original_custody)
 	}
 }
 
+#ifndef CLOG_CREATION_MAIN
+#define CLOG_CREATION_MAIN main
+#endif
 int
-main(void)
+CLOG_CREATION_MAIN(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-creation-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();

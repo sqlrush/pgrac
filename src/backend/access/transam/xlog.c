@@ -10190,6 +10190,15 @@ CreateCheckPoint(int flags)
 	SyncPreCheckpoint();
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Managed CLOG writeback can emit full-image WAL. A shutdown checkpoint
+	 * must drain it before fixing REDO at the checkpoint record's own start.
+	 * Keep the normal Guts flush and the final concurrent-WAL cross-check:
+	 * a later redirty or writer is still a shutdown failure. */
+	if (flags & CHECKPOINT_IS_SHUTDOWN)
+		CheckPointCLOG();
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
 
 	/*
 	 * RF-ROOT P6 (reconfig epoch window):  the checkpoint's recovery-anchor
