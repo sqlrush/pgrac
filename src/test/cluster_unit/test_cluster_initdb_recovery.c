@@ -197,6 +197,11 @@ creator_run(const PgracInitdbRecoveryContext *ctx) {
 	run_origin("original-initdb", &original_request, &original_configuration, shared,
 			   &creator_origins[0], 0, ctx);
 }
+bool
+cluster_initdb_tree_read_registered(int fd, ClusterInitdbTree *out)
+{
+	abort(); /* This original ingress fixture never publishes a registry. */
+}
 static void
 creator_current(void) {
 	InitdbDirectory dirs[4] = {0};
@@ -204,7 +209,7 @@ creator_current(void) {
 	for (unsigned i = 0; i < 4; ++i)
 		dirs[i].fd = shared_fd;
 	creation_sources_current(&original_request, &original_configuration, dirs, creator_origins,
-							 &t, &t, true);
+							 &t, &t, true, false);
 }
 
 UT_TEST(original_creator_retains_actual_pairs_through_registry_selection) {

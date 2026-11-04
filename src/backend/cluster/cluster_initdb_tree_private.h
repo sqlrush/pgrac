@@ -16,4 +16,10 @@ typedef struct ClusterInitdbTree {
  * two ROOT files; these must be independently persisted/read back by creator.
  * No writes, symlink following or descriptor transfer. Failure clears out. */
 extern bool cluster_initdb_tree_read(int fd, bool recheck, ClusterInitdbTree *out);
+/* Only after the original creator has written and independently read back its
+ * complete initial registry. Additionally omit its exact generation-1 file
+ * and parent directory; still traverse the directory and include every other
+ * entry. Require the initial file to exist. The caller must separately recheck
+ * that full registry before ROOT publication; this observation grants nothing. */
+extern bool cluster_initdb_tree_read_registered(int fd, ClusterInitdbTree *out);
 #endif

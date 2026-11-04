@@ -16667,6 +16667,7 @@ test_cluster_initdb_registry_publish: test_cluster_initdb_registry_publish.c tes
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
 		$(top_srcdir)/src/include/common/cluster_recovery_registry.h \

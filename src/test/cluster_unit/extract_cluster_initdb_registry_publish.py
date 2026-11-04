@@ -11,7 +11,7 @@ for name in ["InitdbDirectory", "InitdbOrigin", "InitdbStartupObject"]:
     parts += matches
 parts.append("""static void creation_sources_current(const PgracInitdbCohortContext *,
  const ClusterSharedConfigRef *, InitdbDirectory [4], InitdbOrigin *,
- const ClusterInitdbTree *, const ClusterInitdbTree *, bool);""")
+ const ClusterInitdbTree *, const ClusterInitdbTree *, bool, bool);""")
 for name in ["owned_directory", "same_directory", "parent_current", "directory_current",
              "creation_derived_current", "creation_legacy_format_current",
              "creation_relmap_registry_valid", "creation_boot_registry_valid", "creation_registry_valid", "creation_registry_current", "creation_root_publish"]:

@@ -177,6 +177,67 @@ UT_TEST(recheck_omits_only_creator_derived_objects)
 	UT_ASSERT(unlinkat(fixture_root, "global", AT_REMOVEDIR) == 0);
 }
 
+UT_TEST(initial_registry_is_separate_from_the_original_tree)
+{
+	ClusterInitdbTree before, after;
+	UT_ASSERT(mkdirat(fixture_root, "global", 0700) == 0);
+	put("global/source", "original");
+	UT_ASSERT(cluster_initdb_tree_read(fixture_root, false, &before));
+	memset(&after, 0xa5, sizeof(after));
+	UT_ASSERT(!cluster_initdb_tree_read_registered(fixture_root, &after));
+	UT_ASSERT(zero(&after, sizeof(after)));
+	UT_ASSERT(mkdirat(fixture_root, TREE_REGISTRY_DIR, 0700) == 0);
+	UT_ASSERT(!cluster_initdb_tree_read_registered(fixture_root, &after));
+	put(TREE_INITIAL_REGISTRY, "independently checked registration");
+	UT_ASSERT(cluster_initdb_tree_read_registered(fixture_root, &after));
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+	/* The ordinary/legacy observer never omits a registration. */
+	UT_ASSERT(cluster_initdb_tree_read(fixture_root, true, &after));
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) != 0);
+	put(TREE_REGISTRY_DIR "/unexpected", "not derived");
+	UT_ASSERT(cluster_initdb_tree_read_registered(fixture_root, &after));
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) != 0);
+	UT_ASSERT(unlinkat(fixture_root, TREE_REGISTRY_DIR "/unexpected", 0) == 0);
+	put(TREE_REGISTRY_DIR "/0000000000000002-0000000000000001-0000000000000001.v2", "later");
+	UT_ASSERT(cluster_initdb_tree_read_registered(fixture_root, &after));
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) != 0);
+	UT_ASSERT(unlinkat(fixture_root, TREE_REGISTRY_DIR "/0000000000000002-0000000000000001-0000000000000001.v2", 0) == 0);
+	put("global/source", "modified");
+	UT_ASSERT(cluster_initdb_tree_read_registered(fixture_root, &after));
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) != 0);
+	UT_ASSERT(unlinkat(fixture_root, TREE_INITIAL_REGISTRY, 0) == 0);
+	UT_ASSERT(unlinkat(fixture_root, TREE_REGISTRY_DIR, AT_REMOVEDIR) == 0);
+	UT_ASSERT(unlinkat(fixture_root, "global/source", 0) == 0);
+	UT_ASSERT(unlinkat(fixture_root, "global", AT_REMOVEDIR) == 0);
+}
+
+UT_TEST(initial_registry_wrong_types_and_aliases_refuse)
+{
+	ClusterInitdbTree out;
+	UT_ASSERT(mkdirat(fixture_root, "global", 0700) == 0);
+	put(TREE_REGISTRY_DIR, "not a directory");
+	UT_ASSERT(!cluster_initdb_tree_read_registered(fixture_root, &out));
+	UT_ASSERT(zero(&out, sizeof(out)));
+	UT_ASSERT(unlinkat(fixture_root, TREE_REGISTRY_DIR, 0) == 0);
+	UT_ASSERT(mkdirat(fixture_root, TREE_REGISTRY_DIR, 0700) == 0);
+	for (unsigned kind = 0; kind < 3; kind++) {
+		put("global/source", "original");
+		if (kind == 0)
+			UT_ASSERT(mkdirat(fixture_root, TREE_INITIAL_REGISTRY, 0700) == 0);
+		else if (kind == 1)
+			UT_ASSERT(symlinkat("../source", fixture_root, TREE_INITIAL_REGISTRY) == 0);
+		else
+			UT_ASSERT(linkat(fixture_root, "global/source", fixture_root, TREE_INITIAL_REGISTRY, 0) == 0);
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(!cluster_initdb_tree_read_registered(fixture_root, &out));
+		UT_ASSERT(zero(&out, sizeof(out)));
+		UT_ASSERT(unlinkat(fixture_root, TREE_INITIAL_REGISTRY, kind == 0 ? AT_REMOVEDIR : 0) == 0);
+		UT_ASSERT(unlinkat(fixture_root, "global/source", 0) == 0);
+	}
+	UT_ASSERT(unlinkat(fixture_root, TREE_REGISTRY_DIR, AT_REMOVEDIR) == 0);
+	UT_ASSERT(unlinkat(fixture_root, "global", AT_REMOVEDIR) == 0);
+}
+
 UT_TEST(changes_and_io_failure_clear_observation)
 {
 	ClusterInitdbTree out;
@@ -237,10 +298,12 @@ main(void)
 	fixture_root = open(fixture_directory, O_RDONLY | O_DIRECTORY);
 	if (fixture_root < 0)
 		return 2;
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(empty_and_sorted_tree);
 	UT_RUN(alias_and_unsafe_files_are_not_observations);
 	UT_RUN(recheck_omits_only_creator_derived_objects);
+	UT_RUN(initial_registry_is_separate_from_the_original_tree);
+	UT_RUN(initial_registry_wrong_types_and_aliases_refuse);
 	UT_RUN(changes_and_io_failure_clear_observation);
 	UT_RUN(recursion_can_fill_and_grow_the_inventory);
 	UT_RUN(same_tick_rewrite_clears_observation);

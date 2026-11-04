@@ -1245,7 +1245,8 @@ creation_sources_current(const PgracInitdbCohortContext *request,
 									 const ClusterSharedConfigRef *config,
 									 InitdbDirectory roots[4], InitdbOrigin *origins,
 									 const ClusterInitdbTree *data,
-									 const ClusterInitdbTree *undo, bool derived) {
+									 const ClusterInitdbTree *undo, bool derived,
+									 bool registered) {
 	request_current(request, config);
 	for (unsigned i = 0; i < 4; i++)
 		directory_current(&roots[i]);
@@ -1265,7 +1266,13 @@ creation_sources_current(const PgracInitdbCohortContext *request,
 			!creation_boot_current(&origins[node], false))
 			refuse("original BOOT file identity or bytes changed before ROOT publication");
 	}
-	creation_tree_recheck(roots[1].fd, derived, data);
+	if (registered) {
+		ClusterInitdbTree observed;
+		if (!derived || !cluster_initdb_tree_read_registered(roots[1].fd, &observed)
+			|| memcmp(&observed, data, sizeof(observed)))
+			refuse("original registered file tree changed before publication");
+	} else
+		creation_tree_recheck(roots[1].fd, derived, data);
 	creation_tree_recheck(roots[3].fd, false, undo);
 	request_current(request, config);
 }
@@ -1699,14 +1706,14 @@ creation_root_publish(const PgracInitdbCohortContext *request, const ClusterShar
 	} else
 		creation_legacy_format_current(origins);
 
-	creation_sources_current(request, config, roots, origins, data, undo, true);
+	creation_sources_current(request, config, roots, origins, data, undo, true, false);
 	creation_derived_current(global, startups, objects, root, inputs, NULL);
 	if (registration) {
 		if (!cluster_recovery_registry_create_v2(global->fd, registration, registry_budget,
 												 persisted)
 			|| memcmp(reference, persisted, sizeof(reference)))
 			refuse("cannot persist original complete creation registration");
-		creation_sources_current(request, config, roots, origins, data, undo, true);
+		creation_sources_current(request, config, roots, origins, data, undo, true, true);
 		creation_derived_current(global, startups, objects, root, inputs, NULL);
 		creation_registry_current(global, config, origins, root, registration, registry_budget,
 								  registry_bytes, registry_length, reference);
@@ -1714,13 +1721,13 @@ creation_root_publish(const PgracInitdbCohortContext *request, const ClusterShar
 	if (!cluster_initdb_object_write_observed(global->fd, "pgrac_control_root.bak", selected,
 											  selected_length, &backup))
 		refuse("cannot persist original backup ROOT");
-	creation_sources_current(request, config, roots, origins, data, undo, true);
+	creation_sources_current(request, config, roots, origins, data, undo, true, registration != NULL);
 	creation_derived_current(global, startups, objects, root, inputs, NULL);
 	if (registration) {
 		creation_registry_current(global, config, origins, root, registration, registry_budget,
 								  registry_bytes, registry_length, reference);
 		/* Registry I/O cannot substitute for a final native-source check. */
-		creation_sources_current(request, config, roots, origins, data, undo, true);
+		creation_sources_current(request, config, roots, origins, data, undo, true, true);
 		creation_derived_current(global, startups, objects, root, inputs, NULL);
 		if (!creation_registry_valid(config, origins, root, registration, registry_budget)
 			|| !cluster_recovery_registry_matches_v2(registry_bytes, registry_length, registration,
@@ -1856,7 +1863,7 @@ create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roo
 		if (!pgrac_control_binding_encode(&binding, bindings[node], PGRAC_CONTROL_BINDING_BYTES))
 			refuse("cannot encode original local binding");
 	}
-	creation_sources_current(request, config, roots, origins, &data, &undo, false);
+	creation_sources_current(request, config, roots, origins, &data, &undo, false, false);
 	open_original_child(&roots[1], "global", &global);
 	create_child(&global, "wal_startup", &startups);
 	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {

@@ -12,6 +12,7 @@
 #include "cluster/cluster_initdb_config.h"
 #include "../../backend/cluster/cluster_initdb_origin_private.h"
 #include "../../backend/cluster/cluster_initdb_tree_private.h"
+#include "../../backend/cluster/cluster_initdb_tree.c"
 #include "../../backend/cluster/cluster_cf_contract_private.h"
 #include "../../bin/initdb/pgrac_wal.h"
 
@@ -53,14 +54,24 @@ static int fault_kind;
 static void
 creation_sources_current(const PgracInitdbCohortContext *r, const ClusterSharedConfigRef *c,
 						 InitdbDirectory d[4], InitdbOrigin *o, const ClusterInitdbTree *a,
-						 const ClusterInitdbTree *b, bool derived)
+						 const ClusterInitdbTree *b, bool derived, bool registered)
 {
+	ClusterInitdbTree observed;
 	if (r != &request || c != &original_config || d != directories || o != origins || a != &tree
 		|| b != &tree || !derived)
 		abort();
 	current_calls++;
+	if (!(registered ? cluster_initdb_tree_read_registered(global_dir.parent, &observed)
+					 : cluster_initdb_tree_read(global_dir.parent, true, &observed))
+		|| memcmp(&observed, &tree, sizeof(tree)))
+		refuse("actual original tree changed");
 	if (faccessat(global_dir.fd, "pgrac_control_root", F_OK, 0) == 0)
 		abort(); /* Every original-source check precedes primary publication. */
+	if (fault_kind == 7 && current_calls == fault_at) {
+		int fd = openat(global_dir.fd, "pgrac_recovery_registry/unexpected", O_CREAT | O_EXCL | O_WRONLY, 0600);
+		if (fd < 0 || write(fd, "extra", 5) != 5 || close(fd))
+			abort();
+	}
 	if (current_calls != fault_at)
 		return;
 	if (fault_kind == 1)
@@ -175,6 +186,8 @@ setup(void)
 												  &objects[i].identity))
 			abort();
 	}
+	if (!cluster_initdb_tree_read(parent, true, &tree))
+		abort();
 	current_calls = fault_at = 0;
 	fault_kind = 0;
 	test_registry_io_fault(0);
@@ -360,6 +373,21 @@ UT_TEST(backup_and_startup_changes_are_rechecked_before_primary)
 		cleanup();
 	}
 }
+UT_TEST(extra_registry_material_never_becomes_a_creator_derived_input)
+{
+	uint8 reference[128];
+	setup();
+	fault_kind = 7;
+	fault_at = 2;
+	UT_ASSERT(!publish(true));
+	UT_ASSERT(faccessat(global_dir.fd, "pgrac_control_root", F_OK, 0) != 0);
+	cleanup();
+	setup();
+	UT_ASSERT(cluster_recovery_registry_create_v2(global_dir.fd, &reg, 4096, reference));
+	UT_ASSERT(!publish(false));
+	UT_ASSERT(faccessat(global_dir.fd, "pgrac_control_root", F_OK, 0) != 0);
+	cleanup();
+}
 UT_TEST(legacy_publisher_remains_legacy_and_managed_child_is_closed)
 {
 	struct stat s;
@@ -458,7 +486,7 @@ UT_TEST(managed_registry_matches_each_captured_image_and_preallocated_identity) 
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_original_codec_v4_extent_and_exact_reference);
 	UT_RUN(test_v4_refuses_forged_reference_and_record);
 	UT_RUN(test_selected_root_registry_real_files_and_late_change);
@@ -470,6 +498,7 @@ main(void)
 	UT_RUN(registry_sync_failure_never_publishes_either_root);
 	UT_RUN(late_source_or_registry_changes_leave_primary_absent);
 	UT_RUN(backup_and_startup_changes_are_rechecked_before_primary);
+	UT_RUN(extra_registry_material_never_becomes_a_creator_derived_input);
 	UT_RUN(legacy_publisher_remains_legacy_and_managed_child_is_closed);
 	UT_RUN(managed_child_requires_its_complete_captured_relmap_inventory);
 	UT_RUN(managed_registry_matches_each_captured_image_and_preallocated_identity);

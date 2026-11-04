@@ -12,6 +12,11 @@
 #define TREE_PATH_BYTES (16 * 1024 * 1024)
 #define TREE_DEPTH 64
 
+/* The creator only publishes generation 1. Later registry generations are not
+ * derived objects of this observation. */
+#define TREE_REGISTRY_DIR "global/pgrac_recovery_registry"
+#define TREE_INITIAL_REGISTRY TREE_REGISTRY_DIR "/0000000000000001-0000000000000001-0000000000000001.v2"
+
 typedef struct TreeEntry {
 	char *path;
 	struct stat observed;
@@ -23,6 +28,7 @@ typedef struct TreeScan {
 	unsigned count, capacity;
 	size_t paths;
 	bool recheck;
+	bool initial_registry, registry_observed;
 } TreeScan;
 
 static bool
@@ -165,7 +171,8 @@ tree_scan(TreeScan *scan, int parent, const char *prefix, unsigned depth)
 		char path[MAXPGPATH];
 		TreeEntry entry = { 0 };
 		int child;
-		unsigned slot;
+		unsigned slot = 0;
+		bool omit_directory;
 		size_t length;
 		struct dirent *item;
 		errno = 0;
@@ -188,23 +195,34 @@ tree_scan(TreeScan *scan, int parent, const char *prefix, unsigned depth)
 				break;
 			continue;
 		}
-		length = strlen(path) + 1;
-		if (scan->count == TREE_ENTRIES || length > TREE_PATH_BYTES - scan->paths)
-			break;
-		if (scan->count == scan->capacity) {
-			unsigned capacity = scan->capacity ? scan->capacity * 2 : 64;
-			TreeEntry *entries = realloc(scan->entries, capacity * sizeof(*entries));
-			if (entries == NULL)
+		if (scan->initial_registry && strcmp(path, TREE_INITIAL_REGISTRY) == 0) {
+			if (!S_ISREG(entry.observed.st_mode))
 				break;
-			scan->entries = entries;
-			scan->capacity = capacity;
+			scan->registry_observed = true;
+			continue;
 		}
-		entry.path = strdup(path);
-		if (entry.path == NULL)
+		omit_directory = scan->initial_registry && strcmp(path, TREE_REGISTRY_DIR) == 0;
+		if (omit_directory && !S_ISDIR(entry.observed.st_mode))
 			break;
-		scan->paths += length;
-		slot = scan->count++;
-		scan->entries[slot] = entry;
+		length = strlen(path) + 1;
+		if (!omit_directory) {
+			if (scan->count == TREE_ENTRIES || length > TREE_PATH_BYTES - scan->paths)
+				break;
+			if (scan->count == scan->capacity) {
+				unsigned capacity = scan->capacity ? scan->capacity * 2 : 64;
+				TreeEntry *entries = realloc(scan->entries, capacity * sizeof(*entries));
+				if (entries == NULL)
+					break;
+				scan->entries = entries;
+				scan->capacity = capacity;
+			}
+			entry.path = strdup(path);
+			if (entry.path == NULL)
+				break;
+			scan->paths += length;
+			slot = scan->count++;
+			scan->entries[slot] = entry;
+		}
 		child = openat(parent, item->d_name,
 					   O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
 						   | (S_ISDIR(entry.observed.st_mode) ? O_DIRECTORY : 0));
@@ -223,7 +241,8 @@ tree_scan(TreeScan *scan, int parent, const char *prefix, unsigned depth)
 		if (!ok)
 			break;
 		/* Recursion may have grown entries; use the reserved index. */
-		scan->entries[slot] = entry;
+		if (!omit_directory)
+			scan->entries[slot] = entry;
 		ok = false;
 	}
 	if (fstat(parent, &after) != 0 || !tree_same(&before, &after))
@@ -292,8 +311,8 @@ tree_recheck(int root, const TreeEntry *entry)
 	return ok;
 }
 
-bool
-cluster_initdb_tree_read(int fd, bool recheck, ClusterInitdbTree *out)
+static bool
+tree_read(int fd, bool recheck, bool initial_registry, ClusterInitdbTree *out)
 {
 	static const char domain[] = "PGRAC-CREATION-TREE-V1";
 	static const char identity_domain[] = "PGRAC-CREATION-OBSERVATION-V1";
@@ -306,7 +325,9 @@ cluster_initdb_tree_read(int fd, bool recheck, ClusterInitdbTree *out)
 		return false;
 	memset(out, 0, sizeof(*out));
 	scan.recheck = recheck;
-	if (fstat(fd, &root) != 0 || !tree_scan(&scan, fd, "", 0))
+	scan.initial_registry = initial_registry;
+	if (fstat(fd, &root) != 0 || !tree_scan(&scan, fd, "", 0)
+		|| (initial_registry && !scan.registry_observed))
 		goto done;
 	if (scan.count > 1)
 		qsort(scan.entries, scan.count, sizeof(*scan.entries), tree_compare);
@@ -349,4 +370,17 @@ done:
 		free(scan.entries[i].path);
 	free(scan.entries);
 	return ok;
+}
+
+
+bool
+cluster_initdb_tree_read(int fd, bool recheck, ClusterInitdbTree *out)
+{
+	return tree_read(fd, recheck, false, out);
+}
+
+bool
+cluster_initdb_tree_read_registered(int fd, ClusterInitdbTree *out)
+{
+	return tree_read(fd, true, true, out);
 }
