@@ -5,7 +5,8 @@
 #include "common/cluster_recovery_registry.h"
 #include "common/cluster_recovery_reservations.h"
 /* Pure pre-CF observation. Original fields are validated in private scratch;
- * metadata.bytes is empty and format_version remains 4. No token or grant. */
+ * metadata.bytes is empty and format_version remains 4. DRF1 recognition is
+ * shape only: ordinary AVAILABLE loaders continue to refuse it. No grant. */
 extern bool cluster_control_root_registry_decode_v4(const uint8 *, Size,
 	const uint8 storage_uuid[16], uint64 system_identifier, ControlRootImage *metadata);
 /* Original owner supplies its unpublished candidate and complete registry.

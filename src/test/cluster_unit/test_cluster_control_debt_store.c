@@ -19,8 +19,13 @@ static ssize_t store_pwrite(int fd, const void *p, size_t n, off_t at)
 }
 static ssize_t store_pread(int fd, void *p, size_t n, off_t at)
 {
+	ssize_t result;
 	if (++reads == fail_read) { errno = EIO; return -1; }
-	return pread(fd, p, n, at);
+	result = pread(fd, p, n, at);
+#ifdef CONTROL_DEBT_STORE_TEST_READ_HOOK
+	CONTROL_DEBT_STORE_TEST_READ_HOOK();
+#endif
+	return result;
 }
 static int store_sync(int fd)
 {
@@ -260,7 +265,10 @@ UT_TEST(store_symlink_hardlink_and_unsafe_modes_refuse)
 		UT_ASSERT(loaded == NULL); store_end();
 	}
 }
-int main(void)
+#ifndef DEBT_STORE_TEST_MAIN
+#define DEBT_STORE_TEST_MAIN main
+#endif
+int DEBT_STORE_TEST_MAIN(void)
 {
 	UT_PLAN(9);
 	UT_RUN(store_pages_reload_without_input_vectors);

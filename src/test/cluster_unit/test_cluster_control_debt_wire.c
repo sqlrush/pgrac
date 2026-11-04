@@ -6,9 +6,14 @@
  *-------------------------------------------------------------------------
  */
 #define TEST_CONTROL_REGISTRY 1
+#ifdef DEBT_WIRE_ROOT_FIXTURE
+#define TEST_CONTROL_FILE_SELECTION 1
+#include "test_cluster_control_registry.c"
+#else
 int debt_original_registry_main(void);
 #define main debt_original_registry_main
 #include "test_cluster_recovery_registry.c"
+#endif
 #undef main
 #include "common/cluster_recovery_reservations.h"
 #include "../../backend/cluster/cluster_control_debt_v2.inc"
@@ -21,11 +26,22 @@ static ControlDebtWireEntryV1 debt_entries[130];
 static ControlDebtWireBatchV1 debt_batches[2];
 static ClusterRecoveryRegistryV3 debt_registry;
 static ClusterRecoveryFileReservationV1 debt_reserved[2];
+#ifdef DEBT_WIRE_ROOT_FIXTURE
+static bool debt_fixture_v4;
+#endif
 
 static void
 debt_fixture(uint64 count)
 {
+#ifdef DEBT_WIRE_ROOT_FIXTURE
+	root_fixture();
+	if (debt_fixture_v4) {
+		reg.coverage_format_version = 4;
+		for (unsigned i = 0; i < 2; i++) memset(files[i].creation_batch_uuid, 0x63, 16);
+	}
+#else
 	fixture();
+#endif
 	memset(&debt_registry, 0, sizeof(debt_registry));
 	debt_registry.available = reg;
 	debt_registry.catalog_version = CATALOG_VERSION_NO;

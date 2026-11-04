@@ -42,6 +42,10 @@ extern bool cluster_recovery_registry_encode_v3(const ClusterRecoveryRegistryV3 
 												uint8 reference[128]);
 extern bool cluster_recovery_registry_reference_valid_v3(const uint8 reference[128],
 													 uint32 actual_catalog_version);
+/* Shape only for the distinct debt family. Never an AVAILABLE reference or a
+ * complete debt decoder; the original ROOT owner loads every page and basis. */
+extern bool cluster_recovery_registry_debt_reference_valid_v1(const uint8 reference[128],
+	uint32 actual_catalog_version);
 extern bool cluster_recovery_registry_matches_v3(const uint8 *, Size,
 												 const ClusterRecoveryRegistryV3 *,
 												 const uint8 reference[128]);
