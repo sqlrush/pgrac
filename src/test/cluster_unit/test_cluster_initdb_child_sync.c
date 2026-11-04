@@ -115,8 +115,17 @@ bound_child(uint16 origin, unsigned check, bool wrong_origin)
 		snprintf(value, sizeof(value), "%d", pipe_fd);
 		if (setenv(PGRAC_INITDB_RECOVERY_ENV, value, 1) != 0)
 			_exit(23);
+		/* The peer now authenticates the original pipe before borrowing the
+		 * occupied shared directory; bind reuses and rechecks those FDs. */
+		if (origin != 0)
+		{
+			pgrac_native_data_fd = open(data, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+			pgrac_native_wal_fd = open(data, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+			pgrac_native_base_fd = open(shared, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+			pgrac_native_read_registration();
+		}
 		pgrac_native_bind_creation();
-		if (wrong_origin || !pgrac_native_recovery_requested || config_checks != 1 ||
+		if (wrong_origin || !pgrac_native_recovery_requested || config_checks != (origin == 0 ? 1 : 2) ||
 			getenv(PGRAC_INITDB_RECOVERY_ENV) != NULL ||
 			fcntl(pipe_fd, F_GETFD) != -1 || errno != EBADF)
 			_exit(24);
