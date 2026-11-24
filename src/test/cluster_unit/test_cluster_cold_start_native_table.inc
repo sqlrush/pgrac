@@ -747,3 +747,22 @@ UT_TEST(test_start_debt_captures_input_holders_before_first_control_read)
     start_table_cf_held = false;
     ClusterReleaseColdRecoveryInputs(&info);
 }
+
+/* Keep focused and default execution on the same complete debt regression set. */
+static void
+start_debt_control_tests(void)
+{
+	UT_RUN(test_start_debt_begin_is_once_owned_and_never_rebases_to_later_cf);
+	UT_RUN(test_start_debt_begin_false_error_and_alias_cannot_publish_or_retry);
+	UT_RUN(test_start_debt_query_requires_original_complete_ir_walr_and_same_cf);
+	UT_RUN(test_start_debt_query_refuses_wrong_phase_holder_and_identity);
+	UT_RUN(test_start_debt_query_compares_every_original_control_reference);
+	UT_RUN(test_start_debt_query_late_refusal_and_error_preserve_original_protections);
+	UT_RUN(test_start_debt_binds_first_and_last_original_input_holder);
+	UT_RUN(test_start_debt_binds_scope_and_continuous_retention_incarnation);
+	UT_RUN(test_start_debt_input_capture_refusal_and_error_never_retry_or_release);
+	UT_RUN(test_start_debt_current_input_error_is_sticky_without_mutation_or_cleanup);
+	UT_RUN(test_start_debt_rechecks_input_holders_after_physical_control_validation);
+	UT_RUN(test_start_debt_current_preconditions_do_not_touch_input_holders);
+	UT_RUN(test_start_debt_captures_input_holders_before_first_control_read);
+}

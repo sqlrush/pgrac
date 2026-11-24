@@ -2593,13 +2593,8 @@ int main(void)
 		UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_START_DEBT_CONTROL") != NULL) {
-		UT_PLAN(6);
-		UT_RUN(test_start_debt_begin_is_once_owned_and_never_rebases_to_later_cf);
-		UT_RUN(test_start_debt_begin_false_error_and_alias_cannot_publish_or_retry);
-		UT_RUN(test_start_debt_query_requires_original_complete_ir_walr_and_same_cf);
-		UT_RUN(test_start_debt_query_refuses_wrong_phase_holder_and_identity);
-		UT_RUN(test_start_debt_query_compares_every_original_control_reference);
-		UT_RUN(test_start_debt_query_late_refusal_and_error_preserve_original_protections);
+		UT_PLAN(13);
+		start_debt_control_tests();
 		reset(); UT_DONE(); return ut_failed_count != 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_START_NATIVE_TABLE") != NULL) {
@@ -3233,7 +3228,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(476);
+	UT_PLAN(483);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3244,7 +3239,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(465);
+	UT_PLAN(472);
 #endif
 	UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
 	UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
@@ -3276,7 +3271,7 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(437);
+	UT_PLAN(444);
 #endif
 	UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
 	UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
@@ -3721,19 +3716,7 @@ int main(void)
 	UT_RUN(test_start_images_error_or_late_owner_drift_preserve_original_cleanup);
 	start_native_table_tests();
 	start_managed_census_tests();
-	UT_RUN(test_start_debt_begin_is_once_owned_and_never_rebases_to_later_cf);
-	UT_RUN(test_start_debt_begin_false_error_and_alias_cannot_publish_or_retry);
-	UT_RUN(test_start_debt_query_requires_original_complete_ir_walr_and_same_cf);
-	UT_RUN(test_start_debt_query_refuses_wrong_phase_holder_and_identity);
-	UT_RUN(test_start_debt_query_compares_every_original_control_reference);
-	UT_RUN(test_start_debt_query_late_refusal_and_error_preserve_original_protections);
-	UT_RUN(test_start_debt_binds_first_and_last_original_input_holder);
-	UT_RUN(test_start_debt_binds_scope_and_continuous_retention_incarnation);
-	UT_RUN(test_start_debt_input_capture_refusal_and_error_never_retry_or_release);
-	UT_RUN(test_start_debt_current_input_error_is_sticky_without_mutation_or_cleanup);
-	UT_RUN(test_start_debt_rechecks_input_holders_after_physical_control_validation);
-	UT_RUN(test_start_debt_current_preconditions_do_not_touch_input_holders);
-	UT_RUN(test_start_debt_captures_input_holders_before_first_control_read);
+	start_debt_control_tests();
 	reset();
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
