@@ -19203,6 +19203,7 @@ clean-control-debt-store:
 TESTS += test_cluster_control_debt_selected
 all: test_cluster_control_debt_selected
 test_cluster_control_debt_selected: test_cluster_control_debt_selected.c \
+		test_cluster_control_debt_prepared.inc \
 		test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
 		test_cluster_control_registry.c test_cluster_recovery_registry.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \

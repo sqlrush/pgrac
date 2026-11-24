@@ -868,3 +868,83 @@ done:
 	return ok;
 }
 #endif /* !WIN32: no unsupported-platform storage admission */
+
+#include "cluster_control_root_registry_private.h"
+/* control_debt_root_candidate_v4 -- build the first private PREPARED pair.
+ * Inputs: complete original pair, complete debt image and original bases.
+ * Returns: true with a separate candidate pair; false leaves output unchanged.
+ * Side Effects: bounded temporary allocations only; no I/O or publication.
+ * The original owner must still authenticate Start/CF and the exact before
+ * pair, create/read back the immutable objects, and own the durable ROOT CAS.
+ * Existing selected debt is never treated as an empty basis by this helper. */
+static inline bool
+control_debt_root_candidate_v4(const uint8 *before, Size length,
+	const ControlDebtWireImageV1 *w, const ControlDebtWireBatchV1 *basis, uint64 nb,
+	Size budget, uint8 *out, Size out_length)
+{
+	ClusterRecoveryRegistryDecodedV3 *embedded = NULL;
+	const ClusterRecoveryRegistryV2 *original;
+	ControlRootImage *primary = NULL, *backup = NULL;
+	uint8 *candidate = NULL;
+	Size reserve = 0;
+	uint64 generation, previous;
+	uint32 crc;
+	bool ok = false;
+	if (!before || length != 133120 || !w || !basis || !nb || !out
+		|| out_length != 133120 || nb > SIZE_MAX / sizeof(*basis)
+		|| nb > budget / sizeof(*basis) || w->batch_count != nb
+		|| !w->registry || w->registry_bytes < 256 || !w->pages
+		|| debt_overlap(before, length, out, out_length)
+		|| debt_overlap(w, sizeof(*w), out, out_length)
+		|| debt_overlap(w->registry, w->registry_bytes, out, out_length)
+		|| debt_overlap(w->pages, w->page_bytes, out, out_length)
+		|| debt_overlap(basis, (Size)nb * sizeof(*basis), out, out_length)
+		|| !debt_add(&reserve, 1, 133120, budget)
+		|| !debt_add(&reserve, 3, sizeof(*primary), budget)) return false;
+	for (uint64 i = 0; i < nb; ++i)
+		if (basis[i].entry_count > SIZE_MAX / sizeof(*basis[i].entries)
+			|| debt_overlap(basis[i].basis, basis[i].basis_bytes, out, out_length)
+			|| debt_overlap(basis[i].entries,
+				(Size)basis[i].entry_count * sizeof(*basis[i].entries), out, out_length))
+			return false;
+	if (!control_debt_wire_validate_v1(w->registry, w->registry_bytes, w->reference,
+		w->pages, w->page_bytes, basis, nb, budget - reserve)
+		|| !debt_old_open(w->registry + 256, debt_get(w->registry, 104, 8),
+			before + 512, budget - reserve, &embedded)) goto done;
+	original = &cluster_recovery_registry_view_v3(embedded)->available;
+	primary = malloc(sizeof(*primary)); backup = malloc(sizeof(*backup));
+	candidate = malloc(133120);
+	if (!primary || !backup || !candidate
+		|| !cluster_control_root_registry_decode_v4(before, 66560,
+			original->storage_uuid, original->system_identifier, primary)
+		|| !cluster_control_root_registry_decode_v4(before + 66560, 66560,
+			original->storage_uuid, original->system_identifier, backup)) goto done;
+	previous = primary->header.file_txn_seq;
+	generation = debt_get(w->registry, 72, 8);
+	if (previous >= UINT64_MAX - 1 || generation != previous + 1
+		|| original->coverage.control_generation != previous
+		|| original->database_incarnation != primary->header.v2.database_incarnation
+		|| memcmp(before + 24, before + 66560 + 24, 48)
+		|| memcmp(before + 100, before + 66560 + 100, 96)
+		|| backup->header.file_txn_seq > previous
+		|| (backup->header.file_txn_seq == previous && memcmp(before, before + 66560, 66560)))
+		goto done;
+	for (uint64 i = 0; i < original->coverage.source_count; ++i)
+		if (memcmp(original->coverage.sources[i].source.claim.identity.authority_uuid,
+			primary->header.authority_uuid, 16)) goto done;
+	/* Retain every original common field and record byte. The existing v4
+	 * decoder validates the resulting root; no legacy token is returned. */
+	memcpy(candidate, before, 66560);
+	memcpy(candidate + 66560, before, 66560);
+	for (unsigned i = 0; i < 8; ++i) candidate[16 + i] = (uint8)(generation >> (8 * i));
+	memcpy(candidate + 512, w->reference, 128);
+	crc = debt_crc(candidate, 1020);
+	for (unsigned i = 0; i < 4; ++i) candidate[1020 + i] = (uint8)(crc >> (8 * i));
+	ok = cluster_control_root_registry_decode_v4(candidate, 66560,
+		original->storage_uuid, original->system_identifier, primary);
+	if (ok) memcpy(out, candidate, out_length);
+done:
+	free(candidate); free(backup); free(primary);
+	cluster_recovery_registry_destroy_v3(&embedded);
+	return ok;
+}
