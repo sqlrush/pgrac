@@ -247,6 +247,9 @@ extern bool ClusterColdRecoveryDebtControlCurrentV2(const struct ClusterRecovery
  * Caller keeps selection alive throughout this CF interval and all Current
  * calls. The returned credential is borrowed, never destroyed or copied.
  * Entered refusal/ERROR preserves original holders and cannot be retried.
+ * Binds the complete original selected-input/protection vector by value;
+ * replacement IR grants or a different continuous WALR incarnation cannot
+ * refresh this credential.
  * No PREPARED publication/acceptance or completion is implied. */
 typedef struct ClusterRecoveryDebtStartV2 ClusterRecoveryDebtStartV2;
 extern bool ClusterColdRecoveryDebtBeginV2(const struct ClusterRecoveryStartV1 *,

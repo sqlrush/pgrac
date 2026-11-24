@@ -15,6 +15,8 @@ static uint32 page_source_input_count;
 static bool page_source_error, page_source_native_current, page_source_current_error;
 static void (*page_source_current_step)(void);
 static void (*page_source_step)(void);
+static uint64 page_source_request_delta[CLUSTER_WAL_INPUTS_MAX];
+static uint64 page_source_scope_delta, page_source_retention_delta;
 
 static void
 page_source_fixture_reset(void)
@@ -24,6 +26,8 @@ page_source_fixture_reset(void)
 	page_source_error = page_source_current_error = false; page_source_native_current = true;
 	page_source_current_step = NULL;
 	page_source_step = NULL;
+	memset(page_source_request_delta, 0, sizeof(page_source_request_delta));
+	page_source_scope_delta = page_source_retention_delta = 0;
 }
 
 uint32
@@ -44,6 +48,9 @@ page_source_value(ClusterWalInputsV1 *scope, uint32 index)
 		return value;
 	observed = &observation_wal_sources[ordinal];
 	value.scope = scope; value.ir_request_id = 817;
+	value.ir_request_id += page_source_request_delta[index];
+	value.scope_generation = 19 + page_source_scope_delta;
+	value.input_owner.recovery_generation = 23 + page_source_retention_delta;
 	value.work_generation = native_ctrc_work.generation;
 	value.replay_count = 1; value.generation_count = page_source_input_count;
 	value.generation_index = index;
