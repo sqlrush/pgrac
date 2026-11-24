@@ -14174,6 +14174,7 @@ gcs_block_resource_x_source_settlement_failure_record(
 	bool release_applied, bool status_staged)
 {
 	ClusterSemanticR11CutoverSnapshot cutover;
+	ResourceXGateSnapshot gate;
 	ResourceXFirstFailureEvidence first_failure;
 
 	gcs_block_resource_x_first_failure_from_block(
@@ -14185,8 +14186,12 @@ gcs_block_resource_x_source_settlement_failure_record(
 	first_failure.binding_generation = source_generation;
 	first_failure.holder_mutation_started = release_applied;
 	first_failure.status_staged = status_staged;
-	if (settlement != NULL && cluster_semantic_activation_r11_cutover_snapshot(&cutover)
-		&& cutover.formation_epoch == settlement->common.resource_formation) {
+	/* These are observations from two independent generation domains. Only
+	 * associate a live resource with a current semantic admission snapshot. */
+	if (settlement != NULL && cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		&& gate.formation == settlement->common.resource_formation
+		&& cluster_semantic_activation_r11_cutover_snapshot(&cutover)
+		&& cutover.formation_epoch == cluster_epoch_get_current()) {
 		first_failure.admission_generation = cutover.record_generation;
 		first_failure.r4_generation = cutover.record_generation;
 	}
