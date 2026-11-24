@@ -884,6 +884,11 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_acquire_intent_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 reservation_token, uint8 path,
 	const struct ClusterSemanticAdmissionToken *admission,
 	const ResourceXDecodedAcquireIntent *expected, ResourceXDecodedAcquireIntent *out);
+/* Original pinned GP only, before REQUEST. No grant or native mutation;
+ * an exact old local PI body is retained in its original bounded owner. */
+extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_preserve_resident_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const struct ClusterSemanticAdmissionToken *admission);
 /* Capture the original native episode on both sides of a complete material
  * read. No executor, IO activation, authority or native C is published. */
 extern ResourceXApplyResult cluster_bufmgr_pcm_own_acquire_input_exact(

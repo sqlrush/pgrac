@@ -945,7 +945,7 @@ UT_TEST(test_compact_plan_capacity)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(32);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);
 	UT_RUN(test_data_behind_history_is_refused);
 	UT_RUN(test_a_b_c_exact_order_ignores_scn_and_lsn);

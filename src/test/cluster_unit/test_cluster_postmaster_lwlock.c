@@ -36,6 +36,47 @@ PROC_HDR *ProcGlobal;
 static uint32 wait_event_storage;
 uint32 *my_wait_event_info = &wait_event_storage;
 
+#ifdef USE_PGRAC_CLUSTER
+static unsigned trace_lock_changes;
+static unsigned trace_lock_invalidations;
+static unsigned source_progress_calls;
+static LWLock *releasing_content_lock;
+
+/* Record native hooks without starting a diagnostic region or PCM service. */
+void
+cluster_content_trace_lock_changed(LWLock *lock)
+{
+	UT_ASSERT_NOT_NULL(lock);
+	trace_lock_changes++;
+}
+
+void
+cluster_content_trace_lock_invalidating(LWLock *lock)
+{
+	UT_ASSERT(LWLockHeldByMe(lock));
+	trace_lock_invalidations++;
+}
+
+void
+cluster_content_trace_native_wait_set(LWLock *lock, LWLockMode mode)
+{
+	/* Every exercised acquisition is uncontended or rejected before waiting. */
+	abort();
+}
+
+void
+cluster_pcm_lock_resource_x_source_drain_content_released(void)
+{
+	UT_ASSERT_NOT_NULL(releasing_content_lock);
+	if (releasing_content_lock == NULL)
+		abort();
+	UT_ASSERT(!LWLockHeldByMe(releasing_content_lock));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&releasing_content_lock->state) & LW_LOCK_MASK, 0);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 1);
+	source_progress_calls++;
+}
+#endif
+
 void
 PGSemaphoreLock(PGSemaphore sema)
 {
@@ -122,16 +163,53 @@ UT_TEST(test_initialization_and_child_do_not_inherit_postmaster_prohibition)
 	}
 }
 
+#ifdef USE_PGRAC_CLUSTER
+UT_TEST(test_content_release_notifies_only_after_native_unlock)
+{
+	LWLock lock;
+	unsigned changes_before = trace_lock_changes;
+	unsigned invalidations_before = trace_lock_invalidations;
+	unsigned progress_before = source_progress_calls;
+
+	MyProc = NULL;
+	IsUnderPostmaster = false;
+#ifdef USE_ASSERT_CHECKING
+	PostmasterLWLockWaitForbidden = false;
+#endif
+	LWLockInitialize(&lock, LWTRANCHE_BUFFER_CONTENT);
+	UT_ASSERT(LWLockAcquire(&lock, LW_EXCLUSIVE));
+	releasing_content_lock = &lock;
+	LWLockRelease(&lock);
+	UT_ASSERT_EQ(source_progress_calls, progress_before + 1);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+
+	/* A read-only source probe still releases and traces the native lock. */
+	UT_ASSERT(LWLockAcquire(&lock, LW_SHARED));
+	LWLockReleaseWithoutSourceProgress(&lock);
+	UT_ASSERT_EQ(source_progress_calls, progress_before + 1);
+	UT_ASSERT_EQ(trace_lock_changes, changes_before + 4);
+	UT_ASSERT_EQ(trace_lock_invalidations, invalidations_before + 2);
+	UT_ASSERT_EQ(num_held_lwlocks, 0);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	releasing_content_lock = NULL;
+}
+#endif
+
 int
 main(void)
 {
 #if defined(USE_PGRAC_CLUSTER) && defined(USE_ASSERT_CHECKING)
-	UT_PLAN(2);
+	UT_PLAN(3);
 	UT_RUN(test_postmaster_all_waiting_entries_refuse_before_queueing);
+#elif defined(USE_PGRAC_CLUSTER)
+	UT_PLAN(2);
 #else
 	UT_PLAN(1);
 #endif
 	UT_RUN(test_initialization_and_child_do_not_inherit_postmaster_prohibition);
+#ifdef USE_PGRAC_CLUSTER
+	UT_RUN(test_content_release_notifies_only_after_native_unlock);
+#endif
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

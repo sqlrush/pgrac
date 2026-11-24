@@ -357,6 +357,17 @@ UT_TEST(test_x_phase_ACK_and_actual_callback_independently_retire_notification)
 		RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(&staged, false, 1000002));
 	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
+		RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.send.pending, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_acquire_read_settle_exact(
+		&execution_claim, &prepared_episode, &xp_receipt, &xp_terminal), RESOURCE_X_APPLY_LOCAL_WAIT);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
+		RESOURCE_X_DELIVERY_ACQUIRE_READ_CONSUMED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(&f.ticket,
+		true, Max(++fake_pcm_clock_us, f.ticket.last_attempt_us + 1)));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_acquire_read_settle_exact(
+		&execution_claim, &prepared_episode, &xp_receipt, &xp_terminal), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.delivery_executor_purpose,
 		RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_acquire_read_settle_exact(
 		&execution_claim, &prepared_episode, &xp_receipt, &xp_terminal), RESOURCE_X_APPLY_DUPLICATE);

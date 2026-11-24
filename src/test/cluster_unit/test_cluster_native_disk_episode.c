@@ -85,7 +85,11 @@ static bool
 de_start(EvidenceFixture *f)
 {
 	de_boundary = de_fault = 0;
-	return dg_start(f) && dg_locate_settlement();
+	if (!dg_start(f) || !dg_locate_settlement()) return false;
+	/* These cases isolate notification ordering after REQUEST transport returns. */
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_current_exact(&f->ticket));
+	return cluster_pcm_lock_resource_x_requester_send_complete_exact(&f->ticket,
+		true, Max(++fake_pcm_clock_us, f->ticket.last_attempt_us + 1));
 }
 static ResourceXApplyResult
 de_run(void)
@@ -159,9 +163,11 @@ de_retired(void)
 	ClusterPcmResourceXBootstrapRound *round = &request_entry()->resource_x_bootstrap_round;
 	/* Settle notification debt, retaining bounded resident provenance until
 	 * the original native release/revoke owner ends that separate lifetime. */
-	UT_ASSERT_EQ(round->has_acquire_intent, 1);
+	UT_ASSERT_EQ(round->has_acquire_intent, 0);
+	UT_ASSERT_EQ(round->resident_s_authorized, 1);
+	UT_ASSERT_EQ(round->send.pending, 0);
 	UT_ASSERT_EQ(round->delivery_target.buffer_id_plus_one, 1);
-	UT_ASSERT_EQ(round->delivery_executor_purpose, 9);
+	UT_ASSERT_EQ(round->delivery_executor_purpose, RESOURCE_X_DELIVERY_ACQUIRE_READ_SETTLED);
 	UT_ASSERT_EQ(round->highest_attempt_floor, 1);
 	UT_ASSERT(memcmp(&qn_intent->slot, &empty, sizeof(empty)) == 0);
 	UT_ASSERT_EQ(qn_intent->payload[0], 5);

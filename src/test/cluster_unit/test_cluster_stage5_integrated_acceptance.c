@@ -229,6 +229,7 @@ UT_TEST(test_stage5_heap_itl_wal_delta_width_invariant)
 int
 main(void)
 {
+	UT_PLAN(6);
 	UT_RUN(test_stage5_catversion_at_or_above_spec_5_18);
 	UT_RUN(test_stage5_undo_opcodes_preserved_and_info_mask_clear);
 	UT_RUN(test_stage5_multinode_dump_category_roster);

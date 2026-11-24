@@ -125,6 +125,42 @@ assert_ordered(const char *source, const char *const *needles, int count)
 	}
 }
 
+/* Keep wiring checks inside the named definition, never a later function.
+ * A declaration with the same signature is not an implementation. */
+static char *
+source_function(const char *source, const char *signature)
+{
+	const char *start = source;
+	const char *body = NULL;
+	const char *end;
+	char *function;
+	size_t length;
+
+	while ((start = strstr(start, signature)) != NULL) {
+		const char *declaration = strchr(start, ';');
+
+		body = strstr(start, "\n{");
+		if (body != NULL && (declaration == NULL || body < declaration))
+			break;
+		start += strlen(signature);
+	}
+	UT_ASSERT(start != NULL && body != NULL);
+	if (start == NULL || body == NULL)
+		return NULL;
+	end = strstr(body, "\n}\n");
+	UT_ASSERT(end != NULL);
+	if (end == NULL)
+		return NULL;
+	length = (size_t)(end + 3 - start);
+	function = malloc(length + 1);
+	UT_ASSERT(function != NULL);
+	if (function == NULL)
+		return NULL;
+	memcpy(function, start, length);
+	function[length] = '\0';
+	return function;
+}
+
 static int
 count_occurrences(const char *source, const char *needle)
 {
@@ -615,29 +651,84 @@ UT_TEST(test_aux_pending_direct_init_joins_exact_round_without_second_proof)
 UT_TEST(test_valid_n_s_x_without_proof_uses_target_or_s_reservation)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
-	static const char *const order[] = { "if (pcm_mode == PCM_LOCK_MODE_X)",
-										 "cluster_bufmgr_pcm_x_writer_prepare_target(",
-										 "else",
-										 "cluster_bufmgr_pcm_begin_grant_reservation_wait(",
-										 "cluster_bufmgr_pcm_acquire_shared_owned(",
-										 "buf, &pcm_pending_base, pcm_pending_token" };
-	static const char *const owner[]
-		= { "cluster_bufmgr_pcm_acquire_shared_owned(",
-			"PG_TRY();",
+	char *caller;
+	char *shared;
+	char *error;
+	char *owner;
+	char *abort_owner;
+	static const char *const order[]
+		= { "if (pcm_mode == PCM_LOCK_MODE_X)",
+			"cluster_bufmgr_pcm_x_writer_prepare_target(",
+			"LWLockAcquire(",
+			"BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)",
+			"cluster_bufmgr_pcm_x_writer_activate(",
+			"else if (!cluster_bufmgr_pcm_lock_shared(buf, pcm_barrier_refused))" };
+	static const char *const resident[]
+		= { "read->owner = CurrentResourceOwner",
+			"cluster_bufmgr_first_fill_local_owner(read)",
+			"PG_ENSURE_ERROR_CLEANUP(cluster_bufmgr_first_fill_error, PointerGetDatum(read))",
+			"cluster_bufmgr_pcm_begin_grant_reservation_wait(buf, PCM_LOCK_MODE_S,",
+			"&read->base, &read->token, &covered, barrier_refused)",
+			"read->pending = !covered",
+			"if (!covered)",
+			"cluster_gcs_block_resident_read_begin(buf, &read->base, read->token, &read->request)",
+			"cluster_gcs_block_first_fill_wait(&read->request)",
+			"cluster_bufmgr_pcm_own_acquire_claim_exact(",
+			"cluster_bufmgr_pcm_own_acquire_stage_begin_exact(",
+			"read->delegated = true",
+			"cluster_bufmgr_pcm_own_acquire_fill_resident_exact(",
+			"cluster_bufmgr_first_fill_cleanup(buf, read)",
+			"read->pending = false",
+			"cluster_gcs_block_first_fill_end(&read->request)",
+			"LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)",
+			"cluster_bufmgr_pcm_own_snapshot(buf, &live)",
+			"BM_IO_ERROR",
+			"cluster_pcm_x_cached_cover_reverify_accepts(PCM_STATE_S,",
+			"locked = true",
+			"PG_END_ENSURE_ERROR_CLEANUP(cluster_bufmgr_first_fill_error, PointerGetDatum(read))" };
+	static const char *const legacy_owner[]
+		= { "PG_TRY();",
 			"cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S, retry_denied)",
 			"PG_CATCH();",
-			"LockBufHdr(buf)",
-			"BM_IO_IN_PROGRESS",
-			"cluster_pcm_own_reservation_abort_exact(",
-			"UnlockBufHdr(buf, state)",
+			"cluster_bufmgr_pcm_abort_shared_owned(buf, base, reservation_token, source)",
 			"PG_RE_THROW();" };
+	static const char *const exact_abort[]
+		= { "LockBufHdr(buf)",
+			"BM_IO_IN_PROGRESS",
+			"BufferTagsEqual(&buf->tag, &base->tag)",
+			"cluster_pcm_own_gen_get(buf->buf_id) == base->generation",
+			"cluster_pcm_own_reservation_token_get(buf->buf_id) == token",
+			"cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0",
+			"cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0",
+			"cluster_pcm_own_reservation_abort_exact(",
+			"UnlockBufHdr(buf, state)" };
 
-	UT_ASSERT(source != NULL);
-	if (source != NULL) {
-		assert_ordered(source, order, lengthof(order));
-		assert_ordered(source, owner, lengthof(owner));
-		free(source);
+	if (source == NULL)
+		return;
+	caller = source_function(source, "\nLockBufferInternal_trace_impl(");
+	shared = source_function(source, "\ncluster_bufmgr_pcm_lock_shared(");
+	error = source_function(source, "\ncluster_bufmgr_first_fill_error(");
+	owner = source_function(source, "\ncluster_bufmgr_pcm_acquire_shared_owned(");
+	abort_owner = source_function(source, "\ncluster_bufmgr_pcm_abort_shared_owned(");
+	if (caller != NULL)
+		assert_ordered(caller, order, lengthof(order));
+	if (shared != NULL) {
+		assert_ordered(shared, resident, lengthof(resident));
+		UT_ASSERT_EQ(count_occurrences(shared, "cluster_gcs_block_resident_read_begin("), 1);
+		UT_ASSERT_EQ(count_occurrences(shared, "cluster_gcs_block_first_fill_wait("), 1);
 	}
+	if (error != NULL)
+		UT_ASSERT(strstr(error, "cluster_bufmgr_first_fill_cleanup(read->buf, read)") != NULL);
+	if (owner != NULL)
+		assert_ordered(owner, legacy_owner, lengthof(legacy_owner));
+	if (abort_owner != NULL)
+		assert_ordered(abort_owner, exact_abort, lengthof(exact_abort));
+	free(abort_owner);
+	free(owner);
+	free(error);
+	free(shared);
+	free(caller);
+	free(source);
 }
 
 UT_TEST(test_direct_init_one_shot_image_cannot_return_without_x)
@@ -974,17 +1065,13 @@ UT_TEST(test_aux_direct_init_pending_lifecycle_survives_pin_handoff_only)
 	free(bufmgr);
 }
 
-/* P0-20: RelationGetBufferForTuple acquires two heap content locks for a
- * cross-page UPDATE.  The second acquire must always be conditional: a
- * Resource-X conversion can start before a later type-17 freezes the first
- * page, so barrier-aware blocking is still an outer-lock wait.  On any miss,
- * release the first lock, resolve the second conversion with no content lock
- * held, and retry the ordered pair. */
-UT_TEST(test_cross_page_heap_pair_second_acquire_never_waits_under_first)
+/* The pair helper probes once, then drops the first lock before refresh
+ * and the ordered fallback. Only the scoped heap-pair entry may acquire the
+ * second block with the lower block held. */
+UT_TEST(test_cross_page_heap_pair_probes_then_blocks_in_exact_ordered_scope)
 {
 	char *hio = read_source(HIO_SOURCE_PATH);
-	const char *helper;
-	const char *helper_end;
+	char *helper;
 	const char *pins;
 	const char *pins_end;
 	const char *pins_call;
@@ -997,18 +1084,26 @@ UT_TEST(test_cross_page_heap_pair_second_acquire_never_waits_under_first)
 	const char *extension;
 	const char *extension_call;
 	static const char *const helper_order[]
-		= { "cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)",
+		= { "if (BufferGetBlockNumber(*first) > BufferGetBlockNumber(*second))",
+			"first = second",
+			"second = tmp",
 			"LockBuffer(*first, BUFFER_LOCK_EXCLUSIVE)",
 			"ConditionalLockBufferWithPinCheck(*second, &pin_invalid)",
+			"return;",
 			"LockBuffer(*first, BUFFER_LOCK_UNLOCK)",
+			"if (pin_invalid)",
+			"cluster_hio_refresh_buffer_pair(relation, first, second, true)",
+			"LockBuffer(*first, BUFFER_LOCK_EXCLUSIVE)",
+			"if (RelationUsesLocalBuffers(relation))",
 			"LockBuffer(*second, BUFFER_LOCK_EXCLUSIVE)",
-			"LockBuffer(*second, BUFFER_LOCK_UNLOCK)" };
+			"else if (!ClusterLockBufferHeapPair(relation, *first, *second))",
+			"LockBuffer(*first, BUFFER_LOCK_UNLOCK)",
+			"elog(ERROR," };
 
 	UT_ASSERT(hio != NULL);
 	if (hio == NULL)
 		return;
-	helper = strstr(hio, "cluster_hio_lock_buffer_pair(Relation relation, Buffer *first, Buffer *second)");
-	helper_end = helper != NULL ? strstr(helper, "\n}\n") : NULL;
+	helper = source_function(hio, "\ncluster_hio_lock_buffer_pair(");
 	pins = strstr(hio, "GetVisibilityMapPins(Relation relation");
 	pins_end = pins != NULL ? strstr(pins, "\n}\n") : NULL;
 	pins_call = pins != NULL ? strstr(pins, "cluster_hio_lock_buffer_pair(") : NULL;
@@ -1024,13 +1119,13 @@ UT_TEST(test_cross_page_heap_pair_second_acquire_never_waits_under_first)
 	extension_call = extension != NULL ? strstr(extension, "cluster_hio_lock_buffer_pair(") : NULL;
 
 	UT_ASSERT(helper != NULL);
-	UT_ASSERT(helper_end != NULL);
 	UT_ASSERT(pins != NULL);
 	UT_ASSERT(pins_end != NULL);
 	UT_ASSERT(relation != NULL);
 	UT_ASSERT(relation_end != NULL);
-	if (helper != NULL && helper_end != NULL) {
+	if (helper != NULL) {
 		assert_ordered(helper, helper_order, lengthof(helper_order));
+		UT_ASSERT_EQ(count_occurrences(helper, "ConditionalLockBufferWithPinCheck("), 1);
 		UT_ASSERT(strstr(helper, "ClusterLockBufferExclusiveBarrierAware(second,") == NULL);
 	}
 	UT_ASSERT(pins != NULL && pins_end != NULL && pins_call != NULL && pins_call < pins_end);
@@ -1040,6 +1135,7 @@ UT_TEST(test_cross_page_heap_pair_second_acquire_never_waits_under_first)
 			  && upper_call < relation_end);
 	UT_ASSERT(extension != NULL && extension_call != NULL && relation_end != NULL
 			  && extension_call < relation_end);
+	free(helper);
 	free(hio);
 }
 
@@ -1404,7 +1500,7 @@ main(void)
 	UT_RUN(test_heap_update_drops_vm_pin_across_heap_pcm_wait);
 	UT_RUN(test_vm_fsm_resource_x_wait_releases_and_exactly_repins);
 	UT_RUN(test_aux_direct_init_pending_lifecycle_survives_pin_handoff_only);
-	UT_RUN(test_cross_page_heap_pair_second_acquire_never_waits_under_first);
+	UT_RUN(test_cross_page_heap_pair_probes_then_blocks_in_exact_ordered_scope);
 	UT_RUN(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain);
 	UT_RUN(test_aux_repin_replacement_restarts_from_fresh_relation_ref);
 	UT_RUN(test_ordinary_aux_repin_replacement_reaches_heap_retry);

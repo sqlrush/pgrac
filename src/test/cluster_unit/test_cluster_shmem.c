@@ -52,6 +52,8 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
+#include "cluster/cluster_content_trace.h"
+#include "cluster/cluster_native_itl_trace.h"
 #include "miscadmin.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_conf.h"
@@ -509,6 +511,19 @@ cluster_resolver_cache_request_lwlocks(void)
 void
 cluster_tx_enqueue_shmem_register(void)
 {}
+
+/* This link-only fixture must not initialize either diagnostic region. */
+void
+cluster_content_trace_shmem_register(void)
+{
+	abort();
+}
+
+void
+cluster_native_itl_trace_shmem_register(void)
+{
+	abort();
+}
 
 /* spec-3.2 D5b stub: cluster_init_shmem_module also calls
  * cluster_visibility_inject_shmem_register. */

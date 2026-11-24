@@ -15,6 +15,8 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_block_io_trace.h"
+#include "cluster/cluster_inject.h"
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -106,6 +108,7 @@ static bool cluster_pcm_x_finish_retain_flush_error_context_pushed;
 static ErrorContextCallback *cluster_pcm_x_finish_retain_flush_error_context_previous;
 #ifdef ENABLE_INJECTION
 static bool cluster_pcm_x_finish_retain_flush_fault_active;
+#undef CLUSTER_INJECTION_POINT
 #define CLUSTER_INJECTION_POINT(name) ((void)0)
 #define cluster_injection_should_skip(name) false
 #endif
@@ -637,6 +640,30 @@ cluster_gcs_block_pi_write_note(BufferTag tag, uint64 scn)
 {
 	abort();
 }
+
+/* The original SPACE flush runs with pause injection and diagnostics off. */
+bool
+cluster_injection_is_armed(const char *name)
+{
+	UT_ASSERT(strcmp(name, "cluster-pcm-write-before-data") == 0);
+	return false;
+}
+
+void
+cluster_block_io_trace_note(BufferTag tag, const char *event, uint64 version,
+							uint64 sequence, uint32 holders)
+{
+	abort();
+}
+
+void
+cluster_block_io_trace_write(BufferDesc *buf, const char *bytes)
+{
+	UT_ASSERT(buf->buf_id >= 0 && buf->buf_id < NBuffers);
+	UT_ASSERT_NOT_NULL(bytes);
+	UT_ASSERT(writes > 0);
+}
+
 char *
 PageSetChecksumCopy(Page page, BlockNumber block)
 {

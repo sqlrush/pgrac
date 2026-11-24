@@ -68,6 +68,9 @@ ClusterConf *ClusterConfShmem;
 static ClusterConf pcm_conf;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+volatile uint32 CritSectionCount;
+static ClusterPcmOwnEntry failed_read_owners[64];
+ClusterPcmOwnEntry *ClusterPcmOwnArray = failed_read_owners;
 
 static BufferDescPadded descriptors[64];
 static LWLockPadded mapping_locks[BUFFER_MAPPING_LWLOCK_OFFSET + NUM_BUFFER_PARTITIONS];
@@ -135,6 +138,7 @@ static uint32 clock_hand;
 static unsigned physical_writes;
 static unsigned drain_mapping_race;
 static bool drain_content_busy;
+static void (*conditional_content_hook)(void);
 static bool drain_flush_deferred;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 static bool ko_closed;
@@ -168,9 +172,12 @@ extern ClusterBufferDrainResult cluster_bufmgr_discard_relation_v4(RelFileLocato
 /* Waiting is an explicit fixture boundary. The real caller must arrive
  * here with neither a target reference nor any buffer/mapping lock retained. */
 static void
-cluster_bufmgr_ko_read_wait(void)
+cluster_bufmgr_ko_read_wait(RelFileLocator locator, ForkNumber fork, BlockNumber block, uint64 revision)
 {
 	int id = BufTableLookup(&waiting_tag, BufTableHashCode(&waiting_tag));
+	UT_ASSERT(RelFileLocatorEquals(locator, BufTagGetRelFileLocator(&waiting_tag)));
+	UT_ASSERT_EQ(fork, waiting_tag.forkNum); UT_ASSERT_EQ(block, waiting_tag.blockNum);
+	UT_ASSERT(revision == 0 || revision < ko_revision); /* Absent or now-stale original sample. */
 	UT_ASSERT_EQ(lock_depth, 0);
 	UT_ASSERT_EQ(remembered_pins, 0);
 	UT_ASSERT_EQ(read_io_calls, 0);
@@ -273,6 +280,7 @@ static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_contex
 #define BUF_WRITTEN 0x01
 #define BUF_REUSABLE 0x02
 
+static bool InvalidateBufferCommitLocked(BufferDesc *, BufferTag *, uint32, LWLock *, uint32);
 static void InvalidateBufferCommitTailLocked(BufferDesc *, BufferTag *, uint32, LWLock *, uint32,
 											 uint8, bool);
 static void InvalidateBuffer(BufferDesc *buf);
@@ -506,7 +514,23 @@ cluster_bufmgr_pcm_read_image_last_pin(BufferDesc *buf)
 	UT_ASSERT(buf->pcm_state != (uint8) PCM_STATE_READ_IMAGE);
 }
 
+/* The last-pin owner now shares the native failed-input retirement helper.
+ * Lock enumeration and the sidecar tuple are the same storage leaves as the
+ * surrounding pin/eviction fixture, not alternate retirement decisions. */
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	if (lock_depth != 0) callback(BufferDescriptorGetContentLock(GetBufferDescriptor(0)), LW_EXCLUSIVE, context);
+}
+static void
+failed_read_snapshot(BufferDesc *buf, uint32 state, ClusterPcmOwnSnapshot *out)
+{
+	cluster_pcm_own_eviction_capture_locked(buf, out);
+	out->semantic_buf_state = state & CLUSTER_PCM_OWN_SEMANTIC_BUF_STATE_MASK;
+}
+#define cluster_pcm_own_snapshot_post_state_locked failed_read_snapshot
 #include "test_cluster_buffer_cr_pins.inc"
+#undef cluster_pcm_own_snapshot_post_state_locked
 
 #define REFCOUNT_ARRAY_ENTRIES 8
 static PrivateRefCountEntry PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES];
@@ -580,7 +604,13 @@ LockBuffer(Buffer buffer, int mode)
 bool
 LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
-	return !drain_content_busy && LWLockAcquire(lock, mode);
+	bool acquired = !drain_content_busy && LWLockAcquire(lock, mode);
+	if (acquired && conditional_content_hook != NULL) {
+		void (*hook)(void) = conditional_content_hook;
+		conditional_content_hook = NULL;
+		hook();
+	}
+	return acquired;
 }
 
 bool
@@ -703,6 +733,7 @@ reset_buffers(void)
 	remembered_pins = pin_waiter_signals = reserve_calls = 0;
 	physical_writes = drain_mapping_race = 0;
 	drain_content_busy = drain_flush_deferred = false;
+	conditional_content_hook = NULL;
 	clock_hand = 6;
 	cluster_enabled = false;
 	ClusterConfShmem = NULL;
@@ -1737,6 +1768,220 @@ UT_TEST(test_conditional_nonshared_paths_keep_native_behavior)
 	UT_ASSERT_EQ(lock_depth, 0);
 }
 
+
+/* H29/P17: this API consumes stable cached authority only. These cases
+ * catch a dropped PCM/fence guard or a guard sampled before content-X.
+ * The original owner bodies are extracted by Makefile; only OS lock events
+ * and coherent sidecar storage are leaves. No RPC/acquire implementation is
+ * linked, so adding a conversion or blocking fallback also fails this gate. */
+static BufferDesc *
+conditional_tracked_pin(ForkNumber fork, BlockNumber block)
+{
+	BufferTag tag = reset_buffers();
+	BufferDesc *buf;
+	tag.forkNum = fork; tag.blockNum = block;
+	buf = conditional_read_pin(0, &tag);
+	memset(&pcm_conf, 0, sizeof(pcm_conf)); pcm_conf.node_count = 4;
+	ClusterConfShmem = &pcm_conf; cluster_shared_config = true;
+	cluster_pcm_grd_max_entries = 64;
+	UT_ASSERT(cluster_pcm_is_active());
+	UT_ASSERT(cluster_bufmgr_should_pcm_track(buf));
+	return buf;
+}
+static const ForkNumber conditional_forks[] = {MAIN_FORKNUM, VISIBILITYMAP_FORKNUM,
+	SPACE_FORKNUM, SPACE_FORKNUM};
+static const BlockNumber conditional_blocks[] = {41, 0, 0, 1};
+
+static void
+conditional_exact_attempt(BufferDesc *buf, bool want, unsigned outer_depth, bool cleanup)
+{
+	ClusterPcmOwnSnapshot before, after;
+	PGIOAlignedBlock bytes;
+	uint32 state = pg_atomic_read_u32(&buf->state);
+	unsigned samples = ko_samples, waits = object_waits, reads = read_io_calls;
+	unsigned writes = physical_writes, generations = bumps, reserved = reserve_calls;
+	unsigned pins = remembered_pins;
+	bool pin_invalid = true, got;
+
+	cluster_pcm_own_eviction_capture_locked(buf, &before);
+	memcpy(bytes.data, BufHdrGetBlock(buf), BLCKSZ);
+	lock_depth = outer_depth;
+	got = cleanup ? ConditionalLockBufferForCleanup(BufferDescriptorGetBuffer(buf))
+		: ConditionalLockBufferWithPinCheck(BufferDescriptorGetBuffer(buf), &pin_invalid);
+	UT_ASSERT_EQ(got, want);
+	if (!cleanup) UT_ASSERT(!pin_invalid);
+	UT_ASSERT_EQ(lock_depth, outer_depth + (got ? 1 : 0));
+	if (got) LockBuffer(BufferDescriptorGetBuffer(buf), BUFFER_LOCK_UNLOCK);
+	UT_ASSERT_EQ(lock_depth, outer_depth);
+	cluster_pcm_own_eviction_capture_locked(buf, &after);
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state), state);
+	UT_ASSERT(memcmp(bytes.data, BufHdrGetBlock(buf), BLCKSZ) == 0);
+	UT_ASSERT_EQ(ko_samples, samples); UT_ASSERT_EQ(object_waits, waits);
+	UT_ASSERT_EQ(read_io_calls, reads); UT_ASSERT_EQ(physical_writes, writes);
+	UT_ASSERT_EQ(bumps, generations); UT_ASSERT_EQ(reserve_calls, reserved);
+	UT_ASSERT_EQ(remembered_pins, pins);
+	UT_ASSERT_EQ(owner_delivery[buf->buf_id], 0);
+	lock_depth = 0;
+}
+
+UT_TEST(test_conditional_tracked_non_X_never_converts_or_reserves)
+{
+	static const uint8 states[] = {PCM_STATE_N, PCM_STATE_S, PCM_STATE_READ_IMAGE};
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++)
+		for (unsigned n = 0; n < lengthof(states); n++) {
+			BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+			buf->pcm_state = states[n];
+			conditional_exact_attempt(buf, false, 1, false);
+			/* This test did not create a READ_IMAGE owner; teardown restores
+			 * the fixture input after the byte-exact rejection was checked. */
+			buf->pcm_state = PCM_STATE_X; UnpinBuffer(buf);
+		}
+}
+UT_TEST(test_conditional_X_waits_for_both_activation_fences)
+{
+	static const uint64 fences[][2] = {{1,0}, {0,1}, {7,11}, {UINT64_MAX,0}, {0,UINT64_MAX}};
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++)
+		for (unsigned n = 0; n < lengthof(fences); n++) {
+			BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+			owner_writer[0] = fences[n][0]; owner_activation[0] = fences[n][1];
+			conditional_exact_attempt(buf, false, 1, false); UnpinBuffer(buf);
+		}
+}
+UT_TEST(test_conditional_pending_or_revoking_never_borrows_cached_X)
+{
+	static const uint32 flags[] = {PCM_OWN_FLAG_GRANT_PENDING, PCM_OWN_FLAG_REVOKING,
+		PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING};
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++)
+		for (unsigned n = 0; n < lengthof(flags); n++) {
+			BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+			owner_flags[0] = flags[n];
+			conditional_exact_attempt(buf, false, 1, false); UnpinBuffer(buf);
+		}
+}
+UT_TEST(test_conditional_retained_or_CR_bytes_never_become_current)
+{
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++)
+		for (unsigned kind = 0; kind < 2; kind++) {
+			BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+			buf->buffer_type = kind ? BUF_TYPE_CR : BUF_TYPE_PI;
+			conditional_exact_attempt(buf, false, 1, false);
+			buf->buffer_type = BUF_TYPE_CURRENT; UnpinBuffer(buf);
+		}
+}
+UT_TEST(test_conditional_content_busy_keeps_original_pin_and_native_tuple)
+{
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++) {
+		BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+		unsigned headers = header_calls;
+		drain_content_busy = true; pair_event_count = 0;
+		conditional_exact_attempt(buf, false, 1, false);
+		UT_ASSERT_EQ(header_calls, headers); UT_ASSERT_EQ(pair_event_count, 1);
+		UT_ASSERT_EQ(pair_event_reason, CLPAIR_CONTENT_BUSY);
+		drain_content_busy = false; UnpinBuffer(buf);
+	}
+}
+static unsigned conditional_race;
+static ClusterPcmOwnSnapshot conditional_raced;
+static void
+conditional_revoke_at_content(void)
+{
+	BufferDesc *buf = GetBufferDescriptor(0);
+	UT_ASSERT_EQ(lock_depth, 2);
+	switch (conditional_race) {
+	case 0: buf->pcm_state = PCM_STATE_N; break;
+	case 1: owner_flags[0] = PCM_OWN_FLAG_REVOKING; break;
+	case 2: owner_writer[0] = 9; break;
+	case 3: owner_activation[0] = 17; break;
+	}
+	cluster_pcm_own_eviction_capture_locked(buf, &conditional_raced);
+}
+UT_TEST(test_conditional_revoke_at_content_is_seen_by_original_header_guard)
+{
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++)
+		for (conditional_race = 0; conditional_race < 4; conditional_race++) {
+			BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+			ClusterPcmOwnSnapshot after;
+			unsigned samples = ko_samples; bool pin_invalid = true, got;
+			conditional_content_hook = conditional_revoke_at_content; lock_depth = 1;
+			got = ConditionalLockBufferWithPinCheck(1, &pin_invalid);
+			UT_ASSERT(!got); UT_ASSERT(!pin_invalid); UT_ASSERT(conditional_content_hook == NULL);
+			if (got) LockBuffer(1, BUFFER_LOCK_UNLOCK);
+			UT_ASSERT_EQ(lock_depth, 1); UT_ASSERT_EQ(ko_samples, samples);
+			cluster_pcm_own_eviction_capture_locked(buf, &after);
+			UT_ASSERT(memcmp(&after, &conditional_raced, sizeof(after)) == 0);
+			UT_ASSERT_EQ(bumps + reserve_calls + read_io_calls + physical_writes + object_waits, 0);
+			lock_depth = 0; UnpinBuffer(buf);
+		}
+}
+UT_TEST(test_conditional_cleanup_preserves_same_authority_gate)
+{
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++)
+		for (unsigned fault = 0; fault < 5; fault++) {
+			BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+			if (fault == 0) buf->pcm_state = PCM_STATE_S;
+			if (fault == 1) owner_flags[0] = PCM_OWN_FLAG_GRANT_PENDING;
+			if (fault == 2) owner_flags[0] = PCM_OWN_FLAG_REVOKING;
+			if (fault == 3) owner_writer[0] = 9;
+			if (fault == 4) owner_activation[0] = 17;
+			conditional_exact_attempt(buf, false, 1, true); UnpinBuffer(buf);
+		}
+}
+UT_TEST(test_conditional_stable_X_succeeds_without_protocol_side_effects)
+{
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++)
+		for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+			BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+			conditional_exact_attempt(buf, true, 1, cleanup != 0); UnpinBuffer(buf);
+		}
+}
+UT_TEST(test_conditional_original_owner_progress_reopens_same_cached_X)
+{
+	for (unsigned f = 0; f < lengthof(conditional_forks); f++) {
+		BufferDesc *buf = conditional_tracked_pin(conditional_forks[f], conditional_blocks[f]);
+		owner_flags[0] = PCM_OWN_FLAG_REVOKING;
+		conditional_exact_attempt(buf, false, 1, false);
+		/* An owner event is explicit input, not a timeout or requester retry. */
+		owner_flags[0] = 0;
+		conditional_exact_attempt(buf, true, 1, false); UnpinBuffer(buf);
+	}
+}
+
+UT_TEST(test_failed_input_final_pin_uses_original_eviction_owner)
+{
+	BufferTag tag = reset_buffers();
+	BufferDesc *buf = conditional_read_pin(0, &tag);
+	buf->pcm_state = PCM_STATE_N; buf->buffer_type = BUF_TYPE_CURRENT;
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_VALID);
+	pg_atomic_fetch_or_u32(&buf->state, BM_IO_ERROR);
+	UnpinBuffer(buf);
+	UT_ASSERT_EQ(remembered_pins, 0); UT_ASSERT_EQ(lock_depth, 0);
+	UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), -1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & (BM_TAG_VALID | BM_VALID | BM_IO_ERROR), 0);
+	UT_ASSERT_EQ(bumps, 1); UT_ASSERT_EQ(frees, 1);
+	UT_ASSERT_EQ(physical_writes + read_io_calls, 0);
+}
+UT_TEST(test_failed_input_pin_cleanup_keeps_live_protocol_responsibility)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		BufferTag tag = reset_buffers();
+		BufferDesc *buf = conditional_read_pin(0, &tag);
+		buf->pcm_state = PCM_STATE_N; buf->buffer_type = BUF_TYPE_CURRENT;
+		pg_atomic_fetch_and_u32(&buf->state, ~BM_VALID);
+		pg_atomic_fetch_or_u32(&buf->state, BM_IO_ERROR);
+		if (fault == 0) owner_flags[0] = PCM_OWN_FLAG_GRANT_PENDING;
+		if (fault == 1) owner_flags[0] = PCM_OWN_FLAG_REVOKING;
+		if (fault == 2) owner_delivery[0] = 7;
+		if (fault == 3) pg_atomic_fetch_or_u32(&buf->state, BM_IO_IN_PROGRESS);
+		if (fault == 4) pg_atomic_fetch_or_u32(&buf->state, BM_DIRTY);
+		UnpinBuffer(buf);
+		UT_ASSERT_EQ(remembered_pins, 0); UT_ASSERT_EQ(lock_depth, 0);
+		UT_ASSERT_EQ(BufTableLookup(&tag, BufTableHashCode(&tag)), 0);
+		UT_ASSERT(pg_atomic_read_u32(&buf->state) & BM_IO_ERROR);
+		UT_ASSERT_EQ(bumps + frees + physical_writes + read_io_calls, 0);
+	}
+}
+
 static SMgrRelationData drain_relation;
 
 static ClusterBufferDrainResult
@@ -2018,7 +2263,7 @@ UT_TEST(test_committed_discard_removes_clean_cr_with_original_mapping_tail)
 int
 main(void)
 {
-	UT_PLAN(50);
+	UT_PLAN(61);
 	UT_RUN(test_origin_discard_scope_removes_dead_bytes_without_directory_retirement);
 	printf("# private pin entry: %zu bytes; current admission: %zu bytes\n",
 		   sizeof(PrivateRefCountEntry), sizeof(ClusterKoCurrentAdmissionV3));
@@ -2066,6 +2311,17 @@ main(void)
 	UT_RUN(test_conditional_object_sample_never_replaces_pcm_proof);
 	UT_RUN(test_conditional_reports_each_invalid_pin_sample_after_unlock);
 	UT_RUN(test_conditional_nonshared_paths_keep_native_behavior);
+	UT_RUN(test_conditional_tracked_non_X_never_converts_or_reserves);
+	UT_RUN(test_conditional_X_waits_for_both_activation_fences);
+	UT_RUN(test_conditional_pending_or_revoking_never_borrows_cached_X);
+	UT_RUN(test_conditional_retained_or_CR_bytes_never_become_current);
+	UT_RUN(test_conditional_content_busy_keeps_original_pin_and_native_tuple);
+	UT_RUN(test_conditional_revoke_at_content_is_seen_by_original_header_guard);
+	UT_RUN(test_conditional_cleanup_preserves_same_authority_gate);
+	UT_RUN(test_conditional_stable_X_succeeds_without_protocol_side_effects);
+	UT_RUN(test_conditional_original_owner_progress_reopens_same_cached_X);
+	UT_RUN(test_failed_input_final_pin_uses_original_eviction_owner);
+	UT_RUN(test_failed_input_pin_cleanup_keeps_live_protocol_responsibility);
 	UT_RUN(test_committed_discard_requires_retired_identity_before_any_buffer_touch);
 	UT_RUN(test_committed_discard_removes_dirty_current_and_pi_all_forks_without_io);
 	UT_RUN(test_committed_discard_keeps_pins_io_and_ownership_reservations);

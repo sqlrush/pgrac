@@ -405,6 +405,20 @@ pg_attribute_unused() fixture_object_current(uint64 revision)
 /* Exercise normal post-T3 ledger binding as well as direct-init binding.
  * Distributed acquisition remains an explicit fixture boundary. */
 static ResourceXApplyResult
+cluster_bufmgr_pcm_acquire_resident_x(BufferDesc *buf, const BufferTag *tag,
+	uint64 generation, bool *barrier)
+{
+	UT_ASSERT(buf == &fixture_buf && BufferTagsEqual(tag, &fixture_buf.tag));
+	UT_ASSERT(!fixture_content_held && barrier == NULL);
+	UT_ASSERT_EQ(generation, fixture_ledger_context.r4_record_generation);
+	/* This fixture already owns X. The ordinary N/S acquisition driver is
+	 * exercised separately; cached X continues to the real ledger consumer. */
+	UT_ASSERT_EQ(fixture_state.pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(fixture_state.flags, 0);
+	return RESOURCE_X_APPLY_NOT_FOUND;
+}
+
+static ResourceXApplyResult
 fixture_writer_acquire(BufferDesc *buf, const BufferTag *tag, uint64 generation, uint64 *deadline,
 					   ResourceXAcquisitionRef *out)
 {

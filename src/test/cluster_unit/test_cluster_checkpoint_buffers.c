@@ -3,6 +3,8 @@
  */
 #include "postgres.h"
 #include "access/xlog.h"
+#include "cluster/cluster_lms.h"
+#include "cluster/cluster_pcm_own.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -21,6 +23,8 @@ UT_DEFINE_GLOBALS();
 
 int NBuffers = NB, checkpoint_flush_after;
 bool cluster_enabled = true, cluster_shared_config = true;
+/* Native checkpoint scan only; no PCM output episode is installed here. */
+ClusterPcmOwnEntry *ClusterPcmOwnArray;
 static BufferDescPadded descriptors[NB];
 BufferDescPadded *BufferDescriptors = descriptors;
 static ConditionVariableMinimallyPadded cvs[NB];
@@ -45,6 +49,18 @@ static int SyncOneBuffer(int buf_id, bool skip, WritebackContext *wb);
 static void TerminateBufferIO(BufferDesc *buf, bool clear, uint32 flags);
 #include "test_cluster_checkpoint_buffers_types.inc"
 static int ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
+
+ClusterPcmOwnResult
+cluster_pcm_own_write_io_complete(int buf_id, uint32 *workers)
+{
+	abort();
+}
+
+void
+cluster_lms_wakeup(int worker)
+{
+	abort();
+}
 
 void
 ExceptionalCondition(const char *c, const char *f, int l)

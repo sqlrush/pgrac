@@ -1,6 +1,7 @@
 /* Exercise the extracted production TX resource collector, not a second model. */
 #define USE_PGRAC_CLUSTER 1
 #include "postgres.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_wait_trace.h"
@@ -28,6 +29,8 @@ void ExceptionalCondition(const char *condition, const char *file, int line) {
 	fprintf(stderr, "%s:%d: %s\n", file, line, condition); abort();
 }
 static unsigned reads, locks, emits, hash_cursor, hash_terminated;
+static unsigned publications;
+static ClusterWaitTrace published;
 static ClusterWaitTrace observed[CLUSTER_WAIT_TRACE_RESOURCES + 1];
 static ClusterWaitTraceKind kinds[CLUSTER_WAIT_TRACE_RESOURCES + 1];
 static BufferDesc *test_descriptor(int id) { assert(id >= 0 && id < 64); reads++; return &buffers[id]; }
@@ -47,6 +50,12 @@ uint64 cluster_wait_trace_begin(ClusterWaitTraceKind kind) { assert(kind == CLWA
 void cluster_wait_trace_emit(ClusterWaitTraceKind kind, const ClusterWaitTrace *row) {
 	assert(locks == 0 && emits < lengthof(observed)); kinds[emits] = kind; observed[emits++] = *row;
 }
+/* The original collector publishes to the process-local observation owner.
+ * Capture that boundary without replacing the collector or losing its row. */
+void cluster_content_trace_wait_set(ClusterContentTraceWait kind, const ClusterWaitTrace *row) {
+	assert(locks == 0 && kind == CLCONTENT_TX && row != NULL);
+	published = *row; publications++;
+}
 #define GetBufferDescriptor test_descriptor
 #define LockBufHdr test_lock
 #define UnlockBufHdr test_unlock
@@ -61,7 +70,7 @@ int main(void) {
 	/* OFF must not touch even deliberately invalid backend references. */
 	PrivateRefCountArray[0].buffer = INT_MAX; PrivateRefCountArray[0].refcount = 1;
 	cluster_buffer_trace_tx_wait(CLWAIT_SITE_TX_TARGET, 31, 4195393, 0);
-	assert(reads == 0 && emits == 0);
+	assert(reads == 0 && emits == 0 && publications == 0);
 	cluster_trace_tx_identity = true;
 	PrivateRefCountArray[0].buffer = 1; PrivateRefCountArray[0].refcount = 3;
 	buffers[0].tag.spcOid = 1; buffers[0].tag.dbOid = 2; buffers[0].tag.relNumber = 3;
@@ -81,6 +90,7 @@ int main(void) {
 	assert(row->writer_activation == 74 && row->rx_activation == 75 && row->wait_seq == 31 && row->tx_xid == 4195393);
 	assert(observed[1].ledger_phase == 3 && observed[1].content_held);
 	assert(observed[2].pins_seen == 1 && observed[2].ledger_seen == 1 && observed[2].local_pins == 2 && observed[2].omitted == 0);
+	assert(publications == 1 && memcmp(&published, &observed[2], sizeof(published)) == 0);
 	/* Overflow hash is copied before logging; a bounded cut reports omitted rows. */
 	memset(PrivateRefCountArray, 0, sizeof(PrivateRefCountArray));
 	memset(cluster_bufmgr_pcm_x_writer_ledger, 0, sizeof(cluster_bufmgr_pcm_x_writer_ledger));
@@ -90,6 +100,7 @@ int main(void) {
 	assert(emits == CLUSTER_WAIT_TRACE_RESOURCES + 1 && hash_terminated == 1);
 	row = &observed[emits - 1]; assert(row->pins_seen == 40 && row->omitted == 8 && row->rows == 32);
 	assert(row->request_known && row->request_seq == 99 && row->tx_xid == 42);
+	assert(publications == 2 && memcmp(&published, row, sizeof(published)) == 0);
 	puts("TX resource collector: OFF, pin/hash/ledger identity, lock release and bounded cut PASS");
 	return 0;
 }

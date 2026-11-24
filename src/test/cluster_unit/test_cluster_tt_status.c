@@ -344,6 +344,7 @@ UT_TEST(test_t22_enum_kept_distinct)
 int
 main(void)
 {
+	UT_PLAN(23);
 	UT_RUN(test_t1_status_key_sizeof_24);
 	UT_RUN(test_t2_undo_tt_slot_ref_sizeof_32);
 	UT_RUN(test_t3_enum_unknown_zero);

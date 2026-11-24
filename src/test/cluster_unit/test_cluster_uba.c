@@ -328,6 +328,7 @@ UT_TEST(test_t25_record_decode_rejects_header_boundary_and_segment_alias)
 int
 main(void)
 {
+	UT_PLAN(25);
 	UT_RUN(test_t1_uba_sizeof_16);
 	UT_RUN(test_t2_invalid_uba_all_zero);
 	UT_RUN(test_t3_decode_invalid_uba_returns_false);

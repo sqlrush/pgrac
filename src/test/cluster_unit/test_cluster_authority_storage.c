@@ -34,6 +34,7 @@ void pg_usleep(long microsec);
 #error "STORAGE_QUORUM_SOURCE_PATH must identify the production storage predicate"
 #endif
 #include STORAGE_QUORUM_SOURCE_PATH
+#include "cluster/cluster_pcm_lock.h"
 
 static ClusterStorageQuorumState authority_storage;
 static ClusterStorageQuorumView authority_provider;
@@ -642,6 +643,9 @@ UT_TEST(resource_x_cssd_busy_yields_before_admission_and_never_hides_loss)
 static bool
 authority_requester_gate(bool *out_retry_denied)
 {
+	/* This admission fixture covers the original non-first-fill caller. */
+	const ClusterPcmReadSource *source = NULL;
+
 	*out_retry_denied = false;
 #include "test_cluster_gcs_serving_gate.inc"
 	return true;

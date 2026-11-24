@@ -245,8 +245,10 @@ UT_TEST(test_n_s_source_cannot_publish_marker_inside_read_copy_or_wal)
 		UT_ASSERT_EQ(io_resident_page.data[BLCKSZ - 1], s ? 0x11 : 0x22);
 		UT_ASSERT_EQ(lsn, 0x200);
 		UT_ASSERT_EQ(scn, 93);
-		UT_ASSERT(marker_attempts >= 4);
+		UT_ASSERT(marker_attempts >= (s ? 3 : 4));
 		UT_ASSERT_EQ(marker_accepted, 0);
+		UT_ASSERT_EQ(source_opens, s ? 0 : 1);
+		UT_ASSERT_EQ(source_reads, s ? 0 : 1);
 		UT_ASSERT_EQ(source_wal_flushes, s);
 		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
 		source_check_no_call();
@@ -328,9 +330,19 @@ UT_TEST(test_source_error_and_refusal_keep_exact_abort_before_call_end)
 			PG_TRY(); { result = source_prepare(s, &before, &out, bytes, &lsn, &scn); }
 			PG_CATCH(); { caught = true; }
 			PG_END_TRY();
-			UT_ASSERT_EQ(caught, fault == 1 || fault == 2 || fault == 5);
-			if (!caught)
-				UT_ASSERT_EQ(result, fault == 3 ? CLUSTER_PCM_OWN_CORRUPT : CLUSTER_PCM_OWN_STALE);
+			if (s && fault <= 3) {
+				/* The S holder uses its authorized current, even when storage
+				 * cannot open/read/verify. N still exercises all three faults. */
+				UT_ASSERT(!caught); UT_ASSERT_EQ(result, CLUSTER_PCM_OWN_OK);
+				UT_ASSERT_EQ(source_opens + source_reads, 0);
+				UT_ASSERT_EQ(bytes[BLCKSZ - 1], 0x11);
+				UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_REVOKING);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_abort_s_revoke(&source_buf, &out), CLUSTER_PCM_OWN_OK);
+			} else {
+				UT_ASSERT_EQ(caught, fault == 1 || fault == 2 || fault == 5);
+				if (!caught)
+					UT_ASSERT_EQ(result, fault == 3 ? CLUSTER_PCM_OWN_CORRUPT : CLUSTER_PCM_OWN_STALE);
+			}
 			UT_ASSERT_EQ(marker_accepted, 0);
 			UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 			source_check_no_call();

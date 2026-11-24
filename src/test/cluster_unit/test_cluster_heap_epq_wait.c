@@ -13,6 +13,7 @@
 #include "storage/predicate.h"
 #include "access/syncscan.h"
 #include "access/valid.h"
+#include "access/visibilitymap.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "../../backend/access/heap/heapam_r4_private.h"
@@ -22,6 +23,8 @@
 #undef snprintf
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
+
+#include "test_cluster_heap_maintenance_policy.inc"
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;

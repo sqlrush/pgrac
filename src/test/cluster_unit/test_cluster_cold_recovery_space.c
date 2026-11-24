@@ -772,6 +772,7 @@ UT_TEST(test_space_effect_validation)
 int
 main(void)
 {
+	UT_PLAN(15);
 	UT_RUN(test_space_advance_collected_not_scheduled);
 	UT_RUN(test_space_create_orders_new_relation_pages);
 	UT_RUN(test_space_truncate_boundary_rebase_and_retire);

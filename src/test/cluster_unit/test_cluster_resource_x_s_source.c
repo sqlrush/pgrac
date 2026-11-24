@@ -823,6 +823,52 @@ UT_TEST(test_s_source_forward_cannot_overwrite_any_existing_holder_capacity)
 	}
 }
 
+/* A real previous callback leaves only this nonauthority physical floor.
+ * The multi-process native composition covers how it is produced. */
+UT_TEST(test_s_source_forward_preserves_quiet_send_floors)
+{
+	SSourceFixture f; ResourceXSourceDrainWork work;
+	if (!ss_start(&f)) return;
+	f.master.state->holder_status_intent.slot.first_armed_us = 400;
+	f.master.state->holder_image_intent.first_armed_us = 500;
+	UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(ss_service_probe(&work));
+	UT_ASSERT_EQ(f.master.state->holder_status_intent.slot.first_armed_us, 400);
+	UT_ASSERT_EQ(f.master.state->holder_image_intent.first_armed_us, 500);
+	UT_ASSERT_EQ(ss_capture(&f, &work), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ss_publish(&f), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(f.master.state->holder_status_intent.slot.first_armed_us > 500);
+	UT_ASSERT(f.master.state->holder_image_intent.first_armed_us > 500);
+}
+
+UT_TEST(test_s_source_forward_rejects_every_nonfloor_empty_slot_byte)
+{
+	for (int role = 0; role < 2; role++)
+		for (Size n = 0; n < sizeof(ResourceXIntentSlot); n++) {
+			SSourceFixture f; ResourceXIntentSlot *slot; ClusterPcmResourceXMasterState before;
+			if (n >= offsetof(ResourceXIntentSlot, first_armed_us)
+				&& n < offsetof(ResourceXIntentSlot, first_armed_us) + sizeof(uint64)) continue;
+			if (!ss_start(&f)) return;
+			slot = role ? &f.master.state->holder_image_intent : &f.master.state->holder_status_intent.slot;
+			slot->first_armed_us = 400; ((uint8 *)slot)[n] ^= 1; before = *f.master.state;
+			UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_BAD_STATE);
+			UT_ASSERT(memcmp(&before, f.master.state, sizeof(before)) == 0);
+		}
+}
+
+UT_TEST(test_s_source_forward_rejects_exhausted_send_floor)
+{
+	for (int role = 0; role < 2; role++)
+		for (int exhausted = 0; exhausted < 2; exhausted++) {
+			SSourceFixture f; ResourceXIntentSlot *slot; ClusterPcmResourceXMasterState before;
+			if (!ss_start(&f)) return;
+			slot = role ? &f.master.state->holder_image_intent : &f.master.state->holder_status_intent.slot;
+			slot->first_armed_us = UINT64_MAX - exhausted; before = *f.master.state;
+			UT_ASSERT_EQ(ss_forward(&f), RESOURCE_X_APPLY_BAD_STATE);
+			UT_ASSERT(memcmp(&before, f.master.state, sizeof(before)) == 0);
+		}
+}
+
 UT_TEST(test_s_source_forward_snapshot_has_explicit_no_native_phase)
 {
 	SSourceFixture f; ResourceXDecodedFrame image; ClusterPcmOwnSnapshot native, empty = {0};
@@ -1425,7 +1471,7 @@ UT_TEST(test_x_current_source_member_change_keeps_original_pair_native_debt)
 int
 main(void)
 {
-	UT_PLAN(84);
+	UT_PLAN(87);
 	UT_RUN(test_s_source_reserves_complete_pair_before_native_finish);
 	UT_RUN(test_s_source_exact_prepare_duplicate_is_not_a_second_native_commit);
 	UT_RUN(test_s_source_changed_token_descriptor_or_page_cannot_replace_pending);
@@ -1471,6 +1517,9 @@ main(void)
 	UT_RUN(test_s_source_forward_duplicate_and_changed_domain_cannot_replace_it);
 	UT_RUN(test_s_source_forward_bad_auth_r4_and_crc_never_reserve);
 	UT_RUN(test_s_source_forward_cannot_overwrite_any_existing_holder_capacity);
+	UT_RUN(test_s_source_forward_preserves_quiet_send_floors);
+	UT_RUN(test_s_source_forward_rejects_every_nonfloor_empty_slot_byte);
+	UT_RUN(test_s_source_forward_rejects_exhausted_send_floor);
 	UT_RUN(test_s_source_forward_snapshot_has_explicit_no_native_phase);
 	UT_RUN(test_s_source_forward_busy_waits_real_event_without_dropping_frame);
 	UT_RUN(test_s_source_forward_cancel_and_unsent_forget_cannot_erase_work);

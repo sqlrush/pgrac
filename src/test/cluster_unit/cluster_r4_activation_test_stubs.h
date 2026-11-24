@@ -32,6 +32,11 @@
 #include "storage/ipc.h"
 #include "access/xlog.h"
 
+void
+cluster_gcs_block_acquire_stale_observe(const char *name pg_attribute_unused(),
+	uint64 left pg_attribute_unused(), uint64 right pg_attribute_unused(), bool failed pg_attribute_unused())
+{}
+
 int MyProcPid = 101;
 volatile sig_atomic_t InterruptPending = false;
 volatile uint32 InterruptHoldoffCount = 0;

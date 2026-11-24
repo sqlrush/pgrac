@@ -216,6 +216,7 @@ UT_TEST(test_t18_cluster_local_invalidscn_representable)
 int
 main(void)
 {
+	UT_PLAN(19);
 	UT_RUN(test_t1_snapshot_source_enum_stable);
 	UT_RUN(test_t2_snapshot_cluster_tail_members_present);
 	UT_RUN(test_t3_read_scn_is_scn);

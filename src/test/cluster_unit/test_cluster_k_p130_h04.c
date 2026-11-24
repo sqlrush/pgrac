@@ -129,7 +129,7 @@ h04_matrix(bool body, bool valid, bool revoking)
 	if (body) { carrier = f.master.state->pi_carrier; retained = f.master.state->holder_image; }
 	observed = cluster_pcm_lock_resource_x_resident_image_preserved_exact(&base, before.data);
 	UT_ASSERT_EQ(observed, revoking ? RESOURCE_X_APPLY_INVALID
-		: body && valid ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_LOCAL_WAIT);
+		: !valid ? RESOURCE_X_APPLY_RECOVERY_BLOCKED : body ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_LOCAL_WAIT);
 	printf("# H04 before body=%d VALID=%d REVOKING=%d guard=%d gen=" UINT64_FORMAT
 		" token=" UINT64_FORMAT " crc=%u pair=%u transport=%u PI=%u lowers=%u floor=80\n",
 		body, valid, revoking, observed, generation, token,
@@ -138,8 +138,8 @@ h04_matrix(bool body, bool valid, bool revoking)
 	/* The old source head is deliberately not completed by a fabricated X
 	 * requester. The actual ordinary caller may wait; cancel it explicitly. */
 	UT_ASSERT(!rl_run(NULL));
-	UT_ASSERT_EQ(ordinary_sends, !body && valid && !revoking ? 1 : 0);
-	UT_ASSERT_EQ(h04_delivery_cancels, !body && valid && !revoking ? 1 : 0);
+	UT_ASSERT_EQ(ordinary_sends, 0);
+	UT_ASSERT_EQ(h04_delivery_cancels, 0);
 	UT_ASSERT_EQ(h04_wait_cancels, body || revoking ? 1 : 0);
 	UT_ASSERT_EQ(rl_share_locks, 0); UT_ASSERT_EQ(ordinary_panics, 0);
 	UT_ASSERT_EQ(complete_commits, 0); UT_ASSERT_EQ(complete_io_calls, 0);

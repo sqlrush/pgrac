@@ -197,6 +197,7 @@ UT_TEST(test_stage5_5_wait_events_count_snapshot_124)
 int
 main(void)
 {
+	UT_PLAN(6);
 	UT_RUN(test_stage5_5_catversion_at_or_above_spec_5_15);
 	UT_RUN(test_stage5_5_cr_sqlstate_surface_encodable);
 	UT_RUN(test_stage5_5_cr_dump_category_names);

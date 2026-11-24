@@ -200,6 +200,8 @@ fixture_open_gate(ResourceXGateSnapshot *gate)
 
 /* The acquired-authority branches are not part of this fixture: reaching
  * them after NOT_FOUND must fail, never manufacture a grant for the test. */
+#define cluster_bufmgr_pcm_acquire_resident_x(...)                                                 \
+	(fixture_failure(), RESOURCE_X_APPLY_INVALID)
 #define cluster_gcs_resource_x_target_acquire_until_exact(...)                                     \
 	(fixture_failure(), RESOURCE_X_APPLY_INVALID)
 #define cluster_pcm_lock_resource_x_gate_snapshot fixture_open_gate

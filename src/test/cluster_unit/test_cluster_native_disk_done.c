@@ -383,11 +383,12 @@ UT_TEST(test_done_wire_old_partial_version_reserved_CRC_are_not_repaired)
 UT_TEST(test_done_wire_has_no_alias_to_other_modes_sources_or_holders)
 {
 	EvidenceFixture f;
-	ResourceXDecodedFrame frame, bad;
+	ResourceXDecodedFrame frame, bad, decoded;
 	ResourceXWireReject reject;
-	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES];
+	uint8 bytes[RESOURCE_X_COMPLETE_V5_BYTES], original[RESOURCE_X_COMPLETE_V5_BYTES];
 	uint16 len;
 	if (!done_start(&f)) { UT_ASSERT(false); return; } frame = done_frame();
+	UT_ASSERT(done_encode(&frame, original));
 	for (int n = 0; n < 10; n++) {
 		bad = frame;
 		if (n == 0) bad.common.target_mode = PCM_STATE_X;
@@ -400,8 +401,21 @@ UT_TEST(test_done_wire_has_no_alias_to_other_modes_sources_or_holders)
 		if (n == 7) bad.body.acquire_completion.native_generation++;
 		if (n == 8) bad.body.acquire_completion.write_io_generation = 1;
 		if (n == 9) bad.body.acquire_completion.decision.episode.base_generation = UINT64_MAX - 1;
-		UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
-			&bad, bytes, sizeof(bytes), &len, &reject));
+		if (n == 0 || n == 3) {
+			/* Valid X/resident records remain distinct from this original S episode. */
+			UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+				&bad, bytes, sizeof(bytes), &len, &reject));
+			UT_ASSERT_EQ(len, sizeof(bytes));
+			UT_ASSERT(memcmp(bytes, original, sizeof(bytes)) != 0);
+			UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+				bytes, len, &decoded, &reject));
+			UT_ASSERT_EQ(decoded.common.target_mode, n == 0 ? PCM_STATE_X : PCM_STATE_S);
+			UT_ASSERT_EQ(decoded.body.acquire_completion.decision.episode.path,
+				n == 3 ? RESOURCE_X_ACQUIRE_RESIDENT : RESOURCE_X_ACQUIRE_FIRST_FILL);
+		} else {
+			UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+				&bad, bytes, sizeof(bytes), &len, &reject));
+		}
 	}
 }
 UT_TEST(test_done_wire_sender_rebind_preserves_all_semantic_bytes)

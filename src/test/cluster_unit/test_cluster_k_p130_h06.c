@@ -145,7 +145,7 @@ h06_matrix(bool first_covered, int foreign_kind, bool external)
 	ClusterPcmLocalPiSnapshotV1 local, after;
 	ClusterPcmResourceXMasterState before;
 	ResourceXApplyResult result;
-	bool coverage, eligible = first_covered && foreign_kind == 0 && !external;
+	bool coverage, eligible = first_covered && foreign_kind != 1 && !external;
 	int refs, allocations;
 	if (!replace_start_phase(&f, external ? 0 : 2)) { UT_ASSERT(false); replace_end(&f); return; }
 	if (foreign_kind) {
@@ -160,6 +160,7 @@ h06_matrix(bool first_covered, int foreign_kind, bool external)
 		UT_ASSERT(false); replace_end(&f); return;
 	}
 	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f.old.local.resource, &local));
+	f.old.local = local; /* Retire the actual unchanged foreign logical scope. */
 	coverage = rf_page_online_plan_image_covers_v1(f.plan, &f.last, f.page.data, &local.first, &local.last);
 	UT_ASSERT_EQ(coverage, first_covered && foreign_kind != 1);
 	before = *f.old.source.m.state;

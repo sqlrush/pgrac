@@ -153,6 +153,12 @@ static uint32 work_slot;
 static bool work_native_v3;
 static unsigned finish_local_drift;
 
+static uint32
+work_no_native_capabilities(void)
+{
+	return 0;
+}
+
 static void
 work_finish_sample_drift(void)
 {
@@ -365,27 +371,6 @@ prepare_files(const ClusterSpaceStructureChange *change)
 	}
 }
 
-static void
-prepare_v3_postcommit(void)
-{
-	ClusterKoCompletionV2 *claimed = NULL;
-
-	postcommit_owner = v3_native_structure_owner(CLUSTER_KO_SHARED_V3_OPERATION_DROP);
-	UT_ASSERT(cluster_ko_shared_claim_structure(&space_identity, CLUSTER_SPACE_WAL_TOMBSTONE,
-											  &claimed));
-	UT_ASSERT(claimed == postcommit_owner);
-	v3_structure_record(true, space_identity.operation, &postcommit_binding, postcommit_wal);
-	UT_ASSERT(cluster_ko_shared_observe_space_v2(postcommit_owner, &postcommit_binding,
-												 postcommit_wal, sizeof(postcommit_wal)));
-	postcommit_drop = true;
-	postcommit_error = postcommit_scope_changed = false;
-	postcommit_callback_error = postcommit_buffer_error = false;
-	postcommit_native_count = 1;
-	postcommit_storage_consumer = NULL;
-	postcommit_deletes = postcommit_phases = 0;
-	native_fork_unlinks = native_fork_closes = native_smgr_invalidations = 0;
-}
-
 static bool
 work_setup_impl(const char *name, unsigned native, bool stale)
 {
@@ -413,7 +398,7 @@ work_setup_impl(const char *name, unsigned native, bool stale)
 	finish_local_drift = 0;
 	if (native) {
 		if (native == 2)
-			prepare_v3_postcommit();
+			prepare_v3_postcommit(true);
 		else
 			prepare_postcommit(true);
 		binding = postcommit_binding;
@@ -1004,7 +989,8 @@ UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
 			ClusterKoSharedContext retained;
 
 			snprintf(name, sizeof(name), "native_commit_%u_%u", stale, failed);
-			if (!work_setup_impl(name, true, stale))
+			/* Executable DROP uses v3; keep the old-cut refusal on v2. */
+			if (!(stale ? work_setup_impl(name, 1, true) : work_setup_v3(name)))
 				return;
 			/* The backend has handed off without doing pathname I/O. */
 			UT_ASSERT(ko_completions == NULL);
@@ -1057,33 +1043,38 @@ UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
 UT_TEST(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry)
 {
 	uint64 failures;
-	if (!work_setup_impl("native_poll", true, false))
+	uint32 (*saved_capabilities)(void);
+
+	if (!work_setup_v3("native_poll"))
 		return;
 	ko_drop_poll_boundary = cluster_smgr_drop_work_poll;
 	MyBackendType = B_BACKEND;
 	UT_ASSERT(!run_native_checkpointer());
 	MyBackendType = B_CHECKPOINTER;
-	native_commit_active = false;
+	saved_capabilities = native_capability_hook;
+	native_capability_hook = work_no_native_capabilities;
 	UT_ASSERT(!run_native_checkpointer());
 	UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, 0);
-	native_commit_active = true;
+	native_capability_hook = saved_capabilities;
 	/* A failed unlink which left the same original inode can be retried.
 	 * Unlike fsync failure, it does not lose a prior durability guarantee. */
 	work_fault = WORK_AUX;
 	failures = cluster_ko_failclosed_count();
-	UT_ASSERT(!run_native_checkpointer());
+	/* The first v3 LOCAL scan advances even though the unlink fails. */
+	UT_ASSERT(run_native_checkpointer());
 	UT_ASSERT_EQ(unlinks, 1);
 	UT_ASSERT_EQ(cluster_ko_failclosed_count(), failures + 1);
 	UT_ASSERT_EQ(fixture_log_events, 1);
-	/* A failed item advances the cursor; there is no retry loop this tick. */
-	UT_ASSERT(!run_native_checkpointer());
-	UT_ASSERT_EQ(unlinks, 1);
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+	UT_ASSERT_EQ(ko_drop_scan, work_slot + 1);
+	/* Each tick advances past the failed item after exactly one attempt. */
 	UT_ASSERT(!run_native_checkpointer());
 	UT_ASSERT_EQ(unlinks, 2);
 	UT_ASSERT_EQ(cluster_ko_failclosed_count(), failures + 2);
 	UT_ASSERT_EQ(fixture_log_events, 1);
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+	UT_ASSERT_EQ(ko_drop_scan, work_slot + 1);
 	work_fault = WORK_OK;
-	UT_ASSERT(!run_native_checkpointer());
 	UT_ASSERT(run_native_checkpointer());
 	assert_finished();
 	UT_ASSERT_EQ(truncates, 1);

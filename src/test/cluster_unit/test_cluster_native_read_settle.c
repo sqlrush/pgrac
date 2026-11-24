@@ -91,6 +91,7 @@ settle_run(void)
 #endif
 }
 
+static bool settle_defer_request_callback;
 static bool
 settle_start(EvidenceFixture *f, ResourceXDecodedFrame *frame)
 {
@@ -98,6 +99,11 @@ settle_start(EvidenceFixture *f, ResourceXDecodedFrame *frame)
 	ready_connection_generation = 61;
 	bootstrap_ingress_generation = 0;
 	if (!done_start(f)) return false;
+	/* A settled S must not carry the original REQUEST's physical debt.
+	 * Use its real ticket/callback; the delayed-callback case below retains it. */
+	if (!settle_defer_request_callback)
+		UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(
+			&f->ticket, true, ++fake_pcm_clock_us));
 	UT_ASSERT_EQ(done_run(), RESOURCE_X_APPLY_APPLIED);
 	*frame = settle_frame();
 	return true;
@@ -538,6 +544,8 @@ UT_TEST(test_consumed_ACK_between_DONE_arm_and_postcheck_is_not_a_false_failure)
 {
 	EvidenceFixture f;
 	if (!done_start(&f)) { UT_ASSERT(false); return; }
+	UT_ASSERT(cluster_pcm_lock_resource_x_requester_send_complete_exact(
+		&f.ticket, true, ++fake_pcm_clock_us));
 	settle_postcheck_ack = settle_frame();
 	stage_header_hook = settle_ack_on_next_header;
 	UT_ASSERT_EQ(done_run(), RESOURCE_X_APPLY_APPLIED);
@@ -597,10 +605,30 @@ UT_TEST(test_consumed_real_NOT_ADMITTED_bookkeeping_remains_a_quiet_original_own
 	settle_once(SETTLE_RETIRED);
 }
 
+UT_TEST(test_consumed_original_REQUEST_callback_precedes_resident_S_handoff)
+{
+	EvidenceFixture f; ResourceXDecodedFrame ack;
+	bool ready;
+	settle_defer_request_callback = true;
+	ready = settle_start(&f, &ack);
+	settle_defer_request_callback = false;
+	if (!ready) { UT_ASSERT(false); return; }
+	UT_ASSERT_EQ(settle_receive(&ack), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(settle_run(), RESOURCE_X_APPLY_LOCAL_WAIT);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.has_acquire_intent, 1);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.resident_s_authorized, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_send_complete_exact(
+		&f.ticket, true, ++fake_pcm_clock_us), true);
+	UT_ASSERT_EQ(settle_run(), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.has_acquire_intent, 0);
+	UT_ASSERT_EQ(request_entry()->resource_x_bootstrap_round.resident_s_authorized, 1);
+	settle_once(SETTLE_RETIRED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(test_consumed_ACK_retains_full_original_A_I_and_physical_notice);
 	UT_RUN(test_consumed_quiet_ARMED_notice_retires_only_after_native_S_recheck);
 	UT_RUN(test_consumed_no_master_receipt_is_local_wait_without_erasure);
@@ -634,6 +662,7 @@ main(void)
 	UT_RUN(test_consumed_malformed_physical_descriptor_cannot_be_acknowledged);
 	UT_RUN(test_consumed_malformed_physical_descriptor_is_retained_after_master_ACK);
 	UT_RUN(test_consumed_real_NOT_ADMITTED_bookkeeping_remains_a_quiet_original_owner);
+	UT_RUN(test_consumed_original_REQUEST_callback_precedes_resident_S_handoff);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -18,6 +18,8 @@ int ko_stop_fixture_main(void);
 #undef main
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_gcs_block.h"
+#include "storage/checksum.h"
+#include "storage/checksum_impl.h"
 
 static ClusterKoSharedMessageV3
 ready_operation(ClusterKoSharedMessageV3 request)
@@ -83,6 +85,31 @@ static ClusterKoSharedMessageV3 io_request;
 static bool marker_during_read, raw_read_error;
 static bool raw_open_error, raw_verify_ok = true;
 static unsigned raw_reads, raw_opens;
+static unsigned raw_traces;
+
+bool
+DataChecksumsEnabled(void)
+{
+	return true;
+}
+
+/* File output is a diagnostic leaf; the original refresh still rejects
+ * the failed page and ends its exact directory IO in FINALLY. */
+static void
+raw_trace_failed(BufferTag tag, const char *bytes, const char *source,
+				 uint32 expected, uint32 calculated)
+{
+	UT_ASSERT(RelFileLocatorEquals(BufTagGetRelFileLocator(&tag), io_request.base.key.locator));
+	UT_ASSERT_EQ(BufTagGetForkNum(&tag), MAIN_FORKNUM);
+	UT_ASSERT_EQ(tag.blockNum, 4);
+	UT_ASSERT(bytes != NULL);
+	UT_ASSERT(strcmp(source, "DISK_REFRESH") == 0);
+	/* raw_io_read supplies a new zero-header page, even when its separate
+	 * verification leaf refuses it. */
+	UT_ASSERT_EQ(expected, 0);
+	UT_ASSERT_EQ(calculated, 0);
+	raw_traces++;
+}
 
 static SMgrRelation
 raw_io_open(RelFileLocator locator, BackendId backend)
@@ -185,6 +212,7 @@ raw_nblocks(SMgrRelation rel, ForkNumber fork)
 #define cluster_bufmgr_pcm_x_content_write_permitted refresh_write_permitted
 #define LockBufHdr(buf) refresh_state
 #define UnlockBufHdr(buf, state) ((void)0)
+#define cluster_block_io_trace_failed raw_trace_failed
 #undef BufHdrGetBlock
 #define BufHdrGetBlock(buf) ((Block)refresh_page.data)
 #include "test_cluster_ko_raw_consumers.inc"
@@ -199,6 +227,7 @@ raw_nblocks(SMgrRelation rel, ForkNumber fork)
 #undef cluster_bufmgr_pcm_x_content_write_permitted
 #undef LockBufHdr
 #undef UnlockBufHdr
+#undef cluster_block_io_trace_failed
 #undef BufHdrGetBlock
 
 static BufferTag
@@ -208,6 +237,7 @@ raw_consumer_fixture(unsigned number)
 	io_request = ready_operation(peer_fence_fixture(40000 + number));
 	InitBufferTag(&tag, &io_request.base.key.locator, MAIN_FORKNUM, 4);
 	raw_reads = raw_opens = metadata_reads = 0;
+	raw_traces = 0;
 	marker_during_read = marker_during_copy = false;
 	raw_open_error = raw_read_error = false;
 	raw_verify_ok = refresh_write_allowed = true;
@@ -280,6 +310,7 @@ UT_TEST(test_refresh_call_covers_storage_and_original_content_copy)
 		expecting_error = false;
 		UT_ASSERT_EQ(caught, failure >= 1 && failure <= 3);
 		UT_ASSERT_EQ(result, failure == 0);
+		UT_ASSERT_EQ(raw_traces, failure == 3 ? 1 : 0);
 		UT_ASSERT(!marker_during_read && !marker_during_copy && !refresh_locked);
 		if (!caught)
 			UT_ASSERT_EQ(scn, failure == 0 ? 93 : InvalidScn);

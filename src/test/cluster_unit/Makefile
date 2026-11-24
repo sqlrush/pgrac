@@ -129,7 +129,7 @@ TESTS = test_cluster_relation_size test_cluster_vm_read_visibility test_cluster_
         test_cluster_ts \
         test_cluster_ko \
         test_cluster_hw_snapshot \
-        test_cluster_cf_authority \
+        test_cluster_cf_authority test_cluster_startup_relcache_owner \
 		test_cluster_control_request \
 		test_cluster_control_retire \
 		test_cluster_control_retire_master \
@@ -301,8 +301,21 @@ CLUSTER_RESOURCE_X_IDENTITY_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_identity.o
 CLUSTER_RESOURCE_X_NODE_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_node_wire.o
+# Decoded frames embed identity and PAGE/WAL proofs by value. Both sides of
+# the codec call must rebuild when those layouts change.
+CLUSTER_RESOURCE_X_WIRE_LAYOUT_HEADERS = \
+	$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h \
+	$(top_srcdir)/src/include/cluster/cluster_resource_x_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_buffer_desc.h \
+	$(top_srcdir)/src/include/storage/buf_internals.h \
+	$(top_srcdir)/src/include/cluster/cluster_page_wal.h \
+	$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_source.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_claim.h \
+	$(top_srcdir)/src/include/cluster/cluster_control_root.h \
+	$(top_srcdir)/src/include/storage/relfilelocator.h
 $(CLUSTER_RESOURCE_X_NODE_WIRE_O) test_cluster_pcm_lock_clock_product.o: \
-		$(top_srcdir)/src/include/cluster/cluster_resource_x_node_wire.h
+		$(CLUSTER_RESOURCE_X_WIRE_LAYOUT_HEADERS)
 CLUSTER_RESOURCE_X_RETRY_O = \
 	$(top_builddir)/src/backend/cluster/cluster_resource_x_retry.o
 CLUSTER_IC_TIER1_O = $(top_builddir)/src/backend/cluster/cluster_ic_tier1.o
@@ -373,6 +386,16 @@ test_cluster_gcs_block_dedup: test_cluster_gcs_block_dedup.c unit_test.h $(CLUST
 # + cluster_lms_shard.o so the route == shard_for_tag agreement is asserted
 # against both real objects.  libpgcommon_srv.a for hash_bytes_extended.
 CLUSTER_GCS_BLOCK_SHARD_O = $(top_builddir)/src/backend/cluster/cluster_gcs_block_shard.o
+# Keep the real decoder caller in step with its payload layouts even when
+# compiler-generated header dependencies are disabled.
+$(CLUSTER_GCS_BLOCK_SHARD_O): \
+		$(CLUSTER_RESOURCE_X_WIRE_LAYOUT_HEADERS) \
+		$(top_srcdir)/src/include/cluster/cluster_gcs_block.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic_envelope.h \
+		$(top_srcdir)/src/include/cluster/cluster_lms_shard.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current_wire.h \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h \
+		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h
 test_cluster_gcs_block_shard: test_cluster_gcs_block_shard.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_GCS_BLOCK_SHARD_O) $(CLUSTER_LMS_SHARD_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O)
@@ -400,6 +423,7 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 # objects (the test files stub the PG backend symbols those
 # objects reference).
 SIMPLE_TESTS = $(filter-out test_cluster_native_itl_trace test_cluster_catalog_trace test_cluster_grd_capacity test_cluster_grd_dsa test_cluster_cr_shared_route test_cluster_tt_rollback_entry test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_cold_recovery_validate test_cluster_cold_recovery_io test_cluster_cold_recovery_complete test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete test_cluster_typed_redo test_cluster_cold_recovery_space test_cluster_cold_recovery_space_refail test_cluster_cold_recovery_refail test_cluster_cold_recovery_replay test_cluster_cold_recovery_plan test_cluster_cold_recovery_decode test_cluster_cold_recovery_startup test_cluster_update_trace test_cluster_wait_resources test_cluster_content_trace test_cluster_content_trace_exec test_cluster_pcm_service_trace test_cluster_tx_identity_trace test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_authority_storage test_cluster_serving_sample test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_groups test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_write_fence_durable test_cluster_write_fence_cache test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_recovery_serial test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_control_root test_cluster_recovery_duty test_cluster_formation_witness test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_undo_block0 test_cluster_undo_smgr_publication test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_cr_walk test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order,$(TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_startup_relcache_owner,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_trace,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relation_size,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_cr_reuse test_cluster_snapshot_admission test_cluster_undo_header_durability test_cluster_tt_2pc_finish test_cluster_control_transport test_cluster_cr_native_origin test_cluster_cr_mvcc_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats \
@@ -2500,7 +2524,8 @@ test_cluster_abort_writer_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 test_cluster_pi_drop_storage: test_cluster_pi_drop_storage.c test_cluster_page_data.c
 test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
 test_cluster_page_data test_cluster_sync_error test_cluster_pi_drop_storage test_cluster_abort_writer: $(CLUSTER_KO_O)
-test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
+test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O)
+test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS += $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
@@ -3307,6 +3332,32 @@ test_cluster_cf_authority: test_cluster_cf_authority.c unit_test.h \
 		$(CLUSTER_CF_AUTHORITY_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Exercise the exact pre-transaction initialization block with backend crypto
+# and the complete ResourceOwner implementation, rather than frontend hashes.
+test_cluster_startup_relcache_owner.inc: $(top_srcdir)/src/backend/utils/init/postinit.c Makefile
+	awk '/Load relcache entries for the shared system catalogs/ { start++; emit=1; next } \
+	     emit && !body && /\*\// { body=1; next } \
+	     emit && /Set up process-exit callback/ { end++; emit=0 } \
+	     emit && body { lines[++n]=$$0 } \
+	     END { if (start!=1 || end!=1 || n<3) exit 1; \
+	           for (i=1;i<=n-2;i++) print lines[i] }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_relcache_owner: test_cluster_startup_relcache_owner.c \
+		test_cluster_startup_relcache_owner.inc test_cluster_cf_authority.c unit_test.h \
+		$(top_srcdir)/src/backend/utils/resowner/resowner.c \
+		$(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+clean: clean-startup-relcache-owner
+.PHONY: clean-startup-relcache-owner
+clean-startup-relcache-owner:
+	rm -f test_cluster_startup_relcache_owner test_cluster_startup_relcache_owner.d \
+		test_cluster_startup_relcache_owner.inc test_cluster_startup_relcache_owner.inc.tmp
 
 CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_root.o
 # migration_wal_scan (contract) drives a real XLogReader over the thread
@@ -4740,10 +4791,10 @@ test_cluster_serving_sample: test_cluster_serving_sample.c test_cluster_serving_
 
 # Exercise the actual pre-send gate with the real authority/storage consumer.
 test_cluster_gcs_serving_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^cluster_gcs_send_block_request_and_wait\(/ { requester=1 } \
+	awk '/^gcs_send_block_request_and_wait\(/ { requester=1 } \
 	     requester && /^\tif \(cluster_authority_readiness_managed\(\)/ { emit=1; begin++ } \
 	     emit && /^\t\/\*$$/ { emit=0; requester=0; end++ } \
-	     emit { print } \
+	     emit { print } /^}/ { requester=0 } \
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -4913,7 +4964,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_page_flush.inc
 	rm -f test_cluster_abort_writer_flush.inc
-	rm -f test_cluster_page_identity_equal.c test_cluster_page_identity_equal.o
+	rm -f test_cluster_bufmgr_pcm_identity.inc test_cluster_bufmgr_pcm_identity.inc.tmp
+	rm -f test_cluster_bufmgr_pcm_product.o
 	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_pcm_s_capture_consumer.inc
 	rm -f test_cluster_ko_source_io.inc
@@ -5594,7 +5646,9 @@ test_cluster_pcm_master_durable.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 
 # Exercise the actual master queue callback and its peer/ACK path.
 test_cluster_pcm_bootstrap_tick.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_resource_x_target_peer_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	awk '/^\/\* Begin ordinary acquire STALE observation/ { observation=1 } \
+	     observation { print } /^\/\* End ordinary acquire STALE observation/ { observation=0 } \
+	     /^gcs_block_resource_x_target_peer_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
 	     /^gcs_block_resource_x_bootstrap_ack_stage_exact\(/ { print "static bool"; emit=1; count++ } \
 	     /^gcs_block_resource_x_bootstrap_admitted\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
 	     /^cluster_gcs_block_resource_x_bootstrap_tick\(/ { print "ResourceXApplyResult"; emit=1; count++ } \
@@ -5622,7 +5676,8 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 	mv $@.tmp $@
 
 RESOURCE_X_PCM_TEST_O = test_cluster_pcm_lock_clock_product.o
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_disk_x_done test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_local_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement test_cluster_resource_x_pi_replace: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+RESOURCE_X_PCM_TEST_COMMON_LIB = $(top_builddir)/src/common/libpgcommon_srv.a
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_acquire_stale test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_disk_x_done test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_local_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement test_cluster_resource_x_pi_replace: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -5647,7 +5702,7 @@ test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv te
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_VERSION_O) $(RESOURCE_X_PCM_TEST_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(LDFLAGS) $(RESOURCE_X_PCM_TEST_COMMON_LIB) $(filter -lcrypto,$(LIBS)) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_pcm_stop_cv: $(top_srcdir)/src/backend/storage/lmgr/condition_variable.c
@@ -5776,9 +5831,9 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 # PGRAC: real bounded discard/PI owners, not copies of their decisions.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_pcm_s_capture_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_resource_x_acquire_s_source_capture_owned\(/ { print "static ResourceXApplyResult"; emit=1; capture++ } \
+	awk '/^gcs_block_resource_x_acquire_s_source_capture_(owned|with_plan)\(/ { print "static ResourceXApplyResult"; emit=1; capture++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (capture != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (capture != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_s_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -6896,28 +6951,30 @@ test_cluster_lms_outbound: test_cluster_lms_outbound.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-2.31 D9 v0.5: test_cluster_bufmgr_pcm_hook verifies the bufmgr
-# LockBuffer/LockBufferForCleanup PCM hook layer in isolation by using a
-# fake LockBuffer wrapper that mirrors the D3 hook structure.  Links
-# cluster_pcm_lock.o (real acquire/release behavior) + reuses the same
-# stub family as test_cluster_pcm_lock.
-# PGRAC: the real page identity comparison that cluster_pcm_lock.o calls,
-# without the rest of cluster_page_stable_base.c.
-test_cluster_page_identity_equal.c: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c Makefile
-	@{ echo '#include "postgres.h"'; echo '#include "cluster/cluster_page_stable_base.h"'; \
-	   awk '/^rf_page_identity_equal_v1\(/ { print "bool"; emit=1; n++ } \
-	        emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $<; } > $@
+# legacy hook order in isolation using a fake LockBuffer wrapper. Compile
+# the real PCM source with sections: this local, tag-only fixture needs its
+# acquire/release closure, not unrelated BufferDesc delivery/recovery APIs.
+test_cluster_bufmgr_pcm_product.o: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h \
+		$(top_srcdir)/src/include/cluster/cluster_pi_write.h Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_page_identity_equal.o: test_cluster_page_identity_equal.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+# Keep the actual comparison without a generated .c source in the worktree.
+test_cluster_bufmgr_pcm_identity.inc: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c Makefile
+	awk '/^rf_page_identity_equal_v1\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (n != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_bufmgr_pcm_hook: test_cluster_bufmgr_pcm_hook.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
-		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) test_cluster_page_identity_equal.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
-		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) test_cluster_page_identity_equal.o \
+		test_cluster_bufmgr_pcm_identity.inc test_cluster_bufmgr_pcm_product.o \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMS_SHARD_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_VERSION_O) test_cluster_bufmgr_pcm_product.o $(CLUSTER_LMS_SHARD_O) \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 # spec-2.32 D9: test_cluster_gcs_dispatch verifies GCS request protocol
 # skeleton invariants (msg_type enum 12/13, payload ABI lock, dispatch
@@ -7974,7 +8031,7 @@ test_cluster_index_exhaustion.inc: $(top_srcdir)/src/backend/access/index/indexa
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc test_cluster_index_exhaustion.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
+test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_maintenance_policy.inc test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc test_cluster_index_exhaustion.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -8744,7 +8801,10 @@ test_cluster_buffer_cr_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 	mv $@.tmp $@
 
 test_cluster_buffer_cr_pins.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^typedef struct PrivateRefCountEntry/ { emit=1; type++ } \
+	awk '/^cluster_bufmgr_failed_read_held_lock\(/ { print "static void"; emit=1; held++ } \
+	     /^cluster_bufmgr_failed_read_unpin_lock\(/ { print "static LWLock *"; emit=1; failed_lock++ } \
+	     /^cluster_bufmgr_failed_read_unpin_finish\(/ { print "static void"; emit=1; failed_finish++ } \
+	     /^typedef struct PrivateRefCountEntry/ { emit=1; type++ } \
 	     /^typedef enum PinBufferLookupResult/ { emit=1; lookup_type++ } \
 	     /^PinBufferForLookup\(/ { print "static PinBufferLookupResult"; emit=1; lookup_pin++ } \
 	     /^PinBufferForObjectRead\(/ { print "static PinBufferLookupResult"; emit=1; ko_pin++ } \
@@ -8752,7 +8812,7 @@ test_cluster_buffer_cr_pins.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr
 	     /^PinBuffer_Locked\(/ { print "static void"; emit=1; locked_pin++ } \
 	     /^UnpinBuffer\(/ { print "static void"; emit=1; unpin++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (lookup_pin != 1 || type != 1 || lookup_type != 1 || ko_pin != 1 || pin != 1 || locked_pin != 1 || unpin != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (held != 1 || failed_lock != 1 || failed_finish != 1 || lookup_pin != 1 || type != 1 || lookup_type != 1 || ko_pin != 1 || pin != 1 || locked_pin != 1 || unpin != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_buffer_cr_refs.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -9581,6 +9641,8 @@ test_cluster_ko_relation_scan test_cluster_ko_current_admission: %: %.c test_clu
 
 TESTS += test_cluster_ko_cancel test_cluster_ges_release test_cluster_grd_ko_cancel test_cluster_acquire_ko_cancel
 TESTS += test_cluster_ko_ready_owner test_cluster_ko_drop_io
+all: test_cluster_ko_cancel test_cluster_ges_release test_cluster_grd_ko_cancel test_cluster_acquire_ko_cancel \
+		test_cluster_ko_ready_owner test_cluster_ko_drop_io
 
 # Original S5 receipt -> LOCALLOCK registration -> KO binding reader.
 TESTS += test_cluster_ax_binding
@@ -9616,7 +9678,8 @@ test_cluster_ko_drop_io: test_cluster_ko_raw_io.inc
 test_cluster_ko_raw_consumers.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
 	awk '/^cluster_bufmgr_(read_storage_scn|refresh_block_from_storage|block_is_extension)_for_gcs\(/ { print "bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
-test_cluster_ko_drop_io: test_cluster_ko_raw_consumers.inc
+test_cluster_ko_drop_io: test_cluster_ko_raw_consumers.inc \
+		$(top_srcdir)/src/include/storage/checksum.h $(top_srcdir)/src/include/storage/checksum_impl.h
 
 # Original N/S source preparation and KO COMMIT reference, with physical
 # descriptor/IO boundaries explicit. Author: SqlRush <sqlrush@gmail.com>
@@ -10164,7 +10227,7 @@ test_cluster_resource_x_decision_publish: test_cluster_resource_x_acquire_ingres
 test_cluster_resource_x_acquire_fixture.inc: test_cluster_resource_x_acquire_ingress.c Makefile
 	awk '/^int$$/ { end++; exit } /^UT_TEST\(/ { skip=1; tests++; next } \
 	     skip && /^}/ { skip=0; next } !skip { print } \
-	     END { if (end != 1 || tests != 89 || skip) exit 1 }' $< > $@.tmp
+	     END { if (end != 1 || tests != 92 || skip) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 clean distclean maintainer-clean: clean-decision-publish
 .PHONY: clean-decision-publish
@@ -11058,6 +11121,7 @@ clean-native-wait-cancel:
 TESTS += test_cluster_native_first_fill
 all: test_cluster_native_first_fill
 test_cluster_native_first_fill: test_cluster_native_first_fill.c test_cluster_native_wait_cancel \
+		test_cluster_native_resident_preserve.inc \
 		test_cluster_native_wait_fixture.inc test_cluster_native_disk_guard.inc \
 		test_cluster_native_disk_episode.inc test_cluster_native_image_episode.inc \
 		test_cluster_native_first_fill_gcs.inc test_cluster_native_first_fill_native.inc \
@@ -11078,6 +11142,14 @@ test_cluster_native_first_fill_gcs.inc: $(top_srcdir)/src/backend/cluster/cluste
 	     /^\/\* End ordinary first-fill request driver/ { emit=0; stop=1 } \
 	     emit { print } END { if (found != 1 || !stop) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_native_resident_preserve.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_own_acquire_preserve_resident_exact\(/ { print "ResourceXApplyResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-resident-preserve
+.PHONY: clean-native-resident-preserve
+clean-native-resident-preserve:
+	rm -f test_cluster_native_resident_preserve.inc test_cluster_native_resident_preserve.inc.tmp
 test_cluster_native_first_fill_native.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^\/\* Ordinary first-fill owns one native reservation/ { emit=1; found++ } \
 	     /^\/\* End ordinary first-fill native driver/ { emit=0; stop=1 } \
@@ -11121,11 +11193,11 @@ test_cluster_native_resident_fill_fixture.inc: test_cluster_native_resident_fill
 	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_native_resident_lock_reserve.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^cluster_bufmgr_pcm_own_snapshot\(/ { print "ClusterPcmOwnResult"; emit=1; snapshot++ } \
+	awk '/^cluster_bufmgr_pcm_own_snapshot\(/ { print "#ifndef NATIVE_RESIDENT_LOCK_REUSE_FIXTURE"; print "ClusterPcmOwnResult"; emit=1; snapshot++; snapshot_body=1 } \
 	     /^cluster_pcm_own_begin_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; begin++ } \
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; cancel++ } \
 	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; wait++ } \
-	     emit { print } /^}/ { emit=0 } \
+	     emit { print } /^}/ { if (snapshot_body) { print "#endif"; snapshot_body=0 } emit=0 } \
 	     END { if (snapshot != 1 || begin != 1 || cancel != 1 || wait != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_native_resident_lock.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
@@ -11483,8 +11555,12 @@ test_cluster_resource_x_pi_replace: test_cluster_pi_replace_pcm.o test_cluster_r
 		test_cluster_resource_x_source_ack_fixture.inc test_cluster_resource_x_master_done_ingress.inc \
 		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
 		test_cluster_resource_x_acquire_candidate.inc test_cluster_resource_x_decision_owner_layout.inc \
-		cluster_unit_port_stubs.o cluster_catalog_trace_test.o $(CLUSTER_PAGE_ONLINE_PLAN_O)
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o $(CLUSTER_PAGE_ONLINE_PLAN_O) \
+		$(top_builddir)/src/common/libpgcommon.a
 # This component executes the actual immutable PAGE plan together with PCM.
+# Hash bytes with the real frontend implementation: this standalone fixture
+# supplies its own tracked allocator and has no backend ResourceOwner lifetime.
+test_cluster_resource_x_pi_replace: RESOURCE_X_PCM_TEST_COMMON_LIB = $(top_builddir)/src/common/libpgcommon.a
 test_cluster_resource_x_pi_replace: CLUSTER_VERSION_O += $(CLUSTER_PAGE_ONLINE_PLAN_O)
 test_cluster_resource_x_pi_replace: RESOURCE_X_PCM_TEST_O = test_cluster_pi_replace_pcm.o
 test_cluster_pi_replace_pcm.o: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile \
@@ -11506,7 +11582,8 @@ all: test_cluster_native_holder
 test_cluster_native_holder: test_cluster_native_holder.c test_cluster_native_first_fill \
 		test_cluster_native_first_fill_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
 		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_candidate.inc \
-		test_cluster_native_holder_bufmgr.inc test_cluster_native_holder_gcs.inc test_cluster_native_holder_itl.inc
+		test_cluster_native_holder_bufmgr.inc test_cluster_native_holder_gcs.inc test_cluster_native_holder_itl.inc \
+		test_cluster_native_holder_unlock.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
@@ -11526,8 +11603,8 @@ test_cluster_native_holder_bufmgr.inc: $(top_srcdir)/src/backend/storage/buffer/
 	mv $@.tmp $@
 test_cluster_native_holder_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_acquire_s_(read_finish_owned|native_handoff_owned|source_finish_owned)\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
-	     /^gcs_block_resource_x_acquire_s_source_capture_owned\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
-	     emit { print } /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@.tmp
+	     /^gcs_block_resource_x_acquire_s_source_capture_(owned|with_plan)\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 clean distclean maintainer-clean: clean-native-holder
 .PHONY: clean-native-holder
@@ -11535,7 +11612,13 @@ clean-native-holder:
 	rm -f test_cluster_native_holder test_cluster_native_holder_itl.inc \
 		test_cluster_native_holder_itl.inc.tmp test_cluster_native_holder_bufmgr.inc \
 		test_cluster_native_holder_bufmgr.inc.tmp test_cluster_native_holder_gcs.inc \
-		test_cluster_native_holder_gcs.inc.tmp
+		test_cluster_native_holder_gcs.inc.tmp test_cluster_native_holder_unlock.inc \
+		test_cluster_native_holder_unlock.inc.tmp
+
+test_cluster_native_holder_unlock.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
+	awk '/^LWLockRelease(WithoutSourceProgress)?\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ && emit { emit=0 } END { if (n != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_native_holder_itl.inc: $(top_srcdir)/src/backend/cluster/cluster_itl.c Makefile
 	awk '/^cluster_itl_page_has_active_slot\(/ { print "bool"; emit=1; n++ } \
@@ -11568,7 +11651,7 @@ test_cluster_native_holder_flush_guard.inc: $(top_srcdir)/src/backend/storage/bu
 	mv $@.tmp $@
 
 test_cluster_native_holder_content_release.inc: $(top_srcdir)/src/backend/storage/lmgr/lwlock.c Makefile
-	awk '/^\tif \(lock->tranche == LWTRANCHE_BUFFER_CONTENT\)/ { print; getline; print; n++ } \
+	awk '/^\tif \(lock->tranche == LWTRANCHE_BUFFER_CONTENT && source_progress\)/ { print; getline; print; n++ } \
 	     END { if (n != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -11639,3 +11722,551 @@ clean distclean maintainer-clean: clean-native-three-role
 clean-native-three-role:
 	rm -f test_cluster_native_three_role test_cluster_native_current_fixture.inc \
 		test_cluster_native_current_fixture.inc.tmp
+
+# Real two-holder X completion and per-holder exact retirement.
+TESTS += test_cluster_native_multi_holder
+all: test_cluster_native_multi_holder
+test_cluster_native_multi_holder: test_cluster_native_multi_holder.c test_cluster_native_resident_x test_cluster_native_three_role test_cluster_native_current test_cluster_native_holder test_cluster_native_master \
+		test_cluster_native_first_fill_fixture.inc test_cluster_resource_x_acquire_fixture.inc \
+		test_cluster_resource_x_master_ack_fixture.inc test_cluster_resource_x_acquire_candidate.inc \
+		test_cluster_resource_x_master_done_ingress.inc test_cluster_native_master_fixture.inc test_cluster_native_current_fixture.inc test_cluster_native_resident_x_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_resident_x_fixture.inc: test_cluster_native_resident_x.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-multi-holder
+.PHONY: clean-native-multi-holder
+clean-native-multi-holder:
+	rm -f test_cluster_native_multi_holder test_cluster_native_resident_x_fixture.inc \
+		test_cluster_native_resident_x_fixture.inc.tmp
+
+# Independent current-X writer, actual writeback and later S/X acquisition.
+TESTS += test_cluster_native_remote_x
+all: test_cluster_native_remote_x
+test_cluster_native_remote_x: test_cluster_native_remote_x.c test_cluster_native_multi_holder \
+		test_cluster_native_holder_writeback test_cluster_native_three_role_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_three_role_fixture.inc: test_cluster_native_three_role.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+		END { if (!stop || lines < 150) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-remote-x
+.PHONY: clean-native-remote-x
+clean-native-remote-x:
+	rm -f test_cluster_native_remote_x test_cluster_native_three_role_fixture.inc \
+		test_cluster_native_three_role_fixture.inc.tmp
+
+# Original failed-fill/native cleanup and an independently owned master.
+TESTS += test_cluster_native_cancel_master
+all: test_cluster_native_cancel_master
+test_cluster_native_cancel_master: test_cluster_native_cancel_master.c test_cluster_native_current \
+		test_cluster_native_master_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-cancel-master
+.PHONY: clean-native-cancel-master
+clean-native-cancel-master:
+	rm -f test_cluster_native_cancel_master
+
+# Ordinary resident cancellation with the original independent master.
+TESTS += test_cluster_native_resident_read_cancel_master test_cluster_native_resident_write_cancel_master
+all: test_cluster_native_resident_read_cancel_master test_cluster_native_resident_write_cancel_master
+test_cluster_native_resident_read_cancel_master test_cluster_native_resident_write_cancel_master: test_cluster_native_resident_cancel_master.c test_cluster_native_cancel_master test_cluster_native_resident_lock test_cluster_native_resident_x \
+		test_cluster_native_resident_lock_fixture.inc test_cluster_native_resident_x_fixture.inc test_cluster_native_master_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		$(if $(filter test_cluster_native_resident_write_cancel_master,$@),-DRESIDENT_CANCEL_WRITE) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_resident_lock_fixture.inc: test_cluster_native_resident_lock.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-resident-cancel-master
+.PHONY: clean-native-resident-cancel-master
+clean-native-resident-cancel-master:
+	rm -f test_cluster_native_resident_read_cancel_master test_cluster_native_resident_write_cancel_master \
+		test_cluster_native_resident_lock_fixture.inc test_cluster_native_resident_lock_fixture.inc.tmp
+
+# Independent ordinary remote-image cancellation and source retirement.
+TESTS += test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel
+all: test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel
+test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel: test_cluster_native_remote_cancel.c \
+		test_cluster_native_remote_x test_cluster_native_holder test_cluster_native_resident_lock test_cluster_native_resident_x \
+		test_cluster_native_remote_x_fixture.inc \
+		test_cluster_native_three_role_fixture.inc test_cluster_native_current_fixture.inc \
+		test_cluster_native_resident_lock_fixture.inc test_cluster_native_resident_x_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		$(if $(filter test_cluster_native_remote_write_cancel,$@),-DREMOTE_CANCEL_WRITE) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(CLUSTER_SCN_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-remote-cancel
+.PHONY: clean-native-remote-cancel
+clean-native-remote-cancel:
+	rm -f test_cluster_native_remote_read_cancel test_cluster_native_remote_write_cancel
+
+# Ordinary remote-image acquisition across the original R8 freeze.
+TESTS += test_cluster_native_read_reconfig test_cluster_native_write_reconfig
+all: test_cluster_native_read_reconfig test_cluster_native_write_reconfig
+test_cluster_native_read_reconfig test_cluster_native_write_reconfig: test_cluster_native_reconfig.c \
+		test_cluster_native_remote_x test_cluster_native_holder test_cluster_native_resident_lock test_cluster_native_resident_x \
+		test_cluster_native_remote_x_fixture.inc \
+		test_cluster_native_three_role_fixture.inc test_cluster_native_current_fixture.inc \
+		test_cluster_native_resident_lock_fixture.inc test_cluster_native_resident_x_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		$(if $(filter test_cluster_native_write_reconfig,$@),-DNATIVE_RECONFIG_WRITE) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(CLUSTER_SCN_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-reconfig
+.PHONY: clean-native-reconfig
+clean-native-reconfig:
+	rm -f test_cluster_native_read_reconfig test_cluster_native_write_reconfig
+
+# Real prior S, ordinary S-to-X ERROR cleanup and independent master.
+TESTS += test_cluster_native_s_x_cancel_master
+all: test_cluster_native_s_x_cancel_master
+test_cluster_native_s_x_cancel_master: test_cluster_native_s_x_cancel_master.c \
+		test_cluster_native_master test_cluster_native_resident_x \
+		test_cluster_native_master_fixture.inc test_cluster_native_resident_x_fixture.inc \
+		test_cluster_native_s_release.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-s-x-cancel-master
+.PHONY: clean-native-s-x-cancel-master
+test_cluster_native_s_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_(bump_failure|bump_locked)\(/ { print "static inline ClusterPcmOwnResult"; emit=1; helpers++ } \
+	     /^cluster_bufmgr_pcm_own_finish_s_release_to_n\(/ { print "ClusterPcmOwnResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (helpers != 2 || found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean-native-s-x-cancel-master:
+	rm -f test_cluster_native_s_x_cancel_master test_cluster_native_s_release.inc test_cluster_native_s_release.inc.tmp
+
+# Real prior S and independent master across ordinary acquisition domain loss.
+TESTS += test_cluster_native_s_x_domain
+all: test_cluster_native_s_x_domain
+test_cluster_native_s_x_domain: test_cluster_native_s_x_domain.c \
+		test_cluster_native_s_x_cancel_master test_cluster_native_master_fixture.inc \
+		test_cluster_native_resident_x_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-s-x-domain
+.PHONY: clean-native-s-x-domain
+clean-native-s-x-domain:
+	rm -f test_cluster_native_s_x_domain
+
+# Actual invalidation followed by a new ordinary SHARE on the same descriptor.
+TESTS += test_cluster_native_s_read_successor
+all: test_cluster_native_s_read_successor
+test_cluster_native_s_read_successor: test_cluster_native_s_read_successor.c \
+		test_cluster_native_remote_x test_cluster_native_resident_lock \
+		test_cluster_native_remote_x_fixture.inc test_cluster_native_three_role_fixture.inc \
+		test_cluster_native_resident_lock_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_remote_x_fixture.inc: test_cluster_native_remote_x.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print; lines++ } \
+		END { if (!stop || lines < 100) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-s-read-successor
+.PHONY: clean-native-s-read-successor
+clean-native-s-read-successor:
+	rm -f test_cluster_native_s_read_successor test_cluster_native_remote_x_fixture.inc \
+		test_cluster_native_remote_x_fixture.inc.tmp
+
+# Exact retirement of resident PI reservations before any protocol producer.
+TESTS += test_cluster_native_unissued_pi
+all: test_cluster_native_unissued_pi
+test_cluster_native_unissued_pi: test_cluster_native_unissued_pi.c \
+		test_cluster_native_resident_lock test_cluster_native_resident_lock_fixture.inc \
+		test_cluster_native_first_fill_native.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-unissued-pi
+.PHONY: clean-native-unissued-pi
+clean-native-unissued-pi:
+	rm -f test_cluster_native_unissued_pi
+
+# Same-node requester/master through original native completion and cleanup.
+TESTS += test_cluster_native_local_master
+all: test_cluster_native_local_master
+test_cluster_native_local_master: test_cluster_native_local_master.c \
+		test_cluster_native_master test_cluster_native_resident_x \
+		test_cluster_native_master_fixture.inc test_cluster_native_resident_x_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-local-master
+.PHONY: clean-native-local-master
+clean-native-local-master:
+	rm -f test_cluster_native_local_master
+
+# R/M share their real PCM entry while independently owned S peers revoke.
+TESTS += test_cluster_native_local_holders
+all: test_cluster_native_local_holders
+test_cluster_native_local_holders: test_cluster_native_local_holders.c \
+		test_cluster_native_multi_holder test_cluster_native_local_master \
+		test_cluster_native_multi_holder_fixture.inc test_cluster_native_local_master_read_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_multi_holder_fixture.inc: test_cluster_native_multi_holder.c Makefile
+	awk '/^UT_TEST\(/ { stop=1 } !stop { print }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_local_master_read_fixture.inc: test_cluster_native_local_master.c Makefile
+	awk '/^static PublishFixture lm_master;/ { emit=1; start++ } \
+	     /^static bool lm_writer\(/ { emit=0; stop++ } \
+	     emit { print } END { if (start != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-local-holders
+.PHONY: clean-native-local-holders
+clean-native-local-holders:
+	rm -f test_cluster_native_local_holders test_cluster_native_multi_holder_fixture.inc \
+		test_cluster_native_multi_holder_fixture.inc.tmp test_cluster_native_local_master_read_fixture.inc \
+		test_cluster_native_local_master_read_fixture.inc.tmp
+
+# Same-node requester/master obtains its actual current from a remote holder.
+TESTS += test_cluster_native_local_source
+all: test_cluster_native_local_source
+test_cluster_native_local_source: test_cluster_native_local_source.c \
+		test_cluster_native_remote_x test_cluster_native_local_master \
+		test_cluster_native_remote_x_fixture.inc test_cluster_native_local_master_read_fixture.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-local-source
+.PHONY: clean-native-local-source
+clean-native-local-source:
+	rm -f test_cluster_native_local_source
+
+# Original retained source -> bounded BG proof job -> exact carrier.
+TESTS += test_cluster_source_coverage
+all: test_cluster_source_coverage
+test_cluster_source_coverage: test_cluster_source_coverage.c test_cluster_resource_x_pi_replace \
+		test_cluster_source_coverage_replace.inc \
+		test_cluster_source_coverage_types.inc test_cluster_source_coverage_job.inc \
+		test_cluster_source_coverage_gcs.inc $(top_builddir)/src/common/libpgcommon.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) test_cluster_space_bufpage_product.o \
+		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(CLUSTER_VERSION_O) $(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_WAL_CLAIM_O) test_cluster_pi_replace_pcm.o \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+		$(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(filter -lcrypto,$(LIBS)) -o $@
+test_cluster_source_coverage_types.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
+	awk '/^#define WB_RETRY_US/ { emit=1 } /^static WritebackBatch \*wb_batch;/ { emit=0; next } emit { print }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_source_coverage_job.inc: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c Makefile
+	awk '/^wb_local_advance_locked\(/ { print "static bool"; emit=1; n++ } \
+	     /^wb_(server_finish|forget_server|resource_release|exit)\(/ { print "static void"; emit=1; n++ } \
+	     /^wb_source_tick\(/ { print "static bool"; emit=1; n++ } \
+	     /^cluster_pi_writeback_source_begin_v1\(/ { print "ClusterControlRootResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 7) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_source_coverage_gcs.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_acquire_s_source_capture_(owned|with_plan)\(/ { print "static ResourceXApplyResult"; emit=1; n++ } \
+	     /^cluster_gcs_block_resource_x_source_coverage_capture\(/ { print "ResourceXApplyResult"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-source-coverage
+.PHONY: clean-source-coverage
+clean-source-coverage:
+	rm -f test_cluster_source_coverage test_cluster_source_coverage_replace.inc \
+		test_cluster_source_coverage_replace.inc.tmp test_cluster_source_coverage_types.inc \
+		test_cluster_source_coverage_job.inc test_cluster_source_coverage_gcs.inc \
+		test_cluster_source_coverage_types.inc.tmp test_cluster_source_coverage_job.inc.tmp \
+		test_cluster_source_coverage_gcs.inc.tmp
+
+test_cluster_source_coverage_replace.inc: test_cluster_resource_x_pi_replace.c Makefile
+	awk '/^int$$/ { n++; exit } { print } END { if (n != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Eight cached reader scopes, native output IO and one original conversion.
+TESTS += test_cluster_native_hot_block
+all: test_cluster_native_hot_block
+test_cluster_native_hot_block_drain.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile
+	awk '/^typedef struct ClusterLmsZeroBlockReplyWire / { emit=1; types++ } \
+	     /^(lms_outbound_resource_x_intent_identity_equal|lms_outbound_r4_refusal_header_valid|lms_outbound_frame_current|lms_outbound_block_request_current|cluster_lms_outbound_drain_send)\(/ { print previous; emit=1; found++ } \
+	     emit { print } /^}/ && emit { emit=0 } { previous=$$0 } \
+	     END { if (found != 5 || types != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_writer.inc: test_cluster_native_resident_x.c Makefile
+	awk '/^UT_TEST/ { stop=1; exit } \
+	     /if \(\+\+wc_waits > 8 \|\| rx_cancel_wait\) pg_re_throw\(\);/ { print; print "\thb_wait_event();"; waits++; next } \
+	     /^#include "test_cluster_native_resident_x_driver.inc"/ { \
+	       print "#define cluster_bufmgr_first_fill_error hb_error"; \
+	       print "#define LWLockConditionalAcquire hb_conditional"; \
+	       print "#define cluster_pcm_own_revoke_to_grant_handoff_exact hb_handoff"; \
+	       print; print "#undef cluster_pcm_own_revoke_to_grant_handoff_exact"; \
+	       print "#undef LWLockConditionalAcquire"; \
+	       print "#undef cluster_bufmgr_first_fill_error"; drivers++; next } \
+	     { print } END { if (stop != 1 || waits != 1 || drivers != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_master.inc: test_cluster_native_master.c Makefile
+	awk '/^#include "test_cluster_resource_x_master_done_ingress.inc"/ { emit=1; starts++ } \
+	     /^UT_TEST/ { stop=1; exit } emit { print } \
+	     END { if (starts != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_reserve.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_begin_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; begin++ } \
+	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; abort++ } \
+	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; wait++ } \
+	     emit { print } /^}/ { emit=0 } END { if (begin != 1 || abort != 1 || wait != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_reader.inc: test_cluster_native_resident_lock.c Makefile
+	awk '/^#include "test_cluster_native_resident_fill_fixture.inc"/ { includes++; next } \
+	     /^#include "test_cluster_native_resident_lock_reserve.inc"/ { \
+	       print "#include \"test_cluster_native_hot_block_reserve.inc\""; reserves++; next } \
+	     /^UT_TEST/ { stop=1; exit } { print } \
+	     END { if (includes != 1 || reserves != 1 || stop != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block: test_cluster_native_hot_block.c test_cluster_native_hot_block_writer.inc \
+        test_cluster_native_hot_block_master.inc test_cluster_native_hot_block_reader.inc \
+        test_cluster_native_hot_block_reserve.inc test_cluster_native_hot_block_drain.inc \
+        test_cluster_native_hot_block_io.inc \
+        test_cluster_native_hot_block_owner.inc \
+        test_cluster_native_resident_x test_cluster_native_master test_cluster_native_resident_lock \
+        test_cluster_native_holder_writeback
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-native-hot-block
+.PHONY: clean-native-hot-block
+clean-native-hot-block:
+	rm -f test_cluster_native_hot_block $(addprefix test_cluster_native_hot_block_, \
+        writer.inc writer.inc.tmp master.inc master.inc.tmp reader.inc reader.inc.tmp \
+        reserve.inc reserve.inc.tmp drain.inc drain.inc.tmp io.inc io.inc.tmp \
+        owner.inc owner.inc.tmp)
+
+test_cluster_native_hot_block_io.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^StartBufferIO\(/ { print "static bool"; emit=1; starts++ } \
+         /^TerminateBufferIO\(/ { print "static void"; emit=1; ends++ } \
+         emit { print } /^}/ && emit { emit=0 } \
+         END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_native_hot_block_owner.inc: $(top_srcdir)/src/backend/utils/resowner/resowner.c Makefile
+	awk '/^ResourceArrayFree\(/ { print "static void"; emit=1; arrays++ } \
+         /^ResourceOwner(Delete|NewParent)\(/ { print "void"; emit=1; owners++ } \
+         emit { print } /^}/ && emit { emit=0 } \
+         END { if (arrays != 1 || owners != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# Keep native state through eight readers, a remote writer and its return image.
+TESTS += test_cluster_native_hot_cycle
+all: test_cluster_native_hot_cycle
+test_cluster_native_hot_cycle_roles.inc: test_cluster_native_three_role.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /NM_REQUIRE\(!holder_probe\(&next\)\); holder_content_busy = false;/ { \
+	       print "\t\tNM_REQUIRE(!holder_probe(&next)); hc_release_readers(); holder_content_busy = false;"; hooks++; next } \
+	     { print } END { if (stop != 1 || hooks != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_hot_cycle_remote.inc: test_cluster_native_remote_x.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_three_role_fixture.inc"/ { \
+	       print "#include \"test_cluster_native_hot_cycle_roles.inc\""; includes++; next } \
+	     { print } END { if (stop != 1 || includes != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_hot_cycle_successor.inc: test_cluster_native_s_read_successor.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_remote_x_fixture.inc"/ { \
+	       print "#include \"test_cluster_native_hot_cycle_remote.inc\""; includes++; next } \
+	     /nt_seed_holder = second \? ss_holder_kept : nm_parent_as;/ { \
+	       print "\tnt_seed_holder = second ? ss_holder_kept : hc_seed_eight;"; seeds++; next } \
+	     { print } END { if (stop != 1 || includes != 1 || seeds != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_hot_cycle: test_cluster_native_hot_cycle.c \
+        test_cluster_native_hot_cycle_roles.inc test_cluster_native_hot_cycle_remote.inc \
+        test_cluster_native_hot_cycle_successor.inc test_cluster_native_hot_block_owner.inc \
+        test_cluster_native_s_read_successor test_cluster_native_hot_block
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean distclean maintainer-clean: clean-native-hot-cycle
+.PHONY: clean-native-hot-cycle
+clean-native-hot-cycle:
+	rm -f test_cluster_native_hot_cycle $(addprefix test_cluster_native_hot_cycle_, \
+        roles.inc roles.inc.tmp remote.inc remote.inc.tmp successor.inc successor.inc.tmp)
+
+
+# Read-only normal-stop cuts in original remote-cycle and cancellation bodies.
+TESTS += test_cluster_native_stop_cycle test_cluster_native_stop_cancel test_cluster_native_stop_source_cancel
+all: test_cluster_native_stop_cycle test_cluster_native_stop_cancel test_cluster_native_stop_source_cancel
+test_cluster_native_stop_observer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_stop_held_lock\(/ { print "static void"; emit=1; held++ } \
+	     /^cluster_bufmgr_stop_poll\(/ { print "static ClusterNormalStopPollResult"; emit=1; scan++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (held != 1 || scan != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_roles.inc: test_cluster_native_three_role.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /NM_REQUIRE\(nm_master_admit\(&f, &request\)\);/ { print; print "\tns_cut(0, &request.common.logical_assertion.resource);"; live++; next } \
+	     /NM_REQUIRE\(!holder_probe\(&next\)\); holder_content_busy = false;/ { \
+	       print "\t\tNM_REQUIRE(!holder_probe(&next)); ns_cut(1, &request_buf.tag); hc_release_readers(); holder_content_busy = false;"; parks++; next } \
+	     /NM_REQUIRE\(nc_stage\(&state->holder_status_intent.slot, &proof_send\)\);/ { print "\tns_cut(2, &request_buf.tag);"; acks++ } \
+	     { print } /NM_REQUIRE\(nc_callback\(&proof_send\)\);/ { print "\tns_cut(3, &request_buf.tag);"; sent++ } \
+	     END { if (stop != 1 || live != 1 || parks != 1 || acks != 1 || sent != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_remote.inc: test_cluster_native_remote_x.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_three_role_fixture.inc"/ { \
+	       print "#include \"test_cluster_native_stop_roles.inc\""; includes++; next } \
+	     { print } END { if (stop != 1 || includes != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_successor.inc: test_cluster_native_s_read_successor.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_remote_x_fixture.inc"/ { \
+	       print "#include \"test_cluster_native_stop_remote.inc\""; includes++; next } \
+	     /nt_seed_holder = second \? ss_holder_kept : nm_parent_as;/ { \
+	       print "\tnt_seed_holder = second ? ss_holder_kept : hc_seed_eight;"; seeds++; next } \
+	     { print } END { if (stop != 1 || includes != 1 || seeds != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_cycle.inc: test_cluster_native_hot_cycle.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /^#include "test_cluster_native_hot_cycle_successor.inc"/ { \
+	       print "#include \"test_cluster_native_stop_successor.inc\""; includes++; next } \
+	     { print } END { if (stop != 1 || includes != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_cancel.inc: test_cluster_native_cancel_master.c Makefile
+	awk '/^UT_TEST\(/ { stop=1; exit } \
+	     /disk_on_enter = disk_on_read = disk_on_end = NULL;/ { print "\tns_cancel_io();"; io++ } \
+	     { print } /NM_REQUIRE\(!ordinary_run\(&read\)\);/ { print "\tns_cancel_aborted();"; aborted++ } \
+	     END { if (stop != 1 || io != 1 || aborted != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_stop_cycle: test_cluster_native_stop_cycle.c test_cluster_native_stop_census.h \
+        test_cluster_native_stop_cycle.inc test_cluster_native_stop_roles.inc \
+        test_cluster_native_stop_remote.inc test_cluster_native_stop_successor.inc \
+        test_cluster_native_stop_observer.inc test_cluster_native_hot_cycle
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) $(CLUSTER_SCN_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_stop_cancel: test_cluster_native_stop_cancel.c test_cluster_native_stop_census.h \
+        test_cluster_native_stop_cancel.inc test_cluster_native_stop_observer.inc test_cluster_native_cancel_master
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+        $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_stop_source_cancel: test_cluster_native_stop_source_cancel.c \
+        test_cluster_native_stop_source_cancel.inc test_cluster_native_stop_census.h \
+        test_cluster_native_stop_observer.inc test_cluster_native_remote_read_cancel
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+        -DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+        -DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+        $< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+        $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
+        test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+        $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
+        $(CLUSTER_SCN_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+test_cluster_native_stop_source_cancel.inc: test_cluster_native_remote_cancel.c Makefile
+	awk '/^UT_TEST\(/ { found++; exit } { print } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+clean distclean maintainer-clean: clean-native-stop-census
+.PHONY: clean-native-stop-census
+clean-native-stop-census:
+	rm -f test_cluster_native_stop_cycle test_cluster_native_stop_cancel test_cluster_native_stop_source_cancel \
+	    test_cluster_native_stop_source_cancel.inc test_cluster_native_stop_source_cancel.inc.tmp \
+        $(addprefix test_cluster_native_stop_, observer.inc observer.inc.tmp roles.inc roles.inc.tmp \
+        remote.inc remote.inc.tmp successor.inc successor.inc.tmp cycle.inc cycle.inc.tmp cancel.inc cancel.inc.tmp)
+
+TESTS += test_cluster_resource_x_acquire_stale
+all: test_cluster_resource_x_acquire_stale
+test_cluster_resource_x_acquire_stale: test_cluster_resource_x_acquire_stale.c test_cluster_resource_x_acquire_ingress.c test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_candidate.inc cluster_unit_port_stubs.o

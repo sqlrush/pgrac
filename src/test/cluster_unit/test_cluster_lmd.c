@@ -73,6 +73,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_content_trace.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_shmem.h"
 #include "utils/guc.h"
@@ -99,6 +100,17 @@
 static ClusterCleanLeaveSharedState test_stop_region;
 static ClusterLeaveState *cl_state = &test_stop_region.leave;
 static ClusterNormalStopState *cl_normal_stop;
+static unsigned test_deadline_calls;
+static uint32 test_deadline_reason;
+
+/* Record the real failure hook; graph export has separate collector tests. */
+void
+cluster_content_trace_deadline_dump(uint32 reason)
+{
+	test_deadline_reason = reason;
+	test_deadline_calls++;
+}
+
 static uint32 cl_normal_stop_service_depth, cl_normal_stop_service_bit;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -1301,10 +1313,26 @@ UT_TEST(test_lmd_pending_zero_wait_seq_awaits_remote_revalidation_result)
 	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
 }
 
+UT_TEST(test_stop_deadline_preserves_failure_and_exports_reason)
+{
+	memset(&test_stop_region, 0, sizeof(test_stop_region));
+	cl_normal_stop = &test_stop_region.normal_stop;
+	pg_atomic_init_u32(&cl_normal_stop->failure_reason, CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	test_deadline_calls = test_deadline_reason = 0;
+	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(test_deadline_calls, 1);
+	UT_ASSERT_EQ(test_deadline_reason, CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(test_deadline_calls, 1);
+	cl_normal_stop = NULL;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(23);
+	UT_PLAN(24);
 
 	UT_RUN(test_lmd_auxproc_and_backend_type_surface);
 	UT_RUN(test_lmd_shmem_size_init_idempotent);
@@ -1330,6 +1358,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_lmd_epoch_zero_is_owned_until_original_ack_not_invalid);
 	UT_RUN(test_lmd_pending_zero_wait_seq_awaits_remote_revalidation_result);
 
+	UT_RUN(test_stop_deadline_preserves_failure_and_exports_reason);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

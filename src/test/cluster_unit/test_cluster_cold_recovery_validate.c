@@ -305,6 +305,7 @@ UT_TEST(test_validate_foreign_control_and_scn_bound)
 int
 main(void)
 {
+	UT_PLAN(4);
 	UT_RUN(test_validate_component_shapes);
 	UT_RUN(test_validate_record_components);
 	UT_RUN(test_validate_space_effects);

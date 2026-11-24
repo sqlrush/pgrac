@@ -382,9 +382,25 @@ UT_TEST(test_resume_other_modes_and_source_plans_cannot_use_disk_S_restore)
 {
 	for (int n = 1; n < 8; n++) {
 		EvidenceFixture f;
+		ClusterPcmOwnEntry own;
+		ClusterPcmResourceXBootstrapRound round;
 		UT_ASSERT(execution_start(&f, n, -1)); UT_ASSERT_EQ(execution_enter(), RESOURCE_X_APPLY_APPLIED);
-		resume_canaries(); UT_ASSERT(resume_run() != RESOURCE_X_APPLY_APPLIED); resume_no_output();
+		own = request_own; round = request_entry()->resource_x_bootstrap_round;
+		resume_canaries();
+		if (n == 1) {
+			/* The no-holder disk contract also supports this exact X episode. */
+			UT_ASSERT_EQ(resume_run(), RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(resumed_phase, RESOURCE_X_DELIVERY_ACQUIRE_EXECUTING);
+			UT_ASSERT(memcmp(&resumed_execution, &execution_claim, sizeof(execution_claim)) == 0);
+			prepared_claim.observation.request.target_mode = PCM_STATE_S;
+			resume_canaries();
+		}
+		UT_ASSERT(resume_run() != RESOURCE_X_APPLY_APPLIED); resume_no_output();
+		UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, 0); UT_ASSERT_EQ(complete_commits, 0);
 		UT_ASSERT_EQ(cluster_pcm_own_delivery_attempt_get(0), 1);
+		UT_ASSERT(memcmp(&own, &request_own, sizeof(own)) == 0);
+		UT_ASSERT(memcmp(&round, &request_entry()->resource_x_bootstrap_round, sizeof(round)) == 0);
+		complete_idle();
 	}
 }
 

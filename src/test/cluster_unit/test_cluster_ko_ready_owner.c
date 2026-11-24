@@ -46,6 +46,12 @@ UT_TEST(test_native_owner_refuses_incomplete_or_failed_ready_set)
 									 CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, &owner));
 		owner->native_transaction = true;
 		entry = &storage.contexts[owner->slot];
+		UT_ASSERT(!entry->complete && entry->request_done_peers == 0);
+		UT_ASSERT_EQ(barrier_requests, 0);
+		/* Registration retains the owner; the ordinary caller's next step
+		 * produces READY through the original request and ACK consumers. */
+		ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
+			owner, CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding);
 		UT_ASSERT(entry->complete && entry->request_done_peers == 2);
 		switch (fault) {
 		case 0:
@@ -175,10 +181,12 @@ UT_TEST(test_sql_wait_notification_is_not_exact_ready_authority)
 	barrier_complete = barrier_clock_wait = true;
 	barrier_interrupt_at = 1;
 	barrier_interrupt_sqlstate = ERRCODE_QUERY_CANCELED;
+	UT_ASSERT(ko_shared_begin_v3(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
+		CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, &owner));
 	PG_TRY();
 	{
-		(void)ko_shared_begin_v3(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
-								 CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding, &owner);
+		ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT,
+			owner, CLUSTER_KO_SHARED_V3_OPERATION_DROP, &binding);
 	}
 	PG_CATCH();
 	{
@@ -199,7 +207,7 @@ UT_TEST(test_missing_remote_identity_keeps_original_refusal)
 	ClusterKoCompletionV2 *owner = NULL;
 	volatile bool caught = false;
 
-	formation.membership.membership_state[1] = CLUSTER_MEMBER_ABSENT;
+	formation.membership.last_admitted_incarnation[1] = 0;
 	v3_route_master_node = binding.master_node = 0;
 	expecting_error = true;
 	PG_TRY();
@@ -219,10 +227,45 @@ UT_TEST(test_missing_remote_identity_keeps_original_refusal)
 	UT_ASSERT_EQ(record_count, 0);
 }
 
+UT_TEST(test_absent_peer_does_not_require_a_fabricated_ready_ack)
+{
+	RelationData relation;
+	ClusterKoCompletionV2 *owner;
+	ClusterKoSharedContext snapshot;
+	Oid old_database = MyDatabaseId;
+
+	v3_native_structure_setup(&relation);
+	/* Keep peer 1 admitted and exercise its real ACK consumer. A former
+	 * peer's old incarnation must not add an ACK obligation to this cut. */
+	formation.membership.membership_state[2] = CLUSTER_MEMBER_ABSENT;
+	formation.membership.last_admitted_incarnation[2] = 33;
+	MyDatabaseId = relation.rd_locator.dbOid;
+	cluster_ko_flush_and_wait_ack_relation(&relation, RELPERSISTENCE_PERMANENT,
+		CLUSTER_KO_SHARED_V3_OPERATION_DROP);
+	MyDatabaseId = old_database;
+	owner = ko_completions;
+	UT_ASSERT(owner != NULL);
+	if (owner == NULL)
+		return;
+	UT_ASSERT(owner->barrier_private && owner->native_pending);
+	UT_ASSERT(ko_completion_snapshot(owner, &snapshot));
+	UT_ASSERT(snapshot.complete);
+	UT_ASSERT_EQ(snapshot.peer_boots[2], 0);
+	UT_ASSERT_EQ(snapshot.request.members[0], 3);
+	UT_ASSERT_EQ(snapshot.request_sent_peers, 2);
+	UT_ASSERT_EQ(snapshot.request_done_peers, 2);
+	UT_ASSERT_EQ(barrier_requests, 1);
+	UT_ASSERT_EQ(record_count, 1);
+	UT_ASSERT_EQ(recorded_batch, snapshot.request.batch_id);
+	cluster_ko_shared_release_v2(&owner);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(native_allocated, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_native_private_proof_keeps_exact_ready_set);
 	UT_RUN(test_native_owner_refuses_incomplete_or_failed_ready_set);
 	UT_RUN(test_commit_continuation_preserves_ready_without_legacy_accept);
@@ -230,6 +273,7 @@ main(void)
 	UT_RUN(test_structure_consumer_cannot_replace_missing_ready_with_complete);
 	UT_RUN(test_sql_wait_notification_is_not_exact_ready_authority);
 	UT_RUN(test_missing_remote_identity_keeps_original_refusal);
+	UT_RUN(test_absent_peer_does_not_require_a_fabricated_ready_ack);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

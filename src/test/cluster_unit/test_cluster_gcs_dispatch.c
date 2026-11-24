@@ -968,6 +968,10 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 						bool *out_image)
 {
 	BufferTag tag;
+	/* These cases exercise the legacy post-install registration consumer.
+	 * First-fill pending-S publication is covered by its own fixtures. */
+	ClusterPcmReadSource *source = NULL;
+	struct { GcsBlockReplyHeader reply_header; } reply_slot = { 0 }, *slot = &reply_slot;
 	int final_forwarding_master = 1;
 	bool read_image = false;
 	bool retry_denied = false;

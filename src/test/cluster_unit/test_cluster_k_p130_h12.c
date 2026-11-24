@@ -191,6 +191,7 @@ static bool h12_master(int fd, int mode)
 	if (h12_kind == 2) {
 		PageHeader page = (PageHeader)disk_bytes.data;
 		page->pd_flags |= PD_HAS_ITL; page->pd_special = BLCKSZ - CLUSTER_ITL_ARRAY_SIZE;
+		page->pd_upper = page->pd_special;
 		memset(ClusterPageGetItlSlots(disk_bytes.data), 0, CLUSTER_ITL_ARRAY_SIZE);
 		ClusterPageGetItlSlots(disk_bytes.data)[0].flags = ITL_FLAG_ACTIVE;
 	}

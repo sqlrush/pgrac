@@ -105,6 +105,7 @@ static ClusterLmdVertex test_wfg_waiter;
 static ClusterLmdVertex test_wfg_blocker;
 static int test_wait_publish_calls;
 static int test_wait_clear_calls;
+static int test_content_wait_clear_calls;
 static int test_wait_read_calls;
 static uint8 test_wait_kind;
 static uint64 test_wait_epoch;
@@ -371,6 +372,14 @@ cluster_lmd_wait_state_clear(ClusterLmdProcWaitState *ws)
 	test_wait_read_result = test_real_wait_state_read_exact(ws, &test_wait_snapshot);
 }
 
+/* Diagnostic retirement is separate from the authoritative wait-state clear. */
+void
+cluster_content_trace_wait_clear(ClusterContentTraceWait kind)
+{
+	UT_ASSERT_EQ(kind, CLCONTENT_TX);
+	test_content_wait_clear_calls++;
+}
+
 ClusterLmdWaitStateReadResult
 cluster_lmd_wait_state_read_exact(ClusterLmdProcWaitState *ws, ClusterLmdWaitStateSnapshot *out)
 {
@@ -631,6 +640,7 @@ reset_fixture(void)
 	memset(&test_wfg_blocker, 0, sizeof(test_wfg_blocker));
 	test_wait_publish_calls = 0;
 	test_wait_clear_calls = 0;
+	test_content_wait_clear_calls = 0;
 	test_wait_read_calls = 0;
 	test_wait_kind = 0;
 	test_wait_epoch = 0;
@@ -749,6 +759,7 @@ assert_panic_before_cleanup_mutation(const TestD9AuthoritySnapshot *before)
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 0);
 	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 0);
 	UT_ASSERT_EQ(test_wait_clear_calls, 0);
+	UT_ASSERT_EQ(test_content_wait_clear_calls, 0);
 	assert_d9_authorities_equal(before);
 }
 
@@ -1329,6 +1340,7 @@ UT_TEST(test_backend_exit_cleans_exact_target_and_allows_procno_reuse)
 	UT_ASSERT(!test_wfg_live);
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
 	UT_ASSERT_EQ(test_wait_read_result, CLUSTER_LMD_WAIT_STATE_READ_INACTIVE);
+	UT_ASSERT_EQ(test_content_wait_clear_calls, 1);
 	assert_slot_clean();
 
 	/* Re-entry after cleanup is a no-op, and the reused procno is writable. */
@@ -1336,6 +1348,7 @@ UT_TEST(test_backend_exit_cleans_exact_target_and_allows_procno_reuse)
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 0);
 	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_content_wait_clear_calls, 1);
 	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
 	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
 	txw_slot_clear(0, CLUSTER_TXW_SLOT_TARGET);
@@ -1364,6 +1377,7 @@ UT_TEST(test_backend_exit_cleans_exact_source_and_allows_procno_reuse)
 	UT_ASSERT(!test_wfg_live);
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
 	UT_ASSERT_EQ(test_wait_read_result, CLUSTER_LMD_WAIT_STATE_READ_INACTIVE);
+	UT_ASSERT_EQ(test_content_wait_clear_calls, 1);
 	assert_slot_clean();
 
 	/* A duplicate callback is harmless and the procno can be reused now. */
@@ -1371,6 +1385,7 @@ UT_TEST(test_backend_exit_cleans_exact_source_and_allows_procno_reuse)
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 0);
 	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_content_wait_clear_calls, 1);
 	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
 	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
 	txw_slot_clear(0, CLUSTER_TXW_SLOT_TARGET);
@@ -1401,6 +1416,7 @@ UT_TEST(test_source_normal_cleanup_cancels_wfg_before_state_and_slot)
 	UT_ASSERT_EQ(test_cleanup_events[1], 'W');
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 0);
 	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	UT_ASSERT_EQ(test_content_wait_clear_calls, 1);
 	assert_slot_clean();
 }
 
@@ -1426,6 +1442,7 @@ UT_TEST(test_source_error_cleanup_cancels_wfg_before_state_and_slot)
 	UT_ASSERT_EQ(test_cleanup_events[1], 'W');
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 0);
 	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	UT_ASSERT_EQ(test_content_wait_clear_calls, 1);
 	assert_slot_clean();
 }
 

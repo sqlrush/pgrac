@@ -1685,6 +1685,7 @@ UT_TEST(test_sinval_actual_main_rechecks_before_exit)
 static ClusterLmsSharedState lms_fixture;
 static ClusterLmsSharedState *cluster_lms_state = &lms_fixture;
 static unsigned lms_worker, lms_drains, lms_ticks, lms_closes, lms_polls;
+static unsigned lms_pending_s_ticks, lms_first_fill_ticks;
 static int lms_scenario;
 static bool lms_data_enabled;
 static ClusterNormalStopPollResult lms_ic_observation, lms_cr_observation;
@@ -1786,6 +1787,7 @@ cluster_write_fence_allowed(void)
 static void
 test_lms_work(void)
 {
+	UT_ASSERT_EQ(lock_holds, 0);
 	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
 	if (cluster_normal_stop_requested())
 		UT_ASSERT_EQ(pg_atomic_read_u32(&test_region.normal_stop.service_active_mask),
@@ -1820,6 +1822,20 @@ void
 cluster_gcs_block_invalidate_park_tick(void)
 {
 	test_lms_work();
+}
+/* Keep the complete LMS loops and their work brackets real. Protocol state
+ * belongs to the GCS fixtures; these leaves observe only the service calls. */
+void
+cluster_gcs_block_pending_s_tick(void)
+{
+	test_lms_work();
+	lms_pending_s_ticks++;
+}
+void
+cluster_gcs_block_first_fill_tick(void)
+{
+	test_lms_work();
+	lms_first_fill_ticks++;
 }
 long
 cluster_gcs_block_r4_tx_resolve_wait_timeout(long idle)
@@ -1967,6 +1983,7 @@ run_actual_lms_main(unsigned worker, int scenario)
 	lms_worker = worker;
 	lms_scenario = scenario;
 	lms_drains = lms_ticks = lms_closes = lms_polls = 0;
+	lms_pending_s_ticks = lms_first_fill_ticks = 0;
 	lms_data_enabled = scenario != 8;
 	lms_ic_observation
 		= scenario == 1 ? CLUSTER_NORMAL_STOP_PENDING
@@ -2004,11 +2021,15 @@ UT_TEST(test_lms_actual_both_mains_work_sleep_and_ordinary_runtime)
 		UT_ASSERT_EQ(main_exit_code, 0);
 		UT_ASSERT_EQ(lms_drains, 2);
 		UT_ASSERT_EQ(lms_ticks, 2);
+		UT_ASSERT_EQ(lms_pending_s_ticks, 2);
+		UT_ASSERT_EQ(lms_first_fill_ticks, 2);
 		UT_ASSERT_EQ(lms_closes, 1);
 		UT_ASSERT_EQ(lms_polls, 0);
 		run_actual_lms_main(worker, 8);
 		UT_ASSERT_EQ(main_exit_code, 0);
 		UT_ASSERT_EQ(lms_ticks, 0);
+		UT_ASSERT_EQ(lms_pending_s_ticks, 0);
+		UT_ASSERT_EQ(lms_first_fill_ticks, 0);
 		UT_ASSERT_EQ(main_waits, 2);
 	}
 }

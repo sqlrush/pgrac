@@ -26,19 +26,10 @@ static bool nc_callback(const ResourceXIntentSlot *slot)
 	NM_REQUIRE(cluster_pcm_lock_resource_x_outbound_transport_complete_exact(slot, true, ++fake_pcm_clock_us));
 	return true;
 }
-static bool nc_holder_start(HolderFixture *f, const ResourceXDecodedFrame *request, PcmState mode)
+static bool nc_holder_admit(HolderFixture *f, const ResourceXDecodedFrame *request, PcmState mode)
 {
 	uint32 state;
-	holder_native_start(mode);
-	/* Co-located M/H uses this cohort's actual shared peer identity, rather
-	 * than the unrelated 83-generation leaf in isolated holder cases. */
-	holder_requester_connection = 61;
-	request_buf.tag = request->common.logical_assertion.resource;
-	provenance_grant_for(0, request_buf.tag);
-	if (mode == PCM_STATE_S) service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
-	/* Seed a clean incumbent before this A exists. This is not a fabricated
-	 * write-completion or a retirement of an existing episode's PI debt. */
-	pg_atomic_write_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->pi_holders_bitmap, 0);
+	holder_requester_node = request->common.logical_assertion.requester_node;
 	NM_REQUIRE(nm_master_admit(&f->master, request));
 	f->block = publish_decode(f->master.state->block_intents[0].payload, true);
 	UT_ASSERT_EQ(f->block.body.acquire_decision.source_node, 0);
@@ -49,6 +40,22 @@ static bool nc_holder_start(HolderFixture *f, const ResourceXDecodedFrame *reque
 	NM_REQUIRE(holder_probe(&f->work));
 	state = request_header_lock(&request_buf);
 	cluster_pcm_own_snapshot_locked(&request_buf, &request_base); UnlockBufHdr(&request_buf, state);
+	return true;
+}
+static bool nc_holder_start(HolderFixture *f, const ResourceXDecodedFrame *request, PcmState mode)
+{
+	holder_native_start(mode);
+	/* Co-located M/H uses this cohort's actual shared peer identity, rather
+	 * than the unrelated 83-generation leaf in isolated holder cases. */
+	holder_requester_connection = 61;
+	holder_requester_node = request->common.logical_assertion.requester_node;
+	request_buf.tag = request->common.logical_assertion.resource;
+	provenance_grant_for(0, request_buf.tag);
+	if (mode == PCM_STATE_S) service_directory_transition(PCM_TRANS_X_TO_S_DOWNGRADE, 0);
+	/* Seed a clean incumbent before this A exists. This is not a fabricated
+	 * write-completion or a retirement of an existing episode's PI debt. */
+	pg_atomic_write_u32(&((struct StopPcmEntryLayout *)fake_pcm_entries.data[0])->pi_holders_bitmap, 0);
+	NM_REQUIRE(nc_holder_admit(f, request, mode));
 	/* Make the real source differ from the requester's old disk bytes. */
 	disk_bytes.data[BLCKSZ - 16] = 0x7a;
 	((PageHeader)disk_bytes.data)->pd_checksum = pg_checksum_page(disk_bytes.data, request_buf.tag.blockNum);
@@ -57,7 +64,7 @@ static bool nc_holder_start(HolderFixture *f, const ResourceXDecodedFrame *reque
 	if (mode == PCM_STATE_X) ((PageHeader)disk_shared.data)->pd_checksum ^= UINT16_MAX;
 	return true;
 }
-static bool nc_master(int fd, int mode)
+static bool nc_master_service(int fd, int mode, bool existing_current)
 {
 	HolderFixture f = {0}; PcmState source = mode == 0 ? PCM_STATE_S : PCM_STATE_X;
 	ResourceXDecodedFrame request, image, ack, done, release, retired, consumed;
@@ -65,7 +72,12 @@ static bool nc_master(int fd, int mode)
 	ResourceXMasterSnapshot snapshot; ClusterICEnvelope env = {0};
 	ResourceXSourceDrainWork next;
 	NM_REQUIRE(nm_receive(fd, RESOURCE_X_MSG_ASSERT_X, &request));
-	NM_REQUIRE(nc_holder_start(&f, &request, source));
+	if (existing_current) {
+		/* Serve a new ordinary read from the actual previous S/current.
+		 * Keep native bytes, grants, receipts and all other S holders. */
+		NM_REQUIRE(source == PCM_STATE_S && request_buf.pcm_state == PCM_STATE_S);
+		NM_REQUIRE(nc_holder_admit(&f, &request, source));
+	} else NM_REQUIRE(nc_holder_start(&f, &request, source));
 	if (mode == 5) {
 		holder_content_busy = true;
 		NM_REQUIRE(holder_capture(&f) == RESOURCE_X_APPLY_BAD_STATE);
@@ -82,7 +94,7 @@ static bool nc_master(int fd, int mode)
 	NM_REQUIRE(cluster_pcm_lock_resource_x_holder_image_exact(&f.block.common.logical_assertion, &image) == RESOURCE_X_APPLY_APPLIED);
 	NM_REQUIRE(cluster_pcm_lock_resource_x_holder_status_exact(&f.block.common.logical_assertion, &ack) == RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
-	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), source == PCM_STATE_S ? 901 : 902);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), existing_current ? request_base.generation : source == PCM_STATE_S ? 901 : 902);
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	UT_ASSERT(memcmp(image.body.acquire_image.original_image.page_bytes, disk_shared.data, BLCKSZ) == 0);
 	NM_REQUIRE(nc_stage(&f.master.state->holder_image_intent, &image_send));
@@ -125,13 +137,14 @@ static bool nc_master(int fd, int mode)
 	NM_REQUIRE(nm_send(fd, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &consumed));
 	NM_REQUIRE(nm_master_callback(&f.master.state->grant_intent.slot, true));
 	UT_ASSERT_EQ(f.master.state->deferred_settlement.present, 0);
-	UT_ASSERT_EQ(f.master.state->requests[1].phase, RESOURCE_X_MASTER_NONE);
+	UT_ASSERT_EQ(f.master.state->requests[request.common.logical_assertion.requester_node].phase, RESOURCE_X_MASTER_NONE);
 	UT_ASSERT_EQ(f.master.state->holder_image.valid, 0); UT_ASSERT_EQ(f.master.state->holder_status.valid, 0);
 	UT_ASSERT_EQ(f.master.state->settlement_retry.pending, 0);
 	UT_ASSERT_EQ(f.master.state->pi_carrier.transport_refs, 0);
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0); UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
 	holder_no_debt(); return true;
 }
+static bool nc_master(int fd, int mode) { return nc_master_service(fd, mode, false); }
 static void nc_deliver(void)
 {
 	ResourceXIntentSlot ticket = request_ticket(&nc_request);
@@ -142,7 +155,7 @@ static void nc_deliver(void)
 	if (!nm_receive(nc_image_fd, RESOURCE_X_MSG_IMAGE_OR_GRANT, &nc_image)) { UT_ASSERT(false); pg_re_throw(); }
 	UT_ASSERT_EQ(nc_image.kind, RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	prepared_episode = nc_request.body.acquire_intent;
-	env.msg_type = RESOURCE_X_MSG_IMAGE_OR_GRANT; env.source_node_id = nc_source_node; env.dest_node_id = 1;
+	env.msg_type = RESOURCE_X_MSG_IMAGE_OR_GRANT; env.source_node_id = nc_source_node; env.dest_node_id = cluster_node_id;
 	env.epoch = 17; env.payload_length = nc_image.payload_bytes; auth_peer_boot = nc_source_boot;
 	ResourceXApplyResult result = gcs_block_resource_x_requester_join_ingress(&env, &nc_image, 61, &joined);
 	UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED); if (result != RESOURCE_X_APPLY_APPLIED) pg_re_throw();
@@ -176,12 +189,12 @@ static void nc_auth_peer(int32 node, unsigned sample)
 	UT_ASSERT(node == 0 || node == nc_source_node);
 	auth_peer_boot = node == 0 ? 31 : nc_source_boot;
 }
-static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint64 source_boot)
+static bool nc_parent_role(int fd, int image_fd, int mode, int source_node, uint64 source_boot, int requester)
 {
 	ClusterBufmgrFirstFill read; ClusterPcmResourceXMasterState *state = NULL;
 	ResourceXDecodedFrame done, consumed; ResourceXIntentSlot staged;
 	ClusterICEnvelope env = {0}; ResourceXRequesterJoinSnapshot joined;
-	ordinary_start(&read, 2); nc_fd = fd; nc_image_fd = image_fd; nc_mode = mode;
+	ordinary_start(&read, 2); cluster_node_id = requester; nc_fd = fd; nc_image_fd = image_fd; nc_mode = mode;
 	nc_source_node = source_node; nc_source_boot = source_boot;
 	auth_observation_hook = nc_auth_peer;
 	ordinary_delivery_transport = nc_deliver;
@@ -200,7 +213,7 @@ static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint
 	NM_REQUIRE(nc_stage(&state->requester_settlement_intent.slot, &staged)); NM_REQUIRE(nc_callback(&staged));
 	NM_REQUIRE(nm_send(fd, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &done));
 	NM_REQUIRE(nm_receive(fd, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &consumed));
-	env.msg_type = RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE; env.source_node_id = 0; env.dest_node_id = 1;
+	env.msg_type = RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE; env.source_node_id = 0; env.dest_node_id = cluster_node_id;
 	env.epoch = 17; env.payload_length = consumed.payload_bytes; auth_peer_boot = 31;
 	NM_REQUIRE(gcs_block_resource_x_requester_join_ingress(&env, &consumed, 61, &joined) == RESOURCE_X_APPLY_APPLIED);
 	if (mode == 3) NM_REQUIRE(gcs_block_resource_x_requester_join_ingress(&env, &consumed, 61, &joined) == RESOURCE_X_APPLY_DUPLICATE);
@@ -211,6 +224,8 @@ static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint
 	UT_ASSERT_EQ(complete_commits, 1); UT_ASSERT_EQ(ordinary_sends, 1);
 	complete_idle(); return true;
 }
+static bool nc_parent_from(int fd, int image_fd, int mode, int source_node, uint64 source_boot)
+{ return nc_parent_role(fd, image_fd, mode, source_node, source_boot, 1); }
 static bool nc_parent(int fd, int mode) { return nc_parent_from(fd, fd, mode, 0, 31); }
 UT_TEST(test_native_current_S_to_S_full_episode) { nm_run_roles(0, nc_master, nc_parent); }
 UT_TEST(test_native_current_X_to_S_full_episode) { nm_run_roles(1, nc_master, nc_parent); }

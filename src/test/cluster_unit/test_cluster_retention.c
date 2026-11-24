@@ -610,6 +610,7 @@ UT_TEST(test_d3_retain_during_recovery)
 int
 main(void)
 {
+	UT_PLAN(34);
 	UT_RUN(test_u1_committed_below_horizon_recyclable);
 	UT_RUN(test_u2_committed_above_horizon_retained);
 	UT_RUN(test_u3_aborted_always_recyclable);

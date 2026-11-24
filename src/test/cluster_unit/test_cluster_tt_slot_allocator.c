@@ -1575,6 +1575,7 @@ UT_TEST(test_stop_tt_last_invalid_is_not_hidden_by_first_active)
 int
 main(void)
 {
+	UT_PLAN(62);
 	cluster_tt_slot_shmem_init(); /* one-time init for tests that
 										   don't call reset_allocator */
 

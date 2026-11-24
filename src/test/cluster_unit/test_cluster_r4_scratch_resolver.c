@@ -244,9 +244,13 @@ int cluster_multixact_member_overlay_max_members = 256;
 int cluster_multixact_hint_outbound_slots = 2;
 BackendType MyBackendType = B_LMON;
 static bool ut_hint_install_succeeds;
+static ClusterSemanticAdmissionResult ut_hint_admission;
 static int ut_hint_installs;
 static int ut_hint_wakes;
 static int ut_hint_sends;
+static ClusterTTStatusKey ut_hint_install_key;
+static ClusterTTStatus ut_hint_install_status;
+static SCN ut_hint_install_scn;
 static ClusterNodeInfo ut_hint_nodes[4];
 static ClusterConf ut_hint_conf = { .node_count = 4 };
 ClusterConf *ClusterConfShmem = &ut_hint_conf;
@@ -503,16 +507,20 @@ cluster_vis_memo_probe(const ClusterTTStatusKey *key, uint8 *status_out, SCN *sc
 
 /* Overlay/source fallbacks: none may execute after an exact memo hit. */
 ClusterSemanticAdmissionResult
-cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
-								  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
-								  ClusterTTStatusSourceResult *result pg_attribute_unused())
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
+								  const ClusterTTStatusSourceRequest *request,
+								  ClusterTTStatusSourceResult *result)
 {
 	ut_calls.overlay++;
 	if (op == CLUSTER_TT_SOURCE_INSTALL_LOCAL || op == CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED) {
 		ut_hint_installs++;
+		ut_hint_install_key = *request->key;
+		ut_hint_install_status = request->status;
+		ut_hint_install_scn = request->commit_scn;
 		memset(result, 0, sizeof(*result));
-		result->bool_value = ut_hint_install_succeeds;
-		return CLUSTER_SEMANTIC_ADMISSION_OK;
+		result->bool_value = ut_hint_admission == CLUSTER_SEMANTIC_ADMISSION_OK
+			&& ut_hint_install_succeeds;
+		return ut_hint_admission;
 	}
 	if (ut_overlay_hit) {
 		UT_ASSERT_EQ(op, CLUSTER_TT_SOURCE_LOOKUP);
@@ -2004,6 +2012,10 @@ ut_hint_reset(void)
 	ClusterMultiXactHintOutbound = NULL;
 	ut_hint_installs = ut_hint_wakes = ut_hint_sends = 0;
 	ut_hint_install_succeeds = false;
+	ut_hint_admission = CLUSTER_SEMANTIC_ADMISSION_OK;
+	memset(&ut_hint_install_key, 0, sizeof(ut_hint_install_key));
+	ut_hint_install_status = CLUSTER_TT_STATUS_UNKNOWN;
+	ut_hint_install_scn = InvalidScn;
 }
 
 UT_TEST(test_real_hint_full_and_fanout_keep_loss_observable_without_retry)
@@ -2029,7 +2041,10 @@ UT_TEST(test_real_hint_full_and_fanout_keep_loss_observable_without_retry)
 	ClusterTTHintOutbound = NULL;
 }
 
-UT_TEST(test_real_hint_receiver_wakes_only_after_successful_exact_apply)
+/* The TT install owner publishes and wakes. This resolver fixture replaces
+ * that owner, so the real hint receiver must delegate without a second wake.
+ * test_cluster_r4_d10_tt_source exercises terminal publication and waking. */
+UT_TEST(test_real_hint_receiver_delegates_exact_install_without_duplicate_wake)
 {
 	ClusterTTStatusHintMsgV2 msg;
 	ClusterICEnvelope env;
@@ -2040,6 +2055,8 @@ UT_TEST(test_real_hint_receiver_wakes_only_after_successful_exact_apply)
 	msg.msg_version = CLUSTER_TT_STATUS_HINT_V2;
 	msg.status = CLUSTER_TT_STATUS_COMMITTED;
 	msg.key.origin_node_id = UT_PEER_NODE;
+	msg.key.undo_segment_id = 7;
+	msg.key.tt_slot_id = 11;
 	msg.key.cluster_epoch = UT_CLUSTER_EPOCH;
 	msg.key.local_xid = UT_RAW_XID;
 	msg.commit_scn = UT_COMMIT_SCN;
@@ -2051,17 +2068,41 @@ UT_TEST(test_real_hint_receiver_wakes_only_after_successful_exact_apply)
 	UT_ASSERT_EQ(cluster_tt_status_hint_get_install_count(), 0);
 	ut_hint_install_succeeds = true;
 	cluster_tt_status_hint_handle_envelope_raw(&env, &msg);
-	UT_ASSERT_EQ(ut_hint_wakes, 1);
+	UT_ASSERT_EQ(ut_hint_installs, 2);
+	UT_ASSERT_EQ(memcmp(&ut_hint_install_key, &msg.key, sizeof(msg.key)), 0);
+	UT_ASSERT_EQ(ut_hint_install_status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(ut_hint_install_scn, UT_COMMIT_SCN);
+	UT_ASSERT_EQ(ut_hint_wakes, 0);
 	UT_ASSERT_EQ(cluster_tt_status_hint_get_install_count(), 1);
+	ut_hint_admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	cluster_tt_status_hint_handle_envelope_raw(&env, &msg);
+	UT_ASSERT_EQ(ut_hint_installs, 3);
+	UT_ASSERT_EQ(ut_hint_wakes, 0);
+	UT_ASSERT_EQ(cluster_tt_status_hint_get_install_count(), 1);
+	ut_hint_admission = CLUSTER_SEMANTIC_ADMISSION_OK;
 	msg.key.cluster_epoch++;
 	cluster_tt_status_hint_handle_envelope_raw(&env, &msg);
-	UT_ASSERT_EQ(ut_hint_wakes, 1);
+	UT_ASSERT_EQ(ut_hint_installs, 3);
+	UT_ASSERT_EQ(ut_hint_wakes, 0);
+	UT_ASSERT_EQ(cluster_tt_status_hint_get_install_count(), 1);
 	UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_HINT_STALE], 1);
 	msg.key.cluster_epoch--;
 	msg.key._reserved = 1;
 	cluster_tt_status_hint_handle_envelope_raw(&env, &msg);
-	UT_ASSERT_EQ(ut_hint_wakes, 1);
+	UT_ASSERT_EQ(ut_hint_installs, 3);
+	UT_ASSERT_EQ(ut_hint_wakes, 0);
+	UT_ASSERT_EQ(cluster_tt_status_hint_get_install_count(), 1);
 	UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_HINT_INVALID], 1);
+	msg.key._reserved = 0;
+	msg.status = CLUSTER_TT_STATUS_ABORTED;
+	msg.commit_scn = InvalidScn;
+	cluster_tt_status_hint_handle_envelope_raw(&env, &msg);
+	UT_ASSERT_EQ(ut_hint_installs, 4);
+	UT_ASSERT_EQ(memcmp(&ut_hint_install_key, &msg.key, sizeof(msg.key)), 0);
+	UT_ASSERT_EQ(ut_hint_install_status, CLUSTER_TT_STATUS_ABORTED);
+	UT_ASSERT_EQ(ut_hint_install_scn, InvalidScn);
+	UT_ASSERT_EQ(ut_hint_wakes, 0);
+	UT_ASSERT_EQ(cluster_tt_status_hint_get_install_count(), 2);
 	free(ClusterTTHintOutbound);
 	ClusterTTHintOutbound = NULL;
 }
@@ -3211,7 +3252,7 @@ main(void)
 	UT_RUN(test_stale_live_hint_without_origin_proof_stays_unknown);
 	UT_RUN(test_recycled_data_ref_uses_derived_origin_not_current_slot_owner);
 	UT_RUN(test_real_hint_full_and_fanout_keep_loss_observable_without_retry);
-	UT_RUN(test_real_hint_receiver_wakes_only_after_successful_exact_apply);
+	UT_RUN(test_real_hint_receiver_delegates_exact_install_without_duplicate_wake);
 	UT_RUN(test_three_real_visibility_exits_route_recycle_and_unproven);
 	UT_RUN(test_complete_frozen_live_proof_precedes_legacy_cr);
 	UT_RUN(test_complete_frozen_live_proof_keeps_full_epoch_check);

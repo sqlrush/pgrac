@@ -53,6 +53,8 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_block_redeclare.h"
 #include "cluster/cluster_lms_shard.h" /* PGRAC: spec-7.3 D4 — tag->worker shard */
 #include "cluster/cluster_lmd.h"
@@ -10454,6 +10456,110 @@ gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
 	}
 }
 
+/* Begin ordinary acquire STALE observation */
+#define GCS_ACQUIRE_STALE_FIELDS 96
+/* Process-local diagnostics only; never an authority, receipt or work queue. */
+typedef struct GcsAcquireStaleTrace {
+	bool active, logged, entry_known, selected;
+	uint32 count, omitted;
+	uint64 arrived_us, failure_left, failure_right;
+	const char *reason;
+	struct { const char *name; uint64 left, right; } fields[GCS_ACQUIRE_STALE_FIELDS];
+} GcsAcquireStaleTrace;
+static GcsAcquireStaleTrace gcs_acquire_stale_trace;
+
+void
+cluster_gcs_block_acquire_stale_observe(const char *name, uint64 left, uint64 right, bool failed)
+{
+	GcsAcquireStaleTrace *trace = &gcs_acquire_stale_trace;
+	if (!trace->active)
+		return;
+	if (failed && trace->reason == NULL) {
+		trace->reason = name;
+		trace->failure_left = left;
+		trace->failure_right = right;
+	}
+	if (strcmp(name, "entry.binding") == 0)
+		trace->entry_known = true;
+	if (trace->count < GCS_ACQUIRE_STALE_FIELDS) {
+		trace->fields[trace->count].name = name;
+		trace->fields[trace->count].left = left;
+		trace->fields[trace->count++].right = right;
+	} else if (trace->omitted != UINT32_MAX)
+		trace->omitted++;
+}
+
+static void
+gcs_block_resource_x_acquire_stale_begin(const ResourceXDecodedFrame *frame, uint32 ingress)
+{
+	const BufferTag *tag = &frame->common.logical_assertion.resource;
+	if (gcs_acquire_stale_trace.logged)
+		return;
+	memset(&gcs_acquire_stale_trace, 0, sizeof(gcs_acquire_stale_trace));
+	if (!cluster_trace_tx_identity || MyBackendType != B_LMS
+		|| tag->spcOid != 1664 || tag->dbOid != 0 || tag->relNumber != 1260
+		|| tag->forkNum != MAIN_FORKNUM || tag->blockNum != 0)
+		return;
+	gcs_acquire_stale_trace.active = gcs_acquire_stale_trace.selected = true;
+	gcs_acquire_stale_trace.arrived_us = gcs_block_pcm_x_monotonic_us();
+	cluster_gcs_block_acquire_stale_observe("authenticated.ingress", ingress,
+		frame->common.sender_connection_generation, false);
+}
+
+static void
+gcs_block_resource_x_acquire_stale_finish(const ResourceXDecodedFrame *frame,
+	ResourceXApplyResult result)
+{
+	GcsAcquireStaleTrace *trace = &gcs_acquire_stale_trace;
+	const ResourceXDecodedAcquireIntent *intent = &frame->body.acquire_intent;
+	char values[8192];
+	size_t used = 0;
+
+	trace->active = false;
+	if (result != RESOURCE_X_APPLY_STALE || trace->logged || !trace->selected)
+		return;
+	trace->logged = true;
+	values[0] = '\0';
+	for (uint32 i = 0; i < trace->count && used < sizeof(values) - 1; i++) {
+		int n = snprintf(values + used, sizeof(values) - used, "%s=%llu/%llu ",
+			trace->fields[i].name, (unsigned long long)trace->fields[i].left,
+			(unsigned long long)trace->fields[i].right);
+		if (n < 0 || (size_t)n >= sizeof(values) - used) {
+			trace->omitted += trace->count - i;
+			break;
+		}
+		used += n;
+	}
+	ereport(LOG, (errmsg_internal("Resource-X first acquire STALE comparison"),
+		errdetail("predicate=%s left=%llu right=%llu master=%d requester=%d tag=%u/%u/%u/%u/%u "
+			"attempt=%llu session=%llu formation=%llu sender=%u "
+			"incarnation=%llu backend=%d backend_generation=%llu buffer=%d "
+			"base=%llu token=%llu epoch=%llu r4=%llu path=%u observed=%u target=%u "
+			"arrived_us=%llu observed_us=%llu entry_known=%d omitted=%u comparisons=%s",
+			trace->reason != NULL ? trace->reason : "UNKNOWN",
+			(unsigned long long)trace->failure_left, (unsigned long long)trace->failure_right, cluster_node_id,
+			frame->common.logical_assertion.requester_node,
+			frame->common.logical_assertion.resource.spcOid,
+			frame->common.logical_assertion.resource.dbOid,
+			frame->common.logical_assertion.resource.relNumber,
+			(unsigned)frame->common.logical_assertion.resource.forkNum,
+			frame->common.logical_assertion.resource.blockNum,
+			(unsigned long long)frame->common.assertion_sequence,
+			(unsigned long long)frame->common.master_session_incarnation,
+			(unsigned long long)frame->common.resource_formation,
+			frame->common.sender_connection_generation,
+			(unsigned long long)intent->requester_incarnation, intent->backend_id,
+			(unsigned long long)intent->backend_generation, intent->buffer_id,
+			(unsigned long long)intent->base_generation,
+			(unsigned long long)intent->reservation_token,
+			(unsigned long long)intent->cluster_epoch, (unsigned long long)intent->r4_generation,
+			(unsigned)intent->path, (unsigned)frame->common.observed_mode,
+			(unsigned)frame->common.target_mode, (unsigned long long)trace->arrived_us,
+			(unsigned long long)gcs_block_pcm_x_monotonic_us(), trace->entry_known,
+			trace->omitted, values)));
+}
+/* End ordinary acquire STALE observation */
+
 static PcmXSessionAuthResult
 gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag,
 												  ResourceXGateSnapshot *gate_out,
@@ -10537,14 +10643,24 @@ gcs_block_resource_x_gate_session_recheck_result(const BufferTag *tag,
 		return RESOURCE_X_APPLY_INVALID;
 	sample_result = gcs_block_resource_x_gate_session_snapshot_result(
 		tag, &current_gate, &current_master_node, &current_master_session);
+	cluster_gcs_block_acquire_stale_observe("recheck.gate_phase", current_gate.phase, RESOURCE_X_GATE_OPEN, current_gate.phase != RESOURCE_X_GATE_OPEN);
+	cluster_gcs_block_acquire_stale_observe("recheck.formation", current_gate.formation, expected_gate->formation, current_gate.formation != expected_gate->formation);
+	cluster_gcs_block_acquire_stale_observe("recheck.freeze", current_gate.freeze_generation, expected_gate->freeze_generation, current_gate.freeze_generation != expected_gate->freeze_generation);
+	cluster_gcs_block_acquire_stale_observe("recheck.reserved", current_gate.reserved, expected_gate->reserved, current_gate.reserved != expected_gate->reserved);
+	cluster_gcs_block_acquire_stale_observe("recheck.master", current_master_node, expected_master_node, current_master_node != expected_master_node);
+	cluster_gcs_block_acquire_stale_observe("recheck.session_result", sample_result, PCM_X_SESSION_AUTH_OK, false);
+	cluster_gcs_block_acquire_stale_observe("recheck.session", current_master_session, expected_master_session, false);
 	if (current_gate.phase != RESOURCE_X_GATE_OPEN
 		|| memcmp(&current_gate, expected_gate, sizeof(current_gate)) != 0
 		|| current_master_node != expected_master_node)
 		return RESOURCE_X_APPLY_STALE;
 	if (cluster_gcs_pcm_x_auth_result_retryable(sample_result))
 		return RESOURCE_X_APPLY_BAD_STATE;
-	if (sample_result != PCM_X_SESSION_AUTH_OK)
+	if (sample_result != PCM_X_SESSION_AUTH_OK) {
+		cluster_gcs_block_acquire_stale_observe("recheck.session_result", sample_result, PCM_X_SESSION_AUTH_OK, true);
 		return RESOURCE_X_APPLY_STALE;
+	}
+	cluster_gcs_block_acquire_stale_observe("recheck.session", current_master_session, expected_master_session, current_master_session != expected_master_session);
 	return current_master_session == expected_master_session ? RESOURCE_X_APPLY_APPLIED
 															 : RESOURCE_X_APPLY_STALE;
 }
@@ -10579,25 +10695,70 @@ static ResourceXApplyResult gcs_block_resource_x_target_peer_result_exact(
 	const ClusterSemanticAdmissionToken *admission, int32 peer_node, uint32 connection);
 
 static ResourceXApplyResult
-gcs_block_first_fill_current(ClusterGcsFirstFill *fill)
+gcs_block_acquire_domain_current(const ClusterSemanticAdmissionToken *admission,
+	const BufferTag *tag, const ResourceXGateSnapshot *gate, int32 master_node,
+	uint64 master_session, uint32 requester_connection, uint32 master_connection)
 {
 	ResourceXApplyResult result;
 	uint32 requester = 0, master = 0;
 
-	if (!cluster_semantic_activation_recheck(&fill->admission))
+	if (!cluster_semantic_activation_recheck(admission))
 		return RESOURCE_X_APPLY_STALE;
 	result = gcs_block_resource_x_gate_session_recheck_result(
-		&fill->prepared.common.logical_assertion.resource, &fill->gate,
-		fill->master_node, fill->master_session);
+		tag, gate, master_node, master_session);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
-	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(fill->master_node, &requester)
-		|| !gcs_block_pcm_x_resource_x_peer_ready_exact(fill->master_node, &master))
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(master_node, &requester)
+		|| !gcs_block_pcm_x_resource_x_peer_ready_exact(master_node, &master))
 		return RESOURCE_X_APPLY_BAD_STATE; /* Observation unavailable: retain E. */
-	if (requester != fill->requester_connection || master != fill->master_connection)
+	if (requester != requester_connection || master != master_connection)
 		return RESOURCE_X_APPLY_STALE;
 	return gcs_block_resource_x_target_peer_result_exact(
-		&fill->admission, fill->master_node, master);
+		admission, master_node, master);
+}
+
+static ResourceXApplyResult
+gcs_block_first_fill_current(ClusterGcsFirstFill *fill)
+{
+	return gcs_block_acquire_domain_current(&fill->admission,
+		&fill->prepared.common.logical_assertion.resource, &fill->gate,
+		fill->master_node, fill->master_session, fill->requester_connection,
+		fill->master_connection);
+}
+
+/* Physical execution outlives the foreground's passive wait. Revalidate its
+ * original domain before each new publication; no request, grant or native
+ * completion is produced here. Call only outside content/header/entry locks.
+ * Unavailable observations are local waiting, never expiry of this episode. */
+ResourceXApplyResult
+cluster_gcs_block_acquire_domain_recheck_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	ResourceXGateSnapshot gate;
+	ResourceXApplyResult result;
+
+	if (observation == NULL || admission == NULL || !admission->entered
+		|| observation->request.resource_formation == 0
+		|| observation->request.resource_formation == UINT64_MAX
+		|| observation->r4_record_generation != admission->record_generation
+		|| observation->request.sender_connection_generation == 0
+		|| observation->master_ingress_connection_generation == 0)
+		return RESOURCE_X_APPLY_INVALID;
+	for (;;) {
+		if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+			|| gate.phase != RESOURCE_X_GATE_OPEN
+			|| gate.formation != observation->request.resource_formation)
+			return RESOURCE_X_APPLY_STALE;
+		result = gcs_block_acquire_domain_current(admission,
+			&observation->request.logical_assertion.resource, &gate,
+			observation->master_node, observation->request.master_session_incarnation,
+			observation->request.sender_connection_generation,
+			observation->master_ingress_connection_generation);
+		if (result != RESOURCE_X_APPLY_BAD_STATE)
+			return result;
+		gcs_block_resource_x_observation_pause();
+	}
 }
 
 ResourceXApplyResult
@@ -10659,6 +10820,17 @@ cluster_gcs_block_acquire_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *ba
 		}
 		if (result != RESOURCE_X_APPLY_APPLIED)
 			return result;
+		/* Seal old local PI before this E can occupy master priority.
+		 * No requester retry or new authority is produced by local wait. */
+		if (path == RESOURCE_X_ACQUIRE_RESIDENT && base->pcm_state == PCM_STATE_N) {
+			result = cluster_bufmgr_pcm_own_acquire_preserve_resident_exact(buf,
+				base, &fill->episode, &fill->admission);
+			if (result == RESOURCE_X_APPLY_LOCAL_WAIT) {
+				gcs_block_resource_x_observation_pause();
+				continue;
+			}
+			if (result != RESOURCE_X_APPLY_APPLIED) return result;
+		}
 		now = gcs_block_pcm_x_monotonic_us();
 		slice = (uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1) * UINT64_C(1000);
 		diagnostic_budget = gcs_block_pcm_x_retry_timeout_us();
@@ -10666,10 +10838,10 @@ cluster_gcs_block_acquire_begin(BufferDesc *buf, const ClusterPcmOwnSnapshot *ba
 			|| now >= UINT64_MAX - diagnostic_budget)
 			return RESOURCE_X_APPLY_INVALID;
 		fill->preparing = true;
-		action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(&assertion,
+		action = cluster_pcm_lock_resource_x_acquire_round_step_exact(&assertion,
 			fill->master_node, fill->gate.formation, fill->master_session,
 			fill->admission.record_generation, fill->requester_connection, fill->master_connection,
-			now + diagnostic_budget, diagnostic_budget, now, slice, false, 0, &fill->prepared, &unused);
+			now + diagnostic_budget, diagnostic_budget, now, slice, base, &fill->episode, &fill->prepared, &unused);
 		if (action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST)
 			fill->round_prepared = true;
 		fill->preparing = false;
@@ -14587,6 +14759,8 @@ gcs_block_resource_x_target_peer_result_exact(const ClusterSemanticAdmissionToke
 											  uint32 authenticated_connection_generation)
 {
 	ClusterSemanticResourceXPeerOpenResult peer_result;
+	uint64 epoch;
+	uint32 capability;
 
 	if (admission == NULL || !admission->entered
 		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
@@ -14594,18 +14768,27 @@ gcs_block_resource_x_target_peer_result_exact(const ClusterSemanticAdmissionToke
 		|| admission->record_generation == UINT64_MAX || peer_node < 0
 		|| peer_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || authenticated_connection_generation == 0)
 		return RESOURCE_X_APPLY_INVALID;
-	if (admission->formation_epoch != cluster_epoch_get_current()
-		|| !cluster_semantic_activation_recheck(admission))
+	epoch = cluster_epoch_get_current();
+	cluster_gcs_block_acquire_stale_observe("peer.epoch", admission->formation_epoch, epoch, admission->formation_epoch != epoch);
+	if (admission->formation_epoch != epoch
+		|| !cluster_semantic_activation_recheck(admission)) {
+		if (admission->formation_epoch == epoch)
+			cluster_gcs_block_acquire_stale_observe("peer.admission_current", 0, 1, true);
 		return RESOURCE_X_APPLY_STALE;
-	if (peer_node == cluster_node_id)
-		return (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1)
-					   != 0
-				   ? RESOURCE_X_APPLY_APPLIED
-				   : RESOURCE_X_APPLY_STALE;
+	}
+	if (peer_node == cluster_node_id) {
+		capability = cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+		cluster_gcs_block_acquire_stale_observe("peer.local_capability", capability,
+			PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, capability == 0);
+		return capability != 0 ? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE;
+	}
 	peer_result = cluster_semantic_activation_resource_x_peer_open_check(
 		admission, peer_node, authenticated_connection_generation);
-	if (!cluster_semantic_activation_recheck(admission))
+	cluster_gcs_block_acquire_stale_observe("peer.open_result", peer_result, CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH, false);
+	if (!cluster_semantic_activation_recheck(admission)) {
+		cluster_gcs_block_acquire_stale_observe("peer.admission_recheck", 0, 1, true);
 		return RESOURCE_X_APPLY_STALE;
+	}
 	switch (peer_result) {
 	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH:
 		return RESOURCE_X_APPLY_APPLIED;
@@ -14624,6 +14807,7 @@ gcs_block_resource_x_target_peer_result_exact(const ClusterSemanticAdmissionToke
 	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_PEER_ABSENT:
 	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_PEER_ROW_MISMATCH:
 	case CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT:
+		cluster_gcs_block_acquire_stale_observe("peer.open_result", peer_result, CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH, true);
 		return RESOURCE_X_APPLY_STALE;
 	default:
 		return RESOURCE_X_APPLY_INVALID;
@@ -14742,9 +14926,9 @@ cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *r
  * prepare remains reversible until the exact PCM transaction takes the pair.
  * No retry request, duplicate capture queue, or pin crosses that handoff. */
 static ResourceXApplyResult
-gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWork *work,
+gcs_block_resource_x_acquire_s_source_capture_with_plan(const ResourceXSourceDrainWork *work,
 	const ResourceXDecodedFrame *block, const ClusterSemanticAdmissionToken *admission,
-	const ResourceXGateSnapshot *gate)
+	const ResourceXGateSnapshot *gate, const RfPageOnlinePlanV1 *coverage)
 {
 	ClusterPcmOwnSnapshot current, prepared;
 	volatile ClusterPcmOwnSnapshot owned_prepared;
@@ -14791,6 +14975,16 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 	result = gcs_block_resource_x_target_peer_result_exact(admission,
 		block->common.logical_assertion.requester_node, requester_connection);
 	if (result != RESOURCE_X_APPLY_APPLIED) return result;
+	if (coverage == NULL) {
+		ResourceXDecodedFrame retained;
+		result = cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(work, &retained);
+		if (result == RESOURCE_X_APPLY_APPLIED) {
+			ClusterControlRootResult queued = cluster_pi_writeback_source_begin_v1(work, &retained);
+			return queued == CLUSTER_CONTROL_ROOT_OK_PRIMARY || queued == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+				? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+		if (result != RESOURCE_X_APPLY_NOT_FOUND) return result;
+	}
 	own = cluster_bufmgr_pcm_own_snapshot_by_tag(&work->request.logical_assertion.resource, &buffer_id, &current);
 	if (own == CLUSTER_PCM_OWN_BUSY) return RESOURCE_X_APPLY_BAD_STATE;
 	if (own != CLUSTER_PCM_OWN_OK || buffer_id < 0 || buffer_id >= NBuffers)
@@ -14819,8 +15013,11 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 				result = gcs_block_resource_x_target_peer_result_exact(admission,
 					block->common.logical_assertion.requester_node, requester_connection);
 			if (result == RESOURCE_X_APPLY_APPLIED) {
-				result = cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(work,
-					buffer_id, &prepared, page.data, &wal, requester_connection, master_connection);
+				result = coverage != NULL
+					? cluster_pcm_lock_resource_x_acquire_s_source_covered_capture_exact(work,
+						buffer_id, &prepared, page.data, &wal, requester_connection, master_connection, coverage)
+					: cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(work,
+						buffer_id, &prepared, page.data, &wal, requester_connection, master_connection);
 				/* This nonthrowing assignment must precede any notification or
 				 * further observation after shared ownership was transferred. */
 				if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
@@ -14848,6 +15045,47 @@ gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWo
 fail_closed:
 	gcs_block_resource_x_fail_closed_current();
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_acquire_s_source_capture_owned(const ResourceXSourceDrainWork *work,
+	const ResourceXDecodedFrame *block, const ClusterSemanticAdmissionToken *admission,
+	const ResourceXGateSnapshot *gate)
+{
+	return gcs_block_resource_x_acquire_s_source_capture_with_plan(work, block, admission, gate, NULL);
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_coverage_capture(const ResourceXSourceDrainWork *work,
+	const ResourceXDecodedFrame *expected, const RfPageOnlinePlanV1 *coverage)
+{
+	ClusterSemanticAdmissionToken admission = {0};
+	ResourceXGateSnapshot gate = {0};
+	ResourceXDecodedFrame block;
+	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	int32 master = -1; uint64 session = 0;
+	if (MyBackendType != B_BG_WRITER || work == NULL || expected == NULL || coverage == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission) != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_STALE;
+	PG_TRY();
+	{
+		PcmXSessionAuthResult sample = gcs_block_resource_x_gate_session_snapshot_result(
+			&work->request.logical_assertion.resource, &gate, &master, &session);
+		if (cluster_gcs_pcm_x_auth_result_retryable(sample)) result = RESOURCE_X_APPLY_BAD_STATE;
+		else if (sample == PCM_X_SESSION_AUTH_OK && master == work->master_node
+			&& session == work->request.master_session_incarnation) {
+			result = cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(work, &block);
+			if (result == RESOURCE_X_APPLY_APPLIED) {
+				if (memcmp(expected, &block, sizeof(block)) != 0) result = RESOURCE_X_APPLY_STALE;
+				else result = gcs_block_resource_x_acquire_s_source_capture_with_plan(work,
+					&block, &admission, &gate, coverage);
+			}
+		}
+	}
+	PG_FINALLY(); { cluster_semantic_activation_leave(&admission); } PG_END_TRY();
+	return result;
 }
 
 
@@ -15483,16 +15721,17 @@ gcs_block_resource_x_acquire_context_result(
 	const ClusterSemanticAdmissionToken *admission, uint32 authenticated_ingress,
 	uint32 *master_sender_out)
 {
-	ResourceXGateSnapshot gate;
+	ResourceXGateSnapshot gate = {0};
 	ResourceXApplyResult result;
 	PcmXSessionAuthResult session_result;
-	ClusterGcsPcmXAuthSample sample;
+	ClusterGcsPcmXAuthSample sample = {0};
 	uint64 master_session = 0;
 	uint64 requester_session = 0;
 	uint32 outbound = 0;
 	uint32 current_outbound = 0;
 	int32 master = -1;
 	int32 requester;
+	uint64 current_epoch;
 
 	if (master_sender_out != NULL)
 		*master_sender_out = 0;
@@ -15501,9 +15740,15 @@ gcs_block_resource_x_acquire_context_result(
 		|| intent->requester_incarnation == 0 || intent->requester_incarnation == UINT64_MAX)
 		return RESOURCE_X_APPLY_INVALID;
 	requester = request->logical_assertion.requester_node;
-	if (intent->cluster_epoch != cluster_epoch_get_current()
+	/* Semantic formation is the membership epoch. Resource-X formation is
+	 * independently advanced by cutover/remaster and must match its gate
+	 * below; equal numeric values are not an authority relationship. */
+	current_epoch = cluster_epoch_get_current();
+	cluster_gcs_block_acquire_stale_observe("intent.epoch", intent->cluster_epoch, current_epoch, intent->cluster_epoch != current_epoch);
+	cluster_gcs_block_acquire_stale_observe("admission.formation", intent->cluster_epoch, admission->formation_epoch, intent->cluster_epoch != admission->formation_epoch);
+	cluster_gcs_block_acquire_stale_observe("intent.r4", intent->r4_generation, admission->record_generation, intent->r4_generation != admission->record_generation);
+	if (intent->cluster_epoch != current_epoch
 		|| intent->cluster_epoch != admission->formation_epoch
-		|| request->resource_formation != admission->formation_epoch
 		|| intent->r4_generation != admission->record_generation)
 		return RESOURCE_X_APPLY_STALE;
 	result = gcs_block_resource_x_target_peer_result_exact(admission, requester,
@@ -15512,14 +15757,27 @@ gcs_block_resource_x_acquire_context_result(
 		return result;
 	session_result = gcs_block_resource_x_gate_session_snapshot_result(
 		&request->logical_assertion.resource, &gate, &master, &master_session);
+	cluster_gcs_block_acquire_stale_observe("master.sample_us", gcs_acquire_stale_trace.active ? gcs_block_pcm_x_monotonic_us() : 0, 0, false);
+	cluster_gcs_block_acquire_stale_observe("gate.phase", gate.phase, RESOURCE_X_GATE_OPEN, gate.phase != RESOURCE_X_GATE_OPEN);
+	cluster_gcs_block_acquire_stale_observe("gate.formation", gate.formation, request->resource_formation, gate.formation != request->resource_formation);
+	cluster_gcs_block_acquire_stale_observe("master.node", master, cluster_node_id, master != cluster_node_id);
+	cluster_gcs_block_acquire_stale_observe("master.session_result", session_result, PCM_X_SESSION_AUTH_OK, false);
+	cluster_gcs_block_acquire_stale_observe("master.session", request->master_session_incarnation, master_session, false);
 	if (gate.phase != RESOURCE_X_GATE_OPEN || gate.formation != request->resource_formation
 		|| master != cluster_node_id || !cluster_semantic_activation_recheck(admission))
+	{
+		if (gate.phase == RESOURCE_X_GATE_OPEN && gate.formation == request->resource_formation
+			&& master == cluster_node_id)
+			cluster_gcs_block_acquire_stale_observe("gate.admission_current", 0, 1, true);
 		return RESOURCE_X_APPLY_STALE;
+	}
 	if (cluster_gcs_pcm_x_auth_result_retryable(session_result))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (session_result != PCM_X_SESSION_AUTH_OK || master_session == 0
-		|| master_session == UINT64_MAX || master_session != request->master_session_incarnation)
+		|| master_session == UINT64_MAX || master_session != request->master_session_incarnation) {
+		cluster_gcs_block_acquire_stale_observe("master.session", request->master_session_incarnation, master_session, true);
 		return RESOURCE_X_APPLY_STALE;
+	}
 	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(requester, &outbound))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (outbound == 0 || outbound == UINT32_MAX)
@@ -15536,6 +15794,12 @@ gcs_block_resource_x_acquire_context_result(
 		if (session_result != PCM_X_SESSION_AUTH_OK || requester_session == 0
 			|| requester_session == UINT64_MAX)
 			return RESOURCE_X_APPLY_INVALID;
+		cluster_gcs_block_acquire_stale_observe("requester.pass", pass, pass, false);
+		cluster_gcs_block_acquire_stale_observe("requester.incarnation", intent->requester_incarnation, requester_session, requester_session != intent->requester_incarnation);
+		cluster_gcs_block_acquire_stale_observe("requester.session_before_after", sample.session_before, sample.session_after, false);
+		cluster_gcs_block_acquire_stale_observe("requester.slot_before_after", sample.slot_generation_before, sample.slot_generation_after, false);
+		cluster_gcs_block_acquire_stale_observe("requester.epoch_before_after", sample.observed_epoch_before, sample.observed_epoch_after, false);
+		cluster_gcs_block_acquire_stale_observe("requester.connection_before_after", sample.connection_generation_before, sample.connection_generation_after, false);
 		if (requester_session != intent->requester_incarnation)
 			return RESOURCE_X_APPLY_STALE;
 		if (requester != cluster_node_id) {
@@ -15543,6 +15807,7 @@ gcs_block_resource_x_acquire_context_result(
 				|| sample.connection_generation_before == UINT32_MAX
 				|| sample.slot_generation_before == UINT64_MAX)
 				return RESOURCE_X_APPLY_INVALID;
+			cluster_gcs_block_acquire_stale_observe("requester.ingress", sample.connection_generation_before, authenticated_ingress, sample.connection_generation_before != authenticated_ingress);
 			if (sample.connection_generation_before != authenticated_ingress)
 				return RESOURCE_X_APPLY_STALE;
 		}
@@ -15557,8 +15822,12 @@ gcs_block_resource_x_acquire_context_result(
 		return result;
 	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(requester, &current_outbound))
 		return RESOURCE_X_APPLY_BAD_STATE;
-	if (current_outbound != outbound || !cluster_semantic_activation_recheck(admission))
+	cluster_gcs_block_acquire_stale_observe("master.outbound", current_outbound, outbound, current_outbound != outbound);
+	if (current_outbound != outbound || !cluster_semantic_activation_recheck(admission)) {
+		if (current_outbound == outbound)
+			cluster_gcs_block_acquire_stale_observe("admission.final_recheck", 0, 1, true);
 		return RESOURCE_X_APPLY_STALE;
+	}
 	*master_sender_out = outbound;
 	return RESOURCE_X_APPLY_APPLIED;
 }
@@ -15594,6 +15863,7 @@ gcs_block_resource_x_acquire_ingress(const ClusterICEnvelope *env,
 										  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
 		!= CLUSTER_SEMANTIC_ADMISSION_OK)
 		return RESOURCE_X_APPLY_BAD_STATE;
+	gcs_block_resource_x_acquire_stale_begin(frame, authenticated_ingress);
 	PG_TRY();
 	{
 		result = gcs_block_resource_x_acquire_context_result(
@@ -15605,9 +15875,11 @@ gcs_block_resource_x_acquire_ingress(const ClusterICEnvelope *env,
 	}
 	PG_FINALLY();
 	{
+		gcs_acquire_stale_trace.active = false;
 		cluster_semantic_activation_leave(&admission);
 	}
 	PG_END_TRY();
+	gcs_block_resource_x_acquire_stale_finish(frame, result);
 	return result;
 }
 

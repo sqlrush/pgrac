@@ -2109,6 +2109,15 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_forward
 	uint64 r4_record_generation, uint32 authenticated_connection_generation);
 /* A claimed original FORWARD is atomically replaced by its real native
  * pair. APPLIED/DUPLICATE transfers native completion: never abort after it. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_coverage_snapshot_exact(
+	const ResourceXSourceDrainWork *work, ResourceXDecodedFrame *block);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_coverage_claim_exact(
+	const ResourceXSourceDrainWork *work, const ResourceXDecodedFrame *block, bool claimed, bool cancel);
+#define CLUSTER_PCM_SOURCE_COVERAGE_JOB_V1 1
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_covered_capture_exact(
+	const ResourceXSourceDrainWork *work, int32 buffer_id, const struct ClusterPcmOwnSnapshot *prepared,
+	const char page[BLCKSZ], const struct ClusterPageWalBindingV1 *wal,
+	uint32 requester_connection, uint32 master_connection, const struct RfPageOnlinePlanV1 *coverage);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_s_source_capture_exact(
 	const ResourceXSourceDrainWork *work, int32 buffer_id,
 	const struct ClusterPcmOwnSnapshot *prepared, const char page_bytes[BLCKSZ],
@@ -2889,6 +2898,14 @@ extern void cluster_pcm_lock_pi_holder_note(BufferTag tag, int32 holder_node);
 extern bool cluster_pcm_lock_pi_discard_collect(BufferTag tag, SCN written_scn,
 												uint32 *holders_out);
 
+/* Ordinary native reservations alone can consume a settled resident S
+ * authorization. Generic/bootstrap callers retain their original WAIT. */
+extern ResourceXBootstrapRoundAction cluster_pcm_lock_resource_x_acquire_round_step_exact(
+	const ResourceXAssertion *assertion, int32 master, uint64 formation, uint64 session, uint64 r4,
+	uint32 sender, uint32 ingress, uint64 deadline, uint64 budget, uint64 now, uint64 slice,
+	const struct ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	ResourceXDecodedFrame *dispatch, ResourceXAcquisitionRef *terminal);
+
 /* Original full-E preparation only. Generic delivery claims reject PREPARED.
  * Revert requires bufmgr's exact unpublished/zero-hold native observation;
  * neither operation grants physical IO, image installation or native C. */
@@ -2991,8 +3008,9 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_read_source_sett
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_acquire_source_done_snapshot_exact(
 	const ResourceXBootstrapWork *work, ResourceXDecodedFrame *notice_out);
 
-/* Evidence only. Native GP/delivery and the unchanged bytes must be
- * continuously protected and rechecked by the resident refill adapter. */
+/* Preserve an exact original local PI in the existing holder-body quota if
+ * that body is empty; existing E/A/fence evidence is never replaced. This
+ * grants no access. The caller protects/rechecks native GP and page bytes. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_resident_image_preserved_exact(
 	const struct ClusterPcmOwnSnapshot *base, const char *page);
 

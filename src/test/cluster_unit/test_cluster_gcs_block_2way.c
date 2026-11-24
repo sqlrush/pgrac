@@ -560,7 +560,7 @@ UT_TEST(test_direct_land_arm_blocks_known_different_holder)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(35);
 	UT_RUN(test_block_forward_msg_type_is_16);
 	UT_RUN(test_granted_from_holder_status_is_8);
 	UT_RUN(test_forward_payload_size_locked_at_64);

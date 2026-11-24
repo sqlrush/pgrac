@@ -224,7 +224,8 @@ static bool h08_parent(int fd, int variant)
 	UT_ASSERT_EQ(h08_releases, 2); UT_ASSERT_EQ(rl_service_wakes, 2);
 	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), h08_generation + 1); UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), h08_token + 1);
 	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_X); UT_ASSERT_EQ(request_buf.buffer_type, BUF_TYPE_XCUR);
-	UT_ASSERT_EQ(complete_commits, 2); UT_ASSERT_EQ(complete_io_calls, 1); UT_ASSERT_EQ(disk_reads, 1);
+	/* This callback counts the first read; X completion uses the real native owner below. */
+	UT_ASSERT_EQ(complete_commits, 1); UT_ASSERT_EQ(complete_io_calls, 1); UT_ASSERT_EQ(disk_reads, 1);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&request_buf.state) & CLUSTER_PCM_OWN_SEMANTIC_BUF_STATE_MASK, h08_semantic);
 	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&request_buf.state)), 3); UT_ASSERT(memcmp(h08_bytes.data, disk_shared.data, BLCKSZ) == 0);
 	LWLockAcquire(entry->content_lock, LW_EXCLUSIVE); NM_REQUIRE(cluster_bufmgr_pcm_x_writer_activate(entry, true));

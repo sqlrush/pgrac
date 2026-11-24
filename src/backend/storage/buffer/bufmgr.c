@@ -2480,11 +2480,17 @@ cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, PcmLockMode requested_m
 						out_base->resource_x_activation_generation))
 			result = CLUSTER_PCM_OWN_BUSY;
 		else if (requested_mode == PCM_LOCK_MODE_S && out_base->pcm_state == PCM_STATE_N
-				 && ((out_base->semantic_buf_state & BM_IO_IN_PROGRESS) != 0
-					 || (pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) != 0))
+				 && ((pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) != 0
+					 || ((out_base->semantic_buf_state & BM_IO_IN_PROGRESS) != 0
+						 && ((out_base->semantic_buf_state & BM_VALID) != 0
+							 || out_base->buffer_type != BUF_TYPE_CURRENT
+							 || !ResourceOwnerHasBufferIO(CurrentResourceOwner,
+								 BufferDescriptorGetBuffer(buf))))))
 		{
-			/* The existing physical writer owns this IO. Wait before making
-			 * our GP, so cancellation cannot adopt or abort somebody else's IO. */
+			/* StartBufferIO registers our first input IO before source admission.
+			 * Only that exact owner may carry its invalid CURRENT buffer into GP.
+			 * A physical write or anybody else's IO must finish first, so our
+			 * cancellation cannot adopt or abort that IO. */
 			result = CLUSTER_PCM_OWN_BUSY;
 			*wait_reason = CLUSTER_PCM_GRANT_WAIT_LIVE_RESERVATION;
 		}
@@ -3195,6 +3201,61 @@ cluster_bufmgr_pcm_own_acquire_intent_exact(
 		return CLUSTER_PCM_OWN_STALE;
 	*out = candidate;
 	return CLUSTER_PCM_OWN_OK;
+}
+
+/* Preserve an old N/PI before REQUEST, while its original GP still owns
+ * the descriptor. Content/header capture never overlaps the entry owner.
+ * Conditional content acquisition keeps ordinary capacity wait local. */
+ResourceXApplyResult
+cluster_bufmgr_pcm_own_acquire_preserve_resident_exact(BufferDesc *buf,
+	const ClusterPcmOwnSnapshot *base, const ResourceXDecodedAcquireIntent *episode,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	ResourceXDecodedAcquireIntent checked;
+	ClusterPcmLocalPiSnapshotV1 pi;
+	ClusterPcmOwnSnapshot native, expected;
+	ClusterPcmOwnResult own;
+	PGIOAlignedBlock page;
+	LWLock *content;
+	uint64 write_generation;
+	volatile bool captured = false;
+
+	if (buf == NULL || base == NULL || episode == NULL || admission == NULL
+		|| episode->path != RESOURCE_X_ACQUIRE_RESIDENT || base->pcm_state != PCM_STATE_N)
+		return RESOURCE_X_APPLY_INVALID;
+	content = BufferDescriptorGetContentLock(buf);
+	if (LWLockHeldByMe(content)) return RESOURCE_X_APPLY_BAD_STATE;
+	own = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, episode->reservation_token,
+		episode->path, admission, episode, &checked);
+	if (own != CLUSTER_PCM_OWN_OK)
+		return own == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_APPLY_LOCAL_WAIT : RESOURCE_X_APPLY_STALE;
+	/* Avoid a page copy for the ordinary no-PI case. The original entry
+	 * preflight still rechecks capacity atomically with round preparation. */
+	if (!cluster_pcm_local_pi_snapshot_v1(base->tag, &pi)) return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (pi.first.record_start == 0) return RESOURCE_X_APPLY_APPLIED;
+	write_generation = pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation);
+	if ((write_generation & 1) != 0 || write_generation >= UINT64_MAX-1)
+		return RESOURCE_X_APPLY_LOCAL_WAIT;
+	if (!LWLockConditionalAcquire(content, LW_EXCLUSIVE)) return RESOURCE_X_APPLY_LOCAL_WAIT;
+	expected = *base; expected.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	expected.reservation_token = episode->reservation_token;
+	PG_TRY();
+	{
+		uint32 state = LockBufHdr(buf);
+		cluster_pcm_own_snapshot_locked(buf, &native);
+		captured = cluster_pcm_own_snapshot_equal_exact(&native, &expected)
+			&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0
+			&& pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) == write_generation;
+		UnlockBufHdr(buf, state);
+		if (captured) memcpy(page.data, BufferGetBlock(BufferDescriptorGetBuffer(buf)), BLCKSZ);
+	}
+	PG_FINALLY(); { LWLockRelease(content); } PG_END_TRY();
+	if (!captured) return RESOURCE_X_APPLY_STALE;
+	own = cluster_bufmgr_pcm_own_acquire_intent_exact(buf, base, episode->reservation_token,
+		episode->path, admission, episode, &checked);
+	if (own != CLUSTER_PCM_OWN_OK)
+		return own == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_APPLY_LOCAL_WAIT : RESOURCE_X_APPLY_STALE;
+	return cluster_pcm_lock_resource_x_resident_image_preserved_exact(base, page.data);
 }
 
 ResourceXApplyResult
@@ -7034,6 +7095,17 @@ cluster_bufmgr_first_fill_abort_unissued(ClusterBufmgrFirstFill *read)
 		&& (read->base.semantic_buf_state & (BM_TAG_VALID | BM_VALID)) == (BM_TAG_VALID | BM_VALID)
 		&& (read->base.semantic_buf_state & ~(BM_TAG_VALID | BM_VALID | BM_DIRTY
 			| BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) == 0;
+	/* Unavailable PI bytes still carry their original recovery obligation.
+	 * A rejected, never-issued read may retire only the GP it just acquired;
+	 * this does not make the PI readable or retire any PI/WAL responsibility. */
+	bool unavailable_pi = read->resident && read->base.pcm_state == PCM_STATE_N
+		&& read->base.buffer_type == BUF_TYPE_PI
+		&& read->base.semantic_buf_state == BM_TAG_VALID
+		&& read->base.flags == 0 && read->base.writer_activation_token == 0
+		&& read->base.resource_x_activation_generation == 0
+		&& read->base.generation < UINT64_MAX - 1
+		&& read->base.reservation_token < UINT64_MAX - 1
+		&& read->token == read->base.reservation_token + 1;
 	uint32 state;
 
 	if (!cluster_bufmgr_first_fill_local_owner(read)
@@ -7044,7 +7116,7 @@ cluster_bufmgr_first_fill_abort_unissued(ClusterBufmgrFirstFill *read)
 	state = LockBufHdr(read->buf);
 	cluster_pcm_own_snapshot_locked(read->buf, &live);
 	if (!cluster_pcm_own_snapshot_equal_exact(&expected, &live)
-		|| (!local_s_x && (live.pcm_state != PCM_STATE_N
+		|| (!local_s_x && !unavailable_pi && (live.pcm_state != PCM_STATE_N
 			|| (live.buffer_type != BUF_TYPE_CURRENT && (!read->resident || live.buffer_type != BUF_TYPE_PI))
 			|| live.semantic_buf_state != (BM_TAG_VALID | (read->resident ? BM_VALID : BM_IO_IN_PROGRESS))))
 		|| cluster_pcm_own_delivery_attempt_get(read->buf->buf_id) != 0
@@ -17978,7 +18050,9 @@ cluster_bufmgr_acquire_read_context(BufferDesc *buf, const ClusterPcmOwnSnapshot
 		&& BufferTagsEqual(&base->tag, &execution->observation.request.logical_assertion.resource)
 		&& cluster_bufmgr_acquire_execution_context_io(buf, episode, admission, owner, input_io)
 		&& ResourceOwnerHasBufferIO(owner, BufferDescriptorGetBuffer(buf)) == input_io
-		&& cluster_gcs_lookup_master(base->tag) == execution->observation.master_node;
+		&& cluster_gcs_lookup_master(base->tag) == execution->observation.master_node
+		&& cluster_gcs_block_acquire_domain_recheck_exact(&execution->observation, admission)
+			== RESOURCE_X_APPLY_APPLIED;
 }
 
 static void
@@ -24422,7 +24496,7 @@ typedef enum ClusterPcmOwnSSourceHardFailureReason
 	CLUSTER_PCM_S_SOURCE_HARD_INITIAL_CURRENT_IMAGE,
 	CLUSTER_PCM_S_SOURCE_HARD_INITIAL_IO_ERROR,
 	CLUSTER_PCM_S_SOURCE_HARD_BEGIN_REVOKE_CORRUPT,
-	CLUSTER_PCM_S_SOURCE_HARD_STORAGE_READ_ERROR,
+	CLUSTER_PCM_S_SOURCE_HARD_CAPTURE_ERROR,
 	CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY,
 	CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_CURRENT_IMAGE,
 	CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_IO_ERROR,
@@ -24464,8 +24538,8 @@ cluster_bufmgr_pcm_own_s_source_hard_failure_reason_name(
 			return "initial-io-error";
 		case CLUSTER_PCM_S_SOURCE_HARD_BEGIN_REVOKE_CORRUPT:
 			return "begin-revoke-corrupt";
-		case CLUSTER_PCM_S_SOURCE_HARD_STORAGE_READ_ERROR:
-			return "storage-read-error";
+		case CLUSTER_PCM_S_SOURCE_HARD_CAPTURE_ERROR:
+			return "capture-error";
 		case CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY:
 			return "storage-verify";
 		case CLUSTER_PCM_S_SOURCE_HARD_POST_LOCK_CURRENT_IMAGE:
@@ -24555,10 +24629,10 @@ cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 		 (unsigned int)obs.buffer_type);
 }
 
-/* Freeze an exact S source and materialize the newest safe image visible in
- * either its clean resident page or shared storage.  REVOKING prevents local
- * data writes/reuse while the conditional content-lock hold binds the final
- * comparison and optional storage refresh to the same ownership tuple. */
+/* Freeze an exact S current source and copy its protected resident image.
+ * REVOKING and content EXCLUSIVE bind the copy to the same native tuple.
+ * This holder has no disk-source grant: a missing current/floor proof must
+ * fail closed rather than substitute bytes from shared storage. */
 static ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
@@ -24566,23 +24640,16 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
 	ClusterPageWalBindingV1 *out_wal)
 {
-	PGIOAlignedBlock scratch;
 	ClusterPcmOwnResult abort_result;
 	ClusterPcmOwnResult result;
 	ClusterPcmOwnSnapshot live;
-	SMgrRelation reln;
 	LWLock *content_lock;
-	Page local_page;
-	Page selected_page = NULL;
-	Page storage_page;
+	Page local_page = NULL;
 	SCN local_scn;
-	SCN storage_scn;
 	uint32 buf_state;
 	uint32 observed_buf_state = 0;
 	uint8 observed_buffer_type = 0;
 	bool local_covers;
-	bool replace_resident = false;
-	bool storage_covers;
 	ClusterPageWalBindingV1 wal = { 0 };
 	volatile bool content_locked = false;
 	volatile bool private_pinned = false;
@@ -24691,22 +24758,11 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 		return result;
 	}
 	content_lock = BufferDescriptorGetContentLock(buf);
-	storage_page = (Page)scratch.data;
 	local_scn = InvalidScn;
-	storage_scn = InvalidScn;
 
 	PG_TRY();
 	{
-		reln = smgropen(BufTagGetRelFileLocator(&expected_s->tag), InvalidBackendId);
-		smgrread(reln, BufTagGetForkNum(&expected_s->tag), expected_s->tag.blockNum,
-				 scratch.data);
-		if (!PageIsVerifiedForFork(storage_page, BufTagGetForkNum(&expected_s->tag), expected_s->tag.blockNum,
-								PIV_LOG_WARNING | PIV_REPORT_STAT)) {
-			hard_failure_reason = CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY;
-			result = CLUSTER_PCM_OWN_CORRUPT;
-		}
-		if (result == CLUSTER_PCM_OWN_OK
-			&& LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+		if (LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
 			content_locked = true;
 			buf_state = LockBufHdr(buf);
 			observed_buf_state = buf_state;
@@ -24734,36 +24790,21 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 			else {
 				local_page = (Page)BufHdrGetBlock(buf);
 				local_scn = ((PageHeader)local_page)->pd_block_scn;
-				storage_scn = ((PageHeader)storage_page)->pd_block_scn;
 				local_covers
 					= !SCN_VALID(required_page_scn)
 					  || (SCN_VALID(local_scn)
 						  && scn_local(local_scn) >= scn_local(required_page_scn));
-				storage_covers
-					= !SCN_VALID(required_page_scn)
-					  || (SCN_VALID(storage_scn)
-						  && scn_local(storage_scn) >= scn_local(required_page_scn));
-				/* Every S grant is storage-consistent before publication.  Once an
-				 * exact non-source ACK has published a higher floor, neither copy
-				 * covering it is durable lost-write evidence, not retryable lag. */
-				if (!local_covers && !storage_covers) {
+				/* Only the master-selected protected current can satisfy the
+				 * witness floor. Disk freshness cannot establish this grant. */
+				if (!local_covers) {
 					hard_failure_reason = CLUSTER_PCM_S_SOURCE_HARD_NO_COVER;
 					result = CLUSTER_PCM_OWN_CORRUPT;
-				}
-				else if (local_covers
-						 && (!storage_covers || !SCN_VALID(storage_scn)
-							 || (SCN_VALID(local_scn)
-								 && scn_local(local_scn) >= scn_local(storage_scn)))) {
-					selected_page = local_page;
-				} else {
-					selected_page = storage_page;
-					replace_resident = true;
 				}
 			}
 			UnlockBufHdr(buf, buf_state);
 			if (result == CLUSTER_PCM_OWN_OK)
 				result = cluster_bufmgr_pcm_own_copy_source_image_exact(
-					buf, &live, selected_page, replace_resident, out_revoking,
+					buf, &live, local_page, false, out_revoking,
 					block_data, out_page_lsn, out_page_scn);
 			if (result == CLUSTER_PCM_OWN_OK && cluster_shared_config && out_wal != NULL)
 				(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal);
@@ -24793,11 +24834,11 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 		if (abort_result != CLUSTER_PCM_OWN_OK) {
 			cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 				CLUSTER_PCM_S_SOURCE_HARD_ABORT_FAILURE,
-				CLUSTER_PCM_S_SOURCE_HARD_STORAGE_READ_ERROR, buf, &live,
-				required_page_scn, local_scn, storage_scn, observed_buf_state,
+				CLUSTER_PCM_S_SOURCE_HARD_CAPTURE_ERROR, buf, &live,
+				required_page_scn, local_scn, InvalidScn, observed_buf_state,
 				observed_buffer_type, CLUSTER_PCM_OWN_CORRUPT, abort_result);
 			elog(LOG,
-				 "could not abort exact PCM-X S-source reservation after storage read error: "
+				 "could not abort exact PCM-X S-source reservation after source capture error: "
 				 "buffer=%d generation=%llu token=%llu result=%d; evidence retained",
 				 buf->buf_id, (unsigned long long)live.generation,
 				 (unsigned long long)live.reservation_token, (int)abort_result);
@@ -24815,14 +24856,14 @@ cluster_bufmgr_pcm_own_prepare_s_source_image_internal(
 	if (abort_result != CLUSTER_PCM_OWN_OK) {
 		cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 			CLUSTER_PCM_S_SOURCE_HARD_ABORT_FAILURE, hard_failure_reason, buf, &live,
-			required_page_scn, local_scn, storage_scn, observed_buf_state,
+			required_page_scn, local_scn, InvalidScn, observed_buf_state,
 			observed_buffer_type, result, abort_result);
 		return CLUSTER_PCM_OWN_CORRUPT;
 	}
 	if (result == CLUSTER_PCM_OWN_CORRUPT)
 		cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 			hard_failure_reason, CLUSTER_PCM_S_SOURCE_HARD_NONE, buf, &live,
-			required_page_scn, local_scn, storage_scn, observed_buf_state,
+			required_page_scn, local_scn, InvalidScn, observed_buf_state,
 			observed_buffer_type, result, abort_result);
 	memset(out_revoking, 0, sizeof(*out_revoking));
 	memset(block_data, 0, BLCKSZ);
@@ -24976,7 +25017,13 @@ cluster_bufmgr_pcm_own_prepare_x_source_image_internal(BufferDesc *buf,
 					result = cluster_bufmgr_pcm_own_capture_x_source_locked(buf, &prepared, out_revoking,
 						block_data, out_wal, &content_locked, &io_started);
 				}
-			} else result = CLUSTER_PCM_OWN_BUSY;
+			} else {
+				/* This observation changed nothing. Its own unlock is not
+				 * the external writer/ITL event that can resume this service. */
+				result = CLUSTER_PCM_OWN_BUSY;
+				LWLockReleaseWithoutSourceProgress(content_lock);
+				content_locked = false;
+			}
 		} else result = CLUSTER_PCM_OWN_BUSY;
 		if (content_locked) { LWLockRelease(content_lock); content_locked = false; }
 		if (result == CLUSTER_PCM_OWN_OK && out_wal->record_start != InvalidXLogRecPtr

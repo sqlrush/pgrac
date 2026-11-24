@@ -140,6 +140,10 @@ extern PGDLLIMPORT bool PostmasterLWLockWaitForbidden;
 extern bool LWLockConditionalAcquire(LWLock *lock, LWLockMode mode);
 extern bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode);
 extern void LWLockRelease(LWLock *lock);
+#ifdef USE_PGRAC_CLUSTER
+/* For unchanged, read-only source probes; native lock waiters still wake. */
+extern void LWLockReleaseWithoutSourceProgress(LWLock *lock);
+#endif
 extern void LWLockReleaseClearVar(LWLock *lock, uint64 *valptr, uint64 val);
 extern void LWLockReleaseAll(void);
 extern void ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context);

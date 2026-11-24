@@ -18,6 +18,7 @@ static ConditionVariableMinimallyPadded complete_iocvs[1];
 ConditionVariableMinimallyPadded *BufferIOCVArray = complete_iocvs;
 static unsigned complete_commits, complete_io_calls, complete_broadcasts;
 static bool complete_before_io_error, complete_after_io_error, complete_publish_error;
+static void (*complete_io_boundary)(bool completed);
 static void (*complete_on_content)(void), (*complete_on_broadcast)(void);
 static void
 complete_broadcast(ConditionVariable *cv)
@@ -59,6 +60,7 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_bits)
 	UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_VALID, 0);
 	UT_ASSERT(ResourceOwnerHasBufferIO(original_io_owner, 1));
+	if (complete_io_boundary != NULL) complete_io_boundary(false);
 	if (complete_before_io_error) {
 #ifdef NATIVE_RESIDENT_FILL_COMPOSITION
 		/* A single injected interrupt, including during nested recovery. */
@@ -67,6 +69,7 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_bits)
 		pg_re_throw();
 	}
 	complete_actual_terminate(buf, clear_dirty, set_bits);
+	if (complete_io_boundary != NULL) complete_io_boundary(true);
 	if (complete_after_io_error)
 		pg_re_throw();
 }
@@ -100,6 +103,22 @@ complete_content_acquire(LWLock *lock, LWLockMode mode)
 		complete_on_content();
 	return ok;
 }
+#ifndef NATIVE_FIRST_FILL_COMPOSITION
+/* This physical-only component fixes the authenticated GCS domain as a
+ * provider leaf. Ordinary compositions below include the actual GCS body
+ * and vary its session/connection availability and invalidation instead. */
+ResourceXApplyResult
+cluster_gcs_block_acquire_domain_recheck_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	return observation != NULL && admission != NULL
+		&& memcmp(observation, &input_observation, sizeof(*observation)) == 0
+		&& cluster_semantic_activation_recheck(admission)
+		? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE;
+}
+#endif
 #define LockBufHdr stage_header_lock
 #define LWLockAcquire complete_content_acquire
 #define cluster_pcm_own_delivery_read_commit_exact complete_read_commit
@@ -116,6 +135,7 @@ complete_start(EvidenceFixture *f)
 		return false;
 	complete_commits = complete_io_calls = complete_broadcasts = 0;
 	complete_before_io_error = complete_after_io_error = complete_publish_error = false;
+	complete_io_boundary = NULL;
 	complete_on_content = complete_on_broadcast = NULL;
 	return true;
 }

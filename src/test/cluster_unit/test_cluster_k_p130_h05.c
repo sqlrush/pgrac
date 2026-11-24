@@ -45,9 +45,11 @@ h05_census(PiFixture *f, const char *phase)
 static void
 h05_wait(PiFixture *f, const ResourceXDecodedFrame *block)
 {
-	ClusterPcmResourceXMasterState before = *f->source.m.state;
-	ClusterPcmLocalPiSnapshotV1 local, after;
+	ClusterPcmResourceXMasterState before = *f->source.m.state, after;
+	ClusterPcmLocalPiSnapshotV1 local, current;
 	ResourceXApplyResult prepared, forwarded;
+	bool has_control = before.holder_coverage_forward.valid != 0;
+	bool can_retain = before.pi_carrier.transport_refs == 0;
 	int sleeps = fake_cv_sleep_count;
 	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f->local.resource, &local));
 	prepared = cluster_pcm_lock_resource_x_acquire_s_source_prepare_exact(block,
@@ -55,14 +57,23 @@ h05_wait(PiFixture *f, const ResourceXDecodedFrame *block)
 	UT_ASSERT_EQ(prepared, RESOURCE_X_APPLY_LOCAL_WAIT);
 	UT_ASSERT(memcmp(&before, f->source.m.state, sizeof(before)) == 0);
 	forwarded = cluster_pcm_lock_resource_x_acquire_s_source_forward_exact(block, 2, 83, 61);
-	UT_ASSERT_EQ(forwarded, RESOURCE_X_APPLY_LOCAL_WAIT);
-	UT_ASSERT(memcmp(&before, f->source.m.state, sizeof(before)) == 0);
-	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f->local.resource, &after));
-	UT_ASSERT(memcmp(&local, &after, sizeof(local)) == 0);
-	/* These are nonblocking owner steps, not a replacement foreground wait. */
+	UT_ASSERT_EQ(forwarded, !can_retain ? RESOURCE_X_APPLY_LOCAL_WAIT
+		: has_control ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_APPLIED);
+	after = *f->source.m.state;
+	if (can_retain) {
+		UT_ASSERT_EQ(after.holder_coverage_forward.valid, RESOURCE_X_HOLDER_SOURCE_FORWARD);
+		UT_ASSERT_EQ(after.holder_coverage_forward.logical_generation, block->common.assertion_sequence);
+		UT_ASSERT_EQ(after.holder_coverage_forward.authority_generation, block->common.authority_generation);
+		UT_ASSERT_EQ(after.holder_coverage_forward.resource_formation, block->common.resource_formation);
+		/* A retained control record does not replace the old ACK, PI or image. */
+		after.holder_coverage_forward = before.holder_coverage_forward;
+	}
+	UT_ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(f->local.resource, &current));
+	UT_ASSERT(memcmp(&local, &current, sizeof(local)) == 0);
 	UT_ASSERT_EQ(fake_cv_sleep_count, sleeps);
-	printf("# H05 capacity prepare=%d forward=%d unchanged=%d\n", prepared, forwarded,
-		memcmp(&before, f->source.m.state, sizeof(before)) == 0);
+	printf("# H05 capacity prepare=%d forward=%d retained=%d old_unchanged=1\n",
+		prepared, forwarded, can_retain);
 }
 
 static bool

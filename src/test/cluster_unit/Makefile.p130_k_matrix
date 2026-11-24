@@ -413,7 +413,7 @@ test_cluster_k_p130_h13_data: test_cluster_k_p130_h13.c test_cluster_k_p130_h13_
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
-		$(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		-lcrypto $(filter -llz4 -lzstd,$(LIBS)) -lm -o $@

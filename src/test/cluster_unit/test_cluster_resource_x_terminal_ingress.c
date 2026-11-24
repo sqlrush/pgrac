@@ -170,6 +170,20 @@ gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
 	UT_ASSERT(leaves > 0);
 }
 
+/* These routing cases deliver image/grant frames, not a consumed notice.
+ * Actual notice consumption runs in the native read-settlement fixtures. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_acquire_read_consumed_exact(
+	const ResourceXDecodedFrame *notice pg_attribute_unused(),
+	int32 authenticated_master pg_attribute_unused(),
+	uint32 authenticated_ingress pg_attribute_unused(),
+	int32 current_master pg_attribute_unused(), uint32 master_ingress pg_attribute_unused(),
+	uint64 r4_generation pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Never turn an unexpected completion into a grant. */
+	return RESOURCE_X_APPLY_INVALID;
+}
+
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_requester_join_current_exact(const ResourceXDecodedFrame *frame,
 														 int32 source, uint32 source_ingress,

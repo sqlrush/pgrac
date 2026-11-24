@@ -312,6 +312,7 @@ UT_TEST(test_placeholder_tap_115_3node_x_transfer)
 int
 main(void)
 {
+	UT_PLAN(22);
 	UT_RUN(test_invalidate_msg_type_is_17);
 	UT_RUN(test_invalidate_ack_msg_type_is_18);
 	UT_RUN(test_x_granted_from_holder_status_is_9);

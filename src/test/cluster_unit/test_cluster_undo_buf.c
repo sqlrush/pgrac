@@ -925,6 +925,7 @@ UT_TEST(test_undo_buf_remote_evidence_hold_under_peers)
 int
 main(void)
 {
+	UT_PLAN(16);
 	UT_RUN(test_undo_buf_writeback_gated_off);
 	UT_RUN(test_undo_buf_writeback_gate_truth_table);
 	UT_RUN(test_undo_buf_invalidate_segment);

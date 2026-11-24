@@ -63,11 +63,13 @@
 #include "utils/pg_locale.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
+#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h" /* spec-2.24 D7 cleanup_on_backend_exit_callback */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-6.14 D11 eager exit-hook registration */
 #include "cluster/cluster_tx_enqueue.h" /* spec-8.4 D9 exact wait exit cleanup */
@@ -827,6 +829,33 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * Load relcache entries for the shared system catalogs.  This must create
 	 * at least entries for pg_database and catalogs used for authentication.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && CurrentResourceOwner == NULL)
+	{
+		ResourceOwner owner = ResourceOwnerCreate(NULL, "shared catalog initialization");
+		MemoryContext oldcontext = CurrentMemoryContext;
+		volatile bool completed = false;
+
+		/* Control and ROOT hashing precede the first transaction here. */
+		CurrentResourceOwner = owner;
+		PG_TRY();
+		{
+			RelationCacheInitializePhase2();
+			completed = true;
+		}
+		PG_FINALLY();
+		{
+			MemoryContextSwitchTo(oldcontext);
+			CurrentResourceOwner = NULL;
+			ResourceOwnerRelease(owner, RESOURCE_RELEASE_BEFORE_LOCKS, completed, true);
+			ResourceOwnerRelease(owner, RESOURCE_RELEASE_LOCKS, completed, true);
+			ResourceOwnerRelease(owner, RESOURCE_RELEASE_AFTER_LOCKS, completed, true);
+			ResourceOwnerDelete(owner);
+		}
+		PG_END_TRY();
+	}
+	else
+#endif
 	RelationCacheInitializePhase2();
 
 	/*

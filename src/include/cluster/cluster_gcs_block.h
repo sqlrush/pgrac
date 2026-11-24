@@ -109,6 +109,11 @@ extern ResourceXApplyResult cluster_gcs_block_resident_read_begin(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *base, uint64 token, ClusterGcsFirstFill *fill);
 extern ResourceXApplyResult cluster_gcs_block_first_fill_wait(ClusterGcsFirstFill *fill);
 extern void cluster_gcs_block_first_fill_end(ClusterGcsFirstFill *fill);
+/* Same episode's physical owner, outside content/header/entry locks.
+ * Unavailable authentication observations wait locally; no new REQUEST. */
+extern ResourceXApplyResult cluster_gcs_block_acquire_domain_recheck_exact(
+	const ResourceXInstallClaimJoinObservation *observation,
+	const ClusterSemanticAdmissionToken *admission);
 
 /* One bounded, local requester-delivery callback on the existing LMS loop.
  * No wire ownership or foreground success is implied by this result. */
@@ -122,6 +127,10 @@ cluster_gcs_block_resource_x_bootstrap_tick(const ResourceXBootstrapWork *work);
 /* One bounded source-side callback; claims the existing continuous pin. */
 extern ResourceXApplyResult
 cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref);
+struct RfPageOnlinePlanV1;
+extern ResourceXApplyResult cluster_gcs_block_resource_x_source_coverage_capture(
+	const ResourceXSourceDrainWork *work, const ResourceXDecodedFrame *expected,
+	const struct RfPageOnlinePlanV1 *coverage);
 extern ResourceXApplyResult
 cluster_gcs_block_resource_x_source_drain_tick(const ResourceXSourceDrainWork *work);
 
@@ -590,6 +599,10 @@ cluster_gcs_resource_x_remote_s_failure_decide(ResourceXRemoteSStage stage,
  * half-old identity.  Zero is a valid value for INITIAL epoch and for the
  * registered RDMA connection generation; the explicit *_valid bits carry
  * presence. */
+/* Bounded, process-local observation; never changes an acquisition result. */
+extern void cluster_gcs_block_acquire_stale_observe(const char *name, uint64 left,
+	uint64 right, bool failed);
+
 typedef struct ClusterGcsPcmXAuthSample {
 	uint64 session_before;
 	uint64 session_after;

@@ -48,16 +48,22 @@ uint32 LockBufHdr(BufferDesc *buf) { return request_header_lock(buf); }
 static unsigned ordinary_pauses, ordinary_sends, ordinary_leaves;
 static ResourceXApplyResult ordinary_wait(void);
 static unsigned ordinary_panics;
+/* PANIC terminates the native process without ordinary ERROR unwinding. */
+static void (*ordinary_panic_hook)(void);
 static void ordinary_report(int level)
 {
 	if (level < ERROR) return;
-	if (level >= PANIC) ordinary_panics++;
+	if (level >= PANIC) {
+		ordinary_panics++;
+		if (ordinary_panic_hook != NULL) ordinary_panic_hook();
+	}
 	pg_re_throw();
 }
 static unsigned ordinary_peer_samples, ordinary_current_calls;
 static unsigned ordinary_unavailable_after_send, ordinary_unavailable;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 1;
 static unsigned ordinary_pause_limit, ordinary_cancel_at;
+static void (*ordinary_on_pause)(void);
 static bool ordinary_send_error;
 static int ordinary_profile;
 static uint64 ordinary_master_session = 31;
@@ -122,6 +128,7 @@ static void ordinary_deliver(void);
 static void ordinary_pause(void)
 {
 	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	if (ordinary_on_pause != NULL) ordinary_on_pause();
 	if (++ordinary_pauses >= ordinary_pause_limit) pg_re_throw();
 }
 static ClusterLmsEnqueueResult
@@ -139,6 +146,9 @@ ordinary_send(int32 master, const ResourceXDecodedFrame *frame, BufferDesc *buf,
 	if (result == CLUSTER_LMS_ENQUEUE_ADMITTED) fake_cv_prepare_hook = ordinary_deliver;
 	return result;
 }
+#define LockBufHdr stage_header_lock
+#include "test_cluster_native_resident_preserve.inc"
+#undef LockBufHdr
 #define gcs_block_resource_x_gate_session_snapshot_result ordinary_session
 #define gcs_block_resource_x_gate_session_recheck_result ordinary_current
 #define gcs_block_pcm_x_resource_x_peer_ready_exact ordinary_peer
@@ -284,11 +294,12 @@ ordinary_start(ClusterBufmgrFirstFill *read, int profile)
 	ordinary_active = &read->request;
 	ordinary_delivery_transport = NULL;
 	ordinary_profile = profile; ordinary_sends = ordinary_pauses = ordinary_leaves = 0;
-	ordinary_panics = 0;
+	ordinary_panics = 0; ordinary_panic_hook = NULL;
 	ordinary_master_session = 31; ordinary_connection = 61;
 	ordinary_peer_samples = ordinary_current_calls = 0;
 	ordinary_unavailable = ordinary_unavailable_after_send = 0;
 	ordinary_pause_limit = 8; ordinary_cancel_at = 0; ordinary_send_error = false;
+	ordinary_on_pause = NULL;
 	MyBackendType = B_BACKEND;
 	disk_online_join = false; disk_boot_decided = true; disk_extension = false;
 	disk_on_extension = disk_on_enter = disk_on_open = disk_on_read = disk_on_end = NULL;

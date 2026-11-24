@@ -17,7 +17,7 @@ for name, result in [("space_namespace_capture", "static bool"),
                      ("cluster_space_relation_read_maintenance_identity", "bool")]:
     print(function(space, name, result))
 pcm = function((root / "cluster/cluster_pcm_lock.c").read_text(),
-               "cluster_pcm_lock_acquire_buffer", "bool")
+               "pcm_lock_acquire_buffer", "static bool")
 start = pcm.index("\tif (MyBackendId == InvalidBackendId)")
 end = pcm.index("\n\ttag = buf->tag;", start)
 print("static void\nfixture_pcm_backend_gate(void)\n{")

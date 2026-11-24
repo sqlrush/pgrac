@@ -420,6 +420,7 @@ UT_TEST(test_space_refail_converges_from_any_prefix)
 int
 main(void)
 {
+	UT_PLAN(6);
 	UT_RUN(test_space_refail_history_extension_keeps_files);
 	UT_RUN(test_space_refail_later_truncate_proves_shrink);
 	UT_RUN(test_space_refail_pending_shrink_trusts_no_page_past_size);

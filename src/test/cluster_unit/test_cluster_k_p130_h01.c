@@ -184,8 +184,17 @@ h01_master(int fd, int mode)
 	int requester;
 	NM_REQUIRE(nm_receive(fd, RESOURCE_X_MSG_ASSERT_X, &request));
 	requester = request.common.logical_assertion.requester_node;
-	NM_REQUIRE(nm_master_begin(&f, &request));
+	if (mode == 7) {
+		/* The resource gate advances independently of the membership epoch. */
+		acquire_reset_formation(29);
+		NM_REQUIRE(nm_master_admit(&f, &request));
+	} else {
+		NM_REQUIRE(nm_master_begin(&f, &request));
+	}
+	UT_ASSERT_EQ(request.common.resource_formation, mode == 7 ? 29 : 17);
+	UT_ASSERT_EQ(request.body.acquire_intent.cluster_epoch, 17);
 	grant = publish_decode(f.state->grant_intent.payload, false);
+	UT_ASSERT_EQ(grant.common.resource_formation, request.common.resource_formation);
 	UT_ASSERT(memcmp(&grant.body.acquire_decision.episode, &request.body.acquire_intent,
 		sizeof(request.body.acquire_intent)) == 0);
 	UT_ASSERT_EQ(grant.body.acquire_decision.source_kind, RESOURCE_X_ACQUIRE_SOURCE_DISK);
@@ -197,6 +206,7 @@ h01_master(int fd, int mode)
 	if (mode != 1) NM_REQUIRE(nm_master_callback(&f.state->grant_intent.slot, true));
 	NM_REQUIRE(nm_send(fd, RESOURCE_X_MSG_IMAGE_OR_GRANT, &grant));
 	NM_REQUIRE(nm_receive(fd, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &done));
+	UT_ASSERT_EQ(done.common.resource_formation, request.common.resource_formation);
 	UT_ASSERT(memcmp(&done.body.acquire_completion.decision, &grant.body.acquire_decision,
 		sizeof(grant.body.acquire_decision)) == 0);
 	UT_ASSERT_EQ(done.common.outcome, mode == 4 || mode == 5
@@ -212,6 +222,7 @@ h01_master(int fd, int mode)
 	if (mode == 2) NM_REQUIRE(nm_master_done(&done) == RESOURCE_X_APPLY_DUPLICATE);
 	NM_REQUIRE(cluster_resource_x_wire_decode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
 		f.state->grant_intent.payload, RESOURCE_X_COMPLETE_V5_BYTES, &notice, &(ResourceXWireReject){0}));
+	UT_ASSERT_EQ(notice.common.resource_formation, request.common.resource_formation);
 	if (mode == 3) {
 		NM_REQUIRE(nm_master_callback(&f.state->grant_intent.slot, false));
 		UT_ASSERT_EQ(f.state->deferred_settlement.present, 3);
@@ -249,6 +260,13 @@ h01_requester(int fd, int mode)
 	bool bad = mode == 4 || mode == 5;
 	bool completed;
 	ordinary_start(&read, 0); h01_read = &read;
+	if (mode == 7) {
+		/* Bind both roles' original gates before the ordinary caller starts. */
+		reset_fake_pcm_runtime(4); cluster_node_id = 1; ut_master_session = 101;
+		master_durable_admission = true;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(29), RESOURCE_X_APPLY_APPLIED);
+		fake_gcs_master_node = 0;
+	}
 	h01_sends = h01_pre_a_probes = h01_open_probes = h01_read_probes = 0;
 	h01_has_a = false; nm_fd = fd; nm_mode = mode;
 	ordinary_delivery_transport = h01_deliver;
@@ -262,6 +280,10 @@ h01_requester(int fd, int mode)
 	if (bad) disk_store();
 	completed = ordinary_run(&read);
 	UT_ASSERT_EQ(completed, !bad);
+	UT_ASSERT_EQ(read.request.gate.formation, mode == 7 ? 29 : 17);
+	UT_ASSERT_EQ(read.request.episode.cluster_epoch, 17);
+	UT_ASSERT_EQ(h01_request.common.resource_formation, read.request.gate.formation);
+	UT_ASSERT_EQ(nm_grant.common.resource_formation, read.request.gate.formation);
 	UT_ASSERT_EQ(h01_pre_a_probes, 1); UT_ASSERT_EQ(h01_open_probes, 1);
 	UT_ASSERT_EQ(h01_read_probes, 1); UT_ASSERT_EQ(h01_sends, 1);
 	UT_ASSERT_EQ(ordinary_sends, 1); UT_ASSERT_EQ(disk_reads, 1);
@@ -298,13 +320,14 @@ h01_requester(int fd, int mode)
 	UT_ASSERT_EQ(done.body.acquire_completion.page_scn, bad ? 0 : ((PageHeader)disk_bytes.data)->pd_block_scn);
 	printf("# H01 identity case=%d boot=" UINT64_FORMAT " backend=%d/" UINT64_FORMAT
 		" buffer=%d base=" UINT64_FORMAT " token=" UINT64_FORMAT
-		" epoch=" UINT64_FORMAT " r4=" UINT64_FORMAT " binding=" UINT64_FORMAT
+		" formation=" UINT64_FORMAT " epoch=" UINT64_FORMAT " r4=" UINT64_FORMAT " binding=" UINT64_FORMAT
 		" enqueue=" UINT64_FORMAT " Cgen=" UINT64_FORMAT " write_io=" UINT64_FORMAT
 		" page_lsn=" UINT64_FORMAT " page_scn=" UINT64_FORMAT " aborts=%u\n", mode,
 		h01_request.body.acquire_intent.requester_incarnation,
 		h01_request.body.acquire_intent.backend_id, h01_request.body.acquire_intent.backend_generation,
 		h01_request.body.acquire_intent.buffer_id, h01_request.body.acquire_intent.base_generation,
-		h01_request.body.acquire_intent.reservation_token, h01_request.body.acquire_intent.cluster_epoch,
+		h01_request.body.acquire_intent.reservation_token, h01_request.common.resource_formation,
+		h01_request.body.acquire_intent.cluster_epoch,
 		h01_request.body.acquire_intent.r4_generation, nm_grant.body.acquire_decision.resource_binding,
 		nm_grant.body.acquire_decision.enqueue_order, done.body.acquire_completion.native_generation,
 		done.body.acquire_completion.write_io_generation, (uint64)done.body.acquire_completion.page_lsn,
@@ -346,6 +369,7 @@ UT_TEST(test_k_h01_failed_master_notice_retains_original) { nm_run_roles(3, h01_
 UT_TEST(test_k_h01_bad_checksum_never_completes_native) { nm_run_roles(4, h01_master, h01_requester); }
 UT_TEST(test_k_h01_bad_shape_with_valid_checksum_never_completes_native) { nm_run_roles(5, h01_master, h01_requester); }
 UT_TEST(test_k_h01_ACK_before_real_callback_keeps_notice) { nm_run_roles(6, h01_master, h01_requester); }
+UT_TEST(test_k_h01_resource_formation_independent_of_membership_epoch) { nm_run_roles(7, h01_master, h01_requester); }
 
 int main(void)
 {
@@ -355,7 +379,7 @@ int main(void)
 #else
 	printf("# H01 USE_ASSERT_CHECKING=0\n");
 #endif
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_k_h01_disk_A_before_IO_and_terminal_census);
 	UT_RUN(test_k_h01_DONE_before_grant_callback);
 	UT_RUN(test_k_h01_duplicate_frames_do_not_repeat_C);
@@ -363,5 +387,6 @@ int main(void)
 	UT_RUN(test_k_h01_bad_checksum_never_completes_native);
 	UT_RUN(test_k_h01_bad_shape_with_valid_checksum_never_completes_native);
 	UT_RUN(test_k_h01_ACK_before_real_callback_keeps_notice);
+	UT_RUN(test_k_h01_resource_formation_independent_of_membership_epoch);
 	UT_DONE(); return ut_failed_count == 0 ? 0 : 1;
 }
