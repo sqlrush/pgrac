@@ -6,6 +6,7 @@
 #include <setjmp.h>
 #include <unistd.h>
 
+#include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
@@ -34,7 +35,7 @@ UT_DEFINE_GLOBALS();
 /* Only the private fields touched by the extracted waiter are needed here.
  * Wire headers, authority snapshots and BufferDesc use production types. */
 typedef struct ClusterGcsBlockOutstandingSlot {
-	bool in_use, reply_received, reply_sf_dep_valid, stale;
+	bool in_use, reply_received, reply_sf_dep_valid, stale, first_fill_revoked;
 	uint8 reply_sf_flags;
 	uint64 request_id, request_epoch;
 	int32 expected_master_node;
@@ -167,7 +168,8 @@ void cluster_gcs_block_dedup_register_backend_exit_hook(void) {}
 static ClusterGcsBlockBackendBlock *gcs_block_my_block(void) { return &fixture_backend; }
 static ClusterGcsBlockOutstandingSlot *
 gcs_block_reserve_slot(BufferTag tag pg_attribute_unused(), uint8 transition pg_attribute_unused(),
-					   int32 master pg_attribute_unused(), uint64 *request_id)
+					   int32 master pg_attribute_unused(), uint64 *request_id,
+					   bool local_wait pg_attribute_unused())
 {
 	fixture_backend.slot.in_use = true;
 	fixture_backend.slot.request_id = *request_id = 51;
@@ -190,6 +192,13 @@ gcs_block_install_reply_block(BufferDesc *buf pg_attribute_unused(),
 	installs++;
 }
 static void gcs_block_stamp_touched(int32 a pg_attribute_unused(), int32 b pg_attribute_unused()) {}
+void
+cluster_block_io_trace_failed(BufferTag tag pg_attribute_unused(),
+							  const char *bytes pg_attribute_unused(),
+							  const char *source pg_attribute_unused(),
+							  uint32 expected pg_attribute_unused(), uint32 actual pg_attribute_unused())
+{
+}
 bool cluster_pcm_lock_apply_gcs_transition(BufferTag tag pg_attribute_unused(),
 										 PcmLockTransition transition pg_attribute_unused(),
 										 int32 node pg_attribute_unused()) { return true; }

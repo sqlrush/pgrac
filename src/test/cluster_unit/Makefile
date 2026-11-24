@@ -17000,10 +17000,11 @@ test_cluster_content_trace: test_cluster_content_trace.c unit_test.h \
 test_cluster_gcs_read_image_trace.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^typedef struct GcsReadImageTrace/ { emit=1; types++ } \
 	     /^gcs_block_read_image_trace\(/ { print "static void"; emit=1; loggers++ } \
+	     /^gcs_local_master_read_image_and_wait\(/ { print "static bool"; emit=1; bodies++ } \
 	     /^cluster_gcs_local_master_read_image_and_wait\(/ { print "bool"; emit=1; waiters++ } \
 	     emit { print } \
 	     emit && (/^}$$/ || /^} GcsReadImageTrace;$$/) { emit=0 } \
-	     END { if (waiters != 1 || types > 1 || loggers > 1) exit 1 }' $< > $@.tmp
+	     END { if (waiters != 1 || bodies != 1 || types > 1 || loggers > 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_gcs_read_image_trace: test_cluster_gcs_read_image_trace.c unit_test.h test_cluster_gcs_read_image_trace.inc
