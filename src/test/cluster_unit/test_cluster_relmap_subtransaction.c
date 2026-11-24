@@ -159,6 +159,7 @@ check_child(bool catalog, bool shared, bool immediate, bool existing)
 	UT_ASSERT_EQ(error_level, ERROR);
 	for (i = 0; i < lengthof(maps); i++)
 		UT_ASSERT(memcmp(&before[i], maps[i], sizeof(before[i])) == 0);
+#ifdef USE_PGRAC_CLUSTER
 	if (catalog)
 	{
 		UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
@@ -167,6 +168,7 @@ check_child(bool catalog, bool shared, bool immediate, bool existing)
 		UT_ASSERT(strstr(error_hint, "PL/pgSQL EXCEPTION") != NULL);
 	}
 	else
+#endif
 	{
 		UT_ASSERT_EQ(error_code, ERRCODE_INTERNAL_ERROR);
 		UT_ASSERT(strcmp(error_message, "cannot change relation mapping within subtransaction") == 0);
