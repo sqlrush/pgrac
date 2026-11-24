@@ -14,6 +14,7 @@
 #include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_control_debt_transition.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
 #include "cluster/cluster_cf_enqueue.h"
