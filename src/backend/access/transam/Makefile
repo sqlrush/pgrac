@@ -60,6 +60,11 @@ xlog.o xlogrecovery.o: $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.
 clog.o subtrans.o multixact.o commit_ts.o: \
 	$(top_srcdir)/src/include/cluster/cluster_native_startup.h
 
+# Keep every native SLRU owner on the same control/cache layout even when
+# automatic header dependencies are disabled. Author: SqlRush <sqlrush@gmail.com>
+clog.o commit_ts.o multixact.o slru.o subtrans.o: \
+	$(top_srcdir)/src/include/access/slru.h
+
 # Borrowed-FD helpers retain the original complete file/page ABI.
 clog_replay.o clog_storage.o clog_write.o: \
 	$(top_srcdir)/src/include/access/clog_storage.h \

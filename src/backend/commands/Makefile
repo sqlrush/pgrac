@@ -64,3 +64,7 @@ OBJS = \
 	view.o
 
 include $(top_srcdir)/src/backend/common.mk
+
+# SLRU control/cache ABI, including builds without autodepend.
+# Author: SqlRush <sqlrush@gmail.com>
+async.o: $(top_srcdir)/src/include/access/slru.h

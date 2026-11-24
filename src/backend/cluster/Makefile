@@ -530,6 +530,15 @@ cluster_thread_recovery_worker.o cluster_thread_recovery_finalize.o: \
 
 include $(top_srcdir)/src/backend/common.mk
 
+# Match native SLRU control/cache layouts without autodepend.
+# Author: SqlRush <sqlrush@gmail.com>
+cluster_control_bootstrap_read.o cluster_control_catalog_read.o \
+cluster_initdb_catalog.o cluster_recovery_multixact_join.o \
+cluster_recovery_multixact_scan.o cluster_recovery_namespace.o \
+cluster_recovery_root_set.o cluster_recovery_slru_scan.o \
+cluster_recovery_xact_join.o cluster_remote_xact.o cluster_side_online_plan.o: \
+	$(top_srcdir)/src/include/access/slru.h
+
 # PGRAC: physical origin inspection shares native startup byte predicates.
 # Author: SqlRush <sqlrush@gmail.com>
 cluster_control_bootstrap_read.o: $(top_srcdir)/src/include/cluster/cluster_native_startup.h \

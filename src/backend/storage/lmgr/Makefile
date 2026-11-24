@@ -53,3 +53,7 @@ maintainer-clean: clean
 
 # Native opt-in diagnostic publisher layout.
 lwlock.o proc.o: $(top_srcdir)/src/include/cluster/cluster_content_trace.h
+
+# SLRU control/cache ABI, including builds without autodepend.
+# Author: SqlRush <sqlrush@gmail.com>
+predicate.o: $(top_srcdir)/src/include/access/slru.h
