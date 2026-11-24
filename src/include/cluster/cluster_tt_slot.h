@@ -519,6 +519,8 @@ extern uint64 cluster_tt_slot_retention_off_recycle_count(void); /* spec-3.22 */
  * can catch up to it (requester leg (e) converges).
  */
 extern SCN cluster_tt_slot_max_recycle_horizon(void);
+/* Origin verdict only: volatile proof is restricted to this startup cycle. */
+extern SCN cluster_tt_slot_recycle_bound_for_xid(TransactionId xid);
 extern void cluster_tt_slot_note_gated_recycle_horizon(SCN horizon);
 /* Startup-only evidence, independent of the live recycle horizon. The
  * confirmation count comes from the pre-admission prepared-transaction scan. */

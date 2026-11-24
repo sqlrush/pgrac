@@ -120,6 +120,9 @@ extern ClusterUndoVerdictKind cluster_cr_server_freshref_c1b_pair_verdict(
 
 typedef enum C0TestEvent {
 	C0_EV_SCAN = 1,
+	C0_EV_COMMIT,
+	C0_EV_PRE_SCAN_LOCK,
+	C0_EV_PRE_SCAN_UNLOCK,
 	C0_EV_NATIVE_LOCK,
 	C0_EV_COVERED,
 	C0_EV_DISABLED,
@@ -153,6 +156,8 @@ int cluster_node_id = 0;
 bool cluster_undo_retention_horizon_enabled = true;
 bool cluster_crossnode_runtime_visibility = true;
 static bool c0_did_commit;
+static bool c0_commit_after_scan;
+static bool c0_scan_seen;
 static bool c0_commit_after_procarray;
 static bool c0_durable_drift_after_procarray;
 static bool c0_did_abort;
@@ -161,6 +166,7 @@ static bool c0_expect_procarray_under_native_lock;
 static bool c0_accept_resolved_scn;
 static XidStatus c0_raw_status;
 static bool c0_throw_on_clog;
+static bool c0_throw_on_commit;
 static bool c0_disable_before_native_recheck;
 static bool c0_epoch0_origin_provable;
 static int c0_native_lock_depth;
@@ -263,9 +269,50 @@ c0_event_pos_after(C0TestEvent event, int after)
 	return -1;
 }
 
+/* Real atomic startup state and accessors, with only the shmem container
+ * reduced to the fields they actually use. Normal fixtures retain their
+ * original providers; the crash/prepared regression composes real functions. */
+static struct {
+	pg_atomic_uint64 retention_max_recycle_horizon;
+	pg_atomic_uint64 startup_checkpoint_scn;
+	pg_atomic_uint64 startup_checkpoint_next_xid;
+	pg_atomic_uint64 startup_cycle_next_xid;
+	pg_atomic_uint32 startup_checkpoint_state;
+} c0_cycle_state, *ClusterTTSlotShm = &c0_cycle_state;
+static bool c0_use_actual_cycle;
+static FullTransactionId c0_next_full_xid;
+FullTransactionId
+ReadNextFullTransactionId(void)
+{
+	return c0_next_full_xid;
+}
+static void c0_cycle_capture(SCN scn, FullTransactionId next_xid);
+static void c0_cycle_confirm(bool clean, int prepared);
+static SCN c0_cycle_startup_bound(TransactionId xid);
+static SCN c0_cycle_max_horizon(void);
+static SCN c0_cycle_bound_for_xid(TransactionId xid);
+#define cluster_tt_slot_capture_startup_checkpoint c0_cycle_capture
+#define cluster_tt_slot_confirm_clean_start c0_cycle_confirm
+#define cluster_tt_slot_startup_committed_bound c0_cycle_startup_bound
+#define cluster_tt_slot_max_recycle_horizon c0_cycle_max_horizon
+#define cluster_tt_slot_recycle_bound_for_xid c0_cycle_bound_for_xid
+#include "test_cluster_cr_startup_cycle.inc"
+#undef cluster_tt_slot_capture_startup_checkpoint
+#undef cluster_tt_slot_confirm_clean_start
+#undef cluster_tt_slot_startup_committed_bound
+#undef cluster_tt_slot_max_recycle_horizon
+#undef cluster_tt_slot_recycle_bound_for_xid
+
 static void
 c0_reset(void)
 {
+	c0_use_actual_cycle = false;
+	c0_next_full_xid = FullTransactionIdFromU64(FirstNormalTransactionId);
+	pg_atomic_init_u64(&c0_cycle_state.startup_cycle_next_xid, 0);
+	pg_atomic_init_u64(&c0_cycle_state.retention_max_recycle_horizon, 0);
+	pg_atomic_init_u64(&c0_cycle_state.startup_checkpoint_scn, 0);
+	pg_atomic_init_u64(&c0_cycle_state.startup_checkpoint_next_xid, 0);
+	pg_atomic_init_u32(&c0_cycle_state.startup_checkpoint_state, 0);
 	memset(c0_events, 0, sizeof(c0_events));
 	c0_event_count = 0;
 	c0_resolve = CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH;
@@ -283,6 +330,8 @@ c0_reset(void)
 	cluster_node_id = 0;
 	cluster_undo_retention_horizon_enabled = true;
 	c0_did_commit = false;
+	c0_commit_after_scan = false;
+	c0_scan_seen = false;
 	c0_commit_after_procarray = false;
 	c0_durable_drift_after_procarray = false;
 	c0_did_abort = false;
@@ -291,6 +340,7 @@ c0_reset(void)
 	c0_accept_resolved_scn = false;
 	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
 	c0_throw_on_clog = false;
+	c0_throw_on_commit = false;
 	c0_disable_before_native_recheck = false;
 	c0_epoch0_origin_provable = true;
 	c0_native_lock_depth = 0;
@@ -319,11 +369,19 @@ cluster_tt_slot_durable_resolve_by_xid(TransactionId xid pg_attribute_unused(),
 									   uint32 expected_wrap pg_attribute_unused(), SCN *commit_scn,
 									   uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap)
 {
+	bool was_seen = c0_scan_seen;
 	if (c0_expect_serve_authority) {
 		for (unsigned i = 0; i < lengthof(c0_authority_calls); i++)
 			UT_ASSERT_EQ(c0_authority_calls[i], 1);
 	}
 	c0_note(C0_EV_SCAN);
+	c0_scan_seen = true;
+	if (c0_commit_after_scan && was_seen) {
+		/* The same xid is now durably COMMITTED, not absent/recycled. */
+		if (commit_scn != NULL)
+			*commit_scn = (SCN)200;
+		return CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	}
 	if (commit_scn != NULL)
 		*commit_scn = c0_resolved_scn;
 	if (out_seg != NULL)
@@ -340,7 +398,14 @@ bool
 TransactionIdDidCommit(TransactionId xid pg_attribute_unused())
 {
 	c0_did_commit_calls++;
-	return c0_did_commit || (c0_commit_after_procarray && c0_procarray_calls > 0);
+	c0_note(C0_EV_COMMIT);
+	if (c0_throw_on_commit) {
+		c0_slru_lock_depth++;
+		InterruptHoldoffCount = 0; /* ERROR's holdoff reset, like elog.c. */
+		siglongjmp(*PG_exception_stack, 1);
+	}
+	return c0_did_commit || (c0_commit_after_scan && c0_scan_seen)
+		|| (c0_commit_after_procarray && c0_procarray_calls > 0);
 }
 
 bool
@@ -379,7 +444,7 @@ TransactionIdGetStatus(TransactionId xid pg_attribute_unused(), XLogRecPtr *lsn)
 			siglongjmp(*PG_exception_stack, 1);
 		abort();
 	}
-	return c0_raw_status;
+	return c0_commit_after_scan && c0_scan_seen ? TRANSACTION_STATUS_COMMITTED : c0_raw_status;
 }
 
 bool
@@ -612,13 +677,29 @@ cluster_tt_slot_max_recycle_horizon(void)
 {
 	c0_bound_calls++;
 	c0_note(C0_EV_BOUND);
+	if (c0_use_actual_cycle)
+		return c0_cycle_max_horizon();
 	return c0_retention_ok ? c0_horizon_scn : InvalidScn;
+}
+
+SCN cluster_tt_slot_recycle_bound_for_xid(TransactionId xid);
+SCN
+cluster_tt_slot_recycle_bound_for_xid(TransactionId xid)
+{
+	if (c0_use_actual_cycle) {
+		c0_bound_calls++;
+		c0_note(C0_EV_BOUND);
+		return c0_cycle_bound_for_xid(xid);
+	}
+	return cluster_tt_slot_max_recycle_horizon();
 }
 
 SCN cluster_tt_slot_startup_committed_bound(TransactionId xid);
 SCN
 cluster_tt_slot_startup_committed_bound(TransactionId xid)
 {
+	if (c0_use_actual_cycle)
+		return c0_cycle_startup_bound(xid);
 	return xid < 4275633 ? c0_startup_bound : InvalidScn;
 }
 
@@ -647,7 +728,7 @@ bool
 LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
 	UT_ASSERT(lock == XactTruncationLock);
-	c0_note(C0_EV_XACT_LOCK);
+	c0_note(c0_scan_seen || c0_native_lock_depth > 0 ? C0_EV_XACT_LOCK : C0_EV_PRE_SCAN_LOCK);
 	c0_xact_lock_depth++;
 	InterruptHoldoffCount++;
 	return true;
@@ -657,7 +738,7 @@ void
 LWLockRelease(LWLock *lock)
 {
 	UT_ASSERT(lock == XactTruncationLock);
-	c0_note(C0_EV_XACT_UNLOCK);
+	c0_note(c0_scan_seen || c0_native_lock_depth > 0 ? C0_EV_XACT_UNLOCK : C0_EV_PRE_SCAN_UNLOCK);
 	UT_ASSERT(c0_xact_lock_depth > 0);
 	UT_ASSERT(InterruptHoldoffCount > 0);
 	c0_xact_lock_depth--;
@@ -669,7 +750,7 @@ LWLockReleaseAll(void)
 {
 	c0_release_all_calls++;
 	c0_note(C0_EV_RELEASE_ALL);
-	UT_ASSERT_EQ(c0_native_lock_depth, 1);
+	UT_ASSERT_EQ(c0_native_lock_depth, c0_throw_on_commit ? 0 : 1);
 	UT_ASSERT_EQ(c0_xact_lock_depth, 1);
 	UT_ASSERT_EQ(c0_slru_lock_depth, 1);
 	/* ReleaseAll preserves its caller's interrupt holdoff level. */
@@ -1459,7 +1540,7 @@ UT_TEST(test_c0_real_zero_match_abort_live_and_self_disable)
 	kind = cluster_cr_server_test_own_xid_verdict(4195136, 1, 1, true);
 	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 	UT_ASSERT_EQ(c0_retention_calls, 0);
-	UT_ASSERT_EQ(c0_did_commit_calls, 0);
+	UT_ASSERT_EQ(c0_did_commit_calls, 1);
 	UT_ASSERT_EQ(c0_did_abort_calls, 0);
 
 	c0_reset();
@@ -1482,7 +1563,7 @@ UT_TEST(test_c0_real_zero_match_abort_live_and_self_disable)
 	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 	UT_ASSERT_EQ(c0_procarray_calls, 1);
 	UT_ASSERT_EQ(c0_retention_calls, 0);
-	UT_ASSERT_EQ(c0_did_commit_calls, 0);
+	UT_ASSERT_EQ(c0_did_commit_calls, 1);
 	UT_ASSERT_EQ(c0_did_abort_calls, 0);
 
 	c0_reset();
@@ -1800,7 +1881,8 @@ UT_TEST(test_ordinary_diagnostic_keeps_refusals_and_no_extra_reads)
 		UT_ASSERT_EQ(c0_raw_clog_calls, 0);
 		UT_ASSERT_EQ(c0_procarray_calls, 0);
 		UT_ASSERT_EQ(c0_bound_calls, 0);
-		UT_ASSERT_EQ(c0_did_commit_calls, i == 3 ? 1 : 0);
+		/* One original terminal sample now precedes every scan. */
+		UT_ASSERT_EQ(c0_did_commit_calls, 1);
 		UT_ASSERT_EQ(c0_did_abort_calls, i == 2 ? 1 : 0);
 	}
 }
@@ -1822,7 +1904,7 @@ UT_TEST(test_ordinary_diagnostic_keeps_recycled_bound_and_refusal)
 	UT_ASSERT_STR_EQ(cluster_cr_server_test_ordinary_reason(4269296, 769, &kind),
 					 "RETENTION_UNAVAILABLE");
 	UT_ASSERT_EQ(kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ(c0_did_commit_calls, 0);
+	UT_ASSERT_EQ(c0_did_commit_calls, 1);
 	c0_reset();
 	c0_retention_ok = true;
 	UT_ASSERT_STR_EQ(cluster_cr_server_test_ordinary_reason(4269296, 769, &kind),
@@ -2207,9 +2289,12 @@ UT_TEST(test_service_scan_refusals_keep_the_full_request_key)
 		UT_ASSERT(!cluster_cr_server_test_undo_verdict_serve(&slot));
 		c0_check_service_key(&slot, reasons[i], true);
 		c0_check_service_refusal_bytes(&slot, before, true);
-		UT_ASSERT_EQ(c0_event_pos(C0_EV_SCAN), 1);
+		UT_ASSERT_EQ(c0_event_pos(C0_EV_PRE_SCAN_LOCK), 1);
+		UT_ASSERT_EQ(c0_event_pos(C0_EV_COMMIT), 2);
+		UT_ASSERT_EQ(c0_event_pos(C0_EV_PRE_SCAN_UNLOCK), 3);
+		UT_ASSERT_EQ(c0_event_pos(C0_EV_SCAN), 4);
 		UT_ASSERT_EQ(c0_raw_clog_calls + c0_procarray_calls + c0_bound_calls, 0);
-		UT_ASSERT_EQ(c0_did_commit_calls, i == 3 ? 1 : 0);
+		UT_ASSERT_EQ(c0_did_commit_calls, 1);
 		UT_ASSERT_EQ(c0_did_abort_calls, i == 2 ? 1 : 0);
 		UT_ASSERT_EQ(c0_srv_calls[0], i == 2 ? 0 : 1);
 		UT_ASSERT_EQ(c0_srv_calls[1], 0);
@@ -2513,10 +2598,104 @@ UT_TEST(test_envelope_skip_does_not_invent_exception_or_scan_proof)
 	c0_envelope_reset(false);
 }
 
+/* The real verdict resolver sees ACTIVE during its committed-only scan.
+ * Publication of COMMITTED and CLOG follows that scan, at SCN 200 > old H 100.
+ * A zero match sampled before that commit cannot prove a recycled terminal. */
+UT_TEST(test_commit_between_scan_and_clog_cannot_use_old_recycle_bound)
+{
+	c0_reset();
+	c0_retention_ok = true;
+	c0_commit_after_scan = true;
+	UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4195120, 1, 0, false),
+				 CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT(c0_event_pos(C0_EV_PRE_SCAN_LOCK) < c0_event_pos(C0_EV_COMMIT));
+	UT_ASSERT(c0_event_pos(C0_EV_COMMIT) < c0_event_pos(C0_EV_PRE_SCAN_UNLOCK));
+	UT_ASSERT(c0_event_pos(C0_EV_PRE_SCAN_UNLOCK) < c0_event_pos(C0_EV_SCAN));
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	/* A recursive pre-sample cannot override C0's literal SUB_COMMITTED. */
+	c0_reset();
+	c0_retention_ok = true;
+	c0_did_commit = true;
+	c0_raw_status = TRANSACTION_STATUS_SUB_COMMITTED;
+	UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4195120, 1, 1, true),
+				 CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_bound_calls, 0);
+}
+
+UT_TEST(test_new_cycle_recycle_cannot_bound_pre_start_crash_or_prepared_xid)
+{
+	for (int mode = 0; mode < 3; mode++) {
+		c0_reset();
+		c0_use_actual_cycle = true;
+		c0_did_commit = true;
+		c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+		c0_cycle_capture((SCN)100, FullTransactionIdFromU64(4275633));
+		c0_next_full_xid = FullTransactionIdFromU64(4275633);
+		c0_cycle_confirm(mode != 0, mode == 1 ? 1 : 0);
+		/* A new transaction recycled at H=120. The old xid may have
+		 * committed at 200 during crash recovery or after PREPARE. */
+		pg_atomic_write_u64(&c0_cycle_state.retention_max_recycle_horizon, (SCN)120);
+		if (mode < 2) {
+			UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(4195120), InvalidScn);
+			UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4195120, 1, 0, false),
+				CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		} else {
+			/* Clean startup without prepared retains its independent bound. */
+			UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4195120, 1, 0, false),
+				CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+		}
+		UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4275633, 1, 0, false),
+			CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+		/* The retained-page pair consumes the same cycle-scoped bound. */
+		c0_event_count = 0;
+		UT_ASSERT_EQ(cluster_cr_server_test_own_xid_pair_verdict(4195120, 1, 1, (SCN)90).kind,
+			mode < 2 ? CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED
+					 : CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	}
+}
+
+UT_TEST(test_pre_scan_clog_error_releases_slru_and_truncation_guard)
+{
+	volatile bool caught = false;
+	c0_reset();
+	c0_throw_on_commit = true;
+	PG_TRY();
+	{
+		(void)cluster_cr_server_test_own_xid_verdict(4195120, 1, 0, false);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(c0_release_all_calls, 1);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	UT_ASSERT_EQ(c0_slru_lock_depth, 0);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+
+	/* An unavailable CLOG sample must not fall through into an exact
+	 * binding's recursive DidAbort/terminal recheck on a truncated xid. */
+	c0_reset();
+	c0_variable_cache.oldestClogXid = 4195121;
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_resolved_scn = (SCN)200;
+	c0_matched_segment = 1;
+	UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4195120, 1, 1, true),
+		CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_did_commit_calls, 0);
+	UT_ASSERT_EQ(c0_did_abort_calls, 0);
+	UT_ASSERT(!c0_scan_seen);
+}
+
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(54);
+	UT_RUN(test_pre_scan_clog_error_releases_slru_and_truncation_guard);
+	UT_RUN(test_new_cycle_recycle_cannot_bound_pre_start_crash_or_prepared_xid);
+	UT_RUN(test_commit_between_scan_and_clog_cannot_use_old_recycle_bound);
 	UT_RUN(test_zero_native_history_preserves_ordinary_committed_bound);
 	UT_RUN(test_normal_ordinary_remote_uses_the_same_terminal_proof);
 	UT_RUN(test_normal_ordinary_permission_does_not_widen_other_roles);

@@ -2283,7 +2283,7 @@ typedef enum LmsOwnXidReason {
  * proves the terminal outcome and retains exact/bound consumer checks.
  * Never substitute the current clock or current reader horizon here. */
 static bool
-lms_own_xid_recycle_bound(SCN *out_horizon)
+lms_own_xid_recycle_bound(TransactionId xid, SCN *out_horizon)
 {
 	SCN horizon;
 
@@ -2291,7 +2291,7 @@ lms_own_xid_recycle_bound(SCN *out_horizon)
 	if (cluster_node_id < 0 || !cluster_undo_retention_horizon_enabled
 		|| cluster_tt_slot_retention_off_recycle_count() != 0)
 		return false;
-	horizon = cluster_tt_slot_max_recycle_horizon();
+	horizon = cluster_tt_slot_recycle_bound_for_xid(xid);
 	if (!SCN_VALID(horizon))
 		return false;
 	*out_horizon = horizon;
@@ -2448,7 +2448,7 @@ lms_resolve_own_xid_freshref_c1b_pair(TransactionId xid, uint32 expected_segment
 
 				if (clog_sampled && resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
 					&& raw_clog_status == TRANSACTION_STATUS_COMMITTED) {
-					retention_ok = lms_own_xid_recycle_bound(&horizon_scn);
+					retention_ok = lms_own_xid_recycle_bound(xid, &horizon_scn);
 					/* This path already holds the no-reuse reader fence and
 					 * literal own COMMITTED proof. A clean startup's durable
 					 * bound may cover the pre-start xid when volatile H cannot. */
@@ -2666,6 +2666,37 @@ lms_own_xid_startup_bound(TransactionId xid, SCN stamped_scn, SCN *out_bound)
 	return result;
 }
 
+/* This sample precedes the TT scan, including its early refusal paths.
+ * Keep truncated CLOG unread and release SLRU locks left by a read ERROR
+ * before the long-lived LMS turns the exception into a denied reply. */
+static bool
+lms_own_xid_commit_before_scan(TransactionId xid, bool *sampled)
+{
+	volatile bool committed = false;
+
+	*sampled = false;
+	if (!TransactionIdIsNormal(xid))
+		return false;
+	PG_TRY(commit_before_scan);
+	{
+		LWLockAcquire(XactTruncationLock, LW_SHARED);
+		if (!TransactionIdPrecedes(xid, ShmemVariableCache->oldestClogXid)) {
+			*sampled = true;
+			committed = TransactionIdDidCommit(xid);
+		}
+		LWLockRelease(XactTruncationLock);
+	}
+	PG_CATCH(commit_before_scan);
+	{
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY(commit_before_scan);
+	return committed;
+}
+
 static LmsOwnXidReason
 lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_id,
 									 uint32 expected_tt_slot_id, bool allow_live,
@@ -2693,6 +2724,16 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 	*out_horizon_scn = InvalidScn;
 	*out_wrap = 0;
 
+	/* TT COMMITTED is published before CLOG COMMITTED. Sample the terminal
+	 * first: a later complete zero match can then mean a lost committed
+	 * slot, rather than ACTIVE skipped just before its commit. Never upgrade
+	 * this sample after the scan, or borrow an older recycle horizon for it. */
+	sampled_commit = lms_own_xid_commit_before_scan(xid, &diagnostic->commit_sampled);
+	diagnostic->did_commit = sampled_commit;
+	if (!diagnostic->commit_sampled) {
+		diagnostic->predicate = "CLOG_TRUNCATED";
+		return LMS_OWN_XID_REFUSE_OTHER;
+	}
 	resolve = cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, &scn,
 													 &matched_segment, &matched_slot, &wrap);
 	diagnostic->resolve = resolve;
@@ -2718,7 +2759,7 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 	}
 	switch (resolve) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN: {
-		bool did_commit = TransactionIdDidCommit(xid);
+		bool did_commit = sampled_commit;
 		bool did_abort = false;
 		bool xid_is_mine = false;
 		bool xid_is_in_progress = false;
@@ -2841,7 +2882,7 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 		 * exactly this bound -- no serve forks on the wrap-suspect leg.
 		 */
 		diagnostic->predicate = "RETENTION_UNAVAILABLE";
-		if (!lms_own_xid_recycle_bound(&horizon))
+		if (!lms_own_xid_recycle_bound(xid, &horizon))
 			return LMS_OWN_XID_REFUSE_OTHER;
 		if (scn_time_cmp(scn, horizon) > 0)
 			horizon = scn;
@@ -2965,11 +3006,10 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 				return LMS_OWN_XID_REFUSE_ZERO_MATCH;
 		}
 		diagnostic->predicate = "RETENTION_UNAVAILABLE";
-		if (!lms_own_xid_recycle_bound(&horizon))
+		if (!lms_own_xid_recycle_bound(xid, &horizon))
 			return LMS_OWN_XID_REFUSE_OTHER;
 		diagnostic->horizon_scn = horizon;
 		diagnostic->commit_sampled = true;
-		sampled_commit = TransactionIdDidCommit(xid);
 		diagnostic->did_commit = sampled_commit;
 		if (sampled_commit) {
 			diagnostic->predicate = "COMMITTED_BOUND";

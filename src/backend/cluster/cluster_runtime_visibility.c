@@ -4411,9 +4411,17 @@ rtvis_resolve_own_xid_freshref_c1b_pair(TransactionId raw_xid, uint32 undo_segme
 
 		if (cluster_epoch_get_current() != epoch)
 			return result;
-		if (ordinary.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND
-			|| (ordinary.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
-				&& SCN_VALID(ordinary.commit_scn) && ordinary.commit_scn == retained_commit_scn))
+		if (ordinary.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND) {
+			/* A retained exact page stamp cannot exceed the origin's upper
+			 * bound for the same transaction. Do not hide that contradiction
+			 * by returning a snapshot-relative bound or trying another proof. */
+			if (SCN_VALID(retained_commit_scn) && SCN_VALID(ordinary.commit_scn)
+				&& scn_time_cmp(retained_commit_scn, ordinary.commit_scn) <= 0)
+				return ordinary;
+			return result;
+		}
+		if (ordinary.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+			&& SCN_VALID(ordinary.commit_scn) && ordinary.commit_scn == retained_commit_scn)
 			return ordinary;
 	}
 

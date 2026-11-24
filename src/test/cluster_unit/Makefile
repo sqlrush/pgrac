@@ -2064,6 +2064,7 @@ CLUSTER_CR_SERVER_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_cr_serv
 CLUSTER_CR_SERVER_C0_TEST_O = test_cluster_cr_server_c0_product.o
 $(CLUSTER_CR_SERVER_C0_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_cr_server.c \
 		$(top_srcdir)/src/include/cluster/cluster_cr_server.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
 		$(top_srcdir)/src/include/cluster/cluster_multixact_current.h \
 		$(top_srcdir)/src/include/cluster/cluster_multixact_current_wire.h \
 		$(top_srcdir)/src/include/cluster/cluster_ctrc_origin_fullxid.h
@@ -2079,7 +2080,21 @@ test_cluster_cr_server_envelope.inc: $(top_srcdir)/src/backend/cluster/cluster_c
 	     { previous=$$0 } END { if (count != 5 || types != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_cr_server_policy: test_cluster_cr_server_policy.c test_cluster_cr_server_envelope.inc unit_test.h $(CLUSTER_VERSION_O) \
+# Compose the real startup-cycle state with the real origin verdict leaf.
+# Extract all five functions, including the xid-scoped accessor; no test
+# implementation substitutes these state transitions.
+test_cluster_cr_startup_cycle.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_slot.c Makefile
+	awk '/^(cluster_tt_slot_capture_startup_checkpoint|cluster_tt_slot_confirm_clean_start|cluster_tt_slot_startup_committed_bound|cluster_tt_slot_max_recycle_horizon|cluster_tt_slot_recycle_bound_for_xid)\(/ \
+	     { print previous; emit=1; found++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (found != 5 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+clean distclean maintainer-clean: clean-cr-startup-cycle
+.PHONY: clean-cr-startup-cycle
+clean-cr-startup-cycle:
+	rm -f test_cluster_cr_startup_cycle.inc test_cluster_cr_startup_cycle.inc.tmp
+
+test_cluster_cr_server_policy: test_cluster_cr_server_policy.c test_cluster_cr_server_envelope.inc test_cluster_cr_startup_cycle.inc unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_CR_SERVER_C0_TEST_O) \
 		$(top_builddir)/src/backend/cluster/cluster_undo_retention.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -12451,6 +12466,7 @@ test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 # the production objects are compile prerequisites only.  Linking those objects
 # as well would create duplicate definitions instead of adding coverage.
 test_cluster_undo_block0_current: test_cluster_undo_block0_current.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
 		$(CLUSTER_UNDO_BLOCK0_CURRENT_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) $(CLUSTER_GES_REPLY_WAIT_O) $(CLUSTER_GES_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

@@ -157,6 +157,9 @@ typedef struct ClusterTTSlotShmem {
 	/* A validated own shutdown checkpoint, never a new GC permission. */
 	pg_atomic_uint64 startup_checkpoint_scn;
 	pg_atomic_uint64 startup_checkpoint_next_xid;
+	/* Recovery-end nextXid, distinct from the older checkpoint cutoff.
+	 * Kept even when clean checkpoint authority is refused. */
+	pg_atomic_uint64 startup_cycle_next_xid;
 	pg_atomic_uint32 startup_checkpoint_state; /* 0 absent, 1 captured, 2 clean, 3 refused */
 
 	/* spec-3.13 D5: entries refused for recycle because wrap reached
@@ -459,6 +462,18 @@ cluster_tt_slot_confirm_clean_start(bool clean, int startup_prepared_count)
 	if (ClusterTTSlotShm == NULL)
 		return;
 	state = pg_atomic_read_u32(&ClusterTTSlotShm->startup_checkpoint_state);
+	{
+		uint64 absent = 0;
+		FullTransactionId next_xid = ReadNextFullTransactionId();
+		uint64 cutoff = FullTransactionIdIsValid(next_xid)
+			? U64FromFullTransactionId(next_xid) : UINT64_MAX;
+
+		/* Startup calls this after recovery/prepared prescan and before
+		 * backend admission. Never replace this cycle boundary on later
+		 * calls, even if the prepared list subsequently becomes empty. */
+		(void)pg_atomic_compare_exchange_u64(&ClusterTTSlotShm->startup_cycle_next_xid,
+										   &absent, cutoff);
+	}
 	/* Prepared transactions survive clean shutdown and may commit later.
 	 * Refuse the whole startup bound before admission if any were recovered;
 	 * a later empty runtime list must never undo this decision. */
@@ -1644,6 +1659,7 @@ cluster_tt_slot_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTSlotShm->retention_max_recycle_horizon, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->startup_checkpoint_scn, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->startup_checkpoint_next_xid, 0);
+		pg_atomic_init_u64(&ClusterTTSlotShm->startup_cycle_next_xid, 0);
 		pg_atomic_init_u32(&ClusterTTSlotShm->startup_checkpoint_state, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->tt_slot_wrap_retired_count, 0);
 		SpinLockInit(&ClusterTTSlotShm->protected_lock);
@@ -1693,6 +1709,23 @@ cluster_tt_slot_max_recycle_horizon(void)
 	if (ClusterTTSlotShm == NULL)
 		return InvalidScn;
 	return (SCN)pg_atomic_read_u64(&ClusterTTSlotShm->retention_max_recycle_horizon);
+}
+
+/* A volatile recycle horizon proves only this startup cycle's lost slots.
+ * Older xids need the independent clean-checkpoint proof; crash/prepared
+ * startup must not borrow a bound from a later transaction's recycle. */
+SCN
+cluster_tt_slot_recycle_bound_for_xid(TransactionId xid)
+{
+	uint64 cutoff;
+
+	if (ClusterTTSlotShm == NULL || !TransactionIdIsNormal(xid))
+		return InvalidScn;
+	cutoff = pg_atomic_read_u64(&ClusterTTSlotShm->startup_cycle_next_xid);
+	if (cutoff == 0 || cutoff > UINT32_MAX || !TransactionIdIsNormal((TransactionId)cutoff)
+		|| xid < cutoff)
+		return InvalidScn;
+	return cluster_tt_slot_max_recycle_horizon();
 }
 
 /*
