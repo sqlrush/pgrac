@@ -13447,10 +13447,13 @@ TESTS += test_cluster_mx_history_backend
 all: test_cluster_mx_history_backend
 TESTS += test_cluster_mx_history_gcs
 all: test_cluster_mx_history_gcs
+TESTS += test_cluster_mx_origin_envelope
+all: test_cluster_mx_origin_envelope
+test_cluster_mx_origin_envelope: $(CLUSTER_UNIT_PORT_LIBS)
 test_cluster_r4_route_policy: $(CLUSTER_MX_HISTORY_WIRE_O)
 test_cluster_gcs_block_shard: $(CLUSTER_MX_HISTORY_WIRE_O)
 
-test_cluster_mx_history_backend test_cluster_mx_history_gcs: %: %.c \
+test_cluster_mx_history_backend test_cluster_mx_history_gcs test_cluster_mx_origin_envelope: %: %.c \
         test_cluster_mx_history_backend.c test_cluster_mx_history_wait_backend.inc \
         test_cluster_r4_route_policy.c test_cluster_mx_exact_cold_route.inc unit_test.h \
         $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h \
@@ -13662,7 +13665,8 @@ $(top_builddir)/src/backend/storage/lmgr/lock.o:
 
 # V6 tests execute the real codecs alongside the legacy controlled validators.
 test_cluster_r4_route_policy test_cluster_mx_history_backend \
-        test_cluster_mx_history_gcs test_cluster_mx_history_graph test_cluster_mx_history_members: \
+        test_cluster_mx_history_gcs test_cluster_mx_origin_envelope \
+        test_cluster_mx_history_graph test_cluster_mx_history_members: \
         $(top_srcdir)/src/backend/cluster/cluster_multixact_current_wire.c \
         $(top_srcdir)/src/include/cluster/cluster_multixact_operation_wire.h
 

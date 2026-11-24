@@ -4532,7 +4532,7 @@ UT_TEST(test_current_mx_v6_origin_positive_conflict_and_release)
 			mx_origin_release_failed = true;
 		cluster_gcs_block_test_r4_tx_origin_drain();
 		page = (void *)route_seam.raw_send_page;
-		UT_ASSERT_EQ(page->header.version, 6);
+		UT_ASSERT_EQ(page->header.version, 7);
 		UT_ASSERT_EQ(page->header.result, fault == 0 ? CMX_RESOLVE_OK : CMX_RESOLVE_UNKNOWN);
 		UT_ASSERT_EQ(page->header.entry_count, fault == 0 ? 1 : 0);
 		UT_ASSERT_EQ(mx_origin_guard_held, 0);
@@ -4891,7 +4891,7 @@ UT_TEST(test_current_mx_v6_origin_and_negative_reply_are_paired)
 	cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
 	UT_ASSERT_EQ(route_seam.raw_send_calls, 1);
-	UT_ASSERT_EQ(((ClusterCurrentMxProofReplyHeader *)route_seam.raw_send_page)->version, 6);
+	UT_ASSERT_EQ(((ClusterCurrentMxProofReplyHeader *)route_seam.raw_send_page)->version, 7);
 	UT_ASSERT_EQ(((ClusterCurrentMxProofReplyHeader *)route_seam.raw_send_page)->result,
 				 CMX_RESOLVE_UNKNOWN);
 	UT_ASSERT_EQ(route_seam.current_mx_proof_serve_calls, 0);
