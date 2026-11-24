@@ -3968,6 +3968,24 @@ test_cluster_page_data_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c 
 	awk '/^scn_(time|total)_cmp\(/ { print "int"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
+# The extracted FlushBuffer body reaches the real injection registry and block
+# I/O trace.  Section them so only the reached functions join each fixture.
+PAGE_DATA_FLUSH_DIAG_OBJS = test_cluster_page_data_inject_product.o \
+		test_cluster_page_data_block_io_trace_product.o
+
+test_cluster_page_data_inject_product.o: $(top_srcdir)/src/backend/cluster/cluster_inject.c \
+		$(top_srcdir)/src/include/cluster/cluster_inject.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_page_data_block_io_trace_product.o: $(top_srcdir)/src/backend/cluster/cluster_block_io_trace.c \
+		$(top_srcdir)/src/include/cluster/cluster_block_io_trace.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+clean distclean maintainer-clean: clean-page-data-flush-diag
+.PHONY: clean-page-data-flush-diag
+clean-page-data-flush-diag:
+	rm -f $(PAGE_DATA_FLUSH_DIAG_OBJS)
+
 test_cluster_page_data: test_cluster_page_data.c
 test_cluster_abort_writer: test_cluster_abort_writer.c test_cluster_page_data.c test_cluster_abort_writer_flush.inc
 
@@ -4003,13 +4021,14 @@ test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error test_cl
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_flush.inc \
 		test_cluster_space_recovery_flush.inc test_cluster_page_data_stable.o test_cluster_page_wal_product.o \
+		$(PAGE_DATA_FLUSH_DIAG_OBJS) \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
-		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) \
+		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) $(PAGE_DATA_FLUSH_DIAG_OBJS) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \

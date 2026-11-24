@@ -3,6 +3,7 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 #include <unistd.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 
 #include "access/xlog.h"
@@ -12,8 +13,10 @@
 #include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_block_apply.h"
+#include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_page_data.h"
 #include "cluster/cluster_pi_write.h"
@@ -42,6 +45,7 @@
 #include "storage/smgr.h"
 #include "storage/shmem.h"
 #include "utils/resowner.h"
+#include "utils/timestamp.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -491,8 +495,45 @@ static bool cluster_pcm_x_finish_retain_flush_error_context_pushed;
 static ErrorContextCallback *cluster_pcm_x_finish_retain_flush_error_context_previous;
 #ifdef ENABLE_INJECTION
 static bool cluster_pcm_x_finish_retain_flush_fault_active;
-#define CLUSTER_INJECTION_POINT(name) ((void)0)
-#define cluster_injection_should_skip(name) false
+#endif
+
+/* The extracted FlushBuffer body calls the real injection registry and the
+ * real block I/O trace, both linked as product objects.  Only their process
+ * environment is supplied here: the trace GUC keeps its default, no interrupt
+ * is ever pending, and an enabled trace prints like the backend does. */
+bool cluster_trace_block_io = false;
+int MyProcPid;
+volatile sig_atomic_t InterruptPending = false;
+
+void
+ProcessInterrupts(void)
+{
+	abort();
+}
+
+void
+write_stderr(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fflush(stderr);
+}
+
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+/* The writeback fixture owns a controllable clock; the others read wall time. */
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	struct timeval tp;
+	TimestampTz result;
+
+	gettimeofday(&tp, NULL);
+	result = (TimestampTz)tp.tv_sec - ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
+	return result * USECS_PER_SEC + tp.tv_usec;
+}
 #endif
 
 /* Original native token/boot are the external boundary for this buffer
