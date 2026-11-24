@@ -75,22 +75,23 @@ like($original_metadata, qr/^SEQ:41:1:1$/m, 'setup sequence has its original par
 like($original_metadata, qr/^SEQVAL:41:uncalled$/m, 'setup sequence is still uncalled');
 
 my @cases = (
-	[ 'create', 'CREATE TABLE p013_boundary_new(v int)' ],
-	[ 'serial', 'CREATE TABLE p013_boundary_serial(id serial)' ],
-	[ 'ctas', 'CREATE TABLE p013_boundary_ctas AS SELECT * FROM p013_boundary_target' ],
-	[ 'index', 'CREATE INDEX p013_boundary_new_idx ON p013_boundary_target(v)' ],
-	[ 'restart', 'ALTER SEQUENCE p013_boundary_sequence RESTART WITH 99' ],
-	[ 'sequence-alter', 'ALTER SEQUENCE p013_boundary_sequence INCREMENT BY 2' ],
-	[ 'truncate', 'TRUNCATE p013_boundary_target' ],
-	[ 'drop', 'DROP TABLE p013_boundary_target' ],
-	[ 'reindex', 'REINDEX TABLE p013_boundary_target' ],
-	[ 'rewrite', 'ALTER TABLE p013_boundary_target ALTER COLUMN v TYPE varchar(80)' ],
-	[ 'cluster', 'CLUSTER p013_boundary_target USING p013_boundary_target_pkey' ]
+	[ 'create', 'CREATE TABLE p013_boundary_new(v int)', 'storage' ],
+	[ 'serial', 'CREATE TABLE p013_boundary_serial(id serial)', 'storage' ],
+	[ 'ctas', 'CREATE TABLE p013_boundary_ctas AS SELECT * FROM p013_boundary_target', 'storage' ],
+	[ 'index', 'CREATE INDEX p013_boundary_new_idx ON p013_boundary_target(v)', 'storage' ],
+	[ 'restart', 'ALTER SEQUENCE p013_boundary_sequence RESTART WITH 99', 'storage' ],
+	[ 'sequence-alter', 'ALTER SEQUENCE p013_boundary_sequence INCREMENT BY 2', 'storage' ],
+	[ 'truncate', 'TRUNCATE p013_boundary_target', 'standalone' ],
+	[ 'drop', 'DROP TABLE p013_boundary_target', 'standalone' ],
+	[ 'reindex', 'REINDEX TABLE p013_boundary_target', 'storage' ],
+	[ 'rewrite', 'ALTER TABLE p013_boundary_target ALTER COLUMN v TYPE varchar(80)', 'storage' ],
+	[ 'cluster', 'CLUSTER p013_boundary_target USING p013_boundary_target_pkey', 'shared-scope' ]
 );
 my @kept;
 for my $i (0 .. $#cases)
 {
-	my ($label, $ddl) = @{$cases[$i]};
+	my ($label, $ddl, $producer) = @{$cases[$i]};
+	my $state = $producer eq 'standalone' ? '25001' : '0A000';
 	my ($parent_id, $after_id, $child_id) = (100 + 2*$i, 101 + 2*$i, 10000 + $i);
 	my ($out, $err) = ('','');
 	my $rc = $nodes[$i % 4]->psql('postgres', qq{
@@ -130,12 +131,31 @@ for my $i (0 .. $#cases)
 	diag("$label native stdout=$out stderr=$err");
 	my @errors = $err =~ /^.*ERROR:.*$/mg;
 	is(scalar(@errors), 1, "$label has exactly one intended error");
-	like($err, qr/ERROR:\s+0A000:.*shared relation storage .* does not support subtransactions/,
-		"$label retains the original storage refusal");
-	like($err, qr/HINT:.*top-level transaction.*PL\/pgSQL EXCEPTION/, "$label retains the actionable hint");
-	like($err, qr/RelationCheckStorageTransaction/, "$label reaches the storage producer guard");
+	if ($producer eq 'standalone')
+	{
+		like($err, qr/ERROR:\s+25001:.*shared relation (?:DROP|TRUNCATE) requires a standalone top-level statement/,
+			"$label retains the standalone statement refusal");
+		like($err, qr/HINT:.*Execute shared DROP or TRUNCATE outside a transaction block/,
+			"$label retains the standalone statement hint");
+		like($err, qr/RelationCheckStorageDDLTransaction/, "$label reaches the DDL transaction guard");
+	}
+	elsif ($producer eq 'shared-scope')
+	{
+		like($err, qr/ERROR:\s+0A000:.*CLUSTER is not supported in shared mode/,
+			"$label retains the shared scope refusal");
+		like($err, qr/DETAIL:.*PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED/,
+			"$label retains the unsupported operation detail");
+		like($err, qr/CheckClusterSharedUtilitySupport/, "$label reaches the shared utility guard");
+	}
+	else
+	{
+		like($err, qr/ERROR:\s+0A000:.*shared relation storage .* does not support subtransactions/,
+			"$label retains the original storage refusal");
+		like($err, qr/HINT:.*top-level transaction.*PL\/pgSQL EXCEPTION/, "$label retains the actionable hint");
+		like($err, qr/RelationCheckStorageTransaction/, "$label reaches the storage producer guard");
+	}
 	like($out, qr/^CHILD_DML_STATE=00000$/m, "$label really executed child DML first");
-	like($out, qr/^DDL_STATE=0A000$/m, "$label reports the exact DDL SQLSTATE");
+	like($out, qr/^DDL_STATE=\Q$state\E$/m, "$label reports the exact DDL SQLSTATE");
 	like($out, qr/^CLEAN_ONE=00000$/m, "$label first rollback cleanup succeeds");
 	like($out, qr/^CLEAN_TWO=00000$/m, "$label repeated cleanup succeeds");
 	like($out, qr/^PORTALS=parent_cursor$/m, "$label drops only the child cursor");
