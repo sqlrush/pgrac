@@ -15740,14 +15740,15 @@ gcs_block_resource_x_acquire_context_result(
 		|| intent->requester_incarnation == 0 || intent->requester_incarnation == UINT64_MAX)
 		return RESOURCE_X_APPLY_INVALID;
 	requester = request->logical_assertion.requester_node;
+	/* Semantic formation is the membership epoch. Resource-X formation is
+	 * independently advanced by cutover/remaster and must match its gate
+	 * below; equal numeric values are not an authority relationship. */
 	current_epoch = cluster_epoch_get_current();
 	cluster_gcs_block_acquire_stale_observe("intent.epoch", intent->cluster_epoch, current_epoch, intent->cluster_epoch != current_epoch);
 	cluster_gcs_block_acquire_stale_observe("admission.formation", intent->cluster_epoch, admission->formation_epoch, intent->cluster_epoch != admission->formation_epoch);
-	cluster_gcs_block_acquire_stale_observe("request.formation", request->resource_formation, admission->formation_epoch, request->resource_formation != admission->formation_epoch);
 	cluster_gcs_block_acquire_stale_observe("intent.r4", intent->r4_generation, admission->record_generation, intent->r4_generation != admission->record_generation);
 	if (intent->cluster_epoch != current_epoch
 		|| intent->cluster_epoch != admission->formation_epoch
-		|| request->resource_formation != admission->formation_epoch
 		|| intent->r4_generation != admission->record_generation)
 		return RESOURCE_X_APPLY_STALE;
 	result = gcs_block_resource_x_target_peer_result_exact(admission, requester,

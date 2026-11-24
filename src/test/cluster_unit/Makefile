@@ -10227,7 +10227,7 @@ test_cluster_resource_x_decision_publish: test_cluster_resource_x_acquire_ingres
 test_cluster_resource_x_acquire_fixture.inc: test_cluster_resource_x_acquire_ingress.c Makefile
 	awk '/^int$$/ { end++; exit } /^UT_TEST\(/ { skip=1; tests++; next } \
 	     skip && /^}/ { skip=0; next } !skip { print } \
-	     END { if (end != 1 || tests != 89 || skip) exit 1 }' $< > $@.tmp
+	     END { if (end != 1 || tests != 92 || skip) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 clean distclean maintainer-clean: clean-decision-publish
 .PHONY: clean-decision-publish
@@ -12269,4 +12269,4 @@ clean-native-stop-census:
 
 TESTS += test_cluster_resource_x_acquire_stale
 all: test_cluster_resource_x_acquire_stale
-test_cluster_resource_x_acquire_stale: test_cluster_resource_x_acquire_ingress.c test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_candidate.inc cluster_unit_port_stubs.o
+test_cluster_resource_x_acquire_stale: test_cluster_resource_x_acquire_stale.c test_cluster_resource_x_acquire_ingress.c test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_candidate.inc cluster_unit_port_stubs.o

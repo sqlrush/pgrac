@@ -21,7 +21,7 @@ int pcm_acquire_fixture_main(void);
 #include "test_cluster_resource_x_acquire_candidate.inc"
 
 static void
-acquire_reset(void)
+acquire_reset_formation(uint64 formation)
 {
 	reset_fake_pcm_runtime(4);
 	cluster_node_id = 0;
@@ -35,8 +35,14 @@ acquire_reset(void)
 	bootstrap_ingress_generation = 61;
 	bootstrap_ack_count = 0;
 	auth_peer_boot = 101;
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(formation),
 				 RESOURCE_X_APPLY_APPLIED);
+}
+
+static void
+acquire_reset(void)
+{
+	acquire_reset_formation(17);
 }
 
 static ResourceXDecodedFrame
@@ -133,6 +139,57 @@ UT_TEST(test_acquire_all_ordinary_intents_queue_without_authority_or_ack)
 				UT_ASSERT_EQ(authority.x_holder_node, -1);
 				UT_ASSERT(auth_slot_reads >= 4);
 			}
+}
+
+/* The native R11 cutover advances Resource-X formation independently of
+ * the membership epoch retained by semantic admission and REQUEST intent. */
+UT_TEST(test_acquire_distinct_resource_formation_admits_all_native_intents)
+{
+	for (int node = 0; node < 2; node++)
+		for (int path = RESOURCE_X_ACQUIRE_FIRST_FILL; path <= RESOURCE_X_ACQUIRE_RESIDENT; path++)
+			for (int observed = PCM_STATE_N; observed <= PCM_STATE_X; observed++)
+				for (int target = PCM_STATE_S; target <= PCM_STATE_X; target++) {
+					ResourceXDecodedFrame frame;
+					ResourceXApplyResult result;
+					if (path == RESOURCE_X_ACQUIRE_FIRST_FILL && observed != PCM_STATE_N)
+						continue;
+					acquire_reset_formation(18);
+					frame = acquire_frame(node, path, observed, target);
+					frame.common.resource_formation = 18;
+					result = acquire_deliver(&frame);
+					UT_ASSERT_EQ(result, RESOURCE_X_APPLY_APPLIED);
+					if (result == RESOURCE_X_APPLY_APPLIED) {
+						ResourceXBootstrapWork work = bootstrap_next_work();
+						UT_ASSERT_EQ(work.request.resource_formation, 18);
+						UT_ASSERT_EQ(work.acquire_intent.cluster_epoch, 17);
+					}
+				}
+}
+
+UT_TEST(test_acquire_semantic_epoch_cannot_substitute_for_resource_formation)
+{
+	for (int node = 0; node < 2; node++) {
+		ResourceXDecodedFrame frame;
+		acquire_reset_formation(18);
+		frame = acquire_frame(node, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_S);
+		UT_ASSERT_EQ(acquire_deliver(&frame), RESOURCE_X_APPLY_STALE);
+		UT_ASSERT(!cluster_pcm_lock_resource_x_s_barrier_active(&frame.common.logical_assertion.resource));
+	}
+}
+
+UT_TEST(test_acquire_distinct_resource_formation_keeps_epoch_and_record_guards)
+{
+	for (int node = 0; node < 2; node++)
+		for (int variant = 0; variant < 2; variant++) {
+			ResourceXDecodedFrame frame;
+			acquire_reset_formation(18);
+			frame = acquire_frame(node, RESOURCE_X_ACQUIRE_FIRST_FILL, PCM_STATE_N, PCM_STATE_S);
+			frame.common.resource_formation = 18;
+			if (variant == 0) frame.body.acquire_intent.cluster_epoch++;
+			else frame.body.acquire_intent.r4_generation++;
+			UT_ASSERT(acquire_deliver(&frame) != RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT(!cluster_pcm_lock_resource_x_s_barrier_active(&frame.common.logical_assertion.resource));
+		}
 }
 
 UT_TEST(test_acquire_local_request_uses_self_boot_without_remote_observation)
@@ -2323,9 +2380,12 @@ UT_TEST(test_decision_plan_all32_bits_and_original_master_source_are_preserved)
 int
 main(void)
 {
-	UT_PLAN(89);
+	UT_PLAN(92);
 	UT_RUN(test_acquire_payload_selects_only_exact_request_length);
 	UT_RUN(test_acquire_all_ordinary_intents_queue_without_authority_or_ack);
+	UT_RUN(test_acquire_distinct_resource_formation_admits_all_native_intents);
+	UT_RUN(test_acquire_semantic_epoch_cannot_substitute_for_resource_formation);
+	UT_RUN(test_acquire_distinct_resource_formation_keeps_epoch_and_record_guards);
 	UT_RUN(test_acquire_local_request_uses_self_boot_without_remote_observation);
 	UT_RUN(test_acquire_envelope_cannot_rebind_requester_or_domain);
 	UT_RUN(test_acquire_coherent_wrong_boot_is_stale_not_admitted);
