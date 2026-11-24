@@ -14274,7 +14274,7 @@ test_cluster_undo_lifecycle: test_cluster_undo_lifecycle.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # spec-3.9 D10: test_cluster_cr — ABI / SQLSTATE + the 4 inverse-apply
 # helpers (cluster_cr_apply.o) on a synthetic ITL page.  Chain walker /

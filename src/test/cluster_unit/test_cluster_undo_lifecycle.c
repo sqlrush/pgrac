@@ -4,7 +4,7 @@
  *	  pgrac spec-3.8 D12 — cluster_unit pure ABI / enum / SQLSTATE
  *	  tests for Undo Segment Lifecycle MVP + Autoextend.
  *
- *	  17 tests covering 10 ABI/encoding + 7 behavioural (Fix #375):
+ *	  19 tests covering 10 ABI/encoding + 9 behavioural (Fix #375):
  *	    T1   UndoSegmentState enum 5 byte values 锁(ALLOCATED=0 /
  *	         ACTIVE=1 / COMMITTED=2 / RECYCLABLE=3 / INVALID=0xFF;
  *	         spec-3.8 不写 COMMITTED/RECYCLABLE)
@@ -321,7 +321,7 @@ UT_TEST(test_header_mutation_roundtrip)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 
 	UT_RUN(test_undo_segment_state_enum);
 	UT_RUN(test_undo_segment_flag_constants);
