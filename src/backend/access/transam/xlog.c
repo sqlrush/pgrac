@@ -7303,6 +7303,45 @@ cluster_cold_recovery_consume_loser_inputs_v1(
 	return cluster_recovery_tx_result_finish_v1(start);
 }
 
+/* Creation validates only its unpublished registered initial set. It cannot
+ * mint a Startup owner or run crash-recovery jobs over a guessed local origin. */
+static void
+ClusterTTStartupPostJobs(void)
+{
+	if (cluster_undo_smgr_creation_startup_v2())
+		return;
+	if (!cluster_shared_config
+		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+		cluster_tt_recovery_resolve_active_slots();
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-4.8 D5, L222): advance cluster_scn to the
+	 * durable TT commit_scn high-watermark so a reader's read_scn taken after
+	 * crash-restart is not left below the durable commit/retention bound (which
+	 * over-fail-closes CR "snapshot too old" until organic SCN advance catches
+	 * up).  Lamport-monotonic, so it can only advance cluster_scn.
+	 */
+	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+		cluster_tt_recovery_observe_scn_highwater();
+	cluster_backup_recovery_observe_highwater();
+
+	/*
+	 * PGRAC MODIFICATIONS (spec-4.8 D7): index-safe physical rollback of
+	 * aborted transactions' DELETE writes (durably-ABORTED TT slot chains).
+	 * Clears the aborted deleter's xmax (HEAP_XMAX_INVALID hint -- WAL-free,
+	 * idempotent, no index op so no dangling entry), restoring the tuple to
+	 * live.  INSERT/UPDATE and crash-left in-flight xacts are matrix
+	 * fail-closed (MVCC-invisible + vacuum reclaim).  Best-effort cleanout;
+	 * correctness never depends on it.
+	 */
+	/* Shared recovery uses the typed PAGE/SIDE/undo owners. This optional
+	 * legacy DELETE cleanout is WAL-free and has no page-version edge;
+	 * it must remain unreachable even after typed cold startup is enabled. */
+	if (!cluster_shared_config
+		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+		cluster_tt_recovery_physical_rollback();
+}
+
 #endif
 
 /*
@@ -8511,36 +8550,7 @@ StartupXLOG(void)
 	 */
 	/* A classified normal TARGET validates terminal history without changing
 	 * it. Its strict complete census below replaces these recovery-only jobs. */
-	if (!cluster_shared_config
-		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
-		cluster_tt_recovery_resolve_active_slots();
-
-	/*
-	 * PGRAC MODIFICATIONS (spec-4.8 D5, L222): advance cluster_scn to the
-	 * durable TT commit_scn high-watermark so a reader's read_scn taken after
-	 * crash-restart is not left below the durable commit/retention bound (which
-	 * over-fail-closes CR "snapshot too old" until organic SCN advance catches
-	 * up).  Lamport-monotonic, so it can only advance cluster_scn.
-	 */
-	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
-		cluster_tt_recovery_observe_scn_highwater();
-	cluster_backup_recovery_observe_highwater();
-
-	/*
-	 * PGRAC MODIFICATIONS (spec-4.8 D7): index-safe physical rollback of
-	 * aborted transactions' DELETE writes (durably-ABORTED TT slot chains).
-	 * Clears the aborted deleter's xmax (HEAP_XMAX_INVALID hint -- WAL-free,
-	 * idempotent, no index op so no dangling entry), restoring the tuple to
-	 * live.  INSERT/UPDATE and crash-left in-flight xacts are matrix
-	 * fail-closed (MVCC-invisible + vacuum reclaim).  Best-effort cleanout;
-	 * correctness never depends on it.
-	 */
-	/* Shared recovery uses the typed PAGE/SIDE/undo owners. This optional
-	 * legacy DELETE cleanout is WAL-free and has no page-version edge;
-	 * it must remain unreachable even after typed cold startup is enabled. */
-	if (!cluster_shared_config
-		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
-		cluster_tt_recovery_physical_rollback();
+	ClusterTTStartupPostJobs();
 #endif
 
 	/*

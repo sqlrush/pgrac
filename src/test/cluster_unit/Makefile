@@ -20804,3 +20804,48 @@ test_cluster_clog_creation \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h
+
+# Authenticated unpublished creation validates registered pristine TT only.
+TESTS += test_cluster_native_creation_startup
+all: test_cluster_native_creation_startup
+test_cluster_native_creation_check.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_smgr.c Makefile
+	awk '/^cluster_undo_smgr_creation_startup_v2\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_creation_dispatch.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ClusterTTStartupPostJobs\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_native_creation_startup: test_cluster_native_creation_startup.c unit_test.h \
+		test_cluster_native_creation_check.inc test_cluster_native_creation_dispatch.inc \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(BOOTSTRAP_TEST_SOURCES) $(BOOTSTRAP_TEST_DEPS) \
+		$(top_srcdir)/src/include/cluster/cluster_undo_smgr.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_shared_config.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_thread.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+		$(top_srcdir)/src/include/common/pgrac_initdb_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+		$(top_srcdir)/src/include/cluster/cluster_semantic_activation.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_durable.h \
+		$(top_srcdir)/src/include/cluster/cluster_backup.h \
+		$(top_srcdir)/src/include/cluster/cluster_guc.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h \
+		$(CLUSTER_UBA_O) $(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c $(BOOTSTRAP_TEST_SOURCES) \
+		$(CLUSTER_UBA_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-native-creation-startup
+.PHONY: clean-native-creation-startup
+clean-native-creation-startup:
+	rm -f test_cluster_native_creation_startup test_cluster_native_creation_startup.d \
+		test_cluster_native_creation_check.inc test_cluster_native_creation_dispatch.inc \
+		test_cluster_native_creation_check.inc.tmp test_cluster_native_creation_dispatch.inc.tmp
