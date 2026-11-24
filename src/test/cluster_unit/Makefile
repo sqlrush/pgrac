@@ -12241,6 +12241,15 @@ test_cluster_ctrc_cleaner test_cluster_ctrc_horizon test_cluster_ctrc_capacity t
 		test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence: \
 		$(top_srcdir)/src/include/storage/proc.h
 
+# Every fixture that includes the complete cleaner source compiles its
+# extracted IMAGE owners; a single-target build must generate them first.
+test_cluster_ctrc_horizon test_cluster_ctrc_capacity test_cluster_ctrc_dispatch test_cluster_ctrc_delegation_close \
+		test_cluster_ctrc_itl_reuse test_cluster_ctrc_successor_fence test_cluster_ctrc_local_empty: \
+		test_cluster_gcs_image_receipts.inc test_cluster_gcs_image_receive.inc
+
+# The cleaner link line names the complete port boundary.
+test_cluster_ctrc_cleaner: $(CLUSTER_UNIT_PORT_LIBS)
+
 test_cluster_ctrc_cleaner: test_cluster_ctrc_cleaner.c test_cluster_ctrc_run_pass.inc test_cluster_gcs_image_receipts.inc test_cluster_gcs_image_receive.inc unit_test.h $(CLUSTER_SCN_O) $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o \
 		$(CLUSTER_UBA_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
@@ -14900,6 +14909,9 @@ STARTUP_NATIVE_FIRST_TEST_O = test_cluster_startup_first_wal.o
 STARTUP_NATIVE_CTRC_TEST_CPPFLAGS = -DTEST_CLUSTER_STARTUP_NATIVE_CTRC -DTEST_CLUSTER_STARTUP_NATIVE_FIRST
 endif
 
+# The link line names the complete port boundary; build it in a fresh tree.
+test_cluster_cold_tx_start: $(CLUSTER_UNIT_PORT_LIBS)
+
 test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_owner.inc $(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_PAGE_STABLE_TEST_O) \
 		test_cluster_cold_terminal_checkpoint.inc test_cluster_cold_start_terminal_clog.o \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
@@ -15967,6 +15979,7 @@ test_cluster_startup_native_ctrc_owner.inc: test_cluster_ctrc_local_empty.c Make
 test_cluster_startup_native_ctrc.o: test_cluster_startup_native_ctrc.c \
 		test_cluster_startup_native_ctrc.h test_cluster_startup_native_ctrc_namespace.h \
 		test_cluster_startup_native_ctrc_owner.inc test_cluster_ctrc_cleaner.c \
+		test_cluster_gcs_image_receipts.inc test_cluster_gcs_image_receive.inc \
 		test_cluster_pgproc_active_types.inc test_cluster_ctrc_native_exit.inc \
 		test_cluster_ctrc_native_group_exit.inc test_cluster_ctrc_native_prepare.inc \
 		test_cluster_ctrc_worker_sample.inc test_cluster_ctrc_read_scope.inc \
@@ -16330,11 +16343,12 @@ test_cluster_recovery_native_inputs test_cluster_recovery_scope_native_census: t
 test_cluster_startup_first_wal.o: test_cluster_startup_first_wal.c \
 		test_cluster_startup_first_wal.h test_cluster_startup_first_wal_namespace.h \
 		test_cluster_page_wal.c unit_test.h test_cluster_page_wal_insert.inc \
-		test_cluster_page_wal_pregrant.inc test_cluster_page_data_scn.inc \
+		test_cluster_page_wal_pregrant.inc test_cluster_gcs_image_receipts.inc \
+		test_cluster_page_data_scn.inc \
 		test_cluster_page_wal_image.inc test_cluster_pcm_checksum_owner.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_page_wal.c \
 		$(top_srcdir)/src/include/cluster/cluster_page_wal.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DTEST_CLUSTER_STARTUP_FIRST_WAL -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_cold_tx_start: test_cluster_startup_first_wal.h test_cluster_cold_ctrc_native_first.inc
 clean: clean-startup-first-wal

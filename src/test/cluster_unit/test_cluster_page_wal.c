@@ -1,6 +1,13 @@
 /* Actual native insertion/registration/reset and resident source binding.
  * WAL allocation, shared-memory allocation, PCM and content locks are fixtures.
  * Author: SqlRush <sqlrush@gmail.com> */
+#ifdef TEST_CLUSTER_STARTUP_FIRST_WAL
+/* The Startup target owns the process ERROR stack; keep this fixture's
+ * private unwind state in the bridge namespace. */
+#define PG_exception_stack startup_first_native_PG_exception_stack
+#define error_context_stack startup_first_native_error_context_stack
+#define pg_re_throw startup_first_native_pg_re_throw
+#endif
 #include "postgres.h"
 #include <unistd.h>
 #include "../../common/sha2_int.h"
@@ -2650,7 +2657,7 @@ UT_TEST(received_compact_image_rejects_bad_last_framing_before_any_custody)
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(61);
 	UT_RUN(installed_carrier_matches_explicit_absence_not_snapshot_failure);
 	UT_RUN(output_snapshot_retains_exact_failed_output_binding);
 	UT_RUN(failed_output_distinguishes_empty_latest_from_invalid_binding);
