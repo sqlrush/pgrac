@@ -108,6 +108,10 @@ class Worker(threading.Thread):
 
     def open_connection(self) -> bool:
         """Connect, retrying once a second until the load is told to stop."""
+        if self.conn is not None:
+            # Keep the published object until its replacement is ready: the
+            # controller may still cancel it, even after its handles are closed.
+            self.conn.close()
         while not self.stop_requested.is_set():
             self.note('CONNECT')
             conn = self.connect_factory(self.endpoint)
