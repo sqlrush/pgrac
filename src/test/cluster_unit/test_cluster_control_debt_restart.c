@@ -951,8 +951,11 @@ UT_TEST(restart_identical_recreation_never_overwrites_interrupted_objects)
 	restart_end();
 }
 
+#ifndef CONTROL_DEBT_RESTART_TEST_MAIN
+#define CONTROL_DEBT_RESTART_TEST_MAIN main
+#endif
 int
-main(void)
+CONTROL_DEBT_RESTART_TEST_MAIN(void)
 {
 	UT_PLAN(14);
 	/* The shared ROOT fixture's own premises hold in this binary too. */

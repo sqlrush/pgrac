@@ -203,10 +203,11 @@ UT_TEST(selected_backup_pair_rules_and_missing_primary_remain_exact)
 	}
 }
 #include "test_cluster_control_debt_prepared.inc"
+#include "test_cluster_control_debt_transition.inc"
 
 int main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(22);
 	UT_RUN(test_original_codec_v4_extent_and_exact_reference);
 	UT_RUN(test_v4_refuses_forged_reference_and_record);
 	UT_RUN(test_selected_root_registry_real_files_and_late_change);
@@ -223,5 +224,11 @@ int main(void)
 	UT_RUN(prepared_candidate_refuses_bad_backup_and_debt_pages);
 	UT_RUN(prepared_candidate_aliases_and_budget_preserve_all_inputs);
 	UT_RUN(prepared_candidate_does_not_treat_selected_debt_as_empty);
+	UT_RUN(transition_gets_complete_original_and_prepared_bytes_without_io);
+	UT_RUN(transition_owns_snapshots_after_original_scratch_changes);
+	UT_RUN(transition_wrong_owner_process_or_cf_preserves_output);
+	UT_RUN(transition_copy_and_output_alias_cannot_modify_custody);
+	UT_RUN(transition_build_refuses_invalid_candidate_lock_or_budget);
+	UT_RUN(transition_gets_every_batch_and_rejects_empty_images);
 	UT_DONE(); return ut_failed_count != 0;
 }

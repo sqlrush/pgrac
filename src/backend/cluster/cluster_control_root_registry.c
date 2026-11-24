@@ -289,16 +289,20 @@ done:
 }
 
 bool
-cluster_control_root_registry_capture_v4(int dir, const uint8 storage[16], uint64 sys,
-										 uint8 pair[133120], ControlRootImage *metadata)
+cluster_control_root_registry_capture_reserved_v4(int dir, const uint8 storage[16], uint64 sys,
+										 uint8 pair[133120], ControlRootImage *metadata,
+	ControlRootCaptureWorkV4 *work)
 {
 	static const char *const names[] = { "pgrac_control_root", "pgrac_control_root.bak" };
 	int fds[2] = { -1, -1 };
 	struct stat st[2], directory, after;
-	uint8 *bytes = NULL, *again = NULL;
-	ControlRootImage *logical = NULL, *backup = NULL;
+	uint8 *bytes, *again;
+	ControlRootImage *logical, *backup;
 	bool ok = false;
-	if (!storage || !sys || !pair || !metadata
+	if (!work || !storage || !sys || !pair || !metadata
+		|| overlaps(work, sizeof(*work), pair, 133120)
+		|| overlaps(work, sizeof(*work), metadata, sizeof(*metadata))
+		|| overlaps(work, sizeof(*work), storage, 16)
 		|| overlaps(pair, 133120, metadata, sizeof(*metadata))
 		|| overlaps(storage, 16, pair, 133120) || overlaps(storage, 16, metadata, sizeof(*metadata))
 		|| (!cluster_cf_held_is_clusterwide(ShareLock)
@@ -306,12 +310,8 @@ cluster_control_root_registry_capture_v4(int dir, const uint8 storage[16], uint6
 		|| fstat(dir, &directory) || !S_ISDIR(directory.st_mode) || directory.st_uid != geteuid()
 		|| (directory.st_mode & 0022))
 		return false;
-	bytes = malloc(133120);
-	again = malloc(66560);
-	logical = malloc(sizeof(*logical));
-	backup = malloc(sizeof(*backup));
-	if (!bytes || !again || !logical || !backup)
-		goto done;
+	bytes = work->bytes; again = work->again;
+	logical = &work->logical; backup = &work->backup;
 	for (int i = 0; i < 2; i++) {
 		fds[i] = openat(dir, names[i], O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY);
 		if (fds[i] < 0 || fstat(fds[i], &st[i]) || !current(dir, names[i], fds[i], &st[i])
@@ -346,12 +346,20 @@ done:
 		memcpy(pair, bytes, 133120);
 		*metadata = *logical;
 	}
-	free(backup);
-	free(logical);
-	free(again);
-	free(bytes);
 	return ok;
 }
+bool
+cluster_control_root_registry_capture_v4(int dir, const uint8 storage[16], uint64 sys,
+	uint8 pair[133120], ControlRootImage *metadata)
+{
+	ControlRootCaptureWorkV4 *work = malloc(sizeof(*work));
+	bool ok;
+	if (!work) return false;
+	ok = cluster_control_root_registry_capture_reserved_v4(dir, storage, sys, pair, metadata, work);
+	free(work);
+	return ok;
+}
+
 #endif
 
 /* Preserve the old coverage codec. The container reference replaces only the
