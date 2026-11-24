@@ -20583,3 +20583,37 @@ test_cluster_clog_checkpoint: test_cluster_clog_checkpoint.c unit_test.h \
 clean: clean-clog-checkpoint
 clean-clog-checkpoint:
 	rm -f test_cluster_clog_checkpoint test_cluster_clog_checkpoint.d
+
+# Original Startup CLOG segment/page rmgr through selected SLRU/file replay.
+# The raw FULL fixture supplies abort-only, namespaced managed-replay leaves.
+test_cluster_xid_native_clog.o: $(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+TESTS += test_cluster_clog_native_redo
+all: test_cluster_clog_native_redo
+test_cluster_clog_native_redo: test_cluster_clog_native_redo.c unit_test.h \
+		test_cluster_slru_clog_managed_write test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_replay.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+.PHONY: clean-clog-native-redo
+clean: clean-clog-native-redo
+clean-clog-native-redo:
+	rm -f test_cluster_clog_native_redo test_cluster_clog_native_redo.d

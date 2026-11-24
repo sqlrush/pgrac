@@ -59,6 +59,7 @@
 #include "access/slru.h"
 #include "access/transam.h"
 #include "access/clog_storage.h"
+#include "access/clog_wal.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
@@ -555,6 +556,220 @@ SlruNativeClogFinish(SlruCtl ctl, ClusterControlNativeFileBorrowV2 *borrow, int 
 	bool released = ctl->clog_native_release(borrow);
 
 	return closed && released;
+}
+
+/* Original Startup rmgr only. Independent AVAILABLE custody selects this local
+ * file; record bytes provide an address and image, never file authority. This
+ * entry owns both family and per-buffer I/O locks through fsync/readback and
+ * cache publication. It never creates a segment or inserts recovery WAL. */
+static void
+SlruNativeClogReplay(SlruCtl ctl, uint8 info, const void *record, Size length,
+					XLogRecPtr record_end)
+{
+	SlruShared shared = ctl->shared;
+	ClusterClogWalObservationV2 observed;
+	ClusterControlNativeFileBorrowV2 borrow = {0};
+	ClusterClogFileBindingV2 binding;
+	ClusterClogPageIdentityV2 captured, checked;
+	uint8 current[CLUSTER_CLOG_FRAME_BYTES];
+	PGAlignedBlock payload;
+	XLogRecPtr applied = InvalidXLogRecPtr;
+	volatile int fd = -1, slotno = -1;
+	volatile bool borrowed = false, io_locked = false, control_dropped = false;
+	volatile bool resident = false, old_dirty = false, pending = false;
+	volatile bool body_complete = false;
+	volatile int saved_number = 0;
+	volatile SlruPageStatus saved_status = SLRU_PAGE_EMPTY;
+	volatile ClusterClogFileBindingV2 saved_binding = {0};
+	volatile ClusterClogPageIdentityV2 saved_page = {0};
+	bool segment = info == CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2;
+	int pageno;
+
+	if (!InRecovery || MyBackendType != B_STARTUP || !enableFsync ||
+		!SlruNativeClogRequired(ctl) ||
+		(info != CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2 && !segment) ||
+		!cluster_clog_wal_decode_v2(info, record, length, &observed))
+		SlruNativeClogRefuse();
+	pageno = segment ? observed.binding.segment * SLRU_PAGES_PER_SEGMENT :
+		observed.page.identity.logical_page;
+	LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		SlruNativeClogAcquire(ctl, pageno, &borrow);
+		borrowed = true;
+		binding.identity = borrow.expected;
+		binding.segment = (uint32) pageno / SLRU_PAGES_PER_SEGMENT;
+		if (!SlruClogBindingMatches(&binding, &observed.binding) ||
+			!ctl->clog_native_current(&borrow))
+			SlruNativeClogRefuse();
+		fd = SlruNativeClogOpen(ctl, pageno, O_RDWR);
+		if (fd < 0 || !ctl->clog_native_current(&borrow))
+			SlruNativeClogRefuse();
+		for (;;)
+		{
+			if (segment)
+			{
+				/* Reuse an existing slot in this segment without flushing its
+				 * unflushed replay effects. A header supplies no page birth. */
+				pageno = observed.binding.segment * SLRU_PAGES_PER_SEGMENT;
+				for (int i = 0; i < shared->num_slots; i++)
+					if (shared->page_status[i] != SLRU_PAGE_EMPTY &&
+						shared->page_number[i] / SLRU_PAGES_PER_SEGMENT == observed.binding.segment)
+					{
+						pageno = shared->page_number[i];
+						break;
+					}
+			}
+			slotno = SlruSelectLRUPage(ctl, pageno);
+			if (!ctl->clog_native_current(&borrow))
+				SlruNativeClogRefuse();
+			if (shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS ||
+				shared->page_status[slotno] == SLRU_PAGE_WRITE_IN_PROGRESS)
+			{
+				SimpleLruWaitIO(ctl, slotno);
+				continue;
+			}
+			break;
+		}
+		resident = shared->page_status[slotno] == SLRU_PAGE_VALID &&
+			shared->page_number[slotno] == pageno;
+		old_dirty = shared->page_dirty[slotno];
+		if (segment)
+		{
+			saved_number = shared->page_number[slotno];
+			saved_status = shared->page_status[slotno];
+			saved_binding = shared->clog_file_binding[slotno];
+			saved_page = shared->clog_page_identity[slotno];
+			if (resident && !SlruClogBindingMatches(&binding, &shared->clog_file_binding[slotno]))
+				SlruNativeClogRefuse();
+		}
+		if (resident && !segment)
+		{
+			captured = shared->clog_page_identity[slotno];
+			for (int i = 0; i < shared->lsn_groups_per_page; i++)
+				captured.identity.page_lsn = Max(captured.identity.page_lsn,
+					shared->group_lsn[slotno * shared->lsn_groups_per_page + i]);
+			if (!SlruClogBindingMatches(&binding, &shared->clog_file_binding[slotno]) ||
+				captured.identity.logical_page != (uint64) pageno ||
+				!cluster_clog_file_page_encode_v2(&binding, &captured,
+					shared->page_buffer[slotno], BLCKSZ, current, sizeof(current)))
+				SlruNativeClogRefuse();
+		}
+		LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
+		io_locked = true;
+		shared->page_number[slotno] = pageno;
+		shared->page_status[slotno] = SLRU_PAGE_READ_IN_PROGRESS;
+		shared->clog_file_binding[slotno] = binding;
+		pending = true;
+		LWLockRelease(shared->ControlLock);
+		control_dropped = true;
+		pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
+		if (!cluster_clog_storage_replay_v2(fd, &binding, info, record, length, record_end,
+				resident && !segment ? current : NULL,
+				resident && !segment ? sizeof(current) : 0, &applied) ||
+			applied != record_end ||
+			(!segment && !cluster_clog_storage_read_page_v2(fd, &binding, pageno, &checked,
+														 payload.data, BLCKSZ)))
+			SlruNativeClogRefuse();
+		pgstat_report_wait_end();
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+		control_dropped = false;
+		if (!ctl->clog_native_current(&borrow) ||
+			shared->page_number[slotno] != pageno ||
+			shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS ||
+			!SlruClogBindingMatches(&binding, &shared->clog_file_binding[slotno]))
+			SlruNativeClogRefuse();
+		if (segment)
+		{
+			shared->page_number[slotno] = saved_number;
+			shared->page_status[slotno] = saved_status;
+			shared->page_dirty[slotno] = old_dirty;
+			shared->clog_file_binding[slotno] = saved_binding;
+			shared->clog_page_identity[slotno] = saved_page;
+		}
+		else
+		{
+			memcpy(shared->page_buffer[slotno], payload.data, BLCKSZ);
+			shared->clog_page_identity[slotno] = checked;
+			shared->page_initial_full_xid[slotno] = 0;
+			shared->page_dirty[slotno] = false;
+			shared->page_status[slotno] = SLRU_PAGE_VALID;
+			SimpleLruZeroLSNs(ctl, slotno);
+			SlruRecentlyUsed(shared, slotno);
+		}
+		pending = false;
+		body_complete = true;
+	}
+	PG_FINALLY();
+	{
+		if (!body_complete)
+			InterruptHoldoffCount = 0;
+		PG_TRY(cleanup);
+		{
+			pgstat_report_wait_end();
+			if (control_dropped)
+				LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+			if (pending)
+			{
+				if (segment)
+				{
+					shared->page_number[slotno] = saved_number;
+					shared->page_status[slotno] = saved_status;
+					shared->page_dirty[slotno] = old_dirty;
+					shared->clog_file_binding[slotno] = saved_binding;
+					shared->clog_page_identity[slotno] = saved_page;
+				}
+				else
+				{
+					shared->page_status[slotno] = resident ? SLRU_PAGE_VALID : SLRU_PAGE_EMPTY;
+					shared->page_dirty[slotno] = resident && old_dirty;
+					if (!resident)
+					{
+						memset(&shared->clog_file_binding[slotno], 0, sizeof(binding));
+						memset(&shared->clog_page_identity[slotno], 0, sizeof(checked));
+					}
+				}
+			}
+			if (io_locked)
+			{
+				if (!body_complete)
+					HOLD_INTERRUPTS();
+				LWLockRelease(&shared->buffer_locks[slotno].lock);
+			}
+			if (borrowed && !SlruNativeClogFinish(ctl, &borrow, fd))
+				ereport(PANIC, (errcode(ERRCODE_IO_ERROR),
+								errmsg("could not finish native CLOG replay cleanup")));
+			if (!body_complete)
+			{
+				InterruptHoldoffCount = 0;
+				HOLD_INTERRUPTS();
+			}
+			LWLockRelease(shared->ControlLock);
+		}
+		PG_CATCH(cleanup);
+		{
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("error during native CLOG replay cleanup")));
+		}
+		PG_END_TRY(cleanup);
+	}
+	PG_END_TRY();
+}
+
+void
+SimpleLruNativeClogReplayV2(SlruCtl ctl, const void *record, Size length,
+						  XLogRecPtr record_end)
+{
+	SlruNativeClogReplay(ctl, CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2,
+						record, length, record_end);
+}
+
+void
+SimpleLruNativeClogSegmentReplayV2(SlruCtl ctl, const void *record, Size length,
+								 XLogRecPtr record_end)
+{
+	SlruNativeClogReplay(ctl, CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2,
+						record, length, record_end);
 }
 
 int

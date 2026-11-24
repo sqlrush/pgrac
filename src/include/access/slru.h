@@ -177,6 +177,12 @@ extern void SimpleLruNativeClogWriteV2(SlruCtl ctl, int slotno, bool checkpoint)
  * The returned bytes are not source-cut coverage or a drain certificate. */
 extern bool SimpleLruNativeClogSyncFileV2(SlruCtl ctl,
 	const ClusterRecoveryFileIdentityV2 *expected, ClusterClogFileSyncV2 *out);
+/* Original Startup selected local replay. Owns/retires its family and IO
+ * locks, borrows an existing AVAILABLE file; no segment creation or WAL. */
+extern void SimpleLruNativeClogReplayV2(SlruCtl ctl, const void *record, Size length,
+									  XLogRecPtr record_end);
+extern void SimpleLruNativeClogSegmentReplayV2(SlruCtl ctl, const void *record,
+											 Size length, XLogRecPtr record_end);
 #endif
 
 extern Size SimpleLruShmemSize(int nslots, int nlsns);

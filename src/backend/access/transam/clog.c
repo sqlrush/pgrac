@@ -3629,7 +3629,24 @@ clog_redo(XLogReaderState *record)
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
 #ifdef USE_PGRAC_CLUSTER
-	CLOGRequireLegacyLifecycle();
+	if (CLOGNativeIORequired())
+	{
+		/* This original rmgr call owns Startup's retained source/cut. WAL
+		 * supplies neither a selected file registration nor foreign authority. */
+		if ((info != CLUSTER_RECOVERY_CLOG_PAGE_IMAGE_WAL_V2 &&
+			 info != CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2) ||
+			XLogRecHasAnyBlockRefs(record) ||
+			record->ReadRecPtr == InvalidXLogRecPtr ||
+			record->EndRecPtr == PG_UINT64_MAX || record->EndRecPtr <= record->ReadRecPtr)
+			CLOGRequireLegacyLifecycle();
+		if (info == CLUSTER_RECOVERY_CLOG_SEGMENT_WAL_V2)
+			SimpleLruNativeClogSegmentReplayV2(XactCtl, XLogRecGetData(record),
+											 XLogRecGetDataLen(record), record->EndRecPtr);
+		else
+			SimpleLruNativeClogReplayV2(XactCtl, XLogRecGetData(record),
+									  XLogRecGetDataLen(record), record->EndRecPtr);
+		return;
+	}
 #endif
 	/* Backup blocks are not used in clog records */
 	Assert(info == CLOG_ZEROPAGE_FULL || info == CLOG_TRUNCATE_FULL

@@ -34,6 +34,65 @@ cluster_control_native_files_mode_v2(void)
 	return CLUSTER_NATIVE_FILES_UNKNOWN_V2;
 }
 
+/* The original raw FULL fixture must never enter selected managed replay.
+ * These target-local leaves satisfy the newly linked rmgr branch and abort
+ * on any accidental use; managed replay has its own real-file fixture. */
+bool
+cluster_clog_file_page_encode_v2(const ClusterClogFileBindingV2 *binding,
+	const ClusterClogPageIdentityV2 *page, const void *payload,
+	Size payload_length, void *out, Size length)
+{
+	(void) binding; (void) page; (void) payload; (void) payload_length;
+	(void) out; (void) length;
+	abort();
+}
+
+bool
+cluster_clog_storage_read_page_v2(int fd,
+	const ClusterClogFileBindingV2 *expected, uint64 logical_page,
+	ClusterClogPageIdentityV2 *page_out, void *payload_out, Size payload_length)
+{
+	(void) fd; (void) expected; (void) logical_page; (void) page_out;
+	(void) payload_out; (void) payload_length;
+	abort();
+}
+
+bool
+cluster_clog_storage_replay_v2(int fd,
+	const ClusterClogFileBindingV2 *expected, uint8 info,
+	const void *record, Size record_length, XLogRecPtr record_end,
+	const void *current_frame, Size current_length, XLogRecPtr *applied_end)
+{
+	(void) fd; (void) expected; (void) info; (void) record;
+	(void) record_length; (void) record_end; (void) current_frame;
+	(void) current_length; (void) applied_end;
+	abort();
+}
+
+bool
+cluster_clog_wal_decode_v2(uint8 info, const void *bytes, Size length,
+	ClusterClogWalObservationV2 *out)
+{
+	(void) info; (void) bytes; (void) length; (void) out;
+	abort();
+}
+
+bool
+cluster_recovery_file_identity_encode_v2(
+	const ClusterRecoveryFileIdentityV2 *identity, uint8 *out, Size length)
+{
+	(void) identity; (void) out; (void) length;
+	abort();
+}
+
+bool
+cluster_recovery_file_identity_matches_v2(const uint8 *bytes, Size length,
+	const ClusterRecoveryFileIdentityV2 *expected)
+{
+	(void) bytes; (void) length; (void) expected;
+	abort();
+}
+
 /* This write-only fixture does not lend authority to unused observers. */
 bool cluster_wal_inputs_relmap_source_current_v1(const ClusterRecoveryRelmapSourceV1 *s)
 { (void)s; return false; }
