@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 from pathlib import Path
+import threading
 from typing import List, NamedTuple, Optional
 
 CONNECTION_OK = 0
@@ -75,6 +76,9 @@ class Connection:
         self.handle: Optional[int] = None
         self.cancel_handle: Optional[int] = None
         self.backend_pid: Optional[int] = None
+        # Keep PGcancel alive while a different thread dispatches cancellation.
+        # PQexec must remain outside this guard so cancellation can interrupt it.
+        self._cancel_lock = threading.Lock()
 
     def connect(self) -> Optional[str]:
         """Return None on success, otherwise the libpq failure text."""
@@ -126,15 +130,17 @@ class Connection:
 
     def cancel(self) -> bool:
         """Ask the server to cancel the running statement; thread-safe."""
-        if self.cancel_handle is None:
-            return False
-        buffer = ctypes.create_string_buffer(256)
-        return bool(self.lib.PQcancel(self.cancel_handle, buffer, len(buffer)))
+        with self._cancel_lock:
+            if self.cancel_handle is None:
+                return False
+            buffer = ctypes.create_string_buffer(256)
+            return bool(self.lib.PQcancel(self.cancel_handle, buffer, len(buffer)))
 
     def close(self) -> None:
-        if self.cancel_handle is not None:
-            self.lib.PQfreeCancel(self.cancel_handle)
-            self.cancel_handle = None
-        if self.handle is not None:
-            self.lib.PQfinish(self.handle)
-            self.handle = None
+        with self._cancel_lock:
+            if self.cancel_handle is not None:
+                self.lib.PQfreeCancel(self.cancel_handle)
+                self.cancel_handle = None
+            if self.handle is not None:
+                self.lib.PQfinish(self.handle)
+                self.handle = None
