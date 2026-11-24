@@ -15013,13 +15013,15 @@ ctrc_cleaner_read_scope_exact(const ClusterCtrcParticipantEntry *participant,
 	uint32 mask;
 	bool exact;
 
-	if (!ctrc_cleaner_read_scope_owner() || participant == NULL || receipt == NULL
+	if (!ctrc_cleaner_observation_guard(ctrc_cleaner_read_scope_owner(), "scope.owner")
+		|| participant == NULL || receipt == NULL
 		|| !cluster_ctrc_shmem_ready() || !ctrc_txn_key_valid(&receipt->key)
 		|| !ctrc_cleaner_owns_key(&receipt->key)
 		|| !ctrc_participant_identity_valid(&receipt->key, &participant->identity)
 		|| participant->identity.node_id != cluster_node_id
 		|| participant->state != CTRC_PARTICIPANT_CLOSED_DRAINING
-		|| participant->seal_generation == 0 || participant->applied_count == 0
+		|| !ctrc_cleaner_observation_guard(participant->seal_generation != 0, "scope.seal")
+		|| participant->applied_count == 0
 		|| receipt->state != CTRC_RECEIPT_APPLIED
 		|| receipt->publication.grant_generation != participant->grant_generation
 		|| receipt->publication.journal_slot_generation == 0
@@ -15719,8 +15721,11 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 				XLogFlush(highest_local_lsn);
 			}
 			ctrc_participant_capture_durability(&durability);
-			item->eligible = ctrc_ack_work_local_snapshot(item, &durability, &item->first_ack)
-							 == CLUSTER_CTRC_ACK_RELEASED;
+			if (cluster_trace_normal_stop)
+				ctrc_ack_stop_phase(item, "first.snapshot");
+			item->eligible = ctrc_ack_stop_predicate(item, "first.snapshot_released",
+				ctrc_ack_work_local_snapshot(item, &durability, &item->first_ack)
+					== CLUSTER_CTRC_ACK_RELEASED);
 		}
 
 		/* Independent second range and durability capture, never a reused
@@ -15739,9 +15744,11 @@ ctrc_participant_freeze_ack_batch_shared(Size maximum)
 			if (cluster_trace_normal_stop)
 				ctrc_ack_stop_phase(item, "second.snapshot");
 			item->eligible
-				= ctrc_ack_work_local_snapshot(item, &durability, &item->second_ack)
-					  == CLUSTER_CTRC_ACK_RELEASED
-				  && memcmp(&item->first_ack, &item->second_ack, sizeof(item->first_ack)) == 0;
+				= ctrc_ack_stop_predicate(item, "second.snapshot_released",
+					ctrc_ack_work_local_snapshot(item, &durability, &item->second_ack)
+						== CLUSTER_CTRC_ACK_RELEASED)
+				  && ctrc_ack_stop_predicate(item, "second.ack_equal",
+					memcmp(&item->first_ack, &item->second_ack, sizeof(item->first_ack)) == 0);
 			if (item->eligible) {
 				cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PARTICIPANT_ACK);
 				cluster_ctrc_test_barrier_wait(CTRC_TEST_BARRIER_ACK_DURABLE);

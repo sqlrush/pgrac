@@ -7395,6 +7395,7 @@ UT_TEST(test_participant_stop_trace_exposes_frozen_ack_identity_refusal)
 UT_TEST(test_participant_stop_trace_ack_first_failure_is_not_overwritten)
 {
 	const char *failures[] = {"first.snapshot_released", "second.ack_equal", "freeze.receipt_exact"};
+	const char *phases[] = {"first.snapshot", "second.snapshot", "freeze.exact"};
 	for (unsigned phase = 0; phase < lengthof(failures); phase++) {
 		ClusterCtrcParticipantEntry snapshot;
 		ClusterCtrcReceipt receipt;
@@ -7414,6 +7415,8 @@ UT_TEST(test_participant_stop_trace_ack_first_failure_is_not_overwritten)
 		UT_ASSERT_EQ(ctrc_participant_freeze_ack_batch_shared(1), 0);
 		UT_ASSERT_EQ(participant_log_count, 1);
 		snprintf(field, sizeof(field), "first_failed=%s ", failures[phase]);
+		UT_ASSERT(strstr(participant_logs[0], field) != NULL);
+		snprintf(field, sizeof(field), "first_failed_phase=%s ", phases[phase]);
 		UT_ASSERT(strstr(participant_logs[0], field) != NULL);
 		UT_ASSERT(strstr(participant_logs[0], "frozen=0 ") != NULL);
 		UT_ASSERT_EQ(ctrc_receipt_entries()[receipt_index].state, CTRC_RECEIPT_CANCELLED);
