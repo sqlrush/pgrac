@@ -15,6 +15,8 @@
 #define TEST_CLUSTER_XID_NATIVE_CLOG_NAMESPACE_H
 #include "pg_config.h"
 #define cluster_enabled d3_xid_native_clog_cluster_enabled
+#define GetSystemIdentifier d3_xid_native_clog_GetSystemIdentifier
+#define GetWALInsertionTimeLine d3_xid_native_clog_GetWALInsertionTimeLine
 #define cluster_control_native_files_mode_v2 d3_xid_native_clog_native_files_mode_v2
 #define ClusterRelmapClogBaseHandleV1 D3XidNativeClogHandleV1
 #define AbsorbSyncRequests d3_xid_native_clog_AbsorbSyncRequests

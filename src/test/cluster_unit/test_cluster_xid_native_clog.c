@@ -93,6 +93,10 @@ cluster_recovery_file_identity_matches_v2(const uint8 *bytes, Size length,
 	abort();
 }
 
+/* The raw FULL target owns no selected-file birth identity. */
+uint64 GetSystemIdentifier(void) { abort(); }
+TimeLineID GetWALInsertionTimeLine(void) { abort(); }
+
 /* This write-only fixture does not lend authority to unused observers. */
 bool cluster_wal_inputs_relmap_source_current_v1(const ClusterRecoveryRelmapSourceV1 *s)
 { (void)s; return false; }

@@ -154,6 +154,9 @@ LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_
 void
 XLogFlush(XLogRecPtr lsn)
 {
+#ifdef SLRU_FIXTURE_BIRTH_FLUSH
+	if (SLRU_FIXTURE_BIRTH_PENDING()) { SLRU_FIXTURE_BIRTH_FLUSH(lsn); return; }
+#endif
 	UT_ASSERT(!control_held && io_held);
 	UT_ASSERT_EQ(CritSectionCount, 1);
 	flushed = lsn;

@@ -51,6 +51,9 @@ uint64 GetSystemIdentifier(void) { return 123; }
 TimeLineID GetWALInsertionTimeLine(void) { return 1; }
 bool LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
+#ifdef SLRU_FIXTURE_ISSUER_HELD
+	if (lock == XidGenLock) return mode == LW_EXCLUSIVE && SLRU_FIXTURE_ISSUER_HELD();
+#endif
 	return mode == LW_EXCLUSIVE && LWLockHeldByMe(lock);
 }
 void pg_re_throw(void)
@@ -66,6 +69,9 @@ void XLogRegisterData(char *bytes, uint32 length)
 }
 XLogRecPtr XLogInsert(RmgrId rmgr, uint8 info)
 {
+#ifdef SLRU_FIXTURE_BIRTH_INSERT
+	if (SLRU_FIXTURE_BIRTH_PENDING()) return SLRU_FIXTURE_BIRTH_INSERT(rmgr, info);
+#endif
 	if (rmgr != RM_CLOG_ID || info != 0x50 || registered == NULL ||
 		control_held || !io_held || CritSectionCount != 0 ||
 		!(proc.delayChkptFlags & DELAY_CHKPT_START)) abort();
@@ -77,6 +83,9 @@ XLogRecPtr XLogInsert(RmgrId rmgr, uint8 info)
 }
 void XLogFlush(XLogRecPtr lsn)
 {
+#ifdef SLRU_FIXTURE_BIRTH_FLUSH
+	if (SLRU_FIXTURE_BIRTH_PENDING()) { SLRU_FIXTURE_BIRTH_FLUSH(lsn); return; }
+#endif
 	if (lsn != actual_end || control_held || !io_held || CritSectionCount != 0 ||
 		!(proc.delayChkptFlags & DELAY_CHKPT_START)) abort();
 	flushed = lsn;
