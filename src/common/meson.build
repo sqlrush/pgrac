@@ -11,6 +11,8 @@ common_sources = files(
   'cluster_clog_file.c',
   'cluster_hw_snapshot_codec.c',
   'cluster_recovery_file_identity.c',
+  'cluster_recovery_bootstrap.c',
+  'cluster_undo_segment_init.c',
   'cluster_recovery_registry.c',
   'cluster_relmap_file.c',
   'cluster_relmap_file_io.c',

@@ -56,6 +56,7 @@ OBJS_COMMON = \
 	cluster_clog_file.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_recovery_file_identity.o \
+	cluster_recovery_bootstrap.o \
 	cluster_recovery_registry.o \
 	cluster_relmap_file.o \
 	cluster_relmap_file_io.o \

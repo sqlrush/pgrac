@@ -60,6 +60,7 @@ bool cluster_trace_tx_identity;
 static ClusterWaitPcmAdmission source_admission;
 static unsigned source_observations;
 static bool service_real_formation;
+static uint64 service_membership_epoch = 17;
 static unsigned drain_completions, finish_observations;
 static ClusterWaitPcmAdmission finish_admission;
 static PGPROC recycle_proc;
@@ -265,7 +266,7 @@ cluster_semantic_activation_enter(uint64 feature, ClusterSemanticAdmissionSide s
 	token->feature_bit = feature;
 	token->side = side;
 	token->record_generation = 77;
-	token->formation_epoch = service_real_formation ? 17 : 0;
+	token->formation_epoch = service_real_formation ? service_membership_epoch : 0;
 	token->entered = true;
 	if (eviction_admission_closed) {
 		token->entered = false;
@@ -291,7 +292,7 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 uint64
 cluster_epoch_get_current(void)
 {
-	return service_real_formation ? 17 : 0;
+	return service_real_formation ? service_membership_epoch : 0;
 }
 
 uint32
@@ -1165,6 +1166,7 @@ reset_delivery_fixture(void)
 	authority_mutations = 0;
 	cluster_trace_tx_identity = true; source_observations = 0;
 	service_real_formation = false;
+	service_membership_epoch = 17;
 	drain_completions = finish_observations = 0;
 	memset(&finish_admission, 0, sizeof(finish_admission));
 	memset(&source_admission, 0, sizeof(source_admission));
@@ -1485,6 +1487,61 @@ UT_TEST(actual_type17_exports_only_native_accepted_service_context)
 	peer_observation_gap = CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_NOT_READY;
 	UT_ASSERT_EQ(gcs_block_resource_x_type17_ingress(&env, &frame, 61), RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT_EQ(source_observations, 1); UT_ASSERT_EQ(authority_mutations, 1);
+	reset_delivery_fixture();
+}
+
+UT_TEST(actual_service_uses_independent_membership_and_resource_formations)
+{
+	for (unsigned remote = 0; remote < 2; remote++) {
+		ResourceXSourceDrainWork work = {0};
+		reset_delivery_fixture();
+		master = remote ? 1 : cluster_node_id;
+		service_real_formation = true;
+		service_membership_epoch = 1;
+		work.request.logical_assertion = delivery_ref.assertion;
+		work.request.resource_formation = 17;
+		work.request.master_session_incarnation = 31;
+		work.request.sender_connection_generation = 1;
+		work.master_node = master;
+		work.r4_record_generation = 77;
+		work.authenticated_connection_generation = 61;
+		UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(source_observations, 1);
+		UT_ASSERT_EQ(source_admission.formation_epoch, 1);
+		UT_ASSERT_EQ(source_admission.gate_formation, 17);
+		UT_ASSERT_EQ(drain_completions, 1);
+	}
+	reset_delivery_fixture();
+}
+
+UT_TEST(actual_service_keeps_each_identity_drift_refused)
+{
+	for (unsigned remote = 0; remote < 2; remote++) {
+		for (unsigned drift = 0; drift < 5; drift++) {
+			ResourceXSourceDrainWork work = {0};
+			reset_delivery_fixture();
+			master = remote ? 1 : cluster_node_id;
+			service_real_formation = true;
+			service_membership_epoch = 1;
+			work.request.logical_assertion = delivery_ref.assertion;
+			work.request.resource_formation = 17;
+			work.request.master_session_incarnation = 31;
+			work.request.sender_connection_generation = 1;
+			work.master_node = master;
+			work.r4_record_generation = 77;
+			work.authenticated_connection_generation = 61;
+			if (drift == 0) work.request.resource_formation++;
+			if (drift == 1) work.request.master_session_incarnation++;
+			if (drift == 2) work.r4_record_generation++;
+			if (drift == 3) work.authenticated_connection_generation++;
+			if (drift == 4) scenario = 10;
+			UT_ASSERT_EQ(cluster_gcs_block_resource_x_source_drain_tick(&work),
+						 RESOURCE_X_APPLY_STALE);
+			UT_ASSERT_EQ(source_observations, 0);
+			UT_ASSERT_EQ(drain_completions, 1);
+		}
+	}
 	reset_delivery_fixture();
 }
 
@@ -2672,7 +2729,7 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(33);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2704,6 +2761,8 @@ main(void)
 	UT_RUN(test_actual_failed_round_observation_retries_only_exact_predecessor_shape);
 	UT_RUN(actual_type17_exports_only_native_accepted_service_context);
 	UT_RUN(actual_retained_service_ticks_capture_fresh_admission_without_ingress);
+	UT_RUN(actual_service_uses_independent_membership_and_resource_formations);
+	UT_RUN(actual_service_keeps_each_identity_drift_refused);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

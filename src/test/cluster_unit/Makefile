@@ -19824,3 +19824,33 @@ clean-initdb-managed-catalog:
 	rm -f test_cluster_initdb_managed_catalog test_cluster_initdb_managed_catalog.d
 clean-clog-frame:
 	rm -f test_cluster_clog_frame test_cluster_clog_frame.d
+
+# Original CLOG/TT BOOT I/O: no bootstrap WAL or control publication.
+TESTS += test_cluster_recovery_bootstrap test_cluster_clog_bootstrap
+all: test_cluster_recovery_bootstrap test_cluster_clog_bootstrap
+BOOTSTRAP_TEST_SOURCES = $(top_srcdir)/src/common/cluster_clog_file.c \
+	$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+	$(top_srcdir)/src/common/cluster_undo_segment_init.c $(top_srcdir)/src/common/sha2.c
+BOOTSTRAP_TEST_DEPS = $(top_srcdir)/src/common/cluster_recovery_bootstrap.c \
+	$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment_init.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+	$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+	$(top_srcdir)/src/include/access/clog_file.h \
+	$(top_srcdir)/src/common/sha2_int.h $(CLUSTER_UNIT_PORT_LIBS)
+test_cluster_recovery_bootstrap: test_cluster_recovery_bootstrap.c unit_test.h \
+		$(BOOTSTRAP_TEST_SOURCES) $(BOOTSTRAP_TEST_DEPS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(BOOTSTRAP_TEST_SOURCES) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+test_cluster_clog_bootstrap: test_cluster_clog_bootstrap.c unit_test.h \
+		$(BOOTSTRAP_TEST_SOURCES) $(BOOTSTRAP_TEST_DEPS) \
+		$(top_srcdir)/src/backend/access/transam/clog.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_recovery_bootstrap.c $(BOOTSTRAP_TEST_SOURCES) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+.PHONY: clean-recovery-bootstrap
+clean: clean-recovery-bootstrap
+clean-recovery-bootstrap:
+	rm -f test_cluster_recovery_bootstrap test_cluster_recovery_bootstrap.d \
+		test_cluster_clog_bootstrap test_cluster_clog_bootstrap.d
