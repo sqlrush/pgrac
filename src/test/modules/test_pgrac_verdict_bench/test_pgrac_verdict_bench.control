@@ -1,0 +1,4 @@
+comment = 'Micro-benchmark fixture for the own-xid verdict resolver'
+default_version = '1.0'
+module_pathname = '$libdir/test_pgrac_verdict_bench'
+relocatable = true
