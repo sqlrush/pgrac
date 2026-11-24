@@ -1,0 +1,6 @@
+2026-10-24 11:08:38.690 CST [8123] ERROR:  R4 HOT reconstruction cannot prove the logical row: HOT root or member is unused or unprovable
+2026-10-24 11:08:38.690 CST [8123] STATEMENT:  SELECT id,v
+	FROM lab.stop_load
+	WHERE v<>0
+2026-10-24 11:08:40.000 CST [8124] ERROR:  XX000: sample failure 4242 that no rule of the table quotes
+2026-10-24 11:08:40.000 CST [8124] STATEMENT:  UPDATE lab.stop_load SET v=v+1 WHERE id=7

@@ -1,0 +1,9 @@
+2026-10-24 11:07:48.950 CST [6553] ERROR:  0A000: cluster_gcs_block: could not obtain read image from X holder 1 for tag spc=1663 db=5 relNumber=16388 block=137
+2026-10-24 11:07:48.950 CST [6553] DETAIL:  PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN PGRAC_NODE=1 PGRAC_ATTEMPT=0 attempts=1 last_status=-1
+2026-10-24 11:07:48.950 CST [6553] LOCATION:  cluster_gcs_local_master_read_image_and_wait, cluster_gcs_block.c:5982
+2026-10-24 11:07:48.950 CST [6553] STATEMENT:  SELECT id,v FROM lab.stop_load WHERE v<>0
+2026-10-24 11:08:08.140 CST [6554] ERROR:  54000: cluster TT slot allocator: retention rollover failed for segment 1024 (undo segment pool hard cap reached)
+2026-10-24 11:08:08.140 CST [6554] LOCATION:  cluster_tt_local_rollover_error, cluster_tt_local.c:412
+2026-10-24 11:08:09.001 CST [6555] ERROR:  53R70: ITL slot OVERFLOW on heap page (INITRANS=8 full)
+2026-10-24 11:08:09.001 CST [6555] DETAIL:  PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=TIMEOUT PGRAC_NODE=1 PGRAC_ATTEMPT=0 wait_result=2 deadline_us=1
+2026-10-24 11:08:09.001 CST [6555] LOCATION:  heap_update, heapam.c:16253

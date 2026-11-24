@@ -43,6 +43,15 @@ gate remain prerequisites for four-node workload runs. These scripts neither
 reserve a lab nor establish that gate. A native fixture smoke test or a mock
 adapter does not qualify a physical multi-node deployment.
 
+### Four-member long run
+
+`p0_longrun.py` starts the four-member fixture, applies a shared UPDATE
+workload, collects server and client errors, requests normal CLOSED shutdown
+and judges the retained evidence. Unclassified errors always fail; a failed
+or missing requested stop cannot be replaced by another cycle. See
+[P0_LONGRUN.md](P0_LONGRUN.md) for the ten-minute diagnostic command, three
+normal-stop rounds, result files and offline checks.
+
 ### Retained workload manifest intake
 
 Verify a retained four-node capture without contacting a server:

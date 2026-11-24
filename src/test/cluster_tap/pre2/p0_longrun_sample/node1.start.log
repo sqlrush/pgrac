@@ -1,0 +1,2 @@
+2026-10-24 11:04:01.200 CST [4601] LOG:  00000: database system is ready to accept connections
+2026-10-24 11:04:01.200 CST [4601] LOCATION:  process_pm_child_exit, postmaster.c:3725

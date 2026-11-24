@@ -1,0 +1,8 @@
+Retained-format input for test_p0_longrun_judge.py.
+
+nodeN.STEP.log are server stderr pieces in the plain and the verbose
+(log_error_verbosity=verbose) format. The test concatenates them per member
+and records the piece boundaries as step offsets. Messages are ones the
+product emits, except the "sample failure 4242" record in node2.load.log and
+client-errors.jsonl: it is deliberately quoted by no rule, and a run that
+contains it must be refused and must list it as unclassified.

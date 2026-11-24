@@ -1,0 +1,6 @@
+2026-10-24 11:09:14.070 CST [4801] LOG:  received fast shutdown request
+2026-10-24 11:09:44.119 CST [4850] FATAL:  LMON normal-stop post-dispatch check failed
+2026-10-24 11:09:44.119 CST [4857] PANIC:  cluster normal-stop: pre-checkpoint barrier failed
+2026-10-24 11:09:44.119 CST [4857] DETAIL:  failure=3 module=COORDINATOR reason=NORMAL_STOP_PEER_FRONTENDS_PENDING object=node0
+2026-10-24 11:09:44.300 CST [4801] LOG:  checkpointer process (PID 4857) was terminated by signal 6: Aborted
+2026-10-24 11:09:44.300 CST [4801] LOG:  terminating any other active server processes

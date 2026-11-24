@@ -1,0 +1,2 @@
+2026-10-24 11:04:01.100 CST [4501] LOG:  starting PostgreSQL 16.13 on aarch64-unknown-linux-gnu, compiled by gcc, 64-bit
+2026-10-24 11:04:02.300 CST [4501] LOG:  database system is ready to accept connections
