@@ -44,6 +44,8 @@ static bool publisher_selection_distinct(const ClusterControlRelmapSelectionV2 *
 #undef cluster_recovery_plan_output_distinct_v1
 
 static unsigned publisher_renames, publisher_fault, publisher_fault_at;
+/* Child-only crash points before/after each original durable ROOT rename. */
+static unsigned publisher_interrupt_stage;
 static char publisher_primary[MAXPGPATH], publisher_backup[MAXPGPATH];
 static bool publisher_regular(const char *path, bool absent)
 { struct stat st; return lstat(path, &st) ? absent && errno == ENOENT : S_ISREG(st.st_mode); }
@@ -54,8 +56,12 @@ static int publisher_rename(const char *a, const char *b, int severity)
 {
 	(void)severity;
 	++publisher_renames;
+	if (publisher_interrupt_stage == 1 + 2 * (publisher_renames - 1))
+		kill(getpid(), SIGKILL);
 	if (publisher_fault_at == publisher_renames && publisher_fault == 1) return -1;
 	if (rename(a, b) || fsync(store_global)) return -1;
+	if (publisher_interrupt_stage == 2 * publisher_renames)
+		kill(getpid(), SIGKILL);
 	if (publisher_fault_at == publisher_renames) {
 		if (publisher_fault == 2) cf_held = false;
 		if (publisher_fault == 3) restart_cf_sequence++;
@@ -116,6 +122,7 @@ static ClusterControlDebtTransitionV2 *publisher_begin(uint64 n, unsigned nb)
 {
 	MyProcPid = (int)getpid(); CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
 	publisher_fault = publisher_fault_at = publisher_renames = 0;
+	publisher_interrupt_stage = 0;
 	publisher_lwlock = false; CritSectionCount = 0;
 	restart_begin(n, nb);
 	if (snprintf(publisher_primary, sizeof(publisher_primary), "%s/pgrac_control_root", store_path) >= sizeof(publisher_primary)
@@ -247,9 +254,134 @@ UT_TEST(publisher_budget_and_wrong_directory_cannot_be_retried)
 		publisher_end(&t);
 	}
 }
+
+/* Only the child runs the real publisher. It must bind its own process ID;
+ * neither a copied transition nor the parent's unattempted receipt is reused.
+ * The crash happens inside the original writer's syscall boundary, without
+ * normal/ERROR cleanup or the fixture-owned restart ROOT installer. */
+static int
+publisher_interrupt(unsigned stage)
+{
+	pid_t child;
+	int status = 0;
+
+	fflush(stdout);
+	child = fork();
+	if (child < 0) restart_fixture_abort(__LINE__);
+	if (child == 0) {
+		ClusterControlDebtTransitionV2 *t;
+		MyProcPid = (int)getpid();
+		t = control_debt_transition_build_v2((const void *)publisher_start,
+			(const void *)publisher_selection, restart_before, sizeof(restart_before),
+			image, debt_batches, restart_nb, RESTART_BUDGET);
+		if (!t) _exit(3);
+		publisher_interrupt_stage = stage;
+		(void)publisher_run(t);
+		_exit(4); /* An ordinary return cannot satisfy a killed-writer case. */
+	}
+	if (waitpid(child, &status, 0) != child) restart_fixture_abort(__LINE__);
+	return status;
+}
+
+UT_TEST(publisher_killed_before_primary_retains_original_selection)
+{
+	for (unsigned stage = 1; stage <= 3; stage++) {
+		restart_distinct_bases = true;
+		ClusterControlDebtTransitionV2 *t = publisher_begin(130, 2);
+		ControlDebtWireImageV1 *loaded = NULL;
+		uint8 pair[133120];
+		UT_ASSERT(restart_killed(publisher_interrupt(stage)));
+		control_debt_transition_destroy_v2(&t);
+		restart_forget();
+		int global = restart_open();
+		ControlRootImage *metadata = malloc(sizeof(*metadata));
+		if (!metadata) restart_fixture_abort(__LINE__);
+		bool captured = cluster_control_root_registry_capture_v4(global,
+			restart_storage, restart_system, pair, metadata);
+		UT_ASSERT(captured);
+		/* Immutable objects alone cannot select the unpublished candidate. */
+		if (captured) {
+			UT_ASSERT(!control_debt_store_load_selected_v4(global, pair, sizeof(pair),
+				restart_storage, restart_system, RESTART_BUDGET, &loaded));
+			UT_ASSERT(loaded == NULL);
+			UT_ASSERT(!memcmp(pair, restart_before, sizeof(pair)));
+			UT_ASSERT(restart_basis_complete(global, pair));
+		}
+		free(metadata);
+		UT_ASSERT(control_debt_store_load_v1(global, restart_reference,
+			RESTART_BUDGET, &loaded));
+		UT_ASSERT(restart_image_complete(loaded));
+		control_debt_wire_destroy_v1(&loaded);
+		UT_ASSERT(close(global) == 0);
+		publisher_end(&t);
+	}
+}
+
+UT_TEST(publisher_killed_after_primary_reloads_whole_multibatch_and_many_pages)
+{
+	for (unsigned shape = 0; shape < 2; shape++) {
+		restart_distinct_bases = shape == 0;
+		restart_tt_binding = shape == 0;
+		ClusterControlDebtTransitionV2 *t = publisher_begin(shape ? 4097 : 130, shape ? 1 : 2);
+		ControlDebtWireImageV1 *loaded = NULL;
+		uint8 pair[133120], before[32], after[32];
+		UT_ASSERT(restart_killed(publisher_interrupt(4)));
+		control_debt_transition_destroy_v2(&t);
+		restart_forget();
+		int global = restart_open();
+		uint64 files = restart_tree_digest(before);
+		bool reloaded = restart_reload(global, pair, &loaded);
+		UT_ASSERT(reloaded);
+		if (reloaded) {
+			UT_ASSERT(!memcmp(pair, restart_after, sizeof(pair)));
+			UT_ASSERT(restart_image_complete(loaded));
+			UT_ASSERT_EQ(loaded ? loaded->page_bytes / 33024 : 0, shape ? 65 : 4);
+			UT_ASSERT(restart_basis_complete(global, pair + 66560));
+		}
+		UT_ASSERT_EQ(restart_tree_digest(after), files);
+		UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		control_debt_wire_destroy_v1(&loaded);
+		UT_ASSERT(close(global) == 0);
+		publisher_end(&t);
+	}
+}
+
+UT_TEST(publisher_killed_after_primary_missing_material_has_no_backup_fallback)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		restart_distinct_bases = true;
+		ClusterControlDebtTransitionV2 *t = publisher_begin(130, 2);
+		uint8 before[32], after[32];
+		UT_ASSERT(restart_killed(publisher_interrupt(4)));
+		control_debt_transition_destroy_v2(&t);
+		restart_forget();
+		int global = restart_open();
+		if (fault == 0) {
+			int fd = restart_open_page(global, 3, O_RDWR);
+			UT_ASSERT(fd >= 0 && ftruncate(fd, 33023) == 0);
+			if (fd >= 0) UT_ASSERT(close(fd) == 0);
+		} else if (fault == 1) {
+			char name[96];
+			int dir = openat(global, "pgrac_recovery_registry", O_RDONLY | O_DIRECTORY);
+			debt_store_basis_name(restart_older_ref, name);
+			UT_ASSERT(dir >= 0 && unlinkat(dir, name, 0) == 0);
+			if (dir >= 0) UT_ASSERT(close(dir) == 0);
+		} else {
+			int fd = openat(global, "pgrac_control_root.bak", O_RDWR | O_NOFOLLOW);
+			UT_ASSERT(fd >= 0 && ftruncate(fd, 66559) == 0);
+			if (fd >= 0) UT_ASSERT(close(fd) == 0);
+		}
+		uint64 files = restart_tree_digest(before);
+		restart_expect_refusal(global);
+		UT_ASSERT_EQ(restart_tree_digest(after), files);
+		UT_ASSERT(!memcmp(before, after, sizeof(before)));
+		UT_ASSERT(close(global) == 0);
+		publisher_end(&t);
+	}
+}
 int main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(publisher_replaces_only_primary_and_reloads_every_batch_page);
 	UT_RUN(publisher_complete_before_mismatch_writes_nothing_and_cannot_retry);
 	UT_RUN(publisher_lock_or_owner_refusal_precedes_all_mutation);
@@ -258,5 +390,8 @@ int main(void)
 	UT_RUN(publisher_final_readback_includes_every_page_and_old_basis);
 	UT_RUN(publisher_error_after_primary_preserves_once_only_attempt_and_files);
 	UT_RUN(publisher_budget_and_wrong_directory_cannot_be_retried);
+	UT_RUN(publisher_killed_before_primary_retains_original_selection);
+	UT_RUN(publisher_killed_after_primary_reloads_whole_multibatch_and_many_pages);
+	UT_RUN(publisher_killed_after_primary_missing_material_has_no_backup_fallback);
 	UT_DONE(); return ut_failed_count != 0;
 }
