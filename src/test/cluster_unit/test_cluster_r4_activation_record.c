@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_control_root_prepared.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -165,6 +166,21 @@ ClusterControlRootResult
 cluster_control_root_create_prepared(
 	const ClusterControlRootMigrationImage *image pg_attribute_unused(),
 	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused(),
+	ClusterControlRootFileToken *out_token pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_control_root_prepared_job_identity_current_v1(
+	const ClusterControlRootPreparedWorkV1 *work pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterControlRootResult
+cluster_control_root_prepared_job_poll_v1(
+	ClusterControlRootPreparedWorkV1 *work pg_attribute_unused(),
 	ClusterControlRootFileToken *out_token pg_attribute_unused())
 {
 	abort();
@@ -1570,6 +1586,7 @@ UT_TEST(test_63_ack_tuple_encoder_is_exact_and_clears_reserved_gaps)
 UT_TEST(test_64_shmem_size_includes_exact_ack_table)
 {
 	Size expected = MAXALIGN(sizeof(ClusterSemanticActivationShmem))
+					+ CLUSTER_SURVIVOR_CONTROL_BYTES
 					+ MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem))
 					+ MAXALIGN(CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES)
 					+ MAXALIGN(sizeof(ClusterSemanticActivationPgrdSnapshotShmem))

@@ -40,6 +40,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_semantic_survivor_local.h"
+#endif
 
 #include <sys/time.h>
 #include <time.h>
@@ -565,6 +568,7 @@ CheckpointerMain(void)
 #ifdef USE_PGRAC_CLUSTER
 		/* Drain original input debt on its ACK wake, including a pending
 		 * shutdown interrupt, before entering checkpoint or PI work. */
+		cluster_semantic_survivor_local_process();
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
 		cluster_wal_inputs_jobs_service_poll_v1();

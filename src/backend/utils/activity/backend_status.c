@@ -1266,3 +1266,32 @@ pgstat_clip_activity(const char *raw_activity)
 
 	return activity;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Scalar-only direct identity observation, independent of SQL's cached status
+ * table. A changing writer remains unknown after bounded attempts. */
+bool
+pgstat_read_backend_identity(int slot, int *pid, BackendType *type)
+{
+ volatile PgBackendStatus *entry;
+ if (pid != NULL) *pid = 0;
+ if (type != NULL) *type = B_INVALID;
+ if (pid == NULL || type == NULL || BackendStatusArray == NULL || slot < 0
+  || MaxBackends <= 0 || MaxBackends > INT_MAX - NUM_AUXPROCTYPES
+  || slot >= NumBackendStatSlots) return false;
+ entry = &BackendStatusArray[slot];
+ for (unsigned attempt = 0; attempt < 2; attempt++) {
+  int before, after, observed_pid;
+  BackendType observed_type;
+  pgstat_begin_read_activity(entry, before);
+  observed_pid = entry->st_procpid; observed_type = entry->st_backendType;
+  pgstat_end_read_activity(entry, after);
+  if (pgstat_read_activity_complete(before, after)) {
+   *pid = observed_pid;
+   *type = observed_pid > 0 ? observed_type : B_INVALID;
+   return true;
+  }
+ }
+ return false;
+}
+#endif

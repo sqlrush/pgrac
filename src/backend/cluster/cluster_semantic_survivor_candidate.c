@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
 #include "storage/proc.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_epoch.h"
@@ -49,7 +50,7 @@ candidate_zero(const void *value, Size n)
 static bool
 candidate_owner(void)
 {
-	return IsUnderPostmaster && MyBackendType == B_LMON && AmLmonProcess()
+	return IsUnderPostmaster && !proc_exit_inprogress && MyBackendType == B_LMON && AmLmonProcess()
 		&& cluster_enabled && cluster_shared_config
 		&& MyProc != NULL && MyProcPid > 0 && MyProc->pid == MyProcPid
 		&& MyProc->pgprocno >= 0 && MyProc->backendId == InvalidBackendId
@@ -385,4 +386,30 @@ cluster_semantic_survivor_candidate_probe(ClusterSurvivorControl *c,
 		out->reason != NULL
 			&& strcmp(out->reason, "NATIVE_COLLECTION_PRODUCER_CLOSURE_UNPROVED") == 0
 			? "candidate_producer_closure_unproved" : "candidate_native_pending");
+}
+
+/* Only the actual original LMON can bind a query to the unconfirmed candidate.
+ * No producer call, receipt or state mutation is performed here. */
+bool
+cluster_semantic_survivor_candidate_scope(ClusterSurvivorControl *c,
+ ClusterSurvivorProducerScope *scope, uint8 basis[32])
+{
+ CandidateLocalView view;
+ if (scope == NULL || basis == NULL) return false;
+ memset(scope, 0, sizeof(*scope)); memset(basis, 0, 32);
+ if (!candidate_owner() || !candidate_live(c)
+  || c->header.nonce == 0 || c->header.nonce == UINT64_MAX
+  || c->header.nonce != c->basis.nonce || c->header.nonce != c->tables[0].header.nonce
+  || c->header.round_generation == 0 || c->header.round_generation == UINT64_MAX
+  || c->header.round_generation != c->tables[0].header.round_generation
+  || c->header.ordinary_admission != 0 || c->header.native_closure != 0 || c->header.typed_status != 0
+  || !candidate_open_scope(c->basis.pgsa, c->basis.open_generation, c->header.epoch,
+   c->tables[0].header.source_features, c->tables[0].header.target_features, scope)
+  || candidate_local_view(*scope, &view) != CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_CURRENT)
+  return false;
+ candidate_basis_hash(&c->basis, basis);
+ if (!candidate_same_owner(&view)) {
+  memset(scope, 0, sizeof(*scope)); memset(basis, 0, 32); return false;
+ }
+ return true;
 }

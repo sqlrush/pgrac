@@ -4,6 +4,7 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #define PGRAC_WAL_INPUTS_JOB_PIN_EMBEDDED
 #include "test_cluster_wal_inputs_job_pin.c"
+#include "cluster/cluster_semantic_survivor_local.h"
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_clean_leave.h"
 #include "test_cluster_pi_empty_batch_fixture.h"
@@ -317,7 +318,10 @@ UT_TEST(service_ack_at_latch_reset_is_observed_before_interrupt_handling)
 }
 
 #include "test_cluster_input_job_observation.inc"
+#define SURVIVOR_LOCAL_INPUT_ROUTE
 #include "test_cluster_survivor_producer_inputs.inc"
+#include "test_cluster_survivor_input_route_fixture.h"
+#include "test_cluster_survivor_close_inputs.inc"
 
 int
 main(void)
@@ -335,7 +339,7 @@ main(void)
 	cluster_control_request_shmem_init();
 	control_driver = retire_driver = cluster_control_request_driver_start();
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(21);
+	UT_PLAN(27);
 	UT_RUN(service_bgwriter_128_acks_progress_without_delay_or_new_wait);
 	UT_RUN(service_checkpointer_128_acks_progress_without_checkpoint_timer);
 	UT_RUN(service_ack_at_latch_reset_is_observed_before_interrupt_handling);
@@ -357,6 +361,12 @@ main(void)
  UT_RUN(survivor_input_poll_refuses_wrong_family_and_preserves_unknown);
  UT_RUN(survivor_input_poll_rechecks_actual_original_owner_at_final_return);
  UT_RUN(survivor_input_poll_keeps_original_invalid_and_stale_outcomes);
+ UT_RUN(local_input_reply_projects_original_pending_cf_job_without_ack_or_cleanup);
+	UT_RUN(input_route_cf_and_128_walr_follow_original_ack_ticks);
+	UT_RUN(input_route_query_at_original_reset_is_not_lost);
+	UT_RUN(input_route_pending_scope_drift_keeps_original_debt);
+	UT_RUN(input_route_unknown_status_never_counts_as_returned);
+	UT_RUN(close_query_auxiliary_keeps_cf_ack_progress_and_zero_ordinary_coverage);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -292,6 +292,9 @@ OBJS = \
 	cluster_semantic_survivor.o \
 	cluster_semantic_survivor_candidate.o \
 	cluster_semantic_survivor_producer.o \
+	cluster_semantic_survivor_local.o \
+	cluster_semantic_survivor_targets.o \
+	cluster_semantic_survivor_close.o \
 	cluster_catalog_bootstrap.o \
 	cluster_catalog_startup_input.o \
 	cluster_catalog_migrate.o \

@@ -339,4 +339,9 @@ extern LocalPgBackendStatus *pgstat_get_local_beentry_by_index(int idx);
 extern char *pgstat_clip_activity(const char *raw_activity);
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* No allocation, pointer copy or cached SQL snapshot. false is UNKNOWN. */
+extern bool pgstat_read_backend_identity(int slot, int *pid, BackendType *type);
+#endif
+
 #endif							/* BACKEND_STATUS_H */

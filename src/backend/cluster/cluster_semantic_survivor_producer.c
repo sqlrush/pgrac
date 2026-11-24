@@ -42,18 +42,18 @@ static bool
 survivor_producer_context(ClusterSurvivorProducerOwner owner)
 {
  bool held = false;
- if (!IsUnderPostmaster || !cluster_enabled || !cluster_shared_config
+ if (!IsUnderPostmaster || !cluster_enabled || !cluster_shared_config || proc_exit_inprogress
   || MyProc == NULL || MyProcPid <= 0 || MyProc->pid != MyProcPid
   || MyProc->pgprocno < 0 || MyProc->cluster_grd_generation == 0
   || MyProc->cluster_grd_generation == UINT64_MAX || CritSectionCount != 0
   || !survivor_producer_family(owner))
   return false;
  if (owner == CLUSTER_SURVIVOR_PRODUCER_BACKEND
-  && (proc_exit_inprogress || MyBackendId == InvalidBackendId
+  && (MyBackendId == InvalidBackendId
    || MyProc->backendId != MyBackendId))
   return false;
  if (owner == CLUSTER_SURVIVOR_PRODUCER_INPUT_JOBS
-  && (proc_exit_inprogress || CurrentResourceOwner == NULL
+  && (CurrentResourceOwner == NULL
    || CurrentResourceOwner != AuxProcessResourceOwner))
   return false;
  ForEachLWLockHeldByMe(survivor_producer_lock, &held);
