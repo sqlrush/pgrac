@@ -883,10 +883,11 @@ save_json('execution',{completed=>$completed ? JSON::PP::true : JSON::PP::false,
  error=>$error,decisions=>\@decisions});
 if(!$completed) { fail('B07 native cell completed'); diag($error); }
 my @cleanup;
-for my $s (@sessions) { eval { $s->quit; 1; } or push @cleanup,$@; }
+for my $s (@sessions) { eval { $s->quit or die 'original psql did not quit'; 1; } or push @cleanup,$@; }
 @sessions=();
 save_json('cleanup',{errors=>\@cleanup});
 ok(!@cleanup,'all original test sessions close');
+if (($ENV{PGRAC_ITL_CAPACITY_ONLY} // '') ne '1') {
 for my $kind ('cancel','statement_timeout','capacity_timeout') {
  ok(wait_exit_cell($node,\@nodes,$kind),
   "B08 $kind ends only the original wait and the same backend resumes with exact owners");
@@ -899,11 +900,25 @@ for my $kind ('update','delete') {
 }
 ok(cross_page_cell($node,\@nodes),
  'B06 the original cross-page UPDATE waits on exact destination owners and requalifies its successor');
+}
 $cluster->stop_cluster;
 undef $cluster;
 pass('all four normal members complete the original stop proof');
 for my $n (@nodes) {
  unlike(slurp_file($n->logfile),qr/PANIC|checksum verification failed|invalid page in block/,
   'member has no corruption or PANIC');
+}
+if (($ENV{PGRAC_ITL_CAPACITY_ONLY} // '') eq '1') {
+ for my $i (0..$#nodes) {
+  open my $out,'>',"$evidence/node$i.log" or die $!;
+  print {$out} slurp_file($nodes[$i]->logfile);
+  close $out or die $!;
+ }
+ open my $out,'>',"$evidence/p0-result.json" or die $!;
+ print {$out} JSON::PP->new->canonical->pretty->encode({version=>1,case=>'P0-8',
+  sql_completed=>$completed ? JSON::PP::true : JSON::PP::false,
+  normal_stop=>JSON::PP::true,cleanup_errors=>\@cleanup,nodes=>[0,1,2,3],
+  decisions=>\@decisions});
+ close $out or die $!;
 }
 done_testing();
