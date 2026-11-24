@@ -165,6 +165,8 @@ static bool gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *e pg_attribut
 										const void *p pg_attribute_unused()) { return false; }
 static bool gcs_block_try_land_current_mx_reply(const ClusterICEnvelope *e pg_attribute_unused(),
 											  const void *p pg_attribute_unused()) { return false; }
+static bool gcs_block_try_land_full_mx_reply(const ClusterICEnvelope *e pg_attribute_unused(),
+										   const void *p pg_attribute_unused()) { return false; }
 bool
 cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *e pg_attribute_unused(),
 									 const GcsBlockReplyHeader *h pg_attribute_unused(),
