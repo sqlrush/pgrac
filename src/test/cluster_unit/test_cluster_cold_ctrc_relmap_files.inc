@@ -61,7 +61,7 @@ relmap_files_begin(void)
 	relmap_start_plan.canonical = relmap_files_canonical;
 	relmap_start_plan.participant_count = typed.participant_count;
 	relmap_start_plan.memory_budget = 2 * 1024 * 1024;
-	relmap_start_plan.relmap_count = 1;
+	relmap_start_plan.relmap_count = relmap_start_plan.relmap_input_capacity = 1;
 	relmap_start_plan.relmap_inputs = relmap_start_entries;
 	entry = &relmap_start_entries[0]; input = &entry->input;
 	input->cut = typed.participants[0]; input->source = typed.sources[0];
