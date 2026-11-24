@@ -72,6 +72,7 @@ static void catalog_read_fixture(CatalogReadFixture *f)
 	UT_ASSERT(pgrac_control_binding_encode(&f->expected.binding, binding, sizeof(binding)));
 	sha256_bytes(root->bytes, sizeof(root->bytes), f->expected.root_sha256);
 	f->expected.root_sequence = root->header.file_txn_seq;
+	f->expected.root_format_version = root->header.format_version;
 	for (unsigned i = 0; i < lengthof(dirs); i++) {
 		snprintf(path, sizeof(path), "%s/%s", f->path, dirs[i]); UT_ASSERT_EQ(mkdir(path, 0700), 0);
 	}

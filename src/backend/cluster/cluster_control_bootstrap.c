@@ -292,6 +292,26 @@ bootstrap_decode(const ClusterControlBootstrapInput *input,
 	snapshot.root_format_version = before->header.format_version;
 	snapshot.writer_lifecycle = before->records[input->node_id].lifecycle;
 	memcpy(snapshot.serving, before->header.v2.serving, sizeof(snapshot.serving));
+	/* Preserve the exact independently selected local catalog input. A
+	 * provisional registry may not yet cover this family; absence stays
+	 * explicit and the catalog consumer must refuse, never infer a binding
+	 * from the file it is about to read. RESERVED rows are not coverage. */
+	if (registry != NULL) {
+		for (uint64 i = 0; i < registry->coverage.file_count; i++) {
+			const ClusterRecoveryCheckpointFileV2 *file = &registry->coverage.files[i];
+			const ClusterRecoveryFileIdentityV2 *identity = &file->identity;
+			if (identity->kind != CLUSTER_RECOVERY_FILE_CLOG_V2
+				|| identity->origin != input->node_id || identity->object_id != 0
+				|| identity->database_oid != 0 || identity->tablespace_oid != 0)
+				continue;
+			if (snapshot.catalog_clog_valid || file->copy_count != 1 || file->copy_index != 0) {
+				result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+				goto done;
+			}
+			snapshot.catalog_clog = *identity;
+			snapshot.catalog_clog_valid = true;
+		}
+	}
 	*out = snapshot;
 done:
 	pfree(after);

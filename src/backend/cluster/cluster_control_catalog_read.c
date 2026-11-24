@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "access/slru.h"
+#include "access/clog_file.h"
 #include "cluster/cluster_xid_authority.h"
 #include "common/cryptohash.h"
 #include "cluster_control_catalog_private.h"
@@ -29,6 +30,7 @@ struct ClusterControlCatalogRead {
 	CatalogReadObject objects[8];
 	uint8 *clog;
 	Size clog_length;
+	CatalogReadObject managed_clog;
 	struct stat clog_files[CLUSTER_XID_PREHISTORY_MAX_XID / (4 * BLCKSZ * SLRU_PAGES_PER_SEGMENT)];
 	unsigned clog_count;
 	ControlRootImage root;
@@ -112,6 +114,11 @@ static bool
 catalog_original_current(ClusterControlCatalogRead *read, int clogdir)
 {
 	Size offset = 0;
+	if (read->expected.root_format_version == 4)
+		return read->expected.catalog_clog_valid
+			&& cluster_initdb_object_recheck(clogdir, read->managed_clog.name,
+				read->managed_clog.bytes, read->managed_clog.length,
+				&read->managed_clog.identity);
 	for (unsigned i = 0; i < read->clog_count; i++) {
 		char name[16];
 		Size part = Min(read->clog_length - offset, SLRU_PAGES_PER_SEGMENT * BLCKSZ);
@@ -188,6 +195,7 @@ cluster_control_catalog_read(const char *pgdata, const char *shared,
 	PgracControlBinding binding;
 	int dirs[8];
 	char hex[65], name[112];
+	Size root_length;
 	bool ok;
 	const Size maximum = sizeof(ClusterXidPrehistoryHeader) + CLUSTER_XID_PREHISTORY_MAX_XID / 4;
 
@@ -198,6 +206,15 @@ cluster_control_catalog_read(const char *pgdata, const char *shared,
 		|| pgdata[0] != '/' || shared[0] != '/' || strlen(pgdata) >= MAXPGPATH
 		|| strlen(shared) >= MAXPGPATH
 		|| expected->binding.lineage_kind != PGRAC_CONTROL_LINEAGE_CREATION_V1)
+		return false;
+	/* Consume exactly the version already selected by the early reader. A
+	 * managed ROOT includes its registry reference in the hashed/rechecked
+	 * image; accepting the old prefix would discard that binding. */
+	if (expected->root_format_version == 4)
+		root_length = 66560;
+	else if (expected->root_format_version == 2 || expected->root_format_version == 3)
+		root_length = CLUSTER_CONTROL_ROOT_FILE_BYTES;
+	else
 		return false;
 	read = calloc(1, sizeof(*read));
 	if (read == NULL)
@@ -212,8 +229,7 @@ cluster_control_catalog_read(const char *pgdata, const char *shared,
 	catalog_read_name(&read->objects[0], 2, "pgrac_control_root");
 	ok = catalog_read_dirs(read, dirs, true);
 	if (ok)
-		ok = catalog_read_object(dirs[2], &read->objects[0], CLUSTER_CONTROL_ROOT_FILE_BYTES,
-								 CLUSTER_CONTROL_ROOT_FILE_BYTES);
+		ok = catalog_read_object(dirs[2], &read->objects[0], root_length, root_length);
 	if (ok)
 		ok = catalog_read_dirs_current(read, dirs);
 	if (!catalog_read_close(dirs, ok))
@@ -224,6 +240,7 @@ cluster_control_catalog_read(const char *pgdata, const char *shared,
 												 &read->root)
 			   != 0
 		|| cluster_control_bootstrap_root_bound(&binding, &read->root) != 0
+		|| read->root.header.format_version != expected->root_format_version
 		|| read->root.header.file_txn_seq != expected->root_sequence
 		|| read->root.header.v2.control_image_generation != 1)
 		return false;
@@ -264,7 +281,24 @@ cluster_control_catalog_read(const char *pgdata, const char *shared,
 			ok = fstatat(dirs[6], name, &read->clog_files[i], AT_SYMLINK_NOFOLLOW) == 0
 				 && catalog_read_owned(&read->clog_files[i], false);
 		}
-		if (ok)
+		if (ok && expected->root_format_version == 4) {
+			const ClusterRecoveryFileIdentityV2 *identity = &expected->catalog_clog;
+			/* The expected identity is carried from the same selected registry,
+			 * never recovered from a current file header or native counter. */
+			ok = expected->catalog_clog_valid
+				&& identity->origin == binding.node_id
+				&& identity->system_identifier == binding.system_identifier
+				&& identity->database_incarnation == binding.database_incarnation
+				&& memcmp(identity->storage_uuid, binding.storage_uuid, 16) == 0;
+			catalog_read_name(&read->managed_clog, 6, "0000");
+			if (ok)
+				ok = catalog_read_object(dirs[6], &read->managed_clog,
+					CLUSTER_CLOG_FILE_HEADER_BYTES + CLUSTER_CLOG_FRAME_BYTES,
+					CLUSTER_CLOG_FILE_HEADER_BYTES + CLUSTER_CLOG_FRAME_BYTES)
+					&& cluster_initdb_catalog_read_managed_clog_v2(dirs[6], identity, hw,
+						&read->clog, &read->clog_length)
+					&& catalog_original_current(read, dirs[6]);
+		} else if (ok)
 			ok = cluster_initdb_catalog_read_clog(dirs[6], hw, &read->clog, &read->clog_length)
 				 && catalog_original_current(read, dirs[6]);
 	}
@@ -336,5 +370,6 @@ cluster_control_catalog_release(ClusterControlCatalogRead **readp)
 	for (unsigned i = 0; i < 8; i++)
 		free(read->objects[i].bytes);
 	free(read->clog);
+	free(read->managed_clog.bytes);
 	free(read);
 }

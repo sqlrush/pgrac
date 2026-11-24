@@ -1534,7 +1534,15 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 				work->startup, CLUSTER_WAL_STARTUP_BYTES, root, node, &work->pending);
 			if (result != 0)
 				return result;
-			if (work->registry && work->pending.phase != CLUSTER_WAL_STARTUP_DURABLE)
+			/* The creator's INITIALIZED/RESERVED input has no successor
+			 * claim or WAL. The decoder already bound its complete initial
+			 * cohort; each selected native checkpoint was matched above to
+			 * the registry. Count the input without inventing a pending source.
+			 * Ordinary unfinished startups still lack managed coverage. */
+			if (work->registry && work->pending.phase != CLUSTER_WAL_STARTUP_DURABLE
+				&& !(work->pending.input_kind == CLUSTER_WAL_STARTUP_INITIALIZED
+					 && work->pending.phase == CLUSTER_WAL_STARTUP_RESERVED
+					 && work->pending.formation_epoch == 0))
 				return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
 			if (work->pending.phase != CLUSTER_WAL_STARTUP_RESERVED) {
 				result = read_startup_ref(work->startup, &work->pending, &pending);

@@ -10,6 +10,7 @@
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_wal_source.h"
 #include "common/pgrac_control_binding.h"
+#include "cluster/cluster_recovery_file_identity.h"
 
 typedef struct ClusterControlBootstrapBytes {
 	const uint8 *data;
@@ -53,6 +54,10 @@ typedef struct ClusterControlBootstrapSnapshot {
 	uint32 root_format_version;
 	uint32 writer_lifecycle;
 	uint64 serving[2];
+	/* Independent selected-registry identity for the local initial catalog
+	 * CLOG input. A value never grants custody or physical coverage. */
+	ClusterRecoveryFileIdentityV2 catalog_clog;
+	bool catalog_clog_valid;
 } ClusterControlBootstrapSnapshot;
 
 /*
