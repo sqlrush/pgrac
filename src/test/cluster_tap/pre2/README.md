@@ -976,3 +976,39 @@ It reuses the real voting-file fixture and product objects. It covers accepted
 but unsettled requests under owner handoff, competing replacement requests,
 and recovery from newly allocated shared memory. The last test is a unit
 simulation of shared-memory reinitialization, not a live crash/startup test.
+
+## Small-buffer PCM capacity INSERT
+
+The explicit `p145-grd-capacity` suite selects only
+`t/488_pre2_grd_capacity_insert.pl`; default MultiXact and M1 selections do not
+include it. Use the existing authorized native Linux environment and the
+matching installed candidate:
+
+```sh
+sudo python3 -B src/test/cluster_tap/pre2/run_multixact_lifecycle.py \
+  --suite p145-grd-capacity --source /path/to/source \
+  --install /path/to/install --fixture-install /path/to/fixture-install \
+  --vendor /path/to/quorum-vendor --output /new/path/to/capacity-results \
+  --uid DB_UID --gid DB_GID --expected-postgres-sha256 FULL_POSTGRES_SHA256
+```
+
+This creates four normal members with 16MB buffers and verifies effective GRD
+capacity 2048. It executes the original 10000-row, 6880-byte PLAIN-pad INSERT
+with a 90-second statement timeout. No UPDATE or canonical rollover matrix is
+run. A small test module reads the original PCM statistics; it does not call
+`cluster_dump_state` or initialize undo observations. Evidence requires capacity
+wait/reclaim counter increments in the same postmaster lifetimes, unchanged OPEN
+writer identities, all original row values on all four members, clean member
+logs and the original normal stop. These instance counters do not identify the
+waiting backend or measure time asleep. No wait increment means failure to exercise
+the regression, even when INSERT succeeds. No state or capacity is injected.
+
+Offline tests (no database or lab):
+
+```sh
+cd src/test/cluster_tap/pre2
+python3 -B -m unittest -v test_p145_grd_capacity
+```
+
+These exercise only selection and counter evidence validation. Native runtime
+and the applicable same-binary four-node microbenchmark remain separate gates.

@@ -28,6 +28,7 @@ RETENTION_CASE = 't/484_pre2_retained_snapshot.pl'
 IDLE_FREEZE_CASE = 't/485_pre2_idle_freeze_restart.pl'
 MX_CONTINUATION_CASE = 't/486_pre2_multixact_continuation.pl'
 MX_PAGES_CASE = 't/487_pre2_multixact_offset_pages.pl'
+GRD_CAPACITY_CASE = 't/488_pre2_grd_capacity_insert.pl'
 
 
 def select_cases(suite, cases):
@@ -35,7 +36,8 @@ def select_cases(suite, cases):
                'm1-soak-workload': [SOAK_CASE], 'm1-retention': [RETENTION_CASE],
                'm1-idle-freeze': [IDLE_FREEZE_CASE],
                'm1-mx-continuation': [MX_CONTINUATION_CASE],
-               'm1-mx-pages': [MX_PAGES_CASE]}[suite]
+               'm1-mx-pages': [MX_PAGES_CASE],
+               'p145-grd-capacity': [GRD_CAPACITY_CASE]}[suite]
     selected = list(MX_CASES[1:] if suite == 'multixact' else allowed) if cases is None else list(cases)
     if (not selected or len(set(selected)) != len(selected)
             or any(case not in allowed for case in selected)):
@@ -162,6 +164,13 @@ def run(args):
             str(source/'src/test/cluster_tap/pre2/mx_range.c'), '-o', str(root/'mx_range.so')]
         with (root/'probe-build.log').open('x') as log:
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        if any(invocation['case'] == GRD_CAPACITY_CASE for invocation in invocations):
+            command = drop + ['cc', '-shared', '-fPIC', '-I', str(server_include),
+                '-I', str(source/'src/include'),
+                str(source/'src/test/cluster_tap/pre2/pcm_capacity_stats.c'),
+                '-o', str(root/'pcm_capacity_stats.so')]
+            with (root/'pcm-capacity-probe-build.log').open('x') as log:
+                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
         q.start()
         for invocation in invocations:
             case = invocation['case']
@@ -227,6 +236,9 @@ def run(args):
             if invocation['clients'] is not None:
                 command.insert(command.index('prove'),
                                'PGRAC_PRE2_SOAK_CLIENTS='+str(invocation['clients']))
+            if case == GRD_CAPACITY_CASE:
+                command.insert(command.index('prove'),
+                               'PGRAC_PRE2_PCM_STATS_PROBE='+str(root/'pcm_capacity_stats.so'))
             (directory/'command.json').write_text(json.dumps(command, indent=2)+'\n')
             try:
                 reply = q.run(command, check=False, cwd=directory, timeout=invocation['timeout'])
@@ -299,7 +311,7 @@ def main():
         parser.add_argument('--'+key, type=Path, required=True)
     parser.add_argument('--suite', choices=['multixact', 'm1', 'm1-soak-workload', 'm1-retention',
                                            'm1-idle-freeze', 'm1-mx-continuation',
-                                           'm1-mx-pages'], default='multixact')
+                                           'm1-mx-pages', 'p145-grd-capacity'], default='multixact')
     parser.add_argument('--cases', nargs='+')
     parser.add_argument('--fixture-install', type=Path)
     parser.add_argument('--expected-postgres-sha256')
