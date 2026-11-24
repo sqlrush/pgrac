@@ -7,6 +7,7 @@
 #define CLOG_MANAGED_MAIN redo_managed_main
 int redo_managed_main(void);
 int redo_unused_open(const char *, int);
+#define CLOG_FIXTURE_NATIVE_MODE_PROVIDED
 #include "test_cluster_slru_clog_managed_write.c"
 #undef CLOG_MANAGED_MAIN
 #undef SLRU_FIXTURE_OPEN

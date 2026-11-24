@@ -139,4 +139,18 @@ extern bool cluster_clog_storage_replay_v2(int fd,
 									XLogRecPtr record_end, const void *current_frame,
 									Size current_length, XLogRecPtr *applied_end);
 
+/* Rewrite only the already-born initial page of an authenticated BOOT
+ * creation batch. The original selected-file borrower retains file lifetime,
+ * namespace and page I/O serialization. Both existing and captured pages must
+ * have the original birth FullXid/generation 3 and no WAL watermarks. No file
+ * or page creation, WAL insertion, LSN fabrication or recovery permission.
+ * Success requires complete-frame write, fsync and same-FD full readback.
+ * Failure retains partial material and the caller's dirty/creation duties.
+ * The creator must still sync/read back the complete family before publication.
+ */
+extern bool cluster_clog_storage_bootstrap_write_page_v2(int fd,
+									 const ClusterClogFileBindingV2 *expected,
+									 const ClusterClogPageIdentityV2 *page,
+									 const void *payload, Size payload_length);
+
 #endif

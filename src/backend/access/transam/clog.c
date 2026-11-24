@@ -67,6 +67,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/cluster_control_native_files.h"
@@ -174,10 +175,86 @@ CLOGNativeIORequired(void)
 }
 
 static bool
+CLOGNativeCreationFile(int pageno, ClusterControlNativeTableInfoV2 *selected)
+{
+	const PgracInitdbRecoveryContext *creator;
+	const ClusterRecoveryFileIdentityV2 *expected;
+	uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+	/* The existing getter has authenticated the original closed creator pipe,
+	 * configuration and directories. A table row or processing mode alone is
+	 * insufficient, and the child remains outside online membership even when
+	 * its creation configuration already has cluster.enabled set. */
+	if (pageno < 0 || pageno >= 131072 || cluster_node_id != -1
+		|| MyBackendType != B_STANDALONE_BACKEND || IsUnderPostmaster
+		|| IsPostmasterEnvironment
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_CREATION_V2
+		|| (creator = cluster_wal_thread_initdb_recovery_context()) == NULL
+		|| creator->creator_pid == 0
+		|| !cluster_control_native_files_info_v2(selected)
+		|| selected->mode != CLUSTER_NATIVE_FILES_CREATION_V2
+		|| selected->table_generation == 0
+		|| selected->startup_generation != creator->creator_pid
+		|| memcmp(&selected->creation, creator, sizeof(*creator)) != 0
+		|| selected->creation.boot_file_count == 0
+		|| selected->creation.boot_file_count > PGRAC_INITDB_BOOT_FILES_V2)
+		return false;
+	expected = &selected->creation.boot_files[0];
+	return expected->kind == CLUSTER_RECOVERY_FILE_CLOG_V2
+		&& expected->origin < 128 && expected->database_oid == 0
+		&& expected->tablespace_oid == 0
+		&& expected->object_id == (uint64) pageno / SLRU_PAGES_PER_SEGMENT
+		&& cluster_recovery_file_identity_encode_v2(expected, reference, sizeof(reference));
+}
+
+static bool
+CLOGNativeBootstrapCommit(TransactionId xid, XidStatus status, XLogRecPtr lsn)
+{
+	ClusterControlNativeTableInfoV2 selected;
+
+	/* PG assigns its permanent xid 1 to the original bootstrap transaction.
+	 * It still commits through CLOG. This exception belongs only to the
+	 * authenticated, unpublished creator; it grants no online/recovery xid. */
+	return xid == BootstrapTransactionId
+		&& status == TRANSACTION_STATUS_COMMITTED
+		&& XLogRecPtrIsInvalid(lsn) && IsBootstrapProcessingMode() && !InRecovery
+		&& MyProc != NULL && MyProc->xid == BootstrapTransactionId
+		&& CLOGNativeCreationFile(0, &selected);
+}
+
+static bool
 CLOGNativeFileAcquire(int pageno, ClusterControlNativeFileBorrowV2 *borrow)
 {
 	ClusterControlFileKeyV2 key = {0};
 
+	if (cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2)
+	{
+		ClusterControlNativeTableInfoV2 selected, current;
+		uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+		if (!CLOGNativeCreationFile(pageno, &selected))
+			return false;
+		key.kind = CLUSTER_RECOVERY_FILE_CLOG_V2;
+		key.origin = selected.creation.boot_files[0].origin;
+		key.object_id = selected.creation.boot_files[0].object_id;
+		if (!cluster_control_native_file_acquire_v2(&key, borrow))
+			return false;
+		if (borrow->table_generation == selected.table_generation
+			&& borrow->startup_generation == selected.startup_generation
+			&& cluster_recovery_file_identity_encode_v2(&selected.creation.boot_files[0],
+				reference, sizeof(reference))
+			&& cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &borrow->expected)
+			&& cluster_control_native_file_current_v2(borrow)
+			&& CLOGNativeCreationFile(pageno, &current)
+			&& current.table_generation == selected.table_generation
+			&& current.startup_generation == selected.startup_generation
+			&& memcmp(&current.creation, &selected.creation, sizeof(current.creation)) == 0)
+			return true;
+		if (!cluster_control_native_file_release_v2(borrow))
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not return CLOG creation file identity")));
+		return false;
+	}
 	if (pageno < 0 || pageno >= 131072 || cluster_node_id < 0 ||
 		cluster_node_id > PG_UINT16_MAX ||
 		cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_UNKNOWN_V2)
@@ -276,8 +353,40 @@ CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last,
 	ClusterClogAllocationV2 *value;
 
 	if (!LWLockHeldByMeInMode(XidGenLock, LW_EXCLUSIVE)
-		|| !CLOGAllocationSegments(first, last, &begin, &gap, &total)
-		|| !CLOGAllocationPresence(begin, total))
+		|| !CLOGAllocationSegments(first, last, &begin, &gap, &total))
+		return false;
+	if (cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2)
+	{
+		ClusterControlNativeTableInfoV2 selected;
+		uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+		/* The original exclusive creation batch has already born page zero.
+		 * Its ordinary SQL child may consume that page, not register an online
+		 * gap/successor range or extend the unpublished file's birth authority.
+		 * The original ExtendCLOGFull still verifies the actual page birth. */
+		if (U64FromFullTransactionId(last) >= CLOG_XACTS_PER_PAGE
+			|| !CLOGNativeCreationFile(0, &selected))
+			return false;
+		value = *state;
+		if (!value) {
+			value = palloc0(offsetof(ClusterClogAllocationV2, files) + sizeof(value->files[0]));
+			value->first = 0;
+			value->count = 1;
+			*state = value;
+			if (!CLOGNativeFileAcquire(0, &value->files[0])) {
+				CLOGFinishAllocation(state);
+				return false;
+			}
+		}
+		return value->first == 0 && value->count == 1
+			&& value->files[0].table_generation == selected.table_generation
+			&& value->files[0].startup_generation == selected.startup_generation
+			&& cluster_recovery_file_identity_encode_v2(&selected.creation.boot_files[0],
+				reference, sizeof(reference))
+			&& cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &value->files[0].expected)
+			&& cluster_control_native_file_current_v2(&value->files[0]);
+	}
+	if (!CLOGAllocationPresence(begin, total))
 		return false;
 	value = *state;
 	if (!value) {
@@ -618,11 +727,11 @@ TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 #ifdef USE_PGRAC_CLUSTER
 /* Check before any bit or group LSN on the page changes. */
 static void
-CLOGCheckNativeStatus(TransactionId xid, XidStatus status, int slotno)
+CLOGCheckNativeStatus(TransactionId xid, XidStatus status, XLogRecPtr lsn, int slotno)
 {
 	XidStatus	current;
 
-	if (!TransactionIdIsNormal(xid) ||
+	if ((!TransactionIdIsNormal(xid) && !CLOGNativeBootstrapCommit(xid, status, lsn)) ||
 		(status != TRANSACTION_STATUS_COMMITTED &&
 		 status != TRANSACTION_STATUS_ABORTED &&
 		 status != TRANSACTION_STATUS_SUB_COMMITTED) ||
@@ -673,7 +782,9 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 			nsubxids < 0 || nsubxids > CLOG_XACTS_PER_PAGE ||
 			(nsubxids > 0 && subxids == NULL) ||
 			(TransactionIdIsValid(xid) &&
-			 (!TransactionIdIsNormal(xid) || TransactionIdToPage(xid) != pageno)))
+			 ((!TransactionIdIsNormal(xid) &&
+			   (nsubxids != 0 || !CLOGNativeBootstrapCommit(xid, status, lsn))) ||
+			  TransactionIdToPage(xid) != pageno)))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid managed CLOG page status request")));
@@ -706,12 +817,12 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 	if (native)
 	{
 		if (TransactionIdIsValid(xid))
-			CLOGCheckNativeStatus(xid, status, slotno);
+			CLOGCheckNativeStatus(xid, status, lsn, slotno);
 		for (i = 0; i < nsubxids; i++)
 		{
 			if (TransactionIdIsValid(xid) && status == TRANSACTION_STATUS_COMMITTED)
-				CLOGCheckNativeStatus(subxids[i], TRANSACTION_STATUS_SUB_COMMITTED, slotno);
-			CLOGCheckNativeStatus(subxids[i], status, slotno);
+				CLOGCheckNativeStatus(subxids[i], TRANSACTION_STATUS_SUB_COMMITTED, lsn, slotno);
+			CLOGCheckNativeStatus(subxids[i], status, lsn, slotno);
 		}
 	}
 #endif
@@ -986,7 +1097,7 @@ TransactionIdSetStatusBit(TransactionId xid, XidStatus status, XLogRecPtr lsn, i
 
 #ifdef USE_PGRAC_CLUSTER
 	if (CLOGNativeIORequired())
-		CLOGCheckNativeStatus(xid, status, slotno);
+		CLOGCheckNativeStatus(xid, status, lsn, slotno);
 #endif
 
 	byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
@@ -3381,8 +3492,31 @@ CLOGTrimNative(FullTransactionId next)
 	TransactionId xid = XidFromFullTransactionId(next);
 	int pageno = TransactionIdToPage(xid);
 	volatile bool body_complete = false;
+	const PgracInitdbRecoveryContext *creator = NULL;
+	ClusterControlNativeTableInfoV2 creation = {0};
+	bool creating = false;
 
-	if (!(MyBackendType == B_STARTUP
+	/* Only the authenticated original child may consume its unpublished
+	 * creation table. Processing mode or a table row alone grants nothing. */
+	if (cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2)
+	{
+		creator = cluster_wal_thread_initdb_recovery_context();
+		creating = creator != NULL && MyBackendType == B_STANDALONE_BACKEND
+			&& !IsUnderPostmaster && !IsPostmasterEnvironment
+			&& (IsBootstrapProcessingMode() || IsInitProcessingMode())
+			&& cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2
+			&& cluster_control_native_files_info_v2(&creation)
+			&& creation.mode == CLUSTER_NATIVE_FILES_CREATION_V2
+			&& creation.table_generation != 0 && creator->creator_pid != 0
+			&& creation.startup_generation == creator->creator_pid
+			&& memcmp(&creation.creation, creator, sizeof(*creator)) == 0;
+		if (!creating)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("native CLOG trim requires the original creation context")));
+	}
+
+	if (!(creating || MyBackendType == B_STARTUP
 		  || (!cluster_shared_config && !IsUnderPostmaster && !IsPostmasterEnvironment
 			  && MyBackendType == B_STANDALONE_BACKEND && IsInitProcessingMode()))
 		|| InRecovery || !enableFsync
@@ -3409,6 +3543,20 @@ CLOGTrimNative(FullTransactionId next)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("native CLOG startup cut changed before trim")));
+		if (creating)
+		{
+			ClusterControlNativeTableInfoV2 current;
+
+			if (creator != cluster_wal_thread_initdb_recovery_context()
+				|| !cluster_control_native_files_info_v2(&current)
+				|| current.mode != creation.mode
+				|| current.table_generation != creation.table_generation
+				|| current.startup_generation != creation.startup_generation
+				|| memcmp(&current.creation, &creation.creation, sizeof(current.creation)) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("native CLOG creation context changed before trim")));
+		}
 		page = &XactCtl->shared->clog_page_identity[slotno];
 		birth = XidFromFullTransactionId(page->identity.birth_full_xid);
 		if (!page->identity.birth_observed || page->identity.logical_page != (uint64)pageno
@@ -3420,7 +3568,8 @@ CLOGTrimNative(FullTransactionId next)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("native CLOG page birth does not match the startup FullXid cut")));
-		if (cluster_shared_config) {
+		/* Unpublished BOOT verifies without erasing status or inventing WAL. */
+		if (cluster_shared_config || creating) {
 			if (!cluster_native_clog_suffix_unused(XactCtl->shared->page_buffer[slotno], xid))
 				ereport(FATAL,
 						(errcode(ERRCODE_DATA_CORRUPTED),
@@ -3666,14 +3815,44 @@ ExtendCLOGFull(FullTransactionId newestXact)
 
 		PG_TRY();
 		{
-			(void) SimpleLruNativeClogZeroV2(XactCtl, newestXact);
+			if (cluster_control_native_files_mode_v2() == CLUSTER_NATIVE_FILES_CREATION_V2)
+			{
+				ClusterControlNativeTableInfoV2 selected, current;
+				ClusterClogPageIdentityV2 *page;
+
+				/* BOOT already created page zero, including its permanent xid 1
+				 * commit. The first SQL xid consumes that exact page; it cannot
+				 * zero it or borrow an online node's page-birth authority. */
+				if (!FullTransactionIdEquals(newestXact, FullTransactionIdFromU64(FirstNormalTransactionId))
+					|| !IsNormalProcessingMode() || InRecovery || RecoveryInProgress() || !enableFsync
+					|| !CLOGNativeCreationFile(birth.pageno, &selected))
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("CLOG creation allocation requires its original BOOT page")));
+				slot = SimpleLruReadPage(XactCtl, birth.pageno, false, raw);
+				page = &XactCtl->shared->clog_page_identity[slot];
+				if (!page->identity.birth_observed
+					|| page->identity.page_generation != U64FromFullTransactionId(newestXact)
+					|| !FullTransactionIdEquals(page->identity.birth_full_xid, newestXact)
+					|| !CLOGNativeCreationFile(birth.pageno, &current)
+					|| current.table_generation != selected.table_generation
+					|| current.startup_generation != selected.startup_generation
+					|| memcmp(&current.creation, &selected.creation, sizeof(current.creation)) != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("CLOG creation page birth or selected identity changed")));
+			}
+			else
+				(void) SimpleLruNativeClogZeroV2(XactCtl, newestXact);
 			body_complete = true;
 		}
 		PG_FINALLY();
 		{
 			/* ERROR has reset the holdoff for this still-held family lock. */
-			if (!body_complete)
+			if (!body_complete) {
+				InterruptHoldoffCount = 0;
 				HOLD_INTERRUPTS();
+			}
 			LWLockRelease(XactSLRULock);
 		}
 		PG_END_TRY();
@@ -3695,6 +3874,30 @@ ExtendCLOGFull(FullTransactionId newestXact)
 	LWLockRelease(XactSLRULock);
 }
 
+
+#ifdef USE_PGRAC_CLUSTER
+static bool
+CLOGNativeCreationTruncateNoop(TransactionId oldestXact)
+{
+	ClusterControlNativeTableInfoV2 selected, current;
+
+	/* The unpublished creator owns only the selected initial CLOG segment.
+	 * A cutoff inside that segment cannot remove any selected file. This is
+	 * a read-only return, not permission to scan or truncate raw filenames. */
+	if (!IsNormalProcessingMode() || InRecovery
+		|| !TransactionIdIsNormal(oldestXact)
+		|| TransactionIdToPage(oldestXact) >= SLRU_PAGES_PER_SEGMENT
+		|| !CLOGNativeCreationFile(0, &selected))
+		return false;
+	for (uint32 i = 1; i < selected.creation.boot_file_count; i++)
+		if (selected.creation.boot_files[i].kind == CLUSTER_RECOVERY_FILE_CLOG_V2)
+			return false;
+	return CLOGNativeCreationFile(0, &current)
+		&& current.table_generation == selected.table_generation
+		&& current.startup_generation == selected.startup_generation
+		&& memcmp(&current.creation, &selected.creation, sizeof(current.creation)) == 0;
+}
+#endif
 
 /*
  * Remove all CLOG segments before the one holding the passed transaction ID
@@ -3781,6 +3984,10 @@ TruncateCLOGInternal(TransactionId oldestXact, Oid oldestxid_datoid, uint64 full
 void
 TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 {
+#ifdef USE_PGRAC_CLUSTER
+	if (CLOGNativeCreationTruncateNoop(oldestXact))
+		return;
+#endif
 	TruncateCLOGInternal(oldestXact, oldestxid_datoid, 0);
 }
 

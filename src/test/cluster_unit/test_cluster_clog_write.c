@@ -41,6 +41,7 @@ static bool recovery;
 bool cluster_enabled;
 int cluster_node_id;
 #endif
+#include "test_cluster_clog_no_creation.h"
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static ClusterClogFileBindingV2 binding;

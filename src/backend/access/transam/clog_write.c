@@ -15,7 +15,50 @@
 #include "storage/proc.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_wal_thread.h"
 #endif
+
+static int
+clog_write_origin(const ClusterClogFileBindingV2 *binding)
+{
+	int origin = 0;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled)
+		origin = cluster_node_id;
+	if (cluster_node_id == -1 && cluster_control_native_files_mode_v2() ==
+		CLUSTER_NATIVE_FILES_CREATION_V2)
+	{
+		const PgracInitdbRecoveryContext *creator;
+		ClusterControlNativeTableInfoV2 selected;
+		const ClusterRecoveryFileIdentityV2 *expected;
+		uint8 reference[CLUSTER_CLOG_FILE_REFERENCE_BYTES];
+
+		if (MyBackendType != B_STANDALONE_BACKEND || IsUnderPostmaster ||
+			IsPostmasterEnvironment ||
+			(creator = cluster_wal_thread_initdb_recovery_context()) == NULL ||
+			creator->creator_pid == 0 ||
+			!cluster_control_native_files_info_v2(&selected) ||
+			selected.mode != CLUSTER_NATIVE_FILES_CREATION_V2 ||
+			selected.table_generation == 0 ||
+			selected.startup_generation != creator->creator_pid ||
+			memcmp(&selected.creation, creator, sizeof(*creator)) != 0 ||
+			creator->boot_file_count == 0 ||
+			creator->boot_file_count > PGRAC_INITDB_BOOT_FILES_V2)
+			return -1;
+		expected = &selected.creation.boot_files[0];
+		if (expected->kind != CLUSTER_RECOVERY_FILE_CLOG_V2 ||
+			expected->origin >= 128 || expected->database_oid != 0 ||
+			expected->tablespace_oid != 0 || expected->object_id != binding->segment ||
+			!cluster_recovery_file_identity_encode_v2(expected, reference, sizeof(reference)) ||
+			!cluster_recovery_file_identity_matches_v2(reference, sizeof(reference), &binding->identity))
+			return -1;
+		origin = expected->origin;
+	}
+#endif
+	return origin;
+}
 
 static bool
 clog_write_overlap(const void *left, Size left_bytes,
@@ -160,10 +203,6 @@ cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expec
 #endif
 	ssize_t written;
 
-#ifdef USE_PGRAC_CLUSTER
-	if (cluster_enabled)
-		origin = cluster_node_id;
-#endif
 	if (fd < 0 || expected == NULL || page == NULL || payload == NULL ||
 		last_end == NULL || payload_length != sizeof(checked_payload) ||
 		clog_write_overlap(last_end, sizeof(*last_end), expected, sizeof(*expected)) ||
@@ -174,6 +213,7 @@ cluster_clog_storage_write_page_v2(int fd, const ClusterClogFileBindingV2 *expec
 		return false;
 	}
 	binding = *expected;
+	origin = clog_write_origin(&binding);
 	snapshot = *page;
 	/* These checks exclude local WAL for foreign/recovery/bootstrap writes.
 	 * They do not replace the caller's original registration/source custody. */
@@ -455,4 +495,70 @@ cluster_clog_storage_initialize_v2(int fd, const ClusterClogFileBindingV2 *expec
 	if (success)
 		*last_end = end;
 	return success;
+}
+
+/* Authenticated BOOT rewrites only its existing original first frame. */
+bool
+cluster_clog_storage_bootstrap_write_page_v2(int fd,
+									 const ClusterClogFileBindingV2 *expected,
+									 const ClusterClogPageIdentityV2 *page,
+									 const void *payload, Size payload_length)
+{
+#if defined(USE_PGRAC_CLUSTER) && !defined(WIN32)
+	ClusterClogFileBindingV2 binding;
+	ClusterClogPageIdentityV2 snapshot, previous, checked;
+	uint8 frame[CLUSTER_CLOG_FRAME_BYTES];
+	uint8 checked_payload[CLUSTER_CLOG_PAGE_BYTES];
+	struct stat before, after;
+	int flags;
+	ssize_t written;
+
+	if (fd < 0 || expected == NULL || page == NULL || payload == NULL ||
+		payload_length != sizeof(checked_payload) || MyProc == NULL ||
+		!enableFsync || InRecovery || RecoveryInProgress() ||
+		!IsBootstrapProcessingMode() || cluster_node_id != -1 ||
+		cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_CREATION_V2)
+		return false;
+	binding = *expected;
+	snapshot = *page;
+	/* This is the original initial page, not a new allocator birth. */
+	if (binding.segment != 0 || binding.identity.object_id != 0 ||
+		snapshot.identity.logical_page != 0 || snapshot.identity.page_generation != 3 ||
+		U64FromFullTransactionId(snapshot.identity.birth_full_xid) != FirstNormalTransactionId ||
+		snapshot.identity.page_lsn != InvalidXLogRecPtr || snapshot.image_lsn != InvalidXLogRecPtr ||
+		clog_write_origin(&binding) != binding.identity.origin ||
+		binding.identity.system_identifier != GetSystemIdentifier() ||
+		!cluster_clog_file_page_encode_v2(&binding, &snapshot, payload, payload_length,
+										frame, sizeof(frame)))
+		return false;
+	flags = fcntl(fd, F_GETFL);
+	if (flags < 0 || (flags & O_ACCMODE) != O_RDWR || (flags & O_APPEND) != 0 ||
+		fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) ||
+		before.st_size != CLUSTER_CLOG_FILE_HEADER_BYTES + CLUSTER_CLOG_FRAME_BYTES ||
+		!cluster_clog_storage_read_page_v2(fd, &binding, 0, &previous,
+										 checked_payload, sizeof(checked_payload)) ||
+		!clog_write_same_birth(&snapshot, &previous) ||
+		previous.identity.page_lsn != InvalidXLogRecPtr || previous.image_lsn != InvalidXLogRecPtr)
+		return false;
+	written = pg_pwrite(fd, frame, sizeof(frame), CLUSTER_CLOG_FILE_HEADER_BYTES);
+	if (written != sizeof(frame))
+	{
+		if (written >= 0) errno = ENOSPC;
+		return false;
+	}
+	if (!enableFsync || pg_fsync(fd) != 0 || !enableFsync ||
+		!cluster_clog_storage_read_page_v2(fd, &binding, 0, &checked,
+										 checked_payload, sizeof(checked_payload)) ||
+		fstat(fd, &after) != 0 || before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+		before.st_size != after.st_size || !S_ISREG(after.st_mode) ||
+		!clog_write_same_birth(&snapshot, &checked) ||
+		checked.identity.page_lsn != InvalidXLogRecPtr || checked.image_lsn != InvalidXLogRecPtr ||
+		memcmp(frame + 64, checked_payload, sizeof(checked_payload)) != 0 ||
+		clog_write_origin(&binding) != binding.identity.origin)
+		return false;
+	return true;
+#else
+	(void) fd; (void) expected; (void) page; (void) payload; (void) payload_length;
+	return false;
+#endif
 }

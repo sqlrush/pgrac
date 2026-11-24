@@ -29,6 +29,7 @@ static int fixture_fsync(int fd);
 #undef printf
 #undef fprintf
 #undef snprintf
+#include "test_cluster_clog_no_creation.h"
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 

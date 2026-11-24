@@ -32,6 +32,9 @@ bool enableFsync;
 bool cluster_enabled;
 int cluster_node_id;
 #endif
+#define CLOG_FIXTURE_HAVE_UNDER_POSTMASTER
+#include "test_cluster_clog_no_creation.h"
+#undef CLOG_FIXTURE_HAVE_UNDER_POSTMASTER
 static PGPROC proc;
 static ClusterClogFileBindingV2 binding;
 static ClusterClogFileBindingV2 cached_bindings[1];
@@ -115,7 +118,13 @@ managed_fixture_pread(int fd, void *bytes, size_t length, off_t offset)
 		control_held = false;
 		io_held = true; /* Resume the managed reader's original ownership. */
 	}
-	if (read_throw) siglongjmp(*PG_exception_stack, 1);
+	if (read_throw) {
+#ifdef SLRU_FIXTURE_MANAGED_READ_ERROR
+		SLRU_FIXTURE_MANAGED_READ_ERROR();
+#else
+		siglongjmp(*PG_exception_stack, 1);
+#endif
+	}
 	return pread(fd, bytes, length, offset);
 }
 
