@@ -5973,9 +5973,11 @@ gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot
 			source == NULL
 				&& cluster_cssd_get_peer_state(holder_node) == CLUSTER_CSSD_PEER_DEAD)) {
 		*out_retry_denied = true;
-		/* At most one line per expired reply deadline or exhausted in-place
-		 * refusal budget, so a waiting reader stays visible without the trace. */
-		if (CritSectionCount == 0)
+		/* One line per expired reply deadline keeps a reader that is waiting
+		 * on a silent holder visible without the trace.  A refusal the holder
+		 * did send is already logged there and can repeat within milliseconds,
+		 * so it is not echoed here. */
+		if (last_status == -1 && CritSectionCount == 0)
 			ereport(LOG,
 					(errmsg_internal("cluster_gcs_block: read image from X holder %d not "
 									 "obtained yet; request re-armed",

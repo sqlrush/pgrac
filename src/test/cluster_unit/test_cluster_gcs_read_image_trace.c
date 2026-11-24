@@ -456,6 +456,8 @@ UT_TEST(exhausted_holder_refusal_from_live_holder_rearms_without_error)
 	UT_ASSERT(!caught_error);
 	UT_ASSERT(!result && retry_denied);
 	UT_ASSERT_EQ(sends, 2); UT_ASSERT_EQ(releases, 1); UT_ASSERT_EQ(installs, 0);
+	/* The holder logs its own refusals; the requester adds no line per round. */
+	UT_ASSERT_EQ(strlen(logs), 0);
 }
 
 /* Membership change ends the wait: a DEAD holder cannot answer, so the
