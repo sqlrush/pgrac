@@ -7214,6 +7214,7 @@ cluster_bufmgr_first_fill_begin(BufferDesc *buf, ClusterBufmgrFirstFill *read,
 	ResourceXApplyResult result;
 	ClusterPcmOwnResult native;
 	bool covered = false;
+	const char *diagnostic_stage = "begin";
 
 	read->owner = CurrentResourceOwner;
 	if (MyProc == NULL || MyProc->pid != MyProcPid || MyProcPid <= 0)
@@ -7226,17 +7227,25 @@ cluster_bufmgr_first_fill_begin(BufferDesc *buf, ClusterBufmgrFirstFill *read,
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("first buffer fill could not reserve its exact source")));
 	read->pending = true;
 	result = cluster_gcs_block_first_fill_begin(buf, &read->base, read->token, &read->request);
-	if (result == RESOURCE_X_APPLY_APPLIED)
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		diagnostic_stage = "wait";
 		result = cluster_gcs_block_first_fill_wait(&read->request);
-	if (result == RESOURCE_X_APPLY_APPLIED)
+	}
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		diagnostic_stage = "claim";
 		result = cluster_bufmgr_pcm_own_acquire_claim_exact(buf, &read->base, read->token,
 			RESOURCE_X_ACQUIRE_FIRST_FILL, &read->request.admission, &read->request.observation,
 			&grant, &image, &joined, &read->claim);
-	if (result == RESOURCE_X_APPLY_APPLIED)
+	}
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		diagnostic_stage = "prepare";
 		result = cluster_bufmgr_pcm_own_acquire_stage_begin_exact(buf, &read->base, read->token,
 			RESOURCE_X_ACQUIRE_FIRST_FILL, &read->request.admission, &read->claim, &read->claim);
+	}
 	if (result == RESOURCE_X_APPLY_APPLIED) {
 		read->delegated = true;
+		diagnostic_stage = grant.body.acquire_decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK
+			? "fill_disk" : "fill_image";
 		if (grant.body.acquire_decision.source_kind == RESOURCE_X_ACQUIRE_SOURCE_DISK) {
 			instr_time io_start = pgstat_prepare_io_time();
 			result = cluster_bufmgr_pcm_own_acquire_fill_disk_exact(buf, &read->base,
@@ -7247,6 +7256,19 @@ cluster_bufmgr_first_fill_begin(BufferDesc *buf, ClusterBufmgrFirstFill *read,
 			result = cluster_bufmgr_pcm_own_acquire_fill_image_exact(buf, &read->base,
 				&read->request.episode, &read->request.admission, &read->claim);
 	}
+	if (result == RESOURCE_X_APPLY_RECOVERY_BLOCKED && cluster_trace_tx_identity)
+		ereport(LOG,
+			(errmsg_internal("first-fill result6 stage observation"),
+			 errdetail_internal("stage=%s tag=%u/%u/%u/%d/%u buffer=%d base=" UINT64_FORMAT
+				 " token=" UINT64_FORMAT " attempt=" UINT64_FORMAT " formation=" UINT64_FORMAT
+				 " epoch=" UINT64_FORMAT " r4=" UINT64_FORMAT " purpose=" UINT64_FORMAT,
+				 diagnostic_stage, read->base.tag.spcOid, read->base.tag.dbOid,
+				 read->base.tag.relNumber, read->base.tag.forkNum, read->base.tag.blockNum,
+				 buf->buf_id, read->base.generation, read->token,
+				 read->request.observation.request.assertion_sequence,
+				 read->request.observation.request.resource_formation,
+				 read->request.admission.formation_epoch, read->request.admission.record_generation,
+				 read->claim.purpose)));
 	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 			errmsg("first buffer fill could not complete its original GCS acquisition: result=%d", result)));

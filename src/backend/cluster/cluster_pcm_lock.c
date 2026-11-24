@@ -31164,6 +31164,11 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
 	ResourceXDecodedFrame grant, image;
 	ResourceXRequesterJoinSnapshot snapshot;
 	ClusterWaitTrace wait = {0};
+	const char *diagnostic = NULL;
+	uint64 formation = 0, attempt = 0, floor = 0, purpose = 0, sequence = 0;
+	uint32 phase = 0, format = 0, claim_source = 0, local_state = 0;
+	uint8 intent = 0, resident_s = 0, handoff = 0, pending = 0;
+	bool gate_open;
 	volatile ResourceXApplyResult result = RESOURCE_X_APPLY_INVALID;
 
 	if (observation == NULL || episode == NULL
@@ -31189,7 +31194,8 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
 		context.cv_prepared = true;
 		ConditionVariablePrepareToSleep(&entry->wait_cv);
 		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-		result = cluster_pcm_lock_resource_x_gate_open_exact(observation->request.resource_formation)
+		gate_open = cluster_pcm_lock_resource_x_gate_open_exact(observation->request.resource_formation);
+		result = gate_open
 			? pcm_resource_x_requester_acquire_frames_locked(entry, observation, episode,
 				NULL, &grant, &image, &snapshot) : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		state = pcm_resource_x_master_state_for_entry(entry);
@@ -31200,6 +31206,33 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
 			&& pcm_resource_x_requester_join_snapshot_locked(&state->requester_join, &snapshot)
 			&& (snapshot.flags & RESOURCE_X_REQUESTER_JOIN_EVIDENCE_COMPLETE) == 0)
 			result = RESOURCE_X_APPLY_NOT_FOUND;
+		/* Diagnose only this failed evaluation. Validators below are pure
+		 * readers of bytes still protected by this same original lock. */
+		if (result == RESOURCE_X_APPLY_RECOVERY_BLOCKED && cluster_trace_tx_identity) {
+			const ClusterPcmResourceXBootstrapRound *r = &entry->resource_x_bootstrap_round;
+			if (!gate_open) diagnostic = "wait.gate_open";
+			else if (state == NULL) diagnostic = "frames.master_state";
+			else if (!pcm_resource_x_requester_acquire_valid_locked(r)) diagnostic = "frames.requester_valid";
+			else if (!pcm_resource_x_install_claim_valid_locked(r)) diagnostic = "frames.install_claim_valid";
+			else if (!pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)) diagnostic = "frames.local_owner_valid";
+			else if (state->requester_join.acquire_format != 1) diagnostic = "frames.acquire_format";
+			else if (!pcm_resource_x_requester_join_decode_locked(&state->requester_join, &grant, &image)) diagnostic = "frames.join_decode";
+			else if (!pcm_resource_x_requester_join_snapshot_locked(&state->requester_join, &snapshot)) diagnostic = "frames.join_snapshot";
+			else diagnostic = "frames.gate_open";
+			formation = r->resource_formation;
+			attempt = r->request.assertion_sequence;
+			floor = r->highest_attempt_floor;
+			purpose = r->delivery_executor_purpose;
+			sequence = r->delivery_executor_sequence;
+			phase = r->phase;
+			format = state != NULL ? state->requester_join.acquire_format : 0;
+			claim_source = r->install_claim_source;
+			local_state = entry->resource_x_local_owner.state;
+			intent = r->has_acquire_intent;
+			resident_s = r->resident_s_authorized;
+			handoff = r->acquire_read_handoff;
+			pending = r->send.pending;
+		}
 		LWLockRelease(&entry->entry_lock.lock);
 		if (result == RESOURCE_X_APPLY_NOT_FOUND) {
 			if (cluster_trace_tx_identity)
@@ -31219,6 +31252,18 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
 		pcm_entry_wait_context_cleanup(&context);
 	}
 	PG_END_TRY();
+	if (diagnostic != NULL)
+		ereport(LOG, (errmsg_internal("first-fill result6 entry observation"),
+			errdetail_internal("predicate=%s left=0 right=1 tag=%u/%u/%u/%d/%u attempt=" UINT64_FORMAT
+				" formation=" UINT64_FORMAT " floor=" UINT64_FORMAT " purpose=" UINT64_FORMAT
+				" sequence=" UINT64_FORMAT " phase=%u format=%u claim_source=%u local_state=%u intent=%u resident_s=%u handoff=%u pending=%u",
+				diagnostic, observation->request.logical_assertion.resource.spcOid,
+				observation->request.logical_assertion.resource.dbOid,
+				observation->request.logical_assertion.resource.relNumber,
+				observation->request.logical_assertion.resource.forkNum,
+				observation->request.logical_assertion.resource.blockNum,
+				attempt, formation, floor, purpose, sequence, phase, format, claim_source,
+				local_state, intent, resident_s, handoff, pending)));
 	return result;
 }
 
