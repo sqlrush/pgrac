@@ -20411,3 +20411,34 @@ clean-start-debt-readback:
 # Both fixtures include the original Start's transition-view consumer.
 test_cluster_cold_tx_start test_cluster_relmap_original_start.o: \
 	$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h
+
+# Whole framed-file sync/readback; actual SHA256 and temporary file I/O.
+TESTS += test_cluster_clog_sync
+all: test_cluster_clog_sync
+test_cluster_clog_sync: test_cluster_clog_sync.c test_cluster_clog_storage.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog_sync.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-clog-storage-sync
+.PHONY: clean-clog-storage-sync
+clean-clog-storage-sync:
+	rm -f test_cluster_clog_sync test_cluster_clog_sync.d
+
+test_cluster_clog_sync: \
+	$(top_srcdir)/src/include/common/cryptohash.h \
+	$(top_srcdir)/src/include/miscadmin.h \
+	$(top_srcdir)/src/include/storage/fd.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+	$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+	$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h

@@ -16,6 +16,7 @@ OBJS = \
 	clog.o \
 	clog_replay.o \
 	clog_storage.o \
+	clog_sync.o \
 	clog_write.o \
 	commit_ts.o \
 	generic_xlog.o \

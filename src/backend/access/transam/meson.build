@@ -4,6 +4,7 @@ backend_sources += files(
   'clog.c',
   'clog_replay.c',
   'clog_storage.c',
+  'clog_sync.c',
   'clog_write.c',
   'commit_ts.c',
   'generic_xlog.c',
