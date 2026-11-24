@@ -19,6 +19,7 @@ struct ClusterControlDebtTransitionV2 {
 	const struct ClusterControlDebtTransitionV2 *self;
 	ResourceOwner owner;
 	int pid;
+	bool publish_attempted;
 	ClusterControlDebtTransitionViewV2 view;
 	uint8 *bytes;
 	Size byte_count;

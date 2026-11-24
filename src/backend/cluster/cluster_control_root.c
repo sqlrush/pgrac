@@ -4529,7 +4529,8 @@ fsync_parent_global(void)
 }
 
 static bool
-write_durable_image_size(const char *final_path, const uint8 *bytes, Size length)
+write_durable_image_size_reserved(const char *final_path, const uint8 *bytes, Size length,
+	uint8 *readback)
 {
 	uint8 random_bytes[8];
 	char temp_path[MAXPGPATH];
@@ -4542,7 +4543,9 @@ write_durable_image_size(const char *final_path, const uint8 *bytes, Size length
 	bool renamed = false;
 	bool ok = false;
 
-	if ((length != CLUSTER_CONTROL_ROOT_FILE_BYTES && length != 66560)
+	if (!readback || !bytes || !final_path
+		|| history_ranges_overlap(bytes, length, readback, length)
+		|| (length != CLUSTER_CONTROL_ROOT_FILE_BYTES && length != 66560)
 		|| !regular_or_absent_nosymlink(final_path, true) || !pg_strong_random(random_bytes, 8))
 		return false;
 	for (i = 0; i < 8; i++)
@@ -4582,7 +4585,6 @@ write_durable_image_size(const char *final_path, const uint8 *bytes, Size length
 	if (!fsync_parent_global())
 		goto cleanup_closed;
 	{
-		uint8 *readback = palloc(length);
 		if (length == CLUSTER_CONTROL_ROOT_FILE_BYTES) {
 			ClusterControlRootResult result = read_exact_file(final_path, readback);
 			ok = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !memcmp(readback, bytes, length);
@@ -4604,7 +4606,6 @@ write_durable_image_size(const char *final_path, const uint8 *bytes, Size length
 			closed = held >= 0 && CloseTransientFile(held) == 0;
 			ok = ok && closed;
 		}
-		pfree(readback);
 	}
 	return ok;
 
@@ -4615,6 +4616,21 @@ cleanup_closed:
 	if (created && !renamed)
 		(void)unlink(temp_path);
 	return false;
+}
+
+/* Existing callers keep their writer; protective publication reserves its
+ * readback storage before any immutable or ROOT mutation. */
+static bool
+write_durable_image_size(const char *final_path, const uint8 *bytes, Size length)
+{
+	uint8 *readback;
+	bool ok;
+	if (length != CLUSTER_CONTROL_ROOT_FILE_BYTES && length != 66560)
+		return false;
+	readback = palloc(length);
+	ok = write_durable_image_size_reserved(final_path, bytes, length, readback);
+	pfree(readback);
+	return ok;
 }
 
 static bool
@@ -15990,5 +16006,6 @@ cluster_control_relmap_recovery_create_confirm_locked_v2(
 
 #include "cluster_control_debt_v2.inc"
 #include "cluster_control_debt_transition_v2.inc"
+#include "cluster_control_debt_publish_v2.inc"
 
 #endif /* USE_PGRAC_CLUSTER */

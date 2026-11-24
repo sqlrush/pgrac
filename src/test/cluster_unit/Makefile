@@ -19722,3 +19722,41 @@ clean: clean-control-debt-restart
 .PHONY: clean-control-debt-restart
 clean-control-debt-restart:
 	rm -f test_cluster_control_debt_restart test_cluster_control_debt_restart.d
+
+# Protective ROOT publication component and exact original writer extraction.
+test_cluster_control_debt_writer.inc: $(top_srcdir)/src/backend/cluster/cluster_control_root.c Makefile
+	awk '/^write_durable_image_size_reserved\(/ { print "static bool"; emit=1; entries++ } emit { print } emit && /^}/ { emit=0 } END { if (entries != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+TESTS += test_cluster_control_debt_publish
+all: test_cluster_control_debt_publish
+test_cluster_control_debt_publish: test_cluster_control_debt_publish.c \
+		test_cluster_control_debt_restart.c test_cluster_control_debt_writer.inc \
+		test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
+		test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_transition_v2.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_publish_v2.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		$(top_srcdir)/src/include/storage/lwlock.h \
+		$(top_srcdir)/src/include/utils/resowner.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_registry_common_test.o cluster_control_registry_original.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+cluster_control_registry_original.o: $(top_srcdir)/src/backend/cluster/cluster_control_debt_publish_v2.inc
+clean: clean-control-debt-publish
+.PHONY: clean-control-debt-publish
+clean-control-debt-publish:
+	rm -f test_cluster_control_debt_publish test_cluster_control_debt_publish.d test_cluster_control_debt_writer.inc test_cluster_control_debt_writer.inc.tmp
