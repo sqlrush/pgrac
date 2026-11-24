@@ -63,6 +63,8 @@ UT_TEST(test_startup_native_images_accept_only_unchanged_complete_terminal_page)
 		original = startup_image_expected; subject = native_ctrc_work.entries[0];
 		retirement_run_startup();
 		UT_ASSERT(retirement_service_reached && !info.cluster_tx_start->revoked);
+		UT_ASSERT_EQ(prefix_window.key.target_thread, unchanged ? 0 : 2);
+		UT_ASSERT_EQ(retirement_phase, CLUSTER_RECOVERY_STAMP_EMPTY);
 		for (unsigned i = 0; i < 3; i++) UT_ASSERT_EQ(startup_native_image_calls[i], 2);
 		UT_ASSERT(memcmp(&original, &startup_image_expected, sizeof(original)) == 0);
 		UT_ASSERT(memcmp(&subject, &native_ctrc_work.entries[0], sizeof(subject)) == 0);

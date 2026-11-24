@@ -20,11 +20,15 @@ static void
 retirement_service_probe(void)
 {
 	ClusterColdCtrcPageProgressV1 *progress = cluster_recovery_cold_start->ctrc_page_progress;
-	ClusterRecoveryStampSlotV1 *slot = &cluster_thread_recovery_replay_slot(prefix_window.key.target_thread)->stamp;
+	ClusterThreadReplaySlot *replay = cluster_thread_recovery_replay_slot(prefix_window.key.target_thread);
+
+	/* An unchanged page has no FPI window to retire. */
+	UT_ASSERT(replay != NULL || (prefix_unchanged && prefix_window.key.target_thread == 0));
 
 	retirement_service_reached = true;
 	retirement_target = progress->next_target; retirement_pending = progress->pending;
-	retirement_phase = slot->phase; retirement_steps = prefix_steps;
+	retirement_phase = replay != NULL ? replay->stamp.phase : CLUSTER_RECOVERY_STAMP_EMPTY;
+	retirement_steps = prefix_steps;
 	retirement_reads = pending_readback_calls; retirement_closes = pending_storage_closes;
 	if (retirement_mode == 1) {
 		bool again = ClusterColdRecoveryCtrcPageAdvance(info.cluster_tx_start, 0);

@@ -5680,7 +5680,7 @@ test_cluster_relmap_native_clog.o test_cluster_cold_start_terminal_clog.o: test_
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 # Keep this bridge's original WAL fixture separate from Start's native PAGE WAL.
-test_cluster_cold_start_terminal_clog.o: CPPFLAGS += -DXLogBeginInsert=start_terminal_XLogBeginInsert -DXLogInsert=start_terminal_XLogInsert
+test_cluster_cold_start_terminal_clog.o: CPPFLAGS += -DXLogBeginInsert=start_terminal_XLogBeginInsert -DXLogInsert=start_terminal_XLogInsert -DXLogRegisterData=start_terminal_XLogRegisterData
 
 test_cluster_relmap_retained_arb.o: $(top_srcdir)/src/backend/cluster/cluster_relmap_arb.c \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_arb.h \
@@ -14935,7 +14935,9 @@ test_cluster_cold_tx_start: test_cluster_cold_tx_start.c test_cluster_cold_tx_ow
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
         $(top_srcdir)/src/include/cluster/cluster_recovery_ctrc_record.h $(CLUSTER_UNIT_CRYPTOHASH_O) Makefile
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(STARTUP_NATIVE_CTRC_TEST_CPPFLAGS) -ffunction-sections -fdata-sections $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(STARTUP_NATIVE_CTRC_TEST_CPPFLAGS) \
+		-Drf_page_stable_base_proof_destroy_v1=start_prefix_proof_destroy_v1 \
+		-ffunction-sections -fdata-sections $< \
         $(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
         $(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
 		$(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_PAGE_STABLE_TEST_O) \
