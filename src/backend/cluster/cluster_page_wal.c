@@ -421,6 +421,39 @@ cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1
 	return page_wal_prepare_carrier(buf, state, carrier, image, prepared);
 }
 
+/* Process-local diagnostic only. Comparisons retain original short circuit
+ * evaluation; emission is deferred until the caller releases content. */
+static struct {
+	const char *predicate;
+	uint64 left;
+	uint64 right;
+	bool emitted;
+} page_wal_input_refusal;
+
+static bool
+page_wal_input_observe(const char *predicate, uint64 left, uint64 right, bool matches)
+{
+	if (!matches && cluster_trace_tx_identity && page_wal_input_refusal.predicate == NULL
+		&& !page_wal_input_refusal.emitted) {
+		page_wal_input_refusal.predicate = predicate;
+		page_wal_input_refusal.left = left;
+		page_wal_input_refusal.right = right;
+	}
+	return matches;
+}
+
+void
+cluster_page_wal_log_input_refusal_v1(void)
+{
+	if (cluster_trace_tx_identity && page_wal_input_refusal.predicate != NULL
+		&& !page_wal_input_refusal.emitted) {
+		page_wal_input_refusal.emitted = true;
+		ereport(LOG, (errmsg_internal("first-fill page WAL input refusal observation"),
+			errdetail_internal("predicate=%s left=" UINT64_FORMAT " right=" UINT64_FORMAT,
+				page_wal_input_refusal.predicate, page_wal_input_refusal.left, page_wal_input_refusal.right)));
+	}
+}
+
 bool
 cluster_page_wal_prepare_input_install_v1(BufferDesc *buf,
 	const ClusterPcmOwnSnapshot *pending, uint64 attempt,
@@ -429,30 +462,35 @@ cluster_page_wal_prepare_input_install_v1(BufferDesc *buf,
 	uint32 state;
 	bool exact;
 
-	if (bindings == NULL || buf == NULL || pending == NULL || carrier == NULL || image == NULL
-		|| prepared == NULL || !cluster_enabled || !cluster_shared_config
-		|| buf->buf_id < 0 || buf->buf_id >= NBuffers || ClusterPcmOwnArray == NULL
-		|| attempt == 0 || attempt == UINT64_MAX
-		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+#define INPUT_OBSERVE(expression) page_wal_input_observe(#expression, 0, 1, (expression))
+	page_wal_input_refusal.predicate = NULL;
+
+	if (!INPUT_OBSERVE(bindings != NULL) || !INPUT_OBSERVE(buf != NULL) || !INPUT_OBSERVE(pending != NULL) || !INPUT_OBSERVE(carrier != NULL) || !INPUT_OBSERVE(image != NULL)
+		|| !INPUT_OBSERVE(prepared != NULL) || !INPUT_OBSERVE(cluster_enabled) || !INPUT_OBSERVE(cluster_shared_config)
+		|| !INPUT_OBSERVE(buf->buf_id >= 0) || !INPUT_OBSERVE(buf->buf_id < NBuffers) || !INPUT_OBSERVE(ClusterPcmOwnArray != NULL)
+		|| !INPUT_OBSERVE(attempt != 0) || !INPUT_OBSERVE(attempt != UINT64_MAX)
+		|| !INPUT_OBSERVE(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)))
 		return false;
 	state = LockBufHdr(buf);
-	exact = pending->semantic_buf_state == (BM_TAG_VALID | BM_IO_IN_PROGRESS)
-		&& (state & CLUSTER_PCM_OWN_SEMANTIC_BUF_STATE_MASK) == pending->semantic_buf_state
-		&& pending->pcm_state == PCM_STATE_N && buf->pcm_state == pending->pcm_state
-		&& pending->buffer_type == BUF_TYPE_CURRENT && buf->buffer_type == pending->buffer_type
-		&& pending->flags == PCM_OWN_FLAG_GRANT_PENDING && cluster_pcm_own_flags_get(buf->buf_id) == pending->flags
-		&& pending->reservation_token != 0 && pending->reservation_token < UINT64_MAX - 1
-		&& pending->generation != 0 && pending->generation < UINT64_MAX - 1
-		&& pending->writer_activation_token == 0 && pending->resource_x_activation_generation == 0
-		&& BufferTagsEqual(&pending->tag, &buf->tag)
-		&& cluster_pcm_own_gen_get(buf->buf_id) == pending->generation
-		&& cluster_pcm_own_reservation_token_get(buf->buf_id) == pending->reservation_token
-		&& cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0
-		&& cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0
-		&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == attempt
-		&& (pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) == 0;
+	exact = INPUT_OBSERVE(pending->semantic_buf_state == (BM_TAG_VALID | BM_IO_IN_PROGRESS))
+		&& INPUT_OBSERVE((state & CLUSTER_PCM_OWN_SEMANTIC_BUF_STATE_MASK) == pending->semantic_buf_state)
+		&& INPUT_OBSERVE(pending->pcm_state == PCM_STATE_N && buf->pcm_state == pending->pcm_state)
+		&& INPUT_OBSERVE(pending->buffer_type == BUF_TYPE_CURRENT && buf->buffer_type == pending->buffer_type)
+		&& INPUT_OBSERVE(pending->flags == PCM_OWN_FLAG_GRANT_PENDING && cluster_pcm_own_flags_get(buf->buf_id) == pending->flags)
+		&& INPUT_OBSERVE(pending->reservation_token != 0 && pending->reservation_token < UINT64_MAX - 1)
+		&& page_wal_input_observe("pending->generation != 0", pending->generation, 0, pending->generation != 0)
+		&& INPUT_OBSERVE(pending->generation < UINT64_MAX - 1)
+		&& INPUT_OBSERVE(pending->writer_activation_token == 0 && pending->resource_x_activation_generation == 0)
+		&& INPUT_OBSERVE(BufferTagsEqual(&pending->tag, &buf->tag))
+		&& INPUT_OBSERVE(cluster_pcm_own_gen_get(buf->buf_id) == pending->generation)
+		&& INPUT_OBSERVE(cluster_pcm_own_reservation_token_get(buf->buf_id) == pending->reservation_token)
+		&& INPUT_OBSERVE(cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0)
+		&& INPUT_OBSERVE(cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0)
+		&& INPUT_OBSERVE(cluster_pcm_own_delivery_attempt_get(buf->buf_id) == attempt)
+		&& INPUT_OBSERVE((pg_atomic_read_u64(&ClusterPcmOwnArray[buf->buf_id].write_io_generation) & 1) == 0);
 	UnlockBufHdr(buf, state);
 	return exact && page_wal_prepare_carrier(buf, state, carrier, image, prepared);
+#undef INPUT_OBSERVE
 }
 bool
 cluster_page_wal_publish_install_v1(Buffer buffer, ClusterPageWalInstallV1 *prepared)

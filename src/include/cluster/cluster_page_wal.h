@@ -245,6 +245,8 @@ extern bool cluster_page_wal_prepare_install_v1(Buffer buffer,
  * prepares attribution only; the caller publishes in the same lock hold. */
 struct BufferDesc;
 struct ClusterPcmOwnSnapshot;
+/* Default-off read-only input-refusal diagnostic; caller holds no locks. */
+extern void cluster_page_wal_log_input_refusal_v1(void);
 extern bool cluster_page_wal_prepare_input_install_v1(struct BufferDesc *buf,
 	const struct ClusterPcmOwnSnapshot *pending, uint64 attempt,
 	const ClusterPageWalBindingV1 *carrier, Page image, ClusterPageWalInstallV1 *prepared);
