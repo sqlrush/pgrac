@@ -5,7 +5,8 @@
 #include "common/cluster_recovery_registry.h"
 #include "common/cluster_recovery_reservations.h"
 /* Pure pre-CF observation. Original fields are validated in private scratch;
- * metadata.bytes is empty and format_version remains 4. No token or grant. */
+ * metadata.bytes is empty and format_version remains 4. DRF1 recognition is
+ * shape only: ordinary AVAILABLE loaders continue to refuse it. No grant. */
 extern bool cluster_control_root_registry_decode_v4(const uint8 *, Size,
 	const uint8 storage_uuid[16], uint64 system_identifier, ControlRootImage *metadata);
 /* Original owner supplies its unpublished candidate and complete registry.
@@ -28,6 +29,15 @@ extern bool cluster_control_root_registry_read_selected_v4(int global_directory,
 /* Complete primary+backup capture for the existing control reader. No legacy
  * bytes/token escape; metadata.bytes is empty and format_version stays 4.
  * Both fixed paths are reread before local descriptors close. */
+/* Reserved scratch for the identical complete physical capture. The original
+ * owner allocates it before first mutation; no authority is stored here. */
+typedef struct ControlRootCaptureWorkV4 {
+	uint8 bytes[133120], again[66560];
+	ControlRootImage logical, backup;
+} ControlRootCaptureWorkV4;
+extern bool cluster_control_root_registry_capture_reserved_v4(int global_directory,
+	const uint8 storage_uuid[16], uint64 system_identifier, uint8 pair[133120],
+	ControlRootImage *metadata, ControlRootCaptureWorkV4 *work);
 extern bool cluster_control_root_registry_capture_v4(int global_directory,
 													 const uint8 storage_uuid[16],
 													 uint64 system_identifier, uint8 pair[133120],

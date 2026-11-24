@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import pathlib
 import subprocess
@@ -25,6 +26,65 @@ MANIFEST = (
 
 def canonical_json(value: object) -> str:
     return json.dumps(value, indent=2, sort_keys=True) + "\n"
+
+
+class R11ProductionFragmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        spec = importlib.util.spec_from_file_location("r11_census", TOOL)
+        self.assertIsNotNone(spec)
+        self.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.tool)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = pathlib.Path(directory.name)
+        self.git("init", "--quiet")
+        files = {
+            "src/backend/cluster/owner.c": '#include "owner.inc"\n',
+            "src/backend/cluster/owner.inc": "int original_owner(void) { return 7; }\n",
+            "src/backend/cluster/Makefile": "OBJS = owner.o\n",
+            "src/include/cluster/owner.h": "int original_owner(void);\n",
+            "src/test/cluster_unit/fixture.inc": "test-only fixture\n",
+        }
+        for name, text in files.items():
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        self.git("add", "--", "src")
+        self.tree = self.git("write-tree")
+        self.fragment = self.root / "src/backend/cluster/owner.inc"
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.strip()
+
+    def test_fragment_bytes_are_scanned_and_change_the_current_digest(self) -> None:
+        paths, text, before = self.tool.current_product_text(self.root)
+        self.assertIn("src/backend/cluster/owner.inc", paths)
+        self.assertIn("return 7;", text)
+        self.assertNotIn("test-only fixture", text)
+        self.assertEqual(before["path_count"], 4)
+        # A forbidden writer hidden in a production include must reach the
+        # existing pattern checks and must change the exact product digest.
+        self.fragment.write_text(
+            "void cluster_gcs_pcm_x_acquire_writer(void) {}\n", encoding="utf-8"
+        )
+        after_paths, after_text, after = self.tool.current_product_text(self.root)
+        self.assertEqual(paths, after_paths)
+        self.assertIn("cluster_gcs_pcm_x_acquire_writer", after_text)
+        self.assertNotEqual(before["sha256"], after["sha256"])
+
+    def test_historical_fragment_comes_from_the_named_tree(self) -> None:
+        self.fragment.write_text("int original_owner(void) { return 9; }\n", encoding="utf-8")
+        paths, text = self.tool.tree_text(self.root, self.tree)
+        self.assertIn("src/backend/cluster/owner.inc", paths)
+        self.assertIn("return 7;", text)
+        self.assertNotIn("return 9;", text)
+        self.assertNotIn("test-only fixture", text)
 
 
 class R11SourceRemovalCensusTests(unittest.TestCase):
