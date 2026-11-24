@@ -10,7 +10,7 @@
 #    + view + SQL pipeline is intact end to end on a real PG instance:
 #
 #      - The view exists and is queryable.
-#      - It returns exactly 126 rows (one per registered cluster wait event).
+#      - It returns exactly 127 rows (one per registered cluster wait event).
 #      - It exposes 13 distinct cluster wait classes.
 #      - Per-class row counts match the registered roster.
 #      - Specific event names are present.
@@ -42,12 +42,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 126, including both frontend undo capacity waits.
+# Total row count: 127, including undo and PCM capacity waits.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'126',
-	'pg_stat_cluster_wait_events returns 126 rows including both frontend undo capacity waits');
+	'127',
+	'pg_stat_cluster_wait_events returns 127 registered events');
 
 is($node->safe_psql(
 		'postgres',
@@ -78,7 +78,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 24,	# spec-6.2 D10: +4 Smart Fusion authority waits
+	'Cluster: PCM' => 25,	# Includes the GRD capacity wait.
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
@@ -100,11 +100,11 @@ for my $type (sort keys %expected)
 
 
 # ----------
-# Spot-check 8 event names exist.
+# Spot-check event names exist.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
               'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgWalReceiveLag',
-              'ClusterUndoCapacityWait', 'ClusterUndoTxSlotWait')
+              'ClusterUndoCapacityWait', 'ClusterUndoTxSlotWait', 'ClusterPcmGrdCapacityWait')
 {
 	my $count = $node->safe_psql(
 		'postgres',
@@ -116,6 +116,11 @@ is($node->safe_psql('postgres',
 		q{SELECT type FROM pg_stat_cluster_wait_events WHERE name = 'ClusterUndoCapacityWait'}),
 	'Cluster: Undo',
 	'frontend undo capacity wait is in the Undo class');
+
+is($node->safe_psql('postgres',
+		q{SELECT type FROM pg_stat_cluster_wait_events WHERE name = 'ClusterPcmGrdCapacityWait'}),
+	'Cluster: PCM',
+	'GRD capacity wait is in the PCM class');
 
 
 # ----------

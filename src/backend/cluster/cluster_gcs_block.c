@@ -16368,6 +16368,7 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 	uint64 admission_record_generation = 0;
 	uint64 direct_init_committed_generation = 0;
 	uint64 diagnostic_request_sequence = 0;
+	uint64 capacity_membership_generation = 0;
 	uint64 diagnostic_follow_attempt = 0;
 	uint64 diagnostic_follow_generation = 0;
 	uint64 diagnostic_follow_token = 0;
@@ -16561,6 +16562,7 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 							= peer_open_result == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
 					}
 					if (peer_matches) {
+						capacity_membership_generation = cluster_membership_cut_generation();
 						preflight_current = true;
 						break;
 					}
@@ -17319,6 +17321,52 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 															 caller_witness->reobserve_reason);
 					memset(&target_install_follow, 0, sizeof(target_install_follow));
 					target_install_preuse_retry_seen = false;
+					continue;
+				}
+				if (action == RESOURCE_X_BOOTSTRAP_ROUND_NO_CAPACITY) {
+					uint64 capacity_began_us = gcs_block_pcm_x_monotonic_us();
+					uint64 capacity_ended_us;
+
+					/* No local round was accepted. Exclude only this capacity
+					 * wait from the caller budget; an existing head or follower
+					 * must retain its first absolute protocol deadline. */
+					if (caller_witness->joined_request.assertion_sequence != 0
+						|| capacity_began_us == 0 || capacity_began_us == UINT64_MAX) {
+						result = RESOURCE_X_APPLY_STALE;
+						break;
+					}
+					diagnostic_stage = "round-capacity-wait";
+					wait_result = cluster_pcm_lock_wait_for_capacity_exact(
+						&resource, gate.formation, capacity_membership_generation);
+					capacity_ended_us = gcs_block_pcm_x_monotonic_us();
+					if (wait_result != RESOURCE_X_APPLY_APPLIED) {
+						result = wait_result;
+						break;
+					}
+					if (capacity_ended_us < capacity_began_us
+						|| capacity_ended_us == UINT64_MAX) {
+						result = RESOURCE_X_APPLY_INVALID;
+						break;
+					}
+					absolute_deadline_us = gcs_block_pcm_x_saturating_add_us(
+						absolute_deadline_us, capacity_ended_us - capacity_began_us);
+					if (absolute_deadline_us == UINT64_MAX) {
+						result = RESOURCE_X_APPLY_INVALID;
+						break;
+					}
+					if (absolute_deadline_us_io != NULL)
+						*absolute_deadline_us_io = absolute_deadline_us;
+					wait_diagnostic.threshold_us = absolute_deadline_us;
+					wait_result = gcs_block_resource_x_gate_session_recheck_result(
+						&resource, &gate, master_node, master_session);
+					if (!cluster_semantic_activation_recheck(&admission))
+						wait_result = RESOURCE_X_APPLY_STALE;
+					if (wait_result != RESOURCE_X_APPLY_APPLIED) {
+						result = wait_result;
+						break;
+					}
+					/* Re-enter the original buffer and KO observations. The
+					 * capacity hint itself grants no entry or write authority. */
 					continue;
 				}
 				if (action == RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE) {

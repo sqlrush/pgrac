@@ -978,6 +978,9 @@ pgstat_get_wait_cluster_pcm(WaitEventCluster w)
 		 * hook contention path. */
 		event_name = "ClusterPcmCompatibleStateWait";
 		break;
+	case WAIT_EVENT_PCM_GRD_CAPACITY_WAIT:
+		event_name = "ClusterPcmGrdCapacityWait";
+		break;
 	case WAIT_EVENT_GCS_REPLY_WAIT:
 		/* PGRAC (spec-2.32 D7): cluster_gcs_send_transition_and_wait sender
 		 * waits on outstanding-slot reply CV for master node ACK. */

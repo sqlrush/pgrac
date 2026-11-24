@@ -379,6 +379,8 @@ typedef enum {
 	WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT,
 	WAIT_EVENT_GCS_MULTIXACT_MEMBER_PROOF_WAIT,
 	WAIT_EVENT_GCS_MULTIXACT_STATS_WAIT,
+	/* PGRAC: wait for the original GRD retirement owners to free capacity. */
+	WAIT_EVENT_PCM_GRD_CAPACITY_WAIT,
 
 	/* Cluster: BufferShip (5 events) -- subsystem #5 */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD = PG_WAIT_CLUSTER_BUFFERSHIP,

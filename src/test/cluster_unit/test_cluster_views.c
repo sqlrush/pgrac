@@ -209,7 +209,7 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 UT_DEFINE_GLOBALS();
 
 
-UT_TEST(test_cluster_wait_events_count_is_126)
+UT_TEST(test_cluster_wait_events_count_is_127)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
@@ -243,8 +243,8 @@ UT_TEST(test_cluster_wait_events_count_is_126)
 	 * together, and this test number must be bumped in lockstep.
 	 */
 	/* spec-7.2 D6: +2 LMS data-plane -> 120. */
-	/* Frontend undo capacity wait adds one registered event. */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 126);
+	/* Frontend undo and PCM capacity waits have separate registered events. */
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 127);
 }
 
 UT_TEST(test_capacity_wait_decoder_keeps_undo_and_background_names_distinct)
@@ -253,6 +253,9 @@ UT_TEST(test_capacity_wait_decoder_keeps_undo_and_background_names_distinct)
 	UT_ASSERT_STR_EQ(pgstat_get_wait_event(PG_WAIT_CLUSTER_UNDO | 12U), "ClusterUndoTxSlotWait");
 	UT_ASSERT_STR_EQ(pgstat_get_wait_event_type(PG_WAIT_CLUSTER_UNDO | 12U), "Cluster: Undo");
 	UT_ASSERT_STR_EQ(pgstat_get_wait_event_type(PG_WAIT_CLUSTER_UNDO | 11U), "Cluster: Undo");
+	UT_ASSERT_STR_EQ(pgstat_get_wait_event(WAIT_EVENT_PCM_GRD_CAPACITY_WAIT),
+					 "ClusterPcmGrdCapacityWait");
+	UT_ASSERT_STR_EQ(pgstat_get_wait_event_type(WAIT_EVENT_PCM_GRD_CAPACITY_WAIT), "Cluster: PCM");
 	UT_ASSERT_STR_EQ(pgstat_get_wait_event(WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP),
 					 "ClusterBgProcUndoCleanerMainLoop");
 }
@@ -262,13 +265,14 @@ UT_TEST(test_actual_srf_emits_capacity_once_in_undo_class)
 	LOCAL_FCINFO(fcinfo, 0);
 	ReturnSetInfo rsinfo;
 	unsigned capacity_rows = 0, tx_slot_rows = 0, undo_rows = 0;
+	unsigned grd_capacity_rows = 0;
 
 	MemSet(fcinfo, 0, SizeForFunctionCallInfo(0));
 	MemSet(&rsinfo, 0, sizeof(rsinfo));
 	fcinfo->resultinfo = (Node *)&rsinfo;
 	captured_rows = 0;
 	UT_ASSERT_EQ(cluster_get_wait_events(fcinfo), 0);
-	UT_ASSERT_EQ(captured_rows, 126);
+	UT_ASSERT_EQ(captured_rows, 127);
 	for (unsigned i = 0; i < captured_rows; i++) {
 		UT_ASSERT_NOT_NULL(captured_types[i]);
 		UT_ASSERT_NOT_NULL(captured_names[i]);
@@ -285,10 +289,15 @@ UT_TEST(test_actual_srf_emits_capacity_once_in_undo_class)
 			tx_slot_rows++;
 			UT_ASSERT_STR_EQ(captured_types[i], "Cluster: Undo");
 		}
+		if (strcmp(captured_names[i], "ClusterPcmGrdCapacityWait") == 0) {
+			grd_capacity_rows++;
+			UT_ASSERT_STR_EQ(captured_types[i], "Cluster: PCM");
+		}
 	}
 	UT_ASSERT_EQ(tx_slot_rows, 1);
 	UT_ASSERT_EQ(capacity_rows, 1);
 	UT_ASSERT_EQ(undo_rows, 9);
+	UT_ASSERT_EQ(grd_capacity_rows, 1);
 }
 
 
@@ -333,7 +342,7 @@ int
 main(void)
 {
 	UT_PLAN(7);
-	UT_RUN(test_cluster_wait_events_count_is_126);
+	UT_RUN(test_cluster_wait_events_count_is_127);
 	UT_RUN(test_capacity_wait_decoder_keeps_undo_and_background_names_distinct);
 	UT_RUN(test_actual_srf_emits_capacity_once_in_undo_class);
 	UT_RUN(test_srf_symbol_linkable);

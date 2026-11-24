@@ -2133,6 +2133,8 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_uint64(lifecycle.capacity_retry_count));
 	emit_row(rsinfo, "pcm", "pcm_grd_capacity_fail_count",
 			 fmt_uint64(lifecycle.capacity_fail_count));
+	emit_row(rsinfo, "pcm", "pcm_grd_capacity_wait_count",
+			 fmt_uint64(lifecycle.capacity_wait_count));
 	emit_row(rsinfo, "pcm", "pcm_grd_peak_live_entries", fmt_uint64(lifecycle.peak_live_entries));
 	cluster_pcm_grd_protocol_debt_snapshot(&protocol_debt);
 	emit_row(rsinfo, "pcm", "pcm_grd_wait_refcount", fmt_uint64(protocol_debt.wait_refcount));

@@ -54,6 +54,7 @@
 #include "cluster/cluster_ko.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_qvotec.h"
@@ -803,6 +804,9 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 reclaim_reuse_count;
 	pg_atomic_uint64 reclaim_capacity_retry_count;
 	pg_atomic_uint64 reclaim_capacity_fail_count;
+	pg_atomic_uint64 reclaim_capacity_wait_count;
+	pg_atomic_uint64 reclaim_membership_generation;
+	ConditionVariable capacity_cv;
 	pg_atomic_uint64 reclaim_peak_live_entries;
 	pg_atomic_uint64 reclaim_tombstone_count;
 	pg_atomic_uint64 reclaim_refused[PCM_RETIRE_REFUSAL_N];
@@ -1478,6 +1482,13 @@ pcm_resource_x_inflight_decrement(void)
 	}
 }
 
+static void
+pcm_capacity_wakeup(void)
+{
+	if (ClusterPcm != NULL)
+		ConditionVariableBroadcast(&ClusterPcm->capacity_cv);
+}
+
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation)
 {
@@ -1496,8 +1507,10 @@ cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation)
 		return RESOURCE_X_APPLY_STALE;
 
 	current = 0;
-	if (pg_atomic_compare_exchange_u64(&ClusterPcm->resource_x_gate_formation, &current, formation))
+	if (pg_atomic_compare_exchange_u64(&ClusterPcm->resource_x_gate_formation, &current, formation)) {
+		pcm_capacity_wakeup();
 		return RESOURCE_X_APPLY_APPLIED;
+	}
 	return current == formation ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE;
 }
 
@@ -1610,6 +1623,7 @@ cluster_pcm_lock_resource_x_gate_fail_closed_exact(const ResourceXGateSnapshot *
 										   RESOURCE_X_GATE_RECOVERY_BLOCKED)) {
 			pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_blocked_count, 1);
 			cluster_pcm_rx_metric_note(PCM_RX_GLOBAL_FUSE_TRIGGER);
+			pcm_capacity_wakeup();
 			return RESOURCE_X_APPLY_APPLIED;
 		}
 	}
@@ -1711,6 +1725,7 @@ pcm_resource_x_reconfig_block(void)
 		if (pg_atomic_compare_exchange_u32(&ClusterPcm->resource_x_gate_phase, &phase,
 										   RESOURCE_X_GATE_RECOVERY_BLOCKED)) {
 			pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_blocked_count, 1);
+			pcm_capacity_wakeup();
 			return;
 		}
 	}
@@ -2425,6 +2440,7 @@ pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation, PcmR
 			|| !cluster_page_wal_ref_release_v1(&retired_local[1])))
 		elog(PANIC, "retired DROP lost its owned local PI references");
 	pg_atomic_fetch_add_u64(&ClusterPcm->reclaim_success_count, 1);
+	pcm_capacity_wakeup();
 	return true;
 }
 
@@ -2499,9 +2515,16 @@ cluster_pcm_lock_lmon_reclaim_tick(void)
 {
 	PcmReclaimBatch batch;
 	uint64 live_slots;
+	uint64 membership_generation;
 
-	if (ClusterPcm == NULL || pcm_grd_effective <= 0
-		|| pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN)
+	if (ClusterPcm == NULL || pcm_grd_effective <= 0)
+		return;
+	/* Reuse the original tick, including while the Resource-X gate is closed. */
+	membership_generation = cluster_membership_cut_generation();
+	if (pg_atomic_exchange_u64(&ClusterPcm->reclaim_membership_generation,
+							 membership_generation) != membership_generation)
+		pcm_capacity_wakeup();
+	if (pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN)
 		return;
 	live_slots = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_slot_count);
 	if (live_slots * UINT64_C(100)
@@ -2510,6 +2533,60 @@ cluster_pcm_lock_lmon_reclaim_tick(void)
 	if (pg_atomic_read_u32(&ClusterPcm->reclaim_requested) == 0)
 		return;
 	(void)cluster_pcm_lock_reclaim_bounded(PCM_GRD_LMON_RECLAIM_BUDGET, &batch);
+}
+
+static void
+pcm_capacity_note_held_lock(LWLock *lock pg_attribute_unused(),
+						   LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_wait_for_capacity_exact(const BufferTag *tag, uint64 formation,
+										uint64 membership_generation)
+{
+	bool held_lock = false;
+	bool available;
+	bool found;
+
+	if (tag == NULL || ClusterPcm == NULL || cluster_pcm_htab == NULL || pcm_grd_effective <= 0)
+		return RESOURCE_X_APPLY_INVALID;
+	ForEachLWLockHeldByMe(pcm_capacity_note_held_lock, &held_lock);
+	if (held_lock)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!cluster_pcm_lock_resource_x_gate_open_exact(formation)
+		|| !cluster_membership_cut_generation_current(membership_generation))
+		return RESOURCE_X_APPLY_STALE;
+
+	ConditionVariablePrepareToSleep(&ClusterPcm->capacity_cv);
+	PG_TRY();
+	{
+		/* Capacity is a scheduling hint, never an entry or authority handle.
+		 * Registration precedes the locked predicate, so retirement cannot
+		 * disappear between the recheck and sleeping. */
+		LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+		(void)hash_search(cluster_pcm_htab, tag, HASH_FIND, &found);
+		available = found
+			|| pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_slot_count)
+				   < (uint64)pcm_grd_effective;
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		if (!available && cluster_pcm_lock_resource_x_gate_open_exact(formation)
+			&& cluster_membership_cut_generation_current(membership_generation)) {
+			pcm_entry_reclaim_request();
+			CHECK_FOR_INTERRUPTS();
+			pg_atomic_fetch_add_u64(&ClusterPcm->reclaim_capacity_wait_count, 1);
+			ConditionVariableSleep(&ClusterPcm->capacity_cv, WAIT_EVENT_PCM_GRD_CAPACITY_WAIT);
+		}
+	}
+	PG_FINALLY();
+	{
+		ConditionVariableCancelSleep();
+	}
+	PG_END_TRY();
+	return cluster_pcm_lock_resource_x_gate_open_exact(formation)
+			   && cluster_membership_cut_generation_current(membership_generation)
+		? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_STALE;
 }
 
 static bool
@@ -2939,6 +3016,7 @@ cluster_resource_x_reconfig_freeze_pending_exact(uint64 old_formation, uint32 de
 		pcm_resource_x_reconfig_block();
 		return false;
 	}
+	pcm_capacity_wakeup();
 
 	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_old_formation, old_formation);
 	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_new_formation, 0);
@@ -4478,6 +4556,7 @@ cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token)
 										RESOURCE_X_GATE_OPEN))
 		return false;
 	pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_thaw_count, 1);
+	pcm_capacity_wakeup();
 	return true;
 }
 
@@ -9288,6 +9367,7 @@ cluster_pcm_grd_lifecycle_stats_snapshot(PcmGrdLifecycleStats *out)
 	out->reclaim_reuse_count = pg_atomic_read_u64(&ClusterPcm->reclaim_reuse_count);
 	out->capacity_retry_count = pg_atomic_read_u64(&ClusterPcm->reclaim_capacity_retry_count);
 	out->capacity_fail_count = pg_atomic_read_u64(&ClusterPcm->reclaim_capacity_fail_count);
+	out->capacity_wait_count = pg_atomic_read_u64(&ClusterPcm->reclaim_capacity_wait_count);
 	out->peak_live_entries = pg_atomic_read_u64(&ClusterPcm->reclaim_peak_live_entries);
 	for (refusal = 0; refusal < PCM_RETIRE_REFUSAL_N; refusal++)
 		out->reclaim_refused[refusal] = pg_atomic_read_u64(&ClusterPcm->reclaim_refused[refusal]);
@@ -10096,6 +10176,9 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u64(&ClusterPcm->reclaim_reuse_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->reclaim_capacity_retry_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->reclaim_capacity_fail_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->reclaim_capacity_wait_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->reclaim_membership_generation, 0);
+		ConditionVariableInit(&ClusterPcm->capacity_cv);
 		pg_atomic_init_u64(&ClusterPcm->reclaim_peak_live_entries, 0);
 		pg_atomic_init_u64(&ClusterPcm->reclaim_tombstone_count, 0);
 		for (refusal = 0; refusal < PCM_RETIRE_REFUSAL_N; refusal++)
@@ -16085,8 +16168,18 @@ pcm_resource_x_bootstrap_round_step_internal(
 												   assertion->resource.blockNum, &object_admission);
 
 	if (!pcm_entry_ref_acquire(&assertion->resource, allow_create, &entry_ref, &acquire_result)) {
-		if (allow_create && acquire_result == PCM_ENTRY_ACQUIRE_NO_CAPACITY)
-			return RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE;
+		if (allow_create && acquire_result == PCM_ENTRY_ACQUIRE_NO_CAPACITY) {
+			/* No entry was accepted. A capacity hint must not hide an
+			 * independent object refusal; this lock-free negative check
+			 * publishes no reference or authority. */
+			if (check_object
+				&& (!sampled
+					|| !cluster_ko_peer_current_valid_v3(
+						&object_admission, locator, BufTagGetForkNum(&assertion->resource),
+						assertion->resource.blockNum)))
+				return RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE;
+			return RESOURCE_X_BOOTSTRAP_ROUND_NO_CAPACITY;
+		}
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	}
 	entry = entry_ref.entry;

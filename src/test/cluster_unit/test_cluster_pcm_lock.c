@@ -54,6 +54,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "storage/proc.h"
 #include "cluster/cluster_pi_write.h"
@@ -134,6 +135,7 @@ int cluster_gcs_reply_timeout_ms = 1;
 static uint64 ut_lms_master_generation = (UINT64_C(1) << 32) | UINT64_C(1);
 static uint64 ut_master_session = 31;
 static uint32 ready_connection_generation = 61;
+static uint64 fake_membership_cut_generation = 2;
 static bool ready_peer_ok = true;
 static uint32 bootstrap_ingress_generation;
 static unsigned bootstrap_ack_count;
@@ -142,6 +144,19 @@ uint64
 cluster_qvotec_get_self_incarnation(void)
 {
 	return ut_master_session;
+}
+
+uint64
+cluster_membership_cut_generation(void)
+{
+	return fake_membership_cut_generation;
+}
+
+bool
+cluster_membership_cut_generation_current(uint64 expected)
+{
+	return expected != 0 && (expected & 1) == 0
+		&& expected == fake_membership_cut_generation;
 }
 static uint32 ut_wait_event_info_storage = 0;
 static bool pi_service_blocked;
@@ -318,9 +333,12 @@ bool
 cluster_ko_peer_current_valid_v3(const ClusterKoCurrentAdmissionV3 *sample, RelFileLocator locator,
 								 ForkNumber fork, BlockNumber block)
 {
+	/* A failed allocation also revalidates this lock-free sample, without
+	 * publishing a reference. Positive entry mutations still hold their lock. */
 	return sample != NULL && sample->target.fork == fork && sample->target.block == block
 		   && (sample->target.cleaner.serial == 0 || object_current_continuation)
-		   && cluster_ko_peer_admission_current_v3(&sample->target, locator);
+		   && sample->target.revision != 0 && sample->target.revision == object_admission_revision
+		   && RelFileLocatorEquals(sample->target.locator, locator);
 }
 
 bool
@@ -499,7 +517,12 @@ cluster_lms_wakeup(int worker_id)
 		fake_lms0_wakeup_count++;
 }
 
+#ifndef FAKE_PCM_MAX_ENTRIES
 #define FAKE_PCM_MAX_ENTRIES 24
+#endif
+#ifndef FAKE_PCM_HEADER_BYTES
+#define FAKE_PCM_HEADER_BYTES 2097152
+#endif
 #define FAKE_PCM_ENTRY_BYTES 1456
 StaticAssertDecl(sizeof(struct StopPcmEntryLayout) == FAKE_PCM_ENTRY_BYTES,
 				 "negative fixture field offsets must match the generated original entry");
@@ -568,7 +591,7 @@ static union {
 	/* Sized above sizeof(ClusterPcmShared) plus the 17-entry Resource-X
 	 * reconfiguration fixture.  The retained holder image adds one full
 	 * page per Resource-X master state; fake ShmemInitStruct asserts fit. */
-	char data[2097152];
+	char data[FAKE_PCM_HEADER_BYTES];
 } fake_pcm_header;
 
 static union {
@@ -821,6 +844,7 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_pcm_clock_us = 0;
 	fake_rx_stream_generation = 61;
 	fake_rx_capability_generation = 61;
+	fake_membership_cut_generation = 2;
 	fake_pcm_clock_hook = NULL;
 	fake_pcm_clock_hook_countdown = 0;
 	memset(&fake_pcm_header, 0, sizeof(fake_pcm_header));
@@ -3772,7 +3796,7 @@ UT_TEST(test_pcm_d1_bootstrap_no_capacity_is_pre_mutation_backpressure)
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(1000), (UINT64_C(1000)) - (UINT64_C(100)),
 		UINT64_C(100), UINT64_C(50), false, 0, &dispatch, &terminal_ref);
-	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_NO_CAPACITY);
 	UT_ASSERT(cluster_pcm_lock_resource_x_gate_open_exact(17));
 	UT_ASSERT(!pcm_entry_ref_acquire(&full_tag, false, &ref, &acquire_result));
 	UT_ASSERT_EQ(acquire_result, PCM_ENTRY_ACQUIRE_NOT_FOUND);
@@ -4522,7 +4546,8 @@ UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
 
 	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch), RESOURCE_X_RECONFIG_MORE);
-	UT_ASSERT_EQ(fake_cv_broadcast_count, broadcast_before + 1);
+	/* Freeze wakes capacity waiters; sweep also wakes the old entry waiters. */
+	UT_ASSERT_EQ(fake_cv_broadcast_count, broadcast_before + 2);
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch), RESOURCE_X_RECONFIG_DONE);
 	UT_ASSERT(cluster_resource_x_reconfig_thaw_exact(&token));
 
