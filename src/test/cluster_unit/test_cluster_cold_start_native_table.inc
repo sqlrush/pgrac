@@ -419,6 +419,10 @@ cluster_control_root_relmap_selection_recheck_locked_v4(ClusterControlRelmapSele
     if (debt_selection_fault == 2) observed_writer.epoch++;
     if (debt_selection_fault == 3) pg_re_throw();
     if (debt_selection_fault == 4) start_table_view.table_generation++;
+    if (debt_selection_fault == 5) {
+        page_source_request_delta[0]++;
+        debt_selection_fault = 0;
+    }
     return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -584,4 +588,162 @@ UT_TEST(test_start_debt_begin_false_error_and_alias_cannot_publish_or_retry)
         start_table_cf_held = false;
         ClusterReleaseColdRecoveryInputs(&info);
     }
+}
+
+static void
+start_debt_many_ready(void)
+{
+    start_table_managed_fixture = true;
+    page_sources_three_ready();
+    start_table_managed_fixture = false;
+    debt_selection_reference = info.cluster_tx_start->relmap_table.control;
+    debt_selection_reads = debt_selection_rechecks = debt_selection_fault = 0;
+    start_table_cf_held = true;
+}
+
+UT_TEST(test_start_debt_binds_first_and_last_original_input_holder)
+{
+    for (unsigned index = 0; index < 3; index++) {
+        ClusterRecoveryDebtStartV2 *credential = NULL;
+        start_debt_many_ready();
+        UT_ASSERT(ClusterColdRecoveryDebtBeginV2(info.cluster_tx_start,
+            (ClusterControlRelmapSelectionV2 *)&debt_selection_object, &credential));
+        UT_ASSERT(ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+        page_source_request_delta[index]++;
+        /* A different still-authorized native holder is not the bound grant. */
+        UT_ASSERT(!ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+        page_source_request_delta[index]--;
+        UT_ASSERT(!ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+        UT_ASSERT(observation_scope_live && observation_cursor_live && start_table_cf_held);
+        UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
+        start_table_cf_held = false;
+        ClusterReleaseColdRecoveryInputs(&info);
+    }
+}
+
+UT_TEST(test_start_debt_binds_scope_and_continuous_retention_incarnation)
+{
+    for (unsigned fault = 0; fault < 3; fault++) {
+        ClusterRecoveryDebtStartV2 *credential = NULL;
+        start_debt_many_ready();
+        UT_ASSERT(ClusterColdRecoveryDebtBeginV2(info.cluster_tx_start,
+            (ClusterControlRelmapSelectionV2 *)&debt_selection_object, &credential));
+        if (fault == 0) page_source_scope_delta++;
+        if (fault == 1) page_source_retention_delta++;
+        if (fault == 2) page_source_input_count--;
+        UT_ASSERT(!ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+        UT_ASSERT(observation_scope_live && observation_cursor_live && start_table_cf_held);
+        UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+        start_table_cf_held = false;
+        ClusterReleaseColdRecoveryInputs(&info);
+    }
+}
+
+static unsigned debt_input_capture_steps;
+static void
+debt_input_replace_last(void)
+{
+    if (++debt_input_capture_steps == 3) page_source_request_delta[2]++;
+}
+
+UT_TEST(test_start_debt_input_capture_refusal_and_error_never_retry_or_release)
+{
+    for (unsigned fault = 0; fault < 3; fault++) {
+        ClusterRecoveryDebtStartV2 *credential = NULL;
+        volatile bool accepted = false, caught = false;
+        start_debt_many_ready();
+        debt_input_capture_steps = 0;
+        if (fault == 0) page_source_step = debt_input_replace_last;
+        if (fault == 1) page_source_fault = 1;
+        if (fault == 2) page_source_current_error = true;
+        PG_TRY(); {
+            accepted = ClusterColdRecoveryDebtBeginV2(info.cluster_tx_start,
+                (ClusterControlRelmapSelectionV2 *)&debt_selection_object, &credential);
+        }
+        PG_CATCH(); { caught = true; }
+        PG_END_TRY();
+        UT_ASSERT(!accepted && credential == NULL && caught == (fault == 2));
+        page_source_step = NULL; page_source_fault = 0; page_source_current_error = false;
+        UT_ASSERT(!ClusterColdRecoveryDebtBeginV2(info.cluster_tx_start,
+            (ClusterControlRelmapSelectionV2 *)&debt_selection_object, &credential));
+        UT_ASSERT(credential == NULL && start_table_cf_held);
+        UT_ASSERT(observation_scope_live && observation_cursor_live);
+        UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
+        start_table_cf_held = false;
+        ClusterReleaseColdRecoveryInputs(&info);
+    }
+}
+
+UT_TEST(test_start_debt_current_input_error_is_sticky_without_mutation_or_cleanup)
+{
+    ClusterRecoveryDebtStartV2 *credential = NULL;
+    volatile bool caught = false, accepted = false;
+    start_debt_many_ready();
+    UT_ASSERT(ClusterColdRecoveryDebtBeginV2(info.cluster_tx_start,
+        (ClusterControlRelmapSelectionV2 *)&debt_selection_object, &credential));
+    page_source_current_error = true;
+    PG_TRY(); { accepted = ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential); }
+    PG_CATCH(); { caught = true; }
+    PG_END_TRY();
+    UT_ASSERT(caught && !accepted);
+    page_source_current_error = false;
+    UT_ASSERT(!ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+    UT_ASSERT(observation_scope_live && observation_cursor_live && start_table_cf_held);
+    UT_ASSERT_EQ(window_region.checkpoint_owner.ctrc_accepted_generation, 0);
+    UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
+    start_table_cf_held = false;
+    ClusterReleaseColdRecoveryInputs(&info);
+}
+
+UT_TEST(test_start_debt_rechecks_input_holders_after_physical_control_validation)
+{
+    ClusterRecoveryDebtStartV2 *credential = NULL;
+    start_debt_many_ready();
+    UT_ASSERT(ClusterColdRecoveryDebtBeginV2(info.cluster_tx_start,
+        (ClusterControlRelmapSelectionV2 *)&debt_selection_object, &credential));
+    debt_selection_fault = 5;
+    UT_ASSERT(!ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+    debt_selection_fault = 0; page_source_request_delta[0] = 0;
+    UT_ASSERT(!ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+    UT_ASSERT(observation_scope_live && observation_cursor_live && start_table_cf_held);
+    UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
+    start_table_cf_held = false;
+    ClusterReleaseColdRecoveryInputs(&info);
+}
+
+UT_TEST(test_start_debt_current_preconditions_do_not_touch_input_holders)
+{
+    for (unsigned fault = 0; fault < 4; fault++) {
+        ClusterRecoveryDebtStartV2 *credential = NULL;
+        unsigned factories;
+        start_debt_many_ready();
+        UT_ASSERT(ClusterColdRecoveryDebtBeginV2(info.cluster_tx_start,
+            (ClusterControlRelmapSelectionV2 *)&debt_selection_object, &credential));
+        factories = page_source_factories;
+        if (fault == 0) CritSectionCount++;
+        if (fault == 1) ctrc_driver_lwlocks++;
+        if (fault == 2) MyBackendType = B_BACKEND;
+        if (fault == 3) native_recovery = true;
+        UT_ASSERT(!ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+        UT_ASSERT_EQ(page_source_factories, factories);
+        CritSectionCount = ctrc_driver_lwlocks = 0;
+        MyBackendType = B_STARTUP; native_recovery = false;
+        UT_ASSERT(ClusterColdRecoveryDebtCurrentV2(info.cluster_tx_start, credential));
+        start_table_cf_held = false;
+        ClusterReleaseColdRecoveryInputs(&info);
+    }
+}
+
+UT_TEST(test_start_debt_captures_input_holders_before_first_control_read)
+{
+    ClusterRecoveryDebtStartV2 *credential = NULL;
+    start_debt_many_ready();
+    debt_selection_fault = 5;
+    UT_ASSERT(!ClusterColdRecoveryDebtBeginV2(info.cluster_tx_start,
+        (ClusterControlRelmapSelectionV2 *)&debt_selection_object, &credential));
+    UT_ASSERT(credential == NULL && page_source_request_delta[0] == 1);
+    UT_ASSERT(observation_scope_live && observation_cursor_live && start_table_cf_held);
+    UT_ASSERT_EQ(observation_scope_releases + observation_census_destroys, 0);
+    start_table_cf_held = false;
+    ClusterReleaseColdRecoveryInputs(&info);
 }

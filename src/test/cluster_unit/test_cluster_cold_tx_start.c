@@ -14,6 +14,8 @@
 #include "cluster/cluster_relmap_terminal_internal.h"
 #include "cluster/cluster_cold_relmap.h"
 #include "cluster/cluster_control_native_files.h"
+#include "common/cryptohash.h"
+#include "common/sha2.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_ir.h"
@@ -3725,6 +3727,13 @@ int main(void)
 	UT_RUN(test_start_debt_query_refuses_wrong_phase_holder_and_identity);
 	UT_RUN(test_start_debt_query_compares_every_original_control_reference);
 	UT_RUN(test_start_debt_query_late_refusal_and_error_preserve_original_protections);
+	UT_RUN(test_start_debt_binds_first_and_last_original_input_holder);
+	UT_RUN(test_start_debt_binds_scope_and_continuous_retention_incarnation);
+	UT_RUN(test_start_debt_input_capture_refusal_and_error_never_retry_or_release);
+	UT_RUN(test_start_debt_current_input_error_is_sticky_without_mutation_or_cleanup);
+	UT_RUN(test_start_debt_rechecks_input_holders_after_physical_control_validation);
+	UT_RUN(test_start_debt_current_preconditions_do_not_touch_input_holders);
+	UT_RUN(test_start_debt_captures_input_holders_before_first_control_read);
 	reset();
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
