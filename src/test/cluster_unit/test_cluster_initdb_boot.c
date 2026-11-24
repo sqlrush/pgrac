@@ -21,6 +21,8 @@
 UT_DEFINE_GLOBALS();
 static PgracInitdbRecoveryContext pgrac_native_recovery, initdb_recovery_context;
 static bool initdb_recovery_present;
+static int pgrac_native_thread = -1;
+static char self_path[MAXPGPATH];
 static bool pgrac_native_recovery_requested, present;
 static unsigned raw_calls, managed_calls, undo_calls, fault;
 static jmp_buf failure;
@@ -94,6 +96,9 @@ ControlFileData *get_controlfile(const char *dir, bool *crc)
 static bool initdb_bootstrap_wal_matches(const ControlFileData *control, const PgracInitdbWalContext *ctx)
 { return control->system_identifier == ctx->system_identifier; }
 void cluster_initdb_config_apply_native(const PgracInitdbWalContext *ctx) { (void)ctx; }
+static void pg_log_error(const char *format, ...) { (void)format; abort(); }
+#define pg_malloc(size) malloc(size)
+#define pg_free(pointer) free(pointer)
 #undef ereport
 #define ereport(level, args) longjmp(failure, 1)
 #include "test_cluster_initdb_boot_entries.inc"
@@ -455,10 +460,75 @@ UT_TEST(peer_native_accepts_only_its_complete_cohort_member)
 	}
 }
 
-int
-main(void)
+UT_TEST(redirected_native_child_preserves_exact_creator_parent)
 {
-	UT_PLAN(11);
+	char temp[] = "/tmp/pgrac-native-shell-XXXXXX", child_path[MAXPGPATH],
+		 output_path[MAXPGPATH], command[MAXPGPATH * 3];
+	PgracInitdbRecoveryContext request;
+	PgracInitdbWalContext ctx = {0};
+	int root, data, shared, request_fd, context[2], status;
+	FILE *child;
+	setup();
+	UT_ASSERT(mkdtemp(temp));
+	root = open(temp, O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(root >= 0 && !mkdirat(root, "data", 0700) && !mkdirat(root, "shared", 0700));
+	data = openat(root, "data", O_RDONLY | O_DIRECTORY);
+	shared = openat(root, "shared", O_RDONLY | O_DIRECTORY);
+	UT_ASSERT(data >= 0 && shared >= 0);
+	snprintf(child_path, sizeof(child_path), "%s/child", temp);
+	snprintf(output_path, sizeof(output_path), "%s/output", temp);
+	UT_ASSERT(!symlink(self_path, child_path));
+	for (unsigned wrong_parent = 0; wrong_parent < 2; ++wrong_parent)
+	{
+		UT_ASSERT(pgrac_initdb_recovery_prepare_files_v2(&pgrac_native_recovery.first,
+			pgrac_native_recovery.boot_files, &pgrac_native_recovery.config, data, shared, &request));
+		if (wrong_parent) ++request.creator_pid;
+		UT_ASSERT(pgrac_initdb_recovery_pipe_v2(&request, &request_fd));
+		UT_ASSERT(!fcntl(request_fd, F_SETFD, 0));
+		ctx.phase = PGRAC_INITDB_WAL_POSTBOOTSTRAP;
+		ctx.thread_id = 1;
+		ctx.system_identifier = request.first.system_identifier;
+		ctx.database_incarnation = request.first.database_incarnation;
+		memcpy(ctx.storage_uuid, request.first.storage_uuid, sizeof(ctx.storage_uuid));
+		ctx.base_fd = shared;
+		ctx.recovery_fd = request_fd;
+		ctx.config = request.config;
+		ctx.config.fd = root;
+		UT_ASSERT(!pipe(context) && write(context[1], &ctx, sizeof(ctx)) == sizeof(ctx) &&
+				  !close(context[1]));
+		snprintf(command, sizeof(command), "'%s' --native-context %d %d %u >'%s'",
+				 child_path, context[0], data, wrong_parent, output_path);
+		pgrac_native_thread = 1;
+		child = popen_check(command, "w");
+		UT_ASSERT(child != NULL);
+		status = pclose(child);
+		pgrac_native_thread = -1;
+		UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		UT_ASSERT(!close(context[0]) && !close(request_fd));
+	}
+	UT_ASSERT(!unlink(child_path) && !unlink(output_path) && !close(data) && !close(shared) &&
+			  !unlinkat(root, "data", AT_REMOVEDIR) && !unlinkat(root, "shared", AT_REMOVEDIR) &&
+			  !close(root) && !rmdir(temp));
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc == 5 && !strcmp(argv[1], "--native-context"))
+	{
+		PgracInitdbWalContext ctx;
+		bool accepted, valid;
+		int context = atoi(argv[2]);
+		if (read(context, &ctx, sizeof(ctx)) != sizeof(ctx) || close(context) || fchdir(atoi(argv[3])))
+			return 8;
+		accepted = initdb_boot_recovery_accept(&ctx);
+		valid = atoi(argv[4]) ? !accepted && !initdb_recovery_present :
+			accepted && initdb_recovery_present && ctx.recovery_fd == 0 &&
+			initdb_recovery_context.creator_pid == (uint64)getppid();
+		return valid && fcntl(ctx.base_fd, F_GETFD) >= 0 && fcntl(ctx.config.fd, F_GETFD) >= 0 ? 0 : 9;
+	}
+	if (!realpath(argv[0], self_path)) return 8;
+	UT_PLAN(12);
 	UT_RUN(peer_native_accepts_only_its_complete_cohort_member);
 	UT_RUN(complete_native_postbootstrap_accepts_only_original_closed_batch);
 	UT_RUN(postbootstrap_child_keeps_original_creation_batch_and_base_custody);
@@ -470,6 +540,7 @@ main(void)
 	UT_RUN(producer_false_error_wrong_receipt_and_late_input_never_fall_back);
 	UT_RUN(original_seed_dispatch_checks_complete_undo_result);
 	UT_RUN(incomplete_native_request_never_calls_either_family);
+	UT_RUN(redirected_native_child_preserves_exact_creator_parent);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
