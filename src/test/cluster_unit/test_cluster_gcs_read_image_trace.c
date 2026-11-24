@@ -8,6 +8,7 @@
 
 #include "cluster/cluster_block_io_trace.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
@@ -73,7 +74,10 @@ static BufferDesc fixture_buffer;
 static PcmAuthoritySnapshot fixture_authority;
 static TimestampTz fixture_now;
 static int scenario, sends, releases, installs, cv_waits, lock_depth;
-static int log_level, error_code, injected_log_failures;
+static int log_level, error_code, injected_log_failures, peer_state_queries;
+/* The heartbeat verdict the next scenario observes for the X holder (node 1). */
+static ClusterCssdPeerState next_holder_state = CLUSTER_CSSD_PEER_ALIVE;
+static ClusterCssdPeerState fixture_holder_state = CLUSTER_CSSD_PEER_ALIVE;
 static bool caught_error, result, retry_denied;
 static char log_line[4096], logs[65536], error_detail[1024];
 static GcsBlockForwardPayload last_forward;
@@ -159,6 +163,12 @@ void ExceptionalCondition(const char *condition pg_attribute_unused(),
 TimestampTz GetCurrentTimestamp(void) { return fixture_now; }
 static uint64 gcs_block_pcm_x_monotonic_us(void) { return (uint64)fixture_now; }
 uint64 cluster_epoch_get_current(void) { return 71; }
+ClusterCssdPeerState
+cluster_cssd_get_peer_state(int32 peer_id)
+{
+	peer_state_queries++;
+	return peer_id == 1 ? fixture_holder_state : CLUSTER_CSSD_PEER_ALIVE;
+}
 bool cluster_pcm_lock_authority_matches(BufferTag tag pg_attribute_unused(),
 										const PcmAuthoritySnapshot *a pg_attribute_unused())
 { return scenario != 7; }
@@ -237,6 +247,8 @@ gcs_block_stage_forward_wait(ClusterGcsBlockOutstandingSlot *slot, int32 holder 
 		slot->reply_header.status = scenario == 3 ? GCS_BLOCK_REPLY_DENIED_PENDING_X
 			: scenario == 8 ? GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE
 			: scenario == 9 && sends == 1 ? GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+			: scenario == 11 ? GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+			: scenario == 12 ? GCS_BLOCK_REPLY_DENIED_LOST_WRITE
 			: GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 		slot->reply_header.checksum = scenario == 2 ? 124 : 123;
 		slot->reply_header.page_lsn = 3456;
@@ -270,12 +282,14 @@ run_scenario(int selected, bool trace)
 	fixture_authority.pending_x_since_lsn = 19;
 	fixture_now = 10000;
 	sends = releases = installs = cv_waits = lock_depth = 0;
-	error_code = injected_log_failures = 0;
+	error_code = injected_log_failures = peer_state_queries = 0;
+	fixture_holder_state = next_holder_state;
+	next_holder_state = CLUSTER_CSSD_PEER_ALIVE;
 	logs[0] = error_detail[0] = '\0';
 	caught_error = result = retry_denied = false;
 	cluster_trace_normal_stop = trace;
 	cluster_read_scache = selected == 8;
-	cluster_gcs_block_retransmit_max_retries = selected == 9 ? 1 : 0;
+	cluster_gcs_block_retransmit_max_retries = selected == 9 || selected == 11 ? 1 : 0;
 	PG_exception_stack = &outer;
 	if (sigsetjmp(outer, 0) == 0)
 		result = cluster_gcs_local_master_read_image_and_wait(
@@ -287,6 +301,7 @@ run_scenario(int selected, bool trace)
 
 UT_TEST(default_off_retains_timeout_and_silence)
 {
+	next_holder_state = CLUSTER_CSSD_PEER_DEAD;
 	run_scenario(0, false);
 	UT_ASSERT(caught_error && !retry_denied);
 	UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
@@ -297,6 +312,7 @@ UT_TEST(default_off_retains_timeout_and_silence)
 
 UT_TEST(timeout_is_observer_absence_not_server_verdict)
 {
+	next_holder_state = CLUSTER_CSSD_PEER_DEAD;
 	run_scenario(0, true);
 	UT_ASSERT(caught_error && !retry_denied && releases == 1 && installs == 0);
 	UT_ASSERT(strstr(logs, "event=wait.timeout") != NULL);
@@ -323,8 +339,10 @@ UT_TEST(success_preserves_one_shot_and_exact_identity)
 
 UT_TEST(checksum_failure_preserves_refusal_and_values)
 {
+	/* Bytes that fail verification are never a wait, live holder or not. */
 	run_scenario(2, true);
-	UT_ASSERT(caught_error && installs == 0 && releases == 1);
+	UT_ASSERT(caught_error && !retry_denied && installs == 0 && releases == 1);
+	UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
 	UT_ASSERT(strstr(logs, "event=checksum.reject") != NULL);
 	UT_ASSERT(strstr(logs, "checksum_expected=124 checksum_actual=123") != NULL);
 }
@@ -403,10 +421,73 @@ UT_TEST(log_error_after_reservation_keeps_original_slot_cleanup)
 	UT_ASSERT(!fixture_backend.slot.in_use);
 }
 
+/* A reply that never arrives is not a verdict.  While the heartbeat layer
+ * still counts the holder as a peer, the reader hands its exact reservation
+ * back to the caller's retry boundary instead of failing the transaction. */
+UT_TEST(lost_reply_from_live_holder_rearms_without_error)
+{
+	run_scenario(0, false);
+	UT_ASSERT(!caught_error);
+	UT_ASSERT(!result && retry_denied);
+	UT_ASSERT_EQ(sends, 1); UT_ASSERT_EQ(releases, 1); UT_ASSERT_EQ(installs, 0);
+	UT_ASSERT_EQ(cv_waits, 1);
+	UT_ASSERT(!fixture_backend.slot.in_use);
+
+	next_holder_state = CLUSTER_CSSD_PEER_SUSPECTED;
+	run_scenario(0, false);
+	UT_ASSERT(!caught_error && !result && retry_denied && releases == 1 && installs == 0);
+}
+
+UT_TEST(lost_reply_rearm_is_visible_in_the_trace)
+{
+	run_scenario(0, true);
+	UT_ASSERT(!caught_error && retry_denied && releases == 1);
+	UT_ASSERT(strstr(logs, "event=wait.timeout") != NULL);
+	UT_ASSERT(strstr(logs, "reply_known=0 status=-1") != NULL);
+	UT_ASSERT(strstr(logs, "event=request.finish") != NULL);
+	UT_ASSERT(strstr(logs, "retry_denied=1") != NULL);
+}
+
+/* A holder that keeps answering "cannot ship right now" past the bounded
+ * in-place budget is still alive and still the exact authority: wait. */
+UT_TEST(exhausted_holder_refusal_from_live_holder_rearms_without_error)
+{
+	run_scenario(11, false);
+	UT_ASSERT(!caught_error);
+	UT_ASSERT(!result && retry_denied);
+	UT_ASSERT_EQ(sends, 2); UT_ASSERT_EQ(releases, 1); UT_ASSERT_EQ(installs, 0);
+}
+
+/* Membership change ends the wait: a DEAD holder cannot answer, so the
+ * original fail-closed terminal stays for both miss shapes. */
+UT_TEST(dead_holder_keeps_the_fail_closed_terminal)
+{
+	next_holder_state = CLUSTER_CSSD_PEER_DEAD;
+	run_scenario(0, false);
+	UT_ASSERT(caught_error && !retry_denied && releases == 1 && installs == 0);
+	UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+	UT_ASSERT(strstr(error_detail, "attempts=1 last_status=-1") != NULL);
+
+	next_holder_state = CLUSTER_CSSD_PEER_DEAD;
+	run_scenario(11, false);
+	UT_ASSERT(caught_error && !retry_denied && releases == 1 && installs == 0);
+	UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+	UT_ASSERT(strstr(error_detail, "attempts=2 last_status=6") != NULL);
+}
+
+/* An authoritative refusal is never converted into a wait. */
+UT_TEST(lost_write_denial_stays_terminal_for_a_live_holder)
+{
+	run_scenario(12, false);
+	UT_ASSERT(caught_error && !retry_denied && releases == 1 && installs == 0);
+	UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+	UT_ASSERT(strstr(error_detail, "last_status=12") != NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(17);
 	UT_RUN(default_off_retains_timeout_and_silence);
 	UT_RUN(timeout_is_observer_absence_not_server_verdict);
 	UT_RUN(success_preserves_one_shot_and_exact_identity);
@@ -419,6 +500,11 @@ main(void)
 	UT_RUN(retry_uses_new_request_and_same_operation_parent);
 	UT_RUN(critical_trace_gap_is_disclosed_after_safe_reentry);
 	UT_RUN(log_error_after_reservation_keeps_original_slot_cleanup);
+	UT_RUN(lost_reply_from_live_holder_rearms_without_error);
+	UT_RUN(lost_reply_rearm_is_visible_in_the_trace);
+	UT_RUN(exhausted_holder_refusal_from_live_holder_rearms_without_error);
+	UT_RUN(dead_holder_keeps_the_fail_closed_terminal);
+	UT_RUN(lost_write_denial_stays_terminal_for_a_live_holder);
 	UT_DONE();
 	return ut_failed_count > 0 ? 1 : 0;
 }
