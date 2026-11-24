@@ -44,6 +44,17 @@ The other schedules use a 90-second statement timeout. Output includes SQL
 operations and identities in `log/p0-sql.jsonl`, or existing `m2-b07-*` evidence
 for the capacity cell. Raw TAP is `tap.log`; the judgement is `judgement.json`.
 
+The judgement also retains existing ordinary-TT failure observations in
+`request_evidence`, grouped only when all original carrier fields match.
+Missing or malformed fields remain ungrouped with their raw line. Grouping
+does not establish a process incarnation or prove delivery or consumption.
+For the capacity case, an existing `log/m2-b07-candidate-latest.json` export is
+projected into `itl_evidence`: all eight page slots retain their actual indices,
+and TT publications stay separate. A complete slot copy means only that its
+exported fields are present and fit their byte widths. Producer identity stays
+`UNKNOWN`; no TT wrap is inferred from an ITL wrap. Missing, malformed or
+overflowed exports never supply original-path credit or change the SQL verdict.
+
 Rejudge retained output without contacting a server:
 
 ```sh
@@ -63,6 +74,7 @@ Offline checks:
 
 ```sh
 python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_p0_retest.py
+python3 -m unittest discover -s src/test/cluster_tap/pre2 -p test_p0_retest_evidence.py
 prove -v src/test/cluster_tap/pre2/test_p0_retest_sql.pl \
   src/test/cluster_tap/pre2/test_p0_retest_cleanup.pl
 ```

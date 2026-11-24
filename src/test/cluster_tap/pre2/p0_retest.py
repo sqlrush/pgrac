@@ -12,6 +12,8 @@ import shlex
 import subprocess
 import sys
 
+from p0_retest_evidence import request_evidence, itl_evidence
+
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[3]
 CASES = {
@@ -31,7 +33,7 @@ def judge(case, capture, tap, logs):
     if case not in CASES:
         raise ValueError("unknown case")
     result = dict(case=case, status="NOT_REACHED", original_path="UNKNOWN",
-                  p0_closed=False, errors=[], notes=[])
+                  p0_closed=False, errors=[], notes=[], request_evidence=request_evidence(logs))
     if capture.get("version") != 1 or capture.get("case") != case:
         result["notes"].append("missing or wrong case result")
         return result
@@ -92,6 +94,15 @@ def judge_directory(case, output):
     logs = [(output / f"log/node{n}.log").read_text(errors="replace")
             if (output / f"log/node{n}.log").is_file() else "" for n in range(4)]
     result = judge(case, capture, tap, logs)
+    native_copy = output / "log/m2-b07-candidate-latest.json"
+    if case == "P0-8" and native_copy.is_file():
+        try:
+            document = json.loads(native_copy.read_text())
+            if not isinstance(document, dict):
+                raise ValueError("native copy export must be an object")
+            result["itl_evidence"] = itl_evidence(document.get("trace"))
+        except (ValueError, OSError) as error:
+            result["itl_evidence"] = dict(itl_evidence(None), error=str(error))
     (output / "judgement.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
