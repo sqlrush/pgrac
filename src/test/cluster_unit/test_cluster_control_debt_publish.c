@@ -19,6 +19,7 @@ int debt_publish_old_restart_main(void);
 #include "storage/lwlock.h"
 #include "cluster/cluster_control_debt_transition.h"
 
+#ifndef CONTROL_DEBT_SHARED_ACTOR_TEST
 ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
 int MyProcPid;
 volatile uint32 CritSectionCount;
@@ -30,15 +31,23 @@ static bool publisher_lwlock;
 void ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *p);
 void ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *p)
 { if (publisher_lwlock) callback(NULL, LW_EXCLUSIVE, p); }
+#else
+/* A linked original-Start fixture owns the actor, CF and ERROR stack. */
+static bool publisher_lwlock;
+#endif
 
+#ifndef CONTROL_DEBT_SHARED_ACTOR_TEST
 static char publisher_start[2048], publisher_selection[2048];
 static bool publisher_start_distinct(const struct ClusterRecoveryStartV1 *s, const void *p, Size n)
 { return s == (const void *)publisher_start && !debt_overlap(s, sizeof(publisher_start), p, n); }
 static bool publisher_selection_distinct(const ClusterControlRelmapSelectionV2 *s, const void *p, Size n)
 { return s == (const void *)publisher_selection && !debt_overlap(s, sizeof(publisher_selection), p, n); }
-#define cluster_control_root_debt_transition_get_v2 publisher_transition_get_v2
 #define cluster_recovery_plan_output_distinct_v1 publisher_start_distinct
 #define cluster_control_root_relmap_selection_output_distinct_v4 publisher_selection_distinct
+#else
+static char publisher_start[2048], publisher_selection[2048];
+#endif
+#define cluster_control_root_debt_transition_get_v2 publisher_transition_get_v2
 #include "../../backend/cluster/cluster_control_debt_transition_v2.inc"
 #undef cluster_control_root_relmap_selection_output_distinct_v4
 #undef cluster_recovery_plan_output_distinct_v1
@@ -98,7 +107,9 @@ static int publisher_rename(const char *a, const char *b, int severity)
 #define durable_rename publisher_rename
 #define pg_fsync fsync
 #define history_ranges_overlap debt_overlap
+#ifndef CONTROL_DEBT_SHARED_ACTOR_TEST
 int cluster_node_id;
+#endif
 #include "test_cluster_control_debt_writer.inc"
 #include "../../backend/cluster/cluster_control_debt_publish_v2.inc"
 #undef history_ranges_overlap

@@ -8,11 +8,13 @@ int registry_codec_fixture_main(void);
 #include "storage/lockdefs.h"
 /* Only the lock-presence leaf is controlled; codecs, file reads and digests real. */
 static bool cf_held = true;
+#ifndef CONTROL_DEBT_SHARED_ACTOR_TEST
 bool cluster_cf_held_is_clusterwide(LOCKMODE mode);
 bool cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
 	return cf_held;
 }
+#endif
 static ControlRootImage root;
 static void root_fixture(void)
 {
