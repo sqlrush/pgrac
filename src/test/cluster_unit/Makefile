@@ -19537,6 +19537,35 @@ clean: clean-initdb-main
 .PHONY: clean-initdb-main
 clean-initdb-main:
 	rm -f test_cluster_initdb_main test_cluster_initdb_main.d test_cluster_initdb_main.stamp test_cluster_initdb_main_types.inc test_cluster_initdb_main_helpers.inc test_cluster_initdb_main_body.inc
+
+# Original BOOT dispatch, with controlled family/control-file producers.
+# Author: SqlRush <sqlrush@gmail.com>
+TESTS += test_cluster_initdb_boot
+all: test_cluster_initdb_boot
+test_cluster_initdb_boot_entries.inc: $(top_srcdir)/src/backend/access/transam/xlog.c $(top_srcdir)/src/bin/initdb/initdb.c $(top_srcdir)/src/backend/cluster/cluster_wal_thread.c $(srcdir)/extract_cluster_initdb_boot.py
+	python3 $(srcdir)/extract_cluster_initdb_boot.py $(word 1,$^) $(word 2,$^) $(word 3,$^) $@
+test_cluster_initdb_boot: test_cluster_initdb_boot.c test_cluster_initdb_boot_entries.inc unit_test.h \
+	$(top_srcdir)/src/include/access/xlog_internal.h \
+	$(top_srcdir)/src/include/catalog/pg_control.h \
+	$(top_srcdir)/src/include/catalog/catversion.h \
+	$(top_srcdir)/src/include/cluster/cluster_initdb_config.h \
+	$(top_srcdir)/src/include/cluster/cluster_xlog.h \
+	$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+	$(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+	$(top_srcdir)/src/include/common/pgrac_initdb_wal.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_checkpoint_coverage.h \
+	$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+	$(top_srcdir)/src/common/pgrac_initdb_recovery.c \
+	$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(srcdir) $< $(top_srcdir)/src/common/pgrac_initdb_recovery.c $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-initdb-boot
+.PHONY: clean-initdb-boot
+clean-initdb-boot:
+	rm -f test_cluster_initdb_boot test_cluster_initdb_boot.d test_cluster_initdb_boot_entries.inc test_cluster_initdb_boot_entries.tmp
+
 # Independent CREATE bytes are shared by the original copy consumer and replay.
 test_cluster_relmap_create_copy: test_cluster_relmap_create_replay.inc \
         $(top_srcdir)/src/include/common/cryptohash.h

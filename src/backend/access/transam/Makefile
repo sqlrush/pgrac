@@ -51,6 +51,13 @@ xlog.o: xlog.c $(top_srcdir)/src/include/catalog/catversion.h
 # changes even when autodepend is disabled. Author: SqlRush <sqlrush@gmail.com>
 xlog.o: $(top_srcdir)/src/include/cluster/cluster_ir.h
 
+# Original BOOT dispatch consumes the complete creator and file receipts.
+xlog.o: $(top_srcdir)/src/include/common/pgrac_initdb_recovery.h \
+	$(top_srcdir)/src/include/common/pgrac_initdb_wal.h \
+	$(top_srcdir)/src/include/common/cluster_recovery_bootstrap.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
 # Native recovery and checkpoint retain value-owned recovery stamp handles.
 xlog.o xlogrecovery.o: $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.h \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h
