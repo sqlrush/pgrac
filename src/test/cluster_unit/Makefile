@@ -19760,3 +19760,13 @@ clean: clean-control-debt-publish
 .PHONY: clean-control-debt-publish
 clean-control-debt-publish:
 	rm -f test_cluster_control_debt_publish test_cluster_control_debt_publish.d test_cluster_control_debt_writer.inc test_cluster_control_debt_writer.inc.tmp
+
+test_cluster_control_debt_restart: $(top_srcdir)/src/include/cluster/cluster_tt_slot.h
+
+# These file fixtures link the frontend archive as well as native owners.
+# A catalog change must not retain either old compiled catalog validators.
+test_cluster_control_root: $(top_builddir)/src/common/libpgcommon.a
+$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
+	$(top_builddir)/src/backend/cluster/cluster_control_root_registry.o \
+	$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o: \
+	$(top_srcdir)/src/include/catalog/catversion.h
