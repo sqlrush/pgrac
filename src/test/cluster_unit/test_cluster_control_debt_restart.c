@@ -66,11 +66,13 @@ static uint8 restart_reference[128];
 static uint8 restart_storage[16];
 static uint64 restart_system;
 
+#ifndef CONTROL_DEBT_SHARED_ACTOR_TEST
 uint64
 cluster_cf_attempt_sequence(void)
 {
 	return restart_cf_sequence;
 }
+#endif
 
 /* Armed in the forked writer only: die right after the Nth store read. */
 static void

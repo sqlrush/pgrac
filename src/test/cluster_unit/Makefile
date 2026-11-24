@@ -17751,3 +17751,48 @@ clean-start-debt-readback:
 # Both fixtures include the original Start's transition-view consumer.
 test_cluster_cold_tx_start test_cluster_relmap_original_start.o: \
 	$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h
+
+# Link the original Start to the real protective publisher and whole-file reader.
+TESTS += test_cluster_start_real_debt_readback
+all: test_cluster_start_real_debt_readback
+test_cluster_start_debt_files.o: test_cluster_start_debt_files.c \
+		test_cluster_start_debt_files.h test_cluster_control_debt_readback
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+test_cluster_start_real_debt_main.o: test_cluster_start_real_debt_readback.c \
+		test_cluster_start_debt_files.h test_cluster_cold_tx_start
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(STARTUP_NATIVE_CTRC_TEST_CPPFLAGS) \
+		-Drf_page_stable_base_proof_destroy_v1=start_prefix_proof_destroy_v1 \
+		-ffunction-sections -fdata-sections -c $< -o $@
+# Keep unused ROOT owner exports distinct from the original Start providers.
+# The bridge uses this object's original v3 codecs, not its selection owner.
+test_cluster_start_debt_root.o: $(top_srcdir)/src/backend/cluster/cluster_control_root.c cluster_control_registry_original.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_control_root_identity_equal=start_debt_root_identity_equal \
+		-Dcluster_control_root_debt_transition_get_v2=start_debt_root_transition_get_v2 \
+		-Dcluster_control_root_debt_transition_readback_v2=start_debt_root_transition_readback_v2 \
+		-Dcluster_control_root_relmap_format_locked_v2=start_debt_root_format_locked_v2 \
+		-Dcluster_control_root_relmap_selection_output_distinct_v4=start_debt_root_selection_output_distinct_v4 \
+		-Dcluster_control_root_relmap_selection_recheck_locked_v4=start_debt_root_selection_recheck_locked_v4 \
+		-Dcluster_control_root_relmap_selection_reference_v4=start_debt_root_selection_reference_v4 \
+		-c $< -o $@
+test_cluster_start_real_debt_readback: test_cluster_start_real_debt_main.o \
+		test_cluster_start_debt_files.o test_cluster_start_debt_root.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_start_debt_files.o \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o test_cluster_start_debt_root.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_PAGE_STABLE_TEST_O) \
+		test_cluster_cold_start_terminal_clog.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-start-real-debt-readback
+.PHONY: clean-start-real-debt-readback
+clean-start-real-debt-readback:
+	rm -f test_cluster_start_real_debt_readback test_cluster_start_real_debt_readback.d \
+		test_cluster_start_debt_files.o test_cluster_start_debt_files.d \
+		test_cluster_start_real_debt_main.o test_cluster_start_real_debt_main.d \
+		test_cluster_start_debt_root.o test_cluster_start_debt_root.d
