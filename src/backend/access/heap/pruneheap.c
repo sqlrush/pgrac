@@ -183,6 +183,7 @@ cluster_heap_prune_page_valid(Page page, BlockNumber block)
 	PageHeader header = (PageHeader) page;
 	OffsetNumber off;
 	OffsetNumber maxoff;
+	bool occupied[BLCKSZ / MAXIMUM_ALIGNOF] = { false };
 
 	if (!PageHasItl(page) || PageGetPageSize(page) != BLCKSZ
 		|| header->pd_lower < SizeOfPageHeaderData
@@ -203,11 +204,21 @@ cluster_heap_prune_page_valid(Page page, BlockNumber block)
 			HeapTupleHeader tuple;
 			unsigned int start = ItemIdGetOffset(item);
 			unsigned int length = ItemIdGetLength(item);
+			unsigned int end = start + MAXALIGN(length);
+			unsigned int unit;
 
 			if (start != MAXALIGN(start) || start < header->pd_upper
 				|| length < SizeofHeapTupleHeader
-				|| start + length > header->pd_special)
+				|| end > header->pd_special)
 				return false;
+			/* Compaction must never move two tuples from shared storage.
+			 * Check aligned spans in linear, page-bounded work. */
+			for (unit = start / MAXIMUM_ALIGNOF; unit < end / MAXIMUM_ALIGNOF; unit++)
+			{
+				if (occupied[unit])
+					return false;
+				occupied[unit] = true;
+			}
 			tuple = (HeapTupleHeader) PageGetItem(page, item);
 			if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > length)
 				return false;

@@ -7705,6 +7705,71 @@ UT_TEST(test_hot_prune_reuses_intermediate_slot_and_preserves_index_root)
 	ut_prune_end();
 }
 
+/* UNKNOWN keeps the malformed page away from physical mutation in RED. */
+UT_TEST(test_hot_prune_rejects_overlapping_storage_before_origin_resolution)
+{
+	for (int leg = 0; leg < 3; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		PGAlignedBlock before;
+		Page page;
+		ItemId item;
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		page = (Page)fixture.live_page;
+		if (leg == 0) {
+			/* A second line pointer aliases the unchanged live tail. */
+			((PageHeader)page)->pd_lower += sizeof(ItemIdData);
+			item = PageGetItemId(page, 3);
+			ItemIdSetNormal(PageGetItemId(page, 4), ItemIdGetOffset(item), 64);
+		} else {
+			/* A valid header with a length extending into its neighbour. */
+			item = PageGetItemId(page, leg == 1 ? 2 : 3);
+			ItemIdSetNormal(item, ItemIdGetOffset(item), 72);
+		}
+		ut_prune_verdict_kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+		memcpy(before.data, page, BLCKSZ);
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		UT_ASSERT_EQ(ut_prune_resolve_calls, 0);
+		UT_ASSERT_EQ(ut_prune_reclaimed, 0);
+		UT_ASSERT_EQ(ut_prune_wal_records, 0);
+		UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+		ut_prune_end();
+	}
+}
+
+UT_TEST(test_hot_prune_preserves_adjacent_unaligned_tuple_lengths)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	RelationData relation;
+	FormData_pg_class form;
+	Page page;
+	Size free_before;
+
+	ut_prune_begin(&fixture, &hot, &relation, &form);
+	page = (Page)fixture.live_page;
+	for (OffsetNumber off = 1; off <= 3; off++) {
+		ItemId item = PageGetItemId(page, off);
+
+		ItemIdSetNormal(item, ItemIdGetOffset(item), 63);
+	}
+	PageGetItem(page, PageGetItemId(page, 3))[62] = 0x43;
+	free_before = PageGetHeapFreeSpace(page);
+	heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+	UT_ASSERT_EQ(ut_prune_resolve_calls, 2);
+	UT_ASSERT_EQ(ut_prune_reclaimed, 2);
+	UT_ASSERT_EQ(ut_prune_wal_records, 1);
+	UT_ASSERT_EQ(ItemIdGetRedirect(PageGetItemId(page, 1)), 3);
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId(page, 2)));
+	UT_ASSERT_EQ(ItemIdGetLength(PageGetItemId(page, 3)), 63);
+	UT_ASSERT_EQ(PageGetItem(page, PageGetItemId(page, 3))[62], 0x43);
+	UT_ASSERT_EQ(PageGetHeapFreeSpace(page) - free_before, 128);
+	ut_prune_end();
+}
+
 /* UNKNOWN keeps the old native walker out of the malformed cycle too, so
  * the RED proves the missing structural gate without risking an overrun. */
 UT_TEST(test_hot_prune_rejects_cyclic_input_before_origin_resolution)
@@ -8534,7 +8599,9 @@ UT_TEST(test_current_mx_remote_single_hands_off_vm_before_materialization)
 int
 main(void)
 {
-	UT_PLAN(165);
+	UT_PLAN(167);
+	UT_RUN(test_hot_prune_rejects_overlapping_storage_before_origin_resolution);
+	UT_RUN(test_hot_prune_preserves_adjacent_unaligned_tuple_lengths);
 	UT_RUN(test_current_mx_proof_drops_vm_pin_and_restarts_after_full_repin);
 	UT_RUN(test_current_mx_exact_wait_hands_off_vm_and_keeps_wait_policy);
 	UT_RUN(test_current_mx_remote_single_hands_off_vm_before_materialization);
