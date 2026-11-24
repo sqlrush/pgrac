@@ -19774,7 +19774,12 @@ $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
 # Independent whole transition readback; no live preparation consumer.
 TESTS += test_cluster_control_debt_readback
 all: test_cluster_control_debt_readback
-test_cluster_control_debt_readback: test_cluster_control_debt_readback.c test_cluster_control_debt_publish.c \
+test_cluster_control_debt_readback: test_cluster_control_debt_readback.c test_cluster_control_debt_publish.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		$(top_srcdir)/src/include/catalog/catversion.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h \
 		test_cluster_control_debt_restart.c test_cluster_control_debt_writer.inc \
 		test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
 		test_cluster_control_registry.c test_cluster_recovery_registry.c \
