@@ -13429,12 +13429,15 @@ $(CLUSTER_MULTIXACT_CURRENT_WIRE_O): \
 
 TESTS += test_cluster_mx_history_wire
 all: test_cluster_mx_history_wire
+TESTS += test_cluster_mx_history_envelope
+all: test_cluster_mx_history_envelope
+test_cluster_mx_history_envelope: test_cluster_mx_history_wire.c
 
 $(CLUSTER_MX_HISTORY_WIRE_O): $(top_srcdir)/src/backend/cluster/cluster_mx_history_wire.c \
         $(top_srcdir)/src/include/cluster/cluster_mx_history_wire.h
 	$(MAKE) -C $(top_builddir)/src/backend/cluster cluster_mx_history_wire.o
 
-test_cluster_mx_history_wire: test_cluster_mx_history_wire.c unit_test.h \
+test_cluster_mx_history_wire test_cluster_mx_history_envelope: %: %.c unit_test.h \
         $(CLUSTER_MX_HISTORY_WIRE_O) $(CLUSTER_R4_SLOT_RESERVATION_UBA_O) \
         $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_MX_HISTORY_WIRE_O) \
