@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from p0_retest_evidence import request_evidence, itl_evidence
+from p0_retest_image_evidence import image_evidence
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[3]
@@ -34,6 +35,8 @@ def judge(case, capture, tap, logs):
         raise ValueError("unknown case")
     result = dict(case=case, status="NOT_REACHED", original_path="UNKNOWN",
                   p0_closed=False, errors=[], notes=[], request_evidence=request_evidence(logs))
+    if case == "P0-10":
+        result["image_evidence"] = image_evidence(capture, logs)
     if capture.get("version") != 1 or capture.get("case") != case:
         result["notes"].append("missing or wrong case result")
         return result

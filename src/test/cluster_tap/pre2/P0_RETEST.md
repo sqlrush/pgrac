@@ -55,6 +55,15 @@ exported fields are present and fit their byte widths. Producer identity stays
 `UNKNOWN`; no TT wrap is inferred from an ITL wrap. Missing, malformed or
 overflowed exports never supply original-path credit or change the SQL verdict.
 
+For P0-10, `image_evidence` retains each existing READ_IMAGE, READ_IMAGE_HOP and
+READ_IMAGE_INGRESS observation separately using the shared log parser. It
+compares copied emitter node/PID and relation fields with the SQL capture;
+`block_within_initial_size` refers only to the original relation size. These
+comparisons do not bind an SQL statement, exported snapshot or process lifetime.
+Ingress headers remain unvalidated; guarded unknown fields stay unknown.
+Repeated sequences, missing flags and malformed records are retained without
+joining cuts or assigning original-path credit.
+
 Rejudge retained output without contacting a server:
 
 ```sh
