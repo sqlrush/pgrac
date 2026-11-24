@@ -81,6 +81,8 @@ static ClusterCssdPeerState fixture_holder_state = CLUSTER_CSSD_PEER_ALIVE;
 static bool caught_error, result, retry_denied;
 static char log_line[4096], logs[65536], error_detail[1024];
 static GcsBlockForwardPayload last_forward;
+static uint64 fixture_next_request_id;
+static void (*fixture_wait_hook)(long timeout, uint32 event);
 
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
@@ -182,13 +184,14 @@ gcs_block_reserve_slot(BufferTag tag pg_attribute_unused(), uint8 transition pg_
 					   bool local_wait pg_attribute_unused())
 {
 	fixture_backend.slot.in_use = true;
-	fixture_backend.slot.request_id = *request_id = 51;
+	fixture_backend.slot.request_id = *request_id = ++fixture_next_request_id;
 	return &fixture_backend.slot;
 }
 static void gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot)
 { releases++; slot->in_use = false; }
 static long gcs_block_backoff_ms_for_retry(int attempt pg_attribute_unused()) { return 1; }
-static bool gcs_block_pcm_x_next_request_id(uint64 *id) { ++*id; return true; }
+static bool gcs_block_pcm_x_next_request_id(uint64 *id)
+{ *id = ++fixture_next_request_id; return true; }
 SCN cluster_pcm_lock_pi_watermark_scn_query(BufferTag tag pg_attribute_unused()) { return 99; }
 static uint32 gcs_block_compute_checksum(const char *data pg_attribute_unused()) { return 123; }
 static void
@@ -219,7 +222,12 @@ bool LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attrib
 void LWLockRelease(LWLock *lock pg_attribute_unused()) { lock_depth--; }
 int WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
 			  long timeout, uint32 event pg_attribute_unused())
-{ fixture_now += timeout * 1000; return WL_TIMEOUT; }
+{
+	if (fixture_wait_hook != NULL)
+		fixture_wait_hook(timeout, event);
+	fixture_now += timeout * 1000;
+	return WL_TIMEOUT;
+}
 void ResetLatch(Latch *latch pg_attribute_unused()) {}
 void ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused()) {}
 bool ConditionVariableCancelSleep(void) { return true; }
@@ -260,9 +268,8 @@ gcs_block_stage_forward_wait(ClusterGcsBlockOutstandingSlot *slot, int32 holder 
 #include "test_cluster_gcs_read_image_trace.inc"
 
 static void
-run_scenario(int selected, bool trace)
+reset_scenario(int selected, bool trace)
 {
-	sigjmp_buf outer;
 	scenario = selected;
 	memset(&fixture_backend, 0, sizeof(fixture_backend));
 	memset(&fixture_buffer, 0, sizeof(fixture_buffer));
@@ -290,6 +297,16 @@ run_scenario(int selected, bool trace)
 	cluster_trace_normal_stop = trace;
 	cluster_read_scache = selected == 8;
 	cluster_gcs_block_retransmit_max_retries = selected == 9 || selected == 11 ? 1 : 0;
+	fixture_next_request_id = 50;
+	fixture_wait_hook = NULL;
+}
+
+static void
+run_scenario(int selected, bool trace)
+{
+	sigjmp_buf outer;
+
+	reset_scenario(selected, trace);
 	PG_exception_stack = &outer;
 	if (sigsetjmp(outer, 0) == 0)
 		result = cluster_gcs_local_master_read_image_and_wait(

@@ -59,7 +59,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_r4_tx_rpc_slots test_cluster_ordinary_tt_diagnostic test_cluster_gcs_read_image_trace \
+TESTS = test_cluster_shared_fs_page test_cluster_relmap_lock test_cluster_vm_read_visibility test_cluster_heap_maintenance test_cluster_vacuum_shared_mx test_cluster_heap_cr_reuse test_cluster_buffer_cr test_cluster_buffer_mapping test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_drop test_cluster_shared_fs_cold_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime test_cluster_relation_size test_cluster_vacuum_proof_cleanup test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_r4_tx_rpc_slots test_cluster_ordinary_tt_diagnostic test_cluster_gcs_read_image_trace test_cluster_gcs_read_image_rearm \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -8120,7 +8120,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_m2_pause_state test_cluster_m2_sample_diagnostic test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace test_cluster_ctrc_local_empty,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_m2_pause_state test_cluster_m2_sample_diagnostic test_cluster_cold_tx_start test_cluster_postmaster_lwlock test_cluster_phase_publication test_cluster_checkpoint_cleanup test_cluster_checkpoint_wait_budget test_cluster_checkpoint_error test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse test_cluster_abort_writer test_cluster_storage_abort_writeback test_cluster_heap_hot_full_trace test_cluster_gcs_read_image_hops test_cluster_gcs_read_image_trace test_cluster_gcs_read_image_rearm test_cluster_ctrc_local_empty,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # Native CR metadata checks are inline in the shared descriptor definition.
@@ -17009,6 +17009,19 @@ test_cluster_gcs_read_image_trace.inc: $(top_srcdir)/src/backend/cluster/cluster
 
 test_cluster_gcs_read_image_trace: test_cluster_gcs_read_image_trace.c unit_test.h test_cluster_gcs_read_image_trace.inc
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< -o $@
+
+test_cluster_read_image_publish_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_publish_read_image_exact\(/ { print "ClusterPcmOwnResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_gcs_read_image_rearm: test_cluster_gcs_read_image_rearm.c \
+		test_cluster_gcs_read_image_trace.c unit_test.h test_cluster_gcs_read_image_trace.inc \
+		test_cluster_pcm_snapshot_owner.inc test_cluster_gcs_read_rearm_owner.inc \
+		test_cluster_read_image_publish_owner.inc $(CLUSTER_PCM_OWN_O)
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PCM_OWN_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # Exact R4 requester lifecycle/reply landing plus optional read-image hop observer.
 test_cluster_gcs_read_image_hops.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
