@@ -51,6 +51,7 @@ my @contrib_excludes = (
 	'sepgsql', 'brin',
 	'test_extensions', 'test_misc',
 	'test_pg_dump', 'snapshot_too_old',
+	'test_pgrac_verdict_bench',
 	'unsafe_tests', 'test_escape');
 
 # Set of variables for frontend modules
