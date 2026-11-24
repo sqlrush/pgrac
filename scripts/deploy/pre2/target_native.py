@@ -14,7 +14,8 @@ import sys
 
 from target_guest import LIBVIRT_VERSION
 from target_inventory import _open_path, _read_config
-from target_journal import TargetJournalError
+from target_journal import TargetJournalError, _hex
+import target_operation
 
 CONFIGFS_ROOT = "/sys/kernel/config/target"
 CONFIGFS_MAGIC = 0x62656570
@@ -70,6 +71,39 @@ def _lookup_root():
         raise TargetJournalError("TARGET_NATIVE_DBROOT")
     root.invalidate_caches()
     return root
+
+
+@contextmanager
+def lio_native_handles(target_boot_id):
+    """Look up existing LIO in one kernel boot without requiring libvirt.
+
+    Called under the authenticated owner's exclusive configuration lock. This
+    handle grants no power, writer-exclusion or export-restoration authority.
+    """
+    try:
+        if (sys.platform != "linux" or os.geteuid() != 0
+                or not _hex(target_boot_id, 32)):
+            raise TargetJournalError("TARGET_NATIVE_PRIVILEGE")
+        import rtslib_fb
+        if rtslib_fb.__version__ != RTSLIB_VERSION:
+            raise TargetJournalError("TARGET_NATIVE_VERSION")
+        if target_operation._kernel_boot_id() != target_boot_id:
+            raise TargetJournalError("TARGET_NATIVE_BOOT")
+        identity = _configfs_identity()
+        root = _lookup_root()
+        if (_configfs_identity() != identity
+                or target_operation._kernel_boot_id() != target_boot_id):
+            raise TargetJournalError("TARGET_NATIVE_CHANGED")
+        try:
+            yield root
+        finally:
+            if (_configfs_identity() != identity
+                    or target_operation._kernel_boot_id() != target_boot_id):
+                raise TargetJournalError("TARGET_NATIVE_CHANGED")
+    except TargetJournalError:
+        raise
+    except Exception:
+        raise TargetJournalError("TARGET_NATIVE_UNPROVEN") from None
 
 
 @contextmanager
