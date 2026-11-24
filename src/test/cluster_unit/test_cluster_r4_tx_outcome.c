@@ -6841,6 +6841,17 @@ UT_TEST(test_origin_export_copies_only_the_final_revalidated_resident_data_page)
 
 /* Author: PGRAC. The real local consumer must not discard an already-proven
  * exact terminal merely because a later physical-alias pair would refuse. */
+UT_TEST(test_local_retained_read_rejects_page_stamp_above_origin_bound)
+{
+	ClusterUndoVerdictResult result;
+	reset_exact_origin_fixture();
+	test_local_origin_bound = test_commit_scn - 1;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1,
+		test_commit_scn, test_commit_scn + 1);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+}
+
 UT_TEST(test_local_retained_read_preserves_same_stamp_origin_exact)
 {
 	ClusterUndoVerdictResult result;
@@ -7485,7 +7496,8 @@ UT_TEST(test_retained_slot_identity_does_not_escape_original_final_fences)
 int
 main(void)
 {
-	UT_PLAN(206);
+	UT_PLAN(207);
+	UT_RUN(test_local_retained_read_rejects_page_stamp_above_origin_bound);
 	UT_RUN(test_original_full_xid_reaches_same_and_cross_segment_census_result);
 	UT_RUN(test_original_full_xid_missing_or_key_alias_keeps_verdict_without_identity);
 	UT_RUN(test_original_full_xid_not_queried_for_other_roles_or_abort);

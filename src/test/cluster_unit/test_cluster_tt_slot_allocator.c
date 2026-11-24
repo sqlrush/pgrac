@@ -1448,6 +1448,45 @@ UT_TEST(test_t55_unproven_horizon_retains_until_finite_sample)
 	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, first), 1);
 }
 
+/* Startup publishes the recovery-end cutoff, including on crash start. */
+static FullTransactionId cycle_test_next_xid;
+FullTransactionId
+ReadNextFullTransactionId(void)
+{
+	return cycle_test_next_xid;
+}
+
+UT_TEST(test_recycle_horizon_is_scoped_to_recovery_end_cycle)
+{
+	for (int mode = 0; mode < 3; mode++) {
+		reset_allocator();
+		cycle_test_next_xid = FullTransactionIdFromU64(1200);
+		/* Crash starts have no captured shutdown checkpoint. */
+		if (mode != 0)
+			cluster_tt_slot_capture_startup_checkpoint((SCN)100, FullTransactionIdFromU64(1000));
+		cluster_tt_slot_confirm_clean_start(mode != 0, mode == 1 ? 1 : 0);
+		cluster_tt_slot_note_gated_recycle_horizon((SCN)120);
+		UT_ASSERT_EQ(cluster_tt_slot_recycle_bound_for_xid(500), InvalidScn);
+		UT_ASSERT_EQ(cluster_tt_slot_recycle_bound_for_xid(1100), InvalidScn);
+		UT_ASSERT_EQ(cluster_tt_slot_recycle_bound_for_xid(1200), (SCN)120);
+		cycle_test_next_xid = FullTransactionIdFromU64(1300);
+		cluster_tt_slot_confirm_clean_start(true, 0);
+		UT_ASSERT_EQ(cluster_tt_slot_recycle_bound_for_xid(1200), (SCN)120);
+	}
+	for (int fault = 0; fault < 3; fault++) {
+		reset_allocator();
+		cycle_test_next_xid = FullTransactionIdFromU64(
+			fault == 0 ? 0 : fault == 1 ? FrozenTransactionId : UINT64_C(0x1000004b0));
+		cluster_tt_slot_confirm_clean_start(false, 0);
+		cluster_tt_slot_note_gated_recycle_horizon((SCN)120);
+		UT_ASSERT_EQ(cluster_tt_slot_recycle_bound_for_xid(1500), InvalidScn);
+	}
+	reset_allocator();
+	cluster_tt_slot_note_gated_recycle_horizon((SCN)120);
+	UT_ASSERT_EQ(cluster_tt_slot_recycle_bound_for_xid(1500), InvalidScn);
+	UT_ASSERT_EQ(cluster_tt_slot_recycle_bound_for_xid(FrozenTransactionId), InvalidScn);
+}
+
 UT_TEST(test_clean_checkpoint_bound_is_separate_immutable_and_pre_start_only)
 {
 	int fault;
@@ -1664,7 +1703,8 @@ UT_TEST(test_capacity_real_tt_producers_and_noop)
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(64);
+	UT_RUN(test_recycle_horizon_is_scoped_to_recovery_end_cycle);
 	UT_RUN(test_capacity_real_tt_producers_and_noop);
 	cluster_tt_slot_shmem_init(); /* one-time init for tests that
 										   don't call reset_allocator */

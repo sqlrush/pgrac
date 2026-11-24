@@ -28,6 +28,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_undo_resid.h"
 #include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_undo_segment.h"
@@ -2617,6 +2618,11 @@ cluster_undo_block0_current_live_owner_recycle_exact(const ClusterUndoBlock0Logi
 														(uint8)SEGMENT_RECYCLABLE);
 		if (XLogRecPtrIsInvalid(recycle_lsn))
 			goto recycle_done;
+		/* Publish the bound while the exact current/content-X owner still
+		 * excludes segment rebirth. All 48 slots passed the retention and
+		 * handoff gates above. An I/O error after this conservative upper
+		 * bound is harmless; publishing RECYCLABLE before it is not. */
+		cluster_tt_slot_note_gated_recycle_horizon(horizon);
 		cluster_undo_block0_flush_sync(&pin, successor_block.data, recycle_lsn, false);
 		recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED;
 

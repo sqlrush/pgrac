@@ -232,6 +232,8 @@ static int frame_release_calls;
 static int provision_calls;
 static int provision_abort_calls;
 static int flush_sync_calls;
+static SCN noted_recycle_horizon;
+static bool check_recycle_bound_before_publication;
 static char last_flush_successor[BLCKSZ];
 static XLogRecPtr last_flush_lsn;
 static int reuse_wal_calls;
@@ -888,12 +890,27 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 }
 
 void
+cluster_tt_slot_note_gated_recycle_horizon(SCN horizon)
+{
+	/* The real transition must invoke this before publishing RECYCLABLE,
+	 * with its original exclusive pin and current owner still held. */
+	UT_ASSERT(pin_calls > unpin_calls);
+	if (check_recycle_bound_before_publication)
+		UT_ASSERT_EQ(local_release_calls, 0);
+	if (horizon > noted_recycle_horizon)
+		noted_recycle_horizon = horizon;
+}
+
+void
 cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_page,
 							   XLogRecPtr required_wal_lsn, bool fsync_parent)
 {
 	UT_ASSERT_NOT_NULL(pin);
 	UT_ASSERT_NOT_NULL(successor_page);
 	UT_ASSERT(!fsync_parent);
+	if (check_recycle_bound_before_publication
+		&& ((const UndoSegmentHeaderData *)successor_page)->segment_state == SEGMENT_RECYCLABLE)
+		UT_ASSERT(noted_recycle_horizon >= (SCN)100);
 	flush_sync_calls++;
 	last_flush_lsn = required_wal_lsn;
 	memcpy(last_flush_successor, successor_page, BLCKSZ);
@@ -1207,6 +1224,8 @@ reset_fixture(void)
 	root_resolve_calls = frame_reserve_calls = frame_release_calls = 0;
 	provision_calls = provision_abort_calls = 0;
 	flush_sync_calls = 0;
+	noted_recycle_horizon = InvalidScn;
+	check_recycle_bound_before_publication = false;
 	last_flush_lsn = InvalidXLogRecPtr;
 	memset(last_flush_successor, 0, sizeof(last_flush_successor));
 	reuse_wal_calls = recycle_wal_calls = 0;
@@ -3663,6 +3682,23 @@ UT_TEST(test_live_owner_lifecycle_mutation_rebases_only_exact_current_tt_bytes)
 	UT_ASSERT(UndoSegmentFlags_is_full(current->segment_flags));
 }
 
+UT_TEST(test_recycle_bound_is_published_before_segment_can_be_wiped)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	reset_fixture();
+	fake_modifier_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_generation = (ClusterUndoBlock0Generation){ true, 7 };
+	init_recyclable_block0(fake_disk_page, key.segment_id, key.owner_instance, 7);
+	((UndoSegmentHeaderData *)fake_disk_page)->segment_state = SEGMENT_COMMITTED;
+	memcpy(fake_pin_page, fake_disk_page, BLCKSZ);
+	check_recycle_bound_before_publication = true;
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_recycle_exact(
+		&key, (SCN)100, fake_epoch, 1000), CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED);
+	UT_ASSERT_EQ(noted_recycle_horizon, (SCN)100);
+}
+
 UT_TEST(test_live_owner_recycle_converges_exact_committed_disk_successor)
 {
 	ClusterUndoBlock0LogicalKey key = test_key(1);
@@ -4031,7 +4067,8 @@ UT_TEST(test_capacity_xcur_scope_cancel_error_and_scur)
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(97);
+	UT_RUN(test_recycle_bound_is_published_before_segment_can_be_wiped);
 	UT_RUN(test_first_publication_deny_preserves_private_bytes_and_can_retry);
 	UT_RUN(test_first_publication_deny_does_not_intercept_existing_or_rejected_owners);
 	UT_RUN(test_first_publication_injected_error_uses_original_owner_cleanup);
