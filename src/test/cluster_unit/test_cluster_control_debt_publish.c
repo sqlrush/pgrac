@@ -379,7 +379,10 @@ UT_TEST(publisher_killed_after_primary_missing_material_has_no_backup_fallback)
 		publisher_end(&t);
 	}
 }
-int main(void)
+#ifndef CONTROL_DEBT_PUBLISH_TEST_MAIN
+#define CONTROL_DEBT_PUBLISH_TEST_MAIN main
+#endif
+int CONTROL_DEBT_PUBLISH_TEST_MAIN(void)
 {
 	UT_PLAN(11);
 	UT_RUN(publisher_replaces_only_primary_and_reloads_every_batch_page);

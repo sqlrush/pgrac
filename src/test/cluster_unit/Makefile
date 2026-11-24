@@ -17685,3 +17685,37 @@ $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
 	$(top_builddir)/src/backend/cluster/cluster_control_root_registry.o \
 	$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o: \
 	$(top_srcdir)/src/include/catalog/catversion.h
+
+# Independent whole transition readback; no live preparation consumer.
+TESTS += test_cluster_control_debt_readback
+all: test_cluster_control_debt_readback
+test_cluster_control_debt_readback: test_cluster_control_debt_readback.c test_cluster_control_debt_publish.c \
+		test_cluster_control_debt_restart.c test_cluster_control_debt_writer.inc \
+		test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
+		test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_transition_v2.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_publish_v2.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		$(top_srcdir)/src/include/storage/lwlock.h \
+		$(top_srcdir)/src/include/utils/resowner.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_registry_common_test.o cluster_control_registry_original.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-debt-readback
+.PHONY: clean-control-debt-readback
+clean-control-debt-readback:
+	rm -f test_cluster_control_debt_readback test_cluster_control_debt_readback.d
