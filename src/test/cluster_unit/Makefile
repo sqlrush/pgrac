@@ -20617,3 +20617,34 @@ test_cluster_clog_native_redo: test_cluster_clog_native_redo.c unit_test.h \
 clean: clean-clog-native-redo
 clean-clog-native-redo:
 	rm -f test_cluster_clog_native_redo test_cluster_clog_native_redo.d
+
+# Managed transaction reads retain the original selected CLOG identity checks.
+test_cluster_clog_native_transam: test_cluster_clog_native_transam.c \
+		test_cluster_clog_native_io test_cluster_clog_native_io.c test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/transam.c \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/cluster/cluster_guc.h \
+		$(top_srcdir)/src/include/access/transam.h \
+		$(top_srcdir)/src/include/access/subtrans.h \
+		cluster_catalog_trace_test.o $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_catalog_trace_test.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+TESTS += test_cluster_clog_native_transam
+all: test_cluster_clog_native_transam
+clean-clog-native-transam:
+	rm -f test_cluster_clog_native_transam test_cluster_clog_native_transam.d
+clean: clean-clog-native-transam
+.PHONY: clean-clog-native-transam

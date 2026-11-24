@@ -23,6 +23,10 @@
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "utils/snapmgr.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_guc.h"
+#endif
 
 /*
  * Single-item cache for results of TransactionLogFetch.  It's worth having
@@ -36,6 +40,24 @@ static XLogRecPtr cachedCommitLSN;
 
 /* Local functions */
 static XidStatus TransactionLogFetch(TransactionId transactionId);
+
+/* A raw-XID terminal cache has no selected file identity or current borrow.
+ * Managed CLOG reads must pass through the original lock and page binding on
+ * every use, including commit-LSN reads and creation before cluster serving.
+ * Retire an earlier legacy entry instead of letting it bypass that lookup. */
+static bool
+TransactionLogCacheAllowed(void)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled
+		|| cluster_control_native_files_mode_v2() != CLUSTER_NATIVE_FILES_UNKNOWN_V2)
+	{
+		cachedFetchXid = InvalidTransactionId;
+		return false;
+	}
+#endif
+	return true;
+}
 
 
 /* ----------------------------------------------------------------
@@ -53,12 +75,13 @@ TransactionLogFetch(TransactionId transactionId)
 {
 	XidStatus	xidstatus;
 	XLogRecPtr	xidlsn;
+	bool		cache_allowed = TransactionLogCacheAllowed();
 
 	/*
 	 * Before going to the commit log manager, check our single item cache to
 	 * see if we didn't just check the transaction status a moment ago.
 	 */
-	if (TransactionIdEquals(transactionId, cachedFetchXid))
+	if (cache_allowed && TransactionIdEquals(transactionId, cachedFetchXid))
 		return cachedFetchXidStatus;
 
 	/*
@@ -82,7 +105,7 @@ TransactionLogFetch(TransactionId transactionId)
 	 * Cache it, but DO NOT cache status for unfinished or sub-committed
 	 * transactions!  We only cache status that is guaranteed not to change.
 	 */
-	if (xidstatus != TRANSACTION_STATUS_IN_PROGRESS &&
+	if (cache_allowed && xidstatus != TRANSACTION_STATUS_IN_PROGRESS &&
 		xidstatus != TRANSACTION_STATUS_SUB_COMMITTED)
 	{
 		cachedFetchXid = transactionId;
@@ -389,7 +412,7 @@ TransactionIdGetCommitLSN(TransactionId xid)
 	 * checking TransactionLogFetch's cache will usually succeed and avoid an
 	 * extra trip to shared memory.
 	 */
-	if (TransactionIdEquals(xid, cachedFetchXid))
+	if (TransactionLogCacheAllowed() && TransactionIdEquals(xid, cachedFetchXid))
 		return cachedCommitLSN;
 
 	/* Special XIDs are always known committed */
