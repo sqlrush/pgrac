@@ -746,6 +746,57 @@ cr_r4_history_refusal_log(const char *site, uint32 slot_index,
 		 uba == NULL ? (uint64)0 : uba->raw[1], xid, emitted == 64);
 }
 
+/*
+ * Observe a redirect whose successor is absent after an UPDATE inverse.
+ * This identifies a scratch-page shape, not the producer of that redirect or
+ * the prune floor at its creation.  The immutable record has already passed
+ * the original decoder and inverse checks.  Nothing is decided here: the
+ * image and its result stay exactly as built and the consumer keeps its own
+ * refusal.  The existing trace switch avoids an extra page walk on the
+ * ordinary path.  Retain only bounded observations from the private copy.
+ */
+static void
+cr_r4_history_orphan_root_log(uint32 slot_index, const ClusterR4CrSlotExtension *extension,
+							  Page page, UBA uba, const UndoRecordHeader *record, const char *body)
+{
+	static uint32 emitted;
+	const BufferTag *tag = &extension->route_proof.tag;
+	UndoUpdatePayload update;
+	OffsetNumber maxoff;
+	OffsetNumber off;
+
+	if (!cluster_trace_normal_stop || emitted >= 64 || record->record_type != UNDO_RECORD_UPDATE)
+		return;
+	memcpy(&update, body, sizeof(update));
+	if (update.new_block != tag->blockNum)
+		return;
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (update.new_offset <= maxoff && ItemIdIsNormal(PageGetItemId(page, update.new_offset)))
+		return;
+	for (off = FirstOffsetNumber; off <= maxoff; off++) {
+		ItemId item = PageGetItemId(page, off);
+
+		if (!ItemIdIsRedirected(item) || ItemIdGetRedirect(item) != update.new_offset)
+			continue;
+		emitted++;
+		elog(LOG,
+			 "PGRAC_FAMILY=R4_HISTORY_ORPHAN_ROOT node=%d slot=%u"
+			 " slot_generation=" UINT64_FORMAT " builder_incarnation=" UINT64_FORMAT
+			 " tag=%u/%u/%u/%u/%u read_scn=" UINT64_FORMAT " watermark=" UINT64_FORMAT
+			 " build_steps=%u root=%u successor=%u predecessor=%u xid=%u"
+			 " record_write_scn=" UINT64_FORMAT " uba=" UINT64_FORMAT "/" UINT64_FORMAT
+			 " detail_limit=%d",
+			 cluster_node_id, slot_index, extension->slot_generation,
+			 extension->owner.builder_incarnation, tag->spcOid, tag->dbOid, tag->relNumber,
+			 (unsigned)tag->forkNum, tag->blockNum, (uint64)extension->route_proof.read_scn,
+			 (uint64)ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn,
+			 extension->build_steps, (unsigned)off, (unsigned)update.new_offset,
+			 (unsigned)record->target_offset, record->xid, (uint64)record->write_scn, uba.raw[0],
+			 uba.raw[1], emitted == 64);
+		return;
+	}
+}
+
 static bool
 cr_r4_history_reselect(ClusterR4CrBuildContext *context, Page page, SCN read_scn)
 {
@@ -1101,6 +1152,8 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool 
 					return CLUSTER_R4_CR_STEP_FAIL;
 				}
 				cr_r4_undo_trace(trace, "history.inverse.end", "INVERSE_RETURN_TRUE", 1);
+				cr_r4_history_orphan_root_log(slot_index, extension, (Page)result_page, current_uba,
+											  record, record_buffer.data + sizeof(*record));
 				if (record_from_foreign_page) {
 					cr_r4_clear_foreign_request(extension, context);
 					supplied_foreign_record = false;
