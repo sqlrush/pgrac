@@ -64,6 +64,13 @@ Ingress headers remain unvalidated; guarded unknown fields stay unknown.
 Repeated sequences, missing flags and malformed records are retained without
 joining cuts or assigning original-path credit.
 
+For P0-12, `hot_evidence` retains HOT_FULL member copies and R4_UNDO records in
+their original line order. Each before/FULL root/queried copy uses its own
+known flags. Read SCN/epoch can be compared with the SQL capture as scalar
+values, with no process, statement, logical-member or page-version binding.
+Missing fields, incomplete decisions and repeated cycles remain explicit;
+same-xid observations do not create an undo edge or original-path credit.
+
 Rejudge retained output without contacting a server:
 
 ```sh
