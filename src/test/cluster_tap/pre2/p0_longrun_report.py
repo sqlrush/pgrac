@@ -18,6 +18,7 @@ TITLES = {
 VERDICTS = {'PASS': '通过', 'FAIL': '未通过', 'SELFTEST_OK': '驱动器自检正常（不是验收结果）',
             'SELFTEST_FAILED': '驱动器自检失败（不是验收结果）'}
 FAILURES = {
+    'EVIDENCE_INVALID': '证据不完整或矛盾：{what}（{detail}）',
     'EVIDENCE_MISSING': '证据缺失：{what}', 'MEMBER_COUNT': '成员数不对：应为 {expected}，实际 {actual}',
     'STEP_NOT_PASSED': '步骤 {step} = {status}：{error}', 'FORCED_CLEANUP': '控制器不得不强制清理数据库进程（不是正常停机）',
     'LEFT_RUNNING': '本轮结束时集群仍在运行', 'ERRORS_NOT_ALLOWED': '{count} 条未被允许的错误',

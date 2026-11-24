@@ -54,26 +54,40 @@ def build_run(root: Path, pieces: Dict[str, str], client: List[Dict[str, object]
             offset += len(piece.encode())
         (cycle / 'cluster' / ('node%d.log' % node)).write_bytes(text.encode())
     start_of = dict(init='start', start='start', seed='load', load='load', verify='stop',
-                    drop='stop', stop='stop')
+                    restart='stop', reverify='stop', drop='stop', stop='stop',
+                    restart_again='stop', reverify_again='stop', stop_again='stop')
     steps = [dict(name=name, status=stop_status if name == 'stop' else 'PASS',
                   started_unix=100.0, finished_unix=101.0, log_start=marks[start_of[name]],
                   error='normal stop refused' if name == 'stop' and stop_status != 'PASS'
                   else None)
              for name in planned_steps(spec)]
     journal = dict(cycle=1, planned=planned_steps(spec), steps=steps, left_running=False,
-                   members=[dict(id=n, logfile='cluster/node%d.log' % n) for n in range(4)])
+                   members=[dict(id=n, logfile='cluster/node%d.log' % n) for n in range(4)],
+                   log_end={str(n): (cycle / 'cluster' / ('node%d.log' % n)).stat().st_size
+                            for n in range(4)})
     (cycle / 'evidence/steps.json').write_text(json.dumps(journal))
     (cycle / 'evidence/client-errors.jsonl').write_text(
         ''.join(json.dumps(e) + '\n' for e in client))
-    nodes = [dict(node=n, connections=4, commits=c, statement_errors=0, commit_errors=0,
+    nodes = [dict(node=n, connections=spec['clients_per_node'], commits=c,
+                  statement_errors=0, commit_errors=0,
                   in_doubt=0, anomalies=0, reconnects=0, connect_failures=0,
                   injected_disconnects=0) for n, c in enumerate(commits)]
     (cycle / 'evidence/load.json').write_text(json.dumps(dict(
-        nodes=nodes, commits=sum(commits), elapsed_seconds=180.2, hangs=[], stall=None,
-        crash=None, ran_requested_time=True)))
-    (cycle / 'evidence/verify.json').write_text(json.dumps(dict(step='verify', members=[
-        dict(node=n, status='PASS', rows=131072, violation_count=0, violations=[])
-        for n in range(4)])))
+        nodes=nodes, commits=sum(commits), elapsed_seconds=spec['seconds'] + 0.2,
+        requested_seconds=spec['seconds'], clients_per_node=spec['clients_per_node'],
+        rows=spec['rows'], hangs=[], stall=None,
+        crash=dict(at_elapsed_seconds=spec['seconds']) if spec['crash'] else None,
+        ran_requested_time=True)))
+    for name in ('verify', 'reverify', 'reverify_again'):
+        if name in planned_steps(spec):
+            (cycle / 'evidence' / (name + '.json')).write_text(json.dumps(dict(
+                step=name, members=[dict(node=n, status='PASS', rows=spec['rows'],
+                                         violation_count=0, violations=[])
+                                    for n in range(4)])))
+    for node, count in enumerate(commits):
+        (cycle / 'evidence' / ('ledger-node%d.txt' % node)).write_text(
+            '0 100.000000 1 C\n' * count)
+    (cycle / 'evidence/progress.jsonl').write_text('')
     (root / 'plan.json').write_text(json.dumps(dict(mode=NATIVE, members=4, cycles=[spec])))
     (root / 'identity.json').write_text(json.dumps(dict(postgres_sha256='ab' * 32,
                                                         source_commit='0' * 40)))

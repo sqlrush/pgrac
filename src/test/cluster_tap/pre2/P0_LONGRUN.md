@@ -94,6 +94,14 @@ no abnormal process exit and no client error anywhere in the run. Errors that
 the driver's own crash step causes on the client connections are counted
 separately and are the only exception.
 
+The retained files must support that verdict: a passed workload needs its
+load report and every member's ledger; requested reconciliations, client
+error and progress files must be present. Member identities must cover the
+whole cohort exactly once, logs must reach their recorded end, and measured
+workload time and connection counts must agree with the plan. Missing,
+damaged or contradictory evidence fails the run even when the step journal
+says PASS. A malformed client record fails and does not hide later records.
+
 Each error is given a label from `p0_longrun_rules.py` when one of its rules
 matches: first by quoted message text, then by declared SQLSTATE, then by the
 step in which a severe record appeared. Labels only sort the report. An error

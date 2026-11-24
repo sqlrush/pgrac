@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import Counter
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -121,19 +122,67 @@ class Tally:
 def boundaries(journal: Mapping[str, object], node: str,
                forced: Optional[Mapping[str, object]]) -> List[Tuple[int, str]]:
     marks = [(int(step['log_start'][node]), str(step['name']))
-             for step in journal['steps'] if 'log_start' in step]
-    if forced:
+             for step in journal['steps'] if node in step.get('log_start', {})]
+    if forced and node in forced.get('log_start', {}):
         marks.append((int(forced['log_start'][node]), 'forced_cleanup'))
     return marks
 
 
-def client_events(path: Path) -> Iterator[Dict[str, object]]:
+def document(path: Path, failures: List[Dict[str, object]],
+             fields: Sequence[str]) -> Optional[Dict[str, object]]:
+    """Read one required evidence object; damaged evidence is a failed run."""
     if not path.exists():
+        failures.append(dict(code='EVIDENCE_MISSING', what=path.name))
+        return None
+    try:
+        value = json.loads(path.read_text())
+        if not isinstance(value, dict) or any(key not in value for key in fields):
+            raise ValueError('missing evidence object fields')
+        return value
+    except (OSError, ValueError) as error:
+        failures.append(dict(code='EVIDENCE_INVALID', what=path.name, detail=str(error)))
+        return None
+
+
+def member_coverage(records: object, key: str, members: int, what: str,
+                    failures: List[Dict[str, object]],
+                    fields: Optional[Mapping[str, type]] = None) -> bool:
+    """Require every member once and the fields its evidence consumer needs."""
+    identifiers = [record.get(key) for record in records if isinstance(record, dict)] \
+        if isinstance(records, list) else []
+    valid = (isinstance(records, list) and len(records) == members
+             and len(identifiers) == members
+             and all(type(value) is int for value in identifiers)
+             and set(identifiers) == set(range(members))
+             and all(type(record.get(field)) is kind for record in records
+                     for field, kind in (fields or {}).items()))
+    if not valid:
+        failures.append(dict(code='EVIDENCE_INVALID', what=what,
+                             detail='expected each member 0..%d once with required fields'
+                                    % (members - 1)))
+    return valid
+
+
+def client_events(path: Path, failures: List[Dict[str, object]]) -> Iterator[Dict[str, object]]:
+    if not path.exists():
+        failures.append(dict(code='EVIDENCE_MISSING', what=path.name))
         return
     with path.open() as stream:
-        for line in stream:
-            if line.strip():
-                yield json.loads(line)
+        for number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+                if (not isinstance(event, dict) or event.get('source') != 'client'
+                        or not isinstance(event.get('severity'), str)
+                        or type(event.get('count', 1)) is not int
+                        or event.get('count', 1) <= 0):
+                    raise ValueError('invalid client error record or occurrence count')
+            except ValueError as error:
+                failures.append(dict(code='EVIDENCE_INVALID', what=path.name,
+                                     detail='line %d: %s' % (number, error)))
+                continue
+            yield event
 
 
 def judge_cycle(directory: Path, spec: Mapping[str, object], members: int,
@@ -144,13 +193,12 @@ def judge_cycle(directory: Path, spec: Mapping[str, object], members: int,
                                     server_records=0, client_records=0)
     failures: List[Dict[str, object]] = report['failures']
     journal_path = directory / 'evidence' / 'steps.json'
-    if not journal_path.exists():
-        failures.append(dict(code='EVIDENCE_MISSING', what='steps.json'))
+    journal = document(journal_path, failures, ('members', 'steps', 'log_end'))
+    if journal is None:
         return report
-    journal = json.loads(journal_path.read_text())
-    if len(journal['members']) != members:
-        failures.append(dict(code='MEMBER_COUNT', expected=members,
-                             actual=len(journal['members'])))
+    if not member_coverage(journal['members'], 'id', members, 'steps.json members', failures,
+                           fields={'logfile': str}):
+        journal['members'] = []
     done = {step['name']: step for step in journal['steps']}
     for name in planned_steps(spec):
         step = done.get(name, dict(status='NOT_RUN', reason='no record'))
@@ -170,27 +218,59 @@ def judge_cycle(directory: Path, spec: Mapping[str, object], members: int,
     before = sum(tally.failing.values())
     for member in journal['members']:
         log = directory / member['logfile']
-        if not log.exists():
+        if not log.is_file():
             if any(s['name'] == 'start' for s in journal['steps']):
                 failures.append(dict(code='EVIDENCE_MISSING', what=member['logfile']))
             continue
+        end = journal['log_end'].get(str(member['id']))
+        if type(end) is not int or end < 0 or log.stat().st_size < end:
+            failures.append(dict(code='EVIDENCE_INVALID', what=member['logfile'],
+                                 detail='log is shorter than its recorded end or has no end'))
         for event in read_events(log, int(member['id']),
                                  boundaries(journal, str(member['id']), forced)):
             report['server_records'] += 1
             tally.add(event, cycle)
-    for event in client_events(directory / 'evidence' / 'client-errors.jsonl'):
+    for event in client_events(directory / 'evidence' / 'client-errors.jsonl', failures):
         report['client_records'] += int(event.get('count') or 1)
         tally.add(event, cycle)
     report['failing_records'] = sum(tally.failing.values()) - before
     if report['failing_records']:
         failures.append(dict(code='ERRORS_NOT_ALLOWED', count=report['failing_records']))
+    if not (directory / 'evidence/progress.jsonl').is_file():
+        failures.append(dict(code='EVIDENCE_MISSING', what='progress.jsonl'))
     load_path = directory / 'evidence' / 'load.json'
-    if load_path.exists():
-        load = json.loads(load_path.read_text())
+    load = document(load_path, failures, ('nodes', 'commits', 'elapsed_seconds', 'hangs',
+                    'stall', 'crash', 'ran_requested_time', 'requested_seconds',
+                    'clients_per_node', 'rows')) \
+        if load_path.exists() or done.get('load', {}).get('status') == 'PASS' else None
+    if load is not None and not member_coverage(load['nodes'], 'node', members,
+                                               'load.json members', failures,
+                                               fields={'connections': int, 'commits': int,
+                                                       'anomalies': int}):
+        load = None
+    if load is not None:
         report.update(nodes=load['nodes'], commits=load['commits'],
                       elapsed_seconds=load['elapsed_seconds'], hangs=load['hangs'],
                       stall=load['stall'], crash=load['crash'])
+        elapsed = load['elapsed_seconds']
+        elapsed_valid = (type(elapsed) in (int, float) and math.isfinite(elapsed)
+                         # run_load records elapsed time rounded to three decimals.
+                         and elapsed >= spec['seconds'] - 0.0005)
+        if (load['ran_requested_time'] is not True
+                or not elapsed_valid
+                or load['requested_seconds'] != spec['seconds']
+                or load['clients_per_node'] != spec['clients_per_node']
+                or load['rows'] != spec['rows']
+                or (spec.get('crash') and not load['crash'])):
+            failures.append(dict(code='EVIDENCE_INVALID', what='load.json',
+                                 detail='requested workload duration, shape or crash unproven'))
+        if load['commits'] != sum(node['commits'] for node in load['nodes']):
+            failures.append(dict(code='EVIDENCE_INVALID', what='load.json',
+                                 detail='commit total disagrees with per-member counts'))
         for node in load['nodes']:
+            if node.get('connections') != spec['clients_per_node']:
+                failures.append(dict(code='EVIDENCE_INVALID', what='load.json',
+                                     detail='member connection count disagrees with plan'))
             if node['commits'] <= 0:
                 failures.append(dict(code='NODE_WITHOUT_COMMITS', node=node['node']))
             if node['anomalies']:
@@ -200,12 +280,34 @@ def judge_cycle(directory: Path, spec: Mapping[str, object], members: int,
             failures.append(dict(code='HUNG_CONNECTIONS', count=len(load['hangs'])))
         if load['stall']:
             failures.append(dict(code='WORKLOAD_STALLED', detail=load['stall']))
+    if done.get('load', {}).get('status') == 'PASS':
+        for node in range(members):
+            name = 'ledger-node%d.txt' % node
+            if not (directory / 'evidence' / name).is_file():
+                failures.append(dict(code='EVIDENCE_MISSING', what=name))
     report['reconciliations'] = []
     for name in ('verify', 'reverify', 'reverify_again'):
         path = directory / 'evidence' / (name + '.json')
-        if path.exists():
-            answer = json.loads(path.read_text())
+        if path.exists() or done.get(name, {}).get('status') == 'PASS':
+            answer = document(path, failures, ('step', 'members'))
+            if answer is None:
+                continue
+            if not member_coverage(answer['members'], 'node', members,
+                                   name + '.json members', failures, fields={'status': str}):
+                # Preserve observed mismatches without forwarding malformed
+                # member structures to either the judge or the report renderer.
+                bad = [m.get('node') for m in answer['members'] if isinstance(m, dict)
+                       and m.get('status') != 'PASS'] \
+                    if isinstance(answer['members'], list) else []
+                if bad:
+                    failures.append(dict(code='LEDGER_MISMATCH', step=name, members=bad))
+                continue
             report['reconciliations'].append(answer)
+            if (answer['step'] != name
+                    or any(m['status'] == 'PASS' and (m.get('rows') != spec['rows']
+                               or m.get('violation_count') != 0) for m in answer['members'])):
+                failures.append(dict(code='EVIDENCE_INVALID', what=name + '.json',
+                                     detail='reconciliation disagrees with plan or measurements'))
             bad = [m for m in answer['members'] if m['status'] != 'PASS']
             if bad:
                 failures.append(dict(code='LEDGER_MISMATCH', step=name,
