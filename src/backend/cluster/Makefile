@@ -560,3 +560,9 @@ cluster_control_root_registry.o: $(srcdir)/cluster_control_root_registry_private
 cluster_control_bootstrap.o cluster_control_bootstrap_read.o: \
 	$(srcdir)/cluster_control_root_registry_private.h \
 	$(top_srcdir)/src/include/common/cluster_recovery_registry.h
+
+# Rebuild the original debt owner when its included codec/transition changes.
+cluster_control_root.o: $(srcdir)/cluster_control_debt_v2.inc \
+	$(srcdir)/cluster_control_debt_transition_v2.inc \
+	$(srcdir)/cluster_control_debt_publish_v2.inc \
+	$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h
