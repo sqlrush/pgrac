@@ -17,6 +17,32 @@ import shutil
 import subprocess
 import sys
 
+MX_CASES = ['t/445_pre2_multixact_maintenance.pl',
+            't/447_pre2_multixact_restart.pl',
+            't/448_pre2_multixact_cleared_votes.pl']
+M1_CASES = ['t/431_pre2_start_stop_restart.pl', *MX_CASES,
+            't/453_pre2_vacuum_snapshot_cancel.pl',
+            't/482_pre2_undo_active_slots.pl']
+GRD_CAPACITY_CASE = 't/488_pre2_grd_capacity_insert.pl'
+
+
+def select_cases(suite, cases):
+    allowed = {'multixact': MX_CASES, 'm1': M1_CASES,
+               'p145-grd-capacity': [GRD_CAPACITY_CASE]}[suite]
+    selected = list(MX_CASES[1:] if suite == 'multixact' else allowed) if cases is None else list(cases)
+    if (not selected or len(set(selected)) != len(selected)
+            or any(case not in allowed for case in selected)):
+        raise ValueError('only distinct supported native TAP cases are allowed')
+    negative, positive = MX_CASES[2], MX_CASES[1]
+    if negative in selected and (positive not in selected
+            or selected.index(positive) > selected.index(negative)):
+        raise ValueError('TAP448 requires this invocation to complete TAP447 first')
+    return selected
+
+
+def case_runs(suite, cases):
+    return [dict(case=case, clients=None, timeout=1200, directory=Path(case).stem)
+            for case in select_cases(suite, cases)]
 
 
 def tap_result(output, rc):
@@ -63,16 +89,7 @@ def run(args):
     account = pwd.getpwuid(args.uid)
     if account.pw_gid != args.gid:
         raise ValueError('database UID/GID identity differs')
-    allowed = {'t/445_pre2_multixact_maintenance.pl',
-               't/447_pre2_multixact_restart.pl',
-               't/448_pre2_multixact_cleared_votes.pl'}
-    if len(set(args.cases)) != len(args.cases) or any(case not in allowed for case in args.cases):
-        raise ValueError('only distinct native MultiXact TAP cases are supported')
-    negative_case = 't/448_pre2_multixact_cleared_votes.pl'
-    positive_case = 't/447_pre2_multixact_restart.pl'
-    if negative_case in args.cases and (positive_case not in args.cases
-            or args.cases.index(positive_case) > args.cases.index(negative_case)):
-        raise ValueError('TAP448 requires this invocation to complete TAP447 first')
+    invocations = case_runs(getattr(args, 'suite', 'multixact'), args.cases)
     identity = json.loads(args.identity.read_text()) if args.identity else None
     if args.archive:
         with args.archive.open('rb') as archive:
@@ -116,9 +133,17 @@ def run(args):
             str(source/'src/test/cluster_tap/pre2/mx_range.c'), '-o', str(root/'mx_range.so')]
         with (root/'probe-build.log').open('x') as log:
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        if any(invocation['case'] == GRD_CAPACITY_CASE for invocation in invocations):
+            command = drop + ['cc', '-shared', '-fPIC', '-I', str(server_include),
+                '-I', str(source/'src/include'),
+                str(source/'src/test/cluster_tap/pre2/pcm_capacity_stats.c'),
+                '-o', str(root/'pcm_capacity_stats.so')]
+            with (root/'pcm-capacity-probe-build.log').open('x') as log:
+                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
         q.start()
-        for case in args.cases:
-            directory = root/Path(case).stem
+        for invocation in invocations:
+            case = invocation['case']
+            directory = root/invocation['directory']
             for path in (directory, directory/'log', directory/'data'):
                 path.mkdir(mode=0o700)
                 os.chown(path, args.uid, args.gid)
@@ -177,9 +202,12 @@ def run(args):
             if cold_layout:
                 command.insert(command.index('prove'), 'PGRAC_PRE2_COLD_LAYOUT='+str(cold_layout))
                 command = q.ns(0, command)
+            if case == GRD_CAPACITY_CASE:
+                command.insert(command.index('prove'),
+                               'PGRAC_PRE2_PCM_STATS_PROBE='+str(root/'pcm_capacity_stats.so'))
             (directory/'command.json').write_text(json.dumps(command, indent=2)+'\n')
             try:
-                reply = q.run(command, check=False, cwd=directory, timeout=1200)
+                reply = q.run(command, check=False, cwd=directory, timeout=invocation['timeout'])
                 output, rc = reply.stdout + reply.stderr, reply.returncode
             except subprocess.TimeoutExpired as error:
                 def decoded(value):
@@ -245,7 +273,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ('source', 'install', 'output', 'vendor'):
         parser.add_argument('--'+key, type=Path, required=True)
-    parser.add_argument('--cases', nargs='+', default=['t/447_pre2_multixact_restart.pl', 't/448_pre2_multixact_cleared_votes.pl'])
+    parser.add_argument('--suite', choices=['multixact', 'm1', 'p145-grd-capacity'], default='multixact')
+    parser.add_argument('--cases', nargs='+')
     parser.add_argument('--fixture-install', type=Path)
     parser.add_argument('--expected-postgres-sha256')
     parser.add_argument('--uid', type=int, required=True)
