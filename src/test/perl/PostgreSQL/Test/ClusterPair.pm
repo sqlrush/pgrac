@@ -217,7 +217,10 @@ sub new_pair
 		die "true_shared_sysid_cf does not support cluster_name_override"
 		  if defined $opts{cluster_name_override};
 
-		$shared_control_root = PostgreSQL::Test::Utils::tempdir();
+		# One shared_data_dir GUC selects both user data and pg_control.
+		# Keep the seed's authority in that same root when both are requested;
+		# selecting a second root later would strand its symlink and anchor.
+		$shared_control_root = $shared_data_root // PostgreSQL::Test::Utils::tempdir();
 		mkdir "$shared_control_root/global"
 		  or die "mkdir $shared_control_root/global: $!";
 
