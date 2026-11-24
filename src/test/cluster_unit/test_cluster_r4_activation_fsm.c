@@ -72,7 +72,7 @@ AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 typedef union TestSemanticShmemStorage {
 	pg_atomic_uint64 align;
-	uint8 bytes[TEST_SEMANTIC_GATE_SHMEM_BYTES];
+	uint8 bytes[TEST_SEMANTIC_GATE_SHMEM_BYTES + 65536];
 } TestSemanticShmemStorage;
 
 typedef union TestSemanticUtilityMailboxStorage {
@@ -5890,13 +5890,14 @@ UT_TEST(test_98_admission_token_has_frozen_natural_layout)
 UT_TEST(test_99_shared_gate_layout_and_bootstrap_are_fail_closed)
 {
 	test_gate_reset();
-	UT_ASSERT_EQ(test_shmem_requested_size, TEST_SEMANTIC_GATE_SHMEM_BYTES);
+	UT_ASSERT_EQ(test_shmem_requested_size, TEST_SEMANTIC_GATE_SHMEM_BYTES + CLUSTER_SURVIVOR_CONTROL_BYTES);
 	UT_ASSERT_EQ(test_utility_mailbox_requested_size, TEST_SEMANTIC_UTILITY_MAILBOX_BYTES);
 	UT_ASSERT_EQ(test_ack_table_requested_size, TEST_SEMANTIC_ACK_TABLE_BYTES);
 	UT_ASSERT_EQ(test_pgrd_snapshot_requested_size, TEST_SEMANTIC_PGRD_SNAPSHOT_BYTES);
 	UT_ASSERT_EQ(test_bit22_latch_requested_size, TEST_SEMANTIC_BIT22_LATCH_BYTES);
 	UT_ASSERT_EQ(cluster_semantic_activation_shmem_size(),
-				 TEST_SEMANTIC_GATE_SHMEM_BYTES + TEST_SEMANTIC_UTILITY_MAILBOX_BYTES
+				 TEST_SEMANTIC_GATE_SHMEM_BYTES + CLUSTER_SURVIVOR_CONTROL_BYTES
+					 + TEST_SEMANTIC_UTILITY_MAILBOX_BYTES
 					 + TEST_SEMANTIC_ACK_TABLE_BYTES + TEST_SEMANTIC_PGRD_SNAPSHOT_BYTES
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_LATCH_BYTES)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SEAM_BYTES)
@@ -13049,10 +13050,29 @@ UT_TEST(test_p58_original_close_publisher_blocks_new_use_until_old_token_returns
 	test_gate_reset();
 }
 
+UT_TEST(test_p58_shared_tail_is_created_once_and_preserves_callback_on_attach)
+{
+ ClusterSurvivorControl *c;ClusterSurvivorControl before;
+ ClusterSurvivorLocalMailbox *m;
+ test_gate_reset();c=cluster_semantic_survivor_shared_control();
+ UT_ASSERT(c!=NULL);
+ UT_ASSERT_EQ((char *)c-(char *)SemanticActivationShmem,TEST_SEMANTIC_GATE_SHMEM_BYTES);
+ UT_ASSERT(semantic_activation_bytes_are_zero((uint8 *)c,sizeof(*c)));
+ m=(ClusterSurvivorLocalMailbox *)c->reserved;
+ c->header.callback_debt=7;c->header.seq=2;
+ m->sender_pid=11;m->query.pid=12;
+ pg_atomic_write_u64(&m->word,(17U<<2)|CLUSTER_SURVIVOR_LOCAL_READING);
+ before=*c;test_shmem_found=true;
+ cluster_semantic_activation_shmem_init();
+ UT_ASSERT_EQ(memcmp(c,&before,sizeof(before)),0);
+ test_shmem_found=false;cluster_semantic_activation_shmem_init();
+ UT_ASSERT(semantic_activation_bytes_are_zero((uint8 *)c,sizeof(*c)));
+}
+
 int
 main(void)
 {
-	UT_PLAN(452);
+	UT_PLAN(453);
 	UT_RUN(test_prepared_round_published_result_waits_for_original_release_without_replay);
 	UT_RUN(test_prepared_round_completed_result_survives_table_observation_gap);
 	UT_RUN(test_prepared_round_identity_loss_retires_original_debt_without_delivery);
@@ -13506,6 +13526,7 @@ main(void)
 	UT_RUN(test_p58_return_observer_drift_never_reuses_previous_output);
 	UT_RUN(test_p58_open_or_unpublished_gate_does_not_prove_return_barrier);
 	UT_RUN(test_p58_original_close_publisher_blocks_new_use_until_old_token_returns);
+	UT_RUN(test_p58_shared_tail_is_created_once_and_preserves_callback_on_attach);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

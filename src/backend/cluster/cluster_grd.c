@@ -9481,6 +9481,14 @@ cluster_grd_alloc_generation(void)
 	return pg_atomic_fetch_add_u64(&cluster_grd_state->next_generation, 1);
 }
 
+/* Read-only bound for original process-generation observations. */
+uint64
+cluster_grd_generation_snapshot(void)
+{
+ return cluster_grd_state == NULL ? 0
+  : pg_atomic_read_u64(&cluster_grd_state->next_generation);
+}
+
 void
 cluster_grd_proc_initialize(PGPROC *proc)
 {

@@ -18,6 +18,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "miscadmin.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_control_request.h"
 #include "cluster/cluster_pi_data.h"
@@ -100,3 +101,44 @@ UNUSED_REASON(cluster_pi_data_normal_stop_poll_v1)
 UNUSED_REASON(cluster_wal_cut_normal_stop_poll_v1)
 UNUSED_REASON(cluster_pi_writeback_normal_stop_poll_v1)
 UNUSED_REASON(cluster_ko_shared_normal_stop_poll_v2)
+
+#include "cluster/cluster_semantic_survivor_local.h"
+ClusterSurvivorControl * __attribute__((weak))
+cluster_semantic_survivor_shared_control(void) { return NULL; }
+void __attribute__((weak))
+cluster_semantic_survivor_local_process(void)
+{
+ if (cluster_semantic_survivor_shared_control() != NULL) abort();
+}
+
+/* Unrelated native-loop fixtures do not run the target-census consumer. */
+void cluster_semantic_survivor_targets_tick(void);
+void __attribute__((weak)) cluster_semantic_survivor_targets_tick(void) {}
+
+/* Unrelated loop fixtures have no reconfiguration event provider. Refusal
+ * cannot grant an admission, and close tests link the real implementation. */
+#include "cluster/cluster_semantic_survivor_close.h"
+ClusterSemanticAdmissionObservationResult __attribute__((weak))
+cluster_semantic_survivor_close_begin(void)
+{ return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED; }
+
+/* Unrelated host images have no actual returned backend/close provider. */
+bool cluster_transaction_survivor_returned(void);
+bool __attribute__((weak)) cluster_transaction_survivor_returned(void) { return false; }
+void __attribute__((weak)) cluster_semantic_survivor_backend_command_return(void) {}
+void __attribute__((weak)) cluster_semantic_survivor_backend_start_wait(void) {}
+void __attribute__((weak)) cluster_semantic_survivor_targets_close_tick(void) {}
+ClusterSemanticAdmissionObservationResult __attribute__((weak))
+cluster_semantic_survivor_close_observe(ClusterSurvivorCloseSnapshot *out)
+{
+ if (out != NULL) { memset(out, 0, sizeof(*out)); out->blocked = true; }
+ return CLUSTER_SEMANTIC_ADMISSION_OBSERVATION_REFUSED;
+}
+
+/* Unrelated images never reach the ordinary-backend branch. */
+volatile sig_atomic_t __attribute__((weak)) QueryCancelPending, ProcDiePending;
+volatile uint32 __attribute__((weak)) InterruptHoldoffCount, QueryCancelHoldoffCount;
+bool cluster_transaction_service_pending(void);
+bool __attribute__((weak)) cluster_transaction_service_pending(void) { return true; }
+
+ProcessingMode __attribute__((weak)) Mode = NormalProcessing;

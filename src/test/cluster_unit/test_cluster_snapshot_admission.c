@@ -54,12 +54,69 @@ extern bool cluster_space_relation_identity_current_v1(
 	Relation rel, const ClusterSpaceIdentityObservationV1 *expected);
 #endif
 
+/* Use the original private owner and BufferIO arrays. Snapshot and buffer-pin
+ * accounting remain the existing host boundaries; their unused native twins
+ * are renamed rather than substituting the BufferIO lifecycle under test. */
+#define CurTransactionResourceOwner fixture_native_transaction_owner
+#define TopTransactionResourceOwner fixture_native_top_owner
+#define AuxProcessResourceOwner fixture_native_aux_owner
+#define ResourceOwnerEnlargeSnapshots fixture_native_enlarge_snapshots
+#define ResourceOwnerRememberSnapshot fixture_native_remember_snapshot
+#define ResourceOwnerForgetSnapshot fixture_native_forget_snapshot
+#define ResourceOwnerRememberBuffer fixture_native_remember_buffer
+#define ResourceOwnerForgetBuffer fixture_native_forget_buffer
+void fixture_native_enlarge_snapshots(ResourceOwner owner);
+void fixture_native_remember_snapshot(ResourceOwner owner, Snapshot snapshot);
+void fixture_native_forget_snapshot(ResourceOwner owner, Snapshot snapshot);
+void fixture_native_remember_buffer(ResourceOwner owner, Buffer buffer);
+void fixture_native_forget_buffer(ResourceOwner owner, Buffer buffer);
+#include "../../backend/utils/resowner/resowner.c"
+#undef ResourceOwnerForgetBuffer
+#undef ResourceOwnerRememberBuffer
+#undef ResourceOwnerForgetSnapshot
+#undef ResourceOwnerRememberSnapshot
+#undef ResourceOwnerEnlargeSnapshots
+#undef AuxProcessResourceOwner
+#undef TopTransactionResourceOwner
+#undef CurTransactionResourceOwner
+#include "../../common/hashfn.c"
+
+/* Execute the original private transaction state accessors. Existing snapshot
+ * command/parallel/nesting host boundaries remain; their unused native twins
+ * are renamed. No transaction begin/commit/abort effects are stubbed as success. */
+#define XactIsoLevel fixture_native_xact_iso_level
+#define GetTopTransactionIdIfAny fixture_native_xact_top_id
+#define IsSubTransaction fixture_native_xact_is_sub
+#define xactGetCommittedChildren fixture_native_xact_children
+TransactionId fixture_native_xact_top_id(void);
+bool fixture_native_xact_is_sub(void);
+int fixture_native_xact_children(TransactionId **ptr);
+#define GetCurrentCommandId fixture_native_xact_command_id
+#define GetCurrentTransactionNestLevel fixture_native_xact_nesting
+#define IsInParallelMode fixture_native_xact_parallel
+CommandId fixture_native_xact_command_id(bool used);
+int fixture_native_xact_nesting(void);
+bool fixture_native_xact_parallel(void);
+#define CurTransactionResourceOwner fixture_native_transaction_owner
+#define TopTransactionResourceOwner fixture_native_top_owner
+#include "../../backend/access/transam/xact.c"
+#undef TopTransactionResourceOwner
+#undef CurTransactionResourceOwner
+#undef IsInParallelMode
+#undef GetCurrentTransactionNestLevel
+#undef GetCurrentCommandId
+#undef xactGetCommittedChildren
+#undef IsSubTransaction
+#undef GetTopTransactionIdIfAny
+#undef XactIsoLevel
+
 UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true;
 int cluster_node_id = 1;
 PGPROC *MyProc;
-ResourceOwner CurrentResourceOwner = (ResourceOwner)1;
+static ResourceOwner backend_resource_one, backend_resource_two;
+MemoryContext TopMemoryContext = (MemoryContext)1;
 MemoryContext TopTransactionContext = (MemoryContext)1;
 MemoryContext CurrentMemoryContext = (MemoryContext)1;
 sigjmp_buf *PG_exception_stack;
@@ -359,6 +416,13 @@ palloc(Size size)
 {
 	return MemoryContextAlloc(CurrentMemoryContext, size);
 }
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	void *allocation = MemoryContextAlloc(context, size);
+	memset(allocation, 0, size);
+	return allocation;
+}
 void
 pfree(void *p)
 {
@@ -506,14 +570,14 @@ UT_TEST(snapshot_identity_and_retention_cannot_drift_during_evaluation)
 			pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 101);
 			break;
 		case 5:
-			CurrentResourceOwner = (ResourceOwner)2;
+			CurrentResourceOwner = backend_resource_two;
 			break;
 		case 6:
 			s->snapshot_type = SNAPSHOT_SELF;
 			break;
 		}
 		UT_ASSERT(!evidence(100, s));
-		CurrentResourceOwner = (ResourceOwner)1;
+		CurrentResourceOwner = backend_resource_one;
 		cluster_snapshot_read_exit_v1(&scope);
 		UnregisterSnapshot(s);
 	}
@@ -800,7 +864,7 @@ UT_TEST(cr_identity_preserves_snapshot_and_retention_refusals)
 			pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 101);
 			break;
 		case 6:
-			CurrentResourceOwner = (ResourceOwner)2;
+			CurrentResourceOwner = backend_resource_two;
 			break;
 		case 7:
 			a->read_epoch = scope.read_epoch = 6;
@@ -809,7 +873,7 @@ UT_TEST(cr_identity_preserves_snapshot_and_retention_refusals)
 		UT_ASSERT(!cluster_snapshot_cr_identity_v1(a, &identity));
 		UT_ASSERT_EQ(identity, 777);
 		UT_ASSERT_EQ(a->cluster_cr_identity, 0);
-		CurrentResourceOwner = (ResourceOwner)1;
+		CurrentResourceOwner = backend_resource_one;
 		cluster_snapshot_read_exit_v1(&scope);
 		UnregisterSnapshot(a);
 	}
@@ -1185,11 +1249,17 @@ UT_TEST(original_registered_nonfinite_reader_keeps_h_unqualified_until_retiremen
 
 #include "test_cluster_snapshot_return.inc"
 #include "test_cluster_backend_return.inc"
+#define SURVIVOR_LOCAL_BACKEND_ROUTE
 #include "test_cluster_survivor_producer_backend.inc"
 
 #include "test_cluster_survivor_buffer_fixture.h"
 #include "test_cluster_survivor_buffer_return.inc"
 #include "test_cluster_survivor_return_context.inc"
+#include "test_cluster_survivor_xact_return.inc"
+#include "test_cluster_survivor_backend_interrupt_fixture.h"
+#include "test_cluster_survivor_backend_route_fixture.h"
+#include "test_cluster_survivor_backend_census_fixture.h"
+#include "test_cluster_survivor_close_backend.inc"
 
 /* The native snapshot manager and read-admission body above execute. Only
  * the coherent VM acquisition/storage leaf is scheduled by this fixture. */
@@ -2051,6 +2121,9 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	backend_resource_one = ResourceOwnerCreate(NULL, "backend-one");
+	backend_resource_two = ResourceOwnerCreate(NULL, "backend-two");
+	CurrentResourceOwner = backend_resource_one;
 	MyProc = &proc;
 	proc.pid = 1234;
 	procArray = calloc(1, sizeof(ProcArrayStruct) + 2 * sizeof(int));
@@ -2068,7 +2141,7 @@ main(void)
 	pg_atomic_init_u64(&horizon.admission_refuse_count, 0);
 	oldSnapshotControl = &snapshot_control;
 	pg_atomic_init_u64(&snapshot_control.cr_identity_generation, 0);
-	UT_PLAN(137);
+	UT_PLAN(188);
 	UT_RUN(export_original_registration_publishes_h_before_file_visibility);
 	UT_RUN(export_original_registration_preserves_other_older_snapshot);
 	UT_RUN(export_errors_retain_original_h_until_transaction_cleanup);
@@ -2204,12 +2277,69 @@ main(void)
 	UT_RUN(vm_chain_discards_native_snapshot_drift_and_restores_outer_on_io_errors);
 	UT_RUN(vm_admission_cut_refuses_missing_or_changed_pre_acquire_identity);
 	UT_RUN(vm_admission_cut_rejects_capability_membership_self_admission_and_node_drift);
+	UT_RUN(backend_bufferio_observation_follows_original_remember_and_forget);
+	UT_RUN(backend_bufferio_current_owner_does_not_claim_parent_or_null_closure);
+	UT_RUN(backend_bufferio_change_during_shared_cut_discards_the_point);
+	UT_RUN(survivor_backend_final_refusal_retains_original_bufferio);
+	UT_RUN(backend_bufferio_never_dereferences_a_retired_entry_owner);
+	UT_RUN(backend_return_retains_each_original_transaction_phase);
+	UT_RUN(backend_return_retains_each_original_transaction_block_phase);
+	UT_RUN(backend_return_retains_original_subtransaction_state);
+	UT_RUN(backend_return_discards_transaction_change_during_shared_cut);
+	UT_RUN(backend_return_transaction_observation_preserves_resources_and_empty_pending);
+	UT_RUN(local_backend_reply_projects_actual_snapshot_buffer_and_xact_without_retirement);
+	UT_RUN(local_observation_preserves_original_process_termination_priority);
+	UT_RUN(local_observation_preserves_original_query_cancel_priority);
+	UT_RUN(local_observation_preserves_original_client_loss_priority);
+	UT_RUN(local_observation_preserves_original_timeout_priority);
+	UT_RUN(local_observation_defers_during_cancel_holdoff_and_uses_original_reentry);
+	UT_RUN(local_observation_keeps_original_interrupt_and_critical_holdoffs);
+	UT_RUN(backend_route_returns_original_snapshot_and_observes_its_actual_release);
+	UT_RUN(backend_route_refuses_changed_generation_and_backend_id_before_notification);
+	UT_RUN(backend_route_requires_matching_original_status_identity);
+	UT_RUN(backend_route_notification_failure_cannot_publish_a_sample);
+	UT_RUN(backend_route_cancel_preserves_query_until_original_return);
+	UT_RUN(backend_route_holdoff_uses_original_interrupt_reentry);
+	UT_RUN(backend_route_gate_change_withdraws_published_sample);
+	UT_RUN(backend_route_episode_change_withdraws_published_sample);
+	UT_RUN(backend_route_target_replacement_withdraws_published_sample);
+	UT_RUN(backend_census_observes_original_callback_without_retiring_snapshot);
+	UT_RUN(backend_census_requires_original_gate_close_before_query);
+	UT_RUN(backend_census_waits_for_original_cancel_return_before_advancing);
+	UT_RUN(backend_census_failed_notification_cannot_count_as_observation);
+	UT_RUN(backend_census_unknown_status_is_not_queried_or_rescanned_in_same_round);
+	UT_RUN(backend_census_reasks_replaced_target_only_after_original_callback_returns);
+	UT_RUN(backend_census_new_round_waits_for_original_claimed_callback_to_return);
+	UT_RUN(backend_census_gate_drift_withdraws_original_returned_observation);
+	UT_RUN(backend_census_keeps_next_native_owner_pending_after_backend_observation);
+	UT_RUN(backend_census_real_reap_retires_transport_without_snapshot_return);
+	UT_RUN(close_query_command_read_reports_only_original_return_fact);
+	UT_RUN(close_query_exec_copy_and_pre_start_gap_cannot_claim_return);
+	UT_RUN(close_query_retains_actual_transaction_subtransaction_and_cleanup_phases);
+	UT_RUN(close_query_idle_transaction_and_resource_or_xid_residue_do_not_prove_return);
+	UT_RUN(close_query_original_start_wait_covers_chain_and_next_transaction);
+	UT_RUN(close_query_cancel_exit_holdoff_and_lock_keep_original_priority);
+	UT_RUN(close_query_withdraws_close_gate_owner_target_and_epoch_drift);
+	UT_RUN(close_query_rejects_malformed_binding_and_fact_without_receipt);
+	UT_RUN(close_query_purpose_cannot_cross_consume_callback);
+	UT_RUN(close_census_uses_actual_close_and_never_grants_qualification);
+	UT_RUN(close_census_new_birth_withdraws_reading_without_reusing_callback);
+	UT_RUN(close_query_reading_needs_actual_reap_and_preserves_original_snapshot);
+	UT_RUN(close_query_original_return_error_publishes_refusal_and_rethrows);
+	UT_RUN(close_census_first_birth_after_unknown_cut_reasks_original_process_table);
+	UT_RUN(close_census_switch_retires_original_candidate_callback_before_rebinding);
 	UT_ASSERT_EQ(remembered, 0);
 	UT_ASSERT(pairingheap_is_empty(&RegisteredSnapshots));
 	UT_ASSERT(!ActiveSnapshotSet());
 	free(procArray);
+	/* The remaining cases expect the default fixture epoch; a preceding
+	 * survivor case may leave a later one. */
+	snapshot_return_epoch = 7;
 	UT_RUN(vm_space_identity_refuses_missing_or_failed_capture_before_vm_acquisition);
 	UT_RUN(vm_space_identity_rejects_invalidation_and_relation_drift_during_grant);
+	CurrentResourceOwner = NULL;
+	ResourceOwnerDelete(backend_resource_one);
+	ResourceOwnerDelete(backend_resource_two);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

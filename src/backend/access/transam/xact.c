@@ -111,6 +111,9 @@
  */
 
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_semantic_survivor_close.h"
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 #include "storage/ipc.h"
@@ -533,6 +536,38 @@ IsTransactionState(void)
 	 */
 	return (s->state == TRANS_INPROGRESS);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Original caller's transaction lifecycle only. IsTransactionState() excludes
+ * START/COMMIT/ABORT/PREPARE, which still carry return responsibilities. A
+ * non-top state is pending even before its state/block fields are installed.
+ * False is an idle point, never producer closure or permission. No state,
+ * resources, command IDs, locks or transaction effects are changed here.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_transaction_service_pending(void)
+{
+	return CurrentTransactionState != &TopTransactionStateData
+		|| TopTransactionStateData.state != TRANS_DEFAULT
+		|| TopTransactionStateData.blockState != TBLOCK_DEFAULT;
+}
+
+/* Actual original transaction return only. Does not prove session resources,
+ * transferred PREPARED/CTRC responsibility or asynchronous retirement empty.
+ * No caller-supplied completion flag and no ResourceOwner traversal. */
+bool
+cluster_transaction_survivor_returned(void)
+{
+	TransactionState s = &TopTransactionStateData;
+
+	return CurrentTransactionState == s && s->state == TRANS_DEFAULT
+		&& s->parent == NULL && s->nestingLevel == 0
+		&& !FullTransactionIdIsValid(s->fullTransactionId)
+		&& !FullTransactionIdIsValid(XactTopFullTransactionId)
+		&& s->curTransactionOwner == NULL && TopTransactionResourceOwner == NULL
+		&& CurTransactionResourceOwner == NULL;
+}
+#endif
 
 /*
  *	IsAbortedTransactionBlockState
@@ -2667,6 +2702,10 @@ StartTransaction(void)
 	Assert(s->state == TRANS_DEFAULT);
 
 #ifdef USE_PGRAC_CLUSTER
+	/* No new transaction resources yet; old transaction cleanup is unchanged. */
+	cluster_semantic_survivor_ordinary_wait();
+	/* The wait can block or be cancelled. Retire the previous relmap route
+	 * only once this top-level transaction really starts. */
 	ResetRelmapTransactionIdAllocation();
 	/* PGRAC: the real transaction boundary also covers AND CHAIN and several
 	 * transactions in one frontend message. Never apply protocol defaults in

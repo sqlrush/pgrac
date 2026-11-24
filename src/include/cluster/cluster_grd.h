@@ -491,6 +491,7 @@ typedef struct ClusterGrdShared {
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
 extern uint64 cluster_grd_alloc_generation(void);
+extern uint64 cluster_grd_generation_snapshot(void);
 
 struct PGPROC;
 /* Reset per-owner GRD identity when a backend or auxiliary slot is assigned. */
