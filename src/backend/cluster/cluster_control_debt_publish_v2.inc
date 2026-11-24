@@ -173,3 +173,86 @@ control_debt_transition_publish_files_v2(ClusterControlDebtTransitionV2 *t,
 	PG_END_TRY();
 	return ok;
 }
+
+/* This independent observer is deliberately separate from the publisher's
+ * result. Candidate bytes alone, or the old backup alone, never select debt.
+ * All original snapshots stay private and unchanged even when I/O refuses. */
+bool
+cluster_control_root_debt_transition_readback_v2(const ClusterControlDebtTransitionV2 *t,
+	int global, Size budget)
+{
+	ClusterControlDebtTransitionViewV2 v, confirmed;
+	struct stat directory, final_directory;
+	ControlDebtWireImageV1 image;
+	struct ReadbackWork {
+		ControlDebtWireImageV1 *loaded;
+		ControlDebtWireBatchV1 *basis;
+		uint8 candidate[133120];
+	} *w;
+	Size reserve = 0;
+	bool held = false;
+	volatile bool ok = false;
+
+	if (global < 0 || CritSectionCount
+		|| !cluster_control_root_debt_transition_get_v2(t, &v))
+		return false;
+	ForEachLWLockHeldByMe(control_debt_held_lwlock_v2, &held);
+	if (held || !debt_add(&reserve, 1, sizeof(*w), budget)
+		|| !debt_add(&reserve, 1, sizeof(*t), budget)
+		|| !debt_add(&reserve, t->byte_count, 1, budget)
+		|| !debt_add(&reserve, v.batch_count, sizeof(*t->batches), budget)
+		|| !debt_add(&reserve, v.batch_count, sizeof(*w->basis), budget)
+		|| fstat(global, &directory) || !S_ISDIR(directory.st_mode)
+		|| !debt_store_directory_safe(global))
+		return false;
+	w = calloc(1, sizeof(*w));
+	if (!w)
+		return false;
+	PG_TRY();
+	{
+		w->basis = calloc((Size)v.batch_count, sizeof(*w->basis));
+		if (w->basis) {
+			for (uint64 i = 0; i < v.batch_count; i++) {
+				const ClusterControlDebtBasisViewV2 *b = v.batches + i;
+				ControlDebtWireBatchV1 *to = w->basis + i;
+
+				to->episode = b->episode; to->prepare = b->prepare;
+				to->basis = b->basis; to->basis_bytes = b->basis_bytes;
+				memcpy(to->basis_ref, b->basis_reference, 128);
+				to->entry_count = debt_get(v.registry,
+					debt_get(v.registry, 112, 8) + i * 384 + 56, 8);
+			}
+			memset(&image, 0, sizeof(image));
+			image.registry = (uint8 *)v.registry; image.registry_bytes = v.registry_bytes;
+			image.pages = (uint8 *)v.pages; image.page_bytes = v.page_bytes;
+			image.batch_count = v.batch_count;
+			memcpy(image.reference, v.prepared_reference, 128);
+			ok = control_debt_root_candidate_v4(v.before_root, v.root_pair_bytes,
+					&image, w->basis, v.batch_count, budget - reserve,
+					w->candidate, sizeof(w->candidate))
+				&& !memcmp(w->candidate, v.after_root, sizeof(w->candidate))
+				&& control_debt_store_load_selected_v4(global, v.after_root,
+					v.root_pair_bytes, v.registry + 32, debt_get(v.registry, 16, 8),
+					budget - reserve, &w->loaded)
+				&& w->loaded->batch_count == v.batch_count
+				&& w->loaded->registry_bytes == v.registry_bytes
+				&& w->loaded->page_bytes == v.page_bytes
+				&& !memcmp(w->loaded->reference, v.prepared_reference, 128)
+				&& !memcmp(w->loaded->registry, v.registry, v.registry_bytes)
+				&& !memcmp(w->loaded->pages, v.pages, v.page_bytes)
+				&& !fstat(global, &final_directory)
+				&& directory.st_dev == final_directory.st_dev
+				&& directory.st_ino == final_directory.st_ino
+				&& debt_store_directory_safe(global)
+				&& cluster_control_root_debt_transition_get_v2(t, &confirmed)
+				&& !memcmp(&v, &confirmed, sizeof(v));
+		}
+	}
+	PG_FINALLY();
+	{
+		control_debt_wire_destroy_v1(&w->loaded);
+		free(w->basis); free(w);
+	}
+	PG_END_TRY();
+	return ok;
+}
