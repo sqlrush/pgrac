@@ -5955,6 +5955,37 @@ gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot
 	PG_END_TRY();
 
 	gcs_block_release_slot(slot);
+
+	/*
+	 * A reply that never arrived, or a holder that kept answering that it
+	 * cannot ship right now, carries no verdict about the block.  While the
+	 * exact holder is still a heartbeat peer this is a wait, not a failure:
+	 * return the reservation to the caller's retry boundary, which aborts the
+	 * exact GRANT_PENDING token, re-samples the authority and issues a fresh
+	 * request identity.  No image is installed on this path, so nothing stale
+	 * can be read.  A holder already declared DEAD cannot answer; that
+	 * membership change keeps the fail-closed terminal below.  The first-fill
+	 * source caller owns its own liveness contract and always retries.
+	 */
+	if (!*out_retry_denied && !installed && !durable_s
+		&& gcs_block_read_image_miss_requires_fresh_retry(
+			last_status,
+			source == NULL
+				&& cluster_cssd_get_peer_state(holder_node) == CLUSTER_CSSD_PEER_DEAD)) {
+		*out_retry_denied = true;
+		/* At most one line per expired reply deadline or exhausted in-place
+		 * refusal budget, so a waiting reader stays visible without the trace. */
+		if (CritSectionCount == 0)
+			ereport(LOG,
+					(errmsg_internal("cluster_gcs_block: read image from X holder %d not "
+									 "obtained yet; request re-armed",
+									 holder_node),
+					 errdetail("attempts=%d last_status=%d tag spc=%u db=%u relNumber=%u "
+							   "fork=%d block=%u",
+							   attempts, last_status, tag.spcOid, tag.dbOid,
+							   (unsigned int)BufTagGetRelNumber(&tag), (int)tag.forkNum,
+							   (unsigned int)tag.blockNum)));
+	}
 	if (trace_enabled) {
 		trace.retry_denied = *out_retry_denied;
 		trace.installed = installed;
@@ -5970,15 +6001,9 @@ gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot
 	if (installed)
 		return false; /* one-shot read image — non-durable, leave pcm_state N */
 
-	if (source != NULL && (last_status == -1
-		|| last_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
-		|| last_status == GCS_BLOCK_REPLY_DENIED_PENDING_X)) {
-		*out_retry_denied = true;
-		return false;
-	}
-
-	/* No read image obtained (timeout / holder evict / denial) — fail closed,
-	 * never a silent stale read (Rule 8.A). */
+	/* No read image obtained from a holder that is DEAD, or an authoritative
+	 * refusal (checksum mismatch / lost write / unexpected grant shape) — fail
+	 * closed, never a silent stale read (Rule 8.A). */
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_gcs_block: could not obtain read image from X holder %d "
 						   "for tag spc=%u db=%u relNumber=%u block=%u",

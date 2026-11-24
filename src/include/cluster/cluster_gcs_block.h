@@ -3979,6 +3979,24 @@ gcs_block_forwarded_s_refusal_requires_fresh_retry(GcsBlockReplyStatus status, u
 		   && forwarding_master < 32;
 }
 
+/* The local-master counterpart for a read image that ended without bytes.
+ * last_status is the final accepted reply status, or -1 when no reply arrived
+ * before the deadline.  A missing reply and the two "cannot ship right now"
+ * refusals carry no verdict about the block: while the exact holder is still a
+ * heartbeat peer the reader returns through the same outer retry boundary and
+ * waits.  A holder the heartbeat layer has declared DEAD cannot answer, so
+ * that membership change ends the wait at the caller's fail-closed terminal.
+ * Every other status (checksum mismatch, lost write, unexpected grant shape)
+ * is a refusal and never qualifies. */
+static inline bool
+gcs_block_read_image_miss_requires_fresh_retry(int last_status, bool holder_dead)
+{
+	if (holder_dead)
+		return false;
+	return last_status == -1 || last_status == (int)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+		   || last_status == (int)GCS_BLOCK_REPLY_DENIED_PENDING_X;
+}
+
 /* PGRAC: spec-5.2a D3 — pure master-side decision for an eligible clean-page
  * (sequence) X request.  Kept pure (no shmem / no I/O) so the 5-branch truth
  * table is unit-tested standalone (U3).  The handler runs ON the GCS master,

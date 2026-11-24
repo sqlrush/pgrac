@@ -484,10 +484,33 @@ UT_TEST(lost_write_denial_stays_terminal_for_a_live_holder)
 	UT_ASSERT(strstr(error_detail, "last_status=12") != NULL);
 }
 
+/* The wait is observable without the diagnostic trace: exactly one line per
+ * re-armed request, none on the fail-closed terminal or on success. */
+UT_TEST(rearm_logs_one_line_without_the_trace)
+{
+	static const char line[] = "not obtained yet; request re-armed";
+	const char *first;
+
+	run_scenario(0, false);
+	first = strstr(logs, line);
+	UT_ASSERT(!caught_error && retry_denied);
+	UT_ASSERT(first != NULL);
+	if (first != NULL)
+		UT_ASSERT(strstr(first + strlen(line), line) == NULL);
+	UT_ASSERT(strstr(error_detail, "attempts=1 last_status=-1") != NULL);
+	UT_ASSERT(strstr(error_detail, "relNumber=16388 fork=0 block=137") != NULL);
+
+	run_scenario(1, false);
+	UT_ASSERT(!caught_error && installs == 1 && strlen(logs) == 0);
+
+	/* The holder verdict is consulted only for a miss, never on the hot path. */
+	UT_ASSERT_EQ(peer_state_queries, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(default_off_retains_timeout_and_silence);
 	UT_RUN(timeout_is_observer_absence_not_server_verdict);
 	UT_RUN(success_preserves_one_shot_and_exact_identity);
@@ -505,6 +528,7 @@ main(void)
 	UT_RUN(exhausted_holder_refusal_from_live_holder_rearms_without_error);
 	UT_RUN(dead_holder_keeps_the_fail_closed_terminal);
 	UT_RUN(lost_write_denial_stays_terminal_for_a_live_holder);
+	UT_RUN(rearm_logs_one_line_without_the_trace);
 	UT_DONE();
 	return ut_failed_count > 0 ? 1 : 0;
 }
