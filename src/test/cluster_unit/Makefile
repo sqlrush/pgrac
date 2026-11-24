@@ -20122,3 +20122,158 @@ clean: clean-control-debt-publish
 .PHONY: clean-control-debt-publish
 clean-control-debt-publish:
 	rm -f test_cluster_control_debt_publish test_cluster_control_debt_publish.d test_cluster_control_debt_writer.inc test_cluster_control_debt_writer.inc.tmp
+
+# Complete native CLOG descriptor with common file/record codecs.
+TESTS += test_cluster_clog_wal
+all: test_cluster_clog_wal
+test_cluster_clog_wal: test_cluster_clog_wal.c unit_test.h \
+        $(top_srcdir)/src/backend/access/rmgrdesc/clogdesc.c \
+        $(top_srcdir)/src/common/cluster_clog_wal.c \
+        $(top_srcdir)/src/common/cluster_clog_file.c \
+        $(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+        $(top_srcdir)/src/include/access/clog_wal.h \
+        $(top_srcdir)/src/include/access/clog_file.h \
+        $(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+        $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/backend/access/rmgrdesc/clogdesc.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
+clean: clean-clog-wal-observation
+.PHONY: clean-clog-wal-observation
+clean-clog-wal-observation:
+	rm -f test_cluster_clog_wal test_cluster_clog_wal.d
+
+# Actual borrowed-FD CLOG reads; fault timing wraps the real pread only.
+TESTS += test_cluster_clog_storage
+all: test_cluster_clog_storage
+test_cluster_clog_storage: test_cluster_clog_storage.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-storage-read
+.PHONY: clean-clog-storage-read
+clean-clog-storage-read:
+	rm -f test_cluster_clog_storage test_cluster_clog_storage.d
+
+# Native-WAL-first existing-frame writes, with actual temporary-file I/O.
+TESTS += test_cluster_clog_write
+all: test_cluster_clog_write
+test_cluster_clog_write: test_cluster_clog_write.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-storage-write
+.PHONY: clean-clog-storage-write
+clean-clog-storage-write:
+	rm -f test_cluster_clog_write test_cluster_clog_write.d
+
+# Native-WAL-first header and first-frame initialization of an empty local FD.
+TESTS += test_cluster_clog_initialize
+all: test_cluster_clog_initialize
+test_cluster_clog_initialize: test_cluster_clog_initialize.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-storage-initialize
+.PHONY: clean-clog-storage-initialize
+clean-clog-storage-initialize:
+	rm -f test_cluster_clog_initialize test_cluster_clog_initialize.d
+
+# Native full-image reconstruction preserves earlier same-birth terminal redo.
+TESTS += test_cluster_clog_image_restore
+all: test_cluster_clog_image_restore
+test_cluster_clog_image_restore: test_cluster_clog_image_restore.c unit_test.h \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-clog-image-restore
+.PHONY: clean-clog-image-restore
+clean-clog-image-restore:
+	rm -f test_cluster_clog_image_restore test_cluster_clog_image_restore.d
+
+# Selected native CLOG header/full-frame recovery through a borrowed owner FD.
+TESTS += test_cluster_clog_replay
+all: test_cluster_clog_replay
+test_cluster_clog_replay: test_cluster_clog_replay.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog_replay.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_UNIT_GC_SECTIONS) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+.PHONY: clean-clog-replay
+clean: clean-clog-replay
+clean-clog-replay:
+	rm -f test_cluster_clog_replay test_cluster_clog_replay.d
+
+# All CLOG observation paths consume the same complete file/page identity.
+test_cluster_clog_storage test_cluster_clog_write test_cluster_clog_initialize \
+ test_cluster_clog_image_restore test_cluster_clog_replay test_cluster_clog_wal: \
+	$(top_srcdir)/src/include/access/clog.h \
+	$(top_srcdir)/src/include/access/transam.h \
+	$(top_srcdir)/src/include/access/xlog.h \
+	$(top_srcdir)/src/include/access/xloginsert.h \
+	$(top_srcdir)/src/include/access/xlogutils.h \
+	$(top_srcdir)/src/include/miscadmin.h \
+	$(top_srcdir)/src/include/storage/proc.h \
+	$(top_srcdir)/src/include/storage/fd.h \
+	$(top_srcdir)/src/include/cluster/cluster_guc.h \
+	$(top_srcdir)/src/include/access/clog_file.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h

@@ -9,6 +9,7 @@ common_sources = files(
   'cluster_catalog_manifest.c',
   'cluster_catalog_verify.c',
   'cluster_clog_file.c',
+  'cluster_clog_wal.c',
   'cluster_hw_snapshot_codec.c',
   'cluster_recovery_file_identity.c',
   'cluster_recovery_bootstrap.c',

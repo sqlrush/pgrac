@@ -14,6 +14,9 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	clog.o \
+	clog_replay.o \
+	clog_storage.o \
+	clog_write.o \
 	commit_ts.o \
 	generic_xlog.o \
 	multixact.o \
@@ -55,3 +58,11 @@ xlog.o xlogrecovery.o: $(top_srcdir)/src/include/cluster/cluster_recovery_stamp.
 # Author: SqlRush <sqlrush@gmail.com>
 clog.o subtrans.o multixact.o commit_ts.o: \
 	$(top_srcdir)/src/include/cluster/cluster_native_startup.h
+
+# Borrowed-FD helpers retain the original complete file/page ABI.
+clog_replay.o clog_storage.o clog_write.o: \
+	$(top_srcdir)/src/include/access/clog_storage.h \
+	$(top_srcdir)/src/include/access/clog_wal.h \
+	$(top_srcdir)/src/include/access/clog_file.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h

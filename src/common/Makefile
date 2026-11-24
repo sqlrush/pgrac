@@ -54,6 +54,7 @@ OBJS_COMMON = \
 	cluster_catalog_manifest.o \
 	cluster_catalog_verify.o \
 	cluster_clog_file.o \
+	cluster_clog_wal.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_recovery_file_identity.o \
 	cluster_recovery_bootstrap.o \
@@ -253,3 +254,12 @@ cluster_recovery_registry.o cluster_recovery_registry_srv.o cluster_recovery_reg
 	$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_registry_reservation_format.h \
 	$(top_srcdir)/src/include/catalog/catversion.h
+
+# The shared WAL codec is built for frontend, shared-library and backend users.
+cluster_clog_wal.o cluster_clog_wal_srv.o cluster_clog_wal_shlib.o: \
+	$(top_srcdir)/src/include/access/clog.h \
+	$(top_srcdir)/src/include/access/transam.h \
+	$(top_srcdir)/src/include/access/clog_wal.h \
+	$(top_srcdir)/src/include/access/clog_file.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
