@@ -78,6 +78,9 @@ restart_read_hook(void)
 {
 	if (restart_die_at_read != 0 && reads == restart_die_at_read)
 		kill(getpid(), SIGKILL);
+#ifdef CONTROL_DEBT_RESTART_READ_HOOK
+	CONTROL_DEBT_RESTART_READ_HOOK();
+#endif
 }
 
 /*

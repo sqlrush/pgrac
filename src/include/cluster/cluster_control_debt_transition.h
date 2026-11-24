@@ -49,4 +49,16 @@ typedef struct ClusterControlDebtTransitionViewV2 {
  * No live prepare producer is exposed until those consumers are connected. */
 extern bool cluster_control_root_debt_transition_get_v2(
 	const ClusterControlDebtTransitionV2 *, ClusterControlDebtTransitionViewV2 *out);
+/* Independently reread the exact physical after-pair and every immutable debt
+ * dependency through the original owner's borrowed global-directory FD.
+ * The same CF-X, Start/selection, ResourceOwner and process must remain held.
+ * No LWLock or critical section may enclose this I/O. The caller retains the
+ * original storage/cohort custody; the FD is never adopted or closed here.
+ * True is a complete byte observation only: it neither updates any token nor
+ * proves replay authorization, protection transfer, completion or OPEN.
+ * No create, sync, repair, fallback, ROOT publication or success flag is used.
+ * False/ERROR preserves the original receipt, borrowed FD and protection debt.
+ */
+extern bool cluster_control_root_debt_transition_readback_v2(
+	const ClusterControlDebtTransitionV2 *, int global_directory, Size byte_budget);
 #endif
