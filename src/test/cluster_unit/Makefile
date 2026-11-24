@@ -19232,6 +19232,7 @@ clean-control-debt-store:
 TESTS += test_cluster_control_debt_selected
 all: test_cluster_control_debt_selected
 test_cluster_control_debt_selected: test_cluster_control_debt_selected.c \
+		test_cluster_control_debt_prepared.inc \
 		test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
 		test_cluster_control_registry.c test_cluster_recovery_registry.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
@@ -20047,3 +20048,31 @@ test_cluster_snapshot_admission: test_cluster_survivor_close_backend.inc test_cl
 
 test_cluster_wal_inputs_job_service: test_cluster_survivor_close_inputs.inc test_cluster_survivor_close_event.inc $(top_srcdir)/src/backend/cluster/cluster_semantic_survivor_close.c cluster_unit_service_stubs.o
 test_cluster_wal_inputs_job_service: CLUSTER_UNIT_PORT_LIBS += cluster_unit_service_stubs.o
+
+# Killed-writer and restart-style whole reload of the existing immutable debt store.
+TESTS += test_cluster_control_debt_restart
+all: test_cluster_control_debt_restart
+test_cluster_control_debt_restart: test_cluster_control_debt_restart.c \
+		$(top_srcdir)/src/include/cluster/cluster_tt_slot.h \
+		test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
+		test_cluster_control_registry.c test_cluster_recovery_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
+		$(top_srcdir)/src/include/common/cluster_recovery_reservations.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_debt_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		cluster_registry_common_test.o cluster_control_registry_original.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_registry.c \
+		cluster_registry_common_test.o \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_control_registry_original.o $(LDFLAGS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+clean: clean-control-debt-restart
+.PHONY: clean-control-debt-restart
+clean-control-debt-restart:
+	rm -f test_cluster_control_debt_restart test_cluster_control_debt_restart.d
