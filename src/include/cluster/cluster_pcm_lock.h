@@ -219,6 +219,7 @@ typedef struct PcmGrdLifecycleStats {
 	uint64 reclaim_reuse_count;
 	uint64 capacity_retry_count;
 	uint64 capacity_fail_count;
+	uint64 capacity_wait_count;
 	uint64 peak_live_entries;
 	uint64 reclaim_refused[PCM_RETIRE_REFUSAL_N];
 } PcmGrdLifecycleStats;
@@ -428,7 +429,7 @@ extern void cluster_pcm_vm_clear_note(const BufferTag *tag, BlockNumber heap_blo
 extern void cluster_pcm_vm_latency_note(const BufferTag *tag, bool remote, uint64 elapsed_us);
 extern bool cluster_pcm_vm_stats_snapshot(PcmVmStats *out);
 
-StaticAssertDecl(sizeof(PcmGrdLifecycleStats) == (9 + PCM_RETIRE_REFUSAL_N) * sizeof(uint64),
+StaticAssertDecl(sizeof(PcmGrdLifecycleStats) == (10 + PCM_RETIRE_REFUSAL_N) * sizeof(uint64),
 				 "PcmGrdLifecycleStats must remain a fixed native counter cohort");
 
 /* Read-only current gauges for protocol debt which must drain before a
@@ -635,8 +636,13 @@ typedef enum ResourceXBootstrapRoundAction {
 	RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED,
 	RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE,
 	RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT,
-	RESOURCE_X_BOOTSTRAP_ROUND_REOBSERVE
+	RESOURCE_X_BOOTSTRAP_ROUND_REOBSERVE,
+	RESOURCE_X_BOOTSTRAP_ROUND_NO_CAPACITY
 } ResourceXBootstrapRoundAction;
+
+/* A wakeup is only a hint to repeat the original authority checks. */
+extern ResourceXApplyResult cluster_pcm_lock_wait_for_capacity_exact(
+	const BufferTag *tag, uint64 formation, uint64 membership_generation);
 
 /* D1 read-only projection of the existing requester round.  It deliberately
  * carries no new authority and no entry binding generation: D2 introduces

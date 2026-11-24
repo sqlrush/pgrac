@@ -50,7 +50,7 @@
  *	Anchored as a compile-time constant so unit tests can verify the
  *	internal table in cluster_views.c stays in sync with the enum.
  */
-#define CLUSTER_WAIT_EVENTS_COUNT 126 /* Includes both frontend undo capacity waits. */
+#define CLUSTER_WAIT_EVENTS_COUNT 127 /* Includes undo and PCM capacity waits. */
 
 
 /*

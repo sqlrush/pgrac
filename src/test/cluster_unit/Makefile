@@ -9812,6 +9812,42 @@ test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_wait_exit 
 
 test_cluster_pcm_stop_cv: $(top_srcdir)/src/backend/storage/lmgr/condition_variable.c
 
+# The public pressure regression composes the actual PCM object and exact GCS
+# consumer, keeping registry, process and scheduling inputs controllable.
+TESTS += test_cluster_pcm_grd_capacity
+all: test_cluster_pcm_grd_capacity
+
+test_cluster_pcm_capacity_helpers.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_pcm_x_saturating_add_us\(/ { print "static uint64"; emit=1; count++ } \
+	     /^gcs_block_resource_x_gate_session_recheck_result\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_capacity_consumer.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/if \(action == RESOURCE_X_BOOTSTRAP_ROUND_NO_CAPACITY\)/ { emit=1; begin++ } \
+	     emit && /if \(action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED\)/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_grd_capacity: test_cluster_pcm_grd_capacity.c test_cluster_pcm_lock.c \
+		test_cluster_pcm_lock test_cluster_pcm_capacity_helpers.inc test_cluster_pcm_capacity_consumer.inc \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h $(top_srcdir)/src/include/utils/wait_event.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
+		$< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+clean distclean maintainer-clean: clean-pcm-grd-capacity
+.PHONY: clean-pcm-grd-capacity
+clean-pcm-grd-capacity:
+	rm -f test_cluster_pcm_capacity_helpers.inc test_cluster_pcm_capacity_consumer.inc
+
 # spec-2.36a C1/D5a: the real cluster_pcm_own object is linked against a
 # fake shmem region.  The test also reads the production bufmgr source through
 # an explicit build-time path so the D5a lock-order contract is paired with

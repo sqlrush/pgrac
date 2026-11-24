@@ -1410,6 +1410,7 @@ cluster_pcm_grd_lifecycle_stats_snapshot(PcmGrdLifecycleStats *out)
 	out->reclaim_reuse_count = 5;
 	out->capacity_retry_count = 6;
 	out->capacity_fail_count = 7;
+	out->capacity_wait_count = 8;
 	out->peak_live_entries = 12;
 	out->reclaim_refused[PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N] = 9;
 }
@@ -5623,6 +5624,7 @@ UT_TEST(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_reclaim_reuse_count"), "5");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_capacity_retry_count"), "6");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_capacity_fail_count"), "7");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_capacity_wait_count"), "8");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_peak_live_entries"), "12");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_reclaim_refused_pcm_mode_not_n_count"),
 					 "9");

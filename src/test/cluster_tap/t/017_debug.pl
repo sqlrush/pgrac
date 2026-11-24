@@ -64,8 +64,8 @@ is( $node->safe_psql(
 		q{SELECT string_agg(DISTINCT category COLLATE "C", ','
 		      ORDER BY category COLLATE "C")
 		    FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,ctrc,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,multixact_current,normal_start,pcm,pgstat,phase,r4,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo.cleaner.worker.0,undo.cleaner.worker.1,undo.cleaner.worker.2,undo.cleaner.worker.3,undo.cleaner.worker.4,undo.cleaner.worker.5,undo.cleaner.worker.6,undo.cleaner.worker.7,undo_cleaner,update_trace,update_trace_event,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
-	'all 70 categories appear (including normal-start, CTRC, cleaner workers and update trace)');
+	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,ctrc,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lifecycle,lmd,lmon,lms,multixact_current,normal_start,pcm,pgstat,phase,r4,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo.cleaner.worker.0,undo.cleaner.worker.1,undo.cleaner.worker.2,undo.cleaner.worker.3,undo.cleaner.worker.4,undo.cleaner.worker.5,undo.cleaner.worker.6,undo.cleaner.worker.7,undo_cleaner,update_trace,update_trace_event,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
+	'all 71 categories appear (including normal-start, CTRC, cleaner workers and update trace)');
 
 is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
@@ -102,6 +102,10 @@ is(
 	'AVAILABLE_PROOF_KIND',
 	'Resource-X exact proof-kind observation is available');
 
+is($node->get_cluster_state_value('pcm', 'pcm_grd_capacity_wait_count'),
+	'0',
+	'PCM capacity wait counter is exposed before any capacity sleep');
+
 
 # ----------
 # Test 5: shmem.magic matches CLUSTER_SHMEM_MAGIC ("PGRC" LE = 0x50475243).
@@ -134,15 +138,15 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'187',
-	'all 187 injection points have a .fault_type entry, including the CTRC stage barrier');
+	'191',
+	'all 191 injection points have a .fault_type entry, including the CTRC stage barrier');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'187',
-	'all 187 injection points have a .hits entry, including the CTRC stage barrier');
+	'191',
+	'all 191 injection points have a .hits entry, including the CTRC stage barrier');
 
 
 # ----------
@@ -168,8 +172,8 @@ like($phase, qr/^(init|running|shutdown|\(unset\))$/,
 # ----------
 is( $node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'124',
-	'pg_stat_cluster_wait_events returns 124 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2+1)');
+	'127',
+	'pg_stat_cluster_wait_events returns 127 registered events');
 
 $node->stop;
 

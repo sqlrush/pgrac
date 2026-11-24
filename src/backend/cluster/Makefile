@@ -584,3 +584,7 @@ cluster_control_root.o: $(srcdir)/cluster_control_debt_v2.inc \
 	$(srcdir)/cluster_control_debt_transition_v2.inc \
 	$(srcdir)/cluster_control_debt_publish_v2.inc \
 	$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h
+
+# Keep the PCM snapshot producer and stack consumers on one native layout.
+# Author: SqlRush <sqlrush@gmail.com>
+cluster_pcm_lock.o cluster_gcs_block.o cluster_debug.o: $(top_srcdir)/src/include/cluster/cluster_pcm_lock.h
