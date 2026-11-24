@@ -15989,5 +15989,6 @@ cluster_control_relmap_recovery_create_confirm_locked_v2(
 }
 
 #include "cluster_control_debt_v2.inc"
+#include "cluster_control_debt_transition_v2.inc"
 
 #endif /* USE_PGRAC_CLUSTER */

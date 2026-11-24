@@ -19203,7 +19203,7 @@ clean-control-debt-store:
 TESTS += test_cluster_control_debt_selected
 all: test_cluster_control_debt_selected
 test_cluster_control_debt_selected: test_cluster_control_debt_selected.c \
-		test_cluster_control_debt_prepared.inc \
+		test_cluster_control_debt_prepared.inc test_cluster_control_debt_transition.inc \
 		test_cluster_control_debt_store.c test_cluster_control_debt_wire.c \
 		test_cluster_control_registry.c test_cluster_recovery_registry.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_debt_v2.inc \
@@ -19685,3 +19685,10 @@ $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_STARTUP_O) \
 # Full multi-page native WAL is selected only by terminal batch fixtures.
 test_cluster_cold_relmap_terminal test_cluster_cold_relmap_terminal_start: \
 		test_cluster_relmap_terminal_batch_wal.inc test_cluster_cold_relmap_terminal_many.inc
+
+# Original-owner transition getter and its exact-code fixture.
+cluster_control_registry_original.o test_cluster_control_debt_selected: \
+		$(top_srcdir)/src/backend/cluster/cluster_control_debt_transition_v2.inc \
+		$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h
