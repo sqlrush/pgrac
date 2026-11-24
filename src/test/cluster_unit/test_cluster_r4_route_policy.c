@@ -4406,7 +4406,7 @@ cluster_multixact_current_resolve_operation_member_proof(const ClusterCurrentMxM
 	out->base.member_status = member->member_status;
 	out->base.state = result->status == CLUSTER_TT_STATUS_IN_PROGRESS ? CCM_ACTIVE : CCM_COMMITTED;
 	out->base.commit_scn = result->commit_scn;
-	out->format_version = 2;
+	out->format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 	out->flags = CLUSTER_CURRENT_OPERATION_PROOF_EXACT;
 	out->effect_state = effect->effect_state;
 	out->operation_uba = effect->key.locator.uba;
@@ -4450,7 +4450,7 @@ mx_v6_enqueue_reply(const void *payload, uint16 length, uint32 origin)
 	proof.base.member_ordinal = ask.member.member_ordinal;
 	proof.base.state = CCM_COMMITTED;
 	proof.base.commit_scn = 101;
-	proof.format_version = 2;
+	proof.format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 	UT_ASSERT(cluster_multixact_operation_wire_encode_reply(request, origin,
 		request->prefix.epoch, CMX_RESOLVE_OK, &proof, 1, NULL,
 		UT_CURRENT_MX_CAPABILITY_GENERATION, &reply.page));

@@ -79,7 +79,7 @@ ow_proof(const OperationWireFixture *f, unsigned index, uint8 state, uint8 effec
 	p.base.member_status = f->members[index].member_status;
 	p.base.state = state;
 	p.base.commit_scn = state == CCM_COMMITTED ? scn_encode(0, 900) : InvalidScn;
-	p.format_version = 2;
+	p.format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 	if (!ow_zero(&f->operations[index], sizeof(f->operations[index]))) {
 		p.flags = 1;
 		p.effect_state = effect;
@@ -141,7 +141,7 @@ ow_bad_reply(const OperationWireFixture *f, const void *page, uint32 length)
 	UT_ASSERT_EQ(updater.verdict, CUCP_UNKNOWN);
 	for (unsigned i = 0; i < 7; i++) {
 		ClusterCurrentMemberOperationProof unknown
-			= { .base = { .state = CCM_UNKNOWN }, .format_version = 2 };
+			= { .base = { .state = CCM_UNKNOWN }, .format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION };
 		UT_ASSERT_EQ(memcmp(&out[i], &unknown, sizeof(unknown)), 0);
 	}
 }
@@ -159,7 +159,7 @@ UT_TEST(request_exact_literal_layout)
 	UT_ASSERT_EQ(f.count, 1);
 	UT_ASSERT_EQ(sizeof(f.plans[0].request), 768);
 	UT_ASSERT_EQ(ow_value(&f.plans[0].request, 64, 4), UINT32_C(0x5047434d));
-	UT_ASSERT_EQ(ow_value(&f.plans[0].request, 68, 2), 6);
+	UT_ASSERT_EQ(ow_value(&f.plans[0].request, 68, 2), 7);
 	UT_ASSERT_EQ(ow_value(b, 0, 4), 100);
 	UT_ASSERT_EQ(ow_value(b, 4, 2), 0);
 	UT_ASSERT_EQ(b[6], MultiXactStatusForShare);
@@ -431,6 +431,20 @@ UT_TEST(duplicate_ordinal_or_raw_member_rejected)
 	UT_ASSERT(!cluster_multixact_operation_wire_validate_forward(&bad, 768, 3, 5, 9, &decoded));
 }
 
+UT_TEST(frozen_v3_operation_layout)
+{
+	UT_ASSERT_EQ(sizeof(ClusterCurrentMemberProof), 192);
+	UT_ASSERT_EQ(sizeof(ClusterCurrentMemberOperationProof), 232);
+	UT_ASSERT_EQ(CLUSTER_CURRENT_OPERATION_PROOF_VERSION, 3);
+	UT_ASSERT_EQ(offsetof(ClusterCurrentMemberOperationProof, operation_uba), 192);
+	UT_ASSERT_EQ(offsetof(ClusterCurrentMemberOperationProof, top_fxid), 208);
+	UT_ASSERT_EQ(offsetof(ClusterCurrentMemberOperationProof, operation_fxid), 216);
+	UT_ASSERT_EQ(offsetof(ClusterCurrentMemberOperationProof, effect_state), 224);
+	UT_ASSERT_EQ(offsetof(ClusterCurrentMemberOperationProof, format_version), 225);
+	UT_ASSERT_EQ(offsetof(ClusterCurrentMemberOperationProof, flags), 226);
+	UT_ASSERT_EQ(offsetof(ClusterCurrentMemberOperationProof, reserved), 228);
+}
+
 UT_TEST(reply_exact_literal_layout)
 {
 	OperationWireFixture f;
@@ -443,21 +457,21 @@ UT_TEST(reply_exact_literal_layout)
 	}
 	p = ow_proof(&f, 0, CCM_ACTIVE, CLUSTER_SAVEPOINT_EFFECT_LIVE);
 	UT_ASSERT(ow_page(&f, &p, &page));
-	UT_ASSERT_EQ(page.header.version, 6);
-	UT_ASSERT_EQ(page.header.wire_length, 152);
+	UT_ASSERT_EQ(page.header.version, 7);
+	UT_ASSERT_EQ(page.header.wire_length, 296);
 	UT_ASSERT_EQ(page.header.requester_capability_generation, 313);
 	UT_ASSERT_EQ(ow_value(page.body, 12, 4), 97);
 	UT_ASSERT_EQ(ow_value(page.body, 32, 4), 100);
 	UT_ASSERT_EQ(ow_value(page.body, 40, 4), 47);
-	UT_ASSERT(ow_zero(page.body + 44, 4));
-	UT_ASSERT_EQ(memcmp(page.body + 48, &p.operation_uba, 16), 0);
-	UT_ASSERT_EQ(ow_value(page.body, 64, 8), UINT64_C(0x200000061));
-	UT_ASSERT_EQ(ow_value(page.body, 72, 8), UINT64_C(0x200000064));
-	UT_ASSERT_EQ(page.body[80], CLUSTER_SAVEPOINT_EFFECT_LIVE);
-	UT_ASSERT_EQ(page.body[81], 2);
-	UT_ASSERT_EQ(ow_value(page.body, 82, 2), 1);
-	UT_ASSERT(ow_zero(page.body + 84, 4));
-	UT_ASSERT(ow_zero((char *)&page + 152, 8040));
+	UT_ASSERT(ow_zero(page.body + 188, 4));
+	UT_ASSERT_EQ(memcmp(page.body + 192, &p.operation_uba, 16), 0);
+	UT_ASSERT_EQ(ow_value(page.body, 208, 8), UINT64_C(0x200000061));
+	UT_ASSERT_EQ(ow_value(page.body, 216, 8), UINT64_C(0x200000064));
+	UT_ASSERT_EQ(page.body[224], CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	UT_ASSERT_EQ(page.body[225], 3);
+	UT_ASSERT_EQ(ow_value(page.body, 226, 2), 1);
+	UT_ASSERT(ow_zero(page.body + 228, 4));
+	UT_ASSERT(ow_zero((char *)&page + 296, 7896));
 }
 
 UT_TEST(top_state_and_operation_disposition_round_trip_independently)
@@ -488,7 +502,7 @@ UT_TEST(top_state_and_operation_disposition_round_trip_independently)
 		}
 }
 
-UT_TEST(top_only_format_two_round_trip)
+UT_TEST(top_only_format_three_round_trip)
 {
 	OperationWireFixture f;
 	ClusterCurrentMxOperationReplyPageV6 page;
@@ -509,7 +523,7 @@ UT_TEST(top_only_format_two_round_trip)
 		UT_ASSERT(cluster_multixact_operation_wire_validate_reply(
 			&page, 8192, 5, 9, &f.plans[0].request, &result, &out, 1, &count, &updater, &cap));
 		UT_ASSERT_EQ(out.flags, 0);
-		UT_ASSERT(ow_zero((char *)&out + 48, 33));
+		UT_ASSERT(ow_zero((char *)&out + 192, 33));
 	}
 }
 
@@ -539,12 +553,12 @@ UT_TEST(updater_reply_echo_and_member_proof)
 	updater.verdict = CUCP_MATCH;
 	UT_ASSERT(cluster_multixact_operation_wire_encode_reply(
 		&f.plans[0].request, 5, 9, CMX_RESOLVE_OK, &p, 1, &updater, 313, &page));
-	UT_ASSERT_EQ(page.header.wire_length, 224);
-	UT_ASSERT_EQ(ow_value(page.body, 88, 2), 2);
+	UT_ASSERT_EQ(page.header.wire_length, 368);
+	UT_ASSERT_EQ(ow_value(page.body, 232, 2), 2);
 	UT_ASSERT(cluster_multixact_operation_wire_validate_reply(
 		&page, 8192, 5, 9, &f.plans[0].request, &result, &out, 1, &count, &decoded, &cap));
 	UT_ASSERT_EQ(decoded.updater_xid, 100);
-	page.body[88 + 64] ^= 1;
+	page.body[232 + 64] ^= 1;
 	ow_bad_reply(&f, &page, 8192);
 }
 
@@ -606,7 +620,7 @@ UT_TEST(reply_operation_identity_and_generation_rejected)
 	OperationWireFixture f;
 	ClusterCurrentMxOperationReplyPageV6 good, bad;
 	ClusterCurrentMemberOperationProof p;
-	const unsigned offsets[] = { 0, 4, 8, 12, 20, 22, 32, 34, 36, 38, 48, 64, 72, 80, 81, 82, 84 };
+	const unsigned offsets[] = { 0, 4, 8, 12, 20, 22, 32, 34, 36, 38, 192, 208, 216, 224, 225, 226, 228 };
 	ow_init(&f, 1);
 	if (!ow_build(&f, 1, NULL)) {
 		UT_ASSERT(false);
@@ -629,7 +643,7 @@ UT_TEST(reply_padding_and_late_entry_failure_clear_whole_batch)
 	OperationWireFixture f;
 	ClusterCurrentMxOperationReplyPageV6 good, bad;
 	ClusterCurrentMemberOperationProof p[2];
-	const unsigned offsets[] = { 44, 88 + 44, 88 + 80, 176, 616, 8127 };
+	const unsigned offsets[] = { 188, 232 + 188, 232 + 224, 464, 1624, 8127 };
 	ow_init(&f, 2);
 	if (!ow_build(&f, 2, NULL)) {
 		UT_ASSERT(false);
@@ -768,7 +782,7 @@ UT_TEST(reply_unaligned_length_capacity_and_old_family_separation)
 	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply(
 					 &page, 8192, 5, 9, &oldplan[0].request, &oldout, 1, &count, &updater, &cap),
 				 CMX_RESOLVE_UNKNOWN);
-	UT_ASSERT_EQ(CLUSTER_CURRENT_MX_WIRE_VERSION, 5);
+	UT_ASSERT_EQ(CLUSTER_CURRENT_MX_WIRE_VERSION, 6);
 }
 
 UT_TEST(seven_proofs_round_trip_without_padding_leak)
@@ -789,17 +803,17 @@ UT_TEST(seven_proofs_round_trip_without_padding_leak)
 	for (unsigned i = 0; i < 7; i++) {
 		p[i] = ow_proof(&f, i, CCM_ACTIVE,
 						i % 2 ? CLUSTER_SAVEPOINT_EFFECT_DISCARDED : CLUSTER_SAVEPOINT_EFFECT_LIVE);
-		memset((char *)&p[i] + 44, 0xa5, 4);
+		memset((char *)&p[i] + 188, 0xa5, 4);
 	}
 	UT_ASSERT(ow_page(&f, p, &page));
-	UT_ASSERT_EQ(page.header.wire_length, 680);
+	UT_ASSERT_EQ(page.header.wire_length, 1688);
 	UT_ASSERT(ow_zero(page.reserved, sizeof(page.reserved)));
 	UT_ASSERT(cluster_multixact_operation_wire_validate_reply(
 		&page, 8192, 5, 9, &f.plans[0].request, &result, out, 7, &count, &updater, &cap));
 	UT_ASSERT_EQ(count, 7);
 	for (unsigned i = 0; i < 7; i++) {
-		UT_ASSERT(ow_zero(page.body + i * 88 + 44, 4));
-		memset((char *)&p[i] + 44, 0, 4);
+		UT_ASSERT(ow_zero(page.body + i * 232 + 188, 4));
+		memset((char *)&p[i] + 188, 0, 4);
 		UT_ASSERT_EQ(memcmp(&p[i], &out[i], sizeof(p[i])), 0);
 	}
 }
@@ -895,10 +909,108 @@ UT_TEST(request_bridge_failure_clears_complete_outputs)
 	UT_ASSERT(ow_zero(&copied, sizeof(copied)));
 }
 
+UT_TEST(current_base_envelope_is_preserved_without_translation)
+{
+	OperationWireFixture f;
+	ClusterCurrentMemberOperationProof proof, out;
+	ClusterCurrentMxOperationReplyPageV6 page;
+	ClusterCurrentUpdaterProof updater;
+	ClusterMxResolveResult result;
+	uint16 count;
+	uint32 cap;
+
+	ow_init(&f, 1);
+	UT_ASSERT(ow_build(&f, 1, NULL));
+	proof = ow_proof(&f, 0, CCM_ACTIVE, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	UT_ASSERT_EQ(offsetof(ClusterCurrentMemberProof, origin_fullxid_v2), 44);
+	UT_ASSERT_EQ(sizeof(proof.base.origin_fullxid_v2), 144);
+	/* This is opaque transport input, not a qualified authority fixture. */
+	for (unsigned i = 0; i < sizeof(proof.base.origin_fullxid_v2); i++)
+		proof.base.origin_fullxid_v2[i] = (uint8) (i + 1);
+	proof.base.origin_fullxid_v2[0] = CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION;
+	proof.base.origin_fullxid_v2[1] = 0;
+	proof.base.origin_fullxid_v2[2] = CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES;
+	proof.base.origin_fullxid_v2[3] = 0;
+	UT_ASSERT(ow_page(&f, &proof, &page));
+	UT_ASSERT_EQ(memcmp(page.body, &proof.base, 192), 0);
+	UT_ASSERT(cluster_multixact_operation_wire_validate_reply(
+		&page, sizeof(page), 5, 9, &f.plans[0].request, &result, &out, 1, &count,
+		&updater, &cap));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(memcmp(&out, &proof, sizeof(out)), 0);
+}
+
+UT_TEST(unqualified_base_stays_zero_and_unknown_envelopes_are_refused)
+{
+	OperationWireFixture f;
+	ClusterCurrentMemberOperationProof proof, out;
+	ClusterCurrentMxOperationReplyPageV6 page;
+	ClusterCurrentUpdaterProof updater;
+	ClusterMxResolveResult result;
+	uint16 count;
+	uint32 cap;
+
+	ow_init(&f, 1);
+	UT_ASSERT(ow_build(&f, 1, NULL));
+	proof = ow_proof(&f, 0, CCM_ACTIVE, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	UT_ASSERT(ow_page(&f, &proof, &page));
+	UT_ASSERT(cluster_multixact_operation_wire_validate_reply(
+		&page, sizeof(page), 5, 9, &f.plans[0].request, &result, &out, 1, &count,
+		&updater, &cap));
+	UT_ASSERT(ow_zero(out.base.origin_fullxid_v2, sizeof(out.base.origin_fullxid_v2)));
+	/* An opaque envelope cannot be converted from a partial/unknown header. */
+	for (unsigned byte = 0; byte < 4; byte++) {
+		UT_ASSERT(ow_page(&f, &proof, &page));
+		page.body[44 + byte] = 1;
+		ow_bad_reply(&f, &page, sizeof(page));
+	}
+	proof.base.origin_fullxid_v2[0] = 1;
+	UT_ASSERT(!ow_page(&f, &proof, &page));
+	UT_ASSERT(ow_zero(&page, sizeof(page)));
+}
+
+UT_TEST(legacy_wire_six_and_88_byte_operation_proofs_are_refused)
+{
+	OperationWireFixture f;
+	ClusterCurrentMemberOperationProof proof;
+	ClusterCurrentMxOperationReplyPageV6 good, bad;
+	ClusterCurrentMxOperationForwardV6 request, decoded;
+
+	ow_init(&f, 1);
+	UT_ASSERT(ow_build(&f, 1, NULL));
+	proof = ow_proof(&f, 0, CCM_ACTIVE, CLUSTER_SAVEPOINT_EFFECT_LIVE);
+	UT_ASSERT(ow_page(&f, &proof, &good));
+	request = f.plans[0].request;
+	request.version = 6;
+	UT_ASSERT(!cluster_multixact_operation_wire_validate_forward(
+		&request, sizeof(request), 3, 5, 9, &decoded));
+	UT_ASSERT(ow_zero(&decoded, sizeof(decoded)));
+	bad = good;
+	bad.header.version = 6;
+	ow_bad_reply(&f, &bad, sizeof(bad));
+	/* The outer allocation stays a page; its exact proof byte count cannot
+	 * be the old 64+88 shape, or any intermediate/truncated carrier. */
+	for (unsigned length = 64; length < 296; length++) {
+		bad = good;
+		bad.header.wire_length = length;
+		ow_bad_reply(&f, &bad, sizeof(bad));
+	}
+	bad = good;
+	bad.body[225] = 2;
+	ow_bad_reply(&f, &bad, sizeof(bad));
+	proof.format_version = 2;
+	UT_ASSERT(!ow_page(&f, &proof, &bad));
+	UT_ASSERT(ow_zero(&bad, sizeof(bad)));
+}
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(31);
+	UT_RUN(current_base_envelope_is_preserved_without_translation);
+	UT_RUN(unqualified_base_stays_zero_and_unknown_envelopes_are_refused);
+	UT_RUN(legacy_wire_six_and_88_byte_operation_proofs_are_refused);
+	UT_RUN(frozen_v3_operation_layout);
 	UT_RUN(request_exact_literal_layout);
 	UT_RUN(request_top_only_has_zero_context);
 	UT_RUN(updater_request_carries_challenge_and_exact_entry);
@@ -911,7 +1023,7 @@ main(void)
 	UT_RUN(duplicate_ordinal_or_raw_member_rejected);
 	UT_RUN(reply_exact_literal_layout);
 	UT_RUN(top_state_and_operation_disposition_round_trip_independently);
-	UT_RUN(top_only_format_two_round_trip);
+	UT_RUN(top_only_format_three_round_trip);
 	UT_RUN(updater_reply_echo_and_member_proof);
 	UT_RUN(reply_header_bindings_and_typed_result_rejected);
 	UT_RUN(reply_operation_identity_and_generation_rejected);

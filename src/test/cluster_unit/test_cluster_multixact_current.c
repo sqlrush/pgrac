@@ -696,8 +696,8 @@ StaticAssertDecl(offsetof(ClusterCurrentMxMemberDesc, member_status) == 4,
 StaticAssertDecl(offsetof(ClusterCurrentMxMemberDesc, reserved8) == 5,
 				 "current MX descriptor reserved offset changed");
 
-StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 48,
-				 "current MX member proof must remain 48 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 192,
+				 "current MX member proof must remain 192 bytes");
 StaticAssertDecl(offsetof(ClusterCurrentMemberProof, key) == 0,
 				 "current MX proof key offset changed");
 StaticAssertDecl(offsetof(ClusterCurrentMemberProof, commit_scn) == 24,
@@ -807,7 +807,7 @@ UT_TEST(test_current_multixact_public_symbols_link)
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_build_proof_requests);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_reply);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_reply_frame);
-	UT_ASSERT_EQ(CLUSTER_CURRENT_MX_WIRE_VERSION, 5);
+	UT_ASSERT_EQ(CLUSTER_CURRENT_MX_WIRE_VERSION, 6);
 }
 
 

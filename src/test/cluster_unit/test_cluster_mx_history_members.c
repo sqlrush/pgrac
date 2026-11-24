@@ -59,7 +59,7 @@ member_unknown(uint16 n)
 	ClusterSavepointOperationKey zero = { 0 };
 	for (uint16 i = 0; i < n; ++i) {
 		UT_ASSERT_EQ(member_proofs[i].base.state, CCM_UNKNOWN);
-		UT_ASSERT_EQ(member_proofs[i].format_version, 2);
+		UT_ASSERT_EQ(member_proofs[i].format_version, CLUSTER_CURRENT_OPERATION_PROOF_VERSION);
 		UT_ASSERT_EQ(memcmp(&member_keys[i], &zero, sizeof(zero)), 0);
 	}
 }
@@ -203,7 +203,7 @@ UT_TEST(members_v1_is_exact_top_only)
 	UT_ASSERT_EQ(member_proofs[0].base.member_xid, 100);
 	UT_ASSERT_EQ(member_proofs[0].base.state, CCM_COMMITTED);
 	extension.base = member_proofs[0].base;
-	extension.format_version = 2;
+	extension.format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 	UT_ASSERT_EQ(memcmp(&extension, &member_proofs[0], sizeof(extension)), 0);
 	UT_ASSERT_EQ(memcmp(&zero, &member_keys[0], sizeof(zero)), 0);
 	UT_ASSERT_EQ(member_proofs[1].flags, CLUSTER_CURRENT_OPERATION_PROOF_EXACT);

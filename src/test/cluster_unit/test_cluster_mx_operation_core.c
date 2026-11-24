@@ -114,7 +114,7 @@ static void
 operation_unknown(const ClusterCurrentMemberOperationProof *proof)
 {
 	ClusterCurrentMemberOperationProof unknown
-		= { .base = { .state = CCM_UNKNOWN }, .format_version = 2 };
+		= { .base = { .state = CCM_UNKNOWN }, .format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION };
 	UT_ASSERT_EQ(memcmp(proof, &unknown, sizeof(*proof)), 0);
 }
 
@@ -139,7 +139,7 @@ UT_TEST(all_data_kinds_bind_exact_raw_member_to_canonical_top)
 		UT_ASSERT_EQ(proof.base.key.segment_generation, 7);
 		UT_ASSERT_EQ(proof.base.key.slot_wrap, 3);
 		UT_ASSERT_EQ(proof.base.key.binding_version, 1);
-		UT_ASSERT_EQ(proof.format_version, 2);
+		UT_ASSERT_EQ(proof.format_version, CLUSTER_CURRENT_OPERATION_PROOF_VERSION);
 		UT_ASSERT_EQ(proof.flags, 1);
 		UT_ASSERT_EQ(proof.effect_state, CLUSTER_SAVEPOINT_EFFECT_DISCARDED);
 		UT_ASSERT(cluster_undo_record_uba_equal(proof.operation_uba, f.key.locator.uba));

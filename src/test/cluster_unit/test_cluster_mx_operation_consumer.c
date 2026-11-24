@@ -53,7 +53,7 @@ consumer_setup(ConsumerFixture *f, uint16 n)
 		p->top_fxid = f->keys[i].top_fxid;
 		p->operation_fxid = f->keys[i].operation_fxid;
 		p->effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
-		p->format_version = 2;
+		p->format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 		p->flags = 1;
 	}
 	test_context(&f->ctx, &f->mx, CCM_ACTION_LOCK, MultiXactStatusForUpdate, LockTupleExclusive);
@@ -303,7 +303,7 @@ UT_TEST(consumer_v1_and_exact_mix_keep_original_top_only_contract)
 	memset(&f.keys[1], 0, sizeof(f.keys[1]));
 	memset(&f.proofs[1], 0, sizeof(f.proofs[1]));
 	test_proof(&f.proofs[1].base, &f.members[1], 1, CCM_ABORTED, 5, 3);
-	f.proofs[1].format_version = 2;
+	f.proofs[1].format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 	UT_ASSERT_EQ(consumer_decide(&f, 2, NULL), CMDL_CONTINUE);
 	f.proofs[1].operation_fxid = FullTransactionIdFromEpochAndXid(2, 103);
 	UT_ASSERT_EQ(consumer_decide(&f, 2, NULL), CMDL_UNKNOWN);

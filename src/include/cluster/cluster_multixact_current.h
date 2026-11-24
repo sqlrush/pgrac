@@ -21,6 +21,7 @@
 #ifndef CLUSTER_MULTIXACT_CURRENT_H
 #define CLUSTER_MULTIXACT_CURRENT_H
 
+#include "cluster/cluster_ctrc_origin_fullxid.h"
 #include "access/multixact.h"
 #include "access/tableam.h"
 #include "cluster/cluster_scn.h"
@@ -97,12 +98,14 @@ typedef struct ClusterCurrentMemberProof {
 	uint8 member_status;
 	uint8 state;
 	uint8 reserved8[4];
+	/* Separate V2 envelope; zero remains unqualified. */
+	uint8 origin_fullxid_v2[CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES];
 } ClusterCurrentMemberProof;
 
-#define CLUSTER_CURRENT_OPERATION_PROOF_VERSION UINT8_C(2)
+#define CLUSTER_CURRENT_OPERATION_PROOF_VERSION UINT8_C(3)
 #define CLUSTER_CURRENT_OPERATION_PROOF_EXACT UINT16_C(1)
 
-/* Exact-operation format; not accepted by the existing wire-5 family.
+/* Exact-operation format; not accepted by the existing base wire family.
  * Canonical top state and operation disposition remain independent. */
 typedef struct ClusterCurrentMemberOperationProof {
 	ClusterCurrentMemberProof base;
@@ -394,17 +397,17 @@ StaticAssertDecl(sizeof(ClusterCurrentMxMemberDesc) == 8,
 				 "ClusterCurrentMxMemberDesc must remain 8 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMemberProofKey) == 24,
 				 "ClusterCurrentMemberProofKey must remain 24 bytes");
-StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 48,
-				 "ClusterCurrentMemberProof must remain 48 bytes");
-StaticAssertDecl(sizeof(ClusterCurrentMemberOperationProof) == 88,
-				 "ClusterCurrentMemberOperationProof must remain 88 bytes");
-StaticAssertDecl(offsetof(ClusterCurrentMemberOperationProof, operation_uba) == 48
-					 && offsetof(ClusterCurrentMemberOperationProof, top_fxid) == 64
-					 && offsetof(ClusterCurrentMemberOperationProof, operation_fxid) == 72
-					 && offsetof(ClusterCurrentMemberOperationProof, effect_state) == 80
-					 && offsetof(ClusterCurrentMemberOperationProof, format_version) == 81
-					 && offsetof(ClusterCurrentMemberOperationProof, flags) == 82
-					 && offsetof(ClusterCurrentMemberOperationProof, reserved) == 84,
+StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 192,
+				 "V6 ClusterCurrentMemberProof must remain 192 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMemberOperationProof) == 232,
+				 "ClusterCurrentMemberOperationProof must remain 232 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMemberOperationProof, operation_uba) == 192
+					 && offsetof(ClusterCurrentMemberOperationProof, top_fxid) == 208
+					 && offsetof(ClusterCurrentMemberOperationProof, operation_fxid) == 216
+					 && offsetof(ClusterCurrentMemberOperationProof, effect_state) == 224
+					 && offsetof(ClusterCurrentMemberOperationProof, format_version) == 225
+					 && offsetof(ClusterCurrentMemberOperationProof, flags) == 226
+					 && offsetof(ClusterCurrentMemberOperationProof, reserved) == 228,
 				 "Exact operation proof offsets must remain fixed");
 StaticAssertDecl(sizeof(ClusterCurrentMxSuccessorAlias) == 24,
 				 "ClusterCurrentMxSuccessorAlias must remain 24 bytes");

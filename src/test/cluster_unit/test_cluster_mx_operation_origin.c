@@ -614,7 +614,7 @@ UT_TEST(mx_operation_before_mutation_rechecks_runtime_identity)
 	proof.top_fxid = key.top_fxid;
 	proof.operation_fxid = key.operation_fxid;
 	proof.effect_state = CLUSTER_SAVEPOINT_EFFECT_LIVE;
-	proof.format_version = 2;
+	proof.format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 	proof.flags = 1;
 	UT_ASSERT(
 		cluster_multixact_current_operation_grants_current(&mx, &member, &key, &proof, 1, 313));

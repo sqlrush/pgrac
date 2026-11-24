@@ -1898,7 +1898,7 @@ operation_proof_entry_valid(const ClusterCurrentMxMemberDesc *member,
 	const ClusterCurrentMemberProofKey *binding = &p->base.key;
 	uint32 grant = ClusterCurrentMemberProofGetCtrcGrant(&p->base);
 
-	if (origin < 0 || origin >= CLUSTER_MAX_NODES || p->format_version != 2 || p->reserved != 0
+	if (origin < 0 || origin >= CLUSTER_MAX_NODES || p->format_version != CLUSTER_CURRENT_OPERATION_PROOF_VERSION || p->reserved != 0
 		|| p->base.member_xid != member->xid || p->base.member_status != member->member_status
 		|| p->base.member_ordinal != ordinal || p->base.state == CCM_SELF
 		|| p->base.state >= CCM_UNKNOWN)

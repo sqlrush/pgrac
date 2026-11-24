@@ -62,7 +62,7 @@ receipt_setup(ReceiptFixture *f)
 		p->base.member_ordinal = i;
 		p->base.state = CCM_ACTIVE;
 		ClusterCurrentMemberProofSetCtrcGrant(&p->base, test_ctrc_touch_grant);
-		p->format_version = 2;
+		p->format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 		f->capabilities[i] = 313;
 	}
 	f->keys[0] = (ClusterSavepointOperationKey){ .locator = test_origin_locator,

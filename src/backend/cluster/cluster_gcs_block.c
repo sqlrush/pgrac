@@ -6913,7 +6913,7 @@ cluster_gcs_current_mx_operation_proof_fetch_and_wait(
 		memset(proofs, 0, sizeof(*proofs) * proofs_cap);
 		for (i = 0; i < proofs_cap; i++) {
 			proofs[i].base.state = CCM_UNKNOWN;
-			proofs[i].format_version = 2;
+			proofs[i].format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 		}
 	}
 	if (proof_count != NULL)
@@ -11025,7 +11025,7 @@ gcs_block_current_mx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 				proofs[i] = context->current_mx_operation_proofs[i];
 			else {
 				proofs[i].base = context->current_mx_proofs[i];
-				proofs[i].format_version = 2;
+				proofs[i].format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 			}
 		}
 		built = cluster_cr_server_current_mx_build_operation_proof_page(
@@ -11462,7 +11462,7 @@ gcs_block_current_mx_exact_after_release(GcsBlockR4TxOriginContext *context)
 		context->current_mx_sampled_bitmap |= (uint8)(1U << i);
 	} else {
 		context->current_mx_operation_proofs[i].base = context->current_mx_proofs[i];
-		context->current_mx_operation_proofs[i].format_version = 2;
+		context->current_mx_operation_proofs[i].format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 	}
 	if (context->current_mx_request.prefix.body_kind
 			== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {

@@ -1009,14 +1009,23 @@ operation_wire_proof_fields(uint8 *bytes, ClusterCurrentMemberOperationProof *p,
 		memcpy(bytes + 40, p->base.reserved8, 4);
 	else
 		memcpy(p->base.reserved8, bytes + 40, 4);
-	OP_WIRE_FIELD(bytes, 48, p->operation_uba.raw[0], encode);
-	OP_WIRE_FIELD(bytes, 56, p->operation_uba.raw[1], encode);
-	OP_WIRE_FIELD(bytes, 64, p->top_fxid, encode);
-	OP_WIRE_FIELD(bytes, 72, p->operation_fxid, encode);
-	OP_WIRE_FIELD(bytes, 80, p->effect_state, encode);
-	OP_WIRE_FIELD(bytes, 81, p->format_version, encode);
-	OP_WIRE_FIELD(bytes, 82, p->flags, encode);
-	OP_WIRE_FIELD(bytes, 84, p->reserved, encode);
+	/* Preserve the complete current base envelope; its zero value carries
+	 * no authority. Explicit field copies leave only true C padding zero. */
+	if (encode)
+		memcpy(bytes + offsetof(ClusterCurrentMemberProof, origin_fullxid_v2),
+			   p->base.origin_fullxid_v2, sizeof(p->base.origin_fullxid_v2));
+	else
+		memcpy(p->base.origin_fullxid_v2,
+			   bytes + offsetof(ClusterCurrentMemberProof, origin_fullxid_v2),
+			   sizeof(p->base.origin_fullxid_v2));
+	OP_WIRE_FIELD(bytes, 192, p->operation_uba.raw[0], encode);
+	OP_WIRE_FIELD(bytes, 200, p->operation_uba.raw[1], encode);
+	OP_WIRE_FIELD(bytes, 208, p->top_fxid, encode);
+	OP_WIRE_FIELD(bytes, 216, p->operation_fxid, encode);
+	OP_WIRE_FIELD(bytes, 224, p->effect_state, encode);
+	OP_WIRE_FIELD(bytes, 225, p->format_version, encode);
+	OP_WIRE_FIELD(bytes, 226, p->flags, encode);
+	OP_WIRE_FIELD(bytes, 228, p->reserved, encode);
 }
 
 static bool
@@ -1026,10 +1035,17 @@ operation_wire_proof_valid(const ClusterCurrentMemberOperationProof *p,
 	const ClusterCurrentMemberProofKey *key = &p->base.key;
 	uint32 segment, block;
 	uint16 slot, row;
-	if (p->format_version != 2 || p->reserved != 0 || p->flags != (ask->exact ? 1 : 0)
+	if (p->format_version != CLUSTER_CURRENT_OPERATION_PROOF_VERSION || p->reserved != 0
+		|| p->flags != (ask->exact ? 1 : 0)
 		|| p->base.member_xid != ask->member.xid
 		|| p->base.member_ordinal != ask->member.member_ordinal
 		|| p->base.member_status != ask->member.member_status)
+		return false;
+	if (!bytes_are_zero(p->base.origin_fullxid_v2, sizeof(p->base.origin_fullxid_v2))
+		&& (p->base.origin_fullxid_v2[0] != CLUSTER_CTRC_ORIGIN_FULLXID_V2_VERSION
+			|| p->base.origin_fullxid_v2[1] != 0
+			|| p->base.origin_fullxid_v2[2] != CLUSTER_CTRC_ORIGIN_FULLXID_V2_BYTES
+			|| p->base.origin_fullxid_v2[3] != 0))
 		return false;
 	if (!ask->exact)
 		return bytes_are_zero(&p->operation_uba, sizeof(p->operation_uba))
@@ -1100,7 +1116,7 @@ operation_wire_outputs_reset(ClusterMxResolveResult *result,
 		memset(proofs, 0, sizeof(*proofs) * capacity);
 		for (uint16 i = 0; i < capacity; i++) {
 			proofs[i].base.state = CCM_UNKNOWN;
-			proofs[i].format_version = 2;
+			proofs[i].format_version = CLUSTER_CURRENT_OPERATION_PROOF_VERSION;
 		}
 	}
 	if (count != NULL)
@@ -1152,7 +1168,7 @@ cluster_multixact_operation_wire_validate_reply(
 		*result = (ClusterMxResolveResult)h->result;
 		return true;
 	}
-	used = 64 + checked.prefix.entry_count * 88;
+	used = 64 + checked.prefix.entry_count * CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE;
 	if (checked.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
 		used += sizeof(staged_updater);
 	if (proofs == NULL || capacity < checked.prefix.entry_count
@@ -1162,15 +1178,21 @@ cluster_multixact_operation_wire_validate_reply(
 		return false;
 	for (uint16 i = 0; i < h->entry_count; i++) {
 		ClusterCurrentMxOperationAsk ask;
-		uint8 *bytes = page.body + i * 88;
-		if (!bytes_are_zero(bytes + 44, 4) || !operation_wire_read_ask(&checked, i, source, &ask))
+		uint8 *bytes = page.body + i * CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE;
+		if (!bytes_are_zero(bytes + offsetof(ClusterCurrentMemberProof, origin_fullxid_v2)
+							   + sizeof(staged[i].base.origin_fullxid_v2),
+						   sizeof(ClusterCurrentMemberProof)
+							   - offsetof(ClusterCurrentMemberProof, origin_fullxid_v2)
+							   - sizeof(staged[i].base.origin_fullxid_v2))
+			|| !operation_wire_read_ask(&checked, i, source, &ask))
 			return false;
 		operation_wire_proof_fields(bytes, &staged[i], false);
 		if (!operation_wire_proof_valid(&staged[i], &ask, source, epoch))
 			return false;
 	}
 	if (checked.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
-		memcpy(&staged_updater, page.body + 88, sizeof(staged_updater));
+		memcpy(&staged_updater, page.body + CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE,
+			   sizeof(staged_updater));
 		if (!operation_wire_updater_valid(&staged_updater, &checked))
 			return false;
 	}
@@ -1233,11 +1255,12 @@ cluster_multixact_operation_wire_encode_reply(
 	h->requester_capability_generation = capability_generation;
 	for (uint16 i = 0; i < count; i++) {
 		ClusterCurrentMemberOperationProof proof = proofs[i];
-		operation_wire_proof_fields(out->body + i * 88, &proof, true);
-		h->wire_length += 88;
+		operation_wire_proof_fields(out->body + i * CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE,
+									&proof, true);
+		h->wire_length += CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE;
 	}
 	if (result == CMX_RESOLVE_OK && is_updater) {
-		memcpy(out->body + 88, updater, sizeof(*updater));
+		memcpy(out->body + CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE, updater, sizeof(*updater));
 		h->wire_length += sizeof(*updater);
 	}
 	return true;

@@ -13,7 +13,8 @@
 
 /* These codecs do not activate a transport, grant authority, or change the
  * deployed wire version. All queue/origin/consumer legs must switch together. */
-#define CLUSTER_CURRENT_MX_OPERATION_WIRE_VERSION 6
+#define CLUSTER_CURRENT_MX_OPERATION_WIRE_VERSION 7
+#define CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE 232
 #define CLUSTER_CURRENT_MX_OPERATION_ASK_SIZE 96
 #define CLUSTER_CURRENT_MX_OPERATION_BODY_SIZE 672
 
@@ -40,8 +41,11 @@ typedef struct ClusterCurrentMxOperationAsk {
 
 typedef struct ClusterCurrentMxOperationReplyPageV6 {
 	ClusterCurrentMxProofReplyHeader header;
-	uint8 body[616];
-	uint8 reserved[7512];
+	uint8 body[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
+			   * CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE];
+	uint8 reserved[BLCKSZ - sizeof(ClusterCurrentMxProofReplyHeader)
+				   - CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
+					 * CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE];
 } ClusterCurrentMxOperationReplyPageV6;
 
 StaticAssertDecl(sizeof(ClusterCurrentMxOperationForwardV6) == 768,
@@ -52,6 +56,13 @@ StaticAssertDecl(offsetof(ClusterCurrentMxOperationRequestPlan, request) == 8,
 				 "operation plan must align the request");
 StaticAssertDecl(sizeof(ClusterCurrentMxOperationReplyPageV6) == BLCKSZ,
 				 "operation reply must remain one page");
+
+StaticAssertDecl(CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE
+				 == sizeof(ClusterCurrentMemberOperationProof),
+				 "operation wire proof must match the complete carrier");
+StaticAssertDecl(CLUSTER_CURRENT_MX_OPERATION_PROOF_SIZE + sizeof(ClusterCurrentUpdaterProof)
+				 <= sizeof(((ClusterCurrentMxOperationReplyPageV6 *) 0)->body),
+				 "updater reply must fit the same bounded frame");
 
 /* A NULL operations array or an entirely zero key means canonical top-only.
  * A nonzero incomplete key is rejected, never downgraded to a raw lookup. */
