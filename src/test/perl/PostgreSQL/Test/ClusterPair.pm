@@ -24,6 +24,7 @@ package PostgreSQL::Test::ClusterPair;
 use strict;
 use warnings;
 
+use Cwd qw(abs_path);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
@@ -216,17 +217,24 @@ sub new_pair
 		  unless defined $voting_disks_csv;
 		die "true_shared_sysid_cf does not support cluster_name_override"
 		  if defined $opts{cluster_name_override};
+		$wal_threads_root = abs_path($wal_threads_root)
+		  or die "resolve shared WAL root: $!";
 
 		# One shared_data_dir GUC selects both user data and pg_control.
 		# Keep the seed's authority in that same root when both are requested;
 		# selecting a second root later would strand its symlink and anchor.
 		$shared_control_root = $shared_data_root // PostgreSQL::Test::Utils::tempdir();
-		mkdir "$shared_control_root/global"
-		  or die "mkdir $shared_control_root/global: $!";
+		$shared_control_root = abs_path($shared_control_root)
+		  or die "resolve shared control root: $!";
+		$shared_data_root = $shared_control_root if defined $shared_data_root;
 
+		# initdb owns the exclusive global directory creation and signs the
+		# initial HW snapshot from its own durable shutdown checkpoint.
 		$node0->init(allows_streaming => 1, extra => [
 			'-X', "$wal_threads_root/thread_1",
-			"--pgrac-wal-state-root=$wal_threads_root" ]);
+			"--pgrac-wal-state-root=$wal_threads_root",
+			"--pgrac-hw-snapshot-root=$shared_control_root",
+			'--pgrac-hw-snapshot-owner=0' ]);
 
 		# A2: the seed is a legitimate one-member cluster from its first start.
 		# It publishes the shared control authority and its current-member

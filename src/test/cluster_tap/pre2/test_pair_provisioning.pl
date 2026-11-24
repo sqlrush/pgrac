@@ -5,6 +5,7 @@ use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::RealBin/../../perl";
+use Cwd qw(abs_path);
 use File::Copy qw(copy);
 use File::Path qw(make_path);
 use PostgreSQL::Test::ClusterPair;
@@ -27,6 +28,14 @@ use Test::More;
 	sub init
 	{
 		my ($self, %opts) = @_;
+		$self->{init_extra} = $opts{extra} // [];
+		my ($root_arg) = grep { /^--pgrac-hw-snapshot-root=/ } @{$self->{init_extra}};
+		if (defined $root_arg)
+		{
+			(my $root = $root_arg) =~ s/^--pgrac-hw-snapshot-root=//;
+			$self->{hw_root_was_empty} = !scalar(glob("$root/*"));
+			mkdir "$root/global" or die "initdb shared global: $!";
+		}
 		my $data = $self->data_dir;
 		File::Path::make_path("$data/global", "$data/pg_wal");
 		PostgreSQL::Test::Utils::append_to_file("$data/global/pg_control", "12345\n");
@@ -96,6 +105,11 @@ use Test::More;
 			wal_threads_root => 1, quorum_voting_disks => 1,
 			true_shared_sysid_cf => 1, shared_data => $with_data);
 		my $root = $pair->{shared_control_root};
+		is_deeply([grep { /^--pgrac-hw-snapshot-/ } @{$pair->node0->{init_extra}}],
+			["--pgrac-hw-snapshot-root=$root", '--pgrac-hw-snapshot-owner=0'],
+			'seed delegates its initial HW metadata to the original initdb owner');
+		ok($pair->node0->{hw_root_was_empty},
+			'initdb receives an empty shared root and owns global directory creation');
 		is($pair->node0->{seed_root}, $root, 'seed publishes to the retained authority root');
 		is(readlink($pair->node0->data_dir . '/global/pg_control'), "$root/global/pg_control",
 			'seed link still selects the original authority');
@@ -123,6 +137,33 @@ use Test::More;
 			'data-only pair does not enable shared control implicitly');
 		ok(!-l($node->data_dir . '/global/pg_control'),
 			'data-only pair keeps its per-node control file');
+	}
+
+	my $parent = PostgreSQL::Test::Utils::tempdir();
+	mkdir "$parent/real" or die "mkdir alias target: $!";
+	symlink("$parent/real", "$parent/alias") or die "symlink test root: $!";
+	{
+		no warnings 'once';
+		local $PostgreSQL::Test::Utils::tmp_check = "$parent/alias";
+		my $pair = PostgreSQL::Test::ClusterPair->new_pair('pair_parent_alias',
+			wal_threads_root => 1, quorum_voting_disks => 1,
+			true_shared_sysid_cf => 1, shared_data => 1);
+		my $canonical = abs_path($pair->{shared_control_root});
+		is($pair->{shared_control_root}, $canonical,
+			'shared control root resolves a parent directory alias');
+		is($pair->shared_data_root, $canonical,
+			'shared data accessor keeps the same canonical root');
+		my ($hw_root) = grep { /^--pgrac-hw-snapshot-root=/ } @{$pair->node0->{init_extra}};
+		is($hw_root, "--pgrac-hw-snapshot-root=$canonical",
+			'initdb receives the canonical root required by its creator contract');
+		my $wal_root = abs_path($pair->wal_threads_root);
+		is($pair->wal_threads_root, $wal_root,
+			'WAL accessor resolves the same parent directory alias');
+		my ($wal_arg) = grep { /^--pgrac-wal-state-root=/ } @{$pair->node0->{init_extra}};
+		is($wal_arg, "--pgrac-wal-state-root=$wal_root",
+			'initdb receives the canonical WAL state root');
+		is($pair->node0->{init_extra}->[1], "$wal_root/thread_1",
+			'initdb WAL directory uses the canonical WAL state root');
 	}
 }
 
