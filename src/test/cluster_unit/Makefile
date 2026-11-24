@@ -20277,3 +20277,67 @@ test_cluster_clog_storage test_cluster_clog_write test_cluster_clog_initialize \
 	$(top_srcdir)/src/include/access/clog_file.h \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
 	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
+# CLOG page/WAL dependency snapshot through the complete native SLRU writer.
+TESTS += test_cluster_clog_write_snapshot
+all: test_cluster_clog_write_snapshot
+test_cluster_clog_write_snapshot: test_cluster_clog_write_snapshot.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# Managed SLRU state transitions with the actual WAL-first CLOG writer.
+TESTS += test_cluster_slru_clog_managed_write
+all: test_cluster_slru_clog_managed_write
+test_cluster_slru_clog_managed_write: test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/access/clog_wal.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+clean: clean-slru-clog-managed-write
+.PHONY: clean-slru-clog-managed-write
+clean-slru-clog-managed-write:
+	rm -f test_cluster_slru_clog_managed_write test_cluster_slru_clog_managed_write.d
+
+clean: clean-clog-write-snapshot
+.PHONY: clean-clog-write-snapshot
+clean-clog-write-snapshot:
+	rm -f test_cluster_clog_write_snapshot test_cluster_clog_write_snapshot.d
+
+# These executable recipes include complete SLRU and physical writer bodies.
+test_cluster_clog_write_snapshot test_cluster_slru_clog_managed_write: \
+	$(top_srcdir)/src/include/access/transam.h \
+	$(top_srcdir)/src/include/access/slrudefs.h \
+	$(top_srcdir)/src/include/access/xlog.h \
+	$(top_srcdir)/src/include/access/xloginsert.h \
+	$(top_srcdir)/src/include/access/xlogutils.h \
+	$(top_srcdir)/src/include/miscadmin.h \
+	$(top_srcdir)/src/include/storage/proc.h \
+	$(top_srcdir)/src/include/storage/fd.h \
+	$(top_srcdir)/src/include/cluster/cluster_guc.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
+
+# SUBTRANS fixtures include SLRU directly and share its private write signature.
+test_cluster_subtrans_durability test_cluster_subtrans_order: \
+	$(top_srcdir)/src/include/access/slru.h \
+	$(top_srcdir)/src/include/access/clog_file.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h
