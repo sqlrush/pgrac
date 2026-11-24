@@ -52,13 +52,6 @@ UT_DEFINE_GLOBALS();
 volatile uint32 InterruptHoldoffCount;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
-#ifndef CLUSTER_XID_RETENTION_TEST
-void
-pg_re_throw(void)
-{
-	abort();
-}
-#endif
 XidStatus
 TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 {
@@ -118,6 +111,44 @@ static bool real_stripe, stripe_lock_held, stripe_quorum;
 static LWLock *stripe_lock;
 static uint64 stripe_incarnation;
 static FullTransactionId real_reserved_candidate;
+#ifndef XID_ALLOCATION_EXTENDED
+#define XID_ALLOCATION_EXTENDED() ((void)0)
+#endif
+#ifndef XID_ALLOCATION_WAITED
+#define XID_ALLOCATION_WAITED() ((void)0)
+#endif
+#ifndef XID_ALLOCATION_RAW_CLOG
+#define XID_ALLOCATION_RAW_CLOG(xid) ((void)0)
+#endif
+#ifndef XID_ALLOCATION_ALLOW_ERROR_WAIT
+#define XID_ALLOCATION_ALLOW_ERROR_WAIT false
+#endif
+
+#ifndef CLUSTER_XID_RETENTION_TEST
+void
+pg_re_throw(void)
+{
+#ifdef XID_ALLOCATION_CLOG_PROVIDED
+	if (PG_exception_stack)
+		siglongjmp(*PG_exception_stack, 1);
+	if (allocation_error_expected)
+		siglongjmp(allocation_error_env, 1);
+#endif
+	abort();
+}
+#endif
+/* Old fixtures have no selected native directory; unexpected preparation is fatal. */
+#ifndef XID_ALLOCATION_CLOG_PROVIDED
+bool CLOGAllocationRequired(void) { return false; }
+bool CLOGAllocationRangeReady(FullTransactionId first, FullTransactionId last,
+	ClusterClogAllocationV2 **state) { abort(); }
+void CLOGPrepareForAllocation(FullTransactionId first, FullTransactionId last,
+	ClusterClogAllocationV2 **state) { abort(); }
+void CLOGFinishAllocation(ClusterClogAllocationV2 **state) { abort(); }
+#endif
+/* The production wrapper calls these only for a selected native directory. */
+void *palloc0(Size bytes) { void *p = calloc(1, bytes); if (!p) abort(); return p; }
+void pfree(void *p) { free(p); }
 
 #define proc entries[0]
 #ifdef TEST_CLUSTER_XID_NATIVE_CLOG
@@ -370,7 +401,7 @@ cluster_xid_stripe_wait_lease(FullTransactionId candidate)
 	waits++;
 	/* A refusal test must never reach this boundary. Stop a parent's mock
 	 * wait with a distinct marker, not a synthetic product ERROR/success. */
-	if (allocation_error_expected)
+	if (allocation_error_expected && !XID_ALLOCATION_ALLOW_ERROR_WAIT)
 		siglongjmp(allocation_error_env, 2);
 	if (held)
 		lock_errors++;
@@ -379,10 +410,12 @@ cluster_xid_stripe_wait_lease(FullTransactionId candidate)
 	limit_full = 8196;
 	if (advance_while_unlocked)
 		variables.nextXid = FullTransactionIdFromU64(2084);
+	XID_ALLOCATION_WAITED();
 }
 static void
 extended(void)
 {
+	XID_ALLOCATION_EXTENDED();
 	extensions++;
 	if (cluster_shared_catalog && (real_stripe
 		? !FullTransactionIdIsValid(real_reserved_candidate)
@@ -398,6 +431,7 @@ extended(void)
 void
 ExtendCLOG(TransactionId xid)
 {
+	XID_ALLOCATION_RAW_CLOG(xid);
 	if (full_clog_fixture.active)
 		full_clog_fixture.raw_calls++;
 	extended();
@@ -441,7 +475,11 @@ errstart(int level, const char *domain)
 {
 	if (full_clog_fixture.expect_error)
 		longjmp(full_clog_fixture.error, 1);
-	if (!allocation_error_expected || level != ERROR)
+	if (!allocation_error_expected || (level != ERROR
+#ifdef XID_ALLOCATION_CLOG_PROVIDED
+		&& level != PANIC
+#endif
+		))
 		abort();
 	return true;
 }
@@ -466,6 +504,10 @@ errfinish(const char *file, int line, const char *function)
 	if (!allocation_error_expected)
 		abort();
 	allocation_errors++;
+#ifdef XID_ALLOCATION_CLOG_PROVIDED
+	if (PG_exception_stack)
+		siglongjmp(*PG_exception_stack, 1);
+#endif
 	siglongjmp(allocation_error_env, 1);
 }
 

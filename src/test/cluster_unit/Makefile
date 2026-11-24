@@ -14464,14 +14464,14 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 		$(top_srcdir)/src/backend/storage/ipc/procarray.c Makefile
 	awk '/^typedef struct RelmapXidAllocationV2 / { emit=1; types++ } \
 	     /^(publish_new_transaction_id|relmap_xid_publication|relmap_xid_candidate_check)\(/ { print "static void"; emit=1; found++ } \
-	     /^get_new_transaction_id\(/ { print "static FullTransactionId"; emit=1; found++ } \
+	     /^(GetNewTransactionIdCandidate|get_new_transaction_id(_internal)?)\(/ { print "static FullTransactionId"; emit=1; found++ } \
 	     /^(GetNewTransactionId(FullCLOG)?|cluster_relmap_retention_allocate_xid_v2)\(/ { print "FullTransactionId"; emit=1; found++ } \
 	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
 	     /^ProcArrayGetActiveFullXidSample\(/ { print "bool"; emit=1; found++ } \
 	     /^MarkAsPreparingGuts\(/ { print "static void"; emit=1; found++ } \
 	     /^ProcArrayClearTransaction\(/ { print "void"; emit=1; found++ } \
 	     /^ProcArrayEndTransactionInternal\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (types != 1 || found != 13) exit 1 }' $(filter %.c,$^) > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (types != 1 || found != 15) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_xid_allocation_stripe.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
@@ -20710,3 +20710,44 @@ test_cluster_clog_native_birth: test_cluster_clog_native_birth.c unit_test.h \
 clean: clean-clog-native-birth
 clean-clog-native-birth:
 	rm -f test_cluster_clog_native_birth test_cluster_clog_native_birth.d
+
+# Complete allocator gap and successor selection; retain the current allocator's closure.
+TESTS += test_cluster_xid_clog_preparation
+all: test_cluster_xid_clog_preparation
+test_cluster_xid_clog_preparation: test_cluster_xid_clog_preparation.c \
+		test_cluster_xid_allocation.c test_cluster_xid_allocation unit_test.h \
+		$(top_srcdir)/src/include/access/clog.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_clog_allocation_prepare.inc: $(top_srcdir)/src/backend/access/transam/clog.c Makefile
+	awk '/^#define CLOG_(BITS_PER_XACT|XACTS_PER_BYTE|XACTS_PER_PAGE)[ \t]/ { print; constants++ } \
+	     /^struct ClusterClogAllocationV2 / { emit=1; types++ } \
+	     /^CLOG(NativeIORequired|AllocationSegments|AllocationPresence)\(/ { print "static bool"; emit=1; found++ } \
+	     /^CLOG(AllocationRequired|AllocationRangeReady)\(/ { print "bool"; emit=1; found++ } \
+	     /^CLOG(FinishAllocation|PrepareForAllocation)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 7 || types != 1 || constants != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+TESTS += test_cluster_clog_allocation_prepare
+all: test_cluster_clog_allocation_prepare
+test_cluster_clog_allocation_prepare: test_cluster_clog_allocation_prepare.c \
+		test_cluster_xid_allocation.c test_cluster_xid_allocation unit_test.h test_cluster_xid_allocation.inc \
+		test_cluster_xid_allocation_stripe.inc test_cluster_pgproc_active_types.inc \
+		test_cluster_clog_allocation_prepare.inc $(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/cluster/cluster_cf_enqueue.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_file_identity.h \
+		$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+clean: clean-clog-allocation-prepare
+.PHONY: clean-clog-allocation-prepare
+clean-clog-allocation-prepare:
+	rm -f test_cluster_clog_allocation_prepare test_cluster_clog_allocation_prepare.d \
+		test_cluster_clog_allocation_prepare.inc test_cluster_clog_allocation_prepare.inc.tmp

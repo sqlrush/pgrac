@@ -84,6 +84,33 @@
 VariableCache ShmemVariableCache = NULL;
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* Read-only prediction. Both initial selection and reentry after dropping
+ * XidGenLock use the original counter and the same durable stripe floors.
+ * The caller retains all window, epoch, finite-identity and lease gates. */
+static FullTransactionId
+GetNewTransactionIdCandidate(FullTransactionId next_xid, bool *striped)
+{
+	int			stripe_slot = cluster_xid_allocation_slot();
+
+	*striped = stripe_slot >= 0;
+	if (*striped)
+	{
+		FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
+		FullTransactionId herd_floor = cluster_xid_stripe_herding_floor();
+
+		next_xid = cluster_xid_next_striped_full(next_xid, stripe_slot);
+		if (FullTransactionIdIsValid(slot_floor)
+			&& FullTransactionIdPrecedes(next_xid, slot_floor))
+			next_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
+		if (FullTransactionIdIsValid(herd_floor)
+			&& FullTransactionIdPrecedes(next_xid, herd_floor))
+			next_xid = cluster_xid_next_striped_full(herd_floor, stripe_slot);
+	}
+	return next_xid;
+}
+#endif
+
 /* PGRAC: private request for the dormant original allocator entry. */
 typedef struct RelmapXidAllocationV2 {
 	uint64 system_identifier;
@@ -241,13 +268,16 @@ relmap_xid_candidate_check(const RelmapXidAllocationV2 *allocation,
  * issue a warning about XID wrap.
  */
 static FullTransactionId
-get_new_transaction_id(bool isSubXact, RelmapXidAllocationV2 *allocation, bool full_clog)
+get_new_transaction_id_internal(bool isSubXact, RelmapXidAllocationV2 *allocation,
+	bool full_clog, ClusterClogAllocationV2 **clog, bool *lease_effect)
 {
 	FullTransactionId full_xid;
 	TransactionId xid;
 
 #ifndef USE_PGRAC_CLUSTER
 	(void)allocation;
+	(void)clog;
+	(void)lease_effect;
 #endif
 
 	/*
@@ -302,27 +332,12 @@ retry_cluster_xid_reservation:
 	 * and this block is a no-op (byte-identical vanilla behaviour).
 	 */
 	{
-		int			stripe_slot = cluster_xid_allocation_slot();
+		bool striped_candidate;
 
-		if (stripe_slot >= 0)
+		full_xid = GetNewTransactionIdCandidate(full_xid, &striped_candidate);
+		xid = XidFromFullTransactionId(full_xid);
+		if (striped_candidate)
 		{
-			FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
-			FullTransactionId herd_floor = cluster_xid_stripe_herding_floor();
-
-			full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
-			/* D5e/D0-F2: never issue below the durable per-slot floor
-			 * (external rewinds only — pg_resetwal below the floor). */
-			if (FullTransactionIdIsValid(slot_floor)
-				&& FullTransactionIdPrecedes(full_xid, slot_floor))
-				full_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
-			/* D3: never issue below the armed herding promise (the
-			 * observe-and-jump lands here — the jump abandons only
-			 * never-issued in-class positions, pure slack). */
-			if (FullTransactionIdIsValid(herd_floor)
-				&& FullTransactionIdPrecedes(full_xid, herd_floor))
-				full_xid = cluster_xid_next_striped_full(herd_floor, stripe_slot);
-			xid = XidFromFullTransactionId(full_xid);
-
 			/*
 			 * D3 window hard limit (spec §3.3): if this candidate runs
 			 * ahead of the slowest active slot's published hwm by more
@@ -456,27 +471,12 @@ retry_cluster_xid_reservation:
 		xid = XidFromFullTransactionId(full_xid);
 
 #ifdef USE_PGRAC_CLUSTER
-		/* PGRAC: spec-6.15 D1 -- re-derive the striped candidate from the
-		 * re-read nextXid (mirrors the derivation at the top). */
+		/* Reentry reads the original counter and both current floors. */
 		{
-			int			stripe_slot = cluster_xid_allocation_slot();
+			bool striped_candidate;
 
-			if (stripe_slot >= 0)
-			{
-				FullTransactionId slot_floor = cluster_xid_stripe_my_slot_floor();
-				FullTransactionId herd_floor = cluster_xid_stripe_herding_floor();
-
-				full_xid = cluster_xid_next_striped_full(full_xid, stripe_slot);
-				/* D5e/D0-F2 + D3: same floor clamps as the first
-				 * derivation (the hard-limit refusal already ran). */
-				if (FullTransactionIdIsValid(slot_floor)
-					&& FullTransactionIdPrecedes(full_xid, slot_floor))
-					full_xid = cluster_xid_next_striped_full(slot_floor, stripe_slot);
-				if (FullTransactionIdIsValid(herd_floor)
-					&& FullTransactionIdPrecedes(full_xid, herd_floor))
-					full_xid = cluster_xid_next_striped_full(herd_floor, stripe_slot);
-				xid = XidFromFullTransactionId(full_xid);
-			}
+			full_xid = GetNewTransactionIdCandidate(full_xid, &striped_candidate);
+			xid = XidFromFullTransactionId(full_xid);
 		}
 
 		/* PGRAC: GCS-race round-3 P0-1 — re-assert the wrap-barrier gate on
@@ -507,6 +507,20 @@ retry_cluster_xid_reservation:
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("refusing to assign a new transaction ID: cluster full transaction identity is exhausted or invalid")));
 
+	/* Complete selected gap and both successors before lease or SLRU effects.
+	 * Control registration never runs while the issuer lock is held. */
+	if (clog && !CLOGAllocationRangeReady(ShmemVariableCache->nextXid, full_xid, clog))
+	{
+		FullTransactionId first = ShmemVariableCache->nextXid;
+
+		LWLockRelease(XidGenLock);
+		if (*lease_effect)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("CLOG allocation range changed after a stripe lease request")));
+		CLOGPrepareForAllocation(first, full_xid, clog);
+		goto retry_cluster_xid_reservation;
+	}
+
 	/* PGRAC: consume a majority-durable stripe reservation before SLRU or
 	 * ProcArray mutation. QVOTEC may need XidGenLock to observe nextXid;
 	 * wait outside the lock, then rederive all candidates and limits.
@@ -515,9 +529,14 @@ retry_cluster_xid_reservation:
 		&& !cluster_xid_stripe_lease_ready(full_xid))
 	{
 		LWLockRelease(XidGenLock);
+		if (lease_effect)
+			*lease_effect = true;
 		cluster_xid_stripe_wait_lease(full_xid);
 		goto retry_cluster_xid_reservation;
 	}
+	if (clog && !CLOGAllocationRangeReady(ShmemVariableCache->nextXid, full_xid, clog))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("CLOG allocation identity changed before storage extension")));
 #endif
 
 	/*
@@ -604,6 +623,37 @@ retry_cluster_xid_reservation:
 	LWLockRelease(XidGenLock);
 
 	return full_xid;
+}
+
+/* Keep each original caller's raw/FULL route and retained publication owner.
+ * Per-call selected identities survive through the original ProcArray stores. */
+static FullTransactionId
+get_new_transaction_id(bool isSubXact, RelmapXidAllocationV2 *allocation, bool full_clog)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (!IsBootstrapProcessingMode() && CLOGAllocationRequired())
+	{
+		struct AllocationWork {
+			ClusterClogAllocationV2 *clog;
+			bool lease_effect;
+		} *work = palloc0(sizeof(*work));
+		FullTransactionId result = InvalidFullTransactionId;
+
+		PG_TRY();
+		{
+			result = get_new_transaction_id_internal(isSubXact, allocation, full_clog,
+				&work->clog, &work->lease_effect);
+		}
+		PG_FINALLY();
+		{
+			CLOGFinishAllocation(&work->clog);
+			pfree(work);
+		}
+		PG_END_TRY();
+		return result;
+	}
+#endif
+	return get_new_transaction_id_internal(isSubXact, allocation, full_clog, NULL, NULL);
 }
 
 /* Preserve the ordinary entry: v2 has no live allocator consumer. */

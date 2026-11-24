@@ -14,6 +14,12 @@
 #define TEST_CLUSTER_RECOVERY_EPISODE_ALLOCATOR_NAMESPACE_H
 #include "pg_config.h"
 /* Current C allocator providers remain private beside the recovery fixture. */
+#define CLOGAllocationRequired d3_episode_allocator_CLOGAllocationRequired
+#define CLOGAllocationRangeReady d3_episode_allocator_CLOGAllocationRangeReady
+#define CLOGPrepareForAllocation d3_episode_allocator_CLOGPrepareForAllocation
+#define CLOGFinishAllocation d3_episode_allocator_CLOGFinishAllocation
+#define palloc0 d3_episode_allocator_palloc0
+#define pfree d3_episode_allocator_pfree
 #define InterruptHoldoffCount d3_episode_allocator_InterruptHoldoffCount
 #define IsPostmasterEnvironment d3_episode_allocator_IsPostmasterEnvironment
 #define LWLockHeldByMe d3_episode_allocator_LWLockHeldByMe
