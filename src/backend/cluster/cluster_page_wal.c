@@ -478,7 +478,8 @@ cluster_page_wal_prepare_input_install_v1(BufferDesc *buf,
 		&& INPUT_OBSERVE(pending->buffer_type == BUF_TYPE_CURRENT && buf->buffer_type == pending->buffer_type)
 		&& INPUT_OBSERVE(pending->flags == PCM_OWN_FLAG_GRANT_PENDING && cluster_pcm_own_flags_get(buf->buf_id) == pending->flags)
 		&& INPUT_OBSERVE(pending->reservation_token != 0 && pending->reservation_token < UINT64_MAX - 1)
-		&& page_wal_input_observe("pending->generation != 0", pending->generation, 0, pending->generation != 0)
+		/* An initial fill still has generation zero until native completion.
+		 * Its exact reservation and delivery attempt below bind this input. */
 		&& INPUT_OBSERVE(pending->generation < UINT64_MAX - 1)
 		&& INPUT_OBSERVE(pending->writer_activation_token == 0 && pending->resource_x_activation_generation == 0)
 		&& INPUT_OBSERVE(BufferTagsEqual(&pending->tag, &buf->tag))

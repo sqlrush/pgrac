@@ -17,6 +17,16 @@
 #include "test_cluster_native_disk_episode_fixture.inc"
 #include "cluster/cluster_space_reservation.h"
 
+/* Observation stays off in this fixture; the real WAL consumer still links
+ * its diagnostic leaf without substituting its installation decisions. */
+int
+errdetail_internal(const char *fmt, ...)
+{
+	(void)fmt;
+	UT_ASSERT(!cluster_trace_tx_identity);
+	return 0;
+}
+
 /* The product WAL sidecar uses the same actual descriptor as the native
  * episode; only this fixture's one-buffer address is supplied here. */
 uint32
@@ -410,6 +420,51 @@ UT_TEST(test_image_episode_input_WAL_fence_does_not_reuse_resident_API)
 	LWLockRelease(BufferDescriptorGetContentLock(&request_buf));
 	UT_ASSERT_EQ(complete_commits + disk_reads, 0);
 }
+/* A never-filled native descriptor has generation zero. This exercises the
+ * real WAL input consumer with the same exact reservation and delivery hold. */
+UT_TEST(test_image_episode_input_WAL_accepts_exact_initial_generation)
+{
+	EvidenceFixture f;
+	ClusterPcmOwnSnapshot pending;
+	ClusterPageWalInstallV1 prep = {0};
+
+	UT_ASSERT(im_start(&f, 2, 0));
+	pending = request_base;
+	pending.generation = 0;
+	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	pending.reservation_token = prepared_episode.reservation_token;
+	pg_atomic_write_u64(&request_own.generation, 0);
+	LWLockAcquire(BufferDescriptorGetContentLock(&request_buf), LW_EXCLUSIVE);
+	UT_ASSERT(cluster_page_wal_prepare_input_install_v1(&request_buf, &pending, 1,
+		&im_wal, im_expected.data, &prep));
+	cluster_page_wal_release_install_v1(&prep);
+	LWLockRelease(BufferDescriptorGetContentLock(&request_buf));
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(0), 0);
+	UT_ASSERT_EQ(complete_commits + disk_reads, 0);
+}
+
+UT_TEST(test_image_episode_input_WAL_initial_generation_still_requires_exact_fence)
+{
+	for (unsigned field = 0; field < 3; field++) {
+		EvidenceFixture f;
+		ClusterPcmOwnSnapshot pending;
+		ClusterPageWalInstallV1 prep = {0};
+		UT_ASSERT(im_start(&f, 2, 0));
+		pending = request_base;
+		pending.generation = 0;
+		pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
+		pending.reservation_token = prepared_episode.reservation_token;
+		pg_atomic_write_u64(&request_own.generation, 0);
+		if (field == 0) pg_atomic_write_u64(&request_own.generation, 1);
+		if (field == 1) pending.reservation_token++;
+		if (field == 2) pg_atomic_write_u64(&request_own.delivery_attempt, 2);
+		LWLockAcquire(BufferDescriptorGetContentLock(&request_buf), LW_EXCLUSIVE);
+		UT_ASSERT(!cluster_page_wal_prepare_input_install_v1(&request_buf, &pending, 1,
+			&im_wal, im_expected.data, &prep));
+		LWLockRelease(BufferDescriptorGetContentLock(&request_buf));
+	}
+}
+
 UT_TEST(test_image_episode_input_WAL_rejects_changed_fence_and_odd_write)
 {
 	for (unsigned n = 0; n < 7; n++) {
@@ -483,7 +538,7 @@ UT_TEST(test_image_episode_FATAL_after_WAL_preparation_releases_inner_scope_firs
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(test_image_episode_S_and_X_sources_copy_commit_and_handoff_once);
 	UT_RUN(test_image_episode_memory_checksum_is_not_a_disk_checksum);
 	UT_RUN(test_image_episode_ACK_and_real_callback_end_only_original_notice);
@@ -502,6 +557,8 @@ main(void)
 	UT_RUN(test_image_episode_callback_failure_and_wrong_ACK_keep_original_debt);
 	UT_RUN(test_image_episode_foreign_WAL_is_installed_with_memory_bytes);
 	UT_RUN(test_image_episode_input_WAL_fence_does_not_reuse_resident_API);
+	UT_RUN(test_image_episode_input_WAL_accepts_exact_initial_generation);
+	UT_RUN(test_image_episode_input_WAL_initial_generation_still_requires_exact_fence);
 	UT_RUN(test_image_episode_input_WAL_rejects_changed_fence_and_odd_write);
 	UT_RUN(test_image_episode_ERROR_after_WAL_preparation_returns_original_pool_reference);
 	UT_RUN(test_image_episode_FATAL_after_WAL_preparation_releases_inner_scope_first);
