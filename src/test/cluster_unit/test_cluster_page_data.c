@@ -591,6 +591,25 @@ RecoveryInProgress(void)
 {
 	return false;
 }
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+/* Normal-start classification is an explicit input of these DATA fixtures.
+ * They run on the ordinary target OPEN path unless a case closes the gate;
+ * the writeback fixture supplies its own controllable classification. */
+static ClusterNormalStartState page_data_start_state = CLUSTER_NORMAL_START_TARGET_READY;
+static bool page_data_recovered_open = true;
+
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return page_data_start_state;
+}
+
+bool
+cluster_semantic_activation_recovered_open_current(void)
+{
+	return page_data_recovered_open;
+}
+#endif
 bool cluster_recmerge_window_active;
 bool cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
@@ -1603,6 +1622,37 @@ ordinary_flush_attempt_tracks_actual_data_submission(void)
 	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
 	UT_ASSERT(!attempted); /* An already clean page contributes no new write. */
 	UT_ASSERT_EQ(writes, 1);
+	locks[0] = locks[1] = false;
+	pins[1] = 0;
+	clean();
+}
+
+/* An existing-other start keeps the ordinary flush closed until its recovered
+ * OPEN cut is current.  A closed gate starts no I/O and leaves the page dirty. */
+static void
+ordinary_flush_stays_closed_until_recovered_open(void)
+{
+	BufferDesc *buf;
+	volatile bool attempted = false;
+
+	reset();
+	buf = &descriptors[1].bufferdesc;
+	pins[1] = 1;
+	locks[0] = locks[1] = true;
+	page_data_start_state = CLUSTER_NORMAL_START_EXISTING_OTHER;
+	page_data_recovered_open = false;
+	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
+	UT_ASSERT(!attempted);
+	UT_ASSERT(pg_atomic_read_u32(&buf->state) & BM_DIRTY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & BM_IO_IN_PROGRESS, 0);
+	UT_ASSERT_EQ(writes + wal_flushes + syncs, 0);
+	page_data_recovered_open = true;
+	FlushBufferWithAttempt(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL, &attempted);
+	UT_ASSERT(attempted);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(wal_flushes, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & (BM_DIRTY | BM_IO_IN_PROGRESS), 0);
+	page_data_start_state = CLUSTER_NORMAL_START_TARGET_READY;
 	locks[0] = locks[1] = false;
 	pins[1] = 0;
 	clean();
@@ -5775,7 +5825,7 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(88);
+	UT_PLAN(89);
 	UT_RUN(receipt_rebuild_closed_identity_refuses_before_observation);
 	UT_RUN(receipt_rebuild_owns_allocation_and_publication);
 	UT_RUN(receipt_rebuild_allocation_error_releases_only_its_call);
@@ -5785,6 +5835,7 @@ main(void)
 	UT_RUN(receipt_allocation_error_ends_call_without_output);
 	UT_RUN(receipt_cleanup_error_keeps_unknown_call_owned);
 	UT_RUN(ordinary_flush_attempt_tracks_actual_data_submission);
+	UT_RUN(ordinary_flush_stays_closed_until_recovered_open);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
 	UT_RUN(structural_remote_notice_uses_actual_plan_and_peer_physical_owner);
