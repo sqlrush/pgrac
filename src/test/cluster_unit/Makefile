@@ -20935,3 +20935,26 @@ clean-native-creation-startup:
 	rm -f test_cluster_native_creation_startup test_cluster_native_creation_startup.d \
 		test_cluster_native_creation_check.inc test_cluster_native_creation_dispatch.inc \
 		test_cluster_native_creation_check.inc.tmp test_cluster_native_creation_dispatch.inc.tmp
+
+# Real R4 holder step and scratch HOT walker over fixture-built page/undo
+# shapes; pruning eligibility, record I/O and tuple visibility are controlled.
+TESTS += test_cluster_r4_hot_prune_ahead
+all: test_cluster_r4_hot_prune_ahead
+test_cluster_r4_hot_prune_ahead: test_cluster_r4_hot_prune_ahead.c unit_test.h \
+		test_cluster_heap_cr_reuse_scratch.inc \
+		$(top_srcdir)/src/backend/access/heap/heapam_r4_private.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UBA_O) $(CLUSTER_CR_APPLY_O) \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) \
+		$(CLUSTER_R4_CR_WALK_TEST_O) $(CLUSTER_R4_MULTI_RESOLVE_TEST_O) \
+		cluster_unit_port_stubs.o cluster_catalog_trace_test.o cluster_undo_capacity_unit.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UBA_O) $(CLUSTER_CR_APPLY_O) \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) \
+		$(CLUSTER_R4_CR_WALK_TEST_O) $(CLUSTER_R4_MULTI_RESOLVE_TEST_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+.PHONY: clean-r4-hot-prune-ahead
+clean: clean-r4-hot-prune-ahead
+clean-r4-hot-prune-ahead:
+	rm -f test_cluster_r4_hot_prune_ahead test_cluster_r4_hot_prune_ahead.d
