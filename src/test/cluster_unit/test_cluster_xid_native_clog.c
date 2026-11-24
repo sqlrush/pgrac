@@ -25,6 +25,15 @@ static TransactionId native_terminal_xid;
 static XidNativeClogTerminalFault native_terminal_fault;
 static void (*native_terminal_sync_hook)(void);
 
+/* This original raw FULL fixture has no selected managed file table and
+ * does not inherit the allocator test's online cluster-enabled flag. */
+bool cluster_enabled;
+ClusterControlNativeModeV2
+cluster_control_native_files_mode_v2(void)
+{
+	return CLUSTER_NATIVE_FILES_UNKNOWN_V2;
+}
+
 /* This write-only fixture does not lend authority to unused observers. */
 bool cluster_wal_inputs_relmap_source_current_v1(const ClusterRecoveryRelmapSourceV1 *s)
 { (void)s; return false; }

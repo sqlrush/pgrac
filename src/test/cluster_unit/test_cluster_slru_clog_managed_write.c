@@ -576,7 +576,10 @@ UT_TEST(managed_read_cannot_retain_an_unrelated_native_birth)
 }
 #endif
 
-int main(void)
+#ifndef CLOG_MANAGED_MAIN
+#define CLOG_MANAGED_MAIN main
+#endif
+int CLOG_MANAGED_MAIN(void)
 {
 	strlcpy(directory, "/tmp/pgrac-slru-managed-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();
