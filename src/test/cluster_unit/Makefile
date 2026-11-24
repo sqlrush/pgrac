@@ -8195,7 +8195,10 @@ test_cluster_subtrans_order: test_cluster_subtrans_order.c unit_test.h test_clus
 # PGRAC: actual native startup/trim, explicit memory SLRU boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_clog_startup: test_cluster_clog_startup.c unit_test.h \
-		$(top_srcdir)/src/backend/access/transam/clog.c
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/cluster/cluster_native_startup.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -20648,3 +20651,31 @@ clean-clog-native-transam:
 	rm -f test_cluster_clog_native_transam test_cluster_clog_native_transam.d
 clean: clean-clog-native-transam
 .PHONY: clean-clog-native-transam
+
+# Original Startup exact FullXid trim, whole current CLOG/SLRU/file writers.
+TESTS += test_cluster_clog_native_trim
+all: test_cluster_clog_native_trim
+test_cluster_clog_native_trim: test_cluster_clog_native_trim.c unit_test.h \
+		test_cluster_slru_clog_managed_write test_cluster_slru_clog_managed_write.c \
+		test_cluster_clog_write_snapshot.c \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/cluster/cluster_native_startup.h \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+.PHONY: clean-clog-native-trim
+clean: clean-clog-native-trim
+clean-clog-native-trim:
+	rm -f test_cluster_clog_native_trim test_cluster_clog_native_trim.d

@@ -26,6 +26,21 @@ UT_DEFINE_GLOBALS();
 bool cluster_shared_config;
 bool InRecovery;
 BackendType MyBackendType;
+/* This legacy fixture owns no managed table or managed ERROR cleanup. */
+bool cluster_enabled;
+bool enableFsync;
+bool IsUnderPostmaster;
+bool IsPostmasterEnvironment;
+ProcessingMode Mode;
+volatile uint32 InterruptHoldoffCount;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void pg_re_throw(void) { abort(); }
+ClusterControlNativeModeV2
+cluster_control_native_files_mode_v2(void)
+{
+	return CLUSTER_NATIVE_FILES_UNKNOWN_V2;
+}
 static VariableCacheData variables;
 VariableCache ShmemVariableCache = &variables;
 static LWLockPadded locks[128];
