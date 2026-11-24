@@ -730,6 +730,16 @@ typedef struct ClusterColdCtrcPageProgressV1 {
 
 /* Input identity for the original post-EOR attempt. Old subject identities
  * stay in inputs; writer is a separate, actual installed successor. */
+/* Owned process-local protection credential. The original Start owns all
+ * sources and replay inputs; this adds no purpose, scope or native holder. */
+struct ClusterRecoveryDebtStartV2 {
+	const struct ClusterRecoveryStartV1 *start;
+	ClusterControlRelmapSelectionV2 *selection;
+	ClusterControlRelmapReferenceV2 baseline;
+	uint64 cf_sequence;
+	bool entered, ready, failed;
+};
+
 struct ClusterRecoveryStartV1 {
 	const ClusterColdTypedV1 *inputs;
 	const ClusterColdTopTxCensusV1 *census;
@@ -750,6 +760,7 @@ struct ClusterRecoveryStartV1 {
 	/* Original Start selection, retained after its narrow CF is released. */
 	bool managed_relmap_table;
 	ClusterControlNativeTableInfoV2 relmap_table;
+	ClusterRecoveryDebtStartV2 debt_start;
 	bool ctrc_observation_started, ctrc_observation_complete;
 	bool ctrc_page_plan_started;
 	RfPageOnlinePlanV1 *ctrc_page_plan;
@@ -1568,6 +1579,121 @@ cluster_recovery_cold_page_plan_current(const struct ClusterRecoveryStartV1 *sta
 	return cluster_recovery_cold_ctrc_replays_current(start, work, scope)
 		&& cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
 		&& cluster_recovery_cold_ctrc_replays_current(start, work, scope);
+}
+
+/* Protecting an existing episode is distinct from completing it. Borrow only
+ * the exact original selection after all replay-input holders are authorized;
+ * neither a saved table nor TxCurrent alone proves those native IR holders. */
+bool
+ClusterColdRecoveryDebtControlCurrentV2(const struct ClusterRecoveryStartV1 *start,
+	ClusterControlRelmapSelectionV2 *selection)
+{
+	ClusterControlRelmapReferenceV2 selected, confirmed;
+	ClusterControlNativeTableInfoV2 table, original;
+	struct ClusterWalInputsV1 *scope;
+	uint64 sequence;
+
+	if (selection == NULL || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| !ClusterColdRecoveryTxCurrent(start) || !start->effects_fixed
+		|| !start->managed_relmap_table || !start->ctrc_observation_complete)
+		return false;
+	sequence = cluster_cf_attempt_sequence();
+	scope = ClusterColdRecoveryCtrcScope(start, start->ctrc_observation_work);
+	if (scope == NULL || !cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+		|| !cluster_recovery_cold_ctrc_replays_current(start, start->ctrc_observation_work, scope)
+		|| !cluster_control_native_files_info_v2(&table))
+		return false;
+	original = start->relmap_table;
+	original.borrowed = table.borrowed = 0;
+	if (memcmp(&table, &original, sizeof(table)) != 0
+		|| !cluster_control_root_relmap_selection_reference_v4(selection, &selected)
+		|| memcmp(&selected.config, &original.control.config, sizeof(selected.config)) != 0
+		|| memcmp(selected.root_pair_sha256, original.control.root_pair_sha256, 32) != 0
+		|| memcmp(selected.registry_reference, original.control.registry_reference, 128) != 0
+		|| selected.logical_count != original.control.logical_count
+		|| selected.source_count != original.control.source_count
+		|| cluster_control_root_relmap_selection_recheck_locked_v4(selection)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+		|| !cluster_recovery_cold_ctrc_replays_current(start, start->ctrc_observation_work, scope)
+		|| !cluster_control_native_files_info_v2(&table))
+		return false;
+	table.borrowed = 0;
+	return memcmp(&table, &original, sizeof(table)) == 0
+		&& cluster_control_root_relmap_selection_reference_v4(selection, &confirmed)
+		&& memcmp(&selected, &confirmed, sizeof(selected)) == 0
+		&& cluster_cf_held_is_clusterwide(ExclusiveLock)
+		&& sequence == cluster_cf_attempt_sequence()
+		&& cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+		&& cluster_recovery_cold_ctrc_replays_current(start, start->ctrc_observation_work, scope);
+}
+
+bool
+ClusterColdRecoveryDebtBeginV2(const struct ClusterRecoveryStartV1 *start,
+	ClusterControlRelmapSelectionV2 *selection, ClusterRecoveryDebtStartV2 **out)
+{
+	struct ClusterRecoveryStartV1 *state;
+	ClusterRecoveryDebtStartV2 *credential;
+	volatile bool accepted = false;
+
+	/* Pure extent checks precede dereferencing any borrowed output. */
+	if (start == NULL || start != cluster_recovery_cold_start || selection == NULL
+		|| !ClusterColdRecoveryStartOutputDistinct(start, out, sizeof(*out))
+		|| !cluster_control_root_relmap_selection_output_distinct_v4(selection, out, sizeof(*out))
+		|| *out != NULL || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return false;
+	state = cluster_recovery_cold_start;
+	credential = &state->debt_start;
+	if (credential->entered)
+		return false;
+	/* Before any fallible source/control callback. No storage or protection
+	 * is released on failure; the same Start cannot start another attempt. */
+	credential->entered = true;
+	credential->start = start;
+	credential->selection = selection;
+	credential->cf_sequence = cluster_cf_attempt_sequence();
+	PG_TRY();
+	{
+		accepted = credential->cf_sequence != 0
+			&& ClusterColdRecoveryDebtControlCurrentV2(start, selection)
+			&& cluster_control_root_relmap_selection_reference_v4(selection, &credential->baseline)
+			&& credential->cf_sequence == cluster_cf_attempt_sequence()
+			&& ClusterColdRecoveryDebtControlCurrentV2(start, selection);
+	}
+	PG_CATCH();
+	{
+		credential->failed = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!accepted) {
+		credential->failed = true;
+		return false;
+	}
+	credential->ready = true;
+	*out = credential;
+	return true;
+}
+
+bool
+ClusterColdRecoveryDebtCurrentV2(const struct ClusterRecoveryStartV1 *start,
+	const ClusterRecoveryDebtStartV2 *credential)
+{
+	ClusterControlRelmapReferenceV2 selected;
+
+	/* Match original opaque storage before dereferencing a stale/copy handle. */
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| credential != &start->debt_start || !credential->entered
+		|| !credential->ready || credential->failed || credential->start != start
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| credential->cf_sequence != cluster_cf_attempt_sequence())
+		return false;
+	return ClusterColdRecoveryDebtControlCurrentV2(start, credential->selection)
+		&& cluster_control_root_relmap_selection_reference_v4(credential->selection, &selected)
+		&& memcmp(&selected, &credential->baseline, sizeof(selected)) == 0
+		&& credential->cf_sequence == cluster_cf_attempt_sequence();
 }
 
 static void

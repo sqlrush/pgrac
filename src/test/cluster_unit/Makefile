@@ -19692,3 +19692,6 @@ cluster_control_registry_original.o test_cluster_control_debt_selected: \
 		$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h \
 		$(top_srcdir)/src/include/cluster/cluster_control_file_identity.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h
+
+# Same original Start credential tests, without replacing evolved fixtures.
+test_cluster_cold_tx_start: test_cluster_cold_start_debt_control.inc

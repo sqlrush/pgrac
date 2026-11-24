@@ -2591,12 +2591,24 @@ static void startup_local_empty_reset(void);
 #include "test_cluster_cold_tx_relmap_handoff.inc"
 #include "test_cluster_cold_ctrc_relmap_gate.inc"
 #include "test_cluster_cold_start_native_table.inc"
+#include "test_cluster_cold_start_debt_control.inc"
 #ifdef TEST_CLUSTER_STARTUP_RELMAP_FILES
 #include "test_cluster_cold_ctrc_relmap_files.inc"
 #endif
 
 int main(void)
 {
+	if (getenv("PGRAC_PRE2_TEST_START_DEBT_CONTROL") != NULL) {
+		UT_PLAN(6);
+		UT_RUN(test_start_debt_begin_is_once_owned_and_never_rebases_to_later_cf);
+		UT_RUN(test_start_debt_begin_false_error_and_alias_cannot_publish_or_retry);
+		UT_RUN(test_start_debt_query_requires_original_complete_ir_walr_and_same_cf);
+		UT_RUN(test_start_debt_query_refuses_wrong_phase_holder_and_identity);
+		UT_RUN(test_start_debt_query_compares_every_original_control_reference);
+		UT_RUN(test_start_debt_query_late_refusal_and_error_preserve_original_protections);
+		reset(); UT_DONE(); return ut_failed_count != 0;
+	}
+
 #ifdef TEST_CLUSTER_STARTUP_RELMAP_FILES
 	return test_ctrc_relmap_files_main();
 #endif
@@ -3236,7 +3248,7 @@ int main(void)
 	}
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_CTRC
 #ifdef TEST_CLUSTER_STARTUP_NATIVE_FIRST
-	UT_PLAN(471);
+	UT_PLAN(477);
 	UT_RUN(test_start_borrows_only_its_original_completed_retention_owner);
 	UT_RUN(test_start_raw_records_keep_complete_original_bytes_and_empty_end);
 	UT_RUN(test_start_raw_records_refuse_incomplete_changed_bytes_hash_header_and_end);
@@ -3247,7 +3259,7 @@ int main(void)
 	UT_RUN(test_start_compound_groups_retain_complete_member_input_and_end);
 	UT_RUN(test_start_compound_groups_refuse_missing_mixed_or_nonempty_end);
 #else
-	UT_PLAN(460);
+	UT_PLAN(466);
 #endif
 	UT_RUN(test_start_reference_coverage_classifies_free_without_changing_original_graph);
 	UT_RUN(test_start_reference_coverage_frozen_empty_dead_and_free_wrap_use_whole_page);
@@ -3279,7 +3291,7 @@ int main(void)
 	UT_RUN(test_startup_native_directory_real_origin_cannot_be_discharged_by_wait);
 	UT_RUN(test_startup_native_directory_invalid_layout_and_partial_error_keep_debt);
 #else
-	UT_PLAN(432);
+	UT_PLAN(438);
 #endif
 	UT_RUN(test_start_page_contribution_reaches_original_graph_consumer_with_whole_evidence);
 	UT_RUN(test_start_page_contribution_keeps_unresolved_references_and_observation_optout);
@@ -3725,6 +3737,13 @@ int main(void)
 	start_native_table_tests();
 	start_managed_census_tests();
 	UT_RUN(test_start_cannot_rebase_prepared_registry_or_table);
+	UT_RUN(test_start_debt_begin_is_once_owned_and_never_rebases_to_later_cf);
+	UT_RUN(test_start_debt_begin_false_error_and_alias_cannot_publish_or_retry);
+	UT_RUN(test_start_debt_query_requires_original_complete_ir_walr_and_same_cf);
+	UT_RUN(test_start_debt_query_refuses_wrong_phase_holder_and_identity);
+	UT_RUN(test_start_debt_query_compares_every_original_control_reference);
+	UT_RUN(test_start_debt_query_late_refusal_and_error_preserve_original_protections);
+	reset();
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
