@@ -362,7 +362,10 @@ UT_TEST(native_open_gap_waits_for_original_writer_success_or_failure)
 	}
 }
 
-int main(void)
+#ifndef NATIVE_CLOG_IO_MAIN
+#define NATIVE_CLOG_IO_MAIN main
+#endif
+int NATIVE_CLOG_IO_MAIN(void)
 {
 	strlcpy(directory, "/tmp/pgrac-clog-native-XXXXXX", sizeof(directory));
 	if (mkdtemp(directory) == NULL) abort();

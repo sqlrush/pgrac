@@ -20522,3 +20522,33 @@ clean-clog-native-io:
 test_cluster_xid_native_clog.o: \
 	$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
 	$(top_srcdir)/src/include/access/slru.h
+
+# Validate the complete native page request before changing status or group LSNs.
+TESTS += test_cluster_clog_native_status
+all: test_cluster_clog_native_status
+test_cluster_clog_native_status: test_cluster_clog_native_status.c \
+		test_cluster_clog_native_io test_cluster_clog_native_io.c \
+		test_cluster_slru_clog_managed_write.c test_cluster_clog_write_snapshot.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/clog.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c \
+		$(top_srcdir)/src/backend/access/transam/clog_storage.c \
+		$(top_srcdir)/src/backend/access/transam/clog_write.c \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+		$(top_srcdir)/src/include/access/clog.h \
+		$(top_srcdir)/src/include/access/slru.h \
+		$(top_srcdir)/src/include/access/clog_file.h \
+		$(top_srcdir)/src/include/access/clog_storage.h \
+		cluster_catalog_trace_test.o $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_clog_file.c \
+		$(top_srcdir)/src/common/cluster_clog_wal.c \
+		$(top_srcdir)/src/common/cluster_recovery_file_identity.c \
+		cluster_catalog_trace_test.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+.PHONY: clean-clog-native-status
+clean: clean-clog-native-status
+clean-clog-native-status:
+	rm -f test_cluster_clog_native_status test_cluster_clog_native_status.d
