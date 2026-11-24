@@ -20382,3 +20382,32 @@ clean: clean-control-debt-readback
 .PHONY: clean-control-debt-readback
 clean-control-debt-readback:
 	rm -f test_cluster_control_debt_readback test_cluster_control_debt_readback.d
+
+# Same original Start body and providers; full transition storage is tested
+# independently by test_cluster_control_debt_readback.
+TESTS += test_cluster_start_debt_readback
+all: test_cluster_start_debt_readback
+test_cluster_start_debt_readback: test_cluster_start_debt_readback.c test_cluster_cold_tx_start \
+	$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h \
+	$(top_srcdir)/src/include/cluster/cluster_recovery_format.h \
+	test_cluster_cold_start_native_table.inc test_cluster_cold_ctrc_page_sources.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(STARTUP_NATIVE_CTRC_TEST_CPPFLAGS) \
+		-Drf_page_stable_base_proof_destroy_v1=start_prefix_proof_destroy_v1 \
+		-ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_claim.c \
+		$(top_srcdir)/src/backend/cluster/cluster_recovery_ctrc_record.c \
+		$(STARTUP_NATIVE_CTRC_TEST_O) $(STARTUP_NATIVE_FIRST_TEST_O) $(STARTUP_PAGE_STABLE_TEST_O) \
+		test_cluster_cold_start_terminal_clog.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
+		$(top_builddir)/src/backend/cluster/cluster_relmap_retention.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+clean: clean-start-debt-readback
+.PHONY: clean-start-debt-readback
+clean-start-debt-readback:
+	rm -f test_cluster_start_debt_readback test_cluster_start_debt_readback.d
+
+# Both fixtures include the original Start's transition-view consumer.
+test_cluster_cold_tx_start test_cluster_relmap_original_start.o: \
+	$(top_srcdir)/src/include/cluster/cluster_control_debt_transition.h

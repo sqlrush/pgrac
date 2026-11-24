@@ -210,6 +210,8 @@
 #include "cluster/cluster_relmap_control.h"
 #include "cluster/cluster_relmap_lock.h"
 #include "cluster/cluster_control_native_files.h"
+#include "cluster/cluster_control_debt_transition.h"
+#include "cluster/cluster_recovery_format.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_recovery_census.h"
 #include "cluster/cluster_recovery_ctrc_record.h"
@@ -244,7 +246,9 @@
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h" /* PGRAC: spec-6.14 D9 amend smgr payload routing */
 #include "commands/tablespace.h"
+#include "common/cryptohash.h"
 #include "common/file_utils.h"
+#include "common/sha2.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
@@ -732,6 +736,18 @@ typedef struct ClusterColdCtrcPageProgressV1 {
 
 /* Input identity for the original post-EOR attempt. Old subject identities
  * stay in inputs; writer is a separate, actual installed successor. */
+/* Owned process-local protection credential. The original Start owns all
+ * sources and replay inputs; this adds no purpose, scope or native holder. */
+struct ClusterRecoveryDebtStartV2 {
+	const struct ClusterRecoveryStartV1 *start;
+	ClusterControlRelmapSelectionV2 *selection;
+	ClusterControlRelmapReferenceV2 baseline;
+	uint64 cf_sequence;
+	uint32 input_count;
+	uint8 input_sha256[PG_SHA256_DIGEST_LENGTH];
+	bool entered, ready, failed, readback_active;
+};
+
 struct ClusterRecoveryStartV1 {
 	const ClusterColdTypedV1 *inputs;
 	const ClusterColdTopTxCensusV1 *census;
@@ -752,6 +768,7 @@ struct ClusterRecoveryStartV1 {
 	/* Original Start selection, retained after its narrow CF is released. */
 	bool managed_relmap_table;
 	ClusterControlNativeTableInfoV2 relmap_table;
+	ClusterRecoveryDebtStartV2 debt_start;
 	bool ctrc_observation_started, ctrc_observation_complete;
 	bool ctrc_page_plan_started;
 	RfPageOnlinePlanV1 *ctrc_page_plan;
@@ -1570,6 +1587,330 @@ cluster_recovery_cold_page_plan_current(const struct ClusterRecoveryStartV1 *sta
 	return cluster_recovery_cold_ctrc_replays_current(start, work, scope)
 		&& cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
 		&& cluster_recovery_cold_ctrc_replays_current(start, work, scope);
+}
+
+/* Protecting an existing episode is distinct from completing it. Borrow only
+ * the exact original selection after all replay-input holders are authorized;
+ * neither a saved table nor TxCurrent alone proves those native IR holders. */
+bool
+ClusterColdRecoveryDebtControlCurrentV2(const struct ClusterRecoveryStartV1 *start,
+	ClusterControlRelmapSelectionV2 *selection)
+{
+	ClusterControlRelmapReferenceV2 selected, confirmed;
+	ClusterControlNativeTableInfoV2 table, original;
+	struct ClusterWalInputsV1 *scope;
+	uint64 sequence;
+
+	if (selection == NULL || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| !ClusterColdRecoveryTxCurrent(start) || !start->effects_fixed
+		|| !start->managed_relmap_table || !start->ctrc_observation_complete)
+		return false;
+	sequence = cluster_cf_attempt_sequence();
+	scope = ClusterColdRecoveryCtrcScope(start, start->ctrc_observation_work);
+	if (scope == NULL || !cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+		|| !cluster_recovery_cold_ctrc_replays_current(start, start->ctrc_observation_work, scope)
+		|| !cluster_control_native_files_info_v2(&table))
+		return false;
+	original = start->relmap_table;
+	original.borrowed = table.borrowed = 0;
+	if (memcmp(&table, &original, sizeof(table)) != 0
+		|| !cluster_control_root_relmap_selection_reference_v4(selection, &selected)
+		|| memcmp(&selected.config, &original.control.config, sizeof(selected.config)) != 0
+		|| memcmp(selected.root_pair_sha256, original.control.root_pair_sha256, 32) != 0
+		|| memcmp(selected.registry_reference, original.control.registry_reference, 128) != 0
+		|| selected.logical_count != original.control.logical_count
+		|| selected.source_count != original.control.source_count
+		|| cluster_control_root_relmap_selection_recheck_locked_v4(selection)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| !cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+		|| !cluster_recovery_cold_ctrc_replays_current(start, start->ctrc_observation_work, scope)
+		|| !cluster_control_native_files_info_v2(&table))
+		return false;
+	table.borrowed = 0;
+	return memcmp(&table, &original, sizeof(table)) == 0
+		&& cluster_control_root_relmap_selection_reference_v4(selection, &confirmed)
+		&& memcmp(&selected, &confirmed, sizeof(selected)) == 0
+		&& cluster_cf_held_is_clusterwide(ExclusiveLock)
+		&& sequence == cluster_cf_attempt_sequence()
+		&& cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+		&& cluster_recovery_cold_ctrc_replays_current(start, start->ctrc_observation_work, scope);
+}
+
+/* Freeze the original input protections, not merely their current validity.
+ * The existing by-value producer binds every selected generation to its
+ * actual replay IR request and the continuous native WALR incarnation. No
+ * ROOT access, protection acquisition or replacement happens in this walk. */
+static bool
+cluster_recovery_cold_debt_input_digest(const struct ClusterRecoveryStartV1 *start,
+	uint32 *out_count, uint8 out_sha256[PG_SHA256_DIGEST_LENGTH])
+{
+	struct ClusterWalInputsV1 *scope;
+	pg_cryptohash_ctx *hash;
+	uint32 count;
+	uint8 digest[PG_SHA256_DIGEST_LENGTH];
+	volatile bool valid = false;
+
+	if (!cluster_recovery_cold_ctrc_replays_actor())
+		return false;
+	scope = ClusterColdRecoveryCtrcScope(start, start->ctrc_observation_work);
+	if (scope == NULL || !cluster_wal_inputs_ctrc_replays_authorized_v1(scope))
+		return false;
+	count = cluster_wal_inputs_count_v1(scope);
+	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX)
+		return false;
+	hash = pg_cryptohash_create(PG_SHA256);
+	if (hash == NULL)
+		return false;
+	PG_TRY();
+	{
+		do {
+			if (pg_cryptohash_init(hash) < 0
+				|| pg_cryptohash_update(hash, (const uint8 *)&count, sizeof(count)) < 0)
+				break;
+			for (uint32 i = 0; i < count; i++) {
+				ClusterRecoveryCtrcReplaySetSourceV1 source
+					= cluster_wal_inputs_ctrc_generation_v1(scope, i);
+
+				if (source.scope != scope || source.ir_request_id == 0
+					|| source.generation_count != count || source.generation_index != i
+					|| !cluster_wal_inputs_ctrc_replays_source_current_v1(&source)
+					|| pg_cryptohash_update(hash, (const uint8 *)&source, sizeof(source)) < 0)
+					break;
+				if (i + 1 == count)
+					valid = true;
+			}
+			if (!valid)
+				break;
+			valid = ClusterColdRecoveryCtrcScope(start, start->ctrc_observation_work) == scope
+				&& cluster_wal_inputs_ctrc_replays_authorized_v1(scope)
+				&& cluster_wal_inputs_count_v1(scope) == count
+				&& cluster_recovery_cold_ctrc_replays_actor()
+				&& pg_cryptohash_final(hash, digest, sizeof(digest)) == 0;
+		} while (0);
+	}
+	PG_FINALLY();
+	{
+		pg_cryptohash_free(hash);
+	}
+	PG_END_TRY();
+	if (!valid)
+		return false;
+	*out_count = count;
+	memcpy(out_sha256, digest, sizeof(digest));
+	return true;
+}
+
+bool
+ClusterColdRecoveryDebtBeginV2(const struct ClusterRecoveryStartV1 *start,
+	ClusterControlRelmapSelectionV2 *selection, ClusterRecoveryDebtStartV2 **out)
+{
+	struct ClusterRecoveryStartV1 *state;
+	ClusterRecoveryDebtStartV2 *credential;
+	uint32 confirmed_count;
+	uint8 confirmed_sha256[PG_SHA256_DIGEST_LENGTH];
+	volatile bool accepted = false;
+
+	/* Pure extent checks precede dereferencing any borrowed output. */
+	if (start == NULL || start != cluster_recovery_cold_start || selection == NULL
+		|| !ClusterColdRecoveryStartOutputDistinct(start, out, sizeof(*out))
+		|| !cluster_control_root_relmap_selection_output_distinct_v4(selection, out, sizeof(*out))
+		|| *out != NULL || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return false;
+	state = cluster_recovery_cold_start;
+	credential = &state->debt_start;
+	if (credential->entered)
+		return false;
+	/* Before any fallible source/control callback. No storage or protection
+	 * is released on failure; the same Start cannot start another attempt. */
+	credential->entered = true;
+	credential->start = start;
+	credential->selection = selection;
+	credential->cf_sequence = cluster_cf_attempt_sequence();
+	PG_TRY();
+	{
+		accepted = credential->cf_sequence != 0
+			&& cluster_recovery_cold_debt_input_digest(start,
+				&credential->input_count, credential->input_sha256)
+			&& ClusterColdRecoveryDebtControlCurrentV2(start, selection)
+			&& cluster_control_root_relmap_selection_reference_v4(selection, &credential->baseline)
+			&& credential->cf_sequence == cluster_cf_attempt_sequence()
+			&& ClusterColdRecoveryDebtControlCurrentV2(start, selection)
+			&& cluster_recovery_cold_debt_input_digest(start, &confirmed_count, confirmed_sha256)
+			&& confirmed_count == credential->input_count
+			&& memcmp(confirmed_sha256, credential->input_sha256, sizeof(confirmed_sha256)) == 0
+			&& credential->cf_sequence == cluster_cf_attempt_sequence();
+	}
+	PG_CATCH();
+	{
+		credential->failed = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!accepted) {
+		credential->failed = true;
+		return false;
+	}
+	credential->ready = true;
+	*out = credential;
+	return true;
+}
+
+bool
+ClusterColdRecoveryDebtCurrentV2(const struct ClusterRecoveryStartV1 *start,
+	const ClusterRecoveryDebtStartV2 *credential)
+{
+	ClusterControlRelmapReferenceV2 selected;
+	ClusterRecoveryDebtStartV2 *state;
+	uint32 count, confirmed_count;
+	uint8 digest[PG_SHA256_DIGEST_LENGTH], confirmed[PG_SHA256_DIGEST_LENGTH];
+	volatile bool current = false;
+
+	/* Match original opaque storage before dereferencing a stale/copy handle. */
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| credential != &start->debt_start || !credential->entered
+		|| !credential->ready || credential->failed || credential->start != start
+		|| !cluster_recovery_cold_ctrc_replays_actor()
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| credential->cf_sequence != cluster_cf_attempt_sequence())
+		return false;
+	state = &cluster_recovery_cold_start->debt_start;
+	PG_TRY();
+	{
+		current = cluster_recovery_cold_debt_input_digest(start, &count, digest)
+			&& count == credential->input_count
+			&& memcmp(digest, credential->input_sha256, sizeof(digest)) == 0
+			&& ClusterColdRecoveryDebtControlCurrentV2(start, credential->selection)
+			&& cluster_control_root_relmap_selection_reference_v4(credential->selection, &selected)
+			&& memcmp(&selected, &credential->baseline, sizeof(selected)) == 0
+			&& credential->cf_sequence == cluster_cf_attempt_sequence()
+			&& cluster_recovery_cold_debt_input_digest(start, &confirmed_count, confirmed)
+			&& confirmed_count == count && memcmp(confirmed, digest, sizeof(digest)) == 0
+			&& credential->cf_sequence == cluster_cf_attempt_sequence();
+	}
+	PG_CATCH();
+	{
+		state->failed = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!current)
+		state->failed = true;
+	return current;
+}
+
+/* The physical ROOT is already after at this point. Do not call the old
+ * before-selection recheck, which correctly rejects it. Instead bind the whole
+ * immutable before-pair to the original Start reference, and leave actual
+ * after/dependency validation to the original control owner's readback. */
+static bool
+cluster_recovery_cold_debt_readback_binding(const struct ClusterRecoveryStartV1 *start,
+	const ClusterRecoveryDebtStartV2 *credential, const ClusterControlDebtTransitionV2 *transition,
+	ClusterControlDebtTransitionViewV2 *view)
+{
+	ClusterControlRelmapReferenceV2 selected;
+	ClusterControlNativeTableInfoV2 table, original = start->relmap_table;
+	pg_cryptohash_ctx *hash;
+	uint8 digest[PG_SHA256_DIGEST_LENGTH];
+	volatile bool matched = false;
+
+	if (credential->failed || !cluster_recovery_cold_ctrc_replays_actor()
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| cluster_cf_attempt_sequence() != credential->cf_sequence
+		|| !ClusterColdRecoveryTxCurrent(start) || !start->effects_fixed
+		|| !start->managed_relmap_table || !start->ctrc_observation_complete
+		|| !cluster_control_native_files_info_v2(&table))
+		return false;
+	table.borrowed = original.borrowed = 0;
+	if (memcmp(&table, &original, sizeof(table)) != 0
+		|| memcmp(&original.control, &credential->baseline, sizeof(credential->baseline)) != 0
+		|| !cluster_control_root_relmap_selection_reference_v4(credential->selection, &selected)
+		|| memcmp(&selected, &credential->baseline, sizeof(selected)) != 0
+		|| !cluster_control_root_debt_transition_get_v2(transition, view)
+		|| view->start != start || view->selection != credential->selection
+		|| view->cf_sequence != credential->cf_sequence
+		|| view->root_pair_bytes != 2 * (Size)CLUSTER_RECOVERY_CONTROL_ROOT_FILE_BYTES
+		|| view->before_root == NULL || view->after_root == NULL)
+		return false;
+	hash = pg_cryptohash_create(PG_SHA256);
+	if (hash == NULL)
+		return false;
+	PG_TRY();
+	{
+		matched = pg_cryptohash_init(hash) == 0
+			&& pg_cryptohash_update(hash, view->before_root, view->root_pair_bytes) == 0
+			&& pg_cryptohash_final(hash, digest, sizeof(digest)) == 0
+			&& memcmp(digest, credential->baseline.root_pair_sha256, sizeof(digest)) == 0;
+	}
+	PG_FINALLY();
+	{
+		pg_cryptohash_free(hash);
+	}
+	PG_END_TRY();
+	return matched;
+}
+
+bool
+ClusterColdRecoveryDebtReadbackV2(const struct ClusterRecoveryStartV1 *start,
+	const ClusterRecoveryDebtStartV2 *credential, const ClusterControlDebtTransitionV2 *transition,
+	int global_directory, Size byte_budget)
+{
+	ClusterRecoveryDebtStartV2 *state;
+	ClusterControlDebtTransitionViewV2 view, confirmed;
+	uint32 count;
+	uint8 digest[PG_SHA256_DIGEST_LENGTH];
+	volatile bool current = false;
+
+	/* Locate original storage before dereferencing any borrowed handle. */
+	if (start == NULL || start != cluster_recovery_cold_start
+		|| credential != &start->debt_start || !credential->entered
+		|| !credential->ready || credential->failed || credential->start != start
+		|| !cluster_recovery_cold_ctrc_replays_actor()
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock)
+		|| credential->cf_sequence != cluster_cf_attempt_sequence())
+		return false;
+	state = &cluster_recovery_cold_start->debt_start;
+	if (state->readback_active) {
+		state->failed = true;
+		cluster_recovery_cold_start->revoked = true;
+		cluster_recovery_checkpoint_revoke_v1(start);
+		return false;
+	}
+	state->readback_active = true;
+	PG_TRY();
+	{
+		current = transition != NULL && global_directory >= 0 && byte_budget != 0
+			&& cluster_recovery_cold_debt_input_digest(start, &count, digest)
+			&& count == credential->input_count
+			&& memcmp(digest, credential->input_sha256, sizeof(digest)) == 0
+			&& cluster_recovery_cold_debt_readback_binding(start, credential, transition, &view)
+			&& cluster_control_root_debt_transition_readback_v2(transition, global_directory, byte_budget)
+			&& cluster_recovery_cold_debt_readback_binding(start, credential, transition, &confirmed)
+			&& memcmp(&view, &confirmed, sizeof(view)) == 0
+			&& cluster_recovery_cold_debt_input_digest(start, &count, digest)
+			&& count == credential->input_count
+			&& memcmp(digest, credential->input_sha256, sizeof(digest)) == 0
+			&& !state->failed && cluster_recovery_cold_ctrc_replays_actor()
+			&& cluster_cf_held_is_clusterwide(ExclusiveLock)
+			&& credential->cf_sequence == cluster_cf_attempt_sequence();
+	}
+	PG_CATCH();
+	{
+		state->failed = true;
+		cluster_recovery_cold_start->revoked = true;
+		cluster_recovery_checkpoint_revoke_v1(start);
+		state->readback_active = false;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	state->readback_active = false;
+	if (!current) {
+		state->failed = true;
+		cluster_recovery_cold_start->revoked = true;
+		cluster_recovery_checkpoint_revoke_v1(start);
+	}
+	return current;
 }
 
 static void

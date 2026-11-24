@@ -234,6 +234,40 @@ extern bool ClusterColdRecoveryCtrcObserve(const struct ClusterRecoveryStartV1 *
  * False/ERROR leaves original cleanup responsibility in place, including any
  * original observation cleanup triggered by preflight refusal. */
 extern bool ClusterColdRecoveryCtrcReplaysAcquire(const struct ClusterRecoveryStartV1 *start);
+
+struct ClusterControlRelmapSelectionV2;
+/* Read-only entry to protection preparation. SAME original Start, complete
+ * replay-input IR/WALR and original managed control selection under CF-X.
+ * No MappingLock/retention/LWLock or critical section may surround this query.
+ * No acquire, root mutation, debt retirement, transfer or completion results. */
+extern bool ClusterColdRecoveryDebtControlCurrentV2(const struct ClusterRecoveryStartV1 *start,
+	struct ClusterControlRelmapSelectionV2 *selection);
+/* Process-local credential owned by the SAME Start. Begin is once-only under
+ * the original CF-X; Current rejects release/reacquire or changed selection.
+ * Caller keeps selection alive throughout this CF interval and all Current
+ * calls. The returned credential is borrowed, never destroyed or copied.
+ * Entered refusal/ERROR preserves original holders and cannot be retried.
+ * Binds the complete original selected-input/protection vector by value;
+ * replacement IR grants or a different continuous WALR incarnation cannot
+ * refresh this credential.
+ * No PREPARED publication/acceptance or completion is implied. */
+typedef struct ClusterRecoveryDebtStartV2 ClusterRecoveryDebtStartV2;
+extern bool ClusterColdRecoveryDebtBeginV2(const struct ClusterRecoveryStartV1 *,
+	struct ClusterControlRelmapSelectionV2 *, ClusterRecoveryDebtStartV2 **freshout);
+extern bool ClusterColdRecoveryDebtCurrentV2(const struct ClusterRecoveryStartV1 *,
+	const ClusterRecoveryDebtStartV2 *);
+/* Same original Start/CF and complete before selection. Independently read
+ * back this exact owner's protective transition, bracketed by the fixed input
+ * holders and native table. True is observation only: no token is changed and
+ * no PREPARED acceptance, completion, retirement or OPEN is implied. The
+ * global-directory FD remains borrowed; failure/ERROR retains all protection
+ * debt, latches this credential and revokes the original episode without
+ * releasing its protections. No caller LWLock/critical section. */
+struct ClusterControlDebtTransitionV2;
+extern bool ClusterColdRecoveryDebtReadbackV2(const struct ClusterRecoveryStartV1 *,
+	const ClusterRecoveryDebtStartV2 *, const struct ClusterControlDebtTransitionV2 *,
+	int global_directory, Size byte_budget);
+
 /* Prepare once after original all-replay IR acquisition, outside native
  * recovery/critical sections and with zero caller LWLocks. Keep the complete
  * all-generation graph on the same Start; callbacks revalidate original full
