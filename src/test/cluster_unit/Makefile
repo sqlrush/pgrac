@@ -5646,7 +5646,9 @@ test_cluster_pcm_master_durable.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 
 # Exercise the actual master queue callback and its peer/ACK path.
 test_cluster_pcm_bootstrap_tick.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_resource_x_target_peer_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	awk '/^\/\* Begin ordinary acquire STALE observation/ { observation=1 } \
+	     observation { print } /^\/\* End ordinary acquire STALE observation/ { observation=0 } \
+	     /^gcs_block_resource_x_target_peer_result_exact\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
 	     /^gcs_block_resource_x_bootstrap_ack_stage_exact\(/ { print "static bool"; emit=1; count++ } \
 	     /^gcs_block_resource_x_bootstrap_admitted\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
 	     /^cluster_gcs_block_resource_x_bootstrap_tick\(/ { print "ResourceXApplyResult"; emit=1; count++ } \
@@ -5675,7 +5677,7 @@ test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/clust
 
 RESOURCE_X_PCM_TEST_O = test_cluster_pcm_lock_clock_product.o
 RESOURCE_X_PCM_TEST_COMMON_LIB = $(top_builddir)/src/common/libpgcommon_srv.a
-test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_disk_x_done test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_local_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement test_cluster_resource_x_pi_replace: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+test_cluster_pcm_lock test_cluster_pcm_object_retire test_cluster_pcm_stop_cv test_cluster_pcm_read_grant test_cluster_resource_x_acquire_ingress test_cluster_resource_x_acquire_stale test_cluster_resource_x_decision_send test_cluster_resource_x_decision_publish test_cluster_resource_x_holder_send test_cluster_resource_x_master_ack test_cluster_resource_x_master_done test_cluster_resource_x_master_consumed test_cluster_resource_x_master_quiet test_cluster_resource_x_master_unarmed test_cluster_resource_x_disk_x_done test_cluster_resource_x_source_ack test_cluster_resource_x_s_source test_cluster_resource_x_source_done test_cluster_resource_x_local_done test_cluster_resource_x_clean_settlement test_cluster_resource_x_pi_carrier test_cluster_resource_x_x_source_carrier test_cluster_resource_x_pi_handoff test_cluster_resource_x_write_settlement test_cluster_resource_x_pi_replace: %: %.c test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_pcm_master_durable.inc \
 		test_cluster_pcm_bootstrap_tick.inc \
 		test_cluster_pcm_settlement_ingress.inc \
@@ -12264,3 +12266,7 @@ clean-native-stop-census:
 	    test_cluster_native_stop_source_cancel.inc test_cluster_native_stop_source_cancel.inc.tmp \
         $(addprefix test_cluster_native_stop_, observer.inc observer.inc.tmp roles.inc roles.inc.tmp \
         remote.inc remote.inc.tmp successor.inc successor.inc.tmp cycle.inc cycle.inc.tmp cancel.inc cancel.inc.tmp)
+
+TESTS += test_cluster_resource_x_acquire_stale
+all: test_cluster_resource_x_acquire_stale
+test_cluster_resource_x_acquire_stale: test_cluster_resource_x_acquire_ingress.c test_cluster_resource_x_acquire_fixture.inc test_cluster_resource_x_acquire_candidate.inc cluster_unit_port_stubs.o

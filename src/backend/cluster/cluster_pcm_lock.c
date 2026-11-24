@@ -22134,10 +22134,31 @@ pcm_resource_x_acquire_enqueue_locked(struct GrdEntry *entry,
 	ClusterPcmResourceXMasterRequest *canonical = &state->requests[node];
 	uint64 floor;
 
+	/* Copy scalars while the original entry lock still protects them. */
+	if (cluster_trace_tx_identity) {
+		cluster_gcs_block_acquire_stale_observe("entry.binding", state->binding_generation, 0, false);
+		cluster_gcs_block_acquire_stale_observe("entry.authority", state->authority_generation, 0, false);
+		cluster_gcs_block_acquire_stale_observe("entry.canonical_phase", canonical->phase, 0, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority_state", priority->state, 0, false);
+		cluster_gcs_block_acquire_stale_observe("entry.receipt_state", receipt->state, 0, false);
+		cluster_gcs_block_acquire_stale_observe("entry.receipt_floor", receipt->highest_attempt_floor, 0, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.r4", request->body.acquire_intent.r4_generation, priority->r4_record_generation, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.formation", request->common.resource_formation, priority->request.resource_formation, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.session", request->common.master_session_incarnation, priority->request.master_session_incarnation, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.ingress", ingress, priority->authenticated_ingress_connection_generation, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.outbound", master_sender, priority->master_sender_connection_generation, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.incarnation", request->body.acquire_intent.requester_incarnation, priority->acquire_intent.requester_incarnation, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.backend_generation", request->body.acquire_intent.backend_generation, priority->acquire_intent.backend_generation, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.base", request->body.acquire_intent.base_generation, priority->acquire_intent.base_generation, false);
+		cluster_gcs_block_acquire_stale_observe("entry.priority.token", request->body.acquire_intent.reservation_token, priority->acquire_intent.reservation_token, false);
+		cluster_gcs_block_acquire_stale_observe("entry.canonical_attempt", canonical->assertion_sequence, 0, false);
+	}
 	if (!pcm_resource_x_bootstrap_receipt_valid(receipt))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	if (work != NULL && !pcm_resource_x_bootstrap_work_matches(state, priority, work))
+	if (work != NULL && !pcm_resource_x_bootstrap_work_matches(state, priority, work)) {
+		cluster_gcs_block_acquire_stale_observe("entry.work_matches", 0, 1, true);
 		return RESOURCE_X_APPLY_STALE;
+	}
 	if (priority->state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY) {
 		bool exact = priority->has_acquire_intent
 					 && pcm_resource_x_common_equal(&priority->request, &request->common)
@@ -22146,17 +22167,23 @@ pcm_resource_x_acquire_enqueue_locked(struct GrdEntry *entry,
 					 && priority->r4_record_generation == r4
 					 && priority->authenticated_ingress_connection_generation == ingress
 					 && priority->master_sender_connection_generation == master_sender;
+		cluster_gcs_block_acquire_stale_observe("entry.priority_exact", exact, 1, false);
 		if (exact)
 			return work == NULL ? RESOURCE_X_APPLY_DUPLICATE
 				: pcm_resource_x_acquire_resume_locked(entry, state, priority);
 		/* Capacity belongs to the original episode. No higher attempt, domain
 		 * drift or legacy packet can replace it before an exact terminator. */
+		cluster_gcs_block_acquire_stale_observe("entry.priority_attempt",
+			request->common.assertion_sequence, priority->request.assertion_sequence,
+			request->common.assertion_sequence <= priority->request.assertion_sequence);
 		return request->common.assertion_sequence > priority->request.assertion_sequence
 				   ? RESOURCE_X_APPLY_BAD_STATE
 				   : RESOURCE_X_APPLY_STALE;
 	}
-	if (work != NULL)
+	if (work != NULL) {
+		cluster_gcs_block_acquire_stale_observe("entry.missing_priority", 0, 1, true);
 		return RESOURCE_X_APPLY_STALE;
+	}
 	floor = receipt->highest_attempt_floor;
 	if (canonical->assertion_sequence > floor)
 		floor = canonical->assertion_sequence;
@@ -22164,8 +22191,10 @@ pcm_resource_x_acquire_enqueue_locked(struct GrdEntry *entry,
 		&& state->terminal_tombstone.requester_node == node
 		&& state->terminal_tombstone.request.assertion_sequence > floor)
 		floor = state->terminal_tombstone.request.assertion_sequence;
-	if (request->common.assertion_sequence <= floor)
+	if (request->common.assertion_sequence <= floor) {
+		cluster_gcs_block_acquire_stale_observe("entry.attempt_floor", request->common.assertion_sequence, floor, true);
 		return RESOURCE_X_APPLY_STALE;
+	}
 	if (memcmp(canonical, &empty_request, sizeof(empty_request)) != 0)
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY

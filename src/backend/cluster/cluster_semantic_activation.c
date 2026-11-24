@@ -4411,6 +4411,16 @@ static bool
 semantic_activation_ack_matches(const SemanticActivationAckTuple *observed,
 								const SemanticActivationAckTuple *expected)
 {
+	if (observed != NULL && expected != NULL) {
+		cluster_gcs_block_acquire_stale_observe("peer.row.node_id", observed->node_id, expected->node_id, observed->node_id != expected->node_id);
+		cluster_gcs_block_acquire_stale_observe("peer.row.boot_id", observed->boot_id, expected->boot_id, observed->boot_id != expected->boot_id);
+		cluster_gcs_block_acquire_stale_observe("peer.row.admitted_incarnation", observed->admitted_incarnation, expected->admitted_incarnation, observed->admitted_incarnation != expected->admitted_incarnation);
+		cluster_gcs_block_acquire_stale_observe("peer.row.control_connection_generation", observed->control_connection_generation, expected->control_connection_generation, observed->control_connection_generation != expected->control_connection_generation);
+		cluster_gcs_block_acquire_stale_observe("peer.row.capability_word", observed->capability_word, expected->capability_word, observed->capability_word != expected->capability_word);
+		cluster_gcs_block_acquire_stale_observe("peer.row.capability_generation", observed->capability_generation, expected->capability_generation, observed->capability_generation != expected->capability_generation);
+		cluster_gcs_block_acquire_stale_observe("peer.row.transition_epoch", observed->transition_epoch, expected->transition_epoch, observed->transition_epoch != expected->transition_epoch);
+		cluster_gcs_block_acquire_stale_observe("peer.row.record_generation", observed->record_generation, expected->record_generation, observed->record_generation != expected->record_generation);
+	}
 	return observed != NULL && expected != NULL && observed->node_id == expected->node_id
 		   && observed->boot_id == expected->boot_id
 		   && observed->admitted_incarnation == expected->admitted_incarnation
@@ -9402,8 +9412,13 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	SemanticActivationAdmissionSnapshot snapshot;
 	uint64 current_epoch;
 	int feature_index;
+	bool serving;
 
-	if (token == NULL || !token->entered || !normal_start_serving_allowed())
+	if (token == NULL || !token->entered)
+		return false;
+	serving = normal_start_serving_allowed();
+	cluster_gcs_block_acquire_stale_observe("admission.serving", serving, true, !serving);
+	if (!serving)
 		return false;
 	if (!semantic_activation_feature_index(token->feature_bit, &feature_index)
 		|| token->side > CLUSTER_SEMANTIC_TARGET_SIDE || SemanticActivationShmem == NULL)
@@ -9412,6 +9427,11 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 	if (!semantic_activation_snapshot(&snapshot))
 		return false;
 	current_epoch = cluster_epoch_get_current();
+	cluster_gcs_block_acquire_stale_observe("admission.snapshot_epoch", snapshot.formation_epoch, current_epoch, snapshot.formation_epoch != current_epoch);
+	cluster_gcs_block_acquire_stale_observe("admission.token_epoch", token->formation_epoch, current_epoch, token->formation_epoch != current_epoch);
+	cluster_gcs_block_acquire_stale_observe("admission.record_generation", token->record_generation, snapshot.record_generation, token->record_generation != snapshot.record_generation);
+	cluster_gcs_block_acquire_stale_observe("admission.transition_closed", snapshot.transition_closed, false, snapshot.transition_closed);
+	cluster_gcs_block_acquire_stale_observe("admission.feature", snapshot.active_bits & token->feature_bit, token->side == CLUSTER_SEMANTIC_TARGET_SIDE ? token->feature_bit : 0, (snapshot.active_bits & token->feature_bit) != (token->side == CLUSTER_SEMANTIC_TARGET_SIDE ? token->feature_bit : 0));
 	if (snapshot.formation_epoch != current_epoch || token->formation_epoch != current_epoch)
 		return false;
 	if (snapshot.record_generation == 0 && !normal_start_bootstrap_allowed())
@@ -9986,6 +10006,9 @@ cluster_semantic_activation_resource_x_peer_open_check(const ClusterSemanticAdmi
 	if (!cluster_sf_peer_capability_record_snapshot(authenticated_peer_node_id, &capability))
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_INVALID_INPUT;
 	capability_pending = !capability.valid;
+	cluster_gcs_block_acquire_stale_observe("peer.capability_valid", capability.valid, true, false);
+	cluster_gcs_block_acquire_stale_observe("peer.capability_bits", capability.bits & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, !capability_pending && (capability.bits & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) == 0);
+	cluster_gcs_block_acquire_stale_observe("peer.capability_generation", capability.generation, sampled_capability_generation, !capability_pending && capability.generation != sampled_capability_generation);
 	if (!capability_pending
 		&& ((capability.bits & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) == 0
 			|| capability.generation != sampled_capability_generation))
@@ -9998,6 +10021,15 @@ cluster_semantic_activation_resource_x_peer_open_check(const ClusterSemanticAdmi
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_UNAVAILABLE;
 	if (!semantic_activation_ack_table_snapshot(&table))
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_TORN;
+	cluster_gcs_block_acquire_stale_observe("peer.table_stage", table.stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED, table.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED);
+	cluster_gcs_block_acquire_stale_observe("peer.table_flags", table.flags, CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE, table.flags != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE));
+	cluster_gcs_block_acquire_stale_observe("peer.table_generation", table.record_generation, token->record_generation, table.record_generation != token->record_generation);
+	cluster_gcs_block_acquire_stale_observe("peer.table_epoch", table.transition_epoch, token->formation_epoch, table.transition_epoch != token->formation_epoch);
+	cluster_gcs_block_acquire_stale_observe("peer.table_source", table.source_feature_bitmap, source_bits, table.source_feature_bitmap != source_bits);
+	cluster_gcs_block_acquire_stale_observe("peer.table_target", table.target_feature_bitmap, target_bits, table.target_feature_bitmap != target_bits);
+	cluster_gcs_block_acquire_stale_observe("peer.table_rollback", table.rollback_feature_bitmap, 0, table.rollback_feature_bitmap != 0);
+	cluster_gcs_block_acquire_stale_observe("peer.table_members_lo", table.expected_members_lo, current_members_lo, false);
+	cluster_gcs_block_acquire_stale_observe("peer.table_members_hi", table.expected_members_hi, current_members_hi, false);
 	if (table.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED)
 		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_STAGE_MISMATCH;
 	if (table.flags
