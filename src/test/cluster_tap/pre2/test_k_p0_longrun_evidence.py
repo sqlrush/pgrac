@@ -198,5 +198,93 @@ class CompleteEvidence(unittest.TestCase):
         self.assertEqual(judge(run)['verdict'], 'PASS')
 
 
+class ClientEvidenceCounts(unittest.TestCase):
+    def event(self, known: bool = False, **changes: object) -> dict:
+        return dict(dict(source='client', node=0, connection=0, phase='load',
+                         stage='CONNECT' if not known else 'UPDATE',
+                         severity='CONNECTION' if not known else 'ERROR',
+                         sqlstate=None if not known else 'XX000',
+                         message='connection refused' if not known else
+                                 'cluster TT status unknown for xid 4242',
+                         detail=None, hint=None, location=None, backend_pid=None,
+                         connection_lost=not known, row=None, unix=100.5), **changes)
+
+    def scenario(self, events: list, **changes: object):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        run = build_run(Path(temporary.name), clean_pieces(), events, spec=dict(SPEC, **changes))
+        allow = run / 'allow.json'
+        allow.write_text(json.dumps(dict(version=1, entries=[dict(
+            id='known-only', reason='classified-error control',
+            message='^cluster TT status unknown for xid 4242$')])))
+        return run, allow
+
+    def assert_incomplete(self, run: Path, allow: Path) -> None:
+        result = judge(run, allow)
+        self.assertEqual(result['verdict'], 'FAIL')
+        self.assertFalse(result['zero_errors'])
+        self.assertTrue(any(f['code'] == 'EVIDENCE_INVALID'
+                            and 'client' in f.get('what', '') for f in result['failures']))
+
+    def test_clearing_the_only_client_error_never_turns_it_into_zero_errors(self) -> None:
+        for text in ('', '\n \n'):
+            with self.subTest(text=text):
+                run, allow = self.scenario([self.event()])
+                journal = run / 'cycle1/evidence/steps.json'
+                saved = json.loads(journal.read_text())
+                self.assertEqual(next(s for s in saved['steps'] if s['name'] == 'load')
+                                 ['detail']['client_errors'], 1)
+                load = run / 'cycle1/evidence/load.json'
+                summary = json.loads(load.read_text())
+                summary['nodes'][0]['connect_failures'] = 1
+                load.write_text(json.dumps(summary))
+                self.assertEqual(judge(run)['unclassified']['count'], 1)
+                (run / 'cycle1/evidence/client-errors.jsonl').write_text(text)
+                self.assert_incomplete(run, allow)
+
+    def test_deleting_one_whole_unknown_line_cannot_leave_only_an_allowed_error(self) -> None:
+        known = self.event(known=True)
+        run, allow = self.scenario([self.event(), known])
+        self.assertEqual(judge(run, allow)['unclassified']['count'], 1)
+        (run / 'cycle1/evidence/client-errors.jsonl').write_text(json.dumps(known) + '\n')
+        self.assert_incomplete(run, allow)
+
+    def test_aggregated_occurrences_count_as_records_and_cannot_be_truncated(self) -> None:
+        event = self.event(known=True, count=3)
+        run, allow = self.scenario([event])
+        result = judge(run, allow)
+        self.assertEqual(result['verdict'], 'PASS')
+        self.assertEqual(result['totals']['allowed_records'], 3)
+        (run / 'cycle1/evidence/client-errors.jsonl').write_text(
+            json.dumps(dict(event, count=2)) + '\n')
+        self.assert_incomplete(run, allow)
+
+    def test_the_load_counter_does_not_cover_later_steps(self) -> None:
+        run, allow = self.scenario([self.event(known=True, phase='drop')])
+        self.assertEqual(judge(run, allow)['verdict'], 'PASS')
+
+    def test_missing_or_invalid_producer_counter_is_not_zero(self) -> None:
+        for value in ('missing', None, -1, False, True, 1.5, '0'):
+            with self.subTest(counter=value):
+                run, allow = self.scenario([])
+                path = run / 'cycle1/evidence/steps.json'
+                saved = json.loads(path.read_text())
+                load = next(step for step in saved['steps'] if step['name'] == 'load')
+                if value == 'missing':
+                    load['detail'].pop('client_errors')
+                else:
+                    load['detail']['client_errors'] = value
+                path.write_text(json.dumps(saved))
+                self.assert_incomplete(run, allow)
+
+    def test_planned_crash_disconnects_do_not_invent_client_errors(self) -> None:
+        run, allow = self.scenario([], crash=True)
+        path = run / 'cycle1/evidence/load.json'
+        saved = json.loads(path.read_text())
+        saved['nodes'][0]['injected_disconnects'] = 1
+        path.write_text(json.dumps(saved))
+        self.assertEqual(judge(run, allow)['verdict'], 'PASS')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

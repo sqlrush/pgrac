@@ -61,6 +61,11 @@ def build_run(root: Path, pieces: Dict[str, str], client: List[Dict[str, object]
                   error='normal stop refused' if name == 'stop' and stop_status != 'PASS'
                   else None)
              for name in planned_steps(spec)]
+    for step in steps:
+        if step['name'] == 'load':
+            step['detail'] = dict(commits=sum(commits), client_errors=sum(
+                int(event.get('count', 1)) for event in client
+                if event.get('phase') in ('init', 'start', 'seed', 'load')))
     journal = dict(cycle=1, planned=planned_steps(spec), steps=steps, left_running=False,
                    members=[dict(id=n, logfile='cluster/node%d.log' % n) for n in range(4)],
                    log_end={str(n): (cycle / 'cluster' / ('node%d.log' % n)).stat().st_size

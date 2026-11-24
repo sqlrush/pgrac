@@ -101,6 +101,9 @@ whole cohort exactly once, logs must reach their recorded end, and measured
 workload time and connection counts must agree with the plan. Missing,
 damaged or contradictory evidence fails the run even when the step journal
 says PASS. A malformed client record fails and does not hide later records.
+Client occurrences through the load step must equal the producer's saved
+cumulative error count, including aggregated records. Truncating a valid
+error log cannot turn recorded errors into a passing zero-error result.
 
 Each error is given a label from `p0_longrun_rules.py` when one of its rules
 matches: first by quoted message text, then by declared SQLSTATE, then by the

@@ -175,6 +175,7 @@ def client_events(path: Path, failures: List[Dict[str, object]]) -> Iterator[Dic
                 event = json.loads(line)
                 if (not isinstance(event, dict) or event.get('source') != 'client'
                         or not isinstance(event.get('severity'), str)
+                        or not isinstance(event.get('phase'), str)
                         or type(event.get('count', 1)) is not int
                         or event.get('count', 1) <= 0):
                     raise ValueError('invalid client error record or occurrence count')
@@ -200,7 +201,8 @@ def judge_cycle(directory: Path, spec: Mapping[str, object], members: int,
                            fields={'logfile': str}):
         journal['members'] = []
     done = {step['name']: step for step in journal['steps']}
-    for name in planned_steps(spec):
+    plan = planned_steps(spec)
+    for name in plan:
         step = done.get(name, dict(status='NOT_RUN', reason='no record'))
         report['steps'].append(dict(name=name, status=step['status'],
                                     error=step.get('error') or step.get('reason'),
@@ -230,9 +232,26 @@ def judge_cycle(directory: Path, spec: Mapping[str, object], members: int,
                                  boundaries(journal, str(member['id']), forced)):
             report['server_records'] += 1
             tally.add(event, cycle)
+    through_load = set(plan[:plan.index('load') + 1])
+    covered_client_records = 0
     for event in client_events(directory / 'evidence' / 'client-errors.jsonl', failures):
-        report['client_records'] += int(event.get('count') or 1)
+        occurrences = int(event.get('count') or 1)
+        report['client_records'] += occurrences
+        if event['phase'] in through_load:
+            covered_client_records += occurrences
         tally.add(event, cycle)
+    load_step = done.get('load', {})
+    if load_step.get('status') == 'PASS':
+        detail = load_step.get('detail')
+        expected = detail.get('client_errors') if isinstance(detail, dict) else None
+        if type(expected) is not int or expected < 0:
+            failures.append(dict(code='EVIDENCE_INVALID',
+                                 what='steps.json load.detail.client_errors',
+                                 detail='missing or invalid cumulative client error count'))
+        elif covered_client_records != expected:
+            failures.append(dict(code='EVIDENCE_INVALID', what='client-errors.jsonl',
+                                 detail='records through load total %d; producer recorded %d'
+                                        % (covered_client_records, expected)))
     report['failing_records'] = sum(tally.failing.values()) - before
     if report['failing_records']:
         failures.append(dict(code='ERRORS_NOT_ALLOWED', count=report['failing_records']))
@@ -340,7 +359,9 @@ def judge(run: Path, allow_file: Optional[Path] = None) -> Dict[str, object]:
     result = dict(
         verdict=('PASS' if passed else 'FAIL') if native
         else ('SELFTEST_OK' if passed else 'SELFTEST_FAILED'),
-        acceptance_result=native, mode=plan['mode'], zero_errors=not sum(tally.failing.values()),
+        acceptance_result=native, mode=plan['mode'],
+        zero_errors=not sum(tally.failing.values()) and not any(
+            f['code'] in ('EVIDENCE_MISSING', 'EVIDENCE_INVALID') for f in failures),
         failures=failures, cycles=cycles,
         totals=dict(failing_server_records=tally.failing['server'],
                     failing_client_records=tally.failing['client'],
