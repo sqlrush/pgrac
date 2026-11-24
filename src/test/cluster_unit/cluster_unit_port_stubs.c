@@ -22,6 +22,7 @@
 #include "cluster/cluster_wait_trace.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "cluster/cluster_storage_quorum.h"
+#include "cluster/cluster_gcs_block.h"
 
 void __attribute__((weak))
 ExceptionalCondition(const char *condition pg_attribute_unused(),
@@ -34,6 +35,16 @@ ExceptionalCondition(const char *condition pg_attribute_unused(),
  * Dedicated trace tests override these defaults with the real collector. */
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
 bool cluster_trace_tx_identity __attribute__((weak)) = false;
+/* A policy-only fixture has no active GCS acquire observation. Dedicated
+ * ingress fixtures provide the real process-local collector instead. */
+void __attribute__((weak))
+cluster_gcs_block_acquire_stale_observe(const char *name pg_attribute_unused(),
+	uint64 left pg_attribute_unused(), uint64 right pg_attribute_unused(), bool failed pg_attribute_unused())
+{
+	if (cluster_trace_tx_identity)
+		abort();
+}
+
 void __attribute__((weak))
 cluster_native_itl_trace_tt(ClusterNativeItlTraceKind kind pg_attribute_unused(),
 						  const ClusterCtrcTxnKeyV1 *key pg_attribute_unused(),

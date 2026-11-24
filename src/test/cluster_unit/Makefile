@@ -7010,7 +7010,9 @@ test_cluster_gcs_shared_registration.inc: $(top_srcdir)/src/backend/cluster/clus
 # Compile the actual terminal ingress verbatim. Dependencies are explicit
 # fixture doubles; the master/source decision and call sequence are product C.
 test_cluster_resource_x_terminal_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_pcm_service_admission\(/ { print "static void"; emit=1; service_admission++ } \
+	awk '/^\/\* Begin ordinary acquire STALE observation/ { observation=1 } \
+	     observation { print } /^\/\* End ordinary acquire STALE observation/ { observation=0 } \
+	     /^gcs_block_pcm_service_admission\(/ { print "static void"; emit=1; service_admission++ } \
 	     /^gcs_block_resource_x_requester_terminal_try\(/ { print "static ResourceXApplyResult"; emit=1; owner++ } \
 	     /^gcs_block_resource_x_target_peer_result_exact\(/ { print "static ResourceXApplyResult"; emit=1 } \
 	     /^gcs_block_resource_x_target_peer_matches_exact\(/ { print "static bool"; emit=1; peer++ } \
