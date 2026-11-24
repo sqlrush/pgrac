@@ -8,6 +8,8 @@ use PostgreSQL::Test::ClusterPRE2;
 use Test::More;
 use File::Temp qw(tempdir);
 
+my $current_catalog = PostgreSQL::Test::ClusterPRE2::_catalog_version(
+	"$FindBin::RealBin/../../../include/catalog/catversion.h");
 my $clock = 0;
 {
 	package UnitNode;
@@ -15,7 +17,7 @@ my $clock = 0;
 	sub safe_psql
 	{
 		my ($self, $db, $sql) = @_;
-		return $self->{identity} // '123|202610220' if $sql =~ /pg_control_system/;
+		return $self->{identity} // "123|$current_catalog" if $sql =~ /pg_control_system/;
 		return 'on|on|on|on|on' if $sql =~ /current_setting/;
 		return $self->{id} if $sql =~ /node_id/;
 		die 'unexpected unit SQL';
@@ -90,7 +92,7 @@ sub fixture
 	eval { $late->wait_open };
 	like($@, qr/OPEN deadline expired/, 'all OPEN after deadline remains a failure');
 	$clock = 0;
-	for my $catalog ('202609290', '202610221', '', 'unknown', '0202610220')
+	for my $catalog ('202609290', '202610221', '', 'unknown', "0$current_catalog")
 	{
 		my $mixed = fixture();
 		$mixed->{nodes}[-1]{identity} = "123|$catalog";
@@ -106,7 +108,7 @@ sub fixture
 	eval { $old->start_cluster };
 	like($@, qr/PRE2 format is not activated/, 'a homogeneous legacy catalog is rejected');
 	my $foreign = fixture();
-	$foreign->{nodes}[-1]{identity} = '456|202610220';
+	$foreign->{nodes}[-1]{identity} = "456|$current_catalog";
 	eval { $foreign->start_cluster };
 	like($@, qr/different system identifiers/, 'current catalogs do not bypass system identity');
 }

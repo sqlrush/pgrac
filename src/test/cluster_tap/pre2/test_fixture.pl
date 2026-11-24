@@ -13,7 +13,7 @@ local $ENV{PGRAC_PRE2_ENTRY_FILE};
 delete $ENV{PGRAC_PRE2_ENTRY_FILE};
 my $fixture = eval { PostgreSQL::Test::ClusterPRE2->new_cluster('pre2_no_adapter', nodes => 3) };
 ok(!defined($fixture), 'no fixture without the current product initializer');
-like($@, qr/^BLOCKED: A S11\/S12: supported fresh PRE2 member initialization/,
+like($@, qr/^BLOCKED: A S11\/S12: qualified native PRE2 cohort fixture entry is not configured \(PGRAC_PRE2_ENTRY_FILE\); legacy backup-based --cluster-join is not a replacement\s*$/,
     'missing producer explicitly BLOCKED, not skipped or returned as a fixture');
 for my $number (337, 339, 346, 361, 362, 366, 371)
 {
