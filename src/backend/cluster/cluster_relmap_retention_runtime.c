@@ -98,6 +98,50 @@ cluster_relmap_retention_runtime_shmem_register(void)
 	cluster_shmem_register_region(&region);
 }
 
+static bool
+relmap_runtime_observation_context(void)
+{
+	return relmap_runtime_shmem != NULL && CritSectionCount == 0
+		&& !ShutdownRequestPending && !LWLockHeldByMe(RelationMappingLock)
+		&& !LWLockHeldByMe(XidGenLock) && !LWLockHeldByMe(&relmap_runtime_shmem->lock);
+}
+
+bool
+cluster_relmap_retention_runtime_observe_empty_v1(uint16 origin,
+	ClusterRelmapRetentionEmptyV1 *out)
+{
+	uintptr_t a = (uintptr_t)relmap_runtime_shmem, b = (uintptr_t)out;
+	bool result;
+
+	/* No output can erase another origin or the shared lock/header either. */
+	if (out == NULL || (relmap_runtime_shmem != NULL
+		&& (a <= b ? b - a < sizeof(*relmap_runtime_shmem) : a - b < sizeof(*out))))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (origin >= CLUSTER_MAX_NODES || !relmap_runtime_observation_context())
+		return false;
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = cluster_relmap_retention_observe_empty_v1(
+		&relmap_runtime_shmem->directories[origin], out);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result;
+}
+
+bool
+cluster_relmap_retention_runtime_empty_current_v1(const ClusterRelmapRetentionEmptyV1 *observed)
+{
+	bool result;
+
+	if (observed == NULL || observed->origin >= CLUSTER_MAX_NODES
+		|| !relmap_runtime_observation_context())
+		return false;
+	LWLockAcquire(&relmap_runtime_shmem->lock, LW_EXCLUSIVE);
+	result = cluster_relmap_retention_empty_current_v1(
+		&relmap_runtime_shmem->directories[observed->origin], observed);
+	LWLockRelease(&relmap_runtime_shmem->lock);
+	return result;
+}
+
 bool
 cluster_relmap_retention_runtime_recovery_invalidate_v2(void)
 {

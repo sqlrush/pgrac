@@ -74,9 +74,33 @@ typedef struct ClusterRelmapRetentionDirectory {
 	uint64 native_floor;
 	uint64 last_issued;
 	uint64 truncate_serial;
+	/* Volatile source changes, never a read SCN. Saturation disables observation. */
+	uint64 source_serial;
 	ClusterRelmapRetentionTruncate inflight;
 	ClusterRelmapRetentionPin pins[CLUSTER_RELMAP_RETENTION_CAPACITY];
 } ClusterRelmapRetentionDirectory;
+
+/* Backend-local observation of ONE original COMPLETE directory. Not a census,
+ * SCN, reservation, global empty set or publication permission. Keep the
+ * original storage alive and externally qualify its full source/lifetime.
+ * Never transmit or persist this carrier. */
+typedef struct ClusterRelmapRetentionEmptyV1 {
+	const ClusterRelmapRetentionDirectory *source;
+	uint64 system_identifier;
+	uint64 database_incarnation;
+	uint64 generation;
+	uint64 source_serial;
+	uint16 origin;
+} ClusterRelmapRetentionEmptyV1;
+
+/* Both calls require the same original retention lock. A change, including a
+ * begin/cancel ABA, invalidates an earlier observation. Refusal clears a
+ * separate output; overlapping source/output refuses without changing either.
+ * Existing pins, native reservations and TT duties are never released here. */
+extern bool cluster_relmap_retention_observe_empty_v1(
+	const ClusterRelmapRetentionDirectory *directory, ClusterRelmapRetentionEmptyV1 *out);
+extern bool cluster_relmap_retention_empty_current_v1(
+	const ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetentionEmptyV1 *observed);
 
 /* Start on zeroed, unpublished storage only; cannot reset an old directory.
  * The original Startup owner must qualify the actual native floor and issued

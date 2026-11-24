@@ -1,0 +1,16 @@
+include Makefile
+.DEFAULT_GOAL := test_cluster_k_relmap_history
+K_RELMAP_HISTORY_O ?= $(top_builddir)/src/backend/cluster/cluster_relmap_retention.o
+
+test_cluster_k_relmap_history: test_cluster_k_relmap_history.c test_cluster_relmap_retention.c \
+		unit_test.h $(top_srcdir)/src/include/cluster/cluster_relmap_retention.h \
+		$(K_RELMAP_HISTORY_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(K_RELMAP_HISTORY_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_k_relmap_history_runtime: test_cluster_k_relmap_history_runtime.c \
+		test_cluster_wal_writer $(K_RELMAP_HISTORY_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_WAL_CLAIM_O) \
+		$(K_RELMAP_HISTORY_O) \
+		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@

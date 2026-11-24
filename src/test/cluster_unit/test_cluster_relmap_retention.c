@@ -10,6 +10,13 @@
 
 UT_DEFINE_GLOBALS();
 
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+	fprintf(stderr, "%s %s:%d\n", condition, file, line);
+	abort();
+}
+
 #define BASE UINT64CONST(0x200000000)
 #define HALF UINT64CONST(0x80000000)
 #define OK CLUSTER_RELMAP_RETENTION_OK

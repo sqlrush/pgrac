@@ -11,6 +11,16 @@
  * origin; attachment never rebuilds, clears pins or cancels reservations. */
 extern void cluster_relmap_retention_runtime_shmem_register(void);
 
+/* Backend-local, one-origin empty observation through the original directory
+ * and sole retention lock. No COMPLETE publisher, SCN qualification or global
+ * source proof. Call outside CF/Mapping/XidGen/retention locks and CRIT;
+ * UNKNOWN, incomplete, changed or occupied storage refuses without releasing
+ * any original duty. No owner callbacks, I/O, allocation or retry. */
+extern bool cluster_relmap_retention_runtime_observe_empty_v1(
+	uint16 origin, ClusterRelmapRetentionEmptyV1 *out);
+extern bool cluster_relmap_retention_runtime_empty_current_v1(
+	const ClusterRelmapRetentionEmptyV1 *observed);
+
 /* Original Startup only, before its first ROOT/census/retained-source scan.
  * Under the sole runtime lock revoke ALL origins to UNKNOWN, preserving every
  * pin, TT binding, staged marker, identity, floor/issued observation and native

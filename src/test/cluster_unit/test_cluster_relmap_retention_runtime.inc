@@ -1005,6 +1005,7 @@ UT_TEST(test_relmap_runtime_truncate_uncertain_preserves_reservation_and_pins_on
 	UT_ASSERT_EQ(cluster_relmap_retention_runtime_truncate_uncertain_v2(&receipt), CLUSTER_RELMAP_RETENTION_OK);
 	UT_ASSERT_EQ(directory->state, CLUSTER_RELMAP_RETENTION_UNKNOWN);
 	before.state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+	before.source_serial++;
 	UT_ASSERT_EQ(memcmp(&before, directory, sizeof(before)), 0);
 	relmap_runtime_shmem = NULL;
 	relmap_runtime_registered->init_fn();
@@ -1439,6 +1440,7 @@ UT_TEST(test_relmap_runtime_allocation_holds_final_window_until_original_stores)
 	UT_ASSERT(!relmap_retention_held && relmap_xidgen_held);
 	UT_ASSERT_EQ(InterruptHoldoffCount, 1);
 	before.last_issued = publication.candidate;
+	before.source_serial++;
 	UT_ASSERT_EQ(memcmp(&before, &relmap_runtime_shmem->directories[0], sizeof(before)), 0);
 	UT_ASSERT_EQ(publication.calls, 1);
 	UT_ASSERT_EQ(publication.native_next, publication.candidate + 1);
@@ -1714,8 +1716,13 @@ relmap_runtime_recovery_expect(bool accepted)
 	UT_ASSERT_NOT_NULL(expected);
 	memcpy(expected, relmap_runtime_shmem->directories, bytes);
 	if (accepted)
-		for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin++)
+		for (unsigned origin = 0; origin < CLUSTER_MAX_NODES; origin++) {
+			if (expected[origin].state != CLUSTER_RELMAP_RETENTION_UNKNOWN
+				&& expected[origin].source_serial != 0
+				&& expected[origin].source_serial != PG_UINT64_MAX)
+				expected[origin].source_serial++;
 			expected[origin].state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+		}
 	UT_ASSERT_EQ(cluster_relmap_retention_runtime_recovery_invalidate_v2(), accepted);
 	UT_ASSERT_EQ(memcmp(expected, relmap_runtime_shmem->directories, bytes), 0);
 	UT_ASSERT_EQ(relmap_retention_acquires, acquires + (accepted ? 1 : 0));
@@ -1768,6 +1775,7 @@ UT_TEST(test_relmap_runtime_recovery_keeps_inflight_across_retry_and_attach)
 	UT_ASSERT_NE(directory->inflight.serial, 0);
 	before = *directory;
 	before.state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+	before.source_serial++;
 	MyAuxProcType = StartupProcess;
 	relmap_runtime_recovery_expect(true);
 	relmap_runtime_recovery_expect(true);
@@ -1841,6 +1849,7 @@ UT_TEST(test_relmap_runtime_recovery_never_makes_old_consumers_available)
 	before = *directory;
 	before.state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
 	receipt = relmap_runtime_truncate_receipt(0);
+	before.source_serial++;
 	MyAuxProcType = StartupProcess;
 	relmap_runtime_recovery_expect(true);
 	MyAuxProcType = NotAnAuxProcess;

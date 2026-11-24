@@ -9,6 +9,64 @@
 /* Strictly less than half of the raw-XID space, using full-width identities. */
 #define RELMAP_XID_HALF UINT64CONST(0x80000000)
 
+/* Never wrap/reuse a source cut, and never fail an ordinary writer for it. */
+static void
+source_changed(ClusterRelmapRetentionDirectory *directory)
+{
+	if (directory->source_serial != 0 && directory->source_serial != PG_UINT64_MAX)
+		directory->source_serial++;
+}
+
+static bool
+empty_source(const ClusterRelmapRetentionDirectory *directory)
+{
+	static const ClusterRelmapRetentionPin zero_pin = { 0 };
+
+	if (directory == NULL || directory->state != CLUSTER_RELMAP_RETENTION_COMPLETE
+		|| directory->system_identifier == 0 || directory->database_incarnation == 0
+		|| directory->origin >= 128 || directory->generation == 0
+		|| directory->source_serial == 0 || directory->source_serial == PG_UINT64_MAX
+		|| directory->inflight.generation != 0 || directory->inflight.serial != 0
+		|| directory->inflight.cutoff != 0)
+		return false;
+	for (int i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++)
+		if (memcmp(&directory->pins[i], &zero_pin, sizeof(zero_pin)) != 0)
+			return false;
+	return true;
+}
+
+bool
+cluster_relmap_retention_observe_empty_v1(const ClusterRelmapRetentionDirectory *directory,
+	ClusterRelmapRetentionEmptyV1 *out)
+{
+	uintptr_t a = (uintptr_t)directory, b = (uintptr_t)out;
+
+	if (out == NULL || (directory != NULL
+		&& (a <= b ? b - a < sizeof(*directory) : a - b < sizeof(*out))))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!empty_source(directory))
+		return false;
+	out->source = directory;
+	out->system_identifier = directory->system_identifier;
+	out->database_incarnation = directory->database_incarnation;
+	out->generation = directory->generation;
+	out->source_serial = directory->source_serial;
+	out->origin = directory->origin;
+	return true;
+}
+
+bool
+cluster_relmap_retention_empty_current_v1(const ClusterRelmapRetentionDirectory *directory,
+	const ClusterRelmapRetentionEmptyV1 *observed)
+{
+	return observed != NULL && empty_source(directory) && observed->source == directory
+		&& observed->system_identifier == directory->system_identifier
+		&& observed->database_incarnation == directory->database_incarnation
+		&& observed->origin == directory->origin && observed->generation == directory->generation
+		&& observed->source_serial == directory->source_serial;
+}
+
 static bool
 normal_full_xid(uint64 full)
 {
@@ -100,6 +158,8 @@ enroll_binding(ClusterRelmapRetentionDirectory *directory, uint64 full,
 		ClusterRelmapRetentionPin *pin = &directory->pins[i];
 
 		if (pin->occupied && pin->key.top_full_xid == full) {
+			if (!pin->has_tt_binding || !same_binding(&pin->binding, binding))
+				source_changed(directory);
 			pin->binding = *binding;
 			pin->has_tt_binding = true;
 		}
@@ -185,6 +245,7 @@ add_pin(ClusterRelmapRetentionDirectory *directory, const ClusterRelmapRetention
 	}
 	if (free_pin == NULL)
 		return CLUSTER_RELMAP_RETENTION_CAPACITY_EXCEEDED;
+	source_changed(directory);
 	free_pin->key = *key;
 	free_pin->wal_end = wal_end;
 	memset(&free_pin->binding, 0, sizeof(free_pin->binding));
@@ -205,7 +266,8 @@ cluster_relmap_retention_build_start(ClusterRelmapRetentionDirectory *directory,
 		|| directory->generation != 0 || directory->system_identifier != 0
 		|| directory->database_incarnation != 0 || directory->origin != 0
 		|| directory->native_floor != 0 || directory->last_issued != 0
-		|| directory->truncate_serial != 0 || directory->inflight.generation != 0
+		|| directory->truncate_serial != 0 || directory->source_serial != 0
+		|| directory->inflight.generation != 0
 		|| directory->inflight.serial != 0 || directory->inflight.cutoff != 0)
 		return CLUSTER_RELMAP_RETENTION_INVALID;
 	for (i = 0; i < CLUSTER_RELMAP_RETENTION_CAPACITY; i++)
@@ -223,6 +285,7 @@ cluster_relmap_retention_build_start(ClusterRelmapRetentionDirectory *directory,
 	directory->generation = generation;
 	directory->native_floor = native_floor;
 	directory->last_issued = last_issued;
+	directory->source_serial = 1;
 	directory->state = CLUSTER_RELMAP_RETENTION_BUILDING;
 	return CLUSTER_RELMAP_RETENTION_OK;
 }
@@ -238,8 +301,10 @@ cluster_relmap_retention_build_add(ClusterRelmapRetentionDirectory *directory,
 	result = wal_end != 0 ? add_pin(directory, key, wal_end, true)
 		: CLUSTER_RELMAP_RETENTION_INVALID;
 	/* Incomplete/corrupt/over-capacity enumeration cannot become COMPLETE. */
-	if (result != CLUSTER_RELMAP_RETENTION_OK)
+	if (result != CLUSTER_RELMAP_RETENTION_OK) {
+		source_changed(directory);
 		directory->state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+	}
 	return result;
 }
 
@@ -248,6 +313,7 @@ cluster_relmap_retention_build_finish(ClusterRelmapRetentionDirectory *directory
 {
 	if (directory == NULL || directory->state != CLUSTER_RELMAP_RETENTION_BUILDING)
 		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
+	source_changed(directory);
 	directory->state = CLUSTER_RELMAP_RETENTION_COMPLETE;
 	return CLUSTER_RELMAP_RETENTION_OK;
 }
@@ -255,8 +321,10 @@ cluster_relmap_retention_build_finish(ClusterRelmapRetentionDirectory *directory
 void
 cluster_relmap_retention_invalidate(ClusterRelmapRetentionDirectory *directory)
 {
-	if (directory != NULL)
+	if (directory != NULL && directory->state != CLUSTER_RELMAP_RETENTION_UNKNOWN) {
+		source_changed(directory);
 		directory->state = CLUSTER_RELMAP_RETENTION_UNKNOWN;
+	}
 }
 
 ClusterRelmapRetentionResult
@@ -370,6 +438,8 @@ cluster_relmap_retention_stage_start(ClusterRelmapRetentionDirectory *directory,
 	pin = find_pin(directory, key);
 	if (pin == NULL || (pin->may_be_staged && pin->wal_end != wal_end))
 		return CLUSTER_RELMAP_RETENTION_CONFLICT;
+	if (!pin->may_be_staged || pin->wal_end != wal_end)
+		source_changed(directory);
 	pin->wal_end = wal_end;
 	pin->may_be_staged = true;
 	return CLUSTER_RELMAP_RETENTION_OK;
@@ -408,6 +478,7 @@ cluster_relmap_retention_cancel_prepare(ClusterRelmapRetentionDirectory *directo
 		return CLUSTER_RELMAP_RETENTION_CONFLICT;
 	if (pin->may_be_staged)
 		return CLUSTER_RELMAP_RETENTION_RETAINED;
+	source_changed(directory);
 	memset(pin, 0, sizeof(*pin));
 	return CLUSTER_RELMAP_RETENTION_OK;
 }
@@ -432,6 +503,7 @@ cluster_relmap_retention_truncate_begin(ClusterRelmapRetentionDirectory *directo
 	if (directory->truncate_serial == PG_UINT64_MAX)
 		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
 	cutoff = Min(requested_cutoff, minimum_pin(directory));
+	source_changed(directory);
 	directory->inflight.generation = directory->generation;
 	directory->inflight.serial = ++directory->truncate_serial;
 	directory->inflight.cutoff = cutoff;
@@ -458,6 +530,7 @@ cluster_relmap_retention_truncate_complete(ClusterRelmapRetentionDirectory *dire
 		return CLUSTER_RELMAP_RETENTION_UNAVAILABLE;
 	if (!matches_truncate(directory, reservation))
 		return CLUSTER_RELMAP_RETENTION_CONFLICT;
+	source_changed(directory);
 	directory->native_floor = directory->inflight.cutoff;
 	memset(&directory->inflight, 0, sizeof(directory->inflight));
 	return CLUSTER_RELMAP_RETENTION_OK;
@@ -499,7 +572,9 @@ cluster_relmap_retention_allocation_observe(ClusterRelmapRetentionDirectory *dir
 {
 	ClusterRelmapRetentionResult result = cluster_relmap_retention_allocation_check(directory, candidate);
 
-	if (result == CLUSTER_RELMAP_RETENTION_OK)
+	if (result == CLUSTER_RELMAP_RETENTION_OK) {
+		source_changed(directory);
 		directory->last_issued = candidate;
+	}
 	return result;
 }
