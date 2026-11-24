@@ -411,7 +411,17 @@ RelationMapUpdateMap(Oid relationId, RelFileNumber fileNumber, bool shared,
 		 * infrastructure, but it doesn't presently seem worth it.
 		 */
 		if (GetCurrentTransactionNestLevel() > 1)
+		{
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_shared_catalog)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot change relation mapping within subtransaction"),
+						 errhint("Execute this operation in a top-level transaction. "
+								 "SAVEPOINT and PL/pgSQL EXCEPTION blocks create subtransactions.")));
+#endif
 			elog(ERROR, "cannot change relation mapping within subtransaction");
+		}
 
 		if (IsInParallelMode())
 			elog(ERROR, "cannot change relation mapping in parallel mode");

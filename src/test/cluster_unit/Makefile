@@ -573,6 +573,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
+TESTS += test_cluster_relmap_subtransaction
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_subtransaction,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_xid_order
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_xid_order,$(SIMPLE_TESTS))
 TESTS += test_cluster_relmap_arb
@@ -608,6 +610,13 @@ test_cluster_relmap_arb: test_cluster_relmap_arb.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+# Run the original map entry and in-memory installer, with only error reporting
+# and backend transaction context supplied by the standalone fixture.
+test_cluster_relmap_subtransaction: test_cluster_relmap_subtransaction.c unit_test.h \
+		$(top_srcdir)/src/backend/utils/cache/relmapper.c $(top_builddir)/src/port/libpgport_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(top_builddir)/src/port/libpgport_srv.a -o $@
 
 test_cluster_relmap_xid_order: test_cluster_relmap_xid_order.c unit_test.h \
 		test_cluster_relmap_producer_stage.inc test_cluster_relmap_commit_native.h \
