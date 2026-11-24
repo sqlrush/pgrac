@@ -219,8 +219,10 @@ case remains dependent on the missing observation entry.
 python3 -m unittest discover -s src/test/cluster_tap/pre2 -p 'test_*.py'
 PGRAC_PRE2_BINDIR=/path/to/build/install/bin \
   prove -I src/test/perl src/test/cluster_tap/pre2/test_fixture.pl \
-    src/test/cluster_tap/pre2/test_lifecycle.pl
+    src/test/cluster_tap/pre2/test_lifecycle.pl \
+    src/test/cluster_tap/pre2/test_pair_provisioning.pl
 ```
 
-These checks use explicit in-memory command/observation fixtures. They test
-the judge and process bookkeeping, not real PRE2 startup, recovery or S-cache.
+These checks use command/observation fixtures; the pair-provisioning check
+also writes real configurations and symlinks. They test the judge, process
+bookkeeping and configured paths, not real PRE2 startup, recovery or S-cache.
