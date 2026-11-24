@@ -28,8 +28,6 @@ static unsigned scope_handoff_fault;
 static bool scope_handoff_published;
 static ClusterColdDetailV1 scope_handoff_plan_result;
 static bool scope_handoff_original_plan;
-static uint32 scope_handoff_wait_event;
-uint32 *my_wait_event_info = &scope_handoff_wait_event;
 
 static bool
 scope_handoff_current(void *arg)
@@ -279,7 +277,7 @@ UT_TEST(test_scope_handoff_reuses_native_receipt_without_replaying_after_eor)
 			InvalidOid, &committed));
 		UT_ASSERT_EQ(memcmp(&committed, &zero, sizeof(zero)), 0);
 		UT_ASSERT_EQ(scope_replay_calls, calls);
-		UT_ASSERT_EQ(scope_handoff_wait_event, 0);
+		UT_ASSERT_EQ(*my_wait_event_info, 0);
 		UT_ASSERT_EQ(relmap_failed | ctrc_set_release_calls | scope_native_legacy_calls, 0);
 	}
 	scope_handoff_end(&inputs, &history, fds);

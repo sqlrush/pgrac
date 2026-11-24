@@ -28,6 +28,7 @@ static void (*native_terminal_sync_hook)(void);
 /* This original raw FULL fixture has no selected managed file table and
  * does not inherit the allocator test's online cluster-enabled flag. */
 bool cluster_enabled;
+ProcessingMode Mode = NormalProcessing;
 ClusterControlNativeModeV2
 cluster_control_native_files_mode_v2(void)
 {

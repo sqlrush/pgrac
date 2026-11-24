@@ -6600,6 +6600,10 @@ test_cluster_recovery_episode_side_owner.o: test_cluster_recovery_episode_side_o
 
 test_cluster_recovery_episode_clog.o: test_cluster_recovery_episode_clog.c \
         test_cluster_recovery_episode_clog.h test_cluster_recovery_episode_clog_namespace.h \
+        $(top_srcdir)/src/include/access/clog_storage.h \
+        $(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+        $(top_srcdir)/src/include/cluster/cluster_wal_thread.h \
+        $(top_srcdir)/src/include/miscadmin.h \
         test_cluster_clog_recovery.c test_cluster_clog_relmap_participant.inc \
         test_cluster_clog_relmap_mutation.inc \
         test_cluster_clog_relmap_shared_mutation.inc \
@@ -20553,6 +20557,7 @@ clean-clog-native-io:
 # The original raw FULL fixture explicitly supplies its isolated UNKNOWN mode.
 test_cluster_xid_native_clog.o: \
 	$(top_srcdir)/src/include/cluster/cluster_control_native_files.h \
+	$(top_srcdir)/src/include/miscadmin.h \
 	$(top_srcdir)/src/include/access/slru.h
 
 # Validate the complete native page request before changing status or group LSNs.

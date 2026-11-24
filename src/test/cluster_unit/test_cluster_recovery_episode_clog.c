@@ -24,6 +24,76 @@ int d3_episode_clog_main(void);
 static PGPROC episode_native_proc;
 PGPROC *MyProc = &episode_native_proc;
 
+/* This bridge exercises the original raw/FULL episode, independently of the
+ * caller's online configuration. Selected managed I/O and the unpublished
+ * creator have separate real-file fixtures; entering them here must abort. */
+bool cluster_enabled;
+ProcessingMode Mode = NormalProcessing;
+bool IsPostmasterEnvironment;
+
+ClusterControlNativeModeV2
+cluster_control_native_files_mode_v2(void)
+{
+	return CLUSTER_NATIVE_FILES_UNKNOWN_V2;
+}
+
+bool
+cluster_control_native_files_info_v2(ClusterControlNativeTableInfoV2 *out)
+{
+	(void) out;
+	abort();
+}
+
+const PgracInitdbRecoveryContext *
+cluster_wal_thread_initdb_recovery_context(void)
+{
+	abort();
+}
+
+TimeLineID
+GetWALInsertionTimeLine(void)
+{
+	abort();
+}
+
+bool
+cluster_clog_storage_read_page_v2(int fd,
+	const ClusterClogFileBindingV2 *expected, uint64 logical_page,
+	ClusterClogPageIdentityV2 *page_out, void *payload_out, Size payload_length)
+{
+	(void) fd; (void) expected; (void) logical_page; (void) page_out;
+	(void) payload_out; (void) payload_length;
+	abort();
+}
+
+bool
+cluster_clog_storage_replay_v2(int fd,
+	const ClusterClogFileBindingV2 *expected, uint8 info,
+	const void *record, Size record_length, XLogRecPtr record_end,
+	const void *current_frame, Size current_length, XLogRecPtr *applied_end)
+{
+	(void) fd; (void) expected; (void) info; (void) record;
+	(void) record_length; (void) record_end; (void) current_frame;
+	(void) current_length; (void) applied_end;
+	abort();
+}
+
+bool
+cluster_clog_storage_sync_file_v2(int fd, int directory_fd,
+	const ClusterClogFileBindingV2 *expected, ClusterClogFileSyncV2 *out)
+{
+	(void) fd; (void) directory_fd; (void) expected; (void) out;
+	abort();
+}
+
+bool
+cluster_clog_storage_page_unwritten_v2(int fd,
+	const ClusterClogFileBindingV2 *expected, uint64 logical_page)
+{
+	(void) fd; (void) expected; (void) logical_page;
+	abort();
+}
+
 #undef cluster_wal_inputs_relmap_source_current_v1
 #undef cluster_wal_inputs_relmap_source_fail_v1
 #undef cluster_wal_inputs_relmap_source_revalidate_v1
