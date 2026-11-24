@@ -89,6 +89,9 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+#ifdef SLRU_FIXTURE_COUNT_HOLDOFF
+	if (SLRU_FIXTURE_COUNT_HOLDOFF()) HOLD_INTERRUPTS();
+#endif
 	UT_ASSERT(mode == LW_EXCLUSIVE || mode == LW_SHARED);
 	if (lock == &control) {
 		UT_ASSERT(!control_held);
@@ -131,6 +134,9 @@ LWLockRelease(LWLock *lock)
 		fixture_io_wait_mode = false;
 		io_held = false;
 	}
+#ifdef SLRU_FIXTURE_COUNT_HOLDOFF
+	if (SLRU_FIXTURE_COUNT_HOLDOFF()) RESUME_INTERRUPTS();
+#endif
 }
 
 bool
@@ -212,7 +218,14 @@ bool
 errstart(int level, const char *domain pg_attribute_unused())
 {
 	UT_ASSERT(level >= ERROR);
+#ifdef SLRU_FIXTURE_ERROR_LEVEL
+	SLRU_FIXTURE_ERROR_LEVEL(level);
+#endif
+#ifdef SLRU_FIXTURE_ERROR_LOCKS
+	UT_ASSERT(SLRU_FIXTURE_ERROR_LOCKS());
+#else
 	UT_ASSERT(control_held && !io_held);
+#endif
 	return true;
 }
 bool
@@ -221,6 +234,9 @@ void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
 {
+#ifdef SLRU_FIXTURE_ERROR_RESET
+	SLRU_FIXTURE_ERROR_RESET();
+#endif
 	if (PG_exception_stack == NULL) abort();
 	siglongjmp(*PG_exception_stack, 1);
 }
