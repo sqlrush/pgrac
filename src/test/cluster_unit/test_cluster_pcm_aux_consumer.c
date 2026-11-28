@@ -32,6 +32,8 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+int NBuffers = 1;
+int NLocBuffer = 0;
 
 /* These consumer cases run with observation off, not a trace collector. */
 void
@@ -47,6 +49,7 @@ static sigjmp_buf fixture_error;
 static bool fixture_remote;
 static bool fixture_context_valid;
 static bool fixture_content_held;
+static LWLockMode fixture_content_mode;
 static int fixture_mutation;
 static int fixture_ordinary;
 static int fixture_track;
@@ -61,6 +64,10 @@ static void (*fixture_wait_check)(void);
 static bool fixture_creation_retired;
 static bool fixture_unproven_not_found;
 static int fixture_aborts;
+static void (*fixture_after_unlock)(void);
+static unsigned fixture_init_records;
+static uint8 fixture_peer_state;
+static uint32 fixture_peer_flags;
 static bool fixture_object_enabled, fixture_object_shared, fixture_object_allowed;
 static int fixture_object_tier, fixture_object_smgr;
 static uint64 fixture_object_revision;
@@ -145,10 +152,13 @@ static ResourceXApplyResult
 fixture_acquire(BufferDesc *buf, const BufferTag *tag, uint64 r4_generation, uint64 generation,
 				uint64 token, bool *creation_reobserve, ResourceXAcquisitionRef *ref)
 {
-	UT_ASSERT_NOT_NULL(creation_reobserve);
-	*creation_reobserve = false;
+	bool drops_pin = tag->forkNum == FSM_FORKNUM;
+
+	UT_ASSERT((creation_reobserve != NULL) == drops_pin);
+	if (creation_reobserve != NULL)
+		*creation_reobserve = false;
 	UT_ASSERT(buf == &fixture_buf);
-	UT_ASSERT_EQ(fixture_state.private_refcount, 0);
+	UT_ASSERT_EQ(fixture_state.private_refcount, drops_pin ? 0 : 1);
 	UT_ASSERT_EQ(r4_generation, 6);
 	UT_ASSERT_EQ(generation, 11);
 	UT_ASSERT_EQ(token, 5);
@@ -166,7 +176,8 @@ fixture_acquire(BufferDesc *buf, const BufferTag *tag, uint64 r4_generation, uin
 	if (fixture_remote)
 		fixture_payload = UINT64CONST(0x123456789abcdef0);
 	if (fixture_creation_retired) {
-		*creation_reobserve = true;
+		if (creation_reobserve != NULL)
+			*creation_reobserve = true;
 		fixture_state.generation = 13;
 		fixture_state.reservation_token = 6;
 		fixture_state.buffer_type = (uint8)BUF_TYPE_CURRENT;
@@ -271,9 +282,10 @@ fixture_ordinary_lock(Buffer buffer, int mode, bool *barrier, void *deadline, bo
 	UT_ASSERT(barrier == NULL && deadline == NULL && transient == NULL);
 	UT_ASSERT(context == NULL);
 	UT_ASSERT(!fixture_content_held);
-	UT_ASSERT_EQ(fixture_track, 0);
+	UT_ASSERT_EQ(fixture_track, fixture_activate);
 	*replaced = false;
 	fixture_ordinary++;
+	fixture_content_mode = LW_EXCLUSIVE;
 	fixture_content_held = true;
 }
 
@@ -281,10 +293,25 @@ static bool
 fixture_lock(LWLock *lock, LWLockMode mode)
 {
 	UT_ASSERT(lock == BufferDescriptorGetContentLock(&fixture_buf));
-	UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+	UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 	UT_ASSERT(!fixture_content_held);
+	fixture_content_mode = mode;
 	fixture_content_held = true;
 	return true;
+}
+
+static void
+fixture_unlock(LWLock *lock)
+{
+	void (*after_unlock)(void) = fixture_after_unlock;
+
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(&fixture_buf));
+	UT_ASSERT(fixture_content_held);
+	fixture_content_held = false;
+	if (after_unlock != NULL) {
+		fixture_after_unlock = NULL;
+		after_unlock();
+	}
 }
 
 static void
@@ -335,6 +362,7 @@ fixture_abort(void)
 #define LockBufferInternal fixture_ordinary_lock
 #define LockBuffer(buffer, mode) fixture_failure()
 #define LWLockAcquire fixture_lock
+#define LWLockRelease fixture_unlock
 #undef elog
 #define elog(level, ...) UT_ASSERT_EQ(level, DEBUG1)
 
@@ -354,14 +382,6 @@ fixture_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 	out->writer_activation_token = fixture_state.writer_activation_token;
 	out->resource_x_activation_generation = fixture_state.resource_x_activation_generation;
 	return CLUSTER_PCM_OWN_OK;
-}
-
-static void
-pg_attribute_unused() fixture_unlock(LWLock *lock)
-{
-	UT_ASSERT(lock == BufferDescriptorGetContentLock(&fixture_buf));
-	UT_ASSERT(fixture_content_held);
-	fixture_content_held = false;
 }
 
 /* KO's existing retained-target predicate is a boundary fixture here.
@@ -389,7 +409,6 @@ pg_attribute_unused() fixture_object_current(uint64 revision)
 #define cluster_bufmgr_pcm_own_snapshot fixture_own_snapshot
 #define cluster_node_id 0
 #define LWLockHeldByMe(lock) ((void)(lock), fixture_content_held)
-#define LWLockRelease fixture_unlock
 #define cluster_pcm_lock_resource_x_trace_ref(...) (fixture_activate++)
 #define cluster_enabled fixture_object_enabled
 #define cluster_shared_config fixture_object_shared
@@ -467,11 +486,146 @@ fixture_reset(ClusterPcmDirectInitKind kind, bool remote)
 	fixture_creation_retired = false;
 	fixture_unproven_not_found = false;
 	fixture_aborts = 0;
+	fixture_after_unlock = NULL;
+	fixture_init_records = 0;
 	fixture_object_enabled = fixture_object_shared = fixture_object_allowed = true;
 	fixture_object_tier = CLUSTER_IC_TIER_1;
 	fixture_object_smgr = 1;
 	fixture_object_revision = 13;
 	fixture_object_samples = fixture_object_checks = 0;
+}
+
+/* Execute vm_readbuf's original format/lock/recheck/write bracket. The
+ * descriptor and WAL sink are controlled; arm, gate and their caller are real. */
+static bool
+fixture_init_wal(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(fixture_content_held && fixture_content_mode == LW_EXCLUSIVE);
+	UT_ASSERT(fixture_state.page_is_new);
+	fixture_state.page_is_new = false;
+	fixture_init_records++;
+	return true;
+}
+
+static void
+fixture_vm_unlock(Buffer buffer, int mode)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT_EQ(mode, BUFFER_LOCK_UNLOCK);
+	UT_ASSERT(fixture_content_held && fixture_content_mode == LW_EXCLUSIVE);
+	fixture_unlock(BufferDescriptorGetContentLock(&fixture_buf));
+}
+
+static Buffer
+fixture_vm_format(void)
+{
+	Buffer buf = 1;
+	bool versioned = true;
+
+#define vm_page_is_new(buffer) (fixture_state.page_is_new)
+#define LockBufferForVisibilityMapPageInit(buffer) \
+	LockBufferForAuxiliaryPageInit((buffer), CLUSTER_PCM_DIRECT_INIT_VM)
+#undef LockBuffer
+#define LockBuffer fixture_vm_unlock
+#define cluster_space_init_vm_buffer_wal(identity, buffer) fixture_init_wal(buffer)
+#define PageInit(...) fixture_failure()
+	do {
+#include "test_cluster_pcm_aux_vm_init.inc"
+	} while (false);
+	fixture_failure(); /* A VM retaining its pin must never return InvalidBuffer. */
+	return InvalidBuffer;
+#undef PageInit
+#undef cluster_space_init_vm_buffer_wal
+#undef LockBuffer
+#undef LockBufferForVisibilityMapPageInit
+#undef vm_page_is_new
+}
+
+/* Run the peer between release of the first backend's arm lock and its
+ * gate. Each backend owns one private pin on the same physical mapping. */
+static void
+fixture_peer_init(void)
+{
+	UT_ASSERT(!fixture_content_held);
+	UT_ASSERT_EQ(fixture_reservations, 0);
+	fixture_state.buf_state += BUF_REFCOUNT_ONE;
+	UT_ASSERT_EQ(fixture_vm_format(), 1);
+	UT_ASSERT_EQ(fixture_init_records, 1);
+	fixture_state.buf_state -= BUF_REFCOUNT_ONE;
+	fixture_state.flags = fixture_peer_flags;
+	if (fixture_peer_flags != 0)
+		fixture_state.reservation_token++;
+	if (fixture_peer_state != PCM_STATE_X) {
+		fixture_state.generation++;
+		fixture_state.pcm_state = fixture_peer_state;
+		fixture_state.buffer_type = fixture_peer_state == PCM_STATE_S ? BUF_TYPE_SCUR : BUF_TYPE_PI;
+	}
+}
+
+UT_TEST(test_vm_peer_formats_between_arm_and_gate)
+{
+	const struct { uint8 state; uint32 flags; } cases[] = {
+		{PCM_STATE_X, 0}, {PCM_STATE_S, 0}, {PCM_STATE_N, 0},
+		{PCM_STATE_S, PCM_OWN_FLAG_GRANT_PENDING}, {PCM_STATE_X, PCM_OWN_FLAG_REVOKING}
+	};
+
+	for (size_t i = 0; i < lengthof(cases); i++) {
+		fixture_reset(CLUSTER_PCM_DIRECT_INIT_VM, false);
+		fixture_peer_state = cases[i].state;
+		fixture_peer_flags = cases[i].flags;
+		fixture_after_unlock = fixture_peer_init;
+		if (sigsetjmp(fixture_error, 0) != 0) {
+			UT_ASSERT(!"same pinned VM page rejected after peer finished initialization");
+			continue;
+		}
+		UT_ASSERT_EQ(fixture_vm_format(), 1);
+		UT_ASSERT_EQ(fixture_init_records, 1);
+		UT_ASSERT_EQ(fixture_reservations, 1);
+		UT_ASSERT_EQ(fixture_acquires, 1);
+		UT_ASSERT_EQ(fixture_ordinary, 1);
+		UT_ASSERT_EQ(fixture_track, 1);
+		UT_ASSERT_EQ(fixture_activate, 1);
+		UT_ASSERT_EQ(fixture_state.private_refcount, 1);
+		UT_ASSERT(!fixture_content_held);
+	}
+}
+
+UT_TEST(test_vm_stale_gate_rejects_invalid_mapping_or_proof)
+{
+	for (int cut = 0; cut < 11; cut++) {
+		ClusterPcmDirectInitProof proof;
+		ClusterPcmDirectInitSnapshot observed;
+		bool replaced = false;
+
+		fixture_reset(CLUSTER_PCM_DIRECT_INIT_VM, false);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_arm_direct_init(&fixture_buf,
+			CLUSTER_PCM_DIRECT_INIT_VM, &proof, &observed), CLUSTER_BUFMGR_PCM_DIRECT_INIT_ARMED);
+		fixture_state.page_is_new = false;
+		fixture_state.generation++;
+		fixture_state.pcm_state = PCM_STATE_X;
+		fixture_state.buffer_type = BUF_TYPE_XCUR;
+		switch (cut) {
+			case 0: fixture_state.tag.blockNum++; break;
+			case 1: fixture_state.buf_id++; break;
+			case 2: fixture_state.private_refcount = 0; break;
+			case 3: fixture_state.flags = PCM_OWN_FLAG_REVOKING | PCM_OWN_FLAG_GRANT_PENDING; break;
+			case 4: fixture_state.pcm_state = PCM_STATE_S; break; /* S/XCUR */
+			case 5: proof.armed = false; break;
+			case 6: proof.kind = CLUSTER_PCM_DIRECT_INIT_FSM; break;
+			case 7: fixture_state.buf_state |= BM_IO_ERROR; break;
+			case 8: fixture_state.buf_state &= ~BM_TAG_VALID; break;
+			case 9: fixture_state.generation = proof.identity.generation - 1; break;
+			case 10: fixture_state.reservation_token = proof.identity.reservation_token - 1; break;
+		}
+		if (sigsetjmp(fixture_error, 0) == 0) {
+			(void)cluster_bufmgr_pcm_gate_direct_init(&fixture_buf,
+					CLUSTER_PCM_DIRECT_INIT_VM, &proof, &replaced);
+			UT_ASSERT(!"invalid mapping or credential accepted");
+		}
+		UT_ASSERT_EQ(fixture_reservations + fixture_acquires + fixture_ordinary, 0);
+		UT_ASSERT(!fixture_content_held);
+	}
 }
 
 UT_TEST(test_unproven_not_found_keeps_original_creation_cleanup)
@@ -497,25 +651,38 @@ UT_TEST(test_unproven_not_found_keeps_original_creation_cleanup)
 
 UT_TEST(test_retired_aux_creator_returns_original_reader_without_abort_or_old_access)
 {
-	for (int kind = CLUSTER_PCM_DIRECT_INIT_VM; kind <= CLUSTER_PCM_DIRECT_INIT_FSM; kind++) {
-		fixture_reset((ClusterPcmDirectInitKind)kind, true);
-		fixture_creation_retired = true;
-		if (sigsetjmp(fixture_error, 0) != 0) {
-			UT_ASSERT(!"retired creation tried to abort its consumed token or reported an error");
-			continue;
-		}
-		UT_ASSERT_EQ(LockBufferForAuxiliaryPageInit(1, (ClusterPcmDirectInitKind)kind),
-					 InvalidBuffer);
-		UT_ASSERT_EQ(fixture_post_t3_snapshots, 0);
-		UT_ASSERT_EQ(fixture_ordinary, 0);
-		UT_ASSERT_EQ(fixture_track, 0);
-		UT_ASSERT_EQ(fixture_activate, 0);
-		UT_ASSERT_EQ(fixture_fuse, 0);
-		UT_ASSERT_EQ(fixture_acquires, 1);
-		UT_ASSERT_EQ(fixture_state.private_refcount, 0);
-		UT_ASSERT(!fixture_content_held);
-		UT_ASSERT_EQ(fixture_payload, UINT64CONST(0x123456789abcdef0));
+	fixture_reset(CLUSTER_PCM_DIRECT_INIT_FSM, true);
+	fixture_creation_retired = true;
+	if (sigsetjmp(fixture_error, 0) != 0) {
+		UT_ASSERT(!"retired creation tried to abort its consumed token or reported an error");
+		return;
 	}
+	UT_ASSERT_EQ(LockBufferForAuxiliaryPageInit(1, CLUSTER_PCM_DIRECT_INIT_FSM),
+				 InvalidBuffer);
+	UT_ASSERT_EQ(fixture_post_t3_snapshots, 0);
+	UT_ASSERT_EQ(fixture_ordinary, 0);
+	UT_ASSERT_EQ(fixture_track, 0);
+	UT_ASSERT_EQ(fixture_activate, 0);
+	UT_ASSERT_EQ(fixture_fuse, 0);
+	UT_ASSERT_EQ(fixture_acquires, 1);
+	UT_ASSERT_EQ(fixture_state.private_refcount, 0);
+	UT_ASSERT(!fixture_content_held);
+	UT_ASSERT_EQ(fixture_payload, UINT64CONST(0x123456789abcdef0));
+}
+
+UT_TEST(test_vm_retains_pin_on_retired_creation_without_a_drop_handoff)
+{
+	fixture_reset(CLUSTER_PCM_DIRECT_INIT_VM, true);
+	fixture_creation_retired = true;
+	if (sigsetjmp(fixture_error, 0) == 0) {
+		(void)LockBufferForAuxiliaryPageInit(1, CLUSTER_PCM_DIRECT_INIT_VM);
+		UT_ASSERT(!"unproven VM retirement bypassed the original abort");
+	}
+	UT_ASSERT_EQ(fixture_aborts, 1);
+	UT_ASSERT_EQ(fixture_state.private_refcount, 1);
+	UT_ASSERT_EQ(fixture_acquires, 1);
+	UT_ASSERT_EQ(fixture_ordinary + fixture_activate, 0);
+	UT_ASSERT(!fixture_content_held);
 }
 
 UT_TEST(test_initialized_remote_aux_uses_ordinary_upper_consumer)
@@ -864,9 +1031,12 @@ UT_TEST(test_actual_normal_prepare_binds_object_sample_after_exact_grant)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(19);
+	UT_RUN(test_vm_peer_formats_between_arm_and_gate);
+	UT_RUN(test_vm_stale_gate_rejects_invalid_mapping_or_proof);
 	UT_RUN(test_unproven_not_found_keeps_original_creation_cleanup);
 	UT_RUN(test_retired_aux_creator_returns_original_reader_without_abort_or_old_access);
+	UT_RUN(test_vm_retains_pin_on_retired_creation_without_a_drop_handoff);
 	UT_RUN(test_initialized_remote_aux_uses_ordinary_upper_consumer);
 	UT_RUN(test_known_new_aux_keeps_initialization_proof);
 	UT_RUN(test_initialized_remote_aux_still_rejects_stale_context);

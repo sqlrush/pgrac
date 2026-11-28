@@ -5441,6 +5441,7 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	uint64		pending_token = 0;
 	uint64		writer_r4_generation = 0;
 	bool		aux_pin_required;
+	bool		armed_vm;
 	bool installed_aux_image;
 	bool creation_reobserve = false;
 
@@ -5459,7 +5460,25 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	buf_state = LockBufHdr(buf);
 	cluster_bufmgr_pcm_direct_init_snapshot_locked(
 		buf, buf_state, PageIsNew((Page) BufHdrGetBlock(buf)), &observed);
+	armed_vm = kind == CLUSTER_PCM_DIRECT_INIT_VM && proof->kind == kind && proof->armed;
 	pending_result = cluster_pcm_direct_init_proof_consume(kind, &observed, proof);
+	/* A peer may have won DirectInit after arm released the content lock.
+	 * Discard our consumed proof and re-arm on the same pinned mapping. Only
+	 * the ordinary X path may authorize the caller's final format check. */
+	if (armed_vm
+		&& (pending_result == CLUSTER_PCM_OWN_STALE || pending_result == CLUSTER_PCM_OWN_BUSY)
+		&& observed.buf_id == proof->identity.buf_id
+		&& observed.generation >= proof->identity.generation
+		&& observed.reservation_token >= proof->identity.reservation_token
+		&& BufferTagsEqual(&observed.tag, &proof->identity.tag)
+		&& (buf_state & (BM_VALID | BM_TAG_VALID | BM_IO_ERROR)) == (BM_VALID | BM_TAG_VALID)
+		&& BUF_STATE_GET_REFCOUNT(buf_state) > 0
+		&& cluster_pcm_direct_init_resident_vm(kind, &observed))
+	{
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(BufferDescriptorGetContentLock(buf));
+		return false;
+	}
 	if (pending_result != CLUSTER_PCM_OWN_OK
 		&& (kind == CLUSTER_PCM_DIRECT_INIT_VM
 			|| kind == CLUSTER_PCM_DIRECT_INIT_FSM)

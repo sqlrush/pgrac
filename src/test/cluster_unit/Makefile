@@ -5070,7 +5070,7 @@ clean distclean maintainer-clean:
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_resource_x_eviction_owner.inc \
 		test_cluster_resource_x_failed_round_observation.inc \
-		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
+		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_vm_init.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
 		test_cluster_ctrc_dispatch.inc \
 		test_cluster_ctrc_run_pass.inc \
 		test_cluster_ctrc_read_scope.inc \
@@ -6229,6 +6229,14 @@ test_cluster_pcm_aux_page_space.inc: $(top_srcdir)/src/backend/storage/page/bufp
 	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Final vm_readbuf format probe, exclusive recheck and WAL initialization.
+test_cluster_pcm_aux_vm_init.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^vm_readbuf\(/ { inside=1 } \
+	     inside && /^\t\tif \(vm_page_is_new\(buf\)\)/ { emit=1; starts++ } \
+	     emit { print } emit && /^\t\treturn buf;/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_aux_consumer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^typedef enum ClusterBufmgrPcmDirectInitArmResult/ { emit=1; arm_enum++ } \
 	     /^cluster_bufmgr_pcm_arm_direct_init\(/ { print "static ClusterBufmgrPcmDirectInitArmResult"; emit=1; arm++ } \
@@ -6255,7 +6263,7 @@ test_cluster_pcm_writer_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 	mv $@.tmp $@
 
 test_cluster_pcm_aux_consumer: test_cluster_pcm_aux_consumer.c unit_test.h \
-		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
+		test_cluster_pcm_aux_consumer.inc test_cluster_pcm_aux_vm_init.inc test_cluster_pcm_aux_ledger.inc test_cluster_pcm_writer_prepare.inc \
 		$(CLUSTER_PCM_DIRECT_INIT_O) $(CLUSTER_RESOURCE_X_IDENTITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PCM_DIRECT_INIT_O) \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) \

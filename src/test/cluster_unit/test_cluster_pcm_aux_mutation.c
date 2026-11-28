@@ -308,7 +308,18 @@ fixture_interrupt(void)
 static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 									 XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
 									 uint8 flags, const ClusterSpaceIdentity *identity);
+/* This mutation fixture uses native storage. Tracked VM content locks are
+ * exercised in test_cluster_vm_read_visibility. */
+#define vm_page_is_new(buffer) PageIsNew(BufferGetPage(buffer))
+static LWLock *
+vm_unheld_content_lock(Buffer buffer)
+{
+	UT_ASSERT(!cluster_shared_config);
+	UT_ASSERT(refs[buffer - 1] > 0);
+	return NULL;
+}
 #include "test_cluster_pcm_aux_vm_mutation.inc"
+#undef vm_page_is_new
 #include "test_cluster_pcm_aux_heap_repin.inc"
 #include "test_cluster_heap_lock_vm_needed.inc"
 
@@ -901,6 +912,25 @@ UT_TEST(actual_update_pair_orders_distinct_locks_and_locks_alias_once)
 	}
 }
 
+/* Both instances update distinct heap tuples covered by the same two VM
+ * blocks. Their buffer slots have opposite physical mappings. Compare the
+ * actual lock requests: if the first blocks differ, each node can hold the
+ * block required by the other's second leg. */
+UT_TEST(actual_update_vm_pair_has_one_physical_order_across_nodes)
+{
+	for (int node = 0; node < 2; node++) {
+		reset_update_vm(0, false);
+		dml_tags[0].blockNum = node == 0 ? 7 : 3;
+		dml_tags[1].blockNum = node == 0 ? 3 : 7;
+		dml_tags[2].blockNum = dml_tags[0].blockNum * HEAPBLOCKS_PER_PAGE + node;
+		dml_tags[3].blockNum = dml_tags[1].blockNum * HEAPBLOCKS_PER_PAGE + node;
+		UT_ASSERT_EQ(run_update_vm_bracket(false, false, false), 0);
+		UT_ASSERT_EQ(dml_nacquires, 2);
+		UT_ASSERT_EQ(dml_tags[dml_acquires[0] - 1].blockNum, 3);
+		UT_ASSERT_EQ(dml_tags[dml_acquires[1] - 1].blockNum, 7);
+	}
+}
+
 UT_TEST(actual_update_second_vm_refusal_unwinds_first_lock_for_both_reentries)
 {
 	for (int bits = 0; bits < 8; bits++) {
@@ -1022,7 +1052,7 @@ UT_TEST(actual_pretoast_vm_retry_refreshes_predecessor_before_l2)
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(actual_shared_hio_reads_identity_before_locks_and_versions_existing_zero);
 	UT_RUN(actual_shared_hio_missing_identity_stops_before_page_access);
 	UT_RUN(actual_vm_consumer_requalifies_both_stages_without_replaying_clear);
@@ -1033,6 +1063,7 @@ main(void)
 	UT_RUN(actual_insert_vm_loss_returns_to_target_qualification_before_mutation);
 	UT_RUN(actual_tuple_lock_vm_loss_reloads_tuple_before_l3);
 	UT_RUN(actual_update_pair_orders_distinct_locks_and_locks_alias_once);
+	UT_RUN(actual_update_vm_pair_has_one_physical_order_across_nodes);
 	UT_RUN(actual_update_second_vm_refusal_unwinds_first_lock_for_both_reentries);
 	UT_RUN(actual_update_shared_vm_loss_invalidates_both_aliases);
 	UT_RUN(actual_delete_vm_retry_refreshes_tuple_before_l1);

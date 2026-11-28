@@ -25,7 +25,7 @@ cluster_pcm_direct_init_resident_vm(ClusterPcmDirectInitKind kind,
 	if (snapshot->pcm_state == PCM_STATE_X)
 		return true;
 	if (snapshot->pcm_state == PCM_STATE_S)
-		return snapshot->buffer_type == BUF_TYPE_SCUR || snapshot->buffer_type == BUF_TYPE_XCUR;
+		return snapshot->buffer_type == BUF_TYPE_SCUR;
 	return snapshot->pcm_state == PCM_STATE_N && snapshot->buffer_type == BUF_TYPE_PI;
 }
 

@@ -21,6 +21,7 @@
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -50,6 +51,12 @@ static XLogReaderState reader;
 static DecodedXLogRecord *decoded;
 static uint8 payload[64];
 static bool pins[2], locks[2], identity_ok;
+static BufferDescPadded vm_descriptors[2];
+static ClusterConf vm_conf = {.node_count = 2};
+ClusterConf *ClusterConfShmem = &vm_conf;
+BufferDescPadded *BufferDescriptors = vm_descriptors;
+bool cluster_shared_catalog;
+int cluster_pcm_grd_max_entries = 2;
 static unsigned runtime_reads, restart_reads, dirty, fake_count;
 static jmp_buf error_jump;
 static bool error_ready;
@@ -227,6 +234,38 @@ BufferGetBlockNumber(Buffer buf)
 	if (buf < 1 || buf > 2 || !pins[buf - 1])
 		abort();
 	return buf - 1;
+}
+/* Map the production VM format probe onto the same two pinned pages and
+ * content locks used by the redo caller. */
+static int
+vm_lock_index(LWLock *lock)
+{
+	for (int i = 0; i < 2; i++)
+		if (lock == BufferDescriptorGetContentLock(GetBufferDescriptor(i)) && pins[i])
+			return i;
+	abort();
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return locks[vm_lock_index(lock)];
+}
+
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	int i = vm_lock_index(lock);
+	if (mode != LW_SHARED || locks[i])
+		abort();
+	locks[i] = true;
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock)
+{
+	LockBuffer(vm_lock_index(lock) + 1, BUFFER_LOCK_UNLOCK);
 }
 void
 LockBuffer(Buffer buf, int mode)
@@ -439,6 +478,7 @@ reset(int which)
 	runtime_reads = restart_reads = dirty = fake_count = CritSectionCount = 0;
 	cluster_recmerge_window_active = cluster_recmerge_apply_foreign = false;
 	for (i = 0; i < 2; i++) {
+		InitBufferTag(&GetBufferDescriptor(i)->tag, &locator, VISIBILITYMAP_FORKNUM, i);
 		PageInit(pages[i].data, BLCKSZ, 0);
 		((PageHeader)pages[i].data)->pd_block_scn = 100;
 		PageGetContents(pages[i].data)[0] = VISIBILITYMAP_VALID_BITS;

@@ -193,7 +193,7 @@ UT_TEST(test_resident_vm_init_requires_pin_and_coherent_prior_image)
 	s.buffer_type = BUF_TYPE_SCUR;
 	UT_ASSERT(cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
 	s.buffer_type = BUF_TYPE_XCUR;
-	UT_ASSERT(cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
 	s.pcm_state = PCM_STATE_N;
 	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
 	s.buffer_type = BUF_TYPE_PI;
@@ -214,7 +214,7 @@ check_reserved_resident_vm(uint32 flag)
 {
 	ClusterPcmDirectInitSnapshot s = make_snapshot(CLUSTER_PCM_DIRECT_INIT_VM);
 	const struct { uint8 state; uint8 type; } resident[] = {
-		{PCM_STATE_S, BUF_TYPE_SCUR}, {PCM_STATE_S, BUF_TYPE_XCUR},
+		{PCM_STATE_S, BUF_TYPE_SCUR},
 		{PCM_STATE_X, BUF_TYPE_XCUR}, {PCM_STATE_N, BUF_TYPE_PI}
 	};
 

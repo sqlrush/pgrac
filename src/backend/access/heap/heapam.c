@@ -14245,7 +14245,7 @@ l_pgrac_reacquire:
 	 * share one VM buffer: lock it ONCE (a second acquire of the
 	 * non-reentrant content lock self-deadlocks — caught live by PG219
 	 * hanging at test 110).  When the two VM buffers differ, lock in
-	 * ascending buffer-id order so reverse-direction concurrent updates
+	 * ascending VM block order so reverse-direction concurrent updates
 	 * cannot ABBA.
 	 */
 	vm_locked = false;
@@ -14263,6 +14263,7 @@ l_pgrac_reacquire:
 		RelFileLocator refused_rlocator = {0};
 		ForkNumber refused_forknum = InvalidForkNumber;
 		BlockNumber refused_blocknum = InvalidBlockNumber;
+#endif
 		RelFileLocator old_vm_rlocator = {0};
 		ForkNumber old_vm_forknum = InvalidForkNumber;
 		BlockNumber old_vm_blocknum = InvalidBlockNumber;
@@ -14276,16 +14277,20 @@ l_pgrac_reacquire:
 		if (need_new)
 			BufferGetTag(vmbuffer_new, &new_vm_rlocator, &new_vm_forknum,
 						 &new_vm_blocknum);
-#endif
 
-		if (need_old && need_new && vmbuffer_new == vmbuffer)
-			need_new = false;	/* same map page: one lock covers both */
+		if (need_old && need_new)
+		{
+			Assert(RelFileLocatorEquals(old_vm_rlocator, new_vm_rlocator));
+			Assert(old_vm_forknum == VISIBILITYMAP_FORKNUM && new_vm_forknum == VISIBILITYMAP_FORKNUM);
+			if (vmbuffer_new == vmbuffer)
+				need_new = false;	/* same map page: one lock covers both */
+		}
 
 		/* One adapter owns all declared aliases. Every failed acquisition
 		 * reaches the original caller-owned unwind, including after repeated
 		 * contention; a retry count is not an authority contradiction. */
 		for (int vm_leg = 0; vm_leg < 2; vm_leg++) {
-			bool new_first = need_old && need_new && vmbuffer_new < vmbuffer;
+			bool new_first = need_old && need_new && new_vm_blocknum < old_vm_blocknum;
 			bool is_new = new_first ? vm_leg == 0 : vm_leg == 1;
 			Buffer *target = is_new ? &vmbuffer_new : &vmbuffer;
 #ifdef USE_PGRAC_CLUSTER

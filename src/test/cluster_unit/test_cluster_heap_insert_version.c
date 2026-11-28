@@ -72,7 +72,7 @@ static bool deleting, updating, temp_locking, tuple_locking, chain_locking;
 static bool confirming, spec_aborting;
 static bool multi_inserting;
 static unsigned vm_locks;
-static unsigned vm_shares;
+static unsigned vm_shares, vm_status_reads;
 static bool vm_share_refused, vm_refresh_frozen;
 
 void
@@ -253,6 +253,7 @@ visibilitymap_get_status(Relation rel, BlockNumber heapblock, Buffer *buffer)
 {
 	if (rel != &relation_data || !visibilitymap_pin_ok(heapblock, *buffer))
 		abort();
+	vm_status_reads++;
 	return pages[*buffer - 1].data[SizeOfPageHeaderData];
 }
 
@@ -1194,11 +1195,12 @@ UT_TEST(test_vm_clear_skip_requires_qualified_current_observation)
 		prepare_update(true, false, 1, true);
 		pages[1].data[SizeOfPageHeaderData]
 			= mode == 0 ? VISIBILITYMAP_VALID_BITS : VISIBILITYMAP_ALL_VISIBLE;
-		vm_locks = vm_shares = 0;
+		vm_locks = vm_shares = vm_status_reads = 0;
 		vm_share_refused = mode == 2;
 		vm_refresh_frozen = mode == 3;
 		UT_ASSERT_EQ(cluster_heap_lock_vm_needs_clear(&relation_data, blocks[0], 2), mode != 1);
-		UT_ASSERT_EQ(vm_shares, mode == 0 ? 0 : 1);
+		UT_ASSERT_EQ(vm_shares, 1);
+		UT_ASSERT_EQ(vm_status_reads, vm_share_refused ? 0 : 1);
 		UT_ASSERT_EQ(vm_locks, 0);
 		UT_ASSERT(!dirty[1]);
 	}
