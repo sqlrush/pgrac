@@ -10,7 +10,16 @@ use Test::More;
 use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
 
 my $cluster;
-END { eval { $cluster->stop_cluster } if defined $cluster; }
+my $stop_attempted = 0;
+END
+{
+ if (defined($cluster) && !$stop_attempted) {
+  my $status = $?;
+  my $stopped = eval { $cluster->stop_cluster; 1 };
+  diag("original failure-path normal stop failed: $@") unless $stopped;
+  $? = $status || ($stopped ? 0 : 1);
+ }
+}
 sub require_true { BAIL_OUT($_[1]) unless $_[0]; }
 sub wait_log {
  my ($node,$pattern,$offset)=@_;
@@ -79,6 +88,7 @@ like(substr(slurp_file($a->logfile),$ao),qr/BLOCK_IO event=WRITE_COMPLETE .*pid=
 is($b->safe_psql('postgres','SELECT count(*),sum(v) FROM first_source_data'),'20|40',
  'ordinary native query sees all committed rows and complete values');
 $writer->quit; $reader->quit;
+$stop_attempted = 1;
 $cluster->stop_cluster; undef $cluster;
 for my $node (@nodes) {
  unlike(slurp_file($node->logfile),qr/PANIC|invalid page in block|checksum verification failed/,

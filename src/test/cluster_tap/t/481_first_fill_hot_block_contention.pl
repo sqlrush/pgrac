@@ -15,9 +15,11 @@ END
 {
 	if (defined($cluster) && !$stop_attempted)
 	{
+		my $status = $?;
 		$stop_attempted = 1;
-		eval { $cluster->stop_cluster; 1 }
-		  or diag("original failure-path normal stop failed: $@");
+		my $stopped = eval { $cluster->stop_cluster; 1 };
+		diag("original failure-path normal stop failed: $@") unless $stopped;
+		$? = $status || ($stopped ? 0 : 1);
 	}
 }
 
