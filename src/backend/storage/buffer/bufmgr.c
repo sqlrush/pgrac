@@ -5355,9 +5355,10 @@ cluster_bufmgr_pcm_arm_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kin
 	buf_state = LockBufHdr(buf);
 	cluster_bufmgr_pcm_direct_init_snapshot_locked(
 		buf, buf_state, PageIsNew((Page) BufHdrGetBlock(buf)), &observed);
-	if (pending_observed != NULL && observed.flags == 0
-		&& (observed.pcm_state == PCM_STATE_X
-			|| cluster_pcm_direct_init_resident_vm(kind, &observed)))
+	if (pending_observed != NULL
+		&& (kind == CLUSTER_PCM_DIRECT_INIT_VM
+			? cluster_pcm_direct_init_resident_vm(kind, &observed)
+			: observed.flags == 0 && observed.pcm_state == PCM_STATE_X))
 	{
 		*pending_observed = observed;
 		result = CLUSTER_PCM_OWN_OK;

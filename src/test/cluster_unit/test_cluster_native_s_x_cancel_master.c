@@ -477,13 +477,56 @@ vm_run(unsigned entrance)
 	nm_before_first_read = NULL;
 }
 
+/* A peer already owns the live reservation between the local format probe
+ * and the actual direct-init arm. The arm must leave that reservation intact. */
+UT_TEST(test_resident_vm_arm_defers_to_live_owner)
+{
+	ClusterBufmgrFirstFill read;
+	const uint32 flags[] = {PCM_OWN_FLAG_GRANT_PENDING, PCM_OWN_FLAG_REVOKING};
+
+	ordinary_start(&read, 0);
+	request_buf.tag.forkNum = VISIBILITYMAP_FORKNUM;
+	request_buf.pcm_state = PCM_STATE_S;
+	request_buf.buffer_type = BUF_TYPE_SCUR;
+	pg_atomic_write_u32(&request_buf.state, BM_TAG_VALID | BM_VALID | BUF_REFCOUNT_ONE);
+	memset(disk_shared.data, 0, BLCKSZ);
+	for (size_t i = 0; i < lengthof(flags); i++) {
+		ClusterPcmDirectInitProof proof;
+		ClusterPcmDirectInitSnapshot observed;
+		volatile bool routed = false;
+
+		if (i != 0)
+			PageInit(disk_shared.data, BLCKSZ, 0);
+		pg_atomic_write_u64(&request_own.reservation_token, 7);
+		pg_atomic_write_u32(&request_own.flags, flags[i]);
+		PG_TRY();
+		{
+			routed = cluster_bufmgr_pcm_arm_direct_init(&request_buf,
+				CLUSTER_PCM_DIRECT_INIT_VM, &proof, &observed)
+				== CLUSTER_BUFMGR_PCM_DIRECT_INIT_ORDINARY_X;
+		}
+		PG_CATCH();
+		{
+			routed = false;
+		}
+		PG_END_TRY();
+		UT_ASSERT(routed);
+		UT_ASSERT(!proof.armed);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), flags[i]);
+		UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(0), 7);
+		UT_ASSERT_EQ(ordinary_sends, 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	}
+}
+
 UT_TEST(test_vm_settled_s_qualified_writer) { vm_run(0); }
 UT_TEST(test_vm_settled_s_plain_writer) { vm_run(1); }
 UT_TEST(test_vm_zero_page_first_read_then_init_writer) { vm_run(2); }
 
 int main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
+	UT_RUN(test_resident_vm_arm_defers_to_live_owner);
 	UT_RUN(test_vm_settled_s_qualified_writer);
 	UT_RUN(test_vm_settled_s_plain_writer);
 	UT_RUN(test_vm_zero_page_first_read_then_init_writer);

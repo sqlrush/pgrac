@@ -198,7 +198,7 @@ UT_TEST(test_resident_vm_init_requires_pin_and_coherent_prior_image)
 	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
 	s.buffer_type = BUF_TYPE_PI;
 	UT_ASSERT(cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
-	s.flags = PCM_OWN_FLAG_REVOKING;
+	s.flags = PCM_OWN_FLAG_REVOKING | PCM_OWN_FLAG_GRANT_PENDING;
 	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
 	s.flags = 0;
 	s.private_refcount = 0;
@@ -207,6 +207,39 @@ UT_TEST(test_resident_vm_init_requires_pin_and_coherent_prior_image)
 	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_FSM, &s));
 	s.tag.forkNum = MAIN_FORKNUM;
 	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+}
+
+static void
+check_reserved_resident_vm(uint32 flag)
+{
+	ClusterPcmDirectInitSnapshot s = make_snapshot(CLUSTER_PCM_DIRECT_INIT_VM);
+	const struct { uint8 state; uint8 type; } resident[] = {
+		{PCM_STATE_S, BUF_TYPE_SCUR}, {PCM_STATE_S, BUF_TYPE_XCUR},
+		{PCM_STATE_X, BUF_TYPE_XCUR}, {PCM_STATE_N, BUF_TYPE_PI}
+	};
+
+	for (size_t i = 0; i < lengthof(resident); i++) {
+		s.pcm_state = resident[i].state;
+		s.buffer_type = resident[i].type;
+		s.flags = flag;
+		s.reservation_token = 4;
+		s.page_is_new = true;
+		UT_ASSERT(cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+		s.page_is_new = false;
+		UT_ASSERT(cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+		s.reservation_token = 0;
+		UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+	}
+}
+
+UT_TEST(test_resident_vm_init_joins_pending_grant)
+{
+	check_reserved_resident_vm(PCM_OWN_FLAG_GRANT_PENDING);
+}
+
+UT_TEST(test_resident_vm_init_waits_for_revoke)
+{
+	check_reserved_resident_vm(PCM_OWN_FLAG_REVOKING);
 }
 
 UT_TEST(test_valid_read_miss_proof)
@@ -1491,7 +1524,9 @@ UT_TEST(test_temp_lock_releases_vm_before_nested_work_and_requalifies)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(36);
+	UT_RUN(test_resident_vm_init_joins_pending_grant);
+	UT_RUN(test_resident_vm_init_waits_for_revoke);
 	UT_RUN(test_resident_vm_init_requires_pin_and_coherent_prior_image);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);

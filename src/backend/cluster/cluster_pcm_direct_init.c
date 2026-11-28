@@ -11,16 +11,19 @@
 
 #include "cluster/cluster_pcm_direct_init.h"
 
-/* A prior ordinary fill can leave an all-zero VM page in S, or in PI
- * after revocation.  Its writer must convert the resident image before
- * interpreting or initializing the bytes under content X. */
+/* Ordinary X acquisition joins a resident page reservation and rechecks the
+ * page under content X, even if another writer initialized it meanwhile. */
 bool
 cluster_pcm_direct_init_resident_vm(ClusterPcmDirectInitKind kind,
 									const ClusterPcmDirectInitSnapshot *snapshot)
 {
-	if (kind != CLUSTER_PCM_DIRECT_INIT_VM || snapshot->tag.forkNum != VISIBILITYMAP_FORKNUM
-		|| snapshot->private_refcount <= 0 || snapshot->flags != 0)
+	if (kind != CLUSTER_PCM_DIRECT_INIT_VM || snapshot == NULL
+		|| snapshot->tag.forkNum != VISIBILITYMAP_FORKNUM || snapshot->private_refcount <= 0
+		|| cluster_pcm_own_classify_live_flags(snapshot->flags, snapshot->reservation_token)
+			== CLUSTER_PCM_OWN_CORRUPT)
 		return false;
+	if (snapshot->pcm_state == PCM_STATE_X)
+		return true;
 	if (snapshot->pcm_state == PCM_STATE_S)
 		return snapshot->buffer_type == BUF_TYPE_SCUR || snapshot->buffer_type == BUF_TYPE_XCUR;
 	return snapshot->pcm_state == PCM_STATE_N && snapshot->buffer_type == BUF_TYPE_PI;
