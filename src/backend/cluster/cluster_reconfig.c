@@ -3158,12 +3158,11 @@ cluster_reconfig_has_pending_prebump_stage(void)
 
 static bool
 cluster_reconfig_submit_fence_stage(ClusterReconfigFenceStage *stage, ClusterMarkerAsyncKind kind,
-									int32 target_node, TimestampTz now)
+									int32 target_node)
 {
 	if (stage->submitted)
 		return true;
-	if (!cluster_write_fence_submit_marker_async(&stage->async, &stage->marker, kind, target_node,
-												 now))
+	if (!cluster_write_fence_submit_marker_async(&stage->async, &stage->marker, kind, target_node))
 		return false;
 	stage->submitted = true;
 	return true;
@@ -3172,7 +3171,6 @@ cluster_reconfig_submit_fence_stage(ClusterReconfigFenceStage *stage, ClusterMar
 static bool
 cluster_reconfig_poll_failstop_fence_stage(void)
 {
-	TimestampTz now;
 	uint32 result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 	uint64 elapsed_us = 0;
 	ClusterMarkerPollResult pr;
@@ -3180,13 +3178,12 @@ cluster_reconfig_poll_failstop_fence_stage(void)
 	if (!failstop_fence_stage.async.has_staged_event)
 		return false;
 
-	now = GetCurrentTimestamp();
 	if (!cluster_reconfig_submit_fence_stage(&failstop_fence_stage,
 											 CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
-											 failstop_fence_stage.event.coordinator_node_id, now))
+											 failstop_fence_stage.event.coordinator_node_id))
 		return true;
 
-	pr = cluster_write_fence_poll_marker_async(&failstop_fence_stage.async, now, &result,
+	pr = cluster_write_fence_poll_marker_async(&failstop_fence_stage.async, &result,
 											   &elapsed_us);
 	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
 		return true;
@@ -3220,7 +3217,6 @@ static uint64
 cluster_reconfig_poll_node_removed_fence_stage(int32 removed_node_id, uint64 removal_event_id,
 											   uint64 last_incarnation)
 {
-	TimestampTz now;
 	uint32 result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 	uint64 elapsed_us = 0;
 	ClusterMarkerPollResult pr;
@@ -3231,13 +3227,12 @@ cluster_reconfig_poll_node_removed_fence_stage(int32 removed_node_id, uint64 rem
 		|| node_removed_fence_stage.removal_event_id != removal_event_id)
 		return 0;
 
-	now = GetCurrentTimestamp();
 	if (!cluster_reconfig_submit_fence_stage(&node_removed_fence_stage,
 											 CLUSTER_MARKER_KIND_FENCE_NODE_REMOVED,
-											 removed_node_id, now))
+											 removed_node_id))
 		return 0;
 
-	pr = cluster_write_fence_poll_marker_async(&node_removed_fence_stage.async, now, &result,
+	pr = cluster_write_fence_poll_marker_async(&node_removed_fence_stage.async, &result,
 											   &elapsed_us);
 	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
 		return 0;
@@ -3596,7 +3591,7 @@ cluster_reconfig_publish_prepared_join_commit(void)
 }
 
 static bool
-cluster_reconfig_poll_join_fence_stage(TimestampTz now)
+cluster_reconfig_poll_join_fence_stage(void)
 {
 	uint32 result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 	uint64 elapsed_us = 0;
@@ -3607,13 +3602,13 @@ cluster_reconfig_poll_join_fence_stage(TimestampTz now)
 
 		fence_submit_ok = cluster_write_fence_submit_marker_async(
 			&join_commit_stage.fence_async, &join_commit_stage.fence_marker,
-			CLUSTER_MARKER_KIND_JOIN_COMMITTED, join_commit_stage.node_id, now);
+			CLUSTER_MARKER_KIND_JOIN_COMMITTED, join_commit_stage.node_id);
 		if (!fence_submit_ok)
 			return true;
 		return true;
 	}
 
-	pr = cluster_write_fence_poll_marker_async(&join_commit_stage.fence_async, now, &result,
+	pr = cluster_write_fence_poll_marker_async(&join_commit_stage.fence_async, &result,
 											   &elapsed_us);
 	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
 		return true;
@@ -3657,7 +3652,7 @@ cluster_reconfig_poll_join_commit_stage(void)
 
 	now = GetCurrentTimestamp();
 	if (join_commit_stage.fence_ready)
-		return cluster_reconfig_poll_join_fence_stage(now);
+		return cluster_reconfig_poll_join_fence_stage();
 	if (!join_commit_stage.submitted) {
 		if (!cluster_reconfig_submit_join_marker_async(
 				&join_commit_stage.async, join_commit_stage.node_id, &join_commit_stage.marker,
@@ -3715,7 +3710,7 @@ cluster_reconfig_poll_join_commit_stage(void)
 	}
 
 	if (cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON)
-		return cluster_reconfig_poll_join_fence_stage(now);
+		return cluster_reconfig_poll_join_fence_stage();
 	if (!cluster_reconfig_publish_prepared_join_commit())
 		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
 	cluster_reconfig_release_join_commit_stage();
@@ -6054,7 +6049,7 @@ cold_formation_survivor_verdict(void)
 	}
 }
 
-void
+static void
 cluster_reconfig_offpath_rejoin_tick(void)
 {
 	static bool offpath_decided_local = false;
@@ -6558,7 +6553,7 @@ cluster_reconfig_lmon_tick(void)
 				 && cluster_reconfig_publish_self_current_floor_locked(self_id,
 																	   self_floor_incarnation)) {
 			/* Exact helper retained MEMBER; ordinary writes remain closed. */
-		} else if ((ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed
+		} else if (((ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed
 						&& (cluster_online_join
 							/*
 					   * RF-ROOT P6 (crash-rejoin): a durably admitted
@@ -6576,7 +6571,7 @@ cluster_reconfig_lmon_tick(void)
 					   * would lift the latch is exactly what they gate.
 					   */
 							|| offpath_fast_rejoin_active_local
-							|| (self_floor_authority && cluster_grd_offpath_boot_decided()))
+							|| (self_floor_authority && cluster_grd_offpath_boot_decided())))
 					/*
 				  * RF-ROOT P9 verification / cold-formation cold-formation
 				  * ruling: after the quorum-majority COMMITTED formation
@@ -7273,7 +7268,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 		failstop_fence_stage.async.has_staged_event = true;
 		(void)cluster_reconfig_submit_fence_stage(&failstop_fence_stage,
 												  CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
-												  coordinator_node_id, GetCurrentTimestamp());
+												  coordinator_node_id);
 		/* LMON path: the local staged flag now covers the pending window. */
 		cluster_reconfig_set_prebump_sync_active(0);
 		return; /* fail-closed until the staged marker is majority-durable */
@@ -8884,7 +8879,7 @@ static bool
 cluster_reconfig_formation_disk_snapshot_current(void)
 {
 	const ClusterFormationDiskSnapshot *s = &ReconfigShmem->formation_disk_snapshot;
-	uint64 now = (uint64)GetCurrentTimestamp();
+	uint64 now = cluster_storage_quorum_now_us();
 	uint64 lease = (uint64)cluster_quorum_poll_interval_ms * 30 * 1000;
 
 	return cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON && s->complete
@@ -9575,11 +9570,10 @@ cluster_reconfig_shared_cold_formation_tick_locked(void)
 		if (!cluster_marker_async_is_submitted(&cold_formation_state.initial_fence)) {
 			(void)cluster_write_fence_submit_marker_async(
 				&cold_formation_state.initial_fence, &baseline,
-				CLUSTER_MARKER_KIND_FORMATION_BASELINE, cluster_node_id, GetCurrentTimestamp());
+				CLUSTER_MARKER_KIND_FORMATION_BASELINE, cluster_node_id);
 			return;
 		}
-		if (cluster_write_fence_poll_marker_async(&cold_formation_state.initial_fence,
-												  GetCurrentTimestamp(), &result, NULL)
+		if (cluster_write_fence_poll_marker_async(&cold_formation_state.initial_fence, &result, NULL)
 				!= CLUSTER_MARKER_POLL_ACKED
 			|| result != CLUSTER_FENCE_MARKER_SUBMIT_ACK)
 			return;
@@ -9845,7 +9839,7 @@ cluster_reconfig_cold_formation_tick(void)
 		ereport(
 			LOG,
 			(errmsg_internal("cluster INITIAL formation consumer diagnostic"),
-			 errdetail("node=%d now_pg_us=%llu snapshot_complete=%u sampled_pg_us=%llu "
+			 errdetail("node=%d now_pg_us=%llu snapshot_complete=%u sampled_mono_us=%llu "
 					   "snapshot_boot=%llu self_boot=%llu max_epoch=%llu max_generation=%llu "
 					   "bootstrap_seq=%llu/%llu known=%016llx/%016llx fresh=%016llx/%016llx "
 					   "observe_ticks=%llu staged=%u fence_acked=%u marker_seq=%llu/%llu "

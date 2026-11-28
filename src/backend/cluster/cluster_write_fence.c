@@ -40,6 +40,7 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* D4 marker-write + D6 verify wait events */
 
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_epoch.h" /* cluster_epoch_get_current */
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"		 /* cluster_node_id, cluster_voting_disks */
@@ -470,12 +471,11 @@ write_fence_allowed_observed(ClusterWriteFenceObservation *out)
 	 * startup_self_check before the node serves, so a self-fenced node never gets
 	 * the grace.  After the latch, fall through to the strict pure judge.
 	 */
+	now_us = cluster_storage_quorum_now_us();
 	if (cluster_write_fence_grace_before_engage(enforcement_on, region_attached, fence_engaged,
 												self_fenced))
-		allowed = true;
+		allowed = now_us != 0;
 	else {
-		/* Same wall-clock domain as the lease; retain this very evaluation. */
-		now_us = (uint64)GetCurrentTimestamp();
 		allowed
 			= cluster_write_fence_decide(enforcement_on, region_attached, epoch_current,
 										 authorized_epoch, now_us, lease_expire_us, self_fenced);
@@ -511,6 +511,8 @@ cluster_write_fence_observation_reason(const ClusterWriteFenceObservation *s)
 		return "SHMEM_UNAVAILABLE";
 	if (s->self_fenced)
 		return "SELF_FENCED";
+	if (s->now_us == 0)
+		return "CLOCK_UNAVAILABLE";
 	if (!s->engaged)
 		return "BRINGUP_GRACE";
 	if (s->epoch_current != s->authorized_epoch)
@@ -728,6 +730,7 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 	bool self_fenced;
 	uint64 latched_epoch;
 	uint64 latched_lease;
+	uint64 now_us = cluster_storage_quorum_now_us();
 	uint8 latched_dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
 
 	if (cluster_write_fence_shmem == NULL)
@@ -762,7 +765,7 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 		&& m->fence_epoch == latched_epoch && latched_epoch == cluster_epoch_get_current()
 		&& m->fence_event_id == pg_atomic_read_u64(&cluster_write_fence_shmem->fence_event_id)
 		&& memcmp(m->fenced_dead_bitmap, latched_dead, sizeof(latched_dead)) == 0
-		&& latched_lease > (uint64)GetCurrentTimestamp() && lease_expire_us >= latched_lease)
+		&& now_us != 0 && latched_lease > now_us && lease_expire_us >= latched_lease)
 		goto publish_lease;
 
 	/*
@@ -827,12 +830,11 @@ publish_lease:
 	if (cluster_write_fence_test_before_lease_publish_hook != NULL)
 		cluster_write_fence_test_before_lease_publish_hook();
 #endif
-	pg_atomic_write_u64(&cluster_write_fence_shmem->lease_expire_at_us, lease_expire_us);
+	pg_atomic_write_u64(&cluster_write_fence_shmem->lease_expire_at_us, now_us != 0 ? lease_expire_us : 0);
 
 	/* spec-4.12b D6: record the refresh time so observability can derive the
 	 * authority age (now - last refresh). */
-	pg_atomic_write_u64(&cluster_write_fence_shmem->last_authority_refresh_us,
-						(uint64)GetCurrentTimestamp());
+	pg_atomic_write_u64(&cluster_write_fence_shmem->last_authority_refresh_us, now_us);
 
 	/*
 	 * spec-4.12b D3: the first authority just latched.  Engage the one-way
@@ -955,7 +957,7 @@ cluster_write_fence_get_baseline_authority_age_us(void)
 	last = pg_atomic_read_u64(&cluster_write_fence_shmem->last_authority_refresh_us);
 	if (last == 0)
 		return 0; /* never refreshed */
-	now = (uint64)GetCurrentTimestamp();
+	now = cluster_storage_quorum_now_us();
 	return now > last ? now - last : 0;
 }
 
@@ -1080,9 +1082,10 @@ ClusterFenceMarkerSubmitResult
 cluster_write_fence_submit_marker(const ClusterFenceMarker *m)
 {
 	uint64 seq;
+	uint64 start_us = cluster_storage_quorum_now_us();
 	Latch *qlatch;
 
-	if (cluster_write_fence_shmem == NULL)
+	if (cluster_write_fence_shmem == NULL || start_us == 0)
 		return CLUSTER_FENCE_MARKER_SUBMIT_FAILED; /* region not attached (pre-D7) */
 
 	/* stage the marker, then publish the request (barrier between so qvotec never
@@ -1100,18 +1103,20 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m)
 	{
 		ClusterFenceMarkerSubmitResult result;
 		uint64 deadline_us
-			= (uint64)GetCurrentTimestamp() + (uint64)cluster_write_fence_lease_ms * 1000ULL;
+			= start_us + (uint64)cluster_write_fence_lease_ms * 1000ULL;
 
 		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WRITE_FENCE_MARKER_WRITE);
 		for (;;) {
+			uint64 now_us = cluster_storage_quorum_now_us();
+
+			if (now_us < start_us || now_us >= deadline_us) {
+				result = CLUSTER_FENCE_MARKER_SUBMIT_TIMEOUT;
+				break;
+			}
 			if (pg_atomic_read_u64(&cluster_write_fence_shmem->marker_completion_seq) == seq) {
 				pg_read_barrier();
 				result = (ClusterFenceMarkerSubmitResult)pg_atomic_read_u32(
 					&cluster_write_fence_shmem->marker_result);
-				break;
-			}
-			if ((uint64)GetCurrentTimestamp() >= deadline_us) {
-				result = CLUSTER_FENCE_MARKER_SUBMIT_TIMEOUT;
 				break;
 			}
 			pg_usleep(2 * 1000); /* 2 ms */
@@ -1123,10 +1128,11 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m)
 
 bool
 cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a, const ClusterFenceMarker *m,
-										ClusterMarkerAsyncKind kind, int32 target_node,
-										TimestampTz now)
+										ClusterMarkerAsyncKind kind, int32 target_node)
 {
-	if (cluster_write_fence_shmem == NULL || m == NULL || a == NULL)
+	uint64 now = cluster_storage_quorum_now_us();
+
+	if (now == 0 || cluster_write_fence_shmem == NULL || m == NULL || a == NULL)
 		return false;
 	if (cluster_marker_async_is_submitted(a))
 		return true;
@@ -1142,11 +1148,22 @@ cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a, const ClusterFenc
 }
 
 ClusterMarkerPollResult
-cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now, uint32 *out_result,
+cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a, uint32 *out_result,
 									  uint64 *out_elapsed_us)
 {
+	uint64 now = cluster_storage_quorum_now_us();
+
 	if (cluster_write_fence_shmem == NULL || a == NULL)
 		return CLUSTER_MARKER_POLL_IDLE;
+	if (cluster_marker_async_is_submitted(a)
+		&& (now < (uint64)a->submitted_at || now >= a->deadline_us)) {
+		if (out_result != NULL)
+			*out_result = 0;
+		if (out_elapsed_us != NULL)
+			*out_elapsed_us = now >= (uint64)a->submitted_at ? now - a->submitted_at : 0;
+		a->state = CLUSTER_MARKER_ASYNC_IDLE;
+		return CLUSTER_MARKER_POLL_TIMEOUT;
+	}
 	return cluster_marker_async_poll(a, &cluster_write_fence_shmem->marker_completion_seq,
 									 &cluster_write_fence_shmem->marker_result, now, out_result,
 									 out_elapsed_us);

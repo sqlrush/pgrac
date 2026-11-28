@@ -75,7 +75,7 @@ cluster_write_fence_decide(bool enforcement_on, bool region_attached, uint64 epo
 		return false; /* this node is in the marker's fenced_dead_bitmap */
 	if (epoch_current != authorized_epoch)
 		return false; /* exact == (P0b / user 修正 3): a stale node must not write */
-	if (now_us >= lease_expire_us)
+	if (now_us == 0 || now_us >= lease_expire_us)
 		return false; /* lease expired: failed to refresh (partition) */
 	return true;
 }
@@ -757,7 +757,7 @@ typedef struct ClusterWriteFenceShmem {
 											   * node authored a baseline (it is the leader) */
 	pg_atomic_uint32 baseline_author_is_self;	/* spec-4.12b D6: this node is currently the
 											   * lowest-live baseline-author leader (0/1) */
-	pg_atomic_uint64 last_authority_refresh_us; /* spec-4.12b D6: wall-clock of the last
+	pg_atomic_uint64 last_authority_refresh_us; /* spec-4.12b D6: monotonic time of the last
 											 * successful token refresh (authority age) */
 
 	/* STOP-04 \u00a73.13: external-fence client observability.  These are
@@ -839,10 +839,8 @@ extern ClusterFenceMarkerSubmitResult
 cluster_write_fence_submit_marker(const ClusterFenceMarker *m);
 extern bool cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a,
 													const ClusterFenceMarker *m,
-													ClusterMarkerAsyncKind kind, int32 target_node,
-													TimestampTz now);
+													ClusterMarkerAsyncKind kind, int32 target_node);
 extern ClusterMarkerPollResult cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a,
-																	 TimestampTz now,
 																	 uint32 *out_result,
 																	 uint64 *out_elapsed_us);
 extern void cluster_write_fence_publish_qvotec_latch(struct Latch *latch);

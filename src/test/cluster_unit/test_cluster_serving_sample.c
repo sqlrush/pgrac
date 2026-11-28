@@ -504,6 +504,19 @@ sample_setup(void)
 	UT_ASSERT_EQ(phase4_quorum_check_calls, 0);
 }
 
+UT_TEST(serving_follows_monotonic_lease_across_wall_steps)
+{
+	sample_setup();
+	phase4_test_now += 90000000;
+	sample_mono_us++;
+	UT_ASSERT(cluster_serving_ready_is_current());
+	phase4_test_now -= 30000000;
+	sample_mono_us = 60999999;
+	UT_ASSERT(cluster_serving_ready_is_current());
+	sample_mono_us++;
+	UT_ASSERT(!cluster_serving_ready_is_current());
+}
+
 UT_TEST(deadline_projects_pending_through_real_formation_and_grd)
 {
 	ClusterQvotecAdmissionCheck check;
@@ -708,7 +721,8 @@ UT_TEST(checkpoint_prepare_waits_for_real_formation_lock_and_refuses_real_loss)
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
+	UT_RUN(serving_follows_monotonic_lease_across_wall_steps);
 	UT_RUN(deadline_projects_pending_through_real_formation_and_grd);
 	UT_RUN(serving_deadline_preserves_binding_until_proven_loss_or_identity_drift);
 	UT_RUN(lock_entry_keeps_real_serving_deadline_pending);

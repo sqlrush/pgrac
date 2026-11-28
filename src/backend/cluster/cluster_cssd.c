@@ -83,6 +83,7 @@
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_cf_phase2.h" /* respond_tick: steady-state probe ack (spec-5.6a) */
 #include "cluster/cluster_conf.h"	   /* cluster_conf_lookup_node (SRF row filter) */
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_guc.h"	   /* cluster_node_id + cssd_* GUCs */
 #include "cluster/cluster_ic_router.h" /* ClusterICFanoutResult (heartbeat tick read result) */
 #include "cluster/cluster_inject.h"	   /* CLUSTER_INJECTION_POINT (spec-2.5 D11) */
@@ -187,6 +188,7 @@ cluster_cssd_shmem_init(void)
 		for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
 			pg_atomic_init_u32(&CssdShmem->peers[peer].state, CLUSTER_CSSD_PEER_ALIVE);
 			pg_atomic_init_u64(&CssdShmem->peers[peer].last_heartbeat_recv_at_us, 0);
+			pg_atomic_init_u64(&CssdShmem->peers[peer].last_heartbeat_recv_wall_us, 0);
 			pg_atomic_init_u64(&CssdShmem->peers[peer].last_heartbeat_send_at_us, 0);
 			pg_atomic_init_u64(&CssdShmem->peers[peer].heartbeat_send_count, 0);
 			pg_atomic_init_u64(&CssdShmem->peers[peer].heartbeat_recv_count, 0);
@@ -472,7 +474,7 @@ cluster_cssd_get_peer_last_recv_at(int32 peer_id)
 		return 0;
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return 0;
-	return (TimestampTz)pg_atomic_read_u64(&CssdShmem->peers[peer_id].last_heartbeat_recv_at_us);
+	return (TimestampTz)pg_atomic_read_u64(&CssdShmem->peers[peer_id].last_heartbeat_recv_wall_us);
 }
 
 ClusterCssdOutboundSlot *
@@ -556,6 +558,7 @@ void
 cluster_cssd_dispatch_heartbeat(const ClusterICEnvelope *env, const void *payload)
 {
 	int32 sender;
+	uint64 received_us;
 	ClusterCssdHeartbeatPayload hb;
 
 	if (env == NULL || payload == NULL)
@@ -571,7 +574,11 @@ cluster_cssd_dispatch_heartbeat(const ClusterICEnvelope *env, const void *payloa
 
 	memcpy(&hb, payload, sizeof(hb)); /* L34 unaligned safe */
 
-	pg_atomic_write_u64(&CssdShmem->peers[sender].last_heartbeat_recv_at_us,
+	received_us = cluster_storage_quorum_now_us();
+	if (received_us == 0)
+		return;
+	pg_atomic_write_u64(&CssdShmem->peers[sender].last_heartbeat_recv_at_us, received_us);
+	pg_atomic_write_u64(&CssdShmem->peers[sender].last_heartbeat_recv_wall_us,
 						(uint64)GetCurrentTimestamp());
 	pg_atomic_add_fetch_u64(&CssdShmem->peers[sender].heartbeat_recv_count, 1);
 	pg_atomic_add_fetch_u64(&CssdShmem->total_heartbeat_recv_count, 1);
@@ -774,12 +781,26 @@ cssd_deadband_scan_tick(void)
 	if (CssdShmem == NULL)
 		return;
 
-	now_us = (uint64)GetCurrentTimestamp();
+	now_us = cluster_storage_quorum_now_us();
+	/* An unavailable local clock provides no evidence about remote peers. */
+	if (now_us == 0)
+		return;
+
 	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
 	grace_until = CssdShmem->first_tick_grace_until_us;
 	LWLockRelease(&CssdShmem->lwlock);
 
-	/* Grace period: skip transitions until grace_until_us elapsed. */
+	/* If READY could not sample the clock, start grace at the first
+	 * successful scan.  CSSD is the sole writer of the deadline. */
+	if (grace_until == 0) {
+		uint64 grace = (uint64)cluster_cssd_dead_deadband_factor
+					   * (uint64)cluster_cssd_heartbeat_interval_ms * 1000ULL;
+
+		LWLockAcquire(&CssdShmem->lwlock, LW_EXCLUSIVE);
+		CssdShmem->first_tick_grace_until_us = now_us + grace;
+		LWLockRelease(&CssdShmem->lwlock);
+		return;
+	}
 	if (now_us < grace_until)
 		return;
 
@@ -792,7 +813,7 @@ cssd_deadband_scan_tick(void)
 	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
 		uint64 last_recv_us;
 		uint64 elapsed_us;
-		int elapsed_ms;
+		uint64 elapsed_ms;
 		ClusterCssdPeerState old_state, new_state;
 
 		if (peer == cluster_node_id)
@@ -815,15 +836,16 @@ cssd_deadband_scan_tick(void)
 		if (last_recv_us == 0)
 			last_recv_us = grace_until;
 
-		if (now_us <= last_recv_us)
-			continue; /* clock skew defense */
+		/* A heartbeat can arrive after this scan sampled its clock. */
+		if (now_us < last_recv_us)
+			continue;
 		elapsed_us = now_us - last_recv_us;
-		elapsed_ms = (int)(elapsed_us / 1000);
+		elapsed_ms = elapsed_us / 1000;
 
 		old_state = (ClusterCssdPeerState)pg_atomic_read_u32(&CssdShmem->peers[peer].state);
-		if (elapsed_ms > dead_threshold_ms)
+		if (elapsed_ms >= (uint64)dead_threshold_ms)
 			new_state = CLUSTER_CSSD_PEER_DEAD;
-		else if (elapsed_ms > suspected_threshold_ms)
+		else if (elapsed_ms >= (uint64)suspected_threshold_ms)
 			new_state = CLUSTER_CSSD_PEER_SUSPECTED;
 		else
 			new_state = CLUSTER_CSSD_PEER_ALIVE;
@@ -851,19 +873,21 @@ cssd_deadband_scan_tick(void)
 
 			switch (new_state) {
 			case CLUSTER_CSSD_PEER_SUSPECTED:
-				pg_atomic_write_u64(&CssdShmem->peers[peer].suspected_since_us, now_us);
+				pg_atomic_write_u64(&CssdShmem->peers[peer].suspected_since_us,
+									(uint64)GetCurrentTimestamp());
 				pg_atomic_add_fetch_u64(&CssdShmem->peers[peer].suspected_transitions, 1);
 				ereport(LOG, (errcode(ERRCODE_CLUSTER_CSSD_PEER_SUSPECTED),
 							  errmsg("cssd: peer %d transitioned ALIVE → SUSPECTED "
-									 "(elapsed %d ms > %d ms)",
+									 "(elapsed " UINT64_FORMAT " ms, threshold %d ms)",
 									 peer, elapsed_ms, suspected_threshold_ms)));
 				break;
 			case CLUSTER_CSSD_PEER_DEAD:
-				pg_atomic_write_u64(&CssdShmem->peers[peer].dead_since_us, now_us);
+				pg_atomic_write_u64(&CssdShmem->peers[peer].dead_since_us,
+									(uint64)GetCurrentTimestamp());
 				pg_atomic_add_fetch_u64(&CssdShmem->peers[peer].dead_transitions, 1);
 				ereport(WARNING, (errcode(ERRCODE_CLUSTER_CSSD_PEER_DEAD),
 								  errmsg("cssd: peer %d transitioned %s → DEAD "
-										 "(elapsed %d ms > %d ms);NO reconfig in spec-2.5",
+										 "(elapsed " UINT64_FORMAT " ms, threshold %d ms);NO reconfig in spec-2.5",
 										 peer, cluster_cssd_peer_state_to_string(old_state),
 										 elapsed_ms, dead_threshold_ms)));
 				break;
@@ -928,17 +952,17 @@ CssdMain(void)
 	cssd_publish_status(CLUSTER_CSSD_READY);
 
 	/* spec-2.5 Q6 first-tick grace period:
-	 *   grace_until_us = ready_at + (factor × heartbeat_interval × 1000)
+	 *   grace_until_us = monotonic time at READY + (factor × heartbeat_interval × 1000)
 	 * (per §3.2.1).  During this window deadband-scan does not trigger
 	 * SUSPECTED/DEAD transitions, avoiding spawn-immediate-reconfig
 	 * storm before peer connections finish establishing. */
 	{
-		uint64 ready_us = (uint64)GetCurrentTimestamp();
+		uint64 ready_us = cluster_storage_quorum_now_us();
 		uint64 grace = (uint64)cluster_cssd_dead_deadband_factor
 					   * (uint64)cluster_cssd_heartbeat_interval_ms * 1000ULL;
 
 		LWLockAcquire(&CssdShmem->lwlock, LW_EXCLUSIVE);
-		CssdShmem->first_tick_grace_until_us = ready_us + grace;
+		CssdShmem->first_tick_grace_until_us = ready_us ? ready_us + grace : 0;
 		LWLockRelease(&CssdShmem->lwlock);
 	}
 
@@ -977,8 +1001,8 @@ CssdMain(void)
 			/* spec-2.5 §3.2 + v1.0.2 F2: heartbeat broadcast — only fire
 			 * when next_heartbeat_at reached.  next_heartbeat_at == 0
 			 * forces first-tick fire immediately after READY publish. */
-			now_us = (uint64)GetCurrentTimestamp();
-			if (now_us >= next_heartbeat_at) {
+			now_us = cluster_storage_quorum_now_us();
+			if (now_us != 0 && now_us >= next_heartbeat_at) {
 				cssd_heartbeat_broadcast_tick();
 
 				/* spec-5.6a: ack any rejoining peer's cf phase-2 probe at
@@ -1146,7 +1170,7 @@ cluster_get_cssd_peers(PG_FUNCTION_ARGS)
 	} while (0)
 
 		ADD_TS_ATOMIC(last_heartbeat_send_at_us);
-		ADD_TS_ATOMIC(last_heartbeat_recv_at_us);
+		ADD_TS_ATOMIC(last_heartbeat_recv_wall_us);
 
 		values[col++] = Int64GetDatum((int64)pg_atomic_read_u64(&p->heartbeat_send_count));
 		values[col++] = Int64GetDatum((int64)pg_atomic_read_u64(&p->heartbeat_recv_count));
