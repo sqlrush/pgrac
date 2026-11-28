@@ -12176,6 +12176,7 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	ClusterPageWalFirstResultV1 first_state;
 	bool		first_observed = false;
 	uint64		written_token = 0;
+	uint32		own_flags;
 
 	/* The original pin makes the type stable. CR bytes have no DATA writer,
 	 * including while PCM is inactive or a caller bypasses the shared path. */
@@ -12233,6 +12234,23 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 								  cluster_node_id, buf->buf_id,
 								  (unsigned long long)writer_activation_token,
 								  (unsigned long long)resource_x_activation_generation)));
+	}
+	/* Content SHARE keeps a current image stable across a pending revoke.
+	 * The reservation itself must still be well formed before DATA output. */
+	own_flags = cluster_pcm_own_flags_get(buf->buf_id);
+	if ((buf_state & BM_DIRTY) && own_flags != 0)
+	{
+		uint64 token = cluster_pcm_own_reservation_token_get(buf->buf_id);
+
+		if (cluster_pcm_own_classify_live_flags(own_flags, token) == CLUSTER_PCM_OWN_CORRUPT)
+		{
+			UnlockBufHdr(buf, buf_state);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cannot flush a dirty buffer with an invalid PCM reservation"),
+					 errdetail("Buffer %d, flags %u, reservation token " UINT64_FORMAT ".",
+							   buf->buf_id, own_flags, token)));
+		}
 	}
 	UnlockBufHdr(buf, buf_state);
 #endif

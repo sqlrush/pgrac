@@ -1042,7 +1042,7 @@ read_page_source(void)
 }
 
 static void
-reset(void)
+reset_for_fork(ForkNumber data_fork)
 {
 	PageHeader p = (PageHeader)pages[1].data;
 
@@ -1097,7 +1097,7 @@ reset(void)
 	target.identity.system_identifier = 17;
 	target.identity.storage_uuid[0] = 1;
 	target.identity.locator = (RelFileLocator){ DEFAULTTABLESPACE_OID, 9, 18000 };
-	target.identity.forknum = MAIN_FORKNUM;
+	target.identity.forknum = data_fork;
 	target.identity.blockno = 7;
 	target.version.segment_incarnation[0] = 12;
 	target.version.mutation_token = 80;
@@ -1132,7 +1132,7 @@ reset(void)
 		buf->buf_id = i;
 		buf->pcm_state = i ? PCM_STATE_X : PCM_STATE_S;
 		buf->buffer_type = i ? BUF_TYPE_XCUR : BUF_TYPE_SCUR;
-		InitBufferTag(&buf->tag, &target.identity.locator, i ? MAIN_FORKNUM : SPACE_FORKNUM,
+		InitBufferTag(&buf->tag, &target.identity.locator, i ? data_fork : SPACE_FORKNUM,
 					  i ? 7 : 0);
 		pg_atomic_init_u32(&buf->state,
 						   BM_VALID | BM_TAG_VALID | BM_PERMANENT | (i ? BM_DIRTY : 0));
@@ -1158,6 +1158,12 @@ reset(void)
 	cluster_page_wal_shmem_init();
 	bind_native_source();
 }
+static void
+reset(void)
+{
+	reset_for_fork(MAIN_FORKNUM);
+}
+
 static void
 clean(void)
 {

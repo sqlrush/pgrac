@@ -75,9 +75,9 @@ UnpinBuffer(BufferDesc *buf)
 #include "test_cluster_abort_writer_flush.inc"
 
 static void
-abort_writer_reset(void)
+abort_writer_reset(ForkNumber forknum)
 {
-	reset();
+	reset_for_fork(forknum);
 	memset(&abort_configuration, 0, sizeof(abort_configuration));
 	abort_configuration.node_count = 4;
 	ClusterConfShmem = &abort_configuration;
@@ -103,7 +103,7 @@ check_unpinned(void)
 
 UT_TEST(original_writer_flushes_wal_then_data_for_exact_storage)
 {
-	abort_writer_reset();
+	abort_writer_reset(MAIN_FORKNUM);
 	UT_ASSERT(cluster_bufmgr_flush_created_abort_v1(&relation));
 	UT_ASSERT_EQ(writes, 1);
 	UT_ASSERT_EQ(wal_flushes, 1);
@@ -117,7 +117,7 @@ UT_TEST(original_writer_flushes_wal_then_data_for_exact_storage)
 
 UT_TEST(original_writer_skip_preserves_dirty_and_refuses_completion)
 {
-	abort_writer_reset();
+	abort_writer_reset(MAIN_FORKNUM);
 	cluster_smart_fusion = sf_blocked = true;
 	UT_ASSERT(!cluster_bufmgr_flush_created_abort_v1(&relation));
 	UT_ASSERT_EQ(writes + wal_flushes, 0);
@@ -126,23 +126,87 @@ UT_TEST(original_writer_skip_preserves_dirty_and_refuses_completion)
 	clean();
 }
 
-UT_TEST(auxiliary_revoke_gate_remains_a_refusal)
+UT_TEST(revoking_vm_current_flushes_before_handoff)
 {
-	abort_writer_reset();
-	descriptors[1].bufferdesc.tag.forkNum = VISIBILITYMAP_FORKNUM;
+	abort_writer_reset(VISIBILITYMAP_FORKNUM);
+	pg_atomic_write_u64(&own[1].reservation_token, 9);
 	pg_atomic_write_u32(&own[1].flags, PCM_OWN_FLAG_REVOKING);
-	UT_ASSERT(!cluster_bufmgr_flush_created_abort_v1(&relation));
-	UT_ASSERT_EQ(writes + wal_flushes, 0);
-	UT_ASSERT(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY);
-	pg_atomic_write_u32(&own[1].flags, 0);
+	UT_ASSERT(cluster_bufmgr_flush_created_abort_v1(&relation));
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(wal_flushes, 1);
+	UT_ASSERT(!(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY));
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(1), PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(1), 9);
 	check_unpinned();
 	clean();
+}
+
+UT_TEST(dirty_retained_vm_refuses_abort_writeback)
+{
+	BufferDesc *buf = &descriptors[1].bufferdesc;
+
+	abort_writer_reset(VISIBILITYMAP_FORKNUM);
+	pg_atomic_write_u64(&own[1].reservation_token, 9);
+	pg_atomic_write_u32(&own[1].flags, PCM_OWN_FLAG_REVOKING);
+	buf->pcm_state = PCM_STATE_N;
+	buf->buffer_type = BUF_TYPE_PI;
+	UT_ASSERT(!cluster_bufmgr_flush_created_abort_v1(&relation));
+	UT_ASSERT_EQ(writes + wal_flushes, 0);
+	UT_ASSERT(pg_atomic_read_u32(&buf->state) & BM_DIRTY);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(1), 9);
+	check_unpinned();
+	clean();
+}
+
+/* The ERROR leaf in the DATA fixture resets interrupt holdoff. Model the
+ * abort cleanup of the caller's content lock and pin before checking leaks. */
+static void
+release_abort_writer_after_error(void)
+{
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	locks[1] = false;
+	if (pins[1])
+		UnpinBuffer(&descriptors[1].bufferdesc);
+}
+
+static void
+check_corrupt_vm_reservation(uint32 flags, uint64 token)
+{
+	volatile bool caught = false;
+
+	abort_writer_reset(VISIBILITYMAP_FORKNUM);
+	pg_atomic_write_u64(&own[1].reservation_token, token);
+	pg_atomic_write_u32(&own[1].flags, flags);
+	PG_TRY();
+	{
+		(void) cluster_bufmgr_flush_created_abort_v1(&relation);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(writes + wal_flushes, 0);
+	UT_ASSERT(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(1), flags);
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_token_get(1), token);
+	if (caught)
+		release_abort_writer_after_error();
+	check_unpinned();
+	clean();
+}
+
+UT_TEST(corrupt_vm_reservation_never_reaches_storage)
+{
+	check_corrupt_vm_reservation(PCM_OWN_FLAG_REVOKING, 0);
+	check_corrupt_vm_reservation(PCM_OWN_FLAG_REVOKING | PCM_OWN_FLAG_GRANT_PENDING, 9);
 }
 
 UT_TEST(original_dirty_activation_fence_raises_without_output)
 {
 	volatile bool caught = false;
-	abort_writer_reset();
+	abort_writer_reset(MAIN_FORKNUM);
 	pg_atomic_write_u64(&own[1].writer_activation_token, 7);
 	PG_TRY();
 	{
@@ -157,12 +221,7 @@ UT_TEST(original_dirty_activation_fence_raises_without_output)
 	UT_ASSERT_EQ(writes + wal_flushes, 0);
 	UT_ASSERT(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_DIRTY);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&own[1].writer_activation_token), 7);
-	/* The fixture's ERROR already resets interrupt holdoff like the backend
-	 * release-all boundary; model its content-lock release before unpin. */
-	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
-	locks[1] = false;
-	if (pins[1])
-		UnpinBuffer(&descriptors[1].bufferdesc);
+	release_abort_writer_after_error();
 	pg_atomic_write_u64(&own[1].writer_activation_token, 0);
 	check_unpinned();
 	clean();
@@ -171,7 +230,7 @@ UT_TEST(original_dirty_activation_fence_raises_without_output)
 UT_TEST(clean_io_or_error_is_not_completion)
 {
 	for (int fault = 0; fault < 2; fault++) {
-		abort_writer_reset();
+		abort_writer_reset(MAIN_FORKNUM);
 		pg_atomic_fetch_and_u32(&descriptors[1].bufferdesc.state, ~BM_DIRTY);
 		pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state,
 							  fault == 0 ? BM_IO_IN_PROGRESS : BM_IO_ERROR);
@@ -186,7 +245,7 @@ UT_TEST(clean_io_or_error_is_not_completion)
 
 UT_TEST(local_temp_or_missing_storage_is_not_admitted)
 {
-	abort_writer_reset();
+	abort_writer_reset(MAIN_FORKNUM);
 	UT_ASSERT(!cluster_bufmgr_flush_created_abort_v1(NULL));
 	relation.smgr_which = 0;
 	UT_ASSERT(!cluster_bufmgr_flush_created_abort_v1(&relation));
@@ -201,10 +260,12 @@ UT_TEST(local_temp_or_missing_storage_is_not_admitted)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(original_writer_flushes_wal_then_data_for_exact_storage);
 	UT_RUN(original_writer_skip_preserves_dirty_and_refuses_completion);
-	UT_RUN(auxiliary_revoke_gate_remains_a_refusal);
+	UT_RUN(revoking_vm_current_flushes_before_handoff);
+	UT_RUN(dirty_retained_vm_refuses_abort_writeback);
+	UT_RUN(corrupt_vm_reservation_never_reaches_storage);
 	UT_RUN(original_dirty_activation_fence_raises_without_output);
 	UT_RUN(clean_io_or_error_is_not_completion);
 	UT_RUN(local_temp_or_missing_storage_is_not_admitted);
