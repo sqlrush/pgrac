@@ -112,6 +112,17 @@ extern bool cluster_cf_release_completed(LOCKMODE mode, uint64 cookie);
 extern void cluster_cf_retirement_poll(void);
 extern void cluster_cf_unlock(LOCKMODE mode);
 
+/* Read-only identity of this task's unusable cleanup, never CF permission.
+ * The embedded owner's original registry handle binds the creator incarnation.
+ * Nothing here adopts another task or consumes a completion. */
+typedef struct ClusterCfRetirementSnapshot {
+	uint64 cookie;
+	ClusterControlRequestView registry;
+} ClusterCfRetirementSnapshot;
+
+extern bool cluster_cf_retirement_snapshot(LOCKMODE mode, const void *caller,
+										   ClusterCfRetirementSnapshot *out);
+
 typedef enum ClusterCfReleaseResult {
 	CLUSTER_CF_RELEASE_NOT_HELD = 0,
 	CLUSTER_CF_RELEASE_CONFIRMED = 1,
