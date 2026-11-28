@@ -170,6 +170,31 @@ static bool structural_master_receipt_valid, structural_master_ack_valid;
 static ClusterPcmPiWriteCutV1 structural_master_write_cut;
 static ClusterPcmPiStorageCutV1 structural_master_storage_cut;
 static void (*structural_master_ack_hook)(void);
+/* Controlled IPC leaf, with the same strict LIFO rule as native ipc.c.
+ * The real PG_ENSURE_ERROR_CLEANUP macros use this stack. */
+#include "storage/ipc.h"
+static pg_on_exit_callback disk_exit_callbacks[64];
+static Datum disk_exit_arguments[64];
+static int disk_exit_count, disk_exit_lifo_errors;
+
+void
+before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	if (disk_exit_count >= lengthof(disk_exit_callbacks)) abort();
+	disk_exit_callbacks[disk_exit_count] = callback;
+	disk_exit_arguments[disk_exit_count++] = arg;
+}
+void
+cancel_before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	if (disk_exit_count == 0 || disk_exit_callbacks[disk_exit_count - 1] != callback
+		|| disk_exit_arguments[disk_exit_count - 1] != arg) {
+		disk_exit_lifo_errors++;
+		pg_re_throw();
+	}
+	disk_exit_count--;
+}
+
 static int fake_lwlock_depth = 0;
 static ClusterWaitTrace wait_trace_rows[128];
 static ClusterWaitTraceKind wait_trace_kinds[128];

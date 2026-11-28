@@ -150,6 +150,54 @@ UT_TEST(test_resident_empty_wait_slices_keep_one_request)
 	UT_ASSERT_EQ(ordinary_sends, 1); resident_unchanged_bytes();
 	cluster_gcs_block_first_fill_end(&request); complete_idle();
 }
+static sigjmp_buf resident_wait_exit;
+
+static void
+exit_during_resident_wait_enrollment(void)
+{
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT(fake_cv_prepared);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&request_entry()->wait_refcount), 1);
+	while (disk_exit_count > 0) {
+		int slot = --disk_exit_count;
+		disk_exit_callbacks[slot](1, disk_exit_arguments[slot]);
+	}
+	siglongjmp(resident_wait_exit, 1);
+}
+
+UT_TEST(test_resident_wait_exit_releases_only_its_enrollment)
+{
+	ClusterGcsFirstFill request;
+	PcmEntryRef other;
+	PcmEntryAcquireResult acquired;
+	sigjmp_buf *saved_stack = PG_exception_stack;
+	ErrorContextCallback *saved_context = error_context_stack;
+	uint32 pins;
+
+	resident_start(&request, 2);
+	RESIDENT_REQUIRE_EQ(cluster_gcs_block_resident_read_begin(&request_buf, &request_base,
+		request_token, &request), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(disk_exit_count, 0);
+	UT_ASSERT(pcm_entry_ref_acquire(&request_base.tag, false, &other, &acquired));
+	pins = pg_atomic_read_u32(&request_entry()->pin_count);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&request_entry()->wait_refcount), 0);
+	fake_cv_prepare_hook = exit_during_resident_wait_enrollment;
+	if (sigsetjmp(resident_wait_exit, 0) == 0) {
+		(void)cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
+			&request.observation, &request.episode);
+		UT_ASSERT(false);
+	}
+	PG_exception_stack = saved_stack;
+	error_context_stack = saved_context;
+	UT_ASSERT(!fake_cv_prepared);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&request_entry()->pin_count), pins);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&request_entry()->wait_refcount), 0);
+	UT_ASSERT_EQ(disk_exit_count, 0);
+	pcm_entry_ref_release(&other);
+	cluster_gcs_block_first_fill_end(&request);
+	complete_idle();
+}
+
 UT_TEST(test_resident_completion_during_wait_enrollment_is_not_lost)
 {
 	ClusterGcsFirstFill request;
@@ -507,7 +555,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(21);
+	UT_PLAN(22);
 	UT_RUN(test_resident_current_and_PI_issue_once_and_passively_join);
 	UT_RUN(test_resident_empty_wait_slices_keep_one_request);
 	UT_RUN(test_resident_completion_during_wait_enrollment_is_not_lost);
@@ -529,6 +577,7 @@ main(void)
 	UT_RUN(test_resident_PI_DATA_progress_allows_same_episode_one_REQUEST);
 	UT_RUN(test_resident_PI_valid_local_body_precedes_the_only_REQUEST);
 	UT_RUN(test_resident_PI_capture_wait_turnover_and_ERROR_keep_original_duty);
+	UT_RUN(test_resident_wait_exit_releases_only_its_enrollment);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

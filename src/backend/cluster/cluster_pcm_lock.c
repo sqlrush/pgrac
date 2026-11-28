@@ -73,6 +73,7 @@
 #include "storage/backendid.h" /* PGRAC: spec-6.14 D9 amend — no-backend-identity guard */
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
@@ -5885,6 +5886,12 @@ pcm_entry_wait_context_cleanup(PcmEntryWaitContext *context)
 		pcm_entry_ref_release(&context->ref);
 }
 
+static void
+pcm_entry_wait_before_shmem_exit(int code pg_attribute_unused(), Datum arg)
+{
+	pcm_entry_wait_context_cleanup((PcmEntryWaitContext *)DatumGetPointer(arg));
+}
+
 static bool
 pcm_frontend_wait_can_unwind(void)
 {
@@ -5896,7 +5903,7 @@ pcm_frontend_wait_check_shutdown(void)
 {
 	/* An outer buffer content LWLock defers native SIGTERM processing.
 	 * At these unlocked wait boundaries ERROR can unwind the exact CV/entry
-	 * reference through PG_FINALLY before native LWLock/transaction cleanup.
+	 * reference before native LWLock/transaction cleanup.
 	 * Never clear holdoff counters or the shutdown flag and resume work, and
 	 * never throw through a critical section or change a background role. */
 	if (ProcDiePending && pcm_frontend_wait_can_unwind())
@@ -5917,6 +5924,7 @@ cluster_pcm_lock_check_shutdown_wait(void)
  * but retain only the exact pinned handle and logical Resource-X identity. */
 static PcmEntryWaitContext pcm_resource_x_executor_wait_context;
 static ResourceXAcquisitionRef pcm_resource_x_executor_wait_ref;
+static bool pcm_resource_x_executor_exit_hook_registered;
 
 static bool
 pcm_resource_x_executor_wait_ref_exact(const ResourceXAcquisitionRef *ref)
@@ -5934,6 +5942,25 @@ pcm_resource_x_executor_wait_cleanup(void)
 {
 	pcm_entry_wait_context_cleanup(&pcm_resource_x_executor_wait_context);
 	memset(&pcm_resource_x_executor_wait_ref, 0, sizeof(pcm_resource_x_executor_wait_ref));
+}
+
+static void
+pcm_resource_x_executor_before_shmem_exit(int code pg_attribute_unused(),
+										 Datum arg pg_attribute_unused())
+{
+	if (pcm_resource_x_executor_wait_context.ref.pinned)
+		pcm_resource_x_executor_wait_cleanup();
+}
+
+void
+cluster_pcm_lock_register_backend_exit_hook(void)
+{
+	if (pcm_resource_x_executor_exit_hook_registered || !IsUnderPostmaster)
+		return;
+	if (MyBackendId <= 0 && MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER)
+		return;
+	before_shmem_exit(pcm_resource_x_executor_before_shmem_exit, (Datum)0);
+	pcm_resource_x_executor_exit_hook_registered = true;
 }
 
 ResourceXApplyResult
@@ -8884,15 +8911,12 @@ pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *re
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		acquired = pcm_lock_acquire_local_pinned(tag, mode, remote_x_out, &wait_context, source);
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return acquired;
 }
 
@@ -18059,7 +18083,7 @@ round_wait_predicate_done:
 	remaining_us = Max(retry_slice_us, UINT64_C(1000));
 	timeout_ms = (long)Min((uint64)timeout_ms, remaining_us / UINT64_C(1000));
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_BOOTSTRAP, PCM_LOCK_MODE_X,
@@ -18079,11 +18103,8 @@ round_wait_predicate_done:
 									  cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -18226,7 +18247,7 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 	}
 	remaining_us = Max(requested_sleep_slice_us, UINT64_C(1000));
 	timeout_ms = (long)Min((uint64)LONG_MAX, remaining_us / UINT64_C(1000));
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_PREDECESSOR, PCM_LOCK_MODE_X,
@@ -18246,11 +18267,8 @@ cluster_pcm_lock_resource_x_predecessor_wait_exact(const BufferTag *tag, int32 c
 							   cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -19466,7 +19484,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 	if (deadline_ms < (uint64)sleep_ms)
 		sleep_ms = (long)deadline_ms;
 
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
 	{
 		if (cluster_trace_tx_identity)
 			pcm_trace_wait(entry, CLWAIT_SITE_PCM_INSTALL, PCM_LOCK_MODE_X,
@@ -19486,11 +19504,8 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 									  cluster_node_id)));
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&wait_context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&wait_context));
+	pcm_entry_wait_context_cleanup(&wait_context);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -31185,7 +31200,7 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
 	if (!pcm_entry_ref_acquire(&observation->request.logical_assertion.resource, false,
 		&context.ref, &acquired))
 		return RESOURCE_X_APPLY_STALE;
-	PG_TRY();
+	PG_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&context));
 	{
 		struct GrdEntry *entry = context.ref.entry;
 		ClusterPcmResourceXMasterState *state;
@@ -31247,11 +31262,8 @@ cluster_pcm_lock_resource_x_requester_acquire_wait_exact(
 				result = RESOURCE_X_APPLY_STALE;
 		}
 	}
-	PG_FINALLY();
-	{
-		pcm_entry_wait_context_cleanup(&context);
-	}
-	PG_END_TRY();
+	PG_END_ENSURE_ERROR_CLEANUP(pcm_entry_wait_before_shmem_exit, PointerGetDatum(&context));
+	pcm_entry_wait_context_cleanup(&context);
 	if (diagnostic != NULL)
 		ereport(LOG, (errmsg_internal("first-fill result6 entry observation"),
 			errdetail_internal("predicate=%s left=0 right=1 tag=%u/%u/%u/%d/%u attempt=" UINT64_FORMAT

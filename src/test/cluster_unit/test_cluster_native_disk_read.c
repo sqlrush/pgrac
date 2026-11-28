@@ -24,31 +24,6 @@
 #include "storage/checksum_impl.h"
 #include "storage/shmem.h"
 
-/* Controlled IPC leaf, with the same strict LIFO rule as native ipc.c.
- * The real PG_ENSURE_ERROR_CLEANUP macros use this stack. */
-#include "storage/ipc.h"
-static pg_on_exit_callback disk_exit_callbacks[64];
-static Datum disk_exit_arguments[64];
-static int disk_exit_count, disk_exit_lifo_errors;
-
-void
-before_shmem_exit(pg_on_exit_callback callback, Datum arg)
-{
-	if (disk_exit_count >= lengthof(disk_exit_callbacks)) abort();
-	disk_exit_callbacks[disk_exit_count] = callback;
-	disk_exit_arguments[disk_exit_count++] = arg;
-}
-void
-cancel_before_shmem_exit(pg_on_exit_callback callback, Datum arg)
-{
-	if (disk_exit_count == 0 || disk_exit_callbacks[disk_exit_count - 1] != callback
-		|| disk_exit_arguments[disk_exit_count - 1] != arg) {
-		disk_exit_lifo_errors++;
-		pg_re_throw();
-	}
-	disk_exit_count--;
-}
-
 static PGIOAlignedBlock disk_bytes, disk_output, disk_shared;
 static FILE *disk_file;
 static unsigned disk_enters, disk_ends, disk_opens, disk_reads, disk_bad_pages, disk_traces;

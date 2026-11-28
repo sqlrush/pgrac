@@ -71,6 +71,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd.h" /* spec-2.24 D7 cleanup_on_backend_exit_callback */
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-6.14 D11 eager exit-hook registration */
 #include "cluster/cluster_tx_enqueue.h" /* spec-8.4 D9 exact wait exit cleanup */
 #endif
@@ -905,6 +906,8 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * their calls as no-op backstops for processes that skip InitPostgres.
 	 */
 	cluster_gcs_block_dedup_register_backend_exit_hook();
+	/* Release the executor wait before GRD detaches its entry (LIFO). */
+	cluster_pcm_lock_register_backend_exit_hook();
 #endif
 
 	/* The autovacuum launcher is done here */
