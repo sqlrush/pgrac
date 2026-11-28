@@ -205,7 +205,7 @@ typedef struct ClusterCssdOutboundSlot {
  * ClusterCssdPeerStateShmem -- per-peer dead-detection state.
  *
  *	state                       : ClusterCssdPeerState 3-stage hysteresis
- *	last_heartbeat_recv_at_us   : TimestampTz of last accepted recv (atomic
+ *	last_heartbeat_recv_at_us   : receiver-local monotonic microseconds of last accepted recv (atomic
  *	                              uint64 for handler 4-硬约束 — handler
  *	                              writes here without LWLock)
  *	last_heartbeat_send_at_us   : TimestampTz of last DONE send (LMON-
@@ -223,6 +223,7 @@ typedef struct ClusterCssdOutboundSlot {
 typedef struct ClusterCssdPeerStateShmem {
 	pg_atomic_uint32 state;
 	pg_atomic_uint64 last_heartbeat_recv_at_us;
+	pg_atomic_uint64 last_heartbeat_recv_wall_us; /* TimestampTz for SQL */
 	pg_atomic_uint64 last_heartbeat_send_at_us;
 	pg_atomic_uint64 heartbeat_send_count;
 	pg_atomic_uint64 heartbeat_recv_count;
@@ -252,8 +253,8 @@ typedef struct ClusterCssdShmem {
 	bool shutdown_requested;
 
 	/* spec-2.5 Q6 first-tick grace period: deadband-scan does not
-	 * trigger SUSPECTED/DEAD transitions until now > grace_until_us.
-	 * = ready_at + (cssd_dead_deadband_factor × cssd_heartbeat_interval_ms × 1000) */
+	 * trigger SUSPECTED/DEAD transitions before the monotonic grace deadline.
+	 * = monotonic time at READY + (cssd_dead_deadband_factor × cssd_heartbeat_interval_ms × 1000) */
 	uint64 first_tick_grace_until_us;
 
 	/* Aggregate counters (across all peers). */

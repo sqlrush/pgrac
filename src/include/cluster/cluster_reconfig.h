@@ -105,7 +105,7 @@ typedef enum ClusterReplacementCommittedClosedPublishResultV1 {
 #include "cluster/cluster_write_fence.h"
 
 /* QVOTEC-only disk observation; memory, never a persistent authority.
- * sampled_at_us is the beginning of the scan, not the end of a slow I/O.
+ * sampled_at_us records CLOCK_MONOTONIC microseconds at scan start.
  * Author: SqlRush <sqlrush@gmail.com> */
 typedef struct ClusterFormationDiskSnapshot {
 	uint64 sampled_at_us;

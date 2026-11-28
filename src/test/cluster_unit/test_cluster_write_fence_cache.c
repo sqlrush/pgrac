@@ -145,15 +145,32 @@ void
 cluster_undo_horizon_note_self_member(void)
 {}
 
+static TimestampTz wall_us = 100;
+static uint64 mono_us = 100;
+static unsigned marker_wait_steps;
+
+uint64
+cluster_storage_quorum_now_us(void)
+{
+	return mono_us;
+}
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 100;
+	return wall_us;
 }
 
 void
 pg_usleep(long microsec)
 {
+	if (marker_wait_steps != 0) {
+		/* Simulate two waits spanning opposite wall adjustments. */
+		wall_us += marker_wait_steps == 1 ? 30000000 : -60000000;
+		mono_us += cluster_write_fence_lease_ms * 500ULL;
+		marker_wait_steps++;
+		return;
+	}
 	(void)usleep((useconds_t)microsec);
 }
 
@@ -607,6 +624,60 @@ UT_TEST(test_identical_renewal_cannot_undo_concurrent_startup_fence)
 	UT_ASSERT_EQ(after.expiry_us, 900);
 }
 
+UT_TEST(test_marker_deadlines_use_monotonic_time)
+{
+	ClusterFenceMarker marker = cache_marker(12);
+	ClusterMarkerAsync owner;
+	uint64 elapsed;
+
+	attach_cache();
+	marker_wait_steps = 1;
+	UT_ASSERT_EQ(cluster_write_fence_submit_marker(&marker), CLUSTER_FENCE_MARKER_SUBMIT_TIMEOUT);
+	UT_ASSERT_EQ(marker_wait_steps, 3);
+	marker_wait_steps = 0;
+
+	attach_cache();
+	cluster_marker_async_init(&owner);
+	mono_us = 100;
+	UT_ASSERT(cluster_write_fence_submit_marker_async(&owner, &marker,
+													  CLUSTER_MARKER_KIND_FENCE_FAILSTOP, 2));
+	wall_us += 30000000;
+	UT_ASSERT_EQ(cluster_write_fence_poll_marker_async(&owner, NULL, NULL),
+				 CLUSTER_MARKER_POLL_PENDING);
+	wall_us -= 60000000;
+	mono_us = owner.deadline_us;
+	UT_ASSERT_EQ(cluster_write_fence_poll_marker_async(&owner, NULL, &elapsed),
+				 CLUSTER_MARKER_POLL_TIMEOUT);
+	UT_ASSERT_EQ(elapsed, cluster_write_fence_lease_ms * 1000ULL);
+	attach_cache();
+	mono_us = 0;
+	UT_ASSERT(!cluster_write_fence_submit_marker_async(&owner, &marker,
+													   CLUSTER_MARKER_KIND_FENCE_FAILSTOP, 2));
+	UT_ASSERT_EQ(cluster_write_fence_submit_marker(&marker), CLUSTER_FENCE_MARKER_SUBMIT_FAILED);
+	mono_us = wall_us = 100;
+}
+
+UT_TEST(test_fence_lease_uses_monotonic_time)
+{
+	ClusterFenceMarker marker = cache_marker(12);
+
+	attach_cache();
+	attach_epoch();
+	marker.fence_epoch = cluster_epoch_get_current();
+	cluster_write_fence_refresh_from_marker(&marker, 200);
+	wall_us += 30000000;
+	UT_ASSERT(cluster_write_fence_allowed());
+	wall_us -= 60000000;
+	mono_us = 199;
+	UT_ASSERT(cluster_write_fence_allowed());
+	UT_ASSERT_EQ(cluster_write_fence_get_baseline_authority_age_us(), 99);
+	mono_us = 200;
+	UT_ASSERT(!cluster_write_fence_allowed());
+	mono_us = 0;
+	UT_ASSERT(!cluster_write_fence_allowed());
+	mono_us = wall_us = 100;
+}
+
 UT_TEST(test_passive_fence_snapshot_retains_expiry_without_mutation)
 {
 	ClusterWriteFenceObservation observed;
@@ -726,7 +797,7 @@ UT_TEST(test_stop_marker_waits_for_original_qvotec_completion)
 	attach_cache();
 	cluster_marker_async_init(&owner);
 	UT_ASSERT(cluster_write_fence_submit_marker_async(&owner, &marker,
-													  CLUSTER_MARKER_KIND_FENCE_FAILSTOP, 2, 100));
+													  CLUSTER_MARKER_KIND_FENCE_FAILSTOP, 2));
 	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, &key, &reason),
 				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT(strcmp(reason, "WRITE_FENCE_MARKER_MAILBOX") == 0);
@@ -740,11 +811,11 @@ UT_TEST(test_stop_marker_waits_for_original_qvotec_completion)
 	cluster_write_fence_qvotec_complete(true);
 	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT(cluster_marker_async_is_submitted(&owner));
-	UT_ASSERT_EQ(cluster_write_fence_poll_marker_async(&owner, 101, &result, NULL),
+	UT_ASSERT_EQ(cluster_write_fence_poll_marker_async(&owner, &result, NULL),
 				 CLUSTER_MARKER_POLL_ACKED);
 	UT_ASSERT_EQ(result, CLUSTER_FENCE_MARKER_SUBMIT_ACK);
 	UT_ASSERT(cluster_write_fence_submit_marker_async(&owner, &marker,
-													  CLUSTER_MARKER_KIND_FENCE_FAILSTOP, 2, 102));
+													  CLUSTER_MARKER_KIND_FENCE_FAILSTOP, 2));
 	UT_ASSERT(cluster_write_fence_qvotec_poll_pending(&delivered));
 	cluster_write_fence_qvotec_complete(false);
 	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, &reason),
@@ -780,9 +851,9 @@ int
 main(void)
 {
 #ifdef USE_ASSERT_CHECKING
-	UT_PLAN(17);
+	UT_PLAN(19);
 #else
-	UT_PLAN(16);
+	UT_PLAN(18);
 #endif
 	UT_RUN(test_stop_requires_owning_lmon_and_region);
 	UT_RUN(test_cache_publish_revalidate_and_invalidate);
@@ -803,6 +874,8 @@ main(void)
 	UT_RUN(test_stop_cache_history_is_not_work_but_publisher_is);
 	UT_RUN(test_stop_marker_waits_for_original_qvotec_completion);
 	UT_RUN(test_stop_rejects_self_fence_and_impossible_mailbox);
+	UT_RUN(test_fence_lease_uses_monotonic_time);
+	UT_RUN(test_marker_deadlines_use_monotonic_time);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -246,7 +246,7 @@ qvotec_initial_trace_previous_poll(void)
 		LOG,
 		(errmsg_internal("cluster INITIAL formation producer diagnostic"),
 		 errdetail(
-			 "node=%d next_poll_pg_us=%llu sampled_pg_us=%llu published_pg_us=%llu "
+			 "node=%d next_poll_pg_us=%llu sampled_mono_us=%llu published_pg_us=%llu "
 			 "complete=%u all_slots_read=%u quorum=%u max_epoch=%llu max_generation=%llu "
 			 "declared=%016llx/%016llx known=%016llx/%016llx fresh=%016llx/%016llx "
 			 "oldest_heartbeat_pg_us=%llu newest_heartbeat_pg_us=%llu heartbeat_budget_us=%llu",
@@ -473,6 +473,48 @@ static uint64 qvotec_self_incarnation = 0;
 static uint64 qvotec_slot_generation = 0;
 static ClusterVotingSlot *qvotec_slot_matrix = NULL;
 
+/* Local observations survive transient read failures. The durable slot retains
+ * its writer's wall timestamp and original CRC. */
+typedef struct QvotecSlotProgress
+{
+	uint64 incarnation;
+	uint64 generation;
+	uint64 heartbeat_ts_us;
+	uint64 last_progress_mono_us;
+	bool initialized;
+} QvotecSlotProgress;
+
+static QvotecSlotProgress qvotec_slot_progress[CLUSTER_MAX_VOTING_DISKS][CLUSTER_MAX_NODES];
+
+static bool
+qvotec_slot_is_fresh(const QvotecSlotProgress *progress, uint64 mono_us, uint64 timeout_us)
+{
+	return progress->last_progress_mono_us != 0 && mono_us >= progress->last_progress_mono_us
+		   && mono_us - progress->last_progress_mono_us < timeout_us;
+}
+
+static void
+qvotec_observe_slot(QvotecSlotProgress *progress, const ClusterVotingSlot *slot,
+					uint64 mono_us, uint64 wall_us, uint64 timeout_us)
+{
+	bool changed = progress->incarnation != slot->incarnation
+				   || progress->generation != slot->generation;
+
+	if (mono_us == 0)
+		return;
+	if ((slot->flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE) == 0)
+		progress->last_progress_mono_us = 0;
+	else if (progress->initialized ? changed
+			 : slot->heartbeat_ts_us != 0 && (wall_us <= slot->heartbeat_ts_us
+					|| wall_us - slot->heartbeat_ts_us <= timeout_us))
+		progress->last_progress_mono_us = mono_us;
+	progress->initialized = true;
+	progress->incarnation = slot->incarnation;
+	progress->generation = slot->generation;
+	progress->heartbeat_ts_us = slot->heartbeat_ts_us;
+}
+
+
 /*
  * D10 pgstat counter handles, looked up once at startup.  The poll
  * cycle bumps the global cluster.qvotec.* counters surfaced through
@@ -554,35 +596,22 @@ qvotec_publish_poll_lease(uint64 now_us)
 {
 	uint64 duration_us
 		= (uint64)cluster_quorum_poll_interval_ms * QVOTEC_LEASE_POLL_PERIODS * 1000ULL;
-	uint64 next_lease_expire = now_us + duration_us;
-	uint64 previous_expiry = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
-	uint64 previous_poll = pg_atomic_read_u64(&QvotecShmem->last_poll_ts_us);
 	uint64 previous_mono = pg_atomic_read_u64(&QvotecShmem->admission_lease_sampled_us);
-	uint64 previous_mono_expiry = pg_atomic_read_u64(&QvotecShmem->admission_lease_expires_us);
+	uint64 previous_expiry = pg_atomic_read_u64(&QvotecShmem->admission_lease_expires_us);
 	uint64 sequence = qvotec_admission_publish_begin(false);
 	uint64 monotonic_at = cluster_storage_quorum_now_us();
-	uint64 published_at = (uint64)GetCurrentTimestamp();
-	uint64 remaining
-		= next_lease_expire > published_at ? Min(next_lease_expire - published_at, duration_us) : 0;
 	uint64 monotonic_expiry
-		= monotonic_at != 0 && remaining != 0 && monotonic_at <= UINT64_MAX - remaining
-			  ? monotonic_at + remaining
+		= now_us != 0 && now_us <= monotonic_at && now_us <= UINT64_MAX - duration_us
+			  ? now_us + duration_us
 			  : 0;
-	/* Exchange only while publication is odd. A later observer report remains
-	 * pending; neither reattachment nor a wall-clock rollback can erase it. */
 	uint64 reported_loss = pg_atomic_exchange_u64(&QvotecShmem->admission_lease_loss_reported, 0);
 
-	/* Evaluate expiry while the old publication is inaccessible. A delayed
-	 * writer cannot erase a gap; wall-clock rollback cannot revive the new
-	 * continuity evidence. The original wall-clock lease is unchanged. */
-	if (reported_loss != 0 || previous_expiry == 0 || published_at >= previous_expiry
-		|| now_us < previous_poll || published_at < previous_poll || next_lease_expire <= now_us
-		|| monotonic_expiry == 0 || previous_mono == 0 || monotonic_at < previous_mono
-		|| monotonic_at >= previous_mono_expiry)
+	if (reported_loss || previous_mono == 0 || now_us < previous_mono
+		|| monotonic_at >= previous_expiry || monotonic_at >= monotonic_expiry)
 		qvotec_admission_note_loss();
 
 	pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
-	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
+	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, monotonic_expiry);
 	pg_atomic_write_u64(&QvotecShmem->admission_lease_sampled_us, monotonic_at);
 	pg_atomic_write_u64(&QvotecShmem->admission_lease_expires_us, monotonic_expiry);
 	qvotec_admission_publish_end(sequence);
@@ -655,7 +684,7 @@ qvotec_poll_pre_injection(void)
 	lease_us = QvotecShmem == NULL ? 0 : pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
 	elog(LOG,
 		 "qvotec poll-pre injection begin node=%d pid=%d delay_us=" UINT64_FORMAT
-		 " prior_lease_us=" UINT64_FORMAT " now_us=" INT64_FORMAT " poll_cycle=" UINT64_FORMAT,
+		 " prior_lease_us=" UINT64_FORMAT " wall_us=" INT64_FORMAT " poll_cycle=" UINT64_FORMAT,
 		 cluster_node_id, MyProcPid, delay_us, lease_us, GetCurrentTimestamp(),
 		 cluster_pgstat_read(qvotec_counter_poll_cycle));
 	INSTR_TIME_SET_CURRENT(started);
@@ -1016,7 +1045,7 @@ cluster_qvotec_observe(ClusterQvotecObservation *out)
 	if (out == NULL)
 		return;
 	memset(out, 0, sizeof(*out));
-	out->now_us = (uint64)GetCurrentTimestamp();
+	out->now_us = cluster_storage_quorum_now_us();
 	out->observer_frozen = cluster_writes_frozen != 0;
 	if (QvotecShmem == NULL)
 		return;
@@ -1299,7 +1328,7 @@ cluster_qvotec_get_collision_state_name(void)
  *	Any other state — INITIALIZING / UNCERTAIN / LOST / lease
  *	expired / shmem absent — returns false → backend fail-closed.
  *
- *	Cost: 3 atomic loads + 1 GetCurrentTimestamp() call (~50ns).
+ *	Lease deadlines use the local monotonic clock.
  *	v0.14.0 caller:  CommitTransaction (commit-boundary check; xact.c
  *	D6).  Spec Q5 v0.2 write-intent boundary check at INSERT/UPDATE/
  *	DELETE/DDL entry is deferred to Hardening v0.4+;correctness is
@@ -1426,13 +1455,19 @@ qvotec_admission_sample(ClusterQvotecAdmissionCheck *out, uint64 sequence)
 		return qvotec_storage_admission_denied(q, &storage_check, false);
 
 	lease_expire = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
-	now_us = (uint64)GetCurrentTimestamp();
+	now_us = cluster_storage_quorum_now_us();
 	if (out != NULL) {
 		out->result = CLUSTER_QVOTEC_ADMISSION_LEASE;
 		out->lease_expire_us = lease_expire;
 		out->now_us = now_us;
 	}
-	if (now_us >= lease_expire) {
+	if (now_us == 0 && storage_pending && out != NULL) {
+		out->result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+		out->storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_CLOCK_UNAVAILABLE;
+		pg_atomic_write_u64(&QvotecShmem->admission_lease_loss_reported, 1);
+		return false;
+	}
+	if (now_us == 0 || now_us >= lease_expire) {
 		/* Record only a refusal sampled from one stable publication. A timely
 		 * renewal interleaved with this old getter can cause its original bool
 		 * to reject, but is not evidence of a published qualification gap. */
@@ -1476,7 +1511,7 @@ qvotec_check_admission_once(ClusterQvotecAdmissionCheck *out)
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	/* The legacy shared bool caller must report a proven lease refusal too:
-	 * a different consumer may next request continuity after wall time rolls back. */
+	 * a different consumer may next request continuity after the clock becomes available again. */
 	if (QvotecShmem != NULL && (out != NULL || cluster_shared_config)) {
 		sequence = pg_atomic_read_u64(&QvotecShmem->admission_sequence);
 		pg_read_barrier();
@@ -1500,8 +1535,13 @@ qvotec_check_admission_once(ClusterQvotecAdmissionCheck *out)
 		/* A stable failed/reversed clock or elapsed monotonic lease is not
 		 * publication contention. Preserve it until the owner advances loss
 		 * history, even if another reader later observes a working clock. */
-		if (stable && !lease_current)
+		if (stable && !lease_current) {
 			pg_atomic_write_u64(&QvotecShmem->admission_lease_loss_reported, 1);
+			if (now == 0 || (sampled_at != 0 && (now < sampled_at || now >= expires_at))) {
+				out->result = CLUSTER_QVOTEC_ADMISSION_LEASE;
+				return false;
+			}
+		}
 		out->continuity_valid
 			= stable && generation != 0 && generation != UINT64_MAX && reported_loss == 0
 			  && sampled_at != 0 && lease_current
@@ -3501,6 +3541,7 @@ qvotec_poll_once(void)
 	bool authority_config_ok = false;
 	uint64 authority_sequence = UINT64_MAX;
 	uint64 authority_sampled_us = 0;
+	uint64 fence_lease_expire;
 	ClusterFenceMarker authority_disk_markers[CLUSTER_MAX_VOTING_DISKS];
 	ClusterFenceDiskVoteState authority_disk_states[CLUSTER_MAX_VOTING_DISKS];
 	struct stat authority_disk_stats[CLUSTER_MAX_VOTING_DISKS];
@@ -3509,6 +3550,7 @@ qvotec_poll_once(void)
 	bool all_slots_read = true;
 	uint64 observed_max_fence_epoch = 0;
 	ClusterQuorumDecision decision;
+	uint64 wall_us;
 	uint64 now_us;
 	uint64 heartbeat_timeout_us;
 	int i;
@@ -3603,7 +3645,9 @@ qvotec_poll_once(void)
 	}
 
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_LEASE_PENDING);
-	now_us = (uint64)GetCurrentTimestamp();
+	wall_us = (uint64)GetCurrentTimestamp();
+	now_us = cluster_storage_quorum_now_us();
+	fence_lease_expire = now_us ? now_us + (uint64)cluster_write_fence_lease_ms * 1000ULL : 0;
 	heartbeat_timeout_us = (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
 
 	/* Always update the lease + last_poll_ts so the backend helper
@@ -3653,7 +3697,11 @@ qvotec_poll_once(void)
 	apply_lease_winner.owner_node_id = -1;
 	have_apply_lease_request = cluster_mrp_qvotec_poll_apply_lease_request(&apply_lease_request);
 
-	if (qvotec_n_disks == 0) {
+	if (qvotec_n_disks == 0 || now_us == 0) {
+		/* Without a local clock we cannot distinguish an old self-slot
+		 * from a serving peer. Leave the durable slots untouched. */
+		if (now_us == 0)
+			qvotec_publish_quorum_state(CLUSTER_QVOTEC_QUORUM_LOST);
 		cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
 		if (renew_authority)
 			cluster_write_fence_authority_cache_invalidate();
@@ -3997,8 +4045,6 @@ qvotec_poll_once(void)
 
 		authority = cluster_fence_authority_decide(disk_markers, disk_has_marker, qvotec_n_disks);
 		if (authority.has_authority) {
-			uint64 fence_lease_expire = now_us + (uint64)cluster_write_fence_lease_ms * 1000ULL;
-
 			cluster_write_fence_refresh_from_marker(&authority.marker, fence_lease_expire);
 			/* spec-4.12b D5/P1-1: retain the exact durable tuple so the
 			 * baseline author below cannot regress order/dead membership or
@@ -4077,9 +4123,35 @@ qvotec_poll_once(void)
 	}
 
 	/* ---- 2. decide BEFORE writing self slot ---- */
+	/* Project validated slot copies into the observer's clock domain for the
+	 * decision. Restore their original bytes before durable evidence use. */
+	for (i = 0; i < qvotec_n_disks; i++) {
+		if (io_states[i] != CLUSTER_VOTING_DISK_IO_OK)
+			continue;
+		for (uint32 node = 0; node < CLUSTER_MAX_NODES; node++) {
+			ClusterVotingSlot *slot = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + node];
+			QvotecSlotProgress *progress = &qvotec_slot_progress[i][node];
+
+			if (slot->generation == 0)
+				continue;
+			qvotec_observe_slot(progress, slot, now_us, wall_us, heartbeat_timeout_us);
+			slot->heartbeat_ts_us = qvotec_slot_is_fresh(progress, now_us, heartbeat_timeout_us)
+									? progress->last_progress_mono_us : 0;
+		}
+	}
 	(void)decide_quorum_view(qvotec_slot_matrix, io_states, (uint32)qvotec_n_disks,
 							 CLUSTER_MAX_NODES, (uint32)cluster_node_id, qvotec_self_incarnation,
 							 now_us, heartbeat_timeout_us, &decision);
+	for (i = 0; i < qvotec_n_disks; i++) {
+		if (io_states[i] != CLUSTER_VOTING_DISK_IO_OK)
+			continue;
+		for (uint32 node = 0; node < CLUSTER_MAX_NODES; node++) {
+			ClusterVotingSlot *slot = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + node];
+
+			if (slot->generation != 0)
+				slot->heartbeat_ts_us = qvotec_slot_progress[i][node].heartbeat_ts_us;
+		}
+	}
 	if (formation_scan
 		&& (decision.quorum_state != CLUSTER_QVOTEC_QUORUM_OK
 			|| decision.collision_state == CLUSTER_COLLISION_FATAL_NEWER_SELF))
@@ -4148,7 +4220,7 @@ qvotec_poll_once(void)
 	self_slot.version = CLUSTER_VOTING_SLOT_VERSION;
 	self_slot.node_id = (uint32)cluster_node_id;
 	self_slot.incarnation = qvotec_self_incarnation;
-	self_slot.heartbeat_ts_us = now_us;
+	self_slot.heartbeat_ts_us = (uint64)GetCurrentTimestamp();
 	/*
 	 * spec-5.15: publish the LIVE membership epoch (was current_epoch_at_boot,
 	 * which is initialized to 0 and never updated -> every slot carried epoch 0,
@@ -4483,7 +4555,7 @@ qvotec_poll_once(void)
 	if (fence_majority_written && (have_submit || author_baseline))
 		cluster_write_fence_refresh_from_marker(
 			have_submit ? &submit_marker : &baseline_marker,
-			now_us + (uint64)cluster_write_fence_lease_ms * 1000ULL);
+			fence_lease_expire);
 
 	/*
 	 * spec-6.15 D5b: xid-stripe face.  Keep re-scanning region 5 until a
@@ -4523,7 +4595,7 @@ qvotec_poll_once(void)
 
 		if (prev_state == CLUSTER_QVOTEC_QUORUM_OK
 			&& decision.quorum_state != CLUSTER_QVOTEC_QUORUM_OK) {
-			pg_atomic_write_u64(&QvotecShmem->last_quorum_loss_ts_us, now_us);
+			pg_atomic_write_u64(&QvotecShmem->last_quorum_loss_ts_us, (uint64)GetCurrentTimestamp());
 			cluster_pgstat_inc(qvotec_counter_quorum_loss);
 		}
 
@@ -4651,10 +4723,8 @@ qvotec_poll_once(void)
 			fresh = (decision.alive_bitmap[node / 8] & (uint8)(1u << (node % 8))) != 0
 					&& best_slot != NULL && io_states[best_disk] == CLUSTER_VOTING_DISK_IO_OK
 					&& (best_slot->flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE) != 0
-					&& (heartbeat_timeout_us == 0
-						|| (best_slot->heartbeat_ts_us != 0
-							&& (now_us <= best_slot->heartbeat_ts_us
-								|| now_us - best_slot->heartbeat_ts_us <= heartbeat_timeout_us)));
+					&& qvotec_slot_is_fresh(&qvotec_slot_progress[best_disk][node], now_us,
+											heartbeat_timeout_us);
 			cluster_reconfig_record_observed_fresh_alive((int32)node, fresh);
 			if (formation_scan && cluster_conf_lookup_node((int32)node) != NULL) {
 				uint64 bit = UINT64_C(1) << (node % 64);
@@ -4817,6 +4887,10 @@ qvotec_probe_prior_slots(void)
 				continue;
 			if (!(probe.flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE))
 				continue;
+			/* Start the observation before ghost backoff, so an unchanged
+			 * future-dated slot ages out after one local timeout. */
+			qvotec_observe_slot(&qvotec_slot_progress[d][cluster_node_id], &probe,
+								cluster_storage_quorum_now_us(), now_us, heartbeat_timeout_us);
 			if (probe.incarnation == qvotec_self_incarnation)
 				continue;
 			/* Stale ALIVE still means unclean death, never clean exit. */
@@ -4855,6 +4929,7 @@ cluster_qvotec_test_probe_prior_slots(const int *fds, int n_disks, uint64 incarn
 	for (int i = 0; i < n_disks; i++)
 		qvotec_fds[i] = fds[i];
 	qvotec_self_incarnation = incarnation;
+	memset(qvotec_slot_progress, 0, sizeof(qvotec_slot_progress));
 	cluster_qvotec_publish_self_incarnation(incarnation);
 	qvotec_probe_prior_slots();
 }
@@ -5160,22 +5235,22 @@ ClusterQvotecMain(void)
 bool
 cluster_qvotec_wait_for_ready(int timeout_ms)
 {
-	TimestampTz deadline;
+	uint64 started = cluster_storage_quorum_now_us();
 
-	if (QvotecShmem == NULL)
+	if (QvotecShmem == NULL || started == 0)
 		return false;
-
-	deadline = GetCurrentTimestamp() + (TimestampTz)timeout_ms * 1000;
 
 	for (;;) {
 		uint32 s = pg_atomic_read_u32(&QvotecShmem->state);
+		uint64 now;
 
 		if (s == CLUSTER_QVOTEC_READY)
 			return true;
 		if (s == CLUSTER_QVOTEC_FAILED || s == CLUSTER_QVOTEC_DOWN)
 			return false;
 
-		if (GetCurrentTimestamp() >= deadline)
+		now = cluster_storage_quorum_now_us();
+		if (now < started || timeout_ms <= 0 || now - started >= (uint64)timeout_ms * 1000)
 			return false;
 
 		pg_usleep(10 * 1000); /* 10 ms */

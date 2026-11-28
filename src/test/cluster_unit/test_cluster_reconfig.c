@@ -855,10 +855,19 @@ cluster_injection_should_skip(const char *name pg_attribute_unused())
 
 /* GetCurrentTimestamp + GetXLogInsertRecPtr stubs. */
 #include "datatype/timestamp.h"
+static TimestampTz formation_wall_us = INT64_C(1700000000000000);
+static uint64 formation_mono_us = UINT64_C(70000000);
+
+uint64
+cluster_storage_quorum_now_us(void)
+{
+	return formation_mono_us;
+}
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 1700000000000000LL;
+	return formation_wall_us;
 }
 #include "access/xlogdefs.h"
 XLogRecPtr
@@ -1002,8 +1011,7 @@ static ClusterFenceMarker ut_fence_async_marker;
 
 bool
 cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a, const ClusterFenceMarker *m,
-										ClusterMarkerAsyncKind kind, int32 target_node,
-										TimestampTz now pg_attribute_unused())
+										ClusterMarkerAsyncKind kind, int32 target_node)
 {
 	ut_fence_async_submit_calls++;
 	if (m != NULL) {
@@ -1019,7 +1027,7 @@ cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a, const ClusterFenc
 	return true;
 }
 ClusterMarkerPollResult
-cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a, TimestampTz now pg_attribute_unused(),
+cluster_write_fence_poll_marker_async(ClusterMarkerAsync *a,
 									  uint32 *out_result, uint64 *out_elapsed_us)
 {
 	ut_fence_async_poll_calls++;
@@ -7015,7 +7023,7 @@ pre2_publish_disk_snapshot(void)
 {
 	ClusterReconfigState *state = (ClusterReconfigState *)reconfig_shmem_storage;
 	ClusterFormationDiskSnapshot snapshot = { 0 };
-	snapshot.sampled_at_us = (uint64)GetCurrentTimestamp();
+	snapshot.sampled_at_us = cluster_storage_quorum_now_us();
 	snapshot.self_incarnation = cluster_qvotec_get_self_incarnation();
 	snapshot.fence = ut_formation_authority;
 	snapshot.max_epoch = Max(snapshot.fence.marker.fence_epoch,
@@ -7155,6 +7163,29 @@ pre2_initial_restore(void)
 	ut_recovery_in_progress = false;
 	ut_authority_managed = false;
 	cluster_reconfig_test_reset_cold_formation();
+}
+
+UT_TEST(test_formation_snapshot_uses_observer_monotonic_time)
+{
+	ClusterFenceAuthorityProof proof;
+	uint64 start = formation_mono_us;
+	uint64 lease = (uint64)cluster_quorum_poll_interval_ms * 30000;
+	TimestampTz wall = formation_wall_us;
+
+	pre2_initial_fixture();
+	pre2_publish_disk_snapshot();
+	formation_wall_us += 30000000;
+	UT_ASSERT(cluster_reconfig_read_formation_fence_snapshot(&proof));
+	formation_wall_us -= 60000000;
+	formation_mono_us = start + lease - 1;
+	UT_ASSERT(cluster_reconfig_read_formation_fence_snapshot(&proof));
+	formation_mono_us++;
+	UT_ASSERT(!cluster_reconfig_read_formation_fence_snapshot(&proof));
+	formation_mono_us = 0;
+	UT_ASSERT(!cluster_reconfig_read_formation_fence_snapshot(&proof));
+	formation_mono_us = start;
+	formation_wall_us = wall;
+	pre2_initial_restore();
 }
 
 UT_TEST(test_pre2_published_fence_snapshot_is_readonly_and_bound_to_owner)
@@ -8592,7 +8623,7 @@ UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
 int
 main(void)
 {
-	UT_PLAN(163);
+	UT_PLAN(164);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -8779,6 +8810,7 @@ main(void)
 	UT_RUN(test_pre2_restart_window_reopen_keeps_one_generation_and_slow_peers);
 	UT_RUN(test_pre2_reboot_uses_new_incarnations_and_next_durable_generation);
 	UT_RUN(test_pre2_restart_snapshot_expiry_owner_drift_and_unknown_io_stay_closed);
+	UT_RUN(test_formation_snapshot_uses_observer_monotonic_time);
 	UT_RUN(test_pre2_published_fence_snapshot_is_readonly_and_bound_to_owner);
 	UT_RUN(test_pre2_control_keeps_disk_proof_refresh_until_startup_finishes);
 	UT_RUN(test_serving_formation_keeps_identity_when_storage_observation_moves);

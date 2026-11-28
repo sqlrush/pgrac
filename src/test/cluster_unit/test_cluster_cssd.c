@@ -41,6 +41,8 @@
 #include "postgres.h"
 
 #include <signal.h>
+#include <setjmp.h>
+#include "cluster/cluster_storage_quorum.h"
 
 #include "cluster/cluster_cssd.h"
 #include "storage/proc.h"
@@ -183,30 +185,40 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 }
 
 #include "datatype/timestamp.h"
+static TimestampTz wall_now = 1700000000000000LL;
+static uint64 mono_now = 100000000;
+static jmp_buf cssd_exit;
+static void (*advance_tick)(void);
+
+uint64
+cluster_storage_quorum_now_us(void)
+{
+	return mono_now;
+}
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 1700000000000000LL;
+	return wall_now;
 }
 
-/* proc_exit stub for CssdMain skeleton (not exercised here, but linker
- * needs the symbol). */
+/* Return to the unit harness after the real loop shuts down. */
 void
-proc_exit(int code pg_attribute_unused())
+proc_exit(int code)
 {
+	if (advance_tick && code == 0)
+		longjmp(cssd_exit, 1);
 	abort();
 }
 
-/* spec-5.6a: CssdMain's heartbeat tick acks cf phase-2 probes; the tick
- * body lives in cluster_cf_phase2.o (not linked here) and the main loop is
- * not exercised, so a no-op stub satisfies the link (respond_tick itself is
- * covered by test_cluster_cf_phase2). */
+/* CSSD calls the phase-2 responder once per heartbeat broadcast. */
+static unsigned int broadcasts;
 void
 cluster_cf_phase2_respond_tick(void)
-{}
+{
+	broadcasts++;
+}
 
-/* CssdMain runtime stubs (Step 4 wires postmaster spawn;tests don't
- * invoke the full main loop). */
 #include "miscadmin.h"
 volatile sig_atomic_t InterruptPending = false;
 BackendType MyBackendType = B_INVALID;
@@ -226,6 +238,8 @@ int
 WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
 {
+	if (advance_tick)
+		advance_tick();
 	return 0;
 }
 void
@@ -642,10 +656,78 @@ UT_TEST(test_backend_status_nowait_preserves_busy_and_never_waits)
 	MyProc = NULL;
 }
 
+/* Advance both clocks independently between real CSSD loop iterations. */
+static void
+advance_deadband_tick(void)
+{
+	static int tick;
+	ClusterICEnvelope env = {0};
+	ClusterCssdHeartbeatPayload hb = {0};
+
+	switch (tick++) {
+	case 0:
+		UT_ASSERT_EQ(broadcasts, 1);
+		mono_now += 3000000; /* end startup grace */
+		env.source_node_id = 1;
+		env.payload_length = sizeof(hb);
+		cluster_cssd_dispatch_heartbeat(&env, &hb);
+		UT_ASSERT_EQ(cluster_cssd_get_peer_last_recv_at(1), wall_now);
+		wall_now += 30000000;
+		break;
+	case 1:
+		UT_ASSERT_EQ(broadcasts, 2);
+		UT_ASSERT_EQ(cluster_cssd_get_peer_state(1), CLUSTER_CSSD_PEER_ALIVE);
+		wall_now -= 30000000;
+		mono_now += 1999999;
+		break;
+	case 2:
+		UT_ASSERT_EQ(broadcasts, 3);
+		UT_ASSERT_EQ(cluster_cssd_get_peer_state(1), CLUSTER_CSSD_PEER_ALIVE);
+		mono_now++;
+		break;
+	case 3:
+		UT_ASSERT_EQ(cluster_cssd_get_peer_state(1), CLUSTER_CSSD_PEER_SUSPECTED);
+		mono_now += 1000000;
+		break;
+	case 4:
+		UT_ASSERT_EQ(cluster_cssd_get_peer_state(1), CLUSTER_CSSD_PEER_DEAD);
+		env.source_node_id = 1;
+		env.payload_length = sizeof(hb);
+		cluster_cssd_dispatch_heartbeat(&env, &hb);
+		break;
+	case 5:
+		UT_ASSERT_EQ(cluster_cssd_get_peer_state(2), CLUSTER_CSSD_PEER_DEAD);
+		UT_ASSERT_EQ(cluster_cssd_get_peer_state(1), CLUSTER_CSSD_PEER_ALIVE);
+		mono_now = 0;
+		break;
+	default:
+		UT_ASSERT_EQ(cluster_cssd_get_peer_state(1), CLUSTER_CSSD_PEER_ALIVE);
+		UT_ASSERT_EQ(cluster_cssd_get_peer_state(2), CLUSTER_CSSD_PEER_DEAD);
+		ShutdownRequestPending = true;
+		break;
+	}
+}
+
+UT_TEST(test_deadband_uses_monotonic_time)
+{
+	shmem_init_done = false;
+	cluster_cssd_shmem_init();
+	memset(ut_declared_set, 0, sizeof(ut_declared_set));
+	ut_declared_set[1] = true;
+	ut_declared_set[2] = true;
+	IsUnderPostmaster = true;
+	advance_tick = advance_deadband_tick;
+	if (setjmp(cssd_exit) == 0)
+		CssdMain();
+	advance_tick = NULL;
+	IsUnderPostmaster = false;
+	ShutdownRequestPending = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 
 	UT_RUN(test_t1_status_to_string_round_trip);
 	UT_RUN(test_t2_peer_state_to_string_round_trip);
@@ -661,6 +743,7 @@ main(void)
 	UT_RUN(test_t12_no_pgproc_status_reads_never_block);
 	UT_RUN(test_backend_status_nowait_preserves_busy_and_never_waits);
 
+	UT_RUN(test_deadband_uses_monotonic_time);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
