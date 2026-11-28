@@ -251,7 +251,6 @@ CLUSTER_IC_O = $(top_builddir)/src/backend/cluster/cluster_ic.o
 CLUSTER_IC_ENVELOPE_O = $(top_builddir)/src/backend/cluster/cluster_ic_envelope.o
 CLUSTER_IC_ROUTER_O = $(top_builddir)/src/backend/cluster/cluster_ic_router.o
 CLUSTER_CONF_O = $(top_builddir)/src/backend/cluster/cluster_conf.o
-CLUSTER_INJECT_O = $(top_builddir)/src/backend/cluster/cluster_inject.o
 CLUSTER_PGSTAT_O = $(top_builddir)/src/backend/cluster/cluster_pgstat.o
 CLUSTER_DEBUG_O = $(top_builddir)/src/backend/cluster/cluster_debug.o
 CLUSTER_SHARED_FS_O = $(top_builddir)/src/backend/cluster/storage/cluster_shared_fs.o
@@ -4512,16 +4511,12 @@ test_cluster_ic_mock: test_cluster_ic_mock.c unit_test.h $(CLUSTER_VERSION_O) \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_O) cluster_unit_port_stubs.o -o $@
 
-# test_cluster_inject links cluster_inject.o standalone.  cluster_inject.c
-# references ereport / pg_atomic / pg_usleep / superuser / fmgr / tuple-
-# store machinery; all stubbed in test_cluster_inject.c.  Tests pin the
-# registry size, lookup, arm/disarm transitions via the public assign
-# hook, and the should_skip / SRF linkability invariants.  End-to-end
-# SRF + view behaviour is covered by cluster_tap t/015_inject.pl.
+# Drive the production dispatcher with a controllable wall clock. Keep clock
+# substitution local to the test executable.
 test_cluster_inject: test_cluster_inject.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_INJECT_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_INJECT_O) -o $@
+		$(top_srcdir)/src/backend/cluster/cluster_inject.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Dgettimeofday=inject_test_gettimeofday $< \
+		$(top_srcdir)/src/backend/cluster/cluster_inject.c $(CLUSTER_VERSION_O) -o $@
 
 # test_cluster_pgstat links cluster_pgstat.o standalone.  cluster_pgstat.c
 # references cluster_injection_armed_count (mirror sync) + ereport +

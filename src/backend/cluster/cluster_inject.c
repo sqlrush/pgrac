@@ -45,10 +45,9 @@
 #include "port/atomics.h"
 #include "utils/builtins.h"
 
-#include <sys/time.h> /* gettimeofday (full-duration sleep loop) */
-
 #include "cluster/cluster_inject.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #endif
 
@@ -1217,36 +1216,27 @@ cluster_injection_run(const char *name)
 		break;
 
 	case CLUSTER_FAULT_SLEEP: {
-		/*
-		 * pg_usleep() returns EARLY when interrupted by a signal (latch sets,
-		 * procsignals, etc.).  A backend that is armed with a :sleep injection
-		 * frequently receives such signals while it is paused -- e.g. a node
-		 * mid-clean-leave -- which would cut a :sleep:Nus arm far short of N
-		 * (observed in CI: a 30s arm slept ~2s, so a node meant to be held
-		 * mid-phase raced past the injection and committed before the test could
-		 * act).  A :sleep:Nus injection that sleeps for less than N is a framework
-		 * bug: it makes every injection-driven pause non-deterministic.  Loop on
-		 * the wall clock until the full requested duration has elapsed so the
-		 * injection deterministically holds the phase.  CHECK_FOR_INTERRUPTS()
-		 * keeps a genuine query-cancel / backend-terminate honoured (a SIGKILL is
-		 * uncatchable and ends the backend immediately regardless); a bare latch
-		 * set processes to nothing and the loop simply re-sleeps the remainder.
-		 */
-		struct timeval start, now;
-		int64 elapsed_us;
+		uint64 start_us;
 
-		gettimeofday(&start, NULL);
+		if (param == 0)
+			break;
+		start_us = cluster_storage_quorum_now_us();
+		/* A signal can end pg_usleep early. Charge only monotonic elapsed
+		 * time so a wall-clock adjustment cannot change the armed delay. */
 		for (;;) {
-			int64 remaining;
+			uint64 now_us;
+			uint64 elapsed_us;
 
-			gettimeofday(&now, NULL);
-			elapsed_us = (int64)(now.tv_sec - start.tv_sec) * INT64CONST(1000000)
-						 + (int64)(now.tv_usec - start.tv_usec);
-			if (elapsed_us >= (int64)param)
-				break;
-			remaining = (int64)param - elapsed_us;
 			CHECK_FOR_INTERRUPTS();
-			pg_usleep((long)remaining);
+			now_us = cluster_storage_quorum_now_us();
+			if (start_us == 0 || now_us < start_us)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("cannot measure sleep duration at cluster injection point \"%s\"", name)));
+			elapsed_us = now_us - start_us;
+			if (elapsed_us >= param)
+				break;
+			pg_usleep((long)Min(param - elapsed_us, (uint64)LONG_MAX));
 		}
 		break;
 	}

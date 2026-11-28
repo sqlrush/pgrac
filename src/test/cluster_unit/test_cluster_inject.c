@@ -45,6 +45,8 @@
 #include "postgres.h"
 
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_storage_quorum.h"
+#include <sys/time.h>
 
 #undef printf
 #undef fprintf
@@ -73,6 +75,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
 
@@ -86,7 +89,13 @@ cluster_ctrc_test_barrier_control(ClusterCtrcTestBarrierPhase phase pg_attribute
 }
 
 static int last_elevel = -1;
-static int last_sleep_us = -1;
+static long last_sleep_us = -1;
+static uint64 elapsed_us;
+static int64 wall_step_us;
+static unsigned sleep_calls;
+static bool cancel_on_wake;
+static bool clock_lost_on_wake;
+static sigjmp_buf sleep_exit;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -96,39 +105,56 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+volatile sig_atomic_t InterruptPending = false;
+
+/* Both clocks advance together until pg_usleep first returns early. */
+int
+inject_test_gettimeofday(struct timeval *now, void *zone pg_attribute_unused())
+{
+	int64 wall = INT64CONST(60000000) + (int64)elapsed_us;
+
+	if (sleep_calls > 0)
+		wall += wall_step_us;
+	now->tv_sec = wall / 1000000;
+	now->tv_usec = wall % 1000000;
+	return 0;
+}
+
+uint64
+cluster_storage_quorum_now_us(void)
+{
+	return clock_lost_on_wake && sleep_calls > 0 ? 0 : UINT64CONST(1000000) + elapsed_us;
+}
+
 void
 pg_usleep(long microsec)
 {
-	last_sleep_us = (int)microsec;
+	last_sleep_us = microsec;
+	sleep_calls++;
+	elapsed_us += sleep_calls == 1 ? Min(microsec, 2000000L) : microsec;
+	if (cancel_on_wake)
+		InterruptPending = true;
 }
-
-/*
- * CHECK_FOR_INTERRUPTS() in the full-duration SLEEP dispatcher expands to
- * references to InterruptPending + ProcessInterrupts.  No armed-SLEEP path is
- * exercised here (only the WARNING dispatcher and disarmed runs), so these only
- * satisfy the linker; InterruptPending stays false so the macro is a no-op.
- */
-volatile sig_atomic_t InterruptPending = false;
 
 void
 ProcessInterrupts(void)
-{}
+{
+	InterruptPending = false;
+	if (cancel_on_wake)
+		siglongjmp(sleep_exit, 1);
+}
 
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	last_elevel = elevel;
-	/* Return false so the ereport macro skips errfinish and does not
-	 * longjmp out of the test.  This is the standard "stub for unit
-	 * test" idiom used elsewhere in cluster_unit. */
-	return false;
+	return clock_lost_on_wake && elevel >= ERROR;
 }
 
 bool
-errstart_cold(int elevel, const char *domain pg_attribute_unused())
+errstart_cold(int elevel, const char *domain)
 {
-	last_elevel = elevel;
-	return false;
+	return errstart(elevel, domain);
 }
 
 int
@@ -152,7 +178,10 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{}
+{
+	if (clock_lost_on_wake && last_elevel >= ERROR)
+		siglongjmp(sleep_exit, 1);
+}
 
 void
 InitMaterializedSRF(FunctionCallInfo fcinfo pg_attribute_unused(),
@@ -420,10 +449,87 @@ UT_TEST(test_first_publication_deny_registry_dispatches_only_its_skip)
 	UT_ASSERT(!cluster_injection_is_armed(point));
 }
 
+static void
+run_writer_delay(int64 adjustment)
+{
+	elapsed_us = 0;
+	sleep_calls = 0;
+	wall_step_us = adjustment;
+	cluster_injection_assign_hook("cluster-pcm-write-before-data:sleep:8000000", NULL);
+	cluster_injection_run("cluster-pcm-write-before-data");
+}
+
+UT_TEST(test_writer_sleep_survives_forward_clock_step)
+{
+	run_writer_delay(INT64CONST(30000000));
+	cluster_injection_assign_hook("", NULL);
+	UT_ASSERT_EQ(elapsed_us, 8000000);
+	UT_ASSERT_EQ(sleep_calls, 2);
+	UT_ASSERT_EQ(last_sleep_us, 6000000);
+}
+
+UT_TEST(test_writer_sleep_survives_backward_clock_step)
+{
+	run_writer_delay(-INT64CONST(30000000));
+	cluster_injection_assign_hook("", NULL);
+	UT_ASSERT_EQ(elapsed_us, 8000000);
+	UT_ASSERT_EQ(sleep_calls, 2);
+	UT_ASSERT_EQ(last_sleep_us, 6000000);
+}
+
+UT_TEST(test_cancel_interrupts_writer_sleep)
+{
+	volatile bool cancelled = false;
+
+	cancel_on_wake = true;
+	if (sigsetjmp(sleep_exit, 1) == 0)
+		run_writer_delay(0);
+	else
+		cancelled = true;
+	cancel_on_wake = false;
+	InterruptPending = false;
+	cluster_injection_assign_hook("", NULL);
+	UT_ASSERT(cancelled);
+	UT_ASSERT_EQ(sleep_calls, 1);
+	UT_ASSERT_EQ(elapsed_us, 2000000);
+}
+
+UT_TEST(test_writer_sleep_refuses_unavailable_clock)
+{
+	volatile bool refused = false;
+
+	clock_lost_on_wake = true;
+	last_elevel = -1;
+	if (sigsetjmp(sleep_exit, 1) == 0)
+		run_writer_delay(0);
+	else
+		refused = true;
+	clock_lost_on_wake = false;
+	cluster_injection_assign_hook("", NULL);
+	UT_ASSERT(refused);
+	UT_ASSERT_EQ(last_elevel, ERROR);
+	UT_ASSERT_EQ(sleep_calls, 1);
+	UT_ASSERT_EQ(elapsed_us, 2000000);
+}
+
+UT_TEST(test_writer_sleep_zero_and_one_hour)
+{
+	elapsed_us = 0;
+	sleep_calls = 0;
+	wall_step_us = 0;
+	cluster_injection_assign_hook("cluster-pcm-write-before-data:sleep:0", NULL);
+	cluster_injection_run("cluster-pcm-write-before-data");
+	UT_ASSERT_EQ(sleep_calls, 0);
+	cluster_injection_assign_hook("cluster-pcm-write-before-data:sleep:3600000000", NULL);
+	cluster_injection_run("cluster-pcm-write-before-data");
+	cluster_injection_assign_hook("", NULL);
+	UT_ASSERT_EQ(elapsed_us, UINT64CONST(3600000000));
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(18);
 	UT_RUN(test_inject_count_compile_constant);
 	UT_RUN(test_inject_arm_unknown_is_safe);
 	UT_RUN(test_inject_initial_disarmed);
@@ -437,6 +543,11 @@ main(void)
 	UT_RUN(test_inject_run_disarmed_repeat_no_dispatch);
 	UT_RUN(test_inject_armed_count_clamps_at_zero);
 	UT_RUN(test_first_publication_deny_registry_dispatches_only_its_skip);
+	UT_RUN(test_writer_sleep_survives_forward_clock_step);
+	UT_RUN(test_writer_sleep_survives_backward_clock_step);
+	UT_RUN(test_cancel_interrupts_writer_sleep);
+	UT_RUN(test_writer_sleep_refuses_unavailable_clock);
+	UT_RUN(test_writer_sleep_zero_and_one_hour);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
