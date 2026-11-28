@@ -136,7 +136,8 @@ class LimaPower:
     used as an old-I/O drain, storage-denial proof or service permission.
     """
 
-    def __init__(self, home):
+    def __init__(self, home, *, read_only=False):
+        self.read_only = read_only
         self.home = Path(home)
         if (not self.home.is_absolute() or self.home.name != ".lima-pre2-single"
                 or self.home.resolve() != self.home):
@@ -159,7 +160,8 @@ class LimaPower:
             vm = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
             fds.append(vm)
             vm_id = _trusted(vm, directory=True)
-            lock = os.open("pgrac-power.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            flags = os.O_RDONLY if self.read_only else os.O_RDWR | os.O_CREAT
+            lock = os.open("pgrac-power.lock", flags | os.O_NOFOLLOW | os.O_NONBLOCK,
                            0o600, dir_fd=vm)
             fds.append(lock)
             lock_id = _trusted(lock)
@@ -170,9 +172,10 @@ class LimaPower:
                 for path, identity in ((self.home, root_id), (self.home / name, vm_id),
                                        (self.home / name / "pgrac-power.lock", lock_id)):
                     info = path.lstat()
-                    if (info.st_dev, info.st_ino) != identity or stat.S_ISLNK(info.st_mode):
+                    if ((info.st_dev, info.st_ino) != identity or stat.S_ISLNK(info.st_mode)
+                            or info.st_uid != os.getuid() or info.st_mode & 0o022):
                         raise LimaPowerError("LIMA_PATH_CHANGED")
-                fd = os.open("vz-identifier", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=vm)
+                fd = os.open("vz-identifier", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=vm)
                 try:
                     _trusted(fd)
                     data = os.read(fd, 4097)
@@ -187,7 +190,7 @@ class LimaPower:
                     raise LimaPowerError("LIMA_UUID")
 
             check()
-            yield name, check
+            yield name, check, lock
             check()
         except LimaPowerError:
             raise
@@ -199,7 +202,14 @@ class LimaPower:
 
     def _command(self, arguments, deadline):
         try:
-            result = subprocess.run([LIMACTL, *arguments],
+            argv = [LIMACTL, *arguments]
+            if self.read_only:
+                if len(arguments) != 3 or arguments[0] != "list" or arguments[2] != "--json":
+                    raise LimaPowerError("LIMA_READ_ONLY")
+                # Lima list attempts to unlink stale PID files during inspection.
+                argv = ["/usr/bin/sandbox-exec", "-p",
+                        "(version 1)(allow default)(deny file-write*)", *argv]
+            result = subprocess.run(argv,
                                     env={**os.environ, "LIMA_HOME": str(self.home)},
                                     capture_output=True, text=True, check=False,
                                     timeout=_remaining(deadline))
@@ -254,11 +264,31 @@ class LimaPower:
         return after
 
     def observe(self, target, deadline_mono_ns):
-        with self._owner(target, deadline_mono_ns) as (name, check):
+        with self._owner(target, deadline_mono_ns) as (name, check, _):
             return self._observe(target, name, check, deadline_mono_ns)
 
+    def observe_external_exit(self, target, deadline_mono_ns, await_recheck):
+        """Read both cuts on the same host; the external power owner acts between them."""
+        if not self.read_only:
+            raise LimaPowerError("LIMA_READ_ONLY_REQUIRED")
+        with self._owner(target, deadline_mono_ns) as (name, check, lock):
+            before = self._observe(target, name, check, deadline_mono_ns)
+            if before.state != "Running":
+                raise LimaPowerError("LIMA_ORIGINAL_PROCESS_MISSING")
+            # Keep the original directory and lock descriptors to detect replacement.
+            # The external management action must be free to take the operation lock.
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            await_recheck(before)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            after = self._observe(target, name, check, deadline_mono_ns)
+            if after.state != "Stopped" or process_identity(before.host_process.pid) is not None:
+                raise LimaPowerError("LIMA_ORIGINAL_PROCESS_NOT_EXITED")
+            return PowerOffEvidence(before, after)
+
     def force_off(self, target, deadline_mono_ns):
-        with self._owner(target, deadline_mono_ns) as (name, check):
+        if self.read_only:
+            raise LimaPowerError("LIMA_READ_ONLY")
+        with self._owner(target, deadline_mono_ns) as (name, check, _):
             before = self._observe(target, name, check, deadline_mono_ns)
             if before.state != "Running":
                 raise LimaPowerError("LIMA_ORIGINAL_PROCESS_MISSING")
