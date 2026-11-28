@@ -459,6 +459,8 @@ cluster_initdb_side.o: $(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/s
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 # Native owned diagnostic copy layouts.
+# The DROP trace producer and its SQL reader share the same record layout.
+cluster_ko_lock.o cluster_debug.o: $(top_srcdir)/src/include/cluster/cluster_ko.h
 cluster_pcm_lock.o cluster_ko_lock.o: $(top_srcdir)/src/include/cluster/cluster_wait_graph.h
 cluster_grd.o cluster_ko_lock.o: $(top_srcdir)/src/include/storage/spin.h
 

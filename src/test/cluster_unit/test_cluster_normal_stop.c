@@ -44,6 +44,15 @@
 
 UT_DEFINE_GLOBALS();
 bool cluster_trace_cleanup;
+bool cluster_trace_normal_stop;
+static unsigned stop_trace_records, stop_trace_ko_calls;
+static char stop_trace_detail[1024];
+
+void
+cluster_ko_normal_stop_trace_v1(void)
+{
+	stop_trace_ko_calls++;
+}
 static unsigned deadline_observations;
 void cluster_content_trace_deadline_dump(uint32 reason)
 { UT_ASSERT_EQ(reason, CLUSTER_NORMAL_STOP_FAILURE_DEADLINE); deadline_observations++; }
@@ -88,6 +97,7 @@ static long checkpoint_previous_timeout;
 /* Original owner boundaries: only the real CP loop may schedule these. */
 static unsigned checkpoint_native_remaining, checkpoint_retire_remaining;
 static unsigned checkpoint_native_calls, checkpoint_retire_calls;
+static unsigned checkpoint_censuses_during_native;
 static bool checkpoint_native_fail, checkpoint_native_failed;
 /* Default-off scheduler hook: accepted MORE work can wait while the
  * previously published actor-idle image is still visible. */
@@ -315,6 +325,8 @@ module_fixture(unsigned index, bool post, const char **reason)
 ClusterNormalStopPollResult
 cluster_undo_active_write_normal_stop_poll(int *backend, const char **reason)
 {
+	if (checkpoint_native_remaining != 0)
+		checkpoint_censuses_during_native++;
 	if (backend != NULL)
 		*backend = 73;
 	return module_fixture(0, false, reason);
@@ -1197,7 +1209,7 @@ bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	main_error_level = elevel;
-	return elevel >= ERROR;
+	return elevel >= ERROR || (elevel == LOG && cluster_trace_normal_stop);
 }
 
 bool
@@ -1229,6 +1241,14 @@ errhint(const char *format pg_attribute_unused(), ...)
 int
 errdetail(const char *format pg_attribute_unused(), ...)
 {
+	if (cluster_trace_normal_stop) {
+		va_list args;
+
+		va_start(args, format);
+		vsnprintf(stop_trace_detail, sizeof(stop_trace_detail), format, args);
+		va_end(args);
+		stop_trace_records++;
+	}
 	return 0;
 }
 
@@ -1594,13 +1614,19 @@ cluster_sinval_drain_inbound_and_apply(void)
 	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
 	sinval_stage = 2;
 }
-void
+bool
 cluster_ko_drain_inbound_and_apply(void)
 {
 	UT_ASSERT_EQ(sinval_stage, 2);
 	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
 	sinval_stage = 0;
 	sinval_passes++;
+	if (sinval_scenario == 8 && sinval_passes == 2) {
+		pg_atomic_write_u32(&test_region.normal_stop.phase, CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED);
+		pg_atomic_write_u32(&test_region.normal_stop.service_seal, 2);
+		ShutdownRequestPending = true;
+	}
+	return sinval_scenario == 8;
 }
 
 #define pqsignal test_signal
@@ -1646,6 +1672,13 @@ UT_TEST(test_sinval_actual_main_wraps_full_work_not_sleep)
 	UT_ASSERT_EQ(sinval_passes, 2);
 	UT_ASSERT(sinval_polls >= 3 && ko_polls >= 3);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+UT_TEST(test_sinval_actual_main_continues_immediately_after_ko_progress)
+{
+	run_actual_sinval_main(8);
+	UT_ASSERT_EQ(main_exit_code, 0);
+	UT_ASSERT_EQ(sinval_passes, 2);
+	UT_ASSERT_EQ(main_waits, 0);
 }
 UT_TEST(test_sinval_actual_main_pending_cannot_sign_idle)
 {
@@ -5018,6 +5051,50 @@ UT_TEST(test_actual_ko_census_stays_passive_after_seal_and_keeps_failures)
 	checkpoint_native_failed = false;
 }
 
+UT_TEST(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits)
+{
+	seed_module_drain();
+	stop_trace_records = stop_trace_ko_calls = 0;
+	cl_normal_stop_trace_peer_acks();
+	UT_ASSERT_EQ(stop_trace_records + stop_trace_ko_calls, 0);
+	cl_state->ack_bitmap[0] = 6;
+	cl_normal_stop->peer_reply_sent = 14;
+	cl_normal_stop->peer_reply_pending = 8;
+	cluster_trace_normal_stop = true;
+	cl_normal_stop_trace_peer_acks();
+	UT_ASSERT_EQ(stop_trace_records, 3);
+	UT_ASSERT_EQ(stop_trace_ko_calls, 1);
+	UT_ASSERT(strstr(stop_trace_detail, "node=2 peer=3") != NULL);
+	UT_ASSERT(strstr(stop_trace_detail, "ack=0 reply_sent=1 reply_pending=1") != NULL);
+	UT_ASSERT(strstr(stop_trace_detail, "peer_nonce=") != NULL);
+	UT_ASSERT(strstr(stop_trace_detail, "last_change_pg_us=") != NULL);
+	UT_ASSERT(strstr(stop_trace_detail, "peer_owner=peer_local_log") != NULL);
+	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 6);
+	UT_ASSERT_EQ(cl_normal_stop->peer_reply_pending, 8);
+	cluster_trace_normal_stop = false;
+}
+
+UT_TEST(test_actual_prepare_finishes_productive_batches_before_full_census)
+{
+	ClusterPhase1FullStopPlan plan = {0};
+	uint64 deadline;
+
+	seed_module_drain();
+	idle_original_actors();
+	deadline = cl_state->barrier_deadline_us;
+	checkpoint_native_remaining = 1024;
+	checkpoint_retire_remaining = 0;
+	checkpoint_censuses_during_native = 0;
+	module_results[9] = CLUSTER_NORMAL_STOP_PENDING;
+	start_checkpoint_wait(checkpoint_original_owner_wait);
+	UT_ASSERT(cluster_normal_stop_checkpoint_prepare(&plan, NULL));
+	checkpoint_wait_action = NULL;
+	UT_ASSERT_EQ(checkpoint_native_remaining, 0);
+	UT_ASSERT_EQ(checkpoint_censuses_during_native, 0);
+	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
+	checkpoint_native_remaining = 0;
+}
+
 UT_TEST(test_actual_prepare_keeps_failed_native_work_and_rejects_stop)
 {
 	ClusterPhase1FullStopPlan plan = {0};
@@ -6523,13 +6600,15 @@ main(void)
 		UT_DONE();
 		return ut_failed_count != 0;
 	}
-	UT_PLAN(165);
+	UT_PLAN(168);
+	UT_RUN(test_normal_stop_peer_trace_is_default_off_and_observes_exact_bits);
 	UT_RUN(test_pre_front_buffer_observation_never_advances_cut);
 	UT_RUN(test_original_continuation_gate_ends_at_seal_or_original_deadline);
 	UT_RUN(test_actual_prepare_never_starts_native_work_after_producer_seal);
 	UT_RUN(test_actual_prepare_does_not_start_owner_work_after_original_deadline);
 	UT_RUN(test_actual_prepare_keeps_failed_native_work_and_rejects_stop);
 	UT_RUN(test_actual_prepare_services_original_native_and_am03_with_same_deadline);
+	UT_RUN(test_actual_prepare_finishes_productive_batches_before_full_census);
 	UT_RUN(test_actual_census_observes_native_owner_despite_idle_actor_image);
 	UT_RUN(test_actual_prepare_cannot_seal_while_accepted_more_owner_is_paused);
 	UT_RUN(test_actual_ko_census_stays_passive_after_seal_and_keeps_failures);
@@ -6566,6 +6645,7 @@ main(void)
 	UT_RUN(test_actual_main_does_not_restart_pass_after_idle_park_request);
 	UT_RUN(test_actual_main_early_exit_or_failed_pass_never_signs_clean_shutdown);
 	UT_RUN(test_sinval_actual_main_wraps_full_work_not_sleep);
+	UT_RUN(test_sinval_actual_main_continues_immediately_after_ko_progress);
 	UT_RUN(test_sinval_actual_main_pending_cannot_sign_idle);
 	UT_RUN(test_sinval_actual_main_premature_shutdown_fails);
 	UT_RUN(test_sinval_actual_main_error_and_invalid_do_not_recover_to_clean);

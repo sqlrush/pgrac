@@ -201,7 +201,10 @@ SinvalBcastMain(void)
 	for (;;) {
 		int rc;
 		volatile bool completed = false;
+		bool ko_progress;
 
+		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
 		if (ShutdownRequestPending) {
 			if (!SinvalBcastNormalStopCanExit()) {
 				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
@@ -233,7 +236,7 @@ SinvalBcastMain(void)
 		{
 			cluster_sinval_apply_inbound_overflow_reset_if_pending();
 			cluster_sinval_drain_inbound_and_apply();
-			cluster_ko_drain_inbound_and_apply();
+			ko_progress = cluster_ko_drain_inbound_and_apply();
 			completed = true;
 		}
 		PG_FINALLY();
@@ -251,9 +254,13 @@ SinvalBcastMain(void)
 				   == CLUSTER_NORMAL_STOP_INVALID)
 			ereport(FATAL, (errmsg("SI broadcaster normal-stop observation failed")));
 
+		/* A completed bounded segment must not wait on the idle batch timer.
+		 * Re-enter through the normal interrupt/service/memory boundaries. */
+		if (ko_progress)
+			continue;
+
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					   cluster_sinval_broadcast_batch_timeout_ms, WAIT_EVENT_SINVAL_BROADCAST_SEND);
-		ResetLatch(MyLatch);
 
 		if (rc & WL_POSTMASTER_DEATH)
 			proc_exit(1);
