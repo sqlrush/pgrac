@@ -5566,6 +5566,7 @@ test_cluster_advisory: test_cluster_advisory.c unit_test.h \
 test_cluster_pcm_lock_clock_product.o: \
 		$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
+		$(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		-Dclock_gettime=cluster_test_pcm_clock_gettime -c $< -o $@

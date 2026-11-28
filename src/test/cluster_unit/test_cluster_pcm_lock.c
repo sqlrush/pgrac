@@ -6878,7 +6878,7 @@ check_resource_x_terminal_local_owner_recycle_and_revoke(int32 next_requester,
 	uint64 old_source_generation = 0;
 
 	reset_fake_pcm_runtime(4);
-	tag.forkNum = VISIBILITYMAP_FORKNUM;
+	tag.forkNum = FSM_FORKNUM;
 	cluster_node_id = 1;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
 				 RESOURCE_X_APPLY_APPLIED);
@@ -7123,7 +7123,7 @@ check_resource_x_terminal_local_owner_recycle_and_revoke(int32 next_requester,
 	UT_ASSERT(cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(
 		&successor_block, 0, 77, 91, &revoke, &lineage));
 
-	/* A prior VM conversion may be fully DRAINed before replacement removes
+	/* A prior FSM conversion may be fully DRAINed before replacement removes
 	 * and later recreates the BufferDesc.  Its carrier generation therefore
 	 * belongs to the old descriptor episode even when the new episode reaches
 	 * the same numeric value. */
@@ -7271,7 +7271,7 @@ check_resource_x_terminal_local_owner_recycle_and_revoke(int32 next_requester,
 					 &successor_block, 0, &status, &image, &revoking, &revoke, NULL),
 				 RESOURCE_X_APPLY_APPLIED);
 
-	/* VM/FSM DROP has no retained N+PI descriptor on which SourceSettlement
+	/* FSM DROP has no retained N+PI descriptor on which SourceSettlement
 	 * could later serialize terminal-cover cleanup.  The exact type-17 owner
 	 * must therefore consume its own cover only after the physical X->N
 	 * generation transition.  A mismatched post-drop snapshot changes neither
@@ -19317,6 +19317,7 @@ check_resource_x_self_master_source_episode(bool with_history, ForkNumber fork,
 											uint64 holder_generation, int next_requester)
 {
 	BufferTag tag = make_tag(177);
+	bool retain = (fork == MAIN_FORKNUM || fork == VISIBILITYMAP_FORKNUM);
 	PcmAuthoritySnapshot authority;
 	ResourceXAcquisitionRef expected_ref;
 	ResourceXAcquisitionRef terminal_ref;
@@ -19666,8 +19667,11 @@ check_resource_x_self_master_source_episode(bool with_history, ForkNumber fork,
 	revoking.flags = PCM_OWN_FLAG_REVOKING;
 	revoking.pcm_state = (uint8)PCM_STATE_X;
 
-	/* The local GRD is the authority for a self-master DROP.  The remote-only
-	 * prepared-X provenance class must not veto this exact existing path. */
+	/* The local GRD supplies the authority for both self-master finish modes. */
+	if (fork == VISIBILITYMAP_FORKNUM)
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+						 &block, 0, &status, &image, &revoking, &owner, NULL),
+					 RESOURCE_X_APPLY_STALE);
 	if (with_history && holder_generation <= 60) {
 		ResourceXLocalOwnerHandle stale_owner = owner;
 		ClusterPcmOwnSnapshot stale_revoking = revoking;
@@ -19677,7 +19681,7 @@ check_resource_x_self_master_source_episode(bool with_history, ForkNumber fork,
 			RESOURCE_X_APPLY_STALE);
 		stale_owner.owner_procno++;
 		stale_revoking.reservation_token++;
-		if (fork == MAIN_FORKNUM) {
+		if (retain) {
 			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
 							 &block, 0, &status, &image, &revoking, &stale_owner, NULL),
 						 RESOURCE_X_APPLY_STALE);
@@ -19693,7 +19697,7 @@ check_resource_x_self_master_source_episode(bool with_history, ForkNumber fork,
 						 RESOURCE_X_APPLY_STALE);
 		}
 	}
-	if (fork == MAIN_FORKNUM)
+	if (retain)
 		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
 						 &block, 0, &status, &image, &revoking, &owner, NULL),
 					 RESOURCE_X_APPLY_APPLIED);
