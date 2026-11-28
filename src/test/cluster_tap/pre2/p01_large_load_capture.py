@@ -10,10 +10,10 @@ import time
 from wait_graph_capture import CaptureSession, capture_failed_watchdog, capture_failed_workload
 
 
-def reject_server_errors(text):
-    match = re.search(r'^.*\b(?:ERROR|PANIC):.*$', text, re.M)
+def reject_server_errors(text, node):
+    match = re.search(r'^.*\b(?:ERROR|FATAL|PANIC):.*$', text, re.M)
     if match:
-        raise RuntimeError('server error: ' + match.group(0)[:512])
+        raise RuntimeError(f'server error: node {node}: {match.group(0)[:512]}')
 
 
 def validate_worker(text, rc, elapsed):
@@ -75,12 +75,13 @@ def run(config_path, output):
     def check_server_logs():
         for entry in server_logs:
             text = entry['tail'] + entry['stream'].read()
-            reject_server_errors(text)
+            reject_server_errors(text, entry['node'])
             entry['tail'] = text[-16:]
 
     try:
         for node in config:
-            server_logs.append(dict(stream=Path(node['logfile']).open(errors='replace'), tail=''))
+            server_logs.append(dict(node=node['node'],
+                                    stream=Path(node['logfile']).open(errors='replace'), tail=''))
         check_server_logs()
         diagnostic = CaptureSession(config, output / 'wait-graph')
         for node in sorted(config, key=lambda n: n['node']):

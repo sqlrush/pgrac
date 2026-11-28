@@ -118,10 +118,15 @@ class WorkloadClock:
                 raise AssertionError('owned workers did not start')
             time.sleep(.005)
         self.sleeps += 1
-        if self.scenario in ('success', 'empty', 'client_error', 'early',
-                             'all_client_error', 'all_early', 'late_log_error'):
+        if self.scenario == 'split_fatal' and self.sleeps <= 2:
+            with (self.root / 'server-2.log').open('a') as log:
+                log.write('FA' if self.sleeps == 1 else 'TAL: catalog read refused\n')
+            self.now += .25
+            return
+        full_duration = self.scenario in ('success', 'empty', 'late_log_error', 'split_fatal')
+        if full_duration or self.scenario in ('client_error', 'early', 'all_client_error', 'all_early'):
             (self.root / 'finish').touch()
-            self.now += 180 if self.scenario in ('success', 'empty', 'late_log_error') else .25
+            self.now += 180 if full_duration else .25
             targets = self.workers[:1] if self.scenario in ('client_error', 'early') else self.workers
             while any(process.poll() is None for process in targets):
                 if time.monotonic() >= deadline:
@@ -144,7 +149,7 @@ class WorkloadClock:
 
 
 class FirstErrorTests(unittest.TestCase):
-    def exercise(self, scenario):
+    def exercise(self, scenario, initial_log=''):
         with tempfile.TemporaryDirectory(prefix='p130-first-error-') as directory:
             root = Path(directory)
             (root / 'plan.json').write_text(json.dumps(dict(scenario=scenario)))
@@ -155,7 +160,7 @@ class FirstErrorTests(unittest.TestCase):
             config = []
             for n in range(4):
                 log = root / ('server-%d.log' % n)
-                log.write_text('ERROR: existing failure\n' if scenario == 'preexisting' and n == 0 else '')
+                log.write_text(initial_log if n == 0 else '')
                 config.append(dict(node=n, connstr='node=%d' % n, logfile=str(log)))
             (root / 'config.json').write_text(json.dumps(config))
             # Resolve only the two external commands. Both Popen implementations
@@ -213,6 +218,12 @@ class FirstErrorTests(unittest.TestCase):
         result, _, _ = self.failed_capture('split_panic', 'PANIC: original block refusal')
         self.assertTrue(all(w['elapsed_seconds'] < 240 for w in result['workers']))
 
+    def test_split_server_fatal_captures_live_workers_even_if_clients_can_succeed(self):
+        result, cuts, _ = self.failed_capture('split_fatal', 'FATAL: catalog read refused')
+        self.assertIn('node 2', result['error'])
+        for cut in cuts:
+            self.assertEqual(cut['workers_alive'], [0, 1, 2, 3])
+
     def test_nonzero_client_keeps_failure_and_collects_once(self):
         self.failed_capture('client_error', 'workload client exited nonzero')
 
@@ -258,7 +269,7 @@ class FirstErrorTests(unittest.TestCase):
         self.assertIsNone(graph)
 
     def test_preexisting_error_does_not_open_diagnostic_or_workload(self):
-        result, queries, cuts, graph = self.exercise('preexisting')
+        result, queries, cuts, graph = self.exercise('success', 'ERROR: existing failure\n')
         self.assertEqual(result['status'], 'FAIL')
         self.assertIn('existing failure', result['error'])
         self.assertEqual(result['workers'], [])
@@ -266,6 +277,17 @@ class FirstErrorTests(unittest.TestCase):
         self.assertEqual(cuts, [])
         self.assertIsNone(graph)
         self.assertIn('wait_graph', result)
+        self.assertEqual(result['wait_graph']['capture_error'], 'diagnostic_session_not_ready')
+
+    def test_preexisting_server_fatal_prevents_worker_and_observer_start(self):
+        result, queries, cuts, graph = self.exercise('success', 'FATAL: startup refusal\n')
+        self.assertEqual(result['status'], 'FAIL')
+        self.assertIn('FATAL: startup refusal', result['error'])
+        self.assertIn('node 0', result['error'])
+        self.assertEqual(result['workers'], [])
+        self.assertEqual(queries, [])
+        self.assertEqual(cuts, [])
+        self.assertIsNone(graph)
         self.assertEqual(result['wait_graph']['capture_error'], 'diagnostic_session_not_ready')
 
     def test_prepare_refusal_is_explicitly_unavailable_and_reaps_readers(self):
@@ -313,6 +335,7 @@ class FirstErrorTests(unittest.TestCase):
 METHODS = (
     'test_server_error_captures_before_cleaning_four_live_workers',
     'test_split_panic_is_captured_before_watchdog',
+    'test_split_server_fatal_captures_live_workers_even_if_clients_can_succeed',
     'test_nonzero_client_keeps_failure_and_collects_once',
     'test_early_client_keeps_failure_and_collects_once',
     'test_all_nonzero_clients_still_collect_before_diagnostic_cleanup',
@@ -323,6 +346,7 @@ METHODS = (
     'test_partial_diagnostic_error_cannot_replace_original_error',
     'test_capture_write_error_cannot_replace_original_error',
     'test_preexisting_error_does_not_open_diagnostic_or_workload',
+    'test_preexisting_server_fatal_prevents_worker_and_observer_start',
     'test_prepare_refusal_is_explicitly_unavailable_and_reaps_readers',
     'test_watchdog_keeps_its_reason_without_second_capture',
     'test_original_workload_and_success_judge_are_preserved',
@@ -332,10 +356,10 @@ METHODS = (
 
 def main():
     discovered = unittest.defaultTestLoader.getTestCaseNames(FirstErrorTests)
-    if len(METHODS) != 16 or len(set(METHODS)) != 16 or set(discovered) != set(METHODS):
+    if len(METHODS) != 18 or len(set(METHODS)) != 18 or set(discovered) != set(METHODS):
         print('Bail out! first-error method plan differs from discovery')
         return 1
-    print('1..16', flush=True)
+    print('1..18', flush=True)
     failed = False
     for number, name in enumerate(METHODS, 1):
         result = unittest.TestResult()
