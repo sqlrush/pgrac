@@ -62,6 +62,7 @@
 #include "storage/backendid.h" /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h"
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "utils/hsearch.h"
@@ -98,6 +99,29 @@ AuxProcType MyAuxProcType = NotAnAuxProcess;
 volatile sig_atomic_t ProcDiePending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;
+
+/* The tag-only acquire in this fixture has one active PCM wait context. */
+static pg_on_exit_callback wait_cleanup;
+static Datum wait_cleanup_arg;
+static unsigned int wait_registrations;
+
+void
+before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	UT_ASSERT(wait_cleanup == NULL);
+	UT_ASSERT(callback != NULL && DatumGetPointer(arg) != NULL);
+	wait_cleanup = callback;
+	wait_cleanup_arg = arg;
+	wait_registrations++;
+}
+
+void
+cancel_before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	UT_ASSERT(wait_cleanup != NULL && callback == wait_cleanup && arg == wait_cleanup_arg);
+	wait_cleanup = NULL;
+	wait_cleanup_arg = (Datum) 0;
+}
 
 /* Observation is OFF; no content-owner registry is supplied by this fixture. */
 void
@@ -878,6 +902,8 @@ fake_LockBuffer(MockBufferDesc *buf, int mode, bool is_local)
 static void
 reset_fixture(void)
 {
+	UT_ASSERT(wait_cleanup == NULL);
+	wait_registrations = 0;
 	memset(&fake_pcm_header, 0, sizeof(fake_pcm_header));
 	fake_pcm_header_found = false;
 	fake_pcm_entry_count = 0;
@@ -942,6 +968,8 @@ UT_TEST(test_L2_pcm_acquired_before_lwlock)
 	buf.tag = make_tag(101);
 
 	UT_ASSERT_EQ(fake_LockBuffer(&buf, BUFFER_LOCK_SHARE, false), 0);
+	UT_ASSERT_EQ(wait_registrations, 1);
+	UT_ASSERT(wait_cleanup == NULL);
 	UT_ASSERT(call_log_len >= 2);
 	UT_ASSERT(strcmp(call_log[0], "PCM-acquire") == 0);
 	UT_ASSERT(strcmp(call_log[1], "LWLock-acquire") == 0);
@@ -984,6 +1012,8 @@ UT_TEST(test_L4_success_path_sets_buffer_type_and_pcm_state)
 	fake_LockBuffer(&buf_x, BUFFER_LOCK_EXCLUSIVE, false);
 	UT_ASSERT_EQ((int)buf_x.buffer_type, (int)BUF_TYPE_XCUR);
 	UT_ASSERT_EQ((int)buf_x.pcm_state, (int)PCM_STATE_X);
+	UT_ASSERT_EQ(wait_registrations, 2);
+	UT_ASSERT(wait_cleanup == NULL);
 }
 
 
@@ -1026,6 +1056,7 @@ UT_TEST(test_L6_local_buffer_skips_hook_entirely)
 
 	/* HC68: no PCM call, no LWLock call (PG-native early return). */
 	UT_ASSERT_EQ(call_log_len, 0);
+	UT_ASSERT_EQ(wait_registrations, 0);
 	UT_ASSERT_EQ((int)buf.buffer_type, (int)BUF_TYPE_CURRENT);
 }
 
