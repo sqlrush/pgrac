@@ -31,6 +31,8 @@ MemoryContext CurrentMemoryContext = &startup_context;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static unsigned allocations;
+/* The interrupted phase has a context of its own with at most one chunk. */
+static void *failure_context_chunk;
 static bool fail_allocation;
 static unsigned release_phases;
 static ResourceOwner expected_owner;
@@ -39,7 +41,7 @@ static ClusterCfImageStage original_stage;
 static unsigned phase_mode;
 
 void *
-MemoryContextAlloc(MemoryContext context pg_attribute_unused(), Size size)
+MemoryContextAlloc(MemoryContext context, Size size)
 {
 	void *p;
 	if (fail_allocation) {
@@ -48,8 +50,18 @@ MemoryContextAlloc(MemoryContext context pg_attribute_unused(), Size size)
 	}
 	p = malloc(size);
 	if (!p) abort();
+	if (context == &failure_context) {
+		UT_ASSERT_NULL(failure_context_chunk);
+		failure_context_chunk = p;
+	}
 	allocations++;
 	return p;
+}
+
+void *
+palloc(Size size)
+{
+	return MemoryContextAlloc(CurrentMemoryContext, size);
 }
 
 void *
@@ -64,6 +76,8 @@ void
 pfree(void *p)
 {
 	if (!p || allocations == 0) abort();
+	if (p == failure_context_chunk)
+		failure_context_chunk = NULL;
 	allocations--;
 	free(p);
 }
@@ -137,11 +151,17 @@ RelationCacheInitializePhase2(void)
 		return;
 	}
 	if (phase_mode == 1) {
+		MemoryContextSwitchTo(&failure_context);
 		hash = pg_cryptohash_create(PG_SHA256);
 		UT_ASSERT(hash != NULL);
+#ifdef USE_OPENSSL
 		UT_ASSERT_EQ(CurrentResourceOwner->cryptohasharr.nitems, 1);
-		CurrentMemoryContext = &failure_context;
-		pg_re_throw(); /* the real owner must free this unfinished EVP context */
+		UT_ASSERT_NULL(failure_context_chunk);
+#else
+		UT_ASSERT_EQ(CurrentResourceOwner->cryptohasharr.nitems, 0);
+		UT_ASSERT(failure_context_chunk == hash);
+#endif
+		pg_re_throw();
 	}
 	if (phase_mode == 2) fail_allocation = true;
 	result = cluster_cf_control_image_read_locked(original_stage.generation,
@@ -220,6 +240,15 @@ run_case(unsigned mode)
 		ResourceOwnerDelete(expected_owner);
 		expected_owner = NULL;
 	}
+#ifndef USE_OPENSSL
+	if (mode == 2) {
+		/* After owner release the caller still owns the built-in hash. */
+		UT_ASSERT_EQ(allocations, before + 1);
+		UT_ASSERT_NOT_NULL(failure_context_chunk);
+		pg_cryptohash_free(failure_context_chunk);
+	}
+#endif
+	UT_ASSERT_NULL(failure_context_chunk);
 	UT_ASSERT_EQ(allocations, before);
 	UT_ASSERT(image_cf_global && image_cf_x); /* original CF custody unchanged */
 	UT_ASSERT_EQ(cluster_cf_control_image_discard(&original_stage), 0);
