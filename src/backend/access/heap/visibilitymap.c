@@ -116,12 +116,15 @@
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
 #include "storage/smgr.h"
 #include "utils/inval.h"
 
 #ifdef USE_PGRAC_CLUSTER
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_page_cold_redo.h"
@@ -510,6 +513,41 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	*vmbuf = vm_readbuf(rel, mapBlock, true);
 }
 
+/* A pin fixes the mapping; only the content lock serializes page installs.
+ * A local format probe never requests a grant beneath the heap lock. Once
+ * initialized, a VM page stays formatted for the lifetime of this mapping.
+ * Bitmap values themselves always require a current shared or exclusive grant. */
+static LWLock *
+vm_unheld_content_lock(Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (!BufferIsLocal(buffer) && cluster_pcm_is_active())
+	{
+		BufferDesc *buf = GetBufferDescriptor(buffer - 1);
+		LWLock *lock = BufferDescriptorGetContentLock(buf);
+
+		if (cluster_pcm_x_buffer_tag_tracked(&buf->tag, cluster_shared_catalog)
+			&& !LWLockHeldByMe(lock))
+			return lock;
+	}
+#endif
+	return NULL;
+}
+
+static bool
+vm_page_is_new(Buffer buffer)
+{
+	LWLock *lock = vm_unheld_content_lock(buffer);
+	bool is_new;
+
+	if (lock)
+		LWLockAcquire(lock, LW_SHARED);
+	is_new = PageIsNew(BufferGetPage(buffer));
+	if (lock)
+		LWLockRelease(lock);
+	return is_new;
+}
+
 /*
  * Repin the exact visibility-map block in a recently observed descriptor.
  *
@@ -535,7 +573,7 @@ visibilitymap_pin_recent(Relation rel, BlockNumber heapBlk, Buffer recent_buffer
 #ifdef USE_PGRAC_CLUSTER
 	/* A read-only zero page has no versioned write base yet. Do not do I/O
 	 * below the caller's heap content lock; return to the original pin path. */
-	if (cluster_shared_config && PageIsNew(BufferGetPage(recent_buffer)))
+	if (cluster_shared_config && vm_page_is_new(recent_buffer))
 	{
 		ReleaseBuffer(recent_buffer);
 		return false;
@@ -561,7 +599,7 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf)
 	if (!BufferIsValid(vmbuf) || BufferGetBlockNumber(vmbuf) != mapBlock)
 		return false;
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_shared_config && PageIsNew(BufferGetPage(vmbuf)))
+	if (cluster_shared_config && vm_page_is_new(vmbuf))
 		return false;
 #endif
 	return true;
@@ -780,12 +818,8 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
  * the bit for heapBlk, or InvalidBuffer. The caller is responsible for
  * releasing *vmbuf after it's done testing and setting bits.
  *
- * NOTE: This function is typically called without a lock on the heap page,
- * so somebody else could change the bit just after we look at it.  In fact,
- * since we don't lock the visibility map page either, it's even possible that
- * someone else could have changed the bit just before we look at it, but yet
- * we might see the old value.  It is the caller's responsibility to deal with
- * all concurrency issues!
+ * Callers without a heap lock must tolerate a change immediately after the
+ * observation. Cluster-tracked maps also require readable PCM authority.
  */
 uint8
 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
@@ -795,6 +829,7 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	uint8		mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
 	char	   *map;
 	uint8		result;
+	bool		lock_needed;
 
 #ifdef TRACE_VISIBILITYMAP
 	elog(DEBUG1, "vm_get_status %s %d", RelationGetRelationName(rel), heapBlk);
@@ -817,14 +852,13 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 			return false;
 	}
 
+	lock_needed = vm_unheld_content_lock(*vmbuf) != NULL;
+	if (lock_needed)
+		LockBuffer(*vmbuf, BUFFER_LOCK_SHARE);
 	map = PageGetContents(BufferGetPage(*vmbuf));
-
-	/*
-	 * A single byte read is atomic.  There could be memory-ordering effects
-	 * here, but for performance reasons we make it the caller's job to worry
-	 * about that.
-	 */
 	result = ((map[mapByte] >> mapOffset) & VISIBILITYMAP_VALID_BITS);
+	if (lock_needed)
+		LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
 	return result;
 }
 
@@ -860,11 +894,7 @@ visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_fro
 		if (!BufferIsValid(mapBuffer))
 			break;
 
-		/*
-		 * We choose not to lock the page, since the result is going to be
-		 * immediately stale anyway if anyone is concurrently setting or
-		 * clearing bits, and we only really need an approximate value.
-		 */
+		LockBuffer(mapBuffer, BUFFER_LOCK_SHARE);
 		map = (uint64 *) PageGetContents(BufferGetPage(mapBuffer));
 
 		StaticAssertStmt(MAPSIZE % sizeof(uint64) == 0,
@@ -883,7 +913,7 @@ visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_fro
 			}
 		}
 
-		ReleaseBuffer(mapBuffer);
+		UnlockReleaseBuffer(mapBuffer);
 	}
 
 	*all_visible = nvisible;
@@ -1182,15 +1212,8 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 		if (versioned && !extend)
 			return buf;
 
-		/*
-		 * Initializing the page when needed is trickier than it looks, because
-		 * multiple backends can do this concurrently.  PGRAC may deliberately
-		 * release the only VM pin while waiting for Resource-X.  If the old
-		 * descriptor is reused, the init wrapper returns InvalidBuffer and this
-		 * relation-aware loop obtains a fresh exact mapping before inspecting
-		 * or modifying any page bytes.
-		 */
-		if (PageIsNew(BufferGetPage(buf)))
+		/* Concurrent initializers recheck the header under content X. */
+		if (vm_page_is_new(buf))
 		{
 			buf = LockBufferForVisibilityMapPageInit(buf);
 			if (!BufferIsValid(buf))

@@ -10993,9 +10993,6 @@ cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block,
 	bool		needed;
 
 	Assert(BufferIsValid(vmbuffer) && visibilitymap_pin_ok(heap_block, vmbuffer));
-	if (visibilitymap_get_status(relation, heap_block, &vmbuffer)
-		& VISIBILITYMAP_ALL_FROZEN)
-		return true;
 	if (!ClusterLockBufferShareBarrierAware(vmbuffer))
 		return true;
 	needed = (visibilitymap_get_status(relation, heap_block, &vmbuffer)

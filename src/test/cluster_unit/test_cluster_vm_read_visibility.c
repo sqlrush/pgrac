@@ -27,6 +27,7 @@
 #include "cluster/cluster_space_storage.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
@@ -36,11 +37,13 @@ UT_DEFINE_GLOBALS();
 
 static PGAlignedBlock disk_vm, current_vm, reader_vm;
 static SMgrRelationData fixture_smgr;
-static bool fixture_shared, fixture_visible;
+static bool fixture_shared, fixture_visible, fixture_locked;
 static unsigned fixture_reads, fixture_grants, fixture_fetches, fixture_index_calls;
 static ItemPointerData fixture_tid;
 
 #define MAPSIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
+#define VISIBLE_MASK64 UINT64CONST(0x5555555555555555)
+#define FROZEN_MASK64 UINT64CONST(0xaaaaaaaaaaaaaaaa)
 #define HEAPBLOCKS_PER_PAGE (MAPSIZE * 4)
 #define HEAPBLK_TO_MAPBLOCK(x) ((x) / HEAPBLOCKS_PER_PAGE)
 #define HEAPBLK_TO_MAPBYTE(x) (((x) % HEAPBLOCKS_PER_PAGE) / 4)
@@ -108,8 +111,15 @@ void
 LockBuffer(Buffer buffer, int mode)
 {
 	(void)buffer;
-	(void)mode;
-	fixture_grants++;
+	if (mode == BUFFER_LOCK_SHARE) {
+		UT_ASSERT(!fixture_locked);
+		fixture_locked = true;
+		fixture_grants++;
+		reader_vm = current_vm;
+	} else {
+		UT_ASSERT(mode == BUFFER_LOCK_UNLOCK && fixture_locked);
+		fixture_locked = false;
+	}
 }
 
 ItemPointer
@@ -129,6 +139,15 @@ index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
 	return fixture_visible;
 }
 
+void
+UnlockReleaseBuffer(Buffer buffer)
+{
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buffer);
+}
+
+#define vm_unheld_content_lock(buffer) ((fixture_shared && !fixture_locked) ? &fixture_locked : NULL)
+#define vm_page_is_new(buffer) PageIsNew(BufferGetPage(buffer))
 #include "test_cluster_vm_read_visibility.inc"
 
 static void
@@ -173,15 +192,17 @@ check_read(bool shared, bool visible)
 	scan.xs_itup = &tuple;
 	slot.tts_flags = TTS_FLAG_EMPTY;
 
-	/* Raw diagnostic stays truthful even after semantic consumers distrust it. */
-	UT_ASSERT_EQ(visibilitymap_get_status(&relation, 0, &observer), VISIBILITYMAP_ALL_VISIBLE);
+	/* The shared read sees the owner's clear bit before returning. */
+	UT_ASSERT_EQ(visibilitymap_get_status(&relation, 0, &observer), shared ? 0 : VISIBILITYMAP_ALL_VISIBLE);
 	UT_ASSERT_EQ(fixture_reads, 1);
-	UT_ASSERT_EQ(fixture_grants, 0);
+	UT_ASSERT_EQ(fixture_grants, shared ? 1 : 0);
+	UT_ASSERT(!fixture_locked);
 	UT_ASSERT_EQ(PageGetContents(current_vm.data)[0], 0);
 	ReleaseBuffer(observer);
 	UT_ASSERT(IndexOnlyNext(&node) == &slot);
 	UT_ASSERT_EQ(PageGetContents(disk_vm.data)[0], VISIBILITYMAP_ALL_VISIBLE);
-	UT_ASSERT_EQ(fixture_grants, 0);
+	UT_ASSERT_EQ(fixture_grants, shared ? 1 : 0);
+	UT_ASSERT(!fixture_locked);
 	if (shared)
 	{
 		UT_ASSERT_EQ(fixture_fetches, 1);
@@ -233,6 +254,7 @@ UT_TEST(all_other_consumers_ignore_shared_positive_bits)
 	{
 		bool restricted = mode == 1;
 		fixture_shared = mode != 0;
+		current_vm = reader_vm;
 		form.relpersistence = mode == 2 ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT;
 		UT_ASSERT_EQ(fixture_pagemode(&heap, page.data, &snap), !restricted);
 		UT_ASSERT_EQ(fixture_sample(&heap.rs_base, page.data), !restricted);
@@ -251,10 +273,40 @@ UT_TEST(all_other_consumers_ignore_shared_positive_bits)
 	UT_ASSERT_EQ(PageGetContents(reader_vm.data)[0], VISIBILITYMAP_ALL_VISIBLE);
 }
 
+UT_TEST(shared_status_reuses_held_lock_and_count_reads_current_map)
+{
+	RelationData rel = {0};
+	FormData_pg_class form = {0};
+	BlockNumber visible, frozen;
+	Buffer pin = 1;
+
+	fixture_shared = true;
+	fixture_locked = true;
+	fixture_grants = fixture_reads = 0;
+	rel.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	fixture_smgr.smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 1;
+	memset(&disk_vm, 0, sizeof(disk_vm));
+	memset(&current_vm, 0, sizeof(current_vm));
+	PageGetContents(current_vm.data)[0] = VISIBILITYMAP_VALID_BITS;
+	reader_vm = current_vm;
+	UT_ASSERT_EQ(visibilitymap_get_status(&rel, 0, &pin), VISIBILITYMAP_VALID_BITS);
+	UT_ASSERT(fixture_locked);
+	UT_ASSERT_EQ(fixture_grants, 0);
+	fixture_locked = false;
+	visibilitymap_count(&rel, &visible, &frozen);
+	UT_ASSERT_EQ(visible, 1);
+	UT_ASSERT_EQ(frozen, 1);
+	UT_ASSERT_EQ(fixture_grants, 1);
+	UT_ASSERT_EQ(fixture_reads, 1);
+	UT_ASSERT(!fixture_locked);
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
+	UT_RUN(shared_status_reuses_held_lock_and_count_reads_current_map);
 	UT_RUN(shared_stale_vm_does_not_expose_uncommitted_tid);
 	UT_RUN(shared_stale_vm_keeps_precisely_visible_tuple);
 	UT_RUN(native_vm_shortcut_is_unchanged);

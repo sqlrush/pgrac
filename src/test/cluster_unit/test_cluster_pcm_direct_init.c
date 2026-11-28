@@ -185,6 +185,30 @@ expect_valid_round_trip(ClusterPcmDirectInitKind kind)
 				 CLUSTER_PCM_OWN_OK);
 }
 
+UT_TEST(test_resident_vm_init_requires_pin_and_coherent_prior_image)
+{
+	ClusterPcmDirectInitSnapshot s = make_snapshot(CLUSTER_PCM_DIRECT_INIT_VM);
+
+	s.pcm_state = PCM_STATE_S;
+	s.buffer_type = BUF_TYPE_SCUR;
+	UT_ASSERT(cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+	s.buffer_type = BUF_TYPE_XCUR;
+	UT_ASSERT(cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+	s.pcm_state = PCM_STATE_N;
+	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+	s.buffer_type = BUF_TYPE_PI;
+	UT_ASSERT(cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+	s.flags = PCM_OWN_FLAG_REVOKING;
+	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+	s.flags = 0;
+	s.private_refcount = 0;
+	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+	s.private_refcount = 1;
+	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_FSM, &s));
+	s.tag.forkNum = MAIN_FORKNUM;
+	UT_ASSERT(!cluster_pcm_direct_init_resident_vm(CLUSTER_PCM_DIRECT_INIT_VM, &s));
+}
+
 UT_TEST(test_valid_read_miss_proof)
 {
 	expect_valid_round_trip(CLUSTER_PCM_DIRECT_INIT_READ_MISS);
@@ -603,7 +627,7 @@ UT_TEST(test_aux_pending_direct_init_joins_exact_round_without_second_proof)
 	const char *aux_end;
 	static const char *const aux_order[] = { "LockBufferForAuxiliaryPageInit(",
 											 "cluster_bufmgr_pcm_arm_direct_init(",
-											 "CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X",
+											 "CLUSTER_BUFMGR_PCM_DIRECT_INIT_ORDINARY_X",
 											 "cluster_bufmgr_pcm_join_aux_direct_init_exact(",
 											 "continue;",
 											 "cluster_bufmgr_pcm_gate_direct_init(" };
@@ -952,7 +976,7 @@ UT_TEST(test_vm_fsm_resource_x_wait_releases_and_exactly_repins)
 			"cluster_bufmgr_pcm_x_writer_prepare_target(",
 			"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(", "LWLockAcquire(" };
 	static const char *const direct_order[]
-		= { "aux_pin_required = kind == CLUSTER_PCM_DIRECT_INIT_VM",
+		= { "aux_pin_required = cluster_pcm_x_revoke_finish_mode(&buf->tag, 0) == CLUSTER_PCM_X_REVOKE_FINISH_DROP",
 			"cluster_pcm_own_reservation_begin_exact(",
 			"if (aux_pin_required\n\t\t&& !cluster_bufmgr_pcm_aux_pin_handoff_begin(",
 			"cluster_gcs_resource_x_target_direct_init_acquire_exact(",
@@ -1331,12 +1355,7 @@ UT_TEST(test_aux_repin_replacement_restarts_from_fresh_relation_ref)
 	}
 }
 
-/* Ordinary VM writers use the same deliberate pinless Resource-X interval as
- * direct-init.  A descriptor replacement is therefore a caller-owned retry,
- * not a cluster-wide gate failure and not a client ERROR.  The barrier-aware
- * wrapper must expose replacement separately, and heapam must invalidate the
- * stale numeric Buffer before returning to its existing relation-level repin
- * and requalification paths. */
+/* Preserve the wrapper's replacement channel for DROP callers. */
 UT_TEST(test_ordinary_aux_repin_replacement_reaches_heap_retry)
 {
 	char *bufmgr = read_source(BUFMGR_SOURCE_PATH);
@@ -1472,7 +1491,8 @@ UT_TEST(test_temp_lock_releases_vm_before_nested_work_and_requalifies)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
+	UT_RUN(test_resident_vm_init_requires_pin_and_coherent_prior_image);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);

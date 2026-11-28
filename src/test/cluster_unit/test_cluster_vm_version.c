@@ -374,6 +374,7 @@ errfinish(const char *file, int line, const char *func)
 	abort();
 }
 
+#define vm_page_is_new(buffer) PageIsNew(BufferGetPage(buffer))
 #include "test_cluster_vm_version.inc"
 
 static void

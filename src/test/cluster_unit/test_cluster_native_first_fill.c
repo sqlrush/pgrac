@@ -6,6 +6,14 @@
 #include "cluster/cluster_space_reservation.h"
 #include "pgstat.h"
 
+int
+errdetail_internal(const char *fmt, ...)
+{
+	(void) fmt;
+	UT_ASSERT(!cluster_trace_tx_identity);
+	return 0;
+}
+
 /* Retain the complete real preparation, disk/image execution and cleanup. */
 static void ordinary_report(int level);
 static void cluster_bufmgr_acquire_resident_scope_cleanup(BufferDesc *buf,

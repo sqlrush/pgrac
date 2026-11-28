@@ -411,7 +411,7 @@ cluster_pcm_x_activation_fence_open(uint64 writer_activation_token,
 	return writer_activation_token == 0 && resource_x_activation_generation == 0;
 }
 
-/* VM/FSM readers may consume bytes under a pin alone.  Once an exact revoke
+/* FSM readers may consume bytes under a pin alone.  Once an exact revoke
  * is published, a first passive pin must therefore serialize with that
  * publication under the BufferDesc header lock and retry without changing
  * refcount.  Existing pins predate the fence and are drained separately
@@ -420,7 +420,7 @@ static inline bool
 cluster_pcm_x_aux_pin_admission_allowed(bool runtime_active, bool tracked, ForkNumber forknum,
 										uint32 flags)
 {
-	bool auxiliary = forknum == VISIBILITYMAP_FORKNUM || forknum == FSM_FORKNUM;
+	bool auxiliary = forknum == FSM_FORKNUM;
 
 	return !runtime_active || !tracked || !auxiliary || (flags & PCM_OWN_FLAG_REVOKING) == 0;
 }
@@ -635,11 +635,8 @@ cluster_pcm_x_grant_reservation_kind(const ClusterPcmOwnSnapshot *live,
 	return CLUSTER_PCM_X_GRANT_RESERVATION_INVALID;
 }
 
-/* VM and FSM callers may consume a pinned buffer without taking its content
- * lock.  They therefore cannot coexist with the PI+BM_VALID retained shape:
- * an already-pinned or newly-pinned reader could otherwise observe source
- * bytes after ownership moved to N.  Main/init forks keep the passive-pin
- * tolerant retained path that breaks the S3 writer pin ring. */
+/* VM bytes are protected by the content lock. A passive VM pin, like a
+ * main-fork pin, keeps the descriptor mapped across ownership changes. */
 typedef enum ClusterPcmXRevokeFinishMode {
 	CLUSTER_PCM_X_REVOKE_FINISH_INVALID = 0,
 	CLUSTER_PCM_X_REVOKE_FINISH_RETAIN,
@@ -652,7 +649,7 @@ cluster_pcm_x_revoke_finish_mode(const BufferTag *tag, uint32 shared_refcount)
 {
 	if (tag == NULL || tag->forkNum < MAIN_FORKNUM || tag->forkNum > MAX_FORKNUM)
 		return CLUSTER_PCM_X_REVOKE_FINISH_INVALID;
-	if (tag->forkNum == FSM_FORKNUM || tag->forkNum == VISIBILITYMAP_FORKNUM)
+	if (tag->forkNum == FSM_FORKNUM)
 		return shared_refcount == 0 ? CLUSTER_PCM_X_REVOKE_FINISH_DROP
 									: CLUSTER_PCM_X_REVOKE_FINISH_BUSY;
 	return CLUSTER_PCM_X_REVOKE_FINISH_RETAIN;

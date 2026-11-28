@@ -266,6 +266,7 @@ static bool nm_requester_notice(ClusterPcmResourceXMasterState **state)
 /* Optional read-only observation of the actual retired transport/receipt.
  * Compositions use it to replay old bytes against a real successor. */
 static void (*nm_settled_observer)(const ResourceXIntentSlot *, const ResourceXDecodedFrame *);
+static void (*nm_before_first_read)(void);
 static bool nm_parent_as(int fd, int mode, int requester)
 {
 	ClusterBufmgrFirstFill read;
@@ -273,7 +274,9 @@ static bool nm_parent_as(int fd, int mode, int requester)
 	ResourceXIntentSlot staged; ResourceXDecodedFrame done, notice;
 	ResourceXWireReject reject; ClusterICEnvelope env = {0};
 	ResourceXRequesterJoinSnapshot joined;
-	ordinary_start(&read, 0); cluster_node_id = requester; nm_fd = fd; nm_mode = mode;
+	ordinary_start(&read, 0);
+	if (nm_before_first_read != NULL) nm_before_first_read();
+	cluster_node_id = requester; nm_fd = fd; nm_mode = mode;
 	ordinary_delivery_transport = nm_deliver;
 	NM_REQUIRE(ordinary_run(&read));
 	UT_ASSERT_EQ(ordinary_sends, 1); UT_ASSERT_EQ(disk_reads, 1);

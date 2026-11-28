@@ -6,6 +6,7 @@
 #include "test_cluster_native_master_fixture.inc"
 
 static unsigned sx_cut;
+static ClusterPcmXWriterLedgerEntry *(*sx_vm_entry)(void);
 static bool sx_dirty, sx_late_callback, sx_successor;
 static ResourceXDecodedFrame sx_old_consumed, sx_seed_consumed;
 static ResourceXIntentSlot sx_seed_callback;
@@ -202,7 +203,8 @@ static bool sx_parent(int fd, int mode)
 			if (sigsetjmp(sx_exit_jump, 0) == 0) { (void)rx_prepare(NULL); UT_ASSERT(false); }
 			PG_exception_stack = saved; error_context_stack = context;
 			UT_ASSERT_EQ(disk_exit_count, 0); UT_ASSERT_EQ(disk_exit_lifo_errors, 0);
-		} else entry = rx_prepare(NULL);
+		} else if (sx_vm_entry != NULL) entry = sx_vm_entry();
+		else entry = rx_prepare(NULL);
 		NM_REQUIRE(n == 0 && sx_cut < 3 ? entry == NULL : entry != NULL);
 		UT_ASSERT_EQ(ordinary_sends, 1); UT_ASSERT_EQ(wc_legacy, 0); UT_ASSERT_EQ(ordinary_panics, 0);
 		UT_ASSERT_EQ(disk_reads, 0); UT_ASSERT_EQ(complete_io_calls, 0);
@@ -215,12 +217,15 @@ static bool sx_parent(int fd, int mode)
 		UT_ASSERT(memcmp(before.data, disk_shared.data, BLCKSZ) == 0);
 		UT_ASSERT(!ResourceOwnerHasBufferIO(original_io_owner, 1)); UT_ASSERT(!fake_cv_prepared);
 		if (entry != NULL) {
-			NM_REQUIRE(sx_late_seed());
+			if (sx_vm_entry == NULL) NM_REQUIRE(sx_late_seed());
 			if (n != 0) NM_REQUIRE(sx_late_old());
-			LWLockAcquire(entry->content_lock, LW_EXCLUSIVE);
-			NM_REQUIRE(cluster_bufmgr_pcm_x_writer_activate(entry, true));
+			if (sx_vm_entry == NULL) {
+				LWLockAcquire(entry->content_lock, LW_EXCLUSIVE);
+				NM_REQUIRE(cluster_bufmgr_pcm_x_writer_activate(entry, true));
+			} else UT_ASSERT(LWLockHeldByMe(entry->content_lock));
 			cluster_bufmgr_pcm_x_writer_mark_releasing(entry); LWLockRelease(entry->content_lock);
 			cluster_bufmgr_pcm_x_writer_release(entry);
+			if (sx_vm_entry != NULL) NM_REQUIRE(sx_late_seed());
 		}
 		MyBackendType = B_LMS;
 		NM_REQUIRE(sx_probe(&observed)); NM_REQUIRE(nm_requester_notice(&state));
@@ -373,9 +378,115 @@ UT_TEST(test_S_X_duplicate_quiet_and_installed_receipts) { sx_run(1, 2, true, fa
 UT_TEST(test_S_X_dirty_current_survives_all_ERROR_cuts) { for (unsigned cut = 0; cut < 3; cut++) sx_run(cut, 0, false, true, false); }
 UT_TEST(test_S_X_old_unarmed_receipt_cannot_cancel_successor_X) { sx_run(0, 0, false, false, true); }
 UT_TEST(test_S_X_old_armed_receipt_cannot_cancel_dirty_successor_X) { sx_run(1, 0, true, true, true); }
+/* Drive each public VM entrance over the same first-fill and conversion.
+ * The local content-lock adapter delegates to the production writer ledger.
+ * The separate master consumes both requests and both installed receipts. */
+#include "cluster/cluster_pcm_direct_init.h"
+static unsigned vm_entrance;
+
+static void
+vm_seed(void)
+{
+	request_buf.tag.forkNum = request_base.tag.forkNum = VISIBILITYMAP_FORKNUM;
+	request_prepared.common.logical_assertion.resource = request_base.tag;
+	if (vm_entrance == 2) {
+		memset(disk_bytes.data, 0, BLCKSZ);
+		disk_store();
+	}
+}
+
+static void
+vm_lock_internal(Buffer buffer, int mode, bool *barrier, const ClusterBufferBarrierSiteId *site,
+				 bool *replaced, bool *transient, ResourceXAuxiliaryAcquireContext *aux)
+{
+	ClusterPcmXWriterLedgerEntry *entry;
+	uint64 deadline = 0;
+
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT_EQ(mode, BUFFER_LOCK_EXCLUSIVE);
+	UT_ASSERT(site == NULL);
+	UT_ASSERT_EQ(aux != NULL, vm_entrance == 0);
+	UT_ASSERT(request_private_pin(buffer) > 0);
+	if (replaced != NULL) *replaced = false;
+	entry = cluster_bufmgr_pcm_x_writer_prepare_target(&request_buf, &request_buf.tag,
+		PCM_LOCK_MODE_X, 77, &deadline, barrier, transient, aux);
+	UT_ASSERT(entry != NULL);
+	if (entry != NULL) {
+		LWLockAcquire(entry->content_lock, LW_EXCLUSIVE);
+		UT_ASSERT(cluster_bufmgr_pcm_x_writer_activate(entry, true));
+	}
+}
+
+/* The format snapshot reads the backend-local pin table under the header
+ * lock. No transport or shared-lock acquisition occurs in this lookup. */
+static int vm_private_pins(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, request_buf.buf_id + 1);
+	return request_pins;
+}
+#define GetPrivateRefCount vm_private_pins
+#define BufferIsPinned(buffer) (request_private_pin(buffer) > 0)
+#define LockBufHdr stage_header_lock
+#define GetBufferDescriptor(id) (&request_buf)
+#define BufHdrGetBlock(buf) ((void)(buf), disk_shared.data)
+#define cluster_bufmgr_should_pcm_track(buf) cluster_pcm_x_buffer_tag_tracked(&(buf)->tag, cluster_shared_catalog)
+#define cluster_pcm_is_active() true
+#define LockBufferInternal vm_lock_internal
+#define cluster_bufmgr_pcm_direct_init_report_failure(...) pg_re_throw()
+#define cluster_bufmgr_resource_x_writer_report_failure(...) pg_re_throw()
+#define cluster_bufmgr_pcm_join_aux_direct_init_exact(...) (pg_re_throw(), false)
+#define cluster_bufmgr_pcm_gate_direct_init(...) (pg_re_throw(), false)
+#define cluster_bufmgr_pcm_x_writer_activate_target_direct_init(...) pg_re_throw()
+#undef elog
+#define elog(...) ((void)0)
+#include "test_cluster_vm_writer_entries.inc"
+#undef elog
+
+static ClusterPcmXWriterLedgerEntry *
+vm_enter(void)
+{
+	ResourceXAuxiliaryAcquireContext aux = {0};
+	Buffer buffer = 1;
+	int pins = request_pins;
+
+	UT_ASSERT_EQ(request_buf.tag.forkNum, VISIBILITYMAP_FORKNUM);
+	UT_ASSERT_EQ(request_buf.pcm_state, PCM_STATE_S);
+	UT_ASSERT(pins > 0);
+	if (vm_entrance == 0) {
+		UT_ASSERT(ClusterLockBufferExclusiveAuxiliaryAware(&buffer, &aux));
+		UT_ASSERT_EQ(buffer, 1);
+	} else if (vm_entrance == 1)
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	else {
+		UT_ASSERT(PageIsNew((Page)disk_shared.data));
+		UT_ASSERT_EQ(LockBufferForVisibilityMapPageInit(buffer), buffer);
+		UT_ASSERT(PageIsNew((Page)disk_shared.data));
+	}
+	UT_ASSERT_EQ(request_pins, pins);
+	return cluster_bufmgr_pcm_x_writer_find(&request_buf);
+}
+
+static void
+vm_run(unsigned entrance)
+{
+	vm_entrance = entrance;
+	nm_before_first_read = vm_seed;
+	sx_vm_entry = vm_enter;
+	sx_run(3, 0, false, false, false);
+	sx_vm_entry = NULL;
+	nm_before_first_read = NULL;
+}
+
+UT_TEST(test_vm_settled_s_qualified_writer) { vm_run(0); }
+UT_TEST(test_vm_settled_s_plain_writer) { vm_run(1); }
+UT_TEST(test_vm_zero_page_first_read_then_init_writer) { vm_run(2); }
+
 int main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(19);
+	UT_RUN(test_vm_settled_s_qualified_writer);
+	UT_RUN(test_vm_settled_s_plain_writer);
+	UT_RUN(test_vm_zero_page_first_read_then_init_writer);
 	UT_RUN(test_S_X_unarmed_ERROR_preserves_installed_S);
 	UT_RUN(test_S_X_armed_ERROR_preserves_installed_S);
 	UT_RUN(test_S_X_post_C_ERROR_preserves_exact_X);

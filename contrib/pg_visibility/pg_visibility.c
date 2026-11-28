@@ -16,6 +16,9 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage_xlog.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_pcm_lock.h"
+#endif
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -600,21 +603,25 @@ collect_corrupt_items(Oid relid, bool all_visible, bool all_frozen)
 	/* Loop over every block in the relation. */
 	for (blkno = 0; blkno < nblocks; ++blkno)
 	{
-		bool		check_frozen = false;
-		bool		check_visible = false;
+		bool		check_frozen;
+		bool		check_visible;
+#ifdef USE_PGRAC_CLUSTER
+		bool		lock_vm;
+#endif
 		Buffer		buffer;
 		Page		page;
 		OffsetNumber offnum,
 					maxoff;
 
+#ifdef USE_PGRAC_CLUSTER
+recheck_page:
+#endif
 		/* Make sure we are interruptible. */
 		CHECK_FOR_INTERRUPTS();
 
 		/* Use the visibility map to decide whether to check this page. */
-		if (all_frozen && VM_ALL_FROZEN(rel, blkno, &vmbuffer))
-			check_frozen = true;
-		if (all_visible && VM_ALL_VISIBLE(rel, blkno, &vmbuffer))
-			check_visible = true;
+		check_frozen = all_frozen && VM_ALL_FROZEN(rel, blkno, &vmbuffer);
+		check_visible = all_visible && VM_ALL_VISIBLE(rel, blkno, &vmbuffer);
 		if (!check_visible && !check_frozen)
 			continue;
 
@@ -630,10 +637,23 @@ collect_corrupt_items(Oid relid, bool all_visible, bool all_frozen)
 		 * The visibility map bits might have changed while we were acquiring
 		 * the page lock.  Recheck to avoid returning spurious results.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		/* On a closed barrier, drop the heap lock before requalifying the VM. */
+		lock_vm = !BufferIsLocal(vmbuffer) && cluster_pcm_is_active();
+		if (lock_vm && !ClusterLockBufferShareBarrierAware(vmbuffer))
+		{
+			UnlockReleaseBuffer(buffer);
+			goto recheck_page;
+		}
+#endif
 		if (check_frozen && !VM_ALL_FROZEN(rel, blkno, &vmbuffer))
 			check_frozen = false;
 		if (check_visible && !VM_ALL_VISIBLE(rel, blkno, &vmbuffer))
 			check_visible = false;
+#ifdef USE_PGRAC_CLUSTER
+		if (lock_vm)
+			LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+#endif
 		if (!check_visible && !check_frozen)
 		{
 			UnlockReleaseBuffer(buffer);

@@ -48,6 +48,8 @@ typedef struct ClusterPcmDirectInitProof {
 	bool armed;
 } ClusterPcmDirectInitProof;
 
+extern bool cluster_pcm_direct_init_resident_vm(ClusterPcmDirectInitKind kind,
+											   const ClusterPcmDirectInitSnapshot *snapshot);
 extern ClusterPcmOwnResult
 cluster_pcm_direct_init_proof_arm(ClusterPcmDirectInitKind kind,
 								  const ClusterPcmDirectInitSnapshot *snapshot,

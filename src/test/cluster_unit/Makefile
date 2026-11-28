@@ -11863,11 +11863,11 @@ all: test_cluster_native_s_x_cancel_master
 test_cluster_native_s_x_cancel_master: test_cluster_native_s_x_cancel_master.c \
 		test_cluster_native_master test_cluster_native_resident_x \
 		test_cluster_native_master_fixture.inc test_cluster_native_resident_x_fixture.inc \
-		test_cluster_native_s_release.inc
+		test_cluster_native_s_release.inc test_cluster_vm_writer_entries.inc $(CLUSTER_PCM_DIRECT_INIT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
-		$< test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$< $(CLUSTER_PCM_DIRECT_INIT_O) test_cluster_space_bufpage_product.o test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_VERSION_O) \
 		test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) $(CLUSTER_PCM_OWN_O) \
@@ -11879,7 +11879,18 @@ test_cluster_native_s_release.inc: $(top_srcdir)/src/backend/storage/buffer/bufm
 	     /^cluster_bufmgr_pcm_own_finish_s_release_to_n\(/ { print "ClusterPcmOwnResult"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (helpers != 2 || found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_vm_writer_entries.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^typedef enum ClusterBufmgrPcmDirectInitArmResult/ { emit=1; n++ } \
+	     /^cluster_bufmgr_pcm_direct_init_snapshot_locked\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_bufmgr_pcm_arm_direct_init\(/ { print "static ClusterBufmgrPcmDirectInitArmResult"; emit=1; n++ } \
+	     /^LockBuffer\(/ { print "void"; emit=1; n++ } \
+	     /^ClusterLockBufferExclusiveAuxiliary(Alias)?Aware\(/ { print "bool"; emit=1; n++ } \
+	     /^LockBufferForAuxiliaryPageInit\(/ { print "static Buffer"; emit=1; n++ } \
+	     /^LockBufferForVisibilityMapPageInit\(/ { print "Buffer"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 8 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 clean-native-s-x-cancel-master:
+	rm -f test_cluster_vm_writer_entries.inc test_cluster_vm_writer_entries.inc.tmp
 	rm -f test_cluster_native_s_x_cancel_master test_cluster_native_s_release.inc test_cluster_native_s_release.inc.tmp
 
 # Real prior S and independent master across ordinary acquisition domain loss.

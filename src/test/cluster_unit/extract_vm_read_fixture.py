@@ -17,6 +17,7 @@ if "\ncluster_heap_maintenance_restricted(" in vm:
     print(function(vm, "cluster_heap_maintenance_restricted", "bool"))
 print(function(vm, "vm_readbuf", "static Buffer"))
 print(function(vm, "visibilitymap_get_status", "uint8"))
+print(function(vm, "visibilitymap_count", "void"))
 print(function((root / "executor/nodeIndexonlyscan.c").read_text(),
                "IndexOnlyNext", "static TupleTableSlot *"))
 

@@ -200,8 +200,19 @@ fixture_open_gate(ResourceXGateSnapshot *gate)
 
 /* The acquired-authority branches are not part of this fixture: reaching
  * them after NOT_FOUND must fail, never manufacture a grant for the test. */
-#define cluster_bufmgr_pcm_acquire_resident_x(...)                                                 \
-	(fixture_failure(), RESOURCE_X_APPLY_INVALID)
+static ResourceXApplyResult
+fixture_resident_x(BufferDesc *buf, const BufferTag *tag, uint64 r4, bool *barrier)
+{
+	UT_ASSERT(BufferTagsEqual(&buf->tag, tag));
+	UT_ASSERT_EQ(tag->forkNum, VISIBILITYMAP_FORKNUM);
+	UT_ASSERT_EQ(r4, 6);
+	UT_ASSERT(GetPrivateRefCount(BufferDescriptorGetBuffer(buf)) > 0);
+	UT_ASSERT(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
+	UT_ASSERT(barrier != NULL);
+	*barrier = true;
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+#define cluster_bufmgr_pcm_acquire_resident_x fixture_resident_x
 #define cluster_gcs_resource_x_target_acquire_until_exact(...)                                     \
 	(fixture_failure(), RESOURCE_X_APPLY_INVALID)
 #define cluster_pcm_lock_resource_x_gate_snapshot fixture_open_gate
@@ -223,31 +234,24 @@ fixture_open_gate(ResourceXGateSnapshot *gate)
 #define CHECK_FOR_INTERRUPTS() fixture_failure()
 #include "test_cluster_pcm_aux_prepare.inc"
 
-/* Slow distributed acquisition is controlled, but the real heap entry,
- * buffer wrapper, pin handoff, prepare ledger and reobserve consumer run.
- * Reaching the context-free acquire after relinquishing this pin is the
- * production bug this fixture must expose, not a permitted test shortcut. */
+/* Exercise the real heap entry and writer ledger with a local barrier refusal. */
 static void
 fixture_heap_lock_inner(Buffer buffer, bool *barrier, bool *replaced, bool *transient,
 						ResourceXAuxiliaryAcquireContext *context)
 {
 	BufferDesc *buf = &fixture_buffers[buffer - 1];
 	BufferTag tag = buf->tag;
-	ClusterBufmgrPcmAuxPinHandoff handoff;
 	uint64 deadline = 0;
 	bool local_barrier = false, local_transient = false;
 
-	UT_ASSERT(cluster_bufmgr_pcm_aux_pin_handoff_begin(buf, &tag, &handoff));
-	buf->pcm_state = (uint8)PCM_STATE_N;
-	buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
-	pg_atomic_write_u32(&buf->state, BM_TAG_VALID | BM_IO_IN_PROGRESS);
+	UT_ASSERT(replaced != NULL);
+	*replaced = false;
 	UT_ASSERT(cluster_bufmgr_pcm_x_writer_prepare_target(
 				  buf, &tag, PCM_LOCK_MODE_X, 6, &deadline,
 				  barrier != NULL ? barrier : &local_barrier,
 				  transient != NULL ? transient : &local_transient, context)
 			  == NULL);
-	UT_ASSERT(context != NULL && context->reobserve && replaced != NULL);
-	*replaced = true;
+	UT_ASSERT(context != NULL && !context->reobserve);
 }
 
 typedef struct {
@@ -314,7 +318,7 @@ fixture_reset(ForkNumber fork)
 
 UT_TEST(handoff_releases_every_private_pin_before_the_wait)
 {
-	BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+	BufferTag tag = fixture_reset(FSM_FORKNUM);
 	ClusterBufmgrPcmAuxPinHandoff handoff;
 
 	fixture_refs[0] = 3;
@@ -328,7 +332,7 @@ UT_TEST(handoff_releases_every_private_pin_before_the_wait)
 	UT_ASSERT(!handoff.active);
 }
 
-UT_TEST(real_heap_vm_barrier_entry_reobserves_without_acquiring_unready_bytes)
+UT_TEST(real_heap_vm_barrier_refusal_preserves_pin_and_clears_ledger)
 {
 	bool replaced = false;
 	ResourceXAuxiliaryAcquireContext context = { 0 };
@@ -341,15 +345,15 @@ UT_TEST(real_heap_vm_barrier_entry_reobserves_without_acquiring_unready_bytes)
 														&replaced, NULL, NULL, &context, NULL));
 	} else
 		UT_ASSERT(false);
-	UT_ASSERT(replaced);
+	UT_ASSERT(!replaced);
 	UT_ASSERT_EQ(fixture_errors, 0);
-	UT_ASSERT_EQ(fixture_refs[0], 0);
+	UT_ASSERT_EQ(fixture_refs[0], 1);
 	UT_ASSERT_EQ(fixture_old_access, 0);
 	UT_ASSERT(!fixture_content[0]);
 	UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(&fixture_buffers[0]) == NULL);
 }
 
-UT_TEST(real_heap_vm_plain_entry_must_not_erase_the_retry_channel)
+UT_TEST(real_heap_vm_plain_entry_preserves_pin_on_refusal)
 {
 	bool replaced = false;
 	ResourceXAuxiliaryAcquireContext context = { 0 };
@@ -362,9 +366,9 @@ UT_TEST(real_heap_vm_plain_entry_must_not_erase_the_retry_channel)
 														&replaced, NULL, NULL, &context, NULL));
 	} else
 		UT_ASSERT(false);
-	UT_ASSERT(replaced);
+	UT_ASSERT(!replaced);
 	UT_ASSERT_EQ(fixture_errors, 0);
-	UT_ASSERT_EQ(fixture_refs[0], 0);
+	UT_ASSERT_EQ(fixture_refs[0], 1);
 	UT_ASSERT(!fixture_content[0]);
 }
 
@@ -387,9 +391,9 @@ UT_TEST(repicked_new_heap_target_starts_a_new_vm_request_not_an_old_identity_err
 	} else
 		UT_ASSERT(false);
 	UT_ASSERT_EQ(fixture_errors, 0);
-	UT_ASSERT_EQ(context.resource.blockNum, 1);
-	UT_ASSERT_EQ(context.absolute_deadline_us, 9000);
-	UT_ASSERT(replaced && context.reobserve);
+	UT_ASSERT_EQ(fixture_refs[0], 1);
+	UT_ASSERT_EQ(context.absolute_deadline_us, 0);
+	UT_ASSERT(!replaced && !context.reobserve);
 }
 
 UT_TEST(retarget_does_not_erase_failed_history_old_target_or_namespace)
@@ -428,7 +432,7 @@ UT_TEST(retarget_does_not_erase_failed_history_old_target_or_namespace)
 
 UT_TEST(retagged_old_slot_is_never_repinned_or_read)
 {
-	BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+	BufferTag tag = fixture_reset(FSM_FORKNUM);
 	ClusterBufmgrPcmAuxPinHandoff handoff;
 
 	UT_ASSERT(cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
@@ -457,7 +461,7 @@ UT_TEST(unowned_vm_observation_replacement_is_reobserve_not_stale)
  * handle back to the original caller for ordinary lookup/read/revalidation. */
 UT_TEST(unpinned_n_read_in_progress_returns_to_original_pin_owner)
 {
-	BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+	BufferTag tag = fixture_reset(FSM_FORKNUM);
 	ClusterBufmgrPcmAuxPinHandoff handoff;
 	ClusterPcmOwnSnapshot own = { 0 };
 	ClusterPcmOwnSnapshot saved;
@@ -480,7 +484,7 @@ UT_TEST(unpinned_n_read_in_progress_returns_to_original_pin_owner)
 
 UT_TEST(unpinned_n_before_read_start_returns_to_caller_instead_of_waiting_ownerless)
 {
-	BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+	BufferTag tag = fixture_reset(FSM_FORKNUM);
 	ClusterPcmOwnSnapshot own = { 0 };
 
 	own.tag = tag;
@@ -498,7 +502,7 @@ UT_TEST(unpinned_n_before_read_start_returns_to_caller_instead_of_waiting_ownerl
 
 UT_TEST(read_readiness_escape_never_covers_owned_or_contradictory_images)
 {
-	BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
+	BufferTag tag = fixture_reset(FSM_FORKNUM);
 	ClusterPcmOwnSnapshot base = { 0 };
 
 	base.tag = tag;
@@ -575,36 +579,30 @@ UT_TEST(read_readiness_escape_never_covers_owned_or_contradictory_images)
 	UT_ASSERT_EQ(fixture_production_own_guard(&base, &tag, true), RESOURCE_X_APPLY_NOT_FOUND);
 }
 
-UT_TEST(real_prepare_routes_unready_observation_without_grant_or_pin)
+UT_TEST(retained_vm_wrapper_refuses_unpinned_unready_mapping)
 {
 	for (int io = 0; io < 2; io++) {
 		BufferTag tag = fixture_reset(VISIBILITYMAP_FORKNUM);
 		ClusterBufmgrPcmAuxPinHandoff handoff;
 		ResourceXAuxiliaryAcquireContext context = { 0 };
-		uint64 deadline = 0;
-		bool barrier = false, transient = false;
 		BufferDesc unchanged;
 
-		UT_ASSERT(cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
+		UT_ASSERT(!cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
 		fixture_buffers[0].pcm_state = (uint8)PCM_STATE_N;
 		fixture_buffers[0].buffer_type = (uint8)BUF_TYPE_CURRENT;
 		pg_atomic_write_u32(&fixture_buffers[0].state, BM_TAG_VALID | (io ? BM_IO_IN_PROGRESS : 0));
 		memcpy(&unchanged, &fixture_buffers[0], sizeof(unchanged));
-		fixture_readiness_observation = true;
+		fixture_refs[0] = 0;
+		Buffer buffer = 1;
 		if (sigsetjmp(fixture_error, 1) == 0) {
-			UT_ASSERT(cluster_bufmgr_pcm_x_writer_prepare_target(&fixture_buffers[0], &tag,
-																 PCM_LOCK_MODE_X, 6, &deadline,
-																 &barrier, &transient, &context)
-					  == NULL);
-		} else
+			(void)ClusterLockBufferExclusiveAuxiliaryAware(&buffer, &context);
 			UT_ASSERT(false);
-		UT_ASSERT_EQ(fixture_errors, 0);
-		UT_ASSERT(context.active && context.reobserve);
-		UT_ASSERT_EQ(context.caller.joined_request.assertion_sequence, 77);
-		UT_ASSERT_EQ(deadline, 9000);
-		UT_ASSERT(!barrier && !transient);
+		}
+		UT_ASSERT_EQ(fixture_errors, 1);
+		UT_ASSERT_EQ(fixture_core_calls, 0);
+		UT_ASSERT(!context.reobserve && !context.active);
+		UT_ASSERT_EQ(buffer, 1);
 		UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(&fixture_buffers[0]) == NULL);
-		UT_ASSERT_EQ(fixture_refs[0], 0);
 		UT_ASSERT_EQ(memcmp(&unchanged, &fixture_buffers[0], sizeof(unchanged)), 0);
 	}
 }
@@ -678,14 +676,14 @@ UT_TEST(actual_handle_owner_invalidates_replaced_pin_and_keeps_other_pin_on_retr
 	ResourceXAuxiliaryAcquireContext context = { 0 };
 	Buffer buffer = 1;
 
-	(void)fixture_reset(VISIBILITYMAP_FORKNUM);
+	(void)fixture_reset(FSM_FORKNUM);
 	fixture_lock_outcome = 1;
 	UT_ASSERT(!ClusterLockBufferExclusiveAuxiliaryAware(&buffer, &context));
 	UT_ASSERT_EQ(buffer, InvalidBuffer);
 	UT_ASSERT_EQ(fixture_refs[0], 0);
 	UT_ASSERT_EQ(fixture_releases, 0); /* handoff already released it */
 	UT_ASSERT(context.active && context.reobserve);
-	(void)fixture_reset(VISIBILITYMAP_FORKNUM);
+	(void)fixture_reset(FSM_FORKNUM);
 	buffer = 1;
 	fixture_lock_outcome = 2;
 	UT_ASSERT(!ClusterLockBufferExclusiveAuxiliaryAware(&buffer, &context));
@@ -697,12 +695,12 @@ UT_TEST(actual_handle_owner_invalidates_replaced_pin_and_keeps_other_pin_on_retr
 	UT_ASSERT(fixture_content[0]);
 }
 
-UT_TEST(explicit_two_vm_aliases_are_invalidated_together_without_releasing_the_new_occupant)
+UT_TEST(explicit_two_drop_aliases_are_invalidated_together_without_releasing_the_new_occupant)
 {
 	ResourceXAuxiliaryAcquireContext context = { 0 };
 	Buffer primary = 1, alias = 1;
 
-	(void)fixture_reset(VISIBILITYMAP_FORKNUM);
+	(void)fixture_reset(FSM_FORKNUM);
 	fixture_refs[0] = fixture_declared_refs = 2;
 	fixture_lock_outcome = 1;
 	UT_ASSERT(!ClusterLockBufferExclusiveAuxiliaryAliasAware(&primary, &alias, NULL, &context));
@@ -720,7 +718,7 @@ UT_TEST(alias_contract_rejects_unknown_pins_before_any_handoff)
 		ResourceXAuxiliaryAcquireContext context = { 0 };
 		Buffer primary = 1, alias = 1;
 
-		(void)fixture_reset(VISIBILITYMAP_FORKNUM);
+		(void)fixture_reset(FSM_FORKNUM);
 		fixture_refs[0] = same_variable ? 2 : 3;
 		if (sigsetjmp(fixture_error, 1) == 0) {
 			(void)ClusterLockBufferExclusiveAuxiliaryAliasAware(
@@ -742,28 +740,29 @@ UT_TEST(distinct_vm_alias_is_untouched_and_success_preserves_all_declared_pins)
 
 	(void)fixture_reset(VISIBILITYMAP_FORKNUM);
 	fixture_refs[1] = 1;
-	fixture_lock_outcome = 1;
+	fixture_lock_outcome = 2;
 	UT_ASSERT(!ClusterLockBufferExclusiveAuxiliaryAliasAware(&primary, &alias, NULL, &context));
-	UT_ASSERT_EQ(primary, InvalidBuffer);
+	UT_ASSERT_EQ(primary, 1);
 	UT_ASSERT_EQ(alias, 2);
 	UT_ASSERT_EQ(fixture_refs[1], 1);
 	(void)fixture_reset(VISIBILITYMAP_FORKNUM);
 	primary = alias = 1;
-	fixture_refs[0] = fixture_declared_refs = 2;
+	fixture_refs[0] = fixture_declared_refs = 3;
 	UT_ASSERT(ClusterLockBufferExclusiveAuxiliaryAliasAware(&primary, &alias, NULL, &context));
-	UT_ASSERT_EQ(fixture_refs[0], 2);
+	UT_ASSERT_EQ(fixture_refs[0], 3);
 	UT_ASSERT_EQ(primary, 1);
 	UT_ASSERT_EQ(alias, 1);
 	UT_ASSERT(fixture_content[0]);
 	UT_ASSERT(!context.active && !context.reobserve);
 }
 
-UT_TEST(actual_handle_owner_refuses_unowned_aliases_before_releasing_any_pin)
+UT_TEST(vm_wrapper_rejects_held_content_before_acquisition)
 {
 	ResourceXAuxiliaryAcquireContext context = { 0 };
 	Buffer buffer = 1;
 
 	(void)fixture_reset(VISIBILITYMAP_FORKNUM);
+	fixture_content[0] = true;
 	fixture_refs[0] = 2;
 	if (sigsetjmp(fixture_error, 1) == 0) {
 		(void)ClusterLockBufferExclusiveAuxiliaryAware(&buffer, &context);
@@ -806,7 +805,7 @@ UT_TEST(real_reobserve_entry_preserves_failure_history_namespace_and_deadline)
 	UT_ASSERT(!context.reobserve);
 }
 
-UT_TEST(actual_prepare_preserves_fsm_exclusion_and_reobserves_vm_mapping_loss)
+UT_TEST(fsm_handoff_is_excluded_and_vm_mapping_stays_pinned)
 {
 	for (int fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++) {
 		BufferTag tag = fixture_reset((ForkNumber)fork);
@@ -816,6 +815,12 @@ UT_TEST(actual_prepare_preserves_fsm_exclusion_and_reobserves_vm_mapping_loss)
 		uint64 deadline = 0;
 		bool barrier = false, transient = false;
 
+		if (fork == VISIBILITYMAP_FORKNUM) {
+			UT_ASSERT(!cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
+			UT_ASSERT_EQ(fixture_refs[0], 1);
+			UT_ASSERT_EQ(fixture_releases, 0);
+			continue;
+		}
 		UT_ASSERT(cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
 		memset(&fixture_buffers[0].tag, 0, sizeof(BufferTag));
 		memcpy(&untouched, &fixture_buffers[0], sizeof(untouched));
@@ -823,16 +828,9 @@ UT_TEST(actual_prepare_preserves_fsm_exclusion_and_reobserves_vm_mapping_loss)
 															 PCM_LOCK_MODE_X, 6, &deadline,
 															 &barrier, &transient, &context)
 				  == NULL);
-		if (fork == FSM_FORKNUM) {
-			/* The real tracking predicate excludes advisory FSM ownership. */
-			UT_ASSERT(!context.reobserve);
-			UT_ASSERT_EQ(fixture_core_calls, 0);
-			UT_ASSERT_EQ(deadline, 0);
-		} else {
-			UT_ASSERT(context.reobserve);
-			UT_ASSERT_EQ(fixture_core_calls, 1);
-			UT_ASSERT_EQ(deadline, 9000);
-		}
+		UT_ASSERT(!context.reobserve);
+		UT_ASSERT_EQ(fixture_core_calls, 0);
+		UT_ASSERT_EQ(deadline, 0);
 		UT_ASSERT(!barrier && !transient);
 		UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(&fixture_buffers[0]) == NULL);
 		UT_ASSERT_EQ(fixture_refs[0], 0);
@@ -855,7 +853,7 @@ UT_TEST(actual_prepare_does_not_turn_failed_history_or_namespace_into_retry)
 		context.r4_record_generation = failure == 0 ? 7 : 6;
 		context.caller.failed_attempt = failure == 0 ? 0 : 77;
 		context.absolute_deadline_us = deadline;
-		UT_ASSERT(cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
+		UT_ASSERT(!cluster_bufmgr_pcm_aux_pin_handoff_begin(&fixture_buffers[0], &tag, &handoff));
 		if (sigsetjmp(fixture_error, 1) == 0) {
 			(void)cluster_bufmgr_pcm_x_writer_prepare_target(&fixture_buffers[0], &tag,
 															 PCM_LOCK_MODE_X, 6, &deadline,
@@ -863,9 +861,9 @@ UT_TEST(actual_prepare_does_not_turn_failed_history_or_namespace_into_retry)
 			UT_ASSERT(false);
 		}
 		UT_ASSERT_EQ(fixture_errors, 1);
-		UT_ASSERT(!context.reobserve && !barrier && !transient);
+		UT_ASSERT(!barrier && !transient);
 		UT_ASSERT(cluster_bufmgr_pcm_x_writer_find(&fixture_buffers[0]) == NULL);
-		UT_ASSERT_EQ(fixture_refs[0], 0);
+		UT_ASSERT_EQ(fixture_refs[0], 1);
 	}
 }
 
@@ -875,8 +873,8 @@ main(void)
 	UT_PLAN(22);
 	UT_RUN(real_creation_observer_requires_no_pins_locks_or_writer_ledger);
 	UT_RUN(handoff_releases_every_private_pin_before_the_wait);
-	UT_RUN(real_heap_vm_barrier_entry_reobserves_without_acquiring_unready_bytes);
-	UT_RUN(real_heap_vm_plain_entry_must_not_erase_the_retry_channel);
+	UT_RUN(real_heap_vm_barrier_refusal_preserves_pin_and_clears_ledger);
+	UT_RUN(real_heap_vm_plain_entry_preserves_pin_on_refusal);
 	UT_RUN(repicked_new_heap_target_starts_a_new_vm_request_not_an_old_identity_error);
 	UT_RUN(retarget_does_not_erase_failed_history_old_target_or_namespace);
 	UT_RUN(retagged_old_slot_is_never_repinned_or_read);
@@ -884,16 +882,16 @@ main(void)
 	UT_RUN(unpinned_n_read_in_progress_returns_to_original_pin_owner);
 	UT_RUN(unpinned_n_before_read_start_returns_to_caller_instead_of_waiting_ownerless);
 	UT_RUN(read_readiness_escape_never_covers_owned_or_contradictory_images);
-	UT_RUN(real_prepare_routes_unready_observation_without_grant_or_pin);
+	UT_RUN(retained_vm_wrapper_refuses_unpinned_unready_mapping);
 	UT_RUN(pinned_or_retained_identity_contradiction_is_still_stale);
 	UT_RUN(real_unowned_gate_requires_empty_pin_and_handoff_not_retained_writer);
 	UT_RUN(actual_handle_owner_invalidates_replaced_pin_and_keeps_other_pin_on_retry);
-	UT_RUN(explicit_two_vm_aliases_are_invalidated_together_without_releasing_the_new_occupant);
+	UT_RUN(explicit_two_drop_aliases_are_invalidated_together_without_releasing_the_new_occupant);
 	UT_RUN(alias_contract_rejects_unknown_pins_before_any_handoff);
 	UT_RUN(distinct_vm_alias_is_untouched_and_success_preserves_all_declared_pins);
-	UT_RUN(actual_handle_owner_refuses_unowned_aliases_before_releasing_any_pin);
+	UT_RUN(vm_wrapper_rejects_held_content_before_acquisition);
 	UT_RUN(real_reobserve_entry_preserves_failure_history_namespace_and_deadline);
-	UT_RUN(actual_prepare_preserves_fsm_exclusion_and_reobserves_vm_mapping_loss);
+	UT_RUN(fsm_handoff_is_excluded_and_vm_mapping_stays_pinned);
 	UT_RUN(actual_prepare_does_not_turn_failed_history_or_namespace_into_retry);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
